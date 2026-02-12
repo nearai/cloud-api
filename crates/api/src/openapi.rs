@@ -36,6 +36,7 @@ use utoipa::{Modify, OpenApi};
         (name = "Billing", description = "Billing costs endpoint (HuggingFace integration)"),
         (name = "Health", description = "Health check endpoints"),
         (name = "Attestation", description = "Attestation and verification endpoints"),
+        (name = "Gateway", description = "Model gateway integration endpoints"),
         (name = "Admin", description = "Administrative endpoints (admin access required)"),
     ),
     paths(
@@ -116,6 +117,8 @@ use utoipa::{Modify, OpenApi};
         crate::routes::usage::get_organization_usage_history,
         crate::routes::usage::get_api_key_usage_history,
         crate::routes::usage::record_usage,
+        // Gateway endpoints (model gateway integration)
+        crate::routes::gateway::check_api_key,
         // Billing endpoints (HuggingFace integration)
         crate::routes::billing::get_billing_costs,
         // Admin endpoints (less frequently used)
@@ -220,6 +223,8 @@ use utoipa::{Modify, OpenApi};
             crate::routes::usage::UsageHistoryResponse,
             crate::routes::usage::UsageHistoryEntryResponse,
             crate::routes::usage::RecordUsageResponse,
+            // Gateway models
+            crate::routes::gateway::CheckApiKeyResponse,
             // Billing models (HuggingFace integration)
             crate::routes::billing::BillingCostsRequest,
             crate::routes::billing::BillingCostsResponse,

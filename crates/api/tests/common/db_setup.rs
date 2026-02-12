@@ -53,22 +53,19 @@ async fn ensure_shared_db() {
                 }
             });
 
-            let exists: bool = client
-                .query_one(
-                    "SELECT EXISTS(SELECT 1 FROM pg_database WHERE datname = $1)",
-                    &[&db_name],
-                )
+            // Just attempt CREATE DATABASE; ignore "already exists" (SQLSTATE 42P04).
+            // Multiple test binaries race here since OnceCell is per-process.
+            match client
+                .execute(&format!("CREATE DATABASE {db_name}"), &[])
                 .await
-                .expect("Failed to check if shared database exists")
-                .get(0);
-
-            if !exists {
-                info!("Creating shared e2e database '{db_name}'...");
-                // db_name is a simple env var default; no user-controlled injection risk in test code
-                client
-                    .execute(&format!("CREATE DATABASE {db_name}"), &[])
-                    .await
-                    .expect("Failed to create shared e2e database");
+            {
+                Ok(_) => info!("Created shared e2e database '{db_name}'"),
+                Err(e)
+                    if e.code() == Some(&tokio_postgres::error::SqlState::DUPLICATE_DATABASE) =>
+                {
+                    debug!("Shared e2e database '{db_name}' already exists");
+                }
+                Err(e) => panic!("Failed to create shared e2e database: {e}"),
             }
 
             drop(client);

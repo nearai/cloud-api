@@ -14,7 +14,7 @@ async fn test_admin_list_models_response_structure() {
 
     // List models and verify response structure
     let response = server
-        .get("/v1/admin/models")
+        .get("/v1/admin/models?limit=500")
         .add_header("Authorization", format!("Bearer {}", get_session_id()))
         .add_header("User-Agent", MOCK_USER_AGENT)
         .await;
@@ -77,7 +77,7 @@ async fn test_admin_list_models_with_models() {
 
     // List models
     let response = server
-        .get("/v1/admin/models")
+        .get("/v1/admin/models?limit=500")
         .add_header("Authorization", format!("Bearer {}", get_session_id()))
         .add_header("User-Agent", MOCK_USER_AGENT)
         .await;
@@ -168,7 +168,7 @@ async fn test_admin_list_models_include_inactive() {
 
     // List models without include_inactive (default - should only show active)
     let response = server
-        .get("/v1/admin/models")
+        .get("/v1/admin/models?limit=500")
         .add_header("Authorization", format!("Bearer {}", get_session_id()))
         .add_header("User-Agent", MOCK_USER_AGENT)
         .await;
@@ -194,7 +194,7 @@ async fn test_admin_list_models_include_inactive() {
 
     // List models with include_inactive=true
     let response = server
-        .get("/v1/admin/models?include_inactive=true")
+        .get("/v1/admin/models?include_inactive=true&limit=500")
         .add_header("Authorization", format!("Bearer {}", get_session_id()))
         .add_header("User-Agent", MOCK_USER_AGENT)
         .await;
@@ -315,9 +315,9 @@ async fn test_admin_list_models_has_timestamps() {
     );
     admin_batch_upsert_models(&server, batch, get_session_id()).await;
 
-    // List models
+    // List models (use high limit to find our model in shared DB)
     let response = server
-        .get("/v1/admin/models")
+        .get("/v1/admin/models?limit=500")
         .add_header("Authorization", format!("Bearer {}", get_session_id()))
         .add_header("User-Agent", MOCK_USER_AGENT)
         .await;
@@ -360,7 +360,7 @@ async fn test_admin_list_models_unauthorized() {
     let server = setup_test_server().await;
 
     // Try to list models without auth
-    let response = server.get("/v1/admin/models").await;
+    let response = server.get("/v1/admin/models?limit=500").await;
 
     assert_eq!(
         response.status_code(),
@@ -432,7 +432,7 @@ async fn test_admin_list_models_after_soft_delete() {
 
     // Verify model exists in active list
     let response = server
-        .get("/v1/admin/models")
+        .get("/v1/admin/models?limit=500")
         .add_header("Authorization", format!("Bearer {}", get_session_id()))
         .add_header("User-Agent", MOCK_USER_AGENT)
         .await;
@@ -462,7 +462,7 @@ async fn test_admin_list_models_after_soft_delete() {
 
     // Model should NOT be in default active-only list
     let response = server
-        .get("/v1/admin/models")
+        .get("/v1/admin/models?limit=500")
         .add_header("Authorization", format!("Bearer {}", get_session_id()))
         .add_header("User-Agent", MOCK_USER_AGENT)
         .await;
@@ -481,7 +481,7 @@ async fn test_admin_list_models_after_soft_delete() {
 
     // Model SHOULD be in include_inactive list
     let response = server
-        .get("/v1/admin/models?include_inactive=true")
+        .get("/v1/admin/models?include_inactive=true&limit=500")
         .add_header("Authorization", format!("Bearer {}", get_session_id()))
         .add_header("User-Agent", MOCK_USER_AGENT)
         .await;

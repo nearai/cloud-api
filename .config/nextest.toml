@@ -9,8 +9,8 @@ test-threads = "num-cpus"
 slow-timeout = { period = "60s", terminate-after = 2 }
 
 # Cap e2e/integration tests to 16 parallel threads to avoid PostgreSQL
-# connection exhaustion. Each test uses ~2 admin connections + 2 pool
-# connections, so 16 * 4 = 64, well under PG's default max_connections = 100.
+# connection exhaustion. Each test uses ~4 pool connections (no admin
+# connections), so 16 * 4 = 64, well under PG's default max_connections = 100.
 [test-groups.e2e-db]
 max-threads = 16
 

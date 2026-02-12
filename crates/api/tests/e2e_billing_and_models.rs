@@ -5,7 +5,7 @@ use common::*;
 
 #[tokio::test]
 async fn test_billing_costs_happy_path() {
-    let (server, _guard) = setup_test_server().await;
+    let server = setup_test_server().await;
     setup_qwen_model(&server).await;
     let org = setup_org_with_credits(&server, 10000000000i64).await; // $10.00
     let api_key = get_api_key_for_org(&server, org.id).await;

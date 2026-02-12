@@ -15,7 +15,7 @@ use serde_json::json;
 /// Test basic score request with valid inputs
 #[tokio::test]
 async fn test_score_basic_success() {
-    let (server, guard) = setup_test_server().await;
+    let server = setup_test_server().await;
 
     // Setup: Create org with credits and get API key
     setup_qwen_reranker_model(&server).await;
@@ -77,14 +77,12 @@ async fn test_score_basic_success() {
         usage["prompt_tokens"].is_number() || usage["total_tokens"].is_number(),
         "Should have token usage"
     );
-
-    let _ = guard;
 }
 
 /// Test that usage is recorded correctly for billing
 #[tokio::test]
 async fn test_score_usage_recording() {
-    let (server, guard) = setup_test_server().await;
+    let server = setup_test_server().await;
 
     setup_qwen_reranker_model(&server).await;
     let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
@@ -149,14 +147,12 @@ async fn test_score_usage_recording() {
         total_tokens_after > total_tokens_before,
         "Usage should be recorded after score request"
     );
-
-    let _ = guard;
 }
 
 /// Test input validation: empty text
 #[tokio::test]
 async fn test_score_validation_empty_text_1() {
-    let (server, guard) = setup_test_server().await;
+    let server = setup_test_server().await;
 
     setup_qwen_reranker_model(&server).await;
     let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
@@ -188,14 +184,12 @@ async fn test_score_validation_empty_text_1() {
             .contains("text_1"),
         "Error should mention text_1"
     );
-
-    let _ = guard;
 }
 
 /// Test input validation: whitespace-only text
 #[tokio::test]
 async fn test_score_validation_whitespace_text_2() {
-    let (server, guard) = setup_test_server().await;
+    let server = setup_test_server().await;
 
     setup_qwen_reranker_model(&server).await;
     let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
@@ -227,14 +221,12 @@ async fn test_score_validation_whitespace_text_2() {
             .contains("text_2"),
         "Error should mention text_2"
     );
-
-    let _ = guard;
 }
 
 /// Test input validation: text exceeds length limit
 #[tokio::test]
 async fn test_score_validation_text_too_long() {
-    let (server, guard) = setup_test_server().await;
+    let server = setup_test_server().await;
 
     setup_qwen_reranker_model(&server).await;
     let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
@@ -266,14 +258,12 @@ async fn test_score_validation_text_too_long() {
         error_msg.contains("exceeds maximum length"),
         "Error should mention length limit"
     );
-
-    let _ = guard;
 }
 
 /// Test error handling: model not found
 #[tokio::test]
 async fn test_score_model_not_found() {
-    let (server, guard) = setup_test_server().await;
+    let server = setup_test_server().await;
 
     let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
     let api_key = get_api_key_for_org(&server, org.id).await;
@@ -304,14 +294,12 @@ async fn test_score_model_not_found() {
         Some("not_found_error"),
         "Error type should be 'not_found_error'"
     );
-
-    let _ = guard;
 }
 
 /// Test authentication: missing API key
 #[tokio::test]
 async fn test_score_missing_api_key() {
-    let (server, guard) = setup_test_server().await;
+    let server = setup_test_server().await;
 
     // Test: No Authorization header
     let response = server
@@ -338,14 +326,12 @@ async fn test_score_missing_api_key() {
         "Error type should be 'unauthorized' or 'missing_auth_header', got: {:?}",
         body["error"]["type"]
     );
-
-    let _ = guard;
 }
 
 /// Test authentication: invalid API key
 #[tokio::test]
 async fn test_score_invalid_api_key() {
-    let (server, guard) = setup_test_server().await;
+    let server = setup_test_server().await;
 
     // Test: Invalid API key format
     let response = server
@@ -364,14 +350,12 @@ async fn test_score_invalid_api_key() {
         401,
         "Should return 401 for invalid API key"
     );
-
-    let _ = guard;
 }
 
 /// Test sequential score requests (concurrent limit testing is covered by chat_completions tests)
 #[tokio::test]
 async fn test_score_sequential_requests() {
-    let (server, guard) = setup_test_server().await;
+    let server = setup_test_server().await;
 
     setup_qwen_reranker_model(&server).await;
     let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
@@ -400,14 +384,12 @@ async fn test_score_sequential_requests() {
             i
         );
     }
-
-    let _ = guard;
 }
 
 /// Test response structure matches specification
 #[tokio::test]
 async fn test_score_response_structure() {
-    let (server, guard) = setup_test_server().await;
+    let server = setup_test_server().await;
 
     setup_qwen_reranker_model(&server).await;
     let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
@@ -446,6 +428,4 @@ async fn test_score_response_structure() {
     // Verify usage structure
     let usage = &body["usage"];
     assert!(usage["prompt_tokens"].is_number() || usage["total_tokens"].is_number());
-
-    let _ = guard;
 }

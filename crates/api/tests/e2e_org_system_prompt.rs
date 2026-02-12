@@ -8,7 +8,7 @@ use serde_json::json;
 /// Test complete CRUD lifecycle with three-state PATCH semantics
 #[tokio::test]
 async fn test_system_prompt_crud_with_patch_semantics() {
-    let (server, _guard) = setup_test_server().await;
+    let server = setup_test_server().await;
     let org = setup_org_with_credits(&server, 10000000000i64).await;
     let access_token = get_access_token_from_refresh_token(&server, get_session_id()).await;
 
@@ -98,7 +98,7 @@ async fn test_system_prompt_crud_with_patch_semantics() {
 /// Test that system prompts are isolated between organizations
 #[tokio::test]
 async fn test_system_prompt_isolation() {
-    let (server, _guard) = setup_test_server().await;
+    let server = setup_test_server().await;
     let org1 = setup_org_with_credits(&server, 10000000000i64).await;
     let org2 = setup_org_with_credits(&server, 10000000000i64).await;
     let access_token = get_access_token_from_refresh_token(&server, get_session_id()).await;
@@ -141,7 +141,7 @@ async fn test_system_prompt_isolation() {
 /// Test that system prompt is applied in conversation responses
 #[tokio::test]
 async fn test_system_prompt_integration_with_responses() {
-    let (server, _guard) = setup_test_server().await;
+    let server = setup_test_server().await;
     let org = setup_org_with_credits(&server, 10000000000i64).await;
     let api_key = get_api_key_for_org(&server, org.id.clone()).await;
     let access_token = get_access_token_from_refresh_token(&server, get_session_id()).await;
@@ -187,7 +187,7 @@ async fn test_system_prompt_integration_with_responses() {
 /// Test authentication and authorization requirements
 #[tokio::test]
 async fn test_system_prompt_auth_requirements() {
-    let (server, _guard) = setup_test_server().await;
+    let server = setup_test_server().await;
     let org = setup_org_with_credits(&server, 10000000000i64).await;
 
     // GET without auth should fail
@@ -207,7 +207,7 @@ async fn test_system_prompt_auth_requirements() {
 /// Test edge cases: empty strings and special characters
 #[tokio::test]
 async fn test_system_prompt_edge_cases() {
-    let (server, _guard) = setup_test_server().await;
+    let server = setup_test_server().await;
     let org = setup_org_with_credits(&server, 10000000000i64).await;
     let access_token = get_access_token_from_refresh_token(&server, get_session_id()).await;
 

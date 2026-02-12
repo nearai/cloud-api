@@ -10,7 +10,7 @@ use common::*;
 
 #[tokio::test]
 async fn test_admin_list_models_response_structure() {
-    let (server, _guard) = setup_test_server().await;
+    let server = setup_test_server().await;
 
     // List models and verify response structure
     let response = server
@@ -45,7 +45,7 @@ async fn test_admin_list_models_response_structure() {
 
 #[tokio::test]
 async fn test_admin_list_models_with_models() {
-    let (server, _guard) = setup_test_server().await;
+    let server = setup_test_server().await;
 
     // Create a test model
     let model_name = format!("test-model-{}", uuid::Uuid::new_v4());
@@ -128,7 +128,7 @@ async fn test_admin_list_models_with_models() {
 
 #[tokio::test]
 async fn test_admin_list_models_include_inactive() {
-    let (server, _guard) = setup_test_server().await;
+    let server = setup_test_server().await;
 
     // Create an active model
     let active_model_name = format!("active-model-{}", uuid::Uuid::new_v4());
@@ -237,7 +237,7 @@ async fn test_admin_list_models_include_inactive() {
 
 #[tokio::test]
 async fn test_admin_list_models_pagination() {
-    let (server, _guard) = setup_test_server().await;
+    let server = setup_test_server().await;
 
     // Create multiple models to test pagination
     for i in 0..5 {
@@ -295,7 +295,7 @@ async fn test_admin_list_models_pagination() {
 
 #[tokio::test]
 async fn test_admin_list_models_has_timestamps() {
-    let (server, _guard) = setup_test_server().await;
+    let server = setup_test_server().await;
 
     // Create a model
     let model_name = format!("timestamp-model-{}", uuid::Uuid::new_v4());
@@ -357,7 +357,7 @@ async fn test_admin_list_models_has_timestamps() {
 
 #[tokio::test]
 async fn test_admin_list_models_unauthorized() {
-    let (server, _guard) = setup_test_server().await;
+    let server = setup_test_server().await;
 
     // Try to list models without auth
     let response = server.get("/v1/admin/models").await;
@@ -373,7 +373,7 @@ async fn test_admin_list_models_unauthorized() {
 
 #[tokio::test]
 async fn test_admin_list_models_invalid_pagination() {
-    let (server, _guard) = setup_test_server().await;
+    let server = setup_test_server().await;
 
     // Test negative offset
     let response = server
@@ -410,7 +410,7 @@ async fn test_admin_list_models_invalid_pagination() {
 
 #[tokio::test]
 async fn test_admin_list_models_after_soft_delete() {
-    let (server, _guard) = setup_test_server().await;
+    let server = setup_test_server().await;
 
     // Create a model
     let model_name = format!("delete-test-model-{}", uuid::Uuid::new_v4());

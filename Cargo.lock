@@ -499,6 +499,7 @@ dependencies = [
  "chrono",
  "config",
  "database",
+ "deadpool-postgres",
  "dotenvy",
  "ed25519-dalek",
  "futures",

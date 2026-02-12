@@ -174,7 +174,7 @@ async fn create_response_stream(
 /// and the response has status=Failed with one failed output item (content empty).
 #[tokio::test]
 async fn test_response_stream_fails_with_failed_event_when_inference_fails_at_start() {
-    let (server, _pool, _mock, database, _guard) = setup_test_server_with_pool().await;
+    let (server, _pool, _mock, database) = setup_test_server_with_pool().await;
     // Do NOT call setup_qwen_model so that the requested model is not in the DB
     let org = setup_org_with_credits(&server, 10000000000i64).await;
     let api_key = get_api_key_for_org(&server, org.id).await;
@@ -346,18 +346,10 @@ async fn test_response_stream_fails_with_failed_event_when_inference_fails_at_st
 
 #[tokio::test]
 async fn test_responses_api() {
-    let (server, _guard) = setup_test_server().await;
-    setup_qwen_model(&server).await;
+    let server = setup_test_server().await;
+    let model_id = setup_qwen_model(&server).await;
     let org = setup_org_with_credits(&server, 10000000000i64).await; // $10.00 USD
     let api_key = get_api_key_for_org(&server, org.id).await;
-
-    let response = server
-        .get("/v1/models")
-        .add_header("Authorization", format!("Bearer {api_key}"))
-        .await;
-
-    let models = response.json::<api::models::ModelsResponse>();
-    assert!(!models.data.is_empty());
 
     let conversation = create_conversation(&server, api_key.clone()).await;
     println!("Conversation: {conversation:?}");
@@ -367,7 +359,7 @@ async fn test_responses_api() {
     let response = create_response(
         &server,
         conversation.id.clone(),
-        models.data[0].id.clone(),
+        model_id.clone(),
         message.clone(),
         max_tokens,
         api_key.clone(),
@@ -423,19 +415,10 @@ async fn test_responses_api() {
 
 #[tokio::test]
 async fn test_streaming_responses_api() {
-    let (server, _guard) = setup_test_server().await;
-    setup_qwen_model(&server).await;
+    let server = setup_test_server().await;
+    let model_id = setup_qwen_model(&server).await;
     let org = setup_org_with_credits(&server, 10000000000i64).await; // $10.00 USD
     let api_key = get_api_key_for_org(&server, org.id).await;
-
-    // Get available models
-    let response = server
-        .get("/v1/models")
-        .add_header("Authorization", format!("Bearer {api_key}"))
-        .await;
-
-    let models = response.json::<api::models::ModelsResponse>();
-    assert!(!models.data.is_empty());
 
     // Create a conversation
     let conversation = create_conversation(&server, api_key.clone()).await;
@@ -446,7 +429,7 @@ async fn test_streaming_responses_api() {
     let (streamed_content, streaming_response) = create_response_stream(
         &server,
         conversation.id.clone(),
-        models.data[0].id.clone(),
+        model_id.clone(),
         message.clone(),
         50,
         api_key.clone(),
@@ -484,7 +467,7 @@ async fn test_streaming_responses_api() {
 
 #[tokio::test]
 async fn test_responses_api_usage_limit_enforcement() {
-    let (server, _guard) = setup_test_server().await;
+    let server = setup_test_server().await;
     let org = setup_org_with_credits(&server, 1).await; // 1 nano-dollar (minimal)
     println!("Created organization: {org:?}");
     let api_key = get_api_key_for_org(&server, org.id).await;
@@ -567,7 +550,7 @@ async fn test_responses_api_usage_limit_enforcement() {
 
 #[tokio::test]
 async fn test_responses_api_no_credits() {
-    let (server, _guard) = setup_test_server().await;
+    let server = setup_test_server().await;
     // Create org without credits (no limit set)
     let org = create_org(&server).await;
     let api_key = get_api_key_for_org(&server, org.id).await;
@@ -627,7 +610,7 @@ async fn test_responses_api_no_credits() {
 
 #[tokio::test]
 async fn test_responses_api_zero_credits() {
-    let (server, _guard) = setup_test_server().await;
+    let server = setup_test_server().await;
     // Create org with zero credits
     let org = setup_org_with_credits(&server, 0).await;
     let api_key = get_api_key_for_org(&server, org.id).await;
@@ -687,7 +670,7 @@ async fn test_responses_api_zero_credits() {
 
 #[tokio::test]
 async fn test_responses_api_sufficient_credits() {
-    let (server, _guard) = setup_test_server().await;
+    let server = setup_test_server().await;
     // Create org with sufficient credits
     let org = setup_org_with_credits(&server, 10000000000i64).await; // $10.00 USD
     let api_key = get_api_key_for_org(&server, org.id).await;
@@ -742,7 +725,7 @@ async fn test_responses_api_sufficient_credits() {
 
 #[tokio::test]
 async fn test_responses_api_streaming_usage_limit() {
-    let (server, _guard) = setup_test_server().await;
+    let server = setup_test_server().await;
     let org = setup_org_with_credits(&server, 1).await; // 1 nano-dollar (minimal)
     println!("Created organization: {org:?}");
     let api_key = get_api_key_for_org(&server, org.id).await;
@@ -835,7 +818,7 @@ async fn test_responses_api_streaming_usage_limit() {
 
 #[tokio::test]
 async fn test_conversations_api() {
-    let (server, _guard) = setup_test_server().await;
+    let server = setup_test_server().await;
     let (api_key, _) = create_org_and_api_key(&server).await;
 
     // Test creating a conversation
@@ -852,7 +835,7 @@ async fn test_conversations_api() {
 
 #[tokio::test]
 async fn test_create_conversation_items_backfill() {
-    let (server, _guard) = setup_test_server().await;
+    let server = setup_test_server().await;
     let (api_key, _) = create_org_and_api_key(&server).await;
 
     // Create a conversation
@@ -929,7 +912,7 @@ async fn test_create_conversation_items_backfill() {
 
 #[tokio::test]
 async fn test_create_conversation_items_multiple() {
-    let (server, _guard) = setup_test_server().await;
+    let server = setup_test_server().await;
     let (api_key, _) = create_org_and_api_key(&server).await;
 
     // Create a conversation
@@ -982,7 +965,7 @@ async fn test_create_conversation_items_multiple() {
 
 #[tokio::test]
 async fn test_create_conversation_items_validation_empty() {
-    let (server, _guard) = setup_test_server().await;
+    let server = setup_test_server().await;
     let (api_key, _) = create_org_and_api_key(&server).await;
 
     // Create a conversation
@@ -1009,7 +992,7 @@ async fn test_create_conversation_items_validation_empty() {
 
 #[tokio::test]
 async fn test_create_conversation_items_validation_too_many() {
-    let (server, _guard) = setup_test_server().await;
+    let server = setup_test_server().await;
     let (api_key, _) = create_org_and_api_key(&server).await;
 
     // Create a conversation
@@ -1048,7 +1031,7 @@ async fn test_create_conversation_items_validation_too_many() {
 
 #[tokio::test]
 async fn test_create_conversation_items_nonexistent_conversation() {
-    let (server, _guard) = setup_test_server().await;
+    let server = setup_test_server().await;
     let (api_key, _) = create_org_and_api_key(&server).await;
 
     // Test: Non-existent conversation should fail
@@ -1082,7 +1065,7 @@ async fn test_create_conversation_items_nonexistent_conversation() {
 
 #[tokio::test]
 async fn test_create_conversation_items_max_limit() {
-    let (server, _guard) = setup_test_server().await;
+    let server = setup_test_server().await;
     let (api_key, _) = create_org_and_api_key(&server).await;
 
     // Create a conversation
@@ -1118,7 +1101,7 @@ async fn test_create_conversation_items_max_limit() {
 
 #[tokio::test]
 async fn test_create_conversation_items_text_content() {
-    let (server, _guard) = setup_test_server().await;
+    let server = setup_test_server().await;
     let (api_key, _) = create_org_and_api_key(&server).await;
 
     // Create a conversation
@@ -1161,7 +1144,7 @@ async fn test_create_conversation_items_text_content() {
 
 #[tokio::test]
 async fn test_create_conversation_items_with_file_content() {
-    let (server, _guard) = setup_test_server().await;
+    let server = setup_test_server().await;
     let (api_key, _) = create_org_and_api_key(&server).await;
 
     // Create a conversation
@@ -1251,7 +1234,7 @@ async fn test_create_conversation_items_with_file_content() {
 
 #[tokio::test]
 async fn test_create_conversation_items_different_roles() {
-    let (server, _guard) = setup_test_server().await;
+    let server = setup_test_server().await;
     let (api_key, _) = create_org_and_api_key(&server).await;
 
     // Create a conversation
@@ -1296,11 +1279,10 @@ async fn test_create_conversation_items_different_roles() {
 
 #[tokio::test]
 async fn test_conversation_items_pagination() {
-    let (server, _guard) = setup_test_server().await;
-    setup_qwen_model(&server).await;
+    let server = setup_test_server().await;
+    let model_id = setup_qwen_model(&server).await;
     let org = setup_org_with_credits(&server, 10000000000i64).await;
     let api_key = get_api_key_for_org(&server, org.id).await;
-    let models = list_models(&server, api_key.clone()).await;
 
     // Create a conversation
     let conversation = create_conversation(&server, api_key.clone()).await;
@@ -1312,7 +1294,7 @@ async fn test_conversation_items_pagination() {
         create_response(
             &server,
             conversation.id.clone(),
-            models.data[0].id.clone(),
+            model_id.clone(),
             message,
             max_tokens,
             api_key.clone(),
@@ -1460,7 +1442,7 @@ async fn test_response_previous_next_relationships() {
     use inference_providers::mock::{RequestMatcher, ResponseTemplate};
 
     // Use setup_test_server_with_pool to get access to mock provider
-    let (server, _pool, mock, _db, _guard) = setup_test_server_with_pool().await;
+    let (server, _pool, mock, _db) = setup_test_server_with_pool().await;
     setup_qwen_model(&server).await;
     let org = setup_org_with_credits(&server, 10000000000i64).await; // $10.00 USD
     let api_key = get_api_key_for_org(&server, org.id).await;
@@ -1668,7 +1650,7 @@ async fn test_response_previous_next_relationships() {
 
 #[tokio::test]
 async fn test_first_turn_items_have_root_response_parent() {
-    let (server, _guard) = setup_test_server().await;
+    let server = setup_test_server().await;
     setup_qwen_model(&server).await;
     let org = setup_org_with_credits(&server, 10000000000i64).await; // $10.00 USD
     let api_key = get_api_key_for_org(&server, org.id).await;
@@ -1751,7 +1733,7 @@ async fn test_first_turn_items_have_root_response_parent() {
 async fn test_first_turn_regenerate_creates_siblings_under_root_response() {
     use std::collections::HashSet;
 
-    let (server, _guard) = setup_test_server().await;
+    let server = setup_test_server().await;
     setup_qwen_model(&server).await;
     let org = setup_org_with_credits(&server, 10000000000i64).await; // $10.00 USD
     let api_key = get_api_key_for_org(&server, org.id).await;
@@ -1859,7 +1841,7 @@ async fn test_first_turn_regenerate_creates_siblings_under_root_response() {
 
 #[tokio::test]
 async fn test_response_previous_next_relationships_streaming() {
-    let (server, _guard) = setup_test_server().await;
+    let server = setup_test_server().await;
     setup_qwen_model(&server).await;
     let org = setup_org_with_credits(&server, 10000000000i64).await; // $10.00 USD
     let api_key = get_api_key_for_org(&server, org.id).await;
@@ -1969,7 +1951,7 @@ async fn test_response_previous_next_relationships_streaming() {
 
 #[tokio::test]
 async fn test_conversation_items_include_response_metadata() {
-    let (server, _guard) = setup_test_server().await;
+    let server = setup_test_server().await;
     let org = setup_org_with_credits(&server, 10000000000i64).await; // $10.00 USD
     let api_key = get_api_key_for_org(&server, org.id).await;
 
@@ -2088,7 +2070,7 @@ async fn test_conversation_items_include_response_metadata() {
 
 #[tokio::test]
 async fn test_pin_unpin_conversation() {
-    let (server, _guard) = setup_test_server().await;
+    let server = setup_test_server().await;
     let (api_key, _) = create_org_and_api_key(&server).await;
 
     // Create a conversation
@@ -2174,7 +2156,7 @@ async fn test_pin_unpin_conversation() {
 
 #[tokio::test]
 async fn test_archive_unarchive_conversation() {
-    let (server, _guard) = setup_test_server().await;
+    let server = setup_test_server().await;
     let (api_key, _) = create_org_and_api_key(&server).await;
 
     // Create a conversation
@@ -2251,7 +2233,7 @@ async fn test_archive_unarchive_conversation() {
 
 #[tokio::test]
 async fn test_rename_conversation_via_metadata() {
-    let (server, _guard) = setup_test_server().await;
+    let server = setup_test_server().await;
     let (api_key, _) = create_org_and_api_key(&server).await;
 
     // Create a conversation with initial title in metadata
@@ -2320,7 +2302,7 @@ async fn test_rename_conversation_via_metadata() {
 #[tokio::test]
 async fn test_pin_rename_unpin_conversation() {
     // Test the bug: pin -> rename -> unpin should remove pinned_at from metadata
-    let (server, _guard) = setup_test_server().await;
+    let server = setup_test_server().await;
     let (api_key, _) = create_org_and_api_key(&server).await;
 
     // Create a conversation
@@ -2400,7 +2382,7 @@ async fn test_pin_rename_unpin_conversation() {
 
 #[tokio::test]
 async fn test_clone_conversation() {
-    let (server, _guard) = setup_test_server().await;
+    let server = setup_test_server().await;
     let (api_key, _) = create_org_and_api_key(&server).await;
 
     // Create a conversation with metadata
@@ -2478,8 +2460,8 @@ async fn test_clone_conversation() {
 
 #[tokio::test]
 async fn test_clone_conversation_with_responses_and_items() {
-    let (server, _guard) = setup_test_server().await;
-    setup_qwen_model(&server).await;
+    let server = setup_test_server().await;
+    let model_id = setup_qwen_model(&server).await;
     let org = setup_org_with_credits(&server, 10000000000i64).await; // $10.00 USD
     let api_key = get_api_key_for_org(&server, org.id).await;
 
@@ -2498,13 +2480,10 @@ async fn test_clone_conversation_with_responses_and_items() {
     let original_conv = conv_create_response.json::<api::models::ConversationObject>();
     println!("Created original conversation: {}", original_conv.id);
 
-    // Add multiple responses to the conversation
-    let models = list_models(&server, api_key.clone()).await;
-
     let response1 = create_response(
         &server,
         original_conv.id.clone(),
-        models.data[0].id.clone(),
+        model_id.clone(),
         "First message in conversation".to_string(),
         50,
         api_key.clone(),
@@ -2515,7 +2494,7 @@ async fn test_clone_conversation_with_responses_and_items() {
     let response2 = create_response(
         &server,
         original_conv.id.clone(),
-        models.data[0].id.clone(),
+        model_id.clone(),
         "Second message in conversation".to_string(),
         50,
         api_key.clone(),
@@ -2657,7 +2636,7 @@ async fn test_clone_conversation_with_responses_and_items() {
 
 #[tokio::test]
 async fn test_clone_pinned_and_archived_conversation() {
-    let (server, _guard) = setup_test_server().await;
+    let server = setup_test_server().await;
     let (api_key, _) = create_org_and_api_key(&server).await;
 
     // Create a conversation
@@ -2745,7 +2724,7 @@ async fn test_clone_pinned_and_archived_conversation() {
 
 #[tokio::test]
 async fn test_delete_conversation() {
-    let (server, _guard) = setup_test_server().await;
+    let server = setup_test_server().await;
     let (api_key, _) = create_org_and_api_key(&server).await;
 
     // Create a conversation
@@ -2791,7 +2770,7 @@ async fn test_delete_conversation() {
 
 #[tokio::test]
 async fn test_pin_nonexistent_conversation() {
-    let (server, _guard) = setup_test_server().await;
+    let server = setup_test_server().await;
     let (api_key, _) = create_org_and_api_key(&server).await;
 
     let fake_id = "conv_00000000-0000-0000-0000-000000000000";
@@ -2807,7 +2786,7 @@ async fn test_pin_nonexistent_conversation() {
 
 #[tokio::test]
 async fn test_archive_nonexistent_conversation() {
-    let (server, _guard) = setup_test_server().await;
+    let server = setup_test_server().await;
     let (api_key, _) = create_org_and_api_key(&server).await;
 
     let fake_id = "conv_00000000-0000-0000-0000-000000000000";
@@ -2823,7 +2802,7 @@ async fn test_archive_nonexistent_conversation() {
 
 #[tokio::test]
 async fn test_clone_nonexistent_conversation() {
-    let (server, _guard) = setup_test_server().await;
+    let server = setup_test_server().await;
     let (api_key, _) = create_org_and_api_key(&server).await;
 
     let fake_id = "conv_00000000-0000-0000-0000-000000000000";
@@ -2839,7 +2818,7 @@ async fn test_clone_nonexistent_conversation() {
 
 #[tokio::test]
 async fn test_pin_and_archive_together() {
-    let (server, _guard) = setup_test_server().await;
+    let server = setup_test_server().await;
     let (api_key, _) = create_org_and_api_key(&server).await;
 
     // Create a conversation
@@ -2934,7 +2913,7 @@ async fn test_pin_and_archive_together() {
 
 #[tokio::test]
 async fn test_combined_conversation_operations() {
-    let (server, _guard) = setup_test_server().await;
+    let server = setup_test_server().await;
     let (api_key, _) = create_org_and_api_key(&server).await;
 
     // Create a conversation with metadata
@@ -3037,7 +3016,7 @@ async fn test_combined_conversation_operations() {
 
 #[tokio::test]
 async fn test_conversation_metadata_limits() {
-    let (server, _guard) = setup_test_server().await;
+    let server = setup_test_server().await;
     let (api_key, _) = create_org_and_api_key(&server).await;
 
     // Test: Create conversation with metadata containing multiple key-value pairs
@@ -3084,7 +3063,7 @@ async fn test_conversation_metadata_limits() {
 
 #[tokio::test]
 async fn test_create_and_clone_conversation_return_root_response_id() {
-    let (server, _guard) = setup_test_server().await;
+    let server = setup_test_server().await;
     let (api_key, _) = create_org_and_api_key(&server).await;
 
     // Create conversation: response metadata must include root_response_id for first-turn parallel responses
@@ -3137,7 +3116,7 @@ async fn test_create_and_clone_conversation_return_root_response_id() {
 
 #[tokio::test]
 async fn test_conversation_operations_with_invalid_id_format() {
-    let (server, _guard) = setup_test_server().await;
+    let server = setup_test_server().await;
     let (api_key, _) = create_org_and_api_key(&server).await;
 
     let invalid_id = "not-a-valid-uuid";
@@ -3172,7 +3151,7 @@ async fn test_conversation_operations_with_invalid_id_format() {
 
 #[tokio::test]
 async fn test_conversation_unauthorized_access() {
-    let (server, _guard) = setup_test_server().await;
+    let server = setup_test_server().await;
     let (api_key1, _) = create_org_and_api_key(&server).await;
     let (api_key2, _) = create_org_and_api_key(&server).await;
 
@@ -3215,7 +3194,7 @@ async fn test_conversation_unauthorized_access() {
 
 #[tokio::test]
 async fn test_conversation_items_include_model() {
-    let (server, _guard) = setup_test_server().await;
+    let server = setup_test_server().await;
     let org = setup_org_with_credits(&server, 10000000000i64).await; // $10.00 USD
     let api_key = get_api_key_for_org(&server, org.id).await;
 
@@ -3315,7 +3294,7 @@ async fn test_conversation_items_include_model() {
 
 #[tokio::test]
 async fn test_conversation_items_model_with_streaming() {
-    let (server, _guard) = setup_test_server().await;
+    let server = setup_test_server().await;
     setup_qwen_model(&server).await;
     let org = setup_org_with_credits(&server, 10000000000i64).await; // $10.00 USD
     let api_key = get_api_key_for_org(&server, org.id).await;
@@ -3395,7 +3374,7 @@ async fn test_conversation_items_model_with_streaming() {
 
 #[tokio::test]
 async fn test_backfilled_items_include_model() {
-    let (server, _guard) = setup_test_server().await;
+    let server = setup_test_server().await;
     let org = setup_org_with_credits(&server, 10000000000i64).await; // $10.00 USD
     let api_key = get_api_key_for_org(&server, org.id).await;
 
@@ -3482,7 +3461,7 @@ async fn test_backfilled_items_include_model() {
 
 #[tokio::test]
 async fn test_batch_get_conversations() {
-    let (server, _guard) = setup_test_server().await;
+    let server = setup_test_server().await;
     let (api_key, _) = create_org_and_api_key(&server).await;
 
     // Create 3 conversations
@@ -3654,7 +3633,7 @@ async fn test_batch_get_conversations() {
 async fn test_conversation_title_strips_thinking_tags() {
     use inference_providers::mock::ResponseTemplate;
 
-    let (server, _pool, mock_provider, _db, _guard) = setup_test_server_with_pool().await;
+    let (server, _pool, mock_provider, _db) = setup_test_server_with_pool().await;
     setup_qwen_model(&server).await;
     let org = setup_org_with_credits(&server, 10000000000i64).await;
     let api_key = get_api_key_for_org(&server, org.id).await;
@@ -3758,7 +3737,7 @@ async fn test_chat_completions_with_json_schema() {
     use common::mock_prompts;
     use inference_providers::mock::{RequestMatcher, ResponseTemplate};
 
-    let (server, _pool, mock, _db, _guard) = setup_test_server_with_pool().await;
+    let (server, _pool, mock, _db) = setup_test_server_with_pool().await;
     setup_qwen_model(&server).await;
     let org = setup_org_with_credits(&server, 10000000000i64).await;
     let api_key = get_api_key_for_org(&server, org.id).await;
@@ -3833,7 +3812,7 @@ async fn test_responses_api_with_json_schema() {
     use common::mock_prompts;
     use inference_providers::mock::{RequestMatcher, ResponseTemplate};
 
-    let (server, _pool, mock, _db, _guard) = setup_test_server_with_pool().await;
+    let (server, _pool, mock, _db) = setup_test_server_with_pool().await;
     setup_qwen_model(&server).await;
     let org = setup_org_with_credits(&server, 10000000000i64).await;
     let api_key = get_api_key_for_org(&server, org.id).await;

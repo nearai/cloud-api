@@ -15,5 +15,5 @@ slow-timeout = { period = "60s", terminate-after = 2 }
 max-threads = 16
 
 [[profile.default.overrides]]
-filter = "package(api) & test(/^e2e/)"
+filter = "package(api) & binary(/^e2e/)"
 test-group = "e2e-db"

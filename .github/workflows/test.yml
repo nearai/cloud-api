@@ -47,6 +47,10 @@ jobs:
           docker exec ${{ job.services.postgres.id }} pg_isready -U postgres && break
           sleep 1
         done
+        if ! docker exec ${{ job.services.postgres.id }} pg_isready -U postgres; then
+          echo "PostgreSQL did not become ready after restart within 30 seconds" >&2
+          exit 1
+        fi
     
     - name: Install Rust
       uses: actions-rust-lang/setup-rust-toolchain@v1

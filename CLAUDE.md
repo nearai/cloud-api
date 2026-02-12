@@ -198,6 +198,12 @@ POST /v1/responses
 - Links to conversation history for context
 - Rich metadata and event types
 - Event types: `response.created`, `response.output_text.delta`, `response.completed`, `response.failed`
+- **Tool use**: Supports external function calls, code_interpreter, computer tools (client-executed),
+  plus server-executed web_search, file_search, and MCP tools
+- **Function call flow**: LLM requests a function, response pauses with status `incomplete`,
+  client executes and resumes via `previous_response_id` + `FunctionCallOutput` input.
+  Resumption verifies workspace ownership on `previous_response_id` and validates
+  each `call_id` maps to exactly one stored FunctionCall
 
 **Streaming Flow**:
 ```
@@ -238,7 +244,7 @@ Located in `crates/services/src/`:
 - `user` - User profiles, session management
 - `completions` - AI completion orchestration
 - `conversations` - Conversation lifecycle
-- `responses` - Response streaming with token tracking
+- `responses` - Response streaming with token tracking, tool orchestration (function calls, web search, file search, MCP)
 - `attestation` - TEE attestation reports, chat signatures
 - `models` - Model catalog and pricing
 - `usage` - Token tracking, limit enforcement, billing

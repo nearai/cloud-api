@@ -544,7 +544,56 @@ sequenceDiagram
     Note over Client,Database: Response is stored and linked<br/>to conversation for history
 ```
 
-### 5. Model Discovery Flow
+### 5. External Function Call Flow (Tool Use)
+
+Multi-turn flow where the LLM requests an external function, the client executes
+it, and resumes the response with the result. This covers custom functions,
+code_interpreter, and computer tools (all client-executed).
+
+```mermaid
+sequenceDiagram
+    actor Client
+    participant PlatformAPI
+    participant ResponseService
+    participant Database
+
+    Note over Client,Database: Turn 1 - LLM requests a function call
+
+    Client->>PlatformAPI: POST /v1/responses<br/>{ model, input, tools: [{ type: "function", name: "get_weather", ... }] }
+    PlatformAPI->>ResponseService: create_response_stream(request)
+    ResponseService->>Database: INSERT response (status: in_progress)
+
+    ResponseService-->>Client: SSE: response.created
+
+    Note over ResponseService: LLM emits a tool_call for "get_weather"
+
+    ResponseService->>Database: INSERT response_item (FunctionCall)<br/>call_id is unique per call (generated if LLM omits it)
+    ResponseService-->>Client: SSE: response.output_item.added (FunctionCall)<br/>{ call_id, name: "get_weather", arguments: "..." }
+    ResponseService->>Database: UPDATE response (status: incomplete)
+    ResponseService-->>Client: SSE: response.incomplete<br/>{ reason: "function_call_required" }
+
+    Note over Client,Database: Turn 2 - Client provides function output
+
+    Client->>PlatformAPI: POST /v1/responses<br/>{ model, previous_response_id: "resp_xxx",<br/>  input: [{ type: "function_call_output", call_id, output: "72°F" }] }
+    PlatformAPI->>ResponseService: create_response_stream(request)
+
+    ResponseService->>Database: SELECT response WHERE id = resp_xxx AND workspace_id = caller's workspace
+    Note over ResponseService: Workspace ownership verified (prevents IDOR)
+
+    ResponseService->>Database: SELECT response_items WHERE response_id = resp_xxx
+    Note over ResponseService: Validate each call_id matches exactly one FunctionCall
+
+    ResponseService->>Database: INSERT new response (status: in_progress)
+    ResponseService-->>Client: SSE: response.created
+
+    Note over ResponseService: Resume inference with function result in context
+
+    ResponseService-->>Client: SSE: response.output_text.delta
+    ResponseService->>Database: UPDATE response (status: completed)
+    ResponseService-->>Client: SSE: response.completed
+```
+
+### 6. Model Discovery Flow
 
 The platform periodically discovers available models and their endpoints.
 
@@ -577,7 +626,7 @@ sequenceDiagram
     end
 ```
 
-### 6. Organization Invitation Flow
+### 7. Organization Invitation Flow
 
 Inviting a new member to an organization via email.
 
@@ -637,7 +686,7 @@ sequenceDiagram
     PlatformAPI-->>Browser: Redirect to organization dashboard
 ```
 
-### 7. TEE Attestation Verification Flow
+### 8. TEE Attestation Verification Flow
 
 Client requests and verifies TEE attestation to ensure code is running in secure environment.
 
@@ -679,7 +728,7 @@ sequenceDiagram
     end
 ```
 
-### 8. Usage Tracking & Limit Enforcement
+### 9. Usage Tracking & Limit Enforcement
 
 How the platform tracks token usage and enforces organization limits.
 
@@ -728,33 +777,43 @@ sequenceDiagram
     Note over UsageMiddleware,Database: Usage tracked per request<br/>for billing and analytics
 ```
 
-### 9. Response Lifecycle State Diagram
+### 10. Response Lifecycle State Diagram
 
 State transitions for AI response objects throughout their lifecycle.
 
 ```mermaid
 stateDiagram-v2
     [*] --> in_progress: POST /v1/responses
-    
+
     in_progress --> completed: Inference successful
+    in_progress --> incomplete: Function call required
     in_progress --> failed: Inference error
     in_progress --> cancelled: User cancels<br/>(POST /responses/{id}/cancel)
-    
+
+    incomplete --> in_progress: Client submits FunctionCallOutput<br/>(POST /v1/responses with previous_response_id)
+
     completed --> [*]: Response stored
+    incomplete --> [*]: Client does not resume
     failed --> [*]: Error logged
     cancelled --> [*]: Marked cancelled
-    
+
     note right of in_progress
         Streaming tokens to client
         Tracking usage
     end note
-    
+
+    note right of incomplete
+        LLM requested external function call
+        FunctionCall items stored with unique call_ids
+        Waiting for client to execute and resume
+    end note
+
     note right of completed
         Final response stored
         Usage recorded
         Conversation updated
     end note
-    
+
     note right of failed
         Error details saved
         Partial usage tracked
@@ -762,7 +821,7 @@ stateDiagram-v2
     end note
 ```
 
-### 10. Authentication Decision Flow
+### 11. Authentication Decision Flow
 
 Decision flowchart for determining authentication requirements.
 

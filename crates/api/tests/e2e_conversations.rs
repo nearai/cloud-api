@@ -1401,6 +1401,8 @@ async fn test_conversation_items_pagination() {
             ConversationItem::McpListTools { id, .. } => id.clone(),
             ConversationItem::McpCall { id, .. } => id.clone(),
             ConversationItem::McpApprovalRequest { id, .. } => id.clone(),
+            ConversationItem::FunctionCall { id, .. } => id.clone(),
+            ConversationItem::FunctionCallOutput { id, .. } => id.clone(),
         })
         .collect();
 
@@ -2046,6 +2048,10 @@ async fn test_conversation_items_include_response_metadata() {
             api::models::ConversationItem::ToolCall { created_at, .. } => Some(*created_at),
             api::models::ConversationItem::WebSearchCall { created_at, .. } => Some(*created_at),
             api::models::ConversationItem::Reasoning { created_at, .. } => Some(*created_at),
+            api::models::ConversationItem::FunctionCall { created_at, .. } => Some(*created_at),
+            api::models::ConversationItem::FunctionCallOutput { created_at, .. } => {
+                Some(*created_at)
+            }
             // MCP items don't have created_at field in the API model
             api::models::ConversationItem::McpListTools { .. } => None,
             api::models::ConversationItem::McpCall { .. } => None,
@@ -3272,6 +3278,14 @@ async fn test_conversation_items_include_model() {
                     "Model field should match the model used for the response"
                 );
             }
+            api::models::ConversationItem::FunctionCall { id, model, .. } => {
+                println!("  FunctionCall item {id}: model={model}");
+                assert!(!model.is_empty(), "Model field should not be empty");
+                assert_eq!(
+                    model, model_name,
+                    "Model field should match the model used for the response"
+                );
+            }
             // MCP items don't have model field in the API model
             api::models::ConversationItem::McpListTools { id, .. } => {
                 println!("  McpListTools item {id}");
@@ -3284,6 +3298,10 @@ async fn test_conversation_items_include_model() {
             api::models::ConversationItem::McpApprovalRequest { id, .. } => {
                 println!("  McpApprovalRequest item {id}");
                 assert!(!id.is_empty(), "McpApprovalRequest id should not be empty");
+            }
+            api::models::ConversationItem::FunctionCallOutput { id, .. } => {
+                println!("  FunctionCallOutput item {id}");
+                assert!(!id.is_empty(), "FunctionCallOutput id should not be empty");
             }
         }
     }

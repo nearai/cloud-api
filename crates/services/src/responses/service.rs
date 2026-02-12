@@ -1802,7 +1802,15 @@ impl ResponseServiceImpl {
                 errors::ResponseError::InternalError(format!("Failed to fetch response items: {e}"))
             })?;
 
+        let mut seen_call_ids = std::collections::HashSet::new();
         for (call_id, output) in function_outputs {
+            if !seen_call_ids.insert(call_id) {
+                return Err(errors::ResponseError::InvalidParams(format!(
+                    "duplicate call_id '{}' in function_call_output items",
+                    call_id
+                )));
+            }
+
             let match_count = prev_items
                 .iter()
                 .filter(|item| {

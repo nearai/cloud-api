@@ -1004,6 +1004,8 @@ impl ResponseServiceImpl {
         let function_output_messages = Self::process_function_call_outputs(
             &context.request,
             &context.response_items_repository,
+            &context.response_repository,
+            context.workspace_id,
         )
         .await?;
         messages.extend(function_output_messages);
@@ -1141,12 +1143,15 @@ impl ResponseServiceImpl {
                 errors::ResponseError::InternalError(format!("Failed to load response items: {e}"))
             })?;
 
-        // Filter to get only assistant output items (excluding user input items)
+        // Filter to get only assistant-generated output items.
+        // Exclude user input messages and client-provided FunctionCallOutput items,
+        // which are stored for history but should not appear in the response output.
         let mut output_items: Vec<_> = response_items
             .into_iter()
             .filter(|item| match item {
                 models::ResponseOutputItem::Message { role, .. } => role == "assistant",
-                _ => true, // Include all non-message items (tool calls, web searches, etc.)
+                models::ResponseOutputItem::FunctionCallOutput { .. } => false,
+                _ => true,
             })
             .collect();
 
@@ -1722,13 +1727,18 @@ impl ResponseServiceImpl {
     /// When resuming a response after function calls, the client provides
     /// FunctionCallOutput items with the results. This function:
     /// 1. Extracts FunctionCallOutput items from the request input
-    /// 2. Fetches the stored FunctionCall items by call_id
-    /// 3. Creates tool result messages for the conversation context
+    /// 2. Verifies `previous_response_id` belongs to the caller's workspace
+    ///    (workspace-scoped ownership check, prevents cross-workspace IDOR)
+    /// 3. Fetches stored FunctionCall items and validates each submitted
+    ///    `call_id` matches exactly one FunctionCall (rejects zero or ambiguous matches)
+    /// 4. Creates tool result messages for the conversation context
     ///
     /// Returns messages to add to the conversation context.
     async fn process_function_call_outputs(
         request: &models::CreateResponseRequest,
         response_items_repository: &Arc<dyn ports::ResponseItemRepositoryTrait>,
+        response_repository: &Arc<dyn ports::ResponseRepositoryTrait>,
+        workspace_id: uuid::Uuid,
     ) -> Result<Vec<crate::completions::ports::CompletionMessage>, errors::ResponseError> {
         use crate::completions::ports::CompletionMessage;
 
@@ -1747,11 +1757,11 @@ impl ResponseServiceImpl {
             return Ok(messages);
         }
 
-        // Function call outputs require a previous_response_id so we can verify
-        // the call_id matches a real FunctionCall from that response.
+        // Function call outputs are only valid when resuming a previous response.
         let prev_response_id = request.previous_response_id.as_ref().ok_or_else(|| {
-            errors::ResponseError::FunctionCallNotFound(
-                "function_call_output requires previous_response_id".to_string(),
+            errors::ResponseError::InvalidParams(
+                "function_call_output requires previous_response_id to resume a response"
+                    .to_string(),
             )
         })?;
 
@@ -1765,6 +1775,24 @@ impl ResponseServiceImpl {
             ))
         })?;
 
+        // Verify the previous response belongs to this workspace (prevents IDOR)
+        response_repository
+            .get_by_id(
+                models::ResponseId(response_uuid),
+                crate::workspace::WorkspaceId(workspace_id),
+            )
+            .await
+            .map_err(|e| {
+                errors::ResponseError::InternalError(format!(
+                    "Failed to verify previous response ownership: {e}"
+                ))
+            })?
+            .ok_or_else(|| {
+                errors::ResponseError::FunctionCallNotFound(
+                    "previous_response_id not found in this workspace".to_string(),
+                )
+            })?;
+
         let prev_items = response_items_repository
             .list_by_response(models::ResponseId(response_uuid))
             .await
@@ -1773,17 +1801,26 @@ impl ResponseServiceImpl {
             })?;
 
         for (call_id, output) in function_outputs {
-            let found = prev_items.iter().any(|item| {
-                matches!(item, models::ResponseOutputItem::FunctionCall {
-                    call_id: item_call_id,
-                    ..
-                } if item_call_id == call_id)
-            });
+            let match_count = prev_items
+                .iter()
+                .filter(|item| {
+                    matches!(item, models::ResponseOutputItem::FunctionCall {
+                        call_id: item_call_id,
+                        ..
+                    } if item_call_id == call_id)
+                })
+                .count();
 
-            if !found {
+            if match_count == 0 {
                 return Err(errors::ResponseError::FunctionCallNotFound(
                     call_id.to_string(),
                 ));
+            }
+            if match_count > 1 {
+                return Err(errors::ResponseError::FunctionCallNotFound(format!(
+                    "ambiguous call_id '{}' matches {} function calls",
+                    call_id, match_count
+                )));
             }
 
             // Create tool result message with the function output

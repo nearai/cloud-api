@@ -10,7 +10,18 @@
 //! 3. Server returns response with status=incomplete, reason="function_call_required"
 //! 4. Client executes the function externally
 //! 5. Client submits function output via FunctionCallOutput input
-//! 6. Server resumes response with the function result in context
+//!    with `previous_response_id` pointing to the incomplete response
+//! 6. Server verifies `previous_response_id` belongs to the caller's workspace,
+//!    matches each `call_id` to exactly one stored FunctionCall, then resumes
+//!    the response with function results in context
+//!
+//! Security invariants:
+//! - Every FunctionCall gets a unique `call_id`. If the LLM omits one, the
+//!   executor generates a `call_<uuid>` identifier to prevent ambiguous matching.
+//! - `process_function_call_outputs` enforces workspace-scoped ownership on
+//!   `previous_response_id` before fetching any items (prevents cross-workspace IDOR).
+//! - Each submitted `call_id` must match exactly one stored FunctionCall;
+//!   zero matches or duplicate matches are rejected.
 
 use async_trait::async_trait;
 use std::collections::HashSet;
@@ -92,7 +103,10 @@ impl ToolExecutor for FunctionToolExecutor {
         // The service layer will handle this error and create the FunctionCall output item
         Err(ResponseError::FunctionCallRequired {
             name: tool_call.tool_type.clone(),
-            call_id: tool_call.id.clone().unwrap_or_default(),
+            call_id: tool_call
+                .id
+                .clone()
+                .unwrap_or_else(|| format!("call_{}", uuid::Uuid::new_v4().simple())),
         })
     }
 
@@ -301,7 +315,14 @@ mod tests {
         match result.unwrap_err() {
             ResponseError::FunctionCallRequired { name, call_id } => {
                 assert_eq!(name, "get_weather");
-                assert_eq!(call_id, ""); // Should be empty string, not None
+                assert!(
+                    call_id.starts_with("call_"),
+                    "Generated call_id should start with 'call_', got: {call_id}"
+                );
+                assert!(
+                    call_id.len() > "call_".len(),
+                    "Generated call_id should contain a UUID suffix"
+                );
             }
             other => panic!("Expected FunctionCallRequired, got: {:?}", other),
         }

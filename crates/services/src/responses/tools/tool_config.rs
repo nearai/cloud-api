@@ -4,8 +4,17 @@
 //! to the inference provider format used by the LLM, and parsing tool calls
 //! from LLM responses.
 
+use uuid::Uuid;
+
 use crate::responses::models::{CreateResponseRequest, ResponseTool, ResponseToolChoice};
 use crate::responses::service_helpers::ToolCallInfo;
+
+/// Resolve tool call ID: use LLM-provided id or generate a deterministic fallback.
+/// When the LLM omits tool_call.id, we generate once here so all downstream code
+/// (assistant message, event emission, stored FunctionCall) shares the same value.
+fn resolve_tool_call_id(id_opt: Option<String>, tool_name: &str) -> String {
+    id_opt.unwrap_or_else(|| format!("{}_{}", tool_name, Uuid::new_v4().simple()))
+}
 
 /// Special tool type for error tool calls (malformed calls from LLM)
 pub const ERROR_TOOL_TYPE: &str = "__error__";
@@ -487,11 +496,11 @@ fn parse_tool_args(tool_name: &str, args_str: &str) -> ParseArgsResult {
 fn create_invalid_json_error(
     name: &str,
     idx: i64,
-    id: Option<String>,
+    id: String,
     thought_signature: Option<String>,
 ) -> ToolCallInfo {
     ToolCallInfo {
-        id,
+        id: Some(id),
         tool_type: ERROR_TOOL_TYPE.to_string(),
         query: format!(
             "Tool call for '{name}' (index {idx}) has invalid JSON arguments. \
@@ -510,11 +519,11 @@ fn create_invalid_json_error(
 fn create_missing_query_error(
     name: &str,
     idx: i64,
-    id: Option<String>,
+    id: String,
     thought_signature: Option<String>,
 ) -> ToolCallInfo {
     ToolCallInfo {
-        id,
+        id: Some(id),
         tool_type: ERROR_TOOL_TYPE.to_string(),
         query: format!(
             "Tool call for '{name}' (index {idx}) is missing the required 'query' field \
@@ -587,8 +596,9 @@ pub fn convert_tool_calls(
                         args = args_str,
                         "Tool call missing name - arguments for debugging"
                     );
+                    let id = resolve_tool_call_id(id_opt, ERROR_TOOL_TYPE);
                     tool_calls_detected.push(ToolCallInfo {
-                        id: id_opt,
+                        id: Some(id),
                         tool_type: ERROR_TOOL_TYPE.to_string(),
                         query: format!(
                             "Tool call at index {idx} is missing a tool name. \
@@ -637,7 +647,7 @@ pub fn convert_tool_calls(
                 tool_calls_detected.push(create_invalid_json_error(
                     &name,
                     idx,
-                    id_opt,
+                    resolve_tool_call_id(id_opt, &name),
                     thought_signature,
                 ));
                 continue;
@@ -656,8 +666,9 @@ pub fn convert_tool_calls(
             || is_function_tool
         {
             tracing::debug!("Tool call detected (no query required): {}", name);
+            let id = resolve_tool_call_id(id_opt, &name);
             tool_calls_detected.push(ToolCallInfo {
-                id: id_opt,
+                id: Some(id),
                 tool_type: name,
                 query: String::new(),
                 params: Some(args),
@@ -665,8 +676,9 @@ pub fn convert_tool_calls(
             });
         } else if let Some(query) = args.get("query").and_then(|v| v.as_str()) {
             tracing::debug!("Tool call detected: {}", name);
+            let id = resolve_tool_call_id(id_opt, &name);
             tool_calls_detected.push(ToolCallInfo {
-                id: id_opt,
+                id: Some(id),
                 tool_type: name,
                 query: query.to_string(),
                 params: Some(args),
@@ -682,7 +694,7 @@ pub fn convert_tool_calls(
             tool_calls_detected.push(create_missing_query_error(
                 &name,
                 idx,
-                id_opt,
+                resolve_tool_call_id(id_opt, &name),
                 thought_signature,
             ));
         }
@@ -847,6 +859,35 @@ mod tests {
         assert_eq!(result[0].id, Some("call_123".to_string()));
         assert_eq!(result[0].tool_type, "web_search");
         assert_eq!(result[0].query, "test search");
+    }
+
+    #[test]
+    fn test_convert_tool_calls_generates_id_when_omitted() {
+        // When LLM omits tool_call.id, we generate once so all downstream code shares the same value
+        let mut accumulator = HashMap::new();
+        accumulator.insert(
+            0,
+            ToolCallAccumulatorEntry {
+                id: None,
+                name: Some("get_weather".to_string()),
+                arguments: r#"{"location": "NYC"}"#.to_string(),
+                thought_signature: None,
+            },
+        );
+
+        let result = convert_tool_calls(
+            accumulator,
+            "test-model",
+            &["get_weather".to_string()],
+            &["get_weather".to_string()],
+        );
+        assert_eq!(result.len(), 1);
+        let id = result[0].id.as_ref().expect("id must be set");
+        assert!(
+            id.starts_with("get_weather_"),
+            "Generated id should be {{tool_name}}_{{uuid}}, got: {id}"
+        );
+        assert!(id.len() > "get_weather_".len());
     }
 
     #[test]

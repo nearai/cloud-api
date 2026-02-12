@@ -89,7 +89,7 @@ impl ToolExecutor for FunctionToolExecutor {
             call_id: tool_call
                 .id
                 .clone()
-                .unwrap_or_else(|| format!("call_{}", uuid::Uuid::new_v4().simple())),
+                .expect("ToolCallInfo.id always set by convert_tool_calls"),
         })
     }
 
@@ -280,12 +280,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_function_executor_handles_missing_call_id() {
+    async fn test_function_executor_uses_call_id_from_tool_call_info() {
+        // When LLM omits tool_call.id, convert_tool_calls sets it once; executor passes it through
         let request = create_test_request_with_functions(vec!["get_weather"]);
         let executor = FunctionToolExecutor::new(&request);
 
+        let expected_call_id = "get_weather_abc123def456";
         let tool_call = ToolCallInfo {
-            id: None, // No call_id
+            id: Some(expected_call_id.to_string()),
             tool_type: "get_weather".to_string(),
             query: "".to_string(),
             params: None,
@@ -299,14 +301,7 @@ mod tests {
         match result.unwrap_err() {
             ResponseError::FunctionCallRequired { name, call_id } => {
                 assert_eq!(name, "get_weather");
-                assert!(
-                    call_id.starts_with("call_"),
-                    "Generated call_id should start with 'call_', got: {call_id}"
-                );
-                assert!(
-                    call_id.len() > "call_".len(),
-                    "Generated call_id should contain a UUID suffix"
-                );
+                assert_eq!(call_id, expected_call_id);
             }
             other => panic!("Expected FunctionCallRequired, got: {:?}", other),
         }

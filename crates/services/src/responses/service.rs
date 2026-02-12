@@ -1413,10 +1413,10 @@ impl ResponseServiceImpl {
                     .tool_calls
                     .iter()
                     .map(|tc| {
-                        let id = tc.id.clone().unwrap_or_else(|| {
-                            // Fallback: generate ID if LLM didn't provide one
-                            format!("{}_{}", tc.tool_type, uuid::Uuid::new_v4().simple())
-                        });
+                        let id = tc
+                            .id
+                            .clone()
+                            .expect("ToolCallInfo.id always set by convert_tool_calls");
                         crate::completions::ports::CompletionToolCall {
                             id,
                             name: tc.tool_type.clone(),
@@ -1553,11 +1553,11 @@ impl ResponseServiceImpl {
     ) -> Result<tools::ToolExecutionResult, errors::ResponseError> {
         use crate::completions::ports::CompletionMessage;
 
-        // Use the LLM's tool call ID (required for matching tool results to tool calls)
-        // Fallback to generated ID if the LLM didn't provide one
-        let tool_call_id = tool_call.id.clone().unwrap_or_else(|| {
-            format!("{}_{}", tool_call.tool_type, uuid::Uuid::new_v4().simple())
-        });
+        // Use the tool call ID (always set by convert_tool_calls; required for matching tool results to tool calls)
+        let tool_call_id = tool_call
+            .id
+            .clone()
+            .expect("ToolCallInfo.id always set by convert_tool_calls");
 
         // Handle error tool calls (malformed tool calls detected during parsing)
         if tool_call.tool_type == ERROR_TOOL_TYPE {

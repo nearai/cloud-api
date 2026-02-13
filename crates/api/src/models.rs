@@ -19,7 +19,10 @@ pub use services::responses::models::{
     McpApprovalRequirement,
     McpDiscoveredTool,
     McpToolNameFilter,
+    // Response content types (shared between input listing and services)
+    ResponseContent,
     ResponseContentItem,
+    ResponseContentPart,
     ResponseDeleteResult,
     ResponseError,
     // Supporting types used by the above
@@ -949,42 +952,6 @@ pub struct ResponseInputItem {
     pub content: ResponseContent,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<serde_json::Value>,
-}
-
-/// Content can be text or array of content parts
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-#[serde(untagged)]
-pub enum ResponseContent {
-    Text(String),
-    Parts(Vec<ResponseContentPart>),
-}
-
-/// Content part from user inputs (input-only variants).
-///
-/// This type is used for type-safe operations on user inputs only.
-/// It cannot contain output variants, providing compile-time safety.
-///
-/// Used in:
-/// - ResponseContent::Parts (for input listing)
-/// - list_input_items endpoint
-/// - Input validation operations
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-#[serde(tag = "type")]
-pub enum ResponseContentPart {
-    #[serde(rename = "input_text")]
-    InputText { text: String },
-    #[serde(rename = "input_image")]
-    InputImage {
-        image_url: ResponseImageUrl,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        detail: Option<String>,
-    },
-    #[serde(rename = "input_file")]
-    InputFile {
-        file_id: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        detail: Option<String>,
-    },
 }
 
 /// Input item list for responses
@@ -2445,29 +2412,24 @@ mod tests {
         let request = result.unwrap();
         assert_eq!(request.model, "gpt-4.1");
 
-        // Use services types directly since CreateResponseRequest is re-exported from services
-        use services::responses::models::{
-            ResponseContent as SvcContent, ResponseContentPart as SvcContentPart,
-            ResponseInputItem as SvcInputItem,
-        };
+        use services::responses::models::ResponseInputItem as SvcInputItem;
 
         if let Some(ResponseInput::Items(items)) = request.input {
             assert_eq!(items.len(), 1);
 
-            // Match against the services ResponseInputItem enum
             if let SvcInputItem::Message { role, content, .. } = &items[0] {
                 assert_eq!(role, "user");
 
-                if let SvcContent::Parts(parts) = content {
+                if let ResponseContent::Parts(parts) = content {
                     assert_eq!(parts.len(), 2);
-                    assert!(matches!(parts[0], SvcContentPart::InputText { .. }));
-                    assert!(matches!(parts[1], SvcContentPart::InputImage { .. }));
+                    assert!(matches!(parts[0], ResponseContentPart::InputText { .. }));
+                    assert!(matches!(parts[1], ResponseContentPart::InputImage { .. }));
 
-                    if let SvcContentPart::InputText { text } = &parts[0] {
+                    if let ResponseContentPart::InputText { text } = &parts[0] {
                         assert_eq!(text, "what is in this image?");
                     }
 
-                    if let SvcContentPart::InputImage { image_url, .. } = &parts[1] {
+                    if let ResponseContentPart::InputImage { image_url, .. } = &parts[1] {
                         match image_url {
                             ResponseImageUrl::String(url) => {
                                 assert_eq!(url, "https://example.com/image.jpg");

@@ -686,3 +686,48 @@ async fn test_conversation_items_metadata_precedence() {
         panic!("Expected Message item");
     }
 }
+
+/// Test that oversized metadata on create_conversation_items is rejected
+#[tokio::test]
+async fn test_create_conversation_items_metadata_size_limit() {
+    let (server, _guard) = setup_test_server().await;
+    let (api_key, _) = create_org_and_api_key(&server).await;
+
+    // Create a conversation
+    let conversation = server
+        .post("/v1/conversations")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .json(&json!({
+            "name": "Test Conversation"
+        }))
+        .await;
+    assert_eq!(conversation.status_code(), 201);
+    let conversation: api::models::ConversationObject = conversation.json();
+
+    // Build metadata that exceeds the 16KB limit
+    let large_string = "x".repeat(17 * 1024);
+
+    // POST /v1/conversations/{id}/items with oversized metadata
+    let response = server
+        .post(format!("/v1/conversations/{}/items", conversation.id).as_str())
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .json(&json!({
+            "items": [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "Hello"}],
+                    "metadata": { "big": large_string }
+                }
+            ]
+        }))
+        .await;
+
+    assert_eq!(response.status_code(), 400);
+    let error: api::models::ErrorResponse = response.json();
+    assert!(
+        error.error.message.contains("metadata is too large"),
+        "Error should mention metadata size, got: {}",
+        error.error.message
+    );
+}

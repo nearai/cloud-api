@@ -928,6 +928,21 @@ impl InferenceProviderPool {
                     return Ok((result, provider.clone()));
                 }
                 Err(e) => {
+                    // For HTTP client errors (4xx), don't retry with other providers.
+                    // The request itself is invalid (e.g., too many tokens), so retrying won't help.
+                    if let CompletionError::HttpError { status_code, .. } = &e {
+                        if (400..500).contains(status_code) {
+                            tracing::warn!(
+                                model_id = %model_id,
+                                attempt = attempt + 1,
+                                status_code,
+                                operation = operation_name,
+                                "Client error from provider, not retrying"
+                            );
+                            return Err(e);
+                        }
+                    }
+
                     let error_str = e.to_string();
 
                     // Log the full detailed error for debugging

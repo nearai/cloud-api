@@ -411,7 +411,7 @@ impl AdminRepository for AdminCompositeRepository {
                     ob.total_tokens
                 FROM organizations o
                 LEFT JOIN LATERAL (
-                    SELECT SUM(spend_limit)::BIGINT AS spend_limit
+                    SELECT COALESCE(SUM(spend_limit), 0)::BIGINT AS spend_limit
                     FROM organization_limits_history
                     WHERE organization_id = o.id
                       AND effective_until IS NULL

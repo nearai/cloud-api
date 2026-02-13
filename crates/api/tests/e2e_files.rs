@@ -59,7 +59,7 @@ async fn upload_file_with_expiration(
 
 #[tokio::test]
 async fn test_upload_file_success() {
-    let (server, _guard) = setup_test_server().await;
+    let server = setup_test_server().await;
     let (api_key, _) = create_org_and_api_key(&server).await;
 
     let content = b"Hello, this is a test file!";
@@ -86,7 +86,7 @@ async fn test_upload_file_success() {
 
 #[tokio::test]
 async fn test_upload_file_with_expiration() {
-    let (server, _guard) = setup_test_server().await;
+    let server = setup_test_server().await;
     let (api_key, _) = create_org_and_api_key(&server).await;
 
     let content = b"Temporary file";
@@ -110,7 +110,7 @@ async fn test_upload_file_with_expiration() {
 
 #[tokio::test]
 async fn test_upload_json_file() {
-    let (server, _guard) = setup_test_server().await;
+    let server = setup_test_server().await;
     let (api_key, _) = create_org_and_api_key(&server).await;
 
     let content = br#"{"key": "value", "number": 42}"#;
@@ -132,7 +132,7 @@ async fn test_upload_json_file() {
 
 #[tokio::test]
 async fn test_upload_binary_file() {
-    let (server, _guard) = setup_test_server().await;
+    let server = setup_test_server().await;
     let (api_key, _) = create_org_and_api_key(&server).await;
 
     let content = vec![0u8, 1, 2, 3, 4, 5, 255, 254, 253];
@@ -153,7 +153,7 @@ async fn test_upload_binary_file() {
 
 #[tokio::test]
 async fn test_upload_file_invalid_purpose() {
-    let (server, _guard) = setup_test_server().await;
+    let server = setup_test_server().await;
     let (api_key, _) = create_org_and_api_key(&server).await;
 
     let content = b"Test content";
@@ -174,7 +174,7 @@ async fn test_upload_file_invalid_purpose() {
 
 #[tokio::test]
 async fn test_upload_file_invalid_mime_type() {
-    let (server, _guard) = setup_test_server().await;
+    let server = setup_test_server().await;
     let (api_key, _) = create_org_and_api_key(&server).await;
 
     let content = b"Test content";
@@ -195,7 +195,7 @@ async fn test_upload_file_invalid_mime_type() {
 
 #[tokio::test]
 async fn test_upload_file_missing_purpose() {
-    let (server, _guard) = setup_test_server().await;
+    let server = setup_test_server().await;
     let (api_key, _) = create_org_and_api_key(&server).await;
 
     let response = server
@@ -221,7 +221,7 @@ async fn test_upload_file_missing_purpose() {
 
 #[tokio::test]
 async fn test_upload_file_unauthorized() {
-    let (server, _guard) = setup_test_server().await;
+    let server = setup_test_server().await;
 
     let content = b"Test content";
     let response = upload_file(
@@ -239,7 +239,7 @@ async fn test_upload_file_unauthorized() {
 
 #[tokio::test]
 async fn test_list_files() {
-    let (server, _guard) = setup_test_server().await;
+    let server = setup_test_server().await;
     let (api_key, _) = create_org_and_api_key(&server).await;
 
     // Upload multiple files
@@ -272,7 +272,7 @@ async fn test_list_files() {
 
 #[tokio::test]
 async fn test_list_files_with_limit() {
-    let (server, _guard) = setup_test_server().await;
+    let server = setup_test_server().await;
     let (api_key, _) = create_org_and_api_key(&server).await;
 
     // Upload multiple files
@@ -303,7 +303,7 @@ async fn test_list_files_with_limit() {
 
 #[tokio::test]
 async fn test_list_files_with_pagination() {
-    let (server, _guard) = setup_test_server().await;
+    let server = setup_test_server().await;
     let (api_key, _) = create_org_and_api_key(&server).await;
 
     // Upload multiple files
@@ -346,7 +346,7 @@ async fn test_list_files_with_pagination() {
 
 #[tokio::test]
 async fn test_list_files_with_purpose_filter() {
-    let (server, _guard) = setup_test_server().await;
+    let server = setup_test_server().await;
     let (api_key, _) = create_org_and_api_key(&server).await;
 
     // Upload files with different purposes
@@ -385,7 +385,7 @@ async fn test_list_files_with_purpose_filter() {
 
 #[tokio::test]
 async fn test_list_files_with_order() {
-    let (server, _guard) = setup_test_server().await;
+    let server = setup_test_server().await;
     let (api_key, _) = create_org_and_api_key(&server).await;
 
     // Upload multiple files
@@ -430,7 +430,7 @@ async fn test_list_files_with_order() {
 
 #[tokio::test]
 async fn test_get_file_metadata() {
-    let (server, _guard) = setup_test_server().await;
+    let server = setup_test_server().await;
     let (api_key, _) = create_org_and_api_key(&server).await;
 
     // Upload a file
@@ -464,7 +464,7 @@ async fn test_get_file_metadata() {
 
 #[tokio::test]
 async fn test_get_file_metadata_not_found() {
-    let (server, _guard) = setup_test_server().await;
+    let server = setup_test_server().await;
     let (api_key, _) = create_org_and_api_key(&server).await;
 
     let response = server
@@ -477,7 +477,7 @@ async fn test_get_file_metadata_not_found() {
 
 #[tokio::test]
 async fn test_get_file_content() {
-    let (server, _guard) = setup_test_server().await;
+    let server = setup_test_server().await;
     let (api_key, _) = create_org_and_api_key(&server).await;
 
     // Upload a file
@@ -535,7 +535,7 @@ async fn test_get_file_content() {
 
 #[tokio::test]
 async fn test_get_binary_file_content() {
-    let (server, _guard) = setup_test_server().await;
+    let server = setup_test_server().await;
     let (api_key, _) = create_org_and_api_key(&server).await;
 
     // Upload a binary file
@@ -568,7 +568,7 @@ async fn test_get_binary_file_content() {
 
 #[tokio::test]
 async fn test_get_file_content_not_found() {
-    let (server, _guard) = setup_test_server().await;
+    let server = setup_test_server().await;
     let (api_key, _) = create_org_and_api_key(&server).await;
 
     let response = server
@@ -581,7 +581,7 @@ async fn test_get_file_content_not_found() {
 
 #[tokio::test]
 async fn test_delete_file() {
-    let (server, _guard) = setup_test_server().await;
+    let server = setup_test_server().await;
     let (api_key, _) = create_org_and_api_key(&server).await;
 
     // Upload a file
@@ -622,7 +622,7 @@ async fn test_delete_file() {
 
 #[tokio::test]
 async fn test_delete_file_not_found() {
-    let (server, _guard) = setup_test_server().await;
+    let server = setup_test_server().await;
     let (api_key, _) = create_org_and_api_key(&server).await;
 
     let response = server
@@ -635,7 +635,7 @@ async fn test_delete_file_not_found() {
 
 #[tokio::test]
 async fn test_file_isolation_between_workspaces() {
-    let (server, _guard) = setup_test_server().await;
+    let server = setup_test_server().await;
 
     // Create two organizations with API keys
     let org1 = create_org(&server).await;
@@ -686,7 +686,7 @@ async fn test_file_isolation_between_workspaces() {
 
 #[tokio::test]
 async fn test_upload_and_download_large_file() {
-    let (server, _guard) = setup_test_server().await;
+    let server = setup_test_server().await;
     let (api_key, _) = create_org_and_api_key(&server).await;
 
     // Create a 1MB file
@@ -719,7 +719,7 @@ async fn test_upload_and_download_large_file() {
 
 #[tokio::test]
 async fn test_file_id_formats() {
-    let (server, _guard) = setup_test_server().await;
+    let server = setup_test_server().await;
     let (api_key, _) = create_org_and_api_key(&server).await;
 
     // Upload a file
@@ -755,7 +755,7 @@ async fn test_file_id_formats() {
 
 #[tokio::test]
 async fn test_complete_file_lifecycle() {
-    let (server, _guard) = setup_test_server().await;
+    let server = setup_test_server().await;
     let (api_key, _) = create_org_and_api_key(&server).await;
 
     // 1. Upload file
@@ -813,8 +813,8 @@ async fn test_complete_file_lifecycle() {
 
 #[tokio::test]
 async fn test_file_in_response_api() {
-    let (server, _pool, mock, _database, _guard) = setup_test_server_with_pool().await;
-    setup_qwen_model(&server).await;
+    let (server, _pool, mock, _database) = setup_test_server_with_pool().await;
+    let model_id = setup_qwen_model(&server).await;
     let org = setup_org_with_credits(&server, 10000000000i64).await; // $10.00 USD
     let api_key = get_api_key_for_org(&server, org.id).await;
 
@@ -871,16 +871,7 @@ async fn test_file_in_response_api() {
     let file_obj: api::models::FileUploadResponse = file_response.json();
     println!("File: {file_obj:?}");
 
-    // 2. Get available models
-    let models_response = server
-        .get("/v1/models")
-        .add_header("Authorization", format!("Bearer {api_key}"))
-        .await;
-    let models = models_response.json::<api::models::ModelsResponse>();
-    assert!(!models.data.is_empty());
-    let model_id = models.data[0].id.clone();
-
-    // 3. Create a conversation
+    // 2. Create a conversation
     let conversation_response = server
         .post("/v1/conversations")
         .add_header("Authorization", format!("Bearer {api_key}"))
@@ -1028,19 +1019,10 @@ async fn test_file_in_response_api() {
 
 #[tokio::test]
 async fn test_file_not_found_in_response_api() {
-    let (server, _guard) = setup_test_server().await;
-    setup_qwen_model(&server).await;
+    let server = setup_test_server().await;
+    let model_id = setup_qwen_model(&server).await;
     let org = setup_org_with_credits(&server, 10000000000i64).await; // $10.00 USD
     let api_key = get_api_key_for_org(&server, org.id).await;
-
-    // Get available models
-    let models_response = server
-        .get("/v1/models")
-        .add_header("Authorization", format!("Bearer {api_key}"))
-        .await;
-    let models = models_response.json::<api::models::ModelsResponse>();
-    assert!(!models.data.is_empty());
-    let model_id = models.data[0].id.clone();
 
     // Create a conversation
     let conversation_response = server
@@ -1087,8 +1069,8 @@ async fn test_file_not_found_in_response_api() {
 
 #[tokio::test]
 async fn test_multiple_files_in_response_api() {
-    let (server, _guard) = setup_test_server().await;
-    setup_qwen_model(&server).await;
+    let server = setup_test_server().await;
+    let model_id = setup_qwen_model(&server).await;
     let org = setup_org_with_credits(&server, 10000000000i64).await; // $10.00 USD
     let api_key = get_api_key_for_org(&server, org.id).await;
 
@@ -1119,16 +1101,7 @@ async fn test_multiple_files_in_response_api() {
     assert_eq!(upload2.status_code(), 201);
     let file2: api::models::FileUploadResponse = upload2.json();
 
-    // 2. Get available models
-    let models_response = server
-        .get("/v1/models")
-        .add_header("Authorization", format!("Bearer {api_key}"))
-        .await;
-    let models = models_response.json::<api::models::ModelsResponse>();
-    assert!(!models.data.is_empty());
-    let model_id = models.data[0].id.clone();
-
-    // 3. Create a conversation
+    // 2. Create a conversation
     let conversation_response = server
         .post("/v1/conversations")
         .add_header("Authorization", format!("Bearer {api_key}"))

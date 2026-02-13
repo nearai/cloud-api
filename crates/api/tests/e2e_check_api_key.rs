@@ -5,7 +5,7 @@ use common::*;
 /// Happy path: valid API key with credits returns 200.
 #[tokio::test]
 async fn test_check_api_key_valid() {
-    let (server, _guard) = setup_test_server().await;
+    let server = setup_test_server().await;
     let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
     let api_key = get_api_key_for_org(&server, org.id).await;
 
@@ -28,7 +28,7 @@ async fn test_check_api_key_valid() {
 /// Invalid API key returns 401.
 #[tokio::test]
 async fn test_check_api_key_invalid() {
-    let (server, _guard) = setup_test_server().await;
+    let server = setup_test_server().await;
 
     let response = server
         .post("/v1/check_api_key")
@@ -44,7 +44,7 @@ async fn test_check_api_key_invalid() {
 /// Missing authorization header returns 401.
 #[tokio::test]
 async fn test_check_api_key_missing_auth() {
-    let (server, _guard) = setup_test_server().await;
+    let server = setup_test_server().await;
 
     let response = server.post("/v1/check_api_key").await;
 
@@ -54,7 +54,7 @@ async fn test_check_api_key_missing_auth() {
 /// Organization with no credits returns 402.
 #[tokio::test]
 async fn test_check_api_key_no_credits() {
-    let (server, _guard) = setup_test_server().await;
+    let server = setup_test_server().await;
     // Create org with $0 credits
     let org = setup_org_with_credits(&server, 0i64).await;
     let api_key = get_api_key_for_org(&server, org.id).await;

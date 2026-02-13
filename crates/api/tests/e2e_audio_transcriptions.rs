@@ -57,7 +57,7 @@ async fn setup_whisper_model(server: &axum_test::TestServer, model_name: &str) {
 /// Test basic audio transcription with valid audio file
 #[tokio::test]
 async fn test_audio_transcription_basic() {
-    let (server, _guard) = setup_test_server().await;
+    let server = setup_test_server().await;
 
     // Setup Whisper model
     let model_name = "Qwen/Qwen-Image-2512";
@@ -94,7 +94,7 @@ async fn test_audio_transcription_basic() {
 /// Test audio transcription with language parameter
 #[tokio::test]
 async fn test_audio_transcription_with_language() {
-    let (server, _guard) = setup_test_server().await;
+    let server = setup_test_server().await;
 
     let model_name = "Qwen/Qwen-Image-2512";
     setup_whisper_model(&server, model_name).await;
@@ -128,7 +128,7 @@ async fn test_audio_transcription_with_language() {
 /// Test audio transcription with verbose_json response format
 #[tokio::test]
 async fn test_audio_transcription_verbose_json() {
-    let (server, _guard) = setup_test_server().await;
+    let server = setup_test_server().await;
 
     let model_name = "Qwen/Qwen-Image-2512";
     setup_whisper_model(&server, model_name).await;
@@ -174,7 +174,7 @@ async fn test_audio_transcription_file_too_large() {
 /// Test that empty audio file is rejected
 #[tokio::test]
 async fn test_audio_transcription_empty_file() {
-    let (server, _guard) = setup_test_server().await;
+    let server = setup_test_server().await;
 
     let model_name = "Qwen/Qwen-Image-2512";
     setup_whisper_model(&server, model_name).await;
@@ -207,7 +207,7 @@ async fn test_audio_transcription_empty_file() {
 /// Test that missing model field returns error
 #[tokio::test]
 async fn test_audio_transcription_missing_model() {
-    let (server, _guard) = setup_test_server().await;
+    let server = setup_test_server().await;
 
     let model_name = "Qwen/Qwen-Image-2512";
     setup_whisper_model(&server, model_name).await;
@@ -238,7 +238,7 @@ async fn test_audio_transcription_missing_model() {
 /// Test that non-existent model returns 404
 #[tokio::test]
 async fn test_audio_transcription_model_not_found() {
-    let (server, _guard) = setup_test_server().await;
+    let server = setup_test_server().await;
 
     let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
     let api_key = get_api_key_for_org(&server, org.id).await;
@@ -268,7 +268,7 @@ async fn test_audio_transcription_model_not_found() {
 /// Test that missing API key returns 401
 #[tokio::test]
 async fn test_audio_transcription_missing_api_key() {
-    let (server, _guard) = setup_test_server().await;
+    let server = setup_test_server().await;
 
     let model_name = "Qwen/Qwen-Image-2512";
     setup_whisper_model(&server, model_name).await;
@@ -295,7 +295,7 @@ async fn test_audio_transcription_missing_api_key() {
 /// Test that invalid API key returns 401
 #[tokio::test]
 async fn test_audio_transcription_invalid_api_key() {
-    let (server, _guard) = setup_test_server().await;
+    let server = setup_test_server().await;
 
     let model_name = "Qwen/Qwen-Image-2512";
     setup_whisper_model(&server, model_name).await;
@@ -323,7 +323,7 @@ async fn test_audio_transcription_invalid_api_key() {
 /// Test that invalid temperature returns error
 #[tokio::test]
 async fn test_audio_transcription_invalid_temperature() {
-    let (server, _guard) = setup_test_server().await;
+    let server = setup_test_server().await;
 
     let model_name = "Qwen/Qwen-Image-2512";
     setup_whisper_model(&server, model_name).await;
@@ -357,7 +357,7 @@ async fn test_audio_transcription_invalid_temperature() {
 /// Test audio transcription with different file formats
 #[tokio::test]
 async fn test_audio_transcription_multiple_formats() {
-    let (server, _guard) = setup_test_server().await;
+    let server = setup_test_server().await;
 
     let model_name = "Qwen/Qwen-Image-2512";
     setup_whisper_model(&server, model_name).await;
@@ -404,7 +404,7 @@ async fn test_audio_transcription_multiple_formats() {
 /// Test that invalid response_format returns error
 #[tokio::test]
 async fn test_audio_transcription_invalid_response_format() {
-    let (server, _guard) = setup_test_server().await;
+    let server = setup_test_server().await;
 
     let model_name = "Qwen/Qwen-Image-2512";
     setup_whisper_model(&server, model_name).await;
@@ -440,7 +440,7 @@ async fn test_audio_transcription_invalid_response_format() {
 /// Test that usage is tracked with audio duration
 #[tokio::test]
 async fn test_audio_transcription_usage_tracking() {
-    let (server, _pool, _mock, _database, _guard) = setup_test_server_with_pool().await;
+    let (server, _pool, _mock, _database) = setup_test_server_with_pool().await;
 
     let model_name = "Qwen/Qwen-Image-2512";
     setup_whisper_model(&server, model_name).await;

@@ -17,18 +17,18 @@ async fn test_audio_input_chat_completion() {
         if use_real { "REAL" } else { "MOCK" }
     );
 
-    let (server, api_key, _guard) = if use_real {
-        let (server, _pool, _db, guard) = setup_test_server_real_providers().await;
+    let (server, api_key) = if use_real {
+        let (server, _pool, _db) = setup_test_server_real_providers().await;
         setup_qwen_omni_model(&server).await;
         let org = setup_org_with_credits(&server, 10_000_000_000i64).await; // $10.00 USD
         let api_key = get_api_key_for_org(&server, org.id).await;
-        (server, api_key, guard)
+        (server, api_key)
     } else {
-        let (server, guard) = setup_test_server().await;
+        let server = setup_test_server().await;
         setup_qwen_omni_model(&server).await;
         let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
         let api_key = get_api_key_for_org(&server, org.id).await;
-        (server, api_key, guard)
+        (server, api_key)
     };
 
     // Create test audio data
@@ -150,18 +150,18 @@ async fn test_audio_output_chat_completion() {
         if use_real { "REAL" } else { "MOCK" }
     );
 
-    let (server, api_key, _guard) = if use_real {
-        let (server, _pool, _db, guard) = setup_test_server_real_providers().await;
+    let (server, api_key) = if use_real {
+        let (server, _pool, _db) = setup_test_server_real_providers().await;
         setup_qwen_omni_model(&server).await;
         let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
         let api_key = get_api_key_for_org(&server, org.id).await;
-        (server, api_key, guard)
+        (server, api_key)
     } else {
-        let (server, guard) = setup_test_server().await;
+        let server = setup_test_server().await;
         setup_qwen_omni_model(&server).await;
         let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
         let api_key = get_api_key_for_org(&server, org.id).await;
-        (server, api_key, guard)
+        (server, api_key)
     };
 
     // Send chat completion request with modalities: ["text", "audio"] for audio output
@@ -317,18 +317,18 @@ async fn test_audio_and_text_output_chat_completion() {
         if use_real { "REAL" } else { "MOCK" }
     );
 
-    let (server, api_key, _guard) = if use_real {
-        let (server, _pool, _db, guard) = setup_test_server_real_providers().await;
+    let (server, api_key) = if use_real {
+        let (server, _pool, _db) = setup_test_server_real_providers().await;
         setup_qwen_omni_model(&server).await;
         let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
         let api_key = get_api_key_for_org(&server, org.id).await;
-        (server, api_key, guard)
+        (server, api_key)
     } else {
-        let (server, guard) = setup_test_server().await;
+        let server = setup_test_server().await;
         setup_qwen_omni_model(&server).await;
         let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
         let api_key = get_api_key_for_org(&server, org.id).await;
-        (server, api_key, guard)
+        (server, api_key)
     };
 
     // Send chat completion request with modalities: ["text", "audio"]
@@ -463,18 +463,18 @@ async fn test_image_generation() {
         if use_real { "REAL" } else { "MOCK" }
     );
 
-    let (server, api_key, _guard) = if use_real {
-        let (server, _pool, _db, guard) = setup_test_server_real_providers().await;
+    let (server, api_key) = if use_real {
+        let (server, _pool, _db) = setup_test_server_real_providers().await;
         setup_qwen_image_model(&server).await;
         let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
         let api_key = get_api_key_for_org(&server, org.id).await;
-        (server, api_key, guard)
+        (server, api_key)
     } else {
-        let (server, guard) = setup_test_server().await;
+        let server = setup_test_server().await;
         setup_qwen_image_model(&server).await;
         let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
         let api_key = get_api_key_for_org(&server, org.id).await;
-        (server, api_key, guard)
+        (server, api_key)
     };
 
     // Send image generation request
@@ -581,18 +581,18 @@ async fn test_image_generation_multiple() {
         if use_real { "REAL" } else { "MOCK" }
     );
 
-    let (server, api_key, _guard) = if use_real {
-        let (server, _pool, _db, guard) = setup_test_server_real_providers().await;
+    let (server, api_key) = if use_real {
+        let (server, _pool, _db) = setup_test_server_real_providers().await;
         setup_qwen_image_model(&server).await;
         let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
         let api_key = get_api_key_for_org(&server, org.id).await;
-        (server, api_key, guard)
+        (server, api_key)
     } else {
-        let (server, guard) = setup_test_server().await;
+        let server = setup_test_server().await;
         setup_qwen_image_model(&server).await;
         let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
         let api_key = get_api_key_for_org(&server, org.id).await;
-        (server, api_key, guard)
+        (server, api_key)
     };
 
     // Request multiple images
@@ -648,8 +648,7 @@ async fn test_image_generation_multiple() {
 /// Test image generation validation errors
 #[tokio::test]
 async fn test_image_generation_validation() {
-    let (server, guard) = setup_test_server().await;
-    let _guard = guard;
+    let server = setup_test_server().await;
 
     setup_qwen_image_model(&server).await;
     let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
@@ -695,8 +694,7 @@ async fn test_image_generation_validation() {
 /// - Any other value should be rejected
 #[tokio::test]
 async fn test_verifiable_model_response_format_validation() {
-    let (server, guard) = setup_test_server().await;
-    let _guard = guard;
+    let server = setup_test_server().await;
 
     // Set up the verifiable image model (Qwen/Qwen-Image-2512 has verifiable=true and defaults to attestation_supported=true)
     setup_qwen_image_model(&server).await;
@@ -829,8 +827,7 @@ async fn test_verifiable_model_response_format_validation() {
 /// Test that audio content is properly passed through to providers
 #[tokio::test]
 async fn test_audio_content_passthrough() {
-    let (server, guard) = setup_test_server().await;
-    let _guard = guard;
+    let server = setup_test_server().await;
 
     setup_qwen_omni_model(&server).await;
     let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
@@ -904,8 +901,7 @@ async fn test_audio_content_passthrough() {
 #[tokio::test]
 async fn test_has_audio_content_detection() {
     // This tests the API layer's audio content detection
-    let (server, guard) = setup_test_server().await;
-    let _guard = guard;
+    let server = setup_test_server().await;
 
     setup_qwen_model(&server).await;
     let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
@@ -1028,11 +1024,10 @@ async fn test_audio_output_with_encryption_headers() {
 
     println!("Running audio output attestation test with MOCK providers");
 
-    let (server, guard) = setup_test_server().await;
+    let server = setup_test_server().await;
     setup_qwen_omni_model(&server).await;
     let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
     let api_key = get_api_key_for_org(&server, org.id).await;
-    let _guard = guard;
 
     let model = "Qwen/Qwen3-Omni-30B-A3B-Instruct";
 
@@ -1098,18 +1093,18 @@ async fn test_audio_output_attestation_report() {
         if use_real { "REAL" } else { "MOCK" }
     );
 
-    let (server, api_key, _guard) = if use_real {
-        let (server, _pool, _db, guard) = setup_test_server_real_providers().await;
+    let (server, api_key) = if use_real {
+        let (server, _pool, _db) = setup_test_server_real_providers().await;
         setup_qwen_omni_model(&server).await;
         let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
         let api_key = get_api_key_for_org(&server, org.id).await;
-        (server, api_key, guard)
+        (server, api_key)
     } else {
-        let (server, guard) = setup_test_server().await;
+        let server = setup_test_server().await;
         setup_qwen_omni_model(&server).await;
         let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
         let api_key = get_api_key_for_org(&server, org.id).await;
-        (server, api_key, guard)
+        (server, api_key)
     };
 
     let model = "Qwen/Qwen3-Omni-30B-A3B-Instruct";
@@ -1211,18 +1206,18 @@ async fn test_audio_output_signature_verification() {
         if use_real { "REAL" } else { "MOCK" }
     );
 
-    let (server, api_key, _guard) = if use_real {
-        let (server, _pool, _db, guard) = setup_test_server_real_providers().await;
+    let (server, api_key) = if use_real {
+        let (server, _pool, _db) = setup_test_server_real_providers().await;
         setup_qwen_omni_model(&server).await;
         let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
         let api_key = get_api_key_for_org(&server, org.id).await;
-        (server, api_key, guard)
+        (server, api_key)
     } else {
-        let (server, guard) = setup_test_server().await;
+        let server = setup_test_server().await;
         setup_qwen_omni_model(&server).await;
         let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
         let api_key = get_api_key_for_org(&server, org.id).await;
-        (server, api_key, guard)
+        (server, api_key)
     };
 
     let model = "Qwen/Qwen3-Omni-30B-A3B-Instruct";
@@ -1516,18 +1511,18 @@ async fn test_image_edit() {
         if use_real { "REAL" } else { "MOCK" }
     );
 
-    let (server, api_key, _guard) = if use_real {
-        let (server, _pool, _db, guard) = setup_test_server_real_providers().await;
+    let (server, api_key) = if use_real {
+        let (server, _pool, _db) = setup_test_server_real_providers().await;
         setup_qwen_image_model(&server).await;
         let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
         let api_key = get_api_key_for_org(&server, org.id).await;
-        (server, api_key, guard)
+        (server, api_key)
     } else {
-        let (server, guard) = setup_test_server().await;
+        let server = setup_test_server().await;
         setup_qwen_image_model(&server).await;
         let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
         let api_key = get_api_key_for_org(&server, org.id).await;
-        (server, api_key, guard)
+        (server, api_key)
     };
 
     let image_data = create_test_png_image();
@@ -1630,8 +1625,7 @@ async fn test_image_edit() {
 /// Test image edit validation
 #[tokio::test]
 async fn test_image_edit_validation() {
-    let (server, guard) = setup_test_server().await;
-    let _guard = guard;
+    let server = setup_test_server().await;
 
     setup_qwen_image_model(&server).await;
     let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
@@ -1745,8 +1739,7 @@ async fn test_image_edit_validation() {
 /// Test verifiable model response_format validation for image edit
 #[tokio::test]
 async fn test_image_edit_verifiable_model_response_format() {
-    let (server, guard) = setup_test_server().await;
-    let _guard = guard;
+    let server = setup_test_server().await;
 
     setup_qwen_image_model(&server).await;
     let org = setup_org_with_credits(&server, 10_000_000_000i64).await;

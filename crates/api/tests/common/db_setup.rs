@@ -3,404 +3,142 @@ use std::env;
 use std::sync::Arc;
 use tokio::sync::OnceCell;
 use tokio_postgres::NoTls;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info};
 
-const TEMPLATE_DB_NAME: &str = "platform_api_test_template";
-static TEMPLATE_INITIALIZED: OnceCell<()> = OnceCell::const_new();
+static SHARED_DB_READY: OnceCell<()> = OnceCell::const_new();
 
-/// Validate that a database identifier only contains safe characters (alphanumeric + underscore).
-/// PostgreSQL identifiers with only these characters don't need quoting and are safe from injection.
-/// This prevents any potential SQL injection via format! strings.
-fn validate_db_identifier(name: &str) -> Result<(), String> {
-    if name.is_empty() {
-        return Err("Database name cannot be empty".to_string());
-    }
-    if name.len() > 63 {
-        return Err(format!("Database name too long (max 63 chars): {}", name));
-    }
-    if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
-        return Err(format!(
-            "Database name contains invalid characters (only alphanumeric and _ allowed): {}",
-            name
-        ));
-    }
-    Ok(())
+fn db_host() -> String {
+    env::var("DATABASE_HOST").unwrap_or_else(|_| "localhost".to_string())
+}
+
+fn db_port() -> u16 {
+    env::var("DATABASE_PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(5432)
+}
+
+fn db_user() -> String {
+    env::var("DATABASE_USERNAME").unwrap_or_else(|_| "postgres".to_string())
+}
+
+fn db_password() -> String {
+    env::var("DATABASE_PASSWORD").unwrap_or_else(|_| "postgres".to_string())
 }
 
 pub fn get_test_db_name() -> String {
-    let name = env::var("TEST_DATABASE_NAME").unwrap_or_else(|_| "platform_api_test".to_string());
-    validate_db_identifier(&name).unwrap_or_else(|e| panic!("Invalid TEST_DATABASE_NAME: {}", e));
-    name
+    env::var("TEST_DATABASE_NAME").unwrap_or_else(|_| "platform_api_e2e".to_string())
 }
 
-pub fn get_template_db_name() -> String {
-    let name =
-        env::var("TEST_TEMPLATE_DATABASE_NAME").unwrap_or_else(|_| TEMPLATE_DB_NAME.to_string());
-    validate_db_identifier(&name)
-        .unwrap_or_else(|e| panic!("Invalid TEST_TEMPLATE_DATABASE_NAME: {}", e));
-    name
-}
+/// Fixed key for the PostgreSQL advisory lock that serializes DB bootstrap
+/// across test binaries. Chosen arbitrarily, just needs to be consistent.
+const BOOTSTRAP_LOCK_KEY: i64 = 0x0e2e_b007_57a9;
 
-/// Get admin database name - try 'postgres' first, fallback to 'template1' if not available
-async fn get_admin_db_name(
-    host: &str,
-    port: u16,
-    username: &str,
-    password: &str,
-) -> Result<String, String> {
-    if can_connect_to_db(host, port, username, password, "postgres").await {
-        return Ok("postgres".to_string());
-    }
-
-    if can_connect_to_db(host, port, username, password, "template1").await {
-        warn!("'postgres' database not found, using 'template1' as admin database");
-        return Ok("template1".to_string());
-    }
-
-    Err("Neither 'postgres' nor 'template1' database found".to_string())
-}
-
-async fn can_connect_to_db(
-    host: &str,
-    port: u16,
-    username: &str,
-    password: &str,
-    dbname: &str,
-) -> bool {
-    let conn_string =
-        format!("host={host} port={port} user={username} password={password} dbname={dbname}");
-    tokio_postgres::connect(&conn_string, NoTls).await.is_ok()
-}
-
-/// Connect to the admin database and return the client
-async fn connect_to_admin_db(
-    config: &config::DatabaseConfig,
-) -> Result<tokio_postgres::Client, String> {
-    let host = config
-        .host
-        .clone()
-        .unwrap_or_else(|| "localhost".to_string());
-    let port = config.port;
-    let username = config.username.clone();
-    let password = config.password.clone();
-
-    let admin_db = get_admin_db_name(&host, port, &username, &password).await?;
-
-    let conn_string =
-        format!("host={host} port={port} user={username} password={password} dbname={admin_db}");
-
-    let (client, connection) = tokio_postgres::connect(&conn_string, NoTls)
-        .await
-        .map_err(|e| format!("Failed to connect to admin database: {e}"))?;
-
-    tokio::spawn(async move {
-        if let Err(e) = connection.await {
-            error!("Database connection error: {}", e);
-        }
-    });
-
-    Ok(client)
-}
-
-/// Ensure the template database exists and has migrations applied.
-pub async fn ensure_template_database(config: &config::DatabaseConfig) -> Result<(), String> {
-    TEMPLATE_INITIALIZED
+/// Bootstrap the shared database once: create it if missing, run migrations, drop the bootstrap pool.
+///
+/// OnceCell gates within a single binary (process), while a PostgreSQL advisory
+/// lock serializes across the multiple test binaries that nextest launches in
+/// parallel. The lock is automatically released when the admin connection drops.
+async fn ensure_shared_db() {
+    SHARED_DB_READY
         .get_or_init(|| async {
-            create_template_database_internal(config)
+            let db_name = get_test_db_name();
+            let host = db_host();
+            let port = db_port();
+            let user = db_user();
+            let password = db_password();
+
+            // Connect to the `postgres` admin database. This connection holds the
+            // advisory lock for the entire bootstrap (CREATE DATABASE + migrations).
+            let admin_conn_string =
+                format!("host={host} port={port} user={user} password={password} dbname=postgres");
+            let (client, connection) = tokio_postgres::connect(&admin_conn_string, NoTls)
                 .await
-                .expect("Failed to create template database");
+                .expect("Failed to connect to admin database for bootstrap");
+
+            tokio::spawn(async move {
+                if let Err(e) = connection.await {
+                    eprintln!("Admin connection error during bootstrap: {e}");
+                }
+            });
+
+            // Serialize bootstrap across test binaries. pg_advisory_lock blocks
+            // until the lock is available; it's released when the session ends.
+            client
+                .execute("SELECT pg_advisory_lock($1)", &[&BOOTSTRAP_LOCK_KEY])
+                .await
+                .expect("Failed to acquire advisory lock for e2e bootstrap");
+
+            // CREATE DATABASE inside the lock, swallow errors (another binary may
+            // have already created it in a previous lock holder's session).
+            match client
+                .execute(&format!("CREATE DATABASE {db_name}"), &[])
+                .await
+            {
+                Ok(_) => info!("Created shared e2e database '{db_name}'"),
+                Err(e) => {
+                    debug!("CREATE DATABASE {db_name} returned error (likely already exists): {e}");
+                }
+            }
+
+            // Run migrations while still holding the advisory lock so refinery's
+            // schema_history table creation doesn't race across binaries.
+            let db_config = config::DatabaseConfig {
+                primary_app_id: "postgres-test".to_string(),
+                gateway_subdomain: "cvm1.near.ai".to_string(),
+                port,
+                host: Some(host.clone()),
+                database: db_name.clone(),
+                username: user.clone(),
+                password: password.clone(),
+                max_connections: 2,
+                tls_enabled: false,
+                tls_ca_cert_path: None,
+                refresh_interval: 30,
+                mock: false,
+            };
+
+            let database = Arc::new(
+                Database::from_config(&db_config)
+                    .await
+                    .expect("Failed to connect to shared e2e database for migrations"),
+            );
+
+            database
+                .run_migrations()
+                .await
+                .expect("Failed to run migrations on shared e2e database");
+
+            debug!("Shared e2e database '{db_name}' ready with migrations");
+            drop(database);
+
+            // Dropping `client` closes the session which releases the advisory lock.
+            drop(client);
         })
         .await;
-    Ok(())
 }
 
-/// Advisory lock ID for template database creation (arbitrary but unique)
-const TEMPLATE_DB_LOCK_ID: i64 = 0x5445_5354_5450_4C00;
+/// Create a 4-connection deadpool pool to the shared e2e database.
+/// Called once per test.
+pub async fn create_test_pool() -> database::pool::DbPool {
+    ensure_shared_db().await;
 
-/// Internal function to create the template database with migrations.
-/// Uses PostgreSQL advisory locks to coordinate across multiple test processes.
-async fn create_template_database_internal(config: &config::DatabaseConfig) -> Result<(), String> {
-    let template_db_name = get_template_db_name();
+    let mut pg_config = deadpool_postgres::Config::new();
+    pg_config.host = Some(db_host());
+    pg_config.port = Some(db_port());
+    pg_config.dbname = Some(get_test_db_name());
+    pg_config.user = Some(db_user());
+    pg_config.password = Some(db_password());
 
-    if check_template_database_ready(config, &template_db_name).await {
-        debug!(
-            "Template database '{}' already exists (fast path), skipping creation",
-            template_db_name
-        );
-        return Ok(());
-    }
+    pg_config.pool = Some(deadpool_postgres::PoolConfig {
+        max_size: 4,
+        ..Default::default()
+    });
 
-    let client = connect_to_admin_db(config).await?;
-
-    debug!("Acquiring advisory lock for template database creation...");
-    client
-        .execute(
-            &format!("SELECT pg_advisory_lock({TEMPLATE_DB_LOCK_ID})"),
-            &[],
+    pg_config
+        .create_pool(
+            Some(deadpool_postgres::Runtime::Tokio1),
+            tokio_postgres::NoTls,
         )
-        .await
-        .map_err(|e| format!("Failed to acquire advisory lock: {e}"))?;
-
-    if check_template_database_ready(config, &template_db_name).await {
-        debug!(
-            "Template database '{}' already exists (after lock), skipping creation",
-            template_db_name
-        );
-        let _ = client
-            .execute(
-                &format!("SELECT pg_advisory_unlock({TEMPLATE_DB_LOCK_ID})"),
-                &[],
-            )
-            .await;
-        return Ok(());
-    }
-
-    info!("Creating template database '{}'...", template_db_name);
-
-    let _ = client
-        .execute(
-            &format!(
-                "SELECT pg_terminate_backend(pid) FROM pg_stat_activity
-                 WHERE datname = '{template_db_name}' AND pid <> pg_backend_pid()"
-            ),
-            &[],
-        )
-        .await;
-
-    let _ = client
-        .execute(&format!("DROP DATABASE IF EXISTS {template_db_name}"), &[])
-        .await;
-
-    client
-        .execute(&format!("CREATE DATABASE {template_db_name}"), &[])
-        .await
-        .map_err(|e| {
-            let _ = futures::executor::block_on(client.execute(
-                &format!("SELECT pg_advisory_unlock({TEMPLATE_DB_LOCK_ID})"),
-                &[],
-            ));
-            format!("Failed to create template database: {e}")
-        })?;
-
-    info!(
-        "Template database '{}' created, running migrations...",
-        template_db_name
-    );
-
-    let template_config = config::DatabaseConfig {
-        database: template_db_name.clone(),
-        ..config.clone()
-    };
-
-    let database = Arc::new(
-        Database::from_config(&template_config)
-            .await
-            .map_err(|e| format!("Failed to connect to template database: {e}"))?,
-    );
-
-    database
-        .run_migrations()
-        .await
-        .map_err(|e| format!("Failed to run migrations on template database: {e}"))?;
-
-    info!(
-        "Template database '{}' initialized with migrations",
-        template_db_name
-    );
-
-    drop(database);
-    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-
-    let _ = client
-        .execute(
-            &format!(
-                "SELECT pg_terminate_backend(pid) FROM pg_stat_activity
-                 WHERE datname = '{template_db_name}' AND pid <> pg_backend_pid()"
-            ),
-            &[],
-        )
-        .await;
-
-    debug!("Terminated all connections to template database");
-
-    let _ = client
-        .execute(
-            &format!("SELECT pg_advisory_unlock({TEMPLATE_DB_LOCK_ID})"),
-            &[],
-        )
-        .await;
-
-    Ok(())
-}
-
-/// Check if the template database exists by querying the admin database.
-async fn check_template_database_ready(config: &config::DatabaseConfig, db_name: &str) -> bool {
-    let client = match connect_to_admin_db(config).await {
-        Ok(c) => c,
-        Err(_) => return false,
-    };
-
-    let exists = client
-        .query_one(
-            "SELECT EXISTS(SELECT 1 FROM pg_database WHERE datname = $1)",
-            &[&db_name],
-        )
-        .await
-        .map(|row| row.get::<_, bool>(0))
-        .unwrap_or(false);
-
-    exists
-}
-
-/// Create a unique test database from the template.
-pub async fn create_test_database_from_template(
-    config: &config::DatabaseConfig,
-    test_id: &str,
-) -> Result<String, String> {
-    ensure_template_database(config).await?;
-
-    let template_db_name = get_template_db_name();
-    let sanitized_id = test_id.replace('-', "_");
-    let test_db_name = format!("test_{sanitized_id}");
-
-    validate_db_identifier(&test_db_name)
-        .map_err(|e| format!("Invalid test database name: {}", e))?;
-
-    debug!("Creating test database '{}' from template...", test_db_name);
-
-    let client = connect_to_admin_db(config).await?;
-
-    let _ = client
-        .execute(
-            &format!(
-                "SELECT pg_terminate_backend(pid) FROM pg_stat_activity
-                 WHERE datname = '{test_db_name}' AND pid <> pg_backend_pid()"
-            ),
-            &[],
-        )
-        .await;
-
-    let _ = client
-        .execute(&format!("DROP DATABASE IF EXISTS {test_db_name}"), &[])
-        .await;
-
-    let _ = client
-        .execute(
-            &format!(
-                "SELECT pg_terminate_backend(pid) FROM pg_stat_activity
-                 WHERE datname = '{template_db_name}' AND pid <> pg_backend_pid()"
-            ),
-            &[],
-        )
-        .await;
-
-    client
-        .execute(
-            &format!("CREATE DATABASE {test_db_name} TEMPLATE {template_db_name}"),
-            &[],
-        )
-        .await
-        .map_err(|e| format!("Failed to create test database from template: {e}"))?;
-
-    debug!("Test database '{}' created from template", test_db_name);
-
-    Ok(test_db_name)
-}
-
-/// Drop a test database after test completion.
-pub async fn drop_test_database(
-    config: &config::DatabaseConfig,
-    db_name: &str,
-) -> Result<(), String> {
-    validate_db_identifier(db_name).map_err(|e| format!("Invalid database name: {}", e))?;
-
-    if !db_name.starts_with("test_") {
-        return Err(format!(
-            "Safety check: Can only drop databases starting with 'test_'. Got: {}",
-            db_name
-        ));
-    }
-
-    debug!("Dropping test database '{}'...", db_name);
-
-    let client = connect_to_admin_db(config).await?;
-
-    let _ = client
-        .execute(
-            &format!(
-                "SELECT pg_terminate_backend(pid) FROM pg_stat_activity
-                 WHERE datname = '{db_name}' AND pid <> pg_backend_pid()"
-            ),
-            &[],
-        )
-        .await;
-
-    client
-        .execute(&format!("DROP DATABASE IF EXISTS {db_name}"), &[])
-        .await
-        .map_err(|e| format!("Failed to drop test database: {e}"))?;
-
-    debug!("Test database '{}' dropped", db_name);
-
-    Ok(())
-}
-
-/// Drop ALL test databases (databases starting with 'test_').
-/// This is useful for cleaning up orphaned test databases.
-/// Returns the number of databases dropped.
-pub async fn drop_all_test_databases(config: &config::DatabaseConfig) -> Result<usize, String> {
-    info!("Cleaning up all test databases...");
-
-    let client = connect_to_admin_db(config).await?;
-
-    let rows = client
-        .query(
-            "SELECT datname FROM pg_database WHERE datname LIKE 'test_%'",
-            &[],
-        )
-        .await
-        .map_err(|e| format!("Failed to list test databases: {e}"))?;
-
-    let mut dropped_count = 0;
-    for row in rows {
-        let db_name: String = row.get(0);
-
-        if db_name == get_template_db_name() {
-            debug!("Skipping template database '{}'", db_name);
-            continue;
-        }
-
-        // Defensive check - should be valid from pg_database
-        if let Err(e) = validate_db_identifier(&db_name) {
-            warn!("Skipping database with invalid name: {} ({})", db_name, e);
-            continue;
-        }
-
-        let _ = client
-            .execute(
-                &format!(
-                    "SELECT pg_terminate_backend(pid) FROM pg_stat_activity
-                     WHERE datname = '{db_name}' AND pid <> pg_backend_pid()"
-                ),
-                &[],
-            )
-            .await;
-
-        match client
-            .execute(&format!("DROP DATABASE IF EXISTS {db_name}"), &[])
-            .await
-        {
-            Ok(_) => {
-                debug!("Dropped test database '{}'", db_name);
-                dropped_count += 1;
-            }
-            Err(e) => {
-                warn!("Failed to drop test database '{}': {}", db_name, e);
-            }
-        }
-    }
-
-    info!("Cleaned up {} test database(s)", dropped_count);
-
-    Ok(dropped_count)
+        .expect("Failed to create test connection pool")
 }

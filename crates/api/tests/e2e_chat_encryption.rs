@@ -76,13 +76,12 @@ struct EncryptionTestHarness {
     model: String,
     model_pub_key_ecdsa: String,
     model_pub_key_ed25519: String,
-    _guard: common::TestDatabaseGuard,
 }
 
 impl EncryptionTestHarness {
     /// Setup a basic test harness with server, API key, and model public keys
     async fn new() -> Self {
-        let (server, _guard) = setup_test_server().await;
+        let server = setup_test_server().await;
         setup_deepseek_model(&server).await;
         let org = setup_org_with_credits(&server, 10000000000i64).await; // $10.00 USD
         let api_key = get_api_key_for_org(&server, org.id).await;
@@ -101,7 +100,6 @@ impl EncryptionTestHarness {
             model,
             model_pub_key_ecdsa,
             model_pub_key_ed25519,
-            _guard,
         }
     }
 
@@ -124,7 +122,6 @@ struct EncryptionTestHarnessWithPool {
     model_pub_key_ed25519: String,
     _mock_provider: std::sync::Arc<inference_providers::mock::MockProvider>,
     _database: std::sync::Arc<database::Database>,
-    _guard: common::TestDatabaseGuard,
 }
 
 impl EncryptionTestHarnessWithPool {
@@ -132,7 +129,7 @@ impl EncryptionTestHarnessWithPool {
     async fn new() -> Self {
         use common::setup_test_server_with_pool;
 
-        let (server, pool, _mock_provider, _database, _guard) = setup_test_server_with_pool().await;
+        let (server, pool, _mock_provider, _database) = setup_test_server_with_pool().await;
         setup_deepseek_model(&server).await;
         let org = setup_org_with_credits(&server, 10000000000i64).await; // $10.00 USD
         let api_key = get_api_key_for_org(&server, org.id).await;
@@ -154,7 +151,6 @@ impl EncryptionTestHarnessWithPool {
             model_pub_key_ed25519,
             _mock_provider,
             _database,
-            _guard,
         }
     }
 

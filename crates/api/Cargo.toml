@@ -64,6 +64,7 @@ k256 = { version = "0.13", features = ["ecdsa", "arithmetic"] }
 sha3 = "0.10"
 hmac = "0.12"
 tokio-postgres = "0.7"
+deadpool-postgres = { version = "0.14", features = ["rt_tokio_1"] }
 ed25519-dalek = { version = "2.1", features = ["rand_core"] }
 rand = "0.9"
 services = { path = "../services", features = ["test-mocks"] }

@@ -59,7 +59,7 @@ async fn test_mcp_multi_turn_conversation_with_approval() {
         });
 
     let mcp_factory = Arc::new(mock_factory);
-    let (server, _pool, mock, _guard) = setup_test_server_with_mcp_factory(mcp_factory).await;
+    let (server, _pool, mock) = setup_test_server_with_mcp_factory(mcp_factory).await;
     setup_qwen_model(&server).await;
     let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
     let api_key = get_api_key_for_org(&server, org.id).await;

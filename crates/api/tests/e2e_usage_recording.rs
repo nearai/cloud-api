@@ -6,7 +6,7 @@ use common::*;
 /// Sets up a model with pricing, creates an org with credits, and records usage.
 #[tokio::test]
 async fn test_record_chat_completion_usage() {
-    let (server, _guard) = setup_test_server().await;
+    let server = setup_test_server().await;
 
     // Setup model with known pricing (input: 1_000_000, output: 2_000_000 nano-dollars per token)
     setup_qwen_model(&server).await;
@@ -73,7 +73,7 @@ async fn test_record_chat_completion_usage() {
 /// Happy-path test for POST /v1/usage with type=image_generation.
 #[tokio::test]
 async fn test_record_image_generation_usage() {
-    let (server, _guard) = setup_test_server().await;
+    let server = setup_test_server().await;
 
     // Setup image model with cost_per_image pricing (40_000_000 nano-dollars per image)
     setup_qwen_image_model(&server).await;
@@ -136,7 +136,7 @@ async fn test_record_image_generation_usage() {
 /// Test that the required `id` field is stored and does not affect the response shape.
 #[tokio::test]
 async fn test_record_usage_with_external_id() {
-    let (server, _guard) = setup_test_server().await;
+    let server = setup_test_server().await;
 
     setup_qwen_model(&server).await;
     let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
@@ -173,7 +173,7 @@ async fn test_record_usage_with_external_id() {
 /// Test validation: model not found returns 404.
 #[tokio::test]
 async fn test_record_usage_model_not_found() {
-    let (server, _guard) = setup_test_server().await;
+    let server = setup_test_server().await;
 
     let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
     let api_key = get_api_key_for_org(&server, org.id.clone()).await;
@@ -196,7 +196,7 @@ async fn test_record_usage_model_not_found() {
 /// Test validation: zero tokens returns 400.
 #[tokio::test]
 async fn test_record_usage_zero_tokens() {
-    let (server, _guard) = setup_test_server().await;
+    let server = setup_test_server().await;
 
     setup_qwen_model(&server).await;
     let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
@@ -220,7 +220,7 @@ async fn test_record_usage_zero_tokens() {
 /// Test validation: missing `id` field returns 422 (deserialization error).
 #[tokio::test]
 async fn test_record_usage_missing_id_field() {
-    let (server, _guard) = setup_test_server().await;
+    let server = setup_test_server().await;
 
     setup_qwen_model(&server).await;
     let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
@@ -249,7 +249,7 @@ async fn test_record_usage_missing_id_field() {
 /// Test validation: empty `id` field returns 400.
 #[tokio::test]
 async fn test_record_usage_empty_id() {
-    let (server, _guard) = setup_test_server().await;
+    let server = setup_test_server().await;
 
     setup_qwen_model(&server).await;
     let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
@@ -279,7 +279,7 @@ async fn test_record_usage_empty_id() {
 /// the same record both times and only charges the organization once.
 #[tokio::test]
 async fn test_record_usage_idempotent_duplicate() {
-    let (server, _guard) = setup_test_server().await;
+    let server = setup_test_server().await;
 
     setup_qwen_model(&server).await;
     let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
@@ -352,7 +352,7 @@ async fn test_record_usage_idempotent_duplicate() {
 /// without conflicting — the idempotency scope is per-organization.
 #[tokio::test]
 async fn test_record_usage_same_id_different_orgs() {
-    let (server, _guard) = setup_test_server().await;
+    let server = setup_test_server().await;
 
     setup_qwen_model(&server).await;
 

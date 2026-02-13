@@ -11,7 +11,7 @@ use database::OAuthStateRepository;
 
 #[tokio::test]
 async fn test_oauth_state_stores_frontend_callback_with_github() {
-    let (_server, db, _guard) = setup_test_server_with_database().await;
+    let (_server, db) = setup_test_server_with_database().await;
     let repo = OAuthStateRepository::new(db.pool().clone());
 
     let state = format!("test-state-{}", uuid::Uuid::new_v4());
@@ -46,7 +46,7 @@ async fn test_oauth_state_stores_frontend_callback_with_github() {
 
 #[tokio::test]
 async fn test_oauth_state_stores_frontend_callback_with_google() {
-    let (_server, db, _guard) = setup_test_server_with_database().await;
+    let (_server, db) = setup_test_server_with_database().await;
     let repo = OAuthStateRepository::new(db.pool().clone());
 
     let state = format!("test-state-{}", uuid::Uuid::new_v4());
@@ -80,7 +80,7 @@ async fn test_oauth_state_stores_frontend_callback_with_google() {
 
 #[tokio::test]
 async fn test_oauth_state_without_frontend_callback() {
-    let (_server, db, _guard) = setup_test_server_with_database().await;
+    let (_server, db) = setup_test_server_with_database().await;
     let repo = OAuthStateRepository::new(db.pool().clone());
 
     let state = format!("test-state-{}", uuid::Uuid::new_v4());
@@ -105,7 +105,7 @@ async fn test_oauth_state_without_frontend_callback() {
 
 #[tokio::test]
 async fn test_oauth_callback_with_valid_state_and_frontend_callback() {
-    let (_server, db, _guard) = setup_test_server_with_database().await;
+    let (_server, db) = setup_test_server_with_database().await;
     let repo = OAuthStateRepository::new(db.pool().clone());
 
     // Simulate the OAuth flow: store a state with frontend_callback
@@ -133,7 +133,7 @@ async fn test_oauth_callback_with_valid_state_and_frontend_callback() {
 
 #[tokio::test]
 async fn test_multiple_oauth_states_with_different_frontend_callbacks() {
-    let (_server, db, _guard) = setup_test_server_with_database().await;
+    let (_server, db) = setup_test_server_with_database().await;
     let repo = OAuthStateRepository::new(db.pool().clone());
 
     let callback_url_1 = "https://app1.example.com/auth/callback";
@@ -187,7 +187,7 @@ async fn test_multiple_oauth_states_with_different_frontend_callbacks() {
 
 #[tokio::test]
 async fn test_frontend_callback_with_special_characters_in_path() {
-    let (_server, db, _guard) = setup_test_server_with_database().await;
+    let (_server, db) = setup_test_server_with_database().await;
     let repo = OAuthStateRepository::new(db.pool().clone());
 
     // Frontend URL with special characters in path (no query parameters - those are rejected by validation)
@@ -216,7 +216,7 @@ async fn test_frontend_callback_with_special_characters_in_path() {
 #[tokio::test]
 async fn test_frontend_callback_url_can_store_any_valid_url() {
     // Repository stores any URL; validation happens at route layer
-    let (_server, db, _guard) = setup_test_server_with_database().await;
+    let (_server, db) = setup_test_server_with_database().await;
     let repo = OAuthStateRepository::new(db.pool().clone());
 
     let callback_url_with_params = "https://app.example.com/callback?param=value";
@@ -250,7 +250,7 @@ async fn test_frontend_callback_url_can_store_any_valid_url() {
 
 #[tokio::test]
 async fn test_oauth_state_replay_protection_with_frontend_callback() {
-    let (_server, db, _guard) = setup_test_server_with_database().await;
+    let (_server, db) = setup_test_server_with_database().await;
     let repo = OAuthStateRepository::new(db.pool().clone());
 
     let state = format!("test-state-{}", uuid::Uuid::new_v4());

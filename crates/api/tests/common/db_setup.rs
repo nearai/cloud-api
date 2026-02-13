@@ -30,7 +30,15 @@ pub fn get_test_db_name() -> String {
     env::var("TEST_DATABASE_NAME").unwrap_or_else(|_| "platform_api_e2e".to_string())
 }
 
+/// Fixed key for the PostgreSQL advisory lock that serializes DB bootstrap
+/// across test binaries. Chosen arbitrarily, just needs to be consistent.
+const BOOTSTRAP_LOCK_KEY: i64 = 0x_e2e_b007_57a9;
+
 /// Bootstrap the shared database once: create it if missing, run migrations, drop the bootstrap pool.
+///
+/// OnceCell gates within a single binary (process), while a PostgreSQL advisory
+/// lock serializes across the multiple test binaries that nextest launches in
+/// parallel. The lock is automatically released when the admin connection drops.
 async fn ensure_shared_db() {
     SHARED_DB_READY
         .get_or_init(|| async {
@@ -40,7 +48,8 @@ async fn ensure_shared_db() {
             let user = db_user();
             let password = db_password();
 
-            // Connect to admin database to create the shared DB if it doesn't exist
+            // Connect to the `postgres` admin database. This connection holds the
+            // advisory lock for the entire bootstrap (CREATE DATABASE + migrations).
             let admin_conn_string =
                 format!("host={host} port={port} user={user} password={password} dbname=postgres");
             let (client, connection) = tokio_postgres::connect(&admin_conn_string, NoTls)
@@ -53,10 +62,15 @@ async fn ensure_shared_db() {
                 }
             });
 
-            // Attempt CREATE DATABASE; swallow errors because multiple test binaries
-            // race here (OnceCell is per-process). If the DB truly doesn't exist and
-            // creation fails for a real reason, the migration pool below will panic
-            // with a clear connection error.
+            // Serialize bootstrap across test binaries. pg_advisory_lock blocks
+            // until the lock is available; it's released when the session ends.
+            client
+                .execute("SELECT pg_advisory_lock($1)", &[&BOOTSTRAP_LOCK_KEY])
+                .await
+                .expect("Failed to acquire advisory lock for e2e bootstrap");
+
+            // CREATE DATABASE inside the lock, swallow errors (another binary may
+            // have already created it in a previous lock holder's session).
             match client
                 .execute(&format!("CREATE DATABASE {db_name}"), &[])
                 .await
@@ -67,17 +81,16 @@ async fn ensure_shared_db() {
                 }
             }
 
-            drop(client);
-
-            // Run migrations via a temporary 2-connection pool
+            // Run migrations while still holding the advisory lock so refinery's
+            // schema_history table creation doesn't race across binaries.
             let db_config = config::DatabaseConfig {
                 primary_app_id: "postgres-test".to_string(),
                 gateway_subdomain: "cvm1.near.ai".to_string(),
                 port,
-                host: Some(host),
+                host: Some(host.clone()),
                 database: db_name.clone(),
-                username: user,
-                password,
+                username: user.clone(),
+                password: password.clone(),
                 max_connections: 2,
                 tls_enabled: false,
                 tls_ca_cert_path: None,
@@ -98,6 +111,9 @@ async fn ensure_shared_db() {
 
             debug!("Shared e2e database '{db_name}' ready with migrations");
             drop(database);
+
+            // Dropping `client` closes the session which releases the advisory lock.
+            drop(client);
         })
         .await;
 }

@@ -32,7 +32,7 @@ pub fn get_test_db_name() -> String {
 
 /// Fixed key for the PostgreSQL advisory lock that serializes DB bootstrap
 /// across test binaries. Chosen arbitrarily, just needs to be consistent.
-const BOOTSTRAP_LOCK_KEY: i64 = 0x_e2e_b007_57a9;
+const BOOTSTRAP_LOCK_KEY: i64 = 0x0e2e_b007_57a9;
 
 /// Bootstrap the shared database once: create it if missing, run migrations, drop the bootstrap pool.
 ///

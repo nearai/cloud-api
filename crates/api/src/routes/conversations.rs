@@ -1271,15 +1271,7 @@ fn convert_output_item_to_conversation_item(
         } => ConversationItem::McpListTools {
             id,
             server_label,
-            tools: tools
-                .into_iter()
-                .map(|t| crate::models::McpDiscoveredTool {
-                    name: t.name,
-                    description: t.description,
-                    input_schema: t.input_schema,
-                    annotations: t.annotations,
-                })
-                .collect(),
+            tools,
             error,
         },
         ResponseOutputItem::McpCall {

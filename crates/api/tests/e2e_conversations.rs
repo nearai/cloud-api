@@ -4,7 +4,7 @@ mod common;
 use common::*;
 
 use api::models::{
-    ConversationContentPart, ConversationItem, ResponseOutputContent, ResponseOutputItem,
+    ConversationContentPart, ConversationItem, ResponseContentItem, ResponseOutputItem,
 };
 
 // Helper functions for conversation and response tests
@@ -391,7 +391,7 @@ async fn test_responses_api() {
     for output_item in &response.output {
         if let ResponseOutputItem::Message { content, .. } = output_item {
             for content_part in content {
-                if let ResponseOutputContent::OutputText { text, .. } = content_part {
+                if let ResponseContentItem::OutputText { text, .. } = content_part {
                     println!(
                         "Response text length: {} chars, content: '{}'",
                         text.len(),
@@ -466,7 +466,7 @@ async fn test_streaming_responses_api() {
     assert!(streaming_response.output.iter().any(|item| {
         if let ResponseOutputItem::Message { content, .. } = item {
             content.iter().any(|part| {
-                if let ResponseOutputContent::OutputText { text, .. } = part {
+                if let ResponseContentItem::OutputText { text, .. } = part {
                     !text.is_empty()
                 } else {
                     false
@@ -1634,7 +1634,7 @@ async fn test_response_previous_next_relationships() {
     let has_expected_content = nested_response.output.iter().any(|item| {
         if let api::models::ResponseOutputItem::Message { content, .. } = item {
             content.iter().any(|part| {
-                if let api::models::ResponseOutputContent::OutputText { text, .. } = part {
+                if let api::models::ResponseContentItem::OutputText { text, .. } = part {
                     text.contains("Eiffel Tower was built in 1889")
                 } else {
                     false
@@ -3911,7 +3911,7 @@ async fn test_responses_api_with_json_schema() {
     if let ResponseOutputItem::Message { content, .. } = &response_obj.output[0] {
         assert!(!content.is_empty());
 
-        if let ResponseOutputContent::OutputText { text, .. } = &content[0] {
+        if let ResponseContentItem::OutputText { text, .. } = &content[0] {
             // Verify it's valid JSON matching the schema
             let json_obj: serde_json::Value =
                 serde_json::from_str(text).expect("Content should be valid JSON");

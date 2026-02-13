@@ -952,6 +952,22 @@ pub async fn create_conversation_items(
         ));
     }
 
+    // Validate metadata size for each message item
+    for item in &request.items {
+        if let ConversationInputItem::Message {
+            metadata: Some(meta),
+            ..
+        } = item
+        {
+            services::common::validate_metadata_size(meta, "message metadata").map_err(|e| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    ResponseJson(ErrorResponse::new(e, "invalid_request_error".to_string())),
+                )
+            })?;
+        }
+    }
+
     let parsed_conversation_id = match parse_conversation_id(&conversation_id) {
         Ok(id) => id,
         Err(error) => {
@@ -1255,14 +1271,7 @@ fn convert_output_item_to_conversation_item(
         } => ConversationItem::McpListTools {
             id,
             server_label,
-            tools: tools
-                .into_iter()
-                .map(|t| crate::models::McpDiscoveredTool {
-                    name: t.name,
-                    description: t.description,
-                    input_schema: t.input_schema,
-                })
-                .collect(),
+            tools,
             error,
         },
         ResponseOutputItem::McpCall {

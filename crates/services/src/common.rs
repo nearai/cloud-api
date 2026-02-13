@@ -7,6 +7,28 @@ pub const API_KEY_LENGTH: usize = 35;
 /// Maximum serialized size for metadata blobs (e.g. conversation metadata, response metadata)
 pub const MAX_METADATA_SIZE_BYTES: usize = 16 * 1024;
 
+/// Validates that a JSON-serializable value doesn't exceed the maximum metadata size.
+///
+/// # Arguments
+/// * `value` - The value to validate (must be serializable to JSON)
+/// * `field_name` - Name of the field for error messages (e.g. "metadata", "message metadata")
+///
+/// # Returns
+/// * `Ok(())` if the serialized size is within limits
+/// * `Err(String)` with a descriptive error message if validation fails
+pub fn validate_metadata_size<T: serde::Serialize>(
+    value: &T,
+    field_name: &str,
+) -> Result<(), String> {
+    let serialized = serde_json::to_string(value).map_err(|_| format!("Invalid {field_name}"))?;
+    if serialized.len() > MAX_METADATA_SIZE_BYTES {
+        return Err(format!(
+            "{field_name} is too large (max {MAX_METADATA_SIZE_BYTES} bytes when serialized)"
+        ));
+    }
+    Ok(())
+}
+
 /// Encryption header keys used in params.extra for passing encryption information
 /// These keys are used to pass encryption headers from API routes to completion services.
 /// Note: These use underscores (x_signing_algo) for params.extra HashMap keys,

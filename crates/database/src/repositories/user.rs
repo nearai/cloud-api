@@ -324,12 +324,10 @@ impl UserRepository {
             LEFT JOIN organization_members om ON u.id = om.user_id AND om.role = 'owner'
             LEFT JOIN organizations o ON om.organization_id = o.id AND o.is_active = true
             LEFT JOIN LATERAL (
-                SELECT spend_limit
+                SELECT SUM(spend_limit)::BIGINT AS spend_limit
                 FROM organization_limits_history
                 WHERE organization_id = o.id
                   AND effective_until IS NULL
-                ORDER BY effective_from DESC
-                LIMIT 1
             ) olh ON true
             LEFT JOIN organization_balance ob ON o.id = ob.organization_id
             WHERE u.is_active = true

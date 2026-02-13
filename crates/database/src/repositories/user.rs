@@ -324,7 +324,7 @@ impl UserRepository {
             LEFT JOIN organization_members om ON u.id = om.user_id AND om.role = 'owner'
             LEFT JOIN organizations o ON om.organization_id = o.id AND o.is_active = true
             LEFT JOIN LATERAL (
-                SELECT SUM(spend_limit) AS spend_limit
+                SELECT SUM(spend_limit)::BIGINT AS spend_limit
                 FROM organization_limits_history
                 WHERE organization_id = o.id
                   AND effective_until IS NULL

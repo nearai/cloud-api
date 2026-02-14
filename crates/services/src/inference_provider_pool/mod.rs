@@ -749,12 +749,14 @@ impl InferenceProviderPool {
             CompletionError::HttpError {
                 status_code,
                 message,
+                is_external,
             } => {
                 // For HttpError, sanitize the message and include model_id context
-                // Preserve status_code for proper error mapping (4xx vs 5xx)
+                // Preserve status_code and is_external for proper error mapping
                 CompletionError::HttpError {
                     status_code,
                     message: sanitize_and_format(&message),
+                    is_external,
                 }
             }
             CompletionError::CompletionError(msg) => {
@@ -900,10 +902,8 @@ impl InferenceProviderPool {
             providers.len()
         );
 
-        // Collect sanitized errors for user-facing message
-        let mut sanitized_errors = Vec::new();
-        // Keep detailed errors for logging only
-        let mut detailed_errors = Vec::new();
+        // Track the last error (preserving its structure for proper status code mapping)
+        let mut last_error: Option<CompletionError> = None;
 
         // Try each provider in order until one succeeds
         for (attempt, provider) in providers.iter().enumerate() {
@@ -928,9 +928,7 @@ impl InferenceProviderPool {
                     return Ok((result, provider.clone()));
                 }
                 Err(e) => {
-                    let error_str = e.to_string();
-
-                    // Log the full detailed error for debugging
+                    // Log the failure for debugging
                     tracing::warn!(
                         model_id = %model_id,
                         attempt = attempt + 1,
@@ -938,20 +936,13 @@ impl InferenceProviderPool {
                         "Provider failed, will try next provider if available"
                     );
 
-                    // Store detailed error for logging
-                    detailed_errors.push(format!("Provider {}: {}", attempt + 1, error_str));
-
-                    // Store sanitized error for user-facing response
-                    let sanitized = Self::sanitize_error_message(&error_str);
-                    sanitized_errors.push(format!("Provider {}: {}", attempt + 1, sanitized));
+                    // Sanitize and preserve the last error with its structure intact
+                    last_error = Some(Self::sanitize_completion_error(e, model_id));
                 }
             }
         }
 
-        // All providers failed - log detailed errors but return sanitized message to user
-        // let detailed_error_msg = detailed_errors.join("; ");
-        let sanitized_error_msg = sanitized_errors.join("; ");
-
+        // All providers failed
         if let Some(pub_key) = model_pub_key {
             tracing::error!(
                 model_id = %model_id,
@@ -969,13 +960,32 @@ impl InferenceProviderPool {
             );
         }
 
-        // Return sanitized error to user
-        Err(CompletionError::CompletionError(format!(
-            "All {} provider(s) failed for model '{}': {}",
-            providers.len(),
-            model_id,
-            sanitized_error_msg
-        )))
+        // Return the last error, preserving its HttpError variant for proper status code mapping
+        match last_error {
+            Some(CompletionError::HttpError {
+                status_code,
+                message,
+                is_external,
+            }) => Err(CompletionError::HttpError {
+                status_code,
+                message: if providers.len() > 1 {
+                    format!(
+                        "All {} provider(s) failed for model '{}'. Last error: {}",
+                        providers.len(),
+                        model_id,
+                        message
+                    )
+                } else {
+                    message
+                },
+                is_external,
+            }),
+            Some(other_error) => Err(other_error),
+            None => Err(CompletionError::CompletionError(format!(
+                "No providers available for model '{}'",
+                model_id
+            ))),
+        }
     }
 
     pub async fn get_attestation_report(

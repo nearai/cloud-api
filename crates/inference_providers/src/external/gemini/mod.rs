@@ -215,7 +215,8 @@ impl ExternalBackend for GeminiBackend {
                 .unwrap_or_else(|e| format!("Failed to read error response body: {e}"));
             return Err(CompletionError::HttpError {
                 status_code,
-                message: error_text,
+                message: crate::extract_error_message(&error_text),
+                is_external: true,
             });
         }
 
@@ -254,7 +255,8 @@ impl ExternalBackend for GeminiBackend {
                 .unwrap_or_else(|e| format!("Failed to read error response body: {e}"));
             return Err(CompletionError::HttpError {
                 status_code,
-                message: error_text,
+                message: crate::extract_error_message(&error_text),
+                is_external: true,
             });
         }
 

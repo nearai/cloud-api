@@ -285,6 +285,19 @@ pub fn validate_encryption_headers(
     })
 }
 
+/// Redact sensitive fields (e.g. `api_key`) from a `provider_config` JSON value.
+///
+/// Returns a new value with `api_key` removed, or the original value unchanged
+/// if it is not a JSON object.
+pub fn redact_provider_config(config: Option<serde_json::Value>) -> Option<serde_json::Value> {
+    config.map(|mut v| {
+        if let Some(obj) = v.as_object_mut() {
+            obj.remove("api_key");
+        }
+        v
+    })
+}
+
 /// Map OrganizationError to HTTP response
 pub fn map_organization_error(
     error: OrganizationError,

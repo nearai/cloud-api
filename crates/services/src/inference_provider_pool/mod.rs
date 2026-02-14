@@ -1428,12 +1428,12 @@ impl InferenceProviderPool {
         model_name: &str,
         provider_config: serde_json::Value,
     ) -> Result<(Arc<InferenceProviderTrait>, String), String> {
-        // Extract per-model api_key from raw JSON before deserializing into ProviderConfig
+        // Extract and remove per-model api_key from raw JSON before deserializing into ProviderConfig
+        let mut provider_config = provider_config;
         let per_model_api_key = provider_config
-            .as_object()
-            .and_then(|obj| obj.get("api_key"))
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
+            .as_object_mut()
+            .and_then(|obj| obj.remove("api_key"))
+            .and_then(|v| v.as_str().map(String::from));
 
         let config: ProviderConfig = serde_json::from_value(provider_config)
             .map_err(|e| format!("Failed to parse provider config: {e}"))?;

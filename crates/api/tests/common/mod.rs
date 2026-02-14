@@ -5,6 +5,7 @@
 //! each test clones from template for isolation and speed.
 
 pub mod db_setup;
+pub mod endpoints;
 
 use api::{build_app_with_config, init_auth_services, models::BatchUpdateModelApiRequest};
 use base64::Engine;

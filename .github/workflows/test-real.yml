@@ -1,0 +1,119 @@
+name: Real E2E Tests
+
+on:
+  pull_request:
+    types: [ opened, ready_for_review ] # When PR is ready for review (not draft)
+  issue_comment:
+    types: [ created ]  # Only trigger on PR comments with @tester test
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  CARGO_INCREMENTAL: 0  # Faster CI builds
+
+jobs:
+  test_real:
+    name: Real E2E Test Suite
+    # Only run on:
+    # - push / pull_request events, or
+    # - issue_comment events where the comment is on a PR and mentions @claude
+    if: |
+      github.event_name != 'issue_comment' ||
+      (github.event_name == 'issue_comment' &&
+       github.event.issue.pull_request &&
+       github.event.comment.body == 'test')
+    runs-on: ubuntu_large_x64
+    environment: Cloud API test env
+    permissions:
+      contents: read
+      pull-requests: read
+      issues: read
+    
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: platform_api
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+
+    steps:
+    - name: Get PR head SHA
+      id: pr-head
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        set -e
+        PR_NUMBER=${{ github.event.issue.number }}
+        echo "Fetching PR #${PR_NUMBER} head SHA..."
+        
+        if ! PR_HEAD_SHA=$(gh pr view "$PR_NUMBER" --repo ${{ github.repository }} --json headRefOid --jq '.headRefOid' 2>&1); then
+          echo "Error: Failed to fetch PR #${PR_NUMBER} information" >&2
+          echo "$PR_HEAD_SHA" >&2
+          exit 1
+        fi
+        
+        if [ -z "$PR_HEAD_SHA" ]; then
+          echo "Error: PR head SHA is empty for PR #${PR_NUMBER}" >&2
+          exit 1
+        fi
+        
+        echo "sha=$PR_HEAD_SHA" >> $GITHUB_OUTPUT
+        echo "PR head SHA: $PR_HEAD_SHA"
+
+    - name: Checkout repository
+      uses: actions/checkout@v6
+      with:
+        ref: ${{ steps.pr-head.outputs.sha }}
+    
+    - name: Install Rust
+      uses: actions-rust-lang/setup-rust-toolchain@v1
+      with:
+        components: rustfmt, clippy
+
+    - name: Cache Rust dependencies
+      uses: swatinem/rust-cache@v2
+      with:
+        cache-on-failure: true
+
+    - name: Install cargo-nextest
+      uses: taiki-e/install-action@nextest
+
+    # Run only real_e2e tests (tests with function names starting with real_test_)
+    - name: Run real E2E tests
+      run: cargo nextest run -p api --tests -E 'test(/^real_test_/)'
+      env:
+        POSTGRES_PRIMARY_APP_ID: ${{ secrets.POSTGRES_PRIMARY_APP_ID }}
+        DATABASE_HOST: localhost
+        DATABASE_PORT: 5432
+        DATABASE_NAME: platform_api
+        DATABASE_USERNAME: postgres
+        DATABASE_PASSWORD: postgres
+        DATABASE_MAX_CONNECTIONS: 5
+        DATABASE_TLS_ENABLED: "false"
+        MODEL_DISCOVERY_SERVER_URL: ${{ secrets.MODEL_DISCOVERY_SERVER_URL }}
+        MODEL_DISCOVERY_API_KEY: ${{ secrets.MODEL_DISCOVERY_API_KEY }}
+        AUTH_ENCODING_KEY: ${{ secrets.AUTH_ENCODING_KEY }}
+        AUTH_ADMIN_DOMAINS: ${{ secrets.AUTH_ADMIN_DOMAINS }}
+        BRAVE_SEARCH_PRO_API_KEY: ${{ secrets.BRAVE_SEARCH_PRO_API_KEY }}
+        TEST_TEMPLATE_DATABASE_NAME: platform_api_test_template
+        RUST_LOG: debug
+        DEV: "true"
+
+    - name: Cleanup orphaned test databases
+      if: always()
+      continue-on-error: true
+      run: cargo test --test cleanup_test_databases -- --ignored --nocapture
+      env:
+        DATABASE_HOST: localhost
+        DATABASE_PORT: 5432
+        DATABASE_USERNAME: postgres
+        DATABASE_PASSWORD: postgres
+        TEST_TEMPLATE_DATABASE_NAME: platform_api_test_template

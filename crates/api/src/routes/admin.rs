@@ -240,7 +240,9 @@ pub async fn batch_upsert_models(
                 owned_by: updated_model.owned_by,
                 aliases: updated_model.aliases,
                 provider_type: updated_model.provider_type,
-                provider_config: updated_model.provider_config,
+                provider_config: crate::routes::common::redact_provider_config(
+                    updated_model.provider_config,
+                ),
                 attestation_supported: updated_model.attestation_supported,
                 architecture: ModelArchitecture::from_options(
                     updated_model.input_modalities,
@@ -330,7 +332,9 @@ pub async fn list_models(
                 aliases: model.aliases,
                 owned_by: model.owned_by,
                 provider_type: model.provider_type,
-                provider_config: model.provider_config,
+                provider_config: crate::routes::common::redact_provider_config(
+                    model.provider_config,
+                ),
                 attestation_supported: model.attestation_supported,
                 architecture: ModelArchitecture::from_options(
                     model.input_modalities,

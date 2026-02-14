@@ -57,8 +57,8 @@ async fn test_provider_error_503_propagated() {
     let err = response.json::<api::models::ErrorResponse>();
     assert_eq!(err.error.r#type, "service_overloaded");
     assert!(
-        err.error.message.contains("GPU out of memory"),
-        "Error message should contain provider message. Got: {}",
+        err.error.message.contains("overloaded"),
+        "Error message should indicate overloaded status. Got: {}",
         err.error.message
     );
 }
@@ -130,8 +130,13 @@ async fn test_provider_error_500_becomes_502() {
     let err = response.json::<api::models::ErrorResponse>();
     assert_eq!(err.error.r#type, "bad_gateway");
     assert!(
-        err.error.message.contains("Internal server error"),
-        "Error message should contain provider message. Got: {}",
+        !err.error.message.contains("Internal server error"),
+        "Error message should not expose provider details. Got: {}",
+        err.error.message
+    );
+    assert!(
+        err.error.message.contains("unavailable"),
+        "Error message should use generic message. Got: {}",
         err.error.message
     );
 }
@@ -215,8 +220,8 @@ async fn test_provider_error_message_preserved_in_streaming() {
 
     let err = response.json::<api::models::ErrorResponse>();
     assert!(
-        err.error.message.contains("Model loading in progress"),
-        "Error message should contain provider message. Got: {}",
+        err.error.message.contains("overloaded"),
+        "Error message should indicate overloaded status. Got: {}",
         err.error.message
     );
 }
@@ -225,10 +230,10 @@ async fn test_provider_error_message_preserved_in_streaming() {
 // External provider error mapping tests (is_external: true)
 // ============================================
 
-/// Test that a 400 from an external provider is mapped to 502 (not 400)
-/// External 400 = infrastructure problem (e.g., billing, quota), not client's fault
+/// Test that a 400 from an external provider is passed through as 400 (client error)
+/// External 400 = likely invalid params (context too long, bad format, etc.)
 #[tokio::test]
-async fn test_external_provider_400_becomes_502() {
+async fn test_external_provider_400_stays_400() {
     let (server, _pool, mock_provider, _, _guard) = setup_test_server_with_pool().await;
     setup_qwen_model(&server).await;
     let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
@@ -238,7 +243,7 @@ async fn test_external_provider_400_becomes_502() {
     mock_provider
         .set_error_override(Some(inference_providers::CompletionError::HttpError {
             status_code: 400,
-            message: "Your credit balance is too low".to_string(),
+            message: "This model's maximum context length is 131072 tokens".to_string(),
             is_external: true,
         }))
         .await;
@@ -251,16 +256,16 @@ async fn test_external_provider_400_becomes_502() {
 
     assert_eq!(
         response.status_code(),
-        502,
-        "External provider 400 should become 502, got {}",
+        400,
+        "External provider 400 should stay as 400, got {}",
         response.status_code()
     );
 
     let err = response.json::<api::models::ErrorResponse>();
-    assert_eq!(err.error.r#type, "bad_gateway");
+    assert_eq!(err.error.r#type, "invalid_request_error");
     assert!(
-        err.error.message.contains("currently unavailable"),
-        "Should indicate model unavailability. Got: {}",
+        err.error.message.contains("context length"),
+        "Should preserve the client-facing error message. Got: {}",
         err.error.message
     );
 }

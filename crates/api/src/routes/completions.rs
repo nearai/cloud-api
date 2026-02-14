@@ -1302,16 +1302,24 @@ pub async fn audio_transcriptions(
                 }
                 services::completions::ports::CompletionError::ProviderError {
                     status_code,
-                    message,
+                    ..
                 } => {
                     tracing::error!("Audio transcription provider error");
                     let http_status = StatusCode::from_u16(status_code)
                         .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-                    (http_status, "server_error", message)
+                    (
+                        http_status,
+                        "server_error",
+                        "Audio transcription failed. Please try again later.".to_string(),
+                    )
                 }
-                services::completions::ports::CompletionError::ServiceOverloaded(msg) => {
+                services::completions::ports::CompletionError::ServiceOverloaded(_) => {
                     tracing::warn!("Audio transcription service overloaded");
-                    (StatusCode::SERVICE_UNAVAILABLE, "service_overloaded", msg)
+                    (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "service_overloaded",
+                        "The service is temporarily overloaded. Please retry with exponential backoff.".to_string(),
+                    )
                 }
                 _ => {
                     tracing::error!("Unexpected audio transcription error");
@@ -1940,20 +1948,28 @@ pub async fn rerank(
                 }
                 services::completions::ports::CompletionError::ProviderError {
                     status_code,
-                    message,
+                    ..
                 } => {
                     tracing::error!("Rerank provider error");
                     let http_status = StatusCode::from_u16(status_code)
                         .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-                    (http_status, "server_error", message)
+                    (
+                        http_status,
+                        "server_error",
+                        "Reranking failed. Please try again later.".to_string(),
+                    )
                 }
                 services::completions::ports::CompletionError::InvalidModel(msg) => {
                     tracing::warn!("Rerank model not found");
                     (StatusCode::NOT_FOUND, "not_found_error", msg)
                 }
-                services::completions::ports::CompletionError::ServiceOverloaded(msg) => {
+                services::completions::ports::CompletionError::ServiceOverloaded(_) => {
                     tracing::warn!("Rerank service overloaded");
-                    (StatusCode::SERVICE_UNAVAILABLE, "service_overloaded", msg)
+                    (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "service_overloaded",
+                        "The service is temporarily overloaded. Please retry with exponential backoff.".to_string(),
+                    )
                 }
                 _ => {
                     tracing::error!("Unexpected rerank error");
@@ -2200,20 +2216,28 @@ pub async fn score(
                 }
                 services::completions::ports::CompletionError::ProviderError {
                     status_code,
-                    message,
+                    ..
                 } => {
                     tracing::error!("Score provider error");
                     let http_status = StatusCode::from_u16(status_code)
                         .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-                    (http_status, "server_error", message)
+                    (
+                        http_status,
+                        "server_error",
+                        "Scoring failed. Please try again later.".to_string(),
+                    )
                 }
                 services::completions::ports::CompletionError::InvalidModel(msg) => {
                     tracing::warn!("Score model not found");
                     (StatusCode::NOT_FOUND, "not_found_error", msg)
                 }
-                services::completions::ports::CompletionError::ServiceOverloaded(msg) => {
+                services::completions::ports::CompletionError::ServiceOverloaded(_) => {
                     tracing::warn!("Score service overloaded");
-                    (StatusCode::SERVICE_UNAVAILABLE, "service_overloaded", msg)
+                    (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "service_overloaded",
+                        "The service is temporarily overloaded. Please retry with exponential backoff.".to_string(),
+                    )
                 }
                 _ => {
                     tracing::error!("Unexpected score error");

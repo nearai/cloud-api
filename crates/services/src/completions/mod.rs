@@ -537,50 +537,29 @@ impl CompletionServiceImpl {
                 message,
                 is_external,
             } => match (*status_code, *is_external) {
-                // External provider 4xx (except 429) = our infrastructure problem, not client's fault
-                (400, true) => {
-                    tracing::error!(
-                        model,
-                        status_code,
-                        "External provider error during {}",
-                        operation
-                    );
-                    ports::CompletionError::ProviderError {
-                        status_code: 502,
-                        message: format!("The model is currently unavailable: {}", message),
-                    }
-                }
-                (400, false) => {
-                    // vLLM 400 = actual client error (bad params, context too long, etc.)
+                // --- Client errors that should be passed through (both internal and external) ---
+
+                // 400 Bad Request = invalid params (context too long, bad format, etc.)
+                (400, _) => {
                     tracing::warn!(model, status_code, "Client error during {}", operation);
                     ports::CompletionError::InvalidParams(message.clone())
                 }
-                (401 | 403, _) => {
-                    // Mask auth errors from our infrastructure — don't leak details
-                    tracing::error!(model, status_code, "Auth error during {}", operation);
-                    ports::CompletionError::ProviderError {
-                        status_code: 500,
-                        message: "The model is currently unavailable. Please try again later."
-                            .to_string(),
-                    }
+                // 413 Payload Too Large = client sent too much data
+                (413, _) => {
+                    tracing::warn!(model, status_code, "Payload too large during {}", operation);
+                    ports::CompletionError::InvalidParams(message.clone())
                 }
-                (404, true) => {
-                    // External provider 404 = provider can't serve it, not an invalid model
-                    tracing::error!(
+                // 422 Unprocessable Entity = invalid request content
+                (422, _) => {
+                    tracing::warn!(
                         model,
                         status_code,
-                        "External provider not found during {}",
+                        "Unprocessable entity during {}",
                         operation
                     );
-                    ports::CompletionError::ProviderError {
-                        status_code: 502,
-                        message: format!("The model is currently unavailable: {}", message),
-                    }
+                    ports::CompletionError::InvalidParams(message.clone())
                 }
-                (404, false) => {
-                    tracing::warn!(model, status_code, "Not found during {}", operation);
-                    ports::CompletionError::InvalidModel(message.clone())
-                }
+                // 429 Too Many Requests = rate limited
                 (429, _) => {
                     tracing::warn!(model, status_code, "Rate limited during {}", operation);
                     ports::CompletionError::RateLimitExceeded(format!(
@@ -588,6 +567,59 @@ impl CompletionServiceImpl {
                         model
                     ))
                 }
+
+                // --- Infrastructure errors that should be masked ---
+
+                // 401/403 = auth errors from our infrastructure — never leak details
+                (401 | 403, _) => {
+                    tracing::error!(
+                        model,
+                        status_code,
+                        provider_message = %message,
+                        "Auth error during {}",
+                        operation
+                    );
+                    ports::CompletionError::ProviderError {
+                        status_code: 500,
+                        message: "The model is currently unavailable. Please try again later."
+                            .to_string(),
+                    }
+                }
+                // 404 from external provider = provider can't serve the model, not client's fault
+                (404, true) => {
+                    tracing::error!(
+                        model,
+                        status_code,
+                        provider_message = %message,
+                        "External provider not found during {}",
+                        operation
+                    );
+                    ports::CompletionError::ProviderError {
+                        status_code: 502,
+                        message: "The model is currently unavailable. Please try again later."
+                            .to_string(),
+                    }
+                }
+                // 404 from vLLM = model not found in our infrastructure
+                (404, false) => {
+                    tracing::warn!(model, status_code, "Not found during {}", operation);
+                    ports::CompletionError::InvalidModel(message.clone())
+                }
+                // 408 Request Timeout = provider timed out
+                (408, _) => {
+                    tracing::error!(
+                        model,
+                        status_code,
+                        provider_message = %message,
+                        "Provider timeout during {}",
+                        operation
+                    );
+                    ports::CompletionError::ProviderError {
+                        status_code: 504,
+                        message: "The request timed out. Please try again.".to_string(),
+                    }
+                }
+                // 503 Service Unavailable = service overloaded
                 (503, _) => {
                     tracing::warn!(
                         model,
@@ -595,28 +627,41 @@ impl CompletionServiceImpl {
                         "Service overloaded during {}",
                         operation
                     );
-                    ports::CompletionError::ServiceOverloaded(message.clone())
+                    ports::CompletionError::ServiceOverloaded(
+                        "The service is temporarily overloaded. Please retry with exponential backoff.".to_string(),
+                    )
                 }
+                // 5xx = provider error, use generic message
                 (500..=599, _) => {
-                    tracing::error!(model, status_code, "Provider error during {}", operation);
-                    ports::CompletionError::ProviderError {
-                        status_code: 502,
-                        message: message.clone(),
-                    }
-                }
-                _ if *is_external => {
-                    // Any other external provider error = infrastructure problem
                     tracing::error!(
                         model,
                         status_code,
+                        provider_message = %message,
+                        "Provider error during {}",
+                        operation
+                    );
+                    ports::CompletionError::ProviderError {
+                        status_code: 502,
+                        message: "The model is currently unavailable. Please try again later."
+                            .to_string(),
+                    }
+                }
+                // Any other external provider error = infrastructure problem, use generic message
+                _ if *is_external => {
+                    tracing::error!(
+                        model,
+                        status_code,
+                        provider_message = %message,
                         "External provider error during {}",
                         operation
                     );
                     ports::CompletionError::ProviderError {
                         status_code: 502,
-                        message: format!("The model is currently unavailable: {}", message),
+                        message: "The model is currently unavailable. Please try again later."
+                            .to_string(),
                     }
                 }
+                // Any other vLLM error = pass through status and message
                 _ => {
                     tracing::warn!(model, status_code, "Provider error during {}", operation);
                     ports::CompletionError::ProviderError {
@@ -629,25 +674,43 @@ impl CompletionServiceImpl {
                 if msg.contains("not found in any configured provider") {
                     ports::CompletionError::InvalidModel(msg.clone())
                 } else {
-                    tracing::error!(model, "Provider error during {}", operation);
+                    tracing::error!(
+                        model,
+                        provider_message = %msg,
+                        "Provider error during {}",
+                        operation
+                    );
                     ports::CompletionError::ProviderError {
                         status_code: 502,
-                        message: msg.clone(),
+                        message: "The model is currently unavailable. Please try again later."
+                            .to_string(),
                     }
                 }
             }
             inference_providers::CompletionError::InvalidResponse(msg) => {
-                tracing::error!(model, "Invalid response during {}", operation);
+                tracing::error!(
+                    model,
+                    provider_message = %msg,
+                    "Invalid response during {}",
+                    operation
+                );
                 ports::CompletionError::ProviderError {
                     status_code: 502,
-                    message: format!("Invalid response from provider: {}", msg),
+                    message: "The model is currently unavailable. Please try again later."
+                        .to_string(),
                 }
             }
             inference_providers::CompletionError::Unknown(msg) => {
-                tracing::error!(model, "Unknown error during {}", operation);
+                tracing::error!(
+                    model,
+                    provider_message = %msg,
+                    "Unknown error during {}",
+                    operation
+                );
                 ports::CompletionError::ProviderError {
                     status_code: 502,
-                    message: msg.clone(),
+                    message: "The model is currently unavailable. Please try again later."
+                        .to_string(),
                 }
             }
         }
@@ -2051,7 +2114,7 @@ mod tests {
             ports::CompletionError::ServiceOverloaded(msg) => {
                 assert!(
                     msg.contains("overloaded"),
-                    "Message should be preserved, got: {}",
+                    "Should indicate overloaded status, got: {}",
                     msg
                 );
             }
@@ -2074,8 +2137,13 @@ mod tests {
             } => {
                 assert_eq!(status_code, 502, "Provider 500 should map to 502");
                 assert!(
-                    message.contains("Internal server error from provider"),
-                    "Message should be preserved, got: {}",
+                    !message.contains("Internal server error from provider"),
+                    "Should not expose provider error details, got: {}",
+                    message
+                );
+                assert!(
+                    message.contains("unavailable"),
+                    "Should use generic message, got: {}",
                     message
                 );
             }
@@ -2114,8 +2182,13 @@ mod tests {
             } => {
                 assert_eq!(status_code, 502, "Connection errors should map to 502");
                 assert!(
-                    message.contains("connection refused"),
-                    "Message should be preserved, got: {}",
+                    !message.contains("connection refused"),
+                    "Should not expose provider error details, got: {}",
+                    message
+                );
+                assert!(
+                    message.contains("unavailable"),
+                    "Should use generic message, got: {}",
                     message
                 );
             }
@@ -2128,26 +2201,22 @@ mod tests {
     // ============================================
 
     #[test]
-    fn test_map_provider_error_external_400_becomes_502() {
+    fn test_map_provider_error_external_400_becomes_invalid_params() {
         let error = inference_providers::CompletionError::HttpError {
             status_code: 400,
-            message: "Your credit balance is too low".to_string(),
+            message: "This model's maximum context length is 131072 tokens".to_string(),
             is_external: true,
         };
         let result = CompletionServiceImpl::map_provider_error("test-model", &error, "test");
         match result {
-            ports::CompletionError::ProviderError {
-                status_code,
-                message,
-            } => {
-                assert_eq!(status_code, 502, "External 400 should map to 502");
+            ports::CompletionError::InvalidParams(msg) => {
                 assert!(
-                    message.contains("currently unavailable"),
-                    "Should indicate model unavailability, got: {}",
-                    message
+                    msg.contains("context length"),
+                    "Should preserve client-facing error message, got: {}",
+                    msg
                 );
             }
-            other => panic!("Expected ProviderError, got {:?}", other),
+            other => panic!("Expected InvalidParams, got {:?}", other),
         }
     }
 
@@ -2169,8 +2238,13 @@ mod tests {
                     "External 404 should map to 502, not InvalidModel"
                 );
                 assert!(
-                    message.contains("currently unavailable"),
-                    "Should indicate model unavailability, got: {}",
+                    !message.contains("external provider"),
+                    "Should not expose provider details, got: {}",
+                    message
+                );
+                assert!(
+                    message.contains("unavailable"),
+                    "Should use generic message, got: {}",
                     message
                 );
             }
@@ -2206,6 +2280,70 @@ mod tests {
                 assert_eq!(status_code, 502, "External 500 should map to 502");
             }
             other => panic!("Expected ProviderError, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_map_provider_error_408_becomes_504() {
+        let error = inference_providers::CompletionError::HttpError {
+            status_code: 408,
+            message: "Request timeout".to_string(),
+            is_external: true,
+        };
+        let result = CompletionServiceImpl::map_provider_error("test-model", &error, "test");
+        match result {
+            ports::CompletionError::ProviderError {
+                status_code,
+                message,
+            } => {
+                assert_eq!(status_code, 504, "408 should map to 504 gateway timeout");
+                assert!(
+                    message.contains("timed out"),
+                    "Should indicate timeout, got: {}",
+                    message
+                );
+            }
+            other => panic!("Expected ProviderError, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_map_provider_error_413_becomes_invalid_params() {
+        let error = inference_providers::CompletionError::HttpError {
+            status_code: 413,
+            message: "Request body too large".to_string(),
+            is_external: false,
+        };
+        let result = CompletionServiceImpl::map_provider_error("test-model", &error, "test");
+        match result {
+            ports::CompletionError::InvalidParams(msg) => {
+                assert!(
+                    msg.contains("too large"),
+                    "Should preserve message, got: {}",
+                    msg
+                );
+            }
+            other => panic!("Expected InvalidParams, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_map_provider_error_422_becomes_invalid_params() {
+        let error = inference_providers::CompletionError::HttpError {
+            status_code: 422,
+            message: "Invalid parameter: temperature must be between 0 and 2".to_string(),
+            is_external: true,
+        };
+        let result = CompletionServiceImpl::map_provider_error("test-model", &error, "test");
+        match result {
+            ports::CompletionError::InvalidParams(msg) => {
+                assert!(
+                    msg.contains("temperature"),
+                    "Should preserve message, got: {}",
+                    msg
+                );
+            }
+            other => panic!("Expected InvalidParams, got {:?}", other),
         }
     }
 }

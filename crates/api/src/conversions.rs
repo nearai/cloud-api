@@ -184,14 +184,26 @@ impl From<CompletionError> for crate::models::ErrorResponse {
             CompletionError::InvalidParams(msg) => {
                 ErrorResponse::new(msg, "invalid_request_error".to_string())
             }
-            CompletionError::RateLimitExceeded => ErrorResponse::new(
-                "Rate limit exceeded".to_string(),
-                "rate_limit_exceeded".to_string(),
-            ),
-            CompletionError::ProviderError(msg) => ErrorResponse::new(
-                format!("Provider error: {msg}"),
-                "provider_error".to_string(),
-            ),
+            CompletionError::RateLimitExceeded(msg) => {
+                let message = if msg.is_empty() {
+                    "Rate limit exceeded".to_string()
+                } else {
+                    msg
+                };
+                ErrorResponse::new(message, "rate_limit_exceeded".to_string())
+            }
+            CompletionError::ProviderError {
+                status_code,
+                message,
+            } => {
+                let error_type = match status_code {
+                    502 => "bad_gateway",
+                    503 => "service_overloaded",
+                    504 => "gateway_timeout",
+                    _ => "provider_error",
+                };
+                ErrorResponse::new(message, error_type.to_string())
+            }
             CompletionError::ServiceOverloaded(msg) => {
                 ErrorResponse::new(msg, "service_overloaded".to_string())
             }

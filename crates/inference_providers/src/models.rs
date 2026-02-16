@@ -675,7 +675,15 @@ pub enum CompletionError {
     #[error("Failed to perform completion: {0}")]
     CompletionError(String),
     #[error("HTTP error {status_code}: {message}")]
-    HttpError { status_code: u16, message: String },
+    HttpError {
+        status_code: u16,
+        message: String,
+        /// Whether this error came from an external provider (Anthropic/OpenAI/Gemini)
+        /// vs our own vLLM infrastructure. External provider 4xx errors are mapped to 5xx
+        /// since they represent infrastructure issues, not client errors.
+        #[serde(default)]
+        is_external: bool,
+    },
     #[error("Invalid response format")]
     InvalidResponse(String),
     #[error("Unknown error")]

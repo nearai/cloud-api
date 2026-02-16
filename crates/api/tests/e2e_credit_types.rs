@@ -38,7 +38,7 @@ async fn update_limits_raw(
 /// Test adding various credit types with different sources and currencies
 #[tokio::test]
 async fn test_add_credits_variations() {
-    let (server, _guard) = setup_test_server().await;
+    let server = setup_test_server().await;
     let org = create_org(&server).await;
 
     // Test cases: (credit_type, source, amount, currency, expected_currency)
@@ -79,7 +79,7 @@ async fn test_add_credits_variations() {
 /// Test that credits accumulate across different types
 #[tokio::test]
 async fn test_credits_accumulate_across_types() {
-    let (server, _guard) = setup_test_server().await;
+    let server = setup_test_server().await;
     let org = create_org(&server).await;
 
     // Add grant ($10) and payment ($50)
@@ -119,7 +119,7 @@ async fn test_credits_accumulate_across_types() {
 /// Test that updating the same credit type replaces the previous one
 #[tokio::test]
 async fn test_update_same_type_replaces_previous() {
-    let (server, _guard) = setup_test_server().await;
+    let server = setup_test_server().await;
     let org = create_org(&server).await;
 
     // Add initial grant ($10), then update to $20
@@ -158,7 +158,7 @@ async fn test_update_same_type_replaces_previous() {
 /// Test that different credit types can coexist and be updated independently
 #[tokio::test]
 async fn test_independent_credit_type_updates() {
-    let (server, _guard) = setup_test_server().await;
+    let server = setup_test_server().await;
     let org = create_org(&server).await;
 
     // Add grant ($10) and payment ($50), then update grant to $15
@@ -220,7 +220,7 @@ async fn test_independent_credit_type_updates() {
 /// Test that history entries include credit type and source
 #[tokio::test]
 async fn test_history_includes_credit_type_and_source() {
-    let (server, _guard) = setup_test_server().await;
+    let server = setup_test_server().await;
     let org = create_org(&server).await;
 
     add_credits_with_type(
@@ -264,7 +264,7 @@ async fn test_history_includes_credit_type_and_source() {
 /// Test invalid credit type returns 400 error
 #[tokio::test]
 async fn test_invalid_credit_type_returns_error() {
-    let (server, _guard) = setup_test_server().await;
+    let server = setup_test_server().await;
     let org = create_org(&server).await;
 
     let response = update_limits_raw(
@@ -286,7 +286,7 @@ async fn test_invalid_credit_type_returns_error() {
 /// Test credit type case insensitivity (GRANT -> grant)
 #[tokio::test]
 async fn test_credit_type_case_insensitive() {
-    let (server, _guard) = setup_test_server().await;
+    let server = setup_test_server().await;
     let org = create_org(&server).await;
 
     let response = update_limits_raw(
@@ -314,7 +314,7 @@ async fn test_credit_type_case_insensitive() {
 /// Test missing type field returns error (type is required)
 #[tokio::test]
 async fn test_missing_type_field_returns_error() {
-    let (server, _guard) = setup_test_server().await;
+    let server = setup_test_server().await;
     let org = create_org(&server).await;
 
     let response = update_limits_raw(

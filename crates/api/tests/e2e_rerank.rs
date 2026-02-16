@@ -12,8 +12,7 @@ use common::*;
 /// Test basic rerank functionality
 #[tokio::test]
 async fn test_rerank_basic() {
-    let (server, guard) = setup_test_server().await;
-    let _guard = guard;
+    let server = setup_test_server().await;
 
     setup_rerank_model(&server).await;
     let org = setup_org_with_credits(&server, 10_000_000_000i64).await; // $10.00 USD
@@ -76,8 +75,7 @@ async fn test_rerank_basic() {
 /// Test rerank with multiple documents
 #[tokio::test]
 async fn test_rerank_with_multiple_documents() {
-    let (server, guard) = setup_test_server().await;
-    let _guard = guard;
+    let server = setup_test_server().await;
 
     setup_rerank_model(&server).await;
     let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
@@ -111,8 +109,7 @@ async fn test_rerank_with_multiple_documents() {
 /// Test that documents are included in results
 #[tokio::test]
 async fn test_rerank_documents_included() {
-    let (server, guard) = setup_test_server().await;
-    let _guard = guard;
+    let server = setup_test_server().await;
 
     setup_rerank_model(&server).await;
     let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
@@ -151,8 +148,7 @@ async fn test_rerank_documents_included() {
 /// Test validation: empty documents array
 #[tokio::test]
 async fn test_rerank_validation_empty_documents() {
-    let (server, guard) = setup_test_server().await;
-    let _guard = guard;
+    let server = setup_test_server().await;
 
     setup_rerank_model(&server).await;
     let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
@@ -185,8 +181,7 @@ async fn test_rerank_validation_empty_documents() {
 /// Test validation: empty query
 #[tokio::test]
 async fn test_rerank_validation_empty_query() {
-    let (server, guard) = setup_test_server().await;
-    let _guard = guard;
+    let server = setup_test_server().await;
 
     setup_rerank_model(&server).await;
     let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
@@ -209,8 +204,7 @@ async fn test_rerank_validation_empty_query() {
 /// Test validation: document count exceeds limit (1001 documents)
 #[tokio::test]
 async fn test_rerank_validation_too_many_documents() {
-    let (server, guard) = setup_test_server().await;
-    let _guard = guard;
+    let server = setup_test_server().await;
 
     setup_rerank_model(&server).await;
     let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
@@ -246,8 +240,7 @@ async fn test_rerank_validation_too_many_documents() {
 /// Test validation: empty/whitespace-only documents
 #[tokio::test]
 async fn test_rerank_validation_empty_document_items() {
-    let (server, guard) = setup_test_server().await;
-    let _guard = guard;
+    let server = setup_test_server().await;
 
     setup_rerank_model(&server).await;
     let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
@@ -280,8 +273,7 @@ async fn test_rerank_validation_empty_document_items() {
 /// Test validation: whitespace-only documents
 #[tokio::test]
 async fn test_rerank_validation_whitespace_only_document() {
-    let (server, guard) = setup_test_server().await;
-    let _guard = guard;
+    let server = setup_test_server().await;
 
     setup_rerank_model(&server).await;
     let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
@@ -314,8 +306,7 @@ async fn test_rerank_validation_whitespace_only_document() {
 /// Test model not found
 #[tokio::test]
 async fn test_rerank_model_not_found() {
-    let (server, guard) = setup_test_server().await;
-    let _guard = guard;
+    let server = setup_test_server().await;
 
     let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
     let api_key = get_api_key_for_org(&server, org.id).await;
@@ -347,8 +338,7 @@ async fn test_rerank_model_not_found() {
 /// Test authentication: missing API key
 #[tokio::test]
 async fn test_rerank_missing_api_key() {
-    let (server, guard) = setup_test_server().await;
-    let _guard = guard;
+    let server = setup_test_server().await;
 
     setup_rerank_model(&server).await;
 
@@ -372,8 +362,7 @@ async fn test_rerank_missing_api_key() {
 /// Test authentication: invalid API key
 #[tokio::test]
 async fn test_rerank_invalid_api_key() {
-    let (server, guard) = setup_test_server().await;
-    let _guard = guard;
+    let server = setup_test_server().await;
 
     setup_rerank_model(&server).await;
 
@@ -398,8 +387,7 @@ async fn test_rerank_invalid_api_key() {
 /// Test with max documents (1000)
 #[tokio::test]
 async fn test_rerank_max_documents() {
-    let (server, guard) = setup_test_server().await;
-    let _guard = guard;
+    let server = setup_test_server().await;
 
     setup_rerank_model(&server).await;
     let org = setup_org_with_credits(&server, 100_000_000_000i64).await; // $100 for many tokens
@@ -433,8 +421,7 @@ async fn test_rerank_max_documents() {
 /// Test usage tracking
 #[tokio::test]
 async fn test_rerank_usage_tracking() {
-    let (server, guard) = setup_test_server().await;
-    let _guard = guard;
+    let server = setup_test_server().await;
 
     setup_rerank_model(&server).await;
     let org = setup_org_with_credits(&server, 10_000_000_000i64).await; // $10.00 USD
@@ -463,8 +450,7 @@ async fn test_rerank_usage_tracking() {
 /// Test that rerank costs are correctly deducted from organization balance
 #[tokio::test]
 async fn test_rerank_costs_deducted_correctly() {
-    let (server, guard) = setup_test_server().await;
-    let _guard = guard;
+    let server = setup_test_server().await;
 
     setup_rerank_model(&server).await;
     let org = setup_org_with_credits(&server, 100_000_000_000i64).await; // $100.00 USD
@@ -561,8 +547,7 @@ async fn test_rerank_costs_deducted_correctly() {
 /// Test response structure matches spec
 #[tokio::test]
 async fn test_rerank_response_structure() {
-    let (server, guard) = setup_test_server().await;
-    let _guard = guard;
+    let server = setup_test_server().await;
 
     setup_rerank_model(&server).await;
     let org = setup_org_with_credits(&server, 10_000_000_000i64).await;

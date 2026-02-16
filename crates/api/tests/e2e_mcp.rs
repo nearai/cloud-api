@@ -278,7 +278,7 @@ async fn test_mcp_multi_turn_conversation_with_approval() {
         if let api::models::ResponseOutputItem::Message { content, .. } = final_message.unwrap() {
             assert!(!content.is_empty(), "message content should not be empty");
             match &content[0] {
-                api::models::ResponseOutputContent::OutputText { text, .. } => text.clone(),
+                api::models::ResponseContentItem::OutputText { text, .. } => text.clone(),
                 _ => panic!("Expected OutputText content"),
             }
         } else {

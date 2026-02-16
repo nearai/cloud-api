@@ -10,9 +10,6 @@ pub const MAX_EMAIL_LENGTH: usize = 255;
 /// Maximum length for organization/system prompts
 pub const MAX_SYSTEM_PROMPT_LENGTH: usize = 64 * 1024;
 
-/// Maximum serialized size for small metadata blobs (e.g. conversation metadata)
-pub const MAX_METADATA_SIZE_BYTES: usize = 16 * 1024;
-
 /// Maximum serialized size for settings / larger JSON blobs
 pub const MAX_SETTINGS_SIZE_BYTES: usize = 32 * 1024;
 

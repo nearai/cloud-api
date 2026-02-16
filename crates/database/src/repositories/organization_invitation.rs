@@ -72,7 +72,7 @@ impl PgOrganizationInvitationRepository {
 
     /// Generate a secure random token
     fn generate_token() -> String {
-        use rand::Rng;
+        use rand::RngExt;
         const CHARSET: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
         let mut rng = rand::rng();
         let token: String = (0..64)

@@ -27,7 +27,7 @@ fn chat_request(model: &str, stream: bool) -> serde_json::Value {
 /// Test that a 503 error from the provider is propagated to the client
 #[tokio::test]
 async fn test_provider_error_503_propagated() {
-    let (server, _pool, mock_provider, _, _guard) = setup_test_server_with_pool().await;
+    let (server, _pool, mock_provider, _db) = setup_test_server_with_pool().await;
     setup_qwen_model(&server).await;
     let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
     let api_key = get_api_key_for_org(&server, org.id).await;
@@ -66,7 +66,7 @@ async fn test_provider_error_503_propagated() {
 /// Test that a 429 error from the provider is propagated as rate_limit_exceeded
 #[tokio::test]
 async fn test_provider_error_429_propagated() {
-    let (server, _pool, mock_provider, _, _guard) = setup_test_server_with_pool().await;
+    let (server, _pool, mock_provider, _db) = setup_test_server_with_pool().await;
     setup_qwen_model(&server).await;
     let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
     let api_key = get_api_key_for_org(&server, org.id).await;
@@ -100,7 +100,7 @@ async fn test_provider_error_429_propagated() {
 /// Test that a 500 error from the provider is mapped to 502 Bad Gateway
 #[tokio::test]
 async fn test_provider_error_500_becomes_502() {
-    let (server, _pool, mock_provider, _, _guard) = setup_test_server_with_pool().await;
+    let (server, _pool, mock_provider, _db) = setup_test_server_with_pool().await;
     setup_qwen_model(&server).await;
     let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
     let api_key = get_api_key_for_org(&server, org.id).await;
@@ -144,7 +144,7 @@ async fn test_provider_error_500_becomes_502() {
 /// Test that a model configured in DB but not in provider pool returns 400
 #[tokio::test]
 async fn test_model_not_found_in_provider_returns_400() {
-    let (server, _pool, _mock_provider, _, _guard) = setup_test_server_with_pool().await;
+    let (server, _pool, _mock_provider, _db) = setup_test_server_with_pool().await;
 
     // Register a model in the database that is NOT in the provider pool
     let mut batch = BatchUpdateModelApiRequest::new();
@@ -191,7 +191,7 @@ async fn test_model_not_found_in_provider_returns_400() {
 /// Test that provider error messages are preserved in streaming mode
 #[tokio::test]
 async fn test_provider_error_message_preserved_in_streaming() {
-    let (server, _pool, mock_provider, _, _guard) = setup_test_server_with_pool().await;
+    let (server, _pool, mock_provider, _db) = setup_test_server_with_pool().await;
     setup_qwen_model(&server).await;
     let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
     let api_key = get_api_key_for_org(&server, org.id).await;
@@ -234,7 +234,7 @@ async fn test_provider_error_message_preserved_in_streaming() {
 /// External 400 = likely invalid params (context too long, bad format, etc.)
 #[tokio::test]
 async fn test_external_provider_400_stays_400() {
-    let (server, _pool, mock_provider, _, _guard) = setup_test_server_with_pool().await;
+    let (server, _pool, mock_provider, _db) = setup_test_server_with_pool().await;
     setup_qwen_model(&server).await;
     let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
     let api_key = get_api_key_for_org(&server, org.id).await;
@@ -273,7 +273,7 @@ async fn test_external_provider_400_stays_400() {
 /// Test that a 400 from vLLM stays as 400 (actual client error)
 #[tokio::test]
 async fn test_vllm_400_stays_400() {
-    let (server, _pool, mock_provider, _, _guard) = setup_test_server_with_pool().await;
+    let (server, _pool, mock_provider, _db) = setup_test_server_with_pool().await;
     setup_qwen_model(&server).await;
     let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
     let api_key = get_api_key_for_org(&server, org.id).await;

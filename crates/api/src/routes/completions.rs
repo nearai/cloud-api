@@ -158,6 +158,16 @@ fn analyze_multipart_error(e: &axum::extract::multipart::MultipartError) -> (Sta
     (status, message)
 }
 
+/// Returns a safe-to-log category string for a stream-level completion error.
+fn completion_stream_error_category(e: &inference_providers::CompletionError) -> &'static str {
+    match e {
+        inference_providers::CompletionError::CompletionError(_) => "completion_error",
+        inference_providers::CompletionError::HttpError { .. } => "http_error",
+        inference_providers::CompletionError::InvalidResponse(_) => "invalid_response",
+        inference_providers::CompletionError::Unknown(_) => "unknown",
+    }
+}
+
 // Helper function to extract inference ID from first SSE chunk
 fn extract_inference_id_from_sse(raw_bytes: &[u8]) -> Option<Uuid> {
     let chunk_str = match String::from_utf8(raw_bytes.to_vec()) {
@@ -379,15 +389,20 @@ pub async fn chat_completions(
                 // Accumulate all SSE bytes for response hash computation
                 let accumulated_bytes = Arc::new(tokio::sync::Mutex::new(Vec::new()));
                 let chat_id_state = Arc::new(tokio::sync::Mutex::new(None::<String>));
+                let stream_error_count = Arc::new(std::sync::atomic::AtomicU32::new(0));
 
                 let accumulated_clone = accumulated_bytes.clone();
                 let chat_id_clone = chat_id_state.clone();
+                let error_count_clone = stream_error_count.clone();
+                let request_model = request.model.clone();
 
                 // Convert to raw bytes stream with proper SSE formatting
                 let byte_stream = peekable_stream
                     .then(move |result| {
                         let accumulated_inner = accumulated_clone.clone();
                         let chat_id_inner = chat_id_clone.clone();
+                        let error_count_inner = error_count_clone.clone();
+                        let model_for_err = request_model.clone();
                         async move {
                             match result {
                                 Ok(event) => {
@@ -429,7 +444,15 @@ pub async fn chat_completions(
                                     Ok::<Bytes, Infallible>(sse_bytes)
                                 }
                                 Err(e) => {
-                                    tracing::error!("Completion stream error");
+                                    let count = error_count_inner
+                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    if count == 0 {
+                                        tracing::error!(
+                                            model = %model_for_err,
+                                            error_type = %completion_stream_error_category(&e),
+                                            "Completion stream error"
+                                        );
+                                    }
                                     Ok::<Bytes, Infallible>(Bytes::from(format!(
                                         "data: error: {e}\n\n"
                                     )))
@@ -438,6 +461,16 @@ pub async fn chat_completions(
                         }
                     })
                     .chain(futures::stream::once(async move {
+                        let error_count_final =
+                            stream_error_count.load(std::sync::atomic::Ordering::Relaxed);
+                        if error_count_final > 1 {
+                            tracing::error!(
+                                model = %request.model,
+                                total_stream_errors = error_count_final,
+                                "Completion stream ended with multiple errors"
+                            );
+                        }
+
                         let done_bytes = Bytes::from_static(b"data: [DONE]\n\n");
                         accumulated_bytes
                             .lock()
@@ -1296,25 +1329,32 @@ pub async fn audio_transcriptions(
         }
         Err(e) => {
             let (status_code, error_type, message) = match e {
-                services::completions::ports::CompletionError::RateLimitExceeded => {
+                services::completions::ports::CompletionError::RateLimitExceeded(msg) => {
                     tracing::warn!("Concurrent request limit exceeded for audio transcription");
+                    (StatusCode::TOO_MANY_REQUESTS, "rate_limit_error", msg)
+                }
+                services::completions::ports::CompletionError::ProviderError {
+                    status_code,
+                    ..
+                } => {
+                    tracing::error!("Audio transcription provider error");
+                    let http_status = StatusCode::from_u16(status_code)
+                        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
                     (
-                        StatusCode::TOO_MANY_REQUESTS,
-                        "rate_limit_error",
-                        "Too many concurrent audio transcription requests. Organization limit: 64 concurrent requests per model.".to_string(),
+                        http_status,
+                        "server_error",
+                        "Audio transcription failed. Please try again later.".to_string(),
                     )
                 }
-                services::completions::ports::CompletionError::ProviderError(_) => {
-                    // Don't log error details - may contain customer data
-                    tracing::error!("Audio transcription provider error");
+                services::completions::ports::CompletionError::ServiceOverloaded(_) => {
+                    tracing::warn!("Audio transcription service overloaded");
                     (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "server_error",
-                        "Audio transcription failed".to_string(),
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "service_overloaded",
+                        "The service is temporarily overloaded. Please retry with exponential backoff.".to_string(),
                     )
                 }
                 _ => {
-                    // Don't log error details - may contain customer data
                     tracing::error!("Unexpected audio transcription error");
                     (
                         StatusCode::INTERNAL_SERVER_ERROR,
@@ -1935,33 +1975,37 @@ pub async fn rerank(
         }
         Err(e) => {
             let (status_code, error_type, message) = match e {
-                services::completions::ports::CompletionError::RateLimitExceeded => {
+                services::completions::ports::CompletionError::RateLimitExceeded(msg) => {
                     tracing::warn!("Concurrent request limit exceeded for rerank");
+                    (StatusCode::TOO_MANY_REQUESTS, "rate_limit_error", msg)
+                }
+                services::completions::ports::CompletionError::ProviderError {
+                    status_code,
+                    ..
+                } => {
+                    tracing::error!("Rerank provider error");
+                    let http_status = StatusCode::from_u16(status_code)
+                        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
                     (
-                        StatusCode::TOO_MANY_REQUESTS,
-                        "rate_limit_error",
-                        "Too many concurrent rerank requests. Organization limit: 64 concurrent requests per model. Please wait for in-flight requests to complete before retrying.".to_string(),
+                        http_status,
+                        "server_error",
+                        "Reranking failed. Please try again later.".to_string(),
                     )
                 }
-                services::completions::ports::CompletionError::ProviderError(msg) => {
-                    tracing::error!(error = %msg, "Rerank provider error");
-                    // Check if it's a model not found error
-                    if msg.contains("not found") || msg.contains("does not exist") {
-                        (
-                            StatusCode::NOT_FOUND,
-                            "not_found_error",
-                            "Model not found".to_string(),
-                        )
-                    } else {
-                        (
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            "server_error",
-                            "Reranking failed".to_string(),
-                        )
-                    }
+                services::completions::ports::CompletionError::InvalidModel(msg) => {
+                    tracing::warn!("Rerank model not found");
+                    (StatusCode::NOT_FOUND, "not_found_error", msg)
+                }
+                services::completions::ports::CompletionError::ServiceOverloaded(_) => {
+                    tracing::warn!("Rerank service overloaded");
+                    (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "service_overloaded",
+                        "The service is temporarily overloaded. Please retry with exponential backoff.".to_string(),
+                    )
                 }
                 _ => {
-                    tracing::error!(error = %e, "Unexpected rerank error");
+                    tracing::error!("Unexpected rerank error");
                     (
                         StatusCode::INTERNAL_SERVER_ERROR,
                         "server_error",
@@ -2199,33 +2243,37 @@ pub async fn score(
         }
         Err(e) => {
             let (status_code, error_type, message) = match e {
-                services::completions::ports::CompletionError::RateLimitExceeded => {
+                services::completions::ports::CompletionError::RateLimitExceeded(msg) => {
                     tracing::warn!("Concurrent request limit exceeded for score");
+                    (StatusCode::TOO_MANY_REQUESTS, "rate_limit_error", msg)
+                }
+                services::completions::ports::CompletionError::ProviderError {
+                    status_code,
+                    ..
+                } => {
+                    tracing::error!("Score provider error");
+                    let http_status = StatusCode::from_u16(status_code)
+                        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
                     (
-                        StatusCode::TOO_MANY_REQUESTS,
-                        "rate_limit_error",
-                        "Too many concurrent score requests. Organization limit: 64 concurrent requests per model. Please wait for in-flight requests to complete before retrying.".to_string(),
+                        http_status,
+                        "server_error",
+                        "Scoring failed. Please try again later.".to_string(),
                     )
                 }
-                services::completions::ports::CompletionError::ProviderError(msg) => {
-                    tracing::error!(error = %msg, "Score provider error");
-                    // Check if it's a model not found error
-                    if msg.contains("not found") || msg.contains("does not exist") {
-                        (
-                            StatusCode::NOT_FOUND,
-                            "not_found_error",
-                            "Model not found".to_string(),
-                        )
-                    } else {
-                        (
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            "server_error",
-                            "Scoring failed".to_string(),
-                        )
-                    }
+                services::completions::ports::CompletionError::InvalidModel(msg) => {
+                    tracing::warn!("Score model not found");
+                    (StatusCode::NOT_FOUND, "not_found_error", msg)
+                }
+                services::completions::ports::CompletionError::ServiceOverloaded(_) => {
+                    tracing::warn!("Score service overloaded");
+                    (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "service_overloaded",
+                        "The service is temporarily overloaded. Please retry with exponential backoff.".to_string(),
+                    )
                 }
                 _ => {
-                    tracing::error!(error = %e, "Unexpected score error");
+                    tracing::error!("Unexpected score error");
                     (
                         StatusCode::INTERNAL_SERVER_ERROR,
                         "server_error",

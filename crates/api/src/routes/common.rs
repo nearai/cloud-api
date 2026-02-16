@@ -10,8 +10,10 @@ pub fn map_domain_error_to_status(error: &CompletionError) -> StatusCode {
         CompletionError::InvalidModel(_) | CompletionError::InvalidParams(_) => {
             StatusCode::BAD_REQUEST
         }
-        CompletionError::RateLimitExceeded => StatusCode::TOO_MANY_REQUESTS,
-        CompletionError::ProviderError(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        CompletionError::RateLimitExceeded(_) => StatusCode::TOO_MANY_REQUESTS,
+        CompletionError::ProviderError { status_code, .. } => {
+            StatusCode::from_u16(*status_code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR)
+        }
         CompletionError::ServiceOverloaded(_) => StatusCode::SERVICE_UNAVAILABLE,
         CompletionError::InternalError(_) => StatusCode::INTERNAL_SERVER_ERROR,
     }
@@ -467,5 +469,50 @@ mod tests {
         assert_eq!(format_amount(100), "$0.0000001");
         assert_eq!(format_amount(1), "$0.000000001");
         assert_eq!(format_amount(0), "$0.00");
+    }
+
+    #[test]
+    fn test_map_domain_error_provider_502() {
+        let error = CompletionError::ProviderError {
+            status_code: 502,
+            message: "Bad gateway".to_string(),
+        };
+        assert_eq!(map_domain_error_to_status(&error), StatusCode::BAD_GATEWAY);
+    }
+
+    #[test]
+    fn test_map_domain_error_provider_500() {
+        let error = CompletionError::ProviderError {
+            status_code: 500,
+            message: "Internal error".to_string(),
+        };
+        assert_eq!(
+            map_domain_error_to_status(&error),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
+
+    #[test]
+    fn test_map_domain_error_rate_limited() {
+        let error = CompletionError::RateLimitExceeded("upstream rate limit".to_string());
+        assert_eq!(
+            map_domain_error_to_status(&error),
+            StatusCode::TOO_MANY_REQUESTS
+        );
+    }
+
+    #[test]
+    fn test_map_domain_error_invalid_model() {
+        let error = CompletionError::InvalidModel("model not found".to_string());
+        assert_eq!(map_domain_error_to_status(&error), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn test_map_domain_error_service_overloaded() {
+        let error = CompletionError::ServiceOverloaded("overloaded".to_string());
+        assert_eq!(
+            map_domain_error_to_status(&error),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
     }
 }

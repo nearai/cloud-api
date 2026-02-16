@@ -480,6 +480,8 @@ struct MockExpectation {
 struct MockConfig {
     expectations: Vec<MockExpectation>,
     default_response: ResponseTemplate,
+    /// When set, all chat completion calls return this error instead of generating a response
+    error_override: Option<CompletionError>,
 }
 
 /// Builder for configuring a single expectation
@@ -524,6 +526,7 @@ impl MockProvider {
             config: Arc::new(Mutex::new(MockConfig {
                 expectations: Vec::new(),
                 default_response: ResponseTemplate::new("1. 2. 3."),
+                error_override: None,
             })),
         }
     }
@@ -538,6 +541,7 @@ impl MockProvider {
             config: Arc::new(Mutex::new(MockConfig {
                 expectations: Vec::new(),
                 default_response: ResponseTemplate::new("1. 2. 3."),
+                error_override: None,
             })),
         }
     }
@@ -550,6 +554,7 @@ impl MockProvider {
             config: Arc::new(Mutex::new(MockConfig {
                 expectations: Vec::new(),
                 default_response: ResponseTemplate::new("1. 2. 3."),
+                error_override: None,
             })),
         }
     }
@@ -584,6 +589,13 @@ impl MockProvider {
     pub async fn set_default_response(&self, response: ResponseTemplate) {
         let mut config = self.config.lock().await;
         config.default_response = response;
+    }
+
+    /// Set an error override — when set, all chat completion calls return this error
+    /// instead of generating a response. Pass `None` to clear the override.
+    pub async fn set_error_override(&self, error: Option<CompletionError>) {
+        let mut config = self.config.lock().await;
+        config.error_override = error;
     }
 
     /// Generate a completion ID
@@ -693,15 +705,19 @@ impl crate::InferenceProvider for MockProvider {
     ) -> Result<StreamingResult, CompletionError> {
         // Check for invalid model
         if !self.is_valid_model(&params.model) {
-            return Err(CompletionError::CompletionError(format!(
-                "HTTP 404 Not Found: {{\"error\":{{\"message\":\"The model `{}` does not exist.\",\"type\":\"NotFoundError\",\"param\":null,\"code\":404}}}}",
-                params.model
-            )));
+            return Err(CompletionError::HttpError {
+                status_code: 404,
+                message: format!("The model `{}` does not exist.", params.model),
+                is_external: false,
+            });
         }
 
-        // Check for matching expectation
+        // Check for matching expectation (and error override)
         let response_template = {
             let config = self.config.lock().await;
+            if let Some(ref error) = config.error_override {
+                return Err(error.clone());
+            }
             config
                 .expectations
                 .iter()
@@ -776,19 +792,23 @@ impl crate::InferenceProvider for MockProvider {
     ) -> Result<ChatCompletionResponseWithBytes, CompletionError> {
         // Check for invalid model
         if !self.is_valid_model(&params.model) {
-            return Err(CompletionError::CompletionError(format!(
-                "HTTP 404 Not Found: {{\"error\":{{\"message\":\"The model `{}` does not exist.\",\"type\":\"NotFoundError\",\"param\":null,\"code\":404}}}}",
-                params.model
-            )));
+            return Err(CompletionError::HttpError {
+                status_code: 404,
+                message: format!("The model `{}` does not exist.", params.model),
+                is_external: false,
+            });
         }
 
         let id = self.generate_chat_id();
         let created = self.current_timestamp();
         let model = params.model.clone();
 
-        // Find matching expectation in config
+        // Find matching expectation in config (and check error override)
         let response_template = {
             let config = self.config.lock().await;
+            if let Some(ref error) = config.error_override {
+                return Err(error.clone());
+            }
             config
                 .expectations
                 .iter()
@@ -831,10 +851,11 @@ impl crate::InferenceProvider for MockProvider {
     ) -> Result<StreamingResult, CompletionError> {
         // Check for invalid model
         if !self.is_valid_model(&params.model) {
-            return Err(CompletionError::CompletionError(format!(
-                "HTTP 404 Not Found: {{\"error\":{{\"message\":\"The model `{}` does not exist.\",\"type\":\"NotFoundError\",\"param\":null,\"code\":404}}}}",
-                params.model
-            )));
+            return Err(CompletionError::HttpError {
+                status_code: 404,
+                message: format!("The model `{}` does not exist.", params.model),
+                is_external: false,
+            });
         }
 
         let chunks = self.generate_text_chunks(&params);

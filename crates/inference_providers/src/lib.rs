@@ -94,6 +94,30 @@ pub use external::{
     OpenAiCompatibleBackend, ProviderConfig,
 };
 
+/// Try to extract a human-readable error message from a JSON error response body.
+///
+/// Supports common formats:
+///   - OpenAI/Anthropic: `{"error": {"message": "..."}}`
+///   - vLLM/FastAPI: `{"detail": "..."}`
+///   - Falls back to the raw body if neither matches
+pub fn extract_error_message(body: &str) -> String {
+    if let Ok(json) = serde_json::from_str::<serde_json::Value>(body) {
+        // OpenAI/Anthropic format: {"error": {"message": "..."}}
+        if let Some(msg) = json
+            .get("error")
+            .and_then(|e| e.get("message"))
+            .and_then(|m| m.as_str())
+        {
+            return msg.to_string();
+        }
+        // vLLM/FastAPI format: {"detail": "..."}
+        if let Some(detail) = json.get("detail").and_then(|d| d.as_str()) {
+            return detail.to_string();
+        }
+    }
+    body.to_string()
+}
+
 /// Type alias for streaming completion results
 ///
 /// This represents a stream of SSE events where each event contains:

@@ -10,7 +10,7 @@ description.workspace = true
 async-trait = "0.1"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-uuid = { version = "1.20", features = ["v4", "v5", "serde"] }
+uuid = { version = "1.21", features = ["v4", "v5", "serde"] }
 opentelemetry = { version = "0.31", features = ["metrics"] }
 opentelemetry_sdk = { version = "0.31", features = ["rt-tokio", "metrics"] }
 chrono = { version = "0.4", features = ["serde"] }
@@ -22,7 +22,7 @@ futures = "0.3"
 futures-util = "0.3"
 thiserror = "2.0"
 config = { path = "../config" }
-rand = "0.9"
+rand = "0.10"
 rand_core = { version = "0.6", features = ["getrandom"] }
 utoipa = "5.3"
 # OAuth2 authentication
@@ -32,7 +32,7 @@ url = "2.5"
 bytes = "1.11"
 tokio-stream = "0.1"
 # MCP protocol
-rmcp = { version = "0.14", features = [
+rmcp = { version = "0.15", features = [
     "client",
     "transport-streamable-http-client-reqwest",
 ] }
@@ -48,7 +48,7 @@ jsonwebtoken = { version = "10.3.0", features = ["rust_crypto"] }
 regex = "1.12"
 # AWS S3 for file storage
 aws-config = { version = "1.8", features = ["behavior-version-latest"] }
-aws-sdk-s3 = "1.122"
+aws-sdk-s3 = "1.123"
 # Encryption for file storage
 aes-gcm = "0.10"
 # HMAC for VPC signature verification

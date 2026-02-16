@@ -7,7 +7,7 @@ use services::auth::ports::MOCK_USER_AGENT;
 /// Test getting concurrent limit for a new organization (should return null/default)
 #[tokio::test]
 async fn test_get_concurrent_limit_returns_default_for_new_org() {
-    let (server, _guard) = setup_test_server().await;
+    let server = setup_test_server().await;
     let org = create_org(&server).await;
     let session_id = get_session_id();
 
@@ -34,7 +34,7 @@ async fn test_get_concurrent_limit_returns_default_for_new_org() {
 /// Test updating concurrent limit for an organization
 #[tokio::test]
 async fn test_update_concurrent_limit() {
-    let (server, _guard) = setup_test_server().await;
+    let server = setup_test_server().await;
     let org = create_org(&server).await;
     let session_id = get_session_id();
 
@@ -74,7 +74,7 @@ async fn test_update_concurrent_limit() {
 /// Test resetting concurrent limit to default (null)
 #[tokio::test]
 async fn test_reset_concurrent_limit_to_default() {
-    let (server, _guard) = setup_test_server().await;
+    let server = setup_test_server().await;
     let org = create_org(&server).await;
     let session_id = get_session_id();
 
@@ -131,7 +131,7 @@ async fn test_reset_concurrent_limit_to_default() {
 /// With u32 type, negative values fail at the deserialization layer
 #[tokio::test]
 async fn test_update_concurrent_limit_rejects_negative() {
-    let (server, _guard) = setup_test_server().await;
+    let server = setup_test_server().await;
     let org = create_org(&server).await;
     let session_id = get_session_id();
 
@@ -155,7 +155,7 @@ async fn test_update_concurrent_limit_rejects_negative() {
 /// Test that zero concurrent limit is rejected
 #[tokio::test]
 async fn test_update_concurrent_limit_rejects_zero() {
-    let (server, _guard) = setup_test_server().await;
+    let server = setup_test_server().await;
     let org = create_org(&server).await;
     let session_id = get_session_id();
 
@@ -181,7 +181,7 @@ async fn test_update_concurrent_limit_rejects_zero() {
 /// Test that non-existent organization returns 404
 #[tokio::test]
 async fn test_get_concurrent_limit_nonexistent_org() {
-    let (server, _guard) = setup_test_server().await;
+    let server = setup_test_server().await;
     let session_id = get_session_id();
     let fake_org_id = uuid::Uuid::new_v4();
 
@@ -204,7 +204,7 @@ async fn test_get_concurrent_limit_nonexistent_org() {
 /// Test that updating non-existent organization returns 404
 #[tokio::test]
 async fn test_update_concurrent_limit_nonexistent_org() {
-    let (server, _guard) = setup_test_server().await;
+    let server = setup_test_server().await;
     let session_id = get_session_id();
     let fake_org_id = uuid::Uuid::new_v4();
 
@@ -230,7 +230,7 @@ async fn test_update_concurrent_limit_nonexistent_org() {
 /// Test that invalid organization ID format returns 400
 #[tokio::test]
 async fn test_concurrent_limit_invalid_org_id_format() {
-    let (server, _guard) = setup_test_server().await;
+    let server = setup_test_server().await;
     let session_id = get_session_id();
 
     let response = server
@@ -252,7 +252,7 @@ async fn test_concurrent_limit_invalid_org_id_format() {
 /// Test updating concurrent limit multiple times
 #[tokio::test]
 async fn test_update_concurrent_limit_multiple_times() {
-    let (server, _guard) = setup_test_server().await;
+    let server = setup_test_server().await;
     let org = create_org(&server).await;
     let session_id = get_session_id();
 

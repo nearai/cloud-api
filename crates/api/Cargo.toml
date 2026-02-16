@@ -24,7 +24,7 @@ inference_providers = { path = "../inference_providers" }
 # Authentication dependencies
 tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.6", features = ["cors"] }
-uuid = { version = "1.20", features = ["v4", "serde"] }
+uuid = { version = "1.21", features = ["v4", "serde"] }
 opentelemetry = { version = "0.31", features = ["metrics"] }
 opentelemetry_sdk = { version = "0.31", features = ["rt-tokio"] }
 opentelemetry-otlp = { version = "0.31", features = ["metrics", "grpc-tonic"] }
@@ -42,7 +42,7 @@ bytes = "1.11"
 http-body-util = "0.1"
 # AWS S3 for file storage
 aws-config = { version = "1.8", features = ["behavior-version-latest"] }
-aws-sdk-s3 = "1.122"
+aws-sdk-s3 = "1.123"
 # NEAR wallet authentication
 near-api = "0.8.3"
 base64 = "0.22"
@@ -64,7 +64,8 @@ k256 = { version = "0.13", features = ["ecdsa", "arithmetic"] }
 sha3 = "0.10"
 hmac = "0.12"
 tokio-postgres = "0.7"
+deadpool-postgres = { version = "0.14", features = ["rt_tokio_1"] }
 ed25519-dalek = { version = "2.1", features = ["rand_core"] }
-rand = "0.9"
+rand = "0.10"
 services = { path = "../services", features = ["test-mocks"] }
 async-trait = "0.1"

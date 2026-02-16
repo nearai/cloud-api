@@ -18,7 +18,7 @@ use common::*;
 /// 4. LLM produces final response → response is complete
 #[tokio::test]
 async fn test_function_tool_single_call() {
-    let (server, _, mock, _, _guard) = setup_test_server_with_pool().await;
+    let (server, _, mock, _) = setup_test_server_with_pool().await;
     setup_qwen_model(&server).await;
     let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
     let api_key = get_api_key_for_org(&server, org.id).await;
@@ -201,7 +201,7 @@ async fn test_function_tool_single_call() {
 /// 3. LLM produces final response
 #[tokio::test]
 async fn test_function_tool_parallel_calls() {
-    let (server, _, mock, _, _guard) = setup_test_server_with_pool().await;
+    let (server, _, mock, _) = setup_test_server_with_pool().await;
     setup_qwen_model(&server).await;
     let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
     let api_key = get_api_key_for_org(&server, org.id).await;
@@ -424,7 +424,7 @@ async fn test_function_tool_parallel_calls() {
 /// Bug: [assistant+tool_calls, user_message, tool_result] - wrong
 #[tokio::test]
 async fn test_function_output_and_message_ordering() {
-    let (server, _, mock, _, _guard) = setup_test_server_with_pool().await;
+    let (server, _, mock, _) = setup_test_server_with_pool().await;
     setup_qwen_model(&server).await;
     let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
     let api_key = get_api_key_for_org(&server, org.id).await;
@@ -544,7 +544,7 @@ async fn test_function_output_and_message_ordering() {
 /// without a previous response context.
 #[tokio::test]
 async fn test_function_output_without_previous_response_fails() {
-    let (server, _, _, _, _guard) = setup_test_server_with_pool().await;
+    let (server, _, _, _) = setup_test_server_with_pool().await;
     setup_qwen_model(&server).await;
     let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
     let api_key = get_api_key_for_org(&server, org.id).await;
@@ -596,7 +596,7 @@ async fn test_function_output_without_previous_response_fails() {
 /// The LLM might call a function tool, which should pause for client execution.
 #[tokio::test]
 async fn test_function_tool_coexists_with_builtin_tools() {
-    let (server, _, mock, _, _guard) = setup_test_server_with_pool().await;
+    let (server, _, mock, _) = setup_test_server_with_pool().await;
     setup_qwen_model(&server).await;
     let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
     let api_key = get_api_key_for_org(&server, org.id).await;

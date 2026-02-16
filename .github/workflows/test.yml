@@ -29,11 +29,27 @@ jobs:
           --health-interval 10s
           --health-timeout 5s
           --health-retries 5
+          --shm-size=256mb
         ports:
           - 5432:5432
 
     steps:
     - uses: actions/checkout@v6
+
+    - name: Increase PostgreSQL max connections
+      run: |
+        # 16 parallel tests * 4 pool connections = 64, but allow headroom for spikes.
+        docker exec ${{ job.services.postgres.id }} \
+          psql -U postgres -c "ALTER SYSTEM SET max_connections = 150;"
+        docker restart ${{ job.services.postgres.id }}
+        for i in $(seq 1 30); do
+          docker exec ${{ job.services.postgres.id }} pg_isready -U postgres && break
+          sleep 1
+        done
+        if ! docker exec ${{ job.services.postgres.id }} pg_isready -U postgres; then
+          echo "PostgreSQL did not become ready after restart within 30 seconds" >&2
+          exit 1
+        fi
     
     - name: Install Rust
       uses: actions-rust-lang/setup-rust-toolchain@v1
@@ -72,9 +88,8 @@ jobs:
         BRAVE_SEARCH_PRO_API_KEY: ${{ secrets.BRAVE_SEARCH_PRO_API_KEY }}
         DEV: "true"
 
-    # Integration tests use isolated databases per test (created from a template)
-    # Template DB is created automatically on first test run with all migrations applied
-    # Each test gets its own database copy for complete isolation
+    # All e2e tests share a single database (bootstrapped once with migrations).
+    # Isolation comes from UUID-scoped orgs/workspaces/keys, not separate databases.
     - name: Run integration tests
       run: cargo nextest run -p api --tests
       env:
@@ -91,20 +106,9 @@ jobs:
         AUTH_ENCODING_KEY: ${{ secrets.AUTH_ENCODING_KEY }}
         AUTH_ADMIN_DOMAINS: ${{ secrets.AUTH_ADMIN_DOMAINS }}
         BRAVE_SEARCH_PRO_API_KEY: ${{ secrets.BRAVE_SEARCH_PRO_API_KEY }}
-        TEST_TEMPLATE_DATABASE_NAME: platform_api_test_template
+        TEST_DATABASE_NAME: platform_api_e2e
         RUST_LOG: debug
         DEV: "true"
-
-    - name: Cleanup orphaned test databases
-      if: always()
-      continue-on-error: true
-      run: cargo test --test cleanup_test_databases -- --ignored --nocapture
-      env:
-        DATABASE_HOST: localhost
-        DATABASE_PORT: 5432
-        DATABASE_USERNAME: postgres
-        DATABASE_PASSWORD: postgres
-        TEST_TEMPLATE_DATABASE_NAME: platform_api_test_template
 
     - name: Run vLLM integration tests
       run: cargo test --test integration_tests -- --nocapture

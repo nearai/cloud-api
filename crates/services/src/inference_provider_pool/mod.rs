@@ -749,12 +749,14 @@ impl InferenceProviderPool {
             CompletionError::HttpError {
                 status_code,
                 message,
+                is_external,
             } => {
                 // For HttpError, sanitize the message and include model_id context
-                // Preserve status_code for proper error mapping (4xx vs 5xx)
+                // Preserve status_code and is_external for proper error mapping
                 CompletionError::HttpError {
                     status_code,
                     message: sanitize_and_format(&message),
+                    is_external,
                 }
             }
             CompletionError::CompletionError(msg) => {
@@ -900,10 +902,8 @@ impl InferenceProviderPool {
             providers.len()
         );
 
-        // Collect sanitized errors for user-facing message
-        let mut sanitized_errors = Vec::new();
-        // Keep detailed errors for logging only
-        let mut detailed_errors = Vec::new();
+        // Track the last error (preserving its structure for proper status code mapping)
+        let mut last_error: Option<CompletionError> = None;
 
         // Try each provider in order until one succeeds
         for (attempt, provider) in providers.iter().enumerate() {
@@ -948,9 +948,7 @@ impl InferenceProviderPool {
                         }
                     }
 
-                    let error_str = e.to_string();
-
-                    // Log the full detailed error for debugging
+                    // Log the failure for debugging
                     tracing::warn!(
                         model_id = %model_id,
                         attempt = attempt + 1,
@@ -958,20 +956,13 @@ impl InferenceProviderPool {
                         "Provider failed, will try next provider if available"
                     );
 
-                    // Store detailed error for logging
-                    detailed_errors.push(format!("Provider {}: {}", attempt + 1, error_str));
-
-                    // Store sanitized error for user-facing response
-                    let sanitized = Self::sanitize_error_message(&error_str);
-                    sanitized_errors.push(format!("Provider {}: {}", attempt + 1, sanitized));
+                    // Sanitize and preserve the last error with its structure intact
+                    last_error = Some(Self::sanitize_completion_error(e, model_id));
                 }
             }
         }
 
-        // All providers failed - log detailed errors but return sanitized message to user
-        // let detailed_error_msg = detailed_errors.join("; ");
-        let sanitized_error_msg = sanitized_errors.join("; ");
-
+        // All providers failed
         if let Some(pub_key) = model_pub_key {
             tracing::error!(
                 model_id = %model_id,
@@ -989,13 +980,32 @@ impl InferenceProviderPool {
             );
         }
 
-        // Return sanitized error to user
-        Err(CompletionError::CompletionError(format!(
-            "All {} provider(s) failed for model '{}': {}",
-            providers.len(),
-            model_id,
-            sanitized_error_msg
-        )))
+        // Return the last error, preserving its HttpError variant for proper status code mapping
+        match last_error {
+            Some(CompletionError::HttpError {
+                status_code,
+                message,
+                is_external,
+            }) => Err(CompletionError::HttpError {
+                status_code,
+                message: if providers.len() > 1 {
+                    format!(
+                        "All {} provider(s) failed for model '{}'. Last error: {}",
+                        providers.len(),
+                        model_id,
+                        message
+                    )
+                } else {
+                    message
+                },
+                is_external,
+            }),
+            Some(other_error) => Err(other_error),
+            None => Err(CompletionError::CompletionError(format!(
+                "No providers available for model '{}'",
+                model_id
+            ))),
+        }
     }
 
     pub async fn get_attestation_report(
@@ -1448,6 +1458,13 @@ impl InferenceProviderPool {
         model_name: &str,
         provider_config: serde_json::Value,
     ) -> Result<(Arc<InferenceProviderTrait>, String), String> {
+        // Extract and remove per-model api_key from raw JSON before deserializing into ProviderConfig
+        let mut provider_config = provider_config;
+        let per_model_api_key = provider_config
+            .as_object_mut()
+            .and_then(|obj| obj.remove("api_key"))
+            .and_then(|v| v.as_str().map(String::from));
+
         let config: ProviderConfig = serde_json::from_value(provider_config)
             .map_err(|e| format!("Failed to parse provider config: {e}"))?;
 
@@ -1457,17 +1474,20 @@ impl InferenceProviderPool {
             ProviderConfig::Gemini { .. } => "gemini".to_string(),
         };
 
-        let api_key = self
-            .external_configs
-            .get_api_key(&backend_type)
+        let api_key = per_model_api_key
+            .or_else(|| {
+                self.external_configs
+                    .get_api_key(&backend_type)
+                    .map(|s| s.to_string())
+            })
             .ok_or_else(|| {
                 format!(
                     "No API key configured for backend type '{}'. \
-                     Set the appropriate environment variable (e.g., OPENAI_API_KEY, ANTHROPIC_API_KEY, GEMINI_API_KEY)",
+                     Set the appropriate environment variable (e.g., OPENAI_API_KEY, ANTHROPIC_API_KEY, GEMINI_API_KEY) \
+                     or include 'api_key' in the model's providerConfig",
                     backend_type
                 )
-            })?
-            .to_string();
+            })?;
 
         let external_config = ExternalProviderConfig {
             model_name: model_name.to_string(),
@@ -2420,6 +2440,7 @@ mod tests {
                 Err(CompletionError::HttpError {
                     status_code: 400,
                     message: "Bad request".to_string(),
+                    is_external: false,
                 })
             })
             .await;
@@ -2444,27 +2465,21 @@ mod tests {
                 Err(CompletionError::HttpError {
                     status_code: 429,
                     message: "Rate limit exceeded".to_string(),
+                    is_external: false,
                 })
             })
             .await;
 
-        // Should fail with "All providers failed" since all providers return 429,
-        // NOT with the raw 429 HttpError (which would mean it short-circuited)
+        // Should fail after trying all providers (not short-circuit on 429)
+        // The error should be sanitized (go through the normal retry path with sanitize_completion_error)
         assert!(result.is_err());
         let err = result.err().expect("Expected an error");
-        match err {
-            CompletionError::CompletionError(msg) => {
-                assert!(
-                    msg.contains("All"),
-                    "Expected 'All providers failed' message, got: {}",
-                    msg
-                );
-            }
-            other => panic!(
-                "Expected CompletionError (all providers failed), got: {:?}",
-                other
-            ),
-        }
+        let err_msg = err.to_string();
+        assert!(
+            err_msg.contains("Provider failed for model"),
+            "Expected sanitized error (went through retry path), got: {}",
+            err_msg
+        );
     }
 
     #[tokio::test]
@@ -2477,25 +2492,19 @@ mod tests {
                 Err(CompletionError::HttpError {
                     status_code: 408,
                     message: "Request timeout".to_string(),
+                    is_external: false,
                 })
             })
             .await;
 
         assert!(result.is_err());
         let err = result.err().expect("Expected an error");
-        match err {
-            CompletionError::CompletionError(msg) => {
-                assert!(
-                    msg.contains("All"),
-                    "Expected 'All providers failed' message, got: {}",
-                    msg
-                );
-            }
-            other => panic!(
-                "Expected CompletionError (all providers failed), got: {:?}",
-                other
-            ),
-        }
+        let err_msg = err.to_string();
+        assert!(
+            err_msg.contains("Provider failed for model"),
+            "Expected sanitized error (went through retry path), got: {}",
+            err_msg
+        );
     }
 
     #[tokio::test]
@@ -2507,6 +2516,7 @@ mod tests {
                 Err(CompletionError::HttpError {
                     status_code: 400,
                     message: "Error at http://192.168.0.1:8000/v1/chat/completions".to_string(),
+                    is_external: false,
                 })
             })
             .await;

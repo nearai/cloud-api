@@ -87,7 +87,7 @@ fn extract_text(item: &serde_json::Value) -> Option<String> {
 
 #[tokio::test]
 async fn test_response_items_saved_on_disconnect() {
-    let (server, _pool, mock, database, _guard) = setup_test_server_with_pool().await;
+    let (server, _pool, mock, database) = setup_test_server_with_pool().await;
     setup_qwen_model(&server).await;
     let org = setup_org_with_credits(&server, 10000000000i64).await;
     let api_key = get_api_key_for_org(&server, org.id.clone()).await;
@@ -200,7 +200,7 @@ async fn test_response_items_saved_on_disconnect() {
 
 #[tokio::test]
 async fn test_signature_returns_stream_disconnected_on_client_disconnect() {
-    let (server, _pool, mock, database, _guard) = setup_test_server_with_pool().await;
+    let (server, _pool, mock, database) = setup_test_server_with_pool().await;
     setup_qwen_model(&server).await;
     let org = setup_org_with_credits(&server, 10000000000i64).await;
     let api_key = get_api_key_for_org(&server, org.id.clone()).await;
@@ -318,7 +318,7 @@ async fn test_signature_returns_stream_disconnected_on_client_disconnect() {
 
 #[tokio::test]
 async fn test_signature_returns_404_when_not_client_disconnect() {
-    let (server, _pool, mock, database, _guard) = setup_test_server_with_pool().await;
+    let (server, _pool, mock, database) = setup_test_server_with_pool().await;
     setup_qwen_model(&server).await;
     let org = setup_org_with_credits(&server, 10000000000i64).await;
     let api_key = get_api_key_for_org(&server, org.id.clone()).await;
@@ -411,7 +411,7 @@ async fn test_signature_returns_404_when_not_client_disconnect() {
 
 #[tokio::test]
 async fn test_chat_completion_signature_returns_stream_disconnected_on_client_disconnect() {
-    let (server, _pool, mock, database, _guard) = setup_test_server_with_pool().await;
+    let (server, _pool, mock, database) = setup_test_server_with_pool().await;
     setup_qwen_model(&server).await;
     let org = setup_org_with_credits(&server, 10000000000i64).await;
     let api_key = get_api_key_for_org(&server, org.id.clone()).await;

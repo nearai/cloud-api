@@ -8,7 +8,7 @@ use common::*;
 
 #[tokio::test]
 async fn test_create_api_key_in_workspace() {
-    let (server, _guard) = setup_test_server().await;
+    let server = setup_test_server().await;
     let org = create_org(&server).await;
 
     let workspaces = list_workspaces(&server, org.id.clone()).await;
@@ -44,7 +44,7 @@ async fn test_create_api_key_in_workspace() {
 
 #[tokio::test]
 async fn test_list_workspace_api_keys() {
-    let (server, _guard) = setup_test_server().await;
+    let server = setup_test_server().await;
     let org = create_org(&server).await;
 
     let workspaces = list_workspaces(&server, org.id.clone()).await;
@@ -92,7 +92,7 @@ async fn test_list_workspace_api_keys() {
 
 #[tokio::test]
 async fn test_api_key_prevents_duplicate_names_in_workspace() {
-    let (server, _guard) = setup_test_server().await;
+    let server = setup_test_server().await;
     let org = create_org(&server).await;
 
     let workspaces = list_workspaces(&server, org.id.clone()).await;
@@ -141,7 +141,7 @@ async fn test_api_key_prevents_duplicate_names_in_workspace() {
 
 #[tokio::test]
 async fn test_api_key_same_name_different_workspaces() {
-    let (server, _guard) = setup_test_server().await;
+    let server = setup_test_server().await;
 
     // Create two different organizations (each with their own workspace)
     let org1 = create_org(&server).await;
@@ -178,7 +178,7 @@ async fn test_api_key_same_name_different_workspaces() {
 
 #[tokio::test]
 async fn test_delete_api_key() {
-    let (server, _guard) = setup_test_server().await;
+    let server = setup_test_server().await;
     let org = create_org(&server).await;
 
     let workspaces = list_workspaces(&server, org.id.clone()).await;
@@ -228,7 +228,7 @@ async fn test_delete_api_key() {
 
 #[tokio::test]
 async fn test_deleted_api_key_cannot_be_used() {
-    let (server, _guard) = setup_test_server().await;
+    let server = setup_test_server().await;
     let org = setup_org_with_credits(&server, 10000000000i64).await; // $10.00 USD
 
     let workspaces = list_workspaces(&server, org.id.clone()).await;
@@ -304,7 +304,7 @@ async fn test_deleted_api_key_cannot_be_used() {
 
 #[tokio::test]
 async fn test_api_key_spend_limit_update() {
-    let (server, _guard) = setup_test_server().await;
+    let server = setup_test_server().await;
     let org = create_org(&server).await;
 
     let workspaces = list_workspaces(&server, org.id.clone()).await;
@@ -382,7 +382,7 @@ async fn test_api_key_spend_limit_update() {
 
 #[tokio::test]
 async fn test_api_key_spend_limit_enforcement() {
-    let (server, _guard) = setup_test_server().await;
+    let server = setup_test_server().await;
     let org = setup_org_with_credits(&server, 10000000000i64).await; // $10.00 USD (high limit)
 
     // Create API key and set a very low limit
@@ -469,7 +469,7 @@ async fn test_api_key_spend_limit_enforcement() {
 
 #[tokio::test]
 async fn test_api_key_limit_enforced_before_org_limit() {
-    let (server, _guard) = setup_test_server().await;
+    let server = setup_test_server().await;
     let org = setup_org_with_credits(&server, 5000000000i64).await; // $5.00 USD
 
     // Create API key with lower limit than org ($2.00)
@@ -515,7 +515,7 @@ async fn test_api_key_limit_enforced_before_org_limit() {
 
 #[tokio::test]
 async fn test_list_workspace_api_keys_with_usage() {
-    let (server, _guard) = setup_test_server().await;
+    let server = setup_test_server().await;
     let org = setup_org_with_credits(&server, 10000000000i64).await; // $10.00 USD
 
     // Get the default workspace
@@ -614,7 +614,7 @@ async fn test_list_workspace_api_keys_with_usage() {
 
 #[tokio::test]
 async fn test_api_key_usage_isolated_between_keys() {
-    let (server, _guard) = setup_test_server().await;
+    let server = setup_test_server().await;
     let org = setup_org_with_credits(&server, 10000000000i64).await; // $10.00 USD
 
     let workspaces = list_workspaces(&server, org.id.clone()).await;
@@ -701,7 +701,7 @@ async fn test_api_key_usage_isolated_between_keys() {
 
 #[tokio::test]
 async fn test_api_key_not_in_other_workspace() {
-    let (server, _guard) = setup_test_server().await;
+    let server = setup_test_server().await;
 
     // Create two separate organizations with workspaces
     let org1 = create_org(&server).await;
@@ -742,7 +742,7 @@ async fn test_api_key_not_in_other_workspace() {
 
 #[tokio::test]
 async fn test_api_key_authentication() {
-    let (server, _guard) = setup_test_server().await;
+    let server = setup_test_server().await;
 
     let (api_key, _) = create_org_and_api_key(&server).await;
 
@@ -788,7 +788,7 @@ async fn test_api_key_authentication() {
 
 #[tokio::test]
 async fn test_api_key_with_expiration() {
-    let (server, _guard) = setup_test_server().await;
+    let server = setup_test_server().await;
     let org = create_org(&server).await;
 
     let workspaces = list_workspaces(&server, org.id.clone()).await;
@@ -832,7 +832,7 @@ async fn test_api_key_with_expiration() {
 
 #[tokio::test]
 async fn test_api_key_name_edge_cases() {
-    let (server, _guard) = setup_test_server().await;
+    let server = setup_test_server().await;
     let org = create_org(&server).await;
 
     let workspaces = list_workspaces(&server, org.id.clone()).await;

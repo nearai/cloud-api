@@ -1,8 +1,9 @@
 #![allow(dead_code)]
-//! Test utilities for e2e tests with isolated database per test.
+//! Test utilities for e2e tests.
 //!
-//! Uses template database pattern: migrations run once on template,
-//! each test clones from template for isolation and speed.
+//! All tests share a single database (bootstrapped once with migrations).
+//! Each test gets its own 4-connection pool. Isolation comes from UUID-scoped
+//! orgs/workspaces/keys, not separate databases.
 
 pub mod db_setup;
 
@@ -25,45 +26,16 @@ use sha3::Keccak256;
 
 pub const MOCK_USER_ID: &str = "11111111-1111-1111-1111-111111111111";
 
-/// RAII guard for test database cleanup.
-pub struct TestDatabaseGuard {
-    db_name: String,
-    db_config: config::DatabaseConfig,
-}
-
-impl Drop for TestDatabaseGuard {
-    fn drop(&mut self) {
-        let db_name = self.db_name.clone();
-        let config = self.db_config.clone();
-
-        if db_name.is_empty() {
-            return;
-        }
-
-        let handle = std::thread::spawn(move || {
-            let rt = tokio::runtime::Runtime::new().unwrap();
-            rt.block_on(async {
-                if let Err(e) = db_setup::drop_test_database(&config, &db_name).await {
-                    eprintln!("Warning: Failed to drop test database '{}': {}", db_name, e);
-                }
-            });
-        });
-
-        if handle.join().is_err() {
-            eprintln!("Warning: Database cleanup thread panicked");
-        }
-    }
-}
-
-pub fn test_config_with_db(db_name: &str) -> ApiConfig {
+pub fn test_config() -> ApiConfig {
     let _ = dotenvy::dotenv();
+    let db_name = db_setup::get_test_db_name();
     ApiConfig {
         server: config::ServerConfig {
             host: std::env::var("SERVER_HOST").unwrap_or_else(|_| "127.0.0.1".to_string()),
             port: std::env::var("SERVER_PORT")
                 .ok()
                 .and_then(|p| p.parse().ok())
-                .unwrap_or(0), // Use port 0 to get a random available port
+                .unwrap_or(0),
         },
         model_discovery: config::ModelDiscoveryConfig {
             discovery_server_url: std::env::var("MODEL_DISCOVERY_SERVER_URL")
@@ -74,7 +46,7 @@ pub fn test_config_with_db(db_name: &str) -> ApiConfig {
             refresh_interval: std::env::var("MODEL_DISCOVERY_REFRESH_INTERVAL")
                 .ok()
                 .and_then(|i| i.parse().ok())
-                .unwrap_or(3600), // 1 hour - large value to avoid refresh during tests
+                .unwrap_or(3600),
             timeout: std::env::var("MODEL_DISCOVERY_TIMEOUT")
                 .ok()
                 .and_then(|t| t.parse().ok())
@@ -97,7 +69,23 @@ pub fn test_config_with_db(db_name: &str) -> ApiConfig {
             near: config::NearConfig::default(),
             admin_domains: vec!["test.com".to_string()],
         },
-        database: db_config_for_tests_with_name(db_name),
+        database: config::DatabaseConfig {
+            primary_app_id: "postgres-test".to_string(),
+            gateway_subdomain: "cvm1.near.ai".to_string(),
+            port: std::env::var("DATABASE_PORT")
+                .ok()
+                .and_then(|p| p.parse().ok())
+                .unwrap_or(5432),
+            host: std::env::var("DATABASE_HOST").ok(),
+            database: db_name,
+            username: std::env::var("DATABASE_USERNAME").unwrap_or_else(|_| "postgres".to_string()),
+            password: std::env::var("DATABASE_PASSWORD").unwrap_or_else(|_| "postgres".to_string()),
+            max_connections: 4,
+            tls_enabled: false,
+            tls_ca_cert_path: None,
+            refresh_interval: 30,
+            mock: false,
+        },
         s3: config::S3Config {
             mock: true,
             bucket: std::env::var("AWS_S3_BUCKET").unwrap_or_else(|_| "test-bucket".to_string()),
@@ -114,31 +102,6 @@ pub fn test_config_with_db(db_name: &str) -> ApiConfig {
         cors: config::CorsConfig::default(),
         external_providers: config::ExternalProvidersConfig::default(),
     }
-}
-
-pub fn test_config() -> ApiConfig {
-    test_config_with_db(&db_setup::get_test_db_name())
-}
-
-fn db_config_for_tests_with_name(db_name: &str) -> config::DatabaseConfig {
-    config::DatabaseConfig {
-        primary_app_id: "postgres-test".to_string(),
-        gateway_subdomain: "cvm1.near.ai".to_string(),
-        port: 5432,
-        host: None,
-        database: db_name.to_string(),
-        username: std::env::var("DATABASE_USERNAME").unwrap_or("postgres".to_string()),
-        password: std::env::var("DATABASE_PASSWORD").unwrap_or("postgres".to_string()),
-        max_connections: 2,
-        tls_enabled: false,
-        tls_ca_cert_path: None,
-        refresh_interval: 30,
-        mock: false,
-    }
-}
-
-fn db_config_for_tests() -> config::DatabaseConfig {
-    db_config_for_tests_with_name(&db_setup::get_test_db_name())
 }
 
 pub fn get_session_id() -> String {
@@ -163,14 +126,6 @@ pub async fn get_access_token_from_refresh_token(
 
     let refresh_response = response.json::<api::models::AccessAndRefreshTokenResponse>();
     refresh_response.access_token
-}
-
-async fn init_database_connection(config: &config::DatabaseConfig) -> Arc<Database> {
-    Arc::new(
-        Database::from_config(config)
-            .await
-            .expect("Failed to connect to database"),
-    )
 }
 
 pub fn use_real_providers() -> bool {
@@ -256,26 +211,21 @@ async fn build_test_server_components_with_real_providers(
     (server, inference_provider_pool)
 }
 
-/// Setup test server. Returns guard that must be held to ensure database cleanup.
-pub async fn setup_test_server() -> (axum_test::TestServer, TestDatabaseGuard) {
-    let (server, _, _, _, guard) = setup_test_server_with_pool().await;
-    (server, guard)
+pub async fn setup_test_server() -> axum_test::TestServer {
+    let (server, _, _, _) = setup_test_server_with_pool().await;
+    server
 }
 
-/// Setup test server with database access. Returns guard that must be held to ensure cleanup.
-pub async fn setup_test_server_with_database(
-) -> (axum_test::TestServer, Arc<Database>, TestDatabaseGuard) {
-    let (server, _, _, database, guard) = setup_test_server_with_pool().await;
-    (server, database, guard)
+pub async fn setup_test_server_with_database() -> (axum_test::TestServer, Arc<Database>) {
+    let (server, _, _, database) = setup_test_server_with_pool().await;
+    (server, database)
 }
 
-/// Setup test server with all components. Returns guard that must be held to ensure cleanup.
 pub async fn setup_test_server_with_pool() -> (
     axum_test::TestServer,
     std::sync::Arc<services::inference_provider_pool::InferenceProviderPool>,
     std::sync::Arc<inference_providers::mock::MockProvider>,
     Arc<Database>,
-    TestDatabaseGuard,
 ) {
     let infra = setup_test_infrastructure().await;
 
@@ -287,16 +237,13 @@ pub async fn setup_test_server_with_pool() -> (
         inference_provider_pool,
         mock_provider,
         infra.database,
-        infra.guard,
     )
 }
 
-/// Setup test server with real providers. Returns guard that must be held to ensure database cleanup.
 pub async fn setup_test_server_real_providers() -> (
     axum_test::TestServer,
     Arc<services::inference_provider_pool::InferenceProviderPool>,
     Arc<Database>,
-    TestDatabaseGuard,
 ) {
     let infra = setup_test_infrastructure_for_real_providers().await;
 
@@ -304,48 +251,25 @@ pub async fn setup_test_server_real_providers() -> (
         build_test_server_components_with_real_providers(infra.database.clone(), infra.config)
             .await;
 
-    (server, inference_provider_pool, infra.database, infra.guard)
+    (server, inference_provider_pool, infra.database)
 }
 
-/// Common test infrastructure setup (database, config, guard)
 struct TestInfrastructure {
     database: Arc<Database>,
     config: config::ApiConfig,
-    guard: TestDatabaseGuard,
 }
 
-/// Initialize common test infrastructure (tracing, database, config)
 async fn setup_test_infrastructure() -> TestInfrastructure {
     let _ = tracing_subscriber::fmt()
         .with_test_writer()
         .with_max_level(tracing::level_filters::LevelFilter::DEBUG)
         .try_init();
 
-    // Generate a unique test ID for this test's database
-    let test_id = uuid::Uuid::new_v4().to_string();
+    let pool = db_setup::create_test_pool().await;
+    let database = Arc::new(Database::new(pool));
+    let config = test_config();
 
-    // Get base config for database connection info
-    let base_db_config = db_config_for_tests();
-
-    // Create a unique database from the template
-    let db_name = db_setup::create_test_database_from_template(&base_db_config, &test_id)
-        .await
-        .expect("Failed to create test database from template");
-
-    // Create config with the new database name
-    let config = test_config_with_db(&db_name);
-    let db_config = config.database.clone();
-
-    // Connect to the new test database
-    let database = init_database_connection(&config.database).await;
-
-    let guard = TestDatabaseGuard { db_name, db_config };
-
-    TestInfrastructure {
-        database,
-        config,
-        guard,
-    }
+    TestInfrastructure { database, config }
 }
 
 async fn setup_test_infrastructure_for_real_providers() -> TestInfrastructure {
@@ -354,57 +278,32 @@ async fn setup_test_infrastructure_for_real_providers() -> TestInfrastructure {
         .with_max_level(tracing::level_filters::LevelFilter::DEBUG)
         .try_init();
 
-    // Generate a unique test ID for this test's database
-    let test_id = uuid::Uuid::new_v4().to_string();
-
-    // Get base config for database connection info
-    let base_db_config = db_config_for_tests();
-
-    // Create a unique database from the template
-    let db_name = db_setup::create_test_database_from_template(&base_db_config, &test_id)
-        .await
-        .expect("Failed to create test database from template");
-
-    let mut config = test_config_with_db(&db_name);
+    let pool = db_setup::create_test_pool().await;
+    let database = Arc::new(Database::new(pool));
+    let mut config = test_config();
     config.model_discovery.discovery_server_url = get_real_discovery_server_url();
     config.model_discovery.timeout = 30;
 
-    let db_config = config.database.clone();
-
-    // Connect to the new test database
-    let database = init_database_connection(&config.database).await;
-
-    let guard = TestDatabaseGuard { db_name, db_config };
-
-    TestInfrastructure {
-        database,
-        config,
-        guard,
-    }
+    TestInfrastructure { database, config }
 }
 
-/// Setup test server with MCP client factory injection.
 pub async fn setup_test_server_with_mcp_factory(
     mcp_client_factory: std::sync::Arc<dyn services::responses::tools::McpClientFactory>,
 ) -> (
     axum_test::TestServer,
     std::sync::Arc<services::inference_provider_pool::InferenceProviderPool>,
     std::sync::Arc<inference_providers::mock::MockProvider>,
-    TestDatabaseGuard,
 ) {
     let infra = setup_test_infrastructure().await;
 
-    // Create mock user in database for foreign key constraints
     assert_mock_user_in_db(&infra.database).await;
 
     let auth_components = init_auth_services(infra.database.clone(), &infra.config);
 
-    // Use mock inference providers
     let (inference_provider_pool, mock_provider) =
         api::init_inference_providers_with_mocks(&infra.config).await;
     let metrics_service = Arc::new(services::metrics::MockMetricsService);
 
-    // Initialize domain services with MCP factory
     let domain_services = api::init_domain_services_with_mcp_factory(
         infra.database.clone(),
         &infra.config,
@@ -423,7 +322,7 @@ pub async fn setup_test_server_with_mcp_factory(
     );
     let server = axum_test::TestServer::new(app).unwrap();
 
-    (server, inference_provider_pool, mock_provider, infra.guard)
+    (server, inference_provider_pool, mock_provider)
 }
 
 pub async fn setup_unique_test_session(database: &Arc<Database>) -> (String, String) {

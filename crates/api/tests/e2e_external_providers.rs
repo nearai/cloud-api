@@ -137,7 +137,7 @@ async fn setup_external_gemini_model(server: &axum_test::TestServer) -> String {
 
 #[tokio::test]
 async fn test_admin_configure_external_openai_model() {
-    let (server, _guard) = setup_test_server().await;
+    let server = setup_test_server().await;
 
     let model_name = setup_external_openai_model(&server).await;
 
@@ -174,7 +174,7 @@ async fn test_admin_configure_external_openai_model() {
 
 #[tokio::test]
 async fn test_admin_configure_external_anthropic_model() {
-    let (server, _guard) = setup_test_server().await;
+    let server = setup_test_server().await;
 
     let model_name = setup_external_anthropic_model(&server).await;
 
@@ -205,7 +205,7 @@ async fn test_admin_configure_external_anthropic_model() {
 
 #[tokio::test]
 async fn test_admin_configure_external_gemini_model() {
-    let (server, _guard) = setup_test_server().await;
+    let server = setup_test_server().await;
 
     let model_name = setup_external_gemini_model(&server).await;
 
@@ -236,7 +236,7 @@ async fn test_admin_configure_external_gemini_model() {
 
 #[tokio::test]
 async fn test_external_model_appears_in_models_list() {
-    let (server, _guard) = setup_test_server().await;
+    let server = setup_test_server().await;
 
     let model_name = setup_external_openai_model(&server).await;
 
@@ -265,7 +265,7 @@ async fn test_external_model_appears_in_models_list() {
 
 #[tokio::test]
 async fn test_external_provider_billing_recorded() {
-    let (server, inference_pool, mock_provider, _, _guard) = setup_test_server_with_pool().await;
+    let (server, inference_pool, mock_provider, _) = setup_test_server_with_pool().await;
 
     // Setup external model
     let model_name = setup_external_openai_model(&server).await;
@@ -338,7 +338,7 @@ async fn test_external_provider_billing_recorded() {
 
 #[tokio::test]
 async fn test_external_model_non_streaming_completion() {
-    let (server, inference_pool, mock_provider, _, _guard) = setup_test_server_with_pool().await;
+    let (server, inference_pool, mock_provider, _) = setup_test_server_with_pool().await;
 
     // Setup external model
     let model_name = setup_external_openai_model(&server).await;
@@ -422,7 +422,7 @@ async fn test_external_model_non_streaming_completion() {
 
 #[tokio::test]
 async fn test_external_model_streaming_completion() {
-    let (server, inference_pool, mock_provider, _, _guard) = setup_test_server_with_pool().await;
+    let (server, inference_pool, mock_provider, _) = setup_test_server_with_pool().await;
 
     // Setup external model
     let model_name = setup_external_openai_model(&server).await;
@@ -490,7 +490,7 @@ async fn test_external_model_streaming_completion() {
 
 #[tokio::test]
 async fn test_external_model_completion_with_anthropic_model() {
-    let (server, inference_pool, mock_provider, _, _guard) = setup_test_server_with_pool().await;
+    let (server, inference_pool, mock_provider, _) = setup_test_server_with_pool().await;
 
     // Setup Anthropic external model
     let model_name = setup_external_anthropic_model(&server).await;
@@ -532,7 +532,7 @@ async fn test_external_model_completion_with_anthropic_model() {
 
 #[tokio::test]
 async fn test_external_model_completion_with_gemini_model() {
-    let (server, inference_pool, mock_provider, _, _guard) = setup_test_server_with_pool().await;
+    let (server, inference_pool, mock_provider, _) = setup_test_server_with_pool().await;
 
     // Setup Gemini external model
     let model_name = setup_external_gemini_model(&server).await;
@@ -574,7 +574,7 @@ async fn test_external_model_completion_with_gemini_model() {
 
 #[tokio::test]
 async fn test_external_model_completion_tracks_usage() {
-    let (server, inference_pool, mock_provider, _, _guard) = setup_test_server_with_pool().await;
+    let (server, inference_pool, mock_provider, _) = setup_test_server_with_pool().await;
 
     // Setup external model with known pricing
     let model_name = setup_external_openai_model(&server).await;
@@ -638,7 +638,7 @@ async fn test_external_model_completion_tracks_usage() {
 
 #[tokio::test]
 async fn test_external_model_completion_insufficient_credits() {
-    let (server, inference_pool, mock_provider, _, _guard) = setup_test_server_with_pool().await;
+    let (server, inference_pool, mock_provider, _) = setup_test_server_with_pool().await;
 
     // Setup external model
     let model_name = setup_external_openai_model(&server).await;
@@ -677,7 +677,7 @@ async fn test_external_model_completion_insufficient_credits() {
 
 #[tokio::test]
 async fn test_external_model_cannot_have_attestation_enabled() {
-    let (server, _guard) = setup_test_server().await;
+    let server = setup_test_server().await;
 
     // Try to create an external model with attestation_supported = true
     // The database constraint should prevent this
@@ -725,10 +725,32 @@ async fn test_external_model_cannot_have_attestation_enabled() {
 
 #[tokio::test]
 async fn test_update_external_provider_config() {
-    let (server, _guard) = setup_test_server().await;
+    let server = setup_test_server().await;
 
-    // First create the model
-    let model_name = setup_external_openai_model(&server).await;
+    // Use a unique model name so config updates don't affect other concurrent tests
+    let model_name = format!("openai/gpt-4o-update-{}", uuid::Uuid::new_v4());
+    let mut create_batch = BatchUpdateModelApiRequest::new();
+    create_batch.insert(
+        model_name.clone(),
+        serde_json::from_value(serde_json::json!({
+            "inputCostPerToken": { "amount": 2500000, "currency": "USD" },
+            "outputCostPerToken": { "amount": 10000000, "currency": "USD" },
+            "modelDisplayName": "GPT-4o (update test)",
+            "modelDescription": "Model for update test",
+            "contextLength": 128000,
+            "verifiable": false,
+            "isActive": true,
+            "providerType": "external",
+            "providerConfig": {
+                "backend": "openai_compatible",
+                "base_url": "https://api.openai.com/v1"
+            },
+            "attestationSupported": false
+        }))
+        .unwrap(),
+    );
+    let created = admin_batch_upsert_models(&server, create_batch, get_session_id()).await;
+    assert_eq!(created.len(), 1);
 
     // Update the provider config (e.g., change base_url)
     let mut batch = BatchUpdateModelApiRequest::new();
@@ -737,7 +759,7 @@ async fn test_update_external_provider_config() {
         serde_json::from_value(serde_json::json!({
             "providerConfig": {
                 "backend": "openai_compatible",
-                "base_url": "https://api.together.xyz/v1"  // Changed to Together AI
+                "base_url": "https://api.together.xyz/v1"
             },
             "changeReason": "Switching to Together AI endpoint"
         }))
@@ -758,10 +780,33 @@ async fn test_update_external_provider_config() {
 
 #[tokio::test]
 async fn test_deactivate_external_model() {
-    let (server, inference_pool, _, _, _guard) = setup_test_server_with_pool().await;
+    let (server, inference_pool, _, _) = setup_test_server_with_pool().await;
 
-    // Setup and then deactivate an external model
-    let model_name = setup_external_openai_model(&server).await;
+    // Use a unique model name so deactivation doesn't affect other concurrent tests
+    let model_name = format!("openai/gpt-4o-deactivate-{}", uuid::Uuid::new_v4());
+    let mut deactivate_batch = BatchUpdateModelApiRequest::new();
+    deactivate_batch.insert(
+        model_name.clone(),
+        serde_json::from_value(serde_json::json!({
+            "inputCostPerToken": { "amount": 2500000, "currency": "USD" },
+            "outputCostPerToken": { "amount": 10000000, "currency": "USD" },
+            "modelDisplayName": "GPT-4o (deactivate test)",
+            "modelDescription": "Model for deactivation test",
+            "contextLength": 128000,
+            "verifiable": false,
+            "isActive": true,
+            "providerType": "external",
+            "providerConfig": {
+                "backend": "openai_compatible",
+                "base_url": "https://api.openai.com/v1"
+            },
+            "attestationSupported": false
+        }))
+        .unwrap(),
+    );
+    let created = admin_batch_upsert_models(&server, deactivate_batch, get_session_id()).await;
+    assert_eq!(created.len(), 1);
+    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
     // Verify model is initially active
     // External providers are registered but we just verify the model was created
@@ -799,7 +844,7 @@ async fn test_deactivate_external_model() {
 
 #[tokio::test]
 async fn test_switch_model_from_vllm_to_external() {
-    let (server, _guard) = setup_test_server().await;
+    let server = setup_test_server().await;
 
     // First create a vLLM model (default)
     let model_name = "test/switchable-model".to_string();
@@ -855,7 +900,7 @@ async fn test_switch_model_from_vllm_to_external() {
 
 #[tokio::test]
 async fn test_batch_create_multiple_external_providers() {
-    let (server, _guard) = setup_test_server().await;
+    let server = setup_test_server().await;
 
     // Create multiple external models in one batch
     let mut batch = BatchUpdateModelApiRequest::new();
@@ -924,10 +969,31 @@ async fn test_batch_create_multiple_external_providers() {
 
 #[tokio::test]
 async fn test_external_model_history_records_provider_config() {
-    let (server, _guard) = setup_test_server().await;
+    let server = setup_test_server().await;
 
-    // Create an external model
-    let model_name = setup_external_openai_model(&server).await;
+    // Use a unique model name so updates don't affect other concurrent tests
+    let model_name = format!("openai/gpt-4o-history-{}", uuid::Uuid::new_v4());
+    let mut create_batch = BatchUpdateModelApiRequest::new();
+    create_batch.insert(
+        model_name.clone(),
+        serde_json::from_value(serde_json::json!({
+            "inputCostPerToken": { "amount": 2500000, "currency": "USD" },
+            "outputCostPerToken": { "amount": 10000000, "currency": "USD" },
+            "modelDisplayName": "GPT-4o (history test)",
+            "modelDescription": "Model for history test",
+            "contextLength": 128000,
+            "verifiable": false,
+            "isActive": true,
+            "providerType": "external",
+            "providerConfig": {
+                "backend": "openai_compatible",
+                "base_url": "https://api.openai.com/v1"
+            },
+            "attestationSupported": false
+        }))
+        .unwrap(),
+    );
+    admin_batch_upsert_models(&server, create_batch, get_session_id()).await;
 
     // Update it to change the config
     let mut batch = BatchUpdateModelApiRequest::new();

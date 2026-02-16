@@ -3,7 +3,7 @@ use common::*;
 
 #[tokio::test]
 async fn test_list_workspaces_invalid_limit() {
-    let (server, _guard) = setup_test_server().await;
+    let server = setup_test_server().await;
     let org = create_org(&server).await;
 
     // Test limit <= 0
@@ -31,7 +31,7 @@ async fn test_list_workspaces_invalid_limit() {
 
 #[tokio::test]
 async fn test_list_workspaces_invalid_offset() {
-    let (server, _guard) = setup_test_server().await;
+    let server = setup_test_server().await;
     let org = create_org(&server).await;
 
     // Test offset < 0
@@ -48,7 +48,7 @@ async fn test_list_workspaces_invalid_offset() {
 
 #[tokio::test]
 async fn test_list_api_keys_invalid_limit() {
-    let (server, _guard) = setup_test_server().await;
+    let server = setup_test_server().await;
     let org = create_org(&server).await;
     let workspaces = list_workspaces(&server, org.id.clone()).await;
     let workspace = workspaces.first().unwrap();
@@ -78,7 +78,7 @@ async fn test_list_api_keys_invalid_limit() {
 
 #[tokio::test]
 async fn test_list_api_keys_invalid_offset() {
-    let (server, _guard) = setup_test_server().await;
+    let server = setup_test_server().await;
     let org = create_org(&server).await;
     let workspaces = list_workspaces(&server, org.id.clone()).await;
     let workspace = workspaces.first().unwrap();

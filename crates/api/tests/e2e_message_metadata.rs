@@ -7,7 +7,7 @@ use serde_json::json;
 /// Test that input message metadata is preserved through create response and retrieved via list_input_items
 #[tokio::test]
 async fn test_input_message_metadata_preserved() {
-    let (server, _, _mock, _db, _guard) = setup_test_server_with_pool().await;
+    let (server, _, _mock, _db) = setup_test_server_with_pool().await;
     let org = setup_org_with_credits(&server, 10000000000i64).await; // $10.00 USD
     let api_key = get_api_key_for_org(&server, org.id).await;
 
@@ -77,7 +77,7 @@ async fn test_input_message_metadata_preserved() {
 /// Test that input message without metadata works (backward compatibility)
 #[tokio::test]
 async fn test_input_message_without_metadata() {
-    let (server, _, _mock, _db, _guard) = setup_test_server_with_pool().await;
+    let (server, _, _mock, _db) = setup_test_server_with_pool().await;
     let org = setup_org_with_credits(&server, 10000000000i64).await; // $10.00 USD
     let api_key = get_api_key_for_org(&server, org.id).await;
 
@@ -138,7 +138,7 @@ async fn test_input_message_without_metadata() {
 /// Test that oversized input message metadata is rejected
 #[tokio::test]
 async fn test_input_message_metadata_size_limit() {
-    let (server, _, _mock, _db, _guard) = setup_test_server_with_pool().await;
+    let (server, _, _mock, _db) = setup_test_server_with_pool().await;
     let org = setup_org_with_credits(&server, 10000000000i64).await; // $10.00 USD
     let api_key = get_api_key_for_org(&server, org.id).await;
 
@@ -192,7 +192,7 @@ async fn test_input_message_metadata_size_limit() {
 /// Test that simple text input still works (without metadata support)
 #[tokio::test]
 async fn test_simple_text_input_no_metadata() {
-    let (server, _, _mock, _db, _guard) = setup_test_server_with_pool().await;
+    let (server, _, _mock, _db) = setup_test_server_with_pool().await;
     let org = setup_org_with_credits(&server, 10000000000i64).await; // $10.00 USD
     let api_key = get_api_key_for_org(&server, org.id).await;
 
@@ -250,7 +250,7 @@ async fn test_simple_text_input_no_metadata() {
 /// Test that conversation items include metadata from user messages
 #[tokio::test]
 async fn test_conversation_items_include_user_message_metadata() {
-    let (server, _, _mock, _db, _guard) = setup_test_server_with_pool().await;
+    let (server, _, _mock, _db) = setup_test_server_with_pool().await;
     let org = setup_org_with_credits(&server, 10000000000i64).await; // $10.00 USD
     let api_key = get_api_key_for_org(&server, org.id).await;
 
@@ -328,7 +328,7 @@ async fn test_conversation_items_include_user_message_metadata() {
 /// Test that conversation items include metadata from multiple messages
 #[tokio::test]
 async fn test_conversation_items_include_multiple_message_metadata() {
-    let (server, _, _mock, _db, _guard) = setup_test_server_with_pool().await;
+    let (server, _, _mock, _db) = setup_test_server_with_pool().await;
     let org = setup_org_with_credits(&server, 10000000000i64).await; // $10.00 USD
     let api_key = get_api_key_for_org(&server, org.id).await;
 
@@ -447,7 +447,7 @@ async fn test_conversation_items_include_multiple_message_metadata() {
 /// Test that conversation items preserve metadata from request-level metadata
 #[tokio::test]
 async fn test_conversation_items_include_request_metadata() {
-    let (server, _, _mock, _db, _guard) = setup_test_server_with_pool().await;
+    let (server, _, _mock, _db) = setup_test_server_with_pool().await;
     let org = setup_org_with_credits(&server, 10000000000i64).await; // $10.00 USD
     let api_key = get_api_key_for_org(&server, org.id).await;
 
@@ -518,7 +518,7 @@ async fn test_conversation_items_include_request_metadata() {
 /// Test that conversation items without metadata work correctly
 #[tokio::test]
 async fn test_conversation_items_without_metadata() {
-    let (server, _, _mock, _db, _guard) = setup_test_server_with_pool().await;
+    let (server, _, _mock, _db) = setup_test_server_with_pool().await;
     let org = setup_org_with_credits(&server, 10000000000i64).await; // $10.00 USD
     let api_key = get_api_key_for_org(&server, org.id).await;
 
@@ -587,7 +587,7 @@ async fn test_conversation_items_without_metadata() {
 /// Test that item-level metadata takes precedence over request-level metadata
 #[tokio::test]
 async fn test_conversation_items_metadata_precedence() {
-    let (server, _, _mock, _db, _guard) = setup_test_server_with_pool().await;
+    let (server, _, _mock, _db) = setup_test_server_with_pool().await;
     let org = setup_org_with_credits(&server, 10000000000i64).await; // $10.00 USD
     let api_key = get_api_key_for_org(&server, org.id).await;
 

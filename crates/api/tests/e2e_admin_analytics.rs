@@ -10,7 +10,7 @@ use services::admin::{OrganizationMetrics, PlatformMetrics, TimeSeriesMetrics};
 
 #[tokio::test]
 async fn test_admin_get_organization_metrics_empty() {
-    let (server, _guard) = setup_test_server().await;
+    let server = setup_test_server().await;
 
     // Create an organization (no usage yet)
     let org = create_org(&server).await;
@@ -86,7 +86,7 @@ async fn test_admin_get_organization_metrics_empty() {
 
 #[tokio::test]
 async fn test_admin_get_organization_metrics_with_usage() {
-    let (server, _guard) = setup_test_server().await;
+    let server = setup_test_server().await;
 
     // Create organization with credits
     let org = setup_org_with_credits(&server, 10000000000i64).await; // $10.00 USD
@@ -181,7 +181,7 @@ async fn test_admin_get_organization_metrics_with_usage() {
 
 #[tokio::test]
 async fn test_admin_get_organization_metrics_with_time_range() {
-    let (server, _guard) = setup_test_server().await;
+    let server = setup_test_server().await;
 
     // Create organization
     let org = create_org(&server).await;
@@ -228,7 +228,7 @@ async fn test_admin_get_organization_metrics_with_time_range() {
 
 #[tokio::test]
 async fn test_admin_get_organization_metrics_invalid_org() {
-    let (server, _guard) = setup_test_server().await;
+    let server = setup_test_server().await;
 
     // Try to get metrics for non-existent organization
     let fake_org_id = uuid::Uuid::new_v4().to_string();
@@ -255,7 +255,7 @@ async fn test_admin_get_organization_metrics_invalid_org() {
 
 #[tokio::test]
 async fn test_admin_get_organization_metrics_invalid_org_id_format() {
-    let (server, _guard) = setup_test_server().await;
+    let server = setup_test_server().await;
 
     // Try with invalid UUID format
     let response = server
@@ -283,7 +283,7 @@ async fn test_admin_get_organization_metrics_invalid_org_id_format() {
 
 #[tokio::test]
 async fn test_admin_get_platform_metrics() {
-    let (server, _guard) = setup_test_server().await;
+    let server = setup_test_server().await;
 
     // Create some organizations to have data
     let _org1 = create_org(&server).await;
@@ -339,7 +339,7 @@ async fn test_admin_get_platform_metrics() {
 
 #[tokio::test]
 async fn test_admin_get_platform_metrics_with_usage() {
-    let (server, _guard) = setup_test_server().await;
+    let server = setup_test_server().await;
 
     // Create organization with credits and make requests
     let org = setup_org_with_credits(&server, 10000000000i64).await; // $10.00 USD
@@ -398,7 +398,7 @@ async fn test_admin_get_platform_metrics_with_usage() {
 
 #[tokio::test]
 async fn test_admin_get_platform_metrics_with_time_range() {
-    let (server, _guard) = setup_test_server().await;
+    let server = setup_test_server().await;
 
     // Get metrics with custom time range
     let now = chrono::Utc::now();
@@ -448,7 +448,7 @@ async fn test_admin_get_platform_metrics_with_time_range() {
 
 #[tokio::test]
 async fn test_admin_get_organization_timeseries() {
-    let (server, _guard) = setup_test_server().await;
+    let server = setup_test_server().await;
 
     // Create organization
     let org = create_org(&server).await;
@@ -497,7 +497,7 @@ async fn test_admin_get_organization_timeseries() {
 
 #[tokio::test]
 async fn test_admin_get_organization_timeseries_with_usage() {
-    let (server, _guard) = setup_test_server().await;
+    let server = setup_test_server().await;
 
     // Create organization with credits
     let org = setup_org_with_credits(&server, 10000000000i64).await;
@@ -550,7 +550,7 @@ async fn test_admin_get_organization_timeseries_with_usage() {
 
 #[tokio::test]
 async fn test_admin_get_organization_timeseries_granularity_hour() {
-    let (server, _guard) = setup_test_server().await;
+    let server = setup_test_server().await;
     let org = create_org(&server).await;
 
     let response = server
@@ -580,7 +580,7 @@ async fn test_admin_get_organization_timeseries_granularity_hour() {
 
 #[tokio::test]
 async fn test_admin_get_organization_timeseries_granularity_week() {
-    let (server, _guard) = setup_test_server().await;
+    let server = setup_test_server().await;
     let org = create_org(&server).await;
 
     let response = server
@@ -610,7 +610,7 @@ async fn test_admin_get_organization_timeseries_granularity_week() {
 
 #[tokio::test]
 async fn test_admin_get_organization_timeseries_invalid_granularity() {
-    let (server, _guard) = setup_test_server().await;
+    let server = setup_test_server().await;
     let org = create_org(&server).await;
 
     let response = server
@@ -649,7 +649,7 @@ async fn test_admin_get_organization_timeseries_invalid_granularity() {
 
 #[tokio::test]
 async fn test_admin_analytics_endpoints_unauthorized() {
-    let (server, _guard) = setup_test_server().await;
+    let server = setup_test_server().await;
     let org = create_org(&server).await;
 
     // Test organization metrics without auth
@@ -686,7 +686,7 @@ async fn test_admin_analytics_endpoints_unauthorized() {
 #[tokio::test]
 #[ignore = "MockAuthService accepts any valid-looking token, so this test cannot verify API key rejection"]
 async fn test_admin_analytics_with_api_key_forbidden() {
-    let (server, _guard) = setup_test_server().await;
+    let server = setup_test_server().await;
     let org = setup_org_with_credits(&server, 10000000000i64).await;
     let api_key = get_api_key_for_org(&server, org.id.clone()).await;
 
@@ -715,7 +715,7 @@ async fn test_admin_analytics_with_api_key_forbidden() {
 
 #[tokio::test]
 async fn test_admin_metrics_model_latency_tracking() {
-    let (server, _guard) = setup_test_server().await;
+    let server = setup_test_server().await;
 
     // Create org and make streaming request (which tracks latency metrics)
     let org = setup_org_with_credits(&server, 10000000000i64).await;
@@ -771,7 +771,7 @@ async fn test_admin_metrics_model_latency_tracking() {
 
 #[tokio::test]
 async fn test_admin_metrics_unique_api_keys_tracking() {
-    let (server, _guard) = setup_test_server().await;
+    let server = setup_test_server().await;
 
     // Create org with multiple API keys
     let org = setup_org_with_credits(&server, 10000000000i64).await;

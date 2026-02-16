@@ -288,7 +288,7 @@ impl AuthServiceTrait for AuthService {
 
         // Generate organization name from user email with random suffix
         let org_name = {
-            use rand::Rng;
+            use rand::RngExt;
             let username = oauth_info.email.split('@').next().unwrap_or("user");
             const CHARSET: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
             let mut rng = rand::rng();

@@ -1091,7 +1091,7 @@ pub mod mock_prompts {
 }
 
 use near_api::signer::NEP413Payload;
-use rand::Rng;
+use rand::RngExt;
 
 pub const NEAR_TEST_ACCOUNT: &str = "testuser.near";
 pub const NEAR_TEST_PUBLIC_KEY: &str = "ed25519:7FmyF5aYxwHKVvpBJxWrRi58EXQhG5KUkCb3Jv8TzWqM";

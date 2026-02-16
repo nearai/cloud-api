@@ -30,14 +30,14 @@ pub enum CompletionError {
     #[error("Invalid model: {0}")]
     InvalidModel(String),
 
-    #[error("Rate limit exceeded")]
-    RateLimitExceeded,
+    #[error("Rate limit exceeded: {0}")]
+    RateLimitExceeded(String),
 
     #[error("Invalid parameters: {0}")]
     InvalidParams(String),
 
-    #[error("Provider error: {0}")]
-    ProviderError(String),
+    #[error("Provider error (HTTP {status_code}): {message}")]
+    ProviderError { status_code: u16, message: String },
 
     #[error("Service overloaded: {0}")]
     ServiceOverloaded(String),

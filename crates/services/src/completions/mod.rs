@@ -532,31 +532,186 @@ impl CompletionServiceImpl {
         operation: &str,
     ) -> ports::CompletionError {
         match error {
-            inference_providers::CompletionError::HttpError { status_code, .. } => match *status_code
-            {
-                503 => ports::CompletionError::ServiceOverloaded(
-                    "The service is temporarily overloaded. Please retry with exponential backoff."
-                        .to_string(),
-                ),
-                400..=499 => {
+            inference_providers::CompletionError::HttpError {
+                status_code,
+                message,
+                is_external,
+            } => match (*status_code, *is_external) {
+                // --- Client errors that should be passed through (both internal and external) ---
+
+                // 400 Bad Request = invalid params (context too long, bad format, etc.)
+                (400, _) => {
                     tracing::warn!(model, status_code, "Client error during {}", operation);
-                    ports::CompletionError::InvalidParams(
-                        "Invalid request parameters. Please check your input and try again."
+                    ports::CompletionError::InvalidParams(message.clone())
+                }
+                // 413 Payload Too Large = client sent too much data
+                (413, _) => {
+                    tracing::warn!(model, status_code, "Payload too large during {}", operation);
+                    ports::CompletionError::InvalidParams(message.clone())
+                }
+                // 422 Unprocessable Entity = invalid request content
+                (422, _) => {
+                    tracing::warn!(
+                        model,
+                        status_code,
+                        "Unprocessable entity during {}",
+                        operation
+                    );
+                    ports::CompletionError::InvalidParams(message.clone())
+                }
+                // 429 Too Many Requests = rate limited
+                (429, _) => {
+                    tracing::warn!(model, status_code, "Rate limited during {}", operation);
+                    ports::CompletionError::RateLimitExceeded(format!(
+                        "Rate limit exceeded by upstream provider for model '{}'. Please retry with exponential backoff.",
+                        model
+                    ))
+                }
+
+                // --- Infrastructure errors that should be masked ---
+
+                // 401/403 = auth errors from our infrastructure — never leak details
+                (401 | 403, _) => {
+                    tracing::error!(
+                        model,
+                        status_code,
+                        provider_message = %message,
+                        "Auth error during {}",
+                        operation
+                    );
+                    ports::CompletionError::ProviderError {
+                        status_code: 500,
+                        message: "The model is currently unavailable. Please try again later."
                             .to_string(),
+                    }
+                }
+                // 404 from external provider = provider can't serve the model, not client's fault
+                (404, true) => {
+                    tracing::error!(
+                        model,
+                        status_code,
+                        provider_message = %message,
+                        "External provider not found during {}",
+                        operation
+                    );
+                    ports::CompletionError::ProviderError {
+                        status_code: 502,
+                        message: "The model is currently unavailable. Please try again later."
+                            .to_string(),
+                    }
+                }
+                // 404 from vLLM = model not found in our infrastructure
+                (404, false) => {
+                    tracing::warn!(model, status_code, "Not found during {}", operation);
+                    ports::CompletionError::InvalidModel(message.clone())
+                }
+                // 408 Request Timeout = provider timed out
+                (408, _) => {
+                    tracing::error!(
+                        model,
+                        status_code,
+                        provider_message = %message,
+                        "Provider timeout during {}",
+                        operation
+                    );
+                    ports::CompletionError::ProviderError {
+                        status_code: 504,
+                        message: "The request timed out. Please try again.".to_string(),
+                    }
+                }
+                // 503 Service Unavailable = service overloaded
+                (503, _) => {
+                    tracing::warn!(
+                        model,
+                        status_code,
+                        "Service overloaded during {}",
+                        operation
+                    );
+                    ports::CompletionError::ServiceOverloaded(
+                        "The service is temporarily overloaded. Please retry with exponential backoff.".to_string(),
                     )
                 }
+                // 5xx = provider error, use generic message
+                (500..=599, _) => {
+                    tracing::error!(
+                        model,
+                        status_code,
+                        provider_message = %message,
+                        "Provider error during {}",
+                        operation
+                    );
+                    ports::CompletionError::ProviderError {
+                        status_code: 502,
+                        message: "The model is currently unavailable. Please try again later."
+                            .to_string(),
+                    }
+                }
+                // Any other external provider error = infrastructure problem, use generic message
+                _ if *is_external => {
+                    tracing::error!(
+                        model,
+                        status_code,
+                        provider_message = %message,
+                        "External provider error during {}",
+                        operation
+                    );
+                    ports::CompletionError::ProviderError {
+                        status_code: 502,
+                        message: "The model is currently unavailable. Please try again later."
+                            .to_string(),
+                    }
+                }
+                // Any other vLLM error = pass through status and message
                 _ => {
-                    tracing::error!(model, status_code, "Provider error during {}", operation);
-                    ports::CompletionError::ProviderError(
-                        "The model is currently unavailable. Please try again later.".to_string(),
-                    )
+                    tracing::warn!(model, status_code, "Provider error during {}", operation);
+                    ports::CompletionError::ProviderError {
+                        status_code: *status_code,
+                        message: message.clone(),
+                    }
                 }
             },
-            _ => {
-                tracing::error!(model, "Provider error during {}: {}", operation, error);
-                ports::CompletionError::ProviderError(
-                    "The model is currently unavailable. Please try again later.".to_string(),
-                )
+            inference_providers::CompletionError::CompletionError(msg) => {
+                if msg.contains("not found in any configured provider") {
+                    ports::CompletionError::InvalidModel(msg.clone())
+                } else {
+                    tracing::error!(
+                        model,
+                        provider_message = %msg,
+                        "Provider error during {}",
+                        operation
+                    );
+                    ports::CompletionError::ProviderError {
+                        status_code: 502,
+                        message: "The model is currently unavailable. Please try again later."
+                            .to_string(),
+                    }
+                }
+            }
+            inference_providers::CompletionError::InvalidResponse(msg) => {
+                tracing::error!(
+                    model,
+                    provider_message = %msg,
+                    "Invalid response during {}",
+                    operation
+                );
+                ports::CompletionError::ProviderError {
+                    status_code: 502,
+                    message: "The model is currently unavailable. Please try again later."
+                        .to_string(),
+                }
+            }
+            inference_providers::CompletionError::Unknown(msg) => {
+                tracing::error!(
+                    model,
+                    provider_message = %msg,
+                    "Unknown error during {}",
+                    operation
+                );
+                ports::CompletionError::ProviderError {
+                    status_code: 502,
+                    message: "The model is currently unavailable. Please try again later."
+                        .to_string(),
+                }
             }
         }
     }
@@ -566,8 +721,8 @@ impl CompletionServiceImpl {
         let error_type = match error {
             ports::CompletionError::InvalidModel(_) => ERROR_TYPE_INVALID_MODEL,
             ports::CompletionError::InvalidParams(_) => ERROR_TYPE_INVALID_PARAMS,
-            ports::CompletionError::RateLimitExceeded => ERROR_TYPE_RATE_LIMIT,
-            ports::CompletionError::ProviderError(_) => ERROR_TYPE_INFERENCE_ERROR,
+            ports::CompletionError::RateLimitExceeded(_) => ERROR_TYPE_RATE_LIMIT,
+            ports::CompletionError::ProviderError { .. } => ERROR_TYPE_INFERENCE_ERROR,
             ports::CompletionError::ServiceOverloaded(_) => ERROR_TYPE_SERVICE_OVERLOADED,
             ports::CompletionError::InternalError(_) => ERROR_TYPE_INTERNAL_ERROR,
         };
@@ -684,8 +839,15 @@ impl CompletionServiceImpl {
                     limit = limit,
                     "Organization concurrent request limit exceeded for model"
                 );
-                self.record_error(&ports::CompletionError::RateLimitExceeded, Some(model_name));
-                return Err(ports::CompletionError::RateLimitExceeded);
+                let msg = format!(
+                    "Concurrent request limit exceeded for model {}. Organization limit: {} concurrent requests per model.",
+                    model_name, limit
+                );
+                self.record_error(
+                    &ports::CompletionError::RateLimitExceeded(msg.clone()),
+                    Some(model_name),
+                );
+                return Err(ports::CompletionError::RateLimitExceeded(msg));
             }
             if counter
                 .compare_exchange_weak(current, current + 1, Ordering::AcqRel, Ordering::Acquire)
@@ -1147,21 +1309,40 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         // Handle timeout and map provider errors
         match result {
             Ok(Ok(response)) => Ok(response),
-            Ok(Err(e)) => {
-                let error_msg = match e {
-                    inference_providers::AudioTranscriptionError::TranscriptionError(msg) => msg,
-                    inference_providers::AudioTranscriptionError::HttpError {
-                        status_code,
+            Ok(Err(e)) => match e {
+                inference_providers::AudioTranscriptionError::TranscriptionError(msg) => {
+                    Err(ports::CompletionError::ProviderError {
+                        status_code: 502,
+                        message: msg,
+                    })
+                }
+                inference_providers::AudioTranscriptionError::HttpError {
+                    status_code,
+                    message,
+                } => {
+                    let mapped_status = match status_code {
+                        401 | 403 => 500,
+                        429 => {
+                            return Err(ports::CompletionError::RateLimitExceeded(
+                                "Rate limit exceeded by upstream provider. Please retry with exponential backoff.".to_string(),
+                            ));
+                        }
+                        503 => {
+                            return Err(ports::CompletionError::ServiceOverloaded(message));
+                        }
+                        500..=599 => 502,
+                        other => other,
+                    };
+                    Err(ports::CompletionError::ProviderError {
+                        status_code: mapped_status,
                         message,
-                    } => {
-                        format!("HTTP {}: {}", status_code, message)
-                    }
-                };
-                Err(ports::CompletionError::ProviderError(error_msg))
-            }
-            Err(_) => Err(ports::CompletionError::ProviderError(
-                "Audio transcription request timed out".to_string(),
-            )),
+                    })
+                }
+            },
+            Err(_) => Err(ports::CompletionError::ProviderError {
+                status_code: 504,
+                message: "Audio transcription request timed out".to_string(),
+            }),
         }
     }
 
@@ -1184,18 +1365,36 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         // The guard will automatically release the slot when this function returns or panics
         let result = self.inference_provider_pool.rerank(params).await;
 
-        // Map provider errors to service errors
-        result.map_err(|e| {
-            let error_msg = match e {
-                inference_providers::RerankError::GenerationError(msg) => msg,
-                inference_providers::RerankError::HttpError {
-                    status_code,
-                    message,
-                } => {
-                    format!("HTTP {}: {}", status_code, message)
+        // Map provider errors to service errors with proper status codes
+        result.map_err(|e| match e {
+            inference_providers::RerankError::GenerationError(msg) => {
+                ports::CompletionError::ProviderError {
+                    status_code: 502,
+                    message: msg,
                 }
-            };
-            ports::CompletionError::ProviderError(error_msg)
+            }
+            inference_providers::RerankError::HttpError {
+                status_code,
+                message,
+            } => match status_code {
+                401 | 403 => ports::CompletionError::ProviderError {
+                    status_code: 500,
+                    message: "The model is currently unavailable. Please try again later."
+                        .to_string(),
+                },
+                429 => ports::CompletionError::RateLimitExceeded(
+                    "Rate limit exceeded by upstream provider. Please retry with exponential backoff.".to_string(),
+                ),
+                503 => ports::CompletionError::ServiceOverloaded(message),
+                500..=599 => ports::CompletionError::ProviderError {
+                    status_code: 502,
+                    message,
+                },
+                other => ports::CompletionError::ProviderError {
+                    status_code: other,
+                    message,
+                },
+            },
         })
     }
 
@@ -1222,18 +1421,36 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
             .score(params, request_hash)
             .await;
 
-        // Map provider errors to service errors
-        result.map_err(|e| {
-            let error_msg = match e {
-                inference_providers::ScoreError::GenerationError(msg) => msg,
-                inference_providers::ScoreError::HttpError {
-                    status_code,
-                    message,
-                } => {
-                    format!("HTTP {}: {}", status_code, message)
+        // Map provider errors to service errors with proper status codes
+        result.map_err(|e| match e {
+            inference_providers::ScoreError::GenerationError(msg) => {
+                ports::CompletionError::ProviderError {
+                    status_code: 502,
+                    message: msg,
                 }
-            };
-            ports::CompletionError::ProviderError(error_msg)
+            }
+            inference_providers::ScoreError::HttpError {
+                status_code,
+                message,
+            } => match status_code {
+                401 | 403 => ports::CompletionError::ProviderError {
+                    status_code: 500,
+                    message: "The model is currently unavailable. Please try again later."
+                        .to_string(),
+                },
+                429 => ports::CompletionError::RateLimitExceeded(
+                    "Rate limit exceeded by upstream provider. Please retry with exponential backoff.".to_string(),
+                ),
+                503 => ports::CompletionError::ServiceOverloaded(message),
+                500..=599 => ports::CompletionError::ProviderError {
+                    status_code: 502,
+                    message,
+                },
+                other => ports::CompletionError::ProviderError {
+                    status_code: other,
+                    message,
+                },
+            },
         })
     }
 
@@ -1797,5 +2014,336 @@ mod tests {
             0,
             "Counter should be 0 after stream dropped"
         );
+    }
+
+    // ============================================
+    // vLLM error mapping tests (is_external: false)
+    // ============================================
+
+    #[test]
+    fn test_map_provider_error_400_preserves_message() {
+        let error = inference_providers::CompletionError::HttpError {
+            status_code: 400,
+            message: "max_tokens must be positive".to_string(),
+            is_external: false,
+        };
+        let result = CompletionServiceImpl::map_provider_error("test-model", &error, "test");
+        match result {
+            ports::CompletionError::InvalidParams(msg) => {
+                assert!(
+                    msg.contains("max_tokens must be positive"),
+                    "Message should be preserved, got: {}",
+                    msg
+                );
+            }
+            other => panic!("Expected InvalidParams, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_map_provider_error_404_becomes_invalid_model() {
+        let error = inference_providers::CompletionError::HttpError {
+            status_code: 404,
+            message: "Model 'deepseek-ai/DeepSeek-V3.1' not found".to_string(),
+            is_external: false,
+        };
+        let result = CompletionServiceImpl::map_provider_error("test-model", &error, "test");
+        match result {
+            ports::CompletionError::InvalidModel(msg) => {
+                assert!(
+                    msg.contains("DeepSeek-V3.1"),
+                    "Message should be preserved, got: {}",
+                    msg
+                );
+            }
+            other => panic!("Expected InvalidModel, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_map_provider_error_429_becomes_rate_limited() {
+        let error = inference_providers::CompletionError::HttpError {
+            status_code: 429,
+            message: "Too many requests".to_string(),
+            is_external: false,
+        };
+        let result = CompletionServiceImpl::map_provider_error("test-model", &error, "test");
+        assert!(
+            matches!(result, ports::CompletionError::RateLimitExceeded(_)),
+            "Expected RateLimitExceeded, got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_map_provider_error_401_masks_auth_details() {
+        let error = inference_providers::CompletionError::HttpError {
+            status_code: 401,
+            message: "Invalid API key for vLLM server at 10.0.0.1".to_string(),
+            is_external: false,
+        };
+        let result = CompletionServiceImpl::map_provider_error("test-model", &error, "test");
+        match result {
+            ports::CompletionError::ProviderError {
+                status_code,
+                message,
+            } => {
+                assert_eq!(status_code, 500, "Auth errors should map to 500");
+                assert!(
+                    !message.contains("API key"),
+                    "Should not expose auth details"
+                );
+                assert!(
+                    !message.contains("10.0.0.1"),
+                    "Should not expose internal IPs"
+                );
+            }
+            other => panic!("Expected ProviderError, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_map_provider_error_503_becomes_service_overloaded() {
+        let error = inference_providers::CompletionError::HttpError {
+            status_code: 503,
+            message: "Service temporarily overloaded".to_string(),
+            is_external: false,
+        };
+        let result = CompletionServiceImpl::map_provider_error("test-model", &error, "test");
+        match result {
+            ports::CompletionError::ServiceOverloaded(msg) => {
+                assert!(
+                    msg.contains("overloaded"),
+                    "Should indicate overloaded status, got: {}",
+                    msg
+                );
+            }
+            other => panic!("Expected ServiceOverloaded, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_map_provider_error_500_becomes_502() {
+        let error = inference_providers::CompletionError::HttpError {
+            status_code: 500,
+            message: "Internal server error from provider".to_string(),
+            is_external: false,
+        };
+        let result = CompletionServiceImpl::map_provider_error("test-model", &error, "test");
+        match result {
+            ports::CompletionError::ProviderError {
+                status_code,
+                message,
+            } => {
+                assert_eq!(status_code, 502, "Provider 500 should map to 502");
+                assert!(
+                    !message.contains("Internal server error from provider"),
+                    "Should not expose provider error details, got: {}",
+                    message
+                );
+                assert!(
+                    message.contains("unavailable"),
+                    "Should use generic message, got: {}",
+                    message
+                );
+            }
+            other => panic!("Expected ProviderError, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_map_provider_error_model_not_found_string() {
+        let error = inference_providers::CompletionError::CompletionError(
+            "Model 'test-model' not found in any configured provider".to_string(),
+        );
+        let result = CompletionServiceImpl::map_provider_error("test-model", &error, "test");
+        match result {
+            ports::CompletionError::InvalidModel(msg) => {
+                assert!(
+                    msg.contains("not found"),
+                    "Message should be preserved, got: {}",
+                    msg
+                );
+            }
+            other => panic!("Expected InvalidModel, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_map_provider_error_connection_error_becomes_502() {
+        let error = inference_providers::CompletionError::CompletionError(
+            "error sending request for url: connection refused".to_string(),
+        );
+        let result = CompletionServiceImpl::map_provider_error("test-model", &error, "test");
+        match result {
+            ports::CompletionError::ProviderError {
+                status_code,
+                message,
+            } => {
+                assert_eq!(status_code, 502, "Connection errors should map to 502");
+                assert!(
+                    !message.contains("connection refused"),
+                    "Should not expose provider error details, got: {}",
+                    message
+                );
+                assert!(
+                    message.contains("unavailable"),
+                    "Should use generic message, got: {}",
+                    message
+                );
+            }
+            other => panic!("Expected ProviderError, got {:?}", other),
+        }
+    }
+
+    // ============================================
+    // External provider error mapping tests (is_external: true)
+    // ============================================
+
+    #[test]
+    fn test_map_provider_error_external_400_becomes_invalid_params() {
+        let error = inference_providers::CompletionError::HttpError {
+            status_code: 400,
+            message: "This model's maximum context length is 131072 tokens".to_string(),
+            is_external: true,
+        };
+        let result = CompletionServiceImpl::map_provider_error("test-model", &error, "test");
+        match result {
+            ports::CompletionError::InvalidParams(msg) => {
+                assert!(
+                    msg.contains("context length"),
+                    "Should preserve client-facing error message, got: {}",
+                    msg
+                );
+            }
+            other => panic!("Expected InvalidParams, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_map_provider_error_external_404_becomes_502() {
+        let error = inference_providers::CompletionError::HttpError {
+            status_code: 404,
+            message: "Model not found on external provider".to_string(),
+            is_external: true,
+        };
+        let result = CompletionServiceImpl::map_provider_error("test-model", &error, "test");
+        match result {
+            ports::CompletionError::ProviderError {
+                status_code,
+                message,
+            } => {
+                assert_eq!(
+                    status_code, 502,
+                    "External 404 should map to 502, not InvalidModel"
+                );
+                assert!(
+                    !message.contains("external provider"),
+                    "Should not expose provider details, got: {}",
+                    message
+                );
+                assert!(
+                    message.contains("unavailable"),
+                    "Should use generic message, got: {}",
+                    message
+                );
+            }
+            other => panic!("Expected ProviderError, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_map_provider_error_external_429_still_rate_limited() {
+        let error = inference_providers::CompletionError::HttpError {
+            status_code: 429,
+            message: "Rate limit exceeded".to_string(),
+            is_external: true,
+        };
+        let result = CompletionServiceImpl::map_provider_error("test-model", &error, "test");
+        assert!(
+            matches!(result, ports::CompletionError::RateLimitExceeded(_)),
+            "External 429 should still be RateLimitExceeded, got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_map_provider_error_external_500_becomes_502() {
+        let error = inference_providers::CompletionError::HttpError {
+            status_code: 500,
+            message: "External provider internal error".to_string(),
+            is_external: true,
+        };
+        let result = CompletionServiceImpl::map_provider_error("test-model", &error, "test");
+        match result {
+            ports::CompletionError::ProviderError { status_code, .. } => {
+                assert_eq!(status_code, 502, "External 500 should map to 502");
+            }
+            other => panic!("Expected ProviderError, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_map_provider_error_408_becomes_504() {
+        let error = inference_providers::CompletionError::HttpError {
+            status_code: 408,
+            message: "Request timeout".to_string(),
+            is_external: true,
+        };
+        let result = CompletionServiceImpl::map_provider_error("test-model", &error, "test");
+        match result {
+            ports::CompletionError::ProviderError {
+                status_code,
+                message,
+            } => {
+                assert_eq!(status_code, 504, "408 should map to 504 gateway timeout");
+                assert!(
+                    message.contains("timed out"),
+                    "Should indicate timeout, got: {}",
+                    message
+                );
+            }
+            other => panic!("Expected ProviderError, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_map_provider_error_413_becomes_invalid_params() {
+        let error = inference_providers::CompletionError::HttpError {
+            status_code: 413,
+            message: "Request body too large".to_string(),
+            is_external: false,
+        };
+        let result = CompletionServiceImpl::map_provider_error("test-model", &error, "test");
+        match result {
+            ports::CompletionError::InvalidParams(msg) => {
+                assert!(
+                    msg.contains("too large"),
+                    "Should preserve message, got: {}",
+                    msg
+                );
+            }
+            other => panic!("Expected InvalidParams, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_map_provider_error_422_becomes_invalid_params() {
+        let error = inference_providers::CompletionError::HttpError {
+            status_code: 422,
+            message: "Invalid parameter: temperature must be between 0 and 2".to_string(),
+            is_external: true,
+        };
+        let result = CompletionServiceImpl::map_provider_error("test-model", &error, "test");
+        match result {
+            ports::CompletionError::InvalidParams(msg) => {
+                assert!(
+                    msg.contains("temperature"),
+                    "Should preserve message, got: {}",
+                    msg
+                );
+            }
+            other => panic!("Expected InvalidParams, got {:?}", other),
+        }
     }
 }

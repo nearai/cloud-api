@@ -98,7 +98,9 @@ pub async fn list_models(
                 owned_by: model.owned_by.clone(),
                 aliases: model.aliases.clone(),
                 provider_type: model.provider_type.clone(),
-                provider_config: model.provider_config.clone(),
+                provider_config: crate::routes::common::redact_provider_config(
+                    model.provider_config.clone(),
+                ),
                 attestation_supported: model.attestation_supported,
                 architecture: ModelArchitecture::from_options(
                     model.input_modalities.clone(),
@@ -195,7 +197,7 @@ pub async fn get_model_by_name(
             owned_by: model.owned_by,
             aliases: model.aliases,
             provider_type: model.provider_type,
-            provider_config: model.provider_config,
+            provider_config: crate::routes::common::redact_provider_config(model.provider_config),
             attestation_supported: model.attestation_supported,
             architecture: ModelArchitecture::from_options(
                 model.input_modalities,

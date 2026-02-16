@@ -1438,6 +1438,13 @@ impl InferenceProviderPool {
         model_name: &str,
         provider_config: serde_json::Value,
     ) -> Result<(Arc<InferenceProviderTrait>, String), String> {
+        // Extract and remove per-model api_key from raw JSON before deserializing into ProviderConfig
+        let mut provider_config = provider_config;
+        let per_model_api_key = provider_config
+            .as_object_mut()
+            .and_then(|obj| obj.remove("api_key"))
+            .and_then(|v| v.as_str().map(String::from));
+
         let config: ProviderConfig = serde_json::from_value(provider_config)
             .map_err(|e| format!("Failed to parse provider config: {e}"))?;
 
@@ -1447,17 +1454,20 @@ impl InferenceProviderPool {
             ProviderConfig::Gemini { .. } => "gemini".to_string(),
         };
 
-        let api_key = self
-            .external_configs
-            .get_api_key(&backend_type)
+        let api_key = per_model_api_key
+            .or_else(|| {
+                self.external_configs
+                    .get_api_key(&backend_type)
+                    .map(|s| s.to_string())
+            })
             .ok_or_else(|| {
                 format!(
                     "No API key configured for backend type '{}'. \
-                     Set the appropriate environment variable (e.g., OPENAI_API_KEY, ANTHROPIC_API_KEY, GEMINI_API_KEY)",
+                     Set the appropriate environment variable (e.g., OPENAI_API_KEY, ANTHROPIC_API_KEY, GEMINI_API_KEY) \
+                     or include 'api_key' in the model's providerConfig",
                     backend_type
                 )
-            })?
-            .to_string();
+            })?;
 
         let external_config = ExternalProviderConfig {
             model_name: model_name.to_string(),

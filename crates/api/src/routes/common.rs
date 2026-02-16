@@ -287,6 +287,24 @@ pub fn validate_encryption_headers(
     })
 }
 
+/// Redact sensitive fields (e.g. `api_key`) from a `provider_config` JSON value.
+///
+/// Replaces `api_key` with `"***"` so callers can tell whether one is configured
+/// without exposing the actual value.
+pub fn redact_provider_config(config: Option<serde_json::Value>) -> Option<serde_json::Value> {
+    config.map(|mut v| {
+        if let Some(obj) = v.as_object_mut() {
+            if obj.contains_key("api_key") {
+                obj.insert(
+                    "api_key".to_string(),
+                    serde_json::Value::String("***".to_string()),
+                );
+            }
+        }
+        v
+    })
+}
+
 /// Map OrganizationError to HTTP response
 pub fn map_organization_error(
     error: OrganizationError,

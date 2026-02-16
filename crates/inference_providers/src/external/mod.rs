@@ -96,7 +96,7 @@ fn default_anthropic_version() -> String {
 }
 
 /// Configuration for an external provider
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ExternalProviderConfig {
     /// Model name (used for routing)
     pub model_name: String,
@@ -106,6 +106,17 @@ pub struct ExternalProviderConfig {
     pub api_key: String,
     /// Request timeout in seconds
     pub timeout_seconds: i64,
+}
+
+impl std::fmt::Debug for ExternalProviderConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ExternalProviderConfig")
+            .field("model_name", &self.model_name)
+            .field("provider_config", &self.provider_config)
+            .field("api_key", &"[REDACTED]")
+            .field("timeout_seconds", &self.timeout_seconds)
+            .finish()
+    }
 }
 
 /// External provider facade

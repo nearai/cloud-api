@@ -704,6 +704,13 @@ pub fn build_app_with_config(
         rate_limit_state.clone(),
     );
 
+    let gateway_routes = build_gateway_routes(
+        app_state.clone(),
+        &auth_components.auth_state_middleware,
+        usage_state.clone(),
+        rate_limit_state.clone(),
+    );
+
     let response_routes = build_response_routes(
         domain_services.response_service,
         domain_services.attestation_service.clone(),
@@ -795,6 +802,7 @@ pub fn build_app_with_config(
                 .merge(files_routes)
                 .merge(billing_routes)
                 .merge(usage_recording_routes)
+                .merge(gateway_routes)
                 .merge(health_routes),
         )
         .merge(openapi_routes)
@@ -1161,6 +1169,34 @@ pub fn build_usage_recording_routes(
 ) -> Router {
     Router::new()
         .route("/usage", post(crate::routes::usage::record_usage))
+        .with_state(app_state)
+        .layer(from_fn_with_state(
+            usage_state,
+            middleware::usage_check_middleware,
+        ))
+        .layer(from_fn_with_state(
+            rate_limit_state,
+            middleware::api_key_rate_limit_middleware,
+        ))
+        .layer(from_fn_with_state(
+            auth_state_middleware.clone(),
+            middleware::auth::auth_middleware_with_workspace_context,
+        ))
+}
+
+/// Build gateway routes for external model gateways to validate API keys.
+/// Reuses the same auth, rate limiting, and usage check middleware as completions.
+pub fn build_gateway_routes(
+    app_state: AppState,
+    auth_state_middleware: &AuthState,
+    usage_state: middleware::UsageState,
+    rate_limit_state: middleware::RateLimitState,
+) -> Router {
+    Router::new()
+        .route(
+            "/check_api_key",
+            post(crate::routes::gateway::check_api_key),
+        )
         .with_state(app_state)
         .layer(from_fn_with_state(
             usage_state,

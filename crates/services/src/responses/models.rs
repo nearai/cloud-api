@@ -106,6 +106,15 @@ pub enum ResponseInputItem {
         server_label: String,
         tools: Vec<McpDiscoveredTool>,
     },
+    /// Output from a client-executed function call
+    FunctionCallOutput {
+        #[serde(rename = "type")]
+        type_: FunctionCallOutputType,
+        /// The call_id from the FunctionCall output that this is a response to
+        call_id: String,
+        /// Result of the function execution (typically JSON string)
+        output: String,
+    },
     Message {
         role: String,
         content: ResponseContent,
@@ -127,6 +136,7 @@ impl ResponseInputItem {
             ResponseInputItem::Message { role, .. } => Some(role),
             ResponseInputItem::McpApprovalResponse { .. } => None,
             ResponseInputItem::McpListTools { .. } => None,
+            ResponseInputItem::FunctionCallOutput { .. } => None,
         }
     }
 
@@ -135,6 +145,7 @@ impl ResponseInputItem {
             ResponseInputItem::Message { content, .. } => Some(content),
             ResponseInputItem::McpApprovalResponse { .. } => None,
             ResponseInputItem::McpListTools { .. } => None,
+            ResponseInputItem::FunctionCallOutput { .. } => None,
         }
     }
 
@@ -143,6 +154,7 @@ impl ResponseInputItem {
             ResponseInputItem::Message { metadata, .. } => metadata.as_ref(),
             ResponseInputItem::McpApprovalResponse { .. } => None,
             ResponseInputItem::McpListTools { .. } => None,
+            ResponseInputItem::FunctionCallOutput { .. } => None,
         }
     }
 
@@ -159,6 +171,20 @@ impl ResponseInputItem {
             } => Some((approval_request_id, *approve)),
             ResponseInputItem::Message { .. } => None,
             ResponseInputItem::McpListTools { .. } => None,
+            ResponseInputItem::FunctionCallOutput { .. } => None,
+        }
+    }
+
+    pub fn is_function_call_output(&self) -> bool {
+        matches!(self, ResponseInputItem::FunctionCallOutput { .. })
+    }
+
+    pub fn as_function_call_output(&self) -> Option<(&str, &str)> {
+        match self {
+            ResponseInputItem::FunctionCallOutput {
+                call_id, output, ..
+            } => Some((call_id, output)),
+            _ => None,
         }
     }
 }
@@ -168,6 +194,13 @@ impl ResponseInputItem {
 pub enum McpApprovalResponseType {
     #[serde(rename = "mcp_approval_response")]
     McpApprovalResponse,
+}
+
+/// Type marker for function call output input
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq)]
+pub enum FunctionCallOutputType {
+    #[serde(rename = "function_call_output")]
+    FunctionCallOutput,
 }
 
 /// Content can be text or array of content parts
@@ -569,6 +602,48 @@ pub enum ResponseOutputItem {
         arguments: String,
         model: String,
     },
+    /// Function call requiring client execution
+    /// Emitted when the LLM calls an external function that must be executed by the client.
+    /// The client should execute the function and submit a FunctionCallOutput input.
+    #[serde(rename = "function_call")]
+    FunctionCall {
+        id: String,
+        #[serde(default)]
+        response_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        previous_response_id: Option<String>,
+        #[serde(default)]
+        next_response_ids: Vec<String>,
+        #[serde(default)]
+        created_at: i64,
+        /// The LLM's tool_call_id for correlation with FunctionCallOutput
+        call_id: String,
+        /// Function name
+        name: String,
+        /// JSON-encoded arguments
+        arguments: String,
+        /// Status: "in_progress" when pending client execution
+        status: String,
+        model: String,
+    },
+    /// Result of a client-executed function call.
+    /// Stored when the client submits a FunctionCallOutput input item.
+    #[serde(rename = "function_call_output")]
+    FunctionCallOutput {
+        id: String,
+        #[serde(default)]
+        response_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        previous_response_id: Option<String>,
+        #[serde(default)]
+        next_response_ids: Vec<String>,
+        #[serde(default)]
+        created_at: i64,
+        /// The call_id from the FunctionCall this is a response to
+        call_id: String,
+        /// Result of the function execution
+        output: String,
+    },
 }
 
 impl ResponseOutputItem {
@@ -582,6 +657,8 @@ impl ResponseOutputItem {
             ResponseOutputItem::McpListTools { id, .. } => id,
             ResponseOutputItem::McpCall { id, .. } => id,
             ResponseOutputItem::McpApprovalRequest { id, .. } => id,
+            ResponseOutputItem::FunctionCall { id, .. } => id,
+            ResponseOutputItem::FunctionCallOutput { id, .. } => id,
         }
     }
 
@@ -595,6 +672,8 @@ impl ResponseOutputItem {
             ResponseOutputItem::McpListTools { .. } => ResponseItemStatus::Completed,
             ResponseOutputItem::McpCall { .. } => ResponseItemStatus::Completed,
             ResponseOutputItem::McpApprovalRequest { .. } => ResponseItemStatus::InProgress,
+            ResponseOutputItem::FunctionCall { .. } => ResponseItemStatus::InProgress,
+            ResponseOutputItem::FunctionCallOutput { .. } => ResponseItemStatus::Completed,
         }
     }
 
@@ -608,6 +687,8 @@ impl ResponseOutputItem {
             ResponseOutputItem::McpListTools { .. } => None,
             ResponseOutputItem::McpCall { model, .. } => Some(model),
             ResponseOutputItem::McpApprovalRequest { model, .. } => Some(model),
+            ResponseOutputItem::FunctionCall { model, .. } => Some(model),
+            ResponseOutputItem::FunctionCallOutput { .. } => None,
         }
     }
 
@@ -621,6 +702,8 @@ impl ResponseOutputItem {
             ResponseOutputItem::McpListTools { .. } => None,
             ResponseOutputItem::McpCall { response_id, .. } => Some(response_id),
             ResponseOutputItem::McpApprovalRequest { response_id, .. } => Some(response_id),
+            ResponseOutputItem::FunctionCall { response_id, .. } => Some(response_id),
+            ResponseOutputItem::FunctionCallOutput { response_id, .. } => Some(response_id),
         }
     }
 
@@ -649,6 +732,14 @@ impl ResponseOutputItem {
                 ..
             } => previous_response_id.as_deref(),
             ResponseOutputItem::McpApprovalRequest {
+                previous_response_id,
+                ..
+            } => previous_response_id.as_deref(),
+            ResponseOutputItem::FunctionCall {
+                previous_response_id,
+                ..
+            } => previous_response_id.as_deref(),
+            ResponseOutputItem::FunctionCallOutput {
                 previous_response_id,
                 ..
             } => previous_response_id.as_deref(),

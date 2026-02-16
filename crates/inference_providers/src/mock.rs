@@ -95,7 +95,7 @@ impl RequestMatcher {
             .iter()
             .filter_map(|msg| msg.content.as_ref())
             .filter_map(|c| match c {
-                serde_json::Value::String(s) => Some(s.clone()),
+                serde_json::Value::String(s) if !s.is_empty() => Some(s.clone()),
                 serde_json::Value::Array(parts) => {
                     // Extract text from content parts array
                     let text: String = parts

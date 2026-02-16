@@ -4,8 +4,17 @@
 //! to the inference provider format used by the LLM, and parsing tool calls
 //! from LLM responses.
 
+use uuid::Uuid;
+
 use crate::responses::models::{CreateResponseRequest, ResponseTool, ResponseToolChoice};
 use crate::responses::service_helpers::ToolCallInfo;
+
+/// Resolve tool call ID: use LLM-provided id or generate a deterministic fallback.
+/// When the LLM omits tool_call.id, we generate once here so all downstream code
+/// (assistant message, event emission, stored FunctionCall) shares the same value.
+fn resolve_tool_call_id(id_opt: Option<String>, tool_name: &str) -> String {
+    id_opt.unwrap_or_else(|| format!("{}_{}", tool_name, Uuid::new_v4().simple()))
+}
 
 /// Special tool type for error tool calls (malformed calls from LLM)
 pub const ERROR_TOOL_TYPE: &str = "__error__";
@@ -44,6 +53,40 @@ pub fn get_tool_names(request: &CreateResponseRequest) -> Vec<String> {
                 // MCP tools are dynamically discovered - we don't know actual tool names
                 // until the MCP server is queried asynchronously later
                 ResponseTool::Mcp { .. } => {}
+            }
+        }
+    }
+
+    names
+}
+
+/// Extract client-executed tool names from request tools configuration
+///
+/// Returns names of tools that are executed by the client (not the server):
+/// - Custom function tools (ResponseTool::Function)
+/// - CodeInterpreter tool (no server-side implementation, client must execute)
+/// - Computer tool (no server-side implementation, client must execute)
+///
+/// These tools have their own parameter schemas and don't require a 'query' parameter.
+/// When the LLM calls these tools, the response pauses and returns the tool call
+/// to the client for external execution.
+pub fn get_function_tool_names(request: &CreateResponseRequest) -> Vec<String> {
+    let mut names = Vec::new();
+
+    if let Some(tools) = &request.tools {
+        for tool in tools {
+            match tool {
+                ResponseTool::Function { name, .. } => {
+                    names.push(name.clone());
+                }
+                ResponseTool::CodeInterpreter {} => {
+                    names.push(CODE_INTERPRETER_TOOL_NAME.to_string());
+                }
+                ResponseTool::Computer {} => {
+                    names.push(COMPUTER_TOOL_NAME.to_string());
+                }
+                // Other tools are server-executed, not client-executed
+                _ => {}
             }
         }
     }
@@ -453,11 +496,11 @@ fn parse_tool_args(tool_name: &str, args_str: &str) -> ParseArgsResult {
 fn create_invalid_json_error(
     name: &str,
     idx: i64,
-    id: Option<String>,
+    id: String,
     thought_signature: Option<String>,
 ) -> ToolCallInfo {
     ToolCallInfo {
-        id,
+        id: Some(id),
         tool_type: ERROR_TOOL_TYPE.to_string(),
         query: format!(
             "Tool call for '{name}' (index {idx}) has invalid JSON arguments. \
@@ -476,11 +519,11 @@ fn create_invalid_json_error(
 fn create_missing_query_error(
     name: &str,
     idx: i64,
-    id: Option<String>,
+    id: String,
     thought_signature: Option<String>,
 ) -> ToolCallInfo {
     ToolCallInfo {
-        id,
+        id: Some(id),
         tool_type: ERROR_TOOL_TYPE.to_string(),
         query: format!(
             "Tool call for '{name}' (index {idx}) is missing the required 'query' field \
@@ -507,10 +550,15 @@ fn create_missing_query_error(
 /// The `available_tool_names` parameter is used to infer the tool name when
 /// the model doesn't provide one (e.g., GLM-4.6 intermittently omits function.name).
 /// If only one tool is available and the name is missing, we default to that tool.
+///
+/// The `function_tool_names` parameter is used to identify custom function tools
+/// that don't require a 'query' parameter. These tools have their own parameter
+/// schemas (e.g., get_weather uses {"location": "..."} instead of {"query": "..."}).
 pub fn convert_tool_calls(
     tool_call_accumulator: crate::responses::service_helpers::ToolCallAccumulator,
     model: &str,
     available_tool_names: &[String],
+    function_tool_names: &[String],
 ) -> Vec<ToolCallInfo> {
     let mut tool_calls_detected = Vec::new();
 
@@ -548,8 +596,9 @@ pub fn convert_tool_calls(
                         args = args_str,
                         "Tool call missing name - arguments for debugging"
                     );
+                    let id = resolve_tool_call_id(id_opt, ERROR_TOOL_TYPE);
                     tool_calls_detected.push(ToolCallInfo {
-                        id: id_opt,
+                        id: Some(id),
                         tool_type: ERROR_TOOL_TYPE.to_string(),
                         query: format!(
                             "Tool call at index {idx} is missing a tool name. \
@@ -598,7 +647,7 @@ pub fn convert_tool_calls(
                 tool_calls_detected.push(create_invalid_json_error(
                     &name,
                     idx,
-                    id_opt,
+                    resolve_tool_call_id(id_opt, &name),
                     thought_signature,
                 ));
                 continue;
@@ -609,10 +658,17 @@ pub fn convert_tool_calls(
         // - MCP tools (format: "server_label:tool_name")
         // - code_interpreter (uses "code" parameter)
         // - computer (uses "action" parameter)
-        if name.contains(':') || name == CODE_INTERPRETER_TOOL_NAME || name == COMPUTER_TOOL_NAME {
+        // - Custom function tools (use their own parameter schemas)
+        let is_function_tool = function_tool_names.contains(&name);
+        if name.contains(':')
+            || name == CODE_INTERPRETER_TOOL_NAME
+            || name == COMPUTER_TOOL_NAME
+            || is_function_tool
+        {
             tracing::debug!("Tool call detected (no query required): {}", name);
+            let id = resolve_tool_call_id(id_opt, &name);
             tool_calls_detected.push(ToolCallInfo {
-                id: id_opt,
+                id: Some(id),
                 tool_type: name,
                 query: String::new(),
                 params: Some(args),
@@ -620,8 +676,9 @@ pub fn convert_tool_calls(
             });
         } else if let Some(query) = args.get("query").and_then(|v| v.as_str()) {
             tracing::debug!("Tool call detected: {}", name);
+            let id = resolve_tool_call_id(id_opt, &name);
             tool_calls_detected.push(ToolCallInfo {
-                id: id_opt,
+                id: Some(id),
                 tool_type: name,
                 query: query.to_string(),
                 params: Some(args),
@@ -637,7 +694,7 @@ pub fn convert_tool_calls(
             tool_calls_detected.push(create_missing_query_error(
                 &name,
                 idx,
-                id_opt,
+                resolve_tool_call_id(id_opt, &name),
                 thought_signature,
             ));
         }
@@ -797,11 +854,40 @@ mod tests {
             },
         );
 
-        let result = convert_tool_calls(accumulator, "test-model", &[]);
+        let result = convert_tool_calls(accumulator, "test-model", &[], &[]);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].id, Some("call_123".to_string()));
         assert_eq!(result[0].tool_type, "web_search");
         assert_eq!(result[0].query, "test search");
+    }
+
+    #[test]
+    fn test_convert_tool_calls_generates_id_when_omitted() {
+        // When LLM omits tool_call.id, we generate once so all downstream code shares the same value
+        let mut accumulator = HashMap::new();
+        accumulator.insert(
+            0,
+            ToolCallAccumulatorEntry {
+                id: None,
+                name: Some("get_weather".to_string()),
+                arguments: r#"{"location": "NYC"}"#.to_string(),
+                thought_signature: None,
+            },
+        );
+
+        let result = convert_tool_calls(
+            accumulator,
+            "test-model",
+            &["get_weather".to_string()],
+            &["get_weather".to_string()],
+        );
+        assert_eq!(result.len(), 1);
+        let id = result[0].id.as_ref().expect("id must be set");
+        assert!(
+            id.starts_with("get_weather_"),
+            "Generated id should be {{tool_name}}_{{uuid}}, got: {id}"
+        );
+        assert!(id.len() > "get_weather_".len());
     }
 
     #[test]
@@ -817,7 +903,7 @@ mod tests {
             },
         );
 
-        let result = convert_tool_calls(accumulator, "test-model", &[]);
+        let result = convert_tool_calls(accumulator, "test-model", &[], &[]);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].id, Some("call_456".to_string()));
         assert_eq!(result[0].tool_type, "web_search");
@@ -839,7 +925,7 @@ mod tests {
         );
 
         let available_tools = vec!["web_search".to_string(), "file_search".to_string()];
-        let result = convert_tool_calls(accumulator, "test-model", &available_tools);
+        let result = convert_tool_calls(accumulator, "test-model", &available_tools, &[]);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].tool_type, ERROR_TOOL_TYPE);
         assert_eq!(result[0].id, Some("call_789".to_string())); // ID preserved even in error
@@ -861,7 +947,7 @@ mod tests {
         );
 
         let available_tools = vec!["web_search".to_string()];
-        let result = convert_tool_calls(accumulator, "test-model", &available_tools);
+        let result = convert_tool_calls(accumulator, "test-model", &available_tools, &[]);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].id, Some("call_abc".to_string()));
         assert_eq!(result[0].tool_type, "web_search");
@@ -882,7 +968,7 @@ mod tests {
             },
         );
 
-        let result = convert_tool_calls(accumulator, "test-model", &[]);
+        let result = convert_tool_calls(accumulator, "test-model", &[], &[]);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].tool_type, ERROR_TOOL_TYPE);
     }
@@ -900,7 +986,7 @@ mod tests {
             },
         );
 
-        let result = convert_tool_calls(accumulator, "test-model", &[]);
+        let result = convert_tool_calls(accumulator, "test-model", &[], &[]);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].id, Some("toolu_xyz".to_string()));
         assert_eq!(result[0].tool_type, "server:tool_name");
@@ -921,10 +1007,157 @@ mod tests {
             },
         );
 
-        let result = convert_tool_calls(accumulator, "test-model", &[]);
+        let result = convert_tool_calls(accumulator, "test-model", &[], &[]);
         assert_eq!(result.len(), 1);
         // Should return an error, not attempt repair
         assert_eq!(result[0].tool_type, ERROR_TOOL_TYPE);
         assert_eq!(result[0].id, Some("call_err".to_string())); // ID preserved in error
+    }
+
+    #[test]
+    fn test_convert_tool_calls_function_tool_without_query() {
+        // Custom function tools (like get_weather) don't use 'query' parameter.
+        // They have their own parameter schemas (e.g., {"location": "Tokyo"}).
+        // This should work without requiring a 'query' field.
+        let mut accumulator = HashMap::new();
+        accumulator.insert(
+            0,
+            ToolCallAccumulatorEntry {
+                id: Some("call_func_123".to_string()),
+                name: Some("get_weather".to_string()),
+                arguments: r#"{"location": "Tokyo"}"#.to_string(),
+                thought_signature: None,
+            },
+        );
+
+        // Pass the function tool name in the function_tool_names parameter
+        let function_tool_names = vec!["get_weather".to_string()];
+        let result = convert_tool_calls(accumulator, "test-model", &[], &function_tool_names);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].id, Some("call_func_123".to_string()));
+        assert_eq!(result[0].tool_type, "get_weather");
+        assert!(result[0].query.is_empty()); // Function tools don't require query
+        assert!(result[0].params.is_some());
+        let params = result[0].params.as_ref().unwrap();
+        assert_eq!(
+            params.get("location").and_then(|v| v.as_str()),
+            Some("Tokyo")
+        );
+    }
+
+    #[test]
+    fn test_convert_tool_calls_function_tool_not_in_list_requires_query() {
+        // A tool that is NOT in the function_tool_names list should still require 'query'
+        let mut accumulator = HashMap::new();
+        accumulator.insert(
+            0,
+            ToolCallAccumulatorEntry {
+                id: Some("call_other".to_string()),
+                name: Some("other_tool".to_string()),
+                arguments: r#"{"param": "value"}"#.to_string(),
+                thought_signature: None,
+            },
+        );
+
+        // other_tool is not in function_tool_names, so it should require 'query'
+        let function_tool_names = vec!["get_weather".to_string()];
+        let result = convert_tool_calls(accumulator, "test-model", &[], &function_tool_names);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].tool_type, ERROR_TOOL_TYPE); // Should error due to missing query
+    }
+
+    #[test]
+    fn test_convert_tool_calls_code_interpreter_without_query() {
+        // code_interpreter doesn't use 'query' - it uses 'code' parameter
+        let mut accumulator = HashMap::new();
+        accumulator.insert(
+            0,
+            ToolCallAccumulatorEntry {
+                id: Some("call_code".to_string()),
+                name: Some("code_interpreter".to_string()),
+                arguments: r#"{"code": "print('Hello World')"}"#.to_string(),
+                thought_signature: None,
+            },
+        );
+
+        // code_interpreter is detected by name constant, not function_tool_names
+        let result = convert_tool_calls(accumulator, "test-model", &[], &[]);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].id, Some("call_code".to_string()));
+        assert_eq!(result[0].tool_type, "code_interpreter");
+        assert!(result[0].query.is_empty()); // code_interpreter doesn't require query
+    }
+
+    #[test]
+    fn test_convert_tool_calls_computer_without_query() {
+        // computer doesn't use 'query' - it uses 'action' parameter
+        let mut accumulator = HashMap::new();
+        accumulator.insert(
+            0,
+            ToolCallAccumulatorEntry {
+                id: Some("call_computer".to_string()),
+                name: Some("computer".to_string()),
+                arguments: r#"{"action": "click", "x": 100, "y": 200}"#.to_string(),
+                thought_signature: None,
+            },
+        );
+
+        // computer is detected by name constant, not function_tool_names
+        let result = convert_tool_calls(accumulator, "test-model", &[], &[]);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].id, Some("call_computer".to_string()));
+        assert_eq!(result[0].tool_type, "computer");
+        assert!(result[0].query.is_empty()); // computer doesn't require query
+    }
+
+    #[test]
+    fn test_get_function_tool_names_includes_code_interpreter_and_computer() {
+        use crate::responses::models::CreateResponseRequest;
+
+        let request = CreateResponseRequest {
+            model: "test".to_string(),
+            input: None,
+            instructions: None,
+            conversation: None,
+            previous_response_id: None,
+            max_output_tokens: None,
+            max_tool_calls: None,
+            temperature: None,
+            top_p: None,
+            stream: None,
+            store: None,
+            background: None,
+            tools: Some(vec![
+                ResponseTool::Function {
+                    name: "custom_fn".to_string(),
+                    description: None,
+                    parameters: Some(serde_json::json!({})),
+                },
+                ResponseTool::CodeInterpreter {},
+                ResponseTool::Computer {},
+                ResponseTool::WebSearch {
+                    filters: None,
+                    user_location: None,
+                    search_context_size: None,
+                },
+            ]),
+            tool_choice: None,
+            parallel_tool_calls: None,
+            reasoning: None,
+            include: None,
+            metadata: None,
+            safety_identifier: None,
+            prompt_cache_key: None,
+        };
+
+        let names = get_function_tool_names(&request);
+
+        // Should include custom function, code_interpreter, and computer
+        assert!(names.contains(&"custom_fn".to_string()));
+        assert!(names.contains(&CODE_INTERPRETER_TOOL_NAME.to_string()));
+        assert!(names.contains(&COMPUTER_TOOL_NAME.to_string()));
+        // Should NOT include web_search (it's server-executed)
+        assert!(!names.contains(&crate::responses::tools::WEB_SEARCH_TOOL_NAME.to_string()));
+        assert_eq!(names.len(), 3);
     }
 }

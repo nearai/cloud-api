@@ -1,5 +1,8 @@
 name: Promote Image
 
+permissions:
+  contents: read
+
 on:
   schedule:
     # Tuesday 00:00 UTC — retag :latest → :staging
@@ -28,16 +31,17 @@ jobs:
       (github.event_name == 'workflow_dispatch' && inputs.target == 'staging')
     runs-on: ubuntu-latest
     steps:
-      - name: Install skopeo
+      - name: Install skopeo and jq
         run: |
           sudo apt-get update
-          sudo apt-get install -y skopeo
+          sudo apt-get install -y skopeo jq
 
       - name: Log in to Docker Hub
         run: |
-          skopeo login docker.io \
-            -u "${{ vars.DOCKER_REGISTRY_USER }}" \
-            -p "${{ secrets.DOCKER_REGISTRY_TOKEN }}"
+          echo "${{ secrets.DOCKER_REGISTRY_TOKEN }}" | \
+            skopeo login ${{ env.REGISTRY }} \
+              -u "${{ vars.DOCKER_REGISTRY_USER }}" \
+              --password-stdin
 
       - name: Copy :latest → :staging
         run: |
@@ -48,6 +52,10 @@ jobs:
       - name: Output digest
         run: |
           DIGEST=$(skopeo inspect docker://${{ env.IMAGE }}:staging | jq -r '.Digest')
+          if [ -z "$DIGEST" ] || [ "$DIGEST" = "null" ]; then
+            echo "::error::Failed to retrieve image digest"
+            exit 1
+          fi
           echo "## Promotion: latest → staging" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "- digest: \`${DIGEST}\`" >> "$GITHUB_STEP_SUMMARY"
@@ -58,17 +66,19 @@ jobs:
       (github.event_name == 'schedule' && github.event.schedule == '0 0 * * 4') ||
       (github.event_name == 'workflow_dispatch' && inputs.target == 'prod')
     runs-on: ubuntu-latest
+    environment: production
     steps:
-      - name: Install skopeo
+      - name: Install skopeo and jq
         run: |
           sudo apt-get update
-          sudo apt-get install -y skopeo
+          sudo apt-get install -y skopeo jq
 
       - name: Log in to Docker Hub
         run: |
-          skopeo login docker.io \
-            -u "${{ vars.DOCKER_REGISTRY_USER }}" \
-            -p "${{ secrets.DOCKER_REGISTRY_TOKEN }}"
+          echo "${{ secrets.DOCKER_REGISTRY_TOKEN }}" | \
+            skopeo login ${{ env.REGISTRY }} \
+              -u "${{ vars.DOCKER_REGISTRY_USER }}" \
+              --password-stdin
 
       - name: Copy :staging → :prod
         run: |
@@ -79,6 +89,10 @@ jobs:
       - name: Output digest
         run: |
           DIGEST=$(skopeo inspect docker://${{ env.IMAGE }}:prod | jq -r '.Digest')
+          if [ -z "$DIGEST" ] || [ "$DIGEST" = "null" ]; then
+            echo "::error::Failed to retrieve image digest"
+            exit 1
+          fi
           echo "## Promotion: staging → prod" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "- digest: \`${DIGEST}\`" >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,70 @@
+name: Daily Smoke Tests
+
+on:
+  schedule:
+    # Every day at 06:00 UTC
+    - cron: "0 6 * * *"
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Environment to test"
+        required: true
+        type: choice
+        options:
+          - both
+          - staging
+          - prod
+
+jobs:
+  smoke-test:
+    name: Smoke test (${{ matrix.env_name }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - env_name: staging
+            api_base_url: https://cloud-stg-api.near.ai/v1
+            api_key_secret: SMOKE_TEST_API_KEY_STAGING
+          - env_name: prod
+            api_base_url: https://cloud-api.near.ai/v1
+            api_key_secret: SMOKE_TEST_API_KEY_PROD
+        exclude:
+          - env_name: ${{ github.event_name == 'workflow_dispatch' && inputs.environment == 'prod' && 'staging' || 'NONE' }}
+          - env_name: ${{ github.event_name == 'workflow_dispatch' && inputs.environment == 'staging' && 'prod' || 'NONE' }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Run smoke tests against ${{ matrix.env_name }}
+        env:
+          API_BASE_URL: ${{ matrix.api_base_url }}
+          API_KEY: ${{ secrets[matrix.api_key_secret] }}
+        run: python tests/e2e.py
+
+      - name: Page via Datadog on failure
+        if: failure()
+        run: |
+          curl -sf -X POST "https://api.datadoghq.com/api/v1/events" \
+            -H "DD-API-KEY: ${{ secrets.DD_API_KEY }}" \
+            -H "Content-Type: application/json" \
+            -d '{
+              "title": "Cloud API smoke tests failed (${{ matrix.env_name }})",
+              "text": "Daily smoke tests failed for ${{ matrix.env_name }}.\n\nWorkflow run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}",
+              "priority": "normal",
+              "alert_type": "error",
+              "tags": [
+                "service:cloud-api",
+                "env:${{ matrix.env_name }}",
+                "source:github-actions",
+                "test:smoke"
+              ]
+            }'

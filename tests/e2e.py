@@ -11,12 +11,15 @@ import requests
 import os
 import json
 import sys
+import tempfile
 
 # --- Configuration ---
-API_BASE_URL = os.environ.get("API_BASE_URL", "https://cloud-stg-api.near.ai/v1")
+API_BASE_URL = os.environ.get("API_BASE_URL", "https://cloud-api.near.ai/v1")
 API_KEY = os.environ.get("API_KEY", "")
 MODEL = os.environ.get("MODEL", "zai-org/GLM-4.7")
-FILE_TO_UPLOAD = "test_payload.json"
+REQUEST_TIMEOUT = 30  # seconds for non-streaming requests
+STREAM_TIMEOUT = 90  # seconds for streaming requests
+MAX_STREAM_CHUNKS = 1000  # safety limit for streaming iteration
 
 passed = 0
 failed = 0
@@ -25,7 +28,12 @@ failed = 0
 def report(name, response, expect_status=None):
     """Print result and track pass/fail."""
     global passed, failed
-    status = response.status_code if response else 0
+    if response is None:
+        failed += 1
+        print(f"  [FAIL] {name} — no response (request exception)")
+        return response
+
+    status = response.status_code
     ok = True
     if expect_status and status != expect_status:
         ok = False
@@ -39,7 +47,7 @@ def report(name, response, expect_status=None):
         failed += 1
 
     print(f"  [{tag}] {name} — {status}")
-    if not ok and response is not None and response.text:
+    if not ok and response.text:
         print(f"         {response.text[:200]}")
     return response
 
@@ -52,26 +60,46 @@ def headers(content_type=None):
 
 
 def get(path, params=None, **kwargs):
-    return requests.get(f"{API_BASE_URL}{path}", headers=headers(), params=params, **kwargs)
+    kwargs.setdefault("timeout", REQUEST_TIMEOUT)
+    try:
+        return requests.get(f"{API_BASE_URL}{path}", headers=headers(), params=params, **kwargs)
+    except requests.exceptions.RequestException as e:
+        print(f"         Exception during GET {path}: {e}")
+        return None
 
 
 def post(path, json_payload=None, **kwargs):
-    return requests.post(f"{API_BASE_URL}{path}", headers=headers("application/json"), json=json_payload, **kwargs)
+    kwargs.setdefault("timeout", REQUEST_TIMEOUT)
+    try:
+        return requests.post(f"{API_BASE_URL}{path}", headers=headers("application/json"), json=json_payload, **kwargs)
+    except requests.exceptions.RequestException as e:
+        print(f"         Exception during POST {path}: {e}")
+        return None
 
 
 def delete(path):
-    return requests.delete(f"{API_BASE_URL}{path}", headers=headers())
+    try:
+        return requests.delete(f"{API_BASE_URL}{path}", headers=headers(), timeout=REQUEST_TIMEOUT)
+    except requests.exceptions.RequestException as e:
+        print(f"         Exception during DELETE {path}: {e}")
+        return None
 
 
 def post_file(path, file_path, data=None):
     h = {"Authorization": f"Bearer {API_KEY}"}
-    with open(file_path, "rb") as f:
-        files = {"file": (os.path.basename(file_path), f)}
-        return requests.post(f"{API_BASE_URL}{path}", headers=h, data=data, files=files)
+    try:
+        with open(file_path, "rb") as f:
+            files = {"file": (os.path.basename(file_path), f)}
+            return requests.post(f"{API_BASE_URL}{path}", headers=h, data=data, files=files, timeout=REQUEST_TIMEOUT)
+    except (requests.exceptions.RequestException, OSError) as e:
+        print(f"         Exception during POST {path}: {e}")
+        return None
 
 
 def body(response):
     """Safely parse JSON body."""
+    if response is None:
+        return {}
     try:
         return response.json()
     except Exception:
@@ -118,18 +146,27 @@ def test_chat_completions():
 
     # Streaming
     payload["stream"] = True
-    r = requests.post(
-        f"{API_BASE_URL}/chat/completions",
-        headers=headers("application/json"),
-        json=payload,
-        stream=True,
-    )
-    chunks = 0
-    for line in r.iter_lines():
-        if line:
-            chunks += 1
+    try:
+        r = requests.post(
+            f"{API_BASE_URL}/chat/completions",
+            headers=headers("application/json"),
+            json=payload,
+            stream=True,
+            timeout=STREAM_TIMEOUT,
+        )
+    except requests.exceptions.RequestException as e:
+        print(f"         Exception during POST /chat/completions (stream): {e}")
+        r = None
     report("POST /chat/completions (stream)", r, 200)
-    print(f"         Received {chunks} SSE chunk(s)")
+    if r is not None:
+        chunks = 0
+        for line in r.iter_lines():
+            if line:
+                chunks += 1
+                if chunks >= MAX_STREAM_CHUNKS:
+                    print(f"         WARNING: Exceeded {MAX_STREAM_CHUNKS} chunks, stopping")
+                    break
+        print(f"         Received {chunks} SSE chunk(s)")
 
 
 def test_responses_basic():
@@ -151,9 +188,9 @@ def test_responses_basic():
         print(f"         Output items: {len(data['output'])}")
 
     if response_id:
-        report("GET /responses/{id}", get(f"/responses/{response_id}"))
+        report("GET /responses/{id}", get(f"/responses/{response_id}"), 200)
         report("GET /responses/{id}/input_items", get(f"/responses/{response_id}/input_items"), 200)
-        report("DELETE /responses/{id}", delete(f"/responses/{response_id}"))
+        report("DELETE /responses/{id}", delete(f"/responses/{response_id}"), 200)
 
 
 def test_responses_streaming():
@@ -165,23 +202,34 @@ def test_responses_streaming():
         "max_output_tokens": 20,
         "stream": True,
     }
-    r = requests.post(
-        f"{API_BASE_URL}/responses",
-        headers=headers("application/json"),
-        json=payload,
-        stream=True,
-    )
+    try:
+        r = requests.post(
+            f"{API_BASE_URL}/responses",
+            headers=headers("application/json"),
+            json=payload,
+            stream=True,
+            timeout=STREAM_TIMEOUT,
+        )
+    except requests.exceptions.RequestException as e:
+        print(f"         Exception during POST /responses (stream): {e}")
+        r = None
     report("POST /responses (stream)", r, 200)
 
-    events = {}
-    for line in r.iter_lines(decode_unicode=True):
-        if line and line.startswith("event: "):
-            event_type = line[len("event: "):]
-            events[event_type] = events.get(event_type, 0) + 1
+    if r is not None:
+        events = {}
+        line_count = 0
+        for line in r.iter_lines(decode_unicode=True):
+            line_count += 1
+            if line_count >= MAX_STREAM_CHUNKS:
+                print(f"         WARNING: Exceeded {MAX_STREAM_CHUNKS} lines, stopping")
+                break
+            if line and line.startswith("event: "):
+                event_type = line[len("event: "):]
+                events[event_type] = events.get(event_type, 0) + 1
 
-    print(f"         SSE events: {dict(events)}")
-    if "response.completed" in events or "response.created" in events:
-        print("         Stream lifecycle OK")
+        print(f"         SSE events: {dict(events)}")
+        if "response.completed" in events or "response.created" in events:
+            print("         Stream lifecycle OK")
 
 
 def test_responses_with_instructions():
@@ -224,7 +272,7 @@ def test_responses_with_conversation():
     print("\n=== Responses: Conversation-linked ===")
 
     # Create a conversation first
-    r = post("/conversations", {})
+    r = report("POST /conversations (setup)", post("/conversations", {}), 201)
     conv_data = body(r)
     conv_id = conv_data.get("id")
     if not conv_id:
@@ -239,9 +287,7 @@ def test_responses_with_conversation():
         "max_output_tokens": 30,
         "stream": False,
     }
-    r = report("POST /responses (conversation)", post("/responses", payload), 200)
-    data = body(r)
-    resp_id = data.get("id")
+    report("POST /responses (conversation)", post("/responses", payload), 200)
 
     # Verify conversation items were created
     r2 = report("GET /conversations/{id}/items", get(f"/conversations/{conv_id}/items"), 200)
@@ -250,7 +296,7 @@ def test_responses_with_conversation():
     print(f"         Conversation now has {item_count} item(s)")
 
     # Cleanup
-    delete(f"/conversations/{conv_id}")
+    report("DELETE /conversations/{id} (cleanup)", delete(f"/conversations/{conv_id}"), 200)
 
 
 def test_responses_multi_turn():
@@ -481,35 +527,35 @@ def test_conversations():
 def test_files():
     print("\n=== Files ===")
 
-    # Create dummy file
+    # Create dummy file in temp directory
     dummy = {"test": True, "data": [1, 2, 3]}
-    with open(FILE_TO_UPLOAD, "w") as f:
-        json.dump(dummy, f)
+    tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False)
+    try:
+        json.dump(dummy, tmp)
+        tmp.close()
 
-    # Upload
-    upload_data = {"purpose": "user_data"}
-    r = report("POST /files", post_file("/files", FILE_TO_UPLOAD, upload_data), 201)
-    data = body(r)
-    file_id = data.get("id")
+        # Upload
+        upload_data = {"purpose": "user_data"}
+        r = report("POST /files", post_file("/files", tmp.name, upload_data), 201)
+        data = body(r)
+        file_id = data.get("id")
 
-    # List files
-    report("GET /files", get("/files"), 200)
+        # List files
+        report("GET /files", get("/files"), 200)
 
-    if file_id:
-        # Get metadata
-        report("GET /files/{id}", get(f"/files/{file_id}"), 200)
+        if file_id:
+            # Get metadata
+            report("GET /files/{id}", get(f"/files/{file_id}"), 200)
 
-        # Get content
-        report("GET /files/{id}/content", get(f"/files/{file_id}/content"), 200)
+            # Get content
+            report("GET /files/{id}/content", get(f"/files/{file_id}/content"), 200)
 
-        # Delete
-        report("DELETE /files/{id}", delete(f"/files/{file_id}"), 200)
-    else:
-        print("         Skipping file detail tests (no file_id)")
-
-    # Cleanup
-    if os.path.exists(FILE_TO_UPLOAD):
-        os.remove(FILE_TO_UPLOAD)
+            # Delete
+            report("DELETE /files/{id}", delete(f"/files/{file_id}"), 200)
+        else:
+            print("         Skipping file detail tests (no file_id)")
+    finally:
+        os.unlink(tmp.name)
 
 
 def test_billing():
@@ -518,26 +564,44 @@ def test_billing():
     report("POST /billing/costs", post("/billing/costs", {"requestIds": []}), 200)
 
 
-def main():
-    print(f"Target: {API_BASE_URL}")
-    print(f"API Key: {API_KEY[:10]}...")
+def run_test(test_fn):
+    """Run a test function, catching any unhandled exceptions."""
+    global failed
+    try:
+        test_fn()
+    except Exception as e:
+        failed += 1
+        print(f"  [FAIL] {test_fn.__name__} — unhandled exception: {e}")
 
-    test_health()
-    test_check_api_key()
-    test_models()
-    test_chat_completions()
-    test_responses_basic()
-    test_responses_streaming()
-    test_responses_with_instructions()
-    test_responses_with_metadata()
-    test_responses_with_conversation()
-    test_responses_multi_turn()
-    test_responses_function_calling()
-    test_responses_web_search()
-    test_responses_tool_choice()
-    test_conversations()
-    test_files()
-    test_billing()
+
+def main():
+    if not API_KEY:
+        print(
+            "Error: API_KEY environment variable is not set. "
+            "Please set API_KEY to a valid API key before running this test suite.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    print(f"Target: {API_BASE_URL}")
+    print(f"API Key: {'***' if API_KEY else '(not set)'} (length: {len(API_KEY)})")
+
+    run_test(test_health)
+    run_test(test_check_api_key)
+    run_test(test_models)
+    run_test(test_chat_completions)
+    run_test(test_responses_basic)
+    run_test(test_responses_streaming)
+    run_test(test_responses_with_instructions)
+    run_test(test_responses_with_metadata)
+    run_test(test_responses_with_conversation)
+    run_test(test_responses_multi_turn)
+    run_test(test_responses_function_calling)
+    run_test(test_responses_web_search)
+    run_test(test_responses_tool_choice)
+    run_test(test_conversations)
+    run_test(test_files)
+    run_test(test_billing)
 
     print(f"\n{'='*40}")
     print(f"Results: {passed} passed, {failed} failed, {passed + failed} total")

@@ -1,0 +1,84 @@
+name: Promote Image
+
+on:
+  schedule:
+    # Tuesday 00:00 UTC — retag :latest → :staging
+    - cron: "0 0 * * 2"
+    # Thursday 00:00 UTC — retag :staging → :prod
+    - cron: "0 0 * * 4"
+  workflow_dispatch:
+    inputs:
+      target:
+        description: "Promotion target"
+        required: true
+        type: choice
+        options:
+          - staging
+          - prod
+
+env:
+  REGISTRY: docker.io
+  IMAGE: docker.io/${{ vars.DOCKER_REGISTRY_USER }}/cloud-api
+
+jobs:
+  tag-staging:
+    name: Retag :latest → :staging
+    if: >-
+      (github.event_name == 'schedule' && github.event.schedule == '0 0 * * 2') ||
+      (github.event_name == 'workflow_dispatch' && inputs.target == 'staging')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install skopeo
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y skopeo
+
+      - name: Log in to Docker Hub
+        run: |
+          skopeo login docker.io \
+            -u "${{ vars.DOCKER_REGISTRY_USER }}" \
+            -p "${{ secrets.DOCKER_REGISTRY_TOKEN }}"
+
+      - name: Copy :latest → :staging
+        run: |
+          skopeo copy \
+            docker://${{ env.IMAGE }}:latest \
+            docker://${{ env.IMAGE }}:staging
+
+      - name: Output digest
+        run: |
+          DIGEST=$(skopeo inspect docker://${{ env.IMAGE }}:staging | jq -r '.Digest')
+          echo "## Promotion: latest → staging" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "- digest: \`${DIGEST}\`" >> "$GITHUB_STEP_SUMMARY"
+
+  tag-prod:
+    name: Retag :staging → :prod
+    if: >-
+      (github.event_name == 'schedule' && github.event.schedule == '0 0 * * 4') ||
+      (github.event_name == 'workflow_dispatch' && inputs.target == 'prod')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install skopeo
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y skopeo
+
+      - name: Log in to Docker Hub
+        run: |
+          skopeo login docker.io \
+            -u "${{ vars.DOCKER_REGISTRY_USER }}" \
+            -p "${{ secrets.DOCKER_REGISTRY_TOKEN }}"
+
+      - name: Copy :staging → :prod
+        run: |
+          skopeo copy \
+            docker://${{ env.IMAGE }}:staging \
+            docker://${{ env.IMAGE }}:prod
+
+      - name: Output digest
+        run: |
+          DIGEST=$(skopeo inspect docker://${{ env.IMAGE }}:prod | jq -r '.Digest')
+          echo "## Promotion: staging → prod" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "- digest: \`${DIGEST}\`" >> "$GITHUB_STEP_SUMMARY"

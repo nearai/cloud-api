@@ -39,7 +39,7 @@ impl ModelAliasRepository {
             let transaction = client.transaction().await.map_err(map_db_error)?;
 
             if alias_names.is_empty() {
-                // No new aliases to expose, so a plain DELETE is fine
+                // No aliases — just remove all for this model.
                 transaction
                     .execute(
                         "DELETE FROM model_aliases WHERE canonical_model_id = $1",
@@ -48,31 +48,30 @@ impl ModelAliasRepository {
                     .await
                     .map_err(map_db_error)?;
             } else {
-                // 1. Upsert new aliases — ON CONFLICT atomically reassigns an alias that
-                //    currently points to a different model, avoiding any visibility gap.
-                for alias_name in alias_names {
-                    transaction
-                        .execute(
-                            r#"
-                            INSERT INTO model_aliases (alias_name, canonical_model_id, is_active)
-                            VALUES ($1, $2, true)
-                            ON CONFLICT (alias_name) DO UPDATE SET
-                                canonical_model_id = EXCLUDED.canonical_model_id,
-                                is_active = true,
-                                updated_at = NOW()
-                            "#,
-                            &[&alias_name, &canonical_model_id],
-                        )
-                        .await
-                        .map_err(map_db_error)?;
-                }
+                // 1. Batch upsert — atomically reassigns aliases that may point to
+                //    another model, acquiring row locks in a consistent order to
+                //    avoid deadlocks between concurrent calls.
+                let alias_name_refs: Vec<&str> = alias_names.iter().map(|s| s.as_str()).collect();
+                transaction
+                    .execute(
+                        r#"
+                        INSERT INTO model_aliases (alias_name, canonical_model_id, is_active)
+                        SELECT unnest($1::text[]), $2, true
+                        ON CONFLICT (alias_name) DO UPDATE SET
+                            canonical_model_id = EXCLUDED.canonical_model_id,
+                            is_active = true,
+                            updated_at = NOW()
+                        "#,
+                        &[&alias_name_refs, &canonical_model_id],
+                    )
+                    .await
+                    .map_err(map_db_error)?;
 
-                // 2. Delete aliases that previously belonged to this model but are no longer
-                //    in the new list.
+                // 2. Delete stale aliases no longer in the new list.
                 transaction
                     .execute(
                         "DELETE FROM model_aliases WHERE canonical_model_id = $1 AND alias_name != ALL($2)",
-                        &[&canonical_model_id, &alias_names],
+                        &[&canonical_model_id, &alias_name_refs],
                     )
                     .await
                     .map_err(map_db_error)?;
@@ -93,7 +92,9 @@ impl ModelAliasRepository {
 
             transaction.commit().await.map_err(map_db_error)?;
 
-            Ok::<Vec<ModelAlias>, RepositoryError>(rows.iter().map(|r| self.row_to_alias(r)).collect())
+            Ok::<Vec<ModelAlias>, RepositoryError>(
+                rows.iter().map(|r| self.row_to_alias(r)).collect(),
+            )
         })?;
 
         Ok(aliases)

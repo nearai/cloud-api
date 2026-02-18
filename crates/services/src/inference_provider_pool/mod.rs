@@ -928,6 +928,26 @@ impl InferenceProviderPool {
                     return Ok((result, provider.clone()));
                 }
                 Err(e) => {
+                    // For HTTP client errors (4xx), don't retry with other providers.
+                    // The request itself is invalid (e.g., too many tokens), so retrying won't help.
+                    // Exception: 429 (rate limit) and 408 (request timeout) are retryable
+                    // as other providers may have capacity or better connectivity.
+                    if let CompletionError::HttpError { status_code, .. } = &e {
+                        if (400..=499).contains(status_code)
+                            && *status_code != 429
+                            && *status_code != 408
+                        {
+                            tracing::warn!(
+                                model_id = %model_id,
+                                attempt = attempt + 1,
+                                status_code,
+                                operation = operation_name,
+                                "Client error from provider, not retrying"
+                            );
+                            return Err(Self::sanitize_completion_error(e, model_id));
+                        }
+                    }
+
                     // Log the failure for debugging
                     tracing::warn!(
                         model_id = %model_id,
@@ -2392,5 +2412,131 @@ mod tests {
 
         let external = pool.external_providers.read().await;
         assert_eq!(external.len(), 1);
+    }
+
+    // ==================== 4xx Retry Behavior Tests ====================
+
+    /// Helper to create a pool with a registered mock provider
+    async fn pool_with_mock_provider() -> (InferenceProviderPool, String) {
+        let pool = InferenceProviderPool::new(
+            "http://localhost:8080/models".to_string(),
+            None,
+            5,
+            ExternalProvidersConfig::default(),
+        );
+        let mock_provider = Arc::new(inference_providers::mock::MockProvider::new());
+        let model_id = "Qwen/Qwen3-30B-A3B-Instruct-2507".to_string();
+        pool.register_provider(model_id.clone(), mock_provider)
+            .await;
+        (pool, model_id)
+    }
+
+    #[tokio::test]
+    async fn test_4xx_error_does_not_retry() {
+        let (pool, model_id) = pool_with_mock_provider().await;
+
+        let result: Result<((), _), _> = pool
+            .retry_with_fallback(&model_id, "test_op", None, |_provider| async {
+                Err(CompletionError::HttpError {
+                    status_code: 400,
+                    message: "Bad request".to_string(),
+                    is_external: false,
+                })
+            })
+            .await;
+
+        assert!(result.is_err());
+        let err = result.err().expect("Expected an error");
+        match err {
+            CompletionError::HttpError { status_code, .. } => {
+                assert_eq!(status_code, 400);
+            }
+            other => panic!("Expected HttpError, got: {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_429_error_retries_with_fallback() {
+        let (pool, model_id) = pool_with_mock_provider().await;
+
+        // 429 should NOT short-circuit - it should fall through to the normal retry path
+        let result: Result<((), _), _> = pool
+            .retry_with_fallback(&model_id, "test_op", None, |_provider| async {
+                Err(CompletionError::HttpError {
+                    status_code: 429,
+                    message: "Rate limit exceeded".to_string(),
+                    is_external: false,
+                })
+            })
+            .await;
+
+        // Should fail after trying all providers (not short-circuit on 429)
+        // The error should be sanitized (go through the normal retry path with sanitize_completion_error)
+        assert!(result.is_err());
+        let err = result.err().expect("Expected an error");
+        let err_msg = err.to_string();
+        assert!(
+            err_msg.contains("Provider failed for model"),
+            "Expected sanitized error (went through retry path), got: {}",
+            err_msg
+        );
+    }
+
+    #[tokio::test]
+    async fn test_408_error_retries_with_fallback() {
+        let (pool, model_id) = pool_with_mock_provider().await;
+
+        // 408 should NOT short-circuit - it should fall through to the normal retry path
+        let result: Result<((), _), _> = pool
+            .retry_with_fallback(&model_id, "test_op", None, |_provider| async {
+                Err(CompletionError::HttpError {
+                    status_code: 408,
+                    message: "Request timeout".to_string(),
+                    is_external: false,
+                })
+            })
+            .await;
+
+        assert!(result.is_err());
+        let err = result.err().expect("Expected an error");
+        let err_msg = err.to_string();
+        assert!(
+            err_msg.contains("Provider failed for model"),
+            "Expected sanitized error (went through retry path), got: {}",
+            err_msg
+        );
+    }
+
+    #[tokio::test]
+    async fn test_4xx_error_is_sanitized() {
+        let (pool, model_id) = pool_with_mock_provider().await;
+
+        let result: Result<((), _), _> = pool
+            .retry_with_fallback(&model_id, "test_op", None, |_provider| async {
+                Err(CompletionError::HttpError {
+                    status_code: 400,
+                    message: "Error at http://192.168.0.1:8000/v1/chat/completions".to_string(),
+                    is_external: false,
+                })
+            })
+            .await;
+
+        assert!(result.is_err());
+        let err = result.err().expect("Expected an error");
+        match err {
+            CompletionError::HttpError { message, .. } => {
+                assert!(
+                    !message.contains("192.168.0.1"),
+                    "Error message should be sanitized, but contained IP: {}",
+                    message
+                );
+                assert!(
+                    message.contains("[URL_REDACTED]"),
+                    "Error message should contain redacted URL marker: {}",
+                    message
+                );
+            }
+            other => panic!("Expected HttpError, got: {:?}", other),
+        }
     }
 }

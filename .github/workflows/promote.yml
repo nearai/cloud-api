@@ -31,17 +31,17 @@ jobs:
       (github.event_name == 'workflow_dispatch' && inputs.target == 'staging')
     runs-on: ubuntu-latest
     steps:
+      - name: Log in to Docker registry
+        uses: docker/login-action@0567fa5ae8c9a197cb207537dc5cbb43ca3d803f
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ vars.DOCKER_REGISTRY_USER }}
+          password: ${{ secrets.DOCKER_REGISTRY_TOKEN }}
+
       - name: Install skopeo and jq
         run: |
           sudo apt-get update
           sudo apt-get install -y skopeo jq
-
-      - name: Log in to Docker Hub
-        run: |
-          echo "${{ secrets.DOCKER_REGISTRY_TOKEN }}" | \
-            skopeo login ${{ env.REGISTRY }} \
-              -u "${{ vars.DOCKER_REGISTRY_USER }}" \
-              --password-stdin
 
       - name: Copy :latest → :staging
         run: |
@@ -68,17 +68,17 @@ jobs:
     runs-on: ubuntu-latest
     environment: production
     steps:
+      - name: Log in to Docker registry
+        uses: docker/login-action@0567fa5ae8c9a197cb207537dc5cbb43ca3d803f
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ vars.DOCKER_REGISTRY_USER }}
+          password: ${{ secrets.DOCKER_REGISTRY_TOKEN }}
+
       - name: Install skopeo and jq
         run: |
           sudo apt-get update
           sudo apt-get install -y skopeo jq
-
-      - name: Log in to Docker Hub
-        run: |
-          echo "${{ secrets.DOCKER_REGISTRY_TOKEN }}" | \
-            skopeo login ${{ env.REGISTRY }} \
-              -u "${{ vars.DOCKER_REGISTRY_USER }}" \
-              --password-stdin
 
       - name: Copy :staging → :prod
         run: |

@@ -411,15 +411,33 @@ where
     }
 }
 
-/// RAII guard for concurrent request slots
-/// Automatically releases the slot when dropped, ensuring proper cleanup even if the request panics
+/// RAII guard for concurrent request slots.
+/// Automatically releases the slot when dropped, ensuring proper cleanup even if the request panics.
+/// Use `disarm()` to take ownership of the counter without decrementing (e.g., to transfer it
+/// to an `InterceptStream` that will handle decrement on drop).
 struct ConcurrentSlotGuard {
-    counter: Arc<std::sync::atomic::AtomicU32>,
+    counter: Option<Arc<std::sync::atomic::AtomicU32>>,
+}
+
+impl ConcurrentSlotGuard {
+    fn new(counter: Arc<AtomicU32>) -> Self {
+        Self {
+            counter: Some(counter),
+        }
+    }
+
+    /// Disarm the guard and return the counter without decrementing.
+    /// Used when transferring counter ownership to `InterceptStream`.
+    fn disarm(&mut self) -> Option<Arc<AtomicU32>> {
+        self.counter.take()
+    }
 }
 
 impl Drop for ConcurrentSlotGuard {
     fn drop(&mut self) {
-        self.counter.fetch_sub(1, Ordering::Release);
+        if let Some(counter) = &self.counter {
+            counter.fetch_sub(1, Ordering::Release);
+        }
     }
 }
 
@@ -443,6 +461,9 @@ const ORG_LIMIT_CACHE_TTL_SECS: u64 = 300;
 /// TTL for concurrent count cache entries (10 minutes).
 /// Safety net: if a counter gets stuck (e.g., due to a panic or proxy not propagating
 /// client disconnection), the entry expires and is replaced with a fresh zero counter.
+///
+/// Trade-off: if legitimate long-running requests are still in-flight when the TTL fires,
+/// the limit can be temporarily exceeded until those old requests complete.
 const CONCURRENT_COUNT_TTL_SECS: u64 = 600;
 
 impl CompletionServiceImpl {
@@ -1028,6 +1049,10 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
             .try_acquire_concurrent_slot(organization_id, model.id, canonical_name)
             .await?;
 
+        // RAII guard protects against panics during stream creation.
+        // On success, disarm and transfer counter ownership to InterceptStream.
+        let mut guard = ConcurrentSlotGuard::new(counter);
+
         let provider_start_time = Instant::now();
 
         // Get the LLM stream
@@ -1038,12 +1063,15 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         {
             Ok(stream) => stream,
             Err(e) => {
-                counter.fetch_sub(1, Ordering::Release);
+                // Guard will decrement counter on drop
                 let err = Self::map_provider_error(&request.model, &e, "chat completion stream");
                 self.record_error(&err, Some(canonical_name));
                 return Err(err);
             }
         };
+
+        // Transfer counter ownership to InterceptStream (which decrements on drop)
+        let counter = guard.disarm();
 
         let inference_type = if is_streaming {
             crate::usage::ports::InferenceType::ChatCompletionStream
@@ -1064,7 +1092,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
                 inference_type,
                 service_start_time,
                 provider_start_time,
-                Some(counter),
+                counter,
                 request.response_id,
                 model.attestation_supported,
             )
@@ -1169,7 +1197,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
             .await?;
 
         // RAII guard ensures slot is released on drop (panic, error, or success)
-        let _guard = ConcurrentSlotGuard { counter };
+        let _guard = ConcurrentSlotGuard::new(counter);
 
         let provider_start_time = Instant::now();
         let result = self
@@ -1305,7 +1333,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
             .await?;
 
         // RAII guard ensures slot is released on drop (panic, error, or success)
-        let _guard = ConcurrentSlotGuard { counter };
+        let _guard = ConcurrentSlotGuard::new(counter);
 
         // Call inference provider pool with timeout protection
         let timeout_duration = std::time::Duration::from_secs(120); // 2 minute timeout for audio
@@ -1369,7 +1397,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
             .await?;
 
         // Create RAII guard to ensure slot is released on drop (panic, error, or success)
-        let _guard = ConcurrentSlotGuard { counter };
+        let _guard = ConcurrentSlotGuard::new(counter);
 
         // Call inference provider pool
         // The guard will automatically release the slot when this function returns or panics
@@ -1422,7 +1450,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
             .await?;
 
         // Create RAII guard to ensure slot is released on drop (panic, error, or success)
-        let _guard = ConcurrentSlotGuard { counter };
+        let _guard = ConcurrentSlotGuard::new(counter);
 
         // Call inference provider pool
         // The guard will automatically release the slot when this function returns or panics

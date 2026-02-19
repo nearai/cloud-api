@@ -5,9 +5,9 @@ permissions:
 
 on:
   schedule:
-    # Tuesday 00:00 UTC — retag :latest → :staging
+    # Tuesday 00:00 UTC — freeze :staging → :prod-rc
     - cron: "0 0 * * 2"
-    # Thursday 00:00 UTC — retag :staging → :prod
+    # Thursday 00:00 UTC — promote :prod-rc → :prod
     - cron: "0 0 * * 4"
   workflow_dispatch:
     inputs:
@@ -16,7 +16,7 @@ on:
         required: true
         type: choice
         options:
-          - staging
+          - prod-rc
           - prod
 
 env:
@@ -24,11 +24,11 @@ env:
   IMAGE: docker.io/${{ vars.DOCKER_REGISTRY_USER }}/cloud-api
 
 jobs:
-  tag-staging:
-    name: Retag :latest → :staging
+  freeze-staging:
+    name: Freeze :staging → :prod-rc
     if: >-
       (github.event_name == 'schedule' && github.event.schedule == '0 0 * * 2') ||
-      (github.event_name == 'workflow_dispatch' && inputs.target == 'staging')
+      (github.event_name == 'workflow_dispatch' && inputs.target == 'prod-rc')
     runs-on: ubuntu-latest
     steps:
       - name: Log in to Docker registry
@@ -43,25 +43,26 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y skopeo jq
 
-      - name: Copy :latest → :staging
+      - name: Copy :staging → :prod-rc
         run: |
           skopeo copy \
-            docker://${{ env.IMAGE }}:latest \
-            docker://${{ env.IMAGE }}:staging
+            docker://${{ env.IMAGE }}:staging \
+            docker://${{ env.IMAGE }}:prod-rc
 
       - name: Output digest
         run: |
-          DIGEST=$(skopeo inspect docker://${{ env.IMAGE }}:staging | jq -r '.Digest')
+          DIGEST=$(skopeo inspect docker://${{ env.IMAGE }}:prod-rc | jq -r '.Digest')
           if [ -z "$DIGEST" ] || [ "$DIGEST" = "null" ]; then
             echo "::error::Failed to retrieve image digest"
             exit 1
           fi
-          echo "## Promotion: latest → staging" >> "$GITHUB_STEP_SUMMARY"
+          echo "## Freeze: staging → prod-rc" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "- digest: \`${DIGEST}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- staging continues to receive new commits" >> "$GITHUB_STEP_SUMMARY"
 
   tag-prod:
-    name: Retag :staging → :prod
+    name: Promote :prod-rc → :prod
     if: >-
       (github.event_name == 'schedule' && github.event.schedule == '0 0 * * 4') ||
       (github.event_name == 'workflow_dispatch' && inputs.target == 'prod')
@@ -80,10 +81,10 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y skopeo jq
 
-      - name: Copy :staging → :prod
+      - name: Copy :prod-rc → :prod
         run: |
           skopeo copy \
-            docker://${{ env.IMAGE }}:staging \
+            docker://${{ env.IMAGE }}:prod-rc \
             docker://${{ env.IMAGE }}:prod
 
       - name: Output digest
@@ -93,6 +94,6 @@ jobs:
             echo "::error::Failed to retrieve image digest"
             exit 1
           fi
-          echo "## Promotion: staging → prod" >> "$GITHUB_STEP_SUMMARY"
+          echo "## Promotion: prod-rc → prod" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "- digest: \`${DIGEST}\`" >> "$GITHUB_STEP_SUMMARY"

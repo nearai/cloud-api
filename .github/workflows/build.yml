@@ -31,7 +31,7 @@ jobs:
           username: ${{ vars.DOCKER_REGISTRY_USER }}
           password: ${{ secrets.DOCKER_REGISTRY_TOKEN }}
 
-      - name: Extract image tag from GitHub ref (branch or tag)
+      - name: Extract image tags from GitHub ref (branch or tag)
         run: |
           if [[ "${GITHUB_REF_TYPE}" == 'tag' ]]; then
             TAG=${GITHUB_REF_NAME#v}
@@ -49,6 +49,11 @@ jobs:
             exit 1
           fi
           echo "IMAGE_REFERENCE=${{ env.REGISTRY }}/${{ env.IMAGE_REPOSITORY }}:${TAG}" >> "$GITHUB_ENV"
+
+          # On main branch, also promote to staging for continuous integration
+          if [[ "${GITHUB_REF_NAME}" == 'main' ]]; then
+            echo "ALSO_TAG_STAGING=true" >> "$GITHUB_ENV"
+          fi
 
       - name: Install build dependencies
         run: |
@@ -75,6 +80,13 @@ jobs:
           subject-digest: ${{ env.IMAGE_DIGEST }}
           push-to-registry: true
 
+      - name: Tag staging for continuous integration
+        if: env.ALSO_TAG_STAGING == 'true'
+        run: |
+          STAGING_REF="${{ env.REGISTRY }}/${{ env.IMAGE_REPOSITORY }}:staging"
+          skopeo copy oci-archive:./oci.tar "docker://${STAGING_REF}"
+          echo "STAGING_REFERENCE=${STAGING_REF}" >> "$GITHUB_ENV"
+
       - name: Generate build summary
         run: |
           {
@@ -83,4 +95,7 @@ jobs:
             echo "- tag: \`${{ env.IMAGE_REFERENCE }}\`"
             echo "- digest: \`${{ env.IMAGE_DIGEST }}\`"
             echo "- sigstore: https://search.sigstore.dev/?hash=${{ env.IMAGE_DIGEST }}"
+            if [[ "${{ env.ALSO_TAG_STAGING }}" == 'true' ]]; then
+              echo "- staging: \`${{ env.STAGING_REFERENCE }}\`"
+            fi
           } >> "$GITHUB_STEP_SUMMARY"

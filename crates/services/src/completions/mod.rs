@@ -440,6 +440,11 @@ pub struct CompletionServiceImpl {
 /// TTL for organization concurrent limit cache (5 minutes)
 const ORG_LIMIT_CACHE_TTL_SECS: u64 = 300;
 
+/// TTL for concurrent count cache entries (10 minutes).
+/// Safety net: if a counter gets stuck (e.g., due to a panic or proxy not propagating
+/// client disconnection), the entry expires and is replaced with a fresh zero counter.
+const CONCURRENT_COUNT_TTL_SECS: u64 = 600;
+
 impl CompletionServiceImpl {
     pub fn new(
         inference_provider_pool: Arc<InferenceProviderPool>,
@@ -449,7 +454,10 @@ impl CompletionServiceImpl {
         models_repository: Arc<dyn ModelsRepository>,
         organization_limit_repository: Arc<dyn ports::OrganizationConcurrentLimitRepository>,
     ) -> Self {
-        let concurrent_counts = Cache::builder().max_capacity(100_000).build();
+        let concurrent_counts = Cache::builder()
+            .max_capacity(100_000)
+            .time_to_live(Duration::from_secs(CONCURRENT_COUNT_TTL_SECS))
+            .build();
 
         // Cache for per-organization concurrent limits with 5-minute TTL
         let org_concurrent_limits = Cache::builder()
@@ -1160,12 +1168,14 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
             .try_acquire_concurrent_slot(organization_id, model.id, canonical_name)
             .await?;
 
+        // RAII guard ensures slot is released on drop (panic, error, or success)
+        let _guard = ConcurrentSlotGuard { counter };
+
         let provider_start_time = Instant::now();
         let result = self
             .inference_provider_pool
             .chat_completion(chat_params, request.body_hash.clone())
             .await;
-        counter.fetch_sub(1, Ordering::Release);
 
         let response_with_bytes = match result {
             Ok(response) => response,
@@ -1294,6 +1304,9 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
             .try_acquire_concurrent_slot(organization_id, model_id, model_name)
             .await?;
 
+        // RAII guard ensures slot is released on drop (panic, error, or success)
+        let _guard = ConcurrentSlotGuard { counter };
+
         // Call inference provider pool with timeout protection
         let timeout_duration = std::time::Duration::from_secs(120); // 2 minute timeout for audio
         let result = tokio::time::timeout(
@@ -1302,9 +1315,6 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
                 .audio_transcription(params, request_hash),
         )
         .await;
-
-        // Release the concurrent request slot
-        counter.fetch_sub(1, Ordering::Release);
 
         // Handle timeout and map provider errors
         match result {

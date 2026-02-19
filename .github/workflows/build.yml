@@ -51,8 +51,15 @@ jobs:
           echo "IMAGE_REFERENCE=${{ env.REGISTRY }}/${{ env.IMAGE_REPOSITORY }}:${TAG}" >> "$GITHUB_ENV"
 
           # On main branch, also promote to staging for continuous integration
+          # Skip staging tag on Tuesday (2) and Wednesday (3) — staging is frozen
+          # for prod-candidate testing until Thursday promotion
           if [[ "${GITHUB_REF_NAME}" == 'main' ]]; then
-            echo "ALSO_TAG_STAGING=true" >> "$GITHUB_ENV"
+            DAY_OF_WEEK=$(date -u +%u)
+            if [[ "$DAY_OF_WEEK" -ge 2 && "$DAY_OF_WEEK" -le 3 ]]; then
+              echo "Staging frozen (day $DAY_OF_WEEK) — skipping :staging tag"
+            else
+              echo "ALSO_TAG_STAGING=true" >> "$GITHUB_ENV"
+            fi
           fi
 
       - name: Install build dependencies

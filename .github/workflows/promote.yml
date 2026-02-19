@@ -5,9 +5,7 @@ permissions:
 
 on:
   schedule:
-    # Tuesday 00:00 UTC — freeze :staging → :prod-rc
-    - cron: "0 0 * * 2"
-    # Thursday 00:00 UTC — promote :prod-rc → :prod
+    # Thursday 00:00 UTC — promote frozen :staging → :prod
     - cron: "0 0 * * 4"
   workflow_dispatch:
     inputs:
@@ -16,7 +14,6 @@ on:
         required: true
         type: choice
         options:
-          - prod-rc
           - prod
 
 env:
@@ -24,47 +21,10 @@ env:
   IMAGE: docker.io/${{ vars.DOCKER_REGISTRY_USER }}/cloud-api
 
 jobs:
-  freeze-staging:
-    name: Freeze :staging → :prod-rc
-    if: >-
-      (github.event_name == 'schedule' && github.event.schedule == '0 0 * * 2') ||
-      (github.event_name == 'workflow_dispatch' && inputs.target == 'prod-rc')
-    runs-on: ubuntu-latest
-    steps:
-      - name: Log in to Docker registry
-        uses: docker/login-action@0567fa5ae8c9a197cb207537dc5cbb43ca3d803f
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ vars.DOCKER_REGISTRY_USER }}
-          password: ${{ secrets.DOCKER_REGISTRY_TOKEN }}
-
-      - name: Install skopeo and jq
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y skopeo jq
-
-      - name: Copy :staging → :prod-rc
-        run: |
-          skopeo copy \
-            docker://${{ env.IMAGE }}:staging \
-            docker://${{ env.IMAGE }}:prod-rc
-
-      - name: Output digest
-        run: |
-          DIGEST=$(skopeo inspect docker://${{ env.IMAGE }}:prod-rc | jq -r '.Digest')
-          if [ -z "$DIGEST" ] || [ "$DIGEST" = "null" ]; then
-            echo "::error::Failed to retrieve image digest"
-            exit 1
-          fi
-          echo "## Freeze: staging → prod-rc" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "- digest: \`${DIGEST}\`" >> "$GITHUB_STEP_SUMMARY"
-          echo "- staging continues to receive new commits" >> "$GITHUB_STEP_SUMMARY"
-
   tag-prod:
-    name: Promote :prod-rc → :prod
+    name: Promote :staging → :prod
     if: >-
-      (github.event_name == 'schedule' && github.event.schedule == '0 0 * * 4') ||
+      github.event_name == 'schedule' ||
       (github.event_name == 'workflow_dispatch' && inputs.target == 'prod')
     runs-on: ubuntu-latest
     environment: production
@@ -81,10 +41,10 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y skopeo jq
 
-      - name: Copy :prod-rc → :prod
+      - name: Copy :staging → :prod
         run: |
           skopeo copy \
-            docker://${{ env.IMAGE }}:prod-rc \
+            docker://${{ env.IMAGE }}:staging \
             docker://${{ env.IMAGE }}:prod
 
       - name: Output digest
@@ -94,6 +54,6 @@ jobs:
             echo "::error::Failed to retrieve image digest"
             exit 1
           fi
-          echo "## Promotion: prod-rc → prod" >> "$GITHUB_STEP_SUMMARY"
+          echo "## Promotion: staging → prod" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "- digest: \`${DIGEST}\`" >> "$GITHUB_STEP_SUMMARY"

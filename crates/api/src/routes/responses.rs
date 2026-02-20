@@ -621,7 +621,7 @@ pub async fn get_response(
     Path(_response_id): Path<String>,
     Query(_params): Query<GetResponseQuery>,
     State(_state): State<ResponseRouteState>,
-    Extension(_api_key): Extension<services::workspace::ApiKey>,
+    Extension(_api_key): Extension<AuthenticatedApiKey>,
 ) -> Result<ResponseJson<ResponseObject>, (StatusCode, ResponseJson<ErrorResponse>)> {
     // TODO: Implement get_response method in ResponseService
     Err((
@@ -656,7 +656,7 @@ pub async fn get_response(
 pub async fn delete_response(
     Path(_response_id): Path<String>,
     State(_state): State<ResponseRouteState>,
-    Extension(_api_key): Extension<services::workspace::ApiKey>,
+    Extension(_api_key): Extension<AuthenticatedApiKey>,
 ) -> Result<ResponseJson<ResponseDeleteResult>, (StatusCode, ResponseJson<ErrorResponse>)> {
     // TODO: Implement delete_response method in ResponseService
     Err((
@@ -691,7 +691,7 @@ pub async fn delete_response(
 pub async fn cancel_response(
     Path(_response_id): Path<String>,
     State(_state): State<ResponseRouteState>,
-    Extension(_api_key): Extension<services::workspace::ApiKey>,
+    Extension(_api_key): Extension<AuthenticatedApiKey>,
 ) -> Result<ResponseJson<ResponseObject>, (StatusCode, ResponseJson<ErrorResponse>)> {
     // TODO: Implement cancel_response method in ResponseService
     Err((

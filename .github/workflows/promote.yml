@@ -1,0 +1,59 @@
+name: Promote Image
+
+permissions:
+  contents: read
+
+on:
+  schedule:
+    # Thursday 00:00 UTC — promote frozen :staging → :prod
+    - cron: "0 0 * * 4"
+  workflow_dispatch:
+    inputs:
+      target:
+        description: "Promotion target"
+        required: true
+        type: choice
+        options:
+          - prod
+
+env:
+  REGISTRY: docker.io
+  IMAGE: docker.io/${{ vars.DOCKER_REGISTRY_USER }}/cloud-api
+
+jobs:
+  tag-prod:
+    name: Promote :staging → :prod
+    if: >-
+      github.event_name == 'schedule' ||
+      (github.event_name == 'workflow_dispatch' && inputs.target == 'prod')
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Log in to Docker registry
+        uses: docker/login-action@0567fa5ae8c9a197cb207537dc5cbb43ca3d803f
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ vars.DOCKER_REGISTRY_USER }}
+          password: ${{ secrets.DOCKER_REGISTRY_TOKEN }}
+
+      - name: Install skopeo and jq
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y skopeo jq
+
+      - name: Copy :staging → :prod
+        run: |
+          skopeo copy \
+            docker://${{ env.IMAGE }}:staging \
+            docker://${{ env.IMAGE }}:prod
+
+      - name: Output digest
+        run: |
+          DIGEST=$(skopeo inspect docker://${{ env.IMAGE }}:prod | jq -r '.Digest')
+          if [ -z "$DIGEST" ] || [ "$DIGEST" = "null" ]; then
+            echo "::error::Failed to retrieve image digest"
+            exit 1
+          fi
+          echo "## Promotion: staging → prod" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "- digest: \`${DIGEST}\`" >> "$GITHUB_STEP_SUMMARY"

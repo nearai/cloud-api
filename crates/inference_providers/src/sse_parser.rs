@@ -446,10 +446,8 @@ mod tests {
             state: Arc::new(AtomicU8::new(0)),
         };
 
-        let parser = BufferedSSEParser::<_, OpenAIEventParser>::new(
-            stream,
-            OpenAIParserState::new(true),
-        );
+        let parser =
+            BufferedSSEParser::<_, OpenAIEventParser>::new(stream, OpenAIParserState::new(true));
         let events: Vec<_> = parser.collect().await;
 
         // Should have exactly 1 event (the good chunk).

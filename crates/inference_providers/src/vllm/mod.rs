@@ -288,6 +288,7 @@ impl InferenceProvider for VLlmProvider {
             .post(&url)
             .headers(headers)
             .json(&streaming_params)
+            .timeout(Duration::from_secs(self.config.timeout_seconds as u64))
             .send()
             .await
             .map_err(|e| CompletionError::CompletionError(e.to_string()))?;
@@ -397,6 +398,7 @@ impl InferenceProvider for VLlmProvider {
             .post(&url)
             .headers(headers)
             .json(&streaming_params)
+            .timeout(Duration::from_secs(self.config.timeout_seconds as u64))
             .send()
             .await
             .map_err(|e| CompletionError::CompletionError(e.to_string()))?;

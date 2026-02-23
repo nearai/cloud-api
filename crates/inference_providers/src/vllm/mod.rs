@@ -69,9 +69,6 @@ impl VLlmProvider {
         let client = Client::builder()
             .connect_timeout(std::time::Duration::from_secs(30))
             .pool_idle_timeout(std::time::Duration::from_secs(90))
-            .read_timeout(std::time::Duration::from_secs(
-                config.timeout_seconds as u64,
-            ))
             .build()
             .expect("Failed to create HTTP client");
 

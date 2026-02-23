@@ -60,6 +60,9 @@ pub struct BufferedSSEParser<S, P: SSEEventParser> {
     /// Pending results from previous process_buffer() calls.
     /// Multiple SSE events can arrive in a single network packet.
     pending_results: VecDeque<Result<SSEEvent, CompletionError>>,
+    /// Set to true after the underlying byte stream returns an error or ends.
+    /// Prevents infinite error loops when the stream is broken.
+    finished: bool,
     state: P::State,
     _marker: PhantomData<P>,
 }
@@ -76,6 +79,7 @@ where
             buffer: String::new(),
             bytes_buffer: Vec::new(),
             pending_results: VecDeque::new(),
+            finished: false,
             state,
             _marker: PhantomData,
         }
@@ -135,6 +139,13 @@ where
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
 
+        // If the underlying stream has errored or ended, don't poll it again.
+        // This prevents infinite error loops when the byte stream is broken
+        // (e.g., due to read timeouts under load).
+        if this.finished {
+            return Poll::Ready(None);
+        }
+
         loop {
             // First, return any pending results from previous process_buffer() calls
             if let Some(result) = this.pending_results.pop_front() {
@@ -158,9 +169,12 @@ where
                     continue;
                 }
                 Poll::Ready(Some(Err(e))) => {
+                    // Mark stream as finished so we don't poll the broken stream again
+                    this.finished = true;
                     return Poll::Ready(Some(Err(CompletionError::CompletionError(e.to_string()))));
                 }
                 Poll::Ready(None) => {
+                    this.finished = true;
                     // Stream ended - process any remaining buffer content
                     if !this.buffer.trim().is_empty() {
                         warn!("Incomplete SSE data in buffer at stream end");
@@ -382,5 +396,66 @@ mod tests {
 
         assert_eq!(events.len(), 1, "Expected 1 event, got {}", events.len());
         assert!(events[0].is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_sse_parser_terminates_after_stream_error() {
+        // Test that the parser stops polling the underlying stream after an error.
+        // We use a custom Stream impl that panics if polled after returning an error,
+        // proving the `finished` flag prevents infinite error loops.
+        use std::sync::atomic::{AtomicU8, Ordering};
+        use std::sync::Arc;
+        use std::task::Poll;
+
+        struct ErrorThenPanicStream {
+            state: Arc<AtomicU8>, // 0=send_ok, 1=send_none, 2+=panic
+        }
+
+        impl Stream for ErrorThenPanicStream {
+            type Item = Result<bytes::Bytes, reqwest::Error>;
+
+            fn poll_next(
+                self: Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+            ) -> Poll<Option<Self::Item>> {
+                let s = self.state.fetch_add(1, Ordering::SeqCst);
+                match s {
+                    0 => {
+                        // First poll: return a valid SSE chunk
+                        Poll::Ready(Some(Ok(bytes::Bytes::from(
+                            "data: {\"id\":\"1\",\"object\":\"chat.completion.chunk\",\"created\":1234567890,\"model\":\"test\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hello\"},\"finish_reason\":null}]}\n\n"
+                        ))))
+                    }
+                    1 => {
+                        // Second poll: stream ends (simulating a broken connection)
+                        // We return None here since we can't easily construct a reqwest::Error.
+                        // The `finished` flag is also set on stream end (Poll::Ready(None)).
+                        Poll::Ready(None)
+                    }
+                    _ => {
+                        // Third+ poll: should never happen if `finished` flag works
+                        panic!("Stream was polled after ending! The `finished` flag is broken.");
+                    }
+                }
+            }
+        }
+
+        impl Unpin for ErrorThenPanicStream {}
+
+        let stream = ErrorThenPanicStream {
+            state: Arc::new(AtomicU8::new(0)),
+        };
+
+        let parser = BufferedSSEParser::<_, OpenAIEventParser>::new(
+            stream,
+            OpenAIParserState::new(true),
+        );
+        let events: Vec<_> = parser.collect().await;
+
+        // Should have exactly 1 event (the good chunk).
+        // The stream ended after that, and the parser must NOT poll again.
+        // If the `finished` flag is broken, the ErrorThenPanicStream will panic.
+        assert_eq!(events.len(), 1, "Expected 1 event, got {}", events.len());
+        assert!(events[0].is_ok(), "Event should be Ok");
     }
 }

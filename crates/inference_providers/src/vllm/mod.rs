@@ -69,9 +69,6 @@ impl VLlmProvider {
         let client = Client::builder()
             .connect_timeout(std::time::Duration::from_secs(30))
             .pool_idle_timeout(std::time::Duration::from_secs(90))
-            .read_timeout(std::time::Duration::from_secs(
-                config.timeout_seconds as u64,
-            ))
             .build()
             .expect("Failed to create HTTP client");
 
@@ -151,6 +148,7 @@ impl InferenceProvider for VLlmProvider {
             .client
             .get(&url)
             .headers(headers)
+            .timeout(Duration::from_secs(self.config.timeout_seconds as u64))
             .send()
             .await
             .map_err(|e| CompletionError::CompletionError(e.to_string()))?;
@@ -198,6 +196,7 @@ impl InferenceProvider for VLlmProvider {
             .client
             .get(&url)
             .headers(headers)
+            .timeout(Duration::from_secs(self.config.timeout_seconds as u64))
             .send()
             .await
             .map_err(|e| AttestationError::FetchError(e.to_string()))?;
@@ -237,6 +236,7 @@ impl InferenceProvider for VLlmProvider {
             .client
             .get(&url)
             .headers(headers)
+            .timeout(Duration::from_secs(self.config.timeout_seconds as u64))
             .send()
             .await
             .map_err(|e| ListModelsError::FetchError(format!("{e:?}")))?;
@@ -288,6 +288,7 @@ impl InferenceProvider for VLlmProvider {
             .post(&url)
             .headers(headers)
             .json(&streaming_params)
+            .timeout(Duration::from_secs(self.config.timeout_seconds as u64))
             .send()
             .await
             .map_err(|e| CompletionError::CompletionError(e.to_string()))?;
@@ -336,6 +337,7 @@ impl InferenceProvider for VLlmProvider {
             .post(&url)
             .headers(headers)
             .json(&non_streaming_params)
+            .timeout(Duration::from_secs(self.config.timeout_seconds as u64))
             .send()
             .await
             .map_err(|e| CompletionError::CompletionError(e.to_string()))?;
@@ -396,6 +398,7 @@ impl InferenceProvider for VLlmProvider {
             .post(&url)
             .headers(headers)
             .json(&streaming_params)
+            .timeout(Duration::from_secs(self.config.timeout_seconds as u64))
             .send()
             .await
             .map_err(|e| CompletionError::CompletionError(e.to_string()))?;

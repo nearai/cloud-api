@@ -160,11 +160,12 @@ where
         )
         .entered();
 
-        let (input_tokens, output_tokens, chat_id) =
+        let (input_tokens, output_tokens, cache_read_tokens, chat_id) =
             match (&self.last_usage_stats, &self.last_chat_id) {
                 (Some(usage), Some(chat_id)) => (
                     usage.prompt_tokens,
                     usage.completion_tokens,
+                    usage.cached_tokens(),
                     chat_id.clone(),
                 ),
                 (None, None) => {
@@ -259,6 +260,7 @@ where
                             model_id,
                             input_tokens,
                             output_tokens,
+                            cache_read_tokens,
                             inference_type,
                             ttft_ms,
                             avg_itl_ms,
@@ -1269,6 +1271,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         let model_id = model.id;
         let input_tokens = response_with_bytes.response.usage.prompt_tokens;
         let output_tokens = response_with_bytes.response.usage.completion_tokens;
+        let cache_read_tokens = response_with_bytes.response.usage.cached_tokens();
         // Hash the full chat ID to UUID for storage
         let provider_request_id = response_with_bytes.response.id.clone();
         let inference_id = hash_inference_id_to_uuid(&provider_request_id);
@@ -1292,6 +1295,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
                     model_id,
                     input_tokens,
                     output_tokens,
+                    cache_read_tokens,
                     inference_type: crate::usage::ports::InferenceType::ChatCompletion,
                     ttft_ms: None,    // N/A for non-streaming
                     avg_itl_ms: None, // N/A for non-streaming

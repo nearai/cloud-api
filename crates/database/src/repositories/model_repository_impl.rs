@@ -14,6 +14,7 @@ impl services::usage::ports::ModelRepository for ModelRepository {
             input_cost_per_token: m.input_cost_per_token,
             output_cost_per_token: m.output_cost_per_token,
             cost_per_image: m.cost_per_image,
+            cache_read_cost_per_token: m.cache_read_cost_per_token,
         }))
     }
 
@@ -26,6 +27,7 @@ impl services::usage::ports::ModelRepository for ModelRepository {
             input_cost_per_token: m.input_cost_per_token,
             output_cost_per_token: m.output_cost_per_token,
             cost_per_image: m.cost_per_image,
+            cache_read_cost_per_token: m.cache_read_cost_per_token,
         }))
     }
 }

@@ -710,11 +710,14 @@ pub struct CompletionChoice {
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct Usage {
-    #[serde(alias = "prompt_tokens")]
+    #[serde(rename = "prompt_tokens")]
     pub input_tokens: i32,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "prompt_tokens_details",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub input_tokens_details: Option<InputTokensDetails>,
-    #[serde(alias = "completion_tokens")]
+    #[serde(rename = "completion_tokens")]
     pub output_tokens: i32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub output_tokens_details: Option<OutputTokensDetails>,
@@ -2429,6 +2432,8 @@ pub struct AdminModelWithPricing {
     pub output_cost_per_token: DecimalPrice,
     #[serde(rename = "costPerImage")]
     pub cost_per_image: DecimalPrice,
+    #[serde(rename = "cacheReadCostPerToken")]
+    pub cache_read_cost_per_token: DecimalPrice,
     pub metadata: ModelMetadata,
     #[serde(rename = "isActive")]
     pub is_active: bool,
@@ -2449,6 +2454,8 @@ pub struct ModelWithPricing {
     pub output_cost_per_token: DecimalPrice,
     #[serde(rename = "costPerImage")]
     pub cost_per_image: DecimalPrice,
+    #[serde(rename = "cacheReadCostPerToken")]
+    pub cache_read_cost_per_token: DecimalPrice,
     pub metadata: ModelMetadata,
 }
 
@@ -2558,6 +2565,11 @@ pub struct UpdateModelApiRequest {
     pub output_cost_per_token: Option<DecimalPriceRequest>,
     #[serde(rename = "costPerImage")]
     pub cost_per_image: Option<DecimalPriceRequest>,
+    #[serde(
+        rename = "cacheReadCostPerToken",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub cache_read_cost_per_token: Option<DecimalPriceRequest>,
     #[serde(rename = "modelDisplayName")]
     pub model_display_name: Option<String>,
     #[serde(rename = "modelDescription")]
@@ -2616,6 +2628,8 @@ pub struct ModelHistoryEntry {
     pub output_cost_per_token: DecimalPrice,
     #[serde(rename = "costPerImage")]
     pub cost_per_image: DecimalPrice,
+    #[serde(rename = "cacheReadCostPerToken")]
+    pub cache_read_cost_per_token: DecimalPrice,
     #[serde(rename = "contextLength")]
     pub context_length: i32,
     #[serde(rename = "modelName")]

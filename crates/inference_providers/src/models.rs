@@ -346,6 +346,18 @@ impl TokenUsage {
             prompt_tokens_details: None,
         }
     }
+
+    /// Number of prompt tokens that were cache hits (OpenAI-style prompt_tokens_details.cached_tokens).
+    /// Returns 0 if missing or invalid.
+    pub fn cached_tokens(&self) -> i32 {
+        let Some(ref details) = self.prompt_tokens_details else {
+            return 0;
+        };
+        let Some(v) = details.get("cached_tokens") else {
+            return 0;
+        };
+        v.as_i64().and_then(|n| i32::try_from(n).ok()).unwrap_or(0)
+    }
 }
 
 /// Audio output data (for Qwen3-Omni and similar models)

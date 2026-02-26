@@ -353,6 +353,9 @@ pub enum RecordUsageApiRequest {
         input_tokens: Option<i32>,
         /// Number of output/completion tokens
         output_tokens: Option<i32>,
+        /// Number of prompt tokens that were cache hits (optional; 0 if omitted)
+        #[serde(default)]
+        cached_tokens: Option<i32>,
         /// External identifier (e.g., provider request ID) used as
         /// an idempotency key. Stored as `provider_request_id` and
         /// hashed to a deterministic UUID v5 for `inference_id`.
@@ -384,6 +387,8 @@ pub struct RecordUsageServiceRequest {
     pub model_id: Uuid,
     pub input_tokens: i32,
     pub output_tokens: i32,
+    /// Number of prompt tokens that were cache hits (subset of input_tokens)
+    pub cache_read_tokens: i32,
     pub inference_type: InferenceType,
     /// Time to first token in milliseconds
     pub ttft_ms: Option<i32>,
@@ -412,6 +417,7 @@ pub struct RecordUsageDbRequest {
     pub model_name: String, // Denormalized canonical model name
     pub input_tokens: i32,
     pub output_tokens: i32,
+    pub cache_read_tokens: i32,
     pub input_cost: i64,
     pub output_cost: i64,
     pub total_cost: i64,
@@ -441,6 +447,7 @@ pub struct ModelPricing {
     pub input_cost_per_token: i64,
     pub output_cost_per_token: i64,
     pub cost_per_image: i64,
+    pub cache_read_cost_per_token: i64,
 }
 
 /// Organization spending limit
@@ -501,6 +508,7 @@ pub struct UsageLogEntry {
     pub model: String, // Canonical model name from models table
     pub input_tokens: i32,
     pub output_tokens: i32,
+    pub cache_read_tokens: i32,
     pub total_tokens: i32,
     pub input_cost: i64,
     pub output_cost: i64,

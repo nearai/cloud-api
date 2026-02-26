@@ -44,6 +44,9 @@ pub struct UsageHistoryEntryResponse {
     pub model: String, // Model name (canonical name from models table)
     pub input_tokens: i32,
     pub output_tokens: i32,
+    /// Number of prompt tokens that were cache hits
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_read_tokens: Option<i32>,
     pub total_tokens: i32,
     pub total_cost: i64,            // In nano-dollars (scale 9)
     pub total_cost_display: String, // Human readable, e.g., "$0.00123"
@@ -349,6 +352,7 @@ pub async fn get_organization_usage_history(
             model: entry.model,
             input_tokens: entry.input_tokens,
             output_tokens: entry.output_tokens,
+            cache_read_tokens: Some(entry.cache_read_tokens),
             total_tokens: entry.total_tokens,
             total_cost: entry.total_cost,
             total_cost_display: format_amount(entry.total_cost),
@@ -479,6 +483,7 @@ pub async fn get_api_key_usage_history(
             model: entry.model,
             input_tokens: entry.input_tokens,
             output_tokens: entry.output_tokens,
+            cache_read_tokens: Some(entry.cache_read_tokens),
             total_tokens: entry.total_tokens,
             total_cost: entry.total_cost,
             total_cost_display: format_amount(entry.total_cost),

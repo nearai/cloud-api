@@ -74,6 +74,7 @@ impl UsageServiceTrait for MockUsageService {
         _model_id: &str,
         _input_tokens: i32,
         _output_tokens: i32,
+        _cache_read_tokens: i32,
     ) -> Result<CostBreakdown, UsageError> {
         Ok(CostBreakdown {
             input_cost: 0,
@@ -254,6 +255,7 @@ impl UsageServiceTrait for CapturingUsageService {
         _model_id: &str,
         _input_tokens: i32,
         _output_tokens: i32,
+        _cache_read_tokens: i32,
     ) -> Result<CostBreakdown, UsageError> {
         Ok(CostBreakdown {
             input_cost: 0,

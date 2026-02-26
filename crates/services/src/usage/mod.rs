@@ -8,6 +8,51 @@ pub use ports::*;
 use std::sync::Arc;
 use uuid::Uuid;
 
+/// Compute token-based cost with cache-aware input pricing.
+/// Formula: cache_read = min(cache_read_tokens, input_tokens); input_cost = (input - cache_read)*input_rate + cache_read*cache_read_rate; output_cost = output*output_rate; total = input_cost + output_cost.
+/// All costs in nano-dollars (scale 9). Uses checked arithmetic for overflow safety.
+fn compute_token_cost(
+    input_tokens: i32,
+    output_tokens: i32,
+    cache_read_tokens: i32,
+    pricing: &ModelPricing,
+) -> Result<CostBreakdown, UsageError> {
+    let cache_read = cache_read_tokens.min(input_tokens).max(0) as i64;
+    let non_cached_input = (input_tokens as i64) - cache_read;
+    let input_cost = non_cached_input
+        .checked_mul(pricing.input_cost_per_token)
+        .and_then(|c| {
+            cache_read
+                .checked_mul(pricing.cache_read_cost_per_token)
+                .and_then(|cr| c.checked_add(cr))
+        })
+        .ok_or_else(|| {
+            UsageError::CostCalculationOverflow(format!(
+                "Input cost calculation overflow: input_tokens={} cache_read_tokens={}",
+                input_tokens, cache_read_tokens
+            ))
+        })?;
+    let output_cost = (output_tokens as i64)
+        .checked_mul(pricing.output_cost_per_token)
+        .ok_or_else(|| {
+            UsageError::CostCalculationOverflow(format!(
+                "Output cost calculation overflow: {} tokens * {} cost_per_token",
+                output_tokens, pricing.output_cost_per_token
+            ))
+        })?;
+    let total_cost = input_cost.checked_add(output_cost).ok_or_else(|| {
+        UsageError::CostCalculationOverflow(format!(
+            "Total cost calculation overflow: {} + {}",
+            input_cost, output_cost
+        ))
+    })?;
+    Ok(CostBreakdown {
+        input_cost,
+        output_cost,
+        total_cost,
+    })
+}
+
 pub struct UsageServiceImpl {
     usage_repository: Arc<dyn UsageRepository>,
     model_repository: Arc<dyn ModelRepository>,
@@ -43,8 +88,8 @@ impl UsageServiceTrait for UsageServiceImpl {
         model_id: &str,
         input_tokens: i32,
         output_tokens: i32,
+        cache_read_tokens: i32,
     ) -> Result<CostBreakdown, UsageError> {
-        // Get model pricing
         let model = self
             .model_repository
             .get_model_by_name(model_id)
@@ -52,36 +97,7 @@ impl UsageServiceTrait for UsageServiceImpl {
             .map_err(|e| UsageError::InternalError(format!("Failed to get model: {e}")))?
             .ok_or_else(|| UsageError::ModelNotFound(format!("Model '{model_id}' not found")))?;
 
-        // Calculate costs: tokens * cost_per_token (all in nano-dollars, scale 9)
-        // Use checked arithmetic to prevent integer overflow in billing-critical path
-        let input_cost = (input_tokens as i64)
-            .checked_mul(model.input_cost_per_token)
-            .ok_or_else(|| {
-                UsageError::CostCalculationOverflow(format!(
-                    "Input cost calculation overflow: {} tokens * {} cost_per_token",
-                    input_tokens, model.input_cost_per_token
-                ))
-            })?;
-        let output_cost = (output_tokens as i64)
-            .checked_mul(model.output_cost_per_token)
-            .ok_or_else(|| {
-                UsageError::CostCalculationOverflow(format!(
-                    "Output cost calculation overflow: {} tokens * {} cost_per_token",
-                    output_tokens, model.output_cost_per_token
-                ))
-            })?;
-        let total_cost = input_cost.checked_add(output_cost).ok_or_else(|| {
-            UsageError::CostCalculationOverflow(format!(
-                "Total cost calculation overflow: {} + {}",
-                input_cost, output_cost
-            ))
-        })?;
-
-        Ok(CostBreakdown {
-            input_cost,
-            output_cost,
-            total_cost,
-        })
+        compute_token_cost(input_tokens, output_tokens, cache_read_tokens, &model)
     }
 
     /// Record usage after an API call completes
@@ -145,37 +161,13 @@ impl UsageServiceTrait for UsageServiceImpl {
             }
             _ => {
                 // For token-based models (chat completions, etc.)
-                // Cap cache_read to input_tokens; bill input as (input - cache_read)*input_rate + cache_read*cache_read_rate
-                let cache_read = request.cache_read_tokens.min(request.input_tokens).max(0) as i64;
-                let non_cached_input = (request.input_tokens as i64) - cache_read;
-                let input_cost = non_cached_input
-                    .checked_mul(model.input_cost_per_token)
-                    .and_then(|c| {
-                        (cache_read)
-                            .checked_mul(model.cache_read_cost_per_token)
-                            .and_then(|cr| c.checked_add(cr))
-                    })
-                    .ok_or_else(|| {
-                        UsageError::CostCalculationOverflow(format!(
-                            "Input cost calculation overflow: input_tokens={} cache_read={}",
-                            request.input_tokens, request.cache_read_tokens
-                        ))
-                    })?;
-                let output_cost = (request.output_tokens as i64)
-                    .checked_mul(model.output_cost_per_token)
-                    .ok_or_else(|| {
-                        UsageError::CostCalculationOverflow(format!(
-                            "Output cost calculation overflow: {} tokens * {} cost_per_token",
-                            request.output_tokens, model.output_cost_per_token
-                        ))
-                    })?;
-                let total_cost = input_cost.checked_add(output_cost).ok_or_else(|| {
-                    UsageError::CostCalculationOverflow(format!(
-                        "Total cost calculation overflow: {} + {}",
-                        input_cost, output_cost
-                    ))
-                })?;
-                (input_cost, output_cost, total_cost)
+                let cost = compute_token_cost(
+                    request.input_tokens,
+                    request.output_tokens,
+                    request.cache_read_tokens,
+                    &model,
+                )?;
+                (cost.input_cost, cost.output_cost, cost.total_cost)
             }
         };
 

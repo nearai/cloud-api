@@ -180,12 +180,14 @@ impl std::fmt::Display for StopReason {
 
 #[async_trait::async_trait]
 pub trait UsageServiceTrait: Send + Sync {
-    /// Calculate cost for a given model and token usage
+    /// Calculate cost for a given model and token usage.
+    /// Uses the same formula as record_usage: (input - cache_read)*input_rate + cache_read*cache_read_rate + output*output_rate.
     async fn calculate_cost(
         &self,
         model_id: &str,
         input_tokens: i32,
         output_tokens: i32,
+        cache_read_tokens: i32,
     ) -> Result<CostBreakdown, UsageError>;
 
     /// Record usage after an API call completes

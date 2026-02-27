@@ -9,8 +9,21 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 /// Compute token-based cost with cache-aware input pricing.
-/// Formula: cache_read = min(cache_read_tokens, input_tokens); input_cost = (input - cache_read)*input_rate + cache_read*cache_read_rate; output_cost = output*output_rate; total = input_cost + output_cost.
-/// All costs in nano-dollars (scale 9). Uses checked arithmetic for overflow safety.
+///
+/// Formula (with cache enabled):
+/// - `cache_read = min(cache_read_tokens, input_tokens)`
+/// - `input_cost = (input_tokens - cache_read) * input_rate + cache_read * cache_read_rate`
+/// - `output_cost = output_tokens * output_rate`
+/// - `total = input_cost + output_cost`
+///
+/// **Important semantic**:
+/// - When `pricing.cache_read_cost_per_token == 0`, cache pricing is treated as **disabled** and
+///   all input tokens (including cached ones) are billed at `input_cost_per_token`.
+///   This preserves legacy behavior for existing models even if providers start reporting
+///   `cached_tokens > 0`. Admins must explicitly set a non-zero `cache_read_cost_per_token`
+///   on a model to enable discounted cache billing.
+///
+/// All costs are in nano-dollars (scale 9). Uses checked arithmetic for overflow safety.
 fn compute_token_cost(
     input_tokens: i32,
     output_tokens: i32,
@@ -19,11 +32,18 @@ fn compute_token_cost(
 ) -> Result<CostBreakdown, UsageError> {
     let cache_read = cache_read_tokens.min(input_tokens).max(0) as i64;
     let non_cached_input = (input_tokens as i64) - cache_read;
+    // If cache_read_cost_per_token is 0, treat cache pricing as disabled and bill cached tokens
+    // at the normal input rate. This avoids making cached tokens free for existing models.
+    let effective_cache_rate = if pricing.cache_read_cost_per_token == 0 {
+        pricing.input_cost_per_token
+    } else {
+        pricing.cache_read_cost_per_token
+    };
     let input_cost = non_cached_input
         .checked_mul(pricing.input_cost_per_token)
         .and_then(|c| {
             cache_read
-                .checked_mul(pricing.cache_read_cost_per_token)
+                .checked_mul(effective_cache_rate)
                 .and_then(|cr| c.checked_add(cr))
         })
         .ok_or_else(|| {

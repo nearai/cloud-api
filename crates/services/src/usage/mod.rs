@@ -256,7 +256,8 @@ impl UsageServiceTrait for UsageServiceImpl {
                 }
                 let input = input_tokens.unwrap_or(0);
                 let output = output_tokens.unwrap_or(0);
-                if input < 0 || output < 0 {
+                let cache_read = cached_tokens.unwrap_or(0);
+                if input < 0 || output < 0 || cache_read < 0 {
                     return Err(UsageError::ValidationError(
                         "token counts must be non-negative".into(),
                     ));
@@ -270,7 +271,7 @@ impl UsageServiceTrait for UsageServiceImpl {
                     model.clone(),
                     input,
                     output,
-                    cached_tokens.unwrap_or(0),
+                    cache_read,
                     None,
                     InferenceType::ChatCompletion,
                     id.clone(),
@@ -552,6 +553,61 @@ impl UsageServiceTrait for UsageServiceImpl {
 
 #[cfg(test)]
 mod tests {
+    use super::{compute_token_cost, CostBreakdown, ModelPricing, UsageError};
+    use uuid::Uuid;
+
+    fn make_pricing(
+        input_cost_per_token: i64,
+        output_cost_per_token: i64,
+        cache_read_cost_per_token: i64,
+    ) -> ModelPricing {
+        ModelPricing {
+            id: Uuid::nil(),
+            model_name: "test-model".to_string(),
+            input_cost_per_token,
+            output_cost_per_token,
+            cost_per_image: 0,
+            cache_read_cost_per_token,
+        }
+    }
+
+    fn unwrap_cost(result: Result<CostBreakdown, UsageError>) -> CostBreakdown {
+        result.expect("cost calculation should not overflow in this test")
+    }
+
+    #[test]
+    fn test_compute_token_cost_no_cache() {
+        let pricing = make_pricing(10, 20, 5);
+        let cost = unwrap_cost(compute_token_cost(100, 50, 0, &pricing));
+
+        assert_eq!(cost.input_cost, 100 * 10);
+        assert_eq!(cost.output_cost, 50 * 20);
+        assert_eq!(cost.total_cost, cost.input_cost + cost.output_cost);
+    }
+
+    #[test]
+    fn test_compute_token_cost_partial_cache() {
+        let pricing = make_pricing(10, 20, 5);
+        let cost = unwrap_cost(compute_token_cost(100, 50, 40, &pricing));
+
+        // 60 non-cached * 10 + 40 cached * 5 = 600 + 200
+        assert_eq!(cost.input_cost, 60 * 10 + 40 * 5);
+        assert_eq!(cost.output_cost, 50 * 20);
+        assert_eq!(cost.total_cost, cost.input_cost + cost.output_cost);
+    }
+
+    #[test]
+    fn test_compute_token_cost_cache_capped_to_input() {
+        let pricing = make_pricing(10, 20, 5);
+        // cache_read_tokens > input_tokens, should be capped to input_tokens (30)
+        let cost = unwrap_cost(compute_token_cost(30, 0, 100, &pricing));
+
+        // All 30 input tokens are treated as cache-read
+        assert_eq!(cost.input_cost, 30 * 5);
+        assert_eq!(cost.output_cost, 0);
+        assert_eq!(cost.total_cost, cost.input_cost);
+    }
+
     #[test]
     fn test_cost_calculation_overflow_detection() {
         // This test verifies that i64::checked_mul properly detects overflow conditions

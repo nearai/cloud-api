@@ -509,7 +509,7 @@ impl ModelRepository {
                             context_length = EXCLUDED.context_length,
                             verifiable = EXCLUDED.verifiable,
                             is_active = EXCLUDED.is_active,
-                            owned_by = CASE WHEN $11 IS NULL THEN models.owned_by ELSE EXCLUDED.owned_by END,
+                            owned_by = CASE WHEN $12 IS NULL THEN models.owned_by ELSE EXCLUDED.owned_by END,
                             provider_type = EXCLUDED.provider_type,
                             provider_config = EXCLUDED.provider_config,
                             attestation_supported = EXCLUDED.attestation_supported,
@@ -593,7 +593,10 @@ impl ModelRepository {
                         context_length, verifiable, is_active, owned_by,
                         provider_type, provider_config, attestation_supported,
                         input_modalities, output_modalities
-                    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+                    ) VALUES (
+                        $1, $2, $3, $4, $5, $6, $7, $8,
+                        $9, $10, $11, $12, $13, $14, $15, $16, $17
+                    )
                     RETURNING id, model_name, model_display_name, model_description, model_icon,
                               input_cost_per_token, output_cost_per_token, cost_per_image, cache_read_cost_per_token,
                               context_length, verifiable, is_active, owned_by, created_at, updated_at,
@@ -608,6 +611,7 @@ impl ModelRepository {
                         &model.input_cost_per_token,
                         &model.output_cost_per_token,
                         &model.cost_per_image,
+                        &model.cache_read_cost_per_token,
                         &model.context_length,
                         &model.verifiable,
                         &model.is_active,

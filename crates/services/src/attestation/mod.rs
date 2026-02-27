@@ -57,6 +57,16 @@ impl AttestationService {
         metrics_service: Arc<dyn MetricsServiceTrait>,
         usage_repository: Arc<dyn UsageRepository>,
     ) -> Result<Self, AttestationError> {
+        // Warn if DEV is set in a release build — it has no effect but suggests misconfiguration
+        #[cfg(not(debug_assertions))]
+        if std::env::var("DEV").is_ok() {
+            tracing::error!(
+                "SECURITY: DEV environment variable is set in a release build. \
+                 DEV mode is not available in release builds and will be ignored. \
+                 Remove the DEV variable from your environment."
+            );
+        }
+
         // Load VPC info once during initialization
         let vpc_info = load_vpc_info();
 
@@ -70,18 +80,36 @@ impl AttestationService {
 
         // In TEE, use dstack-derived key material based on app_id so the signing address
         // stays stable across multiple instances of the same app.
-        // In DEV mode, fall back to per-process keys for local development.
+        // In DEV mode (debug builds only), fall back to per-process ephemeral keys.
         let (ed25519_signing_key, ed25519_verifying_key, ecdsa_signing_key, ecdsa_verifying_key) =
             match Self::derive_signing_keys_from_dstack().await {
                 Ok(keys) => keys,
                 Err(e) => {
-                    if std::env::var("DEV").is_ok() {
-                        tracing::warn!(
-                            "DEV mode: Unable to derive signing keys from dstack ({}); falling back to ephemeral keys",
-                            e
-                        );
-                        Self::generate_ephemeral_signing_keys()
-                    } else {
+                    // DEV mode fallback is only available in debug builds.
+                    // In release builds, dstack key derivation failure is always fatal.
+                    #[cfg(debug_assertions)]
+                    {
+                        if std::env::var("DEV").is_ok() {
+                            tracing::warn!(
+                                "DEV mode: Unable to derive signing keys from dstack ({}); falling back to ephemeral keys",
+                                e
+                            );
+                            Self::generate_ephemeral_signing_keys()
+                        } else {
+                            tracing::error!(
+                                "Failed to derive signing keys from dstack ({}). \
+                                 This service must run in a CVM/TEE with dstack available.",
+                                e
+                            );
+                            return Err(AttestationError::InternalError(format!(
+                                "Failed to derive signing keys from dstack: {}. \
+                                 Ensure this service runs in a CVM/TEE with dstack available.",
+                                e
+                            )));
+                        }
+                    }
+                    #[cfg(not(debug_assertions))]
+                    {
                         tracing::error!(
                             "Failed to derive signing keys from dstack ({}). \
                              This service must run in a CVM/TEE with dstack available.",
@@ -111,6 +139,7 @@ impl AttestationService {
         })
     }
 
+    #[cfg(debug_assertions)]
     fn generate_ephemeral_signing_keys(
     ) -> (SigningKey, VerifyingKey, EcdsaSigningKey, EcdsaVerifyingKey) {
         let mut csprng = OsRng;
@@ -706,8 +735,17 @@ impl ports::AttestationServiceTrait for AttestationService {
         // Place nonce in the last 32 bytes
         report_data[32..64].copy_from_slice(&nonce_bytes);
 
+        // Fake attestation data is only available in debug builds with DEV set.
+        // In release builds, real dstack attestation is always required.
+        let use_dev_attestation = {
+            #[cfg(debug_assertions)]
+            { std::env::var("DEV").is_ok() }
+            #[cfg(not(debug_assertions))]
+            { false }
+        };
+
         let gateway_attestation;
-        if let Ok(_dev) = std::env::var("DEV") {
+        if use_dev_attestation {
             gateway_attestation = DstackCpuQuote {
                 signing_address: signing_address_to_use,
                 signing_algo: algo,

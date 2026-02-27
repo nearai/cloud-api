@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - main
+      - chore/image-signing
     tags:
       - 'v*'
 
@@ -86,6 +87,13 @@ jobs:
           subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_REPOSITORY }}
           subject-digest: ${{ env.IMAGE_DIGEST }}
           push-to-registry: true
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign image with cosign (keyless)
+        run: |
+          cosign sign --yes "${{ env.REGISTRY }}/${{ env.IMAGE_REPOSITORY }}@${{ env.IMAGE_DIGEST }}"
 
       - name: Tag staging for continuous integration
         if: env.ALSO_TAG_STAGING == 'true'

@@ -710,12 +710,24 @@ pub struct CompletionChoice {
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct Usage {
+    #[serde(alias = "prompt_tokens")]
     pub input_tokens: i32,
-    #[serde(skip_serializing_if = "Option::is_none")]
+
+    #[serde(
+        alias = "prompt_tokens_details",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub input_tokens_details: Option<InputTokensDetails>,
+
+    #[serde(alias = "completion_tokens")]
     pub output_tokens: i32,
-    #[serde(skip_serializing_if = "Option::is_none")]
+
+    #[serde(
+        alias = "completion_tokens_details",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub output_tokens_details: Option<OutputTokensDetails>,
+
     pub total_tokens: i32,
 }
 

@@ -87,6 +87,13 @@ jobs:
           subject-digest: ${{ env.IMAGE_DIGEST }}
           push-to-registry: true
 
+      - name: Install cosign
+        uses: sigstore/cosign-installer@faadad0cce49287aee09b3a48701e75088a2c6ad  # v4.0.0
+
+      - name: Sign image with cosign (keyless)
+        run: |
+          cosign sign --yes "${{ env.REGISTRY }}/${{ env.IMAGE_REPOSITORY }}@${{ env.IMAGE_DIGEST }}"
+
       - name: Tag staging for continuous integration
         if: env.ALSO_TAG_STAGING == 'true'
         run: |

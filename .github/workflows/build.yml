@@ -92,7 +92,7 @@ jobs:
 
       - name: Sign image with cosign (keyless)
         run: |
-          cosign sign --yes "${{ env.IMAGE_REFERENCE }}"
+          cosign sign --yes "${{ env.REGISTRY }}/${{ env.IMAGE_REPOSITORY }}@${{ env.IMAGE_DIGEST }}"
 
       - name: Tag staging for continuous integration
         if: env.ALSO_TAG_STAGING == 'true'

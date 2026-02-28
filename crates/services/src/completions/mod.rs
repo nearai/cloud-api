@@ -326,7 +326,7 @@ where
         match &mut self.state {
             StreamState::Streaming => {
                 match Pin::new(&mut self.inner).poll_next(cx) {
-                    Poll::Ready(Some(Ok(ref event))) => {
+                    Poll::Ready(Some(Ok(event))) => {
                         let now = Instant::now();
 
                         if !self.first_token_received {
@@ -357,8 +357,10 @@ where
                         }
 
                         if let StreamChunk::Chat(ref chat_chunk) = event.chunk {
-                            // Track chat_id for attestation (updated on each chunk)
-                            self.last_chat_id = Some(chat_chunk.id.clone());
+                            // Only capture chat_id on first token (it never changes within a stream)
+                            if self.last_chat_id.is_none() {
+                                self.last_chat_id = Some(chat_chunk.id.clone());
+                            }
 
                             // Track usage stats (updated on each chunk that has usage)
                             if let Some(usage) = &chat_chunk.usage {
@@ -372,7 +374,7 @@ where
                                 }
                             }
                         }
-                        Poll::Ready(Some(Ok(event.clone())))
+                        Poll::Ready(Some(Ok(event)))
                     }
                     Poll::Ready(None) => {
                         self.stream_completed = true;
@@ -381,12 +383,12 @@ where
                         self.state = StreamState::Done;
                         Poll::Ready(None)
                     }
-                    Poll::Ready(Some(Err(ref err))) => {
+                    Poll::Ready(Some(Err(err))) => {
                         // Capture error for stop_reason in usage recording (handled in Drop)
                         // Note: We intentionally skip attestation for errors
                         // because partial completions cannot be verified by clients
                         self.last_error = Some(err.clone());
-                        Poll::Ready(Some(Err(err.clone())))
+                        Poll::Ready(Some(Err(err)))
                     }
                     Poll::Pending => Poll::Pending,
                 }

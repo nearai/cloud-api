@@ -428,14 +428,12 @@ pub async fn chat_completions(
                                     }
                                 }
 
-                                // raw_bytes contains "data: {...}\n", extract just the JSON part
-                                let raw_str = String::from_utf8_lossy(&event.raw_bytes);
-                                let json_data = raw_str
-                                    .trim()
-                                    .strip_prefix("data: ")
-                                    .unwrap_or(raw_str.trim());
-                                // Format as SSE event with proper newlines
-                                let sse_bytes = Bytes::from(format!("data: {json_data}\n\n"));
+                                // raw_bytes is "data: {...}\n"; append one "\n" for SSE double-newline.
+                                // This avoids re-parsing + re-formatting the entire payload per token.
+                                let mut buf = Vec::with_capacity(event.raw_bytes.len() + 1);
+                                buf.extend_from_slice(&event.raw_bytes);
+                                buf.push(b'\n');
+                                let sse_bytes = Bytes::from(buf);
                                 accumulated_clone
                                     .lock()
                                     .unwrap_or_else(|e| e.into_inner())

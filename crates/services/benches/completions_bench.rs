@@ -1,12 +1,14 @@
 //! Criterion microbenchmarks for completions hot-path optimizations.
 //!
-//! Three benchmark groups:
-//! 1. **sse_token_processing** — per-token `.map()` closure (old async vs new sync path)
-//! 2. **intercept_stream** — `InterceptStream::poll_next` throughput over 200 tokens
-//! 3. **model_resolution_cache** — moka cache hit vs miss for `resolve_and_get_model`
+//! Benchmark groups:
+//! 1. **sse_token_processing** — old async vs new sync per-token path
+//! 2. **sse_operation_breakdown** — isolate each per-token operation
+//! 3. **intercept_stream** — `InterceptStream::poll_next` throughput
+//! 4. **intercept_stream_breakdown** — isolate poll_next sub-operations
+//! 5. **model_resolution_cache** — moka cache hit vs miss
 
 use bytes::Bytes;
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use futures::stream::StreamExt;
 use std::sync::Arc;
 use std::time::Instant;
@@ -188,13 +190,11 @@ fn process_stream_new(payloads: Vec<Bytes>, rt: &tokio::runtime::Runtime) {
             }
         }
 
-        // Accumulate bytes
-        let raw_str = String::from_utf8_lossy(&event_bytes);
-        let json_data = raw_str
-            .trim()
-            .strip_prefix("data: ")
-            .unwrap_or(raw_str.trim());
-        let sse_bytes = Bytes::from(format!("data: {json_data}\n\n"));
+        // Accumulate bytes — append "\n" to raw_bytes ("data: {...}\n" → "data: {...}\n\n")
+        let mut buf = Vec::with_capacity(event_bytes.len() + 1);
+        buf.extend_from_slice(&event_bytes);
+        buf.push(b'\n');
+        let sse_bytes = Bytes::from(buf);
         accumulated_clone
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -246,10 +246,118 @@ fn bench_sse_token_processing(c: &mut Criterion) {
 }
 
 // ===========================================================================
-// Group 2: InterceptStream poll_next throughput
+// Group 2: SSE operation breakdown — isolate per-token costs
 // ===========================================================================
 
-// Stub implementations for services (no-op / instant return)
+fn bench_sse_operation_breakdown(c: &mut Criterion) {
+    let mut group = c.benchmark_group("sse_operation_breakdown");
+    let token_count: usize = 200;
+    group.throughput(Throughput::Elements(token_count as u64));
+
+    let payloads = make_sse_payloads(token_count);
+
+    // 2a: Just String::from_utf8_lossy + strip + format (the re-framing cost)
+    group.bench_with_input(
+        BenchmarkId::new("reframe_bytes_only", token_count),
+        &payloads,
+        |b, payloads| {
+            b.iter(|| {
+                for payload in payloads {
+                    let raw_str = String::from_utf8_lossy(payload);
+                    let json_data = raw_str
+                        .trim()
+                        .strip_prefix("data: ")
+                        .unwrap_or(raw_str.trim());
+                    let sse_bytes = Bytes::from(format!("data: {json_data}\n\n"));
+                    black_box(sse_bytes);
+                }
+            });
+        },
+    );
+
+    // 2b: Just the mutex lock + extend (accumulation cost)
+    group.bench_with_input(
+        BenchmarkId::new("mutex_lock_and_accumulate", token_count),
+        &payloads,
+        |b, payloads| {
+            b.iter(|| {
+                let accumulated = std::sync::Mutex::new(Vec::<u8>::new());
+                for payload in payloads {
+                    accumulated.lock().unwrap().extend_from_slice(payload);
+                }
+                black_box(accumulated);
+            });
+        },
+    );
+
+    // 2c: serde_json parse of a single chunk (the JSON parse cost)
+    let single_payload = &payloads[0];
+    group.bench_function("json_parse_single_chunk", |b| {
+        b.iter(|| {
+            let chunk_str = std::str::from_utf8(single_payload).unwrap();
+            let data = chunk_str.strip_prefix("data: ").unwrap();
+            let val: serde_json::Value = black_box(serde_json::from_str(data.trim()).unwrap());
+            black_box(val);
+        });
+    });
+
+    // 2d: json_parse * 200 (old path) vs json_parse * 1 (new path)
+    group.bench_with_input(
+        BenchmarkId::new("json_parse_all_tokens", token_count),
+        &payloads,
+        |b, payloads| {
+            b.iter(|| {
+                for payload in payloads {
+                    if let Ok(chunk_str) = std::str::from_utf8(payload) {
+                        if let Some(data) = chunk_str.strip_prefix("data: ") {
+                            let _: Result<serde_json::Value, _> =
+                                black_box(serde_json::from_str(data.trim()));
+                        }
+                    }
+                }
+            });
+        },
+    );
+
+    // 2e: Bytes::from(format!(...)) allocation per token
+    group.bench_with_input(
+        BenchmarkId::new("bytes_format_alloc", token_count),
+        &payloads,
+        |b, payloads| {
+            b.iter(|| {
+                for payload in payloads {
+                    let raw_str = std::str::from_utf8(payload).unwrap();
+                    let json_data = raw_str
+                        .trim()
+                        .strip_prefix("data: ")
+                        .unwrap_or(raw_str.trim());
+                    let sse_bytes = Bytes::from(format!("data: {json_data}\n\n"));
+                    black_box(sse_bytes);
+                }
+            });
+        },
+    );
+
+    // 2f: Zero-copy passthrough (raw_bytes already have correct format)
+    group.bench_with_input(
+        BenchmarkId::new("zero_copy_passthrough", token_count),
+        &payloads,
+        |b, payloads| {
+            b.iter(|| {
+                for payload in payloads {
+                    // If raw_bytes were already correctly formatted, we could just pass through
+                    black_box(payload.clone());
+                }
+            });
+        },
+    );
+
+    group.finish();
+}
+
+// ===========================================================================
+// Group 3: InterceptStream poll_next throughput
+// ===========================================================================
 
 struct NoOpMetrics;
 
@@ -489,7 +597,101 @@ fn bench_intercept_stream(c: &mut Criterion) {
 }
 
 // ===========================================================================
-// Group 3: Model resolution cache — hit vs miss
+// Group 4: InterceptStream operation breakdown
+// ===========================================================================
+
+fn bench_intercept_stream_breakdown(c: &mut Criterion) {
+    let mut group = c.benchmark_group("intercept_stream_breakdown");
+    let token_count: usize = 200;
+    group.throughput(Throughput::Elements(token_count as u64));
+
+    let events = make_sse_events(token_count);
+
+    // 4a: Cost of cloning SSEEvents (done inside poll_next via event.clone())
+    group.bench_with_input(
+        BenchmarkId::new("sse_event_clone", token_count),
+        &events,
+        |b, events| {
+            b.iter(|| {
+                for event in events {
+                    if let Ok(e) = event {
+                        black_box(e.clone());
+                    }
+                }
+            });
+        },
+    );
+
+    // 4b: Cost of Instant::now() per token (called on every poll_next)
+    group.bench_with_input(
+        BenchmarkId::new("instant_now_per_token", token_count),
+        &token_count,
+        |b, &n| {
+            b.iter(|| {
+                for _ in 0..n {
+                    black_box(Instant::now());
+                }
+            });
+        },
+    );
+
+    // 4c: Cost of chat_chunk.id.clone() per token
+    group.bench_with_input(
+        BenchmarkId::new("string_clone_chat_id", token_count),
+        &events,
+        |b, events| {
+            b.iter(|| {
+                for event in events {
+                    if let Ok(e) = event {
+                        if let inference_providers::StreamChunk::Chat(ref chunk) = e.chunk {
+                            black_box(chunk.id.clone());
+                        }
+                    }
+                }
+            });
+        },
+    );
+
+    // 4d: Cost of building the Vec<&str> metric tags per first-token call
+    group.bench_function("metric_tags_vec_build", |b| {
+        let metric_tags = vec![
+            "model:bench-model".to_string(),
+            "environment:bench".to_string(),
+        ];
+        b.iter(|| {
+            let tags_str: Vec<&str> = metric_tags.iter().map(|s| s.as_str()).collect();
+            black_box(tags_str);
+        });
+    });
+
+    // 4e: Cost of stream setup (build_intercept_stream without polling)
+    group.bench_with_input(
+        BenchmarkId::new("stream_construction", token_count),
+        &events,
+        |b, events| {
+            b.iter(|| {
+                let stream = build_intercept_stream(events.clone());
+                black_box(stream);
+            });
+        },
+    );
+
+    // 4f: Cost of cloning the events Vec (benchmark overhead baseline)
+    group.bench_with_input(
+        BenchmarkId::new("events_vec_clone", token_count),
+        &events,
+        |b, events| {
+            b.iter(|| {
+                black_box(events.clone());
+            });
+        },
+    );
+
+    group.finish();
+}
+
+// ===========================================================================
+// Group 5: Model resolution cache — hit vs miss
 // ===========================================================================
 
 fn make_test_model() -> services::models::ModelWithPricing {
@@ -579,7 +781,9 @@ fn bench_model_resolution_cache(c: &mut Criterion) {
 criterion_group!(
     benches,
     bench_sse_token_processing,
+    bench_sse_operation_breakdown,
     bench_intercept_stream,
+    bench_intercept_stream_breakdown,
     bench_model_resolution_cache,
 );
 criterion_main!(benches);

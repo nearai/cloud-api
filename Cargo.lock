@@ -504,6 +504,7 @@ dependencies = [
  "bytes",
  "chrono",
  "config",
+ "criterion",
  "database",
  "deadpool-postgres",
  "dotenvy",

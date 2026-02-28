@@ -710,34 +710,33 @@ impl InferenceProviderPool {
             return Some(providers);
         }
 
-        // Apply round-robin load balancing
+        // Apply round-robin load balancing.
+        // Build the index key in a single String allocation (no .clone() needed —
+        // entry().or_insert() only allocates on first insertion).
         let index_key = if let Some(pub_key) = model_pub_key {
             format!("pubkey:{}", pub_key)
         } else {
             format!("id:{}", model_id)
         };
 
-        let mut indices = self
-            .load_balancer_index
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let index = indices.entry(index_key.clone()).or_insert(0);
-        let selected_index = *index % providers.len();
+        let selected_index = {
+            let mut indices = self
+                .load_balancer_index
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let index = indices.entry(index_key).or_insert(0);
+            let selected = *index % providers.len();
+            *index = (*index + 1) % providers.len();
+            selected
+        };
 
-        // Increment for next request
-        *index = (*index + 1) % providers.len();
-
-        // Build ordered list following round-robin pattern:
-        // selected provider first, then continue round-robin (selected+1, selected+2, ...)
-        let mut ordered_providers = Vec::with_capacity(providers.len());
-        for i in 0..providers.len() {
-            let provider_index = (selected_index + i) % providers.len();
-            ordered_providers.push(providers[provider_index].clone());
-        }
+        // Rotate the already-cloned providers vec in-place instead of building a new one.
+        let mut ordered_providers = providers;
+        ordered_providers.rotate_left(selected_index);
 
         tracing::debug!(
-            index_key = %index_key,
-            providers_count = providers.len(),
+            model_id = %model_id,
+            providers_count = ordered_providers.len(),
             selected_index = selected_index,
             "Prepared providers for fallback with round-robin priority"
         );

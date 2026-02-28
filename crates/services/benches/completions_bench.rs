@@ -613,10 +613,8 @@ fn bench_intercept_stream_breakdown(c: &mut Criterion) {
         &events,
         |b, events| {
             b.iter(|| {
-                for event in events {
-                    if let Ok(e) = event {
-                        black_box(e.clone());
-                    }
+                for e in events.iter().flatten() {
+                    black_box(e.clone());
                 }
             });
         },
@@ -641,11 +639,9 @@ fn bench_intercept_stream_breakdown(c: &mut Criterion) {
         &events,
         |b, events| {
             b.iter(|| {
-                for event in events {
-                    if let Ok(e) = event {
-                        if let inference_providers::StreamChunk::Chat(ref chunk) = e.chunk {
-                            black_box(chunk.id.clone());
-                        }
+                for e in events.iter().flatten() {
+                    if let inference_providers::StreamChunk::Chat(ref chunk) = e.chunk {
+                        black_box(chunk.id.clone());
                     }
                 }
             });
@@ -654,7 +650,7 @@ fn bench_intercept_stream_breakdown(c: &mut Criterion) {
 
     // 4d: Cost of building the Vec<&str> metric tags per first-token call
     group.bench_function("metric_tags_vec_build", |b| {
-        let metric_tags = vec![
+        let metric_tags = [
             "model:bench-model".to_string(),
             "environment:bench".to_string(),
         ];

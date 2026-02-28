@@ -629,6 +629,19 @@ mod tests {
     }
 
     #[test]
+    fn test_compute_token_cost_cache_disabled_when_zero() {
+        // cache_read_cost_per_token == 0 means "cache pricing disabled": all input tokens
+        // (including cached) are billed at input_cost_per_token. No free cached tokens.
+        let pricing = make_pricing(10, 20, 0);
+        let cost = unwrap_cost(compute_token_cost(100, 50, 40, &pricing));
+
+        // All 100 input tokens at input rate (cached 40 are not discounted)
+        assert_eq!(cost.input_cost, 100 * 10);
+        assert_eq!(cost.output_cost, 50 * 20);
+        assert_eq!(cost.total_cost, cost.input_cost + cost.output_cost);
+    }
+
+    #[test]
     fn test_cost_calculation_overflow_detection() {
         // This test verifies that i64::checked_mul properly detects overflow conditions
         // These values are used to ensure overflow detection works in billing calculations

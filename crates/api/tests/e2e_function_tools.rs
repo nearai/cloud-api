@@ -179,7 +179,7 @@ async fn test_function_tool_single_call() {
         if let api::models::ResponseOutputItem::Message { content, .. } = final_message.unwrap() {
             assert!(!content.is_empty(), "message content should not be empty");
             match &content[0] {
-                api::models::ResponseOutputContent::OutputText { text, .. } => text.clone(),
+                api::models::ResponseContentItem::OutputText { text, .. } => text.clone(),
                 _ => panic!("Expected OutputText content"),
             }
         } else {
@@ -401,7 +401,7 @@ async fn test_function_tool_parallel_calls() {
     let text =
         if let api::models::ResponseOutputItem::Message { content, .. } = final_message.unwrap() {
             match &content[0] {
-                api::models::ResponseOutputContent::OutputText { text, .. } => text.clone(),
+                api::models::ResponseContentItem::OutputText { text, .. } => text.clone(),
                 _ => panic!("Expected OutputText content"),
             }
         } else {

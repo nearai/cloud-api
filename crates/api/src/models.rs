@@ -4,8 +4,48 @@ use serde_json::Value;
 use std::collections::HashMap;
 use utoipa::ToSchema;
 
-// Re-export ResponseImageUrl from services to avoid duplication
-pub use services::responses::models::ResponseImageUrl;
+// Re-export types from services to avoid duplication
+// These are the canonical definitions used across the codebase
+pub use services::responses::models::{
+    ConversationDeleteResult,
+    ConversationObject,
+    ConversationReference,
+    // Conversation types
+    CreateConversationRequest,
+    // Request/Response types used by routes and OpenAPI
+    CreateResponseRequest,
+    McpApprovalMode,
+    // MCP types
+    McpApprovalRequirement,
+    McpDiscoveredTool,
+    McpToolNameFilter,
+    // Response content types (shared between input listing and services)
+    ResponseContent,
+    ResponseContentItem,
+    ResponseContentPart,
+    ResponseDeleteResult,
+    ResponseError,
+    // Supporting types used by the above
+    ResponseImageUrl,
+    ResponseIncompleteDetails,
+    ResponseInput,
+    ResponseItemStatus,
+    ResponseObject,
+    ResponseOutputContent,
+    ResponseOutputFunction,
+    // Response output types
+    ResponseOutputItem,
+    ResponseOutputToolCall,
+    ResponseReasoningConfig,
+    ResponseReasoningOutput,
+    ResponseStatus,
+    ResponseStreamEvent,
+    ResponseTool,
+    ResponseToolChoice,
+    ResponseToolChoiceFunction,
+    ResponseToolChoiceOutput,
+    UpdateConversationRequest,
+};
 
 // Streaming response models
 #[derive(Debug, Serialize, Deserialize)]
@@ -761,8 +801,8 @@ fn default_n() -> Option<i64> {
 // ============================================
 
 use crate::consts::{
-    MAX_DESCRIPTION_LENGTH, MAX_EMAIL_LENGTH, MAX_INVITATIONS_PER_REQUEST, MAX_METADATA_SIZE_BYTES,
-    MAX_NAME_LENGTH, MAX_SETTINGS_SIZE_BYTES, MAX_SYSTEM_PROMPT_LENGTH,
+    MAX_DESCRIPTION_LENGTH, MAX_EMAIL_LENGTH, MAX_INVITATIONS_PER_REQUEST, MAX_NAME_LENGTH,
+    MAX_SETTINGS_SIZE_BYTES, MAX_SYSTEM_PROMPT_LENGTH,
 };
 use crate::routes::common::{validate_max_length, validate_non_empty_field};
 
@@ -900,483 +940,18 @@ impl ErrorResponse {
 }
 
 // ============================================
-// Response API Models
+// Response API Models (API-specific types for input listing)
+// Note: Most response types are re-exported from services::responses::models
 // ============================================
 
-/// Request to create a response
-#[derive(Debug, Deserialize, ToSchema)]
-pub struct CreateResponseRequest {
-    pub model: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub input: Option<ResponseInput>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub instructions: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub conversation: Option<ConversationReference>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub previous_response_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub max_output_tokens: Option<i64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub max_tool_calls: Option<i64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub temperature: Option<f32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub top_p: Option<f32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub stream: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub store: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub background: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub tools: Option<Vec<ResponseTool>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub tool_choice: Option<ResponseToolChoice>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub parallel_tool_calls: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub text: Option<ResponseTextConfig>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub reasoning: Option<ResponseReasoningConfig>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub include: Option<Vec<String>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub metadata: Option<serde_json::Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub safety_identifier: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub prompt_cache_key: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub signing_algo: Option<String>,
-}
-
-/// Input for a response - can be text, array of items, or single item
-#[derive(Debug, Clone, Deserialize, ToSchema)]
-#[serde(untagged)]
-pub enum ResponseInput {
-    Text(String),
-    Items(Vec<ResponseInputItem>),
-}
-
-/// Single input item
+/// Single input item for API responses (simplified struct version).
+/// Used by list_input_items endpoint for returning input items.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ResponseInputItem {
     pub role: String,
     pub content: ResponseContent,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<serde_json::Value>,
-}
-
-/// Content can be text or array of content parts
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-#[serde(untagged)]
-pub enum ResponseContent {
-    Text(String),
-    Parts(Vec<ResponseContentPart>),
-}
-
-/// Content part from user inputs (input-only variants).
-///
-/// This type is used for type-safe operations on user inputs only.
-/// It cannot contain output variants, providing compile-time safety.
-///
-/// Used in:
-/// - ResponseContent::Parts (for input listing)
-/// - list_input_items endpoint
-/// - Input validation operations
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-#[serde(tag = "type")]
-pub enum ResponseContentPart {
-    #[serde(rename = "input_text")]
-    InputText { text: String },
-    #[serde(rename = "input_image")]
-    InputImage {
-        image_url: ResponseImageUrl,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        detail: Option<String>,
-    },
-    #[serde(rename = "input_file")]
-    InputFile {
-        file_id: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        detail: Option<String>,
-    },
-}
-
-/// Conversation reference
-#[derive(Debug, Clone, Deserialize, ToSchema)]
-#[serde(untagged)]
-pub enum ConversationReference {
-    Id(String),
-    Object {
-        id: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        metadata: Option<serde_json::Value>,
-    },
-}
-
-/// Tool configuration for responses
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-#[serde(tag = "type")]
-pub enum ResponseTool {
-    #[serde(rename = "function")]
-    Function {
-        name: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        description: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        parameters: Option<serde_json::Value>,
-    },
-    #[serde(rename = "web_search")]
-    WebSearch {},
-    #[serde(rename = "file_search")]
-    FileSearch {},
-    #[serde(rename = "code_interpreter")]
-    CodeInterpreter {},
-    #[serde(rename = "computer")]
-    Computer {},
-    #[serde(rename = "mcp")]
-    Mcp {
-        server_label: String,
-        server_url: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        server_description: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        authorization: Option<String>,
-        #[serde(default)]
-        require_approval: McpApprovalRequirement,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        allowed_tools: Option<Vec<String>>,
-    },
-}
-
-/// Approval requirement for MCP tool calls
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-#[serde(untagged)]
-pub enum McpApprovalRequirement {
-    Simple(McpApprovalMode),
-    Granular { never: McpToolNameFilter },
-}
-
-impl Default for McpApprovalRequirement {
-    fn default() -> Self {
-        Self::Simple(McpApprovalMode::Always)
-    }
-}
-
-/// Simple MCP approval mode
-#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
-#[serde(rename_all = "lowercase")]
-pub enum McpApprovalMode {
-    #[default]
-    Always,
-    Never,
-}
-
-/// Filter for tool names that don't require approval
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct McpToolNameFilter {
-    pub tool_names: std::collections::HashSet<String>,
-}
-
-/// Tool choice configuration
-#[derive(Debug, Deserialize, ToSchema)]
-#[serde(untagged)]
-pub enum ResponseToolChoice {
-    Auto(String), // "auto", "none", "required"
-    Specific {
-        #[serde(rename = "type")]
-        type_: String,
-        function: ResponseToolChoiceFunction,
-    },
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct ResponseToolChoiceFunction {
-    pub name: String,
-}
-
-/// Text format configuration
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct ResponseTextConfig {
-    pub format: ResponseTextFormat,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-#[serde(tag = "type")]
-pub enum ResponseTextFormat {
-    #[serde(rename = "text")]
-    Text,
-    #[serde(rename = "json_object")]
-    JsonObject,
-    #[serde(rename = "json_schema")]
-    JsonSchema { json_schema: serde_json::Value },
-}
-
-/// Reasoning configuration
-#[derive(Debug, Deserialize, ToSchema)]
-pub struct ResponseReasoningConfig {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub effort: Option<String>,
-}
-
-/// Complete response object
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct ResponseObject {
-    pub id: String,
-    pub object: String, // "response"
-    pub created_at: i64,
-    pub status: ResponseStatus,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub error: Option<ResponseError>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub incomplete_details: Option<ResponseIncompleteDetails>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub instructions: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub max_output_tokens: Option<i64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub max_tool_calls: Option<i64>,
-    pub model: String,
-    pub output: Vec<ResponseOutputItem>,
-    pub parallel_tool_calls: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub previous_response_id: Option<String>, // Previous response ID (parent in thread)
-    #[serde(default)]
-    pub next_response_ids: Vec<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub reasoning: Option<ResponseReasoningOutput>,
-    pub store: bool,
-    pub temperature: f32,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub text: Option<ResponseTextConfig>,
-    pub tool_choice: ResponseToolChoiceOutput,
-    pub tools: Vec<ResponseTool>,
-    pub top_p: f32,
-    pub truncation: String,
-    pub usage: Usage,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub user: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub metadata: Option<serde_json::Value>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, ToSchema)]
-#[serde(rename_all = "lowercase")]
-pub enum ResponseStatus {
-    Completed,
-    Failed,
-    InProgress,
-    Cancelled,
-    Queued,
-    Incomplete,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct ResponseError {
-    pub message: String,
-    #[serde(rename = "type")]
-    pub type_: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub code: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct ResponseIncompleteDetails {
-    pub reason: String, // "length", "content_filter", "max_tool_calls"
-}
-
-/// Output item from response
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-#[serde(tag = "type")]
-pub enum ResponseOutputItem {
-    #[serde(rename = "message")]
-    Message {
-        id: String,
-        status: ResponseItemStatus,
-        role: String,
-        content: Vec<ResponseOutputContent>,
-    },
-    #[serde(rename = "tool_call")]
-    ToolCall {
-        id: String,
-        status: ResponseItemStatus,
-        tool_type: String,
-        function: ResponseOutputFunction,
-    },
-    #[serde(rename = "reasoning")]
-    Reasoning {
-        id: String,
-        status: ResponseItemStatus,
-        summary: String,
-        content: String,
-    },
-    #[serde(rename = "mcp_list_tools")]
-    McpListTools {
-        id: String,
-        server_label: String,
-        tools: Vec<McpDiscoveredTool>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        error: Option<String>,
-    },
-    #[serde(rename = "mcp_approval_request")]
-    McpApprovalRequest {
-        id: String,
-        #[serde(default)]
-        response_id: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        previous_response_id: Option<String>,
-        #[serde(default)]
-        next_response_ids: Vec<String>,
-        #[serde(default)]
-        created_at: i64,
-        server_label: String,
-        name: String,
-        arguments: String,
-        model: String,
-    },
-    /// External function call requiring client execution.
-    #[serde(rename = "function_call")]
-    FunctionCall {
-        /// Unique identifier for this function call item.
-        id: String,
-        /// The response ID this item belongs to.
-        #[serde(default)]
-        response_id: String,
-        /// The previous response ID if this is a continuation.
-        #[serde(skip_serializing_if = "Option::is_none")]
-        previous_response_id: Option<String>,
-        /// IDs of responses that follow this one.
-        #[serde(default)]
-        next_response_ids: Vec<String>,
-        /// Timestamp when this item was created.
-        #[serde(default)]
-        created_at: i64,
-        /// The tool call ID from the LLM, used to correlate with FunctionCallOutput.
-        call_id: String,
-        /// Name of the function to call.
-        name: String,
-        /// JSON-encoded arguments for the function.
-        arguments: String,
-        /// Status of the function call (typically "in_progress" when pending).
-        status: String,
-        /// The model that requested this function call.
-        model: String,
-    },
-    /// Result of a client-executed function call.
-    #[serde(rename = "function_call_output")]
-    FunctionCallOutput {
-        id: String,
-        #[serde(default)]
-        response_id: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        previous_response_id: Option<String>,
-        #[serde(default)]
-        next_response_ids: Vec<String>,
-        #[serde(default)]
-        created_at: i64,
-        /// The call_id from the FunctionCall this is a response to.
-        call_id: String,
-        /// Result of the function execution.
-        output: String,
-    },
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-pub enum ResponseItemStatus {
-    Completed,
-    Failed,
-    InProgress,
-    Cancelled,
-}
-
-/// Output content from assistant (output-only variants).
-///
-/// This type is used for type-safe operations on assistant outputs only.
-/// It cannot contain input variants, providing compile-time safety.
-/// Used in streaming events and response output items in the API layer.
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-#[serde(tag = "type")]
-pub enum ResponseOutputContent {
-    #[serde(rename = "output_text")]
-    OutputText {
-        text: String,
-        annotations: Vec<serde_json::Value>,
-    },
-    #[serde(rename = "tool_calls")]
-    ToolCalls {
-        tool_calls: Vec<ResponseOutputToolCall>,
-    },
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct ResponseOutputFunction {
-    pub name: String,
-    pub arguments: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct ResponseOutputToolCall {
-    pub id: String,
-    #[serde(rename = "type")]
-    pub type_: String,
-    pub function: ResponseOutputFunction,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct ResponseReasoningOutput {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub effort: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub summary: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-#[serde(untagged)]
-pub enum ResponseToolChoiceOutput {
-    Auto(String),
-    Object {
-        #[serde(rename = "type")]
-        type_: String,
-        function: ResponseToolChoiceFunction,
-    },
-}
-
-/// Response deletion result
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct ResponseDeleteResult {
-    pub id: String,
-    pub object: String, // "response"
-    pub deleted: bool,
-}
-
-// ============================================
-// Response Streaming Event Types
-// ============================================
-
-/// Response streaming event wrapper
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct ResponseStreamEvent {
-    #[serde(rename = "type")]
-    pub event_type: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub response: Option<ResponseObject>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub output_index: Option<usize>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub content_index: Option<usize>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub item: Option<ResponseOutputItem>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub item_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub part: Option<ResponseOutputContent>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub delta: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub text: Option<String>,
 }
 
 /// Input item list for responses
@@ -1391,43 +966,14 @@ pub struct ResponseInputItemList {
 
 // ============================================
 // Conversation API Models
+// Note: CreateConversationRequest, UpdateConversationRequest, ConversationObject,
+// and ConversationDeleteResult are re-exported from services::responses::models
 // ============================================
-
-/// Request to create a conversation
-#[derive(Debug, Deserialize, ToSchema)]
-pub struct CreateConversationRequest {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub metadata: Option<serde_json::Value>,
-}
-
-/// Request to update a conversation
-#[derive(Debug, Deserialize, ToSchema)]
-pub struct UpdateConversationRequest {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub metadata: Option<serde_json::Value>,
-}
 
 /// Request to create items in a conversation
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct CreateConversationItemsRequest {
     pub items: Vec<ConversationInputItem>,
-}
-
-/// Conversation object (follows OpenAI spec)
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct ConversationObject {
-    pub id: String,
-    pub object: String, // "conversation"
-    pub created_at: i64,
-    pub metadata: serde_json::Value,
-}
-
-/// Deleted conversation result
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct ConversationDeleteResult {
-    pub id: String,
-    pub object: String, // "conversation.deleted"
-    pub deleted: bool,
 }
 
 /// Input item for conversations
@@ -1479,14 +1025,7 @@ pub enum ConversationContentPart {
     },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct McpDiscoveredTool {
-    pub name: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub description: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub input_schema: Option<serde_json::Value>,
-}
+// McpDiscoveredTool is re-exported from services::responses::models
 
 /// Conversation item (for responses)
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -1696,86 +1235,8 @@ pub struct ConversationBatchResponse {
     pub missing_ids: Vec<String>,
 }
 
-// ============================================
-// Validation implementations
-// ============================================
-
-impl CreateResponseRequest {
-    pub fn validate(&self) -> Result<(), String> {
-        if self.model.trim().is_empty() {
-            return Err("Model cannot be empty".to_string());
-        }
-
-        if let Some(max_tokens) = self.max_output_tokens {
-            if max_tokens == 0 {
-                return Err("max_output_tokens must be greater than 0".to_string());
-            }
-        }
-
-        if let Some(max_calls) = self.max_tool_calls {
-            if max_calls == 0 {
-                return Err("max_tool_calls must be greater than 0".to_string());
-            }
-        }
-
-        if let Some(temp) = self.temperature {
-            if !(0.0..=2.0).contains(&temp) {
-                return Err("temperature must be between 0.0 and 2.0".to_string());
-            }
-        }
-
-        if let Some(top_p) = self.top_p {
-            if top_p <= 0.0 || top_p > 1.0 {
-                return Err("top_p must be between 0.0 and 1.0".to_string());
-            }
-        }
-
-        // Validate mutual exclusivity
-        if self.conversation.is_some() && self.previous_response_id.is_some() {
-            return Err("Cannot specify both conversation and previous_response_id".to_string());
-        }
-
-        Ok(())
-    }
-}
-
-impl CreateConversationRequest {
-    pub fn validate(&self) -> Result<(), String> {
-        if let Some(metadata) = &self.metadata {
-            // Prevent extremely large metadata blobs from being stored
-            let serialized =
-                serde_json::to_string(metadata).map_err(|_| "Invalid metadata".to_string())?;
-            // Allow reasonably large metadata but cap to protect the database
-            if serialized.len() > MAX_METADATA_SIZE_BYTES {
-                return Err(format!(
-                    "metadata is too large (max {} bytes when serialized)",
-                    MAX_METADATA_SIZE_BYTES
-                ));
-            }
-        }
-
-        Ok(())
-    }
-}
-
-impl UpdateConversationRequest {
-    pub fn validate(&self) -> Result<(), String> {
-        if let Some(metadata) = &self.metadata {
-            // Prevent extremely large metadata blobs from being stored
-            let serialized =
-                serde_json::to_string(metadata).map_err(|_| "Invalid metadata".to_string())?;
-            // Allow reasonably large metadata but cap to protect the database
-            if serialized.len() > MAX_METADATA_SIZE_BYTES {
-                return Err(format!(
-                    "metadata is too large (max {} bytes when serialized)",
-                    MAX_METADATA_SIZE_BYTES
-                ));
-            }
-        }
-
-        Ok(())
-    }
-}
+// Validation implementations are in services::responses::models
+// for CreateResponseRequest, CreateConversationRequest, and UpdateConversationRequest
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct CreateApiKeyRequest {
@@ -2951,31 +2412,38 @@ mod tests {
         let request = result.unwrap();
         assert_eq!(request.model, "gpt-4.1");
 
+        use services::responses::models::ResponseInputItem as SvcInputItem;
+
         if let Some(ResponseInput::Items(items)) = request.input {
             assert_eq!(items.len(), 1);
-            assert_eq!(items[0].role, "user");
 
-            if let ResponseContent::Parts(parts) = &items[0].content {
-                assert_eq!(parts.len(), 2);
-                assert!(matches!(parts[0], ResponseContentPart::InputText { .. }));
-                assert!(matches!(parts[1], ResponseContentPart::InputImage { .. }));
+            if let SvcInputItem::Message { role, content, .. } = &items[0] {
+                assert_eq!(role, "user");
 
-                if let ResponseContentPart::InputText { text } = &parts[0] {
-                    assert_eq!(text, "what is in this image?");
-                }
+                if let ResponseContent::Parts(parts) = content {
+                    assert_eq!(parts.len(), 2);
+                    assert!(matches!(parts[0], ResponseContentPart::InputText { .. }));
+                    assert!(matches!(parts[1], ResponseContentPart::InputImage { .. }));
 
-                if let ResponseContentPart::InputImage { image_url, .. } = &parts[1] {
-                    match image_url {
-                        ResponseImageUrl::String(url) => {
-                            assert_eq!(url, "https://example.com/image.jpg");
-                        }
-                        ResponseImageUrl::Object { url } => {
-                            assert_eq!(url, "https://example.com/image.jpg");
+                    if let ResponseContentPart::InputText { text } = &parts[0] {
+                        assert_eq!(text, "what is in this image?");
+                    }
+
+                    if let ResponseContentPart::InputImage { image_url, .. } = &parts[1] {
+                        match image_url {
+                            ResponseImageUrl::String(url) => {
+                                assert_eq!(url, "https://example.com/image.jpg");
+                            }
+                            ResponseImageUrl::Object { url } => {
+                                assert_eq!(url, "https://example.com/image.jpg");
+                            }
                         }
                     }
+                } else {
+                    panic!("Expected Parts content");
                 }
             } else {
-                panic!("Expected Parts content");
+                panic!("Expected Message variant");
             }
         } else {
             panic!("Expected Items input");

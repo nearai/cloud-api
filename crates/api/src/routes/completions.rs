@@ -404,12 +404,11 @@ pub async fn chat_completions(
                             Ok(event) => {
                                 // Only parse JSON to extract chat_id from the first chunk;
                                 // skip on all subsequent chunks to avoid per-token overhead.
+                                // Single lock acquisition covers both the check and the write.
                                 {
-                                    let need_chat_id = chat_id_clone
-                                        .lock()
-                                        .unwrap_or_else(|e| e.into_inner())
-                                        .is_none();
-                                    if need_chat_id {
+                                    let mut guard =
+                                        chat_id_clone.lock().unwrap_or_else(|e| e.into_inner());
+                                    if guard.is_none() {
                                         if let Ok(chunk_str) = std::str::from_utf8(&event.raw_bytes)
                                         {
                                             if let Some(data) = chunk_str.strip_prefix("data: ") {
@@ -421,10 +420,7 @@ pub async fn chat_completions(
                                                     if let Some(serde_json::Value::String(id)) =
                                                         obj.get("id")
                                                     {
-                                                        *chat_id_clone
-                                                            .lock()
-                                                            .unwrap_or_else(|e| e.into_inner()) =
-                                                            Some(id.clone());
+                                                        *guard = Some(id.clone());
                                                     }
                                                 }
                                             }

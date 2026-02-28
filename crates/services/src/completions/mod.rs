@@ -117,9 +117,17 @@ where
             }
         };
 
+        let handle = match tokio::runtime::Handle::try_current() {
+            Ok(h) => h,
+            Err(_) => {
+                tracing::error!("Cannot store chat signature: no Tokio runtime available");
+                return;
+            }
+        };
+
         let attestation_service = self.attestation_service.clone();
 
-        tokio::spawn(async move {
+        handle.spawn(async move {
             match tokio::time::timeout(
                 Duration::from_secs(FINALIZE_TIMEOUT_SECS),
                 attestation_service.store_chat_signature_from_provider(&chat_id),
@@ -505,21 +513,21 @@ impl CompletionServiceImpl {
     }
 
     /// Resolve a model identifier with caching. Returns the model if found, or None.
+    /// Uses `try_get_with` to deduplicate concurrent misses for the same key,
+    /// preventing DB stampedes when many requests arrive for a cold model.
     async fn resolve_model_cached(
         &self,
         identifier: &str,
     ) -> Result<Option<crate::models::ModelWithPricing>, anyhow::Error> {
-        if let Some(cached) = self.model_resolution_cache.get(identifier).await {
-            return Ok(cached);
-        }
-        let result = self
-            .models_repository
-            .resolve_and_get_model(identifier)
-            .await?;
+        let id = identifier.to_string();
+        let models_repo = self.models_repository.clone();
+
         self.model_resolution_cache
-            .insert(identifier.to_string(), result.clone())
-            .await;
-        Ok(result)
+            .try_get_with(id.clone(), async move {
+                models_repo.resolve_and_get_model(&id).await
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!(e))
     }
 
     /// Extract tools and tool_choice from extra HashMap if present.

@@ -37,9 +37,7 @@ fn make_sse_payload(index: usize, is_last: bool) -> Bytes {
 
 /// Build a Vec of raw SSE byte payloads simulating a 200-token stream.
 fn make_sse_payloads(n: usize) -> Vec<Bytes> {
-    (0..n)
-        .map(|i| make_sse_payload(i, i == n - 1))
-        .collect()
+    (0..n).map(|i| make_sse_payload(i, i == n - 1)).collect()
 }
 
 /// Build SSEEvent objects for InterceptStream benchmarks.
@@ -157,7 +155,9 @@ async fn process_stream_old(payloads: Vec<Bytes>) {
 /// - `std::str::from_utf8` (zero-copy) for chat_id extraction
 /// - Parse JSON only on first token (skip when chat_id already set)
 /// - Uses `.map()` (sync) on the stream
-fn process_stream_new(payloads: Vec<Bytes>) {
+/// Build and drive the new-path stream. The caller provides the runtime to avoid
+/// measuring runtime-construction overhead inside `b.iter()`.
+fn process_stream_new(payloads: Vec<Bytes>, rt: &tokio::runtime::Runtime) {
     let accumulated_bytes = Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
     let chat_id_state = Arc::new(std::sync::Mutex::new(None::<String>));
 
@@ -171,20 +171,15 @@ fn process_stream_new(payloads: Vec<Bytes>) {
 
         // Only parse JSON for chat_id on first token
         {
-            let need_chat_id = chat_id_clone
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .is_none();
-            if need_chat_id {
+            let mut guard = chat_id_clone.lock().unwrap_or_else(|e| e.into_inner());
+            if guard.is_none() {
                 if let Ok(chunk_str) = std::str::from_utf8(&event_bytes) {
                     if let Some(data) = chunk_str.strip_prefix("data: ") {
                         if let Ok(serde_json::Value::Object(obj)) =
                             serde_json::from_str::<serde_json::Value>(data.trim())
                         {
                             if let Some(serde_json::Value::String(id)) = obj.get("id") {
-                                *chat_id_clone
-                                    .lock()
-                                    .unwrap_or_else(|e| e.into_inner()) = Some(id.clone());
+                                *guard = Some(id.clone());
                             }
                         }
                     }
@@ -206,10 +201,6 @@ fn process_stream_new(payloads: Vec<Bytes>) {
         sse_bytes
     });
 
-    // Drive the stream synchronously via block_on (no tokio runtime overhead for the sync path)
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .build()
-        .unwrap();
     rt.block_on(async {
         let _: Vec<_> = mapped.collect().await;
     });
@@ -241,8 +232,11 @@ fn bench_sse_token_processing(c: &mut Criterion) {
         BenchmarkId::new("new_sync_path", token_count),
         &payloads,
         |b, payloads| {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap();
             b.iter(|| {
-                process_stream_new(payloads.clone());
+                process_stream_new(payloads.clone(), &rt);
             });
         },
     );
@@ -547,24 +541,31 @@ fn bench_model_resolution_cache(c: &mut Criterion) {
     });
 
     group.bench_function("cache_miss_and_insert", |b| {
-        // Use a fresh cache per iteration to guarantee misses
-        let miss_cache: moka::future::Cache<String, Option<services::models::ModelWithPricing>> =
-            moka::future::Cache::builder()
-                .max_capacity(1_000)
-                .time_to_live(std::time::Duration::from_secs(60))
-                .build();
         let model_for_insert = make_test_model();
-        b.iter(|| {
-            rt.block_on(async {
-                let key = "bench/test-model";
-                let cached = miss_cache.get(key).await;
-                if cached.is_none() {
-                    miss_cache
-                        .insert(key.to_string(), Some(model_for_insert.clone()))
-                        .await;
-                }
-            });
-        });
+        // Use iter_batched to create a fresh cache per iteration, guaranteeing a true miss.
+        b.iter_batched(
+            || {
+                moka::future::Cache::builder()
+                    .max_capacity(1_000)
+                    .time_to_live(std::time::Duration::from_secs(60))
+                    .build()
+            },
+            |miss_cache: moka::future::Cache<
+                String,
+                Option<services::models::ModelWithPricing>,
+            >| {
+                rt.block_on(async {
+                    let key = "bench/test-model";
+                    let cached = miss_cache.get(key).await;
+                    if cached.is_none() {
+                        miss_cache
+                            .insert(key.to_string(), Some(model_for_insert.clone()))
+                            .await;
+                    }
+                });
+            },
+            criterion::BatchSize::SmallInput,
+        );
     });
 
     group.finish();

@@ -155,8 +155,9 @@ async fn process_stream_old(payloads: Vec<Bytes>) {
 /// - `std::str::from_utf8` (zero-copy) for chat_id extraction
 /// - Parse JSON only on first token (skip when chat_id already set)
 /// - Uses `.map()` (sync) on the stream
-/// Build and drive the new-path stream. The caller provides the runtime to avoid
-/// measuring runtime-construction overhead inside `b.iter()`.
+///
+/// The caller provides the runtime to avoid measuring runtime-construction
+/// overhead inside `b.iter()`.
 fn process_stream_new(payloads: Vec<Bytes>, rt: &tokio::runtime::Runtime) {
     let accumulated_bytes = Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
     let chat_id_state = Arc::new(std::sync::Mutex::new(None::<String>));

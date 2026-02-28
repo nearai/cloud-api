@@ -13,18 +13,16 @@ use uuid::Uuid;
 
 // Create a new stream that intercepts messages, but passes the original ones through
 use crate::metrics::{consts::*, MetricsServiceTrait};
-use futures_util::{Future, Stream};
+use futures_util::Stream;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 const FINALIZE_TIMEOUT_SECS: u64 = 5;
 
-type FinalizeFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
-
-enum StreamState {
+#[doc(hidden)]
+pub enum StreamState {
     Streaming,
-    Finalizing(FinalizeFuture),
     Done,
 }
 
@@ -48,79 +46,80 @@ fn get_input_bucket(token_count: i32) -> &'static str {
     }
 }
 
-struct InterceptStream<S>
+#[doc(hidden)]
+pub struct InterceptStream<S>
 where
     S: Stream<Item = Result<SSEEvent, inference_providers::CompletionError>> + Unpin,
 {
-    inner: S,
-    attestation_service: Arc<dyn AttestationServiceTrait>,
-    usage_service: Arc<dyn UsageServiceTrait + Send + Sync>,
-    metrics_service: Arc<dyn MetricsServiceTrait>,
+    pub inner: S,
+    pub attestation_service: Arc<dyn AttestationServiceTrait>,
+    pub usage_service: Arc<dyn UsageServiceTrait + Send + Sync>,
+    pub metrics_service: Arc<dyn MetricsServiceTrait>,
     // IDs for usage tracking (database)
-    organization_id: Uuid,
-    workspace_id: Uuid,
-    api_key_id: Uuid,
-    model_id: Uuid,
+    pub organization_id: Uuid,
+    pub workspace_id: Uuid,
+    pub api_key_id: Uuid,
+    pub model_id: Uuid,
     #[allow(dead_code)] // Kept for potential debugging/logging use
-    model_name: String,
-    inference_type: crate::usage::ports::InferenceType,
-    service_start_time: Instant,
-    provider_start_time: Instant,
-    first_token_received: bool,
-    first_token_time: Option<Instant>,
+    pub model_name: String,
+    pub inference_type: crate::usage::ports::InferenceType,
+    pub service_start_time: Instant,
+    pub provider_start_time: Instant,
+    pub first_token_received: bool,
+    pub first_token_time: Option<Instant>,
     /// Time to first token in milliseconds (captured for DB storage)
-    ttft_ms: Option<i32>,
+    pub ttft_ms: Option<i32>,
     /// Token count for ITL calculation
-    token_count: i32,
+    pub token_count: i32,
     /// Last token time for ITL calculation
-    last_token_time: Option<Instant>,
+    pub last_token_time: Option<Instant>,
     /// Accumulated inter-token latency for average calculation
-    total_itl_ms: f64,
+    pub total_itl_ms: f64,
     // Pre-allocated low-cardinality metric tags (for Datadog/OTLP)
-    metric_tags: Vec<String>,
-    concurrent_counter: Option<Arc<AtomicU32>>,
+    pub metric_tags: Vec<String>,
+    pub concurrent_counter: Option<Arc<AtomicU32>>,
     /// Last received usage stats from streaming chunks
-    last_usage_stats: Option<inference_providers::TokenUsage>,
+    pub last_usage_stats: Option<inference_providers::TokenUsage>,
     /// Last chat ID from streaming chunks (for attestation and inference_id)
-    last_chat_id: Option<String>,
+    pub last_chat_id: Option<String>,
     /// Flag indicating the stream completed normally (received None from inner stream)
     /// If false when Drop is called, the client disconnected mid-stream
-    stream_completed: bool,
+    pub stream_completed: bool,
     /// Response ID when called from Responses API (for usage tracking FK)
-    response_id: Option<ResponseId>,
+    pub response_id: Option<ResponseId>,
     /// Last finish_reason from provider (e.g., "stop", "length", "tool_calls")
-    last_finish_reason: Option<inference_providers::FinishReason>,
+    pub last_finish_reason: Option<inference_providers::FinishReason>,
     /// Last error from provider (for determining stop_reason)
-    last_error: Option<inference_providers::CompletionError>,
-    state: StreamState,
+    pub last_error: Option<inference_providers::CompletionError>,
+    pub state: StreamState,
     /// Whether the model supports TEE attestation (false for external providers)
-    attestation_supported: bool,
+    pub attestation_supported: bool,
 }
 
 impl<S> InterceptStream<S>
 where
     S: Stream<Item = Result<SSEEvent, inference_providers::CompletionError>> + Unpin,
 {
-    /// Store attestation signature before sending [DONE] to client.
-    /// This runs in the hot path to ensure signature is available when client receives [DONE].
+    /// Spawn attestation signature storage as a background task.
+    /// This no longer blocks [DONE] delivery to the client — the signature is
+    /// stored asynchronously after the stream completes.
     /// Skipped for external providers that don't support TEE attestation.
-    fn create_signature_future(&self) -> FinalizeFuture {
-        // Skip attestation for external providers (OpenAI, Anthropic, Gemini, etc.)
+    fn spawn_signature_storage(&self) {
         if !self.attestation_supported {
-            return Box::pin(async {});
+            return;
         }
 
         let chat_id = match &self.last_chat_id {
             Some(id) => id.clone(),
             None => {
                 tracing::warn!("Cannot store signature: no chat_id received in stream");
-                return Box::pin(async {});
+                return;
             }
         };
 
         let attestation_service = self.attestation_service.clone();
 
-        Box::pin(async move {
+        tokio::spawn(async move {
             match tokio::time::timeout(
                 Duration::from_secs(FINALIZE_TIMEOUT_SECS),
                 attestation_service.store_chat_signature_from_provider(&chat_id),
@@ -138,7 +137,7 @@ where
                     );
                 }
             }
-        })
+        });
     }
 
     /// Record usage and metrics. Called from Drop to ensure it always runs.
@@ -316,82 +315,75 @@ where
     type Item = Result<SSEEvent, inference_providers::CompletionError>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        loop {
-            match &mut self.state {
-                StreamState::Streaming => {
-                    match Pin::new(&mut self.inner).poll_next(cx) {
-                        Poll::Ready(Some(Ok(ref event))) => {
-                            let now = Instant::now();
+        match &mut self.state {
+            StreamState::Streaming => {
+                match Pin::new(&mut self.inner).poll_next(cx) {
+                    Poll::Ready(Some(Ok(ref event))) => {
+                        let now = Instant::now();
 
-                            if !self.first_token_received {
-                                self.first_token_received = true;
-                                self.first_token_time = Some(now);
-                                let backend_ttft = now.duration_since(self.provider_start_time);
-                                let e2e_ttft = now.duration_since(self.service_start_time);
-                                self.ttft_ms = Some(e2e_ttft.as_millis() as i32);
-                                self.last_token_time = Some(now);
-                                let tags_str: Vec<&str> =
-                                    self.metric_tags.iter().map(|s| s.as_str()).collect();
-                                self.metrics_service.record_latency(
-                                    METRIC_LATENCY_TTFT,
-                                    backend_ttft,
-                                    &tags_str,
-                                );
-                                self.metrics_service.record_latency(
-                                    METRIC_LATENCY_TTFT_TOTAL,
-                                    e2e_ttft,
-                                    &tags_str,
-                                );
-                            } else if let Some(last_time) = self.last_token_time {
-                                // Calculate inter-token latency
-                                let itl = now.duration_since(last_time);
-                                self.total_itl_ms += itl.as_secs_f64() * 1000.0;
-                                self.token_count += 1;
-                                self.last_token_time = Some(now);
+                        if !self.first_token_received {
+                            self.first_token_received = true;
+                            self.first_token_time = Some(now);
+                            let backend_ttft = now.duration_since(self.provider_start_time);
+                            let e2e_ttft = now.duration_since(self.service_start_time);
+                            self.ttft_ms = Some(e2e_ttft.as_millis() as i32);
+                            self.last_token_time = Some(now);
+                            let tags_str: Vec<&str> =
+                                self.metric_tags.iter().map(|s| s.as_str()).collect();
+                            self.metrics_service.record_latency(
+                                METRIC_LATENCY_TTFT,
+                                backend_ttft,
+                                &tags_str,
+                            );
+                            self.metrics_service.record_latency(
+                                METRIC_LATENCY_TTFT_TOTAL,
+                                e2e_ttft,
+                                &tags_str,
+                            );
+                        } else if let Some(last_time) = self.last_token_time {
+                            // Calculate inter-token latency
+                            let itl = now.duration_since(last_time);
+                            self.total_itl_ms += itl.as_secs_f64() * 1000.0;
+                            self.token_count += 1;
+                            self.last_token_time = Some(now);
+                        }
+
+                        if let StreamChunk::Chat(ref chat_chunk) = event.chunk {
+                            // Track chat_id for attestation (updated on each chunk)
+                            self.last_chat_id = Some(chat_chunk.id.clone());
+
+                            // Track usage stats (updated on each chunk that has usage)
+                            if let Some(usage) = &chat_chunk.usage {
+                                self.last_usage_stats = Some(usage.clone());
                             }
 
-                            if let StreamChunk::Chat(ref chat_chunk) = event.chunk {
-                                // Track chat_id for attestation (updated on each chunk)
-                                self.last_chat_id = Some(chat_chunk.id.clone());
-
-                                // Track usage stats (updated on each chunk that has usage)
-                                if let Some(usage) = &chat_chunk.usage {
-                                    self.last_usage_stats = Some(usage.clone());
-                                }
-
-                                // Track finish_reason from the final chunk (only set once at end)
-                                if let Some(choice) = chat_chunk.choices.first() {
-                                    if let Some(ref reason) = choice.finish_reason {
-                                        self.last_finish_reason = Some(reason.clone());
-                                    }
+                            // Track finish_reason from the final chunk (only set once at end)
+                            if let Some(choice) = chat_chunk.choices.first() {
+                                if let Some(ref reason) = choice.finish_reason {
+                                    self.last_finish_reason = Some(reason.clone());
                                 }
                             }
-                            return Poll::Ready(Some(Ok(event.clone())));
                         }
-                        Poll::Ready(None) => {
-                            self.stream_completed = true;
-                            let signature_future = self.create_signature_future();
-                            self.state = StreamState::Finalizing(signature_future);
-                        }
-                        Poll::Ready(Some(Err(ref err))) => {
-                            // Capture error for stop_reason in usage recording (handled in Drop)
-                            // Note: We intentionally skip Finalizing state (attestation) for errors
-                            // because partial completions cannot be verified by clients
-                            self.last_error = Some(err.clone());
-                            return Poll::Ready(Some(Err(err.clone())));
-                        }
-                        Poll::Pending => return Poll::Pending,
+                        Poll::Ready(Some(Ok(event.clone())))
                     }
-                }
-                StreamState::Finalizing(ref mut future) => match future.as_mut().poll(cx) {
-                    Poll::Ready(()) => {
+                    Poll::Ready(None) => {
+                        self.stream_completed = true;
+                        // Spawn attestation in background — don't block [DONE]
+                        self.spawn_signature_storage();
                         self.state = StreamState::Done;
-                        return Poll::Ready(None);
+                        Poll::Ready(None)
                     }
-                    Poll::Pending => return Poll::Pending,
-                },
-                StreamState::Done => return Poll::Ready(None),
+                    Poll::Ready(Some(Err(ref err))) => {
+                        // Capture error for stop_reason in usage recording (handled in Drop)
+                        // Note: We intentionally skip attestation for errors
+                        // because partial completions cannot be verified by clients
+                        self.last_error = Some(err.clone());
+                        Poll::Ready(Some(Err(err.clone())))
+                    }
+                    Poll::Pending => Poll::Pending,
+                }
             }
+            StreamState::Done => Poll::Ready(None),
         }
     }
 }
@@ -453,10 +445,17 @@ pub struct CompletionServiceImpl {
     org_concurrent_limits: Cache<Uuid, u32>,
     /// Repository for fetching organization concurrent limits
     organization_limit_repository: Arc<dyn ports::OrganizationConcurrentLimitRepository>,
+    /// Cache for model resolution (avoids DB JOIN on every completion request)
+    model_resolution_cache: Cache<String, Option<crate::models::ModelWithPricing>>,
 }
 
 /// TTL for organization concurrent limit cache (5 minutes)
 const ORG_LIMIT_CACHE_TTL_SECS: u64 = 300;
+
+/// TTL for model resolution cache (60 seconds).
+/// Models rarely change, so a short TTL eliminates per-request DB JOINs
+/// while still picking up model config changes within a minute.
+const MODEL_RESOLUTION_CACHE_TTL_SECS: u64 = 60;
 
 /// TTL for concurrent count cache entries (10 minutes).
 /// Safety net: if a counter gets stuck (e.g., due to a panic or proxy not propagating
@@ -486,6 +485,11 @@ impl CompletionServiceImpl {
             .max_capacity(10_000)
             .build();
 
+        let model_resolution_cache = Cache::builder()
+            .max_capacity(1_000)
+            .time_to_live(Duration::from_secs(MODEL_RESOLUTION_CACHE_TTL_SECS))
+            .build();
+
         Self {
             inference_provider_pool,
             attestation_service,
@@ -496,7 +500,26 @@ impl CompletionServiceImpl {
             concurrent_limit: DEFAULT_CONCURRENT_LIMIT,
             org_concurrent_limits,
             organization_limit_repository,
+            model_resolution_cache,
         }
+    }
+
+    /// Resolve a model identifier with caching. Returns the model if found, or None.
+    async fn resolve_model_cached(
+        &self,
+        identifier: &str,
+    ) -> Result<Option<crate::models::ModelWithPricing>, anyhow::Error> {
+        if let Some(cached) = self.model_resolution_cache.get(identifier).await {
+            return Ok(cached);
+        }
+        let result = self
+            .models_repository
+            .resolve_and_get_model(identifier)
+            .await?;
+        self.model_resolution_cache
+            .insert(identifier.to_string(), result.clone())
+            .await;
+        Ok(result)
     }
 
     /// Extract tools and tool_choice from extra HashMap if present.
@@ -1007,13 +1030,9 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
             extra,
         };
 
-        // Resolve model name (could be an alias) and get model details in a single DB call
+        // Resolve model name (could be an alias) and get model details (cached, 60s TTL)
         // This also validates that the model exists and is active
-        let model = match self
-            .models_repository
-            .resolve_and_get_model(&request.model)
-            .await
-        {
+        let model = match self.resolve_model_cached(&request.model).await {
             Ok(Some(m)) => m,
             Ok(None) => {
                 let err = ports::CompletionError::InvalidModel(format!(
@@ -1144,13 +1163,9 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
             extra,
         };
 
-        // Resolve model name (could be an alias) and get model details in a single DB call
+        // Resolve model name (could be an alias) and get model details (cached, 60s TTL)
         // This also validates that the model exists and is active
-        let model = match self
-            .models_repository
-            .resolve_and_get_model(&request.model)
-            .await
-        {
+        let model = match self.resolve_model_cached(&request.model).await {
             Ok(Some(m)) => m,
             Ok(None) => {
                 let err = ports::CompletionError::InvalidModel(format!(

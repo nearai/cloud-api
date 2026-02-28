@@ -12,6 +12,10 @@ use regex::Regex;
 use serde::Deserialize;
 use std::{collections::HashMap, net::IpAddr, sync::Arc, time::Duration};
 use tokio::sync::{Mutex, RwLock};
+
+/// Alias for a synchronous, non-async mutex used for fast in-memory lookups
+/// with no await points inside the critical section.
+type SyncMutex<T> = std::sync::Mutex<T>;
 use tracing::{debug, info, warn};
 
 type InferenceProviderTrait = dyn InferenceProvider + Send + Sync;
@@ -66,10 +70,10 @@ pub struct InferenceProviderPool {
     external_providers: Arc<RwLock<HashMap<String, Arc<InferenceProviderTrait>>>>,
     /// Configuration for external providers (API keys, timeouts, etc.)
     external_configs: ExternalProvidersConfig,
-    /// Round-robin index for each model
-    load_balancer_index: Arc<RwLock<HashMap<String, usize>>>,
-    /// Map of chat_id -> provider for sticky routing
-    chat_id_mapping: Arc<RwLock<HashMap<String, Arc<InferenceProviderTrait>>>>,
+    /// Round-robin index for each model (std::sync::Mutex — no await points inside)
+    load_balancer_index: Arc<SyncMutex<HashMap<String, usize>>>,
+    /// Map of chat_id -> provider for sticky routing (TTL-bounded to prevent unbounded growth)
+    chat_id_mapping: moka::future::Cache<String, Arc<InferenceProviderTrait>>,
     /// Background task handle for periodic model discovery refresh
     refresh_task_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
     /// Background task handle for periodic external provider refresh
@@ -91,8 +95,11 @@ impl InferenceProviderPool {
             provider_mappings: Arc::new(RwLock::new(ProviderMappings::new())),
             external_providers: Arc::new(RwLock::new(HashMap::new())),
             external_configs,
-            load_balancer_index: Arc::new(RwLock::new(HashMap::new())),
-            chat_id_mapping: Arc::new(RwLock::new(HashMap::new())),
+            load_balancer_index: Arc::new(SyncMutex::new(HashMap::new())),
+            chat_id_mapping: moka::future::Cache::builder()
+                .max_capacity(100_000)
+                .time_to_live(Duration::from_secs(3600)) // 1 hour TTL for sticky routing
+                .build(),
             refresh_task_handle: Arc::new(Mutex::new(None)),
             external_refresh_task_handle: Arc::new(Mutex::new(None)),
         }
@@ -640,8 +647,7 @@ impl InferenceProviderPool {
         chat_id: String,
         provider: Arc<dyn InferenceProvider + Send + Sync>,
     ) {
-        let mut mapping = self.chat_id_mapping.write().await;
-        mapping.insert(chat_id.clone(), provider);
+        self.chat_id_mapping.insert(chat_id.clone(), provider).await;
         tracing::debug!("Stored chat_id mapping: {}", chat_id);
     }
 
@@ -650,8 +656,7 @@ impl InferenceProviderPool {
         &self,
         chat_id: &str,
     ) -> Option<Arc<dyn InferenceProvider + Send + Sync>> {
-        let mapping = self.chat_id_mapping.read().await;
-        mapping.get(chat_id).cloned()
+        self.chat_id_mapping.get(chat_id).await
     }
 
     /// Get providers with load balancing support
@@ -712,7 +717,10 @@ impl InferenceProviderPool {
             format!("id:{}", model_id)
         };
 
-        let mut indices = self.load_balancer_index.write().await;
+        let mut indices = self
+            .load_balancer_index
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let index = indices.entry(index_key.clone()).or_insert(0);
         let selected_index = *index % providers.len();
 
@@ -1667,19 +1675,22 @@ impl InferenceProviderPool {
 
         // Step 3: Clear load balancer indices
         debug!("Step 3: Clearing load balancer indices");
-        let mut lb_index = self.load_balancer_index.write().await;
-        let index_count = lb_index.len();
-        lb_index.clear();
-        debug!("Cleared {} load balancer indices", index_count);
-        drop(lb_index);
+        let index_count = {
+            let mut lb_index = self
+                .load_balancer_index
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let count = lb_index.len();
+            lb_index.clear();
+            debug!("Cleared {} load balancer indices", count);
+            count
+        };
 
         // Step 4: Clear chat_id to provider mappings
         debug!("Step 4: Clearing chat session mappings");
-        let mut chat_mapping = self.chat_id_mapping.write().await;
-        let chat_count = chat_mapping.len();
-        chat_mapping.clear();
+        let chat_count = self.chat_id_mapping.entry_count();
+        self.chat_id_mapping.invalidate_all();
         debug!("Cleared {} chat session mappings", chat_count);
-        drop(chat_mapping);
 
         info!(
             "Inference provider pool shutdown completed. Cleaned up: {} models, {} pubkeys, {} external providers, {} load balancer indices, {} chat mappings",

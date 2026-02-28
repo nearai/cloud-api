@@ -386,9 +386,10 @@ pub async fn chat_completions(
                     );
                 }
 
-                // Accumulate all SSE bytes for response hash computation
-                let accumulated_bytes = Arc::new(tokio::sync::Mutex::new(Vec::new()));
-                let chat_id_state = Arc::new(tokio::sync::Mutex::new(None::<String>));
+                // Accumulate all SSE bytes for response hash computation.
+                // Use std::sync::Mutex (no await points inside critical sections).
+                let accumulated_bytes = Arc::new(std::sync::Mutex::new(Vec::new()));
+                let chat_id_state = Arc::new(std::sync::Mutex::new(None::<String>));
                 let stream_error_count = Arc::new(std::sync::atomic::AtomicU32::new(0));
 
                 let accumulated_clone = accumulated_bytes.clone();
@@ -398,65 +399,66 @@ pub async fn chat_completions(
 
                 // Convert to raw bytes stream with proper SSE formatting
                 let byte_stream = peekable_stream
-                    .then(move |result| {
-                        let accumulated_inner = accumulated_clone.clone();
-                        let chat_id_inner = chat_id_clone.clone();
-                        let error_count_inner = error_count_clone.clone();
-                        let model_for_err = request_model.clone();
-                        async move {
-                            match result {
-                                Ok(event) => {
-                                    // Extract chat_id from the first chunk if available
-                                    if let Ok(chunk_str) =
-                                        String::from_utf8(event.raw_bytes.to_vec())
-                                    {
-                                        if let Some(data) = chunk_str.strip_prefix("data: ") {
-                                            if let Ok(serde_json::Value::Object(obj)) =
-                                                serde_json::from_str::<serde_json::Value>(
-                                                    data.trim(),
-                                                )
-                                            {
-                                                if let Some(serde_json::Value::String(id)) =
-                                                    obj.get("id")
+                    .map(move |result| {
+                        match result {
+                            Ok(event) => {
+                                // Only parse JSON to extract chat_id from the first chunk;
+                                // skip on all subsequent chunks to avoid per-token overhead.
+                                {
+                                    let need_chat_id = chat_id_clone
+                                        .lock()
+                                        .unwrap_or_else(|e| e.into_inner())
+                                        .is_none();
+                                    if need_chat_id {
+                                        if let Ok(chunk_str) = std::str::from_utf8(&event.raw_bytes)
+                                        {
+                                            if let Some(data) = chunk_str.strip_prefix("data: ") {
+                                                if let Ok(serde_json::Value::Object(obj)) =
+                                                    serde_json::from_str::<serde_json::Value>(
+                                                        data.trim(),
+                                                    )
                                                 {
-                                                    // Capture chat_id for use in the chain combinator
-                                                    // The real hash will be registered there after accumulating all bytes
-                                                    let mut cid = chat_id_inner.lock().await;
-                                                    if cid.is_none() {
-                                                        *cid = Some(id.clone());
+                                                    if let Some(serde_json::Value::String(id)) =
+                                                        obj.get("id")
+                                                    {
+                                                        *chat_id_clone
+                                                            .lock()
+                                                            .unwrap_or_else(|e| e.into_inner()) =
+                                                            Some(id.clone());
                                                     }
                                                 }
                                             }
                                         }
                                     }
+                                }
 
-                                    // raw_bytes contains "data: {...}\n", extract just the JSON part
-                                    let raw_str = String::from_utf8_lossy(&event.raw_bytes);
-                                    let json_data = raw_str
-                                        .trim()
-                                        .strip_prefix("data: ")
-                                        .unwrap_or(raw_str.trim())
-                                        .to_string();
-                                    tracing::debug!("Completion stream event: {}", json_data);
-                                    // Format as SSE event with proper newlines
-                                    let sse_bytes = Bytes::from(format!("data: {json_data}\n\n"));
-                                    accumulated_inner.lock().await.extend_from_slice(&sse_bytes);
-                                    Ok::<Bytes, Infallible>(sse_bytes)
+                                // raw_bytes contains "data: {...}\n", extract just the JSON part
+                                let raw_str = String::from_utf8_lossy(&event.raw_bytes);
+                                let json_data = raw_str
+                                    .trim()
+                                    .strip_prefix("data: ")
+                                    .unwrap_or(raw_str.trim());
+                                // Format as SSE event with proper newlines
+                                let sse_bytes = Bytes::from(format!("data: {json_data}\n\n"));
+                                accumulated_clone
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner())
+                                    .extend_from_slice(&sse_bytes);
+                                Ok::<Bytes, Infallible>(sse_bytes)
+                            }
+                            Err(e) => {
+                                let count = error_count_clone
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                if count == 0 {
+                                    tracing::error!(
+                                        model = %request_model,
+                                        error_type = %completion_stream_error_category(&e),
+                                        "Completion stream error"
+                                    );
                                 }
-                                Err(e) => {
-                                    let count = error_count_inner
-                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                    if count == 0 {
-                                        tracing::error!(
-                                            model = %model_for_err,
-                                            error_type = %completion_stream_error_category(&e),
-                                            "Completion stream error"
-                                        );
-                                    }
-                                    Ok::<Bytes, Infallible>(Bytes::from(format!(
-                                        "data: error: {e}\n\n"
-                                    )))
-                                }
+                                Ok::<Bytes, Infallible>(Bytes::from(format!(
+                                    "data: error: {e}\n\n"
+                                )))
                             }
                         }
                     })
@@ -474,7 +476,7 @@ pub async fn chat_completions(
                         let done_bytes = Bytes::from_static(b"data: [DONE]\n\n");
                         accumulated_bytes
                             .lock()
-                            .await
+                            .unwrap_or_else(|e| e.into_inner())
                             .extend_from_slice(&done_bytes);
 
                         Ok::<Bytes, Infallible>(done_bytes)

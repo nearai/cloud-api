@@ -5,8 +5,11 @@ use axum::{
     response::Response,
 };
 use database::User as DbUser;
+use moka::future::Cache;
 use services::auth::{AuthError, AuthServiceTrait, OAuthManager, SessionToken};
+use services::workspace::WorkspaceId;
 use std::sync::Arc;
+use std::time::Duration;
 use tracing::{debug, error};
 
 /// Authenticated user information passed to route handlers
@@ -596,10 +599,20 @@ async fn authenticate_api_key_with_context(
     // Clone workspace_id to avoid partial move
     let workspace_id = validated_api_key.workspace_id.clone();
 
-    // Get workspace with organization info
+    // Try the cache first, fall through to DB on miss
+    if let Some((workspace, organization)) = state.workspace_context_cache.get(&workspace_id).await
+    {
+        return Ok(AuthenticatedApiKey {
+            api_key: validated_api_key,
+            workspace,
+            organization,
+        });
+    }
+
+    // Get workspace with organization info from DB
     match state
         .workspace_repository
-        .get_workspace_with_organization(workspace_id)
+        .get_workspace_with_organization(workspace_id.clone())
         .await
     {
         Ok(Some((workspace, organization))) => {
@@ -607,6 +620,11 @@ async fn authenticate_api_key_with_context(
                 "Resolved workspace: {} and organization: {} for API key",
                 workspace.name, organization.name
             );
+            // Populate cache
+            state
+                .workspace_context_cache
+                .insert(workspace_id, (workspace.clone(), organization.clone()))
+                .await;
             Ok(AuthenticatedApiKey {
                 api_key: validated_api_key,
                 workspace,
@@ -645,6 +663,14 @@ pub struct AuthState {
     pub admin_access_token_repository: Arc<database::repositories::AdminAccessTokenRepository>,
     pub admin_domains: Vec<String>,
     pub encoding_key: String,
+    /// Cache for workspace + organization lookups (avoids DB hit on every request)
+    workspace_context_cache: Cache<
+        WorkspaceId,
+        (
+            services::workspace::Workspace,
+            services::organization::Organization,
+        ),
+    >,
 }
 
 impl AuthState {
@@ -663,6 +689,10 @@ impl AuthState {
             admin_access_token_repository,
             admin_domains,
             encoding_key,
+            workspace_context_cache: Cache::builder()
+                .max_capacity(10_000)
+                .time_to_live(Duration::from_secs(30))
+                .build(),
         }
     }
 }

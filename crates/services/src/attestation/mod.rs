@@ -737,38 +737,67 @@ impl ports::AttestationServiceTrait for AttestationService {
 
         // Fake attestation data is only available in debug builds with DEV set.
         // In release builds, real dstack attestation is always required.
-        let use_dev_attestation = {
-            #[cfg(debug_assertions)]
-            { std::env::var("DEV").is_ok() }
-            #[cfg(not(debug_assertions))]
-            { false }
-        };
-
+        // Both the fake data branch and real dstack branch are gated with #[cfg] so
+        // fake attestation strings are physically absent from release binaries.
         let gateway_attestation;
-        if use_dev_attestation {
-            gateway_attestation = DstackCpuQuote {
-                signing_address: signing_address_to_use,
-                signing_algo: algo,
-                intel_quote: "0x1234567890abcdef".to_string(),
-                event_log: "0x1234567890abcdef".to_string(),
-                report_data: hex::encode(&report_data),
-                request_nonce: nonce.clone(),
-                info: serde_json::json!({
-                    "app_id": "dev-app-id",
-                    "instance_id": "dev-instance-id",
-                    "app_cert": "dev-app-cert",
-                    "tcb_info": {},
-                    "app_name": "dev-app-name",
-                    "device_id": "dev-device-id",
-                    "mr_aggregated": "dev-mr-aggregated",
-                    "os_image_hash": "dev-os-image-hash",
-                    "key_provider_info": "dev-key-provider-info",
-                    "compose_hash": "dev-compose-hash",
-                    "vm_config": {},
-                }),
-                vpc,
-            };
-        } else {
+        #[cfg(debug_assertions)]
+        {
+            if std::env::var("DEV").is_ok() {
+                gateway_attestation = DstackCpuQuote {
+                    signing_address: signing_address_to_use,
+                    signing_algo: algo,
+                    intel_quote: "0x1234567890abcdef".to_string(),
+                    event_log: "0x1234567890abcdef".to_string(),
+                    report_data: hex::encode(&report_data),
+                    request_nonce: nonce.clone(),
+                    info: serde_json::json!({
+                        "app_id": "dev-app-id",
+                        "instance_id": "dev-instance-id",
+                        "app_cert": "dev-app-cert",
+                        "tcb_info": {},
+                        "app_name": "dev-app-name",
+                        "device_id": "dev-device-id",
+                        "mr_aggregated": "dev-mr-aggregated",
+                        "os_image_hash": "dev-os-image-id",
+                        "key_provider_info": "dev-key-provider-info",
+                        "compose_hash": "dev-compose-hash",
+                        "vm_config": {},
+                    }),
+                    vpc,
+                };
+            } else {
+                let client = dstack_client::DstackClient::new(None);
+
+                let info = client.info().await.map_err(|e| {
+                    tracing::error!(
+                        "Failed to get cloud API attestation info, are you running in a CVM?: {e:?}"
+                    );
+                    AttestationError::InternalError(
+                        "failed to get cloud API attestation info".to_string(),
+                    )
+                })?;
+
+                let cpu_quote = client.get_quote(report_data).await.map_err(|e| {
+                    tracing::error!(
+                        "Failed to get cloud API attestation, are you running in a CVM?: {:?}",
+                        e
+                    );
+                    AttestationError::InternalError(
+                        "failed to get cloud API attestation".to_string(),
+                    )
+                })?;
+                gateway_attestation = DstackCpuQuote::from_quote_and_nonce(
+                    signing_address_to_use,
+                    algo,
+                    vpc,
+                    info,
+                    cpu_quote,
+                    nonce,
+                );
+            }
+        }
+        #[cfg(not(debug_assertions))]
+        {
             let client = dstack_client::DstackClient::new(None);
 
             let info = client.info().await.map_err(|e| {

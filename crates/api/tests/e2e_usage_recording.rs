@@ -44,7 +44,7 @@ async fn test_record_chat_completion_usage() {
     assert_eq!(body["input_tokens"], 100);
     assert_eq!(body["output_tokens"], 50);
     assert_eq!(body["total_tokens"], 150);
-    // cached_tokens is not provided, should default to 0 (no cache hits)
+    // cache_read_tokens is not provided, should default to 0 (no cache hits)
     assert_eq!(body["cache_read_tokens"], 0);
 
     // Verify costs are calculated correctly
@@ -422,7 +422,7 @@ async fn test_record_usage_same_id_different_orgs() {
     assert_eq!(body2["input_tokens"], 200);
 }
 
-/// Test recording usage with cached_tokens and cache-read pricing enabled.
+/// Test recording usage with cache_read_tokens and cache-read pricing enabled.
 /// Verifies that cache hits reduce input cost according to cache_read_cost_per_token.
 #[tokio::test]
 async fn test_record_chat_completion_usage_with_cached_tokens() {
@@ -445,7 +445,7 @@ async fn test_record_chat_completion_usage_with_cached_tokens() {
             "model": "Qwen/Qwen3-30B-A3B-Instruct-2507",
             "input_tokens": 100,
             "output_tokens": 50,
-            "cached_tokens": 40,
+            "cache_read_tokens": 40,
             "id": "test-chat-completion-with-cache"
         }))
         .await;
@@ -453,7 +453,7 @@ async fn test_record_chat_completion_usage_with_cached_tokens() {
     assert_eq!(
         response.status_code(),
         200,
-        "Usage recording with cached_tokens should succeed: {}",
+        "Usage recording with cache_read_tokens should succeed: {}",
         response.text()
     );
 
@@ -469,7 +469,7 @@ async fn test_record_chat_completion_usage_with_cached_tokens() {
     assert_eq!(body["cache_read_tokens"], 40);
 
     // Cost expectations with cache pricing:
-    // - input_tokens = 100, cached_tokens = 40
+    // - input_tokens = 100, cache_read_tokens = 40
     // - non_cached_input = 60
     // - input_cost = 60 * 1_000_000 + 40 * 500_000 = 80_000_000
     // - output_cost = 50 * 2_000_000 = 100_000_000
@@ -479,7 +479,7 @@ async fn test_record_chat_completion_usage_with_cached_tokens() {
     assert_eq!(body["total_cost"], 180_000_000i64);
 }
 
-/// Test that cached_tokens greater than input_tokens are rejected by validation.
+/// Test that cache_read_tokens greater than input_tokens are rejected by validation.
 #[tokio::test]
 async fn test_record_chat_completion_usage_cache_read_capped_to_input() {
     let server = setup_test_server().await;
@@ -490,7 +490,7 @@ async fn test_record_chat_completion_usage_cache_read_capped_to_input() {
     let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
     let api_key = get_api_key_for_org(&server, org.id.clone()).await;
 
-    // cached_tokens (100) > input_tokens (30) should be rejected by the API
+    // cache_read_tokens (100) > input_tokens (30) should be rejected by the API
     let response = server
         .post("/v1/usage")
         .add_header("Authorization", format!("Bearer {api_key}"))
@@ -499,7 +499,7 @@ async fn test_record_chat_completion_usage_cache_read_capped_to_input() {
             "model": "Qwen/Qwen3-30B-A3B-Instruct-2507",
             "input_tokens": 30,
             "output_tokens": 0,
-            "cached_tokens": 100,
+            "cache_read_tokens": 100,
             "id": "test-chat-completion-cache-capped"
         }))
         .await;
@@ -507,7 +507,7 @@ async fn test_record_chat_completion_usage_cache_read_capped_to_input() {
     assert_eq!(
         response.status_code(),
         400,
-        "Usage recording with cached_tokens > input_tokens should return 400: {}",
+        "Usage recording with cache_read_tokens > input_tokens should return 400: {}",
         response.text()
     );
 }

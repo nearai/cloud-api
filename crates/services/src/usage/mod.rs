@@ -300,7 +300,7 @@ impl UsageServiceTrait for UsageServiceImpl {
                 model,
                 input_tokens,
                 output_tokens,
-                cached_tokens,
+                cache_read_tokens,
                 id,
             } => {
                 if id.trim().is_empty() {
@@ -310,7 +310,7 @@ impl UsageServiceTrait for UsageServiceImpl {
                 }
                 let input = input_tokens.unwrap_or(0);
                 let output = output_tokens.unwrap_or(0);
-                let cache_read = cached_tokens.unwrap_or(0);
+                let cache_read = cache_read_tokens.unwrap_or(0);
                 if input < 0 || output < 0 || cache_read < 0 {
                     return Err(UsageError::ValidationError(
                         "token counts must be non-negative".into(),
@@ -323,7 +323,7 @@ impl UsageServiceTrait for UsageServiceImpl {
                 }
                 if cache_read > input {
                     return Err(UsageError::ValidationError(
-                        "cached_tokens must be less than or equal to input_tokens".into(),
+                        "cache_read_tokens must be less than or equal to input_tokens".into(),
                     ));
                 }
                 (

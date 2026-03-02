@@ -127,13 +127,13 @@ impl UsageServiceTrait for MockUsageService {
                     model,
                     input_tokens,
                     output_tokens,
-                    cached_tokens,
+                    cache_read_tokens,
                     ..
                 } => (
                     model.clone(),
                     input_tokens.unwrap_or(0),
                     output_tokens.unwrap_or(0),
-                    cached_tokens.unwrap_or(0),
+                    cache_read_tokens.unwrap_or(0),
                     None,
                     InferenceType::ChatCompletion,
                 ),
@@ -310,13 +310,13 @@ impl UsageServiceTrait for CapturingUsageService {
                     model,
                     input_tokens,
                     output_tokens,
-                    cached_tokens,
+                    cache_read_tokens,
                     ..
                 } => (
                     model.clone(),
                     input_tokens.unwrap_or(0),
                     output_tokens.unwrap_or(0),
-                    cached_tokens.unwrap_or(0),
+                    cache_read_tokens.unwrap_or(0),
                     None,
                     InferenceType::ChatCompletion,
                 ),

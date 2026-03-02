@@ -606,6 +606,55 @@ pub async fn setup_qwen_model(server: &axum_test::TestServer) -> String {
     "Qwen/Qwen3-30B-A3B-Instruct-2507".to_string()
 }
 
+/// Setup Qwen chat model with cache-read pricing enabled for testing.
+/// Uses:
+/// - input_cost_per_token: 1_000_000
+/// - output_cost_per_token: 2_000_000
+/// - cache_read_cost_per_token: 500_000
+pub async fn setup_qwen_model_with_cache_pricing(server: &axum_test::TestServer) -> String {
+    let mut batch = BatchUpdateModelApiRequest::new();
+    batch.insert(
+        "Qwen/Qwen3-30B-A3B-Instruct-2507".to_string(),
+        serde_json::from_value(serde_json::json!({
+            "inputCostPerToken": {
+                "amount": 1000000,
+                "currency": "USD"
+            },
+            "outputCostPerToken": {
+                "amount": 2000000,
+                "currency": "USD"
+            },
+            "cacheReadCostPerToken": {
+                "amount": 500000,
+                "currency": "USD"
+            },
+            "modelDisplayName": "Updated Model Name",
+            "modelDescription": "Updated model description",
+            "contextLength": 128000,
+            "verifiable": true,
+            "isActive": true
+        }))
+        .unwrap(),
+    );
+    let updated = admin_batch_upsert_models(server, batch, get_session_id()).await;
+    assert_eq!(updated.len(), 1, "Should have updated 1 model");
+    assert_eq!(
+        updated[0].input_cost_per_token.amount, 1000000,
+        "Input cost per token should be 1000000"
+    );
+    assert_eq!(
+        updated[0].output_cost_per_token.amount, 2000000,
+        "Output cost per token should be 2000000"
+    );
+    assert_eq!(
+        updated[0].cache_read_cost_per_token.amount, 500000,
+        "Cache-read cost per token should be 500000"
+    );
+    // Ensure mock provider registers model before test proceeds
+    tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+    "Qwen/Qwen3-30B-A3B-Instruct-2507".to_string()
+}
+
 pub async fn setup_glm_model(server: &axum_test::TestServer) -> String {
     let mut batch = BatchUpdateModelApiRequest::new();
     batch.insert(

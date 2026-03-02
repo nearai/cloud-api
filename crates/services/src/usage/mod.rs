@@ -125,6 +125,11 @@ impl UsageServiceTrait for UsageServiceImpl {
         &self,
         request: RecordUsageServiceRequest,
     ) -> Result<UsageLogEntry, UsageError> {
+        // Normalize cache_read_tokens to satisfy invariant: 0 <= cache_read_tokens <= input_tokens.
+        // Ensures cost computation and persisted usage stay consistent across all callers
+        // (API, provider parsing, etc.).
+        let cache_read_tokens = request.cache_read_tokens.min(request.input_tokens).max(0);
+
         // Look up the model to get pricing (model_id is already a UUID)
         let model = self
             .model_repository
@@ -184,7 +189,7 @@ impl UsageServiceTrait for UsageServiceImpl {
                 let cost = compute_token_cost(
                     request.input_tokens,
                     request.output_tokens,
-                    request.cache_read_tokens,
+                    cache_read_tokens,
                     &model,
                 )?;
                 (cost.input_cost, cost.output_cost, cost.total_cost)
@@ -200,7 +205,7 @@ impl UsageServiceTrait for UsageServiceImpl {
             model_name: model.model_name.clone(),
             input_tokens: request.input_tokens,
             output_tokens: request.output_tokens,
-            cache_read_tokens: request.cache_read_tokens,
+            cache_read_tokens,
             input_cost,
             output_cost,
             total_cost,

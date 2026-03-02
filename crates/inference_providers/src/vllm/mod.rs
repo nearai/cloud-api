@@ -41,15 +41,22 @@ mod encryption_headers {
 pub struct VLlmConfig {
     pub base_url: String,
     pub api_key: Option<String>,
-    pub timeout_seconds: i64,
+    /// Timeout for non-streaming requests (e.g., model listing, attestation).
+    /// Streaming requests use only the connect timeout — no overall deadline —
+    /// so long generations are never killed mid-stream.
+    pub request_timeout_seconds: i64,
 }
 
 impl VLlmConfig {
-    pub fn new(base_url: String, api_key: Option<String>, timeout_seconds: Option<i64>) -> Self {
+    pub fn new(
+        base_url: String,
+        api_key: Option<String>,
+        request_timeout_seconds: Option<i64>,
+    ) -> Self {
         Self {
             base_url,
             api_key,
-            timeout_seconds: timeout_seconds.unwrap_or(30),
+            request_timeout_seconds: request_timeout_seconds.unwrap_or(30),
         }
     }
 }
@@ -148,7 +155,9 @@ impl InferenceProvider for VLlmProvider {
             .client
             .get(&url)
             .headers(headers)
-            .timeout(Duration::from_secs(self.config.timeout_seconds as u64))
+            .timeout(Duration::from_secs(
+                self.config.request_timeout_seconds as u64,
+            ))
             .send()
             .await
             .map_err(|e| CompletionError::CompletionError(e.to_string()))?;
@@ -196,7 +205,9 @@ impl InferenceProvider for VLlmProvider {
             .client
             .get(&url)
             .headers(headers)
-            .timeout(Duration::from_secs(self.config.timeout_seconds as u64))
+            .timeout(Duration::from_secs(
+                self.config.request_timeout_seconds as u64,
+            ))
             .send()
             .await
             .map_err(|e| AttestationError::FetchError(e.to_string()))?;
@@ -236,7 +247,9 @@ impl InferenceProvider for VLlmProvider {
             .client
             .get(&url)
             .headers(headers)
-            .timeout(Duration::from_secs(self.config.timeout_seconds as u64))
+            .timeout(Duration::from_secs(
+                self.config.request_timeout_seconds as u64,
+            ))
             .send()
             .await
             .map_err(|e| ListModelsError::FetchError(format!("{e:?}")))?;
@@ -283,12 +296,13 @@ impl InferenceProvider for VLlmProvider {
         // Prepare encryption headers
         self.prepare_encryption_headers(&mut headers, &mut streaming_params.extra);
 
+        // No per-request timeout for streaming — the client-level connect_timeout
+        // protects against connection failures, and we must not kill long generations.
         let response = self
             .client
             .post(&url)
             .headers(headers)
             .json(&streaming_params)
-            .timeout(Duration::from_secs(self.config.timeout_seconds as u64))
             .send()
             .await
             .map_err(|e| CompletionError::CompletionError(e.to_string()))?;
@@ -337,7 +351,9 @@ impl InferenceProvider for VLlmProvider {
             .post(&url)
             .headers(headers)
             .json(&non_streaming_params)
-            .timeout(Duration::from_secs(self.config.timeout_seconds as u64))
+            .timeout(Duration::from_secs(
+                self.config.request_timeout_seconds as u64,
+            ))
             .send()
             .await
             .map_err(|e| CompletionError::CompletionError(e.to_string()))?;
@@ -393,12 +409,13 @@ impl InferenceProvider for VLlmProvider {
         let headers = self
             .build_headers()
             .map_err(CompletionError::CompletionError)?;
+        // No per-request timeout for streaming — the client-level connect_timeout
+        // protects against connection failures, and we must not kill long generations.
         let response = self
             .client
             .post(&url)
             .headers(headers)
             .json(&streaming_params)
-            .timeout(Duration::from_secs(self.config.timeout_seconds as u64))
             .send()
             .await
             .map_err(|e| CompletionError::CompletionError(e.to_string()))?;
@@ -531,7 +548,7 @@ impl InferenceProvider for VLlmProvider {
             .headers(headers)
             .multipart(form)
             .timeout(std::time::Duration::from_secs(
-                self.config.timeout_seconds as u64,
+                self.config.request_timeout_seconds as u64,
             ))
             .send()
             .await
@@ -674,7 +691,7 @@ impl InferenceProvider for VLlmProvider {
             .headers(headers)
             .json(&params)
             .timeout(std::time::Duration::from_secs(
-                self.config.timeout_seconds as u64,
+                self.config.request_timeout_seconds as u64,
             ))
             .send()
             .await
@@ -707,7 +724,7 @@ impl InferenceProvider for VLlmProvider {
             .headers(headers)
             .json(&params)
             .timeout(std::time::Duration::from_secs(
-                self.config.timeout_seconds as u64,
+                self.config.request_timeout_seconds as u64,
             ))
             .send()
             .await
@@ -738,7 +755,7 @@ mod tests {
         VLlmProvider::new(VLlmConfig {
             base_url: "http://localhost".to_string(),
             api_key: None,
-            timeout_seconds: 30,
+            request_timeout_seconds: 30,
         })
     }
 

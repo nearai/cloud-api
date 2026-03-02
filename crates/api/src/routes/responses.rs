@@ -268,9 +268,10 @@ pub async fn create_response(
                     "Successfully created streaming response, returning SSE stream with signature accumulation"
                 );
 
-                // Shared state for accumulating bytes and tracking response_id
-                let accumulated_bytes = Arc::new(tokio::sync::Mutex::new(Vec::new()));
-                let response_id_state = Arc::new(tokio::sync::Mutex::new(None::<String>));
+                // Shared state for accumulating bytes and tracking response_id.
+                // Use std::sync::Mutex (not tokio) — no await points inside critical sections.
+                let accumulated_bytes = Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+                let response_id_state = Arc::new(std::sync::Mutex::new(None::<String>));
                 let request_hash = body_hash.hash.clone();
 
                 // Clone for closures
@@ -288,31 +289,54 @@ pub async fn create_response(
                         // Extract response_id from response.created event
                         if event.event_type == "response.created" {
                             if let Some(ref response) = event.response {
-                                let mut rid = response_id_inner.lock().await;
+                                let mut rid = response_id_inner
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner());
                                 if rid.is_none() {
                                     *rid = Some(response.id.clone());
-                                    tracing::debug!("Extracted response_id: {}", response.id);
+                                    tracing::debug!(
+                                        "Extracted response_id: {}",
+                                        response.id
+                                    );
                                 }
                             }
                         }
 
                         // Format as SSE: "event: {type}\ndata: {json}\n\n"
+                        // Pre-allocate buffer to avoid intermediate String allocations.
                         let json = serde_json::to_string(&event)
                             .expect("event serialization failed");
-                        let sse_bytes = format!("event: {}\ndata: {}\n\n", event.event_type, json);
-                        let bytes = Bytes::from(sse_bytes);
+                        let mut buf = Vec::with_capacity(
+                            "event: ".len()
+                                + event.event_type.len()
+                                + "\ndata: ".len()
+                                + json.len()
+                                + "\n\n".len(),
+                        );
+                        buf.extend_from_slice(b"event: ");
+                        buf.extend_from_slice(event.event_type.as_bytes());
+                        buf.extend_from_slice(b"\ndata: ");
+                        buf.extend_from_slice(json.as_bytes());
+                        buf.extend_from_slice(b"\n\n");
+                        let bytes = Bytes::from(buf);
 
-                        // Accumulate bytes synchronously - this ensures all bytes are captured
-                        // before the stream chunk is yielded to the client
-                        accumulated_inner.lock().await.extend_from_slice(&bytes);
+                        // Accumulate bytes — no await points, std::sync::Mutex is sufficient.
+                        accumulated_inner
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .extend_from_slice(&bytes);
 
                         // Check if stream is completing - store signature
                         if event.event_type == "response.completed" {
-                            // At this point, all bytes have been accumulated synchronously
-                            // Now we can safely compute the hash and store the signature
-                            let bytes_accumulated = accumulated_inner.lock().await.clone();
-                            let response_hash = compute_sha256(&bytes_accumulated);
-                            if let Some(rid) = response_id_inner.lock().await.as_ref() {
+                            // Hash directly from the guard reference — no Vec clone needed.
+                            let guard = accumulated_inner
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner());
+                            let response_hash = compute_sha256(&guard);
+                            let rid_guard = response_id_inner
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner());
+                            if let Some(rid) = rid_guard.as_ref() {
                                 let rid = rid.clone();
                                 let req_hash = request_hash_inner.clone();
                                 let attest = attestation_inner.clone();
@@ -325,14 +349,23 @@ pub async fn create_response(
                                 // but we've already computed the hash with complete data
                                 tokio::spawn(async move {
                                     // Store both ECDSA and ED25519 signatures
-                                    if let Err(e) = attest.store_response_signature(
-                                        &rid,
-                                        req_hash.clone(),
-                                        response_hash.clone(),
-                                    ).await {
-                                        tracing::error!("Failed to store response signature: {}", e);
+                                    if let Err(e) = attest
+                                        .store_response_signature(
+                                            &rid,
+                                            req_hash.clone(),
+                                            response_hash.clone(),
+                                        )
+                                        .await
+                                    {
+                                        tracing::error!(
+                                            "Failed to store response signature: {}",
+                                            e
+                                        );
                                     } else {
-                                        tracing::debug!("Successfully stored signature for response_id: {}", rid);
+                                        tracing::debug!(
+                                            "Successfully stored signature for response_id: {}",
+                                            rid
+                                        );
                                     }
                                 });
                             }

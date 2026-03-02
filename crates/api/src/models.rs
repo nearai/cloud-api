@@ -776,7 +776,7 @@ impl ChatCompletionRequest {
             return Err("messages cannot be empty".to_string());
         }
 
-        for (idx, message) in self.messages.iter().enumerate() {
+        for message in &self.messages {
             if message.role.is_empty() {
                 return Err("message role is required".to_string());
             }
@@ -784,15 +784,6 @@ impl ChatCompletionRequest {
                 .contains(&message.role.as_str())
             {
                 return Err(format!("invalid message role: {}", message.role));
-            }
-            // Validate message content can be serialized (catches malformed multimodal content)
-            if let Some(ref content) = message.content {
-                if serde_json::to_value(content).is_err() {
-                    return Err(format!(
-                        "message at index {} has invalid content that cannot be processed",
-                        idx
-                    ));
-                }
             }
         }
 

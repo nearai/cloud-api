@@ -69,3 +69,8 @@ ed25519-dalek = { version = "2.1", features = ["rand_core"] }
 rand = "0.10"
 services = { path = "../services", features = ["test-mocks"] }
 async-trait = "0.1"
+criterion = { version = "0.5", features = ["async_tokio"] }
+
+[[bench]]
+name = "validation_bench"
+harness = false

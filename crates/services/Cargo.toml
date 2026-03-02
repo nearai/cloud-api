@@ -68,3 +68,20 @@ tokio-test = "0.4"
 async-trait = "0.1"
 futures = "0.3"
 mockall = "0.14"
+criterion = { version = "0.5", features = ["async_tokio"] }
+
+[[bench]]
+name = "completions_bench"
+harness = false
+
+[[bench]]
+name = "auth_bench"
+harness = false
+
+[[bench]]
+name = "provider_pool_bench"
+harness = false
+
+[[bench]]
+name = "responses_bench"
+harness = false

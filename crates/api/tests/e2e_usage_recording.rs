@@ -44,8 +44,6 @@ async fn test_record_chat_completion_usage() {
     assert_eq!(body["input_tokens"], 100);
     assert_eq!(body["output_tokens"], 50);
     assert_eq!(body["total_tokens"], 150);
-    // cached_tokens is provided as 40, so cache_read_tokens should reflect that
-    assert_eq!(body["cache_read_tokens"], 40);
     // cached_tokens is not provided, should default to 0 (no cache hits)
     assert_eq!(body["cache_read_tokens"], 0);
 

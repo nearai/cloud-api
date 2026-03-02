@@ -466,6 +466,7 @@ async fn test_record_chat_completion_usage_with_cached_tokens() {
     assert_eq!(body["input_tokens"], 100);
     assert_eq!(body["output_tokens"], 50);
     assert_eq!(body["total_tokens"], 150);
+    assert_eq!(body["cache_read_tokens"], 40);
 
     // Cost expectations with cache pricing:
     // - input_tokens = 100, cached_tokens = 40

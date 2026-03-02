@@ -44,6 +44,10 @@ async fn test_record_chat_completion_usage() {
     assert_eq!(body["input_tokens"], 100);
     assert_eq!(body["output_tokens"], 50);
     assert_eq!(body["total_tokens"], 150);
+    // cached_tokens is not provided, should default to 0
+    assert_eq!(body["cache_read_tokens"], 0);
+    // No cache hits were reported
+    assert_eq!(body["cache_read_tokens"], 0);
 
     // Verify costs are calculated correctly
     // input: 100 tokens * 1_000_000 nano-dollars = 100_000_000
@@ -165,6 +169,7 @@ async fn test_record_usage_with_external_id() {
     assert_eq!(body["type"], "chat_completion");
     assert_eq!(body["input_tokens"], 10);
     assert_eq!(body["output_tokens"], 20);
+    assert_eq!(body["cache_read_tokens"], 0);
 
     // The response id should be the usage log row's primary key (not the external id)
     assert!(body["id"].is_string());
@@ -519,6 +524,7 @@ async fn test_record_chat_completion_usage_cache_read_capped_to_input() {
     // - input_cost = 30 * 500_000 = 15_000_000
     // - output_cost = 0
     // - total_cost = 15_000_000
+    assert_eq!(body["cache_read_tokens"], 30);
     assert_eq!(body["input_cost"], 15_000_000i64);
     assert_eq!(body["output_cost"], 0i64);
     assert_eq!(body["total_cost"], 15_000_000i64);

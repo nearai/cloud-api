@@ -525,6 +525,8 @@ pub enum RecordUsageResponse {
         output_tokens: i32,
         /// Total tokens (input + output)
         total_tokens: i32,
+        /// Number of prompt tokens that were cache hits (subset of input_tokens)
+        cache_read_tokens: i32,
         /// Input cost in nano-dollars (scale 9)
         input_cost: i64,
         /// Output cost in nano-dollars (scale 9)
@@ -662,6 +664,7 @@ pub async fn record_usage(
             input_tokens: entry.input_tokens,
             output_tokens: entry.output_tokens,
             total_tokens: entry.total_tokens,
+            cache_read_tokens: entry.cache_read_tokens,
             input_cost: entry.input_cost,
             output_cost: entry.output_cost,
             total_cost: entry.total_cost,

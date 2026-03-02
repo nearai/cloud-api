@@ -357,16 +357,11 @@ impl TokenUsage {
         let Some(v) = details.get("cached_tokens") else {
             return 0;
         };
-        let mut n = v
+        let n = v
             .as_i64()
             .and_then(|n64| i32::try_from(n64).ok())
             .unwrap_or(0);
-        if n < 0 {
-            n = 0;
-        } else if n > self.prompt_tokens {
-            n = self.prompt_tokens;
-        }
-        n
+        n.min(self.prompt_tokens).max(0)
     }
 }
 

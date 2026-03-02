@@ -1234,13 +1234,9 @@ impl Usage {
         reasoning_tokens: i32,
         cached_tokens: i32,
     ) -> Self {
-        // Ensure cached_tokens is a valid subset of input_tokens: 0 <= cached_tokens <= input_tokens
-        let mut cache = cached_tokens;
-        if cache < 0 {
-            cache = 0;
-        } else if cache > input_tokens {
-            cache = input_tokens;
-        }
+        // Ensure cached_tokens is a valid subset of input_tokens: 0 <= cached_tokens <= input_tokens.
+        // Mirrors the clamping logic used in compute_token_cost to avoid negative or oversized values.
+        let cache = cached_tokens.min(input_tokens).max(0);
 
         Self {
             input_tokens,

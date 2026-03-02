@@ -355,8 +355,7 @@ pub enum RecordUsageApiRequest {
         input_tokens: Option<i32>,
         /// Number of output/completion tokens
         output_tokens: Option<i32>,
-        /// Number of prompt tokens that were cache hits (optional; 0 if omitted)
-        #[serde(default)]
+        /// Number of prompt tokens that were cache hits
         cached_tokens: Option<i32>,
         /// External identifier (e.g., provider request ID) used as
         /// an idempotency key. Stored as `provider_request_id` and

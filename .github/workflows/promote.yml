@@ -1,7 +1,7 @@
 name: Promote Image
 
 permissions:
-  contents: read
+  contents: write
 
 on:
   schedule:
@@ -29,6 +29,9 @@ jobs:
     runs-on: ubuntu-latest
     environment: production
     steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
       - name: Log in to Docker registry
         uses: docker/login-action@0567fa5ae8c9a197cb207537dc5cbb43ca3d803f
         with:
@@ -54,6 +57,26 @@ jobs:
             echo "::error::Failed to retrieve image digest"
             exit 1
           fi
+          echo "IMAGE_DIGEST=${DIGEST}" >> "$GITHUB_ENV"
           echo "## Promotion: staging → prod" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "- digest: \`${DIGEST}\`" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="prod-$(date -u +%Y%m%d-%H%M%S)"
+          gh release create "$TAG" \
+            --title "Production Release ${TAG}" \
+            --notes "$(cat <<EOF
+          ## Production Promotion
+
+          - **Image**: \`${{ env.IMAGE }}:prod\`
+          - **Digest**: \`${IMAGE_DIGEST}\`
+          - **Promoted from**: \`:staging\`
+          - **Sigstore**: https://search.sigstore.dev/?hash=${IMAGE_DIGEST}
+          EOF
+          )" \
+            --latest
+          echo "- release: [\`${TAG}\`](${{ github.server_url }}/${{ github.repository }}/releases/tag/${TAG})" >> "$GITHUB_STEP_SUMMARY"

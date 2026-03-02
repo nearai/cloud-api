@@ -8,7 +8,12 @@ pub use ports::*;
 use std::sync::Arc;
 use uuid::Uuid;
 
-/// Compute token-based cost with cache-aware input pricing.
+/// Compute token-based cost with cache-aware input pricing for token-based chat-style models.
+///
+/// Important: This helper is intended for chat/LLM-style models where cache-read pricing
+/// applies. Non-token billing types (image, audio duration, rerank, etc.) use dedicated
+/// branches in `record_usage` and deliberately ignore `cache_read_tokens` and
+/// `cache_read_cost_per_token` even if configured on the model.
 ///
 /// Formula (with cache enabled):
 /// - `cache_read = min(cache_read_tokens, input_tokens)`
@@ -157,7 +162,9 @@ impl UsageServiceTrait for UsageServiceImpl {
                 (0, image_cost, image_cost)
             }
             ports::InferenceType::AudioTranscription => {
-                // For audio transcription: bill by duration in seconds (stored in input_tokens)
+                // For audio transcription: bill by duration in seconds (stored in input_tokens).
+                // Cache pricing is intentionally NOT applied for audio transcription, even if
+                // cache_read_cost_per_token is configured on the model.
                 // input_tokens contains the audio duration rounded up to nearest second
                 let duration_cost = (request.input_tokens as i64)
                     .checked_mul(model.input_cost_per_token)
@@ -170,7 +177,9 @@ impl UsageServiceTrait for UsageServiceImpl {
                 (duration_cost, 0, duration_cost)
             }
             ports::InferenceType::Rerank => {
-                // For rerank: use input tokens as the billing unit
+                // For rerank: use input tokens as the billing unit.
+                // Cache pricing is intentionally NOT applied for rerank, even if
+                // cache_read_cost_per_token is configured on the model.
                 // Rerank models should set their input_cost_per_token appropriately for the billing model
                 // (e.g., cost per token, cost per document, cost per query, etc.)
                 // Use checked arithmetic to prevent integer overflow in billing-critical path
@@ -196,7 +205,10 @@ impl UsageServiceTrait for UsageServiceImpl {
             }
         };
 
-        // Create database request with model UUID and name (denormalized)
+        // Create database request with model UUID and name (denormalized).
+        // Note: `cache_read_tokens` is persisted for observability across all inference types,
+        // but it currently only affects billing for token-based chat-style models. For other
+        // types (rerank, audio, image) it is informational and does not change cost.
         let db_request = RecordUsageDbRequest {
             organization_id: request.organization_id,
             workspace_id: request.workspace_id,
@@ -290,6 +302,11 @@ impl UsageServiceTrait for UsageServiceImpl {
                 if input == 0 && output == 0 {
                     return Err(UsageError::ValidationError(
                         "at least one of input_tokens or output_tokens must be positive".into(),
+                    ));
+                }
+                if cache_read > input {
+                    return Err(UsageError::ValidationError(
+                        "cached_tokens must be less than or equal to input_tokens".into(),
                     ));
                 }
                 (

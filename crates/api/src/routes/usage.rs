@@ -35,7 +35,10 @@ pub struct OrganizationBalanceResponse {
 }
 
 /// Usage history entry
-/// All costs use fixed scale of 9 (nano-dollars) and USD currency
+/// All costs use fixed scale of 9 (nano-dollars) and USD currency.
+/// `cache_read_tokens` is meaningful only for token-based chat-style models; for other
+/// inference types (e.g., rerank, audio transcription, image), it will typically be 0
+/// and is not used in billing calculations.
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct UsageHistoryEntryResponse {
     pub id: String,

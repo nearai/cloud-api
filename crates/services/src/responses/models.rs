@@ -1234,10 +1234,18 @@ impl Usage {
         reasoning_tokens: i32,
         cached_tokens: i32,
     ) -> Self {
+        // Ensure cached_tokens is a valid subset of input_tokens: 0 <= cached_tokens <= input_tokens
+        let mut cache = cached_tokens;
+        if cache < 0 {
+            cache = 0;
+        } else if cache > input_tokens {
+            cache = input_tokens;
+        }
+
         Self {
             input_tokens,
             input_tokens_details: Some(InputTokensDetails {
-                cached_tokens: cached_tokens as i64,
+                cached_tokens: cache as i64,
             }),
             output_tokens,
             output_tokens_details: Some(OutputTokensDetails {

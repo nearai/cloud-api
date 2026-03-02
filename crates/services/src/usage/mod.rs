@@ -35,6 +35,14 @@ fn compute_token_cost(
     cache_read_tokens: i32,
     pricing: &ModelPricing,
 ) -> Result<CostBreakdown, UsageError> {
+    // Basic validation: token counts must be non-negative. This protects both direct callers
+    // (e.g., calculate_cost) and internal usage from accidentally computing negative costs.
+    if input_tokens < 0 || output_tokens < 0 || cache_read_tokens < 0 {
+        return Err(UsageError::ValidationError(
+            "token counts must be non-negative".into(),
+        ));
+    }
+
     let cache_read = cache_read_tokens.min(input_tokens).max(0) as i64;
     let non_cached_input = (input_tokens as i64) - cache_read;
     // If cache_read_cost_per_token is 0, treat cache pricing as disabled and bill cached tokens
@@ -106,8 +114,17 @@ impl UsageServiceImpl {
 
 #[async_trait::async_trait]
 impl UsageServiceTrait for UsageServiceImpl {
-    /// Calculate cost for a given model and token usage
-    /// All costs use fixed scale of 9 (nano-dollars) and USD currency
+    /// Calculate cost for a given model and token usage.
+    ///
+    /// Uses the same semantics as `record_usage` / `compute_token_cost`:
+    /// - For token-based chat-style models, applies cache-aware pricing:
+    ///   `(input - cache_read) * input_rate + cache_read * cache_read_rate + output * output_rate`.
+    /// - When `cache_read_cost_per_token == 0`, cache pricing is treated as **disabled** and
+    ///   all input tokens (including cached ones) are billed at `input_cost_per_token` (no free cache).
+    /// - Non-token billing types (image, audio duration, rerank, etc.) have dedicated paths in
+    ///   `record_usage` and do not use this helper.
+    ///
+    /// All costs use fixed scale of 9 (nano-dollars) and USD currency.
     async fn calculate_cost(
         &self,
         model_id: &str,

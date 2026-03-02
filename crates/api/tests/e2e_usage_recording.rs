@@ -480,8 +480,7 @@ async fn test_record_chat_completion_usage_with_cached_tokens() {
     assert_eq!(body["total_cost"], 180_000_000i64);
 }
 
-/// Test that cached_tokens greater than input_tokens are effectively capped to input_tokens
-/// for cost and stored usage via record_usage normalization.
+/// Test that cached_tokens greater than input_tokens are rejected by validation.
 #[tokio::test]
 async fn test_record_chat_completion_usage_cache_read_capped_to_input() {
     let server = setup_test_server().await;
@@ -492,7 +491,7 @@ async fn test_record_chat_completion_usage_cache_read_capped_to_input() {
     let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
     let api_key = get_api_key_for_org(&server, org.id.clone()).await;
 
-    // cached_tokens (100) > input_tokens (30) should be treated as 30
+    // cached_tokens (100) > input_tokens (30) should be rejected by the API
     let response = server
         .post("/v1/usage")
         .add_header("Authorization", format!("Bearer {api_key}"))
@@ -508,24 +507,8 @@ async fn test_record_chat_completion_usage_cache_read_capped_to_input() {
 
     assert_eq!(
         response.status_code(),
-        200,
-        "Usage recording with cached_tokens > input_tokens should succeed: {}",
+        400,
+        "Usage recording with cached_tokens > input_tokens should return 400: {}",
         response.text()
     );
-
-    let body: serde_json::Value = response.json();
-    assert_eq!(body["type"], "chat_completion");
-    assert_eq!(body["input_tokens"], 30);
-    assert_eq!(body["output_tokens"], 0);
-    assert_eq!(body["total_tokens"], 30);
-
-    // With input_tokens = 30 and cached_tokens capped to 30:
-    // - all 30 tokens are treated as cache-read at 500_000 nano-dollars
-    // - input_cost = 30 * 500_000 = 15_000_000
-    // - output_cost = 0
-    // - total_cost = 15_000_000
-    assert_eq!(body["cache_read_tokens"], 30);
-    assert_eq!(body["input_cost"], 15_000_000i64);
-    assert_eq!(body["output_cost"], 0i64);
-    assert_eq!(body["total_cost"], 15_000_000i64);
 }

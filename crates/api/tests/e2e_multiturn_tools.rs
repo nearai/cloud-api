@@ -79,7 +79,9 @@ async fn test_chat_completions_multiturn_tool_calls() {
     // Mock the provider to expect all messages (including tool_calls)
     // When the assistant message with tool_calls reaches the mock, it should be present
     mock.when(inference_providers::mock::RequestMatcher::Any)
-        .respond_with(inference_providers::mock::ResponseTemplate::new("The port is 8080"))
+        .respond_with(inference_providers::mock::ResponseTemplate::new(
+            "The port is 8080",
+        ))
         .await;
 
     // Make the chat completion request with the multi-turn tool history
@@ -163,7 +165,9 @@ async fn test_chat_completions_multiturn_tool_calls_streaming() {
     ];
 
     mock.when(inference_providers::mock::RequestMatcher::Any)
-        .respond_with(inference_providers::mock::ResponseTemplate::new("The weather in Tokyo is sunny and 25°C"))
+        .respond_with(inference_providers::mock::ResponseTemplate::new(
+            "The weather in Tokyo is sunny and 25°C",
+        ))
         .await;
 
     let response = server

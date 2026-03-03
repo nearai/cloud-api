@@ -221,12 +221,15 @@ fn convert_chat_request_to_service(
                 content: extract_text_from_content(&msg.content),
                 tool_call_id: msg.tool_call_id.clone(),
                 tool_calls: msg.tool_calls.as_ref().map(|calls| {
-                    calls.iter().map(|tc| services::completions::ports::CompletionToolCall {
-                        id: tc.id.clone(),
-                        name: tc.function.name.clone(),
-                        arguments: tc.function.arguments.clone(),
-                        thought_signature: None,
-                    }).collect()
+                    calls
+                        .iter()
+                        .map(|tc| services::completions::ports::CompletionToolCall {
+                            id: tc.id.clone(),
+                            name: tc.function.name.clone(),
+                            arguments: tc.function.arguments.clone(),
+                            thought_signature: None,
+                        })
+                        .collect()
                 }),
             })
             .collect(),

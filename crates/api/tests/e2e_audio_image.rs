@@ -827,7 +827,7 @@ async fn test_verifiable_model_response_format_validation() {
 /// Test that audio content is properly passed through to providers
 #[tokio::test]
 async fn test_audio_content_passthrough() {
-    let server = setup_test_server().await;
+    let (server, _pool, mock_provider, _db) = setup_test_server_with_pool().await;
 
     setup_qwen_omni_model(&server).await;
     let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
@@ -869,10 +869,6 @@ async fn test_audio_content_passthrough() {
         }))
         .await;
 
-    println!(
-        "Audio passthrough response status: {}",
-        response.status_code()
-    );
     assert_eq!(
         response.status_code(),
         200,
@@ -880,20 +876,43 @@ async fn test_audio_content_passthrough() {
     );
 
     let response_json: serde_json::Value = response.json();
-    println!(
-        "Response: {}",
-        serde_json::to_string_pretty(&response_json).unwrap()
-    );
-
-    // Verify response structure
-    assert!(
-        response_json.get("choices").is_some(),
-        "Should have choices"
-    );
     let choices = response_json.get("choices").unwrap().as_array().unwrap();
     assert!(!choices.is_empty(), "Should have at least one choice");
 
-    // Allow background tasks (usage recording) to complete before test cleanup
+    // Verify the multimodal content array reached the provider with audio converted to audio_url
+    let params = mock_provider.last_chat_params().await.unwrap();
+    let user_msg = params
+        .messages
+        .iter()
+        .find(|m| m.role == inference_providers::MessageRole::User)
+        .expect("Should have a user message");
+
+    let content = user_msg
+        .content
+        .as_ref()
+        .expect("User message should have content");
+    let parts = content
+        .as_array()
+        .expect("Content should be an array (multimodal)");
+
+    // Should have 2 parts: text + audio_url (input_audio converted to audio_url for vLLM)
+    assert_eq!(parts.len(), 2, "Should have text and audio parts");
+    assert_eq!(parts[0]["type"], "text");
+    assert_eq!(parts[0]["text"], "Please analyze this audio:");
+
+    // input_audio should be converted to audio_url format for vLLM
+    assert_eq!(
+        parts[1]["type"], "audio_url",
+        "input_audio should be converted to audio_url"
+    );
+    assert!(
+        parts[1]["audio_url"]["url"]
+            .as_str()
+            .unwrap()
+            .starts_with("data:audio/wav;base64,"),
+        "audio_url should contain base64 data URI"
+    );
+
     tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
 }
 
@@ -1822,5 +1841,85 @@ async fn test_image_edit_verifiable_model_response_format() {
     );
 
     // Allow background tasks to complete
+    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+}
+
+/// Test that image_url content parts pass through to the provider via chat completions.
+/// Verifies the multimodal content array (text + image_url) reaches the inference provider
+/// without being stripped or flattened to text-only.
+#[tokio::test]
+async fn test_image_input_chat_completion() {
+    let (server, _pool, mock_provider, _db) = setup_test_server_with_pool().await;
+    setup_qwen_omni_model(&server).await;
+    let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
+    let api_key = get_api_key_for_org(&server, org.id).await;
+
+    use base64::Engine;
+    let image_base64 = base64::engine::general_purpose::STANDARD.encode(create_test_png_image());
+    let image_data_url = format!("data:image/png;base64,{image_base64}");
+
+    let response = server
+        .post("/v1/chat/completions")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .add_header("User-Agent", MOCK_USER_AGENT)
+        .json(&serde_json::json!({
+            "model": "Qwen/Qwen3-Omni-30B-A3B-Instruct",
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": "What is in this image?"
+                    },
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": image_data_url.clone()
+                        }
+                    }
+                ]
+            }],
+            "stream": false,
+            "max_tokens": 50
+        }))
+        .await;
+
+    assert_eq!(
+        response.status_code(),
+        200,
+        "Image input should be accepted"
+    );
+
+    let response_json: serde_json::Value = response.json();
+    let choices = response_json.get("choices").unwrap().as_array().unwrap();
+    assert!(!choices.is_empty(), "Should have at least one choice");
+
+    // Verify the multimodal content array reached the provider intact
+    let params = mock_provider.last_chat_params().await.unwrap();
+    let user_msg = params
+        .messages
+        .iter()
+        .find(|m| m.role == inference_providers::MessageRole::User)
+        .expect("Should have a user message");
+
+    let content = user_msg
+        .content
+        .as_ref()
+        .expect("User message should have content");
+    let parts = content
+        .as_array()
+        .expect("Content should be an array (multimodal)");
+
+    // Should have exactly 2 parts: text + image_url
+    assert_eq!(parts.len(), 2, "Should have text and image_url parts");
+
+    // Verify text part
+    assert_eq!(parts[0]["type"], "text");
+    assert_eq!(parts[0]["text"], "What is in this image?");
+
+    // Verify image_url part preserved
+    assert_eq!(parts[1]["type"], "image_url");
+    assert_eq!(parts[1]["image_url"]["url"], image_data_url);
+
     tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
 }

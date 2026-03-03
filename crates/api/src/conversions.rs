@@ -35,7 +35,7 @@ impl From<crate::models::Message> for ChatMessage {
     }
 }
 
-fn convert_content_to_vllm(content: MessageContent) -> MessageContent {
+pub fn convert_content_to_vllm(content: MessageContent) -> MessageContent {
     match content {
         MessageContent::Text(text) => MessageContent::Text(text),
         MessageContent::Parts(parts) => {

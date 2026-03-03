@@ -88,7 +88,7 @@ pub struct CompletionToolCall {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompletionMessage {
     pub role: String,
-    pub content: String,
+    pub content: serde_json::Value,
     /// Tool call ID - required for tool role messages to match with assistant's tool_calls
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,

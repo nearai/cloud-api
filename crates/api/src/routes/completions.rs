@@ -183,21 +183,19 @@ fn extract_inference_id_from_sse(raw_bytes: &[u8]) -> Option<Uuid> {
     Some(hash_inference_id_to_uuid(id))
 }
 
-// Helper function to extract text from MessageContent
-fn extract_text_from_content(content: &Option<MessageContent>) -> String {
+// Convert MessageContent to serde_json::Value, preserving multimodal parts (images, audio, etc.)
+fn message_content_to_value(content: &Option<MessageContent>) -> serde_json::Value {
     match content {
-        None => String::new(),
-        Some(MessageContent::Text(text)) => text.clone(),
-        Some(MessageContent::Parts(parts)) => {
-            // Extract text from all text parts and join with newlines
-            parts
-                .iter()
-                .filter_map(|part| match part {
-                    MessageContentPart::Text { text } => Some(text.clone()),
-                    _ => None, // Non-text parts should be filtered out by validation
-                })
-                .collect::<Vec<_>>()
-                .join("\n")
+        None => serde_json::Value::String(String::new()),
+        Some(content) => {
+            let converted = crate::conversions::convert_content_to_vllm(content.clone());
+            serde_json::to_value(&converted).unwrap_or_else(|e| {
+                tracing::error!(
+                    error_type = %e,
+                    "Failed to serialize message content"
+                );
+                serde_json::Value::Null
+            })
         }
     }
 }
@@ -218,7 +216,7 @@ fn convert_chat_request_to_service(
             .iter()
             .map(|msg| CompletionMessage {
                 role: msg.role.clone(),
-                content: extract_text_from_content(&msg.content),
+                content: message_content_to_value(&msg.content),
                 tool_call_id: None,
                 tool_calls: None,
             })
@@ -254,7 +252,7 @@ fn convert_text_request_to_service(
         model: request.model.clone(),
         messages: vec![CompletionMessage {
             role: "user".to_string(),
-            content: request.prompt.clone(),
+            content: serde_json::Value::String(request.prompt.clone()),
             tool_call_id: None,
             tool_calls: None,
         }],

@@ -344,7 +344,7 @@ impl ResponseServiceImpl {
         parts: &[models::ResponseContentPart],
         workspace_id: uuid::Uuid,
         file_service: &Arc<dyn FileServiceTrait>,
-    ) -> Result<String, errors::ResponseError> {
+    ) -> Result<serde_json::Value, errors::ResponseError> {
         // Check if there are any images in the parts
         let has_images = parts
             .iter()
@@ -371,7 +371,7 @@ impl ResponseServiceImpl {
                     }
                 }
             }
-            Ok(content_parts.join("\n\n"))
+            Ok(serde_json::Value::String(content_parts.join("\n\n")))
         }
     }
 
@@ -380,26 +380,23 @@ impl ResponseServiceImpl {
         parts: &[models::ResponseContentPart],
         workspace_id: uuid::Uuid,
         file_service: &Arc<dyn FileServiceTrait>,
-    ) -> Result<String, errors::ResponseError> {
+    ) -> Result<serde_json::Value, errors::ResponseError> {
         let mut content_items = Vec::new();
 
         for part in parts {
             match part {
                 models::ResponseContentPart::InputText { text } => {
-                    // Add text as OpenAI-compatible content object
                     content_items.push(serde_json::json!({
                         "type": "text",
                         "text": text
                     }));
                 }
                 models::ResponseContentPart::InputImage { image_url, detail } => {
-                    // Extract the URL string (handle both String and Object variants)
                     let url = match image_url {
                         models::ResponseImageUrl::String(s) => s.clone(),
                         models::ResponseImageUrl::Object { url } => url.clone(),
                     };
 
-                    // Build image_url object with optional detail parameter
                     let mut image_url_obj = serde_json::json!({
                         "url": url
                     });
@@ -413,16 +410,13 @@ impl ResponseServiceImpl {
                     }));
                 }
                 models::ResponseContentPart::InputFile { file_id, detail } => {
-                    // Process file to get its content
                     let file_content =
                         Self::process_input_file(file_id, workspace_id, file_service).await?;
-                    // For files, treat as text content
                     content_items.push(serde_json::json!({
                         "type": "text",
                         "text": file_content
                     }));
                     if let Some(detail_level) = detail {
-                        // If detail was specified, add it to the previous item
                         if let Some(last) = content_items.last_mut() {
                             last["detail"] = serde_json::Value::String(detail_level.clone());
                         }
@@ -431,13 +425,7 @@ impl ResponseServiceImpl {
             }
         }
 
-        // Serialize the content array as JSON string
-        serde_json::to_string(&content_items).map_err(|e| {
-            errors::ResponseError::InternalError(format!(
-                "Failed to serialize multimodal content: {}",
-                e
-            ))
-        })
+        Ok(serde_json::Value::Array(content_items))
     }
 
     /// Extract response ID UUID from response object
@@ -1395,7 +1383,7 @@ impl ResponseServiceImpl {
                 if !stream_result.text.is_empty() {
                     messages.push(CompletionMessage {
                         role: "assistant".to_string(),
-                        content: stream_result.text.clone(),
+                        content: serde_json::Value::String(stream_result.text.clone()),
                         tool_call_id: None,
                         tool_calls: None,
                     });
@@ -1439,7 +1427,7 @@ impl ResponseServiceImpl {
 
             messages.push(CompletionMessage {
                 role: "assistant".to_string(),
-                content: stream_result.text.clone(),
+                content: serde_json::Value::String(stream_result.text.clone()),
                 tool_call_id: None,
                 tool_calls,
             });
@@ -1492,7 +1480,9 @@ impl ResponseServiceImpl {
                         if !deferred_instructions.is_empty() {
                             messages.push(CompletionMessage {
                                 role: "system".to_string(),
-                                content: std::mem::take(&mut deferred_instructions).join("\n\n"),
+                                content: serde_json::Value::String(
+                                    std::mem::take(&mut deferred_instructions).join("\n\n"),
+                                ),
                                 tool_call_id: None,
                                 tool_calls: None,
                             });
@@ -1512,7 +1502,9 @@ impl ResponseServiceImpl {
                 if !deferred_instructions.is_empty() {
                     messages.push(CompletionMessage {
                         role: "system".to_string(),
-                        content: std::mem::take(&mut deferred_instructions).join("\n\n"),
+                        content: serde_json::Value::String(
+                            std::mem::take(&mut deferred_instructions).join("\n\n"),
+                        ),
                         tool_call_id: None,
                         tool_calls: None,
                     });
@@ -1525,7 +1517,7 @@ impl ResponseServiceImpl {
             if !deferred_instructions.is_empty() {
                 messages.push(CompletionMessage {
                     role: "system".to_string(),
-                    content: deferred_instructions.join("\n\n"),
+                    content: serde_json::Value::String(deferred_instructions.join("\n\n")),
                     tool_call_id: None,
                     tool_calls: None,
                 });
@@ -1566,10 +1558,10 @@ impl ResponseServiceImpl {
             // Note: tool_call_id is required for the API to match results to calls
             messages.push(CompletionMessage {
                 role: "tool".to_string(),
-                content: format!(
+                content: serde_json::Value::String(format!(
                     "ERROR: {}\n\nPlease correct the tool call format and try again.",
                     tool_call.query
-                ),
+                )),
                 tool_call_id: Some(tool_call_id),
                 tool_calls: None,
             });
@@ -1712,7 +1704,7 @@ impl ResponseServiceImpl {
         // This is REQUIRED by all providers for the agent loop to work correctly
         messages.push(CompletionMessage {
             role: "tool".to_string(),
-            content: tool_content,
+            content: serde_json::Value::String(tool_content),
             tool_call_id: Some(tool_call_id),
             tool_calls: None,
         });
@@ -1836,7 +1828,7 @@ impl ResponseServiceImpl {
             // Create tool result message with the function output
             messages.push(CompletionMessage {
                 role: "tool".to_string(),
-                content: output.to_string(),
+                content: serde_json::Value::String(output.to_string()),
                 tool_call_id: Some(call_id.to_string()),
                 tool_calls: None,
             });
@@ -2061,7 +2053,7 @@ impl ResponseServiceImpl {
             if !prompt.is_empty() {
                 messages.push(CompletionMessage {
                     role: "system".to_string(),
-                    content: prompt,
+                    content: serde_json::Value::String(prompt),
                     tool_call_id: None,
                     tool_calls: None,
                 });
@@ -2086,7 +2078,7 @@ impl ResponseServiceImpl {
                 format!("{instructions}\n\n{language_instruction}\n\n{time_context}");
             messages.push(CompletionMessage {
                 role: "system".to_string(),
-                content: combined_instructions,
+                content: serde_json::Value::String(combined_instructions),
                 tool_call_id: None,
                 tool_calls: None,
             });
@@ -2095,7 +2087,7 @@ impl ResponseServiceImpl {
             let system_content = format!("{language_instruction}\n\n{time_context}");
             messages.push(CompletionMessage {
                 role: "system".to_string(),
-                content: system_content,
+                content: serde_json::Value::String(system_content),
                 tool_call_id: None,
                 tool_calls: None,
             });
@@ -2170,7 +2162,7 @@ impl ResponseServiceImpl {
                     if !pending.is_empty() {
                         msgs.push(CompletionMessage {
                             role: "assistant".to_string(),
-                            content: String::new(),
+                            content: serde_json::Value::String(String::new()),
                             tool_call_id: None,
                             tool_calls: Some(std::mem::take(pending)),
                         });
@@ -2240,7 +2232,7 @@ impl ResponseServiceImpl {
                         if !text.is_empty() {
                             messages.push(CompletionMessage {
                                 role: role.clone(),
-                                content: text,
+                                content: serde_json::Value::String(text),
                                 tool_call_id: None,
                                 tool_calls: None,
                             });
@@ -2282,7 +2274,7 @@ impl ResponseServiceImpl {
                         );
                         messages.push(CompletionMessage {
                             role: "tool".to_string(),
-                            content: output,
+                            content: serde_json::Value::String(output),
                             tool_call_id: Some(call_id),
                             tool_calls: None,
                         });
@@ -2330,7 +2322,7 @@ impl ResponseServiceImpl {
                             );
                             messages.push(CompletionMessage {
                                 role: "tool".to_string(),
-                                content: tool_output,
+                                content: serde_json::Value::String(tool_output),
                                 tool_call_id: Some(tool_call_id),
                                 tool_calls: None,
                             });
@@ -2372,7 +2364,9 @@ impl ResponseServiceImpl {
                         );
                         messages.push(CompletionMessage {
                             role: "tool".to_string(),
-                            content: "[tool result not stored]".to_string(),
+                            content: serde_json::Value::String(
+                                "[tool result not stored]".to_string(),
+                            ),
                             tool_call_id: Some(tc_id),
                             tool_calls: None,
                         });
@@ -2406,7 +2400,7 @@ impl ResponseServiceImpl {
                 models::ResponseInput::Text(text) => {
                     messages.push(CompletionMessage {
                         role: "user".to_string(),
-                        content: text.clone(),
+                        content: serde_json::Value::String(text.clone()),
                         tool_call_id: None,
                         tool_calls: None,
                     });
@@ -2417,7 +2411,9 @@ impl ResponseServiceImpl {
                         match item {
                             models::ResponseInputItem::Message { role, content, .. } => {
                                 let content = match content {
-                                    models::ResponseContent::Text(text) => text.clone(),
+                                    models::ResponseContent::Text(text) => {
+                                        serde_json::Value::String(text.clone())
+                                    }
                                     models::ResponseContent::Parts(parts) => {
                                         Self::extract_content_parts(
                                             parts,
@@ -2891,7 +2887,7 @@ impl ResponseServiceImpl {
             model: title_model,
             messages: vec![crate::completions::ports::CompletionMessage {
                 role: "user".to_string(),
-                content: title_prompt,
+                content: serde_json::Value::String(title_prompt),
                 tool_call_id: None,
                 tool_calls: None,
             }],

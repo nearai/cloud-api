@@ -77,11 +77,11 @@ impl OrganizationUsageRepository {
                     r#"
                     INSERT INTO organization_usage_log (
                         id, organization_id, workspace_id, api_key_id,
-                        model_id, model_name, input_tokens, output_tokens, total_tokens,
+                        model_id, model_name, input_tokens, output_tokens, cache_read_tokens, total_tokens,
                         input_cost, output_cost, total_cost,
                         inference_type, created_at, ttft_ms, avg_itl_ms, inference_id,
                         provider_request_id, stop_reason, response_id, image_count
-                    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)
+                    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22)
                     ON CONFLICT (organization_id, inference_id) WHERE inference_id IS NOT NULL DO NOTHING
                     RETURNING *
                     "#,
@@ -94,6 +94,7 @@ impl OrganizationUsageRepository {
                         &request.model_name,
                         &request.input_tokens,
                         &request.output_tokens,
+                        &request.cache_read_tokens,
                         &total_tokens,
                         &request.input_cost,
                         &request.output_cost,
@@ -255,7 +256,7 @@ impl OrganizationUsageRepository {
                     r#"
                     SELECT
                         id, organization_id, workspace_id, api_key_id,
-                        model_id, model_name, input_tokens, output_tokens, total_tokens,
+                        model_id, model_name, input_tokens, output_tokens, cache_read_tokens, total_tokens,
                         input_cost, output_cost, total_cost,
                         inference_type, created_at, ttft_ms, avg_itl_ms, inference_id,
                         provider_request_id, stop_reason, response_id, image_count
@@ -324,7 +325,7 @@ impl OrganizationUsageRepository {
                     r#"
                     SELECT
                         id, organization_id, workspace_id, api_key_id,
-                        model_id, model_name, input_tokens, output_tokens, total_tokens,
+                        model_id, model_name, input_tokens, output_tokens, cache_read_tokens, total_tokens,
                         input_cost, output_cost, total_cost,
                         inference_type, created_at, ttft_ms, avg_itl_ms, inference_id,
                         provider_request_id, stop_reason, response_id, image_count
@@ -402,6 +403,7 @@ impl OrganizationUsageRepository {
             model: row.get("model_name"),
             input_tokens: row.get("input_tokens"),
             output_tokens: row.get("output_tokens"),
+            cache_read_tokens: row.get("cache_read_tokens"),
             total_tokens: row.get("total_tokens"),
             input_cost: row.get("input_cost"),
             output_cost: row.get("output_cost"),

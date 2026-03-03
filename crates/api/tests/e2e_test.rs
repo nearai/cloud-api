@@ -139,6 +139,14 @@ async fn test_chat_completions_api() {
                 "Final response choices should not be empty"
             );
         }
+
+        // If provider reported usage, ensure cached_tokens() is non-negative
+        if let Some(usage) = final_resp.usage {
+            assert!(
+                usage.cached_tokens() >= 0,
+                "cached_tokens derived from prompt_tokens_details should be non-negative"
+            );
+        }
     } else {
         println!("No final response detected - this is okay for some streaming implementations");
     }

@@ -35,7 +35,10 @@ pub struct OrganizationBalanceResponse {
 }
 
 /// Usage history entry
-/// All costs use fixed scale of 9 (nano-dollars) and USD currency
+/// All costs use fixed scale of 9 (nano-dollars) and USD currency.
+/// `cache_read_tokens` is meaningful only for token-based chat-style models; for other
+/// inference types (e.g., rerank, audio transcription, image), it will typically be 0
+/// and is not used in billing calculations.
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct UsageHistoryEntryResponse {
     pub id: String,
@@ -44,6 +47,8 @@ pub struct UsageHistoryEntryResponse {
     pub model: String, // Model name (canonical name from models table)
     pub input_tokens: i32,
     pub output_tokens: i32,
+    /// Number of prompt tokens that were cache hits
+    pub cache_read_tokens: i32,
     pub total_tokens: i32,
     pub total_cost: i64,            // In nano-dollars (scale 9)
     pub total_cost_display: String, // Human readable, e.g., "$0.00123"
@@ -349,6 +354,7 @@ pub async fn get_organization_usage_history(
             model: entry.model,
             input_tokens: entry.input_tokens,
             output_tokens: entry.output_tokens,
+            cache_read_tokens: entry.cache_read_tokens,
             total_tokens: entry.total_tokens,
             total_cost: entry.total_cost,
             total_cost_display: format_amount(entry.total_cost),
@@ -479,6 +485,7 @@ pub async fn get_api_key_usage_history(
             model: entry.model,
             input_tokens: entry.input_tokens,
             output_tokens: entry.output_tokens,
+            cache_read_tokens: entry.cache_read_tokens,
             total_tokens: entry.total_tokens,
             total_cost: entry.total_cost,
             total_cost_display: format_amount(entry.total_cost),
@@ -521,6 +528,8 @@ pub enum RecordUsageResponse {
         output_tokens: i32,
         /// Total tokens (input + output)
         total_tokens: i32,
+        /// Number of prompt tokens that were cache hits (subset of input_tokens)
+        cache_read_tokens: i32,
         /// Input cost in nano-dollars (scale 9)
         input_cost: i64,
         /// Output cost in nano-dollars (scale 9)
@@ -658,6 +667,7 @@ pub async fn record_usage(
             input_tokens: entry.input_tokens,
             output_tokens: entry.output_tokens,
             total_tokens: entry.total_tokens,
+            cache_read_tokens: entry.cache_read_tokens,
             input_cost: entry.input_cost,
             output_cost: entry.output_cost,
             total_cost: entry.total_cost,

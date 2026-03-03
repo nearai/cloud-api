@@ -155,7 +155,7 @@ fn finish_reason_to_string(reason: &FinishReason) -> String {
     }
 }
 
-impl From<&TokenUsage> for crate::models::OpenAIUsage {
+impl From<&TokenUsage> for crate::models::CompletionUsage {
     fn from(usage: &TokenUsage) -> Self {
         Self {
             prompt_tokens: usage.prompt_tokens,

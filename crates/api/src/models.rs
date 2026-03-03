@@ -16,7 +16,7 @@ pub struct StreamChunkResponse {
     pub model: String,
     pub choices: Vec<StreamChoice>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub usage: Option<OpenAIUsage>,
+    pub usage: Option<CompletionUsage>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -135,7 +135,7 @@ pub struct ChatCompletionResponse {
     pub created: i64,
     pub model: String,
     pub choices: Vec<ChatChoice>,
-    pub usage: OpenAIUsage,
+    pub usage: CompletionUsage,
 }
 
 #[derive(Debug, Serialize, ToSchema, Deserialize)]
@@ -174,7 +174,7 @@ pub struct CompletionResponse {
     pub created: i64,
     pub model: String,
     pub choices: Vec<CompletionChoice>,
-    pub usage: OpenAIUsage,
+    pub usage: CompletionUsage,
 }
 
 /// Request for image generation
@@ -708,10 +708,10 @@ pub struct CompletionChoice {
     pub finish_reason: Option<String>, // "stop", "length", "content_filter"
 }
 
-/// Usage for OpenAI-compatible endpoints (chat/completions).
+/// Usage for chat/completions endpoints.
 /// Serializes as prompt_tokens, completion_tokens, prompt_tokens_details, completion_tokens_details, total_tokens.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct OpenAIUsage {
+pub struct CompletionUsage {
     pub prompt_tokens: i32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prompt_tokens_details: Option<InputTokensDetails>,

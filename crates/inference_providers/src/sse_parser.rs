@@ -94,12 +94,12 @@ where
         while let Some(newline_pos) = self.bytes_buffer.iter().position(|&b| b == b'\n') {
             let line_len = newline_pos + 1; // Include the newline character
 
-            // Drain the line bytes out of the buffer
-            let line_bytes: Vec<u8> = self.bytes_buffer.drain(..line_len).collect();
-            let raw_bytes = Bytes::copy_from_slice(&line_bytes);
+            // Extract raw bytes first to avoid an intermediate allocation and copy.
+            let raw_bytes = Bytes::copy_from_slice(&self.bytes_buffer[..line_len]);
+            self.bytes_buffer.drain(..line_len);
 
             // Convert to string for parsing (excluding the trailing newline)
-            let line = String::from_utf8_lossy(&line_bytes[..newline_pos]);
+            let line = String::from_utf8_lossy(&raw_bytes[..newline_pos]);
             let line = line.trim();
 
             // Skip empty lines and comments
@@ -510,8 +510,9 @@ mod tests {
         let parser = new_sse_parser(mock_stream, true);
         let events: Vec<_> = parser.collect().await;
 
-        // Should get 1 event without panicking. The content may contain the
-        // replacement character since the UTF-8 was split, but no crash.
+        // Should get 1 event without panicking. The content will contain the
+        // correctly reassembled é since bytes are buffered until newline.
         assert_eq!(events.len(), 1, "Expected 1 event, got {}", events.len());
+        assert!(events[0].is_ok(), "The event should be parsed successfully");
     }
 }

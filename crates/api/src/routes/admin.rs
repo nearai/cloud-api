@@ -3,7 +3,7 @@ use crate::models::{
     AdminAccessTokenResponse, AdminModelListResponse, AdminModelWithPricing,
     AdminOrganizationResponse, AdminUserOrganizationDetails, AdminUserResponse,
     BatchUpdateModelApiRequest, CreateAdminAccessTokenRequest, CreditType, DecimalPrice,
-    DeleteAdminAccessTokenRequest, DeleteModelRequest, ErrorResponse,
+    DecimalPriceRequest, DeleteAdminAccessTokenRequest, DeleteModelRequest, ErrorResponse,
     GetOrganizationConcurrentLimitResponse, ListOrganizationsAdminResponse, ListUsersResponse,
     ModelArchitecture, ModelHistoryEntry, ModelHistoryResponse, ModelMetadata, ModelWithPricing,
     OrgLimitsHistoryEntry, OrgLimitsHistoryResponse, OrganizationUsage, SpendLimit,
@@ -73,6 +73,28 @@ pub async fn batch_upsert_models(
                 "invalid_request".to_string(),
             )),
         ));
+    }
+
+    // Validate all pricing fields are non-negative to prevent incorrect billing
+    for (model_name, request) in &batch_request {
+        let validate_price = |price: &Option<DecimalPriceRequest>, field: &str| {
+            if let Some(p) = price {
+                p.validate().map_err(|e| {
+                    (
+                        StatusCode::BAD_REQUEST,
+                        ResponseJson(ErrorResponse::new(
+                            format!("model '{model_name}': {field}: {e}"),
+                            "invalid_request".to_string(),
+                        )),
+                    )
+                })?;
+            }
+            Ok::<(), (StatusCode, ResponseJson<ErrorResponse>)>(())
+        };
+        validate_price(&request.input_cost_per_token, "inputCostPerToken")?;
+        validate_price(&request.output_cost_per_token, "outputCostPerToken")?;
+        validate_price(&request.cost_per_image, "costPerImage")?;
+        validate_price(&request.cache_read_cost_per_token, "cacheReadCostPerToken")?;
     }
 
     // Extract admin user context for audit tracking

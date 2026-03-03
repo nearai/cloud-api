@@ -181,7 +181,15 @@ impl std::fmt::Display for StopReason {
 #[async_trait::async_trait]
 pub trait UsageServiceTrait: Send + Sync {
     /// Calculate cost for a given model and token usage.
-    /// Uses the same formula as record_usage: (input - cache_read)*input_rate + cache_read*cache_read_rate + output*output_rate.
+    ///
+    /// Uses the same semantics as `record_usage` and the internal `compute_token_cost` helper:
+    /// - Formula: `(input - cache_read) * input_rate + cache_read * cache_read_rate + output * output_rate`,
+    ///   where `cache_read` is the effective cached token count (see below).
+    /// - **Capping**: The provided `cached_tokens` (or `cache_read_tokens`) is treated as
+    ///   `min(cached_tokens, input_tokens).max(0)`; i.e. cached count is never negative and never exceeds input.
+    /// - **Cache pricing disabled**: When the model’s `cache_read_cost_per_token == 0`, cache pricing is
+    ///   disabled and all input tokens (including cached) are billed at `input_cost_per_token` (cached tokens
+    ///   are not free).
     async fn calculate_cost(
         &self,
         model_id: &str,

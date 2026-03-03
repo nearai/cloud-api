@@ -159,13 +159,15 @@ impl From<ChatMessage> for crate::models::Message {
         let tool_calls = msg.tool_calls.map(|calls| {
             calls
                 .into_iter()
-                .map(|tc| crate::models::ToolCall {
-                    id: tc.id.unwrap_or_default(),
-                    type_: tc.type_.unwrap_or_default(),
-                    function: crate::models::FunctionCall {
-                        name: tc.function.name.unwrap_or_default(),
-                        arguments: tc.function.arguments.unwrap_or_default(),
-                    },
+                .filter_map(|tc| {
+                    Some(crate::models::ToolCall {
+                        id: tc.id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+                        type_: tc.type_?,
+                        function: crate::models::FunctionCall {
+                            name: tc.function.name?,
+                            arguments: tc.function.arguments.unwrap_or_default(),
+                        },
+                    })
                 })
                 .collect()
         });

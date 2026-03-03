@@ -10,6 +10,7 @@ use axum::{
     response::{IntoResponse, Json as ResponseJson, Response},
 };
 use futures::stream::StreamExt;
+use inference_providers::StreamChunk;
 use services::common::encryption_headers as service_encryption_headers;
 use services::completions::{
     hash_inference_id_to_uuid,
@@ -167,6 +168,38 @@ fn completion_stream_error_category(e: &inference_providers::CompletionError) ->
         inference_providers::CompletionError::InvalidResponse(_) => "invalid_response",
         inference_providers::CompletionError::Unknown(_) => "unknown",
     }
+}
+
+/// Replace the `usage` object in an SSE chunk with our CompletionUsage so we do not leak provider cost fields.
+/// If `usage_override` is None or the chunk is not valid JSON (e.g. "[DONE]"), returns the original bytes.
+fn replace_usage_in_sse_chunk(raw_bytes: &[u8], usage_override: Option<CompletionUsage>) -> Bytes {
+    let Some(usage) = usage_override else {
+        return Bytes::copy_from_slice(raw_bytes);
+    };
+    let data = match std::str::from_utf8(raw_bytes) {
+        Ok(s) => s.trim().strip_prefix("data: ").unwrap_or(s.trim()),
+        Err(_) => return Bytes::copy_from_slice(raw_bytes),
+    };
+    if data.is_empty() || data == "[DONE]" {
+        return Bytes::copy_from_slice(raw_bytes);
+    }
+    let mut value: serde_json::Value = match serde_json::from_str(data) {
+        Ok(v) => v,
+        Err(_) => return Bytes::copy_from_slice(raw_bytes),
+    };
+    if value.get("usage").is_none() {
+        return Bytes::copy_from_slice(raw_bytes);
+    }
+    let usage_value = match serde_json::to_value(&usage) {
+        Ok(v) => v,
+        Err(_) => return Bytes::copy_from_slice(raw_bytes),
+    };
+    value["usage"] = usage_value;
+    let json = match serde_json::to_string(&value) {
+        Ok(s) => s,
+        Err(_) => return Bytes::copy_from_slice(raw_bytes),
+    };
+    Bytes::from(format!("data: {json}\n\n"))
 }
 
 // Helper function to extract inference ID from first SSE chunk
@@ -431,16 +464,21 @@ pub async fn chat_completions(
                                         }
                                     }
 
-                                    // raw_bytes contains "data: {...}\n", extract just the JSON part
-                                    let raw_str = String::from_utf8_lossy(&event.raw_bytes);
-                                    let json_data = raw_str
-                                        .trim()
-                                        .strip_prefix("data: ")
-                                        .unwrap_or(raw_str.trim())
-                                        .to_string();
-                                    tracing::debug!("Completion stream event: {}", json_data);
-                                    // Format as SSE event with proper newlines
-                                    let sse_bytes = Bytes::from(format!("data: {json_data}\n\n"));
+                                    // Sanitize usage in chunk so we do not leak provider cost fields
+                                    let usage_override = match &event.chunk {
+                                        StreamChunk::Chat(c) => {
+                                            c.usage.as_ref().map(CompletionUsage::from)
+                                        }
+                                        _ => None,
+                                    };
+                                    let sse_bytes = replace_usage_in_sse_chunk(
+                                        &event.raw_bytes,
+                                        usage_override,
+                                    );
+                                    tracing::debug!(
+                                        "Completion stream event: {}",
+                                        String::from_utf8_lossy(&sse_bytes)
+                                    );
                                     accumulated_inner.lock().await.extend_from_slice(&sse_bytes);
                                     Ok::<Bytes, Infallible>(sse_bytes)
                                 }
@@ -520,22 +558,50 @@ pub async fn chat_completions(
                 let inference_id =
                     Some(hash_inference_id_to_uuid(&response_with_bytes.response.id));
 
-                // Return the exact bytes from the provider for hash verification
-                // This ensures clients can hash the response and compare with attestation endpoints
+                // Deserialize into our type so usage is sanitized (only prompt_tokens, completion_tokens, details, total_tokens).
+                // Unknown top-level fields are collected in extra and re-emitted.
+                let body: ChatCompletionResponse = match serde_json::from_slice(
+                    response_with_bytes.raw_bytes.as_ref(),
+                ) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        tracing::error!(error = %e, "Failed to deserialize chat completion response");
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            ResponseJson(ErrorResponse::new(
+                                "Invalid response from provider".to_string(),
+                                "internal_server_error".to_string(),
+                            )),
+                        )
+                            .into_response();
+                    }
+                };
+                let body_bytes = match serde_json::to_vec(&body) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        tracing::error!(error = %e, "Failed to serialize chat completion response");
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            ResponseJson(ErrorResponse::new(
+                                "Failed to build response".to_string(),
+                                "internal_server_error".to_string(),
+                            )),
+                        )
+                            .into_response();
+                    }
+                };
+
                 let mut response_builder = Response::builder()
                     .status(StatusCode::OK)
                     .header(header::CONTENT_TYPE, "application/json");
 
-                // Add Inference-Id header if available
                 if let Some(uuid) = inference_id {
                     response_builder = response_builder
                         .header(HEADER_INFERENCE_ID, uuid.to_string())
                         .header("Access-Control-Expose-Headers", HEADER_INFERENCE_ID);
                 }
 
-                response_builder
-                    .body(Body::from(response_with_bytes.raw_bytes))
-                    .unwrap()
+                response_builder.body(Body::from(body_bytes)).unwrap()
             }
             Err(domain_error) => {
                 let status_code = map_domain_error_to_status(&domain_error);

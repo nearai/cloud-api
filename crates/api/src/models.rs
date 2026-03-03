@@ -136,6 +136,10 @@ pub struct ChatCompletionResponse {
     pub model: String,
     pub choices: Vec<ChatChoice>,
     pub usage: CompletionUsage,
+    /// Unknown top-level fields from the provider (e.g. system_fingerprint, prompt_logprobs).
+    /// Re-emitted when serializing so we do not drop them.
+    #[serde(flatten, default)]
+    pub extra: HashMap<String, Value>,
 }
 
 #[derive(Debug, Serialize, ToSchema, Deserialize)]

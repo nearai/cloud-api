@@ -19,6 +19,23 @@ impl From<crate::models::Message> for ChatMessage {
             })
         });
 
+        // Convert tool_calls from API format to inference provider format
+        let tool_calls = msg.tool_calls.map(|calls| {
+            calls
+                .into_iter()
+                .map(|tc| inference_providers::models::ToolCall {
+                    id: Some(tc.id),
+                    type_: Some(tc.type_),
+                    function: inference_providers::models::FunctionCall {
+                        name: Some(tc.function.name),
+                        arguments: Some(tc.function.arguments),
+                    },
+                    index: None,
+                    thought_signature: None,
+                })
+                .collect()
+        });
+
         Self {
             role: match msg.role.as_str() {
                 "system" | "developer" => MessageRole::System,
@@ -29,8 +46,8 @@ impl From<crate::models::Message> for ChatMessage {
             },
             content,
             name: msg.name,
-            tool_call_id: None,
-            tool_calls: None,
+            tool_call_id: msg.tool_call_id,
+            tool_calls,
         }
     }
 }
@@ -64,8 +81,14 @@ impl From<ChatCompletionRequest> for ChatCompletionParams {
             .get("modalities")
             .and_then(|v| serde_json::from_value::<Vec<String>>(v.clone()).ok());
 
+        // Extract tools from extra if present
+        let tools = req.extra.get("tools").and_then(|v| {
+            serde_json::from_value::<Vec<inference_providers::ToolDefinition>>(v.clone()).ok()
+        });
+
         let mut extra = req.extra;
         extra.remove("modalities");
+        extra.remove("tools");
 
         Self {
             model: req.model,
@@ -75,7 +98,7 @@ impl From<ChatCompletionRequest> for ChatCompletionParams {
             top_p: req.top_p,
             stop: req.stop,
             stream: req.stream,
-            tools: None, // TODO: Add tools support to API request
+            tools,
             max_completion_tokens: req.max_tokens,
             n: req.n,
             frequency_penalty: req.frequency_penalty,
@@ -132,6 +155,23 @@ impl From<ChatMessage> for crate::models::Message {
             })
         });
 
+        // Convert tool_calls from inference provider format back to API format
+        let tool_calls = msg.tool_calls.map(|calls| {
+            calls
+                .into_iter()
+                .filter_map(|tc| {
+                    Some(crate::models::ToolCall {
+                        id: tc.id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+                        type_: tc.type_?,
+                        function: crate::models::FunctionCall {
+                            name: tc.function.name?,
+                            arguments: tc.function.arguments.unwrap_or_default(),
+                        },
+                    })
+                })
+                .collect()
+        });
+
         Self {
             role: match msg.role {
                 MessageRole::System => "system".to_string(),
@@ -141,6 +181,8 @@ impl From<ChatMessage> for crate::models::Message {
             },
             content,
             name: msg.name.clone(),
+            tool_call_id: msg.tool_call_id,
+            tool_calls,
         }
     }
 }
@@ -627,6 +669,8 @@ mod tests {
             role: "user".to_string(),
             content: Some(crate::models::MessageContent::Text("Hello".to_string())),
             name: None,
+            tool_call_id: None,
+            tool_calls: None,
         };
 
         let domain_msg: ChatMessage = http_msg.into();
@@ -652,6 +696,8 @@ mod tests {
                 "You are helpful.".to_string(),
             )),
             name: None,
+            tool_call_id: None,
+            tool_calls: None,
         };
 
         let domain_msg: ChatMessage = http_msg.into();
@@ -668,6 +714,8 @@ mod tests {
                     "Test message".to_string(),
                 )),
                 name: None,
+                tool_call_id: None,
+                tool_calls: None,
             }],
             max_tokens: Some(100),
             temperature: Some(0.7),

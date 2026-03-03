@@ -55,7 +55,6 @@ pub trait SSEEventParser: Send + Unpin {
 /// - `P`: The provider-specific event parser implementing `SSEEventParser`
 pub struct BufferedSSEParser<S, P: SSEEventParser> {
     inner: S,
-    buffer: String,
     bytes_buffer: Vec<u8>,
     /// Pending results from previous process_buffer() calls.
     /// Multiple SSE events can arrive in a single network packet.
@@ -76,7 +75,6 @@ where
     pub fn new(stream: S, state: P::State) -> Self {
         Self {
             inner: stream,
-            buffer: String::new(),
             bytes_buffer: Vec::new(),
             pending_results: VecDeque::new(),
             finished: false,
@@ -88,16 +86,20 @@ where
     fn process_buffer(&mut self) -> Vec<Result<SSEEvent, CompletionError>> {
         let mut results = Vec::new();
 
-        // Process complete lines in the buffer
-        while let Some(newline_pos) = self.buffer.find('\n') {
+        // Process complete lines in the bytes buffer directly.
+        // We search for newlines in the raw bytes instead of maintaining a separate
+        // String buffer, because String::from_utf8_lossy can change byte counts
+        // (replacing invalid sequences with the 3-byte U+FFFD), which caused the
+        // two buffers to desync and panic with "index out of range for slice".
+        while let Some(newline_pos) = self.bytes_buffer.iter().position(|&b| b == b'\n') {
             let line_len = newline_pos + 1; // Include the newline character
 
-            // Extract the raw bytes for this line
+            // Extract raw bytes first to avoid an intermediate allocation and copy.
             let raw_bytes = Bytes::copy_from_slice(&self.bytes_buffer[..line_len]);
             self.bytes_buffer.drain(..line_len);
 
-            // Extract the string line
-            let line = self.buffer.drain(..=newline_pos).collect::<String>();
+            // Convert to string for parsing (excluding the trailing newline)
+            let line = String::from_utf8_lossy(&raw_bytes[..newline_pos]);
             let line = line.trim();
 
             // Skip empty lines and comments
@@ -164,8 +166,6 @@ where
                 Poll::Ready(Some(Ok(bytes))) => {
                     // Add new data to buffer and loop back to process it
                     this.bytes_buffer.extend_from_slice(&bytes);
-                    let text = String::from_utf8_lossy(&bytes);
-                    this.buffer.push_str(&text);
                     continue;
                 }
                 Poll::Ready(Some(Err(e))) => {
@@ -175,8 +175,10 @@ where
                 }
                 Poll::Ready(None) => {
                     this.finished = true;
-                    // Stream ended - process any remaining buffer content
-                    if !this.buffer.trim().is_empty() {
+                    // Stream ended - check for any remaining incomplete data
+                    if !this.bytes_buffer.is_empty()
+                        && this.bytes_buffer.iter().any(|&b| !b.is_ascii_whitespace())
+                    {
                         warn!("Incomplete SSE data in buffer at stream end");
                     }
                     return Poll::Ready(None);
@@ -455,5 +457,62 @@ mod tests {
         // If the `finished` flag is broken, the ErrorThenPanicStream will panic.
         assert_eq!(events.len(), 1, "Expected 1 event, got {}", events.len());
         assert!(events[0].is_ok(), "Event should be Ok");
+    }
+
+    #[tokio::test]
+    async fn test_sse_parser_multibyte_utf8_no_panic() {
+        // Regression test: the old dual-buffer approach (String + Vec<u8>) panicked
+        // when SSE data contained multi-byte UTF-8 characters, because
+        // String::from_utf8_lossy could change byte counts relative to the raw
+        // bytes buffer, causing an "index out of range for slice" panic.
+        //
+        // This test uses Chinese characters (3 bytes each in UTF-8) to trigger
+        // the length discrepancy that caused the crash in production.
+        let packet = "data: {\"id\":\"1\",\"object\":\"chat.completion.chunk\",\"created\":1234567890,\"model\":\"test\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"你好世界\"},\"finish_reason\":null}]}\n\n";
+
+        let mock_stream =
+            futures_util::stream::iter(vec![Ok::<_, reqwest::Error>(bytes::Bytes::from(packet))]);
+
+        let parser = new_sse_parser(mock_stream, true);
+        let events: Vec<_> = parser.collect().await;
+
+        assert_eq!(events.len(), 1, "Expected 1 event, got {}", events.len());
+        assert!(events[0].is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_sse_parser_split_multibyte_utf8_no_panic() {
+        // Regression test: when a multi-byte UTF-8 character is split across two
+        // network packets, String::from_utf8_lossy would replace the incomplete
+        // sequence with U+FFFD (3 bytes), making the string buffer longer than the
+        // bytes buffer and eventually causing a panic.
+        //
+        // é (U+00E9) is 2 bytes in UTF-8: 0xC3 0xA9
+        // We split it so packet 1 ends with 0xC3 and packet 2 starts with 0xA9.
+        let json_before = b"data: {\"id\":\"1\",\"object\":\"chat.completion.chunk\",\"created\":1234567890,\"model\":\"test\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"caf";
+        let split_byte = b"\xC3"; // First byte of é
+        let rest_byte = b"\xA9"; // Second byte of é
+        let json_after = b"\"},\"finish_reason\":null}]}\n\n";
+
+        let mut packet1 = Vec::new();
+        packet1.extend_from_slice(json_before);
+        packet1.extend_from_slice(split_byte);
+
+        let mut packet2 = Vec::new();
+        packet2.extend_from_slice(rest_byte);
+        packet2.extend_from_slice(json_after);
+
+        let mock_stream = futures_util::stream::iter(vec![
+            Ok::<_, reqwest::Error>(bytes::Bytes::from(packet1)),
+            Ok(bytes::Bytes::from(packet2)),
+        ]);
+
+        let parser = new_sse_parser(mock_stream, true);
+        let events: Vec<_> = parser.collect().await;
+
+        // Should get 1 event without panicking. The content will contain the
+        // correctly reassembled é since bytes are buffered until newline.
+        assert_eq!(events.len(), 1, "Expected 1 event, got {}", events.len());
+        assert!(events[0].is_ok(), "The event should be parsed successfully");
     }
 }

@@ -1156,10 +1156,11 @@ impl ResponseServiceImpl {
         final_response.output = output_items;
 
         // Set usage from accumulated token counts
-        final_response.usage = models::Usage::new_with_reasoning(
+        final_response.usage = models::Usage::new_with_reasoning_and_cache(
             ctx.total_input_tokens,
             ctx.total_output_tokens,
             ctx.reasoning_tokens,
+            ctx.total_cached_tokens,
         );
         tracing::debug!(
             "Final response usage: input={}, output={}, reasoning={}, total={}",
@@ -2693,7 +2694,11 @@ impl ResponseServiceImpl {
                     usage.prompt_tokens,
                     usage.completion_tokens
                 );
-                ctx.add_usage(usage.prompt_tokens, usage.completion_tokens);
+                ctx.add_usage(
+                    usage.prompt_tokens,
+                    usage.completion_tokens,
+                    usage.cached_tokens(),
+                );
             }
         }
     }

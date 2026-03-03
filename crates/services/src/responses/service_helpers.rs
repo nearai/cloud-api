@@ -21,6 +21,8 @@ pub struct ResponseStreamContext {
     /// Accumulated token usage from all completion calls
     pub total_input_tokens: i32,
     pub total_output_tokens: i32,
+    /// Accumulated cache-hit prompt tokens from all completion calls
+    pub total_cached_tokens: i32,
     /// Accumulated reasoning tokens from reasoning content
     pub reasoning_tokens: i32,
     /// Response metadata for enriching output items
@@ -48,6 +50,7 @@ impl ResponseStreamContext {
             output_item_index: 0,
             total_input_tokens: 0,
             total_output_tokens: 0,
+            total_cached_tokens: 0,
             reasoning_tokens: 0,
             response_id_str,
             previous_response_id,
@@ -68,10 +71,11 @@ impl ResponseStreamContext {
         self.output_item_index += 1;
     }
 
-    /// Add usage from a completion call
-    pub fn add_usage(&mut self, input_tokens: i32, output_tokens: i32) {
+    /// Add usage from a completion call (including cache-hit tokens when present)
+    pub fn add_usage(&mut self, input_tokens: i32, output_tokens: i32, cached_tokens: i32) {
         self.total_input_tokens += input_tokens;
         self.total_output_tokens += output_tokens;
+        self.total_cached_tokens += cached_tokens;
     }
 
     /// Add reasoning tokens from detected reasoning content

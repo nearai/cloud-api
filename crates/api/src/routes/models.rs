@@ -89,6 +89,11 @@ pub async fn list_models(
                 scale: 9,
                 currency: "USD".to_string(),
             },
+            cache_read_cost_per_token: DecimalPrice {
+                amount: model.cache_read_cost_per_token,
+                scale: 9,
+                currency: "USD".to_string(),
+            },
             metadata: ModelMetadata {
                 verifiable: model.verifiable,
                 context_length: model.context_length,
@@ -185,6 +190,11 @@ pub async fn get_model_by_name(
         },
         cost_per_image: DecimalPrice {
             amount: model.cost_per_image,
+            scale: 9,
+            currency: "USD".to_string(),
+        },
+        cache_read_cost_per_token: DecimalPrice {
+            amount: model.cache_read_cost_per_token,
             scale: 9,
             currency: "USD".to_string(),
         },

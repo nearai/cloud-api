@@ -180,12 +180,22 @@ impl std::fmt::Display for StopReason {
 
 #[async_trait::async_trait]
 pub trait UsageServiceTrait: Send + Sync {
-    /// Calculate cost for a given model and token usage
+    /// Calculate cost for a given model and token usage.
+    ///
+    /// Uses the same semantics as `record_usage` and the internal `compute_token_cost` helper:
+    /// - Formula: `(input - cache_read) * input_rate + cache_read * cache_read_rate + output * output_rate`,
+    ///   where `cache_read` is the effective cached token count (see below).
+    /// - **Capping**: The provided `cached_tokens` (or `cache_read_tokens`) is treated as
+    ///   `min(cached_tokens, input_tokens).max(0)`; i.e. cached count is never negative and never exceeds input.
+    /// - **Cache pricing disabled**: When the model’s `cache_read_cost_per_token == 0`, cache pricing is
+    ///   disabled and all input tokens (including cached) are billed at `input_cost_per_token` (cached tokens
+    ///   are not free).
     async fn calculate_cost(
         &self,
         model_id: &str,
         input_tokens: i32,
         output_tokens: i32,
+        cache_read_tokens: i32,
     ) -> Result<CostBreakdown, UsageError>;
 
     /// Record usage after an API call completes
@@ -353,6 +363,8 @@ pub enum RecordUsageApiRequest {
         input_tokens: Option<i32>,
         /// Number of output/completion tokens
         output_tokens: Option<i32>,
+        /// Number of prompt tokens that were cache hits
+        cache_read_tokens: Option<i32>,
         /// External identifier (e.g., provider request ID) used as
         /// an idempotency key. Stored as `provider_request_id` and
         /// hashed to a deterministic UUID v5 for `inference_id`.
@@ -384,6 +396,8 @@ pub struct RecordUsageServiceRequest {
     pub model_id: Uuid,
     pub input_tokens: i32,
     pub output_tokens: i32,
+    /// Number of prompt tokens that were cache hits (subset of input_tokens)
+    pub cache_read_tokens: i32,
     pub inference_type: InferenceType,
     /// Time to first token in milliseconds
     pub ttft_ms: Option<i32>,
@@ -412,6 +426,7 @@ pub struct RecordUsageDbRequest {
     pub model_name: String, // Denormalized canonical model name
     pub input_tokens: i32,
     pub output_tokens: i32,
+    pub cache_read_tokens: i32,
     pub input_cost: i64,
     pub output_cost: i64,
     pub total_cost: i64,
@@ -441,6 +456,7 @@ pub struct ModelPricing {
     pub input_cost_per_token: i64,
     pub output_cost_per_token: i64,
     pub cost_per_image: i64,
+    pub cache_read_cost_per_token: i64,
 }
 
 /// Organization spending limit
@@ -501,6 +517,7 @@ pub struct UsageLogEntry {
     pub model: String, // Canonical model name from models table
     pub input_tokens: i32,
     pub output_tokens: i32,
+    pub cache_read_tokens: i32,
     pub total_tokens: i32,
     pub input_cost: i64,
     pub output_cost: i64,

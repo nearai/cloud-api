@@ -45,6 +45,7 @@ fn build_image_usage_request(
         model_id,
         input_tokens: 0,
         output_tokens: 0,
+        cache_read_tokens: 0,
         inference_type,
         ttft_ms: None,
         avg_itl_ms: None,
@@ -217,8 +218,18 @@ fn convert_chat_request_to_service(
             .map(|msg| CompletionMessage {
                 role: msg.role.clone(),
                 content: message_content_to_value(&msg.content),
-                tool_call_id: None,
-                tool_calls: None,
+                tool_call_id: msg.tool_call_id.clone(),
+                tool_calls: msg.tool_calls.as_ref().map(|calls| {
+                    calls
+                        .iter()
+                        .map(|tc| services::completions::ports::CompletionToolCall {
+                            id: tc.id.clone(),
+                            name: tc.function.name.clone(),
+                            arguments: tc.function.arguments.clone(),
+                            thought_signature: None,
+                        })
+                        .collect()
+                }),
             })
             .collect(),
         max_tokens: request.max_tokens,
@@ -1288,6 +1299,7 @@ pub async fn audio_transcriptions(
                 model_id,
                 input_tokens: duration_seconds, // Bill by duration in seconds
                 output_tokens: 0,
+                cache_read_tokens: 0,
                 inference_type: services::usage::ports::InferenceType::AudioTranscription,
                 ttft_ms: None,
                 avg_itl_ms: None,
@@ -1945,6 +1957,7 @@ pub async fn rerank(
                 model_id,
                 input_tokens: token_count,
                 output_tokens: 0,
+                cache_read_tokens: 0,
                 inference_type: services::usage::ports::InferenceType::Rerank,
                 ttft_ms: None,
                 avg_itl_ms: None,
@@ -2149,6 +2162,7 @@ pub async fn score(
                 model_id,
                 input_tokens: 1,
                 output_tokens: 0,
+                cache_read_tokens: 0,
                 inference_type: services::usage::ports::InferenceType::Score,
                 ttft_ms: None,
                 avg_itl_ms: None,
@@ -2181,6 +2195,7 @@ pub async fn score(
                         model_id,
                         input_tokens: 1,
                         output_tokens: 0,
+                        cache_read_tokens: 0,
                         inference_type: services::usage::ports::InferenceType::Score,
                         ttft_ms: None,
                         avg_itl_ms: None,
@@ -2216,6 +2231,7 @@ pub async fn score(
                         model_id,
                         input_tokens: 1,
                         output_tokens: 0,
+                        cache_read_tokens: 0,
                         inference_type: services::usage::ports::InferenceType::Score,
                         ttft_ms: None,
                         avg_itl_ms: None,

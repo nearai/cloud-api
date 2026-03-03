@@ -1015,6 +1015,14 @@ async fn test_file_in_response_api() {
         "final response does not match expected mock response"
     );
     assert_eq!(final_resp.status, api::models::ResponseStatus::Completed);
+
+    // If usage is present, ensure input_tokens_details.cached_tokens is non-negative
+    if let Some(details) = final_resp.usage.input_tokens_details {
+        assert!(
+            details.cached_tokens >= 0,
+            "cached_tokens in input_tokens_details should be non-negative"
+        );
+    }
 }
 
 #[tokio::test]

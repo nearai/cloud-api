@@ -148,7 +148,7 @@ use utoipa::{Modify, OpenApi};
             // Health check models
             crate::routes::health::HealthResponse,
             // Core API models
-            ChatCompletionRequest, ChatCompletionResponse, Message,
+            ChatCompletionRequest, ChatCompletionResponse, Message, OpenAIUsage,
             CompletionRequest, ModelsResponse, ModelInfo, ModelPricing, ErrorResponse,
             // Image generation models
             ImageGenerationRequest, ImageGenerationResponse, ImageData,

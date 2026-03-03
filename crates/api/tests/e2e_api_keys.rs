@@ -555,11 +555,11 @@ async fn test_list_workspace_api_keys_with_usage() {
 
     let completion_response = response.json::<api::models::ChatCompletionResponse>();
     assert!(
-        completion_response.usage.input_tokens > 0,
+        completion_response.usage.prompt_tokens > 0,
         "Should have input tokens"
     );
     assert!(
-        completion_response.usage.output_tokens > 0,
+        completion_response.usage.completion_tokens > 0,
         "Should have output tokens"
     );
 

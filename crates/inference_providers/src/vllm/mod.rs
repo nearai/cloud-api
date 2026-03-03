@@ -283,15 +283,25 @@ impl InferenceProvider for VLlmProvider {
         // Prepare encryption headers
         self.prepare_encryption_headers(&mut headers, &mut streaming_params.extra);
 
-        let response = self
-            .client
-            .post(&url)
-            .headers(headers)
-            .json(&streaming_params)
-            .timeout(Duration::from_secs(self.config.timeout_seconds as u64))
-            .send()
-            .await
-            .map_err(|e| CompletionError::CompletionError(e.to_string()))?;
+        // Use tokio::time::timeout only around .send() so the timeout applies to TTFB only
+        // (connect + response headers), not to body consumption. reqwest's .timeout() on the
+        // RequestBuilder applies to the full request lifecycle including body streaming, which
+        // kills long-running SSE streams at 30s.
+        let response = tokio::time::timeout(
+            Duration::from_secs(self.config.timeout_seconds as u64),
+            self.client
+                .post(&url)
+                .headers(headers)
+                .json(&streaming_params)
+                .send(),
+        )
+        .await
+        .map_err(|_| CompletionError::HttpError {
+            status_code: 504,
+            message: "Timed out waiting for response headers from inference backend".to_string(),
+            is_external: false,
+        })?
+        .map_err(|e| CompletionError::CompletionError(e.to_string()))?;
 
         if !response.status().is_success() {
             let status = response.status();
@@ -393,15 +403,25 @@ impl InferenceProvider for VLlmProvider {
         let headers = self
             .build_headers()
             .map_err(CompletionError::CompletionError)?;
-        let response = self
-            .client
-            .post(&url)
-            .headers(headers)
-            .json(&streaming_params)
-            .timeout(Duration::from_secs(self.config.timeout_seconds as u64))
-            .send()
-            .await
-            .map_err(|e| CompletionError::CompletionError(e.to_string()))?;
+        // Use tokio::time::timeout only around .send() so the timeout applies to TTFB only
+        // (connect + response headers), not to body consumption. reqwest's .timeout() on the
+        // RequestBuilder applies to the full request lifecycle including body streaming, which
+        // kills long-running SSE streams at 30s.
+        let response = tokio::time::timeout(
+            Duration::from_secs(self.config.timeout_seconds as u64),
+            self.client
+                .post(&url)
+                .headers(headers)
+                .json(&streaming_params)
+                .send(),
+        )
+        .await
+        .map_err(|_| CompletionError::HttpError {
+            status_code: 504,
+            message: "Timed out waiting for response headers from inference backend".to_string(),
+            is_external: false,
+        })?
+        .map_err(|e| CompletionError::CompletionError(e.to_string()))?;
 
         if !response.status().is_success() {
             let status = response.status();

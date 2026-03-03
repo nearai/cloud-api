@@ -662,6 +662,19 @@ impl CompletionServiceImpl {
                         "The service is temporarily overloaded. Please retry with exponential backoff.".to_string(),
                     )
                 }
+                // 504 Gateway Timeout = TTFB timeout waiting for our vLLM infrastructure
+                (504, false) => {
+                    tracing::error!(
+                        model,
+                        status_code,
+                        "TTFB timeout waiting for inference backend during {}",
+                        operation
+                    );
+                    ports::CompletionError::ProviderError {
+                        status_code: 504,
+                        message: "The request timed out waiting for the model to respond. Please try again.".to_string(),
+                    }
+                }
                 // 5xx = provider error, use generic message
                 (500..=599, _) => {
                     tracing::error!(

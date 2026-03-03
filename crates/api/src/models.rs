@@ -126,6 +126,24 @@ pub struct Message {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<MessageContent>,
     pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<ToolCall>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ToolCall {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub type_: String,
+    pub function: FunctionCall,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct FunctionCall {
+    pub name: String,
+    pub arguments: String,
 }
 
 #[derive(Debug, Serialize, ToSchema, Deserialize)]
@@ -3098,6 +3116,8 @@ mod tests {
                     },
                 ])),
                 name: None,
+                tool_call_id: None,
+                tool_calls: None,
             }],
             max_tokens: Some(100),
             temperature: None,
@@ -3132,6 +3152,8 @@ mod tests {
                     },
                 ])),
                 name: None,
+                tool_call_id: None,
+                tool_calls: None,
             }],
             max_tokens: Some(100),
             temperature: None,
@@ -3167,6 +3189,8 @@ mod tests {
                     },
                 ])),
                 name: None,
+                tool_call_id: None,
+                tool_calls: None,
             }],
             max_tokens: Some(100),
             temperature: None,
@@ -3197,6 +3221,8 @@ mod tests {
                     file_id: "file-abc123".to_string(),
                 }])),
                 name: None,
+                tool_call_id: None,
+                tool_calls: None,
             }],
             max_tokens: Some(100),
             temperature: None,
@@ -3225,6 +3251,8 @@ mod tests {
                 role: "user".to_string(),
                 content: Some(MessageContent::Text("Hello, world!".to_string())),
                 name: None,
+                tool_call_id: None,
+                tool_calls: None,
             }],
             max_tokens: Some(100),
             temperature: None,

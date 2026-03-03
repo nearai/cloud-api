@@ -913,6 +913,7 @@ async fn test_audio_content_passthrough() {
         "audio_url should contain base64 data URI"
     );
 
+    // Allow background tasks (usage recording) to complete before test cleanup
     tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
 }
 
@@ -1921,5 +1922,6 @@ async fn test_image_input_chat_completion() {
     assert_eq!(parts[1]["type"], "image_url");
     assert_eq!(parts[1]["image_url"]["url"], image_data_url);
 
+    // Allow background tasks (usage recording) to complete before test cleanup
     tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
 }

@@ -190,13 +190,7 @@ fn message_content_to_value(content: &Option<MessageContent>) -> serde_json::Val
         None => serde_json::Value::String(String::new()),
         Some(content) => {
             let converted = crate::conversions::convert_content_to_vllm(content.clone());
-            serde_json::to_value(&converted).unwrap_or_else(|e| {
-                tracing::error!(
-                    error_type = %e,
-                    "Failed to serialize message content"
-                );
-                serde_json::Value::Null
-            })
+            serde_json::to_value(&converted).expect("MessageContent should always be serializable")
         }
     }
 }

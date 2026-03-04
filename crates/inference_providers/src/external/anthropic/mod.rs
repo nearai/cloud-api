@@ -249,6 +249,10 @@ impl ExternalBackend for AnthropicBackend {
             kv_transfer_params: None,
         };
 
+        // Serialize our normalized response. We intentionally overwrite fields
+        // like `usage` (and any future cost-related fields derived from it) instead of passing
+        // through native payload directly, to avoid inconsistencies between what we
+        // bill on and what we expose on the wire.
         let serialized_bytes = serde_json::to_vec(&openai_response).map_err(|e| {
             CompletionError::CompletionError(format!("Failed to serialize response: {e}"))
         })?;

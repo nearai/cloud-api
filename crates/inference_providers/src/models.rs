@@ -582,10 +582,13 @@ pub struct ChatCompletionResponse {
     pub kv_transfer_params: Option<serde_json::Value>,
 }
 
-/// Wrapper for chat completion response that includes raw bytes from provider
+/// Wrapper for chat completion response that includes raw bytes.
 ///
-/// This allows returning the exact bytes from the provider for hash verification
-/// while also providing the parsed response for internal processing (usage tracking, etc.)
+/// For vLLM and OpenAI-compatible backends, `raw_bytes` are the exact bytes returned by the provider,
+/// and are used for hash/attestation verification.
+///
+/// For external backends that we normalize into OpenAI format (e.g. Anthropic, Gemini), `raw_bytes`
+/// are the bytes of our synthesized response, not the original provider HTTP body.
 #[derive(Debug, Clone)]
 pub struct ChatCompletionResponseWithBytes {
     /// The parsed response

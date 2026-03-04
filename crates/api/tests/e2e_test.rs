@@ -1024,8 +1024,8 @@ async fn test_usage_tracking_on_completion() {
     println!("Usage: {:?}", completion_response.usage);
 
     // Verify completion was recorded
-    assert!(completion_response.usage.input_tokens > 0);
-    assert!(completion_response.usage.output_tokens > 0);
+    assert!(completion_response.usage.prompt_tokens > 0);
+    assert!(completion_response.usage.completion_tokens > 0);
 
     // Wait a bit for async usage recording to complete
     tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
@@ -1233,8 +1233,8 @@ async fn test_completion_cost_calculation() {
     let completion_response = response.json::<api::models::ChatCompletionResponse>();
     println!("Usage: {:?}", completion_response.usage);
 
-    let input_tokens = completion_response.usage.input_tokens;
-    let output_tokens = completion_response.usage.output_tokens;
+    let input_tokens = completion_response.usage.prompt_tokens;
+    let output_tokens = completion_response.usage.completion_tokens;
 
     // Verify we got actual token counts
     assert!(input_tokens > 0, "Should have input tokens");
@@ -1564,19 +1564,22 @@ async fn test_high_context_length_completion() {
 
         // Verify we got some tokens (mock provider returns small numbers, real provider would return > 50k)
         assert!(
-            completion_response.usage.input_tokens > 0,
-            "Expected some input tokens, got: {}",
-            completion_response.usage.input_tokens
+            completion_response.usage.prompt_tokens > 0,
+            "Expected some prompt tokens, got: {}",
+            completion_response.usage.prompt_tokens
         );
 
         assert!(
-            completion_response.usage.output_tokens > 0,
+            completion_response.usage.completion_tokens > 0,
             "Should have generated some output"
         );
 
         println!("Successfully processed high context request!");
-        println!("Input tokens: {}", completion_response.usage.input_tokens);
-        println!("Output tokens: {}", completion_response.usage.output_tokens);
+        println!("Prompt tokens: {}", completion_response.usage.prompt_tokens);
+        println!(
+            "Completion tokens: {}",
+            completion_response.usage.completion_tokens
+        );
     } else {
         // If the model isn't available, that's acceptable for this test
         let response_text = response.text();
@@ -1811,8 +1814,8 @@ async fn test_model_aliases() {
         println!("Usage: {:?}", completion.usage);
 
         // Verify response succeeded
-        assert!(completion.usage.input_tokens > 0);
-        assert!(completion.usage.output_tokens > 0);
+        assert!(completion.usage.prompt_tokens > 0);
+        assert!(completion.usage.completion_tokens > 0);
         println!("✓ Successfully completed request using alias");
     } else {
         println!(
@@ -1845,7 +1848,7 @@ async fn test_model_aliases() {
         let completion = response.json::<api::models::ChatCompletionResponse>();
         println!("Completion model field: {}", completion.model);
         println!("Usage: {:?}", completion.usage);
-        assert!(completion.usage.input_tokens > 0);
+        assert!(completion.usage.prompt_tokens > 0);
         println!("✓ Successfully completed request using canonical name");
     } else {
         println!("Model may not be available: {}", response.text());
@@ -1970,8 +1973,8 @@ async fn test_model_alias_consistency() {
 
     let cost1 = if response1.status_code() == 200 {
         let completion1 = response1.json::<api::models::ChatCompletionResponse>();
-        let input_cost = (completion1.usage.input_tokens as i64) * 800000;
-        let output_cost = (completion1.usage.output_tokens as i64) * 1600000;
+        let input_cost = (completion1.usage.prompt_tokens as i64) * 800000;
+        let output_cost = (completion1.usage.completion_tokens as i64) * 1600000;
         let total_cost = input_cost + output_cost;
         println!("Request 1 cost: {total_cost} nano-dollars");
         Some(total_cost)
@@ -1995,8 +1998,8 @@ async fn test_model_alias_consistency() {
 
     if response2.status_code() == 200 {
         let completion2 = response2.json::<api::models::ChatCompletionResponse>();
-        let input_cost = (completion2.usage.input_tokens as i64) * 800000;
-        let output_cost = (completion2.usage.output_tokens as i64) * 1600000;
+        let input_cost = (completion2.usage.prompt_tokens as i64) * 800000;
+        let output_cost = (completion2.usage.completion_tokens as i64) * 1600000;
         let total_cost = input_cost + output_cost;
         println!("Request 2 cost: {total_cost} nano-dollars");
 

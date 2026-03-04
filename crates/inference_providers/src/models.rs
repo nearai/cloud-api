@@ -582,16 +582,17 @@ pub struct ChatCompletionResponse {
     pub kv_transfer_params: Option<serde_json::Value>,
 }
 
-/// Wrapper for chat completion response that includes raw bytes from provider
-///
-/// This allows returning the exact bytes from the provider for hash verification
-/// while also providing the parsed response for internal processing (usage tracking, etc.)
+/// Wrapper for chat completion response that includes raw bytes.
 #[derive(Debug, Clone)]
 pub struct ChatCompletionResponseWithBytes {
     /// The parsed response
     pub response: ChatCompletionResponse,
 
-    /// The raw bytes from the provider response
+    /// For vLLM backends, `raw_bytes` are the exact bytes returned by the provider,
+    /// and are used for hash/attestation verification.
+    ///
+    /// For external backends, `raw_bytes` are the bytes of our synthesized response,
+    /// not the original provider HTTP body.
     pub raw_bytes: Vec<u8>,
 }
 

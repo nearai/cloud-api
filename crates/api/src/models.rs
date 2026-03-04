@@ -16,7 +16,7 @@ pub struct StreamChunkResponse {
     pub model: String,
     pub choices: Vec<StreamChoice>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub usage: Option<Usage>,
+    pub usage: Option<CompletionUsage>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -153,7 +153,11 @@ pub struct ChatCompletionResponse {
     pub created: i64,
     pub model: String,
     pub choices: Vec<ChatChoice>,
-    pub usage: Usage,
+    pub usage: CompletionUsage,
+    /// Unknown top-level fields from the provider (e.g. system_fingerprint, prompt_logprobs).
+    /// Re-emitted when serializing so we do not drop them.
+    #[serde(flatten, default)]
+    pub extra: HashMap<String, Value>,
 }
 
 #[derive(Debug, Serialize, ToSchema, Deserialize)]
@@ -192,7 +196,7 @@ pub struct CompletionResponse {
     pub created: i64,
     pub model: String,
     pub choices: Vec<CompletionChoice>,
-    pub usage: Usage,
+    pub usage: CompletionUsage,
 }
 
 /// Request for image generation
@@ -726,26 +730,29 @@ pub struct CompletionChoice {
     pub finish_reason: Option<String>, // "stop", "length", "content_filter"
 }
 
+/// Usage for chat/completions endpoints.
+/// Serializes as prompt_tokens, completion_tokens, prompt_tokens_details, completion_tokens_details, total_tokens.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct CompletionUsage {
+    pub prompt_tokens: i32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_tokens_details: Option<InputTokensDetails>,
+    pub completion_tokens: i32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completion_tokens_details: Option<OutputTokensDetails>,
+    pub total_tokens: i32,
+}
+
+/// Usage for Response API and other non-OpenAI endpoints.
+/// Serializes as input_tokens, output_tokens, input_tokens_details, output_tokens_details, total_tokens.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct Usage {
-    #[serde(alias = "prompt_tokens")]
     pub input_tokens: i32,
-
-    #[serde(
-        alias = "prompt_tokens_details",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub input_tokens_details: Option<InputTokensDetails>,
-
-    #[serde(alias = "completion_tokens")]
     pub output_tokens: i32,
-
-    #[serde(
-        alias = "completion_tokens_details",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub output_tokens_details: Option<OutputTokensDetails>,
-
     pub total_tokens: i32,
 }
 

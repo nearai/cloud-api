@@ -197,15 +197,15 @@ fn finish_reason_to_string(reason: &FinishReason) -> String {
     }
 }
 
-impl From<&TokenUsage> for crate::models::Usage {
+impl From<&TokenUsage> for crate::models::CompletionUsage {
     fn from(usage: &TokenUsage) -> Self {
         Self {
-            input_tokens: usage.prompt_tokens,
-            input_tokens_details: Some(InputTokensDetails {
+            prompt_tokens: usage.prompt_tokens,
+            prompt_tokens_details: Some(InputTokensDetails {
                 cached_tokens: usage.cached_tokens() as i64,
             }),
-            output_tokens: usage.completion_tokens,
-            output_tokens_details: Some(OutputTokensDetails {
+            completion_tokens: usage.completion_tokens,
+            completion_tokens_details: Some(OutputTokensDetails {
                 reasoning_tokens: 0,
             }),
             total_tokens: usage.total_tokens,

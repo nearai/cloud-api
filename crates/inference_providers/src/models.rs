@@ -584,11 +584,11 @@ pub struct ChatCompletionResponse {
 
 /// Wrapper for chat completion response that includes raw bytes.
 ///
-/// For vLLM and OpenAI-compatible backends, `raw_bytes` are the exact bytes returned by the provider,
+/// For vLLM backends, `raw_bytes` are the exact bytes returned by the provider,
 /// and are used for hash/attestation verification.
 ///
-/// For external backends that we normalize into OpenAI format (e.g. Anthropic, Gemini), `raw_bytes`
-/// are the bytes of our synthesized response, not the original provider HTTP body.
+/// For external backends, `raw_bytes` are the bytes of our synthesized response,
+/// not the original provider HTTP body.
 #[derive(Debug, Clone)]
 pub struct ChatCompletionResponseWithBytes {
     /// The parsed response

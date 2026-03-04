@@ -188,21 +188,26 @@ impl ExternalBackend for OpenAiCompatibleBackend {
             });
         }
 
-        // Get the raw bytes for hash verification
-        let raw_bytes = response
+        let body_bytes = response
             .bytes()
             .await
             .map_err(|e| CompletionError::CompletionError(e.to_string()))?
             .to_vec();
 
-        // Parse the response
-        let chat_response: ChatCompletionResponse =
-            serde_json::from_slice(&raw_bytes).map_err(|e| {
-                CompletionError::CompletionError(format!("Failed to parse response: {e}"))
-            })?;
+        let parsed: ChatCompletionResponse = serde_json::from_slice(&body_bytes).map_err(|e| {
+            CompletionError::CompletionError(format!("Failed to parse response: {e}"))
+        })?;
+
+        // Serialize our normalized response. We intentionally overwrite fields
+        // like `usage` (and any future cost-related fields derived from it) instead of passing
+        // through native payload directly, to avoid inconsistencies between what we
+        // bill on and what we expose on the wire.
+        let raw_bytes = serde_json::to_vec(&parsed).map_err(|e| {
+            CompletionError::CompletionError(format!("Failed to serialize response: {e}"))
+        })?;
 
         Ok(ChatCompletionResponseWithBytes {
-            response: chat_response,
+            response: parsed,
             raw_bytes,
         })
     }

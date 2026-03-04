@@ -509,6 +509,8 @@ pub struct MockProvider {
     signature_hashes: Arc<RwLock<std::collections::HashMap<String, SignatureHashes>>>,
     /// Configuration for conditional responses (thread-safe)
     config: Arc<Mutex<MockConfig>>,
+    /// Last chat completion params received (for test assertions)
+    last_chat_params: Arc<Mutex<Option<ChatCompletionParams>>>,
 }
 
 impl MockProvider {
@@ -528,6 +530,7 @@ impl MockProvider {
                 default_response: ResponseTemplate::new("1. 2. 3."),
                 error_override: None,
             })),
+            last_chat_params: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -543,6 +546,7 @@ impl MockProvider {
                 default_response: ResponseTemplate::new("1. 2. 3."),
                 error_override: None,
             })),
+            last_chat_params: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -556,7 +560,13 @@ impl MockProvider {
                 default_response: ResponseTemplate::new("1. 2. 3."),
                 error_override: None,
             })),
+            last_chat_params: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// Get the last chat completion params received by the mock provider
+    pub async fn last_chat_params(&self) -> Option<ChatCompletionParams> {
+        self.last_chat_params.lock().await.clone()
     }
 
     /// Register request and response hashes for a chat_id
@@ -703,6 +713,8 @@ impl crate::InferenceProvider for MockProvider {
         params: ChatCompletionParams,
         request_hash: String,
     ) -> Result<StreamingResult, CompletionError> {
+        *self.last_chat_params.lock().await = Some(params.clone());
+
         // Check for invalid model
         if !self.is_valid_model(&params.model) {
             return Err(CompletionError::HttpError {
@@ -790,6 +802,8 @@ impl crate::InferenceProvider for MockProvider {
         params: ChatCompletionParams,
         request_hash: String,
     ) -> Result<ChatCompletionResponseWithBytes, CompletionError> {
+        *self.last_chat_params.lock().await = Some(params.clone());
+
         // Check for invalid model
         if !self.is_valid_model(&params.model) {
             return Err(CompletionError::HttpError {

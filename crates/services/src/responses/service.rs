@@ -2679,7 +2679,7 @@ impl ResponseServiceImpl {
         (clean_text, reasoning_result, tag_transition)
     }
 
-    /// Capture usage from SSE chunk and update ctx (overwrite per chunk; caller calls ctx.commit_stream_usage() at stream end).
+    /// Capture usage from SSE chunk and update ctx (overwrite per chunk; last chunk wins for this stream).
     fn capture_usage_from_chunk(
         event: &inference_providers::SSEEvent,
         ctx: &mut crate::responses::service_helpers::ResponseStreamContext,

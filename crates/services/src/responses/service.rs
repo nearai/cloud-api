@@ -695,8 +695,8 @@ impl ResponseServiceImpl {
                         }
                     }
 
-                    // Extract usage from the final chunk
-                    Self::extract_and_accumulate_usage(&sse_event, ctx);
+                    // Update usage from chunk (overwrite; commit at end of stream)
+                    Self::capture_usage_from_chunk(&sse_event, ctx);
 
                     // Accumulate tool call fragments
                     Self::accumulate_tool_calls(&sse_event, &mut tool_call_accumulator);
@@ -2683,9 +2683,8 @@ impl ResponseServiceImpl {
         (clean_text, reasoning_result, tag_transition)
     }
 
-    /// Extract and accumulate usage information from SSE event
-    /// Usage typically comes in the final chunk from the provider
-    fn extract_and_accumulate_usage(
+    /// Capture usage from SSE chunk and update ctx (overwrite per chunk; caller calls ctx.commit_stream_usage() at stream end).
+    fn capture_usage_from_chunk(
         event: &inference_providers::SSEEvent,
         ctx: &mut crate::responses::service_helpers::ResponseStreamContext,
     ) {
@@ -2698,7 +2697,7 @@ impl ResponseServiceImpl {
                     usage.prompt_tokens,
                     usage.completion_tokens
                 );
-                ctx.add_usage(
+                ctx.update_usage(
                     usage.prompt_tokens,
                     usage.completion_tokens,
                     usage.cached_tokens(),

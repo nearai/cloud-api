@@ -18,10 +18,9 @@ pub struct ResponseStreamContext {
     pub conversation_id: Option<ConversationId>,
     pub sequence_number: u64,
     pub output_item_index: usize,
-    /// Accumulated token usage from all completion calls
+    /// Token usage (overwritten per chunk; last chunk wins per stream; for multi-turn agent, last turn only)
     pub total_input_tokens: i32,
     pub total_output_tokens: i32,
-    /// Accumulated cache-hit prompt tokens from all completion calls
     pub total_cached_tokens: i32,
     /// Accumulated reasoning tokens from reasoning content
     pub reasoning_tokens: i32,
@@ -71,11 +70,11 @@ impl ResponseStreamContext {
         self.output_item_index += 1;
     }
 
-    /// Add usage from a completion call (including cache-hit tokens when present)
-    pub fn add_usage(&mut self, input_tokens: i32, output_tokens: i32, cached_tokens: i32) {
-        self.total_input_tokens += input_tokens;
-        self.total_output_tokens += output_tokens;
-        self.total_cached_tokens += cached_tokens;
+    /// Update usage from current completion stream (overwrite each chunk; last chunk wins).
+    pub fn update_usage(&mut self, input_tokens: i32, output_tokens: i32, cached_tokens: i32) {
+        self.total_input_tokens = input_tokens;
+        self.total_output_tokens = output_tokens;
+        self.total_cached_tokens = cached_tokens;
     }
 
     /// Add reasoning tokens from detected reasoning content

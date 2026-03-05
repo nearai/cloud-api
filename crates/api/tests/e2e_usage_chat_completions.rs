@@ -184,13 +184,16 @@ async fn test_chat_completions_stream_records_usage_in_history() {
 
 /// Use mock default response with cache_tokens; call completions and verify
 /// cache_read_tokens in response and in usage history.
-/// Cache is set to (input message length * 0.5); assertion uses min(cache, prompt_tokens) due to clamp.
+/// Cache is set based on the provider's token estimate so it does not exceed prompt_tokens;
+/// we assert equality without clamping in the test.
 #[tokio::test]
 async fn test_chat_completions_with_cache_records_cache_in_history() {
     let (server, _pool, mock_provider, _db) = setup_test_server_with_pool().await;
 
     let message = "hello world";
-    let cache_tokens = (message.len() as f32 * 0.5).floor() as i32;
+    let estimated_tokens = message.split_whitespace().count() as i32;
+    // Simple integer ratio: cache is half of estimated prompt tokens.
+    let cache_tokens = (estimated_tokens / 2).max(1);
     mock_provider
         .set_default_response(
             inference_providers::mock::ResponseTemplate::new("cached reply")
@@ -223,10 +226,9 @@ async fn test_chat_completions_with_cache_records_cache_in_history() {
         .as_ref()
         .map(|d| d.cached_tokens as i32)
         .unwrap_or(0);
-    let expected_cache = cache_tokens.min(completion.usage.prompt_tokens);
     assert_eq!(
-        cached, expected_cache,
-        "response usage cache_read_tokens should be min({cache_tokens}, prompt_tokens)"
+        cached, cache_tokens,
+        "response usage cache_read_tokens should equal configured cache_tokens"
     );
 
     tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
@@ -245,18 +247,19 @@ async fn test_chat_completions_with_cache_records_cache_in_history() {
     assert!(!history.data.is_empty());
     let entry = &history.data[0];
     assert_eq!(
-        entry.cache_read_tokens, expected_cache,
+        entry.cache_read_tokens, cache_tokens,
         "usage history should record cache_read_tokens from completion"
     );
 }
 
-/// Stream version: cache = (input message length * 0.5); assert min(cache, prompt_tokens) in history.
+/// Stream version: cache based on provider token estimate; assert equality without clamping.
 #[tokio::test]
 async fn test_chat_completions_stream_with_cache_records_cache_in_history() {
     let (server, _pool, mock_provider, _db) = setup_test_server_with_pool().await;
 
     let message = "hello world";
-    let cache_tokens = (message.len() as f32 * 0.5).floor() as i32;
+    let estimated_tokens = message.split_whitespace().count() as i32;
+    let cache_tokens = (estimated_tokens / 2).max(1);
     mock_provider
         .set_default_response(
             inference_providers::mock::ResponseTemplate::new("cached reply")
@@ -303,10 +306,9 @@ async fn test_chat_completions_stream_with_cache_records_cache_in_history() {
     let (prompt_tokens, completion_tokens, cached_tokens) =
         last_usage.expect("stream should contain at least one chunk with usage");
     assert!(prompt_tokens > 0 && completion_tokens > 0);
-    let expected_cache = cache_tokens.min(prompt_tokens);
     assert_eq!(
-        cached_tokens, expected_cache,
-        "stream final chunk cached_tokens should be min({cache_tokens}, prompt_tokens)"
+        cached_tokens, cache_tokens,
+        "stream final chunk cached_tokens should equal configured cache_tokens"
     );
 
     tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
@@ -327,7 +329,7 @@ async fn test_chat_completions_stream_with_cache_records_cache_in_history() {
     assert_eq!(entry.input_tokens, prompt_tokens);
     assert_eq!(entry.output_tokens, completion_tokens);
     assert_eq!(
-        entry.cache_read_tokens, expected_cache,
+        entry.cache_read_tokens, cache_tokens,
         "usage history should record cache_read_tokens from stream completion"
     );
 }

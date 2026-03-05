@@ -6,6 +6,7 @@ mod common;
 
 use common::*;
 use serde_json::json;
+use services::responses::models::ResponseStreamEvent;
 
 /// Helper: create a simple conversation for the given API key.
 async fn create_conversation(
@@ -39,7 +40,7 @@ async fn test_responses_non_stream_records_cache_usage_in_history() {
 
     let message = "hello world from responses api";
     let estimated_tokens = message.split_whitespace().count() as i32;
-    // Simple integer ratio: cache is half of estimated input tokens.
+    // Simple integer ratio: cache is roughly half of estimated input tokens.
     let cache_tokens = (estimated_tokens / 2).max(1);
 
     // Configure mock provider to report cached_tokens for this test
@@ -174,11 +175,49 @@ async fn test_responses_stream_records_cache_usage_in_history() {
         resp.text()
     );
 
-    // Drain SSE stream so that the response pipeline completes
+    // Drain SSE stream, parse final response.completed event to inspect usage
     let sse_text = resp.text();
+    let mut completed_response: Option<services::responses::models::ResponseObject> = None;
+
+    for chunk in sse_text.split("\n\n") {
+        if chunk.trim().is_empty() {
+            continue;
+        }
+
+        let mut event_type = "";
+        let mut event_data = "";
+
+        for line in chunk.lines() {
+            if let Some(name) = line.strip_prefix("event: ") {
+                event_type = name;
+            } else if let Some(data) = line.strip_prefix("data: ") {
+                event_data = data;
+            }
+        }
+
+        if event_type == "response.completed" && !event_data.is_empty() {
+            if let Ok(event) = serde_json::from_str::<ResponseStreamEvent>(event_data) {
+                if let Some(resp_obj) = event.response {
+                    completed_response = Some(resp_obj);
+                }
+            }
+        }
+    }
+
+    let completed = completed_response.expect("Should capture final response from stream");
+    let usage = completed.usage;
     assert!(
-        sse_text.contains("response.completed"),
-        "SSE stream should contain response.completed event"
+        usage.input_tokens > 0 && usage.output_tokens > 0,
+        "streaming response usage should have non-zero tokens"
+    );
+    let cached_from_stream: i32 = usage
+        .input_tokens_details
+        .as_ref()
+        .map(|d| d.cached_tokens as i32)
+        .unwrap_or(0);
+    assert_eq!(
+        cached_from_stream, cache_tokens,
+        "streaming ResponseObject usage cached_tokens should equal configured cache_tokens"
     );
 
     // Give ResponseService time to finalize and record usage

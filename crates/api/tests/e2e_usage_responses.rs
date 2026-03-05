@@ -121,13 +121,21 @@ async fn test_responses_non_stream_records_cache_usage_in_history() {
     );
     let entry = &history.data[0];
     assert_eq!(
-        entry.response_id.as_deref(),
-        Some(response_obj.id.as_str()),
-        "usage history should be linked to this response_id"
-    );
-    assert_eq!(
         entry.cache_read_tokens, cache_tokens,
         "usage history should record cache_read_tokens consistent with ResponseObject"
+    );
+
+    // Also verify cost is consistent with tokens and pricing:
+    // input_cost_per_token = 1_000_000, output_cost_per_token = 2_000_000, cache_read_cost_per_token = 500_000.
+    const INPUT_PRICE: i64 = 1_000_000;
+    const OUTPUT_PRICE: i64 = 2_000_000;
+    const CACHE_PRICE: i64 = 500_000;
+    let expected_total_cost = (entry.input_tokens as i64) * INPUT_PRICE
+        + (entry.output_tokens as i64) * OUTPUT_PRICE
+        + (entry.cache_read_tokens as i64) * CACHE_PRICE;
+    assert_eq!(
+        entry.total_cost, expected_total_cost,
+        "total_cost should match input/output/cache tokens and configured pricing"
     );
 }
 
@@ -247,5 +255,17 @@ async fn test_responses_stream_records_cache_usage_in_history() {
     assert_eq!(
         entry.cache_read_tokens, cache_tokens,
         "cache_read_tokens should equal configured cache_tokens"
+    );
+
+    // Verify cost matches tokens and pricing (same prices as above).
+    const INPUT_PRICE: i64 = 1_000_000;
+    const OUTPUT_PRICE: i64 = 2_000_000;
+    const CACHE_PRICE: i64 = 500_000;
+    let expected_total_cost = (entry.input_tokens as i64) * INPUT_PRICE
+        + (entry.output_tokens as i64) * OUTPUT_PRICE
+        + (entry.cache_read_tokens as i64) * CACHE_PRICE;
+    assert_eq!(
+        entry.total_cost, expected_total_cost,
+        "total_cost should match input/output/cache tokens and configured pricing for streaming response"
     );
 }

@@ -6,7 +6,10 @@ mod common;
 
 use common::*;
 use serde_json::json;
-use services::responses::models::ResponseStreamEvent;
+use services::{
+    responses::models::ResponseStreamEvent,
+    usage::{compute_token_cost, ModelPricing},
+};
 
 /// Helper: create a simple conversation for the given API key.
 async fn create_conversation(
@@ -125,14 +128,23 @@ async fn test_responses_non_stream_records_cache_usage_in_history() {
         "usage history should record cache_read_tokens consistent with ResponseObject"
     );
 
-    // Also verify cost is consistent with tokens and pricing:
-    // input_cost_per_token = 1_000_000, output_cost_per_token = 2_000_000, cache_read_cost_per_token = 500_000.
-    const INPUT_PRICE: i64 = 1_000_000;
-    const OUTPUT_PRICE: i64 = 2_000_000;
-    const CACHE_PRICE: i64 = 500_000;
-    let expected_total_cost = (entry.input_tokens as i64) * INPUT_PRICE
-        + (entry.output_tokens as i64) * OUTPUT_PRICE
-        + (entry.cache_read_tokens as i64) * CACHE_PRICE;
+    // Also verify cost is consistent with tokens and pricing using the same helper as the service.
+    let pricing = ModelPricing {
+        id: uuid::Uuid::nil(),
+        model_name: "Qwen/Qwen3-30B-A3B-Instruct-2507".to_string(),
+        input_cost_per_token: 1_000_000,
+        output_cost_per_token: 2_000_000,
+        cost_per_image: 0,
+        cache_read_cost_per_token: 500_000,
+    };
+    let cost = compute_token_cost(
+        entry.input_tokens,
+        entry.output_tokens,
+        entry.cache_read_tokens,
+        &pricing,
+    )
+    .expect("cost calculation should succeed");
+    let expected_total_cost = cost.total_cost;
     assert_eq!(
         entry.total_cost, expected_total_cost,
         "total_cost should match input/output/cache tokens and configured pricing"
@@ -257,13 +269,23 @@ async fn test_responses_stream_records_cache_usage_in_history() {
         "cache_read_tokens should equal configured cache_tokens"
     );
 
-    // Verify cost matches tokens and pricing (same prices as above).
-    const INPUT_PRICE: i64 = 1_000_000;
-    const OUTPUT_PRICE: i64 = 2_000_000;
-    const CACHE_PRICE: i64 = 500_000;
-    let expected_total_cost = (entry.input_tokens as i64) * INPUT_PRICE
-        + (entry.output_tokens as i64) * OUTPUT_PRICE
-        + (entry.cache_read_tokens as i64) * CACHE_PRICE;
+    // Verify cost matches tokens and pricing using shared helper.
+    let pricing = ModelPricing {
+        id: uuid::Uuid::nil(),
+        model_name: "Qwen/Qwen3-30B-A3B-Instruct-2507".to_string(),
+        input_cost_per_token: 1_000_000,
+        output_cost_per_token: 2_000_000,
+        cost_per_image: 0,
+        cache_read_cost_per_token: 500_000,
+    };
+    let cost = compute_token_cost(
+        entry.input_tokens,
+        entry.output_tokens,
+        entry.cache_read_tokens,
+        &pricing,
+    )
+    .expect("cost calculation should succeed");
+    let expected_total_cost = cost.total_cost;
     assert_eq!(
         entry.total_cost, expected_total_cost,
         "total_cost should match input/output/cache tokens and configured pricing for streaming response"

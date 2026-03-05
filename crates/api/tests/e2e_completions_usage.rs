@@ -184,13 +184,17 @@ async fn test_chat_completions_stream_records_usage_in_history() {
 
 /// Use mock default response with cache_tokens; call completions and verify
 /// cache_read_tokens in response and in usage history.
+/// Cache is set to (input message length * 0.5); assertion uses min(cache, prompt_tokens) due to clamp.
 #[tokio::test]
 async fn test_chat_completions_with_cache_records_cache_in_history() {
     let (server, _pool, mock_provider, _db) = setup_test_server_with_pool().await;
 
+    let message = "hello world";
+    let cache_tokens = (message.len() as f32 * 0.5).floor() as i32;
     mock_provider
         .set_default_response(
-            inference_providers::mock::ResponseTemplate::new("cached reply").with_cache_tokens(40),
+            inference_providers::mock::ResponseTemplate::new("cached reply")
+                .with_cache_tokens(cache_tokens),
         )
         .await;
 
@@ -203,7 +207,7 @@ async fn test_chat_completions_with_cache_records_cache_in_history() {
         .add_header("Authorization", format!("Bearer {api_key}"))
         .json(&json!({
             "model": "Qwen/Qwen3-30B-A3B-Instruct-2507",
-            "messages": [{ "role": "user", "content": "hello" }]
+            "messages": [{ "role": "user", "content": message }]
         }))
         .await;
 
@@ -219,9 +223,10 @@ async fn test_chat_completions_with_cache_records_cache_in_history() {
         .as_ref()
         .map(|d| d.cached_tokens as i32)
         .unwrap_or(0);
+    let expected_cache = cache_tokens.min(completion.usage.prompt_tokens);
     assert_eq!(
-        cached, 40,
-        "response usage should have cache_read_tokens = 40"
+        cached, expected_cache,
+        "response usage cache_read_tokens should be min({cache_tokens}, prompt_tokens)"
     );
 
     tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
@@ -240,7 +245,89 @@ async fn test_chat_completions_with_cache_records_cache_in_history() {
     assert!(!history.data.is_empty());
     let entry = &history.data[0];
     assert_eq!(
-        entry.cache_read_tokens, 40,
+        entry.cache_read_tokens, expected_cache,
         "usage history should record cache_read_tokens from completion"
+    );
+}
+
+/// Stream version: cache = (input message length * 0.5); assert min(cache, prompt_tokens) in history.
+#[tokio::test]
+async fn test_chat_completions_stream_with_cache_records_cache_in_history() {
+    let (server, _pool, mock_provider, _db) = setup_test_server_with_pool().await;
+
+    let message = "hello world";
+    let cache_tokens = (message.len() as f32 * 0.5).floor() as i32;
+    mock_provider
+        .set_default_response(
+            inference_providers::mock::ResponseTemplate::new("cached reply")
+                .with_cache_tokens(cache_tokens),
+        )
+        .await;
+
+    setup_qwen_model(&server).await;
+    let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
+    let api_key = get_api_key_for_org(&server, org.id.clone()).await;
+
+    let stream_resp = server
+        .post("/v1/chat/completions")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .json(&json!({
+            "model": "Qwen/Qwen3-30B-A3B-Instruct-2507",
+            "messages": [{ "role": "user", "content": message }],
+            "stream": true
+        }))
+        .await;
+
+    assert_eq!(
+        stream_resp.status_code(),
+        200,
+        "streaming chat/completions should succeed: {}",
+        stream_resp.text()
+    );
+
+    let text = stream_resp.text();
+    let mut last_usage = None::<(i32, i32, i32)>;
+    for line in text.lines() {
+        if let Some(data) = line.strip_prefix("data: ") {
+            if data.trim() == "[DONE]" {
+                break;
+            }
+            if let Ok(StreamChunk::Chat(chat)) = serde_json::from_str::<StreamChunk>(data) {
+                if let Some(usage) = &chat.usage {
+                    let cached = usage.cached_tokens();
+                    last_usage = Some((usage.prompt_tokens, usage.completion_tokens, cached));
+                }
+            }
+        }
+    }
+    let (prompt_tokens, completion_tokens, cached_tokens) =
+        last_usage.expect("stream should contain at least one chunk with usage");
+    assert!(prompt_tokens > 0 && completion_tokens > 0);
+    let expected_cache = cache_tokens.min(prompt_tokens);
+    assert_eq!(
+        cached_tokens, expected_cache,
+        "stream final chunk cached_tokens should be min({cache_tokens}, prompt_tokens)"
+    );
+
+    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+
+    let history_resp = server
+        .get(&format!(
+            "/v1/organizations/{}/usage/history?limit=1&offset=0",
+            org.id
+        ))
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .add_header("User-Agent", MOCK_USER_AGENT)
+        .await;
+
+    assert_eq!(history_resp.status_code(), 200);
+    let history: api::routes::usage::UsageHistoryResponse = history_resp.json();
+    assert!(!history.data.is_empty());
+    let entry = &history.data[0];
+    assert_eq!(entry.input_tokens, prompt_tokens);
+    assert_eq!(entry.output_tokens, completion_tokens);
+    assert_eq!(
+        entry.cache_read_tokens, expected_cache,
+        "usage history should record cache_read_tokens from stream completion"
     );
 }

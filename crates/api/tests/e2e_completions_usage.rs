@@ -140,11 +140,9 @@ async fn test_chat_completions_stream_records_usage_in_history() {
             if data.trim() == "[DONE]" {
                 break;
             }
-            if let Ok(chunk) = serde_json::from_str::<StreamChunk>(data) {
-                if let StreamChunk::Chat(chat) = chunk {
-                    if let Some(usage) = &chat.usage {
-                        last_usage = Some((usage.prompt_tokens, usage.completion_tokens));
-                    }
+            if let Ok(StreamChunk::Chat(chat)) = serde_json::from_str::<StreamChunk>(data) {
+                if let Some(usage) = &chat.usage {
+                    last_usage = Some((usage.prompt_tokens, usage.completion_tokens));
                 }
             }
         }

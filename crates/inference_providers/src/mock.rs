@@ -160,6 +160,8 @@ pub struct ResponseTemplate {
     disconnect_after_chunks: Option<usize>,
     /// Tool calls to include in the response
     tool_calls: Option<Vec<ToolCall>>,
+    /// If set, usage will include prompt_tokens_details.cached_tokens (for cache-hit tests)
+    cache_tokens: Option<i32>,
 }
 
 impl ResponseTemplate {
@@ -170,6 +172,20 @@ impl ResponseTemplate {
             reasoning_content: None,
             disconnect_after_chunks: None,
             tool_calls: None,
+            cache_tokens: None,
+        }
+    }
+
+    /// Set cache_read_tokens for usage (prompt_tokens_details.cached_tokens) in non-stream and stream final chunk.
+    pub fn with_cache_tokens(mut self, cached_tokens: i32) -> Self {
+        self.cache_tokens = Some(cached_tokens);
+        self
+    }
+
+    fn token_usage(&self, input_tokens: i32, output_tokens: i32) -> TokenUsage {
+        match self.cache_tokens {
+            Some(c) => TokenUsage::new_with_cache(input_tokens, output_tokens, c),
+            None => TokenUsage::new(input_tokens, output_tokens),
         }
     }
 
@@ -255,7 +271,7 @@ impl ResponseTemplate {
             }],
             service_tier: None,
             system_fingerprint: None,
-            usage: TokenUsage::new(input_tokens, output_tokens),
+            usage: self.token_usage(input_tokens, output_tokens),
             prompt_logprobs: None,
             prompt_token_ids: None,
             kv_transfer_params: None,
@@ -306,7 +322,7 @@ impl ResponseTemplate {
                         finish_reason: None,
                         token_ids: None,
                     }],
-                    usage: Some(TokenUsage::new(input_tokens, output_token_count)),
+                    usage: Some(self.token_usage(input_tokens, output_token_count)),
                     prompt_token_ids: None,
                     modality: None,
                 });
@@ -350,7 +366,7 @@ impl ResponseTemplate {
                         finish_reason,
                         token_ids: None,
                     }],
-                    usage: Some(TokenUsage::new(input_tokens, output_token_count)),
+                    usage: Some(self.token_usage(input_tokens, output_token_count)),
                     prompt_token_ids: None,
                     modality: None,
                 });
@@ -395,7 +411,7 @@ impl ResponseTemplate {
                         finish_reason: None,
                         token_ids: None,
                     }],
-                    usage: Some(TokenUsage::new(input_tokens, output_token_count)),
+                    usage: Some(self.token_usage(input_tokens, output_token_count)),
                     prompt_token_ids: None,
                     modality: None,
                 });
@@ -445,7 +461,7 @@ impl ResponseTemplate {
                             finish_reason,
                             token_ids: None,
                         }],
-                        usage: Some(TokenUsage::new(input_tokens, output_token_count)),
+                        usage: Some(self.token_usage(input_tokens, output_token_count)),
                         prompt_token_ids: None,
                         modality: None,
                     });
@@ -461,7 +477,7 @@ impl ResponseTemplate {
             model,
             system_fingerprint: None,
             choices: vec![],
-            usage: Some(TokenUsage::new(input_tokens, output_token_count)),
+            usage: Some(self.token_usage(input_tokens, output_token_count)),
             prompt_token_ids: None,
             modality: None,
         });

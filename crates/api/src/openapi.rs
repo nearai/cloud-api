@@ -38,6 +38,7 @@ use utoipa::{Modify, OpenApi};
         (name = "Attestation", description = "Attestation and verification endpoints"),
         (name = "Gateway", description = "Model gateway integration endpoints"),
         (name = "Admin", description = "Administrative endpoints (admin access required)"),
+        (name = "Web Search", description = "Standalone web search endpoint"),
     ),
     paths(
         // Chat completion endpoints (most important for users)
@@ -121,6 +122,8 @@ use utoipa::{Modify, OpenApi};
         crate::routes::gateway::check_api_key,
         // Billing endpoints (HuggingFace integration)
         crate::routes::billing::get_billing_costs,
+        // Web Search (standalone)
+        crate::routes::web_search::get_web_search,
         // Admin endpoints (less frequently used)
         crate::routes::admin::list_models,
         crate::routes::admin::batch_upsert_models,
@@ -137,6 +140,11 @@ use utoipa::{Modify, OpenApi};
         crate::routes::admin::create_admin_access_token,
         crate::routes::admin::list_admin_access_tokens,
         crate::routes::admin::delete_admin_access_token,
+        crate::routes::admin::list_services,
+        crate::routes::admin::get_service_by_id,
+        crate::routes::admin::create_service,
+        crate::routes::admin::update_service,
+        crate::routes::admin::delete_service,
         // Health check endpoint
         crate::routes::health::health_check,
         // Attestation endpoints
@@ -207,6 +215,8 @@ use utoipa::{Modify, OpenApi};
             // Model pricing models
             ModelListResponse, ModelWithPricing, AdminModelListResponse, AdminModelWithPricing,
             DecimalPrice, DecimalPriceRequest, ModelMetadata,
+            WebSearchResponse, WebSearchResultItem, WebSearchQueryParams,
+            AdminServiceResponse, AdminServiceListResponse, CreateServiceRequest, UpdateServiceRequest,
             UpdateModelApiRequest, ModelHistoryEntry, ModelHistoryResponse,
             // Organization limits models (Admin)
             UpdateOrganizationLimitsRequest, UpdateOrganizationLimitsResponse, SpendLimit, SpendLimitRequest,

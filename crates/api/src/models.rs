@@ -779,6 +779,60 @@ pub struct ErrorDetail {
     pub code: Option<String>,
 }
 
+// ============================================
+// Web Search (GET /v1/web/search)
+// ============================================
+
+/// GET /v1/web/search response
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct WebSearchResponse {
+    pub query: String,
+    pub result_count: u32,
+    pub results: Vec<WebSearchResultItem>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct WebSearchResultItem {
+    pub title: String,
+    pub url: String,
+    pub description: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub published: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub site_name: Option<String>,
+}
+
+/// Query parameters for GET /v1/web/search (aligned with Brave WebSearchParams)
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, utoipa::IntoParams)]
+pub struct WebSearchQueryParams {
+    /// Search query (required)
+    pub q: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub country: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub search_lang: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ui_lang: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub count: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub offset: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub safesearch: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub freshness: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text_decorations: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub spellcheck: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub units: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extra_snippets: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub summary: Option<bool>,
+}
+
 fn default_temperature() -> Option<f32> {
     Some(1.0)
 }
@@ -2451,6 +2505,58 @@ pub struct AdminModelListResponse {
     pub limit: i64,
     pub offset: i64,
     pub total: i64,
+}
+
+/// Platform service (admin CRUD) — single item
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct AdminServiceResponse {
+    pub id: uuid::Uuid,
+    #[serde(rename = "serviceName")]
+    pub service_name: String,
+    #[serde(rename = "displayName")]
+    pub display_name: String,
+    pub description: Option<String>,
+    pub unit: String,
+    #[serde(rename = "costPerUnit")]
+    pub cost_per_unit: i64,
+    #[serde(rename = "isActive")]
+    pub is_active: bool,
+    #[serde(rename = "createdAt")]
+    pub created_at: DateTime<Utc>,
+    #[serde(rename = "updatedAt")]
+    pub updated_at: DateTime<Utc>,
+}
+
+/// Response for admin service list endpoint
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct AdminServiceListResponse {
+    pub services: Vec<AdminServiceResponse>,
+    pub limit: i64,
+    pub offset: i64,
+    pub total: i64,
+}
+
+/// Request to create a platform service (admin)
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct CreateServiceRequest {
+    #[serde(rename = "serviceName")]
+    pub service_name: String,
+    #[serde(rename = "displayName")]
+    pub display_name: String,
+    pub description: Option<String>,
+    pub unit: String,
+    #[serde(rename = "costPerUnit")]
+    pub cost_per_unit: i64,
+}
+
+/// Request to update a platform service (admin; only display_name, description, cost_per_unit)
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct UpdateServiceRequest {
+    #[serde(rename = "displayName")]
+    pub display_name: Option<String>,
+    pub description: Option<String>,
+    #[serde(rename = "costPerUnit")]
+    pub cost_per_unit: Option<i64>,
 }
 
 /// Model with pricing information for admin listing

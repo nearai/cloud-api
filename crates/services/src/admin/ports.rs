@@ -325,6 +325,56 @@ pub trait AdminRepository: Send + Sync {
 
     /// Count all active organizations (admin only)
     async fn count_all_organizations(&self) -> Result<i64, anyhow::Error>;
+
+    /// List platform services with pagination (admin only)
+    async fn list_services(
+        &self,
+        include_inactive: bool,
+        limit: i64,
+        offset: i64,
+    ) -> Result<(Vec<PlatformServiceInfo>, i64), anyhow::Error>;
+
+    /// Get platform service by id (admin only)
+    async fn get_service_by_id(
+        &self,
+        id: uuid::Uuid,
+    ) -> Result<Option<PlatformServiceInfo>, anyhow::Error>;
+
+    /// Create a platform service (admin only)
+    async fn create_service(
+        &self,
+        service_name: &str,
+        display_name: &str,
+        description: Option<&str>,
+        unit: &str,
+        cost_per_unit: i64,
+    ) -> Result<PlatformServiceInfo, anyhow::Error>;
+
+    /// Update platform service (display_name, description, cost_per_unit only)
+    async fn update_service(
+        &self,
+        id: uuid::Uuid,
+        display_name: Option<&str>,
+        description: Option<&str>,
+        cost_per_unit: Option<i64>,
+    ) -> Result<Option<PlatformServiceInfo>, anyhow::Error>;
+
+    /// Soft delete platform service (set is_active = false)
+    async fn soft_delete_service(&self, id: uuid::Uuid) -> Result<bool, anyhow::Error>;
+}
+
+/// Platform service info (for admin CRUD)
+#[derive(Debug, Clone)]
+pub struct PlatformServiceInfo {
+    pub id: uuid::Uuid,
+    pub service_name: String,
+    pub display_name: String,
+    pub description: Option<String>,
+    pub unit: String,
+    pub cost_per_unit: i64,
+    pub is_active: bool,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
 }
 
 /// Admin service trait for managing platform configuration
@@ -411,4 +461,40 @@ pub trait AdminService: Send + Sync {
         limit: i64,
         offset: i64,
     ) -> Result<(Vec<AdminOrganizationInfo>, i64), AdminError>;
+
+    /// List platform services with pagination (admin only)
+    async fn list_services(
+        &self,
+        include_inactive: bool,
+        limit: i64,
+        offset: i64,
+    ) -> Result<(Vec<PlatformServiceInfo>, i64), AdminError>;
+
+    /// Get platform service by id (admin only)
+    async fn get_service_by_id(
+        &self,
+        id: uuid::Uuid,
+    ) -> Result<Option<PlatformServiceInfo>, AdminError>;
+
+    /// Create a platform service (admin only)
+    async fn create_service(
+        &self,
+        service_name: &str,
+        display_name: &str,
+        description: Option<&str>,
+        unit: &str,
+        cost_per_unit: i64,
+    ) -> Result<PlatformServiceInfo, AdminError>;
+
+    /// Update platform service (display_name, description, cost_per_unit only)
+    async fn update_service(
+        &self,
+        id: uuid::Uuid,
+        display_name: Option<&str>,
+        description: Option<&str>,
+        cost_per_unit: Option<i64>,
+    ) -> Result<Option<PlatformServiceInfo>, AdminError>;
+
+    /// Soft delete platform service (admin only)
+    async fn delete_service(&self, id: uuid::Uuid) -> Result<(), AdminError>;
 }

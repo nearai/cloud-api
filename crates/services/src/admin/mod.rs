@@ -6,7 +6,7 @@ pub use analytics::{
     OrganizationMetrics, PlatformMetrics, TimeSeriesMetrics, TimeSeriesPoint, TopModelMetrics,
     TopOrganizationMetrics, WorkspaceMetrics,
 };
-pub use ports::*;
+pub use ports::{PlatformServiceInfo, *};
 use std::sync::Arc;
 
 pub struct AdminServiceImpl {
@@ -279,6 +279,92 @@ impl AdminService for AdminServiceImpl {
         let total = total_result.map_err(|e| AdminError::InternalError(e.to_string()))?;
 
         Ok((organizations, total))
+    }
+
+    async fn list_services(
+        &self,
+        include_inactive: bool,
+        limit: i64,
+        offset: i64,
+    ) -> Result<(Vec<PlatformServiceInfo>, i64), AdminError> {
+        self.repository
+            .list_services(include_inactive, limit, offset)
+            .await
+            .map_err(|e| AdminError::InternalError(e.to_string()))
+    }
+
+    async fn get_service_by_id(
+        &self,
+        id: uuid::Uuid,
+    ) -> Result<Option<PlatformServiceInfo>, AdminError> {
+        self.repository
+            .get_service_by_id(id)
+            .await
+            .map_err(|e| AdminError::InternalError(e.to_string()))
+    }
+
+    async fn create_service(
+        &self,
+        service_name: &str,
+        display_name: &str,
+        description: Option<&str>,
+        unit: &str,
+        cost_per_unit: i64,
+    ) -> Result<PlatformServiceInfo, AdminError> {
+        if service_name.trim().is_empty() {
+            return Err(AdminError::InvalidPricing(
+                "Service name cannot be empty".to_string(),
+            ));
+        }
+        if unit != "request" {
+            return Err(AdminError::InvalidPricing(
+                "Only unit 'request' is supported".to_string(),
+            ));
+        }
+        if cost_per_unit < 0 {
+            return Err(AdminError::InvalidPricing(
+                "Cost per unit cannot be negative".to_string(),
+            ));
+        }
+        self.repository
+            .create_service(service_name, display_name, description, unit, cost_per_unit)
+            .await
+            .map_err(|e| AdminError::InternalError(e.to_string()))
+    }
+
+    async fn update_service(
+        &self,
+        id: uuid::Uuid,
+        display_name: Option<&str>,
+        description: Option<&str>,
+        cost_per_unit: Option<i64>,
+    ) -> Result<Option<PlatformServiceInfo>, AdminError> {
+        if let Some(c) = cost_per_unit {
+            if c < 0 {
+                return Err(AdminError::InvalidPricing(
+                    "Cost per unit cannot be negative".to_string(),
+                ));
+            }
+        }
+        self.repository
+            .update_service(id, display_name, description, cost_per_unit)
+            .await
+            .map_err(|e| AdminError::InternalError(e.to_string()))
+    }
+
+    async fn delete_service(&self, id: uuid::Uuid) -> Result<(), AdminError> {
+        let deleted = self
+            .repository
+            .soft_delete_service(id)
+            .await
+            .map_err(|e| AdminError::InternalError(e.to_string()))?;
+        if !deleted {
+            return Err(AdminError::ModelNotFound(format!(
+                "Service {} not found or already inactive",
+                id
+            )));
+        }
+        Ok(())
     }
 }
 

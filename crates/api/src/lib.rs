@@ -5,6 +5,7 @@ pub mod models;
 pub mod openapi;
 pub mod routes;
 
+use crate::routes::web_search::{get_web_search, WebSearchRouteState};
 use crate::{
     middleware::{auth::auth_middleware_with_api_key, auth_middleware, AuthState},
     openapi::ApiDoc,
@@ -81,6 +82,8 @@ pub struct DomainServices {
     pub user_service: Arc<dyn services::user::UserServiceTrait + Send + Sync>,
     pub files_service: Arc<dyn services::files::FileServiceTrait + Send + Sync>,
     pub metrics_service: Arc<dyn services::metrics::MetricsServiceTrait>,
+    pub web_search_provider: Arc<dyn services::responses::tools::WebSearchProviderTrait>,
+    pub service_usage_service: Arc<services::service_usage::ServiceUsageService>,
 }
 
 /// Initialize database connection and run migrations
@@ -458,10 +461,25 @@ pub async fn init_domain_services_with_pool(
         inference_provider_pool.clone(),
         conversation_service.clone(),
         completion_service.clone(),
-        Some(web_search_provider), // web_search_provider
-        None,                      // file_search_provider
-        files_service.clone(),     // file_service
+        Some(web_search_provider.clone()), // web_search_provider
+        None,                              // file_search_provider
+        files_service.clone(),             // file_service
         organization_service.clone(),
+    ));
+
+    let service_repo = Arc::new(database::repositories::ServiceRepository::new(
+        database.pool().clone(),
+    ));
+    let org_service_usage_repo = Arc::new(
+        database::repositories::OrganizationServiceUsageRepository::new(database.pool().clone()),
+    );
+    let service_usage_repo = Arc::new(database::repositories::ServiceUsageRepositoryImpl::new(
+        service_repo,
+        org_service_usage_repo,
+    ))
+        as Arc<dyn services::service_usage::ports::ServiceUsageRepositoryTrait>;
+    let service_usage_service = Arc::new(services::service_usage::ServiceUsageService::new(
+        service_usage_repo,
     ));
 
     DomainServices {
@@ -478,6 +496,8 @@ pub async fn init_domain_services_with_pool(
         user_service,
         files_service,
         metrics_service,
+        web_search_provider,
+        service_usage_service,
     }
 }
 
@@ -714,6 +734,14 @@ pub fn build_app_with_config(
         domain_services.response_service,
         domain_services.attestation_service.clone(),
         &auth_components.auth_state_middleware,
+        usage_state.clone(),
+        rate_limit_state.clone(),
+    );
+
+    let web_search_routes = build_web_search_routes(
+        domain_services.web_search_provider.clone(),
+        domain_services.service_usage_service.clone(),
+        &auth_components.auth_state_middleware,
         usage_state,
         rate_limit_state.clone(),
     );
@@ -790,6 +818,7 @@ pub fn build_app_with_config(
                 .nest("/auth", auth_routes)
                 .merge(completion_routes)
                 .merge(response_routes)
+                .merge(web_search_routes)
                 .merge(conversation_routes)
                 .merge(management_routes)
                 .merge(workspace_routes)
@@ -1014,6 +1043,35 @@ pub fn build_response_routes(
     Router::new().merge(inference_routes).merge(other_routes)
 }
 
+/// Build web search routes (GET /web/search) with API Key auth and usage check
+pub fn build_web_search_routes(
+    web_search_provider: Arc<dyn services::responses::tools::WebSearchProviderTrait>,
+    service_usage_service: Arc<services::service_usage::ServiceUsageService>,
+    auth_state_middleware: &AuthState,
+    usage_state: middleware::UsageState,
+    rate_limit_state: middleware::RateLimitState,
+) -> Router {
+    let route_state = WebSearchRouteState {
+        web_search_provider,
+        service_usage_service,
+    };
+    Router::new()
+        .route("/web/search", get(get_web_search))
+        .with_state(route_state)
+        .layer(from_fn_with_state(
+            usage_state,
+            middleware::usage_check_middleware,
+        ))
+        .layer(from_fn_with_state(
+            rate_limit_state,
+            middleware::api_key_rate_limit_middleware,
+        ))
+        .layer(from_fn_with_state(
+            auth_state_middleware.clone(),
+            middleware::auth::auth_middleware_with_workspace_context,
+        ))
+}
+
 /// Build conversation routes with auth
 pub fn build_conversation_routes(
     conversation_service: Arc<services::ConversationService>,
@@ -1230,11 +1288,13 @@ pub fn build_admin_routes(
 ) -> Router {
     use crate::middleware::admin_middleware;
     use crate::routes::admin::{
-        batch_upsert_models, create_admin_access_token, delete_admin_access_token, delete_model,
-        get_model_history, get_organization_concurrent_limit, get_organization_limits_history,
-        get_organization_metrics, get_organization_timeseries, get_platform_metrics,
-        list_admin_access_tokens, list_models as admin_list_models, list_organizations, list_users,
-        update_organization_concurrent_limit, update_organization_limits, AdminAppState,
+        batch_upsert_models, create_admin_access_token, create_service, delete_admin_access_token,
+        delete_model, delete_service, get_model_history, get_organization_concurrent_limit,
+        get_organization_limits_history, get_organization_metrics, get_organization_timeseries,
+        get_platform_metrics, get_service_by_id, list_admin_access_tokens,
+        list_models as admin_list_models, list_organizations, list_services, list_users,
+        update_organization_concurrent_limit, update_organization_limits, update_service,
+        AdminAppState,
     };
     use database::repositories::{
         AdminAccessTokenRepository, AdminCompositeRepository, PgAnalyticsRepository,
@@ -1280,6 +1340,16 @@ pub fn build_admin_routes(
         .route(
             "/admin/models/{model_name}/history",
             axum::routing::get(get_model_history),
+        )
+        .route(
+            "/admin/services",
+            axum::routing::get(list_services).post(create_service),
+        )
+        .route(
+            "/admin/services/{id}",
+            axum::routing::get(get_service_by_id)
+                .patch(update_service)
+                .delete(delete_service),
         )
         .route(
             "/admin/organizations/{org_id}/limits",

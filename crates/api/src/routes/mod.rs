@@ -16,4 +16,5 @@ pub mod organizations;
 pub mod responses;
 pub mod usage;
 pub mod users;
+pub mod web_search;
 pub mod workspaces;

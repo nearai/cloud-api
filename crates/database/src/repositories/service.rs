@@ -183,10 +183,10 @@ impl ServiceRepository {
                     r#"
                     UPDATE services
                     SET
-                        display_name = COALESCE($2, (SELECT display_name FROM services WHERE id = $1)),
-                        description = COALESCE($3, (SELECT description FROM services WHERE id = $1)),
-                        cost_per_unit = COALESCE($4, (SELECT cost_per_unit FROM services WHERE id = $1)),
-                        is_active = COALESCE($5, (SELECT is_active FROM services WHERE id = $1)),
+                        display_name = COALESCE($2, display_name),
+                        description = COALESCE($3, description),
+                        cost_per_unit = COALESCE($4, cost_per_unit),
+                        is_active = COALESCE($5, is_active),
                         updated_at = NOW()
                     WHERE id = $1
                     RETURNING id, service_name, display_name, description, unit, cost_per_unit,

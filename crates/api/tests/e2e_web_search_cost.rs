@@ -9,7 +9,8 @@ use common::*;
 async fn test_web_search_cost_recorded_correctly() {
     let (server, _database) = setup_test_server_with_mock_web_search().await;
 
-    let org = create_org(&server).await;
+    // Org must have a spend limit or usage middleware returns 402
+    let org = setup_org_with_credits(&server, 10_000_000_000i64).await; // $10.00 USD
     let api_key = get_api_key_for_org(&server, org.id.clone()).await;
 
     // Create web_search service with known cost: 1_000_000 nano-USD per request

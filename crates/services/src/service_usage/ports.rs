@@ -31,6 +31,18 @@ impl TryFrom<&str> for ServiceUnit {
     }
 }
 
+/// Parameters for recording usage with pre-fetched pricing (avoids duplicate DB lookup).
+#[derive(Debug, Clone)]
+pub struct RecordServiceUsageWithPricingParams {
+    pub organization_id: Uuid,
+    pub workspace_id: Uuid,
+    pub api_key_id: Uuid,
+    pub service_id: Uuid,
+    pub cost_per_unit: i64,
+    pub quantity: i32,
+    pub inference_id: Option<Uuid>,
+}
+
 /// Parameters for recording one service usage row (and updating org balance).
 #[derive(Debug, Clone)]
 pub struct RecordServiceUsageParams {

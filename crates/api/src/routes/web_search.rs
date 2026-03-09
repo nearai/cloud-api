@@ -8,7 +8,9 @@ use axum::{
     response::Json as ResponseJson,
 };
 use services::responses::tools::{WebSearchParams, WebSearchProviderTrait};
-use services::service_usage::ports::SERVICE_NAME_WEB_SEARCH;
+use services::service_usage::ports::{
+    RecordServiceUsageWithPricingParams, SERVICE_NAME_WEB_SEARCH,
+};
 use services::service_usage::{ServiceUsageError, ServiceUsageService};
 use std::sync::Arc;
 use tracing::{debug, warn};
@@ -143,15 +145,15 @@ pub async fn get_web_search(
     let workspace_id = api_key.workspace.id.0;
     tokio::spawn(async move {
         if let Err(e) = usage_service
-            .record_service_usage_with_pricing(
+            .record_service_usage_with_pricing(&RecordServiceUsageWithPricingParams {
                 organization_id,
                 workspace_id,
                 api_key_id,
                 service_id,
                 cost_per_unit,
-                1,
-                None,
-            )
+                quantity: 1,
+                inference_id: None,
+            })
             .await
         {
             let variant = match &e {

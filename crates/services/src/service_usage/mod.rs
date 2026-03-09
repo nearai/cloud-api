@@ -1,6 +1,8 @@
 pub mod ports;
 
-use crate::service_usage::ports::{RecordServiceUsageParams, ServiceUsageRepositoryTrait};
+use crate::service_usage::ports::{
+    RecordServiceUsageParams, RecordServiceUsageWithPricingParams, ServiceUsageRepositoryTrait,
+};
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -52,7 +54,7 @@ impl ServiceUsageService {
             return Err(ServiceUsageError::ServiceNotFound(service_name.to_string()));
         };
 
-        self.record_service_usage_with_pricing(
+        self.record_service_usage_with_pricing(&RecordServiceUsageWithPricingParams {
             organization_id,
             workspace_id,
             api_key_id,
@@ -60,7 +62,7 @@ impl ServiceUsageService {
             cost_per_unit,
             quantity,
             inference_id,
-        )
+        })
         .await
     }
 
@@ -68,27 +70,21 @@ impl ServiceUsageService {
     /// has pricing from get_active_service_pricing to avoid duplicate DB lookups and TOCTOU.
     pub async fn record_service_usage_with_pricing(
         &self,
-        organization_id: Uuid,
-        workspace_id: Uuid,
-        api_key_id: Uuid,
-        service_id: Uuid,
-        cost_per_unit: i64,
-        quantity: i32,
-        inference_id: Option<Uuid>,
+        params: &RecordServiceUsageWithPricingParams,
     ) -> Result<(), ServiceUsageError> {
-        let total_cost = (quantity as i64)
-            .checked_mul(cost_per_unit)
+        let total_cost = (params.quantity as i64)
+            .checked_mul(params.cost_per_unit)
             .ok_or(ServiceUsageError::CostOverflow)?;
 
         self.repo
             .record_service_usage(&RecordServiceUsageParams {
-                organization_id,
-                workspace_id,
-                api_key_id,
-                service_id,
-                quantity,
+                organization_id: params.organization_id,
+                workspace_id: params.workspace_id,
+                api_key_id: params.api_key_id,
+                service_id: params.service_id,
+                quantity: params.quantity,
                 total_cost,
-                inference_id,
+                inference_id: params.inference_id,
             })
             .await
             .map_err(|e| ServiceUsageError::InternalError(e.to_string()))?;

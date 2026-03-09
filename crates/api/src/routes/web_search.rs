@@ -11,7 +11,7 @@ use services::responses::tools::{WebSearchParams, WebSearchProviderTrait};
 use services::service_usage::ports::{
     RecordServiceUsageWithPricingParams, SERVICE_NAME_WEB_SEARCH,
 };
-use services::service_usage::{ServiceUsageError, ServiceUsageService};
+use services::service_usage::{ServiceUsageError, ServiceUsageServiceTrait};
 use std::sync::Arc;
 use tracing::{debug, warn};
 use uuid::Uuid;
@@ -19,7 +19,7 @@ use uuid::Uuid;
 #[derive(Clone)]
 pub struct WebSearchRouteState {
     pub web_search_provider: Arc<dyn WebSearchProviderTrait>,
-    pub service_usage_service: Arc<ServiceUsageService>,
+    pub service_usage_service: Arc<dyn ServiceUsageServiceTrait + Send + Sync>,
 }
 
 /// GET /v1/web/search — proxy to Brave, record service usage. Returns 503 if web_search not configured.

@@ -55,6 +55,23 @@ pub struct RecordServiceUsageParams {
     pub inference_id: Option<Uuid>,
 }
 
+/// Port for the service usage service. Implemented by ServiceUsageService.
+#[async_trait]
+pub trait ServiceUsageServiceTrait: Send + Sync {
+    /// Check if a service is configured and active (for pricing). Returns Some((id, cost_per_unit)) or None.
+    async fn get_active_service_pricing(
+        &self,
+        service_name: &str,
+    ) -> anyhow::Result<Option<(Uuid, i64)>>;
+
+    /// Record usage using pre-fetched (service_id, cost_per_unit). Caller must obtain pricing
+    /// from get_active_service_pricing to avoid duplicate DB lookups and TOCTOU.
+    async fn record_service_usage_with_pricing(
+        &self,
+        params: &RecordServiceUsageWithPricingParams,
+    ) -> Result<(), super::ServiceUsageError>;
+}
+
 /// Port for recording platform service usage (e.g. web_search).
 /// Implemented by database layer; used by ServiceUsageService.
 #[async_trait]

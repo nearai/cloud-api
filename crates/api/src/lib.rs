@@ -83,7 +83,8 @@ pub struct DomainServices {
     pub files_service: Arc<dyn services::files::FileServiceTrait + Send + Sync>,
     pub metrics_service: Arc<dyn services::metrics::MetricsServiceTrait>,
     pub web_search_provider: Arc<dyn services::responses::tools::WebSearchProviderTrait>,
-    pub service_usage_service: Arc<services::service_usage::ServiceUsageService>,
+    pub service_usage_service:
+        Arc<dyn services::service_usage::ServiceUsageServiceTrait + Send + Sync>,
 }
 
 /// Initialize database connection and run migrations
@@ -550,6 +551,8 @@ pub async fn init_domain_services_with_mcp_factory(
 }
 
 /// Like `init_domain_services_with_pool` but use the given web search provider (for tests with mock).
+/// Rebuilds response_service so both the standalone web search route and Response API (web search
+/// tool) use the mock; otherwise response_service would still hold the original Brave provider.
 pub async fn init_domain_services_with_pool_and_web_search_provider(
     database: Arc<Database>,
     config: &ApiConfig,
@@ -559,14 +562,34 @@ pub async fn init_domain_services_with_pool_and_web_search_provider(
     web_search_provider: Arc<dyn services::responses::tools::WebSearchProviderTrait>,
 ) -> DomainServices {
     let mut domain_services = init_domain_services_with_pool(
-        database,
+        database.clone(),
         config,
-        organization_service,
-        inference_provider_pool,
+        organization_service.clone(),
+        inference_provider_pool.clone(),
         metrics_service,
     )
     .await;
+
+    let response_repo = Arc::new(database::PgResponseRepository::new(database.pool().clone()));
+    let response_items_repo = Arc::new(database::PgResponseItemsRepository::new(
+        database.pool().clone(),
+    ))
+        as Arc<dyn services::responses::ports::ResponseItemRepositoryTrait>;
+
+    let response_service = Arc::new(services::ResponseService::new(
+        response_repo,
+        response_items_repo,
+        inference_provider_pool,
+        domain_services.conversation_service.clone(),
+        domain_services.completion_service.clone(),
+        Some(web_search_provider.clone()),
+        None,
+        domain_services.files_service.clone(),
+        organization_service,
+    ));
+
     domain_services.web_search_provider = web_search_provider;
+    domain_services.response_service = response_service;
     domain_services
 }
 
@@ -1067,7 +1090,7 @@ pub fn build_response_routes(
 /// Build web search routes (GET /web/search) with API Key auth and usage check
 pub fn build_web_search_routes(
     web_search_provider: Arc<dyn services::responses::tools::WebSearchProviderTrait>,
-    service_usage_service: Arc<services::service_usage::ServiceUsageService>,
+    service_usage_service: Arc<dyn services::service_usage::ServiceUsageServiceTrait + Send + Sync>,
     auth_state_middleware: &AuthState,
     usage_state: middleware::UsageState,
     rate_limit_state: middleware::RateLimitState,

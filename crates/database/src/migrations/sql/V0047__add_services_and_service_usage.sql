@@ -3,7 +3,7 @@
 --
 -- organization_balance (from V0004) is updated when service usage is recorded:
 -- record_usage() inserts into organization_service_usage_log and upserts
--- organization_balance (total_spent += total_cost, total_requests += quantity).
+-- organization_balance (total_spent += total_cost).
 CREATE TABLE services (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     service_name VARCHAR(100) NOT NULL UNIQUE,

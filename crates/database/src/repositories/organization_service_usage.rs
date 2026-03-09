@@ -109,7 +109,6 @@ impl OrganizationServiceUsageRepository {
 
             let id = Uuid::new_v4();
             let now = Utc::now();
-            let quantity_i64 = i64::from(request.quantity);
 
             let maybe_row = transaction
                 .query_opt(
@@ -145,18 +144,16 @@ impl OrganizationServiceUsageRepository {
                             r#"
                             INSERT INTO organization_balance (
                                 organization_id, total_spent, last_usage_at, total_requests, total_tokens, updated_at
-                            ) VALUES ($1, $2, $3, $4, 0, $5)
+                            ) VALUES ($1, $2, $3, 0, 0, $4)
                             ON CONFLICT (organization_id) DO UPDATE SET
                                 total_spent = organization_balance.total_spent + $2,
-                                total_requests = organization_balance.total_requests + $4,
                                 last_usage_at = $3,
-                                updated_at = $5
+                                updated_at = $4
                             "#,
                             &[
                                 &request.organization_id,
                                 &request.total_cost,
                                 &now,
-                                &quantity_i64,
                                 &now,
                             ],
                         )

@@ -803,7 +803,8 @@ pub struct WebSearchResultItem {
     pub site_name: Option<String>,
 }
 
-/// Query parameters for GET /v1/web/search (aligned with Brave WebSearchParams)
+/// Query parameters for GET /v1/web/search (aligned with Brave WebSearchParams).
+/// See Brave Search API docs for full parameter semantics: https://api-dashboard.search.brave.com/documentation/services/web-search
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, utoipa::IntoParams)]
 pub struct WebSearchQueryParams {
     /// Search query (required)

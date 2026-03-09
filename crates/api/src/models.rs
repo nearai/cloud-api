@@ -2528,6 +2528,22 @@ pub struct AdminServiceResponse {
     pub updated_at: DateTime<Utc>,
 }
 
+impl From<services::admin::PlatformServiceInfo> for AdminServiceResponse {
+    fn from(info: services::admin::PlatformServiceInfo) -> Self {
+        AdminServiceResponse {
+            id: info.id,
+            service_name: info.service_name,
+            display_name: info.display_name,
+            description: info.description,
+            unit: info.unit,
+            cost_per_unit: info.cost_per_unit,
+            is_active: info.is_active,
+            created_at: info.created_at,
+            updated_at: info.updated_at,
+        }
+    }
+}
+
 /// Response for admin service list endpoint
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct AdminServiceListResponse {

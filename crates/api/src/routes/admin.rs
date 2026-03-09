@@ -1120,20 +1120,7 @@ pub async fn list_services(
                 )),
             )
         })?;
-    let services_api: Vec<AdminServiceResponse> = services
-        .into_iter()
-        .map(|s| AdminServiceResponse {
-            id: s.id,
-            service_name: s.service_name,
-            display_name: s.display_name,
-            description: s.description,
-            unit: s.unit,
-            cost_per_unit: s.cost_per_unit,
-            is_active: s.is_active,
-            created_at: s.created_at,
-            updated_at: s.updated_at,
-        })
-        .collect();
+    let services_api: Vec<AdminServiceResponse> = services.into_iter().map(Into::into).collect();
     Ok(ResponseJson(AdminServiceListResponse {
         services: services_api,
         limit: params.limit,
@@ -1181,17 +1168,7 @@ pub async fn get_service_by_id(
                 ),
             }
         })?;
-    Ok(ResponseJson(AdminServiceResponse {
-        id: s.id,
-        service_name: s.service_name,
-        display_name: s.display_name,
-        description: s.description,
-        unit: s.unit,
-        cost_per_unit: s.cost_per_unit,
-        is_active: s.is_active,
-        created_at: s.created_at,
-        updated_at: s.updated_at,
-    }))
+    Ok(ResponseJson(s.into()))
 }
 
 /// Create platform service (Admin only)
@@ -1243,17 +1220,7 @@ pub async fn create_service(
                 ),
             }
         })?;
-    Ok(ResponseJson(AdminServiceResponse {
-        id: s.id,
-        service_name: s.service_name,
-        display_name: s.display_name,
-        description: s.description,
-        unit: s.unit,
-        cost_per_unit: s.cost_per_unit,
-        is_active: s.is_active,
-        created_at: s.created_at,
-        updated_at: s.updated_at,
-    }))
+    Ok(ResponseJson(s.into()))
 }
 
 /// Update platform service (Admin only; display_name, description, cost_per_unit, is_active)
@@ -1308,17 +1275,7 @@ pub async fn update_service(
                 ),
             }
         })?;
-    Ok(ResponseJson(AdminServiceResponse {
-        id: s.id,
-        service_name: s.service_name,
-        display_name: s.display_name,
-        description: s.description,
-        unit: s.unit,
-        cost_per_unit: s.cost_per_unit,
-        is_active: s.is_active,
-        created_at: s.created_at,
-        updated_at: s.updated_at,
-    }))
+    Ok(ResponseJson(s.into()))
 }
 
 /// Create admin access token (Admin only)

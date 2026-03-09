@@ -144,7 +144,6 @@ use utoipa::{Modify, OpenApi};
         crate::routes::admin::get_service_by_id,
         crate::routes::admin::create_service,
         crate::routes::admin::update_service,
-        crate::routes::admin::delete_service,
         // Health check endpoint
         crate::routes::health::health_check,
         // Attestation endpoints

@@ -536,17 +536,14 @@ impl AdminRepository for AdminCompositeRepository {
         display_name: Option<&str>,
         description: Option<&str>,
         cost_per_unit: Option<i64>,
+        is_active: Option<bool>,
     ) -> Result<Option<PlatformServiceInfo>> {
         Ok(self
             .service_repo
-            .update(id, display_name, description, cost_per_unit)
+            .update(id, display_name, description, cost_per_unit, is_active)
             .await?
             .as_ref()
             .map(service_to_info)
             .transpose()?)
-    }
-
-    async fn soft_delete_service(&self, id: Uuid) -> Result<bool> {
-        self.service_repo.soft_delete(id).await
     }
 }

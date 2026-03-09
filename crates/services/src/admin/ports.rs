@@ -351,17 +351,15 @@ pub trait AdminRepository: Send + Sync {
         cost_per_unit: i64,
     ) -> Result<PlatformServiceInfo, anyhow::Error>;
 
-    /// Update platform service (display_name, description, cost_per_unit only)
+    /// Update platform service (display_name, description, cost_per_unit, is_active)
     async fn update_service(
         &self,
         id: uuid::Uuid,
         display_name: Option<&str>,
         description: Option<&str>,
         cost_per_unit: Option<i64>,
+        is_active: Option<bool>,
     ) -> Result<Option<PlatformServiceInfo>, anyhow::Error>;
-
-    /// Soft delete platform service (set is_active = false)
-    async fn soft_delete_service(&self, id: uuid::Uuid) -> Result<bool, anyhow::Error>;
 }
 
 /// Platform service info (for admin CRUD)
@@ -487,15 +485,13 @@ pub trait AdminService: Send + Sync {
         cost_per_unit: i64,
     ) -> Result<PlatformServiceInfo, AdminError>;
 
-    /// Update platform service (display_name, description, cost_per_unit only)
+    /// Update platform service (display_name, description, cost_per_unit, is_active)
     async fn update_service(
         &self,
         id: uuid::Uuid,
         display_name: Option<&str>,
         description: Option<&str>,
         cost_per_unit: Option<i64>,
+        is_active: Option<bool>,
     ) -> Result<Option<PlatformServiceInfo>, AdminError>;
-
-    /// Soft delete platform service (admin only)
-    async fn delete_service(&self, id: uuid::Uuid) -> Result<(), AdminError>;
 }

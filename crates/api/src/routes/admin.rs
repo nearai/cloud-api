@@ -1258,7 +1258,7 @@ pub async fn create_service(
     }))
 }
 
-/// Update platform service (Admin only; only display_name, description, cost_per_unit)
+/// Update platform service (Admin only; display_name, description, cost_per_unit, is_active)
 #[utoipa::path(
     patch,
     path = "/v1/admin/services/{id}",
@@ -1287,6 +1287,7 @@ pub async fn update_service(
             req.display_name.as_deref(),
             req.description.as_deref(),
             req.cost_per_unit,
+            req.is_active,
         )
         .await
         .map_err(|e| {
@@ -1328,48 +1329,6 @@ pub async fn update_service(
         created_at: s.created_at,
         updated_at: s.updated_at,
     }))
-}
-
-/// Soft delete platform service (Admin only)
-#[utoipa::path(
-    delete,
-    path = "/v1/admin/services/{id}",
-    tag = "Admin",
-    params(("id" = uuid::Uuid, Path, description = "Service ID")),
-    responses(
-        (status = 200, description = "Service deleted"),
-        (status = 401, description = "Unauthorized", body = ErrorResponse),
-        (status = 404, description = "Not found", body = ErrorResponse),
-        (status = 500, description = "Internal server error", body = ErrorResponse)
-    ),
-    security(("session_token" = []))
-)]
-pub async fn delete_service(
-    State(app_state): State<AdminAppState>,
-    Extension(_admin_user): Extension<AdminUser>,
-    Path(id): Path<uuid::Uuid>,
-) -> Result<StatusCode, (StatusCode, ResponseJson<ErrorResponse>)> {
-    app_state
-        .admin_service
-        .delete_service(id)
-        .await
-        .map_err(|e| {
-            error!("Failed to delete service: {:?}", e);
-            match e {
-                services::admin::AdminError::ModelNotFound(msg) => (
-                    StatusCode::NOT_FOUND,
-                    ResponseJson(ErrorResponse::new(msg, "not_found".to_string())),
-                ),
-                _ => (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    ResponseJson(ErrorResponse::new(
-                        "Failed to delete service".to_string(),
-                        "internal_server_error".to_string(),
-                    )),
-                ),
-            }
-        })?;
-    Ok(StatusCode::OK)
 }
 
 /// Create admin access token (Admin only)

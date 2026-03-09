@@ -160,7 +160,7 @@ impl ServiceRepository {
         Ok(self.row_to_service(&row))
     }
 
-    /// Update only display_name, description, cost_per_unit (service_name and unit immutable).
+    /// Update display_name, description, cost_per_unit, is_active (service_name and unit immutable).
     /// None means leave the column unchanged.
     pub async fn update(
         &self,
@@ -168,6 +168,7 @@ impl ServiceRepository {
         display_name: Option<&str>,
         description: Option<&str>,
         cost_per_unit: Option<i64>,
+        is_active: Option<bool>,
     ) -> Result<Option<Service>> {
         let row = retry_db!("update_service", {
             let client = self
@@ -185,46 +186,19 @@ impl ServiceRepository {
                         display_name = COALESCE($2, (SELECT display_name FROM services WHERE id = $1)),
                         description = COALESCE($3, (SELECT description FROM services WHERE id = $1)),
                         cost_per_unit = COALESCE($4, (SELECT cost_per_unit FROM services WHERE id = $1)),
+                        is_active = COALESCE($5, (SELECT is_active FROM services WHERE id = $1)),
                         updated_at = NOW()
                     WHERE id = $1
                     RETURNING id, service_name, display_name, description, unit, cost_per_unit,
                               is_active, created_at, updated_at
                     "#,
-                    &[&id, &display_name, &description, &cost_per_unit],
+                    &[&id, &display_name, &description, &cost_per_unit, &is_active],
                 )
                 .await
                 .map_err(map_db_error)
         })?;
 
         Ok(row.map(|r| self.row_to_service(&r)))
-    }
-
-    /// Soft delete: set is_active = false.
-    pub async fn soft_delete(&self, id: Uuid) -> Result<bool> {
-        let result = retry_db!("soft_delete_service", {
-            let client = self
-                .pool
-                .get()
-                .await
-                .context("Failed to get database connection")
-                .map_err(RepositoryError::PoolError)?;
-
-            let n = client
-                .execute(
-                    r#"
-                    UPDATE services
-                    SET is_active = false, updated_at = NOW()
-                    WHERE id = $1 AND is_active = true
-                    "#,
-                    &[&id],
-                )
-                .await
-                .map_err(map_db_error)?;
-
-            Ok::<_, RepositoryError>(n)
-        })?;
-
-        Ok(result > 0)
     }
 
     fn row_to_service(&self, row: &Row) -> Service {

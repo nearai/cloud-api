@@ -342,6 +342,7 @@ impl AdminService for AdminServiceImpl {
         display_name: Option<&str>,
         description: Option<&str>,
         cost_per_unit: Option<i64>,
+        is_active: Option<bool>,
     ) -> Result<Option<PlatformServiceInfo>, AdminError> {
         if let Some(c) = cost_per_unit {
             if c < 0 {
@@ -351,24 +352,9 @@ impl AdminService for AdminServiceImpl {
             }
         }
         self.repository
-            .update_service(id, display_name, description, cost_per_unit)
+            .update_service(id, display_name, description, cost_per_unit, is_active)
             .await
             .map_err(|e| AdminError::InternalError(e.to_string()))
-    }
-
-    async fn delete_service(&self, id: uuid::Uuid) -> Result<(), AdminError> {
-        let deleted = self
-            .repository
-            .soft_delete_service(id)
-            .await
-            .map_err(|e| AdminError::InternalError(e.to_string()))?;
-        if !deleted {
-            return Err(AdminError::ModelNotFound(format!(
-                "Service {} not found or already inactive",
-                id
-            )));
-        }
-        Ok(())
     }
 }
 

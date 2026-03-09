@@ -2550,7 +2550,7 @@ pub struct CreateServiceRequest {
     pub cost_per_unit: i64,
 }
 
-/// Request to update a platform service (admin; only display_name, description, cost_per_unit)
+/// Request to update a platform service (admin; display_name, description, cost_per_unit, is_active)
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct UpdateServiceRequest {
     #[serde(rename = "displayName")]
@@ -2558,6 +2558,8 @@ pub struct UpdateServiceRequest {
     pub description: Option<String>,
     #[serde(rename = "costPerUnit")]
     pub cost_per_unit: Option<i64>,
+    #[serde(rename = "isActive")]
+    pub is_active: Option<bool>,
 }
 
 /// Model with pricing information for admin listing

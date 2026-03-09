@@ -308,17 +308,12 @@ impl AdminService for AdminServiceImpl {
         service_name: &str,
         display_name: &str,
         description: Option<&str>,
-        unit: &str,
+        unit: crate::service_usage::ports::ServiceUnit,
         cost_per_unit: i64,
     ) -> Result<PlatformServiceInfo, AdminError> {
         if service_name.trim().is_empty() {
             return Err(AdminError::InvalidPricing(
                 "Service name cannot be empty".to_string(),
-            ));
-        }
-        if unit != "request" {
-            return Err(AdminError::InvalidPricing(
-                "Only unit 'request' is supported".to_string(),
             ));
         }
         if cost_per_unit < 0 {

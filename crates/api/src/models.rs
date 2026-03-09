@@ -6,6 +6,7 @@ use utoipa::ToSchema;
 
 // Re-export ResponseImageUrl from services to avoid duplication
 pub use services::responses::models::ResponseImageUrl;
+pub use services::service_usage::ports::ServiceUnit;
 
 // Streaming response models
 #[derive(Debug, Serialize, Deserialize)]
@@ -2516,7 +2517,7 @@ pub struct AdminServiceResponse {
     #[serde(rename = "displayName")]
     pub display_name: String,
     pub description: Option<String>,
-    pub unit: String,
+    pub unit: ServiceUnit,
     #[serde(rename = "costPerUnit")]
     pub cost_per_unit: i64,
     #[serde(rename = "isActive")]
@@ -2544,7 +2545,7 @@ pub struct CreateServiceRequest {
     #[serde(rename = "displayName")]
     pub display_name: String,
     pub description: Option<String>,
-    pub unit: String,
+    pub unit: ServiceUnit,
     #[serde(rename = "costPerUnit")]
     pub cost_per_unit: i64,
 }

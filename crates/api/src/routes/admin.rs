@@ -1225,7 +1225,7 @@ pub async fn create_service(
             &req.service_name,
             &req.display_name,
             req.description.as_deref(),
-            &req.unit,
+            req.unit,
             req.cost_per_unit,
         )
         .await

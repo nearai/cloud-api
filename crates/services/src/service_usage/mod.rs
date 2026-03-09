@@ -22,12 +22,12 @@ impl ServiceUsageService {
         Self { repo }
     }
 
-    /// Check if a service is configured and active (for billing). Returns Some((id, cost_per_unit)) or None.
-    pub async fn get_active_service_billing(
+    /// Check if a service is configured and active (for pricing). Returns Some((id, cost_per_unit)) or None.
+    pub async fn get_active_service_pricing(
         &self,
         service_name: &str,
     ) -> anyhow::Result<Option<(Uuid, i64)>> {
-        self.repo.get_active_service_billing(service_name).await
+        self.repo.get_active_service_pricing(service_name).await
     }
 
     /// Record one or more units of service usage. Returns error if service is not configured.
@@ -42,7 +42,7 @@ impl ServiceUsageService {
     ) -> Result<(), ServiceUsageError> {
         let Some((service_id, cost_per_unit)) = self
             .repo
-            .get_active_service_billing(service_name)
+            .get_active_service_pricing(service_name)
             .await
             .map_err(|e| ServiceUsageError::ServiceNotFound(e.to_string()))?
         else {

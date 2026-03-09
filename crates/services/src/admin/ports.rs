@@ -1,3 +1,4 @@
+use crate::service_usage::ports::ServiceUnit;
 use async_trait::async_trait;
 
 /// Request to update model pricing and metadata
@@ -346,7 +347,7 @@ pub trait AdminRepository: Send + Sync {
         service_name: &str,
         display_name: &str,
         description: Option<&str>,
-        unit: &str,
+        unit: ServiceUnit,
         cost_per_unit: i64,
     ) -> Result<PlatformServiceInfo, anyhow::Error>;
 
@@ -370,7 +371,7 @@ pub struct PlatformServiceInfo {
     pub service_name: String,
     pub display_name: String,
     pub description: Option<String>,
-    pub unit: String,
+    pub unit: ServiceUnit,
     pub cost_per_unit: i64,
     pub is_active: bool,
     pub created_at: chrono::DateTime<chrono::Utc>,
@@ -482,7 +483,7 @@ pub trait AdminService: Send + Sync {
         service_name: &str,
         display_name: &str,
         description: Option<&str>,
-        unit: &str,
+        unit: ServiceUnit,
         cost_per_unit: i64,
     ) -> Result<PlatformServiceInfo, AdminError>;
 

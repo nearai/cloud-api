@@ -8,6 +8,7 @@ use axum::{
     response::Json as ResponseJson,
 };
 use services::responses::tools::{WebSearchParams, WebSearchProviderTrait};
+use services::service_usage::ports::SERVICE_NAME_WEB_SEARCH;
 use services::service_usage::{ServiceUsageError, ServiceUsageService};
 use std::sync::Arc;
 use tracing::debug;
@@ -54,7 +55,7 @@ pub async fn get_web_search(
     // Require web_search service to be configured before calling Brave
     let _billing = state
         .service_usage_service
-        .get_active_service_billing("web_search")
+        .get_active_service_pricing(SERVICE_NAME_WEB_SEARCH)
         .await
         .map_err(|e| {
             (
@@ -137,7 +138,7 @@ pub async fn get_web_search(
             api_key.organization.id.0,
             api_key.workspace.id.0,
             api_key_id,
-            "web_search",
+            SERVICE_NAME_WEB_SEARCH,
             1,
             None,
         )

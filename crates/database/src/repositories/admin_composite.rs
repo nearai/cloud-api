@@ -11,6 +11,7 @@ use services::admin::{
     OrganizationLimits, OrganizationLimitsHistoryEntry, OrganizationLimitsUpdate,
     PlatformServiceInfo, UpdateModelAdminRequest, UserInfo, UserOrganizationInfo,
 };
+use services::service_usage::ports::ServiceUnit;
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -38,18 +39,19 @@ impl AdminCompositeRepository {
     }
 }
 
-fn service_to_info(s: &crate::models::Service) -> PlatformServiceInfo {
-    PlatformServiceInfo {
+fn service_to_info(s: &crate::models::Service) -> Result<PlatformServiceInfo, anyhow::Error> {
+    let unit = ServiceUnit::try_from(s.unit.as_str()).map_err(|e| anyhow::anyhow!("{}", e))?;
+    Ok(PlatformServiceInfo {
         id: s.id,
         service_name: s.service_name.clone(),
         display_name: s.display_name.clone(),
         description: s.description.clone(),
-        unit: s.unit.clone(),
+        unit,
         cost_per_unit: s.cost_per_unit,
         is_active: s.is_active,
         created_at: s.created_at,
         updated_at: s.updated_at,
-    }
+    })
 }
 
 #[async_trait]
@@ -490,7 +492,11 @@ impl AdminRepository for AdminCompositeRepository {
             .service_repo
             .list(include_inactive, limit, offset)
             .await?;
-        Ok((services.iter().map(service_to_info).collect(), total))
+        let infos: Vec<PlatformServiceInfo> = services
+            .iter()
+            .map(service_to_info)
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok((infos, total))
     }
 
     async fn get_service_by_id(&self, id: Uuid) -> Result<Option<PlatformServiceInfo>> {
@@ -499,7 +505,8 @@ impl AdminRepository for AdminCompositeRepository {
             .get_by_id(id)
             .await?
             .as_ref()
-            .map(service_to_info))
+            .map(service_to_info)
+            .transpose()?)
     }
 
     async fn create_service(
@@ -507,14 +514,20 @@ impl AdminRepository for AdminCompositeRepository {
         service_name: &str,
         display_name: &str,
         description: Option<&str>,
-        unit: &str,
+        unit: ServiceUnit,
         cost_per_unit: i64,
     ) -> Result<PlatformServiceInfo> {
         let s = self
             .service_repo
-            .create(service_name, display_name, description, unit, cost_per_unit)
+            .create(
+                service_name,
+                display_name,
+                description,
+                unit.as_str(),
+                cost_per_unit,
+            )
             .await?;
-        Ok(service_to_info(&s))
+        service_to_info(&s)
     }
 
     async fn update_service(
@@ -529,7 +542,8 @@ impl AdminRepository for AdminCompositeRepository {
             .update(id, display_name, description, cost_per_unit)
             .await?
             .as_ref()
-            .map(service_to_info))
+            .map(service_to_info)
+            .transpose()?)
     }
 
     async fn soft_delete_service(&self, id: Uuid) -> Result<bool> {

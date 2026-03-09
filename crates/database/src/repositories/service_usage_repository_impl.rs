@@ -26,7 +26,7 @@ impl ServiceUsageRepositoryImpl {
 
 #[async_trait]
 impl ServiceUsageRepositoryTrait for ServiceUsageRepositoryImpl {
-    async fn get_active_service_billing(
+    async fn get_active_service_pricing(
         &self,
         service_name: &str,
     ) -> anyhow::Result<Option<(Uuid, i64)>> {

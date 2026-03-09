@@ -211,6 +211,8 @@ pub struct AdminOrganizationInfo {
 pub enum AdminError {
     #[error("Model not found: {0}")]
     ModelNotFound(String),
+    #[error("Service not found: {0}")]
+    ServiceNotFound(String),
     #[error("Organization not found: {0}")]
     OrganizationNotFound(String),
     #[error("Invalid pricing data: {0}")]
@@ -469,11 +471,8 @@ pub trait AdminService: Send + Sync {
         offset: i64,
     ) -> Result<(Vec<PlatformServiceInfo>, i64), AdminError>;
 
-    /// Get platform service by id (admin only)
-    async fn get_service_by_id(
-        &self,
-        id: uuid::Uuid,
-    ) -> Result<Option<PlatformServiceInfo>, AdminError>;
+    /// Get platform service by id (admin only). Returns ServiceNotFound if missing.
+    async fn get_service_by_id(&self, id: uuid::Uuid) -> Result<PlatformServiceInfo, AdminError>;
 
     /// Create a platform service (admin only)
     async fn create_service(
@@ -485,7 +484,7 @@ pub trait AdminService: Send + Sync {
         cost_per_unit: i64,
     ) -> Result<PlatformServiceInfo, AdminError>;
 
-    /// Update platform service (display_name, description, cost_per_unit, is_active)
+    /// Update platform service (display_name, description, cost_per_unit, is_active). Returns ServiceNotFound if missing.
     async fn update_service(
         &self,
         id: uuid::Uuid,
@@ -493,5 +492,5 @@ pub trait AdminService: Send + Sync {
         description: Option<&str>,
         cost_per_unit: Option<i64>,
         is_active: Option<bool>,
-    ) -> Result<Option<PlatformServiceInfo>, AdminError>;
+    ) -> Result<PlatformServiceInfo, AdminError>;
 }

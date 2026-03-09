@@ -1161,32 +1161,26 @@ pub async fn get_service_by_id(
     Extension(_admin_user): Extension<AdminUser>,
     Path(id): Path<uuid::Uuid>,
 ) -> Result<ResponseJson<AdminServiceResponse>, (StatusCode, ResponseJson<ErrorResponse>)> {
-    let service = app_state
+    let s = app_state
         .admin_service
         .get_service_by_id(id)
         .await
         .map_err(|e| {
             error!("Failed to get service: {:?}", e);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                ResponseJson(ErrorResponse::new(
-                    "Failed to retrieve service".to_string(),
-                    "internal_server_error".to_string(),
-                )),
-            )
+            match e {
+                services::admin::AdminError::ServiceNotFound(msg) => (
+                    StatusCode::NOT_FOUND,
+                    ResponseJson(ErrorResponse::new(msg, "not_found".to_string())),
+                ),
+                _ => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    ResponseJson(ErrorResponse::new(
+                        "Failed to retrieve service".to_string(),
+                        "internal_server_error".to_string(),
+                    )),
+                ),
+            }
         })?;
-    let s = match service {
-        Some(s) => s,
-        None => {
-            return Err((
-                StatusCode::NOT_FOUND,
-                ResponseJson(ErrorResponse::new(
-                    "Service not found".to_string(),
-                    "not_found".to_string(),
-                )),
-            ));
-        }
-    };
     Ok(ResponseJson(AdminServiceResponse {
         id: s.id,
         service_name: s.service_name,
@@ -1235,6 +1229,10 @@ pub async fn create_service(
                 services::admin::AdminError::InvalidPricing(msg) => (
                     StatusCode::BAD_REQUEST,
                     ResponseJson(ErrorResponse::new(msg, "invalid_request".to_string())),
+                ),
+                services::admin::AdminError::ServiceNotFound(msg) => (
+                    StatusCode::NOT_FOUND,
+                    ResponseJson(ErrorResponse::new(msg, "not_found".to_string())),
                 ),
                 _ => (
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -1297,6 +1295,10 @@ pub async fn update_service(
                     StatusCode::BAD_REQUEST,
                     ResponseJson(ErrorResponse::new(msg, "invalid_request".to_string())),
                 ),
+                services::admin::AdminError::ServiceNotFound(msg) => (
+                    StatusCode::NOT_FOUND,
+                    ResponseJson(ErrorResponse::new(msg, "not_found".to_string())),
+                ),
                 _ => (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     ResponseJson(ErrorResponse::new(
@@ -1306,18 +1308,6 @@ pub async fn update_service(
                 ),
             }
         })?;
-    let s = match s {
-        Some(s) => s,
-        None => {
-            return Err((
-                StatusCode::NOT_FOUND,
-                ResponseJson(ErrorResponse::new(
-                    "Service not found".to_string(),
-                    "not_found".to_string(),
-                )),
-            ));
-        }
-    };
     Ok(ResponseJson(AdminServiceResponse {
         id: s.id,
         service_name: s.service_name,

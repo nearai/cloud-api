@@ -293,14 +293,12 @@ impl AdminService for AdminServiceImpl {
             .map_err(|e| AdminError::InternalError(e.to_string()))
     }
 
-    async fn get_service_by_id(
-        &self,
-        id: uuid::Uuid,
-    ) -> Result<Option<PlatformServiceInfo>, AdminError> {
+    async fn get_service_by_id(&self, id: uuid::Uuid) -> Result<PlatformServiceInfo, AdminError> {
         self.repository
             .get_service_by_id(id)
             .await
-            .map_err(|e| AdminError::InternalError(e.to_string()))
+            .map_err(|e| AdminError::InternalError(e.to_string()))?
+            .ok_or_else(|| AdminError::ServiceNotFound(format!("Service {id} not found")))
     }
 
     async fn create_service(
@@ -343,7 +341,7 @@ impl AdminService for AdminServiceImpl {
         description: Option<&str>,
         cost_per_unit: Option<i64>,
         is_active: Option<bool>,
-    ) -> Result<Option<PlatformServiceInfo>, AdminError> {
+    ) -> Result<PlatformServiceInfo, AdminError> {
         if let Some(c) = cost_per_unit {
             if c < 0 {
                 return Err(AdminError::InvalidPricing(
@@ -354,7 +352,8 @@ impl AdminService for AdminServiceImpl {
         self.repository
             .update_service(id, display_name, description, cost_per_unit, is_active)
             .await
-            .map_err(|e| AdminError::InternalError(e.to_string()))
+            .map_err(|e| AdminError::InternalError(e.to_string()))?
+            .ok_or_else(|| AdminError::ServiceNotFound(format!("Service {id} not found")))
     }
 }
 

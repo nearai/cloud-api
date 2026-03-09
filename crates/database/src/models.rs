@@ -666,6 +666,7 @@ pub struct Service {
     pub display_name: String,
     pub description: Option<String>,
     pub unit: String,
+    /// Price per unit in nano-USD (scale 9).
     pub cost_per_unit: i64,
     pub is_active: bool,
     pub created_at: DateTime<Utc>,

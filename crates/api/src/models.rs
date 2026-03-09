@@ -2518,6 +2518,7 @@ pub struct AdminServiceResponse {
     pub display_name: String,
     pub description: Option<String>,
     pub unit: ServiceUnit,
+    /// Price per unit in nano-USD (scale 9).
     #[serde(rename = "costPerUnit")]
     pub cost_per_unit: i64,
     #[serde(rename = "isActive")]
@@ -2562,6 +2563,7 @@ pub struct CreateServiceRequest {
     pub display_name: String,
     pub description: Option<String>,
     pub unit: ServiceUnit,
+    /// Price per unit in nano-USD (scale 9).
     #[serde(rename = "costPerUnit")]
     pub cost_per_unit: i64,
 }
@@ -2572,6 +2574,7 @@ pub struct UpdateServiceRequest {
     #[serde(rename = "displayName")]
     pub display_name: Option<String>,
     pub description: Option<String>,
+    /// Price per unit in nano-USD (scale 9).
     #[serde(rename = "costPerUnit")]
     pub cost_per_unit: Option<i64>,
     #[serde(rename = "isActive")]

@@ -372,6 +372,7 @@ pub struct PlatformServiceInfo {
     pub display_name: String,
     pub description: Option<String>,
     pub unit: ServiceUnit,
+    /// Price per unit in nano-USD (scale 9).
     pub cost_per_unit: i64,
     pub is_active: bool,
     pub created_at: chrono::DateTime<chrono::Utc>,

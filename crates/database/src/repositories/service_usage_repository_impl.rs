@@ -58,12 +58,13 @@ impl ServiceUsageRepositoryTrait for ServiceUsageRepositoryImpl {
         limit: i64,
         offset: i64,
     ) -> anyhow::Result<(Vec<ServiceUsageLogEntry>, i64)> {
-        // Resolve service_name to service_id if provided; only active services are considered.
+        // Resolve service_name to service_id if provided; include inactive services so that
+        // history and billing remain accurate even after a service is deactivated.
         let service_id = if let Some(name) = service_name {
-            match self.service_repo.get_active_by_name(name).await? {
+            match self.service_repo.get_by_name_any_status(name).await? {
                 Some(service) => Some(service.id),
                 None => {
-                    // No active service with this name; return empty result.
+                    // No service with this name; return empty result.
                     return Ok((Vec::new(), 0));
                 }
             }

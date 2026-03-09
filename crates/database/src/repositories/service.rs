@@ -71,6 +71,33 @@ impl ServiceRepository {
         Ok(rows.first().map(|row| self.row_to_service(row)))
     }
 
+    /// Get service by service_name regardless of active status (for history/billing lookups).
+    pub async fn get_by_name_any_status(&self, service_name: &str) -> Result<Option<Service>> {
+        let rows = retry_db!("get_service_by_name_any_status", {
+            let client = self
+                .pool
+                .get()
+                .await
+                .context("Failed to get database connection")
+                .map_err(RepositoryError::PoolError)?;
+
+            client
+                .query(
+                    r#"
+                    SELECT id, service_name, display_name, description, unit, cost_per_unit,
+                           is_active, created_at, updated_at
+                    FROM services
+                    WHERE service_name = $1
+                    "#,
+                    &[&service_name],
+                )
+                .await
+                .map_err(map_db_error)
+        })?;
+
+        Ok(rows.first().map(|row| self.row_to_service(row)))
+    }
+
     /// List services with pagination. When include_inactive is false, only active.
     pub async fn list(
         &self,

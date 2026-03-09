@@ -347,6 +347,21 @@ impl TokenUsage {
         }
     }
 
+    /// Same as `new` but with `prompt_tokens_details.cached_tokens` set for cache-hit testing.
+    pub fn new_with_cache(prompt_tokens: i32, completion_tokens: i32, cached_tokens: i32) -> Self {
+        let details = if cached_tokens != 0 {
+            Some(serde_json::json!({ "cached_tokens": cached_tokens }))
+        } else {
+            None
+        };
+        Self {
+            prompt_tokens,
+            completion_tokens,
+            total_tokens: prompt_tokens + completion_tokens,
+            prompt_tokens_details: details,
+        }
+    }
+
     /// Number of prompt tokens that were cache hits (OpenAI-style prompt_tokens_details.cached_tokens).
     /// Returns 0 if missing or invalid.
     /// Clamps to [0, prompt_tokens] to avoid invalid usage when providers report inconsistent values.

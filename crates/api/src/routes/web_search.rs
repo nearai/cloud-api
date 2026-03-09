@@ -140,32 +140,27 @@ pub async fn get_web_search(
         )
     })?;
 
-    // Record usage in background (same pattern as completions): don't block response on DB write.
-    // Use pre-fetched (service_id, cost_per_unit) to avoid duplicate get_active_service_pricing.
-    let usage_service = state.service_usage_service.clone();
-    let organization_id = api_key.organization.id.0;
-    let workspace_id = api_key.workspace.id.0;
-    tokio::spawn(async move {
-        if let Err(e) = usage_service
-            .record_service_usage_with_pricing(&RecordServiceUsageWithPricingParams {
-                organization_id,
-                workspace_id,
-                api_key_id,
-                service_id,
-                cost_per_unit,
-                quantity: 1,
-                inference_id: None,
-            })
-            .await
-        {
-            let variant = match &e {
-                ServiceUsageError::ServiceNotFound(_) => "service_not_found",
-                ServiceUsageError::InternalError(_) => "internal_error",
-                ServiceUsageError::CostOverflow => "cost_overflow",
-            };
-            warn!(error_variant = variant, "Failed to record web search usage");
-        }
-    });
+    // Pricing was pre-fetched to avoid duplicate lookups.
+    if let Err(e) = state
+        .service_usage_service
+        .record_service_usage_with_pricing(&RecordServiceUsageWithPricingParams {
+            organization_id: api_key.organization.id.0,
+            workspace_id: api_key.workspace.id.0,
+            api_key_id,
+            service_id,
+            cost_per_unit,
+            quantity: 1,
+            inference_id: None,
+        })
+        .await
+    {
+        let variant = match &e {
+            ServiceUsageError::ServiceNotFound(_) => "service_not_found",
+            ServiceUsageError::InternalError(_) => "internal_error",
+            ServiceUsageError::CostOverflow => "cost_overflow",
+        };
+        warn!(error_variant = variant, "Failed to record web search usage");
+    }
 
     Ok(ResponseJson(response))
 }

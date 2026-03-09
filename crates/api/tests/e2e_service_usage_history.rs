@@ -57,9 +57,6 @@ async fn test_service_usage_history_web_search() {
         );
     }
 
-    // Allow background record_service_usage task to complete before asserting history
-    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-
     // Unfiltered service-usage history
     let history_after = server
         .get(

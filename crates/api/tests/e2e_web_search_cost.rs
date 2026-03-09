@@ -39,9 +39,6 @@ async fn test_web_search_cost_recorded_correctly() {
         search_response.text()
     );
 
-    // Allow background record_service_usage task to complete before asserting balance
-    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-
     // Balance after: total_spent should be 1 request * 1_000_000 nano-USD
     let balance_after = server
         .get(format!("/v1/organizations/{}/usage/balance", org.id).as_str())

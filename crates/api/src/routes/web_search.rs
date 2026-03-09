@@ -62,10 +62,12 @@ pub async fn get_web_search(
         .get_active_service_pricing(SERVICE_NAME_WEB_SEARCH)
         .await
         .map_err(|e| {
+            // Log internal error details server-side; return generic message to client.
+            warn!(error = ?e, "Failed to get active service pricing for web_search");
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 ResponseJson(crate::models::ErrorResponse::new(
-                    e.to_string(),
+                    "Internal server error".to_string(),
                     "internal_server_error".to_string(),
                 )),
             )

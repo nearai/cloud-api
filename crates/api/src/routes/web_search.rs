@@ -11,7 +11,7 @@ use services::responses::tools::{WebSearchParams, WebSearchProviderTrait};
 use services::service_usage::ports::SERVICE_NAME_WEB_SEARCH;
 use services::service_usage::{ServiceUsageError, ServiceUsageService};
 use std::sync::Arc;
-use tracing::debug;
+use tracing::{debug, warn};
 use uuid::Uuid;
 
 #[derive(Clone)]
@@ -53,8 +53,9 @@ pub async fn get_web_search(
     }
 
     // Require web_search service to be configured before calling the external search API.
-    // This avoids wasting provider credits and returning 503 after we already have results.
-    let _pricing = state
+    // Pre-fetch (service_id, cost_per_unit) once; pass to record_service_usage_with_pricing
+    // to avoid duplicate DB lookups and TOCTOU.
+    let pricing = state
         .service_usage_service
         .get_active_service_pricing(SERVICE_NAME_WEB_SEARCH)
         .await
@@ -67,7 +68,7 @@ pub async fn get_web_search(
                 )),
             )
         })?;
-    let Some(_) = _pricing else {
+    let Some((service_id, cost_per_unit)) = pricing else {
         return Err((
             StatusCode::SERVICE_UNAVAILABLE,
             ResponseJson(crate::models::ErrorResponse::new(
@@ -134,39 +135,33 @@ pub async fn get_web_search(
             )),
         )
     })?;
-    if let Err(e) = state
-        .service_usage_service
-        .record_service_usage(
-            api_key.organization.id.0,
-            api_key.workspace.id.0,
-            api_key_id,
-            SERVICE_NAME_WEB_SEARCH,
-            1,
-            None,
-        )
-        .await
-    {
-        match &e {
-            ServiceUsageError::ServiceNotFound(_) => {
-                return Err((
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    ResponseJson(crate::models::ErrorResponse::new(
-                        "Web search is not configured".to_string(),
-                        "service_unavailable".to_string(),
-                    )),
-                ));
-            }
-            ServiceUsageError::InternalError(_) | ServiceUsageError::CostOverflow => {
-                return Err((
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    ResponseJson(crate::models::ErrorResponse::new(
-                        "Failed to record usage".to_string(),
-                        "internal_server_error".to_string(),
-                    )),
-                ));
-            }
+
+    // Record usage in background (same pattern as completions): don't block response on DB write.
+    // Use pre-fetched (service_id, cost_per_unit) to avoid duplicate get_active_service_pricing.
+    let usage_service = state.service_usage_service.clone();
+    let organization_id = api_key.organization.id.0;
+    let workspace_id = api_key.workspace.id.0;
+    tokio::spawn(async move {
+        if let Err(e) = usage_service
+            .record_service_usage_with_pricing(
+                organization_id,
+                workspace_id,
+                api_key_id,
+                service_id,
+                cost_per_unit,
+                1,
+                None,
+            )
+            .await
+        {
+            let variant = match &e {
+                ServiceUsageError::ServiceNotFound(_) => "service_not_found",
+                ServiceUsageError::InternalError(_) => "internal_error",
+                ServiceUsageError::CostOverflow => "cost_overflow",
+            };
+            warn!(error_variant = variant, "Failed to record web search usage");
         }
-    }
+    });
 
     Ok(ResponseJson(response))
 }

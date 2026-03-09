@@ -15,6 +15,7 @@ pub enum ServiceUsageError {
 }
 
 /// Records platform-level service usage (e.g. web_search) and updates org balance.
+#[derive(Clone)]
 pub struct ServiceUsageService {
     repo: Arc<dyn ServiceUsageRepositoryTrait>,
 }
@@ -32,7 +33,7 @@ impl ServiceUsageService {
         self.repo.get_active_service_pricing(service_name).await
     }
 
-    /// Record one or more units of service usage. Returns error if service is not configured.
+    /// Record one or more units of service usage. Looks up pricing by service_name.
     pub async fn record_service_usage(
         &self,
         organization_id: Uuid,
@@ -51,6 +52,30 @@ impl ServiceUsageService {
             return Err(ServiceUsageError::ServiceNotFound(service_name.to_string()));
         };
 
+        self.record_service_usage_with_pricing(
+            organization_id,
+            workspace_id,
+            api_key_id,
+            service_id,
+            cost_per_unit,
+            quantity,
+            inference_id,
+        )
+        .await
+    }
+
+    /// Record usage using pre-fetched (service_id, cost_per_unit). Use when caller already
+    /// has pricing from get_active_service_pricing to avoid duplicate DB lookups and TOCTOU.
+    pub async fn record_service_usage_with_pricing(
+        &self,
+        organization_id: Uuid,
+        workspace_id: Uuid,
+        api_key_id: Uuid,
+        service_id: Uuid,
+        cost_per_unit: i64,
+        quantity: i32,
+        inference_id: Option<Uuid>,
+    ) -> Result<(), ServiceUsageError> {
         let total_cost = (quantity as i64)
             .checked_mul(cost_per_unit)
             .ok_or(ServiceUsageError::CostOverflow)?;

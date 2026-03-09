@@ -1207,10 +1207,6 @@ pub async fn create_service(
                     StatusCode::BAD_REQUEST,
                     ResponseJson(ErrorResponse::new(msg, "invalid_request".to_string())),
                 ),
-                services::admin::AdminError::ServiceNotFound(msg) => (
-                    StatusCode::NOT_FOUND,
-                    ResponseJson(ErrorResponse::new(msg, "not_found".to_string())),
-                ),
                 _ => (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     ResponseJson(ErrorResponse::new(

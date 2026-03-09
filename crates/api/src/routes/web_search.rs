@@ -140,7 +140,8 @@ pub async fn get_web_search(
         )
     })?;
 
-    // Pricing was pre-fetched to avoid duplicate lookups.
+    // Pricing was pre-fetched to avoid duplicate lookups. If billing fails here,
+    // return 500 to avoid serving unbilled search results.
     if let Err(e) = state
         .service_usage_service
         .record_service_usage_with_pricing(&RecordServiceUsageWithPricingParams {
@@ -160,6 +161,13 @@ pub async fn get_web_search(
             ServiceUsageError::CostOverflow => "cost_overflow",
         };
         warn!(error_variant = variant, "Failed to record web search usage");
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            ResponseJson(crate::models::ErrorResponse::new(
+                "Failed to record service usage".to_string(),
+                "internal_server_error".to_string(),
+            )),
+        ));
     }
 
     Ok(ResponseJson(response))

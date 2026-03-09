@@ -52,6 +52,31 @@ pub async fn get_web_search(
         ));
     }
 
+    // Require web_search service to be configured before calling the external search API.
+    // This avoids wasting provider credits and returning 503 after we already have results.
+    let _pricing = state
+        .service_usage_service
+        .get_active_service_pricing(SERVICE_NAME_WEB_SEARCH)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ResponseJson(crate::models::ErrorResponse::new(
+                    e.to_string(),
+                    "internal_server_error".to_string(),
+                )),
+            )
+        })?;
+    let Some(_) = _pricing else {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            ResponseJson(crate::models::ErrorResponse::new(
+                "Web search is not configured".to_string(),
+                "service_unavailable".to_string(),
+            )),
+        ));
+    };
+
     let search_params = WebSearchParams {
         query: params.q.clone(),
         country: params.country,

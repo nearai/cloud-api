@@ -46,7 +46,7 @@ impl ServiceUsageService {
             .repo
             .get_active_service_pricing(service_name)
             .await
-            .map_err(|e| ServiceUsageError::ServiceNotFound(e.to_string()))?
+            .map_err(|e| ServiceUsageError::InternalError(e.to_string()))?
         else {
             return Err(ServiceUsageError::ServiceNotFound(service_name.to_string()));
         };

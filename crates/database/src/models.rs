@@ -655,6 +655,39 @@ pub struct RecordUsageRequest {
 }
 
 // ============================================
+// Services & Service Usage (platform-level forwarding billing)
+// ============================================
+
+/// Platform-level service (e.g. web_search). Used for forwarding billing.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Service {
+    pub id: Uuid,
+    pub service_name: String,
+    pub display_name: String,
+    pub description: Option<String>,
+    pub unit: String,
+    /// Price per unit in nano-USD (scale 9).
+    pub cost_per_unit: i64,
+    pub is_active: bool,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// One row in organization_service_usage_log (service usage, nano-USD).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OrganizationServiceUsageLog {
+    pub id: Uuid,
+    pub organization_id: Uuid,
+    pub workspace_id: Uuid,
+    pub api_key_id: Uuid,
+    pub service_id: Uuid,
+    pub quantity: i32,
+    pub total_cost: i64,
+    pub inference_id: Option<Uuid>,
+    pub created_at: DateTime<Utc>,
+}
+
+// ============================================
 // File Storage Models
 // ============================================
 

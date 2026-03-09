@@ -1,15 +1,17 @@
 use crate::models::{UpdateModelPricingRequest, UpdateOrganizationLimitsDbRequest};
 use crate::pool::DbPool;
 use crate::repositories::{
-    ModelAliasRepository, ModelRepository, OrganizationLimitsRepository, UserRepository,
+    ModelAliasRepository, ModelRepository, OrganizationLimitsRepository, ServiceRepository,
+    UserRepository,
 };
 use anyhow::Result;
 use async_trait::async_trait;
 use services::admin::{
     AdminModelInfo, AdminOrganizationInfo, AdminRepository, ModelHistoryEntry, ModelPricing,
     OrganizationLimits, OrganizationLimitsHistoryEntry, OrganizationLimitsUpdate,
-    UpdateModelAdminRequest, UserInfo, UserOrganizationInfo,
+    PlatformServiceInfo, UpdateModelAdminRequest, UserInfo, UserOrganizationInfo,
 };
+use services::service_usage::ports::ServiceUnit;
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -21,6 +23,7 @@ pub struct AdminCompositeRepository {
     alias_repo: Arc<ModelAliasRepository>,
     limits_repo: Arc<OrganizationLimitsRepository>,
     user_repo: Arc<UserRepository>,
+    service_repo: Arc<ServiceRepository>,
 }
 
 impl AdminCompositeRepository {
@@ -30,9 +33,25 @@ impl AdminCompositeRepository {
             model_repo: Arc::new(ModelRepository::new(pool.clone())),
             alias_repo: Arc::new(ModelAliasRepository::new(pool.clone())),
             limits_repo: Arc::new(OrganizationLimitsRepository::new(pool.clone())),
-            user_repo: Arc::new(UserRepository::new(pool)),
+            user_repo: Arc::new(UserRepository::new(pool.clone())),
+            service_repo: Arc::new(ServiceRepository::new(pool)),
         }
     }
+}
+
+fn service_to_info(s: &crate::models::Service) -> Result<PlatformServiceInfo, anyhow::Error> {
+    let unit = ServiceUnit::try_from(s.unit.as_str()).map_err(|e| anyhow::anyhow!("{}", e))?;
+    Ok(PlatformServiceInfo {
+        id: s.id,
+        service_name: s.service_name.clone(),
+        display_name: s.display_name.clone(),
+        description: s.description.clone(),
+        unit,
+        cost_per_unit: s.cost_per_unit,
+        is_active: s.is_active,
+        created_at: s.created_at,
+        updated_at: s.updated_at,
+    })
 }
 
 #[async_trait]
@@ -461,5 +480,70 @@ impl AdminRepository for AdminCompositeRepository {
             .await?;
 
         Ok(row.get::<_, i64>("count"))
+    }
+
+    async fn list_services(
+        &self,
+        include_inactive: bool,
+        limit: i64,
+        offset: i64,
+    ) -> Result<(Vec<PlatformServiceInfo>, i64)> {
+        let (services, total) = self
+            .service_repo
+            .list(include_inactive, limit, offset)
+            .await?;
+        let infos: Vec<PlatformServiceInfo> = services
+            .iter()
+            .map(service_to_info)
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok((infos, total))
+    }
+
+    async fn get_service_by_id(&self, id: Uuid) -> Result<Option<PlatformServiceInfo>> {
+        Ok(self
+            .service_repo
+            .get_by_id(id)
+            .await?
+            .as_ref()
+            .map(service_to_info)
+            .transpose()?)
+    }
+
+    async fn create_service(
+        &self,
+        service_name: &str,
+        display_name: &str,
+        description: Option<&str>,
+        unit: ServiceUnit,
+        cost_per_unit: i64,
+    ) -> Result<PlatformServiceInfo> {
+        let s = self
+            .service_repo
+            .create(
+                service_name,
+                display_name,
+                description,
+                unit.as_str(),
+                cost_per_unit,
+            )
+            .await?;
+        service_to_info(&s)
+    }
+
+    async fn update_service(
+        &self,
+        id: Uuid,
+        display_name: Option<&str>,
+        description: Option<&str>,
+        cost_per_unit: Option<i64>,
+        is_active: Option<bool>,
+    ) -> Result<Option<PlatformServiceInfo>> {
+        Ok(self
+            .service_repo
+            .update(id, display_name, description, cost_per_unit, is_active)
+            .await?
+            .as_ref()
+            .map(service_to_info)
+            .transpose()?)
     }
 }

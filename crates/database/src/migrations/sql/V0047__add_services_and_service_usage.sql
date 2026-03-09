@@ -10,7 +10,7 @@ CREATE TABLE services (
     display_name VARCHAR(255) NOT NULL,
     description TEXT,
     unit VARCHAR(50) NOT NULL CHECK (unit = 'request'),
-    cost_per_unit BIGINT NOT NULL,
+    cost_per_unit BIGINT NOT NULL CHECK (cost_per_unit >= 0),
     is_active BOOLEAN NOT NULL DEFAULT true,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
@@ -30,8 +30,8 @@ CREATE TABLE organization_service_usage_log (
     workspace_id UUID NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
     api_key_id UUID NOT NULL REFERENCES api_keys(id),
     service_id UUID NOT NULL REFERENCES services(id),
-    quantity INTEGER NOT NULL,
-    total_cost BIGINT NOT NULL,
+    quantity INTEGER NOT NULL CHECK (quantity > 0),
+    total_cost BIGINT NOT NULL CHECK (total_cost >= 0),
     inference_id UUID,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );

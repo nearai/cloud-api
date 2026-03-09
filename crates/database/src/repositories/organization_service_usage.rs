@@ -73,6 +73,8 @@ impl OrganizationServiceUsageRepository {
                 .await
                 .map_err(map_db_error)?;
 
+            // When conflict occurs (duplicate org_id + inference_id), inference_id is always Some.
+            // The partial unique index only applies when inference_id IS NOT NULL.
             let row = match maybe_row {
                 Some(r) => {
                     transaction
@@ -103,6 +105,11 @@ impl OrganizationServiceUsageRepository {
                 None => {
                     transaction.rollback().await.map_err(map_db_error)?;
 
+                    // inference_id is Some here (conflict only when inference_id IS NOT NULL)
+                    debug_assert!(
+                        request.inference_id.is_some(),
+                        "Conflict branch only reached when inference_id is set"
+                    );
                     let existing = client
                         .query_one(
                             r#"

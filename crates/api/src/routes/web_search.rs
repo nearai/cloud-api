@@ -96,8 +96,9 @@ pub async fn get_web_search(
         .web_search_provider
         .search(search_params)
         .await
-        .map_err(|e| {
-            debug!("Web search provider error: {}", e);
+        .map_err(|_e| {
+            // Do not log error content; it may contain user query (privacy)
+            debug!("Web search provider request failed");
             (
                 StatusCode::BAD_GATEWAY,
                 ResponseJson(crate::models::ErrorResponse::new(
@@ -154,7 +155,7 @@ pub async fn get_web_search(
                     )),
                 ));
             }
-            _ => {
+            ServiceUsageError::InternalError(_) | ServiceUsageError::CostOverflow => {
                 return Err((
                     StatusCode::INTERNAL_SERVER_ERROR,
                     ResponseJson(crate::models::ErrorResponse::new(

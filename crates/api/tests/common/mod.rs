@@ -7,7 +7,10 @@
 
 pub mod db_setup;
 
-use api::{build_app_with_config, init_auth_services, models::BatchUpdateModelApiRequest};
+use api::{
+    build_app_with_config, init_auth_services,
+    models::{BatchUpdateModelApiRequest, CreateServiceRequest},
+};
 use base64::Engine;
 use chrono::Utc;
 use config::ApiConfig;
@@ -678,6 +681,33 @@ pub async fn setup_glm_model(server: &axum_test::TestServer) -> String {
     );
     admin_batch_upsert_models(server, batch, get_session_id()).await;
     "zai-org/GLM-4.6".to_string()
+}
+
+/// Create web_search platform service via admin API (for E2E tests).
+/// Uses cost_per_unit = 1_000_000 nano-USD per request.
+pub async fn create_web_search_service(
+    server: &axum_test::TestServer,
+) -> api::models::AdminServiceResponse {
+    let request = CreateServiceRequest {
+        service_name: services::service_usage::ports::SERVICE_NAME_WEB_SEARCH.to_string(),
+        display_name: "Web Search".to_string(),
+        description: Some("Brave web search API".to_string()),
+        unit: services::service_usage::ports::ServiceUnit::Request,
+        cost_per_unit: 1_000_000,
+    };
+    let response = server
+        .post("/v1/admin/services")
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .add_header("User-Agent", MOCK_USER_AGENT)
+        .json(&request)
+        .await;
+    assert_eq!(
+        response.status_code(),
+        200,
+        "Failed to create web_search service: {}",
+        response.text()
+    );
+    response.json::<api::models::AdminServiceResponse>()
 }
 
 pub async fn setup_deepseek_model(server: &axum_test::TestServer) -> String {

@@ -311,9 +311,18 @@ impl AdminService for AdminServiceImpl {
         unit: crate::service_usage::ports::ServiceUnit,
         cost_per_unit: i64,
     ) -> Result<PlatformServiceInfo, AdminError> {
-        if service_name.trim().is_empty() {
+        let name = service_name.trim();
+        if name.is_empty() {
             return Err(AdminError::InvalidPricing(
                 "Service name cannot be empty".to_string(),
+            ));
+        }
+        if !name
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+        {
+            return Err(AdminError::InvalidPricing(
+                "Service name must contain only lowercase letters, digits, and underscores (e.g. web_search)".to_string(),
             ));
         }
         if cost_per_unit < 0 {
@@ -322,7 +331,7 @@ impl AdminService for AdminServiceImpl {
             ));
         }
         self.repository
-            .create_service(service_name, display_name, description, unit, cost_per_unit)
+            .create_service(name, display_name, description, unit, cost_per_unit)
             .await
             .map_err(|e| AdminError::InternalError(e.to_string()))
     }

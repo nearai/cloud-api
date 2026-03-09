@@ -10,6 +10,8 @@ pub enum ServiceUsageError {
     ServiceNotFound(String),
     #[error("Cost calculation overflow")]
     CostOverflow,
+    #[error("Internal error: {0}")]
+    InternalError(String),
 }
 
 /// Records platform-level service usage (e.g. web_search) and updates org balance.
@@ -64,7 +66,7 @@ impl ServiceUsageService {
                 inference_id,
             })
             .await
-            .map_err(|e| ServiceUsageError::ServiceNotFound(e.to_string()))?;
+            .map_err(|e| ServiceUsageError::InternalError(e.to_string()))?;
 
         Ok(())
     }

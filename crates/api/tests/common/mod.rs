@@ -21,6 +21,7 @@ use services::auth::AccessTokenClaims;
 use services::responses::tools::{
     WebSearchError, WebSearchParams, WebSearchProviderTrait, WebSearchResult,
 };
+use services::usage::ModelPricing;
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
 
@@ -32,6 +33,16 @@ use k256::ecdsa::{RecoveryId, Signature as EcdsaSignature, VerifyingKey};
 use sha3::Keccak256;
 
 pub const MOCK_USER_ID: &str = "11111111-1111-1111-1111-111111111111";
+
+/// Shared pricing constants for e2e tests that use setup_qwen_model / setup_qwen_model_with_cache_pricing.
+/// Cost verification in usage tests should use the matching helper so pricing stays in sync.
+pub const E2E_QWEN_MODEL_NAME: &str = "Qwen/Qwen3-30B-A3B-Instruct-2507";
+pub const E2E_QWEN_INPUT_COST_PER_TOKEN: i64 = 1_000_000;
+pub const E2E_QWEN_OUTPUT_COST_PER_TOKEN: i64 = 2_000_000;
+/// Cache-read cost when setup_qwen_model is used (no cache pricing in API).
+pub const E2E_QWEN_CACHE_READ_COST_NO_CACHE: i64 = 0;
+/// Cache-read cost when setup_qwen_model_with_cache_pricing is used.
+pub const E2E_QWEN_CACHE_READ_COST_WITH_CACHE: i64 = 500_000;
 
 pub fn test_config() -> ApiConfig {
     let _ = dotenvy::dotenv();
@@ -653,14 +664,14 @@ pub async fn create_org_and_api_key(
 pub async fn setup_qwen_model(server: &axum_test::TestServer) -> String {
     let mut batch = BatchUpdateModelApiRequest::new();
     batch.insert(
-        "Qwen/Qwen3-30B-A3B-Instruct-2507".to_string(),
+        E2E_QWEN_MODEL_NAME.to_string(),
         serde_json::from_value(serde_json::json!({
             "inputCostPerToken": {
-                "amount": 1000000,
+                "amount": E2E_QWEN_INPUT_COST_PER_TOKEN,
                 "currency": "USD"
             },
             "outputCostPerToken": {
-                "amount": 2000000,
+                "amount": E2E_QWEN_OUTPUT_COST_PER_TOKEN,
                 "currency": "USD"
             },
             "modelDisplayName": "Updated Model Name",
@@ -674,38 +685,35 @@ pub async fn setup_qwen_model(server: &axum_test::TestServer) -> String {
     let updated = admin_batch_upsert_models(server, batch, get_session_id()).await;
     assert_eq!(updated.len(), 1, "Should have updated 1 model");
     assert_eq!(
-        updated[0].input_cost_per_token.amount, 1000000,
-        "Input cost per token should be 1000000"
+        updated[0].input_cost_per_token.amount, E2E_QWEN_INPUT_COST_PER_TOKEN,
+        "Input cost per token should match E2E_QWEN_INPUT_COST_PER_TOKEN"
     );
     assert_eq!(
-        updated[0].output_cost_per_token.amount, 2000000,
-        "Output cost per token should be 2000000"
+        updated[0].output_cost_per_token.amount, E2E_QWEN_OUTPUT_COST_PER_TOKEN,
+        "Output cost per token should match E2E_QWEN_OUTPUT_COST_PER_TOKEN"
     );
     // Ensure mock provider registers model before test proceeds
     tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
-    "Qwen/Qwen3-30B-A3B-Instruct-2507".to_string()
+    E2E_QWEN_MODEL_NAME.to_string()
 }
 
 /// Setup Qwen chat model with cache-read pricing enabled for testing.
-/// Uses:
-/// - input_cost_per_token: 1_000_000
-/// - output_cost_per_token: 2_000_000
-/// - cache_read_cost_per_token: 500_000
+/// Uses E2E_QWEN_* constants; cost assertions should use e2e_qwen_model_pricing_with_cache().
 pub async fn setup_qwen_model_with_cache_pricing(server: &axum_test::TestServer) -> String {
     let mut batch = BatchUpdateModelApiRequest::new();
     batch.insert(
-        "Qwen/Qwen3-30B-A3B-Instruct-2507".to_string(),
+        E2E_QWEN_MODEL_NAME.to_string(),
         serde_json::from_value(serde_json::json!({
             "inputCostPerToken": {
-                "amount": 1000000,
+                "amount": E2E_QWEN_INPUT_COST_PER_TOKEN,
                 "currency": "USD"
             },
             "outputCostPerToken": {
-                "amount": 2000000,
+                "amount": E2E_QWEN_OUTPUT_COST_PER_TOKEN,
                 "currency": "USD"
             },
             "cacheReadCostPerToken": {
-                "amount": 500000,
+                "amount": E2E_QWEN_CACHE_READ_COST_WITH_CACHE,
                 "currency": "USD"
             },
             "modelDisplayName": "Updated Model Name",
@@ -719,20 +727,44 @@ pub async fn setup_qwen_model_with_cache_pricing(server: &axum_test::TestServer)
     let updated = admin_batch_upsert_models(server, batch, get_session_id()).await;
     assert_eq!(updated.len(), 1, "Should have updated 1 model");
     assert_eq!(
-        updated[0].input_cost_per_token.amount, 1000000,
-        "Input cost per token should be 1000000"
+        updated[0].input_cost_per_token.amount, E2E_QWEN_INPUT_COST_PER_TOKEN,
+        "Input cost per token should match E2E_QWEN_INPUT_COST_PER_TOKEN"
     );
     assert_eq!(
-        updated[0].output_cost_per_token.amount, 2000000,
-        "Output cost per token should be 2000000"
+        updated[0].output_cost_per_token.amount, E2E_QWEN_OUTPUT_COST_PER_TOKEN,
+        "Output cost per token should match E2E_QWEN_OUTPUT_COST_PER_TOKEN"
     );
     assert_eq!(
-        updated[0].cache_read_cost_per_token.amount, 500000,
-        "Cache-read cost per token should be 500000"
+        updated[0].cache_read_cost_per_token.amount, E2E_QWEN_CACHE_READ_COST_WITH_CACHE,
+        "Cache-read cost per token should match E2E_QWEN_CACHE_READ_COST_WITH_CACHE"
     );
     // Ensure mock provider registers model before test proceeds
     tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
-    "Qwen/Qwen3-30B-A3B-Instruct-2507".to_string()
+    E2E_QWEN_MODEL_NAME.to_string()
+}
+
+/// ModelPricing matching setup_qwen_model (no cache-read pricing). Use in cost assertions.
+pub fn e2e_qwen_model_pricing_no_cache() -> ModelPricing {
+    ModelPricing {
+        id: uuid::Uuid::nil(),
+        model_name: E2E_QWEN_MODEL_NAME.to_string(),
+        input_cost_per_token: E2E_QWEN_INPUT_COST_PER_TOKEN,
+        output_cost_per_token: E2E_QWEN_OUTPUT_COST_PER_TOKEN,
+        cost_per_image: 0,
+        cache_read_cost_per_token: E2E_QWEN_CACHE_READ_COST_NO_CACHE,
+    }
+}
+
+/// ModelPricing matching setup_qwen_model_with_cache_pricing. Use in cost assertions.
+pub fn e2e_qwen_model_pricing_with_cache() -> ModelPricing {
+    ModelPricing {
+        id: uuid::Uuid::nil(),
+        model_name: E2E_QWEN_MODEL_NAME.to_string(),
+        input_cost_per_token: E2E_QWEN_INPUT_COST_PER_TOKEN,
+        output_cost_per_token: E2E_QWEN_OUTPUT_COST_PER_TOKEN,
+        cost_per_image: 0,
+        cache_read_cost_per_token: E2E_QWEN_CACHE_READ_COST_WITH_CACHE,
+    }
 }
 
 pub async fn setup_glm_model(server: &axum_test::TestServer) -> String {

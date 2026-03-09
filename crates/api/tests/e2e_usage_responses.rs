@@ -6,10 +6,7 @@ mod common;
 
 use common::*;
 use serde_json::json;
-use services::{
-    responses::models::ResponseStreamEvent,
-    usage::{compute_token_cost, ModelPricing},
-};
+use services::usage::compute_token_cost;
 
 /// Helper: create a simple conversation for the given API key.
 async fn create_conversation(
@@ -66,7 +63,7 @@ async fn test_responses_non_stream_records_cache_usage_in_history() {
             "temperature": 0.7,
             "max_output_tokens": 64,
             "stream": false,
-            "model": "Qwen/Qwen3-30B-A3B-Instruct-2507"
+            "model": E2E_QWEN_MODEL_NAME
         }))
         .await;
 
@@ -128,15 +125,8 @@ async fn test_responses_non_stream_records_cache_usage_in_history() {
         "usage history should record cache_read_tokens consistent with ResponseObject"
     );
 
-    // Also verify cost is consistent with tokens and pricing using the same helper as the service.
-    let pricing = ModelPricing {
-        id: uuid::Uuid::nil(),
-        model_name: "Qwen/Qwen3-30B-A3B-Instruct-2507".to_string(),
-        input_cost_per_token: 1_000_000,
-        output_cost_per_token: 2_000_000,
-        cost_per_image: 0,
-        cache_read_cost_per_token: 500_000,
-    };
+    // Also verify cost is consistent with tokens and pricing (same as setup_qwen_model_with_cache_pricing).
+    let pricing = e2e_qwen_model_pricing_with_cache();
     let cost = compute_token_cost(
         entry.input_tokens,
         entry.output_tokens,
@@ -184,7 +174,7 @@ async fn test_responses_stream_records_cache_usage_in_history() {
             "temperature": 0.7,
             "max_output_tokens": 64,
             "stream": true,
-            "model": "Qwen/Qwen3-30B-A3B-Instruct-2507"
+            "model": E2E_QWEN_MODEL_NAME
         }))
         .await;
 
@@ -195,9 +185,9 @@ async fn test_responses_stream_records_cache_usage_in_history() {
         resp.text()
     );
 
-    // Drain SSE stream, parse final response.completed event to inspect usage
+    // Drain SSE stream: parse as Value then "response" -> api::models::ResponseObject (same as e2e_conversations create_response_stream)
     let sse_text = resp.text();
-    let mut completed_response: Option<services::responses::models::ResponseObject> = None;
+    let mut completed_response: Option<api::models::ResponseObject> = None;
 
     for chunk in sse_text.split("\n\n") {
         if chunk.trim().is_empty() {
@@ -216,9 +206,12 @@ async fn test_responses_stream_records_cache_usage_in_history() {
         }
 
         if event_type == "response.completed" && !event_data.is_empty() {
-            if let Ok(event) = serde_json::from_str::<ResponseStreamEvent>(event_data) {
-                if let Some(resp_obj) = event.response {
-                    completed_response = Some(resp_obj);
+            if let Ok(event_json) = serde_json::from_str::<serde_json::Value>(event_data) {
+                if let Some(response_obj) = event_json.get("response") {
+                    completed_response = Some(
+                        serde_json::from_value::<api::models::ResponseObject>(response_obj.clone())
+                            .expect("Failed to parse response.completed event"),
+                    );
                 }
             }
         }
@@ -269,15 +262,8 @@ async fn test_responses_stream_records_cache_usage_in_history() {
         "cache_read_tokens should equal configured cache_tokens"
     );
 
-    // Verify cost matches tokens and pricing using shared helper.
-    let pricing = ModelPricing {
-        id: uuid::Uuid::nil(),
-        model_name: "Qwen/Qwen3-30B-A3B-Instruct-2507".to_string(),
-        input_cost_per_token: 1_000_000,
-        output_cost_per_token: 2_000_000,
-        cost_per_image: 0,
-        cache_read_cost_per_token: 500_000,
-    };
+    // Verify cost matches tokens and pricing (same as setup_qwen_model_with_cache_pricing).
+    let pricing = e2e_qwen_model_pricing_with_cache();
     let cost = compute_token_cost(
         entry.input_tokens,
         entry.output_tokens,

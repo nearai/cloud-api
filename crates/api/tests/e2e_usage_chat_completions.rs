@@ -7,7 +7,7 @@ mod common;
 use common::*;
 use inference_providers::StreamChunk;
 use serde_json::json;
-use services::usage::{compute_token_cost, ModelPricing};
+use services::usage::compute_token_cost;
 
 /// Call chat/completions (non-streaming), assert usage in response, then verify org usage
 /// history contains a matching entry (including cache_read_tokens).
@@ -23,7 +23,7 @@ async fn test_chat_completions_records_usage_and_history() {
         .post("/v1/chat/completions")
         .add_header("Authorization", format!("Bearer {api_key}"))
         .json(&json!({
-            "model": "Qwen/Qwen3-30B-A3B-Instruct-2507",
+            "model": E2E_QWEN_MODEL_NAME,
             "messages": [
                 { "role": "user", "content": "hello" }
             ]
@@ -106,19 +106,8 @@ async fn test_chat_completions_records_usage_and_history() {
         "total_tokens should equal prompt_tokens + completion_tokens"
     );
 
-    // Verify cost matches tokens and pricing using the shared helper.
-    // setup_qwen_model configures:
-    // - input_cost_per_token = 1_000_000
-    // - output_cost_per_token = 2_000_000
-    // - cache_read_cost_per_token = 0 (cache billed at input rate)
-    let pricing = ModelPricing {
-        id: uuid::Uuid::nil(),
-        model_name: "Qwen/Qwen3-30B-A3B-Instruct-2507".to_string(),
-        input_cost_per_token: 1_000_000,
-        output_cost_per_token: 2_000_000,
-        cost_per_image: 0,
-        cache_read_cost_per_token: 0,
-    };
+    // Verify cost matches tokens and pricing (same as setup_qwen_model).
+    let pricing = e2e_qwen_model_pricing_no_cache();
     let cost = compute_token_cost(
         entry.input_tokens,
         entry.output_tokens,
@@ -146,7 +135,7 @@ async fn test_chat_completions_stream_records_usage_in_history() {
         .post("/v1/chat/completions")
         .add_header("Authorization", format!("Bearer {api_key}"))
         .json(&json!({
-            "model": "Qwen/Qwen3-30B-A3B-Instruct-2507",
+            "model": E2E_QWEN_MODEL_NAME,
             "messages": [{ "role": "user", "content": "hello" }],
             "stream": true
         }))
@@ -207,15 +196,8 @@ async fn test_chat_completions_stream_records_usage_in_history() {
         "total_tokens should equal input + output"
     );
 
-    // Verify cost matches tokens and pricing using the shared helper (no cache pricing).
-    let pricing = ModelPricing {
-        id: uuid::Uuid::nil(),
-        model_name: "Qwen/Qwen3-30B-A3B-Instruct-2507".to_string(),
-        input_cost_per_token: 1_000_000,
-        output_cost_per_token: 2_000_000,
-        cost_per_image: 0,
-        cache_read_cost_per_token: 0,
-    };
+    // Verify cost matches tokens and pricing (same as setup_qwen_model).
+    let pricing = e2e_qwen_model_pricing_no_cache();
     let cost = compute_token_cost(
         entry.input_tokens,
         entry.output_tokens,
@@ -256,7 +238,7 @@ async fn test_chat_completions_with_cache_records_cache_in_history() {
         .post("/v1/chat/completions")
         .add_header("Authorization", format!("Bearer {api_key}"))
         .json(&json!({
-            "model": "Qwen/Qwen3-30B-A3B-Instruct-2507",
+            "model": E2E_QWEN_MODEL_NAME,
             "messages": [{ "role": "user", "content": message }]
         }))
         .await;
@@ -322,7 +304,7 @@ async fn test_chat_completions_stream_with_cache_records_cache_in_history() {
         .post("/v1/chat/completions")
         .add_header("Authorization", format!("Bearer {api_key}"))
         .json(&json!({
-            "model": "Qwen/Qwen3-30B-A3B-Instruct-2507",
+            "model": E2E_QWEN_MODEL_NAME,
             "messages": [{ "role": "user", "content": message }],
             "stream": true
         }))

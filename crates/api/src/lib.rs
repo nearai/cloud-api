@@ -723,6 +723,7 @@ pub fn build_app_with_config(
         auth_service: auth_components.auth_service.clone(),
         attestation_service: domain_services.attestation_service.clone(),
         usage_service: domain_services.usage_service.clone(),
+        service_usage_service: domain_services.service_usage_service.clone(),
         user_service: domain_services.user_service.clone(),
         files_service: domain_services.files_service.clone(),
         inference_provider_pool: domain_services.inference_provider_pool.clone(),

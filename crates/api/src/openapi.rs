@@ -231,6 +231,8 @@ use utoipa::{Modify, OpenApi};
             crate::routes::usage::OrganizationBalanceResponse,
             crate::routes::usage::UsageHistoryResponse,
             crate::routes::usage::UsageHistoryEntryResponse,
+            crate::routes::usage::ServiceUsageHistoryResponse,
+            crate::routes::usage::ServiceUsageEntryResponse,
             crate::routes::usage::RecordUsageResponse,
             // Gateway models
             crate::routes::gateway::CheckApiKeyResponse,

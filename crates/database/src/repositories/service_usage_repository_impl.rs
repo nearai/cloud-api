@@ -1,8 +1,11 @@
+use crate::models::OrganizationServiceUsageLog;
 use crate::repositories::{
     OrganizationServiceUsageRepository, RecordServiceUsageRequest, ServiceRepository,
 };
 use async_trait::async_trait;
-use services::service_usage::ports::{RecordServiceUsageParams, ServiceUsageRepositoryTrait};
+use services::service_usage::ports::{
+    RecordServiceUsageParams, ServiceUsageLogEntry, ServiceUsageRepositoryTrait,
+};
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -46,5 +49,48 @@ impl ServiceUsageRepositoryTrait for ServiceUsageRepositoryImpl {
         };
         self.usage_repo.record_usage(&request).await?;
         Ok(())
+    }
+
+    async fn list_usage_logs(
+        &self,
+        organization_id: Uuid,
+        service_name: Option<&str>,
+        limit: i64,
+        offset: i64,
+    ) -> anyhow::Result<(Vec<ServiceUsageLogEntry>, i64)> {
+        // Resolve service_name to service_id if provided; only active services are considered.
+        let service_id = if let Some(name) = service_name {
+            match self.service_repo.get_active_by_name(name).await? {
+                Some(service) => Some(service.id),
+                None => {
+                    // No active service with this name; return empty result.
+                    return Ok((Vec::new(), 0));
+                }
+            }
+        } else {
+            None
+        };
+
+        let (rows, total) = self
+            .usage_repo
+            .list_for_org(organization_id, service_id, limit, offset)
+            .await?;
+
+        let entries = rows
+            .into_iter()
+            .map(|row: OrganizationServiceUsageLog| ServiceUsageLogEntry {
+                id: row.id,
+                organization_id: row.organization_id,
+                workspace_id: row.workspace_id,
+                api_key_id: row.api_key_id,
+                service_id: row.service_id,
+                quantity: row.quantity,
+                total_cost: row.total_cost,
+                inference_id: row.inference_id,
+                created_at: row.created_at,
+            })
+            .collect();
+
+        Ok((entries, total))
     }
 }

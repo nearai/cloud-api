@@ -29,6 +29,68 @@ impl OrganizationServiceUsageRepository {
         Self { pool }
     }
 
+    /// List service usage rows for an organization, optionally filtered by service_id.
+    /// Results are ordered by created_at DESC.
+    pub async fn list_for_org(
+        &self,
+        organization_id: Uuid,
+        service_id: Option<Uuid>,
+        limit: i64,
+        offset: i64,
+    ) -> Result<(Vec<OrganizationServiceUsageLog>, i64)> {
+        let (rows, total) = retry_db!("list_service_usage", {
+            let client = self
+                .pool
+                .get()
+                .await
+                .context("Failed to get database connection")
+                .map_err(RepositoryError::PoolError)?;
+
+            if let Some(service_id) = service_id {
+                let total: i64 = client
+                    .query_one(
+                        "SELECT COUNT(*)::BIGINT FROM organization_service_usage_log WHERE organization_id = $1 AND service_id = $2",
+                        &[&organization_id, &service_id],
+                    )
+                    .await
+                    .map_err(map_db_error)?
+                    .get(0);
+
+                let rows = client
+                    .query(
+                        "SELECT * FROM organization_service_usage_log WHERE organization_id = $1 AND service_id = $2 ORDER BY created_at DESC LIMIT $3 OFFSET $4",
+                        &[&organization_id, &service_id, &limit, &offset],
+                    )
+                    .await
+                    .map_err(map_db_error)?;
+
+                Ok::<_, RepositoryError>((rows, total))
+            } else {
+                let total: i64 = client
+                    .query_one(
+                        "SELECT COUNT(*)::BIGINT FROM organization_service_usage_log WHERE organization_id = $1",
+                        &[&organization_id],
+                    )
+                    .await
+                    .map_err(map_db_error)?
+                    .get(0);
+
+                let rows = client
+                    .query(
+                        "SELECT * FROM organization_service_usage_log WHERE organization_id = $1 ORDER BY created_at DESC LIMIT $2 OFFSET $3",
+                        &[&organization_id, &limit, &offset],
+                    )
+                    .await
+                    .map_err(map_db_error)?;
+
+                Ok::<_, RepositoryError>((rows, total))
+            }
+        })?;
+
+        let logs = rows.iter().map(|row| self.row_to_log(row)).collect();
+        Ok((logs, total))
+    }
+
     /// Record service usage and update organization_balance. Idempotent when inference_id is set:
     /// duplicate (organization_id, inference_id) skips insert and balance update.
     pub async fn record_usage(

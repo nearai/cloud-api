@@ -64,4 +64,17 @@ impl ServiceUsageServiceTrait for ServiceUsageService {
 
         Ok(())
     }
+
+    async fn get_usage_history(
+        &self,
+        organization_id: Uuid,
+        service_name: Option<&str>,
+        limit: i64,
+        offset: i64,
+    ) -> Result<(Vec<ports::ServiceUsageLogEntry>, i64), ServiceUsageError> {
+        self.repo
+            .list_usage_logs(organization_id, service_name, limit, offset)
+            .await
+            .map_err(|e| ServiceUsageError::InternalError(e.to_string()))
+    }
 }

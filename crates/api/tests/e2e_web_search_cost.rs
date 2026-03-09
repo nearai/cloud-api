@@ -13,8 +13,8 @@ async fn test_web_search_cost_recorded_correctly() {
     let org = setup_org_with_credits(&server, 10_000_000_000i64).await; // $10.00 USD
     let api_key = get_api_key_for_org(&server, org.id.clone()).await;
 
-    // Create web_search service with known cost: 1_000_000 nano-USD per request
-    let created = create_web_search_service(&server).await;
+    // Get or create web_search service with known cost: 1_000_000 nano-USD per request
+    let created = get_or_create_web_search_service(&server).await;
     assert_eq!(created.cost_per_unit, 1_000_000);
 
     // Balance before any web search

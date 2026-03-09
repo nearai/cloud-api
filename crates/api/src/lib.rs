@@ -549,6 +549,27 @@ pub async fn init_domain_services_with_mcp_factory(
     domain_services
 }
 
+/// Like `init_domain_services_with_pool` but use the given web search provider (for tests with mock).
+pub async fn init_domain_services_with_pool_and_web_search_provider(
+    database: Arc<Database>,
+    config: &ApiConfig,
+    organization_service: Arc<dyn services::organization::OrganizationServiceTrait + Send + Sync>,
+    inference_provider_pool: Arc<services::inference_provider_pool::InferenceProviderPool>,
+    metrics_service: Arc<dyn services::metrics::MetricsServiceTrait>,
+    web_search_provider: Arc<dyn services::responses::tools::WebSearchProviderTrait>,
+) -> DomainServices {
+    let mut domain_services = init_domain_services_with_pool(
+        database,
+        config,
+        organization_service,
+        inference_provider_pool,
+        metrics_service,
+    )
+    .await;
+    domain_services.web_search_provider = web_search_provider;
+    domain_services
+}
+
 /// Initialize inference provider pool
 pub async fn init_inference_providers(
     config: &ApiConfig,

@@ -38,6 +38,7 @@ use utoipa::{Modify, OpenApi};
         (name = "Attestation", description = "Attestation and verification endpoints"),
         (name = "Gateway", description = "Model gateway integration endpoints"),
         (name = "Admin", description = "Administrative endpoints (admin access required)"),
+        (name = "Services", description = "Public platform services (e.g. web_search pricing)"),
         (name = "Web Search", description = "Standalone web search endpoint"),
     ),
     paths(
@@ -140,8 +141,8 @@ use utoipa::{Modify, OpenApi};
         crate::routes::admin::create_admin_access_token,
         crate::routes::admin::list_admin_access_tokens,
         crate::routes::admin::delete_admin_access_token,
-        crate::routes::admin::list_services,
-        crate::routes::admin::get_service_by_id,
+        crate::routes::services::list_services,
+        crate::routes::services::get_service_by_name,
         crate::routes::admin::create_service,
         crate::routes::admin::update_service,
         // Health check endpoint
@@ -215,6 +216,7 @@ use utoipa::{Modify, OpenApi};
             ModelListResponse, ModelWithPricing, AdminModelListResponse, AdminModelWithPricing,
             DecimalPrice, DecimalPriceRequest, ModelMetadata,
             WebSearchResponse, WebSearchResultItem, WebSearchQueryParams,
+            ServiceResponse, ServiceListResponse,
             AdminServiceResponse, AdminServiceListResponse, CreateServiceRequest, UpdateServiceRequest,
             UpdateModelApiRequest, ModelHistoryEntry, ModelHistoryResponse,
             // Organization limits models (Admin)

@@ -149,6 +149,24 @@ impl WebSearchToolExecutor {
             if let Some(summary) = params.get("summary").and_then(|v| v.as_bool()) {
                 search_params.summary = Some(summary);
             }
+            if let Some(rf) = params.get("result_filter").and_then(|v| v.as_str()) {
+                search_params.result_filter = Some(rf.to_string());
+            }
+            if let Some(g) = params.get("goggles").and_then(|v| v.as_str()) {
+                search_params.goggles = Some(g.to_string());
+            }
+            if let Some(erc) = params.get("enable_rich_callback").and_then(|v| v.as_bool()) {
+                search_params.enable_rich_callback = Some(erc);
+            }
+            if let Some(ifm) = params
+                .get("include_fetch_metadata")
+                .and_then(|v| v.as_bool())
+            {
+                search_params.include_fetch_metadata = Some(ifm);
+            }
+            if let Some(op) = params.get("operators").and_then(|v| v.as_bool()) {
+                search_params.operators = Some(op);
+            }
         }
 
         search_params
@@ -223,17 +241,23 @@ mod tests {
     use super::*;
     use crate::responses::models::CreateResponseRequest;
     use crate::responses::tools::ports::WebSearchError;
+    use std::sync::{Arc as StdArc, Mutex};
 
     struct MockWebSearchProvider {
         results: Vec<WebSearchResult>,
+        last_params: StdArc<Mutex<Option<WebSearchParams>>>,
     }
 
     #[async_trait]
     impl WebSearchProviderTrait for MockWebSearchProvider {
         async fn search(
             &self,
-            _params: WebSearchParams,
+            params: WebSearchParams,
         ) -> Result<Vec<WebSearchResult>, WebSearchError> {
+            // Capture the last params for inspection in tests
+            if let Ok(mut guard) = self.last_params.lock() {
+                *guard = Some(params);
+            }
             Ok(self.results.clone())
         }
     }
@@ -265,12 +289,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_web_search_returns_sources() {
+        let last_params = StdArc::new(Mutex::new(None));
         let provider = Arc::new(MockWebSearchProvider {
             results: vec![WebSearchResult {
                 title: "Test".to_string(),
                 url: "https://example.com".to_string(),
                 snippet: "Test snippet".to_string(),
             }],
+            last_params,
         });
 
         let executor = WebSearchToolExecutor::new(provider);
@@ -299,7 +325,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_web_search_parses_params() {
-        let provider = Arc::new(MockWebSearchProvider { results: vec![] });
+        let last_params = StdArc::new(Mutex::new(None));
+        let provider = Arc::new(MockWebSearchProvider {
+            results: vec![],
+            last_params: last_params.clone(),
+        });
         let executor = WebSearchToolExecutor::new(provider);
 
         let tool_call = ToolCallInfo {
@@ -309,7 +339,12 @@ mod tests {
             params: Some(serde_json::json!({
                 "country": "US",
                 "count": 10,
-                "safesearch": "moderate"
+                "safesearch": "moderate",
+                "result_filter": "web,news",
+                "goggles": "https://example.com/my-goggles",
+                "enable_rich_callback": true,
+                "include_fetch_metadata": true,
+                "operators": true
             })),
             thought_signature: None,
         };
@@ -317,14 +352,34 @@ mod tests {
         let request = create_test_request();
         let context = ToolExecutionContext { request: &request };
 
-        // Just verify it doesn't error - param parsing happens internally
         let result = executor.execute(&tool_call, &context).await;
-        assert!(result.is_ok());
+        assert!(
+            result.is_ok(),
+            "executor should succeed with extended params"
+        );
+
+        // Verify that all parameters were parsed and passed through to the provider.
+        let guard = last_params.lock().expect("lock last_params");
+        let params = guard.as_ref().expect("expected captured params");
+        assert_eq!(params.country.as_deref(), Some("US"));
+        assert_eq!(params.count, Some(10));
+        assert_eq!(params.safesearch.as_deref(), Some("moderate"));
+        assert_eq!(params.result_filter.as_deref(), Some("web,news"));
+        assert_eq!(
+            params.goggles.as_deref(),
+            Some("https://example.com/my-goggles")
+        );
+        assert_eq!(params.enable_rich_callback, Some(true));
+        assert_eq!(params.include_fetch_metadata, Some(true));
+        assert_eq!(params.operators, Some(true));
     }
 
     #[test]
     fn test_can_handle() {
-        let provider = Arc::new(MockWebSearchProvider { results: vec![] });
+        let provider = Arc::new(MockWebSearchProvider {
+            results: vec![],
+            last_params: StdArc::new(Mutex::new(None)),
+        });
         let executor = WebSearchToolExecutor::new(provider);
 
         assert!(executor.can_handle("web_search"));

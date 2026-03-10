@@ -143,6 +143,22 @@ impl WebSearchProviderTrait for BraveWebSearchProvider {
             query_params.push(("summary", summary));
         }
 
+        if let Some(ref rf) = params.result_filter {
+            query_params.push(("result_filter", rf.clone()));
+        }
+        if let Some(ref g) = params.goggles {
+            query_params.push(("goggles", g.clone()));
+        }
+        if let Some(erc) = params.enable_rich_callback {
+            query_params.push(("enable_rich_callback", erc.to_string()));
+        }
+        if let Some(ifm) = params.include_fetch_metadata {
+            query_params.push(("include_fetch_metadata", ifm.to_string()));
+        }
+        if let Some(op) = params.operators {
+            query_params.push(("operators", op.to_string()));
+        }
+
         tracing::debug!("Query parameters: {:?}", query_params);
 
         let response = self

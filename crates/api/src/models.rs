@@ -833,6 +833,21 @@ pub struct WebSearchQueryParams {
     pub extra_snippets: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub summary: Option<bool>,
+    /// Comma-delimited result types: discussions, faq, infobox, news, query, summarizer, videos, web, locations
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result_filter: Option<String>,
+    /// Goggles URL or inline definition for custom re-ranking
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub goggles: Option<String>,
+    /// Enable rich data (weather, stocks, etc.); forwarded to Brave as enable_rich_callback query param
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enable_rich_callback: Option<bool>,
+    /// Include fetch metadata in response
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub include_fetch_metadata: Option<bool>,
+    /// Enable search operators interpretation in query
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub operators: Option<bool>,
 }
 
 fn default_temperature() -> Option<f32> {
@@ -2550,6 +2565,55 @@ impl From<services::admin::PlatformServiceInfo> for AdminServiceResponse {
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct AdminServiceListResponse {
     pub services: Vec<AdminServiceResponse>,
+    pub limit: i64,
+    pub offset: i64,
+    pub total: i64,
+}
+
+/// Platform service (public) — single item.
+///
+/// Structurally identical to `AdminServiceResponse` today, but kept separate so that
+/// admin vs public representations can evolve independently without breaking clients.
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct ServiceResponse {
+    pub id: uuid::Uuid,
+    #[serde(rename = "serviceName")]
+    pub service_name: String,
+    #[serde(rename = "displayName")]
+    pub display_name: String,
+    pub description: Option<String>,
+    pub unit: ServiceUnit,
+    /// Price per unit in nano-USD (scale 9).
+    #[serde(rename = "costPerUnit")]
+    pub cost_per_unit: i64,
+    #[serde(rename = "isActive")]
+    pub is_active: bool,
+    #[serde(rename = "createdAt")]
+    pub created_at: DateTime<Utc>,
+    #[serde(rename = "updatedAt")]
+    pub updated_at: DateTime<Utc>,
+}
+
+impl From<AdminServiceResponse> for ServiceResponse {
+    fn from(admin: AdminServiceResponse) -> Self {
+        ServiceResponse {
+            id: admin.id,
+            service_name: admin.service_name,
+            display_name: admin.display_name,
+            description: admin.description,
+            unit: admin.unit,
+            cost_per_unit: admin.cost_per_unit,
+            is_active: admin.is_active,
+            created_at: admin.created_at,
+            updated_at: admin.updated_at,
+        }
+    }
+}
+
+/// Response for public service list endpoint
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct ServiceListResponse {
+    pub services: Vec<ServiceResponse>,
     pub limit: i64,
     pub offset: i64,
     pub total: i64,

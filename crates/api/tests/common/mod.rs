@@ -796,7 +796,7 @@ pub async fn setup_glm_model(server: &axum_test::TestServer) -> String {
 /// Uses cost_per_unit = 1_000_000 nano-USD per request when created.
 pub async fn get_or_create_web_search_service(
     server: &axum_test::TestServer,
-) -> api::models::AdminServiceResponse {
+) -> api::models::ServiceResponse {
     let request = CreateServiceRequest {
         service_name: services::service_usage::ports::SERVICE_NAME_WEB_SEARCH.to_string(),
         display_name: "Web Search".to_string(),
@@ -811,35 +811,22 @@ pub async fn get_or_create_web_search_service(
         .json(&request)
         .await;
     if response.status_code() == 200 {
-        return response.json::<api::models::AdminServiceResponse>();
+        return response.json::<api::models::ServiceResponse>();
     }
 
     // If creation failed (e.g., because the service already exists from a previous test),
-    // fall back to listing services and return the existing web_search service if present.
-    let list_resp = server
-        .get("/v1/admin/services?include_inactive=true&limit=100&offset=0")
-        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+    // fall back to the public GET /v1/services/{service_name} and return the existing web_search service if present.
+    let get_resp = server
+        .get("/v1/services/web_search")
         .add_header("User-Agent", MOCK_USER_AGENT)
         .await;
     assert_eq!(
-        list_resp.status_code(),
+        get_resp.status_code(),
         200,
-        "Failed to list services after create_web_search_service failure: {}",
-        list_resp.text()
+        "Failed to get existing web_search service after create_web_search_service failure: {}",
+        get_resp.text()
     );
-    let list = list_resp.json::<api::models::AdminServiceListResponse>();
-    if let Some(existing) = list
-        .services
-        .into_iter()
-        .find(|s| s.service_name == services::service_usage::ports::SERVICE_NAME_WEB_SEARCH)
-    {
-        existing
-    } else {
-        panic!(
-            "Failed to create web_search service and no existing service found. Last response: {}",
-            response.text()
-        );
-    }
+    get_resp.json::<api::models::ServiceResponse>()
 }
 
 pub async fn setup_deepseek_model(server: &axum_test::TestServer) -> String {

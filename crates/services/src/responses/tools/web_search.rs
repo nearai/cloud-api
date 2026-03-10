@@ -149,6 +149,21 @@ impl WebSearchToolExecutor {
             if let Some(summary) = params.get("summary").and_then(|v| v.as_bool()) {
                 search_params.summary = Some(summary);
             }
+            if let Some(rf) = params.get("result_filter").and_then(|v| v.as_str()) {
+                search_params.result_filter = Some(rf.to_string());
+            }
+            if let Some(g) = params.get("goggles").and_then(|v| v.as_str()) {
+                search_params.goggles = Some(g.to_string());
+            }
+            if let Some(erc) = params.get("enable_rich_callback").and_then(|v| v.as_bool()) {
+                search_params.enable_rich_callback = Some(erc);
+            }
+            if let Some(ifm) = params
+                .get("include_fetch_metadata")
+                .and_then(|v| v.as_bool())
+            {
+                search_params.include_fetch_metadata = Some(ifm);
+            }
         }
 
         search_params

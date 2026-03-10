@@ -833,6 +833,18 @@ pub struct WebSearchQueryParams {
     pub extra_snippets: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub summary: Option<bool>,
+    /// Comma-delimited result types: discussions, faq, infobox, news, query, summarizer, videos, web, locations
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result_filter: Option<String>,
+    /// Goggles URL or inline definition for custom re-ranking
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub goggles: Option<String>,
+    /// Enable rich data (weather, stocks, etc.); sends enable_rich_callback=1 when true
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enable_rich_callback: Option<bool>,
+    /// Include fetch metadata in response
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub include_fetch_metadata: Option<bool>,
 }
 
 fn default_temperature() -> Option<f32> {

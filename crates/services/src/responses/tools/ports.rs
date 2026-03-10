@@ -64,6 +64,22 @@ pub struct WebSearchParams {
     /// Enable summary key generation
     #[serde(skip_serializing_if = "Option::is_none")]
     pub summary: Option<bool>,
+
+    /// Comma-delimited result types to include: discussions, faq, infobox, news, query, summarizer, videos, web, locations
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result_filter: Option<String>,
+
+    /// Goggles URL or inline definition for custom re-ranking (see Brave Goggles docs)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub goggles: Option<String>,
+
+    /// Enable rich data callback (weather, stocks, etc.); Brave uses enable_rich_callback=1
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enable_rich_callback: Option<bool>,
+
+    /// Include fetch metadata in the response (Brave API pass-through)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub include_fetch_metadata: Option<bool>,
 }
 
 impl WebSearchParams {

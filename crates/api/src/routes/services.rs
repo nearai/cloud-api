@@ -30,10 +30,12 @@ fn service_to_response(
     s: &database::models::Service,
 ) -> Result<ServiceResponse, (StatusCode, ResponseJson<ErrorResponse>)> {
     let unit = ServiceUnit::try_from(s.unit.as_str()).map_err(|e| {
+        // Log internal details server-side, but return a generic error to the client.
+        error!("Invalid service unit value in database: {}", e);
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             ResponseJson(ErrorResponse::new(
-                format!("Invalid service unit: {e}"),
+                "Internal server error".to_string(),
                 "internal_server_error".to_string(),
             )),
         )

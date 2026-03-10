@@ -839,7 +839,7 @@ pub struct WebSearchQueryParams {
     /// Goggles URL or inline definition for custom re-ranking
     #[serde(skip_serializing_if = "Option::is_none")]
     pub goggles: Option<String>,
-    /// Enable rich data (weather, stocks, etc.); sends enable_rich_callback=1 when true
+    /// Enable rich data (weather, stocks, etc.); forwarded to Brave as enable_rich_callback query param
     #[serde(skip_serializing_if = "Option::is_none")]
     pub enable_rich_callback: Option<bool>,
     /// Include fetch metadata in response

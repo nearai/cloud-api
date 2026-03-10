@@ -73,7 +73,7 @@ pub struct WebSearchParams {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub goggles: Option<String>,
 
-    /// Enable rich data callback (weather, stocks, etc.); Brave uses enable_rich_callback=1
+    /// Enable rich data callback (weather, stocks, etc.); forwarded to Brave as enable_rich_callback query param
     #[serde(skip_serializing_if = "Option::is_none")]
     pub enable_rich_callback: Option<bool>,
 

@@ -150,7 +150,9 @@ impl WebSearchProviderTrait for BraveWebSearchProvider {
             query_params.push(("goggles", g.clone()));
         }
         if let Some(erc) = params.enable_rich_callback {
-            query_params.push(("enable_rich_callback", erc.to_string()));
+            if erc {
+                query_params.push(("enable_rich_callback", "1".to_string()));
+            }
         }
         if let Some(ifm) = params.include_fetch_metadata {
             query_params.push(("include_fetch_metadata", ifm.to_string()));

@@ -23,6 +23,8 @@ pub struct AppState {
     pub auth_service: Arc<dyn AuthServiceTrait>,
     pub attestation_service: Arc<dyn AttestationServiceTrait>,
     pub usage_service: Arc<dyn services::usage::UsageServiceTrait + Send + Sync>,
+    pub service_usage_service:
+        Arc<dyn services::service_usage::ServiceUsageServiceTrait + Send + Sync>,
     pub user_service: Arc<dyn services::user::UserServiceTrait + Send + Sync>,
     pub files_service: Arc<dyn FileServiceTrait + Send + Sync>,
     pub inference_provider_pool: Arc<services::inference_provider_pool::InferenceProviderPool>,
@@ -105,6 +107,10 @@ pub fn build_management_router(app_state: AppState, auth_state: AuthState) -> Ro
         .route(
             "/{id}/usage/history",
             get(crate::routes::usage::get_organization_usage_history),
+        )
+        .route(
+            "/{id}/service-usage/history",
+            get(crate::routes::usage::get_service_usage_history),
         );
 
     // User routes (require access token authentication)

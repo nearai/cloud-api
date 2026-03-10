@@ -7,13 +7,21 @@
 
 pub mod db_setup;
 
-use api::{build_app_with_config, init_auth_services, models::BatchUpdateModelApiRequest};
+use api::{
+    build_app_with_config, init_auth_services,
+    models::{BatchUpdateModelApiRequest, CreateServiceRequest},
+};
+use async_trait::async_trait;
 use base64::Engine;
 use chrono::Utc;
 use config::ApiConfig;
 use database::Database;
 pub use services::auth::ports::MOCK_USER_AGENT;
 use services::auth::AccessTokenClaims;
+use services::responses::tools::{
+    WebSearchError, WebSearchParams, WebSearchProviderTrait, WebSearchResult,
+};
+use services::usage::ModelPricing;
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
 
@@ -25,6 +33,16 @@ use k256::ecdsa::{RecoveryId, Signature as EcdsaSignature, VerifyingKey};
 use sha3::Keccak256;
 
 pub const MOCK_USER_ID: &str = "11111111-1111-1111-1111-111111111111";
+
+/// Shared pricing constants for e2e tests that use setup_qwen_model / setup_qwen_model_with_cache_pricing.
+/// Cost verification in usage tests should use the matching helper so pricing stays in sync.
+pub const E2E_QWEN_MODEL_NAME: &str = "Qwen/Qwen3-30B-A3B-Instruct-2507";
+pub const E2E_QWEN_INPUT_COST_PER_TOKEN: i64 = 1_000_000;
+pub const E2E_QWEN_OUTPUT_COST_PER_TOKEN: i64 = 2_000_000;
+/// Cache-read cost when setup_qwen_model is used (no cache pricing in API).
+pub const E2E_QWEN_CACHE_READ_COST_NO_CACHE: i64 = 0;
+/// Cache-read cost when setup_qwen_model_with_cache_pricing is used.
+pub const E2E_QWEN_CACHE_READ_COST_WITH_CACHE: i64 = 500_000;
 
 pub fn test_config() -> ApiConfig {
     let _ = dotenvy::dotenv();
@@ -209,6 +227,79 @@ async fn build_test_server_components_with_real_providers(
     let server = axum_test::TestServer::new(app).unwrap();
 
     (server, inference_provider_pool)
+}
+
+/// Mock web search provider for e2e tests. Returns a fixed list of results without calling Brave.
+pub struct MockWebSearchProvider {
+    results: Vec<WebSearchResult>,
+}
+
+impl MockWebSearchProvider {
+    pub fn new(results: Vec<WebSearchResult>) -> Self {
+        Self { results }
+    }
+
+    /// Default mock with one placeholder result.
+    pub fn default_results() -> Self {
+        Self::new(vec![WebSearchResult {
+            title: "Mock Result".to_string(),
+            url: "https://example.com/mock".to_string(),
+            snippet: "Snippet from mock web search.".to_string(),
+        }])
+    }
+}
+
+#[async_trait]
+impl WebSearchProviderTrait for MockWebSearchProvider {
+    async fn search(
+        &self,
+        _params: WebSearchParams,
+    ) -> Result<Vec<WebSearchResult>, WebSearchError> {
+        Ok(self.results.clone())
+    }
+}
+
+async fn build_test_server_components_with_mock_web_search(
+    database: Arc<Database>,
+    config: ApiConfig,
+    web_search_provider: Arc<dyn WebSearchProviderTrait>,
+) -> axum_test::TestServer {
+    assert_mock_user_in_db(&database).await;
+
+    let auth_components = init_auth_services(database.clone(), &config);
+
+    let (inference_provider_pool, _mock_provider) =
+        api::init_inference_providers_with_mocks(&config).await;
+    let metrics_service = Arc::new(services::metrics::MockMetricsService);
+    let domain_services = api::init_domain_services_with_pool_and_web_search_provider(
+        database.clone(),
+        &config,
+        auth_components.organization_service.clone(),
+        inference_provider_pool,
+        metrics_service,
+        web_search_provider,
+    )
+    .await;
+
+    let app = build_app_with_config(
+        database.clone(),
+        auth_components,
+        domain_services,
+        Arc::new(config),
+    );
+    axum_test::TestServer::new(app).unwrap()
+}
+
+/// Setup test server with mock web search provider (no Brave API calls). Use for web search billing tests.
+pub async fn setup_test_server_with_mock_web_search() -> (axum_test::TestServer, Arc<Database>) {
+    let infra = setup_test_infrastructure().await;
+    let server = build_test_server_components_with_mock_web_search(
+        infra.database.clone(),
+        infra.config,
+        Arc::new(MockWebSearchProvider::default_results()),
+    )
+    .await;
+    (server, infra.database)
 }
 
 pub async fn setup_test_server() -> axum_test::TestServer {
@@ -573,14 +664,14 @@ pub async fn create_org_and_api_key(
 pub async fn setup_qwen_model(server: &axum_test::TestServer) -> String {
     let mut batch = BatchUpdateModelApiRequest::new();
     batch.insert(
-        "Qwen/Qwen3-30B-A3B-Instruct-2507".to_string(),
+        E2E_QWEN_MODEL_NAME.to_string(),
         serde_json::from_value(serde_json::json!({
             "inputCostPerToken": {
-                "amount": 1000000,
+                "amount": E2E_QWEN_INPUT_COST_PER_TOKEN,
                 "currency": "USD"
             },
             "outputCostPerToken": {
-                "amount": 2000000,
+                "amount": E2E_QWEN_OUTPUT_COST_PER_TOKEN,
                 "currency": "USD"
             },
             "modelDisplayName": "Updated Model Name",
@@ -594,38 +685,35 @@ pub async fn setup_qwen_model(server: &axum_test::TestServer) -> String {
     let updated = admin_batch_upsert_models(server, batch, get_session_id()).await;
     assert_eq!(updated.len(), 1, "Should have updated 1 model");
     assert_eq!(
-        updated[0].input_cost_per_token.amount, 1000000,
-        "Input cost per token should be 1000000"
+        updated[0].input_cost_per_token.amount, E2E_QWEN_INPUT_COST_PER_TOKEN,
+        "Input cost per token should match E2E_QWEN_INPUT_COST_PER_TOKEN"
     );
     assert_eq!(
-        updated[0].output_cost_per_token.amount, 2000000,
-        "Output cost per token should be 2000000"
+        updated[0].output_cost_per_token.amount, E2E_QWEN_OUTPUT_COST_PER_TOKEN,
+        "Output cost per token should match E2E_QWEN_OUTPUT_COST_PER_TOKEN"
     );
     // Ensure mock provider registers model before test proceeds
     tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
-    "Qwen/Qwen3-30B-A3B-Instruct-2507".to_string()
+    E2E_QWEN_MODEL_NAME.to_string()
 }
 
 /// Setup Qwen chat model with cache-read pricing enabled for testing.
-/// Uses:
-/// - input_cost_per_token: 1_000_000
-/// - output_cost_per_token: 2_000_000
-/// - cache_read_cost_per_token: 500_000
+/// Uses E2E_QWEN_* constants; cost assertions should use e2e_qwen_model_pricing_with_cache().
 pub async fn setup_qwen_model_with_cache_pricing(server: &axum_test::TestServer) -> String {
     let mut batch = BatchUpdateModelApiRequest::new();
     batch.insert(
-        "Qwen/Qwen3-30B-A3B-Instruct-2507".to_string(),
+        E2E_QWEN_MODEL_NAME.to_string(),
         serde_json::from_value(serde_json::json!({
             "inputCostPerToken": {
-                "amount": 1000000,
+                "amount": E2E_QWEN_INPUT_COST_PER_TOKEN,
                 "currency": "USD"
             },
             "outputCostPerToken": {
-                "amount": 2000000,
+                "amount": E2E_QWEN_OUTPUT_COST_PER_TOKEN,
                 "currency": "USD"
             },
             "cacheReadCostPerToken": {
-                "amount": 500000,
+                "amount": E2E_QWEN_CACHE_READ_COST_WITH_CACHE,
                 "currency": "USD"
             },
             "modelDisplayName": "Updated Model Name",
@@ -639,20 +727,44 @@ pub async fn setup_qwen_model_with_cache_pricing(server: &axum_test::TestServer)
     let updated = admin_batch_upsert_models(server, batch, get_session_id()).await;
     assert_eq!(updated.len(), 1, "Should have updated 1 model");
     assert_eq!(
-        updated[0].input_cost_per_token.amount, 1000000,
-        "Input cost per token should be 1000000"
+        updated[0].input_cost_per_token.amount, E2E_QWEN_INPUT_COST_PER_TOKEN,
+        "Input cost per token should match E2E_QWEN_INPUT_COST_PER_TOKEN"
     );
     assert_eq!(
-        updated[0].output_cost_per_token.amount, 2000000,
-        "Output cost per token should be 2000000"
+        updated[0].output_cost_per_token.amount, E2E_QWEN_OUTPUT_COST_PER_TOKEN,
+        "Output cost per token should match E2E_QWEN_OUTPUT_COST_PER_TOKEN"
     );
     assert_eq!(
-        updated[0].cache_read_cost_per_token.amount, 500000,
-        "Cache-read cost per token should be 500000"
+        updated[0].cache_read_cost_per_token.amount, E2E_QWEN_CACHE_READ_COST_WITH_CACHE,
+        "Cache-read cost per token should match E2E_QWEN_CACHE_READ_COST_WITH_CACHE"
     );
     // Ensure mock provider registers model before test proceeds
     tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
-    "Qwen/Qwen3-30B-A3B-Instruct-2507".to_string()
+    E2E_QWEN_MODEL_NAME.to_string()
+}
+
+/// ModelPricing matching setup_qwen_model (no cache-read pricing). Use in cost assertions.
+pub fn e2e_qwen_model_pricing_no_cache() -> ModelPricing {
+    ModelPricing {
+        id: uuid::Uuid::nil(),
+        model_name: E2E_QWEN_MODEL_NAME.to_string(),
+        input_cost_per_token: E2E_QWEN_INPUT_COST_PER_TOKEN,
+        output_cost_per_token: E2E_QWEN_OUTPUT_COST_PER_TOKEN,
+        cost_per_image: 0,
+        cache_read_cost_per_token: E2E_QWEN_CACHE_READ_COST_NO_CACHE,
+    }
+}
+
+/// ModelPricing matching setup_qwen_model_with_cache_pricing. Use in cost assertions.
+pub fn e2e_qwen_model_pricing_with_cache() -> ModelPricing {
+    ModelPricing {
+        id: uuid::Uuid::nil(),
+        model_name: E2E_QWEN_MODEL_NAME.to_string(),
+        input_cost_per_token: E2E_QWEN_INPUT_COST_PER_TOKEN,
+        output_cost_per_token: E2E_QWEN_OUTPUT_COST_PER_TOKEN,
+        cost_per_image: 0,
+        cache_read_cost_per_token: E2E_QWEN_CACHE_READ_COST_WITH_CACHE,
+    }
 }
 
 pub async fn setup_glm_model(server: &axum_test::TestServer) -> String {
@@ -678,6 +790,56 @@ pub async fn setup_glm_model(server: &axum_test::TestServer) -> String {
     );
     admin_batch_upsert_models(server, batch, get_session_id()).await;
     "zai-org/GLM-4.6".to_string()
+}
+
+/// Get or create web_search platform service via admin API (for E2E tests).
+/// Uses cost_per_unit = 1_000_000 nano-USD per request when created.
+pub async fn get_or_create_web_search_service(
+    server: &axum_test::TestServer,
+) -> api::models::AdminServiceResponse {
+    let request = CreateServiceRequest {
+        service_name: services::service_usage::ports::SERVICE_NAME_WEB_SEARCH.to_string(),
+        display_name: "Web Search".to_string(),
+        description: Some("Brave web search API".to_string()),
+        unit: services::service_usage::ports::ServiceUnit::Request,
+        cost_per_unit: 1_000_000,
+    };
+    let response = server
+        .post("/v1/admin/services")
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .add_header("User-Agent", MOCK_USER_AGENT)
+        .json(&request)
+        .await;
+    if response.status_code() == 200 {
+        return response.json::<api::models::AdminServiceResponse>();
+    }
+
+    // If creation failed (e.g., because the service already exists from a previous test),
+    // fall back to listing services and return the existing web_search service if present.
+    let list_resp = server
+        .get("/v1/admin/services?include_inactive=true&limit=100&offset=0")
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .add_header("User-Agent", MOCK_USER_AGENT)
+        .await;
+    assert_eq!(
+        list_resp.status_code(),
+        200,
+        "Failed to list services after create_web_search_service failure: {}",
+        list_resp.text()
+    );
+    let list = list_resp.json::<api::models::AdminServiceListResponse>();
+    if let Some(existing) = list
+        .services
+        .into_iter()
+        .find(|s| s.service_name == services::service_usage::ports::SERVICE_NAME_WEB_SEARCH)
+    {
+        existing
+    } else {
+        panic!(
+            "Failed to create web_search service and no existing service found. Last response: {}",
+            response.text()
+        );
+    }
 }
 
 pub async fn setup_deepseek_model(server: &axum_test::TestServer) -> String {

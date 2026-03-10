@@ -1,14 +1,15 @@
 use crate::middleware::AdminUser;
 use crate::models::{
     AdminAccessTokenResponse, AdminModelListResponse, AdminModelWithPricing,
-    AdminOrganizationResponse, AdminUserOrganizationDetails, AdminUserResponse,
-    BatchUpdateModelApiRequest, CreateAdminAccessTokenRequest, CreditType, DecimalPrice,
+    AdminOrganizationResponse, AdminServiceListResponse, AdminServiceResponse,
+    AdminUserOrganizationDetails, AdminUserResponse, BatchUpdateModelApiRequest,
+    CreateAdminAccessTokenRequest, CreateServiceRequest, CreditType, DecimalPrice,
     DecimalPriceRequest, DeleteAdminAccessTokenRequest, DeleteModelRequest, ErrorResponse,
     GetOrganizationConcurrentLimitResponse, ListOrganizationsAdminResponse, ListUsersResponse,
     ModelArchitecture, ModelHistoryEntry, ModelHistoryResponse, ModelMetadata, ModelWithPricing,
     OrgLimitsHistoryEntry, OrgLimitsHistoryResponse, OrganizationUsage, SpendLimit,
     UpdateOrganizationConcurrentLimitRequest, UpdateOrganizationConcurrentLimitResponse,
-    UpdateOrganizationLimitsRequest, UpdateOrganizationLimitsResponse,
+    UpdateOrganizationLimitsRequest, UpdateOrganizationLimitsResponse, UpdateServiceRequest,
 };
 use crate::routes::common::format_amount;
 use axum::{
@@ -1074,6 +1075,203 @@ pub async fn list_organizations(
     };
 
     Ok(ResponseJson(response))
+}
+
+#[derive(Debug, serde::Deserialize, utoipa::IntoParams)]
+pub struct ListServicesQueryParams {
+    #[serde(default = "crate::routes::common::default_limit")]
+    pub limit: i64,
+    #[serde(default)]
+    pub offset: i64,
+    #[serde(default)]
+    pub include_inactive: bool,
+}
+
+/// List platform services (Admin only)
+#[utoipa::path(
+    get,
+    path = "/v1/admin/services",
+    tag = "Admin",
+    params(ListServicesQueryParams),
+    responses(
+        (status = 200, description = "Services list", body = AdminServiceListResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    ),
+    security(("session_token" = []))
+)]
+pub async fn list_services(
+    State(app_state): State<AdminAppState>,
+    Extension(_admin_user): Extension<AdminUser>,
+    Query(params): Query<ListServicesQueryParams>,
+) -> Result<ResponseJson<AdminServiceListResponse>, (StatusCode, ResponseJson<ErrorResponse>)> {
+    crate::routes::common::validate_limit_offset(params.limit, params.offset)?;
+    let (services, total) = app_state
+        .admin_service
+        .list_services(params.include_inactive, params.limit, params.offset)
+        .await
+        .map_err(|e| {
+            error!("Failed to list services: {:?}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ResponseJson(ErrorResponse::new(
+                    "Failed to retrieve services".to_string(),
+                    "internal_server_error".to_string(),
+                )),
+            )
+        })?;
+    let services_api: Vec<AdminServiceResponse> = services.into_iter().map(Into::into).collect();
+    Ok(ResponseJson(AdminServiceListResponse {
+        services: services_api,
+        limit: params.limit,
+        offset: params.offset,
+        total,
+    }))
+}
+
+/// Get platform service by id (Admin only)
+#[utoipa::path(
+    get,
+    path = "/v1/admin/services/{id}",
+    tag = "Admin",
+    params(("id" = uuid::Uuid, Path, description = "Service ID")),
+    responses(
+        (status = 200, description = "Service details", body = AdminServiceResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 404, description = "Not found", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    ),
+    security(("session_token" = []))
+)]
+pub async fn get_service_by_id(
+    State(app_state): State<AdminAppState>,
+    Extension(_admin_user): Extension<AdminUser>,
+    Path(id): Path<uuid::Uuid>,
+) -> Result<ResponseJson<AdminServiceResponse>, (StatusCode, ResponseJson<ErrorResponse>)> {
+    let s = app_state
+        .admin_service
+        .get_service_by_id(id)
+        .await
+        .map_err(|e| {
+            error!("Failed to get service: {:?}", e);
+            match e {
+                services::admin::AdminError::ServiceNotFound(msg) => (
+                    StatusCode::NOT_FOUND,
+                    ResponseJson(ErrorResponse::new(msg, "not_found".to_string())),
+                ),
+                _ => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    ResponseJson(ErrorResponse::new(
+                        "Failed to retrieve service".to_string(),
+                        "internal_server_error".to_string(),
+                    )),
+                ),
+            }
+        })?;
+    Ok(ResponseJson(s.into()))
+}
+
+/// Create platform service (Admin only)
+#[utoipa::path(
+    post,
+    path = "/v1/admin/services",
+    tag = "Admin",
+    request_body = CreateServiceRequest,
+    responses(
+        (status = 200, description = "Service created", body = AdminServiceResponse),
+        (status = 400, description = "Invalid request", body = ErrorResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    ),
+    security(("session_token" = []))
+)]
+pub async fn create_service(
+    State(app_state): State<AdminAppState>,
+    Extension(_admin_user): Extension<AdminUser>,
+    Json(req): Json<CreateServiceRequest>,
+) -> Result<ResponseJson<AdminServiceResponse>, (StatusCode, ResponseJson<ErrorResponse>)> {
+    let s = app_state
+        .admin_service
+        .create_service(
+            &req.service_name,
+            &req.display_name,
+            req.description.as_deref(),
+            req.unit,
+            req.cost_per_unit,
+        )
+        .await
+        .map_err(|e| {
+            error!("Failed to create service: {:?}", e);
+            match e {
+                services::admin::AdminError::InvalidPricing(msg) => (
+                    StatusCode::BAD_REQUEST,
+                    ResponseJson(ErrorResponse::new(msg, "invalid_request".to_string())),
+                ),
+                _ => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    ResponseJson(ErrorResponse::new(
+                        "Failed to create service".to_string(),
+                        "internal_server_error".to_string(),
+                    )),
+                ),
+            }
+        })?;
+    Ok(ResponseJson(s.into()))
+}
+
+/// Update platform service (Admin only; display_name, description, cost_per_unit, is_active)
+#[utoipa::path(
+    patch,
+    path = "/v1/admin/services/{id}",
+    tag = "Admin",
+    params(("id" = uuid::Uuid, Path, description = "Service ID")),
+    request_body = UpdateServiceRequest,
+    responses(
+        (status = 200, description = "Service updated", body = AdminServiceResponse),
+        (status = 400, description = "Invalid request", body = ErrorResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 404, description = "Not found", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    ),
+    security(("session_token" = []))
+)]
+pub async fn update_service(
+    State(app_state): State<AdminAppState>,
+    Extension(_admin_user): Extension<AdminUser>,
+    Path(id): Path<uuid::Uuid>,
+    Json(req): Json<UpdateServiceRequest>,
+) -> Result<ResponseJson<AdminServiceResponse>, (StatusCode, ResponseJson<ErrorResponse>)> {
+    let s = app_state
+        .admin_service
+        .update_service(
+            id,
+            req.display_name.as_deref(),
+            req.description.as_deref(),
+            req.cost_per_unit,
+            req.is_active,
+        )
+        .await
+        .map_err(|e| {
+            error!("Failed to update service: {:?}", e);
+            match e {
+                services::admin::AdminError::InvalidPricing(msg) => (
+                    StatusCode::BAD_REQUEST,
+                    ResponseJson(ErrorResponse::new(msg, "invalid_request".to_string())),
+                ),
+                services::admin::AdminError::ServiceNotFound(msg) => (
+                    StatusCode::NOT_FOUND,
+                    ResponseJson(ErrorResponse::new(msg, "not_found".to_string())),
+                ),
+                _ => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    ResponseJson(ErrorResponse::new(
+                        "Failed to update service".to_string(),
+                        "internal_server_error".to_string(),
+                    )),
+                ),
+            }
+        })?;
+    Ok(ResponseJson(s.into()))
 }
 
 /// Create admin access token (Admin only)

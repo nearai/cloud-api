@@ -89,6 +89,44 @@ pub struct UsageHistoryQuery {
     pub offset: i64,
 }
 
+/// Service usage history entry (platform services like web_search).
+/// All costs use fixed scale of 9 (nano-dollars) and USD currency.
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct ServiceUsageEntryResponse {
+    pub id: String,
+    pub organization_id: String,
+    pub workspace_id: String,
+    pub api_key_id: String,
+    pub service_id: String,
+    pub quantity: i32,
+    pub total_cost: i64,            // In nano-dollars (scale 9)
+    pub total_cost_display: String, // Human readable, e.g., "$0.00123"
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inference_id: Option<String>,
+    pub created_at: String,
+}
+
+/// Service usage history response
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct ServiceUsageHistoryResponse {
+    pub data: Vec<ServiceUsageEntryResponse>,
+    pub total: usize,
+    pub limit: i64,
+    pub offset: i64,
+}
+
+/// Query parameters for service usage history
+#[derive(Debug, Deserialize)]
+pub struct ServiceUsageHistoryQuery {
+    #[serde(default = "crate::routes::common::default_limit")]
+    pub limit: i64,
+    #[serde(default)]
+    pub offset: i64,
+    /// Filter by platform service name (e.g. \"web_search\").
+    #[serde(rename = "serviceName")]
+    pub service_name: Option<String>,
+}
+
 /// Get organization balance
 ///
 /// Returns the current spending balance for an organization
@@ -369,6 +407,129 @@ pub async fn get_organization_usage_history(
         .collect();
 
     Ok(ResponseJson(UsageHistoryResponse {
+        data,
+        total: total as usize,
+        limit: query.limit,
+        offset: query.offset,
+    }))
+}
+
+/// Get service usage history for an organization
+///
+/// Returns paginated service usage logs (e.g., web_search) for an organization.
+#[utoipa::path(
+    get,
+    path = "/v1/organizations/{org_id}/service-usage/history",
+    tag = "Usage",
+    params(
+        ("org_id" = String, Path, description = "Organization ID"),
+        ("serviceName" = Option<String>, Query, description = "Filter by platform service name (e.g. web_search)"),
+        ("limit" = Option<i64>, Query, description = "Number of records to return (default: 100)"),
+        ("offset" = Option<i64>, Query, description = "Offset for pagination (default: 0)")
+    ),
+    responses(
+        (status = 200, description = "Service usage history", body = ServiceUsageHistoryResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 403, description = "Forbidden", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    ),
+    security(
+        ("session_token" = [])
+    )
+)]
+pub async fn get_service_usage_history(
+    State(app_state): State<AppState>,
+    Extension(user): Extension<AuthenticatedUser>,
+    Path(org_id): Path<String>,
+    Query(query): Query<ServiceUsageHistoryQuery>,
+) -> Result<ResponseJson<ServiceUsageHistoryResponse>, (StatusCode, ResponseJson<ErrorResponse>)> {
+    tracing::debug!(
+        "Get service usage history for org {} by user {}, service: {:?}, limit: {}, offset: {}",
+        org_id,
+        user.0.id,
+        query.service_name,
+        query.limit,
+        query.offset
+    );
+
+    // Validate pagination parameters
+    crate::routes::common::validate_limit_offset(query.limit, query.offset)?;
+
+    let organization_id = Uuid::parse_str(&org_id).map_err(|_| {
+        (
+            StatusCode::BAD_REQUEST,
+            ResponseJson(ErrorResponse::new(
+                "Invalid organization ID".to_string(),
+                "invalid_id".to_string(),
+            )),
+        )
+    })?;
+
+    // Check if user is a member of this organization
+    let user_id = crate::conversions::authenticated_user_to_user_id(user);
+    let is_member = app_state
+        .organization_service
+        .is_member(
+            services::organization::OrganizationId(organization_id),
+            user_id,
+        )
+        .await
+        .map_err(|_| {
+            tracing::error!("Failed to check organization membership");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ResponseJson(ErrorResponse::new(
+                    "Failed to verify organization access".to_string(),
+                    "internal_server_error".to_string(),
+                )),
+            )
+        })?;
+
+    if !is_member {
+        return Err((
+            StatusCode::FORBIDDEN,
+            ResponseJson(ErrorResponse::new(
+                "You are not authorized to access this organization's service usage history."
+                    .to_string(),
+                "forbidden".to_string(),
+            )),
+        ));
+    }
+
+    let service_name = query.service_name.as_deref();
+
+    let (history, total) = app_state
+        .service_usage_service
+        .get_usage_history(organization_id, service_name, query.limit, query.offset)
+        .await
+        .map_err(|_| {
+            tracing::error!("Failed to get service usage history");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ResponseJson(ErrorResponse::new(
+                    "Failed to retrieve service usage history".to_string(),
+                    "internal_server_error".to_string(),
+                )),
+            )
+        })?;
+
+    let data = history
+        .into_iter()
+        .map(|entry| ServiceUsageEntryResponse {
+            id: entry.id.to_string(),
+            organization_id: entry.organization_id.to_string(),
+            workspace_id: entry.workspace_id.to_string(),
+            api_key_id: entry.api_key_id.to_string(),
+            service_id: entry.service_id.to_string(),
+            quantity: entry.quantity,
+            total_cost: entry.total_cost,
+            total_cost_display: format_amount(entry.total_cost),
+            inference_id: entry.inference_id.map(|id| id.to_string()),
+            created_at: entry.created_at.to_rfc3339(),
+        })
+        .collect();
+
+    Ok(ResponseJson(ServiceUsageHistoryResponse {
         data,
         total: total as usize,
         limit: query.limit,

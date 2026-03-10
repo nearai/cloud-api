@@ -12,6 +12,7 @@ pub mod metrics;
 pub mod models;
 pub mod organization;
 pub mod responses;
+pub mod service_usage;
 pub mod usage;
 pub mod user;
 pub mod workspace;

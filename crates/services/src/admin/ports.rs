@@ -1,3 +1,4 @@
+use crate::service_usage::ports::ServiceUnit;
 use async_trait::async_trait;
 
 /// Request to update model pricing and metadata
@@ -210,6 +211,8 @@ pub struct AdminOrganizationInfo {
 pub enum AdminError {
     #[error("Model not found: {0}")]
     ModelNotFound(String),
+    #[error("Service not found: {0}")]
+    ServiceNotFound(String),
     #[error("Organization not found: {0}")]
     OrganizationNotFound(String),
     #[error("Invalid pricing data: {0}")]
@@ -325,6 +328,55 @@ pub trait AdminRepository: Send + Sync {
 
     /// Count all active organizations (admin only)
     async fn count_all_organizations(&self) -> Result<i64, anyhow::Error>;
+
+    /// List platform services with pagination (admin only)
+    async fn list_services(
+        &self,
+        include_inactive: bool,
+        limit: i64,
+        offset: i64,
+    ) -> Result<(Vec<PlatformServiceInfo>, i64), anyhow::Error>;
+
+    /// Get platform service by id (admin only)
+    async fn get_service_by_id(
+        &self,
+        id: uuid::Uuid,
+    ) -> Result<Option<PlatformServiceInfo>, anyhow::Error>;
+
+    /// Create a platform service (admin only)
+    async fn create_service(
+        &self,
+        service_name: &str,
+        display_name: &str,
+        description: Option<&str>,
+        unit: ServiceUnit,
+        cost_per_unit: i64,
+    ) -> Result<PlatformServiceInfo, anyhow::Error>;
+
+    /// Update platform service (display_name, description, cost_per_unit, is_active)
+    async fn update_service(
+        &self,
+        id: uuid::Uuid,
+        display_name: Option<&str>,
+        description: Option<&str>,
+        cost_per_unit: Option<i64>,
+        is_active: Option<bool>,
+    ) -> Result<Option<PlatformServiceInfo>, anyhow::Error>;
+}
+
+/// Platform service info (for admin CRUD)
+#[derive(Debug, Clone)]
+pub struct PlatformServiceInfo {
+    pub id: uuid::Uuid,
+    pub service_name: String,
+    pub display_name: String,
+    pub description: Option<String>,
+    pub unit: ServiceUnit,
+    /// Price per unit in nano-USD (scale 9).
+    pub cost_per_unit: i64,
+    pub is_active: bool,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
 }
 
 /// Admin service trait for managing platform configuration
@@ -411,4 +463,35 @@ pub trait AdminService: Send + Sync {
         limit: i64,
         offset: i64,
     ) -> Result<(Vec<AdminOrganizationInfo>, i64), AdminError>;
+
+    /// List platform services with pagination (admin only)
+    async fn list_services(
+        &self,
+        include_inactive: bool,
+        limit: i64,
+        offset: i64,
+    ) -> Result<(Vec<PlatformServiceInfo>, i64), AdminError>;
+
+    /// Get platform service by id (admin only). Returns ServiceNotFound if missing.
+    async fn get_service_by_id(&self, id: uuid::Uuid) -> Result<PlatformServiceInfo, AdminError>;
+
+    /// Create a platform service (admin only)
+    async fn create_service(
+        &self,
+        service_name: &str,
+        display_name: &str,
+        description: Option<&str>,
+        unit: ServiceUnit,
+        cost_per_unit: i64,
+    ) -> Result<PlatformServiceInfo, AdminError>;
+
+    /// Update platform service (display_name, description, cost_per_unit, is_active). Returns ServiceNotFound if missing.
+    async fn update_service(
+        &self,
+        id: uuid::Uuid,
+        display_name: Option<&str>,
+        description: Option<&str>,
+        cost_per_unit: Option<i64>,
+        is_active: Option<bool>,
+    ) -> Result<PlatformServiceInfo, AdminError>;
 }

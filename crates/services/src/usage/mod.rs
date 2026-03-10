@@ -29,7 +29,7 @@ use uuid::Uuid;
 ///   on a model to enable discounted cache billing.
 ///
 /// All costs are in nano-dollars (scale 9). Uses checked arithmetic for overflow safety.
-fn compute_token_cost(
+pub fn compute_token_cost(
     input_tokens: i32,
     output_tokens: i32,
     cache_read_tokens: i32,

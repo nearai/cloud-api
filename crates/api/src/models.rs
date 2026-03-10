@@ -2570,6 +2570,55 @@ pub struct AdminServiceListResponse {
     pub total: i64,
 }
 
+/// Platform service (public) — single item.
+///
+/// Structurally identical to `AdminServiceResponse` today, but kept separate so that
+/// admin vs public representations can evolve independently without breaking clients.
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct ServiceResponse {
+    pub id: uuid::Uuid,
+    #[serde(rename = "serviceName")]
+    pub service_name: String,
+    #[serde(rename = "displayName")]
+    pub display_name: String,
+    pub description: Option<String>,
+    pub unit: ServiceUnit,
+    /// Price per unit in nano-USD (scale 9).
+    #[serde(rename = "costPerUnit")]
+    pub cost_per_unit: i64,
+    #[serde(rename = "isActive")]
+    pub is_active: bool,
+    #[serde(rename = "createdAt")]
+    pub created_at: DateTime<Utc>,
+    #[serde(rename = "updatedAt")]
+    pub updated_at: DateTime<Utc>,
+}
+
+impl From<AdminServiceResponse> for ServiceResponse {
+    fn from(admin: AdminServiceResponse) -> Self {
+        ServiceResponse {
+            id: admin.id,
+            service_name: admin.service_name,
+            display_name: admin.display_name,
+            description: admin.description,
+            unit: admin.unit,
+            cost_per_unit: admin.cost_per_unit,
+            is_active: admin.is_active,
+            created_at: admin.created_at,
+            updated_at: admin.updated_at,
+        }
+    }
+}
+
+/// Response for public service list endpoint
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct ServiceListResponse {
+    pub services: Vec<ServiceResponse>,
+    pub limit: i64,
+    pub offset: i64,
+    pub total: i64,
+}
+
 /// Request to create a platform service (admin)
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct CreateServiceRequest {

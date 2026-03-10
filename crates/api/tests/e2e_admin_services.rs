@@ -3,7 +3,7 @@
 
 mod common;
 
-use api::models::{AdminServiceResponse, CreateServiceRequest, UpdateServiceRequest};
+use api::models::{CreateServiceRequest, ServiceResponse, UpdateServiceRequest};
 use common::*;
 use services::service_usage::ports::ServiceUnit;
 
@@ -17,7 +17,7 @@ async fn test_admin_services_crud() {
         uuid::Uuid::new_v4().to_string().replace('-', "")
     );
 
-    // Create
+    // Create (admin)
     let create_req = CreateServiceRequest {
         service_name: service_name.clone(),
         display_name: "CRUD Test".to_string(),
@@ -32,7 +32,7 @@ async fn test_admin_services_crud() {
         .json(&create_req)
         .await;
     assert_eq!(create_resp.status_code(), 200);
-    let created: AdminServiceResponse =
+    let created: ServiceResponse =
         serde_json::from_str(&create_resp.text()).expect("Parse create response");
     let id = created.id;
 
@@ -42,8 +42,7 @@ async fn test_admin_services_crud() {
         .add_header("User-Agent", MOCK_USER_AGENT)
         .await;
     assert_eq!(get_resp.status_code(), 200);
-    let got: AdminServiceResponse =
-        serde_json::from_str(&get_resp.text()).expect("Parse get response");
+    let got: ServiceResponse = serde_json::from_str(&get_resp.text()).expect("Parse get response");
     assert_eq!(got.id, id);
     assert_eq!(got.display_name, "CRUD Test");
     assert_eq!(got.cost_per_unit, 1_000_000);
@@ -69,7 +68,7 @@ async fn test_admin_services_crud() {
         .add_header("User-Agent", MOCK_USER_AGENT)
         .await;
     assert_eq!(get2_resp.status_code(), 200);
-    let got2: AdminServiceResponse =
+    let got2: ServiceResponse =
         serde_json::from_str(&get2_resp.text()).expect("Parse get2 response");
     assert_eq!(got2.display_name, "CRUD Updated");
     assert_eq!(got2.description.as_deref(), Some("Updated desc"));

@@ -216,6 +216,7 @@ use utoipa::{Modify, OpenApi};
             ModelListResponse, ModelWithPricing, AdminModelListResponse, AdminModelWithPricing,
             DecimalPrice, DecimalPriceRequest, ModelMetadata,
             WebSearchResponse, WebSearchResultItem, WebSearchQueryParams,
+            ServiceResponse, ServiceListResponse,
             AdminServiceResponse, AdminServiceListResponse, CreateServiceRequest, UpdateServiceRequest,
             UpdateModelApiRequest, ModelHistoryEntry, ModelHistoryResponse,
             // Organization limits models (Admin)

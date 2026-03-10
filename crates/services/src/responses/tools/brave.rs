@@ -157,6 +157,9 @@ impl WebSearchProviderTrait for BraveWebSearchProvider {
         if let Some(ifm) = params.include_fetch_metadata {
             query_params.push(("include_fetch_metadata", ifm.to_string()));
         }
+        if let Some(op) = params.operators {
+            query_params.push(("operators", op.to_string()));
+        }
 
         tracing::debug!("Query parameters: {:?}", query_params);
 

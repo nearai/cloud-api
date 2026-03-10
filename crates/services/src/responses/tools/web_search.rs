@@ -164,6 +164,9 @@ impl WebSearchToolExecutor {
             {
                 search_params.include_fetch_metadata = Some(ifm);
             }
+            if let Some(op) = params.get("operators").and_then(|v| v.as_bool()) {
+                search_params.operators = Some(op);
+            }
         }
 
         search_params

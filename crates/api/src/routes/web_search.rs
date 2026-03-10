@@ -100,6 +100,7 @@ pub async fn get_web_search(
         goggles: params.goggles,
         enable_rich_callback: params.enable_rich_callback,
         include_fetch_metadata: params.include_fetch_metadata,
+        operators: params.operators,
     };
 
     let results = state

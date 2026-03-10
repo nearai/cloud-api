@@ -80,6 +80,10 @@ pub struct WebSearchParams {
     /// Include fetch metadata in the response (Brave API pass-through)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub include_fetch_metadata: Option<bool>,
+
+    /// Enable search operators interpretation in query
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub operators: Option<bool>,
 }
 
 impl WebSearchParams {

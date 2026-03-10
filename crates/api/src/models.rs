@@ -845,6 +845,9 @@ pub struct WebSearchQueryParams {
     /// Include fetch metadata in response
     #[serde(skip_serializing_if = "Option::is_none")]
     pub include_fetch_metadata: Option<bool>,
+    /// Enable search operators interpretation in query
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub operators: Option<bool>,
 }
 
 fn default_temperature() -> Option<f32> {

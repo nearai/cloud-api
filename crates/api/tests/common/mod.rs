@@ -815,10 +815,9 @@ pub async fn get_or_create_web_search_service(
     }
 
     // If creation failed (e.g., because the service already exists from a previous test),
-    // fall back to listing services and return the existing web_search service if present.
+    // fall back to listing services (public) and return the existing web_search service if present.
     let list_resp = server
-        .get("/v1/admin/services?include_inactive=true&limit=100&offset=0")
-        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .get("/v1/services?include_inactive=true&limit=100&offset=0")
         .add_header("User-Agent", MOCK_USER_AGENT)
         .await;
     assert_eq!(

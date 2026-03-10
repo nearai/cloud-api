@@ -809,6 +809,8 @@ pub fn build_app_with_config(
 
     let model_routes = build_model_routes(domain_services.models_service.clone());
 
+    let services_routes = build_services_routes(database.pool().clone());
+
     let admin_routes = build_admin_routes(
         database.clone(),
         &auth_components.auth_state_middleware,
@@ -869,6 +871,7 @@ pub fn build_app_with_config(
                 .merge(workspace_routes)
                 .merge(attestation_routes.clone())
                 .merge(model_routes)
+                .merge(services_routes)
                 .merge(admin_routes)
                 .merge(invitation_routes)
                 .merge(auth_vpc_routes)
@@ -1324,6 +1327,20 @@ pub fn build_model_routes(models_service: Arc<dyn ModelsServiceTrait>) -> Router
         .with_state(models_app_state)
 }
 
+/// Build public services routes (no auth) — GET /v1/services, GET /v1/services/{service_name}
+pub fn build_services_routes(pool: database::DbPool) -> Router {
+    use crate::routes::services::{get_service_by_name, list_services, ServicesRouteState};
+    use database::repositories::ServiceRepository;
+
+    let service_repository = Arc::new(ServiceRepository::new(pool));
+    let state = ServicesRouteState { service_repository };
+
+    Router::new()
+        .route("/services", get(list_services))
+        .route("/services/{service_name}", get(get_service_by_name))
+        .with_state(state)
+}
+
 /// Build admin routes (authenticated endpoints)
 pub fn build_admin_routes(
     database: Arc<Database>,
@@ -1336,10 +1353,9 @@ pub fn build_admin_routes(
         batch_upsert_models, create_admin_access_token, create_service, delete_admin_access_token,
         delete_model, get_model_history, get_organization_concurrent_limit,
         get_organization_limits_history, get_organization_metrics, get_organization_timeseries,
-        get_platform_metrics, get_service_by_id, list_admin_access_tokens,
-        list_models as admin_list_models, list_organizations, list_services, list_users,
-        update_organization_concurrent_limit, update_organization_limits, update_service,
-        AdminAppState,
+        get_platform_metrics, list_admin_access_tokens, list_models as admin_list_models,
+        list_organizations, list_users, update_organization_concurrent_limit,
+        update_organization_limits, update_service, AdminAppState,
     };
     use database::repositories::{
         AdminAccessTokenRepository, AdminCompositeRepository, PgAnalyticsRepository,
@@ -1386,14 +1402,8 @@ pub fn build_admin_routes(
             "/admin/models/{model_name}/history",
             axum::routing::get(get_model_history),
         )
-        .route(
-            "/admin/services",
-            axum::routing::get(list_services).post(create_service),
-        )
-        .route(
-            "/admin/services/{id}",
-            axum::routing::get(get_service_by_id).patch(update_service),
-        )
+        .route("/admin/services", axum::routing::post(create_service))
+        .route("/admin/services/{id}", axum::routing::patch(update_service))
         .route(
             "/admin/organizations/{org_id}/limits",
             axum::routing::patch(update_organization_limits),

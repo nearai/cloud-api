@@ -27,7 +27,7 @@ pub struct ListServicesQueryParams {
 }
 
 fn service_to_response(
-    s: &database::models::Service,
+    s: database::models::Service,
 ) -> Result<ServiceResponse, (StatusCode, ResponseJson<ErrorResponse>)> {
     let unit = ServiceUnit::try_from(s.unit.as_str()).map_err(|e| {
         // Log internal details server-side, but return a generic error to the client.
@@ -42,9 +42,9 @@ fn service_to_response(
     })?;
     Ok(ServiceResponse {
         id: s.id,
-        service_name: s.service_name.clone(),
-        display_name: s.display_name.clone(),
-        description: s.description.clone(),
+        service_name: s.service_name,
+        display_name: s.display_name,
+        description: s.description,
         unit,
         cost_per_unit: s.cost_per_unit,
         is_active: s.is_active,
@@ -86,7 +86,7 @@ pub async fn list_services(
             )
         })?;
     let services_api: Vec<ServiceResponse> = services
-        .iter()
+        .into_iter()
         .map(service_to_response)
         .collect::<Result<Vec<_>, _>>()?;
     Ok(ResponseJson(ServiceListResponse {
@@ -136,6 +136,6 @@ pub async fn get_service_by_name(
             )),
         )
     })?;
-    let response = service_to_response(&service)?;
+    let response = service_to_response(service)?;
     Ok(ResponseJson(response))
 }

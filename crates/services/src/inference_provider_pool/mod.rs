@@ -755,9 +755,16 @@ impl InferenceProviderPool {
             counts.retain(|key, _| active_ptrs.contains(key));
         }
 
+        // Compute actual pool size (includes both fresh and retained providers)
+        let actual_total_providers: usize = {
+            let mappings = self.provider_mappings.read().await;
+            mappings.model_to_providers.values().map(|v| v.len()).sum()
+        };
+
         tracing::info!(
             total_models = all_models.len(),
-            total_providers = total_providers,
+            total_providers = actual_total_providers,
+            fresh_providers = total_providers,
             model_ids = ?all_models.iter().map(|m| &m.id).collect::<Vec<_>>(),
             "Model discovery from endpoint completed"
         );

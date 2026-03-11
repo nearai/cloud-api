@@ -66,11 +66,14 @@ pub struct VLlmProvider {
 impl VLlmProvider {
     /// Create a new vLLM provider with the given configuration
     pub fn new(config: VLlmConfig) -> Self {
+        // connect_timeout: 5s is generous for local-network backends. A backend behind a
+        // firewall-drop (not RST) is the worst case; 5s catches it without penalising
+        // fallback latency. Connection-refused is instant regardless.
         // read_timeout guards against stalled backends: if no bytes arrive for this
         // duration after TTFB, the connection is dropped. Intentionally generous (120s)
         // so normal long-running inference is unaffected while truly hung backends release resources.
         let client = Client::builder()
-            .connect_timeout(std::time::Duration::from_secs(30))
+            .connect_timeout(std::time::Duration::from_secs(5))
             .pool_idle_timeout(std::time::Duration::from_secs(90))
             .read_timeout(std::time::Duration::from_secs(120))
             .build()

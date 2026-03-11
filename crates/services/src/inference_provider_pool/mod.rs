@@ -542,8 +542,7 @@ impl InferenceProviderPool {
 
         // The set of all model names listed by discovery (regardless of attestation success).
         // Models NOT in this set have been decommissioned and should be removed.
-        let discovered_model_names: HashSet<String> =
-            model_to_endpoints.keys().cloned().collect();
+        let discovered_model_names: HashSet<String> = model_to_endpoints.keys().cloned().collect();
 
         // Phase 1: Fetch attestation reports concurrently for all endpoints (no locks held).
         // Uses a short-timeout probe provider so a dead backend doesn't block discovery of healthy ones.
@@ -590,7 +589,12 @@ impl InferenceProviderPool {
                             .map(|(key, _)| (key, serving_provider.clone()))
                             .collect();
 
-                        (model_name, serving_provider, pub_keys, has_valid_attestation)
+                        (
+                            model_name,
+                            serving_provider,
+                            pub_keys,
+                            has_valid_attestation,
+                        )
                     }
                 })
             })
@@ -722,7 +726,10 @@ impl InferenceProviderPool {
                 .map(|p| Arc::as_ptr(p) as *const () as usize)
                 .collect();
 
-            let mut counts = self.provider_failure_counts.write().unwrap_or_else(|e| e.into_inner());
+            let mut counts = self
+                .provider_failure_counts
+                .write()
+                .unwrap_or_else(|e| e.into_inner());
             counts.retain(|key, _| active_ptrs.contains(key));
         }
 
@@ -825,7 +832,10 @@ impl InferenceProviderPool {
             format!("id:{}", model_id)
         };
 
-        let mut indices = self.load_balancer_index.write().unwrap_or_else(|e| e.into_inner());
+        let mut indices = self
+            .load_balancer_index
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
         let index = indices.entry(index_key.clone()).or_insert(0);
         let selected_index = *index % providers.len();
 
@@ -845,7 +855,10 @@ impl InferenceProviderPool {
         // Demoted providers (>= MAX_CONSECUTIVE_FAILURES) are still included as last resort
         // but healthy providers are tried first, avoiding unnecessary timeout waits.
         const MAX_CONSECUTIVE_FAILURES: u32 = 10;
-        let counts = self.provider_failure_counts.read().unwrap_or_else(|e| e.into_inner());
+        let counts = self
+            .provider_failure_counts
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
         let (mut healthy, mut demoted): (Vec<_>, Vec<_>) =
             ordered_providers.into_iter().partition(|p| {
                 let key = Arc::as_ptr(p) as *const () as usize;
@@ -1054,7 +1067,10 @@ impl InferenceProviderPool {
                 Ok(result) => {
                     // Reset failure counter on success
                     {
-                        let mut counts = self.provider_failure_counts.write().unwrap_or_else(|e| e.into_inner());
+                        let mut counts = self
+                            .provider_failure_counts
+                            .write()
+                            .unwrap_or_else(|e| e.into_inner());
                         let key = Arc::as_ptr(provider) as *const () as usize;
                         counts.insert(key, 0);
                     }
@@ -1069,7 +1085,10 @@ impl InferenceProviderPool {
                 Err(e) => {
                     // Increment failure counter
                     {
-                        let mut counts = self.provider_failure_counts.write().unwrap_or_else(|e| e.into_inner());
+                        let mut counts = self
+                            .provider_failure_counts
+                            .write()
+                            .unwrap_or_else(|e| e.into_inner());
                         let key = Arc::as_ptr(provider) as *const () as usize;
                         let counter = counts.entry(key).or_insert(0);
                         *counter = counter.saturating_add(1);
@@ -1816,7 +1835,10 @@ impl InferenceProviderPool {
 
         // Step 3: Clear load balancer indices
         debug!("Step 3: Clearing load balancer indices");
-        let mut lb_index = self.load_balancer_index.write().unwrap_or_else(|e| e.into_inner());
+        let mut lb_index = self
+            .load_balancer_index
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
         let index_count = lb_index.len();
         lb_index.clear();
         debug!("Cleared {} load balancer indices", index_count);
@@ -1832,7 +1854,10 @@ impl InferenceProviderPool {
 
         // Step 5: Clear provider failure counts
         debug!("Step 5: Clearing provider failure counts");
-        let mut failure_counts = self.provider_failure_counts.write().unwrap_or_else(|e| e.into_inner());
+        let mut failure_counts = self
+            .provider_failure_counts
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
         let failure_count = failure_counts.len();
         failure_counts.clear();
         debug!("Cleared {} provider failure count entries", failure_count);

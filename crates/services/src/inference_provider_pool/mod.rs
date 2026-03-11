@@ -1834,15 +1834,17 @@ impl InferenceProviderPool {
         drop(external);
 
         // Step 3: Clear load balancer indices
-        debug!("Step 3: Clearing load balancer indices");
-        let mut lb_index = self
-            .load_balancer_index
-            .write()
-            .unwrap_or_else(|e| e.into_inner());
-        let index_count = lb_index.len();
-        lb_index.clear();
-        debug!("Cleared {} load balancer indices", index_count);
-        drop(lb_index);
+        let index_count = {
+            debug!("Step 3: Clearing load balancer indices");
+            let mut lb_index = self
+                .load_balancer_index
+                .write()
+                .unwrap_or_else(|e| e.into_inner());
+            let count = lb_index.len();
+            lb_index.clear();
+            debug!("Cleared {} load balancer indices", count);
+            count
+        };
 
         // Step 4: Clear chat_id to provider mappings
         debug!("Step 4: Clearing chat session mappings");

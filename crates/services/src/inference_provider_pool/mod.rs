@@ -650,13 +650,15 @@ impl InferenceProviderPool {
 
         // Calculate metrics before acquiring locks
         let total_providers: usize = model_providers.values().map(|v| v.len()).sum();
+        // Save keys before model_providers is consumed by the merge loop
+        let model_providers_keys: HashSet<String> = model_providers.keys().cloned().collect();
 
         // Phase 2: Merge new discovery into existing mappings.
         // - Models with successful attestation: replace their providers.
         // - Models in discovery but all attestation failed: keep existing providers
         //   (transient failure — they may still serve traffic).
         // - Models NOT in discovery response at all: remove (decommissioned).
-        // - Pubkey mappings: rebuilt from fresh attestation results.
+        // - Pubkey mappings: prune stale entries, merge fresh attestation results.
         {
             let mut mappings = self.provider_mappings.write().await;
 
@@ -684,17 +686,37 @@ impl InferenceProviderPool {
             // keep existing providers (they're transiently unreachable but may still work)
             let retained_count = discovered_model_names
                 .iter()
+                .filter(|m| !model_providers_keys.contains(m.as_str()))
                 .filter(|m| mappings.model_to_providers.contains_key(m.as_str()))
                 .count();
 
-            // Rebuild pubkey mappings from fresh attestation results
-            mappings.pubkey_to_providers.clear();
+            // Prune pubkey mappings: keep entries pointing to providers still in the pool,
+            // remove entries pointing to providers that were replaced or evicted.
+            // This preserves pubkey routing for retained models whose attestation failed
+            // this cycle, while cleaning up stale entries.
+            let active_provider_ptrs: HashSet<usize> = mappings
+                .model_to_providers
+                .values()
+                .flat_map(|providers| providers.iter())
+                .map(|p| Arc::as_ptr(p) as *const () as usize)
+                .collect();
+            mappings.pubkey_to_providers.retain(|_, providers| {
+                providers.retain(|provider| {
+                    let key = Arc::as_ptr(provider) as *const () as usize;
+                    active_provider_ptrs.contains(&key)
+                });
+                !providers.is_empty()
+            });
+
+            // Merge fresh attestation-derived pubkey mappings
             for (key, provider) in model_pub_key_updates {
-                mappings
-                    .pubkey_to_providers
-                    .entry(key)
-                    .or_default()
-                    .push(provider);
+                let providers = mappings.pubkey_to_providers.entry(key).or_default();
+                if !providers
+                    .iter()
+                    .any(|existing| Arc::ptr_eq(existing, &provider))
+                {
+                    providers.push(provider);
+                }
             }
 
             // Include models retained from previous discovery in all_models for response
@@ -1083,21 +1105,12 @@ impl InferenceProviderPool {
                     return Ok((result, provider.clone()));
                 }
                 Err(e) => {
-                    // Increment failure counter
-                    {
-                        let mut counts = self
-                            .provider_failure_counts
-                            .write()
-                            .unwrap_or_else(|e| e.into_inner());
-                        let key = Arc::as_ptr(provider) as *const () as usize;
-                        let counter = counts.entry(key).or_insert(0);
-                        *counter = counter.saturating_add(1);
-                    }
-
                     // For HTTP client errors (4xx), don't retry with other providers.
                     // The request itself is invalid (e.g., too many tokens), so retrying won't help.
                     // Exception: 429 (rate limit) and 408 (request timeout) are retryable
                     // as other providers may have capacity or better connectivity.
+                    // NOTE: Don't increment the failure counter for non-retryable 4xx —
+                    // these indicate invalid requests, not unhealthy providers.
                     if let CompletionError::HttpError { status_code, .. } = &e {
                         if (400..=499).contains(status_code)
                             && *status_code != 429
@@ -1112,6 +1125,18 @@ impl InferenceProviderPool {
                             );
                             return Err(Self::sanitize_completion_error(e, model_id));
                         }
+                    }
+
+                    // Increment failure counter only for retryable errors
+                    // (5xx, timeouts, network errors — indicators of backend health issues)
+                    {
+                        let mut counts = self
+                            .provider_failure_counts
+                            .write()
+                            .unwrap_or_else(|e| e.into_inner());
+                        let key = Arc::as_ptr(provider) as *const () as usize;
+                        let counter = counts.entry(key).or_insert(0);
+                        *counter = counter.saturating_add(1);
                     }
 
                     // Log the failure for debugging

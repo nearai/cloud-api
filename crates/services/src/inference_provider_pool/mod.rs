@@ -655,7 +655,7 @@ impl InferenceProviderPool {
         // - Models in discovery but all attestation failed: keep existing providers
         //   (transient failure — they may still serve traffic).
         // - Models NOT in discovery response at all: remove (decommissioned).
-        // - Pubkey mappings: rebuilt from fresh attestation results.
+        // - Pubkey mappings: retain active providers and merge fresh attestation results.
         {
             let mut mappings = self.provider_mappings.write().await;
 
@@ -686,14 +686,31 @@ impl InferenceProviderPool {
                 .filter(|m| mappings.model_to_providers.contains_key(m.as_str()))
                 .count();
 
-            // Rebuild pubkey mappings from fresh attestation results
-            mappings.pubkey_to_providers.clear();
+            // Keep pubkey mappings for providers that are still active (retained models),
+            // and drop mappings that point to removed/replaced providers.
+            let active_provider_ptrs: HashSet<usize> = mappings
+                .model_to_providers
+                .values()
+                .flat_map(|providers| providers.iter())
+                .map(|p| Arc::as_ptr(p) as *const () as usize)
+                .collect();
+            mappings.pubkey_to_providers.retain(|_, providers| {
+                providers.retain(|provider| {
+                    let key = Arc::as_ptr(provider) as *const () as usize;
+                    active_provider_ptrs.contains(&key)
+                });
+                !providers.is_empty()
+            });
+
+            // Merge fresh attestation-derived pubkey mappings.
             for (key, provider) in model_pub_key_updates {
-                mappings
-                    .pubkey_to_providers
-                    .entry(key)
-                    .or_default()
-                    .push(provider);
+                let providers = mappings.pubkey_to_providers.entry(key).or_default();
+                if !providers
+                    .iter()
+                    .any(|existing| Arc::ptr_eq(existing, &provider))
+                {
+                    providers.push(provider);
+                }
             }
 
             // Include models retained from previous discovery in all_models for response
@@ -1082,17 +1099,6 @@ impl InferenceProviderPool {
                     return Ok((result, provider.clone()));
                 }
                 Err(e) => {
-                    // Increment failure counter
-                    {
-                        let mut counts = self
-                            .provider_failure_counts
-                            .write()
-                            .unwrap_or_else(|e| e.into_inner());
-                        let key = Arc::as_ptr(provider) as *const () as usize;
-                        let counter = counts.entry(key).or_insert(0);
-                        *counter = counter.saturating_add(1);
-                    }
-
                     // For HTTP client errors (4xx), don't retry with other providers.
                     // The request itself is invalid (e.g., too many tokens), so retrying won't help.
                     // Exception: 429 (rate limit) and 408 (request timeout) are retryable
@@ -1111,6 +1117,17 @@ impl InferenceProviderPool {
                             );
                             return Err(Self::sanitize_completion_error(e, model_id));
                         }
+                    }
+
+                    // Increment failure counter for retryable errors only.
+                    {
+                        let mut counts = self
+                            .provider_failure_counts
+                            .write()
+                            .unwrap_or_else(|e| e.into_inner());
+                        let key = Arc::as_ptr(provider) as *const () as usize;
+                        let counter = counts.entry(key).or_insert(0);
+                        *counter = counter.saturating_add(1);
                     }
 
                     // Log the failure for debugging

@@ -424,7 +424,9 @@ pub async fn chat_completions(
                                     // in a provider-specific format (e.g. Gemini native).
                                     let json_data = serde_json::to_string(&event.chunk)
                                         .unwrap_or_else(|e| {
-                                            tracing::error!("Failed to serialize stream chunk: {e}");
+                                            tracing::error!(
+                                                "Failed to serialize stream chunk: {e}"
+                                            );
                                             "{}".to_string()
                                         });
                                     tracing::debug!("Completion stream event: {}", json_data);
@@ -712,7 +714,8 @@ mod tests {
         let chunk = make_chat_chunk("chatcmpl-123abc");
         let uuid1 = extract_inference_id_from_chunk(&chunk).expect("should extract UUID");
         // UUID should be deterministic - same input produces same UUID
-        let uuid2 = extract_inference_id_from_chunk(&chunk).expect("should extract UUID on second call");
+        let uuid2 =
+            extract_inference_id_from_chunk(&chunk).expect("should extract UUID on second call");
         assert_eq!(uuid1, uuid2);
     }
 

@@ -51,6 +51,9 @@ pub struct ModelWithPricing {
     pub input_modalities: Option<Vec<String>>,
     /// Output modalities the model produces, e.g., ["text"], ["image"]
     pub output_modalities: Option<Vec<String>>,
+
+    /// Base URL for the model's inference endpoint
+    pub inference_url: Option<String>,
 }
 
 #[derive(Debug, thiserror::Error)]

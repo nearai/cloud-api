@@ -80,6 +80,7 @@ impl AdminRepository for AdminCompositeRepository {
             attestation_supported: request.attestation_supported,
             input_modalities: request.input_modalities,
             output_modalities: request.output_modalities,
+            inference_url: request.inference_url,
             change_reason: request.change_reason,
             changed_by_user_id: request.changed_by_user_id,
             changed_by_user_email: request.changed_by_user_email,
@@ -115,6 +116,7 @@ impl AdminRepository for AdminCompositeRepository {
             attestation_supported: model.attestation_supported,
             input_modalities: model.input_modalities,
             output_modalities: model.output_modalities,
+            inference_url: model.inference_url,
         })
     }
 
@@ -153,6 +155,7 @@ impl AdminRepository for AdminCompositeRepository {
                 owned_by: h.owned_by,
                 input_modalities: h.input_modalities,
                 output_modalities: h.output_modalities,
+                inference_url: h.inference_url,
                 effective_from: h.effective_from,
                 effective_until: h.effective_until,
                 changed_by_user_id: h.changed_by_user_id,
@@ -360,6 +363,7 @@ impl AdminRepository for AdminCompositeRepository {
                 attestation_supported: m.attestation_supported,
                 input_modalities: m.input_modalities,
                 output_modalities: m.output_modalities,
+                inference_url: m.inference_url,
             })
             .collect();
 

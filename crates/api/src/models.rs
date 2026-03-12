@@ -2779,6 +2779,10 @@ pub struct ModelMetadata {
     /// Model architecture (input/output modalities)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub architecture: Option<ModelArchitecture>,
+
+    /// Base URL for the model's inference endpoint
+    #[serde(rename = "inferenceUrl", skip_serializing_if = "Option::is_none")]
+    pub inference_url: Option<String>,
 }
 
 /// Request to update model pricing (admin endpoint)
@@ -2827,6 +2831,9 @@ pub struct UpdateModelApiRequest {
     /// Output modalities the model produces, e.g., ["text"], ["image"]
     #[serde(rename = "outputModalities", skip_serializing_if = "Option::is_none")]
     pub output_modalities: Option<Vec<String>>,
+    /// Base URL for the model's inference endpoint
+    #[serde(rename = "inferenceUrl", skip_serializing_if = "Option::is_none")]
+    pub inference_url: Option<String>,
     #[serde(rename = "changeReason", skip_serializing_if = "Option::is_none")]
     pub change_reason: Option<String>,
 }
@@ -2888,6 +2895,9 @@ pub struct ModelHistoryEntry {
     /// Output modalities the model produces, e.g., ["text"], ["image"]
     #[serde(rename = "outputModalities", skip_serializing_if = "Option::is_none")]
     pub output_modalities: Option<Vec<String>>,
+    /// Base URL for the model's inference endpoint
+    #[serde(rename = "inferenceUrl", skip_serializing_if = "Option::is_none")]
+    pub inference_url: Option<String>,
 }
 
 /// Model history response - complete history of model changes

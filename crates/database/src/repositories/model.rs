@@ -98,7 +98,7 @@ impl ModelRepository {
                         m.input_cost_per_token, m.output_cost_per_token, m.cost_per_image, m.cache_read_cost_per_token,
                         m.context_length, m.verifiable, m.is_active, m.owned_by, m.created_at, m.updated_at,
                         m.provider_type, m.provider_config, m.attestation_supported,
-                        m.input_modalities, m.output_modalities,
+                        m.input_modalities, m.output_modalities, m.inference_url,
                         COALESCE(array_agg(a.alias_name) FILTER (WHERE a.alias_name IS NOT NULL), '{}') AS aliases
                     FROM models m
                     LEFT JOIN model_aliases a ON a.canonical_model_id = m.id AND a.is_active = true
@@ -179,7 +179,7 @@ impl ModelRepository {
                             m.input_cost_per_token, m.output_cost_per_token, m.cost_per_image, m.cache_read_cost_per_token,
                             m.context_length, m.verifiable, m.is_active, m.owned_by, m.created_at, m.updated_at,
                             m.provider_type, m.provider_config, m.attestation_supported,
-                            m.input_modalities, m.output_modalities,
+                            m.input_modalities, m.output_modalities, m.inference_url,
                             COALESCE(array_agg(a.alias_name) FILTER (WHERE a.alias_name IS NOT NULL), '{}') AS aliases
                         FROM models m
                         LEFT JOIN model_aliases a ON a.canonical_model_id = m.id AND a.is_active = true
@@ -200,7 +200,7 @@ impl ModelRepository {
                             m.input_cost_per_token, m.output_cost_per_token, m.cost_per_image, m.cache_read_cost_per_token,
                             m.context_length, m.verifiable, m.is_active, m.owned_by, m.created_at, m.updated_at,
                             m.provider_type, m.provider_config, m.attestation_supported,
-                            m.input_modalities, m.output_modalities,
+                            m.input_modalities, m.output_modalities, m.inference_url,
                             COALESCE(array_agg(a.alias_name) FILTER (WHERE a.alias_name IS NOT NULL), '{}') AS aliases
                         FROM models m
                         LEFT JOIN model_aliases a ON a.canonical_model_id = m.id AND a.is_active = true
@@ -242,7 +242,7 @@ impl ModelRepository {
                         input_cost_per_token, output_cost_per_token, cost_per_image, cache_read_cost_per_token,
                         context_length, verifiable, is_active, owned_by, created_at, updated_at,
                         provider_type, provider_config, attestation_supported,
-                        input_modalities, output_modalities
+                        input_modalities, output_modalities, inference_url
                     FROM models
                     WHERE model_name = $1
                     "#,
@@ -277,7 +277,7 @@ impl ModelRepository {
                         input_cost_per_token, output_cost_per_token, cost_per_image, cache_read_cost_per_token,
                         context_length, verifiable, is_active, owned_by, created_at, updated_at,
                         provider_type, provider_config, attestation_supported,
-                        input_modalities, output_modalities
+                        input_modalities, output_modalities, inference_url
                     FROM models
                     WHERE id = $1
                     "#,
@@ -428,13 +428,14 @@ impl ModelRepository {
                             attestation_supported = COALESCE($15, attestation_supported),
                             input_modalities = COALESCE($16, input_modalities),
                             output_modalities = COALESCE($17, output_modalities),
+                            inference_url = COALESCE($18, inference_url),
                             updated_at = NOW()
                         WHERE model_name = $1
                         RETURNING id, model_name, model_display_name, model_description, model_icon,
                                   input_cost_per_token, output_cost_per_token, cost_per_image, cache_read_cost_per_token,
                                   context_length, verifiable, is_active, owned_by, created_at, updated_at,
                                   provider_type, provider_config, attestation_supported,
-                                  input_modalities, output_modalities
+                                  input_modalities, output_modalities, inference_url
                         "#,
                         &[
                             &model_name,
@@ -454,6 +455,7 @@ impl ModelRepository {
                             &update_request.attestation_supported,
                             &input_modalities_json,
                             &output_modalities_json,
+                            &update_request.inference_url,
                         ],
                     )
                     .await
@@ -486,7 +488,7 @@ impl ModelRepository {
                             model_display_name, model_description, model_icon,
                             context_length, verifiable, is_active, owned_by,
                             provider_type, provider_config, attestation_supported,
-                            input_modalities, output_modalities
+                            input_modalities, output_modalities, inference_url
                         ) VALUES (
                             $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11,
                             COALESCE($12, $13),
@@ -496,7 +498,7 @@ impl ModelRepository {
                             -- External providers cannot support attestation, so default to false
                             -- vLLM providers support attestation, so default to true
                             COALESCE($16, CASE WHEN COALESCE($14, 'vllm') = 'external' THEN false ELSE true END),
-                            $17, $18
+                            $17, $18, $19
                         )
                         ON CONFLICT (model_name) DO UPDATE SET
                             input_cost_per_token = EXCLUDED.input_cost_per_token,
@@ -515,12 +517,13 @@ impl ModelRepository {
                             attestation_supported = EXCLUDED.attestation_supported,
                             input_modalities = COALESCE(EXCLUDED.input_modalities, models.input_modalities),
                             output_modalities = COALESCE(EXCLUDED.output_modalities, models.output_modalities),
+                            inference_url = COALESCE(EXCLUDED.inference_url, models.inference_url),
                             updated_at = NOW()
                         RETURNING id, model_name, model_display_name, model_description, model_icon,
                                   input_cost_per_token, output_cost_per_token, cost_per_image, cache_read_cost_per_token,
                                   context_length, verifiable, is_active, owned_by, created_at, updated_at,
                                   provider_type, provider_config, attestation_supported,
-                                  input_modalities, output_modalities
+                                  input_modalities, output_modalities, inference_url
                         "#,
                         &[
                             &model_name,
@@ -541,6 +544,7 @@ impl ModelRepository {
                             &update_request.attestation_supported,
                             &input_modalities_json,
                             &output_modalities_json,
+                            &update_request.inference_url,
                         ],
                     )
                     .await
@@ -592,16 +596,16 @@ impl ModelRepository {
                         input_cost_per_token, output_cost_per_token, cost_per_image, cache_read_cost_per_token,
                         context_length, verifiable, is_active, owned_by,
                         provider_type, provider_config, attestation_supported,
-                        input_modalities, output_modalities
+                        input_modalities, output_modalities, inference_url
                     ) VALUES (
                         $1, $2, $3, $4, $5, $6, $7, $8,
-                        $9, $10, $11, $12, $13, $14, $15, $16, $17
+                        $9, $10, $11, $12, $13, $14, $15, $16, $17, $18
                     )
                     RETURNING id, model_name, model_display_name, model_description, model_icon,
                               input_cost_per_token, output_cost_per_token, cost_per_image, cache_read_cost_per_token,
                               context_length, verifiable, is_active, owned_by, created_at, updated_at,
                               provider_type, provider_config, attestation_supported,
-                              input_modalities, output_modalities
+                              input_modalities, output_modalities, inference_url
                     "#,
                     &[
                         &model.model_name,
@@ -621,6 +625,7 @@ impl ModelRepository {
                         &model.attestation_supported,
                         &input_modalities_json,
                         &output_modalities_json,
+                        &model.inference_url,
                     ],
                 )
                 .await
@@ -648,7 +653,7 @@ impl ModelRepository {
                         context_length, model_name, model_display_name, model_description,
                         model_icon, verifiable, is_active, owned_by,
                         provider_type, provider_config, attestation_supported,
-                        input_modalities, output_modalities,
+                        input_modalities, output_modalities, inference_url,
                         effective_from, effective_until, changed_by_user_id, changed_by_user_email,
                         change_reason, created_at
                     FROM model_history
@@ -690,7 +695,7 @@ impl ModelRepository {
                         context_length, model_name, model_display_name, model_description,
                         model_icon, verifiable, is_active, owned_by,
                         provider_type, provider_config, attestation_supported,
-                        input_modalities, output_modalities,
+                        input_modalities, output_modalities, inference_url,
                         effective_from, effective_until, changed_by_user_id, changed_by_user_email,
                         change_reason, created_at
                     FROM model_history
@@ -762,7 +767,7 @@ impl ModelRepository {
                         h.context_length, h.model_name, h.model_display_name, h.model_description,
                         h.model_icon, h.verifiable, h.is_active, h.owned_by,
                         h.provider_type, h.provider_config, h.attestation_supported,
-                        h.input_modalities, h.output_modalities,
+                        h.input_modalities, h.output_modalities, h.inference_url,
                         h.effective_from, h.effective_until, h.changed_by_user_id, h.changed_by_user_email,
                         h.change_reason, h.created_at
                     FROM model_history h
@@ -810,7 +815,7 @@ impl ModelRepository {
                               input_cost_per_token, output_cost_per_token, cost_per_image, cache_read_cost_per_token,
                               context_length, verifiable, is_active, owned_by, created_at, updated_at,
                               provider_type, provider_config, attestation_supported,
-                              input_modalities, output_modalities
+                              input_modalities, output_modalities, inference_url
                     "#,
                     &[&model_name],
                 )
@@ -890,6 +895,7 @@ impl ModelRepository {
                     attestation_supported,
                     input_modalities,
                     output_modalities,
+                    inference_url,
                     effective_from,
                     effective_until,
                     changed_by_user_id,
@@ -897,8 +903,8 @@ impl ModelRepository {
                     change_reason,
                     created_at
                 ) VALUES (
-                    $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18,
-                    NOW(), NULL, $19, $20, $21, NOW()
+                    $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19,
+                    NOW(), NULL, $20, $21, $22, NOW()
                 )
                 "#,
                 &[
@@ -926,6 +932,10 @@ impl ModelRepository {
                         .flatten(),
                     &model_row
                         .try_get::<_, Option<serde_json::Value>>("output_modalities")
+                        .ok()
+                        .flatten(),
+                    &model_row
+                        .try_get::<_, Option<String>>("inference_url")
                         .ok()
                         .flatten(),
                     &changed_by_user_id,
@@ -1007,6 +1017,7 @@ impl ModelRepository {
                         m.attestation_supported,
                         m.input_modalities,
                         m.output_modalities,
+                        m.inference_url,
                         COALESCE(
                             array_agg(ma_all.alias_name)
                             FILTER (WHERE ma_all.alias_name IS NOT NULL),
@@ -1078,6 +1089,7 @@ impl ModelRepository {
                 "output_modalities",
                 &model_name,
             ),
+            inference_url: row.try_get("inference_url").ok().flatten(),
         }
     }
 
@@ -1116,6 +1128,7 @@ impl ModelRepository {
                 "output_modalities",
                 &model_name,
             ),
+            inference_url: row.try_get("inference_url").ok().flatten(),
             effective_from: row.get("effective_from"),
             effective_until: row.get("effective_until"),
             changed_by_user_id: row.get("changed_by_user_id"),
@@ -1219,6 +1232,7 @@ impl services::models::ModelsRepository for ModelRepository {
                 attestation_supported: m.attestation_supported,
                 input_modalities: m.input_modalities,
                 output_modalities: m.output_modalities,
+                inference_url: m.inference_url,
             })
             .collect())
     }
@@ -1247,6 +1261,7 @@ impl services::models::ModelsRepository for ModelRepository {
             attestation_supported: m.attestation_supported,
             input_modalities: m.input_modalities,
             output_modalities: m.output_modalities,
+            inference_url: m.inference_url,
         }))
     }
 
@@ -1274,6 +1289,7 @@ impl services::models::ModelsRepository for ModelRepository {
             attestation_supported: m.attestation_supported,
             input_modalities: m.input_modalities,
             output_modalities: m.output_modalities,
+            inference_url: m.inference_url,
         }))
     }
 

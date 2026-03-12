@@ -24,6 +24,8 @@ pub struct UpdateModelAdminRequest {
     // Architecture/modalities
     pub input_modalities: Option<Vec<String>>,
     pub output_modalities: Option<Vec<String>>,
+    /// Base URL for the model's inference endpoint
+    pub inference_url: Option<String>,
     // User audit tracking for history
     pub change_reason: Option<String>,
     pub changed_by_user_id: Option<uuid::Uuid>,
@@ -62,6 +64,8 @@ pub struct ModelPricing {
     // Architecture/modalities
     pub input_modalities: Option<Vec<String>>,
     pub output_modalities: Option<Vec<String>>,
+    /// Base URL for the model's inference endpoint
+    pub inference_url: Option<String>,
 }
 
 /// Model history entry - includes pricing, context length, and other model attributes
@@ -84,6 +88,7 @@ pub struct ModelHistoryEntry {
     pub owned_by: String,
     pub input_modalities: Option<Vec<String>>,
     pub output_modalities: Option<Vec<String>>,
+    pub inference_url: Option<String>,
     pub effective_from: chrono::DateTime<chrono::Utc>,
     pub effective_until: Option<chrono::DateTime<chrono::Utc>>,
     pub changed_by_user_id: Option<uuid::Uuid>,
@@ -192,6 +197,8 @@ pub struct AdminModelInfo {
     // Architecture/modalities
     pub input_modalities: Option<Vec<String>>,
     pub output_modalities: Option<Vec<String>>,
+    /// Base URL for the model's inference endpoint
+    pub inference_url: Option<String>,
 }
 
 /// Organization information for admin listing (includes spend limit and usage)

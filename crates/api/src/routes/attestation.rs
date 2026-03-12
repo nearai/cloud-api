@@ -130,7 +130,8 @@ pub struct AttestationQuery {
     pub signing_algo: Option<String>,
     pub nonce: Option<String>,
     pub signing_address: Option<String>,
-    /// Include TLS certificate in attestation and bind its fingerprint into the TDX report_data
+    /// Include TLS certificate in attestation and bind SHA256(file bytes) into report_data
+    /// (entire PEM file hashed, fullchain-safe)
     pub include_tls: Option<bool>,
 }
 
@@ -201,7 +202,7 @@ pub struct AttestationResponse {
     pub gateway_attestation: DstackCpuQuote,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub model_attestations: Vec<serde_json::Map<String, serde_json::Value>>,
-    /// TLS certificate (PEM) served by the ingress sidecar, if available
+    /// TLS certificate file (PEM) from INGRESS_TLS_CERT_PATH; report_data binds via SHA256 of these exact bytes
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tls_certificate: Option<String>,
 }

@@ -50,6 +50,7 @@ impl AttestationServiceTrait for MockAttestationService {
         _signing_algo: Option<String>,
         _nonce: Option<String>,
         _signing_address: Option<String>,
+        _include_tls: bool,
     ) -> Result<AttestationReport, AttestationError> {
         Err(AttestationError::InternalError(
             "Not implemented".to_string(),

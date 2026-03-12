@@ -25,6 +25,7 @@ use crate::{
     usage::{StopReason, UsageRepository},
 };
 
+use base64::Engine;
 use chrono;
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
@@ -620,6 +621,7 @@ impl ports::AttestationServiceTrait for AttestationService {
         signing_algo: Option<String>,
         nonce: Option<String>,
         signing_address: Option<String>,
+        include_tls: bool,
     ) -> Result<AttestationReport, AttestationError> {
         // Resolve model name (could be an alias) and get model details
         let mut model_attestations = vec![];
@@ -726,14 +728,46 @@ impl ports::AttestationServiceTrait for AttestationService {
             signing_address_bytes
         };
 
-        // Build report_data: [signing_address (padded to 32 bytes) || nonce (32 bytes)]
+        // Read TLS certificate if requested
+        let tls_certificate = if include_tls {
+            std::env::var("INGRESS_TLS_CERT_PATH")
+                .ok()
+                .and_then(|path| std::fs::read_to_string(&path).ok())
+        } else {
+            None
+        };
+
+        // Build report_data: [signing_address (32 bytes) || nonce_component (32 bytes)]
+        // When include_tls is set and cert is available:
+        //   nonce_component = SHA256(nonce || SHA256(cert_der))
+        // Otherwise:
+        //   nonce_component = nonce
+        let nonce_component = if let Some(ref pem) = tls_certificate {
+            use sha2::Digest;
+            // Parse PEM to DER and hash the cert
+            let cert_b64: String = pem
+                .lines()
+                .skip_while(|l| !l.starts_with("-----BEGIN CERTIFICATE-----"))
+                .skip(1)
+                .take_while(|l| !l.starts_with("-----END CERTIFICATE-----"))
+                .collect();
+            if let Ok(der) = base64::engine::general_purpose::STANDARD.decode(&cert_b64) {
+                let cert_hash = Sha256::digest(&der);
+                let mut hasher = Sha256::new();
+                hasher.update(&nonce_bytes);
+                hasher.update(cert_hash);
+                hasher.finalize().to_vec()
+            } else {
+                nonce_bytes.clone()
+            }
+        } else {
+            nonce_bytes.clone()
+        };
+
         let mut report_data = vec![0u8; 64];
-        // Pad signing address to 32 bytes (left-justified with zeros)
         report_data[..signing_address_for_report.len()]
             .copy_from_slice(&signing_address_for_report);
-        // Remaining bytes are already zeros
-        // Place nonce in the last 32 bytes
-        report_data[32..64].copy_from_slice(&nonce_bytes);
+        report_data[32..64].copy_from_slice(&nonce_component);
 
         // Fake attestation data is only available in debug builds with DEV set.
         // In release builds, real dstack attestation is always required.
@@ -829,6 +863,7 @@ impl ports::AttestationServiceTrait for AttestationService {
         Ok(AttestationReport {
             gateway_attestation,
             model_attestations,
+            tls_certificate,
         })
     }
 

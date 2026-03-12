@@ -390,9 +390,11 @@ pub fn load_vpc_info() -> Option<VpcInfo> {
     }
 }
 
-/// Load TLS certificate SPKI fingerprint from TLS_CERT_PATH or INGRESS_TLS_CERT_PATH.
+/// Load TLS certificate SPKI fingerprint from the first available cert path.
 pub fn load_tls_cert_fingerprint() -> Option<String> {
-    fn try_path(path: &str, env_name: &str) -> Option<String> {
+    let mut failures: Vec<String> = Vec::new();
+
+    fn try_path(path: &str, env_name: &str, failures: &mut Vec<String>) -> Option<String> {
         match compute_spki_hash(path) {
             Ok(hash) => {
                 tracing::info!(
@@ -404,26 +406,31 @@ pub fn load_tls_cert_fingerprint() -> Option<String> {
                 Some(hash)
             }
             Err(e) => {
-                tracing::warn!(
+                tracing::debug!(
                     tls_cert_path = %path,
                     env = env_name,
                     error = %e,
-                    "Failed to compute TLS cert fingerprint"
+                    "TLS cert fingerprint attempt failed, trying next candidate if any"
                 );
+                failures.push(format!("{env_name}={path}: {e}"));
                 None
             }
         }
     }
 
-    if let Ok(path) = std::env::var("INGRESS_TLS_CERT_PATH") {
-        if let Some(hash) = try_path(&path, "INGRESS_TLS_CERT_PATH") {
-            return Some(hash);
+    for env_name in ["INGRESS_TLS_CERT_PATH", "TLS_CERT_PATH"] {
+        if let Ok(path) = std::env::var(env_name) {
+            if let Some(hash) = try_path(&path, env_name, &mut failures) {
+                return Some(hash);
+            }
         }
     }
-    if let Ok(path) = std::env::var("TLS_CERT_PATH") {
-        if let Some(hash) = try_path(&path, "TLS_CERT_PATH") {
-            return Some(hash);
-        }
+
+    if !failures.is_empty() {
+        tracing::warn!(
+            failures = ?failures,
+            "Could not compute TLS cert fingerprint from any configured path"
+        );
     }
     None
 }
@@ -791,7 +798,7 @@ impl ports::AttestationServiceTrait for AttestationService {
         let tls_fingerprint = if include_tls_fingerprint {
             Some(self.tls_cert_fingerprint.clone().ok_or_else(|| {
                 AttestationError::InternalError(
-                    "include_tls_fingerprint=true but TLS_CERT_PATH is not set or fingerprint could not be computed".to_string(),
+                    "include_tls_fingerprint=true but neither INGRESS_TLS_CERT_PATH nor TLS_CERT_PATH is set or fingerprint could not be computed".to_string(),
                 )
             })?)
         } else {

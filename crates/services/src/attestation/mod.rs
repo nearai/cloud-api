@@ -49,6 +49,23 @@ pub struct AttestationService {
     ecdsa_verifying_key: Arc<EcdsaVerifyingKey>,
 }
 
+/// Build the 32-byte nonce_component when binding a TLS cert PEM file.
+///
+/// Hash the **entire file** as bytes (same idea as `sha256sum cert.pem` on the PEM
+/// file), not a single decoded cert DER.
+/// This binds the quote to the exact bytes served in `tls_certificate`, including
+/// fullchain files with multiple PEM blocks.
+///
+///   nonce_component = SHA256(nonce || SHA256(pem_file_bytes))
+fn nonce_component_with_tls_cert_file_bytes(pem_file_bytes: &[u8], nonce_bytes: &[u8]) -> Vec<u8> {
+    use sha2::Digest;
+    let file_hash = Sha256::digest(pem_file_bytes);
+    let mut hasher = Sha256::new();
+    hasher.update(nonce_bytes);
+    hasher.update(file_hash);
+    hasher.finalize().to_vec()
+}
+
 impl AttestationService {
     pub async fn init(
         repository: Arc<dyn AttestationRepository + Send + Sync>,
@@ -620,6 +637,7 @@ impl ports::AttestationServiceTrait for AttestationService {
         signing_algo: Option<String>,
         nonce: Option<String>,
         signing_address: Option<String>,
+        include_tls: bool,
     ) -> Result<AttestationReport, AttestationError> {
         // Resolve model name (could be an alias) and get model details
         let mut model_attestations = vec![];
@@ -726,14 +744,47 @@ impl ports::AttestationServiceTrait for AttestationService {
             signing_address_bytes
         };
 
-        // Build report_data: [signing_address (padded to 32 bytes) || nonce (32 bytes)]
+        // Read TLS certificate if requested (async I/O; no blocking on tokio worker).
+        // When include_tls=true, the file must be present so report_data binds to it.
+        // Bind by hashing entire file bytes (fullchain-safe),
+        // same spirit as sha256sum on the PEM file—not a single cert DER.
+        let (tls_certificate, nonce_component) = if include_tls {
+            let path = std::env::var("INGRESS_TLS_CERT_PATH").map_err(|_| {
+                AttestationError::InternalError(
+                    "include_tls=true but INGRESS_TLS_CERT_PATH is not set".to_string(),
+                )
+            })?;
+            let pem_bytes = tokio::fs::read(&path).await.map_err(|e| {
+                tracing::error!(
+                    path = %path,
+                    error = %e,
+                    "Failed to read TLS certificate for attestation"
+                );
+                AttestationError::InternalError(format!(
+                    "include_tls=true but TLS certificate could not be read from {path}: {e}"
+                ))
+            })?;
+            if pem_bytes.is_empty() {
+                return Err(AttestationError::InternalError(
+                    "include_tls=true but TLS certificate file is empty".to_string(),
+                ));
+            }
+            let pem_string = String::from_utf8(pem_bytes.clone()).map_err(|e| {
+                AttestationError::InternalError(format!(
+                    "include_tls=true but TLS certificate file is not valid UTF-8: {e}"
+                ))
+            })?;
+            let nonce_component =
+                nonce_component_with_tls_cert_file_bytes(&pem_bytes, &nonce_bytes);
+            (Some(pem_string), nonce_component)
+        } else {
+            (None, nonce_bytes.clone())
+        };
+
         let mut report_data = vec![0u8; 64];
-        // Pad signing address to 32 bytes (left-justified with zeros)
         report_data[..signing_address_for_report.len()]
             .copy_from_slice(&signing_address_for_report);
-        // Remaining bytes are already zeros
-        // Place nonce in the last 32 bytes
-        report_data[32..64].copy_from_slice(&nonce_bytes);
+        report_data[32..64].copy_from_slice(&nonce_component);
 
         // Fake attestation data is only available in debug builds with DEV set.
         // In release builds, real dstack attestation is always required.
@@ -829,6 +880,7 @@ impl ports::AttestationServiceTrait for AttestationService {
         Ok(AttestationReport {
             gateway_attestation,
             model_attestations,
+            tls_certificate,
         })
     }
 

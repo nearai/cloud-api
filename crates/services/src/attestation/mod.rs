@@ -390,26 +390,42 @@ pub fn load_vpc_info() -> Option<VpcInfo> {
     }
 }
 
-/// Load TLS certificate SPKI fingerprint from TLS_CERT_PATH
+/// Load TLS certificate SPKI fingerprint from TLS_CERT_PATH or INGRESS_TLS_CERT_PATH.
 pub fn load_tls_cert_fingerprint() -> Option<String> {
-    if let Ok(path) = std::env::var("TLS_CERT_PATH") {
-        match compute_spki_hash(&path) {
+    fn try_path(path: &str, env_name: &str) -> Option<String> {
+        match compute_spki_hash(path) {
             Ok(hash) => {
                 tracing::info!(
                     tls_cert_path = %path,
+                    env = env_name,
                     fingerprint = %hash,
                     "TLS certificate SPKI hash computed"
                 );
                 Some(hash)
             }
             Err(e) => {
-                tracing::warn!(tls_cert_path = %path, error = %e, "Failed to compute TLS cert fingerprint");
+                tracing::warn!(
+                    tls_cert_path = %path,
+                    env = env_name,
+                    error = %e,
+                    "Failed to compute TLS cert fingerprint"
+                );
                 None
             }
         }
-    } else {
-        None
     }
+
+    if let Ok(path) = std::env::var("INGRESS_TLS_CERT_PATH") {
+        if let Some(hash) = try_path(&path, "INGRESS_TLS_CERT_PATH") {
+            return Some(hash);
+        }
+    }
+    if let Ok(path) = std::env::var("TLS_CERT_PATH") {
+        if let Some(hash) = try_path(&path, "TLS_CERT_PATH") {
+            return Some(hash);
+        }
+    }
+    None
 }
 
 /// Compute SHA-256 hash of the Subject Public Key Info (SPKI) DER from a PEM certificate

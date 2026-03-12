@@ -222,6 +222,7 @@ pub trait InferenceProvider {
         signing_algo: Option<String>,
         nonce: Option<String>,
         signing_address: Option<String>,
+        include_tls_fingerprint: bool,
     ) -> Result<serde_json::Map<String, serde_json::Value>, AttestationError>;
 
     /// Performs an audio transcription request

@@ -431,6 +431,7 @@ impl InferenceProviderPool {
                     signing_algo.map(|s| s.to_string()),
                     None,
                     None,
+                    false,
                 )
                 .await
             {
@@ -1014,6 +1015,7 @@ impl InferenceProviderPool {
         signing_algo: Option<String>,
         nonce: Option<String>,
         signing_address: Option<String>,
+        include_tls_fingerprint: bool,
     ) -> Result<Vec<serde_json::Map<String, serde_json::Value>>, AttestationError> {
         // Get all providers for this model
         let mut model_attestations = vec![];
@@ -1027,6 +1029,7 @@ impl InferenceProviderPool {
                         signing_algo.clone(),
                         nonce.clone(),
                         signing_address.clone(),
+                        include_tls_fingerprint,
                     )
                     .await
                 {

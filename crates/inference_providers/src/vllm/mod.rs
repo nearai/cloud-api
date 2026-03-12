@@ -209,6 +209,7 @@ impl InferenceProvider for VLlmProvider {
         signing_algo: Option<String>,
         nonce: Option<String>,
         signing_address: Option<String>,
+        include_tls_fingerprint: bool,
     ) -> Result<serde_json::Map<String, serde_json::Value>, AttestationError> {
         #[derive(Serialize)]
         struct Query {
@@ -216,6 +217,8 @@ impl InferenceProvider for VLlmProvider {
             signing_algo: Option<String>,
             nonce: Option<String>,
             signing_address: Option<String>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            include_tls_fingerprint: Option<bool>,
         }
 
         let query = Query {
@@ -223,6 +226,11 @@ impl InferenceProvider for VLlmProvider {
             signing_algo,
             nonce,
             signing_address,
+            include_tls_fingerprint: if include_tls_fingerprint {
+                Some(true)
+            } else {
+                None
+            },
         };
 
         // Build URL with optional query parameters

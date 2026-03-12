@@ -1094,6 +1094,7 @@ impl crate::InferenceProvider for MockProvider {
         signing_algo: Option<String>,
         _nonce: Option<String>,
         _signing_address: Option<String>,
+        _include_tls_fingerprint: bool,
     ) -> Result<serde_json::Map<String, serde_json::Value>, AttestationError> {
         let mut report = serde_json::Map::new();
         report.insert("model".to_string(), serde_json::Value::String(model));

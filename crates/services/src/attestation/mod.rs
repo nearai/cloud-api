@@ -773,7 +773,11 @@ impl ports::AttestationServiceTrait for AttestationService {
 
         // Resolve TLS cert fingerprint if requested
         let tls_fingerprint = if include_tls_fingerprint {
-            self.tls_cert_fingerprint.clone()
+            Some(self.tls_cert_fingerprint.clone().ok_or_else(|| {
+                AttestationError::InternalError(
+                    "include_tls_fingerprint=true but TLS_CERT_PATH is not set or fingerprint could not be computed".to_string(),
+                )
+            })?)
         } else {
             None
         };
@@ -793,7 +797,7 @@ impl ports::AttestationServiceTrait for AttestationService {
 
         // Build report_data: [first_32_bytes || nonce (32 bytes)]
         // When include_tls_fingerprint=true: first_32 = SHA256(signing_address_bytes || cert_fingerprint_bytes)
-        // Otherwise: first_32 = signing_address (left-padded with zeros)
+        // Otherwise: first_32 = signing_address (right-padded with zeros)
         let mut report_data = vec![0u8; 64];
         if let Some(ref fp_hex) = tls_fingerprint {
             use sha2::Digest;

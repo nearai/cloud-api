@@ -226,11 +226,7 @@ impl InferenceProvider for VLlmProvider {
             signing_algo,
             nonce,
             signing_address,
-            include_tls_fingerprint: if include_tls_fingerprint {
-                Some(true)
-            } else {
-                None
-            },
+            include_tls_fingerprint: include_tls_fingerprint.then_some(true),
         };
 
         // Build URL with optional query parameters

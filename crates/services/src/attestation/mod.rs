@@ -390,7 +390,7 @@ pub fn load_vpc_info() -> Option<VpcInfo> {
     }
 }
 
-/// Load TLS certificate SPKI fingerprint from `TLS_CERT_PATH` only.
+/// Load TLS certificate SPKI fingerprint from `TLS_CERT_PATH`.
 pub fn load_tls_cert_fingerprint() -> Option<String> {
     let path = std::env::var("TLS_CERT_PATH").ok()?;
     match compute_spki_hash(&path) {

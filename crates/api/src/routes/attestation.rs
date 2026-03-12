@@ -206,7 +206,7 @@ pub struct AttestationResponse {
     pub gateway_attestation: DstackCpuQuote,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub model_attestations: Vec<serde_json::Map<String, serde_json::Value>>,
-    /// TLS certificate file (PEM) from INGRESS_TLS_CERT_PATH; report_data binds via SHA256 of these exact bytes
+    /// TLS certificate file (PEM) from TLS_CERT_PATH; report_data binds via SHA256 of these exact bytes
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tls_certificate: Option<String>,
 }

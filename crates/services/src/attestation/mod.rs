@@ -390,49 +390,27 @@ pub fn load_vpc_info() -> Option<VpcInfo> {
     }
 }
 
-/// Load TLS certificate SPKI fingerprint from the first available cert path.
+/// Load TLS certificate SPKI fingerprint from `TLS_CERT_PATH` only.
 pub fn load_tls_cert_fingerprint() -> Option<String> {
-    let mut failures: Vec<String> = Vec::new();
-
-    fn try_path(path: &str, env_name: &str, failures: &mut Vec<String>) -> Option<String> {
-        match compute_spki_hash(path) {
-            Ok(hash) => {
-                tracing::info!(
-                    tls_cert_path = %path,
-                    env = env_name,
-                    fingerprint = %hash,
-                    "TLS certificate SPKI hash computed"
-                );
-                Some(hash)
-            }
-            Err(e) => {
-                tracing::debug!(
-                    tls_cert_path = %path,
-                    env = env_name,
-                    error = %e,
-                    "TLS cert fingerprint attempt failed, trying next candidate if any"
-                );
-                failures.push(format!("{env_name}={path}: {e}"));
-                None
-            }
+    let path = std::env::var("TLS_CERT_PATH").ok()?;
+    match compute_spki_hash(&path) {
+        Ok(hash) => {
+            tracing::info!(
+                tls_cert_path = %path,
+                fingerprint = %hash,
+                "TLS certificate SPKI hash computed"
+            );
+            Some(hash)
+        }
+        Err(e) => {
+            tracing::warn!(
+                tls_cert_path = %path,
+                error = %e,
+                "Failed to compute TLS cert fingerprint (TLS_CERT_PATH)"
+            );
+            None
         }
     }
-
-    for env_name in ["INGRESS_TLS_CERT_PATH", "TLS_CERT_PATH"] {
-        if let Ok(path) = std::env::var(env_name) {
-            if let Some(hash) = try_path(&path, env_name, &mut failures) {
-                return Some(hash);
-            }
-        }
-    }
-
-    if !failures.is_empty() {
-        tracing::warn!(
-            failures = ?failures,
-            "Could not compute TLS cert fingerprint from any configured path"
-        );
-    }
-    None
 }
 
 /// Compute SHA-256 hash of the Subject Public Key Info (SPKI) DER from a PEM certificate
@@ -798,7 +776,7 @@ impl ports::AttestationServiceTrait for AttestationService {
         let tls_fingerprint = if include_tls_fingerprint {
             Some(self.tls_cert_fingerprint.clone().ok_or_else(|| {
                 AttestationError::InternalError(
-                    "include_tls_fingerprint=true but neither INGRESS_TLS_CERT_PATH nor TLS_CERT_PATH is set or fingerprint could not be computed".to_string(),
+                    "include_tls_fingerprint=true but TLS_CERT_PATH is not set or fingerprint could not be computed".to_string(),
                 )
             })?)
         } else {
@@ -807,9 +785,7 @@ impl ports::AttestationServiceTrait for AttestationService {
 
         // Read TLS certificate PEM if fingerprint is requested (for the response body)
         let tls_certificate = if include_tls_fingerprint {
-            if let Ok(path) = std::env::var("INGRESS_TLS_CERT_PATH") {
-                tokio::fs::read_to_string(&path).await.ok()
-            } else if let Ok(path) = std::env::var("TLS_CERT_PATH") {
+            if let Ok(path) = std::env::var("TLS_CERT_PATH") {
                 tokio::fs::read_to_string(&path).await.ok()
             } else {
                 None

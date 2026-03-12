@@ -179,10 +179,10 @@ fn extract_inference_id_from_chunk(chunk: &inference_providers::StreamChunk) -> 
 }
 
 /// Extract the provider-assigned chat ID string from a parsed stream chunk.
-fn extract_chat_id_from_chunk(chunk: &inference_providers::StreamChunk) -> Option<String> {
+fn extract_chat_id_from_chunk(chunk: &inference_providers::StreamChunk) -> String {
     match chunk {
-        inference_providers::StreamChunk::Chat(c) => Some(c.id.clone()),
-        inference_providers::StreamChunk::Text(c) => Some(c.id.clone()),
+        inference_providers::StreamChunk::Chat(c) => c.id.clone(),
+        inference_providers::StreamChunk::Text(c) => c.id.clone(),
     }
 }
 
@@ -412,10 +412,10 @@ pub async fn chat_completions(
                             match result {
                                 Ok(event) => {
                                     // Extract chat_id from the parsed chunk
-                                    if let Some(id) = extract_chat_id_from_chunk(&event.chunk) {
+                                    {
                                         let mut cid = chat_id_inner.lock().await;
                                         if cid.is_none() {
-                                            *cid = Some(id);
+                                            *cid = Some(extract_chat_id_from_chunk(&event.chunk));
                                         }
                                     }
 
@@ -710,11 +710,10 @@ mod tests {
     #[test]
     fn test_extract_inference_id_from_chunk_valid() {
         let chunk = make_chat_chunk("chatcmpl-123abc");
-        let result = extract_inference_id_from_chunk(&chunk);
-        assert!(result.is_some());
+        let uuid1 = extract_inference_id_from_chunk(&chunk).expect("should extract UUID");
         // UUID should be deterministic - same input produces same UUID
-        let uuid2 = extract_inference_id_from_chunk(&chunk).unwrap();
-        assert_eq!(result.unwrap(), uuid2);
+        let uuid2 = extract_inference_id_from_chunk(&chunk).expect("should extract UUID on second call");
+        assert_eq!(uuid1, uuid2);
     }
 
     #[test]
@@ -739,7 +738,7 @@ mod tests {
     fn test_extract_chat_id_from_chunk() {
         let chunk = make_chat_chunk("chatcmpl-abc123");
         let id = extract_chat_id_from_chunk(&chunk);
-        assert_eq!(id, Some("chatcmpl-abc123".to_string()));
+        assert_eq!(id, "chatcmpl-abc123");
     }
 
     #[test]

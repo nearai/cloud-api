@@ -1156,7 +1156,7 @@ impl ModelRepository {
                         m.input_cost_per_token, m.output_cost_per_token, m.cost_per_image, m.cache_read_cost_per_token,
                         m.context_length, m.verifiable, m.is_active, m.owned_by, m.created_at, m.updated_at,
                         m.provider_type, m.provider_config, m.attestation_supported,
-                        m.input_modalities, m.output_modalities,
+                        m.input_modalities, m.output_modalities, m.inference_url,
                         COALESCE(array_agg(a.alias_name) FILTER (WHERE a.alias_name IS NOT NULL), '{}') AS aliases
                     FROM models m
                     LEFT JOIN model_aliases a ON a.canonical_model_id = m.id AND a.is_active = true

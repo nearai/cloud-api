@@ -429,7 +429,7 @@ pub struct Model {
     /// Output modalities the model produces, e.g., ["text"], ["image"]
     pub output_modalities: Option<Vec<String>>,
 
-    /// Base URL for the model's inference endpoint (e.g., "http://160.72.54.241:8000")
+    /// Base URL for the model's inference endpoint (e.g., "http://localhost:8000")
     pub inference_url: Option<String>,
 
     // Tracking fields

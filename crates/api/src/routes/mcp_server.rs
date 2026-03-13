@@ -12,8 +12,22 @@ use services::web_search::{
 use std::sync::Arc;
 use uuid::Uuid;
 
-const MCP_TOOL_NAME: &str = "web_search";
 const MCP_PROTOCOL_VERSION: &str = "2026-03-13";
+const MCP_SERVER_VERSION: &str = "1.0.0";
+const WEB_SEARCH_TOOL_NAME: &str = "web_search";
+const WEB_SEARCH_TOOL_DESCRIPTION: &str = "Search the web and return structured search results.";
+
+struct McpToolDefinition {
+    name: &'static str,
+    description: &'static str,
+    input_schema: fn() -> Value,
+}
+
+const MCP_TOOLS: &[McpToolDefinition] = &[McpToolDefinition {
+    name: WEB_SEARCH_TOOL_NAME,
+    description: WEB_SEARCH_TOOL_DESCRIPTION,
+    input_schema: web_search_input_schema,
+}];
 
 #[derive(Clone)]
 pub struct McpRouteState {
@@ -138,36 +152,44 @@ fn map_mcp_service_error(id: Value, error: WebSearchServiceError) -> ResponseJso
     }
 }
 
-fn tool_definition() -> Value {
+fn web_search_input_schema() -> Value {
     json!({
-        "name": MCP_TOOL_NAME,
-        "description": "Search the web and return structured search results.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "query": {"type": "string", "description": "Search query"},
-                "country": {"type": "string"},
-                "search_lang": {"type": "string"},
-                "ui_lang": {"type": "string"},
-                "count": {"type": "integer", "minimum": 1, "maximum": 20, "default": 5},
-                "offset": {"type": "integer", "minimum": 0, "maximum": 9},
-                "safesearch": {"type": "string"},
-                "freshness": {"type": "string"},
-                "text_decorations": {"type": "boolean"},
-                "spellcheck": {"type": "boolean"},
-                "units": {"type": "string"},
-                "extra_snippets": {"type": "boolean"},
-                "summary": {"type": "boolean"},
-                "result_filter": {"type": "string"},
-                "goggles": {"type": "string"},
-                "enable_rich_callback": {"type": "boolean"},
-                "include_fetch_metadata": {"type": "boolean"},
-                "operators": {"type": "boolean"}
-            },
-            "required": ["query"],
-            "additionalProperties": false
-        }
+        "type": "object",
+        "properties": {
+            "query": {"type": "string", "description": "Search query"},
+            "country": {"type": "string"},
+            "search_lang": {"type": "string"},
+            "ui_lang": {"type": "string"},
+            "count": {"type": "integer", "minimum": 1, "maximum": 20, "default": 5},
+            "offset": {"type": "integer", "minimum": 0, "maximum": 9},
+            "safesearch": {"type": "string"},
+            "freshness": {"type": "string"},
+            "text_decorations": {"type": "boolean"},
+            "spellcheck": {"type": "boolean"},
+            "units": {"type": "string"},
+            "extra_snippets": {"type": "boolean"},
+            "summary": {"type": "boolean"},
+            "result_filter": {"type": "string"},
+            "goggles": {"type": "string"},
+            "enable_rich_callback": {"type": "boolean"},
+            "include_fetch_metadata": {"type": "boolean"},
+            "operators": {"type": "boolean"}
+        },
+        "required": ["query"],
+        "additionalProperties": false
     })
+}
+
+fn tool_definition(tool: &McpToolDefinition) -> Value {
+    json!({
+        "name": tool.name,
+        "description": tool.description,
+        "inputSchema": (tool.input_schema)(),
+    })
+}
+
+fn get_tool_definition(name: &str) -> Option<&'static McpToolDefinition> {
+    MCP_TOOLS.iter().find(|tool| tool.name == name)
 }
 
 pub async fn handle_mcp_request(
@@ -197,7 +219,7 @@ pub async fn handle_mcp_request(
                     },
                     "serverInfo": {
                         "name": "cloud-api",
-                        "version": env!("CARGO_PKG_VERSION")
+                        "version": MCP_SERVER_VERSION
                     }
                 }),
             ))
@@ -205,7 +227,7 @@ pub async fn handle_mcp_request(
         "tools/list" => Ok(ok_response(
             request.id,
             json!({
-                "tools": [tool_definition()]
+                "tools": MCP_TOOLS.iter().map(tool_definition).collect::<Vec<_>>()
             }),
         )),
         "tools/call" => {
@@ -230,9 +252,9 @@ pub async fn handle_mcp_request(
                 }
             };
 
-            if params.name != MCP_TOOL_NAME {
+            let Some(tool) = get_tool_definition(&params.name) else {
                 return Ok(error_response(request.id, -32601, "Unknown tool"));
-            }
+            };
 
             let args_value = params.arguments.unwrap_or_else(|| json!({}));
             let mut args: McpWebSearchArgs = match serde_json::from_value(args_value) {
@@ -256,36 +278,41 @@ pub async fn handle_mcp_request(
                 Err(_) => return Ok(error_response(request.id, -32603, "Invalid API key id")),
             };
 
-            let result = state
-                .web_search_service
-                .execute(
-                    WebSearchRequest {
-                        query: args.query,
-                        country: args.country,
-                        search_lang: args.search_lang,
-                        ui_lang: args.ui_lang,
-                        count: args.count,
-                        offset: args.offset,
-                        safesearch: args.safesearch,
-                        freshness: args.freshness,
-                        text_decorations: args.text_decorations,
-                        spellcheck: args.spellcheck,
-                        units: args.units,
-                        extra_snippets: args.extra_snippets,
-                        summary: args.summary,
-                        result_filter: args.result_filter,
-                        goggles: args.goggles,
-                        enable_rich_callback: args.enable_rich_callback,
-                        include_fetch_metadata: args.include_fetch_metadata,
-                        operators: args.operators,
-                    },
-                    WebSearchUsageContext {
-                        organization_id: api_key.organization.id.0,
-                        workspace_id: api_key.workspace.id.0,
-                        api_key_id,
-                    },
-                )
-                .await;
+            let result = match tool.name {
+                WEB_SEARCH_TOOL_NAME => {
+                    state
+                        .web_search_service
+                        .execute(
+                            WebSearchRequest {
+                                query: args.query,
+                                country: args.country,
+                                search_lang: args.search_lang,
+                                ui_lang: args.ui_lang,
+                                count: args.count,
+                                offset: args.offset,
+                                safesearch: args.safesearch,
+                                freshness: args.freshness,
+                                text_decorations: args.text_decorations,
+                                spellcheck: args.spellcheck,
+                                units: args.units,
+                                extra_snippets: args.extra_snippets,
+                                summary: args.summary,
+                                result_filter: args.result_filter,
+                                goggles: args.goggles,
+                                enable_rich_callback: args.enable_rich_callback,
+                                include_fetch_metadata: args.include_fetch_metadata,
+                                operators: args.operators,
+                            },
+                            WebSearchUsageContext {
+                                organization_id: api_key.organization.id.0,
+                                workspace_id: api_key.workspace.id.0,
+                                api_key_id,
+                            },
+                        )
+                        .await
+                }
+                _ => return Ok(error_response(request.id, -32601, "Unknown tool")),
+            };
 
             let result = match result {
                 Ok(result) => result,

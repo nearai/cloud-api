@@ -63,15 +63,39 @@ struct CallToolParams {
 struct McpWebSearchArgs {
     query: String,
     #[serde(default)]
-    count: Option<u32>,
-    #[serde(default)]
     country: Option<String>,
     #[serde(default)]
     search_lang: Option<String>,
     #[serde(default)]
     ui_lang: Option<String>,
     #[serde(default)]
+    count: Option<u32>,
+    #[serde(default)]
+    offset: Option<u32>,
+    #[serde(default)]
+    safesearch: Option<String>,
+    #[serde(default)]
     freshness: Option<String>,
+    #[serde(default)]
+    text_decorations: Option<bool>,
+    #[serde(default)]
+    spellcheck: Option<bool>,
+    #[serde(default)]
+    units: Option<String>,
+    #[serde(default)]
+    extra_snippets: Option<bool>,
+    #[serde(default)]
+    summary: Option<bool>,
+    #[serde(default)]
+    result_filter: Option<String>,
+    #[serde(default)]
+    goggles: Option<String>,
+    #[serde(default)]
+    enable_rich_callback: Option<bool>,
+    #[serde(default)]
+    include_fetch_metadata: Option<bool>,
+    #[serde(default)]
+    operators: Option<bool>,
 }
 
 fn ok_response(id: Value, result: Value) -> ResponseJson<McpResponse> {
@@ -122,11 +146,23 @@ fn tool_definition() -> Value {
             "type": "object",
             "properties": {
                 "query": {"type": "string", "description": "Search query"},
-                "count": {"type": "integer", "minimum": 1, "maximum": 20, "default": 5},
                 "country": {"type": "string"},
                 "search_lang": {"type": "string"},
                 "ui_lang": {"type": "string"},
-                "freshness": {"type": "string"}
+                "count": {"type": "integer", "minimum": 1, "maximum": 20, "default": 5},
+                "offset": {"type": "integer", "minimum": 0, "maximum": 9},
+                "safesearch": {"type": "string"},
+                "freshness": {"type": "string"},
+                "text_decorations": {"type": "boolean"},
+                "spellcheck": {"type": "boolean"},
+                "units": {"type": "string"},
+                "extra_snippets": {"type": "boolean"},
+                "summary": {"type": "boolean"},
+                "result_filter": {"type": "string"},
+                "goggles": {"type": "string"},
+                "enable_rich_callback": {"type": "boolean"},
+                "include_fetch_metadata": {"type": "boolean"},
+                "operators": {"type": "boolean"}
             },
             "required": ["query"],
             "additionalProperties": false
@@ -225,11 +261,23 @@ pub async fn handle_mcp_request(
                 .execute(
                     WebSearchRequest {
                         query: args.query,
-                        count: args.count,
                         country: args.country,
                         search_lang: args.search_lang,
                         ui_lang: args.ui_lang,
+                        count: args.count,
+                        offset: args.offset,
+                        safesearch: args.safesearch,
                         freshness: args.freshness,
+                        text_decorations: args.text_decorations,
+                        spellcheck: args.spellcheck,
+                        units: args.units,
+                        extra_snippets: args.extra_snippets,
+                        summary: args.summary,
+                        result_filter: args.result_filter,
+                        goggles: args.goggles,
+                        enable_rich_callback: args.enable_rich_callback,
+                        include_fetch_metadata: args.include_fetch_metadata,
+                        operators: args.operators,
                     },
                     WebSearchUsageContext {
                         organization_id: api_key.organization.id.0,

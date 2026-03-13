@@ -661,6 +661,7 @@ pub async fn init_inference_providers_with_mocks(
         "Qwen/Qwen3-Omni-30B-A3B-Instruct".to_string(),
         "Qwen/Qwen-Image-2512".to_string(),
         "Qwen/Qwen3-Reranker-0.6B".to_string(),
+        "Qwen/Qwen3-Embedding-0.6B".to_string(),
     ];
 
     let providers: Vec<(

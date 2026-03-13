@@ -1,4 +1,5 @@
 use crate::middleware::auth::AuthenticatedApiKey;
+use crate::middleware::rate_limit::{check_rate_limit_for_api_key, RateLimitState};
 use crate::middleware::usage::{check_usage_for_api_key, UsageState};
 use crate::models::ErrorResponse;
 use axum::{
@@ -35,6 +36,7 @@ const MCP_TOOLS: &[McpToolDefinition] = &[McpToolDefinition {
 pub struct McpRouteState {
     pub web_search_service: Arc<WebSearchService>,
     pub usage_state: UsageState,
+    pub rate_limit_state: RateLimitState,
 }
 
 #[derive(Debug, Deserialize)]
@@ -130,6 +132,21 @@ fn error_response(id: Value, code: i64, message: impl Into<String>) -> ResponseJ
             message: message.into(),
         }),
     })
+}
+
+fn map_http_error_to_mcp_error(
+    id: Value,
+    status: StatusCode,
+    error: ErrorResponse,
+) -> ResponseJson<McpResponse> {
+    let code = match status {
+        StatusCode::UNAUTHORIZED => -32001,
+        StatusCode::PAYMENT_REQUIRED => -32002,
+        StatusCode::TOO_MANY_REQUESTS => -32003,
+        _ => -32603,
+    };
+
+    error_response(id, code, error.message)
 }
 
 fn map_mcp_service_error(id: Value, error: WebSearchServiceError) -> ResponseJson<McpResponse> {
@@ -233,7 +250,15 @@ pub async fn handle_mcp_request(
             }),
         )),
         "tools/call" => {
-            check_usage_for_api_key(&state.usage_state, &api_key).await?;
+            if let Err((status, error)) =
+                check_rate_limit_for_api_key(&state.rate_limit_state, &api_key).await
+            {
+                return Ok(map_http_error_to_mcp_error(request.id, status, error.0));
+            }
+            if let Err((status, error)) = check_usage_for_api_key(&state.usage_state, &api_key).await
+            {
+                return Ok(map_http_error_to_mcp_error(request.id, status, error.0));
+            }
 
             let params = match request.params {
                 Some(params) => params,

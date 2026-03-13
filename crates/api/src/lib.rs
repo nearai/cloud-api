@@ -1105,15 +1105,12 @@ pub fn build_mcp_routes(
             service_usage_service,
         )),
         usage_state: usage_state.clone(),
+        rate_limit_state: rate_limit_state.clone(),
     };
 
     Router::new()
         .route("/mcp", post(handle_mcp_request))
         .with_state(route_state)
-        .layer(from_fn_with_state(
-            rate_limit_state,
-            middleware::api_key_rate_limit_middleware,
-        ))
         .layer(from_fn_with_state(
             auth_state_middleware.clone(),
             middleware::auth::auth_middleware_with_workspace_context,

@@ -74,16 +74,10 @@ impl RateLimitState {
     }
 }
 
-pub async fn api_key_rate_limit_middleware(
-    State(state): State<RateLimitState>,
-    request: Request,
-    next: Next,
-) -> Result<Response, (StatusCode, axum::Json<ErrorResponse>)> {
-    let auth_key = match request.extensions().get::<AuthenticatedApiKey>() {
-        Some(key) => key.clone(),
-        None => return Ok(next.run(request).await),
-    };
-
+pub async fn check_rate_limit_for_api_key(
+    state: &RateLimitState,
+    auth_key: &AuthenticatedApiKey,
+) -> Result<(), (StatusCode, axum::Json<ErrorResponse>)> {
     let api_key_id = &auth_key.api_key.id.0;
     let (allowed, count, limit) = state.check_limit(api_key_id).await;
 
@@ -107,6 +101,20 @@ pub async fn api_key_rate_limit_middleware(
         "API key rate limit check passed for {}: {}/{}",
         api_key_id, count, limit
     );
+    Ok(())
+}
+
+pub async fn api_key_rate_limit_middleware(
+    State(state): State<RateLimitState>,
+    request: Request,
+    next: Next,
+) -> Result<Response, (StatusCode, axum::Json<ErrorResponse>)> {
+    let auth_key = match request.extensions().get::<AuthenticatedApiKey>() {
+        Some(key) => key.clone(),
+        None => return Ok(next.run(request).await),
+    };
+
+    check_rate_limit_for_api_key(&state, &auth_key).await?;
     Ok(next.run(request).await)
 }
 

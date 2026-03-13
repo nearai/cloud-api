@@ -18,6 +18,8 @@ pub mod encryption_headers {
     pub const CLIENT_PUB_KEY: &str = "x_client_pub_key";
     /// Key for model public key in params.extra (corresponds to x-model-pub-key HTTP header)
     pub const MODEL_PUB_KEY: &str = "x_model_pub_key";
+    /// Key for encryption version in params.extra (corresponds to x-encryption-version HTTP header)
+    pub const ENCRYPTION_VERSION: &str = "x_encryption_version";
 }
 
 pub fn generate_api_key() -> String {

@@ -132,6 +132,7 @@ pub trait ResponseServiceTrait: Send + Sync {
         signing_algo: Option<String>,
         client_pub_key: Option<String>,
         model_pub_key: Option<String>,
+        encryption_version: Option<String>,
     ) -> Result<
         Pin<Box<dyn Stream<Item = models::ResponseStreamEvent> + Send>>,
         errors::ResponseError,

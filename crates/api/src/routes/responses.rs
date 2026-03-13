@@ -214,6 +214,7 @@ pub async fn create_response(
     let signing_algo = encryption_headers.signing_algo;
     let client_pub_key = encryption_headers.client_pub_key;
     let model_pub_key = encryption_headers.model_pub_key;
+    let encryption_version = encryption_headers.encryption_version;
 
     // Encryption requires streaming mode because encrypted chunks from vLLM are independently
     // encrypted and cannot be concatenated. Non-streaming mode would produce corrupted data.
@@ -259,6 +260,7 @@ pub async fn create_response(
                 signing_algo.clone(),
                 client_pub_key.clone(),
                 model_pub_key.clone(),
+                encryption_version.clone(),
             )
             .await
         {
@@ -381,6 +383,7 @@ pub async fn create_response(
                 signing_algo.clone(),
                 client_pub_key.clone(),
                 model_pub_key.clone(),
+                encryption_version.clone(),
             )
             .await
         {

@@ -34,6 +34,8 @@ mod encryption_headers {
     /// but kept here for consistency with other encryption header constants
     #[allow(dead_code)]
     pub const MODEL_PUB_KEY: &str = "x_model_pub_key";
+    /// Key for encryption version (x-encryption-version header)
+    pub const ENCRYPTION_VERSION: &str = "x_encryption_version";
 }
 
 /// Configuration for vLLM provider
@@ -132,6 +134,17 @@ impl VLlmProvider {
 
         // Remove x_model_pub_key from extra (not forwarded to vllm-proxy, used only for routing)
         extra.remove(encryption_headers::MODEL_PUB_KEY);
+
+        // Extract and forward x_encryption_version as HTTP header, then remove from extra
+        if let Some(version) = extra
+            .remove(encryption_headers::ENCRYPTION_VERSION)
+            .as_ref()
+            .and_then(|v| v.as_str())
+        {
+            if let Ok(value) = HeaderValue::from_str(version) {
+                headers.insert("X-Encryption-Version", value);
+            }
+        }
     }
 
     /// Send a streaming HTTP POST request with TTFB timeout protection.

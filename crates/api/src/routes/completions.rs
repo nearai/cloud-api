@@ -362,6 +362,12 @@ pub async fn chat_completions(
             serde_json::Value::String(model_pub_key.clone()),
         );
     }
+    if let Some(ref encryption_version) = encryption_headers.encryption_version {
+        service_request.extra.insert(
+            service_encryption_headers::ENCRYPTION_VERSION.to_string(),
+            serde_json::Value::String(encryption_version.clone()),
+        );
+    }
 
     // Check if streaming is requested
     if request.stream == Some(true) {
@@ -916,6 +922,12 @@ pub async fn image_generations(
         extra.insert(
             service_encryption_headers::MODEL_PUB_KEY.to_string(),
             serde_json::Value::String(model_pub_key.clone()),
+        );
+    }
+    if let Some(ref encryption_version) = encryption_headers.encryption_version {
+        extra.insert(
+            service_encryption_headers::ENCRYPTION_VERSION.to_string(),
+            serde_json::Value::String(encryption_version.clone()),
         );
     }
 

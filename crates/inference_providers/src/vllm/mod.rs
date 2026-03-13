@@ -23,6 +23,11 @@ fn to_score_error<E: std::fmt::Display>(e: E) -> ScoreError {
     ScoreError::GenerationError(e.to_string())
 }
 
+/// Convert any displayable error to EmbeddingError::RequestFailed
+fn to_embedding_error<E: std::fmt::Display>(e: E) -> EmbeddingError {
+    EmbeddingError::RequestFailed(e.to_string())
+}
+
 /// Encryption header keys used in params.extra for passing encryption information
 mod encryption_headers {
     /// Key for signing algorithm (x-signing-algo header)
@@ -751,6 +756,38 @@ impl InferenceProvider for VLlmProvider {
 
         let rerank_response: RerankResponse = response.json().await.map_err(to_rerank_error)?;
         Ok(rerank_response)
+    }
+
+    async fn embeddings_raw(&self, body: bytes::Bytes) -> Result<bytes::Bytes, EmbeddingError> {
+        let url = format!("{}/v1/embeddings", self.config.base_url);
+
+        let headers = self.build_headers().map_err(to_embedding_error)?;
+
+        let response = self
+            .client
+            .post(&url)
+            .headers(headers)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(body)
+            .timeout(Duration::from_secs(self.config.timeout_seconds as u64))
+            .send()
+            .await
+            .map_err(to_embedding_error)?;
+
+        if !response.status().is_success() {
+            let status_code = response.status().as_u16();
+            let message = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "Unknown error".to_string());
+            return Err(EmbeddingError::HttpError {
+                status_code,
+                message,
+            });
+        }
+
+        let raw_bytes = response.bytes().await.map_err(to_embedding_error)?;
+        Ok(raw_bytes)
     }
 }
 

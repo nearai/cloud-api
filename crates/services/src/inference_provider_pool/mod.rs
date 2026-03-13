@@ -1571,6 +1571,70 @@ impl InferenceProviderPool {
         Err(RerankError::GenerationError(error_msg))
     }
 
+    pub async fn embeddings(
+        &self,
+        model: &str,
+        body: bytes::Bytes,
+    ) -> Result<bytes::Bytes, inference_providers::EmbeddingError> {
+        tracing::debug!(model = %model, "Starting embeddings request");
+
+        // Check if this model exists as an external provider
+        if let Some(provider) = self.get_external_provider(model).await {
+            return provider.embeddings_raw(body).await;
+        }
+
+        // Ensure vLLM models are discovered
+        self.ensure_models_discovered().await.map_err(|e| {
+            inference_providers::EmbeddingError::RequestFailed(Self::sanitize_error_message(
+                &e.to_string(),
+            ))
+        })?;
+
+        // Get vLLM providers with load balancing
+        let providers = match self.get_providers_with_fallback(model, None).await {
+            Some(p) => p,
+            None => {
+                let mappings = self.provider_mappings.read().await;
+                let available_models: Vec<_> = mappings.model_to_providers.keys().collect();
+
+                tracing::error!(
+                    model = %model,
+                    available_models = ?available_models,
+                    operation = "embeddings",
+                    "No vLLM provider found for model"
+                );
+
+                return Err(inference_providers::EmbeddingError::RequestFailed(format!(
+                    "Model '{}' not found in vLLM providers. Available models: {:?}",
+                    model, available_models
+                )));
+            }
+        };
+
+        // Try with each provider (with fallback)
+        let mut last_error = None;
+        for provider in providers {
+            match provider.embeddings_raw(body.clone()).await {
+                Ok(response) => {
+                    tracing::info!(model = %model, "Embeddings completed successfully");
+                    return Ok(response);
+                }
+                Err(e) => {
+                    tracing::warn!(model = %model, error = %e, "Embeddings failed with provider, trying next");
+                    last_error = Some(e);
+                }
+            }
+        }
+
+        let error_msg = last_error
+            .map(|e| Self::sanitize_error_message(&e.to_string()))
+            .unwrap_or_else(|| "No providers available for embeddings".to_string());
+
+        Err(inference_providers::EmbeddingError::RequestFailed(
+            error_msg,
+        ))
+    }
+
     pub async fn score(
         &self,
         params: inference_providers::ScoreParams,

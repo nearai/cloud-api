@@ -6,10 +6,10 @@
 
 use crate::{
     AudioTranscriptionError, AudioTranscriptionParams, AudioTranscriptionResponse,
-    ChatCompletionParams, ChatCompletionResponseWithBytes, CompletionError, ImageEditError,
-    ImageEditParams, ImageEditResponseWithBytes, ImageGenerationError, ImageGenerationParams,
-    ImageGenerationResponseWithBytes, RerankError, RerankParams, RerankResponse, ScoreError,
-    ScoreParams, ScoreResponse, StreamingResult,
+    ChatCompletionParams, ChatCompletionResponseWithBytes, CompletionError, EmbeddingError,
+    ImageEditError, ImageEditParams, ImageEditResponseWithBytes, ImageGenerationError,
+    ImageGenerationParams, ImageGenerationResponseWithBytes, RerankError, RerankParams,
+    RerankResponse, ScoreError, ScoreParams, ScoreResponse, StreamingResult,
 };
 use async_trait::async_trait;
 use std::collections::HashMap;
@@ -165,6 +165,20 @@ pub trait ExternalBackend: Send + Sync {
     ) -> Result<RerankResponse, RerankError> {
         Err(RerankError::GenerationError(format!(
             "Reranking is not supported by the {} backend.",
+            self.backend_type()
+        )))
+    }
+
+    /// Performs an embeddings request as a raw passthrough.
+    ///
+    /// Default implementation returns an error indicating embeddings are not supported.
+    async fn embeddings_raw(
+        &self,
+        _config: &BackendConfig,
+        _body: bytes::Bytes,
+    ) -> Result<bytes::Bytes, EmbeddingError> {
+        Err(EmbeddingError::RequestFailed(format!(
+            "Embeddings are not supported by the {} backend.",
             self.backend_type()
         )))
     }

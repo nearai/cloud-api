@@ -18,8 +18,8 @@ use crate::{
         },
         billing::{get_billing_costs, BillingRouteState},
         completions::{
-            audio_transcriptions, chat_completions, image_edits, image_generations, models, rerank,
-            score,
+            audio_transcriptions, chat_completions, embeddings, image_edits, image_generations,
+            models, rerank, score,
         },
         conversations,
         health::health_check,
@@ -978,6 +978,7 @@ pub fn build_completion_routes(
         .route("/images/generations", post(image_generations))
         .route("/audio/transcriptions", post(audio_transcriptions))
         .route("/rerank", post(rerank))
+        .route("/embeddings", post(embeddings))
         .route("/score", post(score))
         .layer(DefaultBodyLimit::max(AUDIO_TRANSCRIPTION_MAX_BODY_SIZE))
         .with_state(app_state.clone())

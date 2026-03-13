@@ -5,7 +5,7 @@ pub mod models;
 pub mod openapi;
 pub mod routes;
 
-use crate::routes::web_search::{get_web_search, WebSearchRouteState};
+use crate::routes::mcp_server::{handle_mcp_request, McpRouteState};
 use crate::{
     middleware::{auth::auth_middleware_with_api_key, auth_middleware, AuthState},
     openapi::ApiDoc,
@@ -46,6 +46,7 @@ use database::{
 use services::{
     auth::{AuthService, AuthServiceTrait, MockAuthService, OAuthManager},
     models::ModelsServiceTrait,
+    web_search::WebSearchService,
 };
 use std::sync::Arc;
 use tower_http::cors::{AllowOrigin, Any, CorsLayer};
@@ -783,11 +784,11 @@ pub fn build_app_with_config(
         rate_limit_state.clone(),
     );
 
-    let web_search_routes = build_web_search_routes(
+    let mcp_routes = build_mcp_routes(
         domain_services.web_search_provider.clone(),
         domain_services.service_usage_service.clone(),
         &auth_components.auth_state_middleware,
-        usage_state,
+        usage_state.clone(),
         rate_limit_state.clone(),
     );
 
@@ -865,7 +866,6 @@ pub fn build_app_with_config(
                 .nest("/auth", auth_routes)
                 .merge(completion_routes)
                 .merge(response_routes)
-                .merge(web_search_routes)
                 .merge(conversation_routes)
                 .merge(management_routes)
                 .merge(workspace_routes)
@@ -882,6 +882,7 @@ pub fn build_app_with_config(
                 .merge(health_routes),
         )
         .merge(openapi_routes)
+        .merge(mcp_routes)
         .layer(cors)
         // Add HTTP metrics middleware to track all requests
         .layer(from_fn_with_state(
@@ -1091,29 +1092,25 @@ pub fn build_response_routes(
     Router::new().merge(inference_routes).merge(other_routes)
 }
 
-/// Build web search routes (GET /web/search) with API Key auth and usage check
-pub fn build_web_search_routes(
+pub fn build_mcp_routes(
     web_search_provider: Arc<dyn services::responses::tools::WebSearchProviderTrait>,
     service_usage_service: Arc<dyn services::service_usage::ServiceUsageServiceTrait + Send + Sync>,
     auth_state_middleware: &AuthState,
     usage_state: middleware::UsageState,
     rate_limit_state: middleware::RateLimitState,
 ) -> Router {
-    let route_state = WebSearchRouteState {
-        web_search_provider,
-        service_usage_service,
+    let route_state = McpRouteState {
+        web_search_service: Arc::new(WebSearchService::new(
+            web_search_provider,
+            service_usage_service,
+        )),
+        usage_state: usage_state.clone(),
+        rate_limit_state: rate_limit_state.clone(),
     };
+
     Router::new()
-        .route("/web/search", get(get_web_search))
+        .route("/mcp", post(handle_mcp_request))
         .with_state(route_state)
-        .layer(from_fn_with_state(
-            usage_state,
-            middleware::usage_check_middleware,
-        ))
-        .layer(from_fn_with_state(
-            rate_limit_state,
-            middleware::api_key_rate_limit_middleware,
-        ))
         .layer(from_fn_with_state(
             auth_state_middleware.clone(),
             middleware::auth::auth_middleware_with_workspace_context,

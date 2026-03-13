@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use services::web_search::{
     WebSearchRequest, WebSearchService, WebSearchServiceError, WebSearchUsageContext,
+    WEB_SEARCH_MAX_COUNT, WEB_SEARCH_MAX_OFFSET,
 };
 use std::sync::Arc;
 use uuid::Uuid;
@@ -19,6 +20,18 @@ const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
 const MCP_SERVER_VERSION: &str = "1.0.0";
 const WEB_SEARCH_TOOL_NAME: &str = "web_search";
 const WEB_SEARCH_TOOL_DESCRIPTION: &str = "Search the web and return structured search results.";
+// JSON-RPC reserves -32000..-32099 for server-defined errors. We use a small
+// stable subset here to translate HTTP-layer auth/usage/rate-limit failures
+// into MCP-framed responses without changing the underlying REST middleware.
+//
+// References:
+// - JSON-RPC 2.0 error object: https://www.jsonrpc.org/specification#error_object
+// - MCP uses JSON-RPC 2.0 framing: https://modelcontextprotocol.io/specification/2024-11-05/basic/messages
+const MCP_ERR_AUTH_REQUIRED: i64 = -32001;
+const MCP_ERR_PAYMENT_REQUIRED: i64 = -32002;
+const MCP_ERR_RATE_LIMITED: i64 = -32003;
+const MCP_ERR_TOOL_NOT_CONFIGURED: i64 = -32010;
+const MCP_ERR_TOOL_EXECUTION_FAILED: i64 = -32011;
 
 struct McpToolDefinition {
     name: &'static str,
@@ -139,10 +152,14 @@ fn map_http_error_to_mcp_error(
     status: StatusCode,
     error: ErrorResponse,
 ) -> ResponseJson<McpResponse> {
+    // This helper only translates HTTP-style errors from MCP-local checks
+    // (`check_usage_for_api_key` and `check_rate_limit_for_api_key`).
+    // JSON parsing/protocol errors and tool execution errors are mapped in the
+    // request handler and `map_mcp_service_error`.
     let code = match status {
-        StatusCode::UNAUTHORIZED => -32001,
-        StatusCode::PAYMENT_REQUIRED => -32002,
-        StatusCode::TOO_MANY_REQUESTS => -32003,
+        StatusCode::UNAUTHORIZED => MCP_ERR_AUTH_REQUIRED,
+        StatusCode::PAYMENT_REQUIRED => MCP_ERR_PAYMENT_REQUIRED,
+        StatusCode::TOO_MANY_REQUESTS => MCP_ERR_RATE_LIMITED,
         _ => -32603,
     };
 
@@ -156,18 +173,32 @@ fn map_mcp_service_error(id: Value, error: WebSearchServiceError) -> ResponseJso
             -32602,
             "Tool argument 'query' is required and cannot be empty",
         ),
-        WebSearchServiceError::CountOutOfRange => {
-            error_response(id, -32602, "Tool argument 'count' must be between 1 and 20")
-        }
-        WebSearchServiceError::OffsetOutOfRange => {
-            error_response(id, -32602, "Tool argument 'offset' must be between 0 and 9")
-        }
-        WebSearchServiceError::NotConfigured => {
-            error_response(id, -32001, "Web search is not configured")
-        }
-        WebSearchServiceError::ProviderFailure => {
-            error_response(id, -32002, "Web search request failed")
-        }
+        WebSearchServiceError::CountOutOfRange => error_response(
+            id,
+            -32602,
+            format!(
+                "Tool argument 'count' must be between 1 and {}",
+                WEB_SEARCH_MAX_COUNT
+            ),
+        ),
+        WebSearchServiceError::OffsetOutOfRange => error_response(
+            id,
+            -32602,
+            format!(
+                "Tool argument 'offset' must be between 0 and {}",
+                WEB_SEARCH_MAX_OFFSET
+            ),
+        ),
+        WebSearchServiceError::NotConfigured => error_response(
+            id,
+            MCP_ERR_TOOL_NOT_CONFIGURED,
+            "Web search is not configured",
+        ),
+        WebSearchServiceError::ProviderFailure => error_response(
+            id,
+            MCP_ERR_TOOL_EXECUTION_FAILED,
+            "Web search request failed",
+        ),
         WebSearchServiceError::UsageRecordingFailed | WebSearchServiceError::Internal => {
             error_response(id, -32603, "Internal server error")
         }
@@ -182,8 +213,8 @@ fn web_search_input_schema() -> Value {
             "country": {"type": "string"},
             "search_lang": {"type": "string"},
             "ui_lang": {"type": "string"},
-            "count": {"type": "integer", "minimum": 1, "maximum": 20, "default": 5},
-            "offset": {"type": "integer", "minimum": 0, "maximum": 9},
+            "count": {"type": "integer", "minimum": 1, "maximum": WEB_SEARCH_MAX_COUNT},
+            "offset": {"type": "integer", "minimum": 0, "maximum": WEB_SEARCH_MAX_OFFSET},
             "safesearch": {"type": "string"},
             "freshness": {"type": "string"},
             "text_decorations": {"type": "boolean"},
@@ -287,21 +318,10 @@ pub async fn handle_mcp_request(
             };
 
             let args_value = params.arguments.unwrap_or_else(|| json!({}));
-            let mut args: McpWebSearchArgs = match serde_json::from_value(args_value) {
+            let args: McpWebSearchArgs = match serde_json::from_value(args_value) {
                 Ok(args) => args,
                 Err(_) => return Ok(error_response(request.id, -32602, "Invalid tool arguments")),
             };
-
-            if args.count.is_none() {
-                args.count = Some(5);
-            }
-            if args.count.is_some_and(|count| count > 20 || count == 0) {
-                return Ok(error_response(
-                    request.id,
-                    -32602,
-                    "Tool argument 'count' must be between 1 and 20",
-                ));
-            }
 
             let api_key_id = match Uuid::parse_str(&api_key.api_key.id.0) {
                 Ok(api_key_id) => api_key_id,

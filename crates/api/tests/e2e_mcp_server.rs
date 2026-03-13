@@ -62,7 +62,7 @@ async fn test_mcp_tools_list_exposes_web_search() {
     assert_eq!(tools.len(), 1);
     assert_eq!(tools[0]["name"], "web_search");
     assert_eq!(tools[0]["inputSchema"]["required"], json!(["query"]));
-    assert_eq!(tools[0]["inputSchema"]["properties"]["count"]["default"], 5);
+    assert!(tools[0]["inputSchema"]["properties"]["count"]["default"].is_null());
     assert_eq!(
         tools[0]["inputSchema"]["properties"]["count"]["maximum"],
         20
@@ -76,6 +76,16 @@ async fn test_mcp_tool_call_records_web_search_usage() {
     let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
     let api_key = get_api_key_for_org(&server, org.id.clone()).await;
     let created = get_or_create_web_search_service(&server).await;
+    let initial_balance = server
+        .get(format!("/v1/organizations/{}/usage/balance", org.id).as_str())
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .add_header("User-Agent", MOCK_USER_AGENT)
+        .await;
+
+    assert_eq!(initial_balance.status_code(), 200, "{}", initial_balance.text());
+    let initial_balance_body =
+        initial_balance.json::<api::routes::usage::OrganizationBalanceResponse>();
+    let initial_spent = initial_balance_body.total_spent;
 
     let response = server
         .post("/mcp")
@@ -124,6 +134,20 @@ async fn test_mcp_tool_call_records_web_search_usage() {
     assert!(!history_body.data.is_empty());
     assert_eq!(history_body.data[0].quantity, 1);
     assert_eq!(history_body.data[0].total_cost, created.cost_per_unit);
+
+    let final_balance = server
+        .get(format!("/v1/organizations/{}/usage/balance", org.id).as_str())
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .add_header("User-Agent", MOCK_USER_AGENT)
+        .await;
+
+    assert_eq!(final_balance.status_code(), 200, "{}", final_balance.text());
+    let final_balance_body =
+        final_balance.json::<api::routes::usage::OrganizationBalanceResponse>();
+    assert_eq!(
+        final_balance_body.total_spent - initial_spent,
+        created.cost_per_unit
+    );
 }
 
 #[tokio::test]

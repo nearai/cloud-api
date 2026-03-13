@@ -7,6 +7,9 @@ use std::sync::Arc;
 use tracing::error;
 use uuid::Uuid;
 
+pub const WEB_SEARCH_MAX_COUNT: u32 = 20;
+pub const WEB_SEARCH_MAX_OFFSET: u32 = 9;
+
 #[derive(Debug, Clone)]
 pub struct WebSearchRequest {
     pub query: String,
@@ -56,9 +59,9 @@ pub struct WebSearchResponse {
 pub enum WebSearchServiceError {
     #[error("Query parameter 'query' is required and cannot be empty")]
     EmptyQuery,
-    #[error("Parameter 'count' must be less than or equal to 20")]
+    #[error("Parameter 'count' must be less than or equal to {WEB_SEARCH_MAX_COUNT}")]
     CountOutOfRange,
-    #[error("Parameter 'offset' must be less than or equal to 9")]
+    #[error("Parameter 'offset' must be less than or equal to {WEB_SEARCH_MAX_OFFSET}")]
     OffsetOutOfRange,
     #[error("Web search is not configured")]
     NotConfigured,
@@ -96,12 +99,12 @@ impl WebSearchService {
             return Err(WebSearchServiceError::EmptyQuery);
         }
         if let Some(count) = request.count {
-            if count > 20 {
+            if count > WEB_SEARCH_MAX_COUNT {
                 return Err(WebSearchServiceError::CountOutOfRange);
             }
         }
         if let Some(offset) = request.offset {
-            if offset > 9 {
+            if offset > WEB_SEARCH_MAX_OFFSET {
                 return Err(WebSearchServiceError::OffsetOutOfRange);
             }
         }

@@ -37,6 +37,7 @@ pub trait AttestationServiceTrait: Send + Sync {
         signing_algo: Option<String>,
         nonce: Option<String>,
         signing_address: Option<String>,
+        include_tls_fingerprint: bool,
     ) -> Result<AttestationReport, AttestationError>;
 
     /// Verify a VPC shared secret signature

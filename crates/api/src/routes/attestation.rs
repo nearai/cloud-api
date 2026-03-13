@@ -130,6 +130,9 @@ pub struct AttestationQuery {
     pub signing_algo: Option<String>,
     pub nonce: Option<String>,
     pub signing_address: Option<String>,
+    /// Include TLS certificate fingerprint in the report data.
+    /// Defaults to false; when true, report_data[..32] = SHA256(signing_address || cert_fingerprint).
+    pub include_tls_fingerprint: Option<bool>,
 }
 
 /// Evidence item in NVIDIA payload
@@ -174,6 +177,9 @@ pub struct DstackCpuQuote {
     /// VPC information (optional)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub vpc: Option<VpcInfo>,
+    /// SHA-256 hash of the TLS certificate's SPKI, if requested via include_tls_fingerprint.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tls_cert_fingerprint: Option<String>,
 }
 
 impl From<services::attestation::models::DstackCpuQuote> for DstackCpuQuote {
@@ -190,6 +196,7 @@ impl From<services::attestation::models::DstackCpuQuote> for DstackCpuQuote {
                 vpc_server_app_id: v.vpc_server_app_id,
                 vpc_hostname: v.vpc_hostname,
             }),
+            tls_cert_fingerprint: quote.tls_cert_fingerprint,
         }
     }
 }
@@ -199,6 +206,9 @@ pub struct AttestationResponse {
     pub gateway_attestation: DstackCpuQuote,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub model_attestations: Vec<serde_json::Map<String, serde_json::Value>>,
+    /// TLS certificate file (PEM) from TLS_CERT_PATH; report_data binds via SHA256 of these exact bytes
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tls_certificate: Option<String>,
 }
 
 impl From<services::attestation::models::AttestationReport> for AttestationResponse {
@@ -206,6 +216,7 @@ impl From<services::attestation::models::AttestationReport> for AttestationRespo
         Self {
             gateway_attestation: report.gateway_attestation.into(),
             model_attestations: report.model_attestations,
+            tls_certificate: report.tls_certificate,
         }
     }
 }
@@ -237,6 +248,7 @@ pub async fn get_attestation_report(
             params.signing_algo,
             params.nonce,
             params.signing_address,
+            params.include_tls_fingerprint.unwrap_or(false),
         )
         .await
         .map_err(|e| {

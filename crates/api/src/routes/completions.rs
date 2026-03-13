@@ -751,6 +751,39 @@ mod tests {
         // Empty string should still produce a valid UUID
         assert!(result.is_some());
     }
+
+    #[test]
+    fn test_stream_chunk_serialization_preserves_field_order() {
+        // Verify that StreamChunk::Chat serializes with struct field order
+        // (not alphabetical), matching what serde_json::to_string produces.
+        // The server uses to_string(&StreamChunk) and the mock must match.
+        let chunk = inference_providers::models::ChatCompletionChunk {
+            id: "chatcmpl-test".to_string(),
+            object: "chat.completion.chunk".to_string(),
+            created: 1234567890,
+            model: "test-model".to_string(),
+            system_fingerprint: None,
+            choices: vec![],
+            usage: Some(inference_providers::models::TokenUsage::new(10, 5)),
+            prompt_token_ids: None,
+            modality: None,
+        };
+
+        let stream_chunk = inference_providers::StreamChunk::Chat(chunk.clone());
+
+        // Both serialization paths must produce identical output
+        let from_inner = serde_json::to_string(&chunk).unwrap();
+        let from_enum = serde_json::to_string(&stream_chunk).unwrap();
+        assert_eq!(from_inner, from_enum);
+
+        // Field order should be struct order, not alphabetical
+        let id_pos = from_inner.find("\"id\"").unwrap();
+        let choices_pos = from_inner.find("\"choices\"").unwrap();
+        assert!(
+            id_pos < choices_pos,
+            "id should appear before choices (struct field order)"
+        );
+    }
 }
 
 /// Generate images from text prompt

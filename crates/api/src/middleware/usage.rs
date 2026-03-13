@@ -20,26 +20,10 @@ pub struct UsageState {
     pub api_key_repository: Arc<database::repositories::ApiKeyRepository>,
 }
 
-/// Middleware to check if organization has sufficient credits before processing request
-pub async fn usage_check_middleware(
-    State(state): State<UsageState>,
-    request: Request,
-    next: Next,
-) -> Result<Response, (StatusCode, axum::Json<ErrorResponse>)> {
-    // Extract organization from authenticated API key
-    let api_key = request
-        .extensions()
-        .get::<AuthenticatedApiKey>()
-        .ok_or_else(|| {
-            (
-                StatusCode::UNAUTHORIZED,
-                axum::Json(ErrorResponse::new(
-                    "API key authentication required".to_string(),
-                    "unauthorized".to_string(),
-                )),
-            )
-        })?;
-
+pub async fn check_usage_for_api_key(
+    state: &UsageState,
+    api_key: &AuthenticatedApiKey,
+) -> Result<(), (StatusCode, axum::Json<ErrorResponse>)> {
     let organization_id = api_key.organization.id.0;
     let api_key_id = api_key.api_key.id.clone();
 
@@ -127,7 +111,7 @@ pub async fn usage_check_middleware(
                 organization_id,
                 format_amount(remaining)
             );
-            Ok(next.run(request).await)
+            Ok(())
         }
         UsageCheckResult::LimitExceeded { spent, limit } => {
             warn!(
@@ -169,4 +153,27 @@ pub async fn usage_check_middleware(
             ))
         }
     }
+}
+
+/// Middleware to check if organization has sufficient credits before processing request
+pub async fn usage_check_middleware(
+    State(state): State<UsageState>,
+    request: Request,
+    next: Next,
+) -> Result<Response, (StatusCode, axum::Json<ErrorResponse>)> {
+    let api_key = request
+        .extensions()
+        .get::<AuthenticatedApiKey>()
+        .ok_or_else(|| {
+            (
+                StatusCode::UNAUTHORIZED,
+                axum::Json(ErrorResponse::new(
+                    "API key authentication required".to_string(),
+                    "unauthorized".to_string(),
+                )),
+            )
+        })?;
+
+    check_usage_for_api_key(&state, api_key).await?;
+    Ok(next.run(request).await)
 }

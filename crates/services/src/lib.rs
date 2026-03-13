@@ -15,6 +15,7 @@ pub mod responses;
 pub mod service_usage;
 pub mod usage;
 pub mod user;
+pub mod web_search;
 pub mod workspace;
 
 pub use auth::UserId;

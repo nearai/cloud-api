@@ -169,19 +169,21 @@ fn completion_stream_error_category(e: &inference_providers::CompletionError) ->
     }
 }
 
-// Helper function to extract inference ID from first SSE chunk
-fn extract_inference_id_from_sse(raw_bytes: &[u8]) -> Option<Uuid> {
-    let chunk_str = match String::from_utf8(raw_bytes.to_vec()) {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::warn!(error = %e, "Invalid UTF-8 in SSE chunk, cannot extract inference ID");
-            return None;
-        }
+// Helper function to extract inference ID from a parsed stream chunk
+fn extract_inference_id_from_chunk(chunk: &inference_providers::StreamChunk) -> Uuid {
+    let id = match chunk {
+        inference_providers::StreamChunk::Chat(c) => &c.id,
+        inference_providers::StreamChunk::Text(c) => &c.id,
     };
-    let data = chunk_str.strip_prefix("data: ")?;
-    let obj = serde_json::from_str::<serde_json::Value>(data.trim()).ok()?;
-    let id = obj.get("id")?.as_str()?;
-    Some(hash_inference_id_to_uuid(id))
+    hash_inference_id_to_uuid(id)
+}
+
+/// Extract the provider-assigned chat ID string from a parsed stream chunk.
+fn extract_chat_id_from_chunk(chunk: &inference_providers::StreamChunk) -> String {
+    match chunk {
+        inference_providers::StreamChunk::Chat(c) => c.id.clone(),
+        inference_providers::StreamChunk::Text(c) => c.id.clone(),
+    }
 }
 
 // Convert MessageContent to serde_json::Value, preserving multimodal parts (images, audio, etc.)
@@ -387,7 +389,7 @@ pub async fn chat_completions(
                     .peek()
                     .await
                     .and_then(|result| result.as_ref().ok())
-                    .and_then(|event| extract_inference_id_from_sse(&event.raw_bytes));
+                    .map(|event| extract_inference_id_from_chunk(&event.chunk));
 
                 if inference_id.is_none() {
                     tracing::warn!(
@@ -415,37 +417,24 @@ pub async fn chat_completions(
                         async move {
                             match result {
                                 Ok(event) => {
-                                    // Extract chat_id from the first chunk if available
-                                    if let Ok(chunk_str) =
-                                        String::from_utf8(event.raw_bytes.to_vec())
+                                    // Extract chat_id from the parsed chunk
                                     {
-                                        if let Some(data) = chunk_str.strip_prefix("data: ") {
-                                            if let Ok(serde_json::Value::Object(obj)) =
-                                                serde_json::from_str::<serde_json::Value>(
-                                                    data.trim(),
-                                                )
-                                            {
-                                                if let Some(serde_json::Value::String(id)) =
-                                                    obj.get("id")
-                                                {
-                                                    // Capture chat_id for use in the chain combinator
-                                                    // The real hash will be registered there after accumulating all bytes
-                                                    let mut cid = chat_id_inner.lock().await;
-                                                    if cid.is_none() {
-                                                        *cid = Some(id.clone());
-                                                    }
-                                                }
-                                            }
+                                        let mut cid = chat_id_inner.lock().await;
+                                        if cid.is_none() {
+                                            *cid = Some(extract_chat_id_from_chunk(&event.chunk));
                                         }
                                     }
 
-                                    // raw_bytes contains "data: {...}\n", extract just the JSON part
-                                    let raw_str = String::from_utf8_lossy(&event.raw_bytes);
-                                    let json_data = raw_str
-                                        .trim()
-                                        .strip_prefix("data: ")
-                                        .unwrap_or(raw_str.trim())
-                                        .to_string();
+                                    // Serialize the parsed chunk (normalized to OpenAI format)
+                                    // instead of forwarding raw provider bytes, which may be
+                                    // in a provider-specific format (e.g. Gemini native).
+                                    let json_data = serde_json::to_string(&event.chunk)
+                                        .unwrap_or_else(|e| {
+                                            tracing::error!(
+                                                "Failed to serialize stream chunk: {e}"
+                                            );
+                                            "{}".to_string()
+                                        });
                                     tracing::debug!("Completion stream event: {}", json_data);
                                     // Format as SSE event with proper newlines
                                     let sse_bytes = Bytes::from(format!("data: {json_data}\n\n"));
@@ -712,85 +701,101 @@ pub async fn models(
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_extract_inference_id_from_sse_valid() {
-        let sse_data = b"data: {\"id\":\"chatcmpl-123abc\",\"object\":\"chat.completion.chunk\",\"created\":1234567890,\"model\":\"test-model\",\"choices\":[]}";
-
-        let result = extract_inference_id_from_sse(sse_data);
-
-        assert!(result.is_some());
-        let uuid = result.unwrap();
-        // UUID should be deterministic - same input produces same UUID
-        let uuid2 = extract_inference_id_from_sse(sse_data).unwrap();
-        assert_eq!(uuid, uuid2);
+    fn make_chat_chunk(id: &str) -> inference_providers::StreamChunk {
+        inference_providers::StreamChunk::Chat(inference_providers::models::ChatCompletionChunk {
+            id: id.to_string(),
+            object: "chat.completion.chunk".to_string(),
+            created: 1234567890,
+            model: "test-model".to_string(),
+            system_fingerprint: None,
+            choices: vec![],
+            usage: None,
+            prompt_token_ids: None,
+            modality: None,
+        })
     }
 
     #[test]
-    fn test_extract_inference_id_from_sse_deterministic() {
-        // Test that the same chat ID always produces the same UUID
-        let sse_data1 = b"data: {\"id\":\"chatcmpl-test123\",\"object\":\"chat.completion.chunk\"}";
-        let sse_data2 = b"data: {\"id\":\"chatcmpl-test123\",\"object\":\"chat.completion.chunk\",\"model\":\"different\"}";
-
-        let uuid1 = extract_inference_id_from_sse(sse_data1).unwrap();
-        let uuid2 = extract_inference_id_from_sse(sse_data2).unwrap();
-
-        // Same ID should produce same UUID even with different JSON structure
+    fn test_extract_inference_id_from_chunk_valid() {
+        let chunk = make_chat_chunk("chatcmpl-123abc");
+        let uuid1 = extract_inference_id_from_chunk(&chunk);
+        // UUID should be deterministic - same input produces same UUID
+        let uuid2 = extract_inference_id_from_chunk(&chunk);
         assert_eq!(uuid1, uuid2);
     }
 
     #[test]
-    fn test_extract_inference_id_from_sse_different_ids() {
-        let sse_data1 = b"data: {\"id\":\"chatcmpl-abc123\"}";
-        let sse_data2 = b"data: {\"id\":\"chatcmpl-xyz789\"}";
+    fn test_extract_inference_id_from_chunk_deterministic() {
+        let chunk1 = make_chat_chunk("chatcmpl-test123");
+        let chunk2 = make_chat_chunk("chatcmpl-test123");
+        let uuid1 = extract_inference_id_from_chunk(&chunk1);
+        let uuid2 = extract_inference_id_from_chunk(&chunk2);
+        assert_eq!(uuid1, uuid2);
+    }
 
-        let uuid1 = extract_inference_id_from_sse(sse_data1).unwrap();
-        let uuid2 = extract_inference_id_from_sse(sse_data2).unwrap();
-
-        // Different IDs should produce different UUIDs
+    #[test]
+    fn test_extract_inference_id_from_chunk_different_ids() {
+        let chunk1 = make_chat_chunk("chatcmpl-abc123");
+        let chunk2 = make_chat_chunk("chatcmpl-xyz789");
+        let uuid1 = extract_inference_id_from_chunk(&chunk1);
+        let uuid2 = extract_inference_id_from_chunk(&chunk2);
         assert_ne!(uuid1, uuid2);
     }
 
     #[test]
-    fn test_extract_inference_id_from_sse_missing_data_prefix() {
-        let invalid_data = b"{\"id\":\"chatcmpl-123abc\"}";
-        let result = extract_inference_id_from_sse(invalid_data);
-        assert!(result.is_none());
+    fn test_extract_chat_id_from_chunk() {
+        let chunk = make_chat_chunk("chatcmpl-abc123");
+        let id = extract_chat_id_from_chunk(&chunk);
+        assert_eq!(id, "chatcmpl-abc123");
     }
 
     #[test]
-    fn test_extract_inference_id_from_sse_invalid_json() {
-        let invalid_json = b"data: {invalid json}";
-        let result = extract_inference_id_from_sse(invalid_json);
-        assert!(result.is_none());
-    }
-
-    #[test]
-    fn test_extract_inference_id_from_sse_missing_id_field() {
-        let no_id = b"data: {\"object\":\"chat.completion.chunk\",\"model\":\"test\"}";
-        let result = extract_inference_id_from_sse(no_id);
-        assert!(result.is_none());
-    }
-
-    #[test]
-    fn test_extract_inference_id_from_sse_id_not_string() {
-        let id_not_string = b"data: {\"id\":12345}";
-        let result = extract_inference_id_from_sse(id_not_string);
-        assert!(result.is_none());
-    }
-
-    #[test]
-    fn test_extract_inference_id_from_sse_invalid_utf8() {
-        let invalid_utf8 = b"data: \xff\xfe{\"id\":\"test\"}";
-        let result = extract_inference_id_from_sse(invalid_utf8);
-        assert!(result.is_none());
-    }
-
-    #[test]
-    fn test_extract_inference_id_from_sse_empty_id() {
-        let empty_id = b"data: {\"id\":\"\"}";
-        let result = extract_inference_id_from_sse(empty_id);
+    fn test_extract_inference_id_from_chunk_empty_id() {
+        let chunk = make_chat_chunk("");
+        let result = extract_inference_id_from_chunk(&chunk);
         // Empty string should still produce a valid UUID
-        assert!(result.is_some());
+        assert!(
+            !result.is_nil(),
+            "empty provider ID should still produce a non-nil UUID"
+        );
+    }
+
+    #[test]
+    fn test_stream_chunk_serialization_preserves_field_order() {
+        // Verify that StreamChunk::Chat serializes with struct field order
+        // (not alphabetical), matching what serde_json::to_string produces.
+        // The server uses to_string(&StreamChunk) and the mock must match.
+        let chunk = inference_providers::models::ChatCompletionChunk {
+            id: "chatcmpl-test".to_string(),
+            object: "chat.completion.chunk".to_string(),
+            created: 1234567890,
+            model: "test-model".to_string(),
+            system_fingerprint: None,
+            choices: vec![],
+            usage: Some(inference_providers::models::TokenUsage::new(10, 5)),
+            prompt_token_ids: None,
+            modality: None,
+        };
+
+        let stream_chunk = inference_providers::StreamChunk::Chat(chunk.clone());
+
+        // Both serialization paths must produce identical output
+        let from_inner = serde_json::to_string(&chunk).expect("inner chunk should serialize");
+        let from_enum =
+            serde_json::to_string(&stream_chunk).expect("enum-wrapped chunk should serialize");
+        assert_eq!(from_inner, from_enum);
+
+        // Field order should be struct order, not alphabetical
+        let id_pos = from_inner
+            .find("\"id\"")
+            .expect("serialized chunk should contain id field");
+        let choices_pos = from_inner
+            .find("\"choices\"")
+            .expect("serialized chunk should contain choices field");
+        assert!(
+            id_pos < choices_pos,
+            "id should appear before choices (struct field order)"
+        );
     }
 }
 

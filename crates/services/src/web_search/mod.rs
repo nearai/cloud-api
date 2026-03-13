@@ -4,7 +4,7 @@ use crate::service_usage::ports::{
 };
 use crate::service_usage::ServiceUsageError;
 use std::sync::Arc;
-use tracing::{debug, error};
+use tracing::{error, warn};
 use uuid::Uuid;
 
 pub const WEB_SEARCH_MAX_COUNT: u32 = 20;
@@ -144,9 +144,8 @@ impl WebSearchService {
                 operators: request.operators,
             })
             .await
-            .map_err(|err| {
-                error!("Web search provider failure");
-                debug!(?err, "Web search provider failure: provider error detail");
+            .map_err(|_| {
+                warn!("Web search provider failure");
                 WebSearchServiceError::ProviderFailure
             })?;
 

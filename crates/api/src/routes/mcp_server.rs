@@ -56,7 +56,8 @@ pub struct McpRouteState {
 pub struct McpRequest {
     #[serde(default)]
     pub jsonrpc: Option<String>,
-    pub id: Value,
+    #[serde(default)]
+    pub id: Option<Value>,
     pub method: String,
     #[serde(default)]
     pub params: Option<Value>,
@@ -76,6 +77,10 @@ pub struct McpResponse {
 pub struct McpErrorBody {
     pub code: i64,
     pub message: String,
+}
+
+fn response_id(id: Option<Value>) -> Value {
+    id.unwrap_or(Value::Null)
 }
 
 #[derive(Debug, Deserialize)]
@@ -126,19 +131,23 @@ struct McpWebSearchArgs {
     operators: Option<bool>,
 }
 
-fn ok_response(id: Value, result: Value) -> ResponseJson<McpResponse> {
+fn ok_response(id: Option<Value>, result: Value) -> ResponseJson<McpResponse> {
     ResponseJson(McpResponse {
         jsonrpc: "2.0",
-        id,
+        id: response_id(id),
         result: Some(result),
         error: None,
     })
 }
 
-fn error_response(id: Value, code: i64, message: impl Into<String>) -> ResponseJson<McpResponse> {
+fn error_response(
+    id: Option<Value>,
+    code: i64,
+    message: impl Into<String>,
+) -> ResponseJson<McpResponse> {
     ResponseJson(McpResponse {
         jsonrpc: "2.0",
-        id,
+        id: response_id(id),
         result: None,
         error: Some(McpErrorBody {
             code,
@@ -148,7 +157,7 @@ fn error_response(id: Value, code: i64, message: impl Into<String>) -> ResponseJ
 }
 
 fn map_http_error_to_mcp_error(
-    id: Value,
+    id: Option<Value>,
     status: StatusCode,
     error: ErrorResponse,
 ) -> ResponseJson<McpResponse> {
@@ -166,7 +175,10 @@ fn map_http_error_to_mcp_error(
     error_response(id, code, error.error.message)
 }
 
-fn map_mcp_service_error(id: Value, error: WebSearchServiceError) -> ResponseJson<McpResponse> {
+fn map_mcp_service_error(
+    id: Option<Value>,
+    error: WebSearchServiceError,
+) -> ResponseJson<McpResponse> {
     match error {
         WebSearchServiceError::EmptyQuery => error_response(
             id,
@@ -250,9 +262,15 @@ pub async fn handle_mcp_request(
     Extension(api_key): Extension<AuthenticatedApiKey>,
     Json(request): Json<McpRequest>,
 ) -> Result<ResponseJson<McpResponse>, (StatusCode, ResponseJson<ErrorResponse>)> {
+    let request_id = request.id.clone();
+
+    if request_id.is_none() {
+        return Ok(error_response(request_id, -32600, "Missing request id"));
+    }
+
     if request.jsonrpc.as_deref() != Some("2.0") {
         return Ok(error_response(
-            request.id,
+            request_id,
             -32600,
             "Invalid jsonrpc version, must be \"2.0\"",
         ));
@@ -260,7 +278,7 @@ pub async fn handle_mcp_request(
 
     match request.method.as_str() {
         "initialize" => Ok(ok_response(
-            request.id,
+            request_id,
             json!({
                 "protocolVersion": MCP_PROTOCOL_VERSION,
                 "capabilities": {
@@ -275,7 +293,7 @@ pub async fn handle_mcp_request(
             }),
         )),
         "tools/list" => Ok(ok_response(
-            request.id,
+            request_id,
             json!({
                 "tools": MCP_TOOLS.iter().map(tool_definition).collect::<Vec<_>>()
             }),
@@ -284,19 +302,19 @@ pub async fn handle_mcp_request(
             if let Err((status, error)) =
                 check_rate_limit_for_api_key(&state.rate_limit_state, &api_key).await
             {
-                return Ok(map_http_error_to_mcp_error(request.id, status, error.0));
+                return Ok(map_http_error_to_mcp_error(request_id, status, error.0));
             }
             if let Err((status, error)) =
                 check_usage_for_api_key(&state.usage_state, &api_key).await
             {
-                return Ok(map_http_error_to_mcp_error(request.id, status, error.0));
+                return Ok(map_http_error_to_mcp_error(request_id, status, error.0));
             }
 
             let params = match request.params {
                 Some(params) => params,
                 None => {
                     return Ok(error_response(
-                        request.id,
+                        request_id,
                         -32602,
                         "Missing tools/call params",
                     ));
@@ -306,7 +324,7 @@ pub async fn handle_mcp_request(
                 Ok(params) => params,
                 Err(_) => {
                     return Ok(error_response(
-                        request.id,
+                        request_id,
                         -32602,
                         "Invalid tools/call params",
                     ));
@@ -314,12 +332,12 @@ pub async fn handle_mcp_request(
             };
 
             let Some(tool) = get_tool_definition(&params.name) else {
-                return Ok(error_response(request.id, -32601, "Unknown tool"));
+                return Ok(error_response(request_id, -32601, "Unknown tool"));
             };
 
             let api_key_id = match Uuid::parse_str(&api_key.api_key.id.0) {
                 Ok(api_key_id) => api_key_id,
-                Err(_) => return Ok(error_response(request.id, -32603, "Invalid API key id")),
+                Err(_) => return Ok(error_response(request_id, -32603, "Invalid API key id")),
             };
 
             let result = match tool.name {
@@ -329,7 +347,7 @@ pub async fn handle_mcp_request(
                         Ok(args) => args,
                         Err(_) => {
                             return Ok(error_response(
-                                request.id,
+                                request_id,
                                 -32602,
                                 "Invalid tool arguments",
                             ));
@@ -367,12 +385,12 @@ pub async fn handle_mcp_request(
                         )
                         .await
                 }
-                _ => return Ok(error_response(request.id, -32601, "Unknown tool")),
+                _ => return Ok(error_response(request_id, -32601, "Unknown tool")),
             };
 
             let result = match result {
                 Ok(result) => result,
-                Err(error) => return Ok(map_mcp_service_error(request.id, error)),
+                Err(error) => return Ok(map_mcp_service_error(request_id, error)),
             };
 
             let payload = json!({
@@ -388,7 +406,7 @@ pub async fn handle_mcp_request(
             });
 
             Ok(ok_response(
-                request.id,
+                request_id,
                 json!({
                     "content": [{
                         "type": "text",
@@ -399,6 +417,6 @@ pub async fn handle_mcp_request(
                 }),
             ))
         }
-        _ => Ok(error_response(request.id, -32601, "Method not found")),
+        _ => Ok(error_response(request_id, -32601, "Method not found")),
     }
 }

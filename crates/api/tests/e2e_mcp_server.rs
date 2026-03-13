@@ -21,6 +21,29 @@ async fn test_mcp_requires_api_key_auth() {
 }
 
 #[tokio::test]
+async fn test_mcp_missing_id_returns_jsonrpc_error() {
+    let (server, _database) = setup_test_server_with_mock_web_search().await;
+    let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
+    let api_key = get_api_key_for_org(&server, org.id.clone()).await;
+
+    let response = server
+        .post("/mcp")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "method": "initialize",
+            "params": {}
+        }))
+        .await;
+
+    assert_eq!(response.status_code(), 200, "{}", response.text());
+    let body = response.json::<serde_json::Value>();
+    assert_eq!(body["jsonrpc"], "2.0");
+    assert_eq!(body["id"], serde_json::Value::Null);
+    assert_eq!(body["error"]["code"], -32600);
+}
+
+#[tokio::test]
 async fn test_mcp_tools_list_exposes_web_search() {
     let (server, _database) = setup_test_server_with_mock_web_search().await;
     let org = setup_org_with_credits(&server, 10_000_000_000i64).await;

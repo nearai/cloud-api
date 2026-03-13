@@ -170,12 +170,12 @@ fn completion_stream_error_category(e: &inference_providers::CompletionError) ->
 }
 
 // Helper function to extract inference ID from a parsed stream chunk
-fn extract_inference_id_from_chunk(chunk: &inference_providers::StreamChunk) -> Option<Uuid> {
+fn extract_inference_id_from_chunk(chunk: &inference_providers::StreamChunk) -> Uuid {
     let id = match chunk {
         inference_providers::StreamChunk::Chat(c) => &c.id,
         inference_providers::StreamChunk::Text(c) => &c.id,
     };
-    Some(hash_inference_id_to_uuid(id))
+    hash_inference_id_to_uuid(id)
 }
 
 /// Extract the provider-assigned chat ID string from a parsed stream chunk.
@@ -383,7 +383,7 @@ pub async fn chat_completions(
                     .peek()
                     .await
                     .and_then(|result| result.as_ref().ok())
-                    .and_then(|event| extract_inference_id_from_chunk(&event.chunk));
+                    .map(|event| extract_inference_id_from_chunk(&event.chunk));
 
                 if inference_id.is_none() {
                     tracing::warn!(
@@ -712,10 +712,9 @@ mod tests {
     #[test]
     fn test_extract_inference_id_from_chunk_valid() {
         let chunk = make_chat_chunk("chatcmpl-123abc");
-        let uuid1 = extract_inference_id_from_chunk(&chunk).expect("should extract UUID");
+        let uuid1 = extract_inference_id_from_chunk(&chunk);
         // UUID should be deterministic - same input produces same UUID
-        let uuid2 =
-            extract_inference_id_from_chunk(&chunk).expect("should extract UUID on second call");
+        let uuid2 = extract_inference_id_from_chunk(&chunk);
         assert_eq!(uuid1, uuid2);
     }
 
@@ -723,8 +722,8 @@ mod tests {
     fn test_extract_inference_id_from_chunk_deterministic() {
         let chunk1 = make_chat_chunk("chatcmpl-test123");
         let chunk2 = make_chat_chunk("chatcmpl-test123");
-        let uuid1 = extract_inference_id_from_chunk(&chunk1).unwrap();
-        let uuid2 = extract_inference_id_from_chunk(&chunk2).unwrap();
+        let uuid1 = extract_inference_id_from_chunk(&chunk1);
+        let uuid2 = extract_inference_id_from_chunk(&chunk2);
         assert_eq!(uuid1, uuid2);
     }
 
@@ -732,8 +731,8 @@ mod tests {
     fn test_extract_inference_id_from_chunk_different_ids() {
         let chunk1 = make_chat_chunk("chatcmpl-abc123");
         let chunk2 = make_chat_chunk("chatcmpl-xyz789");
-        let uuid1 = extract_inference_id_from_chunk(&chunk1).unwrap();
-        let uuid2 = extract_inference_id_from_chunk(&chunk2).unwrap();
+        let uuid1 = extract_inference_id_from_chunk(&chunk1);
+        let uuid2 = extract_inference_id_from_chunk(&chunk2);
         assert_ne!(uuid1, uuid2);
     }
 
@@ -749,7 +748,7 @@ mod tests {
         let chunk = make_chat_chunk("");
         let result = extract_inference_id_from_chunk(&chunk);
         // Empty string should still produce a valid UUID
-        assert!(result.is_some());
+        assert!(!result.is_nil(), "empty provider ID should still produce a non-nil UUID");
     }
 
     #[test]
@@ -772,13 +771,16 @@ mod tests {
         let stream_chunk = inference_providers::StreamChunk::Chat(chunk.clone());
 
         // Both serialization paths must produce identical output
-        let from_inner = serde_json::to_string(&chunk).unwrap();
-        let from_enum = serde_json::to_string(&stream_chunk).unwrap();
+        let from_inner = serde_json::to_string(&chunk).expect("inner chunk should serialize");
+        let from_enum =
+            serde_json::to_string(&stream_chunk).expect("enum-wrapped chunk should serialize");
         assert_eq!(from_inner, from_enum);
 
         // Field order should be struct order, not alphabetical
-        let id_pos = from_inner.find("\"id\"").unwrap();
-        let choices_pos = from_inner.find("\"choices\"").unwrap();
+        let id_pos = from_inner.find("\"id\"").expect("serialized chunk should contain id field");
+        let choices_pos = from_inner
+            .find("\"choices\"")
+            .expect("serialized chunk should contain choices field");
         assert!(
             id_pos < choices_pos,
             "id should appear before choices (struct field order)"

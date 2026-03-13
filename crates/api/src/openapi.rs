@@ -39,7 +39,6 @@ use utoipa::{Modify, OpenApi};
         (name = "Gateway", description = "Model gateway integration endpoints"),
         (name = "Admin", description = "Administrative endpoints (admin access required)"),
         (name = "Services", description = "Public platform services (e.g. web_search pricing)"),
-        (name = "Web Search", description = "Standalone web search endpoint"),
     ),
     paths(
         // Chat completion endpoints (most important for users)
@@ -123,8 +122,6 @@ use utoipa::{Modify, OpenApi};
         crate::routes::gateway::check_api_key,
         // Billing endpoints (HuggingFace integration)
         crate::routes::billing::get_billing_costs,
-        // Web Search (standalone)
-        crate::routes::web_search::get_web_search,
         // Admin endpoints (less frequently used)
         crate::routes::admin::list_models,
         crate::routes::admin::batch_upsert_models,
@@ -215,7 +212,6 @@ use utoipa::{Modify, OpenApi};
             // Model pricing models
             ModelListResponse, ModelWithPricing, AdminModelListResponse, AdminModelWithPricing,
             DecimalPrice, DecimalPriceRequest, ModelMetadata,
-            WebSearchResponse, WebSearchResultItem, WebSearchQueryParams,
             ServiceResponse, ServiceListResponse,
             AdminServiceResponse, AdminServiceListResponse, CreateServiceRequest, UpdateServiceRequest,
             UpdateModelApiRequest, ModelHistoryEntry, ModelHistoryResponse,

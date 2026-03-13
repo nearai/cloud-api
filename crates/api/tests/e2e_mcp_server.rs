@@ -153,3 +153,35 @@ async fn test_mcp_tool_call_rejects_invalid_count() {
     let body = response.json::<serde_json::Value>();
     assert_eq!(body["error"]["code"], -32602);
 }
+
+#[tokio::test]
+async fn test_mcp_tool_call_rejects_invalid_offset() {
+    let (server, _database) = setup_test_server_with_mock_web_search().await;
+    let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
+    let api_key = get_api_key_for_org(&server, org.id.clone()).await;
+
+    let response = server
+        .post("/mcp")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 5,
+            "method": "tools/call",
+            "params": {
+                "name": "web_search",
+                "arguments": {
+                    "query": "test query",
+                    "offset": 10
+                }
+            }
+        }))
+        .await;
+
+    assert_eq!(response.status_code(), 200, "{}", response.text());
+    let body = response.json::<serde_json::Value>();
+    assert_eq!(body["error"]["code"], -32602);
+    assert_eq!(
+        body["error"]["message"],
+        "Tool argument 'offset' must be between 0 and 9"
+    );
+}

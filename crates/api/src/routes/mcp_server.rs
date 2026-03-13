@@ -1,4 +1,6 @@
 use crate::middleware::auth::AuthenticatedApiKey;
+use crate::middleware::usage::{check_usage_for_api_key, UsageState};
+use crate::models::ErrorResponse;
 use axum::{
     extract::{Extension, Json, State},
     http::StatusCode,
@@ -12,7 +14,7 @@ use services::web_search::{
 use std::sync::Arc;
 use uuid::Uuid;
 
-const MCP_PROTOCOL_VERSION: &str = "2026-03-13";
+const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
 const MCP_SERVER_VERSION: &str = "1.0.0";
 const WEB_SEARCH_TOOL_NAME: &str = "web_search";
 const WEB_SEARCH_TOOL_DESCRIPTION: &str = "Search the web and return structured search results.";
@@ -32,6 +34,7 @@ const MCP_TOOLS: &[McpToolDefinition] = &[McpToolDefinition {
 #[derive(Clone)]
 pub struct McpRouteState {
     pub web_search_service: Arc<WebSearchService>,
+    pub usage_state: UsageState,
 }
 
 #[derive(Debug, Deserialize)]
@@ -61,12 +64,7 @@ pub struct McpErrorBody {
 }
 
 #[derive(Debug, Deserialize)]
-struct InitializeParams {
-    #[serde(rename = "protocolVersion")]
-    protocol_version: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct CallToolParams {
     name: String,
     #[serde(default)]
@@ -74,6 +72,7 @@ struct CallToolParams {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct McpWebSearchArgs {
     query: String,
     #[serde(default)]
@@ -140,6 +139,12 @@ fn map_mcp_service_error(id: Value, error: WebSearchServiceError) -> ResponseJso
             -32602,
             "Tool argument 'query' is required and cannot be empty",
         ),
+        WebSearchServiceError::CountOutOfRange => {
+            error_response(id, -32602, "Tool argument 'count' must be between 1 and 20")
+        }
+        WebSearchServiceError::OffsetOutOfRange => {
+            error_response(id, -32602, "Tool argument 'offset' must be between 0 and 9")
+        }
         WebSearchServiceError::NotConfigured => {
             error_response(id, -32001, "Web search is not configured")
         }
@@ -196,34 +201,31 @@ pub async fn handle_mcp_request(
     State(state): State<McpRouteState>,
     Extension(api_key): Extension<AuthenticatedApiKey>,
     Json(request): Json<McpRequest>,
-) -> Result<ResponseJson<McpResponse>, StatusCode> {
-    let _ = request.jsonrpc.as_deref();
+) -> Result<ResponseJson<McpResponse>, (StatusCode, ResponseJson<ErrorResponse>)> {
+    if request.jsonrpc.as_deref() != Some("2.0") {
+        return Ok(error_response(
+            request.id,
+            -32600,
+            "Invalid jsonrpc version, must be \"2.0\"",
+        ));
+    }
 
     match request.method.as_str() {
-        "initialize" => {
-            let protocol_version = request
-                .params
-                .clone()
-                .and_then(|params| serde_json::from_value::<InitializeParams>(params).ok())
-                .and_then(|params| params.protocol_version)
-                .unwrap_or_else(|| MCP_PROTOCOL_VERSION.to_string());
-
-            Ok(ok_response(
-                request.id,
-                json!({
-                    "protocolVersion": protocol_version,
-                    "capabilities": {
-                        "tools": {
-                            "listChanged": false
-                        }
-                    },
-                    "serverInfo": {
-                        "name": "cloud-api",
-                        "version": MCP_SERVER_VERSION
+        "initialize" => Ok(ok_response(
+            request.id,
+            json!({
+                "protocolVersion": MCP_PROTOCOL_VERSION,
+                "capabilities": {
+                    "tools": {
+                        "listChanged": false
                     }
-                }),
-            ))
-        }
+                },
+                "serverInfo": {
+                    "name": "cloud-api",
+                    "version": MCP_SERVER_VERSION
+                }
+            }),
+        )),
         "tools/list" => Ok(ok_response(
             request.id,
             json!({
@@ -231,6 +233,8 @@ pub async fn handle_mcp_request(
             }),
         )),
         "tools/call" => {
+            check_usage_for_api_key(&state.usage_state, &api_key).await?;
+
             let params = match request.params {
                 Some(params) => params,
                 None => {

@@ -1104,15 +1104,12 @@ pub fn build_mcp_routes(
             web_search_provider,
             service_usage_service,
         )),
+        usage_state: usage_state.clone(),
     };
 
     Router::new()
         .route("/mcp", post(handle_mcp_request))
         .with_state(route_state)
-        .layer(from_fn_with_state(
-            usage_state,
-            middleware::usage_check_middleware,
-        ))
         .layer(from_fn_with_state(
             rate_limit_state,
             middleware::api_key_rate_limit_middleware,

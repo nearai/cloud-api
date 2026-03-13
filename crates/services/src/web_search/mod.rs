@@ -4,6 +4,7 @@ use crate::service_usage::ports::{
 };
 use crate::service_usage::ServiceUsageError;
 use std::sync::Arc;
+use tracing::error;
 use uuid::Uuid;
 
 #[derive(Debug, Clone)]
@@ -55,6 +56,10 @@ pub struct WebSearchResponse {
 pub enum WebSearchServiceError {
     #[error("Query parameter 'query' is required and cannot be empty")]
     EmptyQuery,
+    #[error("Parameter 'count' must be less than or equal to 20")]
+    CountOutOfRange,
+    #[error("Parameter 'offset' must be less than or equal to 9")]
+    OffsetOutOfRange,
     #[error("Web search is not configured")]
     NotConfigured,
     #[error("Web search request failed")]
@@ -90,12 +95,25 @@ impl WebSearchService {
         if request.query.trim().is_empty() {
             return Err(WebSearchServiceError::EmptyQuery);
         }
+        if let Some(count) = request.count {
+            if count > 20 {
+                return Err(WebSearchServiceError::CountOutOfRange);
+            }
+        }
+        if let Some(offset) = request.offset {
+            if offset > 9 {
+                return Err(WebSearchServiceError::OffsetOutOfRange);
+            }
+        }
 
         let pricing = self
             .service_usage_service
             .get_active_service_pricing(SERVICE_NAME_WEB_SEARCH)
             .await
-            .map_err(|_| WebSearchServiceError::Internal)?;
+            .map_err(|err| {
+                error!(?err, "Failed to get active web search service pricing");
+                WebSearchServiceError::Internal
+            })?;
         let Some((service_id, cost_per_unit)) = pricing else {
             return Err(WebSearchServiceError::NotConfigured);
         };
@@ -123,7 +141,10 @@ impl WebSearchService {
                 operators: request.operators,
             })
             .await
-            .map_err(|_| WebSearchServiceError::ProviderFailure)?;
+            .map_err(|err| {
+                error!(?err, "Web search provider failure");
+                WebSearchServiceError::ProviderFailure
+            })?;
 
         self.service_usage_service
             .record_service_usage_with_pricing(&RecordServiceUsageWithPricingParams {
@@ -137,9 +158,10 @@ impl WebSearchService {
             })
             .await
             .map_err(|err| match err {
-                ServiceUsageError::ServiceNotFound(_)
-                | ServiceUsageError::InternalError(_)
-                | ServiceUsageError::CostOverflow => WebSearchServiceError::UsageRecordingFailed,
+                ServiceUsageError::InternalError(_) => WebSearchServiceError::Internal,
+                ServiceUsageError::ServiceNotFound(_) | ServiceUsageError::CostOverflow => {
+                    WebSearchServiceError::UsageRecordingFailed
+                }
             })?;
 
         Ok(WebSearchResponse {

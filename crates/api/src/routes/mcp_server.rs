@@ -12,7 +12,7 @@ use services::web_search::{
 use std::sync::Arc;
 use uuid::Uuid;
 
-const MCP_TOOL_NAME: &str = "nearai_web_search";
+const MCP_TOOL_NAME: &str = "web_search";
 const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
 
 #[derive(Clone)]

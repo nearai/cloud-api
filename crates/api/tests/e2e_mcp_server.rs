@@ -21,7 +21,7 @@ async fn test_mcp_requires_api_key_auth() {
 }
 
 #[tokio::test]
-async fn test_mcp_tools_list_exposes_nearai_web_search() {
+async fn test_mcp_tools_list_exposes_web_search() {
     let (server, _database) = setup_test_server_with_mock_web_search().await;
     let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
     let api_key = get_api_key_for_org(&server, org.id.clone()).await;
@@ -60,7 +60,7 @@ async fn test_mcp_tools_list_exposes_nearai_web_search() {
         .as_array()
         .expect("tools should be an array");
     assert_eq!(tools.len(), 1);
-    assert_eq!(tools[0]["name"], "nearai_web_search");
+    assert_eq!(tools[0]["name"], "web_search");
     assert_eq!(tools[0]["inputSchema"]["required"], json!(["query"]));
     assert_eq!(tools[0]["inputSchema"]["properties"]["count"]["default"], 5);
     assert_eq!(
@@ -85,7 +85,7 @@ async fn test_mcp_tool_call_records_web_search_usage() {
             "id": 3,
             "method": "tools/call",
             "params": {
-                "name": "nearai_web_search",
+                "name": "web_search",
                 "arguments": {
                     "query": "test query",
                     "count": 5
@@ -140,7 +140,7 @@ async fn test_mcp_tool_call_rejects_invalid_count() {
             "id": 4,
             "method": "tools/call",
             "params": {
-                "name": "nearai_web_search",
+                "name": "web_search",
                 "arguments": {
                     "query": "test query",
                     "count": 21

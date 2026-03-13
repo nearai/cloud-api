@@ -111,6 +111,7 @@ pub async fn list_models(
                     model.input_modalities.clone(),
                     model.output_modalities.clone(),
                 ),
+                inference_url: model.inference_url.clone(),
             },
         })
         .collect();
@@ -213,6 +214,7 @@ pub async fn get_model_by_name(
                 model.input_modalities,
                 model.output_modalities,
             ),
+            inference_url: model.inference_url,
         },
     };
 

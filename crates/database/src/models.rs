@@ -429,6 +429,9 @@ pub struct Model {
     /// Output modalities the model produces, e.g., ["text"], ["image"]
     pub output_modalities: Option<Vec<String>>,
 
+    /// Base URL for the model's inference endpoint (e.g., "http://localhost:8000")
+    pub inference_url: Option<String>,
+
     // Tracking fields
     pub is_active: bool,
     pub owned_by: String,
@@ -459,6 +462,8 @@ pub struct UpdateModelPricingRequest {
     // Architecture/modalities
     pub input_modalities: Option<Vec<String>>,
     pub output_modalities: Option<Vec<String>>,
+    /// Base URL for the model's inference endpoint
+    pub inference_url: Option<String>,
     // User audit tracking for history
     pub change_reason: Option<String>,
     pub changed_by_user_id: Option<Uuid>,
@@ -496,6 +501,9 @@ pub struct ModelHistory {
     // Architecture/modalities snapshot
     pub input_modalities: Option<Vec<String>>,
     pub output_modalities: Option<Vec<String>>,
+
+    /// Base URL for the model's inference endpoint
+    pub inference_url: Option<String>,
 
     // Temporal fields
     pub effective_from: DateTime<Utc>,

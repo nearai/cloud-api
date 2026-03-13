@@ -784,6 +784,10 @@ mod tests {
             encryption_headers::MODEL_PUB_KEY.to_string(),
             serde_json::Value::String("def456".to_string()),
         );
+        extra.insert(
+            encryption_headers::ENCRYPTION_VERSION.to_string(),
+            serde_json::Value::String("2".to_string()),
+        );
 
         provider.prepare_encryption_headers(&mut headers, &mut extra);
 
@@ -799,6 +803,10 @@ mod tests {
         assert!(
             !extra.contains_key(encryption_headers::MODEL_PUB_KEY),
             "x_model_pub_key should be removed from extra"
+        );
+        assert!(
+            !extra.contains_key(encryption_headers::ENCRYPTION_VERSION),
+            "x_encryption_version should be removed from extra"
         );
     }
 
@@ -820,6 +828,10 @@ mod tests {
             encryption_headers::MODEL_PUB_KEY.to_string(),
             serde_json::Value::String("def456".to_string()),
         );
+        extra.insert(
+            encryption_headers::ENCRYPTION_VERSION.to_string(),
+            serde_json::Value::String("2".to_string()),
+        );
 
         provider.prepare_encryption_headers(&mut headers, &mut extra);
 
@@ -833,6 +845,11 @@ mod tests {
             headers.get("X-Client-Pub-Key").unwrap(),
             "abc123",
             "X-Client-Pub-Key header should be forwarded"
+        );
+        assert_eq!(
+            headers.get("X-Encryption-Version").unwrap(),
+            "2",
+            "X-Encryption-Version header should be forwarded"
         );
         // model_pub_key should NOT be forwarded (used only for routing, not sent to vllm-proxy)
         assert!(
@@ -931,6 +948,10 @@ mod tests {
             serde_json::Value::String("def456".to_string()),
         );
         extra.insert(
+            encryption_headers::ENCRYPTION_VERSION.to_string(),
+            serde_json::Value::String("2".to_string()),
+        );
+        extra.insert(
             "some_valid_param".to_string(),
             serde_json::Value::String("value".to_string()),
         );
@@ -963,6 +984,10 @@ mod tests {
         assert!(
             !json.contains("x_model_pub_key"),
             "x_model_pub_key should NOT appear in serialized JSON after prepare_encryption_headers"
+        );
+        assert!(
+            !json.contains("x_encryption_version"),
+            "x_encryption_version should NOT appear in serialized JSON after prepare_encryption_headers"
         );
 
         // Valid params should still be present

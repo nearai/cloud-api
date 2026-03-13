@@ -4,7 +4,7 @@ use crate::service_usage::ports::{
 };
 use crate::service_usage::ServiceUsageError;
 use std::sync::Arc;
-use tracing::error;
+use tracing::{debug, error};
 use uuid::Uuid;
 
 pub const WEB_SEARCH_MAX_COUNT: u32 = 20;
@@ -59,7 +59,7 @@ pub struct WebSearchResponse {
 pub enum WebSearchServiceError {
     #[error("Query parameter 'query' is required and cannot be empty")]
     EmptyQuery,
-    #[error("Parameter 'count' must be less than or equal to {WEB_SEARCH_MAX_COUNT}")]
+    #[error("Parameter 'count' must be between 1 and {WEB_SEARCH_MAX_COUNT}")]
     CountOutOfRange,
     #[error("Parameter 'offset' must be less than or equal to {WEB_SEARCH_MAX_OFFSET}")]
     OffsetOutOfRange,
@@ -99,7 +99,7 @@ impl WebSearchService {
             return Err(WebSearchServiceError::EmptyQuery);
         }
         if let Some(count) = request.count {
-            if count > WEB_SEARCH_MAX_COUNT {
+            if count == 0 || count > WEB_SEARCH_MAX_COUNT {
                 return Err(WebSearchServiceError::CountOutOfRange);
             }
         }
@@ -145,7 +145,8 @@ impl WebSearchService {
             })
             .await
             .map_err(|err| {
-                error!(?err, "Web search provider failure");
+                error!("Web search provider failure");
+                debug!(?err, "Web search provider failure: provider error detail");
                 WebSearchServiceError::ProviderFailure
             })?;
 

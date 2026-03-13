@@ -82,7 +82,12 @@ async fn test_mcp_tool_call_records_web_search_usage() {
         .add_header("User-Agent", MOCK_USER_AGENT)
         .await;
 
-    assert_eq!(initial_balance.status_code(), 200, "{}", initial_balance.text());
+    assert_eq!(
+        initial_balance.status_code(),
+        200,
+        "{}",
+        initial_balance.text()
+    );
     let initial_balance_body =
         initial_balance.json::<api::routes::usage::OrganizationBalanceResponse>();
     let initial_spent = initial_balance_body.total_spent;

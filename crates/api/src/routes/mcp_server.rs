@@ -317,12 +317,6 @@ pub async fn handle_mcp_request(
                 return Ok(error_response(request.id, -32601, "Unknown tool"));
             };
 
-            let args_value = params.arguments.unwrap_or_else(|| json!({}));
-            let args: McpWebSearchArgs = match serde_json::from_value(args_value) {
-                Ok(args) => args,
-                Err(_) => return Ok(error_response(request.id, -32602, "Invalid tool arguments")),
-            };
-
             let api_key_id = match Uuid::parse_str(&api_key.api_key.id.0) {
                 Ok(api_key_id) => api_key_id,
                 Err(_) => return Ok(error_response(request.id, -32603, "Invalid API key id")),
@@ -330,6 +324,18 @@ pub async fn handle_mcp_request(
 
             let result = match tool.name {
                 WEB_SEARCH_TOOL_NAME => {
+                    let args_value = params.arguments.unwrap_or_else(|| json!({}));
+                    let args: McpWebSearchArgs = match serde_json::from_value(args_value) {
+                        Ok(args) => args,
+                        Err(_) => {
+                            return Ok(error_response(
+                                request.id,
+                                -32602,
+                                "Invalid tool arguments",
+                            ));
+                        }
+                    };
+
                     state
                         .web_search_service
                         .execute(

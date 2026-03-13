@@ -27,6 +27,11 @@ const WEB_SEARCH_TOOL_DESCRIPTION: &str = "Search the web and return structured 
 // References:
 // - JSON-RPC 2.0 error object: https://www.jsonrpc.org/specification#error_object
 // - MCP uses JSON-RPC 2.0 framing: https://modelcontextprotocol.io/specification/2024-11-05/basic/messages
+const JSONRPC_INVALID_REQUEST: i64 = -32600;
+const JSONRPC_METHOD_NOT_FOUND: i64 = -32601;
+const JSONRPC_INVALID_PARAMS: i64 = -32602;
+const JSONRPC_INTERNAL_ERROR: i64 = -32603;
+
 const MCP_ERR_AUTH_REQUIRED: i64 = -32001;
 const MCP_ERR_PAYMENT_REQUIRED: i64 = -32002;
 const MCP_ERR_RATE_LIMITED: i64 = -32003;
@@ -169,7 +174,7 @@ fn map_http_error_to_mcp_error(
         StatusCode::UNAUTHORIZED => MCP_ERR_AUTH_REQUIRED,
         StatusCode::PAYMENT_REQUIRED => MCP_ERR_PAYMENT_REQUIRED,
         StatusCode::TOO_MANY_REQUESTS => MCP_ERR_RATE_LIMITED,
-        _ => -32603,
+        _ => JSONRPC_INTERNAL_ERROR,
     };
 
     error_response(id, code, error.error.message)
@@ -182,12 +187,12 @@ fn map_mcp_service_error(
     match error {
         WebSearchServiceError::EmptyQuery => error_response(
             id,
-            -32602,
+            JSONRPC_INVALID_PARAMS,
             "Tool argument 'query' is required and cannot be empty",
         ),
         WebSearchServiceError::CountOutOfRange => error_response(
             id,
-            -32602,
+            JSONRPC_INVALID_PARAMS,
             format!(
                 "Tool argument 'count' must be between 1 and {}",
                 WEB_SEARCH_MAX_COUNT
@@ -195,7 +200,7 @@ fn map_mcp_service_error(
         ),
         WebSearchServiceError::OffsetOutOfRange => error_response(
             id,
-            -32602,
+            JSONRPC_INVALID_PARAMS,
             format!(
                 "Tool argument 'offset' must be between 0 and {}",
                 WEB_SEARCH_MAX_OFFSET
@@ -212,7 +217,7 @@ fn map_mcp_service_error(
             "Web search request failed",
         ),
         WebSearchServiceError::UsageRecordingFailed | WebSearchServiceError::Internal => {
-            error_response(id, -32603, "Internal server error")
+            error_response(id, JSONRPC_INTERNAL_ERROR, "Internal server error")
         }
     }
 }
@@ -265,13 +270,17 @@ pub async fn handle_mcp_request(
     let request_id = request.id.clone();
 
     if request_id.is_none() {
-        return Ok(error_response(request_id, -32600, "Missing request id"));
+        return Ok(error_response(
+            request_id,
+            JSONRPC_INVALID_REQUEST,
+            "Missing request id",
+        ));
     }
 
     if request.jsonrpc.as_deref() != Some("2.0") {
         return Ok(error_response(
             request_id,
-            -32600,
+            JSONRPC_INVALID_REQUEST,
             "Invalid jsonrpc version, must be \"2.0\"",
         ));
     }
@@ -315,7 +324,7 @@ pub async fn handle_mcp_request(
                 None => {
                     return Ok(error_response(
                         request_id,
-                        -32602,
+                        JSONRPC_INVALID_PARAMS,
                         "Missing tools/call params",
                     ));
                 }
@@ -325,19 +334,29 @@ pub async fn handle_mcp_request(
                 Err(_) => {
                     return Ok(error_response(
                         request_id,
-                        -32602,
+                        JSONRPC_INVALID_PARAMS,
                         "Invalid tools/call params",
                     ));
                 }
             };
 
             let Some(tool) = get_tool_definition(&params.name) else {
-                return Ok(error_response(request_id, -32601, "Unknown tool"));
+                return Ok(error_response(
+                    request_id,
+                    JSONRPC_METHOD_NOT_FOUND,
+                    "Unknown tool",
+                ));
             };
 
             let api_key_id = match Uuid::parse_str(&api_key.api_key.id.0) {
                 Ok(api_key_id) => api_key_id,
-                Err(_) => return Ok(error_response(request_id, -32603, "Invalid API key id")),
+                Err(_) => {
+                    return Ok(error_response(
+                        request_id,
+                        JSONRPC_INTERNAL_ERROR,
+                        "Invalid API key id",
+                    ))
+                }
             };
 
             let result = match tool.name {
@@ -348,7 +367,7 @@ pub async fn handle_mcp_request(
                         Err(_) => {
                             return Ok(error_response(
                                 request_id,
-                                -32602,
+                                JSONRPC_INVALID_PARAMS,
                                 "Invalid tool arguments",
                             ));
                         }
@@ -385,7 +404,13 @@ pub async fn handle_mcp_request(
                         )
                         .await
                 }
-                _ => return Ok(error_response(request_id, -32601, "Unknown tool")),
+                _ => {
+                    return Ok(error_response(
+                        request_id,
+                        JSONRPC_METHOD_NOT_FOUND,
+                        "Unknown tool",
+                    ))
+                }
             };
 
             let result = match result {
@@ -417,6 +442,10 @@ pub async fn handle_mcp_request(
                 }),
             ))
         }
-        _ => Ok(error_response(request_id, -32601, "Method not found")),
+        _ => Ok(error_response(
+            request_id,
+            JSONRPC_METHOD_NOT_FOUND,
+            "Method not found",
+        )),
     }
 }

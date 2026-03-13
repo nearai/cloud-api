@@ -43,6 +43,7 @@ pub struct AttestationService {
     pub usage_repository: Arc<dyn UsageRepository>,
     pub vpc_info: Option<VpcInfo>,
     pub vpc_shared_secret: Option<String>,
+    pub tls_cert_fingerprint: Option<String>,
     ed25519_signing_key: Arc<SigningKey>,
     ed25519_verifying_key: Arc<VerifyingKey>,
     ecdsa_signing_key: Arc<EcdsaSigningKey>,
@@ -72,6 +73,9 @@ impl AttestationService {
 
         // Load VPC shared secret from environment
         let vpc_shared_secret = load_vpc_shared_secret();
+
+        // Load TLS certificate fingerprint if configured
+        let tls_cert_fingerprint = load_tls_cert_fingerprint();
         if vpc_shared_secret.is_none() {
             tracing::warn!(
                 "Cannot load VPC shared secret. VPC-based authentication will be disabled"
@@ -132,6 +136,7 @@ impl AttestationService {
             usage_repository,
             vpc_info,
             vpc_shared_secret,
+            tls_cert_fingerprint,
             ed25519_signing_key: Arc::new(ed25519_signing_key),
             ed25519_verifying_key: Arc::new(ed25519_verifying_key),
             ecdsa_signing_key: Arc::new(ecdsa_signing_key),
@@ -385,6 +390,45 @@ pub fn load_vpc_info() -> Option<VpcInfo> {
     }
 }
 
+/// Load TLS certificate SPKI fingerprint from `TLS_CERT_PATH`.
+pub fn load_tls_cert_fingerprint() -> Option<String> {
+    let path = std::env::var("TLS_CERT_PATH").ok()?;
+    match compute_spki_hash(&path) {
+        Ok(hash) => {
+            tracing::info!(
+                tls_cert_path = %path,
+                fingerprint = %hash,
+                "TLS certificate SPKI hash computed"
+            );
+            Some(hash)
+        }
+        Err(e) => {
+            tracing::warn!(
+                tls_cert_path = %path,
+                error = %e,
+                "Failed to compute TLS cert fingerprint (TLS_CERT_PATH)"
+            );
+            None
+        }
+    }
+}
+
+/// Compute SHA-256 hash of the Subject Public Key Info (SPKI) DER from a PEM certificate
+pub fn compute_spki_hash(cert_path: &str) -> Result<String, String> {
+    use sha2::Digest;
+    let pem_data =
+        std::fs::read(cert_path).map_err(|e| format!("failed to read cert {cert_path}: {e}"))?;
+    let (_, pem) = x509_parser::pem::parse_x509_pem(&pem_data)
+        .map_err(|e| format!("failed to parse PEM: {e}"))?;
+    let (_, cert) = x509_parser::parse_x509_certificate(&pem.contents)
+        .map_err(|e| format!("failed to parse X.509: {e}"))?;
+    let spki_der = cert.tbs_certificate.subject_pki.raw;
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(spki_der);
+    let hash = hasher.finalize();
+    Ok(hex::encode(hash))
+}
+
 /// Load VPC shared secret from file
 pub fn load_vpc_shared_secret() -> Option<String> {
     if let Ok(path) = std::env::var("VPC_SHARED_SECRET_FILE") {
@@ -620,6 +664,7 @@ impl ports::AttestationServiceTrait for AttestationService {
         signing_algo: Option<String>,
         nonce: Option<String>,
         signing_address: Option<String>,
+        include_tls_fingerprint: bool,
     ) -> Result<AttestationReport, AttestationError> {
         // Resolve model name (could be an alias) and get model details
         let mut model_attestations = vec![];
@@ -695,6 +740,7 @@ impl ports::AttestationServiceTrait for AttestationService {
                     signing_algo.clone(),
                     Some(nonce.clone()),
                     signing_address,
+                    include_tls_fingerprint,
                 )
                 .await
                 .map_err(|e| AttestationError::ProviderError(e.to_string()))?;
@@ -726,13 +772,46 @@ impl ports::AttestationServiceTrait for AttestationService {
             signing_address_bytes
         };
 
-        // Build report_data: [signing_address (padded to 32 bytes) || nonce (32 bytes)]
+        // Resolve TLS cert fingerprint if requested
+        let tls_fingerprint = if include_tls_fingerprint {
+            Some(self.tls_cert_fingerprint.clone().ok_or_else(|| {
+                AttestationError::InternalError(
+                    "include_tls_fingerprint=true but TLS_CERT_PATH is not set or fingerprint could not be computed".to_string(),
+                )
+            })?)
+        } else {
+            None
+        };
+
+        // Read TLS certificate PEM if fingerprint is requested (for the response body)
+        let tls_certificate = if include_tls_fingerprint {
+            if let Ok(path) = std::env::var("TLS_CERT_PATH") {
+                tokio::fs::read_to_string(&path).await.ok()
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        // Build report_data: [first_32_bytes || nonce (32 bytes)]
+        // When include_tls_fingerprint=true: first_32 = SHA256(signing_address_bytes || cert_fingerprint_bytes)
+        // Otherwise: first_32 = signing_address (right-padded with zeros)
         let mut report_data = vec![0u8; 64];
-        // Pad signing address to 32 bytes (left-justified with zeros)
-        report_data[..signing_address_for_report.len()]
-            .copy_from_slice(&signing_address_for_report);
-        // Remaining bytes are already zeros
-        // Place nonce in the last 32 bytes
+        if let Some(ref fp_hex) = tls_fingerprint {
+            use sha2::Digest;
+            let fp_bytes = hex::decode(fp_hex).map_err(|e| {
+                AttestationError::InternalError(format!("bad cert fingerprint hex: {e}"))
+            })?;
+            let mut hasher = sha2::Sha256::new();
+            hasher.update(&signing_address_for_report);
+            hasher.update(&fp_bytes);
+            let hash = hasher.finalize();
+            report_data[..32].copy_from_slice(&hash);
+        } else {
+            report_data[..signing_address_for_report.len()]
+                .copy_from_slice(&signing_address_for_report);
+        }
         report_data[32..64].copy_from_slice(&nonce_bytes);
 
         // Fake attestation data is only available in debug builds with DEV set.
@@ -764,6 +843,7 @@ impl ports::AttestationServiceTrait for AttestationService {
                         "vm_config": {},
                     }),
                     vpc,
+                    tls_cert_fingerprint: tls_fingerprint.clone(),
                 };
             } else {
                 let client = dstack_client::DstackClient::new(None);
@@ -793,6 +873,7 @@ impl ports::AttestationServiceTrait for AttestationService {
                     info,
                     cpu_quote,
                     nonce,
+                    tls_fingerprint.clone(),
                 );
             }
         }
@@ -823,12 +904,14 @@ impl ports::AttestationServiceTrait for AttestationService {
                 info,
                 cpu_quote,
                 nonce,
+                tls_fingerprint,
             );
         }
 
         Ok(AttestationReport {
             gateway_attestation,
             model_attestations,
+            tls_certificate,
         })
     }
 

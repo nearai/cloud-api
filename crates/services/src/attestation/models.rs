@@ -74,6 +74,10 @@ pub struct DstackCpuQuote {
     /// VPC information (optional)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub vpc: Option<VpcInfo>,
+    /// SHA-256 hash of the TLS certificate's SPKI, if requested.
+    /// When present, report_data[..32] = SHA256(signing_address_bytes || cert_fingerprint_bytes).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tls_cert_fingerprint: Option<String>,
 }
 
 impl DstackCpuQuote {
@@ -84,6 +88,7 @@ impl DstackCpuQuote {
         info: dstack_sdk::dstack_client::InfoResponse,
         quote: dstack_sdk::dstack_client::GetQuoteResponse,
         nonce: String,
+        tls_cert_fingerprint: Option<String>,
     ) -> Self {
         Self {
             signing_address,
@@ -94,6 +99,7 @@ impl DstackCpuQuote {
             request_nonce: nonce,
             info: serde_json::to_value(info).unwrap_or_default(),
             vpc,
+            tls_cert_fingerprint,
         }
     }
 }
@@ -101,6 +107,7 @@ impl DstackCpuQuote {
 pub struct AttestationReport {
     pub gateway_attestation: DstackCpuQuote,
     pub model_attestations: Vec<serde_json::Map<String, serde_json::Value>>,
+    pub tls_certificate: Option<String>,
 }
 
 pub type DstackAppInfo = dstack_sdk::dstack_client::InfoResponse;

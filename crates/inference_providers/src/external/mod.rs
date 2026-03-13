@@ -289,6 +289,7 @@ impl InferenceProvider for ExternalProvider {
         _signing_algo: Option<String>,
         _nonce: Option<String>,
         _signing_address: Option<String>,
+        _include_tls_fingerprint: bool,
     ) -> Result<serde_json::Map<String, serde_json::Value>, AttestationError> {
         Err(AttestationError::FetchError(
             "TEE attestation is not supported for external providers. \
@@ -731,7 +732,7 @@ mod tests {
 
         let provider = ExternalProvider::new(config);
         let result = provider
-            .get_attestation_report("gpt-4".to_string(), None, None, None)
+            .get_attestation_report("gpt-4".to_string(), None, None, None, false)
             .await;
 
         assert!(result.is_err());

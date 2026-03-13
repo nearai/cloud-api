@@ -748,7 +748,10 @@ mod tests {
         let chunk = make_chat_chunk("");
         let result = extract_inference_id_from_chunk(&chunk);
         // Empty string should still produce a valid UUID
-        assert!(!result.is_nil(), "empty provider ID should still produce a non-nil UUID");
+        assert!(
+            !result.is_nil(),
+            "empty provider ID should still produce a non-nil UUID"
+        );
     }
 
     #[test]
@@ -777,7 +780,9 @@ mod tests {
         assert_eq!(from_inner, from_enum);
 
         // Field order should be struct order, not alphabetical
-        let id_pos = from_inner.find("\"id\"").expect("serialized chunk should contain id field");
+        let id_pos = from_inner
+            .find("\"id\"")
+            .expect("serialized chunk should contain id field");
         let choices_pos = from_inner
             .find("\"choices\"")
             .expect("serialized chunk should contain choices field");

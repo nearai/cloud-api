@@ -146,7 +146,7 @@ fn map_http_error_to_mcp_error(
         _ => -32603,
     };
 
-    error_response(id, code, error.message)
+    error_response(id, code, error.error.message)
 }
 
 fn map_mcp_service_error(id: Value, error: WebSearchServiceError) -> ResponseJson<McpResponse> {

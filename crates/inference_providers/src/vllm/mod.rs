@@ -34,6 +34,8 @@ mod encryption_headers {
     /// but kept here for consistency with other encryption header constants
     #[allow(dead_code)]
     pub const MODEL_PUB_KEY: &str = "x_model_pub_key";
+    /// Key for encryption version (x-encryption-version header)
+    pub const ENCRYPTION_VERSION: &str = "x_encryption_version";
 }
 
 /// Configuration for vLLM provider
@@ -132,6 +134,17 @@ impl VLlmProvider {
 
         // Remove x_model_pub_key from extra (not forwarded to vllm-proxy, used only for routing)
         extra.remove(encryption_headers::MODEL_PUB_KEY);
+
+        // Extract and forward x_encryption_version as HTTP header, then remove from extra
+        if let Some(version) = extra
+            .remove(encryption_headers::ENCRYPTION_VERSION)
+            .as_ref()
+            .and_then(|v| v.as_str())
+        {
+            if let Ok(value) = HeaderValue::from_str(version) {
+                headers.insert("X-Encryption-Version", value);
+            }
+        }
     }
 
     /// Send a streaming HTTP POST request with TTFB timeout protection.
@@ -771,6 +784,10 @@ mod tests {
             encryption_headers::MODEL_PUB_KEY.to_string(),
             serde_json::Value::String("def456".to_string()),
         );
+        extra.insert(
+            encryption_headers::ENCRYPTION_VERSION.to_string(),
+            serde_json::Value::String("2".to_string()),
+        );
 
         provider.prepare_encryption_headers(&mut headers, &mut extra);
 
@@ -786,6 +803,10 @@ mod tests {
         assert!(
             !extra.contains_key(encryption_headers::MODEL_PUB_KEY),
             "x_model_pub_key should be removed from extra"
+        );
+        assert!(
+            !extra.contains_key(encryption_headers::ENCRYPTION_VERSION),
+            "x_encryption_version should be removed from extra"
         );
     }
 
@@ -807,6 +828,10 @@ mod tests {
             encryption_headers::MODEL_PUB_KEY.to_string(),
             serde_json::Value::String("def456".to_string()),
         );
+        extra.insert(
+            encryption_headers::ENCRYPTION_VERSION.to_string(),
+            serde_json::Value::String("2".to_string()),
+        );
 
         provider.prepare_encryption_headers(&mut headers, &mut extra);
 
@@ -820,6 +845,11 @@ mod tests {
             headers.get("X-Client-Pub-Key").unwrap(),
             "abc123",
             "X-Client-Pub-Key header should be forwarded"
+        );
+        assert_eq!(
+            headers.get("X-Encryption-Version").unwrap(),
+            "2",
+            "X-Encryption-Version header should be forwarded"
         );
         // model_pub_key should NOT be forwarded (used only for routing, not sent to vllm-proxy)
         assert!(
@@ -918,6 +948,10 @@ mod tests {
             serde_json::Value::String("def456".to_string()),
         );
         extra.insert(
+            encryption_headers::ENCRYPTION_VERSION.to_string(),
+            serde_json::Value::String("2".to_string()),
+        );
+        extra.insert(
             "some_valid_param".to_string(),
             serde_json::Value::String("value".to_string()),
         );
@@ -950,6 +984,10 @@ mod tests {
         assert!(
             !json.contains("x_model_pub_key"),
             "x_model_pub_key should NOT appear in serialized JSON after prepare_encryption_headers"
+        );
+        assert!(
+            !json.contains("x_encryption_version"),
+            "x_encryption_version should NOT appear in serialized JSON after prepare_encryption_headers"
         );
 
         // Valid params should still be present

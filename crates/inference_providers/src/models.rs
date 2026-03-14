@@ -1230,3 +1230,12 @@ pub enum ScoreError {
     #[error("HTTP {status_code}: {message}")]
     HttpError { status_code: u16, message: String },
 }
+
+#[derive(Debug, thiserror::Error)]
+pub enum EmbeddingError {
+    #[error("Embedding request failed: {0}")]
+    RequestFailed(String),
+
+    #[error("HTTP {status_code}: {message}")]
+    HttpError { status_code: u16, message: String },
+}

@@ -74,13 +74,13 @@ pub use models::{
     AudioOutput, AudioTranscriptionError, AudioTranscriptionParams, AudioTranscriptionResponse,
     ChatCompletionParams, ChatCompletionResponse, ChatCompletionResponseChoice,
     ChatCompletionResponseWithBytes, ChatDelta, ChatMessage, ChatResponseMessage, ChatSignature,
-    CompletionError, CompletionParams, FinishReason, FunctionChoice, FunctionDefinition, ImageData,
-    ImageEditError, ImageEditParams, ImageEditResponse, ImageEditResponseWithBytes,
-    ImageGenerationError, ImageGenerationParams, ImageGenerationResponse,
-    ImageGenerationResponseWithBytes, MessageRole, ModelInfo, RerankError, RerankParams,
-    RerankResponse, RerankResult, RerankUsage, ScoreError, ScoreParams, ScoreResponse, ScoreResult,
-    ScoreUsage, StreamChunk, StreamOptions, TokenUsage, ToolChoice, ToolDefinition,
-    TranscriptionSegment, TranscriptionWord,
+    CompletionError, CompletionParams, EmbeddingError, FinishReason, FunctionChoice,
+    FunctionDefinition, ImageData, ImageEditError, ImageEditParams, ImageEditResponse,
+    ImageEditResponseWithBytes, ImageGenerationError, ImageGenerationParams,
+    ImageGenerationResponse, ImageGenerationResponseWithBytes, MessageRole, ModelInfo, RerankError,
+    RerankParams, RerankResponse, RerankResult, RerankUsage, ScoreError, ScoreParams,
+    ScoreResponse, ScoreResult, ScoreUsage, StreamChunk, StreamOptions, TokenUsage, ToolChoice,
+    ToolDefinition, TranscriptionSegment, TranscriptionWord,
 };
 pub use sse_parser::{new_sse_parser, BufferedSSEParser, SSEEvent, SSEEventParser, SSEParser};
 pub use vllm::{VLlmConfig, VLlmProvider};
@@ -209,6 +209,12 @@ pub trait InferenceProvider {
     ) -> Result<ScoreResponse, ScoreError>;
 
     async fn rerank(&self, params: RerankParams) -> Result<RerankResponse, RerankError>;
+
+    /// Performs an embeddings request as a raw passthrough.
+    ///
+    /// Accepts the raw JSON request body and returns the raw JSON response bytes.
+    /// No deserialization is performed — the cloud API proxies the request as-is.
+    async fn embeddings_raw(&self, body: bytes::Bytes) -> Result<bytes::Bytes, EmbeddingError>;
 
     async fn get_signature(
         &self,

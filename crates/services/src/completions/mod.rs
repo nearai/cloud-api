@@ -1422,6 +1422,53 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         })
     }
 
+    async fn try_embeddings(
+        &self,
+        organization_id: Uuid,
+        model_id: Uuid,
+        model_name: &str,
+        body: bytes::Bytes,
+    ) -> Result<bytes::Bytes, ports::CompletionError> {
+        let counter = self
+            .try_acquire_concurrent_slot(organization_id, model_id, model_name)
+            .await?;
+        let _guard = ConcurrentSlotGuard::new(counter);
+
+        self.inference_provider_pool
+            .embeddings(model_name, body)
+            .await
+            .map_err(|e| match e {
+                inference_providers::EmbeddingError::RequestFailed(msg) => {
+                    ports::CompletionError::ProviderError {
+                        status_code: 502,
+                        message: msg,
+                    }
+                }
+                inference_providers::EmbeddingError::HttpError {
+                    status_code,
+                    message,
+                } => match status_code {
+                    401 | 403 => ports::CompletionError::ProviderError {
+                        status_code: 500,
+                        message: "The model is currently unavailable. Please try again later."
+                            .to_string(),
+                    },
+                    429 => ports::CompletionError::RateLimitExceeded(
+                        "Rate limit exceeded by upstream provider. Please retry with exponential backoff.".to_string(),
+                    ),
+                    503 => ports::CompletionError::ServiceOverloaded(message),
+                    500..=599 => ports::CompletionError::ProviderError {
+                        status_code: 502,
+                        message,
+                    },
+                    other => ports::CompletionError::ProviderError {
+                        status_code: other,
+                        message,
+                    },
+                },
+            })
+    }
+
     async fn try_score(
         &self,
         organization_id: Uuid,

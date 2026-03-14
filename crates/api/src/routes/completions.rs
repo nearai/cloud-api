@@ -2137,6 +2137,8 @@ pub async fn embeddings(
 
             // Token anomaly detection
             const MAX_REASONABLE_TOKENS: i32 = 1_000_000;
+            let mut token_anomaly_detected = false;
+
             if token_count > MAX_REASONABLE_TOKENS {
                 tracing::error!(
                     token_count = token_count,
@@ -2145,6 +2147,7 @@ pub async fn embeddings(
                     organization_id = %organization_id,
                     "Provider returned unreasonable token count for embeddings - capping"
                 );
+                token_anomaly_detected = true;
                 let model_tag = format!("model:{}", model_name);
                 let reason_tag = format!(
                     "reason:{}",
@@ -2165,6 +2168,7 @@ pub async fn embeddings(
                     organization_id = %organization_id,
                     "Provider returned zero tokens for embeddings"
                 );
+                token_anomaly_detected = true;
                 let model_tag = format!("model:{}", model_name);
                 let reason_tag =
                     format!("reason:{}", services::metrics::consts::REASON_MISSING_USAGE);
@@ -2173,6 +2177,15 @@ pub async fn embeddings(
                     services::metrics::consts::METRIC_PROVIDER_ZERO_TOKENS,
                     1,
                     &zero_tokens_tags,
+                );
+            }
+
+            if token_anomaly_detected {
+                tracing::info!(
+                    model = %model_name,
+                    organization_id = %organization_id,
+                    final_token_count = token_count,
+                    "Token count anomaly: Provider data quality issue detected. Recommendation: Check provider logs and configuration."
                 );
             }
 

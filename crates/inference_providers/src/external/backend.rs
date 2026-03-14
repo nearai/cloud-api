@@ -172,6 +172,7 @@ pub trait ExternalBackend: Send + Sync {
     /// Performs an embeddings request as a raw passthrough.
     ///
     /// Default implementation returns an error indicating embeddings are not supported.
+    /// TODO: Implement for OpenAiCompatibleBackend to support external embedding models (e.g. OpenAI text-embedding-3-*).
     async fn embeddings_raw(
         &self,
         _config: &BackendConfig,

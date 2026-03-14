@@ -189,7 +189,7 @@ async fn build_test_server_components(
         domain_services,
         Arc::new(config),
     );
-    let server = axum_test::TestServer::new(app).unwrap();
+    let server = axum_test::TestServer::new(app);
 
     (server, inference_provider_pool, mock_provider)
 }
@@ -224,7 +224,7 @@ async fn build_test_server_components_with_real_providers(
         domain_services,
         Arc::new(config),
     );
-    let server = axum_test::TestServer::new(app).unwrap();
+    let server = axum_test::TestServer::new(app);
 
     (server, inference_provider_pool)
 }
@@ -287,7 +287,7 @@ async fn build_test_server_components_with_mock_web_search(
         domain_services,
         Arc::new(config),
     );
-    axum_test::TestServer::new(app).unwrap()
+    axum_test::TestServer::new(app)
 }
 
 /// Setup test server with mock web search provider (no Brave API calls). Use for web search billing tests.
@@ -411,7 +411,7 @@ pub async fn setup_test_server_with_mcp_factory(
         domain_services,
         Arc::new(infra.config),
     );
-    let server = axum_test::TestServer::new(app).unwrap();
+    let server = axum_test::TestServer::new(app);
 
     (server, inference_provider_pool, mock_provider)
 }

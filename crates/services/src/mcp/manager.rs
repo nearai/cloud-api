@@ -317,12 +317,10 @@ impl McpClientManager {
         // Convert arguments to the expected format
         let args = arguments.and_then(|v| v.as_object().cloned());
 
-        let request_params = CallToolRequestParams {
-            name: name.clone().into(),
-            arguments: args,
-            task: None,
-            meta: None,
-        };
+        let mut request_params = CallToolRequestParams::new(name.clone());
+        if let Some(args) = args {
+            request_params = request_params.with_arguments(args);
+        }
 
         let result = {
             let client = client_arc.lock().await;
@@ -372,10 +370,7 @@ impl McpClientManager {
     ) -> Result<ReadResourceResult, McpError> {
         let client_arc = self.get_or_create_client_arc(connector_id).await?;
 
-        let request_params = ReadResourceRequestParams {
-            uri: uri.clone(),
-            meta: None,
-        };
+        let request_params = ReadResourceRequestParams::new(uri.clone());
 
         let result = {
             let client = client_arc.lock().await;
@@ -429,11 +424,10 @@ impl McpClientManager {
         // Convert arguments to the expected format
         let args = arguments.and_then(|v| v.as_object().cloned());
 
-        let request_params = GetPromptRequestParams {
-            name: name.clone(),
-            arguments: args,
-            meta: None,
-        };
+        let mut request_params = GetPromptRequestParams::new(name.clone());
+        if let Some(args) = args {
+            request_params = request_params.with_arguments(args);
+        }
 
         let result = {
             let client = client_arc.lock().await;

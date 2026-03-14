@@ -113,12 +113,10 @@ impl McpClient for RealMcpClient {
         arguments: serde_json::Value,
     ) -> Result<String, ResponseError> {
         let args = arguments.as_object().cloned();
-        let request = CallToolRequestParams {
-            name: tool_name.to_string().into(),
-            arguments: args,
-            task: None,
-            meta: None,
-        };
+        let mut request = CallToolRequestParams::new(tool_name.to_string());
+        if let Some(args) = args {
+            request = request.with_arguments(args);
+        }
 
         let client = self.client.lock().await;
         let result = timeout(

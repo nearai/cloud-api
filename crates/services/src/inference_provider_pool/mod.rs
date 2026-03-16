@@ -1127,7 +1127,7 @@ impl InferenceProviderPool {
                                 model_id = %model_id,
                                 attempt = attempt + 1,
                                 status_code,
-                                error_type = %e,
+                                error_detail = %e,
                                 operation = operation_name,
                                 "Client error from provider, not retrying"
                             );
@@ -1151,7 +1151,7 @@ impl InferenceProviderPool {
                     tracing::warn!(
                         model_id = %model_id,
                         attempt = attempt + 1,
-                        error_type = %e,
+                        error_detail = %e,
                         operation = operation_name,
                         "Provider failed, will try next provider if available"
                     );

@@ -107,8 +107,12 @@ pub struct FileSearchResult {
 
 #[derive(Debug, thiserror::Error)]
 pub enum WebSearchError {
-    #[error("Web search failed: {0}")]
-    WebSearchRequestFailed(String),
+    #[error("Web search failed: {message}")]
+    WebSearchRequestFailed {
+        message: String,
+        status: Option<u16>,
+        invalid_fields: Vec<String>,
+    },
     #[error("Web search response parsing failed: {0}")]
     WebSearchResponseParsingFailed(String),
 }

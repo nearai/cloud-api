@@ -1,5 +1,6 @@
 pub use super::ports::*;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 
 static BRAVE_API_URL: &str = "https://api.search.brave.com/res/v1/web/search";
 
@@ -12,6 +13,92 @@ impl Default for BraveWebSearchProvider {
     fn default() -> Self {
         Self::new()
     }
+}
+
+#[derive(Debug, Deserialize)]
+struct BraveErrorEnvelope {
+    error: BraveErrorBody,
+}
+
+#[derive(Debug, Deserialize)]
+struct BraveErrorBody {
+    #[serde(default)]
+    detail: Option<String>,
+    #[serde(default)]
+    meta: Option<BraveErrorMeta>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BraveErrorMeta {
+    #[serde(default)]
+    errors: Vec<BraveValidationError>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BraveValidationError {
+    #[serde(default)]
+    loc: Vec<serde_json::Value>,
+}
+
+fn extract_invalid_fields(error_body: &str) -> Vec<String> {
+    let parsed = match serde_json::from_str::<BraveErrorEnvelope>(error_body) {
+        Ok(parsed) => parsed,
+        Err(_) => return Vec::new(),
+    };
+
+    let mut fields = BTreeSet::new();
+
+    if let Some(meta) = parsed.error.meta {
+        for error in meta.errors {
+            if let Some(field) = extract_field_name(&error.loc) {
+                fields.insert(field);
+            }
+        }
+    }
+
+    fields.into_iter().collect()
+}
+
+fn extract_field_name(path: &[serde_json::Value]) -> Option<String> {
+    if let Some(serde_json::Value::String(root)) = path.first() {
+        if root == "query" {
+            return path.get(1).and_then(|value| match value {
+                serde_json::Value::String(name) => Some(name.clone()),
+                _ => None,
+            });
+        }
+    }
+
+    path.iter().find_map(|value| match value {
+        serde_json::Value::String(name)
+            if !name.starts_with("function-") && !name.contains('[') =>
+        {
+            Some(name.clone())
+        }
+        _ => None,
+    })
+}
+
+fn sanitize_error_message(status: reqwest::StatusCode, error_body: &str) -> (String, Vec<String>) {
+    let invalid_fields = extract_invalid_fields(error_body);
+
+    if status == reqwest::StatusCode::UNPROCESSABLE_ENTITY && !invalid_fields.is_empty() {
+        return (
+            format!(
+                "Brave rejected one or more web search parameters: {}",
+                invalid_fields.join(", ")
+            ),
+            invalid_fields,
+        );
+    }
+
+    let detail = serde_json::from_str::<BraveErrorEnvelope>(error_body)
+        .ok()
+        .and_then(|parsed| parsed.error.detail);
+
+    let message =
+        detail.unwrap_or_else(|| format!("Brave API request failed with status {status}"));
+    (message, invalid_fields)
 }
 
 impl BraveWebSearchProvider {
@@ -166,7 +253,11 @@ impl WebSearchProviderTrait for BraveWebSearchProvider {
             .query(&query_params)
             .send()
             .await
-            .map_err(|e| WebSearchError::WebSearchRequestFailed(e.to_string()))?;
+            .map_err(|e| WebSearchError::WebSearchRequestFailed {
+                message: "Failed to send Brave web search request".to_string(),
+                status: e.status().map(|status| status.as_u16()),
+                invalid_fields: Vec::new(),
+            })?;
 
         // Check response status
         let status = response.status();
@@ -175,10 +266,17 @@ impl WebSearchProviderTrait for BraveWebSearchProvider {
                 .text()
                 .await
                 .unwrap_or_else(|_| "Unable to read error body".to_string());
-            tracing::warn!("Brave API error (status {}): {}", status, error_body);
-            return Err(WebSearchError::WebSearchRequestFailed(format!(
-                "HTTP {status}: {error_body}"
-            )));
+            let (message, invalid_fields) = sanitize_error_message(status, &error_body);
+            tracing::warn!(
+                status = %status,
+                invalid_fields = ?invalid_fields,
+                "Brave API error"
+            );
+            return Err(WebSearchError::WebSearchRequestFailed {
+                message,
+                status: Some(status.as_u16()),
+                invalid_fields,
+            });
         }
 
         // Get response text for debugging

@@ -1,4 +1,4 @@
-use crate::responses::tools::{WebSearchParams, WebSearchProviderTrait};
+use crate::responses::tools::{WebSearchError, WebSearchParams, WebSearchProviderTrait};
 use crate::service_usage::ports::{
     RecordServiceUsageWithPricingParams, ServiceUsageServiceTrait, SERVICE_NAME_WEB_SEARCH,
 };
@@ -55,6 +55,13 @@ pub struct WebSearchResponse {
     pub results: Vec<WebSearchResultItem>,
 }
 
+#[derive(Debug, Clone)]
+pub struct WebSearchProviderFailureDetail {
+    pub message: String,
+    pub status: Option<u16>,
+    pub invalid_fields: Vec<String>,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum WebSearchServiceError {
     #[error("Query parameter 'query' is required and cannot be empty")]
@@ -66,7 +73,7 @@ pub enum WebSearchServiceError {
     #[error("Web search is not configured")]
     NotConfigured,
     #[error("Web search request failed")]
-    ProviderFailure,
+    ProviderFailure(WebSearchProviderFailureDetail),
     #[error("Failed to record service usage")]
     UsageRecordingFailed,
     #[error("Internal server error")]
@@ -144,9 +151,27 @@ impl WebSearchService {
                 operators: request.operators,
             })
             .await
-            .map_err(|_| {
+            .map_err(|err| {
                 warn!("Web search provider failure");
-                WebSearchServiceError::ProviderFailure
+                let detail = match err {
+                    WebSearchError::WebSearchRequestFailed {
+                        message,
+                        status,
+                        invalid_fields,
+                    } => WebSearchProviderFailureDetail {
+                        message,
+                        status,
+                        invalid_fields,
+                    },
+                    WebSearchError::WebSearchResponseParsingFailed(_) => {
+                        WebSearchProviderFailureDetail {
+                            message: "Failed to parse Brave web search response".to_string(),
+                            status: None,
+                            invalid_fields: Vec::new(),
+                        }
+                    }
+                };
+                WebSearchServiceError::ProviderFailure(detail)
             })?;
 
         self.service_usage_service

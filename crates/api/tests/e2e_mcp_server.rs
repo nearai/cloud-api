@@ -1,7 +1,32 @@
 mod common;
 
+use async_trait::async_trait;
 use common::*;
 use serde_json::json;
+use services::responses::tools::{WebSearchError, WebSearchParams, WebSearchProviderTrait};
+use std::sync::Arc;
+
+struct ValidationErrorWebSearchProvider;
+
+#[async_trait]
+impl WebSearchProviderTrait for ValidationErrorWebSearchProvider {
+    async fn search(
+        &self,
+        _params: WebSearchParams,
+    ) -> Result<Vec<services::responses::tools::WebSearchResult>, WebSearchError> {
+        Err(WebSearchError::WebSearchRequestFailed {
+            message:
+                "Brave rejected one or more web search parameters: ui_lang, result_filter, goggles"
+                    .to_string(),
+            status: Some(422),
+            invalid_fields: vec![
+                "ui_lang".to_string(),
+                "result_filter".to_string(),
+                "goggles".to_string(),
+            ],
+        })
+    }
+}
 
 #[tokio::test]
 async fn test_mcp_requires_api_key_auth() {
@@ -235,5 +260,54 @@ async fn test_mcp_tool_call_rejects_invalid_offset() {
     assert_eq!(
         body["error"]["message"],
         "Tool argument 'offset' must be between 0 and 9"
+    );
+}
+
+#[tokio::test]
+async fn test_mcp_tool_call_surfaces_sanitized_provider_validation_error() {
+    let (server, _database) = setup_test_server_with_custom_web_search_provider(Arc::new(
+        ValidationErrorWebSearchProvider,
+    ))
+    .await;
+    let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
+    let api_key = get_api_key_for_org(&server, org.id.clone()).await;
+    let _created = get_or_create_web_search_service(&server).await;
+
+    let response = server
+        .post("/mcp")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 6,
+            "method": "tools/call",
+            "params": {
+                "name": "web_search",
+                "arguments": {
+                    "query": "test query",
+                    "ui_lang": "en",
+                    "result_filter": "",
+                    "goggles": ""
+                }
+            }
+        }))
+        .await;
+
+    assert_eq!(response.status_code(), 200, "{}", response.text());
+    let body = response.json::<serde_json::Value>();
+    assert_eq!(body["error"]["code"], -32011);
+    assert_eq!(
+        body["error"]["message"],
+        "Brave rejected one or more web search parameters: ui_lang, result_filter, goggles"
+    );
+    assert_eq!(body["error"]["data"]["type"], "tool_error");
+    assert_eq!(body["error"]["data"]["tool"], "web_search");
+    assert_eq!(body["error"]["data"]["provider_status"], 422);
+    assert_eq!(
+        body["error"]["data"]["details"]["kind"],
+        "provider_validation_error"
+    );
+    assert_eq!(
+        body["error"]["data"]["details"]["invalid_fields"],
+        json!(["ui_lang", "result_filter", "goggles"])
     );
 }

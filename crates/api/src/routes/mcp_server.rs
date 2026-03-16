@@ -82,6 +82,8 @@ pub struct McpResponse {
 pub struct McpErrorBody {
     pub code: i64,
     pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data: Option<Value>,
 }
 
 fn response_id(id: Option<Value>) -> Value {
@@ -157,6 +159,7 @@ fn error_response(
         error: Some(McpErrorBody {
             code,
             message: message.into(),
+            data: None,
         }),
     })
 }
@@ -211,11 +214,24 @@ fn map_mcp_service_error(
             MCP_ERR_TOOL_NOT_CONFIGURED,
             "Web search is not configured",
         ),
-        WebSearchServiceError::ProviderFailure => error_response(
-            id,
-            MCP_ERR_TOOL_EXECUTION_FAILED,
-            "Web search request failed",
-        ),
+        WebSearchServiceError::ProviderFailure(detail) => ResponseJson(McpResponse {
+            jsonrpc: "2.0",
+            id: response_id(id),
+            result: None,
+            error: Some(McpErrorBody {
+                code: MCP_ERR_TOOL_EXECUTION_FAILED,
+                message: detail.message.clone(),
+                data: Some(json!({
+                    "type": "tool_error",
+                    "tool": WEB_SEARCH_TOOL_NAME,
+                    "provider_status": detail.status,
+                    "details": {
+                        "kind": "provider_validation_error",
+                        "invalid_fields": detail.invalid_fields,
+                    }
+                })),
+            }),
+        }),
         WebSearchServiceError::UsageRecordingFailed | WebSearchServiceError::Internal => {
             error_response(id, JSONRPC_INTERNAL_ERROR, "Internal server error")
         }

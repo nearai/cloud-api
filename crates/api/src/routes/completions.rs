@@ -2049,6 +2049,50 @@ pub async fn rerank(
 ///
 /// Proxies embedding requests to the appropriate backend model.
 /// Only the `model` field is read from the request for routing; the rest is forwarded as-is.
+///
+/// These documentation-only types approximate the request and response bodies
+/// for OpenAPI schema generation. The runtime handler still accepts a raw
+/// `Bytes` body and forwards it transparently to the provider.
+#[cfg_attr(
+    feature = "openapi",
+    derive(utoipa::ToSchema, serde::Serialize, serde::Deserialize)
+)]
+struct EmbeddingsRequestDoc {
+    /// ID of the model to use for generating embeddings.
+    model: String,
+    /// Input text or tokens to embed. This may be a string, array of strings,
+    /// or other JSON-compatible structure, so we document it generically.
+    #[serde(default)]
+    input: serde_json::Value,
+}
+
+#[cfg_attr(
+    feature = "openapi",
+    derive(utoipa::ToSchema, serde::Serialize, serde::Deserialize)
+)]
+struct EmbeddingsResponseDoc {
+    /// Provider-specific embeddings payload; documented generically.
+    #[serde(default)]
+    data: serde_json::Value,
+}
+
+#[utoipa::path(
+    post,
+    path = "/v1/embeddings",
+    tag = "Embeddings",
+    request_body = EmbeddingsRequestDoc,
+    responses(
+        (status = 200, description = "Embeddings generated successfully", body = EmbeddingsResponseDoc),
+        (status = 400, description = "Invalid request", body = ErrorResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 404, description = "Model not found", body = ErrorResponse),
+        (status = 429, description = "Rate limit exceeded", body = ErrorResponse),
+        (status = 500, description = "Server error", body = ErrorResponse)
+    ),
+    security(
+        ("api_key" = [])
+    )
+)]
 pub async fn embeddings(
     State(app_state): State<AppState>,
     Extension(api_key): Extension<AuthenticatedApiKey>,

@@ -2053,10 +2053,7 @@ pub async fn rerank(
 /// These documentation-only types approximate the request and response bodies
 /// for OpenAPI schema generation. The runtime handler still accepts a raw
 /// `Bytes` body and forwards it transparently to the provider.
-#[cfg_attr(
-    feature = "openapi",
-    derive(utoipa::ToSchema, serde::Serialize, serde::Deserialize)
-)]
+#[derive(utoipa::ToSchema, serde::Serialize, serde::Deserialize)]
 struct EmbeddingsRequestDoc {
     /// ID of the model to use for generating embeddings.
     model: String,
@@ -2066,10 +2063,7 @@ struct EmbeddingsRequestDoc {
     input: serde_json::Value,
 }
 
-#[cfg_attr(
-    feature = "openapi",
-    derive(utoipa::ToSchema, serde::Serialize, serde::Deserialize)
-)]
+#[derive(utoipa::ToSchema, serde::Serialize, serde::Deserialize)]
 struct EmbeddingsResponseDoc {
     /// Provider-specific embeddings payload; documented generically.
     #[serde(default)]

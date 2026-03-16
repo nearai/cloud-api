@@ -1127,6 +1127,7 @@ impl InferenceProviderPool {
                                 model_id = %model_id,
                                 attempt = attempt + 1,
                                 status_code,
+                                error_detail = %e,
                                 operation = operation_name,
                                 "Client error from provider, not retrying"
                             );
@@ -1146,10 +1147,11 @@ impl InferenceProviderPool {
                         *counter = counter.saturating_add(1);
                     }
 
-                    // Log the failure for debugging
+                    // Log the failure for debugging (before sanitization strips details)
                     tracing::warn!(
                         model_id = %model_id,
                         attempt = attempt + 1,
+                        error_detail = %e,
                         operation = operation_name,
                         "Provider failed, will try next provider if available"
                     );

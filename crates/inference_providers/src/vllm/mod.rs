@@ -559,7 +559,15 @@ impl InferenceProvider for VLlmProvider {
             ))
             .send()
             .await
-            .map_err(|e| AudioTranscriptionError::TranscriptionError(e.to_string()))?;
+            .map_err(|e| {
+                tracing::debug!(
+                    error_type = %e.status().map(|s| s.as_u16()).unwrap_or(0),
+                    is_timeout = e.is_timeout(),
+                    is_connect = e.is_connect(),
+                    "Audio transcription send failed"
+                );
+                AudioTranscriptionError::TranscriptionError(e.to_string())
+            })?;
 
         if !response.status().is_success() {
             let status_code = response.status().as_u16();
@@ -567,16 +575,24 @@ impl InferenceProvider for VLlmProvider {
                 .text()
                 .await
                 .unwrap_or_else(|_| "Unknown error".to_string());
+            tracing::error!(
+                status_code,
+                "Audio transcription request failed with HTTP error"
+            );
             return Err(AudioTranscriptionError::HttpError {
                 status_code,
                 message,
             });
         }
 
-        let transcription_response: AudioTranscriptionResponse = response
-            .json()
-            .await
-            .map_err(|e| AudioTranscriptionError::TranscriptionError(e.to_string()))?;
+        let transcription_response: AudioTranscriptionResponse =
+            response.json().await.map_err(|e| {
+                tracing::debug!(
+                    error_type = %e,
+                    "Audio transcription response deserialization failed"
+                );
+                AudioTranscriptionError::TranscriptionError(e.to_string())
+            })?;
 
         Ok(transcription_response)
     }

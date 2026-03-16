@@ -15,6 +15,10 @@ on:
         type: choice
         options:
           - prod
+      digest:
+        description: "Image digest to promote (e.g. sha256:abc...). If empty, promotes :staging"
+        required: false
+        type: string
 
 env:
   REGISTRY: docker.io
@@ -22,7 +26,7 @@ env:
 
 jobs:
   tag-prod:
-    name: Promote :staging → :prod
+    name: Promote → :prod
     if: >-
       github.event_name == 'schedule' ||
       (github.event_name == 'workflow_dispatch' && inputs.target == 'prod')
@@ -33,7 +37,7 @@ jobs:
         uses: actions/checkout@v6
 
       - name: Log in to Docker registry
-        uses: docker/login-action@0567fa5ae8c9a197cb207537dc5cbb43ca3d803f
+        uses: docker/login-action@9fe7774c8f8ebfade96f0a62aa10f3882309d517
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ vars.DOCKER_REGISTRY_USER }}
@@ -44,11 +48,18 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y skopeo jq
 
-      - name: Copy :staging → :prod
+      - name: Copy image → :prod
         run: |
-          skopeo copy \
-            docker://${{ env.IMAGE }}:staging \
-            docker://${{ env.IMAGE }}:prod
+          DIGEST_INPUT="${{ inputs.digest }}"
+          if [ -n "$DIGEST_INPUT" ]; then
+            echo "Promoting by digest: ${DIGEST_INPUT}"
+            SOURCE="${{ env.IMAGE }}@${DIGEST_INPUT}"
+          else
+            echo "Promoting :staging tag"
+            SOURCE="${{ env.IMAGE }}:staging"
+          fi
+          echo "PROMOTE_SOURCE=${SOURCE}" >> "$GITHUB_ENV"
+          skopeo copy "docker://${SOURCE}" "docker://${{ env.IMAGE }}:prod"
 
       - name: Output digest
         run: |
@@ -58,7 +69,7 @@ jobs:
             exit 1
           fi
           echo "IMAGE_DIGEST=${DIGEST}" >> "$GITHUB_ENV"
-          echo "## Promotion: staging → prod" >> "$GITHUB_STEP_SUMMARY"
+          echo "## Promotion: ${PROMOTE_SOURCE} → prod" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "- digest: \`${DIGEST}\`" >> "$GITHUB_STEP_SUMMARY"
 
@@ -74,7 +85,7 @@ jobs:
 
           - **Image**: \`${{ env.IMAGE }}:prod\`
           - **Digest**: \`${IMAGE_DIGEST}\`
-          - **Promoted from**: \`:staging\`
+          - **Promoted from**: \`${PROMOTE_SOURCE}\`
           - **Sigstore**: https://search.sigstore.dev/?hash=${IMAGE_DIGEST}
           EOF
           )" \

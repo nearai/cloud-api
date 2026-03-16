@@ -134,6 +134,7 @@ pub struct EncryptionHeaders {
     pub signing_algo: Option<String>,
     pub client_pub_key: Option<String>,
     pub model_pub_key: Option<String>,
+    pub encryption_version: Option<String>,
 }
 
 /// Validate and extract encryption headers from HTTP request
@@ -144,6 +145,7 @@ pub struct EncryptionHeaders {
 ///   - Ed25519: 64 hex characters (32 bytes)
 ///   - ECDSA: 128 hex characters (64 bytes) or 130 hex characters (65 bytes with 0x04 prefix)
 /// - `x-model-pub-key`: Must be a valid hex string (reasonable length: 64-130 hex characters)
+/// - `x-encryption-version`: Must be "1" or "2" (selects encryption protocol version)
 ///
 /// Returns:
 /// - `Ok(EncryptionHeaders)` if all provided headers are valid
@@ -164,6 +166,26 @@ pub fn validate_encryption_headers(
         .get("x-model-pub-key")
         .and_then(|h| h.to_str().ok())
         .map(|s| s.to_string());
+    let encryption_version = headers
+        .get("x-encryption-version")
+        .and_then(|h| h.to_str().ok())
+        .map(|s| s.to_string());
+
+    // Validate encryption version if provided
+    if let Some(ref version) = encryption_version {
+        if version != "1" && version != "2" {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                ResponseJson(ErrorResponse::new(
+                    format!(
+                        "Invalid X-Encryption-Version: '{}'. Must be '1' or '2'",
+                        version
+                    ),
+                    "invalid_parameter".to_string(),
+                )),
+            ));
+        }
+    }
 
     // Validate signing algorithm if provided
     if let Some(ref algo) = signing_algo {
@@ -284,6 +306,7 @@ pub fn validate_encryption_headers(
         signing_algo,
         client_pub_key,
         model_pub_key,
+        encryption_version,
     })
 }
 
@@ -514,5 +537,37 @@ mod tests {
             map_domain_error_to_status(&error),
             StatusCode::SERVICE_UNAVAILABLE
         );
+    }
+
+    #[test]
+    fn test_validate_encryption_version_valid() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-encryption-version", "2".parse().unwrap());
+        let result = validate_encryption_headers(&headers).unwrap();
+        assert_eq!(result.encryption_version, Some("2".to_string()));
+    }
+
+    #[test]
+    fn test_validate_encryption_version_v1() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-encryption-version", "1".parse().unwrap());
+        let result = validate_encryption_headers(&headers).unwrap();
+        assert_eq!(result.encryption_version, Some("1".to_string()));
+    }
+
+    #[test]
+    fn test_validate_encryption_version_invalid() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-encryption-version", "3".parse().unwrap());
+        let err = validate_encryption_headers(&headers).unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert!(err.1 .0.error.message.contains("X-Encryption-Version"));
+    }
+
+    #[test]
+    fn test_validate_encryption_version_absent() {
+        let headers = HeaderMap::new();
+        let result = validate_encryption_headers(&headers).unwrap();
+        assert_eq!(result.encryption_version, None);
     }
 }

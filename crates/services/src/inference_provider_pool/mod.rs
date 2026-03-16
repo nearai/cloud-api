@@ -10,7 +10,12 @@ use inference_providers::{
 };
 use regex::Regex;
 use serde::Deserialize;
-use std::{collections::HashMap, net::IpAddr, sync::Arc, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    net::IpAddr,
+    sync::Arc,
+    time::Duration,
+};
 use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, info, warn};
 
@@ -66,14 +71,21 @@ pub struct InferenceProviderPool {
     external_providers: Arc<RwLock<HashMap<String, Arc<InferenceProviderTrait>>>>,
     /// Configuration for external providers (API keys, timeouts, etc.)
     external_configs: ExternalProvidersConfig,
-    /// Round-robin index for each model
-    load_balancer_index: Arc<RwLock<HashMap<String, usize>>>,
+    /// Round-robin index for each model.
+    /// Uses std::sync::RwLock because operations are instant HashMap lookups/inserts.
+    load_balancer_index: Arc<std::sync::RwLock<HashMap<String, usize>>>,
     /// Map of chat_id -> provider for sticky routing
     chat_id_mapping: Arc<RwLock<HashMap<String, Arc<InferenceProviderTrait>>>>,
     /// Background task handle for periodic model discovery refresh
     refresh_task_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
     /// Background task handle for periodic external provider refresh
     external_refresh_task_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    /// Per-provider consecutive failure count, keyed by Arc pointer address.
+    /// Providers with high failure counts are deprioritized in load balancing.
+    /// Counts reset to 0 on success and are cleaned up on discovery refresh.
+    /// Uses std::sync::RwLock (not tokio) because all operations are non-blocking
+    /// HashMap lookups/inserts — no .await while holding the lock.
+    provider_failure_counts: Arc<std::sync::RwLock<HashMap<usize, u32>>>,
 }
 
 impl InferenceProviderPool {
@@ -91,10 +103,11 @@ impl InferenceProviderPool {
             provider_mappings: Arc::new(RwLock::new(ProviderMappings::new())),
             external_providers: Arc::new(RwLock::new(HashMap::new())),
             external_configs,
-            load_balancer_index: Arc::new(RwLock::new(HashMap::new())),
+            load_balancer_index: Arc::new(std::sync::RwLock::new(HashMap::new())),
             chat_id_mapping: Arc::new(RwLock::new(HashMap::new())),
             refresh_task_handle: Arc::new(Mutex::new(None)),
             external_refresh_task_handle: Arc::new(Mutex::new(None)),
+            provider_failure_counts: Arc::new(std::sync::RwLock::new(HashMap::new())),
         }
     }
 
@@ -501,9 +514,9 @@ impl InferenceProviderPool {
         // Group by model name
         let mut model_to_endpoints: HashMap<String, Vec<(String, u16)>> = HashMap::new();
 
-        for (key, entry) in discovery_map {
+        for (key, entry) in &discovery_map {
             // Filter out non-IP keys
-            if let Some((ip, port)) = Self::parse_ip_port(&key) {
+            if let Some((ip, port)) = Self::parse_ip_port(key) {
                 tracing::debug!(
                     key = %key,
                     model = %entry.model,
@@ -514,7 +527,7 @@ impl InferenceProviderPool {
                 );
 
                 model_to_endpoints
-                    .entry(entry.model)
+                    .entry(entry.model.clone())
                     .or_default()
                     .push((ip, port));
             } else {
@@ -527,96 +540,231 @@ impl InferenceProviderPool {
             }
         }
 
-        // Phase 1: Collect all attestation reports and create providers (no locks held)
-        // This minimizes lock duration by doing all network I/O before acquiring locks
+        // The set of all model names listed by discovery (regardless of attestation success).
+        // Models NOT in this set have been decommissioned and should be removed.
+        let discovered_model_names: HashSet<String> = model_to_endpoints.keys().cloned().collect();
+
+        // Phase 1: Fetch attestation reports concurrently for all endpoints (no locks held).
+        // Uses a short-timeout probe provider so a dead backend doesn't block discovery of healthy ones.
+        // Concurrency is bounded by buffer_unordered to avoid thundering-herd on attestation endpoints.
+        let api_key = self.api_key.clone();
+
+        // Flatten into per-endpoint futures
+        let endpoint_futures: Vec<_> = model_to_endpoints
+            .iter()
+            .flat_map(|(model_name, endpoints)| {
+                let api_key = api_key.clone();
+                endpoints.iter().map(move |(ip, port)| {
+                    let model_name = model_name.clone();
+                    let url = format!("http://{ip}:{port}");
+                    let api_key = api_key.clone();
+                    async move {
+                        // Probe provider with 10s TTFB timeout for attestation fetches.
+                        // The serving provider uses the default 30s timeout.
+                        let probe_provider = Arc::new(VLlmProvider::new(VLlmConfig::new(
+                            url.clone(),
+                            api_key.clone(),
+                            Some(10),
+                        )))
+                            as Arc<InferenceProviderTrait>;
+
+                        let serving_provider = Arc::new(VLlmProvider::new(VLlmConfig::new(
+                            url.clone(),
+                            api_key,
+                            None,
+                        )))
+                            as Arc<InferenceProviderTrait>;
+
+                        let (pub_keys, has_valid_attestation) =
+                            Self::fetch_signing_public_keys_for_both_algorithms(
+                                &probe_provider,
+                                &model_name,
+                                &url,
+                            )
+                            .await;
+
+                        // Return pub_keys referencing the serving_provider (not probe)
+                        let pub_keys: Vec<(String, Arc<InferenceProviderTrait>)> = pub_keys
+                            .into_iter()
+                            .map(|(key, _)| (key, serving_provider.clone()))
+                            .collect();
+
+                        (
+                            model_name,
+                            serving_provider,
+                            pub_keys,
+                            has_valid_attestation,
+                        )
+                    }
+                })
+            })
+            .collect();
+
+        // Run all attestation probes concurrently (bounded to avoid flooding)
+        use futures::stream::{self, StreamExt};
+        let results: Vec<_> = stream::iter(endpoint_futures)
+            .buffer_unordered(20)
+            .collect()
+            .await;
+
+        // Aggregate results by model
         let mut all_models = Vec::new();
         let mut model_providers: HashMap<String, Vec<Arc<InferenceProviderTrait>>> = HashMap::new();
         let mut model_pub_key_updates: Vec<(String, Arc<InferenceProviderTrait>)> = Vec::new();
 
-        for (model_name, endpoints) in model_to_endpoints {
+        // Track per-model endpoint counts for logging
+        let mut model_endpoint_counts: HashMap<&str, usize> = HashMap::new();
+        for (model_name, endpoints) in &model_to_endpoints {
+            model_endpoint_counts.insert(model_name, endpoints.len());
+        }
+
+        for (model_name, provider, pub_keys, has_valid_attestation) in results {
+            if has_valid_attestation {
+                model_pub_key_updates.extend(pub_keys);
+                model_providers
+                    .entry(model_name)
+                    .or_default()
+                    .push(provider);
+            }
+        }
+
+        for (model_name, providers) in &model_providers {
+            let endpoint_count = model_endpoint_counts
+                .get(model_name.as_str())
+                .copied()
+                .unwrap_or(0);
             tracing::info!(
                 model = %model_name,
-                providers_count = endpoints.len(),
-                "Discovered model with {} provider(s)",
-                endpoints.len()
+                endpoints_discovered = endpoint_count,
+                providers_valid = providers.len(),
+                "Discovered model"
             );
 
-            let mut providers_for_model = Vec::new();
-
-            for (ip, port) in endpoints {
-                let url = format!("http://{ip}:{port}");
-                tracing::debug!(
-                    model = %model_name,
-                    url = %url,
-                    "Creating provider for model"
-                );
-
-                let provider = Arc::new(VLlmProvider::new(VLlmConfig::new(
-                    url.clone(),
-                    self.api_key.clone(),
-                    None,
-                ))) as Arc<InferenceProviderTrait>;
-
-                // Fetch attestation report with retries to handle transient network failures
-                // We need at least one successful attestation report to include the provider
-                // But we fetch both ECDSA and Ed25519 keys to register the provider for both algorithms
-                let (pub_keys, has_valid_attestation) =
-                    Self::fetch_signing_public_keys_for_both_algorithms(
-                        &provider,
-                        &model_name,
-                        &url,
-                    )
-                    .await;
-
-                // If we got at least one successful attestation report, the provider is valid and should be included
-                // Note: signing_public_key may not be present in the attestation report (e.g., for non-encrypted providers)
-                if has_valid_attestation {
-                    model_pub_key_updates.extend(pub_keys);
-                    providers_for_model.push(provider);
-                }
-            }
-
-            if !providers_for_model.is_empty() {
-                model_providers.insert(model_name.clone(), providers_for_model);
-
-                all_models.push(inference_providers::models::ModelInfo {
-                    id: model_name,
-                    object: "model".to_string(),
-                    created: 0,
-                    owned_by: "discovered".to_string(),
-                });
-            }
+            all_models.push(inference_providers::models::ModelInfo {
+                id: model_name.clone(),
+                object: "model".to_string(),
+                created: 0,
+                owned_by: "discovered".to_string(),
+            });
         }
 
         // Calculate metrics before acquiring locks
         let total_providers: usize = model_providers.values().map(|v| v.len()).sum();
+        // Save keys before model_providers is consumed by the merge loop
+        let model_providers_keys: HashSet<String> = model_providers.keys().cloned().collect();
 
-        // Phase 2: Atomic bulk update of both mappings under a single lock
-        // This ensures consistency - both mappings are updated together atomically
-        // Build new mappings structure
-        let mut new_mappings = ProviderMappings::new();
-        for (model_name, providers) in model_providers {
-            new_mappings
-                .model_to_providers
-                .insert(model_name, providers);
-        }
-        for (key, provider) in model_pub_key_updates {
-            new_mappings
-                .pubkey_to_providers
-                .entry(key)
-                .or_default()
-                .push(provider);
-        }
-
-        // Atomic swap: replace entire mappings structure in one operation
+        // Phase 2: Merge new discovery into existing mappings.
+        // - Models with successful attestation: replace their providers.
+        // - Models in discovery but all attestation failed: keep existing providers
+        //   (transient failure — they may still serve traffic).
+        // - Models NOT in discovery response at all: remove (decommissioned).
+        // - Pubkey mappings: prune stale entries, merge fresh attestation results.
         {
             let mut mappings = self.provider_mappings.write().await;
-            *mappings = new_mappings;
+
+            // Remove models that are no longer listed by discovery server
+            let removed_models: Vec<String> = mappings
+                .model_to_providers
+                .keys()
+                .filter(|k| !discovered_model_names.contains(k.as_str()))
+                .cloned()
+                .collect();
+            for model_name in &removed_models {
+                mappings.model_to_providers.remove(model_name);
+                tracing::info!(
+                    model = %model_name,
+                    "Removed model no longer in discovery"
+                );
+            }
+
+            // For models with successful attestation: replace providers
+            for (model_name, providers) in model_providers {
+                mappings.model_to_providers.insert(model_name, providers);
+            }
+
+            // For models in discovered_model_names but NOT in model_providers:
+            // keep existing providers (they're transiently unreachable but may still work)
+            let retained_count = discovered_model_names
+                .iter()
+                .filter(|m| !model_providers_keys.contains(m.as_str()))
+                .filter(|m| mappings.model_to_providers.contains_key(m.as_str()))
+                .count();
+
+            // Prune pubkey mappings: keep entries pointing to providers still in the pool,
+            // remove entries pointing to providers that were replaced or evicted.
+            // This preserves pubkey routing for retained models whose attestation failed
+            // this cycle, while cleaning up stale entries.
+            let active_provider_ptrs: HashSet<usize> = mappings
+                .model_to_providers
+                .values()
+                .flat_map(|providers| providers.iter())
+                .map(|p| Arc::as_ptr(p) as *const () as usize)
+                .collect();
+            mappings.pubkey_to_providers.retain(|_, providers| {
+                providers.retain(|provider| {
+                    let key = Arc::as_ptr(provider) as *const () as usize;
+                    active_provider_ptrs.contains(&key)
+                });
+                !providers.is_empty()
+            });
+
+            // Merge fresh attestation-derived pubkey mappings
+            for (key, provider) in model_pub_key_updates {
+                let providers = mappings.pubkey_to_providers.entry(key).or_default();
+                if !providers
+                    .iter()
+                    .any(|existing| Arc::ptr_eq(existing, &provider))
+                {
+                    providers.push(provider);
+                }
+            }
+
+            // Include models retained from previous discovery in all_models for response
+            for model_name in mappings.model_to_providers.keys() {
+                if !all_models.iter().any(|m| m.id == *model_name) {
+                    all_models.push(inference_providers::models::ModelInfo {
+                        id: model_name.clone(),
+                        object: "model".to_string(),
+                        created: 0,
+                        owned_by: "discovered".to_string(),
+                    });
+                }
+            }
+
+            tracing::info!(
+                removed = removed_models.len(),
+                retained = retained_count,
+                "Merged discovery results into provider mappings"
+            );
         }
+
+        // Clean up failure counts for providers that no longer exist
+        {
+            let mappings = self.provider_mappings.read().await;
+            let active_ptrs: HashSet<usize> = mappings
+                .model_to_providers
+                .values()
+                .flat_map(|providers| providers.iter())
+                .map(|p| Arc::as_ptr(p) as *const () as usize)
+                .collect();
+
+            let mut counts = self
+                .provider_failure_counts
+                .write()
+                .unwrap_or_else(|e| e.into_inner());
+            counts.retain(|key, _| active_ptrs.contains(key));
+        }
+
+        // Compute actual pool size (includes both fresh and retained providers)
+        let actual_total_providers: usize = {
+            let mappings = self.provider_mappings.read().await;
+            mappings.model_to_providers.values().map(|v| v.len()).sum()
+        };
 
         tracing::info!(
             total_models = all_models.len(),
-            total_providers = total_providers,
+            total_providers = actual_total_providers,
+            fresh_providers = total_providers,
             model_ids = ?all_models.iter().map(|m| &m.id).collect::<Vec<_>>(),
             "Model discovery from endpoint completed"
         );
@@ -713,12 +861,16 @@ impl InferenceProviderPool {
             format!("id:{}", model_id)
         };
 
-        let mut indices = self.load_balancer_index.write().await;
+        let mut indices = self
+            .load_balancer_index
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
         let index = indices.entry(index_key.clone()).or_insert(0);
         let selected_index = *index % providers.len();
 
         // Increment for next request
         *index = (*index + 1) % providers.len();
+        drop(indices);
 
         // Build ordered list following round-robin pattern:
         // selected provider first, then continue round-robin (selected+1, selected+2, ...)
@@ -728,11 +880,33 @@ impl InferenceProviderPool {
             ordered_providers.push(providers[provider_index].clone());
         }
 
+        // Partition providers by failure count: healthy providers first, then demoted.
+        // Demoted providers (>= MAX_CONSECUTIVE_FAILURES) are still included as last resort
+        // but healthy providers are tried first, avoiding unnecessary timeout waits.
+        const MAX_CONSECUTIVE_FAILURES: u32 = 10;
+        let counts = self
+            .provider_failure_counts
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
+        let (mut healthy, mut demoted): (Vec<_>, Vec<_>) =
+            ordered_providers.into_iter().partition(|p| {
+                let key = Arc::as_ptr(p) as *const () as usize;
+                let failures = counts.get(&key).copied().unwrap_or(0);
+                failures < MAX_CONSECUTIVE_FAILURES
+            });
+        drop(counts);
+
+        // Healthy providers first (in round-robin order), then demoted as last resort.
+        // This way, if 1 of 2 providers is down, requests immediately go to the healthy
+        // one instead of waiting 5s for the dead one's connect timeout.
+        healthy.append(&mut demoted);
+        let ordered_providers = healthy;
+
         tracing::debug!(
             index_key = %index_key,
-            providers_count = providers.len(),
+            providers_count = ordered_providers.len(),
             selected_index = selected_index,
-            "Prepared providers for fallback with round-robin priority"
+            "Prepared providers for fallback with round-robin priority and failure demotion"
         );
 
         Some(ordered_providers)
@@ -920,6 +1094,15 @@ impl InferenceProviderPool {
 
             match provider_fn(provider.clone()).await {
                 Ok(result) => {
+                    // Reset failure counter on success
+                    {
+                        let mut counts = self
+                            .provider_failure_counts
+                            .write()
+                            .unwrap_or_else(|e| e.into_inner());
+                        let key = Arc::as_ptr(provider) as *const () as usize;
+                        counts.insert(key, 0);
+                    }
                     tracing::info!(
                         model_id = %model_id,
                         attempt = attempt + 1,
@@ -933,6 +1116,8 @@ impl InferenceProviderPool {
                     // The request itself is invalid (e.g., too many tokens), so retrying won't help.
                     // Exception: 429 (rate limit) and 408 (request timeout) are retryable
                     // as other providers may have capacity or better connectivity.
+                    // NOTE: Don't increment the failure counter for non-retryable 4xx —
+                    // these indicate invalid requests, not unhealthy providers.
                     if let CompletionError::HttpError { status_code, .. } = &e {
                         if (400..=499).contains(status_code)
                             && *status_code != 429
@@ -942,6 +1127,7 @@ impl InferenceProviderPool {
                                 model_id = %model_id,
                                 attempt = attempt + 1,
                                 status_code,
+                                error_detail = %e,
                                 operation = operation_name,
                                 "Client error from provider, not retrying"
                             );
@@ -949,10 +1135,23 @@ impl InferenceProviderPool {
                         }
                     }
 
-                    // Log the failure for debugging
+                    // Increment failure counter only for retryable errors
+                    // (5xx, timeouts, network errors — indicators of backend health issues)
+                    {
+                        let mut counts = self
+                            .provider_failure_counts
+                            .write()
+                            .unwrap_or_else(|e| e.into_inner());
+                        let key = Arc::as_ptr(provider) as *const () as usize;
+                        let counter = counts.entry(key).or_insert(0);
+                        *counter = counter.saturating_add(1);
+                    }
+
+                    // Log the failure for debugging (before sanitization strips details)
                     tracing::warn!(
                         model_id = %model_id,
                         attempt = attempt + 1,
+                        error_detail = %e,
                         operation = operation_name,
                         "Provider failed, will try next provider if available"
                     );
@@ -1374,6 +1573,70 @@ impl InferenceProviderPool {
         Err(RerankError::GenerationError(error_msg))
     }
 
+    pub async fn embeddings(
+        &self,
+        model: &str,
+        body: bytes::Bytes,
+    ) -> Result<bytes::Bytes, inference_providers::EmbeddingError> {
+        tracing::debug!(model = %model, "Starting embeddings request");
+
+        // Check if this model exists as an external provider
+        if let Some(provider) = self.get_external_provider(model).await {
+            return provider.embeddings_raw(body).await;
+        }
+
+        // Ensure vLLM models are discovered
+        self.ensure_models_discovered().await.map_err(|e| {
+            inference_providers::EmbeddingError::RequestFailed(Self::sanitize_error_message(
+                &e.to_string(),
+            ))
+        })?;
+
+        // Get vLLM providers with load balancing
+        let providers = match self.get_providers_with_fallback(model, None).await {
+            Some(p) => p,
+            None => {
+                let mappings = self.provider_mappings.read().await;
+                let available_models: Vec<_> = mappings.model_to_providers.keys().collect();
+
+                tracing::error!(
+                    model = %model,
+                    available_models = ?available_models,
+                    operation = "embeddings",
+                    "No vLLM provider found for model"
+                );
+
+                return Err(inference_providers::EmbeddingError::RequestFailed(format!(
+                    "Model '{}' not found in vLLM providers. Available models: {:?}",
+                    model, available_models
+                )));
+            }
+        };
+
+        // Try with each provider (with fallback)
+        let mut last_error = None;
+        for provider in providers {
+            match provider.embeddings_raw(body.clone()).await {
+                Ok(response) => {
+                    tracing::info!(model = %model, "Embeddings completed successfully");
+                    return Ok(response);
+                }
+                Err(e) => {
+                    tracing::warn!(model = %model, error = %e, "Embeddings failed with provider, trying next");
+                    last_error = Some(e);
+                }
+            }
+        }
+
+        let error_msg = last_error
+            .map(|e| Self::sanitize_error_message(&e.to_string()))
+            .unwrap_or_else(|| "No providers available for embeddings".to_string());
+
+        Err(inference_providers::EmbeddingError::RequestFailed(
+            error_msg,
+        ))
+    }
+
     pub async fn score(
         &self,
         params: inference_providers::ScoreParams,
@@ -1669,12 +1932,17 @@ impl InferenceProviderPool {
         drop(external);
 
         // Step 3: Clear load balancer indices
-        debug!("Step 3: Clearing load balancer indices");
-        let mut lb_index = self.load_balancer_index.write().await;
-        let index_count = lb_index.len();
-        lb_index.clear();
-        debug!("Cleared {} load balancer indices", index_count);
-        drop(lb_index);
+        let index_count = {
+            debug!("Step 3: Clearing load balancer indices");
+            let mut lb_index = self
+                .load_balancer_index
+                .write()
+                .unwrap_or_else(|e| e.into_inner());
+            let count = lb_index.len();
+            lb_index.clear();
+            debug!("Cleared {} load balancer indices", count);
+            count
+        };
 
         // Step 4: Clear chat_id to provider mappings
         debug!("Step 4: Clearing chat session mappings");
@@ -1684,9 +1952,20 @@ impl InferenceProviderPool {
         debug!("Cleared {} chat session mappings", chat_count);
         drop(chat_mapping);
 
+        // Step 5: Clear provider failure counts
+        debug!("Step 5: Clearing provider failure counts");
+        let mut failure_counts = self
+            .provider_failure_counts
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+        let failure_count = failure_counts.len();
+        failure_counts.clear();
+        debug!("Cleared {} provider failure count entries", failure_count);
+        drop(failure_counts);
+
         info!(
-            "Inference provider pool shutdown completed. Cleaned up: {} models, {} pubkeys, {} external providers, {} load balancer indices, {} chat mappings",
-            model_count, pubkey_count, external_count, index_count, chat_count
+            "Inference provider pool shutdown completed. Cleaned up: {} models, {} pubkeys, {} external providers, {} load balancer indices, {} chat mappings, {} failure counts",
+            model_count, pubkey_count, external_count, index_count, chat_count, failure_count
         );
     }
 }

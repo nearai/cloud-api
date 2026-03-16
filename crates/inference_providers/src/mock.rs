@@ -8,8 +8,8 @@ use crate::{
     AudioTranscriptionResponse, ChatChoice, ChatCompletionChunk, ChatCompletionParams,
     ChatCompletionResponse, ChatCompletionResponseChoice, ChatCompletionResponseWithBytes,
     ChatDelta, ChatResponseMessage, ChatSignature, CompletionChunk, CompletionError,
-    CompletionParams, FinishReason, FunctionCallDelta, ImageData, ImageEditError, ImageEditParams,
-    ImageEditResponseWithBytes, ImageGenerationError, ImageGenerationParams,
+    CompletionParams, EmbeddingError, FinishReason, FunctionCallDelta, ImageData, ImageEditError,
+    ImageEditParams, ImageEditResponseWithBytes, ImageGenerationError, ImageGenerationParams,
     ImageGenerationResponse, ImageGenerationResponseWithBytes, ListModelsError, MessageRole,
     ModelInfo, ModelsResponse, RerankError, RerankParams, RerankResponse, RerankResult,
     RerankUsage, SSEEvent, ScoreError, ScoreParams, ScoreResponse, ScoreResult, ScoreUsage,
@@ -780,17 +780,20 @@ impl crate::InferenceProvider for MockProvider {
         // Register signature hashes for this chat_id.
         // response_hash is computed over SSE bytes in the same format as returned by the API:
         // concatenated "data: {json}\n\n" lines plus the final "data: [DONE]\n\n" terminator.
+        // IMPORTANT: Use serde_json::to_string (preserves struct field order) rather than
+        // serde_json::to_value().to_string() (sorts keys alphabetically via BTreeMap).
+        // The server serializes StreamChunk with to_string, so the mock must match.
         let chat_id_opt = chunks.first().map(|c| c.id.clone());
         if let Some(chat_id) = chat_id_opt {
             let mut accumulated: Vec<u8> = Vec::new();
             for chunk in &chunks {
-                let json = serde_json::to_value(chunk).map_err(|e| {
+                let json_str = serde_json::to_string(chunk).map_err(|e| {
                     CompletionError::CompletionError(format!(
                         "Failed to serialize mock chunk to JSON for hashing: {e}"
                     ))
                 })?;
-                let raw_bytes = Self::sse_data_static(&json);
-                accumulated.extend_from_slice(&raw_bytes);
+                let sse_line = format!("data: {json_str}\n\n");
+                accumulated.extend_from_slice(sse_line.as_bytes());
             }
             if response_template.disconnect_after_chunks.is_none() {
                 accumulated.extend_from_slice(b"data: [DONE]\n\n");
@@ -802,8 +805,8 @@ impl crate::InferenceProvider for MockProvider {
 
         // Convert chunks to SSE stream
         let stream = stream::iter(chunks.into_iter().map(move |chunk| {
-            let json = serde_json::to_value(&chunk).unwrap();
-            let raw_bytes = Self::sse_data_static(&json);
+            let json_str = serde_json::to_string(&chunk).unwrap();
+            let raw_bytes = Bytes::from(format!("data: {json_str}\n\n"));
             Ok(SSEEvent {
                 raw_bytes,
                 chunk: StreamChunk::Chat(chunk),
@@ -892,8 +895,8 @@ impl crate::InferenceProvider for MockProvider {
 
         // Convert chunks to SSE stream
         let stream = stream::iter(chunks.into_iter().map(move |chunk| {
-            let json = serde_json::to_value(&chunk).unwrap();
-            let raw_bytes = Self::sse_data_static(&json);
+            let json_str = serde_json::to_string(&chunk).unwrap();
+            let raw_bytes = Bytes::from(format!("data: {json_str}\n\n"));
             Ok(SSEEvent {
                 raw_bytes,
                 chunk: StreamChunk::Text(chunk),
@@ -1050,6 +1053,26 @@ impl crate::InferenceProvider for MockProvider {
         Ok(response)
     }
 
+    async fn embeddings_raw(&self, _body: bytes::Bytes) -> Result<bytes::Bytes, EmbeddingError> {
+        let embedding: Vec<f64> = vec![0.0; 384];
+        let response_json = serde_json::json!({
+            "object": "list",
+            "data": [{
+                "object": "embedding",
+                "embedding": embedding,
+                "index": 0
+            }],
+            "model": "mock-embedding-model",
+            "usage": {
+                "prompt_tokens": 10,
+                "total_tokens": 10
+            }
+        });
+        let bytes = serde_json::to_vec(&response_json)
+            .map_err(|e| EmbeddingError::RequestFailed(e.to_string()))?;
+        Ok(bytes::Bytes::from(bytes))
+    }
+
     async fn get_signature(
         &self,
         chat_id: &str,
@@ -1162,13 +1185,6 @@ impl crate::InferenceProvider for MockProvider {
 }
 
 impl MockProvider {
-    /// Generate SSE bytes from a JSON value (static method for use in closures)
-    fn sse_data_static(json: &serde_json::Value) -> Bytes {
-        let json_str = json.to_string();
-        let sse_line = format!("data: {json_str}\n\n");
-        Bytes::from(sse_line)
-    }
-
     /// Count tokens in content (handles serde_json::Value)
     fn count_tokens_in_content(content: &serde_json::Value) -> i32 {
         match content {

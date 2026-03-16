@@ -131,6 +131,7 @@ pub async fn batch_upsert_models(
                     attestation_supported: request.attestation_supported,
                     input_modalities: request.input_modalities.clone(),
                     output_modalities: request.output_modalities.clone(),
+                    inference_url: request.inference_url.clone(),
                     change_reason: request.change_reason.clone(),
                     changed_by_user_id: Some(admin_user_id),
                     changed_by_user_email: Some(admin_user_email.clone()),
@@ -280,6 +281,7 @@ pub async fn batch_upsert_models(
                     updated_model.input_modalities,
                     updated_model.output_modalities,
                 ),
+                inference_url: updated_model.inference_url,
             },
         })
         .collect();
@@ -377,6 +379,7 @@ pub async fn list_models(
                     model.input_modalities,
                     model.output_modalities,
                 ),
+                inference_url: model.inference_url,
             },
             is_active: model.is_active,
             created_at: model.created_at,
@@ -506,6 +509,7 @@ pub async fn get_model_history(
             created_at: h.created_at.to_rfc3339(),
             input_modalities: h.input_modalities,
             output_modalities: h.output_modalities,
+            inference_url: h.inference_url,
         })
         .collect();
 

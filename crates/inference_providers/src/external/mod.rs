@@ -31,8 +31,8 @@ pub mod openai_compatible;
 use crate::{
     AttestationError, AudioTranscriptionError, AudioTranscriptionParams,
     AudioTranscriptionResponse, ChatCompletionParams, ChatCompletionResponseWithBytes,
-    ChatSignature, CompletionError, CompletionParams, ImageEditError, ImageEditParams,
-    ImageEditResponseWithBytes, ImageGenerationError, ImageGenerationParams,
+    ChatSignature, CompletionError, CompletionParams, EmbeddingError, ImageEditError,
+    ImageEditParams, ImageEditResponseWithBytes, ImageGenerationError, ImageGenerationParams,
     ImageGenerationResponseWithBytes, InferenceProvider, ListModelsError, ModelsResponse,
     RerankError, RerankParams, RerankResponse, ScoreError, ScoreParams, ScoreResponse,
     StreamingResult,
@@ -354,6 +354,10 @@ impl InferenceProvider for ExternalProvider {
         self.backend
             .rerank(&self.config, &self.model_name, params)
             .await
+    }
+
+    async fn embeddings_raw(&self, body: bytes::Bytes) -> Result<bytes::Bytes, EmbeddingError> {
+        self.backend.embeddings_raw(&self.config, body).await
     }
 }
 

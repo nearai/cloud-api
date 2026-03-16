@@ -160,6 +160,15 @@ pub trait CompletionServiceTrait: Send + Sync {
         params: inference_providers::RerankParams,
     ) -> Result<inference_providers::RerankResponse, CompletionError>;
 
+    /// Execute an embeddings request as a raw passthrough with concurrent request limiting.
+    async fn try_embeddings(
+        &self,
+        organization_id: Uuid,
+        model_id: Uuid,
+        model_name: &str,
+        body: bytes::Bytes,
+    ) -> Result<bytes::Bytes, CompletionError>;
+
     /// Execute a score request with proper concurrent request limiting.
     ///
     /// Each organization has a per-model concurrent request limit (default: 64).

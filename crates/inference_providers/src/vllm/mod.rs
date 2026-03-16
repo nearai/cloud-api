@@ -23,6 +23,11 @@ fn to_score_error<E: std::fmt::Display>(e: E) -> ScoreError {
     ScoreError::GenerationError(e.to_string())
 }
 
+/// Convert any displayable error to EmbeddingError::RequestFailed
+fn to_embedding_error<E: std::fmt::Display>(e: E) -> EmbeddingError {
+    EmbeddingError::RequestFailed(e.to_string())
+}
+
 /// Encryption header keys used in params.extra for passing encryption information
 mod encryption_headers {
     /// Key for signing algorithm (x-signing-algo header)
@@ -34,6 +39,8 @@ mod encryption_headers {
     /// but kept here for consistency with other encryption header constants
     #[allow(dead_code)]
     pub const MODEL_PUB_KEY: &str = "x_model_pub_key";
+    /// Key for encryption version (x-encryption-version header)
+    pub const ENCRYPTION_VERSION: &str = "x_encryption_version";
 }
 
 /// Configuration for vLLM provider
@@ -66,11 +73,14 @@ pub struct VLlmProvider {
 impl VLlmProvider {
     /// Create a new vLLM provider with the given configuration
     pub fn new(config: VLlmConfig) -> Self {
+        // connect_timeout: 5s is generous for local-network backends. A backend behind a
+        // firewall-drop (not RST) is the worst case; 5s catches it without penalising
+        // fallback latency. Connection-refused is instant regardless.
         // read_timeout guards against stalled backends: if no bytes arrive for this
         // duration after TTFB, the connection is dropped. Intentionally generous (120s)
         // so normal long-running inference is unaffected while truly hung backends release resources.
         let client = Client::builder()
-            .connect_timeout(std::time::Duration::from_secs(30))
+            .connect_timeout(std::time::Duration::from_secs(5))
             .pool_idle_timeout(std::time::Duration::from_secs(90))
             .read_timeout(std::time::Duration::from_secs(120))
             .build()
@@ -129,6 +139,17 @@ impl VLlmProvider {
 
         // Remove x_model_pub_key from extra (not forwarded to vllm-proxy, used only for routing)
         extra.remove(encryption_headers::MODEL_PUB_KEY);
+
+        // Extract and forward x_encryption_version as HTTP header, then remove from extra
+        if let Some(version) = extra
+            .remove(encryption_headers::ENCRYPTION_VERSION)
+            .as_ref()
+            .and_then(|v| v.as_str())
+        {
+            if let Ok(value) = HeaderValue::from_str(version) {
+                headers.insert("X-Encryption-Version", value);
+            }
+        }
     }
 
     /// Send a streaming HTTP POST request with TTFB timeout protection.
@@ -543,7 +564,15 @@ impl InferenceProvider for VLlmProvider {
             ))
             .send()
             .await
-            .map_err(|e| AudioTranscriptionError::TranscriptionError(e.to_string()))?;
+            .map_err(|e| {
+                tracing::debug!(
+                    error_type = %e.status().map(|s| s.as_u16()).unwrap_or(0),
+                    is_timeout = e.is_timeout(),
+                    is_connect = e.is_connect(),
+                    "Audio transcription send failed"
+                );
+                AudioTranscriptionError::TranscriptionError(e.to_string())
+            })?;
 
         if !response.status().is_success() {
             let status_code = response.status().as_u16();
@@ -551,16 +580,24 @@ impl InferenceProvider for VLlmProvider {
                 .text()
                 .await
                 .unwrap_or_else(|_| "Unknown error".to_string());
+            tracing::error!(
+                status_code,
+                "Audio transcription request failed with HTTP error"
+            );
             return Err(AudioTranscriptionError::HttpError {
                 status_code,
                 message,
             });
         }
 
-        let transcription_response: AudioTranscriptionResponse = response
-            .json()
-            .await
-            .map_err(|e| AudioTranscriptionError::TranscriptionError(e.to_string()))?;
+        let transcription_response: AudioTranscriptionResponse =
+            response.json().await.map_err(|e| {
+                tracing::debug!(
+                    error_type = %e,
+                    "Audio transcription response deserialization failed"
+                );
+                AudioTranscriptionError::TranscriptionError(e.to_string())
+            })?;
 
         Ok(transcription_response)
     }
@@ -736,6 +773,38 @@ impl InferenceProvider for VLlmProvider {
         let rerank_response: RerankResponse = response.json().await.map_err(to_rerank_error)?;
         Ok(rerank_response)
     }
+
+    async fn embeddings_raw(&self, body: bytes::Bytes) -> Result<bytes::Bytes, EmbeddingError> {
+        let url = format!("{}/v1/embeddings", self.config.base_url);
+
+        let headers = self.build_headers().map_err(to_embedding_error)?;
+
+        let response = self
+            .client
+            .post(&url)
+            .headers(headers)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(body)
+            .timeout(Duration::from_secs(self.config.timeout_seconds as u64))
+            .send()
+            .await
+            .map_err(to_embedding_error)?;
+
+        if !response.status().is_success() {
+            let status_code = response.status().as_u16();
+            let message = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "Unknown error".to_string());
+            return Err(EmbeddingError::HttpError {
+                status_code,
+                message,
+            });
+        }
+
+        let raw_bytes = response.bytes().await.map_err(to_embedding_error)?;
+        Ok(raw_bytes)
+    }
 }
 
 #[cfg(test)]
@@ -768,6 +837,10 @@ mod tests {
             encryption_headers::MODEL_PUB_KEY.to_string(),
             serde_json::Value::String("def456".to_string()),
         );
+        extra.insert(
+            encryption_headers::ENCRYPTION_VERSION.to_string(),
+            serde_json::Value::String("2".to_string()),
+        );
 
         provider.prepare_encryption_headers(&mut headers, &mut extra);
 
@@ -783,6 +856,10 @@ mod tests {
         assert!(
             !extra.contains_key(encryption_headers::MODEL_PUB_KEY),
             "x_model_pub_key should be removed from extra"
+        );
+        assert!(
+            !extra.contains_key(encryption_headers::ENCRYPTION_VERSION),
+            "x_encryption_version should be removed from extra"
         );
     }
 
@@ -804,6 +881,10 @@ mod tests {
             encryption_headers::MODEL_PUB_KEY.to_string(),
             serde_json::Value::String("def456".to_string()),
         );
+        extra.insert(
+            encryption_headers::ENCRYPTION_VERSION.to_string(),
+            serde_json::Value::String("2".to_string()),
+        );
 
         provider.prepare_encryption_headers(&mut headers, &mut extra);
 
@@ -817,6 +898,11 @@ mod tests {
             headers.get("X-Client-Pub-Key").unwrap(),
             "abc123",
             "X-Client-Pub-Key header should be forwarded"
+        );
+        assert_eq!(
+            headers.get("X-Encryption-Version").unwrap(),
+            "2",
+            "X-Encryption-Version header should be forwarded"
         );
         // model_pub_key should NOT be forwarded (used only for routing, not sent to vllm-proxy)
         assert!(
@@ -915,6 +1001,10 @@ mod tests {
             serde_json::Value::String("def456".to_string()),
         );
         extra.insert(
+            encryption_headers::ENCRYPTION_VERSION.to_string(),
+            serde_json::Value::String("2".to_string()),
+        );
+        extra.insert(
             "some_valid_param".to_string(),
             serde_json::Value::String("value".to_string()),
         );
@@ -947,6 +1037,10 @@ mod tests {
         assert!(
             !json.contains("x_model_pub_key"),
             "x_model_pub_key should NOT appear in serialized JSON after prepare_encryption_headers"
+        );
+        assert!(
+            !json.contains("x_encryption_version"),
+            "x_encryption_version should NOT appear in serialized JSON after prepare_encryption_headers"
         );
 
         // Valid params should still be present

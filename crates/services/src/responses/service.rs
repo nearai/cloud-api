@@ -37,6 +37,7 @@ struct ProcessStreamContext {
     signing_algo: Option<String>,
     client_pub_key: Option<String>,
     model_pub_key: Option<String>,
+    encryption_version: Option<String>,
     response_repository: Arc<dyn ports::ResponseRepositoryTrait>,
     response_items_repository: Arc<dyn ports::ResponseItemRepositoryTrait>,
     completion_service: Arc<dyn CompletionServiceTrait>,
@@ -141,6 +142,7 @@ impl ports::ResponseServiceTrait for ResponseServiceImpl {
         signing_algo: Option<String>,
         client_pub_key: Option<String>,
         model_pub_key: Option<String>,
+        encryption_version: Option<String>,
     ) -> Result<
         Pin<Box<dyn Stream<Item = models::ResponseStreamEvent> + Send>>,
         errors::ResponseError,
@@ -178,6 +180,7 @@ impl ports::ResponseServiceTrait for ResponseServiceImpl {
         let signing_algo_clone = signing_algo.clone();
         let client_pub_key_clone = client_pub_key.clone();
         let model_pub_key_clone = model_pub_key.clone();
+        let encryption_version_clone = encryption_version.clone();
 
         tokio::spawn(async move {
             let mut tool_registry = tools::ToolRegistry::new();
@@ -199,6 +202,7 @@ impl ports::ResponseServiceTrait for ResponseServiceImpl {
                 signing_algo: signing_algo_clone,
                 client_pub_key: client_pub_key_clone,
                 model_pub_key: model_pub_key_clone,
+                encryption_version: encryption_version_clone,
                 response_repository,
                 response_items_repository,
                 completion_service,
@@ -1322,6 +1326,12 @@ impl ResponseServiceImpl {
                 extra.insert(
                     encryption_headers::MODEL_PUB_KEY.to_string(),
                     serde_json::Value::String(model_pub_key.clone()),
+                );
+            }
+            if let Some(ref encryption_version) = process_context.encryption_version {
+                extra.insert(
+                    encryption_headers::ENCRYPTION_VERSION.to_string(),
+                    serde_json::Value::String(encryption_version.clone()),
                 );
             }
 

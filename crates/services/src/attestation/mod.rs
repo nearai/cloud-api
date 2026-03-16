@@ -390,25 +390,26 @@ pub fn load_vpc_info() -> Option<VpcInfo> {
     }
 }
 
-/// Load TLS certificate SPKI fingerprint from TLS_CERT_PATH
+/// Load TLS certificate SPKI fingerprint from `TLS_CERT_PATH`.
 pub fn load_tls_cert_fingerprint() -> Option<String> {
-    if let Ok(path) = std::env::var("TLS_CERT_PATH") {
-        match compute_spki_hash(&path) {
-            Ok(hash) => {
-                tracing::info!(
-                    tls_cert_path = %path,
-                    fingerprint = %hash,
-                    "TLS certificate SPKI hash computed"
-                );
-                Some(hash)
-            }
-            Err(e) => {
-                tracing::warn!(tls_cert_path = %path, error = %e, "Failed to compute TLS cert fingerprint");
-                None
-            }
+    let path = std::env::var("TLS_CERT_PATH").ok()?;
+    match compute_spki_hash(&path) {
+        Ok(hash) => {
+            tracing::info!(
+                tls_cert_path = %path,
+                fingerprint = %hash,
+                "TLS certificate SPKI hash computed"
+            );
+            Some(hash)
         }
-    } else {
-        None
+        Err(e) => {
+            tracing::warn!(
+                tls_cert_path = %path,
+                error = %e,
+                "Failed to compute TLS cert fingerprint (TLS_CERT_PATH)"
+            );
+            None
+        }
     }
 }
 
@@ -784,9 +785,7 @@ impl ports::AttestationServiceTrait for AttestationService {
 
         // Read TLS certificate PEM if fingerprint is requested (for the response body)
         let tls_certificate = if include_tls_fingerprint {
-            if let Ok(path) = std::env::var("INGRESS_TLS_CERT_PATH") {
-                tokio::fs::read_to_string(&path).await.ok()
-            } else if let Ok(path) = std::env::var("TLS_CERT_PATH") {
+            if let Ok(path) = std::env::var("TLS_CERT_PATH") {
                 tokio::fs::read_to_string(&path).await.ok()
             } else {
                 None

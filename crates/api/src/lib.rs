@@ -18,8 +18,8 @@ use crate::{
         },
         billing::{get_billing_costs, BillingRouteState},
         completions::{
-            audio_transcriptions, chat_completions, image_edits, image_generations, models, rerank,
-            score,
+            audio_transcriptions, chat_completions, embeddings, image_edits, image_generations,
+            models, rerank, score,
         },
         conversations,
         health::health_check,
@@ -661,6 +661,7 @@ pub async fn init_inference_providers_with_mocks(
         "Qwen/Qwen3-Omni-30B-A3B-Instruct".to_string(),
         "Qwen/Qwen-Image-2512".to_string(),
         "Qwen/Qwen3-Reranker-0.6B".to_string(),
+        "Qwen/Qwen3-Embedding-0.6B".to_string(),
     ];
 
     let providers: Vec<(
@@ -978,6 +979,7 @@ pub fn build_completion_routes(
         .route("/images/generations", post(image_generations))
         .route("/audio/transcriptions", post(audio_transcriptions))
         .route("/rerank", post(rerank))
+        .route("/embeddings", post(embeddings))
         .route("/score", post(score))
         .layer(DefaultBodyLimit::max(AUDIO_TRANSCRIPTION_MAX_BODY_SIZE))
         .with_state(app_state.clone())

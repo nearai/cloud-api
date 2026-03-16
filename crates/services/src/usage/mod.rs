@@ -193,22 +193,22 @@ impl UsageServiceTrait for UsageServiceImpl {
                     })?;
                 (duration_cost, 0, duration_cost)
             }
-            ports::InferenceType::Rerank => {
-                // For rerank: use input tokens as the billing unit.
-                // Cache pricing is intentionally NOT applied for rerank, even if
+            ports::InferenceType::Rerank | ports::InferenceType::Embedding => {
+                // For rerank/embedding: use input tokens as the billing unit.
+                // Cache pricing is intentionally NOT applied, even if
                 // cache_read_cost_per_token is configured on the model.
-                // Rerank models should set their input_cost_per_token appropriately for the billing model
-                // (e.g., cost per token, cost per document, cost per query, etc.)
                 // Use checked arithmetic to prevent integer overflow in billing-critical path
-                let rerank_cost = (request.input_tokens as i64)
+                let cost = (request.input_tokens as i64)
                     .checked_mul(model.input_cost_per_token)
                     .ok_or_else(|| {
                         UsageError::CostCalculationOverflow(format!(
-                            "Rerank cost calculation overflow: {} tokens * {} cost_per_token",
-                            request.input_tokens, model.input_cost_per_token
+                            "{} cost calculation overflow: {} tokens * {} cost_per_token",
+                            request.inference_type,
+                            request.input_tokens,
+                            model.input_cost_per_token
                         ))
                     })?;
-                (rerank_cost, 0, rerank_cost)
+                (cost, 0, cost)
             }
             _ => {
                 // For token-based models (chat completions, etc.)

@@ -8,8 +8,8 @@ use crate::{
     AudioTranscriptionResponse, ChatChoice, ChatCompletionChunk, ChatCompletionParams,
     ChatCompletionResponse, ChatCompletionResponseChoice, ChatCompletionResponseWithBytes,
     ChatDelta, ChatResponseMessage, ChatSignature, CompletionChunk, CompletionError,
-    CompletionParams, FinishReason, FunctionCallDelta, ImageData, ImageEditError, ImageEditParams,
-    ImageEditResponseWithBytes, ImageGenerationError, ImageGenerationParams,
+    CompletionParams, EmbeddingError, FinishReason, FunctionCallDelta, ImageData, ImageEditError,
+    ImageEditParams, ImageEditResponseWithBytes, ImageGenerationError, ImageGenerationParams,
     ImageGenerationResponse, ImageGenerationResponseWithBytes, ListModelsError, MessageRole,
     ModelInfo, ModelsResponse, RerankError, RerankParams, RerankResponse, RerankResult,
     RerankUsage, SSEEvent, ScoreError, ScoreParams, ScoreResponse, ScoreResult, ScoreUsage,
@@ -1051,6 +1051,26 @@ impl crate::InferenceProvider for MockProvider {
         };
 
         Ok(response)
+    }
+
+    async fn embeddings_raw(&self, _body: bytes::Bytes) -> Result<bytes::Bytes, EmbeddingError> {
+        let embedding: Vec<f64> = vec![0.0; 384];
+        let response_json = serde_json::json!({
+            "object": "list",
+            "data": [{
+                "object": "embedding",
+                "embedding": embedding,
+                "index": 0
+            }],
+            "model": "mock-embedding-model",
+            "usage": {
+                "prompt_tokens": 10,
+                "total_tokens": 10
+            }
+        });
+        let bytes = serde_json::to_vec(&response_json)
+            .map_err(|e| EmbeddingError::RequestFailed(e.to_string()))?;
+        Ok(bytes::Bytes::from(bytes))
     }
 
     async fn get_signature(

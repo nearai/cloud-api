@@ -21,6 +21,8 @@ pub enum InferenceType {
     Rerank,
     /// Text similarity scoring
     Score,
+    /// Text embeddings
+    Embedding,
 }
 
 impl InferenceType {
@@ -34,6 +36,7 @@ impl InferenceType {
             InferenceType::AudioTranscription => "audio_transcription",
             InferenceType::Rerank => "rerank",
             InferenceType::Score => "score",
+            InferenceType::Embedding => "embedding",
         }
     }
 }
@@ -56,6 +59,7 @@ impl std::str::FromStr for InferenceType {
             "audio_transcription" => Ok(InferenceType::AudioTranscription),
             "rerank" => Ok(InferenceType::Rerank),
             "score" => Ok(InferenceType::Score),
+            "embedding" => Ok(InferenceType::Embedding),
             _ => Err(format!("Unknown inference type: {}", s)),
         }
     }

@@ -585,10 +585,8 @@ impl InferenceProvider for VLlmProvider {
             });
         }
 
-        let transcription_response: AudioTranscriptionResponse = response
-            .json()
-            .await
-            .map_err(|e| {
+        let transcription_response: AudioTranscriptionResponse =
+            response.json().await.map_err(|e| {
                 tracing::debug!(
                     error_type = %e,
                     "Audio transcription response deserialization failed"

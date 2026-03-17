@@ -211,11 +211,9 @@ fn map_mcp_service_error(
             MCP_ERR_TOOL_NOT_CONFIGURED,
             "Web search is not configured",
         ),
-        WebSearchServiceError::ProviderFailure => error_response(
-            id,
-            MCP_ERR_TOOL_EXECUTION_FAILED,
-            "Web search request failed",
-        ),
+        WebSearchServiceError::ProviderFailure(message) => {
+            error_response(id, MCP_ERR_TOOL_EXECUTION_FAILED, message)
+        }
         WebSearchServiceError::UsageRecordingFailed | WebSearchServiceError::Internal => {
             error_response(id, JSONRPC_INTERNAL_ERROR, "Internal server error")
         }

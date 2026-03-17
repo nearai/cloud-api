@@ -1,3 +1,4 @@
+use crate::responses::tools::WebSearchError;
 use crate::responses::tools::{WebSearchParams, WebSearchProviderTrait};
 use crate::service_usage::ports::{
     RecordServiceUsageWithPricingParams, ServiceUsageServiceTrait, SERVICE_NAME_WEB_SEARCH,
@@ -65,8 +66,8 @@ pub enum WebSearchServiceError {
     OffsetOutOfRange,
     #[error("Web search is not configured")]
     NotConfigured,
-    #[error("Web search request failed")]
-    ProviderFailure,
+    #[error("Web search request failed: {0}")]
+    ProviderFailure(String),
     #[error("Failed to record service usage")]
     UsageRecordingFailed,
     #[error("Internal server error")]
@@ -144,9 +145,13 @@ impl WebSearchService {
                 operators: request.operators,
             })
             .await
-            .map_err(|_| {
-                warn!("Web search provider failure");
-                WebSearchServiceError::ProviderFailure
+            .map_err(|err| {
+                warn!(?err, "Web search provider failure");
+                let message = match err {
+                    WebSearchError::WebSearchRequestFailed(message)
+                    | WebSearchError::WebSearchResponseParsingFailed(message) => message,
+                };
+                WebSearchServiceError::ProviderFailure(message)
             })?;
 
         self.service_usage_service

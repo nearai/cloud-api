@@ -221,31 +221,7 @@ fn map_mcp_service_error(
 }
 
 fn web_search_input_schema() -> Value {
-    json!({
-        "type": "object",
-        "properties": {
-            "query": {"type": "string", "description": "Search query"},
-            "country": {"type": "string"},
-            "search_lang": {"type": "string"},
-            "ui_lang": {"type": "string"},
-            "count": {"type": "integer", "minimum": 1, "maximum": WEB_SEARCH_MAX_COUNT},
-            "offset": {"type": "integer", "minimum": 0, "maximum": WEB_SEARCH_MAX_OFFSET},
-            "safesearch": {"type": "string"},
-            "freshness": {"type": "string"},
-            "text_decorations": {"type": "boolean"},
-            "spellcheck": {"type": "boolean"},
-            "units": {"type": "string"},
-            "extra_snippets": {"type": "boolean"},
-            "summary": {"type": "boolean"},
-            "result_filter": {"type": "string"},
-            "goggles": {"type": "string"},
-            "enable_rich_callback": {"type": "boolean"},
-            "include_fetch_metadata": {"type": "boolean"},
-            "operators": {"type": "boolean"}
-        },
-        "required": ["query"],
-        "additionalProperties": false
-    })
+    services::responses::tools::web_search_parameters_schema()
 }
 
 fn tool_definition(tool: &McpToolDefinition) -> Value {

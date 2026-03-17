@@ -3,6 +3,7 @@
 //! Implements the ToolExecutor trait for web search functionality.
 
 use async_trait::async_trait;
+use serde_json::{json, Value};
 use std::sync::Arc;
 
 use super::executor::{ToolEventContext, ToolExecutionContext, ToolExecutor, ToolOutput};
@@ -10,6 +11,7 @@ use super::ports::{WebSearchParams, WebSearchProviderTrait, WebSearchResult};
 use crate::responses::errors::ResponseError;
 use crate::responses::models::{ResponseItemStatus, ResponseOutputItem, WebSearchAction};
 use crate::responses::service_helpers::ToolCallInfo;
+use crate::web_search::{WEB_SEARCH_MAX_COUNT, WEB_SEARCH_MAX_OFFSET};
 
 /// Create a web search output item for streaming events
 fn create_web_search_item(
@@ -32,6 +34,115 @@ fn create_web_search_item(
 }
 
 pub const WEB_SEARCH_TOOL_NAME: &str = "web_search";
+
+/// Shared JSON Schema for Brave-backed web search parameters.
+/// Keep this in one place so MCP tool exposure and model-facing tool definitions stay aligned.
+pub fn web_search_parameters_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "query": {
+                "type": "string",
+                "description": "Brave web search query string. Put search operators directly in this field, for example exact phrases in quotes, `site:github.com rust tutorials`, `filetype:pdf`, or excluded terms like `-jquery`.",
+                "examples": [
+                    "machine learning tutorials",
+                    "site:github.com rust tutorials",
+                    "\"climate change solutions\" filetype:pdf -policy"
+                ]
+            },
+            "country": {
+                "type": "string",
+                "description": "2-character country code used to target results from a specific country, for example `US`, `GB`, or `DE`.",
+                "minLength": 2,
+                "maxLength": 2,
+                "examples": ["US", "DE"]
+            },
+            "search_lang": {
+                "type": "string",
+                "description": "Preferred language of matching documents/content, typically a 2-character language code such as `en`, `es`, or `de`.",
+                "minLength": 2,
+                "examples": ["en", "de"]
+            },
+            "ui_lang": {
+                "type": "string",
+                "description": "Preferred language/locale for response metadata, for example `en-US` or `de-DE`.",
+                "examples": ["en-US", "de-DE"]
+            },
+            "count": {
+                "type": "integer",
+                "description": "Maximum number of results to return in one page. Brave documents a maximum of 20, and the actual number returned may be smaller.",
+                "minimum": 1,
+                "maximum": WEB_SEARCH_MAX_COUNT,
+                "examples": [5, 10, 20]
+            },
+            "offset": {
+                "type": "integer",
+                "description": "Zero-based pagination offset. Brave documents a maximum of 9; request the next page only when Brave indicates more results are available.",
+                "minimum": 0,
+                "maximum": WEB_SEARCH_MAX_OFFSET,
+                "examples": [0, 1, 2]
+            },
+            "safesearch": {
+                "type": "string",
+                "description": "Adult-content filtering level. `moderate` is Brave's documented default.",
+                "enum": ["off", "moderate", "strict"]
+            },
+            "freshness": {
+                "type": "string",
+                "description": "Time filter for results: `pd` (last 24h), `pw` (last 7d), `pm` (last 31d), `py` (last 365d), or a custom date range formatted as `YYYY-MM-DDtoYYYY-MM-DD`.",
+                "examples": ["pd", "pw", "pm", "py", "2022-04-01to2022-07-30"]
+            },
+            "text_decorations": {
+                "type": "boolean",
+                "description": "Whether Brave should include text-decoration/highlighting markers in returned snippets."
+            },
+            "spellcheck": {
+                "type": "boolean",
+                "description": "Whether Brave should apply query spellchecking/correction before searching."
+            },
+            "units": {
+                "type": "string",
+                "description": "Measurement units for responses that include unit-bearing data.",
+                "enum": ["metric", "imperial"]
+            },
+            "extra_snippets": {
+                "type": "boolean",
+                "description": "When true, request up to 5 additional excerpts per result to provide richer previews."
+            },
+            "summary": {
+                "type": "boolean",
+                "description": "Request Brave summary-key generation when supported by the upstream API/plan."
+            },
+            "result_filter": {
+                "type": "string",
+                "description": "Comma-delimited result types to include. Supported pass-through values are `discussions`, `faq`, `infobox`, `news`, `query`, `summarizer`, `videos`, `web`, and `locations`.",
+                "examples": ["web", "web,news", "locations,web"]
+            },
+            "goggles": {
+                "type": "string",
+                "description": "Brave Goggles URL or inline definition used for custom re-ranking/filtering. Brave documentation notes goggles may be provided as hosted URLs or inline definitions.",
+                "examples": [
+                    "https://example.com/my.goggle",
+                    "https://example.com/one.goggle,https://example.com/two.goggle"
+                ]
+            },
+            "enable_rich_callback": {
+                "type": "boolean",
+                "description": "Ask Brave to include rich-result callback hints for supported intents such as weather, sports, or stocks. If available, the response contains a `rich.hint.callback_key` for follow-up `/web/rich` fetches."
+            },
+            "include_fetch_metadata": {
+                "type": "boolean",
+                "description": "Pass-through flag requesting additional fetch metadata in Brave responses when available."
+            },
+            "operators": {
+                "type": "boolean",
+                "description": "Optional pass-through flag for operator handling. Search operators themselves still belong directly inside `query`."
+            }
+        },
+        "required": ["query"],
+        "additionalProperties": false
+    })
+}
 
 /// Citation instruction provided on first web search.
 pub const CITATION_INSTRUCTION: &str = r#"CITATION REQUIREMENT: Use [s:N]text[/s:N] for EVERY fact from web search results.

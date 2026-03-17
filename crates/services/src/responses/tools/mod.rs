@@ -25,7 +25,8 @@ pub use tool_config::{
 // Tool executors
 pub use file_search::{FileSearchToolExecutor, FILE_SEARCH_TOOL_NAME};
 pub use web_search::{
-    FormattedWebSearchResult, WebSearchToolExecutor, CITATION_INSTRUCTION, WEB_SEARCH_TOOL_NAME,
+    web_search_parameters_schema, FormattedWebSearchResult, WebSearchToolExecutor,
+    CITATION_INSTRUCTION, WEB_SEARCH_TOOL_NAME,
 };
 
 // MCP

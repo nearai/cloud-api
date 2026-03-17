@@ -56,7 +56,7 @@ impl VLlmConfig {
         Self {
             base_url,
             api_key,
-            timeout_seconds: timeout_seconds.unwrap_or(30),
+            timeout_seconds: timeout_seconds.unwrap_or(90),
         }
     }
 }

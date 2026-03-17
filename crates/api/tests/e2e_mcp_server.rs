@@ -263,6 +263,7 @@ async fn test_mcp_tool_call_propagates_provider_error_message() {
     let (server, _database) =
         setup_test_server_with_web_search_provider(Arc::new(FailingWebSearchProvider)).await;
     let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
+    let _created = get_or_create_web_search_service(&server).await;
     let api_key = get_api_key_for_org(&server, org.id.clone()).await;
 
     let response = server

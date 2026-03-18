@@ -146,7 +146,7 @@ impl WebSearchService {
             })
             .await
             .map_err(|err| {
-                warn!(?err, "Web search provider failure");
+                warn!("Web search provider failure");
                 let message = match err {
                     WebSearchError::WebSearchRequestFailed(message)
                     | WebSearchError::WebSearchResponseParsingFailed(message) => message,

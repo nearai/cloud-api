@@ -65,7 +65,26 @@ impl WebSearchProviderTrait for BraveWebSearchProvider {
         &self,
         params: WebSearchParams,
     ) -> Result<Vec<WebSearchResult>, WebSearchError> {
-        tracing::debug!("Searching with params: {:?}", params);
+        tracing::debug!(
+            has_country = params.country.is_some(),
+            has_search_lang = params.search_lang.is_some(),
+            has_ui_lang = params.ui_lang.is_some(),
+            has_count = params.count.is_some(),
+            has_offset = params.offset.is_some(),
+            has_safesearch = params.safesearch.is_some(),
+            has_freshness = params.freshness.is_some(),
+            has_text_decorations = params.text_decorations.is_some(),
+            has_spellcheck = params.spellcheck.is_some(),
+            has_units = params.units.is_some(),
+            has_extra_snippets = params.extra_snippets.is_some(),
+            has_summary = params.summary.is_some(),
+            has_result_filter = params.result_filter.is_some(),
+            has_goggles = params.goggles.is_some(),
+            has_enable_rich_callback = params.enable_rich_callback.is_some(),
+            has_include_fetch_metadata = params.include_fetch_metadata.is_some(),
+            has_operators = params.operators.is_some(),
+            "Starting Brave web search"
+        );
 
         // Build query parameters dynamically
         let mut query_params = vec![("q", params.query.clone())];
@@ -159,7 +178,10 @@ impl WebSearchProviderTrait for BraveWebSearchProvider {
             query_params.push(("operators", op.to_string()));
         }
 
-        tracing::debug!("Query parameters: {:?}", query_params);
+        tracing::debug!(
+            query_param_count = query_params.len(),
+            "Built Brave query parameters"
+        );
 
         let response = self
             .brave_get_builder()
@@ -175,7 +197,7 @@ impl WebSearchProviderTrait for BraveWebSearchProvider {
                 .text()
                 .await
                 .unwrap_or_else(|_| "Unable to read error body".to_string());
-            tracing::warn!("Brave API error (status {}): {}", status, error_body);
+            tracing::warn!(status = %status, "Brave API error response");
             return Err(WebSearchError::WebSearchRequestFailed(format!(
                 "HTTP {status}: {error_body}"
             )));
@@ -187,7 +209,10 @@ impl WebSearchProviderTrait for BraveWebSearchProvider {
             .await
             .map_err(|e| WebSearchError::WebSearchResponseParsingFailed(e.to_string()))?;
 
-        tracing::debug!("Brave API response body: {}", response_text);
+        tracing::debug!(
+            response_size_bytes = response_text.len(),
+            "Received Brave API response body"
+        );
 
         // Parse JSON
         let brave_response: BraveSearchResponse =
@@ -196,7 +221,6 @@ impl WebSearchProviderTrait for BraveWebSearchProvider {
                 WebSearchError::WebSearchResponseParsingFailed(format!("JSON parsing error: {e}"))
             })?;
 
-        tracing::debug!("Brave response: {:?}", brave_response);
         // Extract web results and convert to our internal format
         let results: Vec<WebSearchResult> = brave_response
             .web
@@ -211,8 +235,7 @@ impl WebSearchProviderTrait for BraveWebSearchProvider {
                     .collect()
             })
             .unwrap_or_default();
-        tracing::debug!("Found {} results", results.len());
-        tracing::debug!("Results: {:?}", results);
+        tracing::debug!(result_count = results.len(), "Parsed Brave search results");
         Ok(results)
     }
 }

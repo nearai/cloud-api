@@ -209,6 +209,8 @@ impl WebSearchProviderTrait for BraveWebSearchProvider {
             .await
             .map_err(|e| WebSearchError::WebSearchResponseParsingFailed(e.to_string()))?;
 
+        tracing::debug!("Brave API response body: {}", response_text);
+
         tracing::debug!(
             response_size_bytes = response_text.len(),
             "Received Brave API response body"

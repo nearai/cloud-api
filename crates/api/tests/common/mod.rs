@@ -302,6 +302,19 @@ pub async fn setup_test_server_with_mock_web_search() -> (axum_test::TestServer,
     (server, infra.database)
 }
 
+pub async fn setup_test_server_with_web_search_provider(
+    web_search_provider: Arc<dyn WebSearchProviderTrait>,
+) -> (axum_test::TestServer, Arc<Database>) {
+    let infra = setup_test_infrastructure().await;
+    let server = build_test_server_components_with_mock_web_search(
+        infra.database.clone(),
+        infra.config,
+        web_search_provider,
+    )
+    .await;
+    (server, infra.database)
+}
+
 pub async fn setup_test_server() -> axum_test::TestServer {
     let (server, _, _, _) = setup_test_server_with_pool().await;
     server

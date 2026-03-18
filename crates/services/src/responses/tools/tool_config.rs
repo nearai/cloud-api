@@ -112,72 +112,10 @@ pub fn prepare_tools(request: &CreateResponseRequest) -> Vec<inference_providers
                                 \n- Use 'freshness' for time-sensitive queries (news, recent events, current trends)\
                                 \n- Use 'country' for location-specific information\
                                 \n- Use 'count' to limit results when user asks for specific number\
+                                \n- Put Brave search operators directly into 'query' (for example site:, filetype:, quoted phrases, or exclusions)\
                                 \n- Use 'safesearch' when dealing with sensitive topics".to_string()
                             ),
-                            parameters: serde_json::json!({
-                                "type": "object",
-                                "properties": {
-                                    "query": {
-                                        "type": "string",
-                                        "description": "The search query to look up (required, max 400 characters)"
-                                    },
-                                    "country": {
-                                        "type": "string",
-                                        "description": "2-character country code where results come from (e.g., 'US', 'GB', 'DE'). Use when user asks about location-specific information or mentions a country."
-                                    },
-                                    "search_lang": {
-                                        "type": "string",
-                                        "description": "2+ character language code for search results (e.g., 'en', 'es', 'de'). Use when user's query or language preference suggests non-English results."
-                                    },
-                                    "ui_lang": {
-                                        "type": "string",
-                                        "description": "User interface language (e.g., 'en-US', 'es-ES')"
-                                    },
-                                    "count": {
-                                        "type": "integer",
-                                        "description": "Number of search results to return (1-20, default: 20). Use lower values (5-10) for focused queries, higher values (15-20) for comprehensive research.",
-                                        "minimum": 1,
-                                        "maximum": 20
-                                    },
-                                    "offset": {
-                                        "type": "integer",
-                                        "description": "Zero-based offset for pagination (0-9)",
-                                        "minimum": 0,
-                                        "maximum": 9
-                                    },
-                                    "safesearch": {
-                                        "type": "string",
-                                        "description": "Safe search filter: 'strict' for educational/family content, 'moderate' (default) for general use, 'off' only when explicitly needed",
-                                        "enum": ["off", "moderate", "strict"]
-                                    },
-                                    "freshness": {
-                                        "type": "string",
-                                        "description": "Filter by freshness: 'pd' (24h) for breaking news, 'pw' (7d) for recent events, 'pm' (31d) for current trends, 'py' (365d) for recent developments. Always use for: news, current events, latest updates, recent changes, today's info."
-                                    },
-                                    "text_decorations": {
-                                        "type": "boolean",
-                                        "description": "Include text highlighting markers (default: true)"
-                                    },
-                                    "spellcheck": {
-                                        "type": "boolean",
-                                        "description": "Enable spellcheck on query (default: true)"
-                                    },
-                                    "units": {
-                                        "type": "string",
-                                        "description": "Measurement units: 'metric' or 'imperial'",
-                                        "enum": ["metric", "imperial"]
-                                    },
-                                    "extra_snippets": {
-                                        "type": "boolean",
-                                        "description": "Get up to 5 additional alternative excerpts (requires AI/Data plan)"
-                                    },
-                                    "summary": {
-                                        "type": "boolean",
-                                        "description": "Enable summary key generation (requires AI/Data plan)"
-                                    }
-                                },
-                                "required": ["query"]
-                            }),
+                            parameters: super::web_search_parameters_schema(),
                         },
                     });
                 }

@@ -1,7 +1,27 @@
 mod common;
 
+use async_trait::async_trait;
 use common::*;
 use serde_json::json;
+use services::responses::tools::{
+    WebSearchError, WebSearchParams, WebSearchProviderTrait, WebSearchResult,
+};
+use std::sync::Arc;
+
+struct FailingWebSearchProvider;
+
+#[async_trait]
+impl WebSearchProviderTrait for FailingWebSearchProvider {
+    async fn search(
+        &self,
+        _params: WebSearchParams,
+    ) -> Result<Vec<WebSearchResult>, WebSearchError> {
+        Err(WebSearchError::WebSearchRequestFailed(
+            "HTTP 422 Unprocessable Entity: {\"error\":{\"message\":\"Invalid freshness value\"}}"
+                .to_string(),
+        ))
+    }
+}
 
 #[tokio::test]
 async fn test_mcp_requires_api_key_auth() {
@@ -235,5 +255,38 @@ async fn test_mcp_tool_call_rejects_invalid_offset() {
     assert_eq!(
         body["error"]["message"],
         "Tool argument 'offset' must be between 0 and 9"
+    );
+}
+
+#[tokio::test]
+async fn test_mcp_tool_call_propagates_provider_error_message() {
+    let (server, _database) =
+        setup_test_server_with_web_search_provider(Arc::new(FailingWebSearchProvider)).await;
+    let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
+    let _created = get_or_create_web_search_service(&server).await;
+    let api_key = get_api_key_for_org(&server, org.id.clone()).await;
+
+    let response = server
+        .post("/mcp")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 6,
+            "method": "tools/call",
+            "params": {
+                "name": "web_search",
+                "arguments": {
+                    "query": "test query"
+                }
+            }
+        }))
+        .await;
+
+    assert_eq!(response.status_code(), 200, "{}", response.text());
+    let body = response.json::<serde_json::Value>();
+    assert_eq!(body["error"]["code"], -32011);
+    assert_eq!(
+        body["error"]["message"],
+        "HTTP 422 Unprocessable Entity: {\"error\":{\"message\":\"Invalid freshness value\"}}"
     );
 }

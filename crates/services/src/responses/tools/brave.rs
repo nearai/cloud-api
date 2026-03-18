@@ -65,27 +65,6 @@ impl WebSearchProviderTrait for BraveWebSearchProvider {
         &self,
         params: WebSearchParams,
     ) -> Result<Vec<WebSearchResult>, WebSearchError> {
-        tracing::debug!(
-            has_country = params.country.is_some(),
-            has_search_lang = params.search_lang.is_some(),
-            has_ui_lang = params.ui_lang.is_some(),
-            has_count = params.count.is_some(),
-            has_offset = params.offset.is_some(),
-            has_safesearch = params.safesearch.is_some(),
-            has_freshness = params.freshness.is_some(),
-            has_text_decorations = params.text_decorations.is_some(),
-            has_spellcheck = params.spellcheck.is_some(),
-            has_units = params.units.is_some(),
-            has_extra_snippets = params.extra_snippets.is_some(),
-            has_summary = params.summary.is_some(),
-            has_result_filter = params.result_filter.is_some(),
-            has_goggles = params.goggles.is_some(),
-            has_enable_rich_callback = params.enable_rich_callback.is_some(),
-            has_include_fetch_metadata = params.include_fetch_metadata.is_some(),
-            has_operators = params.operators.is_some(),
-            "Starting Brave web search"
-        );
-
         // Build query parameters dynamically
         let mut query_params = vec![("q", params.query.clone())];
 

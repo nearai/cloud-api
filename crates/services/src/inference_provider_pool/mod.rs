@@ -560,7 +560,7 @@ impl InferenceProviderPool {
                     let api_key = api_key.clone();
                     async move {
                         // Probe provider with 10s TTFB timeout for attestation fetches.
-                        // The serving provider uses the default 30s timeout.
+                        // The serving provider uses the default 90s timeout.
                         let probe_provider = Arc::new(VLlmProvider::new(VLlmConfig::new(
                             url.clone(),
                             api_key.clone(),

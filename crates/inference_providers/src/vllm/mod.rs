@@ -56,7 +56,7 @@ impl VLlmConfig {
         Self {
             base_url,
             api_key,
-            timeout_seconds: timeout_seconds.unwrap_or(30),
+            timeout_seconds: timeout_seconds.unwrap_or(90),
         }
     }
 }
@@ -77,12 +77,13 @@ impl VLlmProvider {
         // firewall-drop (not RST) is the worst case; 5s catches it without penalising
         // fallback latency. Connection-refused is instant regardless.
         // read_timeout guards against stalled backends: if no bytes arrive for this
-        // duration after TTFB, the connection is dropped. Intentionally generous (120s)
-        // so normal long-running inference is unaffected while truly hung backends release resources.
+        // duration, the connection is dropped. Must be generous (300s) because under
+        // heavy load vLLM can stall between chunks during decode when KV cache is under
+        // pressure, causing premature stream termination and lost usage stats.
         let client = Client::builder()
             .connect_timeout(std::time::Duration::from_secs(5))
             .pool_idle_timeout(std::time::Duration::from_secs(90))
-            .read_timeout(std::time::Duration::from_secs(120))
+            .read_timeout(std::time::Duration::from_secs(300))
             .build()
             .expect("Failed to create HTTP client");
 

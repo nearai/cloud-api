@@ -178,10 +178,7 @@ impl WebSearchProviderTrait for BraveWebSearchProvider {
             query_params.push(("operators", op.to_string()));
         }
 
-        tracing::debug!(
-            query_param_count = query_params.len(),
-            "Built Brave query parameters"
-        );
+        tracing::debug!("Query parameters: {:?}", query_params);
 
         let response = self
             .brave_get_builder()
@@ -210,11 +207,6 @@ impl WebSearchProviderTrait for BraveWebSearchProvider {
             .map_err(|e| WebSearchError::WebSearchResponseParsingFailed(e.to_string()))?;
 
         tracing::debug!("Brave API response body: {}", response_text);
-
-        tracing::debug!(
-            response_size_bytes = response_text.len(),
-            "Received Brave API response body"
-        );
 
         // Parse JSON
         let brave_response: BraveSearchResponse =

@@ -134,8 +134,9 @@ pub fn extract_error_message(body: &str) -> String {
 }
 
 /// Regex to extract 'type' values from Python-formatted validation error dicts.
+/// Handles both single-quoted and double-quoted strings.
 static VALIDATION_TYPE_RE: std::sync::LazyLock<regex::Regex> =
-    std::sync::LazyLock::new(|| regex::Regex::new(r"'type':\s*'([^']+)'").unwrap());
+    std::sync::LazyLock::new(|| regex::Regex::new(r#"'type':\s*(?:'([^']+)'|"([^"]+)")"#).unwrap());
 
 /// Regex to extract 'msg' values from Python-formatted validation error dicts.
 /// Handles both single-quoted and double-quoted strings.
@@ -149,46 +150,48 @@ static VALIDATION_MSG_RE: std::sync::LazyLock<regex::Regex> =
 /// and other sensitive conversation content. This function strips those fields while
 /// preserving useful error type and message information.
 fn sanitize_provider_error(message: &str) -> String {
-    // Only sanitize if the message contains user input data in validation errors
-    if !message.contains("'input':") {
+    // Only sanitize if the message contains sensitive fields in validation errors
+    if !message.contains("'input':") && !message.contains("'ctx':") {
         return message.to_string();
     }
 
-    let mut result = Vec::new();
+    message
+        .lines()
+        .filter_map(|line| {
+            let trimmed = line.trim();
 
-    for line in message.lines() {
-        let trimmed = line.trim();
-
-        // Skip stack traces and HTTP method lines (also leak internal paths)
-        if trimmed.starts_with("File \"")
-            || trimmed.starts_with("POST ")
-            || trimmed.starts_with("GET ")
-        {
-            continue;
-        }
-
-        // For validation error dict lines containing 'input', extract only type and msg
-        if trimmed.starts_with('{') && trimmed.contains("'input':") {
-            let error_type = VALIDATION_TYPE_RE
-                .captures(trimmed)
-                .and_then(|c| c.get(1))
-                .map(|m| m.as_str());
-            let error_msg = VALIDATION_MSG_RE
-                .captures(trimmed)
-                .and_then(|c| c.get(1).or_else(|| c.get(2)))
-                .map(|m| m.as_str());
-
-            match (error_type, error_msg) {
-                (Some(t), Some(m)) => result.push(format!("  {}: {}", t, m)),
-                (Some(t), None) => result.push(format!("  {}", t)),
-                _ => result.push("  (validation error)".to_string()),
+            // Skip stack traces and HTTP method lines (also leak internal paths)
+            if trimmed.starts_with("File \"")
+                || trimmed.starts_with("POST ")
+                || trimmed.starts_with("GET ")
+            {
+                return None;
             }
-        } else {
-            result.push(line.to_string());
-        }
-    }
 
-    result.join("\n")
+            // Any line containing 'input' or 'ctx' fields needs sanitization,
+            // regardless of whether it starts with '{' (handles varied formatting)
+            if trimmed.contains("'input':") || trimmed.contains("'ctx':") {
+                let error_type = VALIDATION_TYPE_RE
+                    .captures(trimmed)
+                    .and_then(|c| c.get(1).or_else(|| c.get(2)))
+                    .map(|m| m.as_str());
+                let error_msg = VALIDATION_MSG_RE
+                    .captures(trimmed)
+                    .and_then(|c| c.get(1).or_else(|| c.get(2)))
+                    .map(|m| m.as_str());
+
+                let sanitized = match (error_type, error_msg) {
+                    (Some(t), Some(m)) => format!("  {}: {}", t, m),
+                    (Some(t), None) => format!("  {}", t),
+                    _ => "  (validation error)".to_string(),
+                };
+                Some(sanitized)
+            } else {
+                Some(line.to_string())
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Type alias for streaming completion results
@@ -386,5 +389,29 @@ mod tests {
         assert!(!result.contains("sensitive user data"));
         assert!(result.contains("1 validation errors:"));
         assert!(result.contains("value_error: bad request"));
+    }
+
+    #[test]
+    fn test_sanitize_strips_ctx_only_lines() {
+        // Lines with 'ctx' but no 'input' should also be sanitized
+        let message = concat!(
+            "1 validation errors:\n",
+            "  {'type': 'value_error', 'msg': 'bad', 'ctx': {'error': ValueError('secret data')}}"
+        );
+        let result = sanitize_provider_error(message);
+        assert!(!result.contains("secret data"));
+        assert!(result.contains("value_error: bad"));
+    }
+
+    #[test]
+    fn test_sanitize_handles_non_dict_lines_with_input() {
+        // Lines that don't start with '{' but contain 'input' should still be sanitized
+        let message = concat!(
+            "1 validation errors:\n",
+            "  - {'type': 'value_error', 'msg': 'bad', 'input': 'secret user message'}"
+        );
+        let result = sanitize_provider_error(message);
+        assert!(!result.contains("secret user message"));
+        assert!(result.contains("value_error: bad"));
     }
 }

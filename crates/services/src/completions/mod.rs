@@ -1,6 +1,7 @@
 pub mod ports;
 
 use crate::attestation::ports::AttestationServiceTrait;
+use crate::common::encryption_headers;
 use crate::inference_provider_pool::InferenceProviderPool;
 use crate::models::ModelsRepository;
 use crate::responses::models::ResponseId;
@@ -19,6 +20,7 @@ use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 const FINALIZE_TIMEOUT_SECS: u64 = 5;
+const API_KEY_MODEL_AFFINITY_TTL_SECS: u64 = 300;
 
 type FinalizeFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
 
@@ -449,6 +451,7 @@ pub struct CompletionServiceImpl {
     pub usage_service: Arc<dyn UsageServiceTrait + Send + Sync>,
     pub metrics_service: Arc<dyn MetricsServiceTrait>,
     pub models_repository: Arc<dyn ModelsRepository>,
+    api_key_model_affinity_repository: Arc<dyn ports::ApiKeyModelAffinityRepository>,
     concurrent_counts: Cache<(Uuid, Uuid), Arc<AtomicU32>>,
     concurrent_limit: u32,
     /// Cache for per-organization concurrent limits (5-minute TTL)
@@ -475,6 +478,7 @@ impl CompletionServiceImpl {
         usage_service: Arc<dyn UsageServiceTrait + Send + Sync>,
         metrics_service: Arc<dyn MetricsServiceTrait>,
         models_repository: Arc<dyn ModelsRepository>,
+        api_key_model_affinity_repository: Arc<dyn ports::ApiKeyModelAffinityRepository>,
         organization_limit_repository: Arc<dyn ports::OrganizationConcurrentLimitRepository>,
     ) -> Self {
         let concurrent_counts = Cache::builder()
@@ -494,6 +498,7 @@ impl CompletionServiceImpl {
             usage_service,
             metrics_service,
             models_repository,
+            api_key_model_affinity_repository,
             concurrent_counts,
             concurrent_limit: DEFAULT_CONCURRENT_LIMIT,
             org_concurrent_limits,
@@ -542,6 +547,70 @@ impl CompletionServiceImpl {
                 }
             })
             .await
+    }
+
+    async fn should_use_api_key_model_affinity(
+        &self,
+        model_name: &str,
+        extra: &std::collections::HashMap<String, serde_json::Value>,
+    ) -> bool {
+        if extra.contains_key(encryption_headers::MODEL_PUB_KEY) {
+            return false;
+        }
+
+        !self
+            .inference_provider_pool
+            .is_external_provider(model_name)
+            .await
+    }
+
+    async fn get_preferred_provider_url(
+        &self,
+        api_key_id: Uuid,
+        model_name: &str,
+    ) -> Option<String> {
+        match self
+            .api_key_model_affinity_repository
+            .get_active_provider_url(api_key_id, model_name)
+            .await
+        {
+            Ok(provider_url) => provider_url,
+            Err(error) => {
+                tracing::warn!(
+                    %api_key_id,
+                    model_name,
+                    error = %error,
+                    "Failed to fetch api key model affinity binding; falling back to local routing"
+                );
+                None
+            }
+        }
+    }
+
+    async fn refresh_provider_affinity(
+        &self,
+        api_key_id: Uuid,
+        model_name: &str,
+        provider_url: &str,
+    ) {
+        if let Err(error) = self
+            .api_key_model_affinity_repository
+            .upsert_provider_url(
+                api_key_id,
+                model_name,
+                provider_url,
+                Duration::from_secs(API_KEY_MODEL_AFFINITY_TTL_SECS),
+            )
+            .await
+        {
+            tracing::warn!(
+                %api_key_id,
+                model_name,
+                provider_url,
+                error = %error,
+                "Failed to refresh api key model affinity binding"
+            );
+        }
     }
 
     /// Create low-cardinality metric tags for a request
@@ -1029,6 +1098,16 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
             chat_params.model = canonical_name.clone();
         }
 
+        let preferred_provider_url = if self
+            .should_use_api_key_model_affinity(canonical_name, &request.extra)
+            .await
+        {
+            self.get_preferred_provider_url(api_key_id, canonical_name)
+                .await
+        } else {
+            None
+        };
+
         let counter = self
             .try_acquire_concurrent_slot(organization_id, model.id, canonical_name)
             .await?;
@@ -1040,12 +1119,16 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         let provider_start_time = Instant::now();
 
         // Get the LLM stream
-        let llm_stream = match self
+        let (llm_stream, used_provider_url) = match self
             .inference_provider_pool
-            .chat_completion_stream(chat_params, request.body_hash.clone())
+            .chat_completion_stream_with_preferred_provider(
+                chat_params,
+                request.body_hash.clone(),
+                preferred_provider_url.clone(),
+            )
             .await
         {
-            Ok(stream) => stream,
+            Ok(result) => result,
             Err(e) => {
                 // Guard will decrement counter on drop
                 let err = Self::map_provider_error(&request.model, &e, "chat completion stream");
@@ -1053,6 +1136,11 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
                 return Err(err);
             }
         };
+
+        if let Some(provider_url) = used_provider_url.as_deref() {
+            self.refresh_provider_affinity(api_key_id, canonical_name, provider_url)
+                .await;
+        }
 
         // Transfer counter ownership to InterceptStream (which decrements on drop)
         let counter = guard.disarm();
@@ -1175,6 +1263,16 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
             chat_params.model = canonical_name.clone();
         }
 
+        let preferred_provider_url = if self
+            .should_use_api_key_model_affinity(canonical_name, &request.extra)
+            .await
+        {
+            self.get_preferred_provider_url(api_key_id, canonical_name)
+                .await
+        } else {
+            None
+        };
+
         let organization_id = request.organization_id;
         let counter = self
             .try_acquire_concurrent_slot(organization_id, model.id, canonical_name)
@@ -1186,10 +1284,14 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         let provider_start_time = Instant::now();
         let result = self
             .inference_provider_pool
-            .chat_completion(chat_params, request.body_hash.clone())
+            .chat_completion_with_preferred_provider(
+                chat_params,
+                request.body_hash.clone(),
+                preferred_provider_url.clone(),
+            )
             .await;
 
-        let response_with_bytes = match result {
+        let (response_with_bytes, used_provider_url) = match result {
             Ok(response) => response,
             Err(e) => {
                 let err = Self::map_provider_error(&request.model, &e, "chat completion");
@@ -1197,6 +1299,11 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
                 return Err(err);
             }
         };
+
+        if let Some(provider_url) = used_provider_url.as_deref() {
+            self.refresh_provider_affinity(api_key_id, canonical_name, provider_url)
+                .await;
+        }
 
         let e2e_latency = service_start_time.elapsed();
         let backend_latency = provider_start_time.elapsed();

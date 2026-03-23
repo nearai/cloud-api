@@ -292,6 +292,10 @@ pub async fn init_domain_services_with_pool(
     let models_repo = Arc::new(database::repositories::ModelRepository::new(
         database.pool().clone(),
     ));
+    let api_key_model_affinity_repo = Arc::new(
+        database::repositories::PgApiKeyModelAffinityRepository::new(database.pool().clone()),
+    )
+        as Arc<dyn services::completions::ports::ApiKeyModelAffinityRepository>;
 
     // Load external providers from database
     match models_repo.get_external_models().await {
@@ -416,6 +420,7 @@ pub async fn init_domain_services_with_pool(
         usage_service.clone(),
         metrics_service.clone(),
         models_repo.clone() as Arc<dyn services::models::ModelsRepository>,
+        api_key_model_affinity_repo,
         org_limit_repository,
     ));
 

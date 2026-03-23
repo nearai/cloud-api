@@ -67,6 +67,9 @@ pub struct InferenceProviderPool {
     discovery_timeout: Duration,
     /// Combined provider mappings (updated atomically to prevent race conditions)
     provider_mappings: Arc<RwLock<ProviderMappings>>,
+    /// Best-effort mapping of provider pointer -> provider URL for discovered vLLM backends.
+    /// Used by api-key affinity routing to prefer a previously bound provider URL.
+    provider_urls: Arc<RwLock<HashMap<usize, String>>>,
     /// External providers (keyed by model name, created from database config)
     external_providers: Arc<RwLock<HashMap<String, Arc<InferenceProviderTrait>>>>,
     /// Configuration for external providers (API keys, timeouts, etc.)
@@ -101,6 +104,7 @@ impl InferenceProviderPool {
             api_key,
             discovery_timeout: Duration::from_secs(discovery_timeout_secs as u64),
             provider_mappings: Arc::new(RwLock::new(ProviderMappings::new())),
+            provider_urls: Arc::new(RwLock::new(HashMap::new())),
             external_providers: Arc::new(RwLock::new(HashMap::new())),
             external_configs,
             load_balancer_index: Arc::new(std::sync::RwLock::new(HashMap::new())),
@@ -109,6 +113,10 @@ impl InferenceProviderPool {
             external_refresh_task_handle: Arc::new(Mutex::new(None)),
             provider_failure_counts: Arc::new(std::sync::RwLock::new(HashMap::new())),
         }
+    }
+
+    fn provider_ptr(provider: &Arc<InferenceProviderTrait>) -> usize {
+        Arc::as_ptr(provider) as *const () as usize
     }
 
     /// Register an external provider for a model
@@ -591,6 +599,7 @@ impl InferenceProviderPool {
 
                         (
                             model_name,
+                            url,
                             serving_provider,
                             pub_keys,
                             has_valid_attestation,
@@ -611,6 +620,7 @@ impl InferenceProviderPool {
         let mut all_models = Vec::new();
         let mut model_providers: HashMap<String, Vec<Arc<InferenceProviderTrait>>> = HashMap::new();
         let mut model_pub_key_updates: Vec<(String, Arc<InferenceProviderTrait>)> = Vec::new();
+        let mut provider_url_updates: Vec<(usize, String)> = Vec::new();
 
         // Track per-model endpoint counts for logging
         let mut model_endpoint_counts: HashMap<&str, usize> = HashMap::new();
@@ -618,8 +628,9 @@ impl InferenceProviderPool {
             model_endpoint_counts.insert(model_name, endpoints.len());
         }
 
-        for (model_name, provider, pub_keys, has_valid_attestation) in results {
+        for (model_name, url, provider, pub_keys, has_valid_attestation) in results {
             if has_valid_attestation {
+                provider_url_updates.push((Self::provider_ptr(&provider), url));
                 model_pub_key_updates.extend(pub_keys);
                 model_providers
                     .entry(model_name)
@@ -745,7 +756,7 @@ impl InferenceProviderPool {
                 .model_to_providers
                 .values()
                 .flat_map(|providers| providers.iter())
-                .map(|p| Arc::as_ptr(p) as *const () as usize)
+                .map(Self::provider_ptr)
                 .collect();
 
             let mut counts = self
@@ -753,6 +764,25 @@ impl InferenceProviderPool {
                 .write()
                 .unwrap_or_else(|e| e.into_inner());
             counts.retain(|key, _| active_ptrs.contains(key));
+        }
+
+        {
+            let mappings = self.provider_mappings.read().await;
+            let active_ptrs: HashSet<usize> = mappings
+                .model_to_providers
+                .values()
+                .flat_map(|providers| providers.iter())
+                .map(Self::provider_ptr)
+                .collect();
+            drop(mappings);
+
+            let mut provider_urls = self.provider_urls.write().await;
+            provider_urls.retain(|key, _| active_ptrs.contains(key));
+            for (provider_ptr, url) in provider_url_updates {
+                if active_ptrs.contains(&provider_ptr) {
+                    provider_urls.insert(provider_ptr, url);
+                }
+            }
         }
 
         // Compute actual pool size (includes both fresh and retained providers)
@@ -815,6 +845,7 @@ impl InferenceProviderPool {
         &self,
         model_id: &str,
         model_pub_key: Option<&str>,
+        preferred_provider_url: Option<&str>,
     ) -> Option<Vec<Arc<InferenceProviderTrait>>> {
         let mappings = self.provider_mappings.read().await;
 
@@ -861,16 +892,18 @@ impl InferenceProviderPool {
             format!("id:{}", model_id)
         };
 
-        let mut indices = self
-            .load_balancer_index
-            .write()
-            .unwrap_or_else(|e| e.into_inner());
-        let index = indices.entry(index_key.clone()).or_insert(0);
-        let selected_index = *index % providers.len();
+        let selected_index = {
+            let mut indices = self
+                .load_balancer_index
+                .write()
+                .unwrap_or_else(|e| e.into_inner());
+            let index = indices.entry(index_key.clone()).or_insert(0);
+            let selected_index = *index % providers.len();
 
-        // Increment for next request
-        *index = (*index + 1) % providers.len();
-        drop(indices);
+            // Increment for next request
+            *index = (*index + 1) % providers.len();
+            selected_index
+        };
 
         // Build ordered list following round-robin pattern:
         // selected provider first, then continue round-robin (selected+1, selected+2, ...)
@@ -878,6 +911,19 @@ impl InferenceProviderPool {
         for i in 0..providers.len() {
             let provider_index = (selected_index + i) % providers.len();
             ordered_providers.push(providers[provider_index].clone());
+        }
+
+        if let Some(preferred_provider_url) = preferred_provider_url {
+            let provider_urls = self.provider_urls.read().await;
+            if let Some(preferred_index) = ordered_providers.iter().position(|provider| {
+                provider_urls
+                    .get(&Self::provider_ptr(provider))
+                    .map(|url| url == preferred_provider_url)
+                    .unwrap_or(false)
+            }) {
+                let preferred_provider = ordered_providers.remove(preferred_index);
+                ordered_providers.insert(0, preferred_provider);
+            }
         }
 
         // Partition providers by failure count: healthy providers first, then demoted.
@@ -910,6 +956,11 @@ impl InferenceProviderPool {
         );
 
         Some(ordered_providers)
+    }
+
+    async fn get_provider_url(&self, provider: &Arc<InferenceProviderTrait>) -> Option<String> {
+        let provider_urls = self.provider_urls.read().await;
+        provider_urls.get(&Self::provider_ptr(provider)).cloned()
     }
 
     /// Sanitize a CompletionError by preserving its variant structure while sanitizing messages
@@ -987,6 +1038,7 @@ impl InferenceProviderPool {
         model_id: &str,
         operation_name: &str,
         model_pub_key: Option<&str>,
+        preferred_provider_url: Option<&str>,
         provider_fn: F,
     ) -> Result<(T, Arc<InferenceProviderTrait>), CompletionError>
     where
@@ -1030,7 +1082,7 @@ impl InferenceProviderPool {
 
         // Get vLLM providers with load balancing (handles both model_id and model_pub_key cases)
         let providers = match self
-            .get_providers_with_fallback(model_id, model_pub_key)
+            .get_providers_with_fallback(model_id, model_pub_key, preferred_provider_url)
             .await
         {
             Some(p) => p,
@@ -1263,9 +1315,21 @@ impl InferenceProviderPool {
 
     pub async fn chat_completion_stream(
         &self,
-        mut params: ChatCompletionParams,
+        params: ChatCompletionParams,
         request_hash: String,
     ) -> Result<StreamingResult, CompletionError> {
+        let (stream, _provider_url) = self
+            .chat_completion_stream_with_preferred_provider(params, request_hash, None)
+            .await?;
+        Ok(stream)
+    }
+
+    pub async fn chat_completion_stream_with_preferred_provider(
+        &self,
+        mut params: ChatCompletionParams,
+        request_hash: String,
+        preferred_provider_url: Option<String>,
+    ) -> Result<(StreamingResult, Option<String>), CompletionError> {
         let model_id = params.model.clone();
 
         // Extract model_pub_key from params.extra for routing
@@ -1287,6 +1351,7 @@ impl InferenceProviderPool {
                 &model_id,
                 "chat_completion_stream",
                 model_pub_key,
+                preferred_provider_url.as_deref(),
                 |provider| {
                     let params = params_for_provider.clone();
                     let request_hash = request_hash.clone();
@@ -1297,6 +1362,7 @@ impl InferenceProviderPool {
 
         // Store chat_id mapping for sticky routing by peeking at the first event
         // Must be synchronous to ensure attestation service can find the provider
+        let provider_url = self.get_provider_url(&provider).await;
         let mut peekable = StreamingResultExt::peekable(stream);
         if let Some(Ok(event)) = peekable.peek().await {
             if let inference_providers::StreamChunk::Chat(chat_chunk) = &event.chunk {
@@ -1308,14 +1374,32 @@ impl InferenceProviderPool {
                 self.store_chat_id_mapping(chat_id, provider).await;
             }
         }
-        Ok(Box::pin(peekable))
+        Ok((Box::pin(peekable), provider_url))
     }
 
     pub async fn chat_completion(
         &self,
-        mut params: ChatCompletionParams,
+        params: ChatCompletionParams,
         request_hash: String,
     ) -> Result<inference_providers::ChatCompletionResponseWithBytes, CompletionError> {
+        let (response, _provider_url) = self
+            .chat_completion_with_preferred_provider(params, request_hash, None)
+            .await?;
+        Ok(response)
+    }
+
+    pub async fn chat_completion_with_preferred_provider(
+        &self,
+        mut params: ChatCompletionParams,
+        request_hash: String,
+        preferred_provider_url: Option<String>,
+    ) -> Result<
+        (
+            inference_providers::ChatCompletionResponseWithBytes,
+            Option<String>,
+        ),
+        CompletionError,
+    > {
         let model_id = params.model.clone();
 
         // Extract model_pub_key from params.extra for routing before any cloning.
@@ -1336,15 +1420,22 @@ impl InferenceProviderPool {
         let params_for_provider = params.clone();
 
         let (response, provider) = self
-            .retry_with_fallback(&model_id, "chat_completion", model_pub_key, |provider| {
-                let params = params_for_provider.clone();
-                let request_hash = request_hash.clone();
-                async move { provider.chat_completion(params, request_hash).await }
-            })
+            .retry_with_fallback(
+                &model_id,
+                "chat_completion",
+                model_pub_key,
+                preferred_provider_url.as_deref(),
+                |provider| {
+                    let params = params_for_provider.clone();
+                    let request_hash = request_hash.clone();
+                    async move { provider.chat_completion(params, request_hash).await }
+                },
+            )
             .await?;
 
         // Store the chat_id mapping SYNCHRONOUSLY before returning
         // This ensures the attestation service can find the provider
+        let provider_url = self.get_provider_url(&provider).await;
         let chat_id = response.response.id.clone();
         tracing::info!(
             chat_id = %chat_id,
@@ -1356,7 +1447,7 @@ impl InferenceProviderPool {
             "Stored chat_id mapping before returning response"
         );
 
-        Ok(response)
+        Ok((response, provider_url))
     }
 
     /// Generate images using the specified model
@@ -1387,16 +1478,22 @@ impl InferenceProviderPool {
         let cloned_params = params.clone();
 
         let (response, provider) = self
-            .retry_with_fallback(&model_id, "image_generation", model_pub_key, |provider| {
-                let params = cloned_params.clone();
-                let request_hash = request_hash.clone();
-                async move {
-                    provider
-                        .image_generation(params, request_hash)
-                        .await
-                        .map_err(|e| CompletionError::CompletionError(e.to_string()))
-                }
-            })
+            .retry_with_fallback(
+                &model_id,
+                "image_generation",
+                model_pub_key,
+                None,
+                |provider| {
+                    let params = cloned_params.clone();
+                    let request_hash = request_hash.clone();
+                    async move {
+                        provider
+                            .image_generation(params, request_hash)
+                            .await
+                            .map_err(|e| CompletionError::CompletionError(e.to_string()))
+                    }
+                },
+            )
             .await
             .map_err(|e| ImageGenerationError::GenerationError(e.to_string()))?;
 
@@ -1428,7 +1525,7 @@ impl InferenceProviderPool {
         );
 
         let (response, _provider) = self
-            .retry_with_fallback(&model_id, "audio_transcription", None, |provider| {
+            .retry_with_fallback(&model_id, "audio_transcription", None, None, |provider| {
                 let params = params.clone();
                 let request_hash = request_hash.clone();
                 async move {
@@ -1472,7 +1569,7 @@ impl InferenceProviderPool {
         let params = Arc::new(params);
 
         let (response, provider) = self
-            .retry_with_fallback(&model_id, "image_edit", None, |provider| {
+            .retry_with_fallback(&model_id, "image_edit", None, None, |provider| {
                 let params = params.clone();
                 let request_hash = request_hash.clone();
                 async move {
@@ -1522,7 +1619,10 @@ impl InferenceProviderPool {
         })?;
 
         // Get vLLM providers with load balancing
-        let providers = match self.get_providers_with_fallback(&model_id, None).await {
+        let providers = match self
+            .get_providers_with_fallback(&model_id, None, None)
+            .await
+        {
             Some(p) => p,
             None => {
                 let mappings = self.provider_mappings.read().await;
@@ -1593,7 +1693,7 @@ impl InferenceProviderPool {
         })?;
 
         // Get vLLM providers with load balancing
-        let providers = match self.get_providers_with_fallback(model, None).await {
+        let providers = match self.get_providers_with_fallback(model, None, None).await {
             Some(p) => p,
             None => {
                 let mappings = self.provider_mappings.read().await;
@@ -1667,7 +1767,10 @@ impl InferenceProviderPool {
         })?;
 
         // Get vLLM providers with load balancing
-        let providers = match self.get_providers_with_fallback(&model_id, None).await {
+        let providers = match self
+            .get_providers_with_fallback(&model_id, None, None)
+            .await
+        {
             Some(p) => p,
             None => {
                 let mappings = self.provider_mappings.read().await;
@@ -2136,6 +2239,47 @@ mod tests {
 
         while stream.next().await.is_some() {}
         assert!(pool.get_provider_by_chat_id(&chat_id).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_preferred_provider_url_is_prioritized_when_available() {
+        use inference_providers::mock::MockProvider;
+
+        let pool = InferenceProviderPool::new(
+            "http://localhost:8080/models".to_string(),
+            None,
+            5,
+            ExternalProvidersConfig::default(),
+        );
+
+        let provider_a: Arc<InferenceProviderTrait> = Arc::new(MockProvider::new());
+        let provider_b: Arc<InferenceProviderTrait> = Arc::new(MockProvider::new());
+        let model_id = "Qwen/Qwen3-30B-A3B-Instruct-2507".to_string();
+
+        pool.register_providers(vec![
+            (model_id.clone(), provider_a.clone()),
+            (model_id.clone(), provider_b.clone()),
+        ])
+        .await;
+
+        {
+            let mut provider_urls = pool.provider_urls.write().await;
+            provider_urls.insert(
+                InferenceProviderPool::provider_ptr(&provider_a),
+                "http://10.0.0.1:8000".to_string(),
+            );
+            provider_urls.insert(
+                InferenceProviderPool::provider_ptr(&provider_b),
+                "http://10.0.0.2:8000".to_string(),
+            );
+        }
+
+        let providers = pool
+            .get_providers_with_fallback(&model_id, None, Some("http://10.0.0.2:8000"))
+            .await
+            .expect("providers should exist");
+
+        assert!(Arc::ptr_eq(&providers[0], &provider_b));
     }
 
     // ==================== External Provider Tests ====================
@@ -2718,7 +2862,7 @@ mod tests {
         let (pool, model_id) = pool_with_mock_provider().await;
 
         let result: Result<((), _), _> = pool
-            .retry_with_fallback(&model_id, "test_op", None, |_provider| async {
+            .retry_with_fallback(&model_id, "test_op", None, None, |_provider| async {
                 Err(CompletionError::HttpError {
                     status_code: 400,
                     message: "Bad request".to_string(),
@@ -2743,7 +2887,7 @@ mod tests {
 
         // 429 should NOT short-circuit - it should fall through to the normal retry path
         let result: Result<((), _), _> = pool
-            .retry_with_fallback(&model_id, "test_op", None, |_provider| async {
+            .retry_with_fallback(&model_id, "test_op", None, None, |_provider| async {
                 Err(CompletionError::HttpError {
                     status_code: 429,
                     message: "Rate limit exceeded".to_string(),
@@ -2770,7 +2914,7 @@ mod tests {
 
         // 408 should NOT short-circuit - it should fall through to the normal retry path
         let result: Result<((), _), _> = pool
-            .retry_with_fallback(&model_id, "test_op", None, |_provider| async {
+            .retry_with_fallback(&model_id, "test_op", None, None, |_provider| async {
                 Err(CompletionError::HttpError {
                     status_code: 408,
                     message: "Request timeout".to_string(),
@@ -2794,7 +2938,7 @@ mod tests {
         let (pool, model_id) = pool_with_mock_provider().await;
 
         let result: Result<((), _), _> = pool
-            .retry_with_fallback(&model_id, "test_op", None, |_provider| async {
+            .retry_with_fallback(&model_id, "test_op", None, None, |_provider| async {
                 Err(CompletionError::HttpError {
                     status_code: 400,
                     message: "Error at http://192.168.0.1:8000/v1/chat/completions".to_string(),

@@ -3,6 +3,7 @@ use crate::UserId;
 use async_trait::async_trait;
 use inference_providers::StreamingResult;
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
 use uuid::Uuid;
 
 /// Default concurrent request limit per organization per model
@@ -121,6 +122,23 @@ pub trait OrganizationConcurrentLimitRepository: Send + Sync {
     /// Get the concurrent request limit for an organization
     /// Returns None if no custom limit is set (use default)
     async fn get_concurrent_limit(&self, org_id: Uuid) -> Result<Option<u32>, anyhow::Error>;
+}
+
+#[async_trait]
+pub trait ApiKeyModelAffinityRepository: Send + Sync {
+    async fn get_active_provider_url(
+        &self,
+        api_key_id: Uuid,
+        model_name: &str,
+    ) -> Result<Option<String>, anyhow::Error>;
+
+    async fn upsert_provider_url(
+        &self,
+        api_key_id: Uuid,
+        model_name: &str,
+        provider_url: &str,
+        ttl: Duration,
+    ) -> Result<(), anyhow::Error>;
 }
 
 #[async_trait]

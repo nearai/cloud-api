@@ -21,6 +21,9 @@ use std::time::{Duration, Instant};
 
 const FINALIZE_TIMEOUT_SECS: u64 = 5;
 const API_KEY_MODEL_AFFINITY_TTL_SECS: u64 = 300;
+// Best-effort background refreshes should fail fast under DB pool pressure or transient
+// Postgres slowness. If this timeout is hit, we only lose one affinity refresh and may reduce
+// short-term cache locality on a later request; it must not affect request correctness.
 const API_KEY_MODEL_AFFINITY_REFRESH_TIMEOUT_SECS: u64 = 2;
 
 type FinalizeFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
@@ -602,9 +605,14 @@ impl CompletionServiceImpl {
         {
             Ok(provider_url) => provider_url,
             Err(error) => {
-                tracing::warn!(
+                tracing::debug!(
                     %api_key_id,
                     model_name,
+                    error = %error,
+                    "Failed to fetch api key model affinity binding"
+                );
+                tracing::warn!(
+                    %api_key_id,
                     error = %error,
                     "Failed to fetch api key model affinity binding; falling back to local routing"
                 );
@@ -624,6 +632,8 @@ impl CompletionServiceImpl {
         let provider_url = provider_url.to_string();
 
         tokio::spawn(async move {
+            // This refresh is intentionally fire-and-forget so successful completions do not
+            // wait on a DB upsert before returning to the client.
             match tokio::time::timeout(
                 Duration::from_secs(API_KEY_MODEL_AFFINITY_REFRESH_TIMEOUT_SECS),
                 repository.upsert_provider_url(
@@ -637,16 +647,21 @@ impl CompletionServiceImpl {
             {
                 Ok(Ok(())) => {}
                 Ok(Err(error)) => {
-                    tracing::warn!(
+                    tracing::debug!(
                         %api_key_id,
                         model_name,
                         provider_url,
                         error = %error,
                         "Failed to refresh api key model affinity binding"
                     );
+                    tracing::warn!(
+                        %api_key_id,
+                        error = %error,
+                        "Failed to refresh api key model affinity binding"
+                    );
                 }
                 Err(_) => {
-                    tracing::warn!(
+                    tracing::debug!(
                         %api_key_id,
                         model_name,
                         provider_url,

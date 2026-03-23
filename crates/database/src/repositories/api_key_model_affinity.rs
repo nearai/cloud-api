@@ -17,6 +17,11 @@ impl PgApiKeyModelAffinityRepository {
     }
 
     fn advisory_lock_key(api_key_id: Uuid, model_name: &str) -> i64 {
+        // PostgreSQL advisory locks take a signed 64-bit key, so we hash the logical
+        // identifier `(api_key_id, model_name)` down to a deterministic i64. Taking the
+        // first 8 bytes of SHA-256 gives us a stable 64-bit value without introducing a
+        // custom serialization format, and masking with `i64::MAX` clears the sign bit so
+        // the lock key stays non-negative in logs/debugging output.
         let mut hasher = Sha256::new();
         hasher.update(api_key_id.as_bytes());
         hasher.update([0]);

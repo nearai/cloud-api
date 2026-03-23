@@ -21,6 +21,7 @@ use std::time::{Duration, Instant};
 
 const FINALIZE_TIMEOUT_SECS: u64 = 5;
 const API_KEY_MODEL_AFFINITY_TTL_SECS: u64 = 300;
+const API_KEY_MODEL_AFFINITY_REFRESH_TIMEOUT_SECS: u64 = 2;
 
 type FinalizeFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
 
@@ -612,30 +613,49 @@ impl CompletionServiceImpl {
         }
     }
 
-    async fn refresh_provider_affinity(
+    fn schedule_provider_affinity_refresh(
         &self,
         api_key_id: Uuid,
         model_name: &str,
         provider_url: &str,
     ) {
-        if let Err(error) = self
-            .api_key_model_affinity_repository
-            .upsert_provider_url(
-                api_key_id,
-                model_name,
-                provider_url,
-                Duration::from_secs(API_KEY_MODEL_AFFINITY_TTL_SECS),
+        let repository = self.api_key_model_affinity_repository.clone();
+        let model_name = model_name.to_string();
+        let provider_url = provider_url.to_string();
+
+        tokio::spawn(async move {
+            match tokio::time::timeout(
+                Duration::from_secs(API_KEY_MODEL_AFFINITY_REFRESH_TIMEOUT_SECS),
+                repository.upsert_provider_url(
+                    api_key_id,
+                    &model_name,
+                    &provider_url,
+                    Duration::from_secs(API_KEY_MODEL_AFFINITY_TTL_SECS),
+                ),
             )
             .await
-        {
-            tracing::warn!(
-                %api_key_id,
-                model_name,
-                provider_url,
-                error = %error,
-                "Failed to refresh api key model affinity binding"
-            );
-        }
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    tracing::warn!(
+                        %api_key_id,
+                        model_name,
+                        provider_url,
+                        error = %error,
+                        "Failed to refresh api key model affinity binding"
+                    );
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        %api_key_id,
+                        model_name,
+                        provider_url,
+                        timeout_secs = API_KEY_MODEL_AFFINITY_REFRESH_TIMEOUT_SECS,
+                        "Timed out while refreshing api key model affinity binding"
+                    );
+                }
+            }
+        });
     }
 
     /// Create low-cardinality metric tags for a request
@@ -1163,8 +1183,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         };
 
         if let Some(provider_url) = used_provider_url.as_deref() {
-            self.refresh_provider_affinity(api_key_id, canonical_name, provider_url)
-                .await;
+            self.schedule_provider_affinity_refresh(api_key_id, canonical_name, provider_url);
         }
 
         // Transfer counter ownership to InterceptStream (which decrements on drop)
@@ -1326,8 +1345,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         };
 
         if let Some(provider_url) = used_provider_url.as_deref() {
-            self.refresh_provider_affinity(api_key_id, canonical_name, provider_url)
-                .await;
+            self.schedule_provider_affinity_refresh(api_key_id, canonical_name, provider_url);
         }
 
         let e2e_latency = service_start_time.elapsed();

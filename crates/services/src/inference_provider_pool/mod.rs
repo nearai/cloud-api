@@ -963,6 +963,30 @@ impl InferenceProviderPool {
         provider_urls.get(&Self::provider_ptr(provider)).cloned()
     }
 
+    pub async fn select_provider_url_for_model(
+        &self,
+        model_id: &str,
+    ) -> Result<Option<String>, CompletionError> {
+        if self.get_external_provider(model_id).await.is_some() {
+            return Ok(None);
+        }
+
+        self.ensure_models_discovered().await?;
+
+        let providers = match self.get_providers_with_fallback(model_id, None, None).await {
+            Some(providers) => providers,
+            None => return Ok(None),
+        };
+
+        for provider in providers {
+            if let Some(provider_url) = self.get_provider_url(&provider).await {
+                return Ok(Some(provider_url));
+            }
+        }
+
+        Ok(None)
+    }
+
     /// Sanitize a CompletionError by preserving its variant structure while sanitizing messages
     fn sanitize_completion_error(error: CompletionError, model_id: &str) -> CompletionError {
         // Helper to sanitize message and format with model_id context

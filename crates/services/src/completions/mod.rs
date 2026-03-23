@@ -30,6 +30,21 @@ enum StreamState {
     Done,
 }
 
+struct ExistingRoutingProviderUrlSelector {
+    inference_provider_pool: Arc<InferenceProviderPool>,
+    model_name: String,
+}
+
+#[async_trait::async_trait]
+impl ports::ProviderUrlSelector for ExistingRoutingProviderUrlSelector {
+    async fn select_provider_url(&self) -> Result<Option<String>, anyhow::Error> {
+        self.inference_provider_pool
+            .select_provider_url_for_model(&self.model_name)
+            .await
+            .map_err(|error| anyhow::anyhow!(error.to_string()))
+    }
+}
+
 /// Hash inference ID to UUID deterministically using MD5 (v5)
 /// Takes the full ID including prefix (e.g., "chatcmpl-abc123") and returns a stable UUID
 pub fn hash_inference_id_to_uuid(full_id: &str) -> Uuid {
@@ -564,14 +579,24 @@ impl CompletionServiceImpl {
             .await
     }
 
-    async fn get_preferred_provider_url(
+    async fn get_or_create_preferred_provider_url(
         &self,
         api_key_id: Uuid,
         model_name: &str,
     ) -> Option<String> {
+        let selector = ExistingRoutingProviderUrlSelector {
+            inference_provider_pool: self.inference_provider_pool.clone(),
+            model_name: model_name.to_string(),
+        };
+
         match self
             .api_key_model_affinity_repository
-            .get_active_provider_url(api_key_id, model_name)
+            .get_or_create_active_provider_url(
+                api_key_id,
+                model_name,
+                Duration::from_secs(API_KEY_MODEL_AFFINITY_TTL_SECS),
+                &selector,
+            )
             .await
         {
             Ok(provider_url) => provider_url,
@@ -1102,7 +1127,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
             .should_use_api_key_model_affinity(canonical_name, &request.extra)
             .await
         {
-            self.get_preferred_provider_url(api_key_id, canonical_name)
+            self.get_or_create_preferred_provider_url(api_key_id, canonical_name)
                 .await
         } else {
             None
@@ -1267,7 +1292,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
             .should_use_api_key_model_affinity(canonical_name, &request.extra)
             .await
         {
-            self.get_preferred_provider_url(api_key_id, canonical_name)
+            self.get_or_create_preferred_provider_url(api_key_id, canonical_name)
                 .await
         } else {
             None

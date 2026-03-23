@@ -126,6 +126,14 @@ pub trait OrganizationConcurrentLimitRepository: Send + Sync {
 
 #[async_trait]
 pub trait ApiKeyModelAffinityRepository: Send + Sync {
+    async fn get_or_create_active_provider_url(
+        &self,
+        api_key_id: Uuid,
+        model_name: &str,
+        ttl: Duration,
+        selector: &(dyn ProviderUrlSelector + Send + Sync),
+    ) -> Result<Option<String>, anyhow::Error>;
+
     async fn get_active_provider_url(
         &self,
         api_key_id: Uuid,
@@ -139,6 +147,11 @@ pub trait ApiKeyModelAffinityRepository: Send + Sync {
         provider_url: &str,
         ttl: Duration,
     ) -> Result<(), anyhow::Error>;
+}
+
+#[async_trait]
+pub trait ProviderUrlSelector: Send + Sync {
+    async fn select_provider_url(&self) -> Result<Option<String>, anyhow::Error>;
 }
 
 #[async_trait]

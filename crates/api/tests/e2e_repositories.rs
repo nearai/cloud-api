@@ -2,13 +2,36 @@
 // These tests directly test repository behavior with the database
 mod common;
 
+use async_trait::async_trait;
 use chrono::{Duration, Utc};
-use database::OAuthStateRepository;
+use database::{OAuthStateRepository, PgApiKeyModelAffinityRepository};
+use services::completions::ports::ApiKeyModelAffinityRepository;
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc,
+};
+use std::time::Duration as StdDuration;
+use tokio::sync::Barrier;
+use uuid::Uuid;
 
 async fn get_test_pool() -> database::pool::DbPool {
     let (_server, _inference_provider_pool, _mock_provider, database) =
         common::setup_test_server_with_pool().await;
     database.pool().clone()
+}
+
+struct TestProviderUrlSelector {
+    provider_url: String,
+    call_count: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl services::completions::ports::ProviderUrlSelector for TestProviderUrlSelector {
+    async fn select_provider_url(&self) -> Result<Option<String>, anyhow::Error> {
+        self.call_count.fetch_add(1, Ordering::SeqCst);
+        tokio::time::sleep(StdDuration::from_millis(50)).await;
+        Ok(Some(self.provider_url.clone()))
+    }
 }
 
 // ============================================
@@ -113,4 +136,63 @@ async fn test_state_replay_protection() {
     // Second get should fail (replay protection)
     let second = repo.get_and_delete(&state).await.unwrap();
     assert!(second.is_none());
+}
+
+// ============================================
+// API Key Model Affinity Repository Tests
+// ============================================
+
+#[tokio::test]
+async fn test_affinity_get_or_create_uses_advisory_lock_for_concurrent_miss() {
+    let pool = get_test_pool().await;
+    let repo = Arc::new(PgApiKeyModelAffinityRepository::new(pool.clone()));
+
+    let api_key_id = Uuid::new_v4();
+    let model_name = format!("test-model-{}", Uuid::new_v4());
+    let provider_url = "http://10.0.0.7:8000".to_string();
+    let selector_calls = Arc::new(AtomicUsize::new(0));
+    let barrier = Arc::new(Barrier::new(4));
+
+    let mut handles: Vec<tokio::task::JoinHandle<anyhow::Result<Option<String>>>> = Vec::new();
+    for _ in 0..4 {
+        let repo = repo.clone();
+        let barrier = barrier.clone();
+        let selector_calls = selector_calls.clone();
+        let provider_url = provider_url.clone();
+        let model_name = model_name.clone();
+
+        handles.push(tokio::spawn(async move {
+            let selector = TestProviderUrlSelector {
+                provider_url,
+                call_count: selector_calls,
+            };
+
+            barrier.wait().await;
+
+            repo.get_or_create_active_provider_url(
+                api_key_id,
+                &model_name,
+                StdDuration::from_secs(300),
+                &selector,
+            )
+            .await
+        }));
+    }
+
+    let mut results = Vec::new();
+    for handle in handles {
+        results.push(handle.await.unwrap().unwrap());
+    }
+
+    assert_eq!(selector_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(results.len(), 4);
+    assert!(results
+        .iter()
+        .all(|value: &Option<String>| value.as_deref() == Some(provider_url.as_str())));
+
+    let stored = repo
+        .get_active_provider_url(api_key_id, &model_name)
+        .await
+        .unwrap();
+    assert_eq!(stored.as_deref(), Some(provider_url.as_str()));
 }

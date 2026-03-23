@@ -2,9 +2,9 @@ use crate::pool::DbPool;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use chrono::{Duration as ChronoDuration, Utc};
+use deadpool_postgres::GenericClient;
 use sha2::{Digest, Sha256};
 use std::time::Duration;
-use tracing::warn;
 use uuid::Uuid;
 
 pub struct PgApiKeyModelAffinityRepository {
@@ -29,11 +29,14 @@ impl PgApiKeyModelAffinityRepository {
         i64::from_be_bytes(bytes) & i64::MAX
     }
 
-    async fn get_active_provider_url_with_client(
-        client: &tokio_postgres::Client,
+    async fn get_active_provider_url_with_client<C>(
+        client: &C,
         api_key_id: Uuid,
         model_name: &str,
-    ) -> Result<Option<String>> {
+    ) -> Result<Option<String>>
+    where
+        C: GenericClient + Sync,
+    {
         let now = Utc::now();
         let row = client
             .query_opt(
@@ -52,13 +55,16 @@ impl PgApiKeyModelAffinityRepository {
         Ok(row.map(|row| row.get("provider_url")))
     }
 
-    async fn upsert_provider_url_with_client(
-        client: &tokio_postgres::Client,
+    async fn upsert_provider_url_with_client<C>(
+        client: &C,
         api_key_id: Uuid,
         model_name: &str,
         provider_url: &str,
         ttl: Duration,
-    ) -> Result<()> {
+    ) -> Result<()>
+    where
+        C: GenericClient + Sync,
+    {
         let now = Utc::now();
         let ttl = ChronoDuration::from_std(ttl).context("Invalid affinity TTL")?;
         let expires_at = now + ttl;
@@ -100,21 +106,34 @@ impl services::completions::ports::ApiKeyModelAffinityRepository
         ttl: Duration,
         selector: &(dyn services::completions::ports::ProviderUrlSelector + Send + Sync),
     ) -> Result<Option<String>> {
-        let client = self
+        let mut client = self
             .pool
             .get()
             .await
             .context("Failed to get database connection")?;
+
+        if let Some(provider_url) =
+            Self::get_active_provider_url_with_client(&client, api_key_id, model_name).await?
+        {
+            return Ok(Some(provider_url));
+        }
+
         let lock_key = Self::advisory_lock_key(api_key_id, model_name);
 
-        client
-            .execute("SELECT pg_advisory_lock($1)", &[&lock_key])
+        let transaction = client
+            .transaction()
             .await
-            .context("Failed to acquire api key model affinity advisory lock")?;
+            .context("Failed to start api key model affinity transaction")?;
 
-        let result = async {
+        transaction
+            .execute("SELECT pg_advisory_xact_lock($1)", &[&lock_key])
+            .await
+            .context("Failed to acquire transaction-scoped api key model affinity advisory lock")?;
+
+        let provider_url = async {
             if let Some(provider_url) =
-                Self::get_active_provider_url_with_client(&client, api_key_id, model_name).await?
+                Self::get_active_provider_url_with_client(&transaction, api_key_id, model_name)
+                    .await?
             {
                 return Ok(Some(provider_url));
             }
@@ -122,7 +141,7 @@ impl services::completions::ports::ApiKeyModelAffinityRepository
             let provider_url = selector.select_provider_url().await?;
             if let Some(provider_url) = provider_url.as_deref() {
                 Self::upsert_provider_url_with_client(
-                    &client,
+                    &transaction,
                     api_key_id,
                     model_name,
                     provider_url,
@@ -135,23 +154,19 @@ impl services::completions::ports::ApiKeyModelAffinityRepository
         }
         .await;
 
-        if let Err(unlock_error) = client
-            .execute("SELECT pg_advisory_unlock($1)", &[&lock_key])
-            .await
-        {
-            warn!(
-                %api_key_id,
-                model_name,
-                error = %unlock_error,
-                "Failed to release api key model affinity advisory lock"
-            );
-            if result.is_ok() {
-                return Err(unlock_error)
-                    .context("Failed to release api key model affinity advisory lock");
+        match provider_url {
+            Ok(provider_url) => {
+                transaction
+                    .commit()
+                    .await
+                    .context("Failed to commit api key model affinity transaction")?;
+                Ok(provider_url)
+            }
+            Err(error) => {
+                drop(transaction);
+                Err(error)
             }
         }
-
-        result
     }
 
     async fn get_active_provider_url(

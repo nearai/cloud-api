@@ -6,12 +6,14 @@ use async_trait::async_trait;
 use chrono::{Duration, Utc};
 use database::{OAuthStateRepository, PgApiKeyModelAffinityRepository};
 use services::completions::ports::ApiKeyModelAffinityRepository;
+use sha2::{Digest, Sha256};
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
     Arc,
 };
 use std::time::Duration as StdDuration;
 use tokio::sync::Barrier;
+use tokio::time::timeout;
 use uuid::Uuid;
 
 async fn get_test_pool() -> database::pool::DbPool {
@@ -23,6 +25,19 @@ async fn get_test_pool() -> database::pool::DbPool {
 struct TestProviderUrlSelector {
     provider_url: String,
     call_count: Arc<AtomicUsize>,
+}
+
+fn advisory_lock_key(api_key_id: Uuid, model_name: &str) -> i64 {
+    let mut hasher = Sha256::new();
+    hasher.update(api_key_id.as_bytes());
+    hasher.update([0]);
+    hasher.update(model_name.as_bytes());
+
+    let digest = hasher.finalize();
+    let mut bytes = [0_u8; 8];
+    bytes.copy_from_slice(&digest[..8]);
+
+    i64::from_be_bytes(bytes) & i64::MAX
 }
 
 #[async_trait]
@@ -195,4 +210,57 @@ async fn test_affinity_get_or_create_uses_advisory_lock_for_concurrent_miss() {
         .await
         .unwrap();
     assert_eq!(stored.as_deref(), Some(provider_url.as_str()));
+}
+
+#[tokio::test]
+async fn test_affinity_hit_does_not_wait_on_advisory_lock() {
+    let pool = get_test_pool().await;
+    let repo = Arc::new(PgApiKeyModelAffinityRepository::new(pool.clone()));
+
+    let api_key_id = Uuid::new_v4();
+    let model_name = format!("test-model-{}", Uuid::new_v4());
+    let provider_url = "http://10.0.0.9:8000".to_string();
+    let selector_calls = Arc::new(AtomicUsize::new(0));
+
+    repo.upsert_provider_url(
+        api_key_id,
+        &model_name,
+        &provider_url,
+        StdDuration::from_secs(300),
+    )
+    .await
+    .unwrap();
+
+    let mut client = pool.get().await.unwrap();
+    let transaction = client.transaction().await.unwrap();
+    transaction
+        .execute(
+            "SELECT pg_advisory_xact_lock($1)",
+            &[&advisory_lock_key(api_key_id, &model_name)],
+        )
+        .await
+        .unwrap();
+
+    let selector = TestProviderUrlSelector {
+        provider_url: "http://10.0.0.10:8000".to_string(),
+        call_count: selector_calls.clone(),
+    };
+
+    let result = timeout(
+        StdDuration::from_millis(200),
+        repo.get_or_create_active_provider_url(
+            api_key_id,
+            &model_name,
+            StdDuration::from_secs(300),
+            &selector,
+        ),
+    )
+    .await
+    .expect("cache hit should not wait on advisory lock")
+    .unwrap();
+
+    assert_eq!(result.as_deref(), Some(provider_url.as_str()));
+    assert_eq!(selector_calls.load(Ordering::SeqCst), 0);
+
+    drop(transaction);
 }

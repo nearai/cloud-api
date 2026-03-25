@@ -1138,6 +1138,41 @@ impl ModelRepository {
         }
     }
 
+    /// Get all active models with inference_url set.
+    /// Returns (model_name, inference_url) pairs for direct routing.
+    pub async fn get_inference_url_models(&self) -> Result<Vec<(String, String)>> {
+        let rows = retry_db!("get_inference_url_models", {
+            let client = self
+                .pool
+                .get()
+                .await
+                .context("Failed to get database connection")
+                .map_err(RepositoryError::PoolError)?;
+
+            client
+                .query(
+                    r#"
+                    SELECT model_name, inference_url
+                    FROM models
+                    WHERE is_active = true AND inference_url IS NOT NULL
+                    "#,
+                    &[],
+                )
+                .await
+                .map_err(map_db_error)
+        })?;
+
+        let models = rows
+            .into_iter()
+            .map(|row| {
+                let model_name: String = row.get("model_name");
+                let inference_url: String = row.get("inference_url");
+                (model_name, inference_url)
+            })
+            .collect();
+        Ok(models)
+    }
+
     /// Get all active external provider models
     pub async fn get_external_models(&self) -> Result<Vec<Model>> {
         let rows = retry_db!("get_external_models", {
@@ -1195,6 +1230,12 @@ impl services::inference_provider_pool::ExternalModelsSource for ModelRepository
                     .map(|config| (model.model_name, config))
             })
             .collect())
+    }
+
+    async fn fetch_inference_url_models(&self) -> Result<Vec<(String, String)>, String> {
+        self.get_inference_url_models()
+            .await
+            .map_err(|e| format!("Failed to fetch inference_url models: {e}"))
     }
 }
 

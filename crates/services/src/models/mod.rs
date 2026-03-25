@@ -5,20 +5,13 @@ use std::sync::Arc;
 use async_trait::async_trait;
 pub use ports::{ModelInfo, ModelWithPricing, ModelsError, ModelsRepository, ModelsServiceTrait};
 
-use crate::inference_provider_pool::InferenceProviderPool;
-
 pub struct ModelsServiceImpl {
-    pub inference_provider_pool: Arc<InferenceProviderPool>,
     pub models_repository: Arc<dyn ModelsRepository>,
 }
 
 impl ModelsServiceImpl {
-    pub fn new(
-        inference_provider_pool: Arc<InferenceProviderPool>,
-        models_repository: Arc<dyn ModelsRepository>,
-    ) -> Self {
+    pub fn new(models_repository: Arc<dyn ModelsRepository>) -> Self {
         Self {
-            inference_provider_pool,
             models_repository,
         }
     }
@@ -27,22 +20,16 @@ impl ModelsServiceImpl {
 #[async_trait]
 impl ModelsServiceTrait for ModelsServiceImpl {
     async fn get_models(&self) -> Result<Vec<ModelInfo>, ModelsError> {
-        self.inference_provider_pool
-            .models()
-            .await
-            .map(|models| {
-                models
-                    .data
-                    .into_iter()
-                    .map(|model| ModelInfo {
-                        created: model.created,
-                        id: model.id,
-                        object: model.object,
-                        owned_by: model.owned_by,
-                    })
-                    .collect()
+        let (models, _total) = self.get_models_with_pricing(1000, 0).await?;
+        Ok(models
+            .into_iter()
+            .map(|m| ModelInfo {
+                created: m.id.as_fields().0 as i64, // Use UUID timestamp component
+                id: m.model_name,
+                object: "model".to_string(),
+                owned_by: m.owned_by,
             })
-            .map_err(|e| ModelsError::InternalError(e.to_string()))
+            .collect())
     }
 
     async fn get_models_with_pricing(

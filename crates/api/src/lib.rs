@@ -255,7 +255,7 @@ pub async fn init_domain_services(
     organization_service: Arc<dyn services::organization::OrganizationServiceTrait + Send + Sync>,
     metrics_service: Arc<dyn services::metrics::MetricsServiceTrait>,
 ) -> DomainServices {
-    let inference_provider_pool = init_inference_providers(config).await;
+    let inference_provider_pool = init_inference_providers(database.clone(), config).await;
     init_domain_services_with_pool(
         database,
         config,
@@ -293,48 +293,8 @@ pub async fn init_domain_services_with_pool(
         database.pool().clone(),
     ));
 
-    // Load external providers from database
-    match models_repo.get_external_models().await {
-        Ok(external_models) => {
-            if !external_models.is_empty() {
-                let models_for_pool: Vec<(String, serde_json::Value)> = external_models
-                    .into_iter()
-                    .filter_map(|model| {
-                        model
-                            .provider_config
-                            .map(|config| (model.model_name, config))
-                    })
-                    .collect();
-
-                if !models_for_pool.is_empty() {
-                    tracing::info!(
-                        count = models_for_pool.len(),
-                        "Loading external providers from database"
-                    );
-                    if let Err(e) = inference_provider_pool
-                        .load_external_providers(models_for_pool)
-                        .await
-                    {
-                        tracing::warn!(error = %e, "Failed to load some external providers");
-                    }
-                }
-            }
-        }
-        Err(e) => {
-            tracing::warn!(error = %e, "Failed to fetch external models from database");
-        }
-    }
-
-    // Start periodic external provider refresh task
-    let refresh_interval = config.external_providers.refresh_interval_secs;
-    if refresh_interval > 0 {
-        let external_source =
-            models_repo.clone() as Arc<dyn services::inference_provider_pool::ExternalModelsSource>;
-        inference_provider_pool
-            .clone()
-            .start_external_refresh_task(external_source, refresh_interval)
-            .await;
-    }
+    // Note: inference_url models and external providers are loaded in init_inference_providers.
+    // Periodic refresh is also started there.
 
     // Create conversation service
     let conversation_service = Arc::new(services::ConversationService::new(
@@ -363,7 +323,6 @@ pub async fn init_domain_services_with_pool(
 
     // Create models service
     let models_service = Arc::new(services::models::ModelsServiceImpl::new(
-        inference_provider_pool.clone(),
         models_repo.clone(),
     ));
 
@@ -595,31 +554,61 @@ pub async fn init_domain_services_with_pool_and_web_search_provider(
 }
 
 /// Initialize inference provider pool
+///
+/// Loads inference_url models and external providers from the database,
+/// then starts a periodic refresh task to keep them in sync.
 pub async fn init_inference_providers(
+    database: Arc<Database>,
     config: &ApiConfig,
 ) -> Arc<services::inference_provider_pool::InferenceProviderPool> {
-    let discovery_url = config.model_discovery.discovery_server_url.clone();
-    let api_key = config.model_discovery.api_key.clone();
+    let api_key = config.inference_api_key.clone();
 
-    // Create pool with discovery URL and API key
     let pool = Arc::new(
         services::inference_provider_pool::InferenceProviderPool::new(
-            discovery_url,
             api_key,
-            config.model_discovery.timeout,
             config.external_providers.clone(),
         ),
     );
 
-    // Initialize model discovery during startup
-    if pool.initialize().await.is_err() {
-        tracing::warn!("Failed to initialize model discovery during startup");
-        tracing::info!("Models will be discovered on first request");
+    let models_repo = Arc::new(database::repositories::ModelRepository::new(
+        database.pool().clone(),
+    ));
+    let models_source =
+        models_repo.clone() as Arc<dyn services::inference_provider_pool::ExternalModelsSource>;
+
+    // Load inference_url models (our own vLLM/SGLang backends)
+    match models_source.fetch_inference_url_models().await {
+        Ok(models) if !models.is_empty() => {
+            tracing::info!(count = models.len(), "Loading inference_url models");
+            pool.load_inference_url_models(models).await;
+        }
+        Ok(_) => {
+            tracing::info!("No inference_url models found in database");
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "Failed to fetch inference_url models");
+        }
     }
 
-    // Start periodic refresh task with handle management
-    let refresh_interval = config.model_discovery.refresh_interval as u64;
-    pool.clone().start_refresh_task(refresh_interval).await;
+    // Load external providers (OpenAI, Anthropic, Gemini, etc.)
+    match models_source.fetch_external_models().await {
+        Ok(models) if !models.is_empty() => {
+            tracing::info!(count = models.len(), "Loading external providers");
+            if let Err(e) = pool.load_external_providers(models).await {
+                tracing::warn!(error = %e, "Failed to load some external providers");
+            }
+        }
+        Ok(_) => {}
+        Err(e) => {
+            tracing::warn!(error = %e, "Failed to fetch external models");
+        }
+    }
+
+    // Start periodic refresh task
+    let refresh_interval = config.external_providers.refresh_interval_secs;
+    pool.clone()
+        .start_refresh_task(models_source, refresh_interval)
+        .await;
 
     pool
 }
@@ -636,12 +625,9 @@ pub async fn init_inference_providers_with_mocks(
     use inference_providers::MockProvider;
     use std::sync::Arc;
 
-    // Create pool with dummy discovery URL (won't be used since we're registering providers directly)
     let pool = Arc::new(
         services::inference_provider_pool::InferenceProviderPool::new(
-            "http://localhost:8080/models".to_string(),
             None,
-            5,
             config::ExternalProvidersConfig::default(),
         ),
     );
@@ -1550,12 +1536,7 @@ mod tests {
                 host: "127.0.0.1".to_string(),
                 port: 0, // Use port 0 for testing to get a random available port
             },
-            model_discovery: config::ModelDiscoveryConfig {
-                discovery_server_url: "http://localhost:8080/models".to_string(),
-                api_key: Some("test-key".to_string()),
-                refresh_interval: 0,
-                timeout: 5,
-            },
+            inference_api_key: Some("test-key".to_string()),
             logging: config::LoggingConfig {
                 level: "info".to_string(),
                 format: "compact".to_string(),
@@ -1653,12 +1634,7 @@ mod tests {
                 host: "127.0.0.1".to_string(),
                 port: 0,
             },
-            model_discovery: config::ModelDiscoveryConfig {
-                discovery_server_url: "http://localhost:8080/models".to_string(),
-                api_key: Some("test-key".to_string()),
-                refresh_interval: 0,
-                timeout: 5,
-            },
+            inference_api_key: Some("test-key".to_string()),
             logging: config::LoggingConfig {
                 level: "info".to_string(),
                 format: "compact".to_string(),

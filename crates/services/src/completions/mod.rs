@@ -1037,6 +1037,19 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         // On success, disarm and transfer counter ownership to InterceptStream.
         let mut guard = ConcurrentSlotGuard::new(counter);
 
+        // Reject E2EE for models that don't support attestation (external providers)
+        if !model.attestation_supported {
+            if let Some(pub_key) = chat_params.extra.get(crate::common::encryption_headers::MODEL_PUB_KEY) {
+                if pub_key.as_str().is_some() {
+                    return Err(ports::CompletionError::InvalidModel(format!(
+                        "Model '{}' does not support encryption. \
+                         External providers run outside of our Trusted Execution Environment.",
+                        canonical_name
+                    )));
+                }
+            }
+        }
+
         let provider_start_time = Instant::now();
 
         // Get the LLM stream
@@ -1182,6 +1195,19 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
 
         // RAII guard ensures slot is released on drop (panic, error, or success)
         let _guard = ConcurrentSlotGuard::new(counter);
+
+        // Reject E2EE for models that don't support attestation (external providers)
+        if !model.attestation_supported {
+            if let Some(pub_key) = chat_params.extra.get(crate::common::encryption_headers::MODEL_PUB_KEY) {
+                if pub_key.as_str().is_some() {
+                    return Err(ports::CompletionError::InvalidModel(format!(
+                        "Model '{}' does not support encryption. \
+                         External providers run outside of our Trusted Execution Environment.",
+                        canonical_name
+                    )));
+                }
+            }
+        }
 
         let provider_start_time = Instant::now();
         let result = self

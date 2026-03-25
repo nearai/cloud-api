@@ -169,16 +169,39 @@ pub async fn batch_upsert_models(
             }
         })?;
 
-    // Update external providers at runtime
-    // This allows newly added/updated external models to be used without server restart
+    // Update providers at runtime so changes take effect without server restart
 
-    // Collect models to register (active external providers with valid config)
-    let models_to_register: Vec<(String, serde_json::Value)> = batch_request
+    // Register inference_url models (our own vLLM/SGLang backends)
+    let inference_url_models: Vec<(String, String)> = batch_request
         .iter()
         .filter_map(|(model_name, request)| {
-            // Only register models that are:
-            // 1. External providers with valid config
-            // 2. Active (is_active != Some(false))
+            let is_active = request.is_active != Some(false);
+            if is_active {
+                request
+                    .inference_url
+                    .clone()
+                    .map(|url| (model_name.clone(), url))
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    if !inference_url_models.is_empty() {
+        tracing::info!(
+            count = inference_url_models.len(),
+            "Registering inference_url models at runtime"
+        );
+        app_state
+            .inference_provider_pool
+            .load_inference_url_models(inference_url_models)
+            .await;
+    }
+
+    // Register external providers (OpenAI, Anthropic, Gemini, etc.)
+    let external_models: Vec<(String, serde_json::Value)> = batch_request
+        .iter()
+        .filter_map(|(model_name, request)| {
             let is_external = request.provider_type.as_deref() == Some("external");
             let is_active = request.is_active != Some(false);
 
@@ -193,19 +216,11 @@ pub async fn batch_upsert_models(
         })
         .collect();
 
-    // Collect models to unregister:
-    // - Models explicitly set to non-external provider_type
-    // - Models explicitly set to is_active = false
+    // Unregister models that are explicitly deactivated
     let models_to_unregister: Vec<String> = batch_request
         .iter()
         .filter_map(|(model_name, request)| {
-            let is_non_external = request
-                .provider_type
-                .as_ref()
-                .is_some_and(|t| t != "external");
-            let is_inactive = request.is_active == Some(false);
-
-            if is_non_external || is_inactive {
+            if request.is_active == Some(false) {
                 Some(model_name.clone())
             } else {
                 None
@@ -213,27 +228,23 @@ pub async fn batch_upsert_models(
         })
         .collect();
 
-    // Unregister models that are no longer external or are inactive
     for model_name in &models_to_unregister {
         app_state
             .inference_provider_pool
-            .unregister_external_provider(model_name)
+            .unregister_provider(model_name)
             .await;
     }
 
-    // Register/update external providers
-    if !models_to_register.is_empty() {
+    if !external_models.is_empty() {
         tracing::info!(
-            count = models_to_register.len(),
+            count = external_models.len(),
             "Registering external providers at runtime"
         );
         if let Err(e) = app_state
             .inference_provider_pool
-            .load_external_providers(models_to_register)
+            .load_external_providers(external_models)
             .await
         {
-            // Log but don't fail the request - the models are saved to DB
-            // They will be loaded on next server restart if runtime registration fails
             tracing::warn!(error = %e, "Failed to register some external providers at runtime");
         }
     }
@@ -838,7 +849,7 @@ pub async fn delete_model(
     // This is a no-op for vLLM models (they are discovered, not registered)
     app_state
         .inference_provider_pool
-        .unregister_external_provider(&model_name)
+        .unregister_provider(&model_name)
         .await;
 
     Ok(StatusCode::NO_CONTENT)

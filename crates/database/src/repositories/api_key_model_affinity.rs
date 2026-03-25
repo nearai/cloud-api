@@ -16,7 +16,7 @@ impl PgApiKeyModelAffinityRepository {
         Self { pool }
     }
 
-    fn advisory_lock_key(api_key_id: Uuid, model_name: &str) -> i64 {
+    pub fn advisory_lock_key(api_key_id: Uuid, model_name: &str) -> i64 {
         // PostgreSQL advisory locks take a signed 64-bit key, so we hash the logical
         // identifier `(api_key_id, model_name)` down to a deterministic i64. Taking the
         // first 8 bytes of SHA-256 gives us a stable 64-bit value without introducing a
@@ -168,7 +168,7 @@ impl services::completions::ports::ApiKeyModelAffinityRepository
                 Ok(provider_url)
             }
             Err(error) => {
-                drop(transaction);
+                let _ = transaction.rollback().await;
                 Err(error)
             }
         }

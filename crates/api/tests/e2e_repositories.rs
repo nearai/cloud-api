@@ -6,7 +6,6 @@ use async_trait::async_trait;
 use chrono::{Duration, Utc};
 use database::{OAuthStateRepository, PgApiKeyModelAffinityRepository};
 use services::completions::ports::ApiKeyModelAffinityRepository;
-use sha2::{Digest, Sha256};
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
     Arc,
@@ -25,19 +24,6 @@ async fn get_test_pool() -> database::pool::DbPool {
 struct TestProviderUrlSelector {
     provider_url: String,
     call_count: Arc<AtomicUsize>,
-}
-
-fn advisory_lock_key(api_key_id: Uuid, model_name: &str) -> i64 {
-    let mut hasher = Sha256::new();
-    hasher.update(api_key_id.as_bytes());
-    hasher.update([0]);
-    hasher.update(model_name.as_bytes());
-
-    let digest = hasher.finalize();
-    let mut bytes = [0_u8; 8];
-    bytes.copy_from_slice(&digest[..8]);
-
-    i64::from_be_bytes(bytes) & i64::MAX
 }
 
 #[async_trait]
@@ -236,7 +222,10 @@ async fn test_affinity_hit_does_not_wait_on_advisory_lock() {
     transaction
         .execute(
             "SELECT pg_advisory_xact_lock($1)",
-            &[&advisory_lock_key(api_key_id, &model_name)],
+            &[&PgApiKeyModelAffinityRepository::advisory_lock_key(
+                api_key_id,
+                &model_name,
+            )],
         )
         .await
         .unwrap();

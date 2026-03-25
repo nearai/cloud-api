@@ -978,8 +978,9 @@ impl InferenceProviderPool {
             None => return Ok(None),
         };
 
+        let provider_urls = self.provider_urls.read().await;
         for provider in providers {
-            if let Some(provider_url) = self.get_provider_url(&provider).await {
+            if let Some(provider_url) = provider_urls.get(&Self::provider_ptr(&provider)).cloned() {
                 return Ok(Some(provider_url));
             }
         }

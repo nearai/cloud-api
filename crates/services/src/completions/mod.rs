@@ -605,12 +605,6 @@ impl CompletionServiceImpl {
         {
             Ok(provider_url) => provider_url,
             Err(error) => {
-                tracing::debug!(
-                    %api_key_id,
-                    model_name,
-                    error = %error,
-                    "Failed to fetch api key model affinity binding"
-                );
                 tracing::warn!(
                     %api_key_id,
                     error = %error,
@@ -647,13 +641,6 @@ impl CompletionServiceImpl {
             {
                 Ok(Ok(())) => {}
                 Ok(Err(error)) => {
-                    tracing::debug!(
-                        %api_key_id,
-                        model_name,
-                        provider_url,
-                        error = %error,
-                        "Failed to refresh api key model affinity binding"
-                    );
                     tracing::warn!(
                         %api_key_id,
                         error = %error,
@@ -1158,6 +1145,14 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
             chat_params.model = canonical_name.clone();
         }
 
+        let counter = self
+            .try_acquire_concurrent_slot(organization_id, model.id, canonical_name)
+            .await?;
+
+        // RAII guard protects against panics during stream creation.
+        // On success, disarm and transfer counter ownership to InterceptStream.
+        let mut guard = ConcurrentSlotGuard::new(counter);
+
         let preferred_provider_url = if self
             .should_use_api_key_model_affinity(canonical_name, &request.extra)
             .await
@@ -1167,14 +1162,6 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         } else {
             None
         };
-
-        let counter = self
-            .try_acquire_concurrent_slot(organization_id, model.id, canonical_name)
-            .await?;
-
-        // RAII guard protects against panics during stream creation.
-        // On success, disarm and transfer counter ownership to InterceptStream.
-        let mut guard = ConcurrentSlotGuard::new(counter);
 
         let provider_start_time = Instant::now();
 
@@ -1322,6 +1309,14 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
             chat_params.model = canonical_name.clone();
         }
 
+        let organization_id = request.organization_id;
+        let counter = self
+            .try_acquire_concurrent_slot(organization_id, model.id, canonical_name)
+            .await?;
+
+        // RAII guard ensures slot is released on drop (panic, error, or success)
+        let _guard = ConcurrentSlotGuard::new(counter);
+
         let preferred_provider_url = if self
             .should_use_api_key_model_affinity(canonical_name, &request.extra)
             .await
@@ -1331,14 +1326,6 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         } else {
             None
         };
-
-        let organization_id = request.organization_id;
-        let counter = self
-            .try_acquire_concurrent_slot(organization_id, model.id, canonical_name)
-            .await?;
-
-        // RAII guard ensures slot is released on drop (panic, error, or success)
-        let _guard = ConcurrentSlotGuard::new(counter);
 
         let provider_start_time = Instant::now();
         let result = self

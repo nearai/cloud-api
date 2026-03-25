@@ -11,9 +11,7 @@ pub struct ModelsServiceImpl {
 
 impl ModelsServiceImpl {
     pub fn new(models_repository: Arc<dyn ModelsRepository>) -> Self {
-        Self {
-            models_repository,
-        }
+        Self { models_repository }
     }
 }
 
@@ -24,7 +22,7 @@ impl ModelsServiceTrait for ModelsServiceImpl {
         Ok(models
             .into_iter()
             .map(|m| ModelInfo {
-                created: m.id.as_fields().0 as i64, // Use UUID timestamp component
+                created: 0,
                 id: m.model_name,
                 object: "model".to_string(),
                 owned_by: m.owned_by,

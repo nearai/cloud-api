@@ -1154,7 +1154,9 @@ impl ModelRepository {
                     r#"
                     SELECT model_name, inference_url
                     FROM models
-                    WHERE is_active = true AND inference_url IS NOT NULL
+                    WHERE is_active = true
+                      AND inference_url IS NOT NULL
+                      AND provider_type != 'external'
                     "#,
                     &[],
                 )

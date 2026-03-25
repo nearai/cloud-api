@@ -141,7 +141,6 @@ pub fn use_real_providers() -> bool {
         .unwrap_or(false)
 }
 
-
 async fn build_test_server_components(
     database: Arc<Database>,
     config: ApiConfig,

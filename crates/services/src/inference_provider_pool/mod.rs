@@ -9,11 +9,7 @@ use inference_providers::{
     RerankResponse, StreamingResult, StreamingResultExt, VLlmConfig, VLlmProvider,
 };
 use regex::Regex;
-use std::{
-    collections::HashMap,
-    sync::Arc,
-    time::Duration,
-};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, info, warn};
 
@@ -112,10 +108,17 @@ impl InferenceProviderPool {
             }
         }
 
-        info!(success = success_count, errors = error_count, "Loaded external providers");
+        info!(
+            success = success_count,
+            errors = error_count,
+            "Loaded external providers"
+        );
 
         if error_count > 0 && success_count == 0 {
-            Err(format!("All {} external provider(s) failed to load", error_count))
+            Err(format!(
+                "All {} external provider(s) failed to load",
+                error_count
+            ))
         } else {
             Ok(())
         }
@@ -128,13 +131,24 @@ impl InferenceProviderPool {
     }
 
     /// Remove a provider by model name. Used when admin deactivates a model.
+    /// Also cleans up pubkey_to_providers entries that referenced the removed provider.
     pub async fn unregister_provider(&self, model_name: &str) -> bool {
         let mut mappings = self.provider_mappings.write().await;
-        let removed = mappings.model_to_providers.remove(model_name).is_some();
-        if removed {
+        let removed_providers = mappings.model_to_providers.remove(model_name);
+        if let Some(removed) = &removed_providers {
+            // Prune pubkey entries pointing to the removed providers
+            let removed_ptrs: std::collections::HashSet<usize> = removed
+                .iter()
+                .map(|p| Arc::as_ptr(p) as *const () as usize)
+                .collect();
+            mappings.pubkey_to_providers.retain(|_, providers| {
+                providers
+                    .retain(|p| !removed_ptrs.contains(&(Arc::as_ptr(p) as *const () as usize)));
+                !providers.is_empty()
+            });
             info!(model = %model_name, "Unregistered provider");
         }
-        removed
+        removed_providers.is_some()
     }
 
     /// Register a provider for a model manually (useful for testing with mock providers)
@@ -1218,7 +1232,9 @@ impl InferenceProviderPool {
 
         let api_key = self.api_key.clone();
 
-        // Phase 1: Create providers and probe attestation concurrently
+        // Phase 1: Create providers and probe attestation concurrently.
+        // Uses a short-timeout probe provider (10s) so dead backends don't stall startup.
+        // The serving provider uses the default 90s timeout.
         let endpoint_futures: Vec<_> = models
             .iter()
             .map(|(model_name, url)| {
@@ -1226,7 +1242,13 @@ impl InferenceProviderPool {
                 let url = url.clone();
                 let api_key = api_key.clone();
                 async move {
-                    let provider = Arc::new(VLlmProvider::new(VLlmConfig::new(
+                    let probe_provider = Arc::new(VLlmProvider::new(VLlmConfig::new(
+                        url.clone(),
+                        api_key.clone(),
+                        Some(10),
+                    ))) as Arc<InferenceProviderTrait>;
+
+                    let serving_provider = Arc::new(VLlmProvider::new(VLlmConfig::new(
                         url.clone(),
                         api_key,
                         None,
@@ -1234,13 +1256,19 @@ impl InferenceProviderPool {
 
                     let (pub_keys, _has_valid_attestation) =
                         Self::fetch_signing_public_keys_for_both_algorithms(
-                            &provider,
+                            &probe_provider,
                             &model_name,
                             &url,
                         )
                         .await;
 
-                    (model_name, url, provider, pub_keys)
+                    // Return pub_keys referencing the serving_provider (not probe)
+                    let pub_keys: Vec<(String, Arc<InferenceProviderTrait>)> = pub_keys
+                        .into_iter()
+                        .map(|(key, _)| (key, serving_provider.clone()))
+                        .collect();
+
+                    (model_name, url, serving_provider, pub_keys)
                 }
             })
             .collect();
@@ -1251,7 +1279,8 @@ impl InferenceProviderPool {
             .collect()
             .await;
 
-        // Phase 2: Register in provider_mappings
+        // Phase 2: Register in provider_mappings.
+        // Collect old provider Arcs so we can prune stale pubkey entries.
         let mut model_providers: HashMap<String, Vec<Arc<InferenceProviderTrait>>> = HashMap::new();
         let mut pub_key_updates: Vec<(String, Arc<InferenceProviderTrait>)> = Vec::new();
 
@@ -1269,12 +1298,36 @@ impl InferenceProviderPool {
             pub_key_updates.extend(pub_keys.iter().cloned());
         }
 
-        // Atomic update
+        // Atomic update: replace model providers and rebuild pubkey mappings
         {
             let mut mappings = self.provider_mappings.write().await;
+
+            // Collect old provider ptrs for models being replaced, so we can prune pubkeys
+            let mut old_provider_ptrs = std::collections::HashSet::new();
+            for model_name in model_providers.keys() {
+                if let Some(old) = mappings.model_to_providers.get(model_name) {
+                    for p in old {
+                        old_provider_ptrs.insert(Arc::as_ptr(p) as *const () as usize);
+                    }
+                }
+            }
+
+            // Replace model_to_providers entries
             for (model_name, providers) in model_providers {
                 mappings.model_to_providers.insert(model_name, providers);
             }
+
+            // Prune pubkey entries that pointed to old (now-replaced) providers
+            if !old_provider_ptrs.is_empty() {
+                mappings.pubkey_to_providers.retain(|_, providers| {
+                    providers.retain(|p| {
+                        !old_provider_ptrs.contains(&(Arc::as_ptr(p) as *const () as usize))
+                    });
+                    !providers.is_empty()
+                });
+            }
+
+            // Add new pubkey entries
             for (key, provider) in pub_key_updates {
                 mappings
                     .pubkey_to_providers

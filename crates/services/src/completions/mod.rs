@@ -1,6 +1,7 @@
 pub mod ports;
 
 use crate::attestation::ports::AttestationServiceTrait;
+use crate::common::encryption_headers;
 use crate::inference_provider_pool::InferenceProviderPool;
 use crate::models::ModelsRepository;
 use crate::responses::models::ResponseId;
@@ -19,6 +20,11 @@ use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 const FINALIZE_TIMEOUT_SECS: u64 = 5;
+const API_KEY_MODEL_AFFINITY_TTL_SECS: u64 = 300;
+// Best-effort background refreshes should fail fast under DB pool pressure or transient
+// Postgres slowness. If this timeout is hit, we only lose one affinity refresh and may reduce
+// short-term cache locality on a later request; it must not affect request correctness.
+const API_KEY_MODEL_AFFINITY_REFRESH_TIMEOUT_SECS: u64 = 2;
 
 type FinalizeFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
 
@@ -26,6 +32,21 @@ enum StreamState {
     Streaming,
     Finalizing(FinalizeFuture),
     Done,
+}
+
+struct ExistingRoutingProviderUrlSelector {
+    inference_provider_pool: Arc<InferenceProviderPool>,
+    model_name: String,
+}
+
+#[async_trait::async_trait]
+impl ports::ProviderUrlSelector for ExistingRoutingProviderUrlSelector {
+    async fn select_provider_url(&self) -> Result<Option<String>, anyhow::Error> {
+        self.inference_provider_pool
+            .select_provider_url_for_model(&self.model_name)
+            .await
+            .map_err(|error| anyhow::anyhow!(error.to_string()))
+    }
 }
 
 /// Hash inference ID to UUID deterministically using MD5 (v5)
@@ -449,6 +470,7 @@ pub struct CompletionServiceImpl {
     pub usage_service: Arc<dyn UsageServiceTrait + Send + Sync>,
     pub metrics_service: Arc<dyn MetricsServiceTrait>,
     pub models_repository: Arc<dyn ModelsRepository>,
+    api_key_model_affinity_repository: Arc<dyn ports::ApiKeyModelAffinityRepository>,
     concurrent_counts: Cache<(Uuid, Uuid), Arc<AtomicU32>>,
     concurrent_limit: u32,
     /// Cache for per-organization concurrent limits (5-minute TTL)
@@ -475,6 +497,7 @@ impl CompletionServiceImpl {
         usage_service: Arc<dyn UsageServiceTrait + Send + Sync>,
         metrics_service: Arc<dyn MetricsServiceTrait>,
         models_repository: Arc<dyn ModelsRepository>,
+        api_key_model_affinity_repository: Arc<dyn ports::ApiKeyModelAffinityRepository>,
         organization_limit_repository: Arc<dyn ports::OrganizationConcurrentLimitRepository>,
     ) -> Self {
         let concurrent_counts = Cache::builder()
@@ -494,6 +517,7 @@ impl CompletionServiceImpl {
             usage_service,
             metrics_service,
             models_repository,
+            api_key_model_affinity_repository,
             concurrent_counts,
             concurrent_limit: DEFAULT_CONCURRENT_LIMIT,
             org_concurrent_limits,
@@ -542,6 +566,98 @@ impl CompletionServiceImpl {
                 }
             })
             .await
+    }
+
+    async fn should_use_api_key_model_affinity(
+        &self,
+        model_name: &str,
+        extra: &std::collections::HashMap<String, serde_json::Value>,
+    ) -> bool {
+        if extra.contains_key(encryption_headers::MODEL_PUB_KEY) {
+            return false;
+        }
+
+        !self
+            .inference_provider_pool
+            .is_external_provider(model_name)
+            .await
+    }
+
+    async fn get_or_create_preferred_provider_url(
+        &self,
+        api_key_id: Uuid,
+        model_name: &str,
+    ) -> Option<String> {
+        let selector = ExistingRoutingProviderUrlSelector {
+            inference_provider_pool: self.inference_provider_pool.clone(),
+            model_name: model_name.to_string(),
+        };
+
+        match self
+            .api_key_model_affinity_repository
+            .get_or_create_active_provider_url(
+                api_key_id,
+                model_name,
+                Duration::from_secs(API_KEY_MODEL_AFFINITY_TTL_SECS),
+                &selector,
+            )
+            .await
+        {
+            Ok(provider_url) => provider_url,
+            Err(error) => {
+                tracing::warn!(
+                    %api_key_id,
+                    error = %error,
+                    "Failed to fetch api key model affinity binding; falling back to local routing"
+                );
+                None
+            }
+        }
+    }
+
+    fn schedule_provider_affinity_refresh(
+        &self,
+        api_key_id: Uuid,
+        model_name: &str,
+        provider_url: &str,
+    ) {
+        let repository = self.api_key_model_affinity_repository.clone();
+        let model_name = model_name.to_string();
+        let provider_url = provider_url.to_string();
+
+        tokio::spawn(async move {
+            // This refresh is intentionally fire-and-forget so successful completions do not
+            // wait on a DB upsert before returning to the client.
+            match tokio::time::timeout(
+                Duration::from_secs(API_KEY_MODEL_AFFINITY_REFRESH_TIMEOUT_SECS),
+                repository.upsert_provider_url(
+                    api_key_id,
+                    &model_name,
+                    &provider_url,
+                    Duration::from_secs(API_KEY_MODEL_AFFINITY_TTL_SECS),
+                ),
+            )
+            .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    tracing::warn!(
+                        %api_key_id,
+                        error = %error,
+                        "Failed to refresh api key model affinity binding"
+                    );
+                }
+                Err(_) => {
+                    tracing::debug!(
+                        %api_key_id,
+                        model_name,
+                        provider_url,
+                        timeout_secs = API_KEY_MODEL_AFFINITY_REFRESH_TIMEOUT_SECS,
+                        "Timed out while refreshing api key model affinity binding"
+                    );
+                }
+            }
+        });
     }
 
     /// Create low-cardinality metric tags for a request
@@ -1037,15 +1153,29 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         // On success, disarm and transfer counter ownership to InterceptStream.
         let mut guard = ConcurrentSlotGuard::new(counter);
 
+        let preferred_provider_url = if self
+            .should_use_api_key_model_affinity(canonical_name, &request.extra)
+            .await
+        {
+            self.get_or_create_preferred_provider_url(api_key_id, canonical_name)
+                .await
+        } else {
+            None
+        };
+
         let provider_start_time = Instant::now();
 
         // Get the LLM stream
-        let llm_stream = match self
+        let (llm_stream, used_provider_url) = match self
             .inference_provider_pool
-            .chat_completion_stream(chat_params, request.body_hash.clone())
+            .chat_completion_stream_with_preferred_provider(
+                chat_params,
+                request.body_hash.clone(),
+                preferred_provider_url.clone(),
+            )
             .await
         {
-            Ok(stream) => stream,
+            Ok(result) => result,
             Err(e) => {
                 // Guard will decrement counter on drop
                 let err = Self::map_provider_error(&request.model, &e, "chat completion stream");
@@ -1053,6 +1183,10 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
                 return Err(err);
             }
         };
+
+        if let Some(provider_url) = used_provider_url.as_deref() {
+            self.schedule_provider_affinity_refresh(api_key_id, canonical_name, provider_url);
+        }
 
         // Transfer counter ownership to InterceptStream (which decrements on drop)
         let counter = guard.disarm();
@@ -1183,13 +1317,27 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         // RAII guard ensures slot is released on drop (panic, error, or success)
         let _guard = ConcurrentSlotGuard::new(counter);
 
+        let preferred_provider_url = if self
+            .should_use_api_key_model_affinity(canonical_name, &request.extra)
+            .await
+        {
+            self.get_or_create_preferred_provider_url(api_key_id, canonical_name)
+                .await
+        } else {
+            None
+        };
+
         let provider_start_time = Instant::now();
         let result = self
             .inference_provider_pool
-            .chat_completion(chat_params, request.body_hash.clone())
+            .chat_completion_with_preferred_provider(
+                chat_params,
+                request.body_hash.clone(),
+                preferred_provider_url.clone(),
+            )
             .await;
 
-        let response_with_bytes = match result {
+        let (response_with_bytes, used_provider_url) = match result {
             Ok(response) => response,
             Err(e) => {
                 let err = Self::map_provider_error(&request.model, &e, "chat completion");
@@ -1197,6 +1345,10 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
                 return Err(err);
             }
         };
+
+        if let Some(provider_url) = used_provider_url.as_deref() {
+            self.schedule_provider_affinity_refresh(api_key_id, canonical_name, provider_url);
+        }
 
         let e2e_latency = service_start_time.elapsed();
         let backend_latency = provider_start_time.elapsed();

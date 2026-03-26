@@ -55,21 +55,10 @@ pub fn test_config() -> ApiConfig {
                 .and_then(|p| p.parse().ok())
                 .unwrap_or(0),
         },
-        model_discovery: config::ModelDiscoveryConfig {
-            discovery_server_url: std::env::var("MODEL_DISCOVERY_SERVER_URL")
-                .unwrap_or_else(|_| "http://localhost:8080/models".to_string()),
-            api_key: std::env::var("MODEL_DISCOVERY_API_KEY")
-                .ok()
-                .or(Some("test_api_key".to_string())),
-            refresh_interval: std::env::var("MODEL_DISCOVERY_REFRESH_INTERVAL")
-                .ok()
-                .and_then(|i| i.parse().ok())
-                .unwrap_or(3600),
-            timeout: std::env::var("MODEL_DISCOVERY_TIMEOUT")
-                .ok()
-                .and_then(|t| t.parse().ok())
-                .unwrap_or(5),
-        },
+        inference_api_key: std::env::var("INFERENCE_API_KEY")
+            .or_else(|_| std::env::var("MODEL_DISCOVERY_API_KEY"))
+            .ok()
+            .or(Some("test_api_key".to_string())),
         logging: config::LoggingConfig {
             level: "debug".to_string(),
             format: "compact".to_string(),
@@ -152,11 +141,6 @@ pub fn use_real_providers() -> bool {
         .unwrap_or(false)
 }
 
-pub fn get_real_discovery_server_url() -> String {
-    std::env::var("MODEL_DISCOVERY_SERVER_URL")
-        .unwrap_or_else(|_| "http://localhost:8080/models".to_string())
-}
-
 async fn build_test_server_components(
     database: Arc<Database>,
     config: ApiConfig,
@@ -206,8 +190,8 @@ async fn build_test_server_components_with_real_providers(
 
     let auth_components = init_auth_services(database.clone(), &config);
 
-    // Use real inference providers from discovery server
-    let inference_provider_pool = api::init_inference_providers(&config).await;
+    // Use real inference providers from database
+    let inference_provider_pool = api::init_inference_providers(database.clone(), &config).await;
     let metrics_service = Arc::new(services::metrics::MockMetricsService);
     let domain_services = api::init_domain_services_with_pool(
         database.clone(),
@@ -384,9 +368,7 @@ async fn setup_test_infrastructure_for_real_providers() -> TestInfrastructure {
 
     let pool = db_setup::create_test_pool().await;
     let database = Arc::new(Database::new(pool));
-    let mut config = test_config();
-    config.model_discovery.discovery_server_url = get_real_discovery_server_url();
-    config.model_discovery.timeout = 30;
+    let config = test_config();
 
     TestInfrastructure { database, config }
 }

@@ -546,6 +546,26 @@ impl CompletionServiceImpl {
 
     /// Create low-cardinality metric tags for a request
     ///
+    /// Reject E2EE requests for models that don't support attestation (external providers).
+    fn reject_e2ee_if_unsupported(
+        attestation_supported: bool,
+        extra: &std::collections::HashMap<String, serde_json::Value>,
+        model_name: &str,
+    ) -> Result<(), ports::CompletionError> {
+        if !attestation_supported {
+            if let Some(pub_key) = extra.get(crate::common::encryption_headers::MODEL_PUB_KEY) {
+                if pub_key.as_str().is_some() {
+                    return Err(ports::CompletionError::InvalidModel(format!(
+                        "Model '{}' does not support encryption. \
+                         External providers run outside of our Trusted Execution Environment.",
+                        model_name
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// These tags are used for OTLP/Datadog metrics and should only include
     /// low-cardinality values to minimize costs (~98% savings vs high-cardinality).
     /// High-cardinality data (org/workspace/key) is tracked via database analytics.
@@ -1037,6 +1057,12 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         // On success, disarm and transfer counter ownership to InterceptStream.
         let mut guard = ConcurrentSlotGuard::new(counter);
 
+        Self::reject_e2ee_if_unsupported(
+            model.attestation_supported,
+            &chat_params.extra,
+            canonical_name,
+        )?;
+
         let provider_start_time = Instant::now();
 
         // Get the LLM stream
@@ -1182,6 +1208,12 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
 
         // RAII guard ensures slot is released on drop (panic, error, or success)
         let _guard = ConcurrentSlotGuard::new(counter);
+
+        Self::reject_e2ee_if_unsupported(
+            model.attestation_supported,
+            &chat_params.extra,
+            canonical_name,
+        )?;
 
         let provider_start_time = Instant::now();
         let result = self

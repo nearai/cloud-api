@@ -837,8 +837,8 @@ async fn test_deactivate_external_model() {
 
     // Provider should be unregistered
     assert!(
-        !inference_pool.is_external_provider(&model_name).await,
-        "External provider should be unregistered after deactivation"
+        !inference_pool.has_provider(&model_name).await,
+        "Provider should be unregistered after deactivation"
     );
 }
 

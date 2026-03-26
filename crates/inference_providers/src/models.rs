@@ -992,6 +992,7 @@ pub struct AudioTranscriptionResponse {
     pub text: String,
 
     /// Total audio duration in seconds (may be a string in some provider responses)
+    #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(deserialize_with = "deserialize_duration")]
     pub duration: Option<f64>,

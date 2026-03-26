@@ -323,6 +323,7 @@ pub async fn init_domain_services_with_pool(
 
     // Create models service
     let models_service = Arc::new(services::models::ModelsServiceImpl::new(
+        inference_provider_pool.clone(),
         models_repo.clone(),
     ));
 

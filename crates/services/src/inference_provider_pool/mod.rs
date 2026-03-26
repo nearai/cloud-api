@@ -131,7 +131,7 @@ impl InferenceProviderPool {
     }
 
     /// Remove a provider by model name. Used when admin deactivates a model.
-    /// Also cleans up pubkey_to_providers entries that referenced the removed provider.
+    /// Also cleans up pubkey_to_providers, load_balancer_index, and provider_failure_counts.
     pub async fn unregister_provider(&self, model_name: &str) -> bool {
         let mut mappings = self.provider_mappings.write().await;
         let removed_providers = mappings.model_to_providers.remove(model_name);
@@ -146,6 +146,17 @@ impl InferenceProviderPool {
                     .retain(|p| !removed_ptrs.contains(&(Arc::as_ptr(p) as *const () as usize)));
                 !providers.is_empty()
             });
+
+            // Clean up load balancer index and failure counts for removed providers
+            self.load_balancer_index
+                .write()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(model_name);
+            self.provider_failure_counts
+                .write()
+                .unwrap_or_else(|e| e.into_inner())
+                .retain(|key, _| !removed_ptrs.contains(key));
+
             info!(model = %model_name, "Unregistered provider");
         }
         removed_providers.is_some()
@@ -1210,6 +1221,12 @@ impl InferenceProviderPool {
         Ok((provider, backend_type))
     }
 
+    /// Return the set of model names currently registered in provider_mappings.
+    pub async fn registered_model_names(&self) -> Vec<String> {
+        let mappings = self.provider_mappings.read().await;
+        mappings.model_to_providers.keys().cloned().collect()
+    }
+
     /// Sync external providers — just re-loads them into provider_mappings.
     async fn sync_external_providers(&self, models: Vec<(String, serde_json::Value)>) {
         if let Err(e) = self.load_external_providers(models).await {
@@ -1346,10 +1363,72 @@ impl InferenceProviderPool {
         self.load_inference_url_models(models).await;
     }
 
+    /// Remove models from provider_mappings that are not in `valid_model_names`.
+    /// Also cleans up load_balancer_index and provider_failure_counts for removed providers.
+    async fn remove_stale_providers(
+        &self,
+        valid_model_names: &std::collections::HashSet<String>,
+    ) {
+        let mut mappings = self.provider_mappings.write().await;
+
+        let stale_models: Vec<String> = mappings
+            .model_to_providers
+            .keys()
+            .filter(|k| !valid_model_names.contains(k.as_str()))
+            .cloned()
+            .collect();
+
+        if stale_models.is_empty() {
+            return;
+        }
+
+        // Collect provider ptrs being removed for ancillary cleanup
+        let mut removed_ptrs = std::collections::HashSet::new();
+        for model_name in &stale_models {
+            if let Some(providers) = mappings.model_to_providers.remove(model_name) {
+                for p in &providers {
+                    removed_ptrs.insert(Arc::as_ptr(p) as *const () as usize);
+                }
+            }
+        }
+
+        // Prune pubkey entries
+        mappings.pubkey_to_providers.retain(|_, providers| {
+            providers
+                .retain(|p| !removed_ptrs.contains(&(Arc::as_ptr(p) as *const () as usize)));
+            !providers.is_empty()
+        });
+
+        // Drop mappings lock before touching std::sync locks
+        drop(mappings);
+
+        // Clean up load balancer indices and failure counts
+        {
+            let mut lb = self
+                .load_balancer_index
+                .write()
+                .unwrap_or_else(|e| e.into_inner());
+            for model_name in &stale_models {
+                lb.remove(model_name);
+            }
+        }
+        self.provider_failure_counts
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|key, _| !removed_ptrs.contains(key));
+
+        info!(
+            removed = stale_models.len(),
+            models = ?stale_models,
+            "Removed stale providers not in database"
+        );
+    }
+
     /// Start a periodic background task that refreshes all providers from the database.
     ///
     /// Refreshes both inference_url models (VLlm providers) and external providers
-    /// (OpenAI, Anthropic, etc.) on each tick.
+    /// (OpenAI, Anthropic, etc.) on each tick. Removes providers for models that
+    /// are no longer in the database.
     ///
     /// The first tick is skipped because providers are already loaded at startup.
     /// If `refresh_interval_secs` is 0, this is a no-op.
@@ -1374,25 +1453,47 @@ impl InferenceProviderPool {
                     interval.tick().await;
                     debug!("Running periodic provider refresh");
 
+                    let mut valid_model_names = std::collections::HashSet::new();
+
                     // Refresh inference_url models
                     match source.fetch_inference_url_models().await {
                         Ok(models) => {
+                            for (name, _) in &models {
+                                valid_model_names.insert(name.clone());
+                            }
                             pool.sync_inference_url_models(models).await;
                         }
                         Err(e) => {
                             warn!(error = %e, "Failed to refresh inference_url models");
+                            // On failure, keep all existing inference_url models
+                            // (we don't know which are still valid)
+                            let mappings = pool.provider_mappings.read().await;
+                            valid_model_names
+                                .extend(mappings.model_to_providers.keys().cloned());
+                            drop(mappings);
                         }
                     }
 
                     // Refresh external providers
                     match source.fetch_external_models().await {
                         Ok(models) => {
+                            for (name, _) in &models {
+                                valid_model_names.insert(name.clone());
+                            }
                             pool.sync_external_providers(models).await;
                         }
                         Err(e) => {
                             warn!(error = %e, "Failed to refresh external providers");
+                            // On failure, keep all existing providers
+                            let mappings = pool.provider_mappings.read().await;
+                            valid_model_names
+                                .extend(mappings.model_to_providers.keys().cloned());
+                            drop(mappings);
                         }
                     }
+
+                    // Remove providers for models no longer in the database
+                    pool.remove_stale_providers(&valid_model_names).await;
                 }
             }
         });

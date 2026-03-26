@@ -5,27 +5,36 @@ use std::sync::Arc;
 use async_trait::async_trait;
 pub use ports::{ModelInfo, ModelWithPricing, ModelsError, ModelsRepository, ModelsServiceTrait};
 
+use crate::inference_provider_pool::InferenceProviderPool;
+
 pub struct ModelsServiceImpl {
+    pub inference_provider_pool: Arc<InferenceProviderPool>,
     pub models_repository: Arc<dyn ModelsRepository>,
 }
 
 impl ModelsServiceImpl {
-    pub fn new(models_repository: Arc<dyn ModelsRepository>) -> Self {
-        Self { models_repository }
+    pub fn new(
+        inference_provider_pool: Arc<InferenceProviderPool>,
+        models_repository: Arc<dyn ModelsRepository>,
+    ) -> Self {
+        Self {
+            inference_provider_pool,
+            models_repository,
+        }
     }
 }
 
 #[async_trait]
 impl ModelsServiceTrait for ModelsServiceImpl {
     async fn get_models(&self) -> Result<Vec<ModelInfo>, ModelsError> {
-        let (models, _total) = self.get_models_with_pricing(1000, 0).await?;
-        Ok(models
+        let names = self.inference_provider_pool.registered_model_names().await;
+        Ok(names
             .into_iter()
-            .map(|m| ModelInfo {
+            .map(|name| ModelInfo {
                 created: 0,
-                id: m.model_name,
+                id: name,
                 object: "model".to_string(),
-                owned_by: m.owned_by,
+                owned_by: "system".to_string(),
             })
             .collect())
     }

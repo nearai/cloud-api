@@ -169,14 +169,32 @@ pub async fn batch_upsert_models(
             }
         })?;
 
-    // Update providers at runtime so changes take effect without server restart
+    // Update providers at runtime so changes take effect without server restart.
+    // Unregister first, then re-register — this handles type transitions
+    // (e.g., inference_url → external) and deactivations cleanly.
+
+    // Unregister models that are deactivated or changing provider type.
+    // This covers: is_active=false, provider_type changed, inference_url cleared.
+    // Re-registration below will add back the ones that should still be active.
+    for (model_name, request) in &batch_request {
+        let is_inactive = request.is_active == Some(false);
+        let has_type_change = request.provider_type.is_some() || request.inference_url.is_some();
+        if is_inactive || has_type_change {
+            app_state
+                .inference_provider_pool
+                .unregister_provider(model_name)
+                .await;
+        }
+    }
 
     // Register inference_url models (our own vLLM/SGLang backends)
+    // Only for active, non-external models with an inference_url set
     let inference_url_models: Vec<(String, String)> = batch_request
         .iter()
         .filter_map(|(model_name, request)| {
             let is_active = request.is_active != Some(false);
-            if is_active {
+            let is_external = request.provider_type.as_deref() == Some("external");
+            if is_active && !is_external {
                 request
                     .inference_url
                     .clone()
@@ -215,25 +233,6 @@ pub async fn batch_upsert_models(
             }
         })
         .collect();
-
-    // Unregister models that are explicitly deactivated
-    let models_to_unregister: Vec<String> = batch_request
-        .iter()
-        .filter_map(|(model_name, request)| {
-            if request.is_active == Some(false) {
-                Some(model_name.clone())
-            } else {
-                None
-            }
-        })
-        .collect();
-
-    for model_name in &models_to_unregister {
-        app_state
-            .inference_provider_pool
-            .unregister_provider(model_name)
-            .await;
-    }
 
     if !external_models.is_empty() {
         tracing::info!(

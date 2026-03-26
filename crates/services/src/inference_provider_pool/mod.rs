@@ -67,6 +67,10 @@ pub struct InferenceProviderPool {
     /// Uses std::sync::RwLock (not tokio) because all operations are non-blocking
     /// HashMap lookups/inserts — no .await while holding the lock.
     provider_failure_counts: Arc<std::sync::RwLock<HashMap<usize, u32>>>,
+    /// Cache of inference_url → serving provider. When a model's URL hasn't changed
+    /// across refreshes, the existing provider (and its warm reqwest::Client with
+    /// pooled TLS connections) is reused instead of creating a new one.
+    inference_url_providers: Arc<RwLock<HashMap<String, Arc<InferenceProviderTrait>>>>,
 }
 
 impl InferenceProviderPool {
@@ -80,6 +84,7 @@ impl InferenceProviderPool {
             chat_id_mapping: Arc::new(RwLock::new(HashMap::new())),
             refresh_task_handle: Arc::new(Mutex::new(None)),
             provider_failure_counts: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            inference_url_providers: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -754,45 +759,45 @@ impl InferenceProviderPool {
         signing_address: Option<String>,
         include_tls_fingerprint: bool,
     ) -> Result<Vec<serde_json::Map<String, serde_json::Value>>, AttestationError> {
-        // Get all providers for this model
-        let mut model_attestations = vec![];
+        let providers = self
+            .get_providers_for_model(&model)
+            .await
+            .ok_or_else(|| AttestationError::ProviderNotFound(model.clone()))?;
 
-        if let Some(providers) = self.get_providers_for_model(&model).await {
-            // Broadcast to all providers
-            for provider in providers {
-                match provider
-                    .get_attestation_report(
-                        model.clone(),
-                        signing_algo.clone(),
-                        nonce.clone(),
-                        signing_address.clone(),
-                        include_tls_fingerprint,
-                    )
-                    .await
-                {
-                    Ok(mut attestation) => {
-                        // Remove 'all_attestations' field if present
-                        attestation.remove("all_attestations");
-                        model_attestations.push(attestation);
-                    }
-                    Err(e) => {
-                        // Log and continue to next provider (404 is expected when
-                        // signing_address doesn't match)
-                        tracing::debug!(
-                            model = %model,
-                            error = %e,
-                            "Provider returned error for attestation request, continuing to next provider"
-                        );
-                    }
+        // Each inference_url points to a proxy that load-balances across CVMs.
+        // All CVMs behind the proxy share the same signing key (derived from model
+        // name via dstack KMS), so one attestation report is sufficient.
+        // Try providers in order and return the first successful response.
+        let mut last_error = None;
+        for provider in providers {
+            match provider
+                .get_attestation_report(
+                    model.clone(),
+                    signing_algo.clone(),
+                    nonce.clone(),
+                    signing_address.clone(),
+                    include_tls_fingerprint,
+                )
+                .await
+            {
+                Ok(mut attestation) => {
+                    attestation.remove("all_attestations");
+                    return Ok(vec![attestation]);
+                }
+                Err(e) => {
+                    tracing::debug!(
+                        model = %model,
+                        error = %e,
+                        "Provider returned error for attestation request, trying next"
+                    );
+                    last_error = Some(e);
                 }
             }
         }
 
-        if model_attestations.is_empty() {
-            return Err(AttestationError::ProviderNotFound(model));
-        }
-
-        Ok(model_attestations)
+        Err(last_error
+            .map(|e| AttestationError::FetchError(e.to_string()))
+            .unwrap_or_else(|| AttestationError::ProviderNotFound(model)))
     }
 
     pub async fn chat_completion_stream(
@@ -1236,9 +1241,9 @@ impl InferenceProviderPool {
 
     /// Load models with inference_url as VLlmProviders into provider_mappings.
     ///
-    /// These models bypass the discovery server entirely. A VLlmProvider is created
-    /// for each inference_url, attestation keys are probed, and the provider is
-    /// registered in provider_mappings (the same path as discovered vLLM models).
+    /// For each model, reuses the existing provider (and its warm TLS connections)
+    /// if the inference_url hasn't changed since last load. Only creates new providers
+    /// for models whose URL changed or that are new.
     ///
     /// # Arguments
     /// * `models` - List of (model_name, inference_url) tuples
@@ -1249,37 +1254,50 @@ impl InferenceProviderPool {
 
         let api_key = self.api_key.clone();
 
-        // Phase 1: Create providers and probe attestation concurrently.
-        // Uses a short-timeout probe provider (10s) so dead backends don't stall startup.
-        // The serving provider uses the default 90s timeout.
-        let endpoint_futures: Vec<_> = models
+        // Check which models can reuse their existing provider (URL unchanged)
+        let existing_cache = self.inference_url_providers.read().await;
+        let mut reused: Vec<(String, String, Arc<InferenceProviderTrait>)> = Vec::new();
+        let mut needs_creation: Vec<(String, String)> = Vec::new();
+
+        for (model_name, url) in &models {
+            if let Some(existing) = existing_cache.get(url) {
+                reused.push((model_name.clone(), url.clone(), existing.clone()));
+            } else {
+                needs_creation.push((model_name.clone(), url.clone()));
+            }
+        }
+        drop(existing_cache);
+
+        if !needs_creation.is_empty() {
+            info!(
+                new = needs_creation.len(),
+                reused = reused.len(),
+                "Creating new providers for changed/new inference URLs"
+            );
+        }
+
+        // Phase 1: Create providers for new/changed URLs and probe attestation concurrently.
+        let endpoint_futures: Vec<_> = needs_creation
             .iter()
             .map(|(model_name, url)| {
                 let model_name = model_name.clone();
                 let url = url.clone();
                 let api_key = api_key.clone();
                 async move {
-                    let probe_provider = Arc::new(VLlmProvider::new(VLlmConfig::new(
-                        url.clone(),
-                        api_key.clone(),
-                        Some(10),
-                    ))) as Arc<InferenceProviderTrait>;
-
                     let serving_provider = Arc::new(VLlmProvider::new(VLlmConfig::new(
                         url.clone(),
                         api_key,
                         None,
                     ))) as Arc<InferenceProviderTrait>;
 
-                    let (pub_keys, _has_valid_attestation) =
+                    let (pub_keys, _) =
                         Self::fetch_signing_public_keys_for_both_algorithms(
-                            &probe_provider,
+                            &serving_provider,
                             &model_name,
                             &url,
                         )
                         .await;
 
-                    // Return pub_keys referencing the serving_provider (not probe)
                     let pub_keys: Vec<(String, Arc<InferenceProviderTrait>)> = pub_keys
                         .into_iter()
                         .map(|(key, _)| (key, serving_provider.clone()))
@@ -1291,17 +1309,27 @@ impl InferenceProviderPool {
             .collect();
 
         use futures::stream::{self, StreamExt};
-        let results: Vec<_> = stream::iter(endpoint_futures)
+        let new_results: Vec<_> = stream::iter(endpoint_futures)
             .buffer_unordered(20)
             .collect()
             .await;
 
-        // Phase 2: Register in provider_mappings.
-        // Collect old provider Arcs so we can prune stale pubkey entries.
+        // Phase 2: Merge reused and new providers, update mappings.
         let mut model_providers: HashMap<String, Vec<Arc<InferenceProviderTrait>>> = HashMap::new();
         let mut pub_key_updates: Vec<(String, Arc<InferenceProviderTrait>)> = Vec::new();
+        let mut new_url_cache: HashMap<String, Arc<InferenceProviderTrait>> = HashMap::new();
 
-        for (model_name, url, provider, pub_keys) in &results {
+        // Reused providers (URL unchanged — keep warm TLS connections)
+        for (model_name, url, provider) in &reused {
+            model_providers
+                .entry(model_name.clone())
+                .or_default()
+                .push(provider.clone());
+            new_url_cache.insert(url.clone(), provider.clone());
+        }
+
+        // Newly created providers
+        for (model_name, url, provider, pub_keys) in &new_results {
             info!(
                 model = %model_name,
                 url = %url,
@@ -1313,6 +1341,7 @@ impl InferenceProviderPool {
                 .or_default()
                 .push(provider.clone());
             pub_key_updates.extend(pub_keys.iter().cloned());
+            new_url_cache.insert(url.clone(), provider.clone());
         }
 
         // Atomic update: replace model providers and rebuild pubkey mappings
@@ -1329,12 +1358,10 @@ impl InferenceProviderPool {
                 }
             }
 
-            // Replace model_to_providers entries
             for (model_name, providers) in model_providers {
                 mappings.model_to_providers.insert(model_name, providers);
             }
 
-            // Prune pubkey entries that pointed to old (now-replaced) providers
             if !old_provider_ptrs.is_empty() {
                 mappings.pubkey_to_providers.retain(|_, providers| {
                     providers.retain(|p| {
@@ -1344,7 +1371,6 @@ impl InferenceProviderPool {
                 });
             }
 
-            // Add new pubkey entries
             for (key, provider) in pub_key_updates {
                 mappings
                     .pubkey_to_providers
@@ -1354,7 +1380,15 @@ impl InferenceProviderPool {
             }
         }
 
-        info!(count = results.len(), "Loaded inference_url models");
+        // Update the URL→provider cache
+        *self.inference_url_providers.write().await = new_url_cache;
+
+        info!(
+            total = models.len(),
+            reused = reused.len(),
+            created = new_results.len(),
+            "Loaded inference_url models"
+        );
     }
 
     /// Refresh inference_url models from the database.
@@ -1535,6 +1569,7 @@ impl InferenceProviderPool {
             .write()
             .unwrap_or_else(|e| e.into_inner())
             .clear();
+        self.inference_url_providers.write().await.clear();
 
         info!(model_count, "Inference provider pool shutdown completed");
     }

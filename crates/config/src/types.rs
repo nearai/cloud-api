@@ -3,7 +3,8 @@ use std::{collections::HashMap, env};
 #[derive(Debug, Clone)]
 pub struct ApiConfig {
     pub server: ServerConfig,
-    pub model_discovery: ModelDiscoveryConfig,
+    /// API key for authenticating with inference backends (vLLM/SGLang via inference_url)
+    pub inference_api_key: Option<String>,
     pub logging: LoggingConfig,
     pub dstack_client: DstackClientConfig,
     pub auth: AuthConfig,
@@ -19,7 +20,9 @@ impl ApiConfig {
     pub fn from_env() -> Result<Self, String> {
         Ok(Self {
             server: ServerConfig::from_env()?,
-            model_discovery: ModelDiscoveryConfig::from_env()?,
+            inference_api_key: env::var("INFERENCE_API_KEY")
+                .or_else(|_| env::var("MODEL_DISCOVERY_API_KEY"))
+                .ok(),
             logging: LoggingConfig::from_env()?,
             dstack_client: DstackClientConfig::from_env()?,
             auth: AuthConfig::from_env()?,
@@ -121,76 +124,6 @@ impl ServerConfig {
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct ModelDiscoveryConfig {
-    pub discovery_server_url: String,
-    pub api_key: Option<String>,
-    pub refresh_interval: i64, // seconds
-    pub timeout: i64,          // seconds (for discovery requests)
-}
-
-impl ModelDiscoveryConfig {
-    /// Load from environment variables
-    pub fn from_env() -> Result<Self, String> {
-        let config = Self {
-            discovery_server_url: env::var("MODEL_DISCOVERY_SERVER_URL")
-                .map_err(|_| "MODEL_DISCOVERY_SERVER_URL not set")?,
-            api_key: env::var("MODEL_DISCOVERY_API_KEY").ok(),
-            refresh_interval: env::var("MODEL_DISCOVERY_REFRESH_INTERVAL")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(300), // 5 minutes
-            timeout: env::var("MODEL_DISCOVERY_TIMEOUT")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(30), // 30 seconds
-        };
-        config.validate()?;
-        Ok(config)
-    }
-
-    /// Validate that all timeout values are positive
-    /// Called at startup to catch invalid configuration early
-    pub fn validate(&self) -> Result<(), String> {
-        if self.timeout <= 0 {
-            return Err(format!(
-                "MODEL_DISCOVERY_TIMEOUT must be positive (got: {}). \
-                 If set to 0 or negative, all discovery requests will timeout immediately.",
-                self.timeout
-            ));
-        }
-
-        if self.refresh_interval <= 0 {
-            return Err(format!(
-                "MODEL_DISCOVERY_REFRESH_INTERVAL must be positive (got: {})",
-                self.refresh_interval
-            ));
-        }
-
-        Ok(())
-    }
-}
-
-impl Default for ModelDiscoveryConfig {
-    fn default() -> Self {
-        let config = Self {
-            discovery_server_url: env::var("MODEL_DISCOVERY_SERVER_URL")
-                .expect("MODEL_DISCOVERY_SERVER_URL environment variable is required"),
-            api_key: env::var("MODEL_DISCOVERY_API_KEY").ok(),
-            refresh_interval: env::var("MODEL_DISCOVERY_REFRESH_INTERVAL")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(300), // 5 minutes
-            timeout: env::var("MODEL_DISCOVERY_TIMEOUT")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(30), // 30 seconds
-        };
-        config.validate().expect("Invalid ModelDiscoveryConfig");
-        config
-    }
-}
-
 /// Logging Configuration
 #[derive(Debug, Clone)]
 pub struct LoggingConfig {
@@ -255,7 +188,6 @@ impl DstackClientConfig {
 // Domain-specific configuration types that will be used by domain layer
 #[derive(Debug, Clone)]
 pub struct DomainConfig {
-    pub model_discovery: ModelDiscoveryConfig,
     pub dstack_client: DstackClientConfig,
     pub auth: AuthConfig,
     pub external_providers: ExternalProvidersConfig,
@@ -423,7 +355,6 @@ impl From<GoogleOAuthConfig> for OAuthProviderConfig {
 impl From<ApiConfig> for DomainConfig {
     fn from(api_config: ApiConfig) -> Self {
         Self {
-            model_discovery: api_config.model_discovery,
             dstack_client: api_config.dstack_client,
             auth: api_config.auth,
             external_providers: api_config.external_providers,

@@ -27,22 +27,16 @@ impl ModelsServiceImpl {
 #[async_trait]
 impl ModelsServiceTrait for ModelsServiceImpl {
     async fn get_models(&self) -> Result<Vec<ModelInfo>, ModelsError> {
-        self.inference_provider_pool
-            .models()
-            .await
-            .map(|models| {
-                models
-                    .data
-                    .into_iter()
-                    .map(|model| ModelInfo {
-                        created: model.created,
-                        id: model.id,
-                        object: model.object,
-                        owned_by: model.owned_by,
-                    })
-                    .collect()
+        let names = self.inference_provider_pool.registered_model_names().await;
+        Ok(names
+            .into_iter()
+            .map(|name| ModelInfo {
+                created: 0,
+                id: name,
+                object: "model".to_string(),
+                owned_by: "system".to_string(),
             })
-            .map_err(|e| ModelsError::InternalError(e.to_string()))
+            .collect())
     }
 
     async fn get_models_with_pricing(

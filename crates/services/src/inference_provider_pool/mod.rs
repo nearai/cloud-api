@@ -1343,16 +1343,28 @@ impl InferenceProviderPool {
             new_url_cache.insert(url.clone(), provider.clone());
         }
 
-        // Atomic update: replace model providers and rebuild pubkey mappings
+        // Atomic update: replace model providers and rebuild pubkey mappings.
+        // Only prune pubkey entries for providers that are truly being replaced
+        // (new Arc), not for reused providers (same Arc, same pubkeys).
         {
             let mut mappings = self.provider_mappings.write().await;
 
-            // Collect old provider ptrs for models being replaced, so we can prune pubkeys
-            let mut old_provider_ptrs = std::collections::HashSet::new();
+            // Ptrs of providers being kept (reused + newly created)
+            let kept_ptrs: std::collections::HashSet<usize> = model_providers
+                .values()
+                .flat_map(|v| v.iter())
+                .map(|p| Arc::as_ptr(p) as *const () as usize)
+                .collect();
+
+            // Collect ptrs of old providers being replaced (not reused)
+            let mut replaced_ptrs = std::collections::HashSet::new();
             for model_name in model_providers.keys() {
                 if let Some(old) = mappings.model_to_providers.get(model_name) {
                     for p in old {
-                        old_provider_ptrs.insert(Arc::as_ptr(p) as *const () as usize);
+                        let ptr = Arc::as_ptr(p) as *const () as usize;
+                        if !kept_ptrs.contains(&ptr) {
+                            replaced_ptrs.insert(ptr);
+                        }
                     }
                 }
             }
@@ -1361,10 +1373,11 @@ impl InferenceProviderPool {
                 mappings.model_to_providers.insert(model_name, providers);
             }
 
-            if !old_provider_ptrs.is_empty() {
+            // Only prune pubkey entries for truly replaced providers
+            if !replaced_ptrs.is_empty() {
                 mappings.pubkey_to_providers.retain(|_, providers| {
                     providers.retain(|p| {
-                        !old_provider_ptrs.contains(&(Arc::as_ptr(p) as *const () as usize))
+                        !replaced_ptrs.contains(&(Arc::as_ptr(p) as *const () as usize))
                     });
                     !providers.is_empty()
                 });

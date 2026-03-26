@@ -1290,13 +1290,12 @@ impl InferenceProviderPool {
                         None,
                     ))) as Arc<InferenceProviderTrait>;
 
-                    let (pub_keys, _) =
-                        Self::fetch_signing_public_keys_for_both_algorithms(
-                            &serving_provider,
-                            &model_name,
-                            &url,
-                        )
-                        .await;
+                    let (pub_keys, _) = Self::fetch_signing_public_keys_for_both_algorithms(
+                        &serving_provider,
+                        &model_name,
+                        &url,
+                    )
+                    .await;
 
                     let pub_keys: Vec<(String, Arc<InferenceProviderTrait>)> = pub_keys
                         .into_iter()
@@ -1399,10 +1398,7 @@ impl InferenceProviderPool {
 
     /// Remove models from provider_mappings that are not in `valid_model_names`.
     /// Also cleans up load_balancer_index and provider_failure_counts for removed providers.
-    async fn remove_stale_providers(
-        &self,
-        valid_model_names: &std::collections::HashSet<String>,
-    ) {
+    async fn remove_stale_providers(&self, valid_model_names: &std::collections::HashSet<String>) {
         let mut mappings = self.provider_mappings.write().await;
 
         let stale_models: Vec<String> = mappings
@@ -1428,8 +1424,7 @@ impl InferenceProviderPool {
 
         // Prune pubkey entries
         mappings.pubkey_to_providers.retain(|_, providers| {
-            providers
-                .retain(|p| !removed_ptrs.contains(&(Arc::as_ptr(p) as *const () as usize)));
+            providers.retain(|p| !removed_ptrs.contains(&(Arc::as_ptr(p) as *const () as usize)));
             !providers.is_empty()
         });
 
@@ -1502,8 +1497,7 @@ impl InferenceProviderPool {
                             // On failure, keep all existing inference_url models
                             // (we don't know which are still valid)
                             let mappings = pool.provider_mappings.read().await;
-                            valid_model_names
-                                .extend(mappings.model_to_providers.keys().cloned());
+                            valid_model_names.extend(mappings.model_to_providers.keys().cloned());
                             drop(mappings);
                         }
                     }
@@ -1520,8 +1514,7 @@ impl InferenceProviderPool {
                             warn!(error = %e, "Failed to refresh external providers");
                             // On failure, keep all existing providers
                             let mappings = pool.provider_mappings.read().await;
-                            valid_model_names
-                                .extend(mappings.model_to_providers.keys().cloned());
+                            valid_model_names.extend(mappings.model_to_providers.keys().cloned());
                             drop(mappings);
                         }
                     }

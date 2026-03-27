@@ -844,6 +844,9 @@ impl InferenceProviderPool {
                     chat_id = %chat_id,
                     "Storing chat_id mapping for streaming completion"
                 );
+                // Pin the dedicated TLS connection so signature fetches
+                // reuse the same connection that served this completion.
+                provider.pin_chat_connection(&request_hash, &chat_id);
                 self.store_chat_id_mapping(chat_id, provider).await;
             }
         }

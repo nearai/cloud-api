@@ -5,6 +5,7 @@ use crate::{
 use async_trait::async_trait;
 use reqwest::{header::HeaderValue, Client};
 use serde::Serialize;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -68,6 +69,16 @@ impl VLlmConfig {
 pub struct VLlmProvider {
     config: VLlmConfig,
     client: Client,
+    /// Dedicated per-completion clients for connection-pinned signature fetching.
+    /// With L4 TLS passthrough load balancing, each TLS connection is pinned to a
+    /// specific backend. Signature fetches must reuse the same connection that served
+    /// the completion, otherwise they hit a different backend and get 404.
+    ///
+    /// Flow: completion creates a dedicated Client → stored in `pending_clients[request_hash]`
+    /// → pool peeks chat_id from stream → calls `pin_chat_connection(request_hash, chat_id)`
+    /// → moves client to `signature_clients[chat_id]` → `get_signature` uses it.
+    pending_clients: Arc<std::sync::Mutex<HashMap<String, Client>>>,
+    signature_clients: Arc<std::sync::Mutex<HashMap<String, Client>>>,
 }
 
 impl VLlmProvider {
@@ -87,7 +98,25 @@ impl VLlmProvider {
             .build()
             .expect("Failed to create HTTP client");
 
-        Self { config, client }
+        Self {
+            config,
+            client,
+            pending_clients: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            signature_clients: Arc::new(std::sync::Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// Create a dedicated reqwest::Client for a single completion.
+    /// This client has its own connection pool, ensuring the TLS connection
+    /// used for the completion is reused for subsequent signature fetches.
+    fn create_dedicated_client() -> Client {
+        Client::builder()
+            .pool_max_idle_per_host(1)
+            .connect_timeout(std::time::Duration::from_secs(5))
+            .pool_idle_timeout(std::time::Duration::from_secs(90))
+            .read_timeout(std::time::Duration::from_secs(300))
+            .build()
+            .expect("Failed to create dedicated HTTP client")
     }
 
     /// Build HTTP request headers
@@ -159,15 +188,19 @@ impl VLlmProvider {
     /// (connect + response headers), not to body consumption. reqwest's `.timeout()` on the
     /// `RequestBuilder` applies to the full request lifecycle including body streaming, which
     /// kills long-running SSE streams at 30s.
+    ///
+    /// `client_override` allows using a dedicated client for connection pinning.
     async fn send_streaming_request<T: serde::Serialize + Send + Sync>(
         &self,
         url: &str,
         headers: reqwest::header::HeaderMap,
         params: &T,
+        client_override: Option<&Client>,
     ) -> Result<reqwest::Response, CompletionError> {
+        let client = client_override.unwrap_or(&self.client);
         let response = tokio::time::timeout(
             Duration::from_secs(self.config.timeout_seconds as u64),
-            self.client.post(url).headers(headers).json(params).send(),
+            client.post(url).headers(headers).json(params).send(),
         )
         .await
         .map_err(|_| CompletionError::HttpError {
@@ -210,19 +243,63 @@ impl InferenceProvider for VLlmProvider {
         let headers = self
             .build_headers()
             .map_err(CompletionError::CompletionError)?;
-        let response = self
-            .client
+
+        // Use the dedicated client for this chat_id if available.
+        // This ensures the signature fetch goes over the same TLS connection
+        // that served the completion (critical for L4 load-balanced backends).
+        let dedicated_client = self
+            .signature_clients
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(chat_id)
+            .cloned();
+        let client = dedicated_client.as_ref().unwrap_or(&self.client);
+
+        let response = client
             .get(&url)
             .headers(headers)
             .timeout(Duration::from_secs(self.config.timeout_seconds as u64))
             .send()
             .await
             .map_err(|e| CompletionError::CompletionError(e.to_string()))?;
+
+        if !response.status().is_success() {
+            let status = response.status().as_u16();
+            let error_text = response
+                .text()
+                .await
+                .unwrap_or_else(|e| format!("Failed to read error response body: {e}"));
+            return Err(CompletionError::CompletionError(format!(
+                "Signature fetch failed (HTTP {status}): {error_text}"
+            )));
+        }
+
         let signature = response
             .json()
             .await
             .map_err(|e| CompletionError::CompletionError(e.to_string()))?;
         Ok(signature)
+    }
+
+    fn pin_chat_connection(&self, request_hash: &str, chat_id: &str) {
+        if let Some(client) = self
+            .pending_clients
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(request_hash)
+        {
+            self.signature_clients
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(chat_id.to_string(), client);
+        }
+    }
+
+    fn unpin_chat_connection(&self, chat_id: &str) {
+        self.signature_clients
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(chat_id);
     }
 
     async fn get_attestation_report(
@@ -353,9 +430,20 @@ impl InferenceProvider for VLlmProvider {
         // Prepare encryption headers
         self.prepare_encryption_headers(&mut headers, &mut streaming_params.extra);
 
+        // Use a dedicated client for this completion so the signature fetch
+        // can reuse the same TLS connection (required for L4 load balancing).
+        let dedicated_client = Self::create_dedicated_client();
         let response = self
-            .send_streaming_request(&url, headers, &streaming_params)
+            .send_streaming_request(&url, headers, &streaming_params, Some(&dedicated_client))
             .await?;
+
+        // Store the dedicated client keyed by request_hash.
+        // The pool will call pin_chat_connection() after peeking the chat_id
+        // to move it to signature_clients[chat_id].
+        self.pending_clients
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(request_hash, dedicated_client);
 
         // Use the SSE parser to handle the stream properly
         let sse_stream = new_sse_parser(response.bytes_stream(), true);
@@ -382,8 +470,9 @@ impl InferenceProvider for VLlmProvider {
         // Prepare encryption headers
         self.prepare_encryption_headers(&mut headers, &mut non_streaming_params.extra);
 
-        let response = self
-            .client
+        // Use a dedicated client for connection pinning (same TLS connection for signature)
+        let dedicated_client = Self::create_dedicated_client();
+        let response = dedicated_client
             .post(&url)
             .headers(headers)
             .json(&non_streaming_params)
@@ -419,6 +508,14 @@ impl InferenceProvider for VLlmProvider {
             CompletionError::CompletionError(format!("Failed to parse response: {e}"))
         })?;
 
+        // Store the dedicated client for signature fetching.
+        // For non-streaming, we know the chat_id immediately.
+        let chat_id = chat_completion_response.id.clone();
+        self.signature_clients
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(chat_id, dedicated_client);
+
         Ok(ChatCompletionResponseWithBytes {
             response: chat_completion_response,
             raw_bytes,
@@ -444,7 +541,7 @@ impl InferenceProvider for VLlmProvider {
             .build_headers()
             .map_err(CompletionError::CompletionError)?;
         let response = self
-            .send_streaming_request(&url, headers, &streaming_params)
+            .send_streaming_request(&url, headers, &streaming_params, None)
             .await?;
 
         // Use the SSE parser to handle the stream properly

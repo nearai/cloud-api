@@ -542,6 +542,9 @@ impl ports::AttestationServiceTrait for AttestationService {
                 })?;
         }
 
+        // Clean up the dedicated TLS connection now that signatures are stored
+        provider.unpin_chat_connection(chat_id);
+
         // Record successful verification
         let duration = start_time.elapsed();
         self.metrics_service

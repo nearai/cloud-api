@@ -837,6 +837,7 @@ impl InferenceProviderPool {
         // Store chat_id mapping for sticky routing by peeking at the first event
         // Must be synchronous to ensure attestation service can find the provider
         let mut peekable = StreamingResultExt::peekable(stream);
+        let mut pinned = false;
         if let Some(Ok(event)) = peekable.peek().await {
             if let inference_providers::StreamChunk::Chat(chat_chunk) = &event.chunk {
                 let chat_id = chat_chunk.id.clone();
@@ -844,8 +845,17 @@ impl InferenceProviderPool {
                     chat_id = %chat_id,
                     "Storing chat_id mapping for streaming completion"
                 );
-                self.store_chat_id_mapping(chat_id, provider).await;
+                // Pin the dedicated TLS connection so signature fetches
+                // reuse the same connection that served this completion.
+                provider.pin_chat_connection(&request_hash, &chat_id);
+                pinned = true;
+                self.store_chat_id_mapping(chat_id, provider.clone()).await;
             }
+        }
+        if !pinned {
+            // Clean up orphaned pending client when peek fails or yields no chat_id
+            provider.pin_chat_connection(&request_hash, "");
+            provider.unpin_chat_connection("");
         }
         Ok(Box::pin(peekable))
     }

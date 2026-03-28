@@ -222,6 +222,15 @@ pub trait InferenceProvider {
         signing_algo: Option<String>,
     ) -> Result<ChatSignature, CompletionError>;
 
+    /// Pin a dedicated TLS connection to a chat_id for signature fetching.
+    /// Called by the pool after peeking the chat_id from the stream.
+    /// For L4 load-balanced backends, this ensures the signature fetch
+    /// goes over the same TLS connection that served the completion.
+    fn pin_chat_connection(&self, _request_hash: &str, _chat_id: &str) {}
+
+    /// Clean up the dedicated client for a chat_id after signature fetching.
+    fn unpin_chat_connection(&self, _chat_id: &str) {}
+
     async fn get_attestation_report(
         &self,
         model: String,

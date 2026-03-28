@@ -247,6 +247,8 @@ impl InferenceProvider for VLlmProvider {
         // Use the dedicated client for this chat_id if available.
         // This ensures the signature fetch goes over the same TLS connection
         // that served the completion (critical for L4 load-balanced backends).
+        // Clone rather than remove — get_signature is called once per algo
+        // (ecdsa + ed25519). Cleanup happens via unpin_chat_connection.
         let dedicated_client = self
             .signature_clients
             .lock()

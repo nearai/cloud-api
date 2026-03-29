@@ -2041,6 +2041,55 @@ mod tests {
         }
     }
 
+    /// Test that E2EE routing via pubkey works end-to-end after register_provider.
+    /// This exercises: register_provider → fetch attestation → store pubkey → route by pubkey.
+    #[tokio::test]
+    async fn test_e2ee_pubkey_routing_after_register() {
+        use inference_providers::mock::MockProvider;
+
+        let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
+        let model_id = "test-e2ee-model".to_string();
+
+        // Register provider (fetches attestation, stores pubkeys)
+        let mock_provider = Arc::new(MockProvider::new());
+        pool.register_provider(model_id.clone(), mock_provider)
+            .await;
+
+        // The mock provider returns this ECDSA key
+        let ecdsa_key = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+        // Test 1: routing WITHOUT pubkey should work
+        let result: Result<((), _), _> = pool
+            .retry_with_fallback(&model_id, "test_op", None, |_provider| async {
+                Ok(())
+            })
+            .await;
+        assert!(result.is_ok(), "Routing without pubkey should succeed");
+
+        // Test 2: routing WITH correct pubkey should work
+        let result: Result<((), _), _> = pool
+            .retry_with_fallback(&model_id, "test_op", Some(ecdsa_key), |_provider| async {
+                Ok(())
+            })
+            .await;
+        assert!(
+            result.is_ok(),
+            "Routing with correct ECDSA pubkey should succeed, got: {:?}",
+            result.err()
+        );
+
+        // Test 3: routing with WRONG pubkey should fail
+        let result: Result<((), _), _> = pool
+            .retry_with_fallback(
+                &model_id,
+                "test_op",
+                Some("deadbeef00000000deadbeef00000000deadbeef00000000deadbeef00000000deadbeef00000000deadbeef00000000deadbeef00000000deadbeef00000000"),
+                |_provider| async { Ok(()) },
+            )
+            .await;
+        assert!(result.is_err(), "Routing with wrong pubkey should fail");
+    }
+
     #[tokio::test]
     async fn test_sync_external_providers() {
         let pool = InferenceProviderPool::new(

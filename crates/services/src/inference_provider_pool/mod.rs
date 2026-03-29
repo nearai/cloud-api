@@ -2060,9 +2060,7 @@ mod tests {
 
         // Test 1: routing WITHOUT pubkey should work
         let result: Result<((), _), _> = pool
-            .retry_with_fallback(&model_id, "test_op", None, |_provider| async {
-                Ok(())
-            })
+            .retry_with_fallback(&model_id, "test_op", None, |_provider| async { Ok(()) })
             .await;
         assert!(result.is_ok(), "Routing without pubkey should succeed");
 

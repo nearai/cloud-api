@@ -160,31 +160,35 @@ where
         )
         .entered();
 
-        let (input_tokens, output_tokens, cache_read_tokens, chat_id) =
-            match (&self.last_usage_stats, &self.last_chat_id) {
-                (Some(usage), Some(chat_id)) => (
-                    usage.prompt_tokens,
-                    usage.completion_tokens,
-                    usage.cached_tokens(),
-                    chat_id.clone(),
-                ),
-                (None, None) => {
-                    tracing::error!("Stream ended but no usage stats and no chat_id available");
-                    return;
-                }
-                (None, Some(chat_id)) => {
-                    tracing::error!(%chat_id, "Stream ended but no usage stats available");
-                    return;
-                }
-                (Some(usage), None) => {
-                    tracing::error!(
-                        prompt_tokens = usage.prompt_tokens,
-                        completion_tokens = usage.completion_tokens,
-                        "Stream ended but no chat_id available"
-                    );
-                    return;
-                }
-            };
+        let (input_tokens, output_tokens, cache_read_tokens, chat_id) = match (
+            &self.last_usage_stats,
+            &self.last_chat_id,
+        ) {
+            (Some(usage), Some(chat_id)) => (
+                usage.prompt_tokens,
+                usage.completion_tokens,
+                usage.cached_tokens(),
+                chat_id.clone(),
+            ),
+            (None, None) => {
+                tracing::error!(%organization_id, %model_id, "Stream ended but no usage stats and no chat_id available");
+                return;
+            }
+            (None, Some(chat_id)) => {
+                tracing::error!(%chat_id, %organization_id, %model_id, "Stream ended but no usage stats available");
+                return;
+            }
+            (Some(usage), None) => {
+                tracing::error!(
+                    prompt_tokens = usage.prompt_tokens,
+                    completion_tokens = usage.completion_tokens,
+                    %organization_id,
+                    %model_id,
+                    "Stream ended but no chat_id available"
+                );
+                return;
+            }
+        };
 
         if input_tokens == 0 && output_tokens == 0 {
             return;

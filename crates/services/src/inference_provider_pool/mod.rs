@@ -584,9 +584,30 @@ impl InferenceProviderPool {
             Some(p) => p,
             None => {
                 if let Some(pub_key) = model_pub_key {
+                    let (available_pubkeys, model_provider_count) = {
+                        let mappings = self.provider_mappings.read().await;
+                        let pubkeys: Vec<String> = mappings
+                            .pubkey_to_providers
+                            .keys()
+                            .map(|k| {
+                                let prefix: String = k.chars().take(16).collect();
+                                format!("{}...({})", prefix, k.len())
+                            })
+                            .collect();
+                        let count = mappings
+                            .model_to_providers
+                            .get(model_id)
+                            .map(|v| v.len())
+                            .unwrap_or(0);
+                        (pubkeys, count)
+                    };
+                    let model_pub_key_prefix: String = pub_key.chars().take(16).collect();
                     tracing::warn!(
                         model_id = %model_id,
-                        model_pub_key = %pub_key,
+                        model_pub_key_prefix = %model_pub_key_prefix,
+                        model_pub_key_len = pub_key.len(),
+                        available_pubkeys = ?available_pubkeys,
+                        model_provider_count = model_provider_count,
                         operation = operation_name,
                         "No provider found for model public key"
                     );
@@ -1400,6 +1421,27 @@ impl InferenceProviderPool {
             }
         }
 
+        // Log pubkey mapping state for debugging E2EE routing issues
+        let (pubkey_count, pubkey_summaries) = {
+            let mappings = self.provider_mappings.read().await;
+            let count = mappings.pubkey_to_providers.len();
+            let summaries: Vec<String> = mappings
+                .pubkey_to_providers
+                .iter()
+                .take(10)
+                .map(|(k, v)| {
+                    let prefix: String = k.chars().take(16).collect();
+                    format!("{}...({}chars,{}providers)", prefix, k.len(), v.len())
+                })
+                .collect();
+            (count, summaries)
+        };
+        info!(
+            pubkey_mapping_count = pubkey_count,
+            pubkey_summaries = ?pubkey_summaries,
+            "pubkey_to_providers state after update"
+        );
+
         // Update the URL→provider cache
         *self.inference_url_providers.write().await = new_url_cache;
 
@@ -1997,6 +2039,53 @@ mod tests {
                 "ECDSA key should be PRESERVED for reused providers after refresh"
             );
         }
+    }
+
+    /// Test that E2EE routing via pubkey works end-to-end after register_provider.
+    /// This exercises: register_provider → fetch attestation → store pubkey → route by pubkey.
+    #[tokio::test]
+    async fn test_e2ee_pubkey_routing_after_register() {
+        use inference_providers::mock::MockProvider;
+
+        let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
+        let model_id = "test-e2ee-model".to_string();
+
+        // Register provider (fetches attestation, stores pubkeys)
+        let mock_provider = Arc::new(MockProvider::new());
+        pool.register_provider(model_id.clone(), mock_provider)
+            .await;
+
+        // The mock provider returns this ECDSA key
+        let ecdsa_key = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+        // Test 1: routing WITHOUT pubkey should work
+        let result: Result<((), _), _> = pool
+            .retry_with_fallback(&model_id, "test_op", None, |_provider| async { Ok(()) })
+            .await;
+        assert!(result.is_ok(), "Routing without pubkey should succeed");
+
+        // Test 2: routing WITH correct pubkey should work
+        let result: Result<((), _), _> = pool
+            .retry_with_fallback(&model_id, "test_op", Some(ecdsa_key), |_provider| async {
+                Ok(())
+            })
+            .await;
+        assert!(
+            result.is_ok(),
+            "Routing with correct ECDSA pubkey should succeed, got: {:?}",
+            result.err()
+        );
+
+        // Test 3: routing with WRONG pubkey should fail
+        let result: Result<((), _), _> = pool
+            .retry_with_fallback(
+                &model_id,
+                "test_op",
+                Some("deadbeef00000000deadbeef00000000deadbeef00000000deadbeef00000000deadbeef00000000deadbeef00000000deadbeef00000000deadbeef00000000"),
+                |_provider| async { Ok(()) },
+            )
+            .await;
+        assert!(result.is_err(), "Routing with wrong pubkey should fail");
     }
 
     #[tokio::test]

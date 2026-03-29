@@ -584,9 +584,24 @@ impl InferenceProviderPool {
             Some(p) => p,
             None => {
                 if let Some(pub_key) = model_pub_key {
+                    let mappings = self.provider_mappings.read().await;
+                    let available_pubkeys: Vec<String> = mappings
+                        .pubkey_to_providers
+                        .keys()
+                        .map(|k| format!("{}...({})", &k[..k.len().min(16)], k.len()))
+                        .collect();
+                    let model_provider_count = mappings
+                        .model_to_providers
+                        .get(model_id)
+                        .map(|v| v.len())
+                        .unwrap_or(0);
+                    drop(mappings);
                     tracing::warn!(
                         model_id = %model_id,
                         model_pub_key = %pub_key,
+                        model_pub_key_len = pub_key.len(),
+                        available_pubkeys = ?available_pubkeys,
+                        model_provider_count = model_provider_count,
                         operation = operation_name,
                         "No provider found for model public key"
                     );
@@ -1398,6 +1413,22 @@ impl InferenceProviderPool {
                     .or_default()
                     .push(provider);
             }
+        }
+
+        // Log pubkey mapping state for debugging E2EE routing issues
+        {
+            let mappings = self.provider_mappings.read().await;
+            let pubkey_count = mappings.pubkey_to_providers.len();
+            let pubkey_keys: Vec<String> = mappings
+                .pubkey_to_providers
+                .keys()
+                .map(|k| format!("{}...({})", &k[..k.len().min(16)], k.len()))
+                .collect();
+            info!(
+                pubkey_mapping_count = pubkey_count,
+                pubkey_keys = ?pubkey_keys,
+                "pubkey_to_providers state after update"
+            );
         }
 
         // Update the URL→provider cache

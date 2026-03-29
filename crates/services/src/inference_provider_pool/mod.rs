@@ -584,21 +584,27 @@ impl InferenceProviderPool {
             Some(p) => p,
             None => {
                 if let Some(pub_key) = model_pub_key {
-                    let mappings = self.provider_mappings.read().await;
-                    let available_pubkeys: Vec<String> = mappings
-                        .pubkey_to_providers
-                        .keys()
-                        .map(|k| format!("{}...({})", &k[..k.len().min(16)], k.len()))
-                        .collect();
-                    let model_provider_count = mappings
-                        .model_to_providers
-                        .get(model_id)
-                        .map(|v| v.len())
-                        .unwrap_or(0);
-                    drop(mappings);
+                    let (available_pubkeys, model_provider_count) = {
+                        let mappings = self.provider_mappings.read().await;
+                        let pubkeys: Vec<String> = mappings
+                            .pubkey_to_providers
+                            .keys()
+                            .map(|k| {
+                                let prefix: String = k.chars().take(16).collect();
+                                format!("{}...({})", prefix, k.len())
+                            })
+                            .collect();
+                        let count = mappings
+                            .model_to_providers
+                            .get(model_id)
+                            .map(|v| v.len())
+                            .unwrap_or(0);
+                        (pubkeys, count)
+                    };
+                    let model_pub_key_prefix: String = pub_key.chars().take(16).collect();
                     tracing::warn!(
                         model_id = %model_id,
-                        model_pub_key = %pub_key,
+                        model_pub_key_prefix = %model_pub_key_prefix,
                         model_pub_key_len = pub_key.len(),
                         available_pubkeys = ?available_pubkeys,
                         model_provider_count = model_provider_count,
@@ -1416,27 +1422,25 @@ impl InferenceProviderPool {
         }
 
         // Log pubkey mapping state for debugging E2EE routing issues
-        {
+        let (pubkey_count, pubkey_summaries) = {
             let mappings = self.provider_mappings.read().await;
-            let pubkey_count = mappings.pubkey_to_providers.len();
-            let pubkey_summaries: Vec<String> = mappings
+            let count = mappings.pubkey_to_providers.len();
+            let summaries: Vec<String> = mappings
                 .pubkey_to_providers
                 .iter()
+                .take(10)
                 .map(|(k, v)| {
-                    format!(
-                        "{}...({}chars,{}providers)",
-                        &k[..k.len().min(16)],
-                        k.len(),
-                        v.len()
-                    )
+                    let prefix: String = k.chars().take(16).collect();
+                    format!("{}...({}chars,{}providers)", prefix, k.len(), v.len())
                 })
                 .collect();
-            info!(
-                pubkey_mapping_count = pubkey_count,
-                pubkey_summaries = ?pubkey_summaries,
-                "pubkey_to_providers state after update"
-            );
-        }
+            (count, summaries)
+        };
+        info!(
+            pubkey_mapping_count = pubkey_count,
+            pubkey_summaries = ?pubkey_summaries,
+            "pubkey_to_providers state after update"
+        );
 
         // Update the URL→provider cache
         *self.inference_url_providers.write().await = new_url_cache;

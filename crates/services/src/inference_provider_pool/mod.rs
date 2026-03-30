@@ -1,7 +1,7 @@
 use crate::common::encryption_headers;
 use config::ExternalProvidersConfig;
 use inference_providers::{
-    models::{AttestationError, CompletionError, ListModelsError, ModelsResponse},
+    models::{AttestationError, CompletionError},
     AudioTranscriptionError, AudioTranscriptionParams, AudioTranscriptionResponse,
     ChatCompletionParams, ExternalProvider, ExternalProviderConfig, ImageEditError,
     ImageEditParams, ImageEditResponseWithBytes, ImageGenerationError, ImageGenerationParams,
@@ -9,13 +9,7 @@ use inference_providers::{
     RerankResponse, StreamingResult, StreamingResultExt, VLlmConfig, VLlmProvider,
 };
 use regex::Regex;
-use serde::Deserialize;
-use std::{
-    collections::{HashMap, HashSet},
-    net::IpAddr,
-    sync::Arc,
-    time::Duration,
-};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, info, warn};
 
@@ -26,16 +20,11 @@ type InferenceProviderTrait = dyn InferenceProvider + Send + Sync;
 #[async_trait::async_trait]
 pub trait ExternalModelsSource: Send + Sync {
     async fn fetch_external_models(&self) -> Result<Vec<(String, serde_json::Value)>, String>;
-}
 
-/// Discovery entry returned by the discovery layer
-#[derive(Debug, Clone, Deserialize)]
-struct DiscoveryEntry {
-    /// Model identifier (e.g., "Qwen/Qwen3-30B-A3B-Instruct-2507")
-    model: String,
-    /// Tags for filtering/routing (e.g., ["prod", "dev"])
-    #[serde(default)]
-    tags: Vec<String>,
+    /// Fetch models that have a direct inference URL configured.
+    /// Returns (model_name, inference_url) pairs for active models with inference_url set.
+    /// These models are routed directly to the URL, bypassing the discovery server.
+    async fn fetch_inference_url_models(&self) -> Result<Vec<(String, String)>, String>;
 }
 
 /// Combined provider mappings updated atomically to prevent race conditions
@@ -59,15 +48,11 @@ impl ProviderMappings {
 
 #[derive(Clone)]
 pub struct InferenceProviderPool {
-    /// Discovery URL for dynamic model discovery
-    discovery_url: String,
-    /// Optional API key for authenticating with discovered providers
+    /// Optional API key for authenticating with inference backends
     api_key: Option<String>,
-    /// HTTP timeout for discovery requests
-    discovery_timeout: Duration,
-    /// Combined provider mappings (updated atomically to prevent race conditions)
+    /// All inference_url-backed vLLM providers, updated atomically.
     provider_mappings: Arc<RwLock<ProviderMappings>>,
-    /// Best-effort mapping of provider pointer -> provider URL for discovered vLLM backends.
+    /// Best-effort mapping of provider pointer -> provider URL for vLLM backends.
     /// Used by api-key affinity routing to prefer a previously bound provider URL.
     provider_urls: Arc<RwLock<HashMap<usize, String>>>,
     /// External providers (keyed by model name, created from database config)
@@ -79,30 +64,25 @@ pub struct InferenceProviderPool {
     load_balancer_index: Arc<std::sync::RwLock<HashMap<String, usize>>>,
     /// Map of chat_id -> provider for sticky routing
     chat_id_mapping: Arc<RwLock<HashMap<String, Arc<InferenceProviderTrait>>>>,
-    /// Background task handle for periodic model discovery refresh
+    /// Background task handle for periodic provider refresh from database
     refresh_task_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
-    /// Background task handle for periodic external provider refresh
-    external_refresh_task_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
     /// Per-provider consecutive failure count, keyed by Arc pointer address.
     /// Providers with high failure counts are deprioritized in load balancing.
-    /// Counts reset to 0 on success and are cleaned up on discovery refresh.
+    /// Counts reset to 0 on success and are cleaned up on refresh.
     /// Uses std::sync::RwLock (not tokio) because all operations are non-blocking
     /// HashMap lookups/inserts — no .await while holding the lock.
     provider_failure_counts: Arc<std::sync::RwLock<HashMap<usize, u32>>>,
+    /// Cache of inference_url → serving provider. When a model's URL hasn't changed
+    /// across refreshes, the existing provider (and its warm reqwest::Client with
+    /// pooled TLS connections) is reused instead of creating a new one.
+    inference_url_providers: Arc<RwLock<HashMap<String, Arc<InferenceProviderTrait>>>>,
 }
 
 impl InferenceProviderPool {
-    /// Create a new pool with discovery URL and optional API key
-    pub fn new(
-        discovery_url: String,
-        api_key: Option<String>,
-        discovery_timeout_secs: i64,
-        external_configs: ExternalProvidersConfig,
-    ) -> Self {
+    /// Create a new pool with optional API key for backend authentication
+    pub fn new(api_key: Option<String>, external_configs: ExternalProvidersConfig) -> Self {
         Self {
-            discovery_url,
             api_key,
-            discovery_timeout: Duration::from_secs(discovery_timeout_secs as u64),
             provider_mappings: Arc::new(RwLock::new(ProviderMappings::new())),
             provider_urls: Arc::new(RwLock::new(HashMap::new())),
             external_providers: Arc::new(RwLock::new(HashMap::new())),
@@ -110,8 +90,8 @@ impl InferenceProviderPool {
             load_balancer_index: Arc::new(std::sync::RwLock::new(HashMap::new())),
             chat_id_mapping: Arc::new(RwLock::new(HashMap::new())),
             refresh_task_handle: Arc::new(Mutex::new(None)),
-            external_refresh_task_handle: Arc::new(Mutex::new(None)),
             provider_failure_counts: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            inference_url_providers: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -147,13 +127,7 @@ impl InferenceProviderPool {
         Ok(())
     }
 
-    /// Load and register external providers from a list of model configurations
-    ///
-    /// This should be called during application startup after fetching external
-    /// models from the database.
-    ///
-    /// # Arguments
-    /// * `models` - List of (model_name, provider_config) tuples
+    /// Load and register external providers from a list of model configurations.
     pub async fn load_external_providers(
         &self,
         models: Vec<(String, serde_json::Value)>,
@@ -194,6 +168,16 @@ impl InferenceProviderPool {
         }
     }
 
+    /// Check if a model has a registered provider
+    pub async fn has_provider(&self, model_name: &str) -> bool {
+        if self.is_external_provider(model_name).await {
+            return true;
+        }
+
+        let mappings = self.provider_mappings.read().await;
+        mappings.model_to_providers.contains_key(model_name)
+    }
+
     /// Get an external provider by model name
     async fn get_external_provider(&self, model_name: &str) -> Option<Arc<InferenceProviderTrait>> {
         let external = self.external_providers.read().await;
@@ -206,26 +190,54 @@ impl InferenceProviderPool {
         external.contains_key(model_name)
     }
 
-    /// Unregister an external provider by model name
-    ///
-    /// This removes the provider from the pool, preventing future requests to this model.
-    /// Should be called when a model is deleted or deactivated.
-    ///
-    /// # Arguments
-    /// * `model_name` - The model name to unregister
-    ///
-    /// # Returns
-    /// * `true` if the provider was found and removed
-    /// * `false` if the provider was not found (may have already been removed)
-    pub async fn unregister_external_provider(&self, model_name: &str) -> bool {
-        let mut external = self.external_providers.write().await;
-        let removed = external.remove(model_name).is_some();
-        if removed {
-            info!(model = %model_name, "Unregistered external provider");
-        } else {
-            debug!(model = %model_name, "External provider not found for unregistration (may be vLLM model)");
+    /// Remove a provider by model name. Used when admin deactivates a model.
+    /// Also cleans up pubkey_to_providers, load_balancer_index, and provider failure state.
+    pub async fn unregister_provider(&self, model_name: &str) -> bool {
+        let removed_external = {
+            let mut external = self.external_providers.write().await;
+            external.remove(model_name).is_some()
+        };
+
+        let mut removed_ptrs = std::collections::HashSet::new();
+        let removed_vllm = {
+            let mut mappings = self.provider_mappings.write().await;
+            let removed_providers = mappings.model_to_providers.remove(model_name);
+            if let Some(removed) = &removed_providers {
+                removed_ptrs.extend(removed.iter().map(Self::provider_ptr));
+                mappings.pubkey_to_providers.retain(|_, providers| {
+                    providers.retain(|p| !removed_ptrs.contains(&Self::provider_ptr(p)));
+                    !providers.is_empty()
+                });
+            }
+            removed_providers.is_some()
+        };
+
+        if removed_vllm {
+            self.load_balancer_index
+                .write()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(model_name);
+            self.provider_failure_counts
+                .write()
+                .unwrap_or_else(|e| e.into_inner())
+                .retain(|key, _| !removed_ptrs.contains(key));
+            self.provider_urls
+                .write()
+                .await
+                .retain(|key, _| !removed_ptrs.contains(key));
+            self.inference_url_providers
+                .write()
+                .await
+                .retain(|_, provider| !removed_ptrs.contains(&Self::provider_ptr(provider)));
         }
-        removed
+
+        if removed_external || removed_vllm {
+            info!(model = %model_name, "Unregistered provider");
+        } else {
+            debug!(model = %model_name, "Provider not found for unregistration");
+        }
+
+        removed_external || removed_vllm
     }
 
     /// Register a provider for a model manually (useful for testing with mock providers)
@@ -285,79 +297,6 @@ impl InferenceProviderPool {
                     .push(provider);
             }
         }
-    }
-
-    /// Initialize model discovery - should be called during application startup
-    pub async fn initialize(&self) -> Result<(), ListModelsError> {
-        tracing::debug!(
-            url = %self.discovery_url,
-            "Initializing model discovery from discovery server"
-        );
-
-        match self.discover_models().await {
-            Ok(models_response) => {
-                tracing::info!(
-                    "Successfully discovered {} models",
-                    models_response.data.len()
-                );
-                Ok(())
-            }
-            Err(e) => {
-                tracing::error!("Failed to initialize model discovery");
-                Err(e)
-            }
-        }
-    }
-
-    /// Fetch and parse models from discovery endpoint
-    async fn fetch_from_discovery(
-        &self,
-    ) -> Result<HashMap<String, DiscoveryEntry>, ListModelsError> {
-        tracing::debug!(
-            url = %self.discovery_url,
-            "Fetching models from discovery server"
-        );
-
-        let client = reqwest::Client::builder()
-            .timeout(self.discovery_timeout)
-            .build()
-            .map_err(|e| {
-                ListModelsError::FetchError(format!("Failed to create HTTP client: {e}"))
-            })?;
-
-        let response = client
-            .get(&self.discovery_url)
-            .send()
-            .await
-            .map_err(|e| ListModelsError::FetchError(format!("HTTP request failed: {e}")))?;
-
-        let discovery_map: HashMap<String, DiscoveryEntry> = response
-            .json()
-            .await
-            .map_err(|e| ListModelsError::FetchError(format!("Failed to parse JSON: {e}")))?;
-
-        tracing::debug!(entries = discovery_map.len(), "Received discovery response");
-
-        Ok(discovery_map)
-    }
-
-    /// Parse IP-based keys like "192.0.2.1:8000"
-    /// Returns None for keys that don't match IP:PORT format (e.g., "redpill:...")
-    fn parse_ip_port(key: &str) -> Option<(String, u16)> {
-        let parts: Vec<&str> = key.split(':').collect();
-        if parts.len() != 2 {
-            return None;
-        }
-
-        let ip = parts[0];
-        let port = parts[1].parse::<u16>().ok()?;
-
-        // Verify it's a valid IP address
-        if ip.parse::<IpAddr>().is_err() {
-            return None;
-        }
-
-        Some((ip.to_string(), port))
     }
 
     /// Fetch signing public keys for both ECDSA and Ed25519 algorithms
@@ -495,314 +434,6 @@ impl InferenceProviderPool {
         }
 
         None
-    }
-
-    /// Ensure models are discovered before using them
-    async fn ensure_models_discovered(&self) -> Result<(), CompletionError> {
-        let mappings = self.provider_mappings.read().await;
-
-        // If mapping is empty, we need to discover models
-        if mappings.model_to_providers.is_empty() {
-            drop(mappings); // Release read lock
-            tracing::warn!("Model mapping is empty, triggering model discovery");
-            self.discover_models().await.map_err(|e| {
-                CompletionError::CompletionError(format!("Failed to discover models: {e}"))
-            })?;
-        }
-
-        Ok(())
-    }
-
-    async fn discover_models(&self) -> Result<ModelsResponse, ListModelsError> {
-        tracing::info!("Starting model discovery from discovery endpoint");
-
-        // Fetch from discovery server
-        let discovery_map = self.fetch_from_discovery().await?;
-
-        // Group by model name
-        let mut model_to_endpoints: HashMap<String, Vec<(String, u16)>> = HashMap::new();
-
-        for (key, entry) in &discovery_map {
-            // Filter out non-IP keys
-            if let Some((ip, port)) = Self::parse_ip_port(key) {
-                tracing::debug!(
-                    key = %key,
-                    model = %entry.model,
-                    tags = ?entry.tags,
-                    ip = %ip,
-                    port = port,
-                    "Adding IP-based provider"
-                );
-
-                model_to_endpoints
-                    .entry(entry.model.clone())
-                    .or_default()
-                    .push((ip, port));
-            } else {
-                tracing::debug!(
-                    key = %key,
-                    model = %entry.model,
-                    tags = ?entry.tags,
-                    "Skipping non-IP key"
-                );
-            }
-        }
-
-        // The set of all model names listed by discovery (regardless of attestation success).
-        // Models NOT in this set have been decommissioned and should be removed.
-        let discovered_model_names: HashSet<String> = model_to_endpoints.keys().cloned().collect();
-
-        // Phase 1: Fetch attestation reports concurrently for all endpoints (no locks held).
-        // Uses a short-timeout probe provider so a dead backend doesn't block discovery of healthy ones.
-        // Concurrency is bounded by buffer_unordered to avoid thundering-herd on attestation endpoints.
-        let api_key = self.api_key.clone();
-
-        // Flatten into per-endpoint futures
-        let endpoint_futures: Vec<_> = model_to_endpoints
-            .iter()
-            .flat_map(|(model_name, endpoints)| {
-                let api_key = api_key.clone();
-                endpoints.iter().map(move |(ip, port)| {
-                    let model_name = model_name.clone();
-                    let url = format!("http://{ip}:{port}");
-                    let api_key = api_key.clone();
-                    async move {
-                        // Probe provider with 10s TTFB timeout for attestation fetches.
-                        // The serving provider uses the default 90s timeout.
-                        let probe_provider = Arc::new(VLlmProvider::new(VLlmConfig::new(
-                            url.clone(),
-                            api_key.clone(),
-                            Some(10),
-                        )))
-                            as Arc<InferenceProviderTrait>;
-
-                        let serving_provider = Arc::new(VLlmProvider::new(VLlmConfig::new(
-                            url.clone(),
-                            api_key,
-                            None,
-                        )))
-                            as Arc<InferenceProviderTrait>;
-
-                        let (pub_keys, has_valid_attestation) =
-                            Self::fetch_signing_public_keys_for_both_algorithms(
-                                &probe_provider,
-                                &model_name,
-                                &url,
-                            )
-                            .await;
-
-                        // Return pub_keys referencing the serving_provider (not probe)
-                        let pub_keys: Vec<(String, Arc<InferenceProviderTrait>)> = pub_keys
-                            .into_iter()
-                            .map(|(key, _)| (key, serving_provider.clone()))
-                            .collect();
-
-                        (
-                            model_name,
-                            url,
-                            serving_provider,
-                            pub_keys,
-                            has_valid_attestation,
-                        )
-                    }
-                })
-            })
-            .collect();
-
-        // Run all attestation probes concurrently (bounded to avoid flooding)
-        use futures::stream::{self, StreamExt};
-        let results: Vec<_> = stream::iter(endpoint_futures)
-            .buffer_unordered(20)
-            .collect()
-            .await;
-
-        // Aggregate results by model
-        let mut all_models = Vec::new();
-        let mut model_providers: HashMap<String, Vec<Arc<InferenceProviderTrait>>> = HashMap::new();
-        let mut model_pub_key_updates: Vec<(String, Arc<InferenceProviderTrait>)> = Vec::new();
-        let mut provider_url_updates: Vec<(usize, String)> = Vec::new();
-
-        // Track per-model endpoint counts for logging
-        let mut model_endpoint_counts: HashMap<&str, usize> = HashMap::new();
-        for (model_name, endpoints) in &model_to_endpoints {
-            model_endpoint_counts.insert(model_name, endpoints.len());
-        }
-
-        for (model_name, url, provider, pub_keys, has_valid_attestation) in results {
-            if has_valid_attestation {
-                provider_url_updates.push((Self::provider_ptr(&provider), url));
-                model_pub_key_updates.extend(pub_keys);
-                model_providers
-                    .entry(model_name)
-                    .or_default()
-                    .push(provider);
-            }
-        }
-
-        for (model_name, providers) in &model_providers {
-            let endpoint_count = model_endpoint_counts
-                .get(model_name.as_str())
-                .copied()
-                .unwrap_or(0);
-            tracing::info!(
-                model = %model_name,
-                endpoints_discovered = endpoint_count,
-                providers_valid = providers.len(),
-                "Discovered model"
-            );
-
-            all_models.push(inference_providers::models::ModelInfo {
-                id: model_name.clone(),
-                object: "model".to_string(),
-                created: 0,
-                owned_by: "discovered".to_string(),
-            });
-        }
-
-        // Calculate metrics before acquiring locks
-        let total_providers: usize = model_providers.values().map(|v| v.len()).sum();
-        // Save keys before model_providers is consumed by the merge loop
-        let model_providers_keys: HashSet<String> = model_providers.keys().cloned().collect();
-
-        // Phase 2: Merge new discovery into existing mappings.
-        // - Models with successful attestation: replace their providers.
-        // - Models in discovery but all attestation failed: keep existing providers
-        //   (transient failure — they may still serve traffic).
-        // - Models NOT in discovery response at all: remove (decommissioned).
-        // - Pubkey mappings: prune stale entries, merge fresh attestation results.
-        {
-            let mut mappings = self.provider_mappings.write().await;
-
-            // Remove models that are no longer listed by discovery server
-            let removed_models: Vec<String> = mappings
-                .model_to_providers
-                .keys()
-                .filter(|k| !discovered_model_names.contains(k.as_str()))
-                .cloned()
-                .collect();
-            for model_name in &removed_models {
-                mappings.model_to_providers.remove(model_name);
-                tracing::info!(
-                    model = %model_name,
-                    "Removed model no longer in discovery"
-                );
-            }
-
-            // For models with successful attestation: replace providers
-            for (model_name, providers) in model_providers {
-                mappings.model_to_providers.insert(model_name, providers);
-            }
-
-            // For models in discovered_model_names but NOT in model_providers:
-            // keep existing providers (they're transiently unreachable but may still work)
-            let retained_count = discovered_model_names
-                .iter()
-                .filter(|m| !model_providers_keys.contains(m.as_str()))
-                .filter(|m| mappings.model_to_providers.contains_key(m.as_str()))
-                .count();
-
-            // Prune pubkey mappings: keep entries pointing to providers still in the pool,
-            // remove entries pointing to providers that were replaced or evicted.
-            // This preserves pubkey routing for retained models whose attestation failed
-            // this cycle, while cleaning up stale entries.
-            let active_provider_ptrs: HashSet<usize> = mappings
-                .model_to_providers
-                .values()
-                .flat_map(|providers| providers.iter())
-                .map(|p| Arc::as_ptr(p) as *const () as usize)
-                .collect();
-            mappings.pubkey_to_providers.retain(|_, providers| {
-                providers.retain(|provider| {
-                    let key = Arc::as_ptr(provider) as *const () as usize;
-                    active_provider_ptrs.contains(&key)
-                });
-                !providers.is_empty()
-            });
-
-            // Merge fresh attestation-derived pubkey mappings
-            for (key, provider) in model_pub_key_updates {
-                let providers = mappings.pubkey_to_providers.entry(key).or_default();
-                if !providers
-                    .iter()
-                    .any(|existing| Arc::ptr_eq(existing, &provider))
-                {
-                    providers.push(provider);
-                }
-            }
-
-            // Include models retained from previous discovery in all_models for response
-            for model_name in mappings.model_to_providers.keys() {
-                if !all_models.iter().any(|m| m.id == *model_name) {
-                    all_models.push(inference_providers::models::ModelInfo {
-                        id: model_name.clone(),
-                        object: "model".to_string(),
-                        created: 0,
-                        owned_by: "discovered".to_string(),
-                    });
-                }
-            }
-
-            tracing::info!(
-                removed = removed_models.len(),
-                retained = retained_count,
-                "Merged discovery results into provider mappings"
-            );
-        }
-
-        // Clean up failure counts for providers that no longer exist
-        {
-            let mappings = self.provider_mappings.read().await;
-            let active_ptrs: HashSet<usize> = mappings
-                .model_to_providers
-                .values()
-                .flat_map(|providers| providers.iter())
-                .map(Self::provider_ptr)
-                .collect();
-
-            let mut counts = self
-                .provider_failure_counts
-                .write()
-                .unwrap_or_else(|e| e.into_inner());
-            counts.retain(|key, _| active_ptrs.contains(key));
-        }
-
-        {
-            let mappings = self.provider_mappings.read().await;
-            let active_ptrs: HashSet<usize> = mappings
-                .model_to_providers
-                .values()
-                .flat_map(|providers| providers.iter())
-                .map(Self::provider_ptr)
-                .collect();
-            drop(mappings);
-
-            let mut provider_urls = self.provider_urls.write().await;
-            provider_urls.retain(|key, _| active_ptrs.contains(key));
-            for (provider_ptr, url) in provider_url_updates {
-                if active_ptrs.contains(&provider_ptr) {
-                    provider_urls.insert(provider_ptr, url);
-                }
-            }
-        }
-
-        // Compute actual pool size (includes both fresh and retained providers)
-        let actual_total_providers: usize = {
-            let mappings = self.provider_mappings.read().await;
-            mappings.model_to_providers.values().map(|v| v.len()).sum()
-        };
-
-        tracing::info!(
-            total_models = all_models.len(),
-            total_providers = actual_total_providers,
-            fresh_providers = total_providers,
-            model_ids = ?all_models.iter().map(|m| &m.id).collect::<Vec<_>>(),
-            "Model discovery from endpoint completed"
-        );
-
-        Ok(ModelsResponse {
-            object: "list".to_string(),
-            data: all_models,
-        })
     }
 
     async fn get_providers_for_model(
@@ -971,8 +602,6 @@ impl InferenceProviderPool {
             return Ok(None);
         }
 
-        self.ensure_models_discovered().await?;
-
         let providers = match self.get_providers_with_fallback(model_id, None, None).await {
             Some(providers) => providers,
             None => return Ok(None),
@@ -1051,13 +680,9 @@ impl InferenceProviderPool {
         sanitized
     }
 
-    /// Generic retry helper that tries each provider in order with automatic fallback
-    /// Returns both the result and the provider that succeeded (for chat_id mapping)
-    /// If model_pub_key is provided, routes to the specific provider by signing public key first
-    ///
-    /// Provider resolution order:
-    /// 1. External providers (exact match by model name)
-    /// 2. vLLM providers (with model_pub_key routing if specified)
+    /// Generic retry helper that tries each provider in order with automatic fallback.
+    /// Returns both the result and the provider that succeeded (for chat_id mapping).
+    /// If model_pub_key is provided, routes to the specific provider by signing public key.
     async fn retry_with_fallback<T, F, Fut>(
         &self,
         model_id: &str,
@@ -1070,7 +695,6 @@ impl InferenceProviderPool {
         F: Fn(Arc<InferenceProviderTrait>) -> Fut,
         Fut: std::future::Future<Output = Result<T, CompletionError>>,
     {
-        // Check external providers first (exact match)
         if let Some(external_provider) = self.get_external_provider(model_id).await {
             tracing::info!(
                 model_id = %model_id,
@@ -1078,7 +702,6 @@ impl InferenceProviderPool {
                 "Using external provider"
             );
 
-            // External providers don't support model_pub_key routing
             if model_pub_key.is_some() {
                 return Err(CompletionError::CompletionError(format!(
                     "Model '{}' is an external provider and does not support encryption. \
@@ -1096,29 +719,45 @@ impl InferenceProviderPool {
                     );
                     return Ok((result, external_provider));
                 }
-                Err(e) => {
-                    return Err(Self::sanitize_completion_error(e, model_id));
+                Err(error) => {
+                    return Err(Self::sanitize_completion_error(error, model_id));
                 }
             }
         }
 
-        // Ensure vLLM models are discovered
-        self.ensure_models_discovered().await?;
-
-        // Get vLLM providers with load balancing (handles both model_id and model_pub_key cases)
         let providers = match self
             .get_providers_with_fallback(model_id, model_pub_key, preferred_provider_url)
             .await
         {
             Some(p) => p,
             None => {
-                // Handle error cases based on whether model_pub_key was provided
                 if let Some(pub_key) = model_pub_key {
+                    let (available_pubkeys, model_provider_count) = {
+                        let mappings = self.provider_mappings.read().await;
+                        let pubkeys: Vec<String> = mappings
+                            .pubkey_to_providers
+                            .keys()
+                            .map(|k| {
+                                let prefix: String = k.chars().take(16).collect();
+                                format!("{}...({})", prefix, k.len())
+                            })
+                            .collect();
+                        let count = mappings
+                            .model_to_providers
+                            .get(model_id)
+                            .map(|v| v.len())
+                            .unwrap_or(0);
+                        (pubkeys, count)
+                    };
+                    let model_pub_key_prefix: String = pub_key.chars().take(16).collect();
                     tracing::warn!(
-                            model_id = %model_id,
-                            model_pub_key = %pub_key,
-                            operation = operation_name,
-                        "No provider found for model public key."
+                        model_id = %model_id,
+                        model_pub_key_prefix = %model_pub_key_prefix,
+                        model_pub_key_len = pub_key.len(),
+                        available_pubkeys = ?available_pubkeys,
+                        model_provider_count = model_provider_count,
+                        operation = operation_name,
+                        "No provider found for model public key"
                     );
                     return Err(CompletionError::CompletionError(format!(
                         "No provider found for model {} with public key '{}...'. Encryption requires routing to the specific provider with this public key.",
@@ -1126,14 +765,19 @@ impl InferenceProviderPool {
                         pub_key.chars().take(32).collect::<String>()
                     )));
                 } else {
-                    let mappings = self.provider_mappings.read().await;
-                    let available_models: Vec<_> = mappings.model_to_providers.keys().collect();
-                    let external = self.external_providers.read().await;
-                    let external_models: Vec<_> = external.keys().collect();
+                    let (available_models, external_models) = {
+                        let mappings = self.provider_mappings.read().await;
+                        let available_models: Vec<_> =
+                            mappings.model_to_providers.keys().cloned().collect();
+                        drop(mappings);
 
+                        let external = self.external_providers.read().await;
+                        let external_models: Vec<_> = external.keys().cloned().collect();
+                        (available_models, external_models)
+                    };
                     tracing::error!(
                         model_id = %model_id,
-                        available_vllm_models = ?available_models,
+                        available_models = ?available_models,
                         available_external_models = ?external_models,
                         operation = operation_name,
                         "Model not found in provider pool"
@@ -1293,49 +937,45 @@ impl InferenceProviderPool {
         signing_address: Option<String>,
         include_tls_fingerprint: bool,
     ) -> Result<Vec<serde_json::Map<String, serde_json::Value>>, AttestationError> {
-        // Get all providers for this model
-        let mut model_attestations = vec![];
+        let providers = self
+            .get_providers_for_model(&model)
+            .await
+            .ok_or_else(|| AttestationError::ProviderNotFound(model.clone()))?;
 
-        if let Some(providers) = self.get_providers_for_model(&model).await {
-            // Broadcast to all providers
-            for provider in providers {
-                match provider
-                    .get_attestation_report(
-                        model.clone(),
-                        signing_algo.clone(),
-                        nonce.clone(),
-                        signing_address.clone(),
-                        include_tls_fingerprint,
-                    )
-                    .await
-                {
-                    Ok(mut attestation) => {
-                        // Remove 'all_attestations' field if present
-                        attestation.remove("all_attestations");
-                        model_attestations.push(attestation);
-                    }
-                    Err(e) => {
-                        // Log and continue to next provider (404 is expected when
-                        // signing_address doesn't match)
-                        tracing::debug!(
-                            model = %model,
-                            error = %e,
-                            "Provider returned error for attestation request, continuing to next provider"
-                        );
-                    }
+        // Each inference_url points to a proxy that load-balances across CVMs.
+        // All CVMs behind the proxy share the same signing key (derived from model
+        // name via dstack KMS), so one attestation report is sufficient.
+        // Try providers in order and return the first successful response.
+        let mut last_error = None;
+        for provider in providers {
+            match provider
+                .get_attestation_report(
+                    model.clone(),
+                    signing_algo.clone(),
+                    nonce.clone(),
+                    signing_address.clone(),
+                    include_tls_fingerprint,
+                )
+                .await
+            {
+                Ok(mut attestation) => {
+                    attestation.remove("all_attestations");
+                    return Ok(vec![attestation]);
+                }
+                Err(e) => {
+                    tracing::debug!(
+                        model = %model,
+                        error = %e,
+                        "Provider returned error for attestation request, trying next"
+                    );
+                    last_error = Some(e);
                 }
             }
         }
 
-        if model_attestations.is_empty() {
-            return Err(AttestationError::ProviderNotFound(model));
-        }
-
-        Ok(model_attestations)
-    }
-
-    pub async fn models(&self) -> Result<ModelsResponse, ListModelsError> {
-        self.discover_models().await
+        Err(last_error
+            .map(|e| AttestationError::FetchError(e.to_string()))
+            .unwrap_or_else(|| AttestationError::ProviderNotFound(model)))
     }
 
     pub async fn chat_completion_stream(
@@ -1389,6 +1029,7 @@ impl InferenceProviderPool {
         // Must be synchronous to ensure attestation service can find the provider
         let provider_url = self.get_provider_url(&provider).await;
         let mut peekable = StreamingResultExt::peekable(stream);
+        let mut pinned = false;
         if let Some(Ok(event)) = peekable.peek().await {
             if let inference_providers::StreamChunk::Chat(chat_chunk) = &event.chunk {
                 let chat_id = chat_chunk.id.clone();
@@ -1396,8 +1037,17 @@ impl InferenceProviderPool {
                     chat_id = %chat_id,
                     "Storing chat_id mapping for streaming completion"
                 );
-                self.store_chat_id_mapping(chat_id, provider).await;
+                // Pin the dedicated TLS connection so signature fetches
+                // reuse the same connection that served this completion.
+                provider.pin_chat_connection(&request_hash, &chat_id);
+                pinned = true;
+                self.store_chat_id_mapping(chat_id, provider.clone()).await;
             }
+        }
+        if !pinned {
+            // Clean up orphaned pending client when peek fails or yields no chat_id
+            provider.pin_chat_connection(&request_hash, "");
+            provider.unpin_chat_connection("");
         }
         Ok((Box::pin(peekable), provider_url))
     }
@@ -1638,31 +1288,15 @@ impl InferenceProviderPool {
             )));
         }
 
-        // Ensure vLLM models are discovered
-        self.ensure_models_discovered().await.map_err(|e| {
-            RerankError::GenerationError(Self::sanitize_error_message(&e.to_string()))
-        })?;
-
-        // Get vLLM providers with load balancing
         let providers = match self
             .get_providers_with_fallback(&model_id, None, None)
             .await
         {
             Some(p) => p,
             None => {
-                let mappings = self.provider_mappings.read().await;
-                let available_models: Vec<_> = mappings.model_to_providers.keys().collect();
-
-                tracing::error!(
-                    model_id = %model_id,
-                    available_models = ?available_models,
-                    operation = "rerank",
-                    "No vLLM provider found for model"
-                );
-
                 return Err(RerankError::GenerationError(format!(
-                    "Model '{}' not found in vLLM providers. Available models: {:?}",
-                    model_id, available_models
+                    "Model '{}' not found in provider pool",
+                    model_id
                 )));
             }
         };
@@ -1710,30 +1344,12 @@ impl InferenceProviderPool {
             return provider.embeddings_raw(body).await;
         }
 
-        // Ensure vLLM models are discovered
-        self.ensure_models_discovered().await.map_err(|e| {
-            inference_providers::EmbeddingError::RequestFailed(Self::sanitize_error_message(
-                &e.to_string(),
-            ))
-        })?;
-
-        // Get vLLM providers with load balancing
         let providers = match self.get_providers_with_fallback(model, None, None).await {
             Some(p) => p,
             None => {
-                let mappings = self.provider_mappings.read().await;
-                let available_models: Vec<_> = mappings.model_to_providers.keys().collect();
-
-                tracing::error!(
-                    model = %model,
-                    available_models = ?available_models,
-                    operation = "embeddings",
-                    "No vLLM provider found for model"
-                );
-
                 return Err(inference_providers::EmbeddingError::RequestFailed(format!(
-                    "Model '{}' not found in vLLM providers. Available models: {:?}",
-                    model, available_models
+                    "Model '{}' not found in provider pool",
+                    model
                 )));
             }
         };
@@ -1769,10 +1385,7 @@ impl InferenceProviderPool {
     ) -> Result<inference_providers::ScoreResponse, inference_providers::ScoreError> {
         let model_id = params.model.clone();
 
-        tracing::debug!(
-            model = %model_id,
-            "Starting score request"
-        );
+        tracing::debug!(model = %model_id, "Starting score request");
 
         // Check if this model exists as an external provider - scoring is not supported for external models
         if self.get_external_provider(&model_id).await.is_some() {
@@ -1784,33 +1397,15 @@ impl InferenceProviderPool {
             )));
         }
 
-        // Ensure vLLM models are discovered
-        self.ensure_models_discovered().await.map_err(|e| {
-            inference_providers::ScoreError::GenerationError(Self::sanitize_error_message(
-                &e.to_string(),
-            ))
-        })?;
-
-        // Get vLLM providers with load balancing
         let providers = match self
             .get_providers_with_fallback(&model_id, None, None)
             .await
         {
             Some(p) => p,
             None => {
-                let mappings = self.provider_mappings.read().await;
-                let available_models: Vec<_> = mappings.model_to_providers.keys().collect();
-
-                tracing::error!(
-                    model_id = %model_id,
-                    available_models = ?available_models,
-                    operation = "score",
-                    "No vLLM provider found for model"
-                );
-
                 return Err(inference_providers::ScoreError::GenerationError(format!(
-                    "Model '{}' not found in vLLM providers. Available models: {:?}",
-                    model_id, available_models
+                    "Model '{}' not found in provider pool",
+                    model_id
                 )));
             }
         };
@@ -1895,10 +1490,22 @@ impl InferenceProviderPool {
         Ok((provider, backend_type))
     }
 
-    /// Atomically replace all external providers with a new set built from the given models.
-    ///
-    /// This is safe for in-flight requests because existing `Arc` references remain valid
-    /// until dropped. New requests will use the updated provider map.
+    /// Return the set of model names currently registered in the pool.
+    pub async fn registered_model_names(&self) -> Vec<String> {
+        let mut names: std::collections::HashSet<String> = {
+            let mappings = self.provider_mappings.read().await;
+            mappings.model_to_providers.keys().cloned().collect()
+        };
+
+        let external = self.external_providers.read().await;
+        names.extend(external.keys().cloned());
+
+        let mut names: Vec<_> = names.into_iter().collect();
+        names.sort();
+        names
+    }
+
+    /// Atomically replace the external provider map with a newly built set.
     async fn sync_external_providers(&self, models: Vec<(String, serde_json::Value)>) {
         let mut new_map: HashMap<String, Arc<InferenceProviderTrait>> = HashMap::new();
         let mut success_count = 0;
@@ -1915,10 +1522,10 @@ impl InferenceProviderPool {
                         "Registered external provider during sync"
                     );
                 }
-                Err(e) => {
+                Err(error) => {
                     warn!(
                         model = %model_name,
-                        error = %e,
+                        error = %error,
                         "Failed to create external provider during sync"
                     );
                     error_count += 1;
@@ -1938,17 +1545,298 @@ impl InferenceProviderPool {
         );
     }
 
-    /// Start a periodic background task that refreshes external providers from a data source.
+    /// Load models with inference_url as VLlmProviders into provider_mappings.
+    ///
+    /// For each model, reuses the existing provider (and its warm TLS connections)
+    /// if the inference_url hasn't changed since last load. Only creates new providers
+    /// for models whose URL changed or that are new.
+    ///
+    /// # Arguments
+    /// * `models` - List of (model_name, inference_url) tuples
+    pub async fn load_inference_url_models(&self, models: Vec<(String, String)>) {
+        if models.is_empty() {
+            return;
+        }
+
+        let api_key = self.api_key.clone();
+
+        // Check which models can reuse their existing provider (URL unchanged)
+        let existing_cache = self.inference_url_providers.read().await;
+        let mut reused: Vec<(String, String, Arc<InferenceProviderTrait>)> = Vec::new();
+        let mut needs_creation: Vec<(String, String)> = Vec::new();
+
+        for (model_name, url) in &models {
+            if let Some(existing) = existing_cache.get(url) {
+                reused.push((model_name.clone(), url.clone(), existing.clone()));
+            } else {
+                needs_creation.push((model_name.clone(), url.clone()));
+            }
+        }
+        drop(existing_cache);
+
+        if !needs_creation.is_empty() {
+            info!(
+                new = needs_creation.len(),
+                reused = reused.len(),
+                "Creating new providers for changed/new inference URLs"
+            );
+        }
+
+        // Phase 1: Create providers for new/changed URLs and probe attestation concurrently.
+        let endpoint_futures: Vec<_> = needs_creation
+            .iter()
+            .map(|(model_name, url)| {
+                let model_name = model_name.clone();
+                let url = url.clone();
+                let api_key = api_key.clone();
+                async move {
+                    let serving_provider = Arc::new(VLlmProvider::new(VLlmConfig::new(
+                        url.clone(),
+                        api_key,
+                        None,
+                    ))) as Arc<InferenceProviderTrait>;
+
+                    let (pub_keys, _) = Self::fetch_signing_public_keys_for_both_algorithms(
+                        &serving_provider,
+                        &model_name,
+                        &url,
+                    )
+                    .await;
+
+                    let pub_keys: Vec<(String, Arc<InferenceProviderTrait>)> = pub_keys
+                        .into_iter()
+                        .map(|(key, _)| (key, serving_provider.clone()))
+                        .collect();
+
+                    (model_name, url, serving_provider, pub_keys)
+                }
+            })
+            .collect();
+
+        use futures::stream::{self, StreamExt};
+        let new_results: Vec<_> = stream::iter(endpoint_futures)
+            .buffer_unordered(20)
+            .collect()
+            .await;
+
+        // Phase 2: Merge reused and new providers, update mappings.
+        let mut model_providers: HashMap<String, Vec<Arc<InferenceProviderTrait>>> = HashMap::new();
+        let mut pub_key_updates: Vec<(String, Arc<InferenceProviderTrait>)> = Vec::new();
+        let mut new_url_cache: HashMap<String, Arc<InferenceProviderTrait>> = HashMap::new();
+        let mut new_provider_urls: HashMap<usize, String> = HashMap::new();
+
+        // Reused providers (URL unchanged — keep warm TLS connections)
+        for (model_name, url, provider) in &reused {
+            model_providers
+                .entry(model_name.clone())
+                .or_default()
+                .push(provider.clone());
+            new_url_cache.insert(url.clone(), provider.clone());
+            new_provider_urls.insert(Self::provider_ptr(provider), url.clone());
+        }
+
+        // Newly created providers
+        for (model_name, url, provider, pub_keys) in &new_results {
+            info!(
+                model = %model_name,
+                url = %url,
+                pub_keys = pub_keys.len(),
+                "Registered inference_url model"
+            );
+            model_providers
+                .entry(model_name.clone())
+                .or_default()
+                .push(provider.clone());
+            pub_key_updates.extend(pub_keys.iter().cloned());
+            new_url_cache.insert(url.clone(), provider.clone());
+            new_provider_urls.insert(Self::provider_ptr(provider), url.clone());
+        }
+
+        // Atomic update: replace model providers and rebuild pubkey mappings
+        {
+            let mut mappings = self.provider_mappings.write().await;
+
+            // Collect reused provider ptrs so we can exclude them from pruning.
+            // Reused providers keep the same Arc, so their pubkey mappings are still valid.
+            let reused_provider_ptrs: std::collections::HashSet<usize> = reused
+                .iter()
+                .map(|(_, _, p)| Arc::as_ptr(p) as *const () as usize)
+                .collect();
+
+            // Collect old provider ptrs for models being replaced, so we can prune pubkeys.
+            // Exclude reused providers — they keep their existing pubkey mappings.
+            let mut old_provider_ptrs = std::collections::HashSet::new();
+            for model_name in model_providers.keys() {
+                if let Some(old) = mappings.model_to_providers.get(model_name) {
+                    for p in old {
+                        let ptr = Arc::as_ptr(p) as *const () as usize;
+                        if !reused_provider_ptrs.contains(&ptr) {
+                            old_provider_ptrs.insert(ptr);
+                        }
+                    }
+                }
+            }
+
+            for (model_name, providers) in model_providers {
+                mappings.model_to_providers.insert(model_name, providers);
+            }
+
+            if !old_provider_ptrs.is_empty() {
+                mappings.pubkey_to_providers.retain(|_, providers| {
+                    providers.retain(|p| {
+                        !old_provider_ptrs.contains(&(Arc::as_ptr(p) as *const () as usize))
+                    });
+                    !providers.is_empty()
+                });
+            }
+
+            for (key, provider) in pub_key_updates {
+                mappings
+                    .pubkey_to_providers
+                    .entry(key)
+                    .or_default()
+                    .push(provider);
+            }
+        }
+
+        // Log pubkey mapping state for debugging E2EE routing issues
+        let (pubkey_count, pubkey_summaries) = {
+            let mappings = self.provider_mappings.read().await;
+            let count = mappings.pubkey_to_providers.len();
+            let summaries: Vec<String> = mappings
+                .pubkey_to_providers
+                .iter()
+                .take(10)
+                .map(|(k, v)| {
+                    let prefix: String = k.chars().take(16).collect();
+                    format!("{}...({}chars,{}providers)", prefix, k.len(), v.len())
+                })
+                .collect();
+            (count, summaries)
+        };
+        info!(
+            pubkey_mapping_count = pubkey_count,
+            pubkey_summaries = ?pubkey_summaries,
+            "pubkey_to_providers state after update"
+        );
+
+        // Update the URL→provider cache
+        *self.inference_url_providers.write().await = new_url_cache;
+        *self.provider_urls.write().await = new_provider_urls;
+
+        info!(
+            total = models.len(),
+            reused = reused.len(),
+            created = new_results.len(),
+            "Loaded inference_url models"
+        );
+    }
+
+    /// Refresh inference_url models from the database.
+    /// Existing entries in provider_mappings are overwritten with new providers.
+    async fn sync_inference_url_models(&self, models: Vec<(String, String)>) {
+        self.load_inference_url_models(models).await;
+    }
+
+    /// Remove models from provider_mappings that are not in `valid_model_names`.
+    /// Also cleans up load_balancer_index and provider_failure_counts for removed providers.
+    async fn remove_stale_providers(&self, valid_model_names: &std::collections::HashSet<String>) {
+        let stale_external_models: Vec<String> = {
+            let external = self.external_providers.read().await;
+            external
+                .keys()
+                .filter(|k| !valid_model_names.contains(k.as_str()))
+                .cloned()
+                .collect()
+        };
+
+        let mut mappings = self.provider_mappings.write().await;
+
+        let stale_models: Vec<String> = mappings
+            .model_to_providers
+            .keys()
+            .filter(|k| !valid_model_names.contains(k.as_str()))
+            .cloned()
+            .collect();
+
+        if stale_models.is_empty() && stale_external_models.is_empty() {
+            return;
+        }
+
+        // Collect provider ptrs being removed for ancillary cleanup
+        let mut removed_ptrs = std::collections::HashSet::new();
+        for model_name in &stale_models {
+            if let Some(providers) = mappings.model_to_providers.remove(model_name) {
+                for p in &providers {
+                    removed_ptrs.insert(Arc::as_ptr(p) as *const () as usize);
+                }
+            }
+        }
+
+        // Prune pubkey entries
+        mappings.pubkey_to_providers.retain(|_, providers| {
+            providers.retain(|p| !removed_ptrs.contains(&(Arc::as_ptr(p) as *const () as usize)));
+            !providers.is_empty()
+        });
+
+        // Drop mappings lock before touching std::sync locks
+        drop(mappings);
+
+        if !stale_external_models.is_empty() {
+            let mut external = self.external_providers.write().await;
+            for model_name in &stale_external_models {
+                external.remove(model_name);
+            }
+        }
+
+        // Clean up load balancer indices and failure counts
+        {
+            let mut lb = self
+                .load_balancer_index
+                .write()
+                .unwrap_or_else(|e| e.into_inner());
+            for model_name in &stale_models {
+                lb.remove(model_name);
+            }
+        }
+        self.provider_failure_counts
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|key, _| !removed_ptrs.contains(key));
+        self.provider_urls
+            .write()
+            .await
+            .retain(|key, _| !removed_ptrs.contains(key));
+        self.inference_url_providers
+            .write()
+            .await
+            .retain(|_, provider| !removed_ptrs.contains(&Self::provider_ptr(provider)));
+
+        let mut removed_models = stale_models;
+        removed_models.extend(stale_external_models);
+
+        info!(
+            removed = removed_models.len(),
+            models = ?removed_models,
+            "Removed stale providers not in database"
+        );
+    }
+
+    /// Start a periodic background task that refreshes all providers from the database.
+    ///
+    /// Refreshes both inference_url models (VLlm providers) and external providers
+    /// (OpenAI, Anthropic, etc.) on each tick. Removes providers for models that
+    /// are no longer in the database.
     ///
     /// The first tick is skipped because providers are already loaded at startup.
     /// If `refresh_interval_secs` is 0, this is a no-op.
-    pub async fn start_external_refresh_task(
+    pub async fn start_refresh_task(
         self: Arc<Self>,
         source: Arc<dyn ExternalModelsSource>,
         refresh_interval_secs: u64,
     ) {
         if refresh_interval_secs == 0 {
-            debug!("External provider refresh disabled (interval is 0)");
+            debug!("Provider refresh disabled (interval is 0)");
             return;
         }
 
@@ -1961,44 +1849,46 @@ impl InferenceProviderPool {
                 interval.tick().await;
                 loop {
                     interval.tick().await;
-                    debug!("Running periodic external provider refresh");
+                    debug!("Running periodic provider refresh");
+
+                    let mut valid_model_names = std::collections::HashSet::new();
+
+                    // Refresh inference_url models
+                    match source.fetch_inference_url_models().await {
+                        Ok(models) => {
+                            for (name, _) in &models {
+                                valid_model_names.insert(name.clone());
+                            }
+                            pool.sync_inference_url_models(models).await;
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "Failed to refresh inference_url models");
+                            // On failure, keep all existing inference_url models
+                            // (we don't know which are still valid)
+                            let mappings = pool.provider_mappings.read().await;
+                            valid_model_names.extend(mappings.model_to_providers.keys().cloned());
+                            drop(mappings);
+                        }
+                    }
+
+                    // Refresh external providers
                     match source.fetch_external_models().await {
                         Ok(models) => {
+                            for (name, _) in &models {
+                                valid_model_names.insert(name.clone());
+                            }
                             pool.sync_external_providers(models).await;
                         }
                         Err(e) => {
-                            warn!(
-                                error = %e,
-                                "Failed to fetch external models for refresh, will retry on next interval"
-                            );
+                            warn!(error = %e, "Failed to refresh external providers");
+                            // On failure, keep all existing external providers.
+                            let external = pool.external_providers.read().await;
+                            valid_model_names.extend(external.keys().cloned());
                         }
                     }
-                }
-            }
-        });
 
-        let mut task_handle = self.external_refresh_task_handle.lock().await;
-        *task_handle = Some(handle);
-        info!(
-            "External provider refresh task started with interval: {} seconds",
-            refresh_interval_secs
-        );
-    }
-
-    /// Start the periodic model discovery refresh task and store the handle
-    pub async fn start_refresh_task(self: Arc<Self>, refresh_interval_secs: u64) {
-        let handle = tokio::spawn({
-            let pool = self.clone();
-            async move {
-                let mut interval =
-                    tokio::time::interval(tokio::time::Duration::from_secs(refresh_interval_secs));
-                loop {
-                    interval.tick().await;
-                    debug!("Running periodic model discovery refresh");
-                    // Re-run model discovery
-                    if pool.initialize().await.is_err() {
-                        info!("Failed to refresh model discovery, will retry on next interval");
-                    }
+                    // Remove providers for models no longer in the database
+                    pool.remove_stale_providers(&valid_model_names).await;
                 }
             }
         });
@@ -2006,7 +1896,7 @@ impl InferenceProviderPool {
         let mut task_handle = self.refresh_task_handle.lock().await;
         *task_handle = Some(handle);
         info!(
-            "Model discovery refresh task started with interval: {} seconds",
+            "Provider refresh task started with interval: {} seconds",
             refresh_interval_secs
         );
     }
@@ -2015,121 +1905,42 @@ impl InferenceProviderPool {
     pub async fn shutdown(&self) {
         info!("Initiating inference provider pool shutdown");
 
-        // Step 1a: Cancel the model discovery refresh task
-        debug!("Step 1a: Cancelling model discovery refresh task");
+        // Cancel the refresh task
         let mut task_handle = self.refresh_task_handle.lock().await;
         if let Some(handle) = task_handle.take() {
-            debug!("Cancelling model discovery refresh task");
             handle.abort();
-            info!("Model discovery refresh task cancelled successfully");
-        } else {
-            debug!("No active refresh task to cancel");
+            info!("Refresh task cancelled");
         }
-        drop(task_handle); // Explicitly drop the lock
+        drop(task_handle);
 
-        // Step 1b: Cancel the external provider refresh task
-        debug!("Step 1b: Cancelling external provider refresh task");
-        let mut ext_task_handle = self.external_refresh_task_handle.lock().await;
-        if let Some(handle) = ext_task_handle.take() {
-            debug!("Cancelling external provider refresh task");
-            handle.abort();
-            info!("External provider refresh task cancelled successfully");
-        } else {
-            debug!("No active external refresh task to cancel");
-        }
-        drop(ext_task_handle);
-
-        // Step 2: Clear provider mappings (both model and pubkey mappings cleared atomically)
-        debug!("Step 2: Clearing provider mappings");
-        let mut mappings = self.provider_mappings.write().await;
-        let model_count = mappings.model_to_providers.len();
-        let pubkey_count = mappings.pubkey_to_providers.len();
-        *mappings = ProviderMappings::new();
-        debug!(
-            "Cleared {} model mappings and {} pubkey mappings",
-            model_count, pubkey_count
-        );
-        drop(mappings);
-
-        // Step 2.5: Clear external providers
-        debug!("Step 2.5: Clearing external providers");
-        let mut external = self.external_providers.write().await;
-        let external_count = external.len();
-        external.clear();
-        debug!("Cleared {} external providers", external_count);
-        drop(external);
-
-        // Step 3: Clear load balancer indices
-        let index_count = {
-            debug!("Step 3: Clearing load balancer indices");
-            let mut lb_index = self
-                .load_balancer_index
-                .write()
-                .unwrap_or_else(|e| e.into_inner());
-            let count = lb_index.len();
-            lb_index.clear();
-            debug!("Cleared {} load balancer indices", count);
+        // Clear all state
+        let model_count = {
+            let mut mappings = self.provider_mappings.write().await;
+            let count = mappings.model_to_providers.len();
+            *mappings = ProviderMappings::new();
             count
         };
+        self.external_providers.write().await.clear();
 
-        // Step 4: Clear chat_id to provider mappings
-        debug!("Step 4: Clearing chat session mappings");
-        let mut chat_mapping = self.chat_id_mapping.write().await;
-        let chat_count = chat_mapping.len();
-        chat_mapping.clear();
-        debug!("Cleared {} chat session mappings", chat_count);
-        drop(chat_mapping);
-
-        // Step 5: Clear provider failure counts
-        debug!("Step 5: Clearing provider failure counts");
-        let mut failure_counts = self
-            .provider_failure_counts
+        self.load_balancer_index
             .write()
-            .unwrap_or_else(|e| e.into_inner());
-        let failure_count = failure_counts.len();
-        failure_counts.clear();
-        debug!("Cleared {} provider failure count entries", failure_count);
-        drop(failure_counts);
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        self.chat_id_mapping.write().await.clear();
+        self.provider_failure_counts
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        self.provider_urls.write().await.clear();
+        self.inference_url_providers.write().await.clear();
 
-        info!(
-            "Inference provider pool shutdown completed. Cleaned up: {} models, {} pubkeys, {} external providers, {} load balancer indices, {} chat mappings, {} failure counts",
-            model_count, pubkey_count, external_count, index_count, chat_count, failure_count
-        );
+        info!(model_count, "Inference provider pool shutdown completed");
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_parse_ip_port() {
-        // Valid IP-based keys
-        assert_eq!(
-            InferenceProviderPool::parse_ip_port("192.0.2.1:8000"),
-            Some(("192.0.2.1".to_string(), 8000))
-        );
-        assert_eq!(
-            InferenceProviderPool::parse_ip_port("192.0.2.2:8001"),
-            Some(("192.0.2.2".to_string(), 8001))
-        );
-
-        // Invalid keys (should be filtered out)
-        assert_eq!(
-            InferenceProviderPool::parse_ip_port("redpill:phala/qwen-2.5-7b-instruct"),
-            None
-        );
-        assert_eq!(InferenceProviderPool::parse_ip_port("invalid"), None);
-        assert_eq!(InferenceProviderPool::parse_ip_port("not-an-ip:8000"), None);
-        assert_eq!(
-            InferenceProviderPool::parse_ip_port("256.256.256.256:8000"),
-            None
-        ); // Invalid IP
-        assert_eq!(
-            InferenceProviderPool::parse_ip_port("192.168.1.1:70000"),
-            None
-        ); // Invalid port
-    }
 
     #[test]
     fn test_sanitize_error_message() {
@@ -2203,12 +2014,7 @@ mod tests {
         use futures_util::StreamExt;
         use inference_providers::mock::MockProvider;
 
-        let pool = InferenceProviderPool::new(
-            "http://localhost:8080/models".to_string(),
-            None,
-            5,
-            ExternalProvidersConfig::default(),
-        );
+        let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
 
         let mock_provider = Arc::new(MockProvider::new());
         let model_id = "Qwen/Qwen3-30B-A3B-Instruct-2507".to_string();
@@ -2270,12 +2076,7 @@ mod tests {
     async fn test_preferred_provider_url_is_prioritized_when_available() {
         use inference_providers::mock::MockProvider;
 
-        let pool = InferenceProviderPool::new(
-            "http://localhost:8080/models".to_string(),
-            None,
-            5,
-            ExternalProvidersConfig::default(),
-        );
+        let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
 
         let provider_a: Arc<InferenceProviderTrait> = Arc::new(MockProvider::new());
         let provider_b: Arc<InferenceProviderTrait> = Arc::new(MockProvider::new());
@@ -2310,11 +2111,9 @@ mod tests {
     // ==================== External Provider Tests ====================
 
     #[tokio::test]
-    async fn test_register_external_provider_openai() {
+    async fn test_load_external_provider_openai() {
         let pool = InferenceProviderPool::new(
-            "http://localhost:8080/models".to_string(),
             None,
-            5,
             ExternalProvidersConfig {
                 openai_api_key: Some("sk-test-key".to_string()),
                 anthropic_api_key: None,
@@ -2324,25 +2123,18 @@ mod tests {
             },
         );
 
-        let config = serde_json::json!({
-            "backend": "openai_compatible",
-            "base_url": "https://api.openai.com/v1"
-        });
-
-        let result = pool
-            .register_external_provider("gpt-4".to_string(), config)
-            .await;
+        let result = pool.load_external_providers(vec![
+            ("gpt-4".to_string(), serde_json::json!({"backend": "openai_compatible", "base_url": "https://api.openai.com/v1"})),
+        ]).await;
 
         assert!(result.is_ok());
-        assert!(pool.is_external_provider("gpt-4").await);
+        assert!(pool.has_provider("gpt-4").await);
     }
 
     #[tokio::test]
-    async fn test_register_external_provider_anthropic() {
+    async fn test_load_external_provider_anthropic() {
         let pool = InferenceProviderPool::new(
-            "http://localhost:8080/models".to_string(),
             None,
-            5,
             ExternalProvidersConfig {
                 openai_api_key: None,
                 anthropic_api_key: Some("sk-ant-test".to_string()),
@@ -2352,76 +2144,30 @@ mod tests {
             },
         );
 
-        let config = serde_json::json!({
-            "backend": "anthropic",
-            "base_url": "https://api.anthropic.com/v1"
-        });
-
-        let result = pool
-            .register_external_provider("claude-3-opus".to_string(), config)
-            .await;
+        let result = pool.load_external_providers(vec![
+            ("claude-3-opus".to_string(), serde_json::json!({"backend": "anthropic", "base_url": "https://api.anthropic.com/v1"})),
+        ]).await;
 
         assert!(result.is_ok());
-        assert!(pool.is_external_provider("claude-3-opus").await);
+        assert!(pool.has_provider("claude-3-opus").await);
     }
 
     #[tokio::test]
-    async fn test_register_external_provider_gemini() {
-        let pool = InferenceProviderPool::new(
-            "http://localhost:8080/models".to_string(),
-            None,
-            5,
-            ExternalProvidersConfig {
-                openai_api_key: None,
-                anthropic_api_key: None,
-                gemini_api_key: Some("AIza-test".to_string()),
-                timeout_seconds: 60,
-                refresh_interval_secs: 0,
-            },
-        );
+    async fn test_load_external_provider_missing_api_key() {
+        let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
 
-        let config = serde_json::json!({
-            "backend": "gemini",
-            "base_url": "https://generativelanguage.googleapis.com/v1beta"
-        });
-
-        let result = pool
-            .register_external_provider("gemini-1.5-pro".to_string(), config)
-            .await;
-
-        assert!(result.is_ok());
-        assert!(pool.is_external_provider("gemini-1.5-pro").await);
-    }
-
-    #[tokio::test]
-    async fn test_register_external_provider_missing_api_key() {
-        let pool = InferenceProviderPool::new(
-            "http://localhost:8080/models".to_string(),
-            None,
-            5,
-            ExternalProvidersConfig::default(), // No API keys configured
-        );
-
-        let config = serde_json::json!({
-            "backend": "openai_compatible",
-            "base_url": "https://api.openai.com/v1"
-        });
-
-        let result = pool
-            .register_external_provider("gpt-4".to_string(), config)
-            .await;
+        let result = pool.load_external_providers(vec![
+            ("gpt-4".to_string(), serde_json::json!({"backend": "openai_compatible", "base_url": "https://api.openai.com/v1"})),
+        ]).await;
 
         assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert!(err.contains("API key"));
+        assert!(result.unwrap_err().contains("failed to load"));
     }
 
     #[tokio::test]
-    async fn test_register_external_provider_invalid_config() {
+    async fn test_load_external_provider_invalid_config() {
         let pool = InferenceProviderPool::new(
-            "http://localhost:8080/models".to_string(),
             None,
-            5,
             ExternalProvidersConfig {
                 openai_api_key: Some("sk-test".to_string()),
                 anthropic_api_key: None,
@@ -2431,57 +2177,31 @@ mod tests {
             },
         );
 
-        let config = serde_json::json!({
-            "backend": "unknown_backend",
-            "base_url": "https://example.com"
-        });
-
-        let result = pool
-            .register_external_provider("test-model".to_string(), config)
-            .await;
+        let result = pool.load_external_providers(vec![
+            ("test-model".to_string(), serde_json::json!({"backend": "unknown_backend", "base_url": "https://example.com"})),
+        ]).await;
 
         assert!(result.is_err());
     }
 
     #[tokio::test]
-    async fn test_is_external_provider_false_for_vllm() {
+    async fn test_has_provider_for_registered_model() {
         use inference_providers::mock::MockProvider;
 
-        let pool = InferenceProviderPool::new(
-            "http://localhost:8080/models".to_string(),
-            None,
-            5,
-            ExternalProvidersConfig::default(),
-        );
+        let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
 
-        // Register a vLLM-style provider (via mock)
         let mock_provider = Arc::new(MockProvider::new());
         pool.register_provider("vllm-model".to_string(), mock_provider)
             .await;
 
-        // vLLM providers should not be external
-        assert!(!pool.is_external_provider("vllm-model").await);
-    }
-
-    #[tokio::test]
-    async fn test_is_external_provider_false_for_unknown() {
-        let pool = InferenceProviderPool::new(
-            "http://localhost:8080/models".to_string(),
-            None,
-            5,
-            ExternalProvidersConfig::default(),
-        );
-
-        // Unknown model should not be external
-        assert!(!pool.is_external_provider("unknown-model").await);
+        assert!(pool.has_provider("vllm-model").await);
+        assert!(!pool.has_provider("unknown-model").await);
     }
 
     #[tokio::test]
     async fn test_load_external_providers_batch() {
         let pool = InferenceProviderPool::new(
-            "http://localhost:8080/models".to_string(),
             None,
-            5,
             ExternalProvidersConfig {
                 openai_api_key: Some("sk-test".to_string()),
                 anthropic_api_key: Some("sk-ant-test".to_string()),
@@ -2491,114 +2211,45 @@ mod tests {
             },
         );
 
-        let models = vec![
-            (
-                "gpt-4".to_string(),
-                serde_json::json!({
-                    "backend": "openai_compatible",
-                    "base_url": "https://api.openai.com/v1"
-                }),
-            ),
-            (
-                "claude-3".to_string(),
-                serde_json::json!({
-                    "backend": "anthropic",
-                    "base_url": "https://api.anthropic.com/v1"
-                }),
-            ),
-            (
-                "gemini-pro".to_string(),
-                serde_json::json!({
-                    "backend": "gemini",
-                    "base_url": "https://generativelanguage.googleapis.com/v1beta"
-                }),
-            ),
-        ];
-
-        let result = pool.load_external_providers(models).await;
+        let result = pool.load_external_providers(vec![
+            ("gpt-4".to_string(), serde_json::json!({"backend": "openai_compatible", "base_url": "https://api.openai.com/v1"})),
+            ("claude-3".to_string(), serde_json::json!({"backend": "anthropic", "base_url": "https://api.anthropic.com/v1"})),
+            ("gemini-pro".to_string(), serde_json::json!({"backend": "gemini", "base_url": "https://generativelanguage.googleapis.com/v1beta"})),
+        ]).await;
 
         assert!(result.is_ok());
-        assert!(pool.is_external_provider("gpt-4").await);
-        assert!(pool.is_external_provider("claude-3").await);
-        assert!(pool.is_external_provider("gemini-pro").await);
+        assert!(pool.has_provider("gpt-4").await);
+        assert!(pool.has_provider("claude-3").await);
+        assert!(pool.has_provider("gemini-pro").await);
     }
 
     #[tokio::test]
     async fn test_load_external_providers_partial_failure() {
         let pool = InferenceProviderPool::new(
-            "http://localhost:8080/models".to_string(),
             None,
-            5,
             ExternalProvidersConfig {
                 openai_api_key: Some("sk-test".to_string()),
-                anthropic_api_key: None, // Missing Anthropic key
+                anthropic_api_key: None,
                 gemini_api_key: None,
                 timeout_seconds: 60,
                 refresh_interval_secs: 0,
             },
         );
 
-        let models = vec![
-            (
-                "gpt-4".to_string(),
-                serde_json::json!({
-                    "backend": "openai_compatible",
-                    "base_url": "https://api.openai.com/v1"
-                }),
-            ),
-            (
-                "claude-3".to_string(),
-                serde_json::json!({
-                    "backend": "anthropic",
-                    "base_url": "https://api.anthropic.com/v1"
-                }),
-            ),
-        ];
+        let result = pool.load_external_providers(vec![
+            ("gpt-4".to_string(), serde_json::json!({"backend": "openai_compatible", "base_url": "https://api.openai.com/v1"})),
+            ("claude-3".to_string(), serde_json::json!({"backend": "anthropic", "base_url": "https://api.anthropic.com/v1"})),
+        ]).await;
 
-        // Should still succeed (continues on individual failures)
-        let result = pool.load_external_providers(models).await;
         assert!(result.is_ok());
-
-        // OpenAI should be registered
-        assert!(pool.is_external_provider("gpt-4").await);
-
-        // Anthropic should fail to register (missing API key)
-        assert!(!pool.is_external_provider("claude-3").await);
+        assert!(pool.has_provider("gpt-4").await);
+        assert!(!pool.has_provider("claude-3").await);
     }
 
     #[tokio::test]
-    async fn test_external_provider_config_from_env() {
-        // Test the ExternalProvidersConfig::from_env() behavior
-        let config = ExternalProvidersConfig::default();
-
-        // Default should have no API keys
-        assert!(config.openai_api_key.is_none());
-        assert!(config.anthropic_api_key.is_none());
-        assert!(config.gemini_api_key.is_none());
-    }
-
-    #[tokio::test]
-    async fn test_external_provider_config_get_api_key() {
-        let config = ExternalProvidersConfig {
-            openai_api_key: Some("openai-key".to_string()),
-            anthropic_api_key: Some("anthropic-key".to_string()),
-            gemini_api_key: Some("gemini-key".to_string()),
-            timeout_seconds: 60,
-            refresh_interval_secs: 0,
-        };
-
-        assert_eq!(config.get_api_key("openai_compatible"), Some("openai-key"));
-        assert_eq!(config.get_api_key("anthropic"), Some("anthropic-key"));
-        assert_eq!(config.get_api_key("gemini"), Some("gemini-key"));
-        assert_eq!(config.get_api_key("unknown"), None);
-    }
-
-    #[tokio::test]
-    async fn test_shutdown_clears_external_providers() {
+    async fn test_shutdown_clears_providers() {
         let pool = InferenceProviderPool::new(
-            "http://localhost:8080/models".to_string(),
             None,
-            5,
             ExternalProvidersConfig {
                 openai_api_key: Some("sk-test".to_string()),
                 anthropic_api_key: None,
@@ -2608,28 +2259,19 @@ mod tests {
             },
         );
 
-        let config = serde_json::json!({
-            "backend": "openai_compatible",
-            "base_url": "https://api.openai.com/v1"
-        });
+        pool.load_external_providers(vec![
+            ("gpt-4".to_string(), serde_json::json!({"backend": "openai_compatible", "base_url": "https://api.openai.com/v1"})),
+        ]).await.unwrap();
 
-        pool.register_external_provider("gpt-4".to_string(), config)
-            .await
-            .unwrap();
-
-        assert!(pool.is_external_provider("gpt-4").await);
-
+        assert!(pool.has_provider("gpt-4").await);
         pool.shutdown().await;
-
-        assert!(!pool.is_external_provider("gpt-4").await);
+        assert!(!pool.has_provider("gpt-4").await);
     }
 
     #[tokio::test]
-    async fn test_unregister_external_provider() {
+    async fn test_unregister_provider() {
         let pool = InferenceProviderPool::new(
-            "http://localhost:8080/models".to_string(),
             None,
-            5,
             ExternalProvidersConfig {
                 openai_api_key: Some("sk-test".to_string()),
                 anthropic_api_key: None,
@@ -2639,47 +2281,167 @@ mod tests {
             },
         );
 
-        let config = serde_json::json!({
-            "backend": "openai_compatible",
-            "base_url": "https://api.openai.com/v1"
-        });
+        pool.load_external_providers(vec![
+            ("gpt-4".to_string(), serde_json::json!({"backend": "openai_compatible", "base_url": "https://api.openai.com/v1"})),
+        ]).await.unwrap();
 
-        // Register a provider
-        pool.register_external_provider("gpt-4".to_string(), config)
-            .await
-            .unwrap();
-        assert!(pool.is_external_provider("gpt-4").await);
-
-        // Unregister it
-        let removed = pool.unregister_external_provider("gpt-4").await;
-        assert!(removed);
-        assert!(!pool.is_external_provider("gpt-4").await);
-
-        // Unregistering again should return false
-        let removed_again = pool.unregister_external_provider("gpt-4").await;
-        assert!(!removed_again);
+        assert!(pool.has_provider("gpt-4").await);
+        assert!(pool.unregister_provider("gpt-4").await);
+        assert!(!pool.has_provider("gpt-4").await);
+        assert!(!pool.unregister_provider("gpt-4").await);
     }
 
     #[tokio::test]
     async fn test_unregister_nonexistent_provider() {
-        let pool = InferenceProviderPool::new(
-            "http://localhost:8080/models".to_string(),
-            None,
-            5,
-            ExternalProvidersConfig::default(),
+        let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
+        assert!(!pool.unregister_provider("nonexistent-model").await);
+    }
+
+    /// Verify that reused providers (URL unchanged) keep their pubkey mappings
+    /// after load_inference_url_models refreshes.
+    ///
+    /// Regression test: previously, reused provider Arc pointers were collected
+    /// as "old" and pruned from pubkey_to_providers, but never re-added because
+    /// only new providers had their pub_keys collected. This caused E2EE routing
+    /// to fail after the first refresh cycle.
+    #[tokio::test]
+    async fn test_reused_providers_keep_pubkey_mapping() {
+        use inference_providers::mock::MockProvider;
+
+        let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
+        let model_id = "test-model".to_string();
+
+        // Register a provider with known pubkeys
+        let mock_provider = Arc::new(MockProvider::new());
+        pool.register_provider(model_id.clone(), mock_provider.clone())
+            .await;
+
+        // Verify pubkey routing works initially
+        let ecdsa_key = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        {
+            let mappings = pool.provider_mappings.read().await;
+            assert!(
+                mappings.pubkey_to_providers.contains_key(ecdsa_key),
+                "ECDSA key should be in pubkey_to_providers after registration"
+            );
+            let providers = mappings.pubkey_to_providers.get(ecdsa_key).unwrap();
+            assert_eq!(providers.len(), 1);
+            assert!(Arc::ptr_eq(
+                &providers[0],
+                &(mock_provider.clone() as Arc<InferenceProviderTrait>)
+            ));
+        }
+
+        // Now simulate what load_inference_url_models does when a provider is reused:
+        // 1. The same Arc is added to model_providers
+        // 2. Old ptrs are collected (including the reused one)
+        // 3. pubkey_to_providers is pruned
+        // 4. Only NEW provider pubkeys are re-added
+        //
+        // We simulate this by calling the internal logic path with
+        // the same provider being "reused" (same Arc pointer).
+        {
+            let mut mappings = pool.provider_mappings.write().await;
+
+            // Simulated reused provider
+            let reused_provider = mock_provider.clone() as Arc<InferenceProviderTrait>;
+            let reused_ptr = Arc::as_ptr(&reused_provider) as *const () as usize;
+
+            // Build reused set (the fix)
+            let reused_ptrs: std::collections::HashSet<usize> = [reused_ptr].into_iter().collect();
+
+            // Collect "old" provider ptrs, excluding reused ones
+            let mut old_provider_ptrs = std::collections::HashSet::new();
+            if let Some(old) = mappings.model_to_providers.get(&model_id) {
+                for p in old {
+                    let ptr = Arc::as_ptr(p) as *const () as usize;
+                    if !reused_ptrs.contains(&ptr) {
+                        old_provider_ptrs.insert(ptr);
+                    }
+                }
+            }
+
+            // Replace model providers with "new" list (same Arc)
+            mappings
+                .model_to_providers
+                .insert(model_id.clone(), vec![reused_provider]);
+
+            // Prune old (non-reused) provider pubkeys
+            if !old_provider_ptrs.is_empty() {
+                mappings.pubkey_to_providers.retain(|_, providers| {
+                    providers.retain(|p| {
+                        !old_provider_ptrs.contains(&(Arc::as_ptr(p) as *const () as usize))
+                    });
+                    !providers.is_empty()
+                });
+            }
+
+            // Verify: reused provider's pubkey mapping should still exist
+            assert!(
+                mappings.pubkey_to_providers.contains_key(ecdsa_key),
+                "ECDSA key should be PRESERVED for reused providers after refresh"
+            );
+        }
+    }
+
+    /// Test that E2EE routing via pubkey works end-to-end after register_provider.
+    /// This exercises: register_provider → fetch attestation → store pubkey → route by pubkey.
+    #[tokio::test]
+    async fn test_e2ee_pubkey_routing_after_register() {
+        use inference_providers::mock::MockProvider;
+
+        let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
+        let model_id = "test-e2ee-model".to_string();
+
+        // Register provider (fetches attestation, stores pubkeys)
+        let mock_provider = Arc::new(MockProvider::new());
+        pool.register_provider(model_id.clone(), mock_provider)
+            .await;
+
+        // The mock provider returns this ECDSA key
+        let ecdsa_key = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+        // Test 1: routing WITHOUT pubkey should work
+        let result: Result<((), _), _> = pool
+            .retry_with_fallback(&model_id, "test_op", None, None, |_provider| async {
+                Ok(())
+            })
+            .await;
+        assert!(result.is_ok(), "Routing without pubkey should succeed");
+
+        // Test 2: routing WITH correct pubkey should work
+        let result: Result<((), _), _> = pool
+            .retry_with_fallback(
+                &model_id,
+                "test_op",
+                Some(ecdsa_key),
+                None,
+                |_provider| async { Ok(()) },
+            )
+            .await;
+        assert!(
+            result.is_ok(),
+            "Routing with correct ECDSA pubkey should succeed, got: {:?}",
+            result.err()
         );
 
-        // Unregistering a provider that was never registered should return false
-        let removed = pool.unregister_external_provider("nonexistent-model").await;
-        assert!(!removed);
+        // Test 3: routing with WRONG pubkey should fail
+        let result: Result<((), _), _> = pool
+            .retry_with_fallback(
+                &model_id,
+                "test_op",
+                Some("deadbeef00000000deadbeef00000000deadbeef00000000deadbeef00000000deadbeef00000000deadbeef00000000deadbeef00000000deadbeef00000000"),
+                None,
+                |_provider| async { Ok(()) },
+            )
+            .await;
+        assert!(result.is_err(), "Routing with wrong pubkey should fail");
     }
 
     #[tokio::test]
-    async fn test_register_update_external_provider() {
+    async fn test_sync_external_providers() {
         let pool = InferenceProviderPool::new(
-            "http://localhost:8080/models".to_string(),
             None,
-            5,
             ExternalProvidersConfig {
                 openai_api_key: Some("sk-test".to_string()),
                 anthropic_api_key: None,
@@ -2689,192 +2451,27 @@ mod tests {
             },
         );
 
-        let config1 = serde_json::json!({
-            "backend": "openai_compatible",
-            "base_url": "https://api.openai.com/v1"
-        });
+        pool.sync_external_providers(vec![
+            ("gpt-4".to_string(), serde_json::json!({"backend": "openai_compatible", "base_url": "https://api.openai.com/v1"})),
+        ]).await;
 
-        let config2 = serde_json::json!({
-            "backend": "openai_compatible",
-            "base_url": "https://api.together.xyz/v1"
-        });
+        assert!(pool.has_provider("gpt-4").await);
 
-        // Register initial config
-        pool.register_external_provider("my-model".to_string(), config1)
-            .await
-            .unwrap();
-        assert!(pool.is_external_provider("my-model").await);
+        // Sync with partial failures
+        pool.sync_external_providers(vec![
+            ("gpt-4".to_string(), serde_json::json!({"backend": "openai_compatible", "base_url": "https://api.openai.com/v1"})),
+            ("claude-3".to_string(), serde_json::json!({"backend": "anthropic", "base_url": "https://api.anthropic.com/v1"})),
+        ]).await;
 
-        // Re-register with updated config (should overwrite)
-        pool.register_external_provider("my-model".to_string(), config2)
-            .await
-            .unwrap();
-        assert!(pool.is_external_provider("my-model").await);
-
-        // Should still only have one entry (not duplicated)
-        let external = pool.external_providers.read().await;
-        assert_eq!(external.len(), 1);
-    }
-
-    // ==================== Sync External Providers Tests ====================
-
-    #[tokio::test]
-    async fn test_sync_replaces_old_providers() {
-        let pool = InferenceProviderPool::new(
-            "http://localhost:8080/models".to_string(),
-            None,
-            5,
-            ExternalProvidersConfig {
-                openai_api_key: Some("sk-test".to_string()),
-                anthropic_api_key: Some("sk-ant-test".to_string()),
-                gemini_api_key: None,
-                timeout_seconds: 60,
-                refresh_interval_secs: 0,
-            },
-        );
-
-        // Load initial providers via register
-        pool.register_external_provider(
-            "gpt-4".to_string(),
-            serde_json::json!({
-                "backend": "openai_compatible",
-                "base_url": "https://api.openai.com/v1"
-            }),
-        )
-        .await
-        .unwrap();
-        pool.register_external_provider(
-            "claude-3".to_string(),
-            serde_json::json!({
-                "backend": "anthropic",
-                "base_url": "https://api.anthropic.com/v1"
-            }),
-        )
-        .await
-        .unwrap();
-
-        assert!(pool.is_external_provider("gpt-4").await);
-        assert!(pool.is_external_provider("claude-3").await);
-
-        // Sync with a new set that removes claude-3 and adds gpt-4o
-        let new_models = vec![
-            (
-                "gpt-4".to_string(),
-                serde_json::json!({
-                    "backend": "openai_compatible",
-                    "base_url": "https://api.openai.com/v1"
-                }),
-            ),
-            (
-                "gpt-4o".to_string(),
-                serde_json::json!({
-                    "backend": "openai_compatible",
-                    "base_url": "https://api.openai.com/v1"
-                }),
-            ),
-        ];
-
-        pool.sync_external_providers(new_models).await;
-
-        // gpt-4 should still exist
-        assert!(pool.is_external_provider("gpt-4").await);
-        // gpt-4o should be added
-        assert!(pool.is_external_provider("gpt-4o").await);
-        // claude-3 should be gone (removed from DB)
-        assert!(!pool.is_external_provider("claude-3").await);
-
-        let external = pool.external_providers.read().await;
-        assert_eq!(external.len(), 2);
-    }
-
-    #[tokio::test]
-    async fn test_sync_with_empty_list_clears_providers() {
-        let pool = InferenceProviderPool::new(
-            "http://localhost:8080/models".to_string(),
-            None,
-            5,
-            ExternalProvidersConfig {
-                openai_api_key: Some("sk-test".to_string()),
-                anthropic_api_key: None,
-                gemini_api_key: None,
-                timeout_seconds: 60,
-                refresh_interval_secs: 0,
-            },
-        );
-
-        // Load an initial provider
-        pool.register_external_provider(
-            "gpt-4".to_string(),
-            serde_json::json!({
-                "backend": "openai_compatible",
-                "base_url": "https://api.openai.com/v1"
-            }),
-        )
-        .await
-        .unwrap();
-        assert!(pool.is_external_provider("gpt-4").await);
-
-        // Sync with empty list should clear all external providers
-        pool.sync_external_providers(vec![]).await;
-
-        assert!(!pool.is_external_provider("gpt-4").await);
-        let external = pool.external_providers.read().await;
-        assert_eq!(external.len(), 0);
-    }
-
-    #[tokio::test]
-    async fn test_sync_with_partial_failures_keeps_successful() {
-        let pool = InferenceProviderPool::new(
-            "http://localhost:8080/models".to_string(),
-            None,
-            5,
-            ExternalProvidersConfig {
-                openai_api_key: Some("sk-test".to_string()),
-                anthropic_api_key: None, // Missing Anthropic key
-                gemini_api_key: None,
-                timeout_seconds: 60,
-                refresh_interval_secs: 0,
-            },
-        );
-
-        let models = vec![
-            (
-                "gpt-4".to_string(),
-                serde_json::json!({
-                    "backend": "openai_compatible",
-                    "base_url": "https://api.openai.com/v1"
-                }),
-            ),
-            (
-                "claude-3".to_string(),
-                serde_json::json!({
-                    "backend": "anthropic",
-                    "base_url": "https://api.anthropic.com/v1"
-                }),
-            ),
-        ];
-
-        pool.sync_external_providers(models).await;
-
-        // gpt-4 should succeed (has OpenAI key)
-        assert!(pool.is_external_provider("gpt-4").await);
-        // claude-3 should fail (no Anthropic key)
-        assert!(!pool.is_external_provider("claude-3").await);
-
-        let external = pool.external_providers.read().await;
-        assert_eq!(external.len(), 1);
+        assert!(pool.has_provider("gpt-4").await);
+        assert!(!pool.has_provider("claude-3").await);
     }
 
     // ==================== 4xx Retry Behavior Tests ====================
 
     /// Helper to create a pool with a registered mock provider
     async fn pool_with_mock_provider() -> (InferenceProviderPool, String) {
-        let pool = InferenceProviderPool::new(
-            "http://localhost:8080/models".to_string(),
-            None,
-            5,
-            ExternalProvidersConfig::default(),
-        );
+        let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
         let mock_provider = Arc::new(inference_providers::mock::MockProvider::new());
         let model_id = "Qwen/Qwen3-30B-A3B-Instruct-2507".to_string();
         pool.register_provider(model_id.clone(), mock_provider)

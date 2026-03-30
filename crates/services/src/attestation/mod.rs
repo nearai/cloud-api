@@ -488,59 +488,71 @@ impl ports::AttestationServiceTrait for AttestationService {
         // Always fetch and store both ECDSA and ED25519 signatures from the provider/model.
         // This avoids gateway-side signature synthesis and ensures signing_address reflects
         // the provider/model identity.
-        for algo in ["ecdsa", "ed25519"] {
-            let provider_signature = provider
-                .get_signature(chat_id, Some(algo.to_string()))
-                .await
-                .map_err(|e| {
-                    tracing::error!(
-                        "Failed to get chat signature from provider for algorithm: {}",
-                        algo
-                    );
-                    let duration = start_time.elapsed();
-                    self.metrics_service.record_count(
-                        METRIC_VERIFICATION_FAILURE,
-                        1,
-                        &[&format!("{TAG_REASON}:{REASON_INFERENCE_ERROR}"), &env_tag],
-                    );
-                    self.metrics_service.record_latency(
-                        METRIC_VERIFICATION_DURATION,
-                        duration,
-                        &[&env_tag],
-                    );
-                    AttestationError::ProviderError(e.to_string())
-                })?;
+        //
+        // Use a closure to ensure unpin_chat_connection runs on all paths (success or error),
+        // preventing the dedicated client from leaking in signature_clients.
+        let result: Result<(), AttestationError> = async {
+            for algo in ["ecdsa", "ed25519"] {
+                let provider_signature = provider
+                    .get_signature(chat_id, Some(algo.to_string()))
+                    .await
+                    .map_err(|e| {
+                        tracing::error!(
+                            "Failed to get chat signature from provider for algorithm: {}",
+                            algo
+                        );
+                        let duration = start_time.elapsed();
+                        self.metrics_service.record_count(
+                            METRIC_VERIFICATION_FAILURE,
+                            1,
+                            &[&format!("{TAG_REASON}:{REASON_INFERENCE_ERROR}"), &env_tag],
+                        );
+                        self.metrics_service.record_latency(
+                            METRIC_VERIFICATION_DURATION,
+                            duration,
+                            &[&env_tag],
+                        );
+                        AttestationError::ProviderError(e.to_string())
+                    })?;
 
-            let signature = ChatSignature {
-                text: provider_signature.text,
-                signature: provider_signature.signature,
-                signing_address: provider_signature.signing_address,
-                signing_algo: provider_signature.signing_algo,
-            };
+                let signature = ChatSignature {
+                    text: provider_signature.text,
+                    signature: provider_signature.signature,
+                    signing_address: provider_signature.signing_address,
+                    signing_algo: provider_signature.signing_algo,
+                };
 
-            // Store in repository
-            self.repository
-                .add_chat_signature(chat_id, signature)
-                .await
-                .map_err(|e| {
-                    tracing::error!(
-                        "Failed to store chat signature in repository for algorithm: {}",
-                        algo
-                    );
-                    let duration = start_time.elapsed();
-                    self.metrics_service.record_count(
-                        METRIC_VERIFICATION_FAILURE,
-                        1,
-                        &[&format!("{TAG_REASON}:{REASON_REPOSITORY_ERROR}"), &env_tag],
-                    );
-                    self.metrics_service.record_latency(
-                        METRIC_VERIFICATION_DURATION,
-                        duration,
-                        &[&env_tag],
-                    );
-                    AttestationError::RepositoryError(e.to_string())
-                })?;
+                // Store in repository
+                self.repository
+                    .add_chat_signature(chat_id, signature)
+                    .await
+                    .map_err(|e| {
+                        tracing::error!(
+                            "Failed to store chat signature in repository for algorithm: {}",
+                            algo
+                        );
+                        let duration = start_time.elapsed();
+                        self.metrics_service.record_count(
+                            METRIC_VERIFICATION_FAILURE,
+                            1,
+                            &[&format!("{TAG_REASON}:{REASON_REPOSITORY_ERROR}"), &env_tag],
+                        );
+                        self.metrics_service.record_latency(
+                            METRIC_VERIFICATION_DURATION,
+                            duration,
+                            &[&env_tag],
+                        );
+                        AttestationError::RepositoryError(e.to_string())
+                    })?;
+            }
+            Ok(())
         }
+        .await;
+
+        // Always clean up the dedicated TLS connection, even on error
+        provider.unpin_chat_connection(chat_id);
+
+        result?;
 
         // Record successful verification
         let duration = start_time.elapsed();

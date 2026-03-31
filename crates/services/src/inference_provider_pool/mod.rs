@@ -641,97 +641,132 @@ impl InferenceProviderPool {
             providers.len()
         );
 
+        // Retry once on transient connection errors (QEMU SLIRP backlog=1, brief nginx reloads).
+        // Most models have only 1 provider (via model-proxy), so provider fallback alone doesn't help.
+        const MAX_ROUNDS: usize = 2;
+        const RETRY_DELAY: Duration = Duration::from_millis(500);
+
         // Track the last error (preserving its structure for proper status code mapping)
         let mut last_error: Option<CompletionError> = None;
 
-        // Try each provider in order until one succeeds
-        for (attempt, provider) in providers.iter().enumerate() {
-            tracing::debug!(
-                model_id = %model_id,
-                attempt = attempt + 1,
-                total_providers = providers.len(),
-                operation = operation_name,
-                "Trying provider {} of {}",
-                attempt + 1,
-                providers.len()
-            );
+        for round in 0..MAX_ROUNDS {
+            if round > 0 {
+                tracing::info!(
+                    model_id = %model_id,
+                    round = round + 1,
+                    delay_ms = RETRY_DELAY.as_millis() as u64,
+                    operation = operation_name,
+                    "Retrying after transient connection failure"
+                );
+                tokio::time::sleep(RETRY_DELAY).await;
+            }
 
-            match provider_fn(provider.clone()).await {
-                Ok(result) => {
-                    // Reset failure counter on success
-                    {
-                        let mut counts = self
-                            .provider_failure_counts
-                            .write()
-                            .unwrap_or_else(|e| e.into_inner());
-                        let key = Arc::as_ptr(provider) as *const () as usize;
-                        counts.insert(key, 0);
-                    }
-                    tracing::info!(
-                        model_id = %model_id,
-                        attempt = attempt + 1,
-                        operation = operation_name,
-                        "Successfully completed request with provider"
-                    );
-                    return Ok((result, provider.clone()));
-                }
-                Err(e) => {
-                    // For HTTP client errors (4xx), don't retry with other providers.
-                    // The request itself is invalid (e.g., too many tokens), so retrying won't help.
-                    // Exception: 429 (rate limit) and 408 (request timeout) are retryable
-                    // as other providers may have capacity or better connectivity.
-                    // NOTE: Don't increment the failure counter for non-retryable 4xx —
-                    // these indicate invalid requests, not unhealthy providers.
-                    if let CompletionError::HttpError { status_code, .. } = &e {
-                        if (400..=499).contains(status_code)
-                            && *status_code != 429
-                            && *status_code != 408
+            // Try each provider in order until one succeeds
+            for (attempt, provider) in providers.iter().enumerate() {
+                tracing::debug!(
+                    model_id = %model_id,
+                    attempt = attempt + 1,
+                    total_providers = providers.len(),
+                    round = round + 1,
+                    operation = operation_name,
+                    "Trying provider {} of {} (round {})",
+                    attempt + 1,
+                    providers.len(),
+                    round + 1
+                );
+
+                match provider_fn(provider.clone()).await {
+                    Ok(result) => {
+                        // Reset failure counter on success
                         {
-                            tracing::warn!(
-                                model_id = %model_id,
-                                attempt = attempt + 1,
-                                status_code,
-                                error_detail = %e,
-                                operation = operation_name,
-                                "Client error from provider, not retrying"
-                            );
-                            return Err(Self::sanitize_completion_error(e, model_id));
+                            let mut counts = self
+                                .provider_failure_counts
+                                .write()
+                                .unwrap_or_else(|e| e.into_inner());
+                            let key = Arc::as_ptr(provider) as *const () as usize;
+                            counts.insert(key, 0);
                         }
+                        tracing::info!(
+                            model_id = %model_id,
+                            attempt = attempt + 1,
+                            round = round + 1,
+                            operation = operation_name,
+                            "Successfully completed request with provider"
+                        );
+                        return Ok((result, provider.clone()));
                     }
+                    Err(e) => {
+                        // For HTTP client errors (4xx), don't retry with other providers.
+                        // The request itself is invalid (e.g., too many tokens), so retrying won't help.
+                        // Exception: 429 (rate limit) and 408 (request timeout) are retryable
+                        // as other providers may have capacity or better connectivity.
+                        // NOTE: Don't increment the failure counter for non-retryable 4xx —
+                        // these indicate invalid requests, not unhealthy providers.
+                        if let CompletionError::HttpError { status_code, .. } = &e {
+                            if (400..=499).contains(status_code)
+                                && *status_code != 429
+                                && *status_code != 408
+                            {
+                                tracing::warn!(
+                                    model_id = %model_id,
+                                    attempt = attempt + 1,
+                                    status_code,
+                                    error_detail = %e,
+                                    operation = operation_name,
+                                    "Client error from provider, not retrying"
+                                );
+                                return Err(Self::sanitize_completion_error(e, model_id));
+                            }
+                        }
 
-                    // Increment failure counter only for retryable errors
-                    // (5xx, timeouts, network errors — indicators of backend health issues)
-                    {
-                        let mut counts = self
-                            .provider_failure_counts
-                            .write()
-                            .unwrap_or_else(|e| e.into_inner());
-                        let key = Arc::as_ptr(provider) as *const () as usize;
-                        let counter = counts.entry(key).or_insert(0);
-                        *counter = counter.saturating_add(1);
+                        // Increment failure counter only for retryable errors
+                        // (5xx, timeouts, network errors — indicators of backend health issues)
+                        {
+                            let mut counts = self
+                                .provider_failure_counts
+                                .write()
+                                .unwrap_or_else(|e| e.into_inner());
+                            let key = Arc::as_ptr(provider) as *const () as usize;
+                            let counter = counts.entry(key).or_insert(0);
+                            *counter = counter.saturating_add(1);
+                        }
+
+                        // Log the failure for debugging (before sanitization strips details)
+                        tracing::warn!(
+                            model_id = %model_id,
+                            attempt = attempt + 1,
+                            round = round + 1,
+                            error_detail = %e,
+                            operation = operation_name,
+                            "Provider failed, will try next provider if available"
+                        );
+
+                        // Sanitize and preserve the last error with its structure intact
+                        last_error = Some(Self::sanitize_completion_error(e, model_id));
                     }
-
-                    // Log the failure for debugging (before sanitization strips details)
-                    tracing::warn!(
-                        model_id = %model_id,
-                        attempt = attempt + 1,
-                        error_detail = %e,
-                        operation = operation_name,
-                        "Provider failed, will try next provider if available"
-                    );
-
-                    // Sanitize and preserve the last error with its structure intact
-                    last_error = Some(Self::sanitize_completion_error(e, model_id));
                 }
+            }
+
+            // Check if the last error is retryable (connection/server errors, not client errors)
+            let is_retryable = match &last_error {
+                Some(CompletionError::CompletionError(_)) => true, // Connection failures, timeouts
+                Some(CompletionError::HttpError { status_code, .. }) => *status_code >= 500,
+                _ => false,
+            };
+
+            if !is_retryable {
+                break;
             }
         }
 
-        // All providers failed
+        // All providers failed after all retry rounds
+        let total_attempts = providers.len() * MAX_ROUNDS.min(if last_error.is_some() { MAX_ROUNDS } else { 1 });
         if let Some(pub_key) = model_pub_key {
             tracing::error!(
                 model_id = %model_id,
                 model_pub_key_prefix = %pub_key.chars().take(32).collect::<String>(),
                 providers_tried = providers.len(),
+                total_attempts,
                 operation = operation_name,
                 "All providers failed for model with public key"
             );
@@ -739,6 +774,7 @@ impl InferenceProviderPool {
             tracing::error!(
                 model_id = %model_id,
                 providers_tried = providers.len(),
+                total_attempts,
                 operation = operation_name,
                 "All providers failed for model"
             );

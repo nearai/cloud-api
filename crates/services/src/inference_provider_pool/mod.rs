@@ -648,6 +648,7 @@ impl InferenceProviderPool {
 
         // Track the last error (preserving its structure for proper status code mapping)
         let mut last_error: Option<CompletionError> = None;
+        let mut total_attempts: usize = 0;
 
         for round in 0..MAX_ROUNDS {
             if round > 0 {
@@ -663,6 +664,7 @@ impl InferenceProviderPool {
 
             // Try each provider in order until one succeeds
             for (attempt, provider) in providers.iter().enumerate() {
+                total_attempts += 1;
                 tracing::debug!(
                     model_id = %model_id,
                     attempt = attempt + 1,
@@ -747,9 +749,18 @@ impl InferenceProviderPool {
                 }
             }
 
-            // Check if the last error is retryable (connection/server errors, not client errors)
+            // Only retry on connection failures (reqwest errors) and server errors (5xx).
+            // CompletionError::CompletionError can also contain non-transient errors
+            // (e.g., JSON parse failures), so check for connection-related keywords.
             let is_retryable = match &last_error {
-                Some(CompletionError::CompletionError(_)) => true, // Connection failures, timeouts
+                Some(CompletionError::CompletionError(msg)) => {
+                    msg.contains("connection")
+                        || msg.contains("timed out")
+                        || msg.contains("timeout")
+                        || msg.contains("connect")
+                        || msg.contains("reset")
+                        || msg.contains("broken pipe")
+                }
                 Some(CompletionError::HttpError { status_code, .. }) => *status_code >= 500,
                 _ => false,
             };
@@ -758,10 +769,6 @@ impl InferenceProviderPool {
                 break;
             }
         }
-
-        // All providers failed after all retry rounds
-        let total_attempts =
-            providers.len() * MAX_ROUNDS.min(if last_error.is_some() { MAX_ROUNDS } else { 1 });
         if let Some(pub_key) = model_pub_key {
             tracing::error!(
                 model_id = %model_id,
@@ -2240,6 +2247,119 @@ mod tests {
             "Expected sanitized error (went through retry path), got: {}",
             err_msg
         );
+    }
+
+    #[tokio::test]
+    async fn test_connection_error_retries_once() {
+        let (pool, model_id) = pool_with_mock_provider().await;
+
+        let attempt_count = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let count_clone = attempt_count.clone();
+
+        let result: Result<((), _), _> = pool
+            .retry_with_fallback(&model_id, "test_op", None, move |_provider| {
+                let count = count_clone.clone();
+                async move {
+                    count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    Err(CompletionError::CompletionError(
+                        "error sending request: connection refused".to_string(),
+                    ))
+                }
+            })
+            .await;
+
+        assert!(result.is_err());
+        // Should have tried twice (1 provider × 2 rounds)
+        assert_eq!(
+            attempt_count.load(std::sync::atomic::Ordering::Relaxed),
+            2,
+            "Connection errors should be retried once"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_non_connection_error_does_not_retry() {
+        let (pool, model_id) = pool_with_mock_provider().await;
+
+        let attempt_count = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let count_clone = attempt_count.clone();
+
+        let result: Result<((), _), _> = pool
+            .retry_with_fallback(&model_id, "test_op", None, move |_provider| {
+                let count = count_clone.clone();
+                async move {
+                    count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    Err(CompletionError::CompletionError(
+                        "Failed to parse JSON response".to_string(),
+                    ))
+                }
+            })
+            .await;
+
+        assert!(result.is_err());
+        // Non-connection errors should NOT be retried
+        assert_eq!(
+            attempt_count.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "Non-connection errors should not be retried"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_5xx_error_retries_once() {
+        let (pool, model_id) = pool_with_mock_provider().await;
+
+        let attempt_count = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let count_clone = attempt_count.clone();
+
+        let result: Result<((), _), _> = pool
+            .retry_with_fallback(&model_id, "test_op", None, move |_provider| {
+                let count = count_clone.clone();
+                async move {
+                    count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    Err(CompletionError::HttpError {
+                        status_code: 502,
+                        message: "Bad gateway".to_string(),
+                        is_external: false,
+                    })
+                }
+            })
+            .await;
+
+        assert!(result.is_err());
+        // 5xx should be retried once
+        assert_eq!(
+            attempt_count.load(std::sync::atomic::Ordering::Relaxed),
+            2,
+            "5xx errors should be retried once"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_retry_succeeds_on_second_attempt() {
+        let (pool, model_id) = pool_with_mock_provider().await;
+
+        let attempt_count = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let count_clone = attempt_count.clone();
+
+        let result: Result<((), _), _> = pool
+            .retry_with_fallback(&model_id, "test_op", None, move |_provider| {
+                let count = count_clone.clone();
+                async move {
+                    let n = count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if n == 0 {
+                        Err(CompletionError::CompletionError(
+                            "error sending request: connection refused".to_string(),
+                        ))
+                    } else {
+                        Ok(())
+                    }
+                }
+            })
+            .await;
+
+        assert!(result.is_ok(), "Should succeed on retry");
+        assert_eq!(attempt_count.load(std::sync::atomic::Ordering::Relaxed), 2,);
     }
 
     #[tokio::test]

@@ -2471,8 +2471,7 @@ mod tests {
         let error = inference_providers::CompletionError::NoPubKeyProvider(
             "No provider found for model test-model with public key '59e5d3f7...'".to_string(),
         );
-        let result =
-            CompletionServiceImpl::map_provider_error("test-model", &error, "test");
+        let result = CompletionServiceImpl::map_provider_error("test-model", &error, "test");
         match result {
             ports::CompletionError::ProviderError {
                 status_code,

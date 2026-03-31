@@ -132,7 +132,7 @@ where
             {
                 Ok(Ok(())) => {}
                 Ok(Err(e)) => {
-                    tracing::error!(%organization_id, %model_id, "Failed to store chat signature: {:?}", e);
+                    tracing::error!(%organization_id, %model_id, error = ?e, "Failed to store chat signature");
                 }
                 Err(_elapsed) => {
                     tracing::error!(

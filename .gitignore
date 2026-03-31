@@ -13,3 +13,4 @@ oci.tar
 .claude
 .DS_Store
 secret
+repro_*.sh

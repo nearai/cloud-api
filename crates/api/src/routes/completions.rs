@@ -393,6 +393,8 @@ pub async fn chat_completions(
 
                 if inference_id.is_none() {
                     tracing::warn!(
+                        organization_id = %api_key.organization.id,
+                        model = %request.model,
                         "Could not extract inference ID from first chunk for chat completion (streaming)"
                     );
                 }
@@ -406,6 +408,7 @@ pub async fn chat_completions(
                 let chat_id_clone = chat_id_state.clone();
                 let error_count_clone = stream_error_count.clone();
                 let request_model = request.model.clone();
+                let org_id_for_stream = api_key.organization.id.0;
 
                 // Convert to raw bytes stream with proper SSE formatting
                 let byte_stream = peekable_stream
@@ -431,6 +434,7 @@ pub async fn chat_completions(
                                     let json_data = serde_json::to_string(&event.chunk)
                                         .unwrap_or_else(|e| {
                                             tracing::error!(
+                                                organization_id = %org_id_for_stream,
                                                 "Failed to serialize stream chunk: {e}"
                                             );
                                             "{}".to_string()
@@ -446,6 +450,7 @@ pub async fn chat_completions(
                                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                     if count == 0 {
                                         tracing::error!(
+                                            organization_id = %org_id_for_stream,
                                             model = %model_for_err,
                                             error_type = %completion_stream_error_category(&e),
                                             "Completion stream error"
@@ -458,24 +463,28 @@ pub async fn chat_completions(
                             }
                         }
                     })
-                    .chain(futures::stream::once(async move {
-                        let error_count_final =
-                            stream_error_count.load(std::sync::atomic::Ordering::Relaxed);
-                        if error_count_final > 1 {
-                            tracing::error!(
-                                model = %request.model,
-                                total_stream_errors = error_count_final,
-                                "Completion stream ended with multiple errors"
-                            );
+                    .chain(futures::stream::once({
+                        let org_id = api_key.organization.id.0;
+                        async move {
+                            let error_count_final =
+                                stream_error_count.load(std::sync::atomic::Ordering::Relaxed);
+                            if error_count_final > 1 {
+                                tracing::error!(
+                                    organization_id = %org_id,
+                                    model = %request.model,
+                                    total_stream_errors = error_count_final,
+                                    "Completion stream ended with multiple errors"
+                                );
+                            }
+
+                            let done_bytes = Bytes::from_static(b"data: [DONE]\n\n");
+                            accumulated_bytes
+                                .lock()
+                                .await
+                                .extend_from_slice(&done_bytes);
+
+                            Ok::<Bytes, Infallible>(done_bytes)
                         }
-
-                        let done_bytes = Bytes::from_static(b"data: [DONE]\n\n");
-                        accumulated_bytes
-                            .lock()
-                            .await
-                            .extend_from_slice(&done_bytes);
-
-                        Ok::<Bytes, Infallible>(done_bytes)
                     }));
 
                 // Return raw streaming response with SSE headers

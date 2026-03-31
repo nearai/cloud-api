@@ -83,8 +83,9 @@ where
     last_usage_stats: Option<inference_providers::TokenUsage>,
     /// Last chat ID from streaming chunks (for attestation and inference_id)
     last_chat_id: Option<String>,
-    /// Flag indicating the stream completed normally (received None from inner stream)
-    /// If false when Drop is called, the client disconnected mid-stream
+    /// Flag indicating the stream completed normally (received None from inner stream).
+    /// If false when Drop is called, the stream was interrupted — either the client
+    /// disconnected mid-stream or the provider returned an error (check `last_error`).
     stream_completed: bool,
     /// Response ID when called from Responses API (for usage tracking FK)
     response_id: Option<ResponseId>,

@@ -760,7 +760,8 @@ impl InferenceProviderPool {
         }
 
         // All providers failed after all retry rounds
-        let total_attempts = providers.len() * MAX_ROUNDS.min(if last_error.is_some() { MAX_ROUNDS } else { 1 });
+        let total_attempts =
+            providers.len() * MAX_ROUNDS.min(if last_error.is_some() { MAX_ROUNDS } else { 1 });
         if let Some(pub_key) = model_pub_key {
             tracing::error!(
                 model_id = %model_id,

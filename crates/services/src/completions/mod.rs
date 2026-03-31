@@ -171,11 +171,24 @@ where
                 chat_id.clone(),
             ),
             (None, None) => {
-                tracing::error!(%organization_id, %model_id, "Stream ended but no usage stats and no chat_id available");
+                // Distinguish client disconnect / provider error from truly unexpected cases.
+                // Client disconnects and provider errors are expected — usage is only sent
+                // in the final chunk, so an interrupted stream will never have it.
+                if !self.stream_completed {
+                    tracing::warn!(%organization_id, %model_id, stream_error = self.last_error.is_some(),
+                        "Stream interrupted before usage stats or chat_id received (client disconnect or provider error)");
+                } else {
+                    tracing::error!(%organization_id, %model_id, "Stream completed but no usage stats and no chat_id available");
+                }
                 return;
             }
             (None, Some(chat_id)) => {
-                tracing::error!(%chat_id, %organization_id, %model_id, "Stream ended but no usage stats available");
+                if !self.stream_completed {
+                    tracing::warn!(%chat_id, %organization_id, %model_id, stream_error = self.last_error.is_some(),
+                        "Stream interrupted before usage stats received (client disconnect or provider error)");
+                } else {
+                    tracing::error!(%chat_id, %organization_id, %model_id, "Stream completed but no usage stats available");
+                }
                 return;
             }
             (Some(usage), None) => {

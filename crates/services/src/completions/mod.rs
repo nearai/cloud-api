@@ -741,6 +741,19 @@ impl CompletionServiceImpl {
             inference_providers::CompletionError::CompletionError(msg) => {
                 if msg.contains("not found in any configured provider") {
                     ports::CompletionError::InvalidModel(msg.clone())
+                } else if msg.contains("with public key") {
+                    // E2EE pubkey routing failure: the client's cached attestation key
+                    // doesn't match any active provider (likely backend restarted with new keys).
+                    tracing::warn!(
+                        model,
+                        provider_message = %msg,
+                        "E2EE pubkey routing failed during {} (stale attestation?)",
+                        operation
+                    );
+                    ports::CompletionError::ProviderError {
+                        status_code: 421,
+                        message: "The encryption key is no longer valid. Please refresh your attestation report and retry.".to_string(),
+                    }
                 } else {
                     tracing::error!(
                         model,

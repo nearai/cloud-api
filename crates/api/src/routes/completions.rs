@@ -165,6 +165,7 @@ fn completion_stream_error_category(e: &inference_providers::CompletionError) ->
         inference_providers::CompletionError::CompletionError(_) => "completion_error",
         inference_providers::CompletionError::HttpError { .. } => "http_error",
         inference_providers::CompletionError::InvalidResponse(_) => "invalid_response",
+        inference_providers::CompletionError::NoPubKeyProvider(_) => "stale_pubkey",
         inference_providers::CompletionError::Unknown(_) => "unknown",
     }
 }

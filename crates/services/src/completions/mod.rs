@@ -83,8 +83,9 @@ where
     last_usage_stats: Option<inference_providers::TokenUsage>,
     /// Last chat ID from streaming chunks (for attestation and inference_id)
     last_chat_id: Option<String>,
-    /// Flag indicating the stream completed normally (received None from inner stream)
-    /// If false when Drop is called, the client disconnected mid-stream
+    /// Flag indicating the stream completed normally (received None from inner stream).
+    /// If false when Drop is called, the stream was interrupted — either the client
+    /// disconnected mid-stream or the provider returned an error (check `last_error`).
     stream_completed: bool,
     /// Response ID when called from Responses API (for usage tracking FK)
     response_id: Option<ResponseId>,
@@ -176,11 +177,24 @@ where
                 chat_id.clone(),
             ),
             (None, None) => {
-                tracing::error!(%organization_id, %model_id, "Stream ended but no usage stats and no chat_id available");
+                // Distinguish client disconnect / provider error from truly unexpected cases.
+                // Client disconnects and provider errors are expected — usage is only sent
+                // in the final chunk, so an interrupted stream will never have it.
+                if !self.stream_completed {
+                    tracing::warn!(%organization_id, %model_id, stream_error = self.last_error.is_some(),
+                        "Stream interrupted before usage stats or chat_id received (client disconnect or provider error)");
+                } else {
+                    tracing::error!(%organization_id, %model_id, "Stream completed but no usage stats and no chat_id available");
+                }
                 return;
             }
             (None, Some(chat_id)) => {
-                tracing::error!(%chat_id, %organization_id, %model_id, "Stream ended but no usage stats available");
+                if !self.stream_completed {
+                    tracing::warn!(%chat_id, %organization_id, %model_id, stream_error = self.last_error.is_some(),
+                        "Stream interrupted before usage stats received (client disconnect or provider error)");
+                } else {
+                    tracing::error!(%chat_id, %organization_id, %model_id, "Stream completed but no usage stats available");
+                }
                 return;
             }
             (Some(usage), None) => {
@@ -752,6 +766,18 @@ impl CompletionServiceImpl {
                     }
                 }
             },
+            inference_providers::CompletionError::NoPubKeyProvider(msg) => {
+                tracing::warn!(
+                    model,
+                    provider_message = %msg,
+                    "E2EE pubkey routing failed during {} (stale attestation?)",
+                    operation
+                );
+                ports::CompletionError::ProviderError {
+                    status_code: 421,
+                    message: "The encryption key is no longer valid. Please refresh your attestation report and retry.".to_string(),
+                }
+            }
             inference_providers::CompletionError::CompletionError(msg) => {
                 if msg.contains("not found in any configured provider") {
                     ports::CompletionError::InvalidModel(msg.clone())
@@ -2493,6 +2519,28 @@ mod tests {
                 );
             }
             other => panic!("Expected InvalidParams, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_map_provider_error_no_pubkey_provider_returns_421() {
+        let error = inference_providers::CompletionError::NoPubKeyProvider(
+            "No provider found for model test-model with public key '59e5d3f7...'".to_string(),
+        );
+        let result = CompletionServiceImpl::map_provider_error("test-model", &error, "test");
+        match result {
+            ports::CompletionError::ProviderError {
+                status_code,
+                message,
+            } => {
+                assert_eq!(status_code, 421, "Should return 421 for stale pubkey");
+                assert!(
+                    message.contains("encryption key"),
+                    "Should mention encryption key, got: {}",
+                    message
+                );
+            }
+            other => panic!("Expected ProviderError with 421, got {:?}", other),
         }
     }
 }

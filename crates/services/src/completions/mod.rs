@@ -111,10 +111,13 @@ where
             return Box::pin(async {});
         }
 
+        let organization_id = self.organization_id;
+        let model_id = self.model_id;
+
         let chat_id = match &self.last_chat_id {
             Some(id) => id.clone(),
             None => {
-                tracing::warn!("Cannot store signature: no chat_id received in stream");
+                tracing::warn!(%organization_id, %model_id, "Cannot store signature: no chat_id received in stream");
                 return Box::pin(async {});
             }
         };
@@ -130,10 +133,12 @@ where
             {
                 Ok(Ok(())) => {}
                 Ok(Err(e)) => {
-                    tracing::error!("Failed to store chat signature: {:?}", e);
+                    tracing::error!(%organization_id, %model_id, error = ?e, "Failed to store chat signature");
                 }
                 Err(_elapsed) => {
                     tracing::error!(
+                        %organization_id,
+                        %model_id,
                         "Timeout storing chat signature after {}s",
                         FINALIZE_TIMEOUT_SECS
                     );
@@ -599,6 +604,7 @@ impl CompletionServiceImpl {
         model: &str,
         error: &inference_providers::CompletionError,
         operation: &str,
+        organization_id: Uuid,
     ) -> ports::CompletionError {
         match error {
             inference_providers::CompletionError::HttpError {
@@ -610,17 +616,18 @@ impl CompletionServiceImpl {
 
                 // 400 Bad Request = invalid params (context too long, bad format, etc.)
                 (400, _) => {
-                    tracing::warn!(model, status_code, "Client error during {}", operation);
+                    tracing::warn!(%organization_id, model, status_code, "Client error during {}", operation);
                     ports::CompletionError::InvalidParams(message.clone())
                 }
                 // 413 Payload Too Large = client sent too much data
                 (413, _) => {
-                    tracing::warn!(model, status_code, "Payload too large during {}", operation);
+                    tracing::warn!(%organization_id, model, status_code, "Payload too large during {}", operation);
                     ports::CompletionError::InvalidParams(message.clone())
                 }
                 // 422 Unprocessable Entity = invalid request content
                 (422, _) => {
                     tracing::warn!(
+                        %organization_id,
                         model,
                         status_code,
                         "Unprocessable entity during {}",
@@ -630,7 +637,7 @@ impl CompletionServiceImpl {
                 }
                 // 429 Too Many Requests = rate limited
                 (429, _) => {
-                    tracing::warn!(model, status_code, "Rate limited during {}", operation);
+                    tracing::warn!(%organization_id, model, status_code, "Rate limited during {}", operation);
                     ports::CompletionError::RateLimitExceeded(format!(
                         "Rate limit exceeded by upstream provider for model '{}'. Please retry with exponential backoff.",
                         model
@@ -642,6 +649,7 @@ impl CompletionServiceImpl {
                 // 401/403 = auth errors from our infrastructure — never leak details
                 (401 | 403, _) => {
                     tracing::error!(
+                        %organization_id,
                         model,
                         status_code,
                         provider_message = %message,
@@ -657,6 +665,7 @@ impl CompletionServiceImpl {
                 // 404 from external provider = provider can't serve the model, not client's fault
                 (404, true) => {
                     tracing::error!(
+                        %organization_id,
                         model,
                         status_code,
                         provider_message = %message,
@@ -671,12 +680,13 @@ impl CompletionServiceImpl {
                 }
                 // 404 from vLLM = model not found in our infrastructure
                 (404, false) => {
-                    tracing::warn!(model, status_code, "Not found during {}", operation);
+                    tracing::warn!(%organization_id, model, status_code, "Not found during {}", operation);
                     ports::CompletionError::InvalidModel(message.clone())
                 }
                 // 408 Request Timeout = provider timed out
                 (408, _) => {
                     tracing::error!(
+                        %organization_id,
                         model,
                         status_code,
                         provider_message = %message,
@@ -691,6 +701,7 @@ impl CompletionServiceImpl {
                 // 503 Service Unavailable = service overloaded
                 (503, _) => {
                     tracing::warn!(
+                        %organization_id,
                         model,
                         status_code,
                         "Service overloaded during {}",
@@ -703,6 +714,7 @@ impl CompletionServiceImpl {
                 // 504 Gateway Timeout = TTFB timeout waiting for our vLLM infrastructure
                 (504, false) => {
                     tracing::error!(
+                        %organization_id,
                         model,
                         status_code,
                         "TTFB timeout waiting for inference backend during {}",
@@ -716,6 +728,7 @@ impl CompletionServiceImpl {
                 // 5xx = provider error, use generic message
                 (500..=599, _) => {
                     tracing::error!(
+                        %organization_id,
                         model,
                         status_code,
                         provider_message = %message,
@@ -731,6 +744,7 @@ impl CompletionServiceImpl {
                 // Any other external provider error = infrastructure problem, use generic message
                 _ if *is_external => {
                     tracing::error!(
+                        %organization_id,
                         model,
                         status_code,
                         provider_message = %message,
@@ -745,7 +759,7 @@ impl CompletionServiceImpl {
                 }
                 // Any other vLLM error = pass through status and message
                 _ => {
-                    tracing::warn!(model, status_code, "Provider error during {}", operation);
+                    tracing::warn!(%organization_id, model, status_code, "Provider error during {}", operation);
                     ports::CompletionError::ProviderError {
                         status_code: *status_code,
                         message: message.clone(),
@@ -769,6 +783,7 @@ impl CompletionServiceImpl {
                     ports::CompletionError::InvalidModel(msg.clone())
                 } else {
                     tracing::error!(
+                        %organization_id,
                         model,
                         provider_message = %msg,
                         "Provider error during {}",
@@ -783,6 +798,7 @@ impl CompletionServiceImpl {
             }
             inference_providers::CompletionError::InvalidResponse(msg) => {
                 tracing::error!(
+                    %organization_id,
                     model,
                     provider_message = %msg,
                     "Invalid response during {}",
@@ -796,6 +812,7 @@ impl CompletionServiceImpl {
             }
             inference_providers::CompletionError::Unknown(msg) => {
                 tracing::error!(
+                    %organization_id,
                     model,
                     provider_message = %msg,
                     "Unknown error during {}",
@@ -1104,7 +1121,12 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
             Ok(stream) => stream,
             Err(e) => {
                 // Guard will decrement counter on drop
-                let err = Self::map_provider_error(&request.model, &e, "chat completion stream");
+                let err = Self::map_provider_error(
+                    &request.model,
+                    &e,
+                    "chat completion stream",
+                    organization_id,
+                );
                 self.record_error(&err, Some(canonical_name));
                 return Err(err);
             }
@@ -1254,7 +1276,12 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         let response_with_bytes = match result {
             Ok(response) => response,
             Err(e) => {
-                let err = Self::map_provider_error(&request.model, &e, "chat completion");
+                let err = Self::map_provider_error(
+                    &request.model,
+                    &e,
+                    "chat completion",
+                    organization_id,
+                );
                 self.record_error(&err, Some(canonical_name));
                 return Err(err);
             }
@@ -2160,7 +2187,8 @@ mod tests {
             message: "max_tokens must be positive".to_string(),
             is_external: false,
         };
-        let result = CompletionServiceImpl::map_provider_error("test-model", &error, "test");
+        let result =
+            CompletionServiceImpl::map_provider_error("test-model", &error, "test", Uuid::nil());
         match result {
             ports::CompletionError::InvalidParams(msg) => {
                 assert!(
@@ -2180,7 +2208,8 @@ mod tests {
             message: "Model 'deepseek-ai/DeepSeek-V3.1' not found".to_string(),
             is_external: false,
         };
-        let result = CompletionServiceImpl::map_provider_error("test-model", &error, "test");
+        let result =
+            CompletionServiceImpl::map_provider_error("test-model", &error, "test", Uuid::nil());
         match result {
             ports::CompletionError::InvalidModel(msg) => {
                 assert!(
@@ -2200,7 +2229,8 @@ mod tests {
             message: "Too many requests".to_string(),
             is_external: false,
         };
-        let result = CompletionServiceImpl::map_provider_error("test-model", &error, "test");
+        let result =
+            CompletionServiceImpl::map_provider_error("test-model", &error, "test", Uuid::nil());
         assert!(
             matches!(result, ports::CompletionError::RateLimitExceeded(_)),
             "Expected RateLimitExceeded, got {:?}",
@@ -2215,7 +2245,8 @@ mod tests {
             message: "Invalid API key for vLLM server at 10.0.0.1".to_string(),
             is_external: false,
         };
-        let result = CompletionServiceImpl::map_provider_error("test-model", &error, "test");
+        let result =
+            CompletionServiceImpl::map_provider_error("test-model", &error, "test", Uuid::nil());
         match result {
             ports::CompletionError::ProviderError {
                 status_code,
@@ -2242,7 +2273,8 @@ mod tests {
             message: "Service temporarily overloaded".to_string(),
             is_external: false,
         };
-        let result = CompletionServiceImpl::map_provider_error("test-model", &error, "test");
+        let result =
+            CompletionServiceImpl::map_provider_error("test-model", &error, "test", Uuid::nil());
         match result {
             ports::CompletionError::ServiceOverloaded(msg) => {
                 assert!(
@@ -2262,7 +2294,8 @@ mod tests {
             message: "Internal server error from provider".to_string(),
             is_external: false,
         };
-        let result = CompletionServiceImpl::map_provider_error("test-model", &error, "test");
+        let result =
+            CompletionServiceImpl::map_provider_error("test-model", &error, "test", Uuid::nil());
         match result {
             ports::CompletionError::ProviderError {
                 status_code,
@@ -2289,7 +2322,8 @@ mod tests {
         let error = inference_providers::CompletionError::CompletionError(
             "Model 'test-model' not found in any configured provider".to_string(),
         );
-        let result = CompletionServiceImpl::map_provider_error("test-model", &error, "test");
+        let result =
+            CompletionServiceImpl::map_provider_error("test-model", &error, "test", Uuid::nil());
         match result {
             ports::CompletionError::InvalidModel(msg) => {
                 assert!(
@@ -2307,7 +2341,8 @@ mod tests {
         let error = inference_providers::CompletionError::CompletionError(
             "error sending request for url: connection refused".to_string(),
         );
-        let result = CompletionServiceImpl::map_provider_error("test-model", &error, "test");
+        let result =
+            CompletionServiceImpl::map_provider_error("test-model", &error, "test", Uuid::nil());
         match result {
             ports::CompletionError::ProviderError {
                 status_code,
@@ -2340,7 +2375,8 @@ mod tests {
             message: "This model's maximum context length is 131072 tokens".to_string(),
             is_external: true,
         };
-        let result = CompletionServiceImpl::map_provider_error("test-model", &error, "test");
+        let result =
+            CompletionServiceImpl::map_provider_error("test-model", &error, "test", Uuid::nil());
         match result {
             ports::CompletionError::InvalidParams(msg) => {
                 assert!(
@@ -2360,7 +2396,8 @@ mod tests {
             message: "Model not found on external provider".to_string(),
             is_external: true,
         };
-        let result = CompletionServiceImpl::map_provider_error("test-model", &error, "test");
+        let result =
+            CompletionServiceImpl::map_provider_error("test-model", &error, "test", Uuid::nil());
         match result {
             ports::CompletionError::ProviderError {
                 status_code,
@@ -2392,7 +2429,8 @@ mod tests {
             message: "Rate limit exceeded".to_string(),
             is_external: true,
         };
-        let result = CompletionServiceImpl::map_provider_error("test-model", &error, "test");
+        let result =
+            CompletionServiceImpl::map_provider_error("test-model", &error, "test", Uuid::nil());
         assert!(
             matches!(result, ports::CompletionError::RateLimitExceeded(_)),
             "External 429 should still be RateLimitExceeded, got {:?}",
@@ -2407,7 +2445,8 @@ mod tests {
             message: "External provider internal error".to_string(),
             is_external: true,
         };
-        let result = CompletionServiceImpl::map_provider_error("test-model", &error, "test");
+        let result =
+            CompletionServiceImpl::map_provider_error("test-model", &error, "test", Uuid::nil());
         match result {
             ports::CompletionError::ProviderError { status_code, .. } => {
                 assert_eq!(status_code, 502, "External 500 should map to 502");
@@ -2423,7 +2462,8 @@ mod tests {
             message: "Request timeout".to_string(),
             is_external: true,
         };
-        let result = CompletionServiceImpl::map_provider_error("test-model", &error, "test");
+        let result =
+            CompletionServiceImpl::map_provider_error("test-model", &error, "test", Uuid::nil());
         match result {
             ports::CompletionError::ProviderError {
                 status_code,
@@ -2447,7 +2487,8 @@ mod tests {
             message: "Request body too large".to_string(),
             is_external: false,
         };
-        let result = CompletionServiceImpl::map_provider_error("test-model", &error, "test");
+        let result =
+            CompletionServiceImpl::map_provider_error("test-model", &error, "test", Uuid::nil());
         match result {
             ports::CompletionError::InvalidParams(msg) => {
                 assert!(
@@ -2467,7 +2508,8 @@ mod tests {
             message: "Invalid parameter: temperature must be between 0 and 2".to_string(),
             is_external: true,
         };
-        let result = CompletionServiceImpl::map_provider_error("test-model", &error, "test");
+        let result =
+            CompletionServiceImpl::map_provider_error("test-model", &error, "test", Uuid::nil());
         match result {
             ports::CompletionError::InvalidParams(msg) => {
                 assert!(
@@ -2485,7 +2527,8 @@ mod tests {
         let error = inference_providers::CompletionError::NoPubKeyProvider(
             "No provider found for model test-model with public key '59e5d3f7...'".to_string(),
         );
-        let result = CompletionServiceImpl::map_provider_error("test-model", &error, "test");
+        let result =
+            CompletionServiceImpl::map_provider_error("test-model", &error, "test", Uuid::nil());
         match result {
             ports::CompletionError::ProviderError {
                 status_code,

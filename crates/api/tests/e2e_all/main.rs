@@ -40,7 +40,7 @@ mod rerank;
 mod response_signature_verification;
 mod score;
 mod signature_verification;
-mod test;
+mod general;
 mod usage_chat_completions;
 mod usage_recording;
 mod usage_responses;

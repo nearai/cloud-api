@@ -529,6 +529,9 @@ impl InferenceProviderPool {
                 CompletionError::InvalidResponse(sanitize_and_format(&msg))
             }
             CompletionError::Unknown(msg) => CompletionError::Unknown(sanitize_and_format(&msg)),
+            CompletionError::NoPubKeyProvider(msg) => {
+                CompletionError::NoPubKeyProvider(sanitize_and_format(&msg))
+            }
         }
     }
 
@@ -611,8 +614,8 @@ impl InferenceProviderPool {
                         operation = operation_name,
                         "No provider found for model public key"
                     );
-                    return Err(CompletionError::CompletionError(format!(
-                        "No provider found for model {} with public key '{}...'. Encryption requires routing to the specific provider with this public key.",
+                    return Err(CompletionError::NoPubKeyProvider(format!(
+                        "No provider found for model {} with public key '{}...'",
                         model_id,
                         pub_key.chars().take(32).collect::<String>()
                     )));

@@ -721,6 +721,10 @@ pub enum CompletionError {
     InvalidResponse(String),
     #[error("Unknown error")]
     Unknown(String),
+    /// No provider found matching the requested E2EE public key.
+    /// Client should refresh their attestation report and retry.
+    #[error("No provider found for encryption key: {0}")]
+    NoPubKeyProvider(String),
 }
 
 /// Parameters for image generation requests

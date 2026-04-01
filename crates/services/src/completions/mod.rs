@@ -752,6 +752,18 @@ impl CompletionServiceImpl {
                     }
                 }
             },
+            inference_providers::CompletionError::NoPubKeyProvider(msg) => {
+                tracing::warn!(
+                    model,
+                    provider_message = %msg,
+                    "E2EE pubkey routing failed during {} (stale attestation?)",
+                    operation
+                );
+                ports::CompletionError::ProviderError {
+                    status_code: 421,
+                    message: "The encryption key is no longer valid. Please refresh your attestation report and retry.".to_string(),
+                }
+            }
             inference_providers::CompletionError::CompletionError(msg) => {
                 if msg.contains("not found in any configured provider") {
                     ports::CompletionError::InvalidModel(msg.clone())
@@ -2465,6 +2477,28 @@ mod tests {
                 );
             }
             other => panic!("Expected InvalidParams, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_map_provider_error_no_pubkey_provider_returns_421() {
+        let error = inference_providers::CompletionError::NoPubKeyProvider(
+            "No provider found for model test-model with public key '59e5d3f7...'".to_string(),
+        );
+        let result = CompletionServiceImpl::map_provider_error("test-model", &error, "test");
+        match result {
+            ports::CompletionError::ProviderError {
+                status_code,
+                message,
+            } => {
+                assert_eq!(status_code, 421, "Should return 421 for stale pubkey");
+                assert!(
+                    message.contains("encryption key"),
+                    "Should mention encryption key, got: {}",
+                    message
+                );
+            }
+            other => panic!("Expected ProviderError with 421, got {:?}", other),
         }
     }
 }

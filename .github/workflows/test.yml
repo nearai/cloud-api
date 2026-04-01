@@ -12,11 +12,34 @@ env:
   CARGO_INCREMENTAL: 0  # Faster CI builds
 
 jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu_large_x64
+
+    steps:
+    - uses: actions/checkout@v6
+
+    - name: Install Rust
+      uses: actions-rust-lang/setup-rust-toolchain@v1
+      with:
+        components: rustfmt, clippy
+
+    - name: Cache Rust dependencies
+      uses: swatinem/rust-cache@v2
+      with:
+        cache-on-failure: true
+
+    - name: Run cargo fmt
+      run: cargo fmt --all -- --check
+
+    - name: Run cargo clippy
+      run: cargo clippy --all-targets --all-features -- -D warnings
+
   test:
     name: Test Suite
     runs-on: ubuntu_large_x64
     environment: Cloud API test env
-    
+
     services:
       postgres:
         image: postgres:15
@@ -50,11 +73,9 @@ jobs:
           echo "PostgreSQL did not become ready after restart within 30 seconds" >&2
           exit 1
         fi
-    
+
     - name: Install Rust
       uses: actions-rust-lang/setup-rust-toolchain@v1
-      with:
-        components: rustfmt, clippy
 
     - name: Cache Rust dependencies
       uses: swatinem/rust-cache@v2
@@ -63,12 +84,6 @@ jobs:
 
     - name: Install cargo-nextest
       uses: taiki-e/install-action@nextest
-
-    - name: Run cargo fmt
-      run: cargo fmt --all -- --check
-
-    - name: Run cargo clippy
-      run: cargo clippy --all-targets --all-features -- -D warnings
 
     - name: Run unit tests
       run: cargo nextest run --lib --bins
@@ -88,10 +103,10 @@ jobs:
         BRAVE_SEARCH_PRO_API_KEY: ${{ secrets.BRAVE_SEARCH_PRO_API_KEY }}
         DEV: "true"
 
-    # All e2e tests share a single database (bootstrapped once with migrations).
+    # All e2e tests are compiled into a single binary (tests/e2e_all/) for faster linking.
     # Isolation comes from UUID-scoped orgs/workspaces/keys, not separate databases.
     - name: Run integration tests
-      run: cargo nextest run -p api --tests
+      run: cargo nextest run --test e2e_all
       env:
         POSTGRES_PRIMARY_APP_ID: ${{ secrets.POSTGRES_PRIMARY_APP_ID }}
         DATABASE_HOST: localhost
@@ -115,7 +130,7 @@ jobs:
       env:
         VLLM_BASE_URL: ${{ secrets.VLLM_BASE_URL }}
         VLLM_API_KEY: ${{ secrets.VLLM_API_KEY }}
-        
+
     # Only build release on main branch, not on PRs
     - name: Build release
       if: github.event_name == 'push' && github.ref == 'refs/heads/main'

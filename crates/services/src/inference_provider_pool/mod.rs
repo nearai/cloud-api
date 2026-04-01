@@ -644,97 +644,140 @@ impl InferenceProviderPool {
             providers.len()
         );
 
+        // Retry once on transient connection errors (QEMU SLIRP backlog=1, brief nginx reloads).
+        // Most models have only 1 provider (via model-proxy), so provider fallback alone doesn't help.
+        const MAX_ROUNDS: usize = 2;
+        const RETRY_DELAY: Duration = Duration::from_millis(500);
+
         // Track the last error (preserving its structure for proper status code mapping)
         let mut last_error: Option<CompletionError> = None;
+        let mut total_attempts: usize = 0;
 
-        // Try each provider in order until one succeeds
-        for (attempt, provider) in providers.iter().enumerate() {
-            tracing::debug!(
-                model_id = %model_id,
-                attempt = attempt + 1,
-                total_providers = providers.len(),
-                operation = operation_name,
-                "Trying provider {} of {}",
-                attempt + 1,
-                providers.len()
-            );
+        for round in 0..MAX_ROUNDS {
+            if round > 0 {
+                tracing::info!(
+                    model_id = %model_id,
+                    round = round + 1,
+                    delay_ms = RETRY_DELAY.as_millis() as u64,
+                    operation = operation_name,
+                    "Retrying after transient connection failure"
+                );
+                tokio::time::sleep(RETRY_DELAY).await;
+            }
 
-            match provider_fn(provider.clone()).await {
-                Ok(result) => {
-                    // Reset failure counter on success
-                    {
-                        let mut counts = self
-                            .provider_failure_counts
-                            .write()
-                            .unwrap_or_else(|e| e.into_inner());
-                        let key = Arc::as_ptr(provider) as *const () as usize;
-                        counts.insert(key, 0);
-                    }
-                    tracing::info!(
-                        model_id = %model_id,
-                        attempt = attempt + 1,
-                        operation = operation_name,
-                        "Successfully completed request with provider"
-                    );
-                    return Ok((result, provider.clone()));
-                }
-                Err(e) => {
-                    // For HTTP client errors (4xx), don't retry with other providers.
-                    // The request itself is invalid (e.g., too many tokens), so retrying won't help.
-                    // Exception: 429 (rate limit) and 408 (request timeout) are retryable
-                    // as other providers may have capacity or better connectivity.
-                    // NOTE: Don't increment the failure counter for non-retryable 4xx —
-                    // these indicate invalid requests, not unhealthy providers.
-                    if let CompletionError::HttpError { status_code, .. } = &e {
-                        if (400..=499).contains(status_code)
-                            && *status_code != 429
-                            && *status_code != 408
+            // Try each provider in order until one succeeds
+            for (attempt, provider) in providers.iter().enumerate() {
+                total_attempts += 1;
+                tracing::debug!(
+                    model_id = %model_id,
+                    attempt = attempt + 1,
+                    total_providers = providers.len(),
+                    round = round + 1,
+                    operation = operation_name,
+                    "Trying provider {} of {} (round {})",
+                    attempt + 1,
+                    providers.len(),
+                    round + 1
+                );
+
+                match provider_fn(provider.clone()).await {
+                    Ok(result) => {
+                        // Reset failure counter on success
                         {
-                            tracing::warn!(
-                                model_id = %model_id,
-                                attempt = attempt + 1,
-                                status_code,
-                                error_detail = %e,
-                                operation = operation_name,
-                                "Client error from provider, not retrying"
-                            );
-                            return Err(Self::sanitize_completion_error(e, model_id));
+                            let mut counts = self
+                                .provider_failure_counts
+                                .write()
+                                .unwrap_or_else(|e| e.into_inner());
+                            let key = Arc::as_ptr(provider) as *const () as usize;
+                            counts.insert(key, 0);
                         }
+                        tracing::info!(
+                            model_id = %model_id,
+                            attempt = attempt + 1,
+                            round = round + 1,
+                            operation = operation_name,
+                            "Successfully completed request with provider"
+                        );
+                        return Ok((result, provider.clone()));
                     }
+                    Err(e) => {
+                        // For HTTP client errors (4xx), don't retry with other providers.
+                        // The request itself is invalid (e.g., too many tokens), so retrying won't help.
+                        // Exception: 429 (rate limit) and 408 (request timeout) are retryable
+                        // as other providers may have capacity or better connectivity.
+                        // NOTE: Don't increment the failure counter for non-retryable 4xx —
+                        // these indicate invalid requests, not unhealthy providers.
+                        if let CompletionError::HttpError { status_code, .. } = &e {
+                            if (400..=499).contains(status_code)
+                                && *status_code != 429
+                                && *status_code != 408
+                            {
+                                tracing::warn!(
+                                    model_id = %model_id,
+                                    attempt = attempt + 1,
+                                    status_code,
+                                    error_detail = %e,
+                                    operation = operation_name,
+                                    "Client error from provider, not retrying"
+                                );
+                                return Err(Self::sanitize_completion_error(e, model_id));
+                            }
+                        }
 
-                    // Increment failure counter only for retryable errors
-                    // (5xx, timeouts, network errors — indicators of backend health issues)
-                    {
-                        let mut counts = self
-                            .provider_failure_counts
-                            .write()
-                            .unwrap_or_else(|e| e.into_inner());
-                        let key = Arc::as_ptr(provider) as *const () as usize;
-                        let counter = counts.entry(key).or_insert(0);
-                        *counter = counter.saturating_add(1);
+                        // Increment failure counter only for retryable errors
+                        // (5xx, timeouts, network errors — indicators of backend health issues)
+                        {
+                            let mut counts = self
+                                .provider_failure_counts
+                                .write()
+                                .unwrap_or_else(|e| e.into_inner());
+                            let key = Arc::as_ptr(provider) as *const () as usize;
+                            let counter = counts.entry(key).or_insert(0);
+                            *counter = counter.saturating_add(1);
+                        }
+
+                        // Log the failure for debugging (before sanitization strips details)
+                        tracing::warn!(
+                            model_id = %model_id,
+                            attempt = attempt + 1,
+                            round = round + 1,
+                            error_detail = %e,
+                            operation = operation_name,
+                            "Provider failed, will try next provider if available"
+                        );
+
+                        // Sanitize and preserve the last error with its structure intact
+                        last_error = Some(Self::sanitize_completion_error(e, model_id));
                     }
-
-                    // Log the failure for debugging (before sanitization strips details)
-                    tracing::warn!(
-                        model_id = %model_id,
-                        attempt = attempt + 1,
-                        error_detail = %e,
-                        operation = operation_name,
-                        "Provider failed, will try next provider if available"
-                    );
-
-                    // Sanitize and preserve the last error with its structure intact
-                    last_error = Some(Self::sanitize_completion_error(e, model_id));
                 }
             }
-        }
 
-        // All providers failed
+            // Only retry on connection failures (reqwest errors) and server errors (5xx).
+            // CompletionError::CompletionError can also contain non-transient errors
+            // (e.g., JSON parse failures), so check for connection-related keywords.
+            let is_retryable = match &last_error {
+                Some(CompletionError::CompletionError(msg)) => {
+                    msg.contains("connection")
+                        || msg.contains("timed out")
+                        || msg.contains("timeout")
+                        || msg.contains("connect")
+                        || msg.contains("reset")
+                        || msg.contains("broken pipe")
+                }
+                Some(CompletionError::HttpError { status_code, .. }) => *status_code >= 500,
+                _ => false,
+            };
+
+            if !is_retryable {
+                break;
+            }
+        }
         if let Some(pub_key) = model_pub_key {
             tracing::error!(
                 model_id = %model_id,
                 model_pub_key_prefix = %pub_key.chars().take(32).collect::<String>(),
                 providers_tried = providers.len(),
+                total_attempts,
                 operation = operation_name,
                 "All providers failed for model with public key"
             );
@@ -742,6 +785,7 @@ impl InferenceProviderPool {
             tracing::error!(
                 model_id = %model_id,
                 providers_tried = providers.len(),
+                total_attempts,
                 operation = operation_name,
                 "All providers failed for model"
             );
@@ -2206,6 +2250,119 @@ mod tests {
             "Expected sanitized error (went through retry path), got: {}",
             err_msg
         );
+    }
+
+    #[tokio::test]
+    async fn test_connection_error_retries_once() {
+        let (pool, model_id) = pool_with_mock_provider().await;
+
+        let attempt_count = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let count_clone = attempt_count.clone();
+
+        let result: Result<((), _), _> = pool
+            .retry_with_fallback(&model_id, "test_op", None, move |_provider| {
+                let count = count_clone.clone();
+                async move {
+                    count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    Err(CompletionError::CompletionError(
+                        "error sending request: connection refused".to_string(),
+                    ))
+                }
+            })
+            .await;
+
+        assert!(result.is_err());
+        // Should have tried twice (1 provider × 2 rounds)
+        assert_eq!(
+            attempt_count.load(std::sync::atomic::Ordering::Relaxed),
+            2,
+            "Connection errors should be retried once"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_non_connection_error_does_not_retry() {
+        let (pool, model_id) = pool_with_mock_provider().await;
+
+        let attempt_count = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let count_clone = attempt_count.clone();
+
+        let result: Result<((), _), _> = pool
+            .retry_with_fallback(&model_id, "test_op", None, move |_provider| {
+                let count = count_clone.clone();
+                async move {
+                    count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    Err(CompletionError::CompletionError(
+                        "Failed to parse JSON response".to_string(),
+                    ))
+                }
+            })
+            .await;
+
+        assert!(result.is_err());
+        // Non-connection errors should NOT be retried
+        assert_eq!(
+            attempt_count.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "Non-connection errors should not be retried"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_5xx_error_retries_once() {
+        let (pool, model_id) = pool_with_mock_provider().await;
+
+        let attempt_count = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let count_clone = attempt_count.clone();
+
+        let result: Result<((), _), _> = pool
+            .retry_with_fallback(&model_id, "test_op", None, move |_provider| {
+                let count = count_clone.clone();
+                async move {
+                    count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    Err(CompletionError::HttpError {
+                        status_code: 502,
+                        message: "Bad gateway".to_string(),
+                        is_external: false,
+                    })
+                }
+            })
+            .await;
+
+        assert!(result.is_err());
+        // 5xx should be retried once
+        assert_eq!(
+            attempt_count.load(std::sync::atomic::Ordering::Relaxed),
+            2,
+            "5xx errors should be retried once"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_retry_succeeds_on_second_attempt() {
+        let (pool, model_id) = pool_with_mock_provider().await;
+
+        let attempt_count = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let count_clone = attempt_count.clone();
+
+        let result: Result<((), _), _> = pool
+            .retry_with_fallback(&model_id, "test_op", None, move |_provider| {
+                let count = count_clone.clone();
+                async move {
+                    let n = count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if n == 0 {
+                        Err(CompletionError::CompletionError(
+                            "error sending request: connection refused".to_string(),
+                        ))
+                    } else {
+                        Ok(())
+                    }
+                }
+            })
+            .await;
+
+        assert!(result.is_ok(), "Should succeed on retry");
+        assert_eq!(attempt_count.load(std::sync::atomic::Ordering::Relaxed), 2,);
     }
 
     #[tokio::test]

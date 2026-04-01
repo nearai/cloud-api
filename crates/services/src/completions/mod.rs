@@ -83,8 +83,9 @@ where
     last_usage_stats: Option<inference_providers::TokenUsage>,
     /// Last chat ID from streaming chunks (for attestation and inference_id)
     last_chat_id: Option<String>,
-    /// Flag indicating the stream completed normally (received None from inner stream)
-    /// If false when Drop is called, the client disconnected mid-stream
+    /// Flag indicating the stream completed normally (received None from inner stream).
+    /// If false when Drop is called, the stream was interrupted — either the client
+    /// disconnected mid-stream or the provider returned an error (check `last_error`).
     stream_completed: bool,
     /// Response ID when called from Responses API (for usage tracking FK)
     response_id: Option<ResponseId>,
@@ -171,11 +172,24 @@ where
                 chat_id.clone(),
             ),
             (None, None) => {
-                tracing::error!(%organization_id, %model_id, "Stream ended but no usage stats and no chat_id available");
+                // Distinguish client disconnect / provider error from truly unexpected cases.
+                // Client disconnects and provider errors are expected — usage is only sent
+                // in the final chunk, so an interrupted stream will never have it.
+                if !self.stream_completed {
+                    tracing::warn!(%organization_id, %model_id, stream_error = self.last_error.is_some(),
+                        "Stream interrupted before usage stats or chat_id received (client disconnect or provider error)");
+                } else {
+                    tracing::error!(%organization_id, %model_id, "Stream completed but no usage stats and no chat_id available");
+                }
                 return;
             }
             (None, Some(chat_id)) => {
-                tracing::error!(%chat_id, %organization_id, %model_id, "Stream ended but no usage stats available");
+                if !self.stream_completed {
+                    tracing::warn!(%chat_id, %organization_id, %model_id, stream_error = self.last_error.is_some(),
+                        "Stream interrupted before usage stats received (client disconnect or provider error)");
+                } else {
+                    tracing::error!(%chat_id, %organization_id, %model_id, "Stream completed but no usage stats available");
+                }
                 return;
             }
             (Some(usage), None) => {

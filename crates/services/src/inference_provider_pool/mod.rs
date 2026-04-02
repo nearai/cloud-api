@@ -644,25 +644,44 @@ impl InferenceProviderPool {
             providers.len()
         );
 
-        // Retry once on transient connection errors (QEMU SLIRP backlog=1, brief nginx reloads).
+        // Retry on transient connection errors (QEMU SLIRP backlog=1, brief nginx reloads)
+        // and on 429 rate limits with exponential backoff.
         // Most models have only 1 provider (via model-proxy), so provider fallback alone doesn't help.
-        const MAX_ROUNDS: usize = 2;
-        const RETRY_DELAY: Duration = Duration::from_millis(500);
+        const MAX_CONNECTION_ROUNDS: usize = 2;
+        const MAX_RATE_LIMIT_ROUNDS: usize = 4;
+        const CONNECTION_RETRY_DELAY: Duration = Duration::from_millis(500);
+        const RATE_LIMIT_INITIAL_DELAY: Duration = Duration::from_secs(1);
+        const RATE_LIMIT_MAX_DELAY: Duration = Duration::from_secs(8);
 
         // Track the last error (preserving its structure for proper status code mapping)
         let mut last_error: Option<CompletionError> = None;
         let mut total_attempts: usize = 0;
+        let mut last_was_rate_limit = false;
 
-        for round in 0..MAX_ROUNDS {
+        let max_rounds = MAX_CONNECTION_ROUNDS.max(MAX_RATE_LIMIT_ROUNDS);
+        for round in 0..max_rounds {
             if round > 0 {
+                let delay = if last_was_rate_limit {
+                    // Exponential backoff for 429: 1s, 2s, 4s, 8s (capped)
+                    let exp_delay = RATE_LIMIT_INITIAL_DELAY
+                        .saturating_mul(1 << (round - 1).min(3));
+                    exp_delay.min(RATE_LIMIT_MAX_DELAY)
+                } else {
+                    CONNECTION_RETRY_DELAY
+                };
+                let reason = if last_was_rate_limit {
+                    "rate limit (429)"
+                } else {
+                    "transient connection failure"
+                };
                 tracing::info!(
                     model_id = %model_id,
                     round = round + 1,
-                    delay_ms = RETRY_DELAY.as_millis() as u64,
+                    delay_ms = delay.as_millis() as u64,
                     operation = operation_name,
-                    "Retrying after transient connection failure"
+                    "Retrying after {}", reason
                 );
-                tokio::time::sleep(RETRY_DELAY).await;
+                tokio::time::sleep(delay).await;
             }
 
             // Try each provider in order until one succeeds
@@ -752,10 +771,15 @@ impl InferenceProviderPool {
                 }
             }
 
-            // Only retry on connection failures (reqwest errors) and server errors (5xx).
+            // Retry on connection failures, server errors (5xx), and rate limits (429).
             // CompletionError::CompletionError can also contain non-transient errors
             // (e.g., JSON parse failures), so check for connection-related keywords.
-            let is_retryable = match &last_error {
+            last_was_rate_limit = matches!(
+                &last_error,
+                Some(CompletionError::HttpError { status_code, .. }) if *status_code == 429
+            );
+
+            let is_connection_error = match &last_error {
                 Some(CompletionError::CompletionError(msg)) => {
                     msg.contains("connection")
                         || msg.contains("timed out")
@@ -768,7 +792,18 @@ impl InferenceProviderPool {
                 _ => false,
             };
 
-            if !is_retryable {
+            // Enforce per-error-type round limits:
+            // - Connection/5xx errors: 2 rounds
+            // - 429 rate limits: 4 rounds with exponential backoff
+            let should_retry = if last_was_rate_limit {
+                round + 1 < MAX_RATE_LIMIT_ROUNDS
+            } else if is_connection_error {
+                round + 1 < MAX_CONNECTION_ROUNDS
+            } else {
+                false
+            };
+
+            if !should_retry {
                 break;
             }
         }
@@ -2201,23 +2236,34 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_429_error_retries_with_fallback() {
+    async fn test_429_error_retries_with_exponential_backoff() {
         let (pool, model_id) = pool_with_mock_provider().await;
 
-        // 429 should NOT short-circuit - it should fall through to the normal retry path
+        let attempt_count = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let count_clone = attempt_count.clone();
+
+        // 429 should retry with exponential backoff across all rounds
         let result: Result<((), _), _> = pool
-            .retry_with_fallback(&model_id, "test_op", None, |_provider| async {
-                Err(CompletionError::HttpError {
-                    status_code: 429,
-                    message: "Rate limit exceeded".to_string(),
-                    is_external: false,
-                })
+            .retry_with_fallback(&model_id, "test_op", None, move |_provider| {
+                let count = count_clone.clone();
+                async move {
+                    count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    Err(CompletionError::HttpError {
+                        status_code: 429,
+                        message: "Rate limit exceeded".to_string(),
+                        is_external: false,
+                    })
+                }
             })
             .await;
 
-        // Should fail after trying all providers (not short-circuit on 429)
-        // The error should be sanitized (go through the normal retry path with sanitize_completion_error)
         assert!(result.is_err());
+        // Should have tried 4 times (1 provider × 4 rounds with exponential backoff)
+        assert_eq!(
+            attempt_count.load(std::sync::atomic::Ordering::Relaxed),
+            4,
+            "429 errors should be retried with exponential backoff across all rounds"
+        );
         let err = result.err().expect("Expected an error");
         let err_msg = err.to_string();
         assert!(

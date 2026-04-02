@@ -17,7 +17,12 @@ impl ModelAliasRepository {
         Self { pool }
     }
 
-    /// Upsert aliases for a model (replaces all existing aliases)
+    /// Upsert aliases for a model (replaces all existing aliases without visibility gaps).
+    ///
+    /// Uses a merge approach instead of DELETE-then-INSERT to avoid downtime during
+    /// cross-model alias reassignment:
+    /// 1. UPSERT new aliases (atomically reassigns from another model if needed)
+    /// 2. DELETE stale aliases that no longer belong to this model
     pub async fn upsert_aliases_for_model(
         &self,
         canonical_model_id: &Uuid,
@@ -33,38 +38,63 @@ impl ModelAliasRepository {
 
             let transaction = client.transaction().await.map_err(map_db_error)?;
 
-            // Delete existing aliases for this model
-            transaction
-                .execute(
-                    "DELETE FROM model_aliases WHERE canonical_model_id = $1",
+            if alias_names.is_empty() {
+                // No aliases — just remove all for this model.
+                transaction
+                    .execute(
+                        "DELETE FROM model_aliases WHERE canonical_model_id = $1",
+                        &[&canonical_model_id],
+                    )
+                    .await
+                    .map_err(map_db_error)?;
+            } else {
+                // 1. Batch upsert — atomically reassigns aliases that may point to
+                //    another model, acquiring row locks in a consistent order to
+                //    avoid deadlocks between concurrent calls.
+                let alias_name_refs: Vec<&str> = alias_names.iter().map(|s| s.as_str()).collect();
+                transaction
+                    .execute(
+                        r#"
+                        INSERT INTO model_aliases (alias_name, canonical_model_id, is_active)
+                        SELECT unnest($1::text[]), $2, true
+                        ON CONFLICT (alias_name) DO UPDATE SET
+                            canonical_model_id = EXCLUDED.canonical_model_id,
+                            is_active = true,
+                            updated_at = NOW()
+                        "#,
+                        &[&alias_name_refs, &canonical_model_id],
+                    )
+                    .await
+                    .map_err(map_db_error)?;
+
+                // 2. Delete stale aliases no longer in the new list.
+                transaction
+                    .execute(
+                        "DELETE FROM model_aliases WHERE canonical_model_id = $1 AND alias_name != ALL($2)",
+                        &[&canonical_model_id, &alias_name_refs],
+                    )
+                    .await
+                    .map_err(map_db_error)?;
+            }
+
+            // 3. Return the final set of aliases for this model.
+            let rows = transaction
+                .query(
+                    r#"
+                    SELECT id, alias_name, canonical_model_id, is_active, created_at, updated_at
+                    FROM model_aliases
+                    WHERE canonical_model_id = $1
+                    "#,
                     &[&canonical_model_id],
                 )
                 .await
                 .map_err(map_db_error)?;
 
-            // Insert new aliases
-            let mut aliases = Vec::new();
-            for alias_name in alias_names {
-                let row = transaction
-                    .query_one(
-                        r#"
-                        INSERT INTO model_aliases (
-                            alias_name, canonical_model_id, is_active
-                        ) VALUES ($1, $2, true)
-                        RETURNING id, alias_name, canonical_model_id,
-                                  is_active, created_at, updated_at
-                        "#,
-                        &[&alias_name, &canonical_model_id],
-                    )
-                    .await
-                    .map_err(map_db_error)?;
-
-                aliases.push(self.row_to_alias(&row));
-            }
-
             transaction.commit().await.map_err(map_db_error)?;
 
-            Ok::<Vec<ModelAlias>, RepositoryError>(aliases)
+            Ok::<Vec<ModelAlias>, RepositoryError>(
+                rows.iter().map(|r| self.row_to_alias(r)).collect(),
+            )
         })?;
 
         Ok(aliases)

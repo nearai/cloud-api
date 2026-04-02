@@ -108,6 +108,14 @@ jobs:
           skopeo copy oci-archive:./oci.tar "docker://${STAGING_REF}"
           echo "STAGING_REFERENCE=${STAGING_REF}" >> "$GITHUB_ENV"
 
+      - name: Trigger staging deployment
+        if: env.ALSO_TAG_STAGING == 'true'
+        uses: peter-evans/repository-dispatch@28959ce8df70de7be546dd1250a005dd32156697 # v4.0.1
+        with:
+          token: ${{ secrets.REPOSITORY_DISPATCH_TOKEN }}
+          repository: nearai/cvm-ansible-playbooks
+          event-type: deploy-cloud-api-stg
+
       - name: Generate build summary
         run: |
           {

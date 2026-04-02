@@ -663,8 +663,8 @@ impl InferenceProviderPool {
             if round > 0 {
                 let delay = if last_was_rate_limit {
                     // Exponential backoff for 429: 1s, 2s, 4s, 8s (capped)
-                    let exp_delay = RATE_LIMIT_INITIAL_DELAY
-                        .saturating_mul(1 << (round - 1).min(3));
+                    let exp_delay =
+                        RATE_LIMIT_INITIAL_DELAY.saturating_mul(1 << (round - 1).min(3));
                     exp_delay.min(RATE_LIMIT_MAX_DELAY)
                 } else {
                     CONNECTION_RETRY_DELAY

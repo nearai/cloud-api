@@ -57,6 +57,7 @@ pub mod chunk_builder;
 pub mod external;
 pub mod mock;
 pub mod models;
+pub mod spki_verifier;
 pub mod sse_parser;
 pub mod vllm;
 

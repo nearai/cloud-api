@@ -592,11 +592,11 @@ impl ExternalProvidersConfig {
             .and_then(|s| s.parse().ok())
             .unwrap_or(300);
 
-        // Refresh interval for external providers (default 15 minutes)
+        // Refresh interval for external providers (default 5 minutes)
         let refresh_interval_secs = env::var("EXTERNAL_PROVIDER_REFRESH_INTERVAL")
             .ok()
             .and_then(|s| s.parse().ok())
-            .unwrap_or(900);
+            .unwrap_or(300);
 
         Self {
             openai_api_key,

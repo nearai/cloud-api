@@ -1,11 +1,11 @@
 use crate::{
-    models::StreamOptions, sse_parser::new_sse_parser, ImageEditError, ImageGenerationError,
-    RerankError, ScoreError, *,
+    models::StreamOptions, spki_verifier, sse_parser::new_sse_parser, ImageEditError,
+    ImageGenerationError, RerankError, ScoreError, *,
 };
 use async_trait::async_trait;
 use reqwest::{header::HeaderValue, Client};
 use serde::Serialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -79,11 +79,19 @@ pub struct VLlmProvider {
     /// → moves client to `signature_clients[chat_id]` → `get_signature` uses it.
     pending_clients: Arc<std::sync::Mutex<HashMap<String, Client>>>,
     signature_clients: Arc<std::sync::Mutex<HashMap<String, Client>>>,
+    /// Shared set of expected SPKI fingerprints for TLS verification.
+    /// Empty = bootstrap mode (accept any valid cert). Populated after attestation
+    /// verification pins the fingerprint from the attested TDX report.
+    expected_fingerprints: Arc<std::sync::RwLock<HashSet<String>>>,
 }
 
 impl VLlmProvider {
     /// Create a new vLLM provider with the given configuration
     pub fn new(config: VLlmConfig) -> Self {
+        let expected_fingerprints = Arc::new(std::sync::RwLock::new(HashSet::new()));
+        let tls_config =
+            spki_verifier::build_rustls_config_with_verifier(expected_fingerprints.clone());
+
         // connect_timeout: 5s is generous for local-network backends. A backend behind a
         // firewall-drop (not RST) is the worst case; 5s catches it without penalising
         // fallback latency. Connection-refused is instant regardless.
@@ -92,6 +100,7 @@ impl VLlmProvider {
         // heavy load vLLM can stall between chunks during decode when KV cache is under
         // pressure, causing premature stream termination and lost usage stats.
         let client = Client::builder()
+            .use_preconfigured_tls(tls_config)
             .connect_timeout(std::time::Duration::from_secs(5))
             .pool_idle_timeout(std::time::Duration::from_secs(90))
             .read_timeout(std::time::Duration::from_secs(300))
@@ -103,20 +112,43 @@ impl VLlmProvider {
             client,
             pending_clients: Arc::new(std::sync::Mutex::new(HashMap::new())),
             signature_clients: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            expected_fingerprints,
         }
     }
 
     /// Create a dedicated reqwest::Client for a single completion.
     /// This client has its own connection pool, ensuring the TLS connection
     /// used for the completion is reused for subsequent signature fetches.
-    fn create_dedicated_client() -> Client {
+    /// Shares the same SPKI fingerprint verification as the main client.
+    fn create_dedicated_client(&self) -> Client {
+        let tls_config =
+            spki_verifier::build_rustls_config_with_verifier(self.expected_fingerprints.clone());
         Client::builder()
+            .use_preconfigured_tls(tls_config)
             .pool_max_idle_per_host(1)
             .connect_timeout(std::time::Duration::from_secs(5))
             .pool_idle_timeout(std::time::Duration::from_secs(90))
             .read_timeout(std::time::Duration::from_secs(300))
             .build()
             .expect("Failed to create dedicated HTTP client")
+    }
+
+    /// Add a verified SPKI fingerprint to the expected set.
+    /// After this call, all new TLS connections (shared and dedicated clients)
+    /// will verify the server cert's SPKI fingerprint is in this set.
+    pub fn add_expected_fingerprint(&self, fingerprint: String) {
+        self.expected_fingerprints
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(fingerprint);
+    }
+
+    /// Returns the number of verified fingerprints currently pinned.
+    pub fn expected_fingerprint_count(&self) -> usize {
+        self.expected_fingerprints
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .len()
     }
 
     /// Build HTTP request headers
@@ -434,7 +466,7 @@ impl InferenceProvider for VLlmProvider {
 
         // Use a dedicated client for this completion so the signature fetch
         // can reuse the same TLS connection (required for L4 load balancing).
-        let dedicated_client = Self::create_dedicated_client();
+        let dedicated_client = self.create_dedicated_client();
         let response = self
             .send_streaming_request(&url, headers, &streaming_params, Some(&dedicated_client))
             .await?;
@@ -473,7 +505,7 @@ impl InferenceProvider for VLlmProvider {
         self.prepare_encryption_headers(&mut headers, &mut non_streaming_params.extra);
 
         // Use a dedicated client for connection pinning (same TLS connection for signature)
-        let dedicated_client = Self::create_dedicated_client();
+        let dedicated_client = self.create_dedicated_client();
         let response = dedicated_client
             .post(&url)
             .headers(headers)

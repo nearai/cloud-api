@@ -55,6 +55,7 @@ aes-gcm = "0.10"
 hmac = "0.12"
 sha2 = "0.10"
 x509-parser = "0.18"
+dcap-qvl = "0.3"
 moka = { version = "0.12.14", features = ["future"] }
 bloomfilter = "3.0.1"
 mockall = { version = "0.14", optional = true }

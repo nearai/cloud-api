@@ -71,8 +71,13 @@ impl ServerCertVerifier for SpkiFingerprintVerifier {
         now: UnixTime,
     ) -> Result<ServerCertVerified, TlsError> {
         // First, run the standard WebPKI verification (CA chain, expiry, etc.)
-        self.inner
-            .verify_server_cert(end_entity, intermediates, server_name, ocsp_response, now)?;
+        self.inner.verify_server_cert(
+            end_entity,
+            intermediates,
+            server_name,
+            ocsp_response,
+            now,
+        )?;
 
         // Check SPKI fingerprint against expected set
         let fps = self
@@ -85,9 +90,8 @@ impl ServerCertVerifier for SpkiFingerprintVerifier {
             return Ok(ServerCertVerified::assertion());
         }
 
-        let spki_hash = compute_spki_fingerprint_from_der(end_entity.as_ref()).map_err(|e| {
-            TlsError::General(format!("failed to compute SPKI fingerprint: {e}"))
-        })?;
+        let spki_hash = compute_spki_fingerprint_from_der(end_entity.as_ref())
+            .map_err(|e| TlsError::General(format!("failed to compute SPKI fingerprint: {e}")))?;
 
         if fps.contains(&spki_hash) {
             Ok(ServerCertVerified::assertion())
@@ -133,13 +137,12 @@ pub fn build_rustls_config_with_verifier(
 
     let provider = rustls::crypto::aws_lc_rs::default_provider();
 
-    let default_verifier =
-        rustls::client::WebPkiServerVerifier::builder_with_provider(
-            Arc::new(root_store),
-            Arc::new(provider.clone()),
-        )
-        .build()
-        .expect("failed to build WebPKI verifier");
+    let default_verifier = rustls::client::WebPkiServerVerifier::builder_with_provider(
+        Arc::new(root_store),
+        Arc::new(provider.clone()),
+    )
+    .build()
+    .expect("failed to build WebPKI verifier");
 
     let verifier = SpkiFingerprintVerifier::new(default_verifier, expected_fingerprints);
 

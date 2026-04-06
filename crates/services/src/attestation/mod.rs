@@ -2,8 +2,8 @@ pub mod models;
 pub mod verification;
 use dstack_sdk::dstack_client;
 pub use models::{AttestationError, ChatSignature, SignatureLookupResult};
-pub use verification::{AttestationVerificationError, AttestationVerifier, VerifiedAttestation};
 use std::sync::Arc;
+pub use verification::{AttestationVerificationError, AttestationVerifier, VerifiedAttestation};
 
 use async_trait::async_trait;
 use ed25519_dalek::{Signer, SigningKey, VerifyingKey};

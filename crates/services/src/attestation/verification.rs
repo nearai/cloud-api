@@ -120,20 +120,18 @@ impl AttestationVerifier {
         let intel_quote_hex = attestation_report
             .get("intel_quote")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| {
-                AttestationVerificationError::MissingField("intel_quote".to_string())
-            })?;
+            .ok_or_else(|| AttestationVerificationError::MissingField("intel_quote".to_string()))?;
 
         let quote_bytes = hex::decode(intel_quote_hex).map_err(|e| {
             AttestationVerificationError::InvalidFormat(format!("intel_quote hex decode: {e}"))
         })?;
 
-        let verified_report = dcap_qvl::collateral::get_collateral_and_verify(
-            &quote_bytes,
-            self.pccs_url.as_deref(),
-        )
-        .await
-        .map_err(|e| AttestationVerificationError::TdxVerificationFailed(format!("{e:#}")))?;
+        let verified_report =
+            dcap_qvl::collateral::get_collateral_and_verify(&quote_bytes, self.pccs_url.as_deref())
+                .await
+                .map_err(|e| {
+                    AttestationVerificationError::TdxVerificationFailed(format!("{e:#}"))
+                })?;
 
         // Check debug mode is disabled
         let td_report = verified_report.report.as_td10().ok_or_else(|| {
@@ -230,10 +228,9 @@ impl AttestationVerifier {
         _signing_algo: &str,
     ) -> Result<(), AttestationVerificationError> {
         // Verify nonce (second 32 bytes)
-        let nonce_bytes =
-            hex::decode(nonce.strip_prefix("0x").unwrap_or(nonce)).map_err(|e| {
-                AttestationVerificationError::InvalidFormat(format!("nonce hex decode: {e}"))
-            })?;
+        let nonce_bytes = hex::decode(nonce.strip_prefix("0x").unwrap_or(nonce)).map_err(|e| {
+            AttestationVerificationError::InvalidFormat(format!("nonce hex decode: {e}"))
+        })?;
         if nonce_bytes.len() != 32 {
             return Err(AttestationVerificationError::ReportDataMismatch(format!(
                 "nonce must be 32 bytes, got {}",
@@ -251,20 +248,17 @@ impl AttestationVerifier {
             .strip_prefix("0x")
             .unwrap_or(signing_address);
         let addr_bytes = hex::decode(addr_hex).map_err(|e| {
-            AttestationVerificationError::InvalidFormat(format!(
-                "signing_address hex decode: {e}"
-            ))
+            AttestationVerificationError::InvalidFormat(format!("signing_address hex decode: {e}"))
         })?;
 
         if let Some(fp_hex) = tls_cert_fingerprint {
             // TLS fingerprint binding: SHA256(signing_address_bytes || fingerprint_bytes)
-            let fp_bytes = hex::decode(fp_hex.strip_prefix("0x").unwrap_or(fp_hex)).map_err(
-                |e| {
+            let fp_bytes =
+                hex::decode(fp_hex.strip_prefix("0x").unwrap_or(fp_hex)).map_err(|e| {
                     AttestationVerificationError::InvalidFormat(format!(
                         "tls_cert_fingerprint hex decode: {e}"
                     ))
-                },
-            )?;
+                })?;
             let mut hasher = Sha256::new();
             hasher.update(&addr_bytes);
             hasher.update(&fp_bytes);
@@ -309,15 +303,16 @@ impl AttestationVerifier {
         quoted_rtmr3: &[u8; 48],
     ) -> Result<EventLogData, AttestationVerificationError> {
         // Parse event log from attestation response
-        let event_log = attestation_report.get("event_log").ok_or_else(|| {
-            AttestationVerificationError::MissingField("event_log".to_string())
-        })?;
+        let event_log = attestation_report
+            .get("event_log")
+            .ok_or_else(|| AttestationVerificationError::MissingField("event_log".to_string()))?;
 
-        let events: Vec<EventLogEntry> = serde_json::from_value(event_log.clone()).map_err(|e| {
-            AttestationVerificationError::InvalidFormat(format!(
-                "failed to parse event_log: {e}"
-            ))
-        })?;
+        let events: Vec<EventLogEntry> =
+            serde_json::from_value(event_log.clone()).map_err(|e| {
+                AttestationVerificationError::InvalidFormat(format!(
+                    "failed to parse event_log: {e}"
+                ))
+            })?;
 
         // Replay RTMR3: SHA-384 chain of all events with imr == 3
         // Stops at "boot-mr-done" marker — only pre-boot events are measured into
@@ -329,9 +324,7 @@ impl AttestationVerifier {
                 continue;
             }
             let digest_bytes = hex::decode(&event.digest).map_err(|e| {
-                AttestationVerificationError::InvalidFormat(format!(
-                    "event digest hex decode: {e}"
-                ))
+                AttestationVerificationError::InvalidFormat(format!("event digest hex decode: {e}"))
             })?;
             // RTMR extension: RTMR = SHA-384(RTMR || digest)
             use sha2::Sha384;
@@ -391,12 +384,11 @@ impl AttestationVerifier {
             _ => return Ok(None), // No GPU evidence — acceptable for non-GPU CVMs
         };
 
-        let payload: serde_json::Value =
-            serde_json::from_str(nvidia_payload_str).map_err(|e| {
-                AttestationVerificationError::GpuVerificationFailed(format!(
-                    "failed to parse nvidia_payload JSON: {e}"
-                ))
-            })?;
+        let payload: serde_json::Value = serde_json::from_str(nvidia_payload_str).map_err(|e| {
+            AttestationVerificationError::GpuVerificationFailed(format!(
+                "failed to parse nvidia_payload JSON: {e}"
+            ))
+        })?;
 
         // Verify nonce matches
         let payload_nonce = payload

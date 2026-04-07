@@ -307,17 +307,25 @@ impl AttestationVerifier {
             .get("event_log")
             .ok_or_else(|| AttestationVerificationError::MissingField("event_log".to_string()))?;
 
-        let events: Vec<EventLogEntry> =
+        // Event log may be a JSON array directly or a JSON string containing the array
+        let events: Vec<EventLogEntry> = if let Some(s) = event_log.as_str() {
+            serde_json::from_str(s).map_err(|e| {
+                AttestationVerificationError::InvalidFormat(format!(
+                    "failed to parse event_log string: {e}"
+                ))
+            })?
+        } else {
             serde_json::from_value(event_log.clone()).map_err(|e| {
                 AttestationVerificationError::InvalidFormat(format!(
-                    "failed to parse event_log: {e}"
+                    "failed to parse event_log value: {e}"
                 ))
-            })?;
+            })?
+        };
 
-        // Replay RTMR3: SHA-384 chain of all events with imr == 3
-        // Stops at "boot-mr-done" marker — only pre-boot events are measured into
-        // the dstack-controlled RTMR3 value. Events after boot-mr-done are
-        // extended at runtime (KMS, os-image-hash, key-provider, etc.)
+        // Replay RTMR3: SHA-384 chain of ALL events with imr == 3.
+        // This includes both boot-time events (system-preparing, app-id, compose-hash,
+        // instance-id, boot-mr-done) and runtime events (mr-kms, os-image-hash,
+        // key-provider, storage-fs, system-ready).
         let mut rtmr3 = [0u8; 48];
         for event in &events {
             if event.imr != 3 {
@@ -329,9 +337,9 @@ impl AttestationVerifier {
             // RTMR extension: RTMR = SHA-384(RTMR || digest)
             use sha2::Sha384;
             let mut hasher = Sha384::new();
-            sha2::Digest::update(&mut hasher, rtmr3);
-            sha2::Digest::update(&mut hasher, &digest_bytes);
-            let result = sha2::Digest::finalize(hasher);
+            hasher.update(rtmr3);
+            hasher.update(&digest_bytes);
+            let result = hasher.finalize();
             rtmr3.copy_from_slice(&result);
         }
 

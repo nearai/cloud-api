@@ -1443,7 +1443,12 @@ impl InferenceProviderPool {
                         })
                         .collect();
 
-                    let discovery_results = futures::future::join_all(discovery_futures).await;
+                    let discovery_results = tokio::time::timeout(
+                        Duration::from_secs(30),
+                        futures::future::join_all(discovery_futures),
+                    )
+                    .await
+                    .unwrap_or_default();
 
                     // Verify each unique attestation and accumulate fingerprints
                     let mut pinned_count = 0u32;
@@ -1489,10 +1494,16 @@ impl InferenceProviderPool {
                             "TLS SPKI fingerprints pinned from attestation discovery"
                         );
                     } else {
+                        // Fail closed: insert a sentinel so the provider exits bootstrap
+                        // mode and rejects all TLS connections until a verified fingerprint
+                        // is discovered on a future refresh cycle.
+                        vllm_provider.add_expected_fingerprint(
+                            "__attestation_verification_required__".to_string(),
+                        );
                         tracing::warn!(
                             model = %model_name,
                             url = %url,
-                            "No TLS fingerprints pinned — attestation verification failed or unavailable"
+                            "No TLS fingerprints pinned — provider will reject connections until attestation succeeds"
                         );
                     }
 

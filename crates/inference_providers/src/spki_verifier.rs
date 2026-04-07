@@ -131,7 +131,11 @@ pub fn build_rustls_config_with_verifier(
     expected_fingerprints: Arc<RwLock<HashSet<String>>>,
 ) -> rustls::ClientConfig {
     let mut root_store = rustls::RootCertStore::empty();
-    for cert in rustls_native_certs::load_native_certs().expect("failed to load native certs") {
+    let native = rustls_native_certs::load_native_certs();
+    for err in &native.errors {
+        tracing::warn!("error loading native root cert: {err}");
+    }
+    for cert in native.certs {
         root_store.add(cert).ok();
     }
 

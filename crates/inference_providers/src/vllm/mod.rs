@@ -1,3 +1,4 @@
+use crate::spki_verifier::FingerprintState;
 use crate::{
     models::StreamOptions, spki_verifier, sse_parser::new_sse_parser, ImageEditError,
     ImageGenerationError, RerankError, ScoreError, *,
@@ -5,7 +6,7 @@ use crate::{
 use async_trait::async_trait;
 use reqwest::{header::HeaderValue, Client};
 use serde::Serialize;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -79,18 +80,17 @@ pub struct VLlmProvider {
     /// → moves client to `signature_clients[chat_id]` → `get_signature` uses it.
     pending_clients: Arc<std::sync::Mutex<HashMap<String, Client>>>,
     signature_clients: Arc<std::sync::Mutex<HashMap<String, Client>>>,
-    /// Shared set of expected SPKI fingerprints for TLS verification.
-    /// Empty = bootstrap mode (accept any valid cert). Populated after attestation
-    /// verification pins the fingerprint from the attested TDX report.
-    expected_fingerprints: Arc<std::sync::RwLock<HashSet<String>>>,
+    /// TLS fingerprint verification state (Bootstrap → Pinned or Blocked).
+    /// Shared across the main client and all dedicated per-completion clients.
+    fingerprint_state: Arc<std::sync::RwLock<FingerprintState>>,
 }
 
 impl VLlmProvider {
     /// Create a new vLLM provider with the given configuration
     pub fn new(config: VLlmConfig) -> Self {
-        let expected_fingerprints = Arc::new(std::sync::RwLock::new(HashSet::new()));
+        let fingerprint_state = Arc::new(std::sync::RwLock::new(FingerprintState::Bootstrap));
         let tls_config =
-            spki_verifier::build_rustls_config_with_verifier(expected_fingerprints.clone());
+            spki_verifier::build_rustls_config_with_verifier(fingerprint_state.clone());
 
         // connect_timeout: 5s is generous for local-network backends. A backend behind a
         // firewall-drop (not RST) is the worst case; 5s catches it without penalising
@@ -112,7 +112,7 @@ impl VLlmProvider {
             client,
             pending_clients: Arc::new(std::sync::Mutex::new(HashMap::new())),
             signature_clients: Arc::new(std::sync::Mutex::new(HashMap::new())),
-            expected_fingerprints,
+            fingerprint_state,
         }
     }
 
@@ -122,7 +122,7 @@ impl VLlmProvider {
     /// Shares the same SPKI fingerprint verification as the main client.
     fn create_dedicated_client(&self) -> Client {
         let tls_config =
-            spki_verifier::build_rustls_config_with_verifier(self.expected_fingerprints.clone());
+            spki_verifier::build_rustls_config_with_verifier(self.fingerprint_state.clone());
         Client::builder()
             .use_preconfigured_tls(tls_config)
             .pool_max_idle_per_host(1)
@@ -133,22 +133,30 @@ impl VLlmProvider {
             .expect("Failed to create dedicated HTTP client")
     }
 
-    /// Add a verified SPKI fingerprint to the expected set.
-    /// After this call, all new TLS connections (shared and dedicated clients)
-    /// will verify the server cert's SPKI fingerprint is in this set.
-    pub fn add_expected_fingerprint(&self, fingerprint: String) {
-        self.expected_fingerprints
+    /// Add a verified SPKI fingerprint. Transitions Bootstrap → Pinned,
+    /// or adds to existing Pinned set. Unblocks a Blocked provider.
+    pub fn add_verified_fingerprint(&self, fingerprint: String) {
+        self.fingerprint_state
             .write()
             .unwrap_or_else(|e| e.into_inner())
-            .insert(fingerprint);
+            .add_fingerprint(fingerprint);
+    }
+
+    /// Block all TLS connections (attestation verification failed).
+    /// Only blocks from Bootstrap state — does not override existing Pinned fingerprints.
+    pub fn block_connections(&self) {
+        self.fingerprint_state
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .block();
     }
 
     /// Returns the number of verified fingerprints currently pinned.
-    pub fn expected_fingerprint_count(&self) -> usize {
-        self.expected_fingerprints
+    pub fn pinned_fingerprint_count(&self) -> usize {
+        self.fingerprint_state
             .read()
             .unwrap_or_else(|e| e.into_inner())
-            .len()
+            .pinned_count()
     }
 
     /// Build HTTP request headers

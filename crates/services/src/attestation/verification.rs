@@ -346,6 +346,15 @@ impl AttestationVerifier {
             rtmr3.copy_from_slice(&result);
         }
 
+        // Reject if no RTMR3 events found — an empty event log with all-zeros RTMR3
+        // in the quote would silently pass and bypass the image hash allowlist.
+        let has_rtmr3_events = events.iter().any(|e| e.imr == 3);
+        if !has_rtmr3_events {
+            return Err(AttestationVerificationError::RtmrMismatch(
+                "no RTMR3 events in event log — cannot verify runtime measurements".to_string(),
+            ));
+        }
+
         if rtmr3 != *quoted_rtmr3 {
             return Err(AttestationVerificationError::RtmrMismatch(format!(
                 "RTMR3 replay mismatch: replayed={}, quoted={}",

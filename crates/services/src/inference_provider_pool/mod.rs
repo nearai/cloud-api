@@ -1404,7 +1404,7 @@ impl InferenceProviderPool {
                 let api_key = api_key.clone();
                 let verifier = verifier.clone();
                 async move {
-                    // Create provider with empty fingerprint set (bootstrap mode)
+                    // Create provider in bootstrap mode (accepts any valid cert)
                     let vllm_provider = Arc::new(VLlmProvider::new(VLlmConfig::new(
                         url.clone(),
                         api_key,
@@ -1413,28 +1413,29 @@ impl InferenceProviderPool {
                     let serving_provider =
                         vllm_provider.clone() as Arc<InferenceProviderTrait>;
 
-                    let (pub_keys, _, _) =
-                        Self::fetch_signing_public_keys_for_both_algorithms(
-                            &serving_provider,
-                            &model_name,
-                            &url,
-                        )
-                        .await;
-
-                    // Fire N parallel attestation calls to discover TLS fingerprints
-                    // from different backends behind L4 load balancing. Each call may
-                    // hit a different CVM with a different TLS certificate.
+                    // Step 1: Discover and verify TLS fingerprints FIRST.
+                    // Uses N parallel attestation calls to hit multiple backends behind
+                    // L4 load balancing. Each call generates a client-side nonce for
+                    // freshness (prevents replay of old attestation reports).
                     let discovery_futures: Vec<_> = (0..discovery_parallelism)
                         .map(|_| {
                             let provider = serving_provider.clone();
                             let model = model_name.clone();
                             async move {
-                                provider
+                                // Generate client-side nonce for freshness
+                                let nonce_bytes: [u8; 32] = rand::random();
+                                let nonce = hex::encode(nonce_bytes);
+                                let report = provider
                                     .get_attestation_report(
-                                        model, None, None, None, true,
+                                        model,
+                                        None,
+                                        Some(nonce.clone()),
+                                        None,
+                                        true,
                                     )
                                     .await
-                                    .ok()
+                                    .ok()?;
+                                Some((report, nonce))
                             }
                         })
                         .collect();
@@ -1449,7 +1450,7 @@ impl InferenceProviderPool {
                     // Verify each unique attestation and accumulate fingerprints
                     let mut pinned_count = 0u32;
                     let mut seen_fingerprints = std::collections::HashSet::new();
-                    for report in discovery_results.into_iter().flatten() {
+                    for (report, client_nonce) in discovery_results.into_iter().flatten() {
                         let fp = report
                             .get("tls_cert_fingerprint")
                             .and_then(|v| v.as_str())
@@ -1458,14 +1459,14 @@ impl InferenceProviderPool {
                         if fp.is_empty() || !seen_fingerprints.insert(fp.clone()) {
                             continue; // Skip empty or already-verified fingerprints
                         }
-                        let nonce = report
-                            .get("request_nonce")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or_default();
-                        match verifier.verify_attestation_report(&report, nonce).await {
+                        // Verify with the CLIENT-generated nonce (not the backend's)
+                        match verifier
+                            .verify_attestation_report(&report, &client_nonce)
+                            .await
+                        {
                             Ok(verified) => {
                                 if let Some(ref vfp) = verified.tls_cert_fingerprint {
-                                    vllm_provider.add_expected_fingerprint(vfp.clone());
+                                    vllm_provider.add_verified_fingerprint(vfp.clone());
                                     pinned_count += 1;
                                 }
                             }
@@ -1490,18 +1491,25 @@ impl InferenceProviderPool {
                             "TLS SPKI fingerprints pinned from attestation discovery"
                         );
                     } else {
-                        // Fail closed: insert a sentinel so the provider exits bootstrap
-                        // mode and rejects all TLS connections until a verified fingerprint
-                        // is discovered on a future refresh cycle.
-                        vllm_provider.add_expected_fingerprint(
-                            "__attestation_verification_required__".to_string(),
-                        );
+                        // Fail closed: block connections so the provider exits bootstrap
+                        // mode and rejects all TLS until a future refresh succeeds.
+                        vllm_provider.block_connections();
                         tracing::warn!(
                             model = %model_name,
                             url = %url,
                             "No TLS fingerprints pinned — provider will reject connections until attestation succeeds"
                         );
                     }
+
+                    // Step 2: Fetch signing public keys WITH TLS pinning active.
+                    // This ensures signing keys are fetched over verified connections.
+                    let (pub_keys, _, _) =
+                        Self::fetch_signing_public_keys_for_both_algorithms(
+                            &serving_provider,
+                            &model_name,
+                            &url,
+                        )
+                        .await;
 
                     let pub_keys: Vec<(String, Arc<InferenceProviderTrait>)> = pub_keys
                         .into_iter()

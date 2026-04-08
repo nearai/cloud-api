@@ -172,12 +172,12 @@ async fn test_image_hash_rejection() {
 
 #[tokio::test]
 async fn test_spki_fingerprint_verifier() {
-    use inference_providers::spki_verifier;
+    use inference_providers::spki_verifier::{self, FingerprintState};
     use std::sync::{Arc, RwLock};
 
-    // Test bootstrap mode (empty set accepts any cert)
-    let fps = Arc::new(RwLock::new(HashSet::<String>::new()));
-    let config = spki_verifier::build_rustls_config_with_verifier(fps.clone());
+    // Test bootstrap mode (accepts any valid cert)
+    let state = Arc::new(RwLock::new(FingerprintState::Bootstrap));
+    let config = spki_verifier::build_rustls_config_with_verifier(state.clone());
     let client = reqwest::Client::builder()
         .use_preconfigured_tls(config)
         .build()
@@ -204,10 +204,10 @@ async fn test_spki_fingerprint_verifier() {
     }
 
     // Now pin a wrong fingerprint — should reject
-    fps.write()
-        .unwrap()
-        .insert("0000000000000000000000000000000000000000000000000000000000000000".to_string());
-    let config2 = spki_verifier::build_rustls_config_with_verifier(fps.clone());
+    state.write().unwrap().add_fingerprint(
+        "0000000000000000000000000000000000000000000000000000000000000000".to_string(),
+    );
+    let config2 = spki_verifier::build_rustls_config_with_verifier(state.clone());
     let client2 = reqwest::Client::builder()
         .use_preconfigured_tls(config2)
         .build()

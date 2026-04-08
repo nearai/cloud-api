@@ -122,7 +122,10 @@ impl AttestationVerifier {
             .and_then(|v| v.as_str())
             .ok_or_else(|| AttestationVerificationError::MissingField("intel_quote".to_string()))?;
 
-        let quote_bytes = hex::decode(intel_quote_hex).map_err(|e| {
+        let quote_hex = intel_quote_hex
+            .strip_prefix("0x")
+            .unwrap_or(intel_quote_hex);
+        let quote_bytes = hex::decode(quote_hex).map_err(|e| {
             AttestationVerificationError::InvalidFormat(format!("intel_quote hex decode: {e}"))
         })?;
 

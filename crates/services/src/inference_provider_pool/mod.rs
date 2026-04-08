@@ -1431,11 +1431,7 @@ impl InferenceProviderPool {
                             async move {
                                 provider
                                     .get_attestation_report(
-                                        model,
-                                        Some("ed25519".to_string()),
-                                        None,
-                                        None,
-                                        true,
+                                        model, None, None, None, true,
                                     )
                                     .await
                                     .ok()

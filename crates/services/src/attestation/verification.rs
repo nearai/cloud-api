@@ -492,15 +492,18 @@ fn extract_nvidia_verdict(jwt: &str) -> Result<String, AttestationVerificationEr
         ))
     })?;
 
-    payload
-        .get("x-nvidia-overall-att-result")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
-        .ok_or_else(|| {
-            AttestationVerificationError::GpuVerificationFailed(
-                "x-nvidia-overall-att-result not found in NRAS JWT".to_string(),
-            )
-        })
+    let result = payload.get("x-nvidia-overall-att-result").ok_or_else(|| {
+        AttestationVerificationError::GpuVerificationFailed(
+            "x-nvidia-overall-att-result not found in NRAS JWT".to_string(),
+        )
+    })?;
+
+    // NRAS returns either boolean true/false or string "PASS"/"FAIL"
+    match result {
+        serde_json::Value::Bool(b) => Ok(if *b { "PASS" } else { "FAIL" }.to_string()),
+        serde_json::Value::String(s) => Ok(s.clone()),
+        other => Ok(other.to_string()),
+    }
 }
 
 #[derive(Debug, thiserror::Error)]

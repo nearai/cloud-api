@@ -61,10 +61,16 @@ pub struct AttestationVerifier {
     allowed_image_hashes: HashSet<String>,
     /// Optional PCCS URL override for Intel collateral fetching.
     pccs_url: Option<String>,
+    /// If true, reject attestations where TCB status is not "UpToDate".
+    require_tcb_up_to_date: bool,
 }
 
 impl AttestationVerifier {
-    pub fn new(allowed_image_hashes: HashSet<String>, pccs_url: Option<String>) -> Self {
+    pub fn new(
+        allowed_image_hashes: HashSet<String>,
+        pccs_url: Option<String>,
+        require_tcb_up_to_date: bool,
+    ) -> Self {
         let http_client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(30))
             .build()
@@ -73,6 +79,7 @@ impl AttestationVerifier {
             http_client,
             allowed_image_hashes,
             pccs_url,
+            require_tcb_up_to_date,
         }
     }
 
@@ -98,7 +105,11 @@ impl AttestationVerifier {
 
         let pccs_url = std::env::var("PCCS_URL").ok().filter(|s| !s.is_empty());
 
-        Self::new(allowed_image_hashes, pccs_url)
+        let require_tcb_up_to_date = std::env::var("REQUIRE_TCB_UP_TO_DATE")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+
+        Self::new(allowed_image_hashes, pccs_url, require_tcb_up_to_date)
     }
 
     /// Verify an attestation report from an inference backend.
@@ -135,6 +146,22 @@ impl AttestationVerifier {
                 .map_err(|e| {
                     AttestationVerificationError::TdxVerificationFailed(format!("{e:#}"))
                 })?;
+
+        // Check TCB status
+        let tcb_status = &verified_report.status;
+        if self.require_tcb_up_to_date && tcb_status != "UpToDate" {
+            return Err(AttestationVerificationError::TdxVerificationFailed(format!(
+                "TCB status is '{tcb_status}' but REQUIRE_TCB_UP_TO_DATE is set (advisory_ids: {:?})",
+                verified_report.advisory_ids
+            )));
+        }
+        if tcb_status != "UpToDate" {
+            tracing::warn!(
+                tcb_status = %tcb_status,
+                advisory_ids = ?verified_report.advisory_ids,
+                "TDX TCB status is not UpToDate — microcode may need updating"
+            );
+        }
 
         // Check debug mode is disabled
         let td_report = verified_report.report.as_td10().ok_or_else(|| {

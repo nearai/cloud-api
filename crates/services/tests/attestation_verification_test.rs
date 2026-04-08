@@ -64,7 +64,7 @@ async fn test_verify_glm5_attestation() {
     // Verify with the known-good image hash from production
     let allowed: HashSet<String> =
         ["9b69bb1698bacbb6985409a2c272bcb892e09cdcea63d5399c6768b67d3ff677".to_string()].into();
-    let verifier = services::attestation::AttestationVerifier::new(allowed, None);
+    let verifier = services::attestation::AttestationVerifier::new(allowed, None, false);
 
     match verifier.verify_attestation_report(&report, nonce).await {
         Ok(verified) => {
@@ -116,7 +116,7 @@ async fn test_verify_qwen35_attestation() {
         .expect("missing request_nonce");
 
     // No image hash allowlist — skip that check
-    let verifier = services::attestation::AttestationVerifier::new(HashSet::new(), None);
+    let verifier = services::attestation::AttestationVerifier::new(HashSet::new(), None, false);
 
     match verifier.verify_attestation_report(&report, nonce).await {
         Ok(verified) => {
@@ -158,7 +158,7 @@ async fn test_image_hash_rejection() {
 
     // Use a wrong image hash — should reject
     let wrong_hash: HashSet<String> = ["deadbeef00000000".to_string()].into();
-    let verifier = services::attestation::AttestationVerifier::new(wrong_hash, None);
+    let verifier = services::attestation::AttestationVerifier::new(wrong_hash, None, false);
 
     let result = verifier.verify_attestation_report(&report, nonce).await;
     assert!(result.is_err(), "should reject wrong image hash");

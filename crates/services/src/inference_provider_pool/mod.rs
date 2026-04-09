@@ -1501,11 +1501,19 @@ impl InferenceProviderPool {
                         );
                     }
 
-                    // Step 2: Fetch signing public keys WITH TLS pinning active.
-                    // This ensures signing keys are fetched over verified connections.
+                    // Step 2: Fetch signing public keys over a FRESH provider.
+                    // The bootstrap provider's reqwest pool may have pre-pin connections.
+                    // Creating a new VLlmProvider that shares the same fingerprint_state
+                    // ensures all new TLS connections are verified against pinned fingerprints.
+                    let pinned_provider = Arc::new(VLlmProvider::new_with_fingerprint_state(
+                        VLlmConfig::new(url.clone(), vllm_provider.config().api_key.clone(), None),
+                        vllm_provider.fingerprint_state(),
+                    ));
+                    let pinned_trait = pinned_provider.clone() as Arc<InferenceProviderTrait>;
+
                     let (pub_keys, _, _) =
                         Self::fetch_signing_public_keys_for_both_algorithms(
-                            &serving_provider,
+                            &pinned_trait,
                             &model_name,
                             &url,
                         )
@@ -1513,10 +1521,10 @@ impl InferenceProviderPool {
 
                     let pub_keys: Vec<(String, Arc<InferenceProviderTrait>)> = pub_keys
                         .into_iter()
-                        .map(|(key, _)| (key, serving_provider.clone()))
+                        .map(|(key, _)| (key, pinned_trait.clone()))
                         .collect();
 
-                    (model_name, url, serving_provider, pub_keys, pinned_count)
+                    (model_name, url, pinned_trait as Arc<InferenceProviderTrait>, pub_keys, pinned_count)
                 }
             })
             .collect();

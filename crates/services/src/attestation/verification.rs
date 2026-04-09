@@ -37,15 +37,21 @@ struct EventLogData {
     compose_hash: Option<String>,
 }
 
+/// dstack runtime event type constant (0x08000001).
+const DSTACK_RUNTIME_EVENT_TYPE: u32 = 0x08000001;
+
 /// An entry from the TDX event log.
 #[derive(Debug, Clone, serde::Deserialize)]
 struct EventLogEntry {
     /// SHA-384 digest of the event (hex-encoded).
     digest: String,
+    /// Event type (0x08000001 for dstack runtime events).
+    #[serde(default)]
+    event_type: u32,
     /// Event name (e.g., "os-image-hash", "compose-hash", "app-id").
     #[serde(default)]
     event: String,
-    /// Event payload (hex-encoded or plaintext depending on event type).
+    /// Event payload (hex-encoded raw bytes).
     #[serde(default)]
     event_payload: String,
     /// Which RTMR this event extends (0-3).
@@ -353,29 +359,71 @@ impl AttestationVerifier {
         };
 
         // Replay RTMR3: SHA-384 chain of ALL events with imr == 3.
-        // This includes both boot-time events (system-preparing, app-id, compose-hash,
-        // instance-id, boot-mr-done) and runtime events (mr-kms, os-image-hash,
-        // key-provider, storage-fs, system-ready).
+        // For runtime events (event_type == 0x08000001), we first validate that the
+        // digest matches SHA384(event_type_le || ":" || event_name || ":" || payload_bytes).
+        // This prevents an attacker from keeping valid digests while swapping payloads.
+        use sha2::Sha384;
         let mut rtmr3 = [0u8; 48];
+        let mut rtmr3_event_count = 0u32;
         for event in &events {
             if event.imr != 3 {
                 continue;
             }
-            let digest_bytes = hex::decode(&event.digest).map_err(|e| {
-                AttestationVerificationError::InvalidFormat(format!("event digest hex decode: {e}"))
-            })?;
+            rtmr3_event_count += 1;
+
+            // For runtime events, validate digest matches payload
+            let digest_bytes = if event.event_type == DSTACK_RUNTIME_EVENT_TYPE {
+                let payload_bytes = hex::decode(&event.event_payload).map_err(|e| {
+                    AttestationVerificationError::InvalidFormat(format!(
+                        "runtime event '{}' payload hex decode: {e}",
+                        event.event
+                    ))
+                })?;
+                let mut hasher = Sha384::new();
+                sha2::Digest::update(&mut hasher, DSTACK_RUNTIME_EVENT_TYPE.to_ne_bytes());
+                sha2::Digest::update(&mut hasher, b":");
+                sha2::Digest::update(&mut hasher, event.event.as_bytes());
+                sha2::Digest::update(&mut hasher, b":");
+                sha2::Digest::update(&mut hasher, &payload_bytes);
+                let computed: [u8; 48] = sha2::Digest::finalize(hasher).into();
+
+                // If the event has a stored digest, verify it matches
+                if !event.digest.is_empty() {
+                    let stored = hex::decode(&event.digest).map_err(|e| {
+                        AttestationVerificationError::InvalidFormat(format!(
+                            "event '{}' digest hex decode: {e}",
+                            event.event
+                        ))
+                    })?;
+                    if computed[..] != stored[..] {
+                        return Err(AttestationVerificationError::RtmrMismatch(format!(
+                            "runtime event '{}' digest does not match payload: computed={}, stored={}",
+                            event.event,
+                            hex::encode(computed),
+                            hex::encode(&stored)
+                        )));
+                    }
+                }
+                computed.to_vec()
+            } else {
+                // Non-runtime events: use stored digest directly
+                hex::decode(&event.digest).map_err(|e| {
+                    AttestationVerificationError::InvalidFormat(format!(
+                        "event digest hex decode: {e}"
+                    ))
+                })?
+            };
+
             // RTMR extension: RTMR = SHA-384(RTMR || digest)
-            use sha2::Sha384;
             let mut hasher = Sha384::new();
-            hasher.update(rtmr3);
-            hasher.update(&digest_bytes);
-            let result = hasher.finalize();
+            sha2::Digest::update(&mut hasher, rtmr3);
+            sha2::Digest::update(&mut hasher, &digest_bytes);
+            let result = sha2::Digest::finalize(hasher);
             rtmr3.copy_from_slice(&result);
         }
 
-        // Reject if no RTMR3 events found — an empty event log with all-zeros RTMR3
-        // in the quote would silently pass and bypass the image hash allowlist.
-        let has_rtmr3_events = events.iter().any(|e| e.imr == 3);
+        // Reject if no RTMR3 events found
+        let has_rtmr3_events = rtmr3_event_count > 0;
         if !has_rtmr3_events {
             return Err(AttestationVerificationError::RtmrMismatch(
                 "no RTMR3 events in event log — cannot verify runtime measurements".to_string(),

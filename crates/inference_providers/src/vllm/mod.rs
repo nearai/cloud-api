@@ -89,6 +89,16 @@ impl VLlmProvider {
     /// Create a new vLLM provider with the given configuration
     pub fn new(config: VLlmConfig) -> Self {
         let fingerprint_state = Arc::new(std::sync::RwLock::new(FingerprintState::Bootstrap));
+        Self::new_with_fingerprint_state(config, fingerprint_state)
+    }
+
+    /// Create a new vLLM provider sharing an existing fingerprint state.
+    /// Used to create a fresh connection pool after TLS pinning is established,
+    /// ensuring all new connections go through the SPKI verifier.
+    pub fn new_with_fingerprint_state(
+        config: VLlmConfig,
+        fingerprint_state: Arc<std::sync::RwLock<FingerprintState>>,
+    ) -> Self {
         let tls_config =
             spki_verifier::build_rustls_config_with_verifier(fingerprint_state.clone());
 
@@ -114,6 +124,16 @@ impl VLlmProvider {
             signature_clients: Arc::new(std::sync::Mutex::new(HashMap::new())),
             fingerprint_state,
         }
+    }
+
+    /// Access the provider's configuration.
+    pub fn config(&self) -> &VLlmConfig {
+        &self.config
+    }
+
+    /// Get a reference to the shared fingerprint state.
+    pub fn fingerprint_state(&self) -> Arc<std::sync::RwLock<FingerprintState>> {
+        self.fingerprint_state.clone()
     }
 
     /// Create a dedicated reqwest::Client for a single completion.

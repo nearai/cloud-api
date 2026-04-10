@@ -19,6 +19,7 @@ fn num_buckets() -> usize {
         .and_then(|s| s.parse().ok())
         .filter(|&n| n > 0)
         .unwrap_or(64)
+        .min(1024) // Cap to prevent excessive memory from misconfiguration
 }
 
 /// Maximum number of messages to consider for routing.
@@ -26,6 +27,7 @@ fn max_trie_depth() -> usize {
     std::env::var("PREFIX_MAX_MESSAGES")
         .ok()
         .and_then(|s| s.parse().ok())
+        .filter(|&n| n > 0)
         .unwrap_or(8)
 }
 
@@ -51,7 +53,10 @@ pub struct PrefixRouter {
 
 impl PrefixRouter {
     pub fn new() -> Self {
-        let num_buckets = num_buckets();
+        Self::with_config(num_buckets(), max_trie_depth())
+    }
+
+    fn with_config(num_buckets: usize, max_depth: usize) -> Self {
         Self {
             trie: RwLock::new(TrieNode {
                 children: HashMap::new(),
@@ -59,7 +64,7 @@ impl PrefixRouter {
             }),
             next_bucket: AtomicUsize::new(1),
             num_buckets,
-            max_depth: max_trie_depth(),
+            max_depth,
         }
     }
 
@@ -74,28 +79,35 @@ impl PrefixRouter {
             return 0;
         }
 
-        // Fast path: read-only lookup
-        {
-            let trie = self.trie.read().unwrap_or_else(|e| e.into_inner());
-            if let Some(bucket) = Self::lookup_readonly(&trie, &hashes) {
-                return bucket;
-            }
+        // Fast path: read-only lookup. Since deeper nodes inherit parent buckets,
+        // this always returns a valid bucket even for partially-unseen prefixes.
+        // Only take write lock when the first message (system prompt) is brand new.
+        let trie = self.trie.read().unwrap_or_else(|e| e.into_inner());
+        let first_msg_exists = trie.children.contains_key(&hashes[0]);
+        let bucket = Self::lookup_readonly(&trie, &hashes);
+        drop(trie);
+
+        if first_msg_exists {
+            return bucket;
         }
 
-        // Slow path: insert new nodes
+        // Slow path: first message unseen — need to assign a new bucket
         let mut trie = self.trie.write().unwrap_or_else(|e| e.into_inner());
         self.lookup_or_insert(&mut trie, &hashes)
     }
 
-    fn lookup_readonly(node: &TrieNode, hashes: &[u64]) -> Option<usize> {
+    /// Read-only lookup. Returns the deepest matching node's bucket.
+    /// Since deeper nodes inherit the parent's bucket, we can return early
+    /// when we hit an unseen message — the parent's bucket is correct.
+    fn lookup_readonly(node: &TrieNode, hashes: &[u64]) -> usize {
         let mut current = node;
         for h in hashes {
             match current.children.get(h) {
                 Some(child) => current = child,
-                None => return None,
+                None => break, // Unseen message — parent's bucket is inherited
             }
         }
-        Some(current.bucket)
+        current.bucket
     }
 
     /// Only root's direct children get fresh buckets. All deeper nodes inherit
@@ -176,9 +188,13 @@ mod tests {
         }
     }
 
+    fn router() -> PrefixRouter {
+        PrefixRouter::with_config(64, 8)
+    }
+
     #[test]
     fn test_same_system_prompt_same_bucket() {
-        let router = PrefixRouter::new();
+        let router = router();
         let msgs1 = vec![
             msg(MessageRole::System, "You are a helpful assistant."),
             msg(MessageRole::User, "What is 2+2?"),
@@ -194,7 +210,7 @@ mod tests {
 
     #[test]
     fn test_identical_conversations_same_bucket() {
-        let router = PrefixRouter::new();
+        let router = router();
         let msgs = vec![
             msg(MessageRole::System, "You are helpful."),
             msg(MessageRole::User, "Hi"),
@@ -204,7 +220,7 @@ mod tests {
 
     #[test]
     fn test_different_system_prompts_different_buckets() {
-        let router = PrefixRouter::new();
+        let router = router();
         let msgs1 = vec![msg(MessageRole::System, "You are a Python expert.")];
         let msgs2 = vec![msg(MessageRole::System, "You are a Rust expert.")];
         assert_ne!(router.route(&msgs1), router.route(&msgs2));
@@ -212,13 +228,13 @@ mod tests {
 
     #[test]
     fn test_empty_messages() {
-        let router = PrefixRouter::new();
+        let router = router();
         assert_eq!(router.route(&[]), 0);
     }
 
     #[test]
     fn test_bucket_range() {
-        let router = PrefixRouter::new();
+        let router = router();
         for i in 0..100 {
             let msgs = vec![msg(MessageRole::User, &format!("message {i}"))];
             assert!(router.route(&msgs) < router.num_buckets());

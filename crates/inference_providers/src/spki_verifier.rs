@@ -168,41 +168,63 @@ impl ServerCertVerifier for SpkiFingerprintVerifier {
     }
 }
 
+/// Shared TLS infrastructure (root certs + crypto provider) for building
+/// multiple `ClientConfig`s without duplicating the ~150KB root cert store.
+#[derive(Clone)]
+pub struct SharedTlsRoots {
+    root_store: Arc<rustls::RootCertStore>,
+    provider: Arc<rustls::crypto::CryptoProvider>,
+}
+
+impl SharedTlsRoots {
+    /// Load native root certificates once. Reuse via `.clone()` for multiple clients.
+    pub fn load() -> Self {
+        let mut root_store = rustls::RootCertStore::empty();
+        let native = rustls_native_certs::load_native_certs();
+        for err in &native.errors {
+            tracing::warn!("error loading native root cert: {err}");
+        }
+        for cert in native.certs {
+            root_store.add(cert).ok();
+        }
+        Self {
+            root_store: Arc::new(root_store),
+            provider: Arc::new(rustls::crypto::aws_lc_rs::default_provider()),
+        }
+    }
+
+    /// Build a `rustls::ClientConfig` with SPKI fingerprint verification.
+    pub fn build_config(&self, state: Arc<RwLock<FingerprintState>>) -> rustls::ClientConfig {
+        let default_verifier = rustls::client::WebPkiServerVerifier::builder_with_provider(
+            self.root_store.clone(),
+            self.provider.clone(),
+        )
+        .build()
+        .expect("failed to build WebPKI verifier");
+
+        let verifier = SpkiFingerprintVerifier::new(default_verifier, state);
+
+        let mut config = rustls::ClientConfig::builder_with_provider(self.provider.clone())
+            .with_safe_default_protocol_versions()
+            .expect("failed to set protocol versions")
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(verifier))
+            .with_no_client_auth();
+
+        config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+        config
+    }
+}
+
 /// Build a `rustls::ClientConfig` using native root certificates and a custom
 /// `SpkiFingerprintVerifier` that pins to the given fingerprint state.
+///
+/// Convenience wrapper — loads root certs each call. For creating many clients,
+/// use `SharedTlsRoots::load()` once and call `.build_config()` per client.
 pub fn build_rustls_config_with_verifier(
     state: Arc<RwLock<FingerprintState>>,
 ) -> rustls::ClientConfig {
-    let mut root_store = rustls::RootCertStore::empty();
-    let native = rustls_native_certs::load_native_certs();
-    for err in &native.errors {
-        tracing::warn!("error loading native root cert: {err}");
-    }
-    for cert in native.certs {
-        root_store.add(cert).ok();
-    }
-
-    let provider = rustls::crypto::aws_lc_rs::default_provider();
-
-    let default_verifier = rustls::client::WebPkiServerVerifier::builder_with_provider(
-        Arc::new(root_store),
-        Arc::new(provider.clone()),
-    )
-    .build()
-    .expect("failed to build WebPKI verifier");
-
-    let verifier = SpkiFingerprintVerifier::new(default_verifier, state);
-
-    let mut config = rustls::ClientConfig::builder_with_provider(Arc::new(provider))
-        .with_safe_default_protocol_versions()
-        .expect("failed to set protocol versions")
-        .dangerous()
-        .with_custom_certificate_verifier(Arc::new(verifier))
-        .with_no_client_auth();
-
-    // reqwest negotiates ALPN; without this, HTTP/2 and HTTP/1.1 won't work
-    config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
-    config
+    SharedTlsRoots::load().build_config(state)
 }
 
 #[cfg(test)]

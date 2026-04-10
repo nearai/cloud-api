@@ -1204,6 +1204,7 @@ impl InferenceProviderPool {
         &self,
         model: &str,
         body: bytes::Bytes,
+        extra: std::collections::HashMap<String, serde_json::Value>,
     ) -> Result<bytes::Bytes, inference_providers::EmbeddingError> {
         tracing::debug!(model = %model, "Starting embeddings request");
 
@@ -1220,7 +1221,7 @@ impl InferenceProviderPool {
         // Try with each provider (with fallback)
         let mut last_error = None;
         for provider in providers {
-            match provider.embeddings_raw(body.clone()).await {
+            match provider.embeddings_raw(body.clone(), extra.clone()).await {
                 Ok(response) => {
                     tracing::info!(model = %model, "Embeddings completed successfully");
                     return Ok(response);

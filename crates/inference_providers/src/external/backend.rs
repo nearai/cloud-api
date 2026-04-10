@@ -177,6 +177,7 @@ pub trait ExternalBackend: Send + Sync {
         &self,
         _config: &BackendConfig,
         _body: bytes::Bytes,
+        _extra: std::collections::HashMap<String, serde_json::Value>,
     ) -> Result<bytes::Bytes, EmbeddingError> {
         Err(EmbeddingError::RequestFailed(format!(
             "Embeddings are not supported by the {} backend.",

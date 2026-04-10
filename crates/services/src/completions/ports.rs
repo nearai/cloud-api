@@ -167,6 +167,7 @@ pub trait CompletionServiceTrait: Send + Sync {
         model_id: Uuid,
         model_name: &str,
         body: bytes::Bytes,
+        extra: std::collections::HashMap<String, serde_json::Value>,
     ) -> Result<bytes::Bytes, CompletionError>;
 
     /// Execute a score request with proper concurrent request limiting.

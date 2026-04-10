@@ -1,6 +1,6 @@
 mod prefix_router;
 
-use crate::spki_verifier::FingerprintState;
+use crate::spki_verifier::{FingerprintState, SharedTlsRoots};
 use crate::{
     models::StreamOptions, spki_verifier, sse_parser::new_sse_parser, ImageEditError,
     ImageGenerationError, RerankError, ScoreError, *,
@@ -104,11 +104,12 @@ impl VLlmProvider {
         config: VLlmConfig,
         fingerprint_state: Arc<std::sync::RwLock<FingerprintState>>,
     ) -> Self {
+        // Load root certs once, share across all clients (~150KB instead of N×150KB)
+        let tls_roots = SharedTlsRoots::load();
+
         // General-purpose client for non-completion requests
-        let tls_config =
-            spki_verifier::build_rustls_config_with_verifier(fingerprint_state.clone());
         let client = Client::builder()
-            .use_preconfigured_tls(tls_config)
+            .use_preconfigured_tls(tls_roots.build_config(fingerprint_state.clone()))
             .connect_timeout(Duration::from_secs(5))
             .pool_idle_timeout(Duration::from_secs(90))
             .read_timeout(Duration::from_secs(300))
@@ -125,10 +126,8 @@ impl VLlmProvider {
         // With HTTP/2, concurrent requests multiplex on the same connection.
         let bucket_clients: Vec<Client> = (0..num_buckets)
             .map(|_| {
-                let tls_config =
-                    spki_verifier::build_rustls_config_with_verifier(fingerprint_state.clone());
                 Client::builder()
-                    .use_preconfigured_tls(tls_config)
+                    .use_preconfigured_tls(tls_roots.build_config(fingerprint_state.clone()))
                     .pool_max_idle_per_host(1)
                     .connect_timeout(Duration::from_secs(5))
                     .pool_idle_timeout(Duration::from_secs(300))

@@ -356,8 +356,12 @@ impl InferenceProvider for ExternalProvider {
             .await
     }
 
-    async fn embeddings_raw(&self, body: bytes::Bytes) -> Result<bytes::Bytes, EmbeddingError> {
-        self.backend.embeddings_raw(&self.config, body).await
+    async fn embeddings_raw(
+        &self,
+        body: bytes::Bytes,
+        extra: std::collections::HashMap<String, serde_json::Value>,
+    ) -> Result<bytes::Bytes, EmbeddingError> {
+        self.backend.embeddings_raw(&self.config, body, extra).await
     }
 }
 

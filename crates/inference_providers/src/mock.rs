@@ -1053,7 +1053,11 @@ impl crate::InferenceProvider for MockProvider {
         Ok(response)
     }
 
-    async fn embeddings_raw(&self, _body: bytes::Bytes) -> Result<bytes::Bytes, EmbeddingError> {
+    async fn embeddings_raw(
+        &self,
+        _body: bytes::Bytes,
+        _extra: std::collections::HashMap<String, serde_json::Value>,
+    ) -> Result<bytes::Bytes, EmbeddingError> {
         let embedding: Vec<f64> = vec![0.0; 384];
         let response_json = serde_json::json!({
             "object": "list",

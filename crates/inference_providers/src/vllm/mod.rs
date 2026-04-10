@@ -666,7 +666,7 @@ impl InferenceProvider for VLlmProvider {
 
     async fn audio_transcription(
         &self,
-        params: AudioTranscriptionParams,
+        mut params: AudioTranscriptionParams,
         request_hash: String,
     ) -> Result<AudioTranscriptionResponse, AudioTranscriptionError> {
         let url = format!("{}/v1/audio/transcriptions", self.config.base_url);
@@ -705,6 +705,8 @@ impl InferenceProvider for VLlmProvider {
         let mut headers = self
             .build_headers()
             .map_err(|e| AudioTranscriptionError::TranscriptionError(e.to_string()))?;
+        // Forward encryption headers from extra to HTTP headers
+        self.prepare_encryption_headers(&mut headers, &mut params.extra);
         // Remove Content-Type header - reqwest will set it automatically for multipart
         headers.remove("Content-Type");
         headers.insert(
@@ -862,12 +864,13 @@ impl InferenceProvider for VLlmProvider {
     /// Performs a document reranking request
     async fn score(
         &self,
-        params: ScoreParams,
+        mut params: ScoreParams,
         request_hash: String,
     ) -> Result<ScoreResponse, ScoreError> {
         let url = format!("{}/v1/score", self.config.base_url);
 
         let mut headers = self.build_headers().map_err(to_score_error)?;
+        self.prepare_encryption_headers(&mut headers, &mut params.extra);
         headers.insert(
             "X-Request-Hash",
             reqwest::header::HeaderValue::from_str(&request_hash).map_err(to_score_error)?,
@@ -901,10 +904,11 @@ impl InferenceProvider for VLlmProvider {
         Ok(score_response)
     }
 
-    async fn rerank(&self, params: RerankParams) -> Result<RerankResponse, RerankError> {
+    async fn rerank(&self, mut params: RerankParams) -> Result<RerankResponse, RerankError> {
         let url = format!("{}/v1/rerank", self.config.base_url);
 
-        let headers = self.build_headers().map_err(to_rerank_error)?;
+        let mut headers = self.build_headers().map_err(to_rerank_error)?;
+        self.prepare_encryption_headers(&mut headers, &mut params.extra);
 
         let response = self
             .client
@@ -934,10 +938,15 @@ impl InferenceProvider for VLlmProvider {
         Ok(rerank_response)
     }
 
-    async fn embeddings_raw(&self, body: bytes::Bytes) -> Result<bytes::Bytes, EmbeddingError> {
+    async fn embeddings_raw(
+        &self,
+        body: bytes::Bytes,
+        mut extra: std::collections::HashMap<String, serde_json::Value>,
+    ) -> Result<bytes::Bytes, EmbeddingError> {
         let url = format!("{}/v1/embeddings", self.config.base_url);
 
-        let headers = self.build_headers().map_err(to_embedding_error)?;
+        let mut headers = self.build_headers().map_err(to_embedding_error)?;
+        self.prepare_encryption_headers(&mut headers, &mut extra);
 
         let response = self
             .client

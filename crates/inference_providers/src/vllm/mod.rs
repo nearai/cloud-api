@@ -2,8 +2,8 @@ mod prefix_router;
 
 use crate::spki_verifier::{FingerprintState, SharedTlsRoots};
 use crate::{
-    models::StreamOptions, spki_verifier, sse_parser::new_sse_parser, ImageEditError,
-    ImageGenerationError, RerankError, ScoreError, *,
+    models::StreamOptions, sse_parser::new_sse_parser, ImageEditError, ImageGenerationError,
+    RerankError, ScoreError, *,
 };
 use async_trait::async_trait;
 use prefix_router::PrefixRouter;

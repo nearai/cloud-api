@@ -16,7 +16,6 @@ Usage:
     MODEL=glm-4-0520 python3 scripts/eval_prefix_cache.py
 """
 
-import json
 import os
 import time
 import sys

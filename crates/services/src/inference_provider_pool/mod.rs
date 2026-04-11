@@ -1540,7 +1540,61 @@ impl InferenceProviderPool {
         let mut pub_key_updates: Vec<(String, Arc<InferenceProviderTrait>)> = Vec::new();
         let mut new_url_cache: HashMap<String, Arc<InferenceProviderTrait>> = HashMap::new();
 
-        // Reused providers (URL unchanged — keep warm TLS connections)
+        // Reused providers (URL unchanged — keep warm TLS connections).
+        // Check if any reused provider is missing pubkey mappings and re-fetch if so.
+        // This can happen when the initial pubkey fetch failed (e.g., transient network
+        // error during startup) — since reused providers skip pubkey discovery, the keys
+        // would be permanently lost without this recovery path.
+        {
+            let mappings = self.provider_mappings.read().await;
+            let mut needs_pubkey_refetch: Vec<(String, String, Arc<InferenceProviderTrait>)> =
+                Vec::new();
+            for (model_name, url, provider) in &reused {
+                let ptr = Arc::as_ptr(provider) as *const () as usize;
+                let has_pubkey = mappings.pubkey_to_providers.values().any(|providers| {
+                    providers
+                        .iter()
+                        .any(|p| Arc::as_ptr(p) as *const () as usize == ptr)
+                });
+                if !has_pubkey {
+                    needs_pubkey_refetch.push((model_name.clone(), url.clone(), provider.clone()));
+                }
+            }
+            drop(mappings);
+
+            if !needs_pubkey_refetch.is_empty() {
+                warn!(
+                    count = needs_pubkey_refetch.len(),
+                    models = ?needs_pubkey_refetch.iter().map(|(m, _, _)| m.as_str()).collect::<Vec<_>>(),
+                    "Reused providers missing pubkey mappings — re-fetching signing keys"
+                );
+                for (model_name, url, provider) in &needs_pubkey_refetch {
+                    let (keys, _, _) = Self::fetch_signing_public_keys_for_both_algorithms(
+                        provider, model_name, url,
+                    )
+                    .await;
+                    let keys: Vec<(String, Arc<InferenceProviderTrait>)> = keys
+                        .into_iter()
+                        .map(|(k, _)| (k, provider.clone()))
+                        .collect();
+                    if keys.is_empty() {
+                        warn!(
+                            model = %model_name,
+                            url = %url,
+                            "Failed to re-fetch signing keys for reused provider"
+                        );
+                    } else {
+                        info!(
+                            model = %model_name,
+                            pub_keys = keys.len(),
+                            "Re-fetched signing keys for reused provider"
+                        );
+                        pub_key_updates.extend(keys);
+                    }
+                }
+            }
+        }
+
         for (model_name, url, provider) in &reused {
             model_providers
                 .entry(model_name.clone())

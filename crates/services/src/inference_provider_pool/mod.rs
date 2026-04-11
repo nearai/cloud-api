@@ -1547,20 +1547,25 @@ impl InferenceProviderPool {
         // would be permanently lost without this recovery path.
         {
             let mappings = self.provider_mappings.read().await;
-            let mut needs_pubkey_refetch: Vec<(String, String, Arc<InferenceProviderTrait>)> =
-                Vec::new();
+            // Build a set of all provider pointers currently in pubkey mappings (O(N+M)
+            // instead of scanning all values per reused provider).
+            let mut known_ptrs: std::collections::HashSet<usize> = mappings
+                .pubkey_to_providers
+                .values()
+                .flatten()
+                .map(|p| Arc::as_ptr(p) as *const () as usize)
+                .collect();
+            drop(mappings);
+
+            let mut needs_pubkey_refetch = Vec::new();
             for (model_name, url, provider) in &reused {
                 let ptr = Arc::as_ptr(provider) as *const () as usize;
-                let has_pubkey = mappings.pubkey_to_providers.values().any(|providers| {
-                    providers
-                        .iter()
-                        .any(|p| Arc::as_ptr(p) as *const () as usize == ptr)
-                });
-                if !has_pubkey {
+                // insert() returns true only if the pointer was NOT already present,
+                // which also deduplicates when multiple models share a provider.
+                if known_ptrs.insert(ptr) {
                     needs_pubkey_refetch.push((model_name.clone(), url.clone(), provider.clone()));
                 }
             }
-            drop(mappings);
 
             if !needs_pubkey_refetch.is_empty() {
                 warn!(
@@ -1573,10 +1578,6 @@ impl InferenceProviderPool {
                         provider, model_name, url,
                     )
                     .await;
-                    let keys: Vec<(String, Arc<InferenceProviderTrait>)> = keys
-                        .into_iter()
-                        .map(|(k, _)| (k, provider.clone()))
-                        .collect();
                     if keys.is_empty() {
                         warn!(
                             model = %model_name,

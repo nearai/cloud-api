@@ -43,6 +43,8 @@ mod encryption_headers {
     pub const MODEL_PUB_KEY: &str = "x_model_pub_key";
     /// Key for encryption version (x-encryption-version header)
     pub const ENCRYPTION_VERSION: &str = "x_encryption_version";
+    /// Key for full field encryption opt-in (x-encrypt-all-fields header)
+    pub const ENCRYPT_ALL_FIELDS: &str = "x_encrypt_all_fields";
 }
 
 /// Configuration for vLLM provider
@@ -238,6 +240,17 @@ impl VLlmProvider {
         {
             if let Ok(value) = HeaderValue::from_str(version) {
                 headers.insert("X-Encryption-Version", value);
+            }
+        }
+
+        // Extract and forward x_encrypt_all_fields as HTTP header, then remove from extra
+        if let Some(val) = extra
+            .remove(encryption_headers::ENCRYPT_ALL_FIELDS)
+            .as_ref()
+            .and_then(|v| v.as_str())
+        {
+            if let Ok(value) = HeaderValue::from_str(val) {
+                headers.insert("X-Encrypt-All-Fields", value);
             }
         }
     }

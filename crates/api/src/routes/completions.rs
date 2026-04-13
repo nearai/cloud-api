@@ -54,6 +54,12 @@ fn insert_encryption_headers(
             serde_json::Value::String(encryption_version.clone()),
         );
     }
+    if let Some(ref encrypt_all_fields) = encryption_headers.encrypt_all_fields {
+        extra.insert(
+            service_encryption_headers::ENCRYPT_ALL_FIELDS.to_string(),
+            serde_json::Value::String(encrypt_all_fields.clone()),
+        );
+    }
 }
 
 // Custom header for exposing the inference ID as a UUID

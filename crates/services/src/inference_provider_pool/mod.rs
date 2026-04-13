@@ -1540,7 +1540,62 @@ impl InferenceProviderPool {
         let mut pub_key_updates: Vec<(String, Arc<InferenceProviderTrait>)> = Vec::new();
         let mut new_url_cache: HashMap<String, Arc<InferenceProviderTrait>> = HashMap::new();
 
-        // Reused providers (URL unchanged — keep warm TLS connections)
+        // Reused providers (URL unchanged — keep warm TLS connections).
+        // Check if any reused provider is missing pubkey mappings and re-fetch if so.
+        // This can happen when the initial pubkey fetch failed (e.g., transient network
+        // error during startup) — since reused providers skip pubkey discovery, the keys
+        // would be permanently lost without this recovery path.
+        {
+            let mappings = self.provider_mappings.read().await;
+            // Build a set of all provider pointers currently in pubkey mappings (O(N+M)
+            // instead of scanning all values per reused provider).
+            let mut known_ptrs: std::collections::HashSet<usize> = mappings
+                .pubkey_to_providers
+                .values()
+                .flatten()
+                .map(|p| Arc::as_ptr(p) as *const () as usize)
+                .collect();
+            drop(mappings);
+
+            let mut needs_pubkey_refetch = Vec::new();
+            for (model_name, url, provider) in &reused {
+                let ptr = Arc::as_ptr(provider) as *const () as usize;
+                // insert() returns true only if the pointer was NOT already present,
+                // which also deduplicates when multiple models share a provider.
+                if known_ptrs.insert(ptr) {
+                    needs_pubkey_refetch.push((model_name.clone(), url.clone(), provider.clone()));
+                }
+            }
+
+            if !needs_pubkey_refetch.is_empty() {
+                warn!(
+                    count = needs_pubkey_refetch.len(),
+                    models = ?needs_pubkey_refetch.iter().map(|(m, _, _)| m.as_str()).collect::<Vec<_>>(),
+                    "Reused providers missing pubkey mappings — re-fetching signing keys"
+                );
+                for (model_name, url, provider) in &needs_pubkey_refetch {
+                    let (keys, _, _) = Self::fetch_signing_public_keys_for_both_algorithms(
+                        provider, model_name, url,
+                    )
+                    .await;
+                    if keys.is_empty() {
+                        warn!(
+                            model = %model_name,
+                            url = %url,
+                            "Failed to re-fetch signing keys for reused provider"
+                        );
+                    } else {
+                        info!(
+                            model = %model_name,
+                            pub_keys = keys.len(),
+                            "Re-fetched signing keys for reused provider"
+                        );
+                        pub_key_updates.extend(keys);
+                    }
+                }
+            }
+        }
+
         for (model_name, url, provider) in &reused {
             model_providers
                 .entry(model_name.clone())
@@ -2231,6 +2286,79 @@ mod tests {
                 "ECDSA key should be PRESERVED for reused providers after refresh"
             );
         }
+    }
+
+    /// Verify that the self-healing recovery path re-fetches pubkeys for reused
+    /// providers that are missing from pubkey_to_providers.
+    ///
+    /// Regression test: if the initial pubkey fetch failed during provider creation
+    /// (transient network error), the provider was cached in inference_url_providers
+    /// but had no pubkey mappings. Subsequent refreshes reused the provider and never
+    /// retried the pubkey fetch, leaving E2EE permanently broken for that model.
+    #[tokio::test]
+    async fn test_reused_provider_missing_pubkeys_are_refetched() {
+        use inference_providers::mock::MockProvider;
+
+        let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
+        let model_id = "test-model".to_string();
+
+        // Register a provider with known pubkeys
+        let mock_provider = Arc::new(MockProvider::new());
+        pool.register_provider(model_id.clone(), mock_provider.clone())
+            .await;
+
+        let ecdsa_key = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+        // Verify pubkeys exist after registration
+        {
+            let mappings = pool.provider_mappings.read().await;
+            assert!(
+                mappings.pubkey_to_providers.contains_key(ecdsa_key),
+                "ECDSA key should exist after registration"
+            );
+        }
+
+        // Simulate the bug: clear pubkey mappings (as if initial fetch failed)
+        {
+            let mut mappings = pool.provider_mappings.write().await;
+            mappings.pubkey_to_providers.clear();
+        }
+
+        // Seed the URL cache so the provider is "reused" on next load
+        let url = "https://test.completions.near.ai".to_string();
+        {
+            let mut cache = pool.inference_url_providers.write().await;
+            cache.insert(
+                url.clone(),
+                mock_provider.clone() as Arc<InferenceProviderTrait>,
+            );
+        }
+
+        // Call load_inference_url_models — the provider should be reused and
+        // the self-healing path should detect missing pubkeys and re-fetch them.
+        pool.load_inference_url_models(vec![(model_id.clone(), url)])
+            .await;
+
+        // Verify pubkeys were recovered
+        {
+            let mappings = pool.provider_mappings.read().await;
+            assert!(
+                mappings.pubkey_to_providers.contains_key(ecdsa_key),
+                "ECDSA key should be RECOVERED after refresh via self-healing path"
+            );
+        }
+
+        // Verify E2EE routing works
+        let result: Result<((), _), _> = pool
+            .retry_with_fallback(&model_id, "test_op", Some(ecdsa_key), |_provider| async {
+                Ok(())
+            })
+            .await;
+        assert!(
+            result.is_ok(),
+            "E2EE routing should work after pubkey recovery, got: {:?}",
+            result.err()
+        );
     }
 
     /// Test that E2EE routing via pubkey works end-to-end after register_provider.

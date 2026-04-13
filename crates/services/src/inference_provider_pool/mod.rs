@@ -2288,6 +2288,79 @@ mod tests {
         }
     }
 
+    /// Verify that the self-healing recovery path re-fetches pubkeys for reused
+    /// providers that are missing from pubkey_to_providers.
+    ///
+    /// Regression test: if the initial pubkey fetch failed during provider creation
+    /// (transient network error), the provider was cached in inference_url_providers
+    /// but had no pubkey mappings. Subsequent refreshes reused the provider and never
+    /// retried the pubkey fetch, leaving E2EE permanently broken for that model.
+    #[tokio::test]
+    async fn test_reused_provider_missing_pubkeys_are_refetched() {
+        use inference_providers::mock::MockProvider;
+
+        let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
+        let model_id = "test-model".to_string();
+
+        // Register a provider with known pubkeys
+        let mock_provider = Arc::new(MockProvider::new());
+        pool.register_provider(model_id.clone(), mock_provider.clone())
+            .await;
+
+        let ecdsa_key = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+        // Verify pubkeys exist after registration
+        {
+            let mappings = pool.provider_mappings.read().await;
+            assert!(
+                mappings.pubkey_to_providers.contains_key(ecdsa_key),
+                "ECDSA key should exist after registration"
+            );
+        }
+
+        // Simulate the bug: clear pubkey mappings (as if initial fetch failed)
+        {
+            let mut mappings = pool.provider_mappings.write().await;
+            mappings.pubkey_to_providers.clear();
+        }
+
+        // Seed the URL cache so the provider is "reused" on next load
+        let url = "https://test.completions.near.ai".to_string();
+        {
+            let mut cache = pool.inference_url_providers.write().await;
+            cache.insert(
+                url.clone(),
+                mock_provider.clone() as Arc<InferenceProviderTrait>,
+            );
+        }
+
+        // Call load_inference_url_models — the provider should be reused and
+        // the self-healing path should detect missing pubkeys and re-fetch them.
+        pool.load_inference_url_models(vec![(model_id.clone(), url)])
+            .await;
+
+        // Verify pubkeys were recovered
+        {
+            let mappings = pool.provider_mappings.read().await;
+            assert!(
+                mappings.pubkey_to_providers.contains_key(ecdsa_key),
+                "ECDSA key should be RECOVERED after refresh via self-healing path"
+            );
+        }
+
+        // Verify E2EE routing works
+        let result: Result<((), _), _> = pool
+            .retry_with_fallback(&model_id, "test_op", Some(ecdsa_key), |_provider| async {
+                Ok(())
+            })
+            .await;
+        assert!(
+            result.is_ok(),
+            "E2EE routing should work after pubkey recovery, got: {:?}",
+            result.err()
+        );
+    }
+
     /// Test that E2EE routing via pubkey works end-to-end after register_provider.
     /// This exercises: register_provider → fetch attestation → store pubkey → route by pubkey.
     #[tokio::test]

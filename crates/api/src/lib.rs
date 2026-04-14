@@ -1,6 +1,5 @@
 pub mod consts;
 pub mod conversions;
-pub mod credit_event_adapter;
 pub mod middleware;
 pub mod models;
 pub mod openapi;
@@ -1275,20 +1274,15 @@ pub fn build_credit_event_routes(
     organization_service: Arc<dyn services::organization::OrganizationServiceTrait + Send + Sync>,
     workspace_service: Arc<dyn services::workspace::WorkspaceServiceTrait + Send + Sync>,
 ) -> Router {
-    use crate::credit_event_adapter::LimitsRepositoryAdapter;
-    use services::credit_events::ports::{CreditEventRepositoryTrait, CreditsLimitsRepository};
+    use services::credit_events::ports::CreditEventRepositoryTrait;
     use services::credit_events::CreditEventServiceImpl;
 
     let credit_event_repo: Arc<dyn CreditEventRepositoryTrait> = Arc::new(
         database::repositories::CreditEventRepository::new(database.pool().clone()),
     );
-    let limits_repo: Arc<dyn CreditsLimitsRepository> = Arc::new(LimitsRepositoryAdapter::new(
-        database::repositories::OrganizationLimitsRepository::new(database.pool().clone()),
-    ));
 
     let credit_event_service = Arc::new(CreditEventServiceImpl::new(
         credit_event_repo as Arc<dyn CreditEventRepositoryTrait>,
-        limits_repo,
         auth_service,
         organization_service,
         workspace_service,

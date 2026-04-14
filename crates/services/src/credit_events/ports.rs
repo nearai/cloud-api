@@ -95,6 +95,19 @@ pub struct CreditClaimData {
 // ============================================
 
 #[derive(Debug, Clone)]
+pub struct CreditAdditionParams {
+    pub spend_limit: i64,
+    pub credit_type: String,
+    pub source: Option<String>,
+    pub currency: String,
+    pub credit_expires_at: Option<DateTime<Utc>>,
+    pub changed_by: Option<String>,
+    pub change_reason: Option<String>,
+    pub changed_by_user_id: Option<Uuid>,
+    pub changed_by_user_email: Option<String>,
+}
+
+#[derive(Debug, Clone)]
 pub struct CreateEventRequest {
     pub name: String,
     pub description: Option<String>,
@@ -186,7 +199,6 @@ pub trait CreditEventRepositoryTrait: Send + Sync {
     async fn generate_codes(
         &self,
         event_id: Uuid,
-        count: i32,
         codes: Vec<String>,
     ) -> Result<Vec<CreditEventCodeData>, CreditEventError>;
     async fn get_codes_for_event(
@@ -205,31 +217,8 @@ pub trait CreditEventRepositoryTrait: Send + Sync {
         user_id: Uuid,
         near_account_id: &str,
         organization_id: Uuid,
-        organization_limit_id: Option<Uuid>,
+        credits: CreditAdditionParams,
     ) -> Result<CreditClaimData, CreditEventError>;
-}
-
-// ============================================
-// Limits Repository Extension (for adding credits)
-// ============================================
-
-#[derive(Debug, Clone)]
-pub struct AddCreditsRequest {
-    pub organization_id: Uuid,
-    pub spend_limit: i64,
-    pub credit_type: String,
-    pub source: Option<String>,
-    pub currency: String,
-    pub credit_expires_at: Option<DateTime<Utc>>,
-    pub changed_by: Option<String>,
-    pub change_reason: Option<String>,
-    pub changed_by_user_id: Option<Uuid>,
-    pub changed_by_user_email: Option<String>,
-}
-
-#[async_trait::async_trait]
-pub trait CreditsLimitsRepository: Send + Sync {
-    async fn add_credits(&self, request: AddCreditsRequest) -> Result<Uuid, CreditEventError>;
 }
 
 // ============================================

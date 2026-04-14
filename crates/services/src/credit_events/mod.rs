@@ -51,7 +51,6 @@ fn code_to_info(code: &CreditEventCodeData) -> CreditEventCodeInfo {
 
 pub struct CreditEventServiceImpl {
     credit_event_repo: Arc<dyn CreditEventRepositoryTrait>,
-    limits_repo: Arc<dyn CreditsLimitsRepository>,
     auth_service: Arc<dyn AuthServiceTrait>,
     organization_service: Arc<dyn OrganizationServiceTrait + Send + Sync>,
     workspace_service: Arc<dyn WorkspaceServiceTrait + Send + Sync>,
@@ -60,14 +59,12 @@ pub struct CreditEventServiceImpl {
 impl CreditEventServiceImpl {
     pub fn new(
         credit_event_repo: Arc<dyn CreditEventRepositoryTrait>,
-        limits_repo: Arc<dyn CreditsLimitsRepository>,
         auth_service: Arc<dyn AuthServiceTrait>,
         organization_service: Arc<dyn OrganizationServiceTrait + Send + Sync>,
         workspace_service: Arc<dyn WorkspaceServiceTrait + Send + Sync>,
     ) -> Self {
         Self {
             credit_event_repo,
-            limits_repo,
             auth_service,
             organization_service,
             workspace_service,
@@ -165,7 +162,7 @@ impl CreditEventServiceTrait for CreditEventServiceImpl {
         let codes_clone = codes.clone();
 
         self.credit_event_repo
-            .generate_codes(request.event_id, request.count, codes_clone)
+            .generate_codes(request.event_id, codes_clone)
             .await?;
 
         Ok(codes)
@@ -229,7 +226,7 @@ impl CreditEventServiceTrait for CreditEventServiceImpl {
             .await
             .map_err(|e| CreditEventError::InternalError(format!("Failed to list orgs: {e}")))?;
 
-        let (org_id, created_new) = if let Some(org) = orgs.first() {
+        let (org_id, created_new) = if let Some(org) = orgs.into_iter().min_by_key(|o| o.created_at) {
             (org.id.0, false)
         } else {
             let org_name = format!(
@@ -263,25 +260,19 @@ impl CreditEventServiceTrait for CreditEventServiceImpl {
                 })?;
         }
 
-        // 5. Add credits via organization_limits_history
-        let credit_type = format!("event:{}", request.event_id);
-        let limit_id = self
-            .limits_repo
-            .add_credits(AddCreditsRequest {
-                organization_id: org_id,
-                spend_limit: event.credit_amount,
-                credit_type,
-                source: Some("event_claim".to_string()),
-                currency: event.currency.clone(),
-                credit_expires_at: Some(event.credit_expires_at),
-                changed_by: Some("credit_event_claim".to_string()),
-                change_reason: Some(format!("Credits from event: {}", event.name)),
-                changed_by_user_id: Some(request.user_id),
-                changed_by_user_email: Some(user.email.clone()),
-            })
-            .await?;
+        // 5. Atomically claim code + add credits + increment claim count (single transaction)
+        let credits = CreditAdditionParams {
+            spend_limit: event.credit_amount,
+            credit_type: format!("event:{}", request.event_id),
+            source: Some("event_claim".to_string()),
+            currency: event.currency.clone(),
+            credit_expires_at: Some(event.credit_expires_at),
+            changed_by: Some("credit_event_claim".to_string()),
+            change_reason: Some(format!("Credits from event: {}", event.name)),
+            changed_by_user_id: Some(request.user_id),
+            changed_by_user_email: Some(user.email.clone()),
+        };
 
-        // 6. Atomically claim the code + increment claim count (single transaction)
         let claim = self
             .credit_event_repo
             .claim_code(
@@ -290,7 +281,7 @@ impl CreditEventServiceTrait for CreditEventServiceImpl {
                 request.user_id,
                 &request.near_account_id,
                 org_id,
-                Some(limit_id),
+                credits,
             )
             .await
             .map_err(|e| match e {
@@ -302,7 +293,7 @@ impl CreditEventServiceTrait for CreditEventServiceImpl {
                 other => other,
             })?;
 
-        // 7. Create API key if user doesn't have one yet
+        // 6. Create API key if user doesn't have one yet
         let org_id_typed = OrganizationId(org_id);
         let workspaces = self
             .workspace_service

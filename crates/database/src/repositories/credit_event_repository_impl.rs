@@ -1,5 +1,5 @@
 use crate::models::{CreditClaim, CreditEvent, CreditEventCode};
-use crate::repositories::CreditEventRepository;
+use crate::repositories::credit_event::{ClaimCodeCredits, CreditEventRepository};
 use services::common::RepositoryError;
 use services::credit_events::ports::*;
 
@@ -131,10 +131,9 @@ impl CreditEventRepositoryTrait for CreditEventRepository {
     async fn generate_codes(
         &self,
         event_id: uuid::Uuid,
-        count: i32,
         codes: Vec<String>,
     ) -> Result<Vec<CreditEventCodeData>, CreditEventError> {
-        self.generate_codes(event_id, count, codes)
+        self.generate_codes(event_id, codes)
             .await
             .map_err(map_error)
             .map(|v| v.iter().map(db_code_to_data).collect())
@@ -168,15 +167,26 @@ impl CreditEventRepositoryTrait for CreditEventRepository {
         user_id: uuid::Uuid,
         near_account_id: &str,
         organization_id: uuid::Uuid,
-        organization_limit_id: Option<uuid::Uuid>,
+        credits: CreditAdditionParams,
     ) -> Result<CreditClaimData, CreditEventError> {
+        let db_credits = ClaimCodeCredits {
+            spend_limit: credits.spend_limit,
+            credit_type: credits.credit_type,
+            source: credits.source,
+            currency: credits.currency,
+            credit_expires_at: credits.credit_expires_at,
+            changed_by: credits.changed_by,
+            change_reason: credits.change_reason,
+            changed_by_user_id: credits.changed_by_user_id,
+            changed_by_user_email: credits.changed_by_user_email,
+        };
         self.claim_code(
             code_id,
             event_id,
             user_id,
             near_account_id,
             organization_id,
-            organization_limit_id,
+            db_credits,
         )
         .await
         .map_err(map_error)

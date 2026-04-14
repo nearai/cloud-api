@@ -129,19 +129,41 @@ fn event_to_response(
 )]
 pub async fn create_credit_event(
     State(app_state): State<CreditEventAppState>,
-    Extension(_admin_user): Extension<AdminUser>,
+    Extension(admin_user): Extension<AdminUser>,
     ResponseJson(request): ResponseJson<CreateCreditEventRequest>,
 ) -> Result<ResponseJson<CreditEventResponse>, (StatusCode, ResponseJson<ErrorResponse>)> {
-    let starts_at = request.starts_at.as_ref().and_then(|s| {
-        chrono::DateTime::parse_from_rfc3339(s)
-            .ok()
-            .map(|dt| dt.to_utc())
-    });
-    let claim_deadline = request.claim_deadline.as_ref().and_then(|s| {
-        chrono::DateTime::parse_from_rfc3339(s)
-            .ok()
-            .map(|dt| dt.to_utc())
-    });
+    let starts_at = match request.starts_at {
+        Some(ref s) => Some(
+            chrono::DateTime::parse_from_rfc3339(s)
+                .map_err(|_| {
+                    (
+                        StatusCode::BAD_REQUEST,
+                        ResponseJson(ErrorResponse::new(
+                            "Invalid startsAt format, expected ISO 8601".to_string(),
+                            "validation_error".to_string(),
+                        )),
+                    )
+                })?
+                .to_utc(),
+        ),
+        None => None,
+    };
+    let claim_deadline = match request.claim_deadline {
+        Some(ref s) => Some(
+            chrono::DateTime::parse_from_rfc3339(s)
+                .map_err(|_| {
+                    (
+                        StatusCode::BAD_REQUEST,
+                        ResponseJson(ErrorResponse::new(
+                            "Invalid claimDeadline format, expected ISO 8601".to_string(),
+                            "validation_error".to_string(),
+                        )),
+                    )
+                })?
+                .to_utc(),
+        ),
+        None => None,
+    };
     let credit_expires_at = chrono::DateTime::parse_from_rfc3339(&request.credit_expires_at)
         .map_err(|_| {
             (
@@ -163,7 +185,7 @@ pub async fn create_credit_event(
         starts_at,
         claim_deadline,
         credit_expires_at,
-        created_by_user_id: None,
+        created_by_user_id: Some(admin_user.0.id),
     };
 
     let event = app_state

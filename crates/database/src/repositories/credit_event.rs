@@ -8,6 +8,18 @@ use services::common::RepositoryError;
 use tokio_postgres::Row;
 use uuid::Uuid;
 
+pub struct ClaimCodeCredits {
+    pub spend_limit: i64,
+    pub credit_type: String,
+    pub source: Option<String>,
+    pub currency: String,
+    pub credit_expires_at: Option<chrono::DateTime<Utc>>,
+    pub changed_by: Option<String>,
+    pub change_reason: Option<String>,
+    pub changed_by_user_id: Option<Uuid>,
+    pub changed_by_user_email: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct CreditEventRepository {
     pool: DbPool,
@@ -156,7 +168,6 @@ impl CreditEventRepository {
     pub async fn generate_codes(
         &self,
         event_id: Uuid,
-        _count: i32,
         codes: Vec<String>,
     ) -> Result<Vec<CreditEventCode>> {
         let rows = retry_db!("generate_credit_event_codes", {
@@ -180,23 +191,19 @@ impl CreditEventRepository {
                 )));
             }
 
-            let mut result_rows = Vec::new();
-            for code in &codes {
-                let row = transaction
-                    .query_one(
-                        r#"
-                        INSERT INTO credit_event_codes (credit_event_id, code)
-                        VALUES ($1, $2)
-                        RETURNING id, credit_event_id, code, is_claimed,
-                                  claimed_by_user_id, claimed_by_near_account_id,
-                                  claimed_at, created_at
-                        "#,
-                        &[&event_id, &code],
-                    )
-                    .await
-                    .map_err(map_db_error)?;
-                result_rows.push(row);
-            }
+            let result_rows = transaction
+                .query(
+                    r#"
+                    INSERT INTO credit_event_codes (credit_event_id, code)
+                    SELECT $1, unnest($2::text[])
+                    RETURNING id, credit_event_id, code, is_claimed,
+                              claimed_by_user_id, claimed_by_near_account_id,
+                              claimed_at, created_at
+                    "#,
+                    &[&event_id, &codes],
+                )
+                .await
+                .map_err(map_db_error)?;
 
             transaction.commit().await.map_err(map_db_error)?;
 
@@ -271,9 +278,9 @@ impl CreditEventRepository {
         Ok(result.map(|row| self.row_to_credit_event_code(&row)))
     }
 
-    /// Atomically claim a promo code and increment the event's claim count
-    /// within a single transaction. Returns appropriate errors if the code
-    /// is already claimed or max_claims has been reached.
+    /// Atomically claim a promo code, add credits, and increment the event's
+    /// claim count within a single transaction. Returns appropriate errors
+    /// if the code is already claimed or max_claims has been reached.
     pub async fn claim_code(
         &self,
         code_id: Uuid,
@@ -281,7 +288,7 @@ impl CreditEventRepository {
         user_id: Uuid,
         near_account_id: &str,
         organization_id: Uuid,
-        organization_limit_id: Option<Uuid>,
+        credits: ClaimCodeCredits,
     ) -> Result<CreditClaim> {
         let row = retry_db!("claim_credit_event_code", {
             let mut client = self
@@ -293,7 +300,57 @@ impl CreditEventRepository {
 
             let transaction = client.transaction().await.map_err(map_db_error)?;
 
-            // Step 1: Atomically increment claim_count, enforcing max_claims
+            // Step 1: Close any existing active limits of the same credit_type
+            transaction
+                .execute(
+                    r#"
+                    UPDATE organization_limits_history
+                    SET effective_until = NOW()
+                    WHERE organization_id = $1 AND credit_type = $2 AND effective_until IS NULL
+                    "#,
+                    &[&organization_id, &credits.credit_type],
+                )
+                .await
+                .map_err(map_db_error)?;
+
+            // Step 2: Insert new credit limit and capture the limit_id
+            let limit_row = transaction
+                .query_one(
+                    r#"
+                    INSERT INTO organization_limits_history (
+                        organization_id,
+                        spend_limit,
+                        credit_type,
+                        source,
+                        currency,
+                        credit_expires_at,
+                        effective_from,
+                        changed_by,
+                        change_reason,
+                        changed_by_user_id,
+                        changed_by_user_email
+                    ) VALUES ($1, $2, $3, $4, $5, $6, NOW(), $7, $8, $9, $10)
+                    RETURNING id
+                    "#,
+                    &[
+                        &organization_id,
+                        &credits.spend_limit,
+                        &credits.credit_type,
+                        &credits.source,
+                        &credits.currency,
+                        &credits.credit_expires_at,
+                        &credits.changed_by,
+                        &credits.change_reason,
+                        &credits.changed_by_user_id,
+                        &credits.changed_by_user_email,
+                    ],
+                )
+                .await
+                .map_err(map_db_error)?;
+
+            let limit_id: Uuid = limit_row.get("id");
+
+            // Step 3: Atomically increment claim_count, enforcing max_claims
             let incremented = transaction
                 .execute(
                     r#"
@@ -313,7 +370,7 @@ impl CreditEventRepository {
                 ));
             }
 
-            // Step 2: Mark code as claimed (fails if already claimed)
+            // Step 4: Mark code as claimed (fails if already claimed)
             let code_row = transaction
                 .query_opt(
                     r#"
@@ -336,7 +393,7 @@ impl CreditEventRepository {
                 return Err(RepositoryError::AlreadyExists);
             }
 
-            // Step 3: Insert claim record
+            // Step 5: Insert claim record
             let claim_row = transaction
                 .query_one(
                     r#"
@@ -353,7 +410,7 @@ impl CreditEventRepository {
                         &near_account_id,
                         &user_id,
                         &organization_id,
-                        &organization_limit_id,
+                        &Some(limit_id),
                     ],
                 )
                 .await

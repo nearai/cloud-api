@@ -35,6 +35,7 @@ headers = "0.4"
 # OpenAPI documentation generation
 utoipa = { version = "5", features = ["axum_extras", "chrono", "uuid"] }
 thiserror = "2.0"
+async-trait = "0.1"
 # Body hashing middleware dependencies
 sha2 = "0.10"
 hex = "0.4"

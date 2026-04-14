@@ -195,6 +195,7 @@ impl AdminRepository for AdminCompositeRepository {
             credit_type: limits.credit_type,
             source: limits.source,
             currency: limits.currency,
+            credit_expires_at: limits.credit_expires_at,
             changed_by: limits.changed_by,
             change_reason: limits.change_reason,
             changed_by_user_id: limits.changed_by_user_id,
@@ -212,6 +213,7 @@ impl AdminRepository for AdminCompositeRepository {
             credit_type: history.credit_type,
             source: history.source,
             currency: history.currency,
+            credit_expires_at: history.credit_expires_at,
             effective_from: history.effective_from,
         })
     }
@@ -230,6 +232,7 @@ impl AdminRepository for AdminCompositeRepository {
                 credit_type: h.credit_type,
                 source: h.source,
                 currency: h.currency,
+                credit_expires_at: h.credit_expires_at,
                 effective_from: h.effective_from,
             })
             .collect())
@@ -259,6 +262,7 @@ impl AdminRepository for AdminCompositeRepository {
                 credit_type: h.credit_type,
                 source: h.source,
                 currency: h.currency,
+                credit_expires_at: h.credit_expires_at,
                 effective_from: h.effective_from,
                 effective_until: h.effective_until,
                 changed_by: h.changed_by,

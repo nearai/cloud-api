@@ -2955,6 +2955,9 @@ pub struct UpdateOrganizationLimitsRequest {
     pub source: Option<String>,
     #[serde(rename = "spendLimit")]
     pub spend_limit: SpendLimitRequest,
+    /// When set, this credit grant expires at this time. ISO 8601 format.
+    #[serde(rename = "creditExpiresAt", skip_serializing_if = "Option::is_none")]
+    pub credit_expires_at: Option<String>,
     #[serde(rename = "changedBy", skip_serializing_if = "Option::is_none")]
     pub changed_by: Option<String>,
     #[serde(rename = "changeReason", skip_serializing_if = "Option::is_none")]
@@ -3002,6 +3005,9 @@ pub struct UpdateOrganizationLimitsResponse {
     pub source: Option<String>,
     #[serde(rename = "spendLimit")]
     pub spend_limit: SpendLimit,
+    /// When set, this credit grant expires at this time
+    #[serde(rename = "creditExpiresAt", skip_serializing_if = "Option::is_none")]
+    pub credit_expires_at: Option<String>,
     pub updated_at: String,
 }
 
@@ -3017,6 +3023,9 @@ pub struct OrgLimitsHistoryEntry {
     pub source: Option<String>,
     #[serde(rename = "spendLimit")]
     pub spend_limit: SpendLimit,
+    /// When set, this credit grant expires at this time
+    #[serde(rename = "creditExpiresAt", skip_serializing_if = "Option::is_none")]
+    pub credit_expires_at: Option<String>,
     #[serde(rename = "effectiveFrom")]
     pub effective_from: String,
     #[serde(rename = "effectiveUntil")]
@@ -3587,4 +3596,114 @@ pub struct ScoreUsage {
     /// Prompt tokens details
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prompt_tokens_details: Option<serde_json::Value>,
+}
+
+// ============================================
+// Credit Event API Models
+// ============================================
+
+/// Request to create a credit event (admin only)
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct CreateCreditEventRequest {
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Credit amount per claim in nano-USD (scale 9). $5 = 5_000_000_000
+    #[serde(rename = "creditAmount")]
+    pub credit_amount: i64,
+    #[serde(rename = "currency", skip_serializing_if = "Option::is_none")]
+    pub currency: Option<String>,
+    /// Maximum number of claims (null = unlimited)
+    #[serde(rename = "maxClaims", skip_serializing_if = "Option::is_none")]
+    pub max_claims: Option<i32>,
+    /// When the claim window opens (defaults to now)
+    #[serde(rename = "startsAt", skip_serializing_if = "Option::is_none")]
+    pub starts_at: Option<String>,
+    /// When the claim window closes (null = no deadline)
+    #[serde(rename = "claimDeadline", skip_serializing_if = "Option::is_none")]
+    pub claim_deadline: Option<String>,
+    /// When the credits expire (required)
+    #[serde(rename = "creditExpiresAt")]
+    pub credit_expires_at: String,
+}
+
+/// Response for a credit event
+#[derive(Debug, Serialize, ToSchema)]
+pub struct CreditEventResponse {
+    pub id: String,
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(rename = "creditAmount")]
+    pub credit_amount: i64,
+    pub currency: String,
+    #[serde(rename = "maxClaims", skip_serializing_if = "Option::is_none")]
+    pub max_claims: Option<i32>,
+    #[serde(rename = "claimCount")]
+    pub claim_count: i32,
+    #[serde(rename = "startsAt")]
+    pub starts_at: String,
+    #[serde(rename = "claimDeadline", skip_serializing_if = "Option::is_none")]
+    pub claim_deadline: Option<String>,
+    #[serde(rename = "creditExpiresAt")]
+    pub credit_expires_at: String,
+    #[serde(rename = "isActive")]
+    pub is_active: bool,
+    #[serde(rename = "createdAt")]
+    pub created_at: String,
+}
+
+/// Request to generate promo codes for an event (admin only)
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct GenerateCodesRequest {
+    pub count: i32,
+}
+
+/// Response for generated promo codes
+#[derive(Debug, Serialize, ToSchema)]
+pub struct GenerateCodesResponse {
+    pub codes: Vec<String>,
+}
+
+/// Promo code info in a list
+#[derive(Debug, Serialize, ToSchema)]
+pub struct CreditEventCodeResponse {
+    pub id: String,
+    pub code: String,
+    #[serde(rename = "isClaimed")]
+    pub is_claimed: bool,
+    #[serde(rename = "claimedByUserId", skip_serializing_if = "Option::is_none")]
+    pub claimed_by_user_id: Option<String>,
+    #[serde(
+        rename = "claimedByNearAccountId",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub claimed_by_near_account_id: Option<String>,
+    #[serde(rename = "claimedAt", skip_serializing_if = "Option::is_none")]
+    pub claimed_at: Option<String>,
+}
+
+/// Request to claim credits with a promo code
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct ClaimCreditsRequest {
+    pub code: String,
+}
+
+/// Response for a successful credit claim
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ClaimCreditsResponse {
+    #[serde(rename = "claimId")]
+    pub claim_id: String,
+    #[serde(rename = "eventId")]
+    pub event_id: String,
+    #[serde(rename = "nearAccountId")]
+    pub near_account_id: String,
+    #[serde(rename = "organizationId")]
+    pub organization_id: String,
+    #[serde(rename = "creditAmount")]
+    pub credit_amount: i64,
+    #[serde(rename = "apiKey", skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<String>,
+    #[serde(rename = "creditExpiresAt")]
+    pub credit_expires_at: String,
 }

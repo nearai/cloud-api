@@ -39,6 +39,7 @@ use utoipa::{Modify, OpenApi};
         (name = "Gateway", description = "Model gateway integration endpoints"),
         (name = "Admin", description = "Administrative endpoints (admin access required)"),
         (name = "Services", description = "Public platform services (e.g. web_search pricing)"),
+        (name = "Credit Events", description = "Credit event and promo code management"),
     ),
     paths(
         // Chat completion endpoints (most important for users)
@@ -147,6 +148,14 @@ use utoipa::{Modify, OpenApi};
         // Attestation endpoints
         crate::routes::attestation::get_signature,
         crate::routes::attestation::get_attestation_report,
+        // Credit event endpoints
+        crate::routes::credit_events::create_credit_event,
+        crate::routes::credit_events::get_credit_event,
+        crate::routes::credit_events::list_credit_events,
+        crate::routes::credit_events::deactivate_credit_event,
+        crate::routes::credit_events::generate_promo_codes,
+        crate::routes::credit_events::list_credit_event_codes,
+        crate::routes::credit_events::claim_credits,
     ),
     components(
         schemas(
@@ -240,6 +249,10 @@ use utoipa::{Modify, OpenApi};
             crate::routes::billing::RequestCost,
             // File models
             FileUploadResponse, ExpiresAfter, FileListResponse, FileDeleteResponse,
+            // Credit event models
+            CreateCreditEventRequest, CreditEventResponse,
+            GenerateCodesRequest, GenerateCodesResponse,
+            CreditEventCodeResponse, ClaimCreditsRequest, ClaimCreditsResponse,
         ),
     ),
     modifiers(&SecurityAddon)
@@ -284,6 +297,19 @@ impl Modify for SecurityAddon {
                         .bearer_format("api_key")
                         .description(Some(
                             "API key for programmatic access (Authorization: Bearer sk-<api_key>)",
+                        ))
+                        .build(),
+                ),
+            );
+            // Admin token authentication
+            components.add_security_scheme(
+                "admin_token",
+                SecurityScheme::Http(
+                    HttpBuilder::new()
+                        .scheme(HttpAuthScheme::Bearer)
+                        .bearer_format("admin_token")
+                        .description(Some(
+                            "Admin access token for administrative endpoints (Authorization: Bearer <admin_token>)",
                         ))
                         .build(),
                 ),

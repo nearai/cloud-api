@@ -547,6 +547,9 @@ pub struct OrganizationLimitsHistory {
     pub source: Option<String>,
     pub currency: String,
 
+    // When set, this credit grant expires and is excluded from available credits
+    pub credit_expires_at: Option<DateTime<Utc>>,
+
     // Temporal fields
     pub effective_from: DateTime<Utc>,
     pub effective_until: Option<DateTime<Utc>>,
@@ -554,8 +557,8 @@ pub struct OrganizationLimitsHistory {
     // Tracking fields
     pub changed_by: Option<String>,
     pub change_reason: Option<String>,
-    pub changed_by_user_id: Option<Uuid>, // The authenticated user ID who made the change
-    pub changed_by_user_email: Option<String>, // The email of the authenticated user who made the change
+    pub changed_by_user_id: Option<Uuid>,
+    pub changed_by_user_email: Option<String>,
     pub created_at: DateTime<Utc>,
 }
 
@@ -567,10 +570,12 @@ pub struct UpdateOrganizationLimitsDbRequest {
     pub credit_type: String,
     pub source: Option<String>,
     pub currency: String,
+    /// When set, this credit grant expires at this time
+    pub credit_expires_at: Option<DateTime<Utc>>,
     pub changed_by: Option<String>,
     pub change_reason: Option<String>,
-    pub changed_by_user_id: Option<Uuid>, // The authenticated user ID who made the change
-    pub changed_by_user_email: Option<String>, // The email of the authenticated user who made the change
+    pub changed_by_user_id: Option<Uuid>,
+    pub changed_by_user_email: Option<String>,
 }
 
 // ============================================
@@ -753,4 +758,59 @@ impl std::str::FromStr for FilePurpose {
             _ => Err(format!("Invalid file purpose: {s}")),
         }
     }
+}
+
+// ============================================
+// Credit Event Models
+// ============================================
+
+/// Credit event - defines a credit distribution campaign (e.g., hackathon)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreditEvent {
+    pub id: Uuid,
+    pub name: String,
+    pub description: Option<String>,
+    /// Credit amount per claim in nano-USD (scale 9)
+    pub credit_amount: i64,
+    pub currency: String,
+    /// Maximum number of claims (NULL = unlimited)
+    pub max_claims: Option<i32>,
+    /// Number of claims made so far
+    pub claim_count: i32,
+    /// When the event starts accepting claims
+    pub starts_at: DateTime<Utc>,
+    /// When the claim window closes (NULL = no deadline)
+    pub claim_deadline: Option<DateTime<Utc>>,
+    /// When the credits themselves expire
+    pub credit_expires_at: DateTime<Utc>,
+    pub is_active: bool,
+    pub created_by_user_id: Option<Uuid>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// Credit event promo code - unique redeemable codes for claiming credits
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreditEventCode {
+    pub id: Uuid,
+    pub credit_event_id: Uuid,
+    pub code: String,
+    pub is_claimed: bool,
+    pub claimed_by_user_id: Option<Uuid>,
+    pub claimed_by_near_account_id: Option<String>,
+    pub claimed_at: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+}
+
+/// Credit claim - audit trail of credit redemptions
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreditClaim {
+    pub id: Uuid,
+    pub credit_event_id: Uuid,
+    pub code_id: Uuid,
+    pub near_account_id: String,
+    pub user_id: Uuid,
+    pub organization_id: Uuid,
+    pub organization_limit_id: Option<Uuid>,
+    pub claimed_at: DateTime<Utc>,
 }

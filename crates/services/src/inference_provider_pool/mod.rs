@@ -1608,7 +1608,24 @@ impl InferenceProviderPool {
                 if !urls_to_evict.is_empty() {
                     let evict_set: std::collections::HashSet<&str> =
                         urls_to_evict.iter().map(|u| u.as_str()).collect();
+
+                    // Collect model names before modifying `reused`.
+                    let evicted_models: Vec<String> = needs_pubkey_refetch
+                        .iter()
+                        .filter(|(_, url, _)| evict_set.contains(url.as_str()))
+                        .map(|(model, _, _)| model.clone())
+                        .collect();
+
                     reused.retain(|(_, url, _)| !evict_set.contains(url.as_str()));
+
+                    // Remove blocked providers from the active model_to_providers so
+                    // they don't serve requests during this cycle.
+                    {
+                        let mut mappings = self.provider_mappings.write().await;
+                        for model in &evicted_models {
+                            mappings.model_to_providers.remove(model);
+                        }
+                    }
 
                     let mut cache = self.inference_url_providers.write().await;
                     for url in &urls_to_evict {
@@ -2762,15 +2779,14 @@ mod tests {
             );
         }
 
-        // Verify that the model is no longer in model_to_providers (evicted provider
-        // was removed from reused list, so it wasn't added to model_providers)
+        // The evicted model should also be removed from model_to_providers
+        // so it doesn't serve requests with a blocked provider during this cycle.
         {
             let mappings = pool.provider_mappings.read().await;
-            let _has_model = mappings.model_to_providers.contains_key(&model_id);
-            // The model might still be there from register_provider, but the provider
-            // Arc should be different (not the blocked mock). What matters is the URL
-            // cache eviction — on the NEXT refresh cycle, needs_creation will pick it up.
-            drop(mappings);
+            assert!(
+                !mappings.model_to_providers.contains_key(&model_id),
+                "Evicted model should be removed from model_to_providers"
+            );
         }
 
         // Simulate next refresh cycle — now the URL is not in the cache,

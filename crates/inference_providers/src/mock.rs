@@ -587,7 +587,8 @@ impl MockProvider {
 
     /// Make get_attestation_report return an error (simulates blocked/broken backend).
     pub fn set_fail_attestation(&self, fail: bool) {
-        self.fail_attestation.store(fail, std::sync::atomic::Ordering::Relaxed);
+        self.fail_attestation
+            .store(fail, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Get the last chat completion params received by the mock provider
@@ -1133,7 +1134,10 @@ impl crate::InferenceProvider for MockProvider {
         _signing_address: Option<String>,
         _include_tls_fingerprint: bool,
     ) -> Result<serde_json::Map<String, serde_json::Value>, AttestationError> {
-        if self.fail_attestation.load(std::sync::atomic::Ordering::Relaxed) {
+        if self
+            .fail_attestation
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
             return Err(AttestationError::FetchError(
                 "Mock attestation failure (simulating blocked backend)".to_string(),
             ));

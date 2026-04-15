@@ -2766,7 +2766,7 @@ mod tests {
         // was removed from reused list, so it wasn't added to model_providers)
         {
             let mappings = pool.provider_mappings.read().await;
-            let has_model = mappings.model_to_providers.contains_key(&model_id);
+            let _has_model = mappings.model_to_providers.contains_key(&model_id);
             // The model might still be there from register_provider, but the provider
             // Arc should be different (not the blocked mock). What matters is the URL
             // cache eviction — on the NEXT refresh cycle, needs_creation will pick it up.

@@ -25,6 +25,43 @@ use uuid::Uuid;
 // Timeout for synchronous usage recording before response is returned
 const USAGE_RECORDING_TIMEOUT_SECS: u64 = 5;
 
+/// Insert validated E2EE headers into a provider `extra` HashMap.
+fn insert_encryption_headers(
+    encryption_headers: &crate::routes::common::EncryptionHeaders,
+    extra: &mut std::collections::HashMap<String, serde_json::Value>,
+) {
+    if let Some(ref signing_algo) = encryption_headers.signing_algo {
+        extra.insert(
+            service_encryption_headers::SIGNING_ALGO.to_string(),
+            serde_json::Value::String(signing_algo.clone()),
+        );
+    }
+    if let Some(ref client_pub_key) = encryption_headers.client_pub_key {
+        extra.insert(
+            service_encryption_headers::CLIENT_PUB_KEY.to_string(),
+            serde_json::Value::String(client_pub_key.clone()),
+        );
+    }
+    if let Some(ref model_pub_key) = encryption_headers.model_pub_key {
+        extra.insert(
+            service_encryption_headers::MODEL_PUB_KEY.to_string(),
+            serde_json::Value::String(model_pub_key.clone()),
+        );
+    }
+    if let Some(ref encryption_version) = encryption_headers.encryption_version {
+        extra.insert(
+            service_encryption_headers::ENCRYPTION_VERSION.to_string(),
+            serde_json::Value::String(encryption_version.clone()),
+        );
+    }
+    if let Some(ref encrypt_all_fields) = encryption_headers.encrypt_all_fields {
+        extra.insert(
+            service_encryption_headers::ENCRYPT_ALL_FIELDS.to_string(),
+            serde_json::Value::String(encrypt_all_fields.clone()),
+        );
+    }
+}
+
 // Custom header for exposing the inference ID as a UUID
 const HEADER_INFERENCE_ID: &str = "Inference-Id";
 
@@ -347,30 +384,7 @@ pub async fn chat_completions(
     };
 
     // Add validated headers to service_request.extra
-    if let Some(ref signing_algo) = encryption_headers.signing_algo {
-        service_request.extra.insert(
-            service_encryption_headers::SIGNING_ALGO.to_string(),
-            serde_json::Value::String(signing_algo.clone()),
-        );
-    }
-    if let Some(ref client_pub_key) = encryption_headers.client_pub_key {
-        service_request.extra.insert(
-            service_encryption_headers::CLIENT_PUB_KEY.to_string(),
-            serde_json::Value::String(client_pub_key.clone()),
-        );
-    }
-    if let Some(ref model_pub_key) = encryption_headers.model_pub_key {
-        service_request.extra.insert(
-            service_encryption_headers::MODEL_PUB_KEY.to_string(),
-            serde_json::Value::String(model_pub_key.clone()),
-        );
-    }
-    if let Some(ref encryption_version) = encryption_headers.encryption_version {
-        service_request.extra.insert(
-            service_encryption_headers::ENCRYPTION_VERSION.to_string(),
-            serde_json::Value::String(encryption_version.clone()),
-        );
-    }
+    insert_encryption_headers(&encryption_headers, &mut service_request.extra);
 
     // Check if streaming is requested
     if request.stream == Some(true) {
@@ -920,32 +934,7 @@ pub async fn image_generations(
 
     // Convert API request to provider params
     let mut extra = std::collections::HashMap::new();
-
-    // Add validated encryption headers to extra
-    if let Some(ref signing_algo) = encryption_headers.signing_algo {
-        extra.insert(
-            service_encryption_headers::SIGNING_ALGO.to_string(),
-            serde_json::Value::String(signing_algo.clone()),
-        );
-    }
-    if let Some(ref client_pub_key) = encryption_headers.client_pub_key {
-        extra.insert(
-            service_encryption_headers::CLIENT_PUB_KEY.to_string(),
-            serde_json::Value::String(client_pub_key.clone()),
-        );
-    }
-    if let Some(ref model_pub_key) = encryption_headers.model_pub_key {
-        extra.insert(
-            service_encryption_headers::MODEL_PUB_KEY.to_string(),
-            serde_json::Value::String(model_pub_key.clone()),
-        );
-    }
-    if let Some(ref encryption_version) = encryption_headers.encryption_version {
-        extra.insert(
-            service_encryption_headers::ENCRYPTION_VERSION.to_string(),
-            serde_json::Value::String(encryption_version.clone()),
-        );
-    }
+    insert_encryption_headers(&encryption_headers, &mut extra);
 
     let params = inference_providers::ImageGenerationParams {
         model: request.model.clone(),
@@ -1107,6 +1096,7 @@ pub async fn audio_transcriptions(
     State(app_state): State<AppState>,
     Extension(api_key): Extension<AuthenticatedApiKey>,
     Extension(body_hash): Extension<RequestBodyHash>,
+    headers: header::HeaderMap,
     mut multipart: Multipart,
 ) -> axum::response::Response {
     debug!(
@@ -1257,7 +1247,16 @@ pub async fn audio_transcriptions(
     let model_name = request.model.clone();
     let organization_id = api_key.organization.id.0;
 
+    // Extract and validate encryption headers if present
+    let encryption_headers = match crate::routes::common::validate_encryption_headers(&headers) {
+        Ok(headers) => headers,
+        Err(err) => return err.into_response(),
+    };
+
     // Convert API request to provider params
+    let mut extra = std::collections::HashMap::new();
+    insert_encryption_headers(&encryption_headers, &mut extra);
+
     let params = inference_providers::AudioTranscriptionParams {
         model: model_name.clone(),
         file_bytes: request.file_bytes,
@@ -1266,7 +1265,7 @@ pub async fn audio_transcriptions(
         response_format: request.response_format,
         temperature: request.temperature,
         timestamp_granularities: request.timestamp_granularities,
-        extra: std::collections::HashMap::new(),
+        extra,
     };
 
     // Call completion service which handles concurrent request limiting
@@ -1812,6 +1811,7 @@ pub async fn rerank(
     State(app_state): State<AppState>,
     Extension(api_key): Extension<AuthenticatedApiKey>,
     Extension(_body_hash): Extension<RequestBodyHash>,
+    headers: header::HeaderMap,
     Json(request): Json<crate::models::RerankRequest>,
 ) -> axum::response::Response {
     debug!(
@@ -1864,12 +1864,21 @@ pub async fn rerank(
     let model_id = model.id;
     let organization_id = api_key.organization.id.0;
 
+    // Extract and validate encryption headers if present
+    let encryption_headers = match crate::routes::common::validate_encryption_headers(&headers) {
+        Ok(headers) => headers,
+        Err(err) => return err.into_response(),
+    };
+
     // Convert API request to provider params
+    let mut extra = std::collections::HashMap::new();
+    insert_encryption_headers(&encryption_headers, &mut extra);
+
     let params = inference_providers::RerankParams {
         model: request.model.clone(),
         query: request.query.clone(),
         documents: request.documents.clone(),
-        extra: std::collections::HashMap::new(),
+        extra,
     };
 
     // Call completion service which handles concurrent request limiting
@@ -2102,6 +2111,7 @@ pub async fn embeddings(
     State(app_state): State<AppState>,
     Extension(api_key): Extension<AuthenticatedApiKey>,
     Extension(_body_hash): Extension<RequestBodyHash>,
+    headers: header::HeaderMap,
     body: Bytes,
 ) -> axum::response::Response {
     // Minimal deserialization: extract only the model name for routing
@@ -2161,9 +2171,17 @@ pub async fn embeddings(
     let model_id = model.id;
     let organization_id = api_key.organization.id.0;
 
+    // Extract and validate encryption headers if present
+    let encryption_headers = match crate::routes::common::validate_encryption_headers(&headers) {
+        Ok(headers) => headers,
+        Err(err) => return err.into_response(),
+    };
+    let mut extra = std::collections::HashMap::new();
+    insert_encryption_headers(&encryption_headers, &mut extra);
+
     match app_state
         .completion_service
-        .try_embeddings(organization_id, model_id, &model_name, body)
+        .try_embeddings(organization_id, model_id, &model_name, body, extra)
         .await
     {
         Ok(response_bytes) => {
@@ -2368,6 +2386,7 @@ pub async fn score(
     State(app_state): State<AppState>,
     Extension(api_key): Extension<AuthenticatedApiKey>,
     Extension(body_hash): Extension<RequestBodyHash>,
+    headers: header::HeaderMap,
     Json(request): Json<crate::models::ScoreRequest>,
 ) -> axum::response::Response {
     debug!(
@@ -2430,11 +2449,22 @@ pub async fn score(
             model_id,
             &request.model,
             body_hash.hash.clone(),
-            inference_providers::ScoreParams {
-                model: request.model.clone(),
-                text_1: request.text_1.clone(),
-                text_2: request.text_2.clone(),
-                extra: std::collections::HashMap::new(),
+            {
+                // Extract and validate encryption headers if present
+                let encryption_headers =
+                    match crate::routes::common::validate_encryption_headers(&headers) {
+                        Ok(headers) => headers,
+                        Err(err) => return err.into_response(),
+                    };
+                let mut extra = std::collections::HashMap::new();
+                insert_encryption_headers(&encryption_headers, &mut extra);
+
+                inference_providers::ScoreParams {
+                    model: request.model.clone(),
+                    text_1: request.text_1.clone(),
+                    text_2: request.text_2.clone(),
+                    extra,
+                }
             },
         )
         .await

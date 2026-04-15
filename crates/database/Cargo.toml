@@ -16,7 +16,7 @@ tokio-postgres = { version = "0.7", features = ["with-chrono-0_4", "with-uuid-1"
 # Documentation: https://docs.rs/deadpool-postgres/latest/deadpool_postgres/
 # Crate: https://crates.io/crates/deadpool-postgres
 deadpool-postgres = { version = "0.14", features = ["rt_tokio_1"] }
-deadpool = "0.12"
+deadpool = "0.13"
 
 # TLS support for PostgreSQL connections (required for remote databases like DigitalOcean)
 # Documentation: https://docs.rs/tokio-postgres-rustls/latest/tokio_postgres_rustls/
@@ -25,7 +25,7 @@ tokio-postgres-rustls = "0.13"
 rustls = { version = "0.23", features = ["ring"] }
 # Platform-native certificate verifier with OS integration and revocation support
 # Documentation: https://docs.rs/rustls-platform-verifier/latest/rustls_platform_verifier/
-rustls-platform-verifier = "0.6"
+rustls-platform-verifier = "0.7"
 
 # PostgreSQL types
 postgres-types = { version = "0.2", features = ["derive", "with-chrono-0_4", "with-uuid-1", "with-serde_json-1"] }
@@ -36,7 +36,7 @@ async-trait = "0.1"
 thiserror = "2.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-uuid = { version = "1.22", features = ["v4", "serde"] }
+uuid = { version = "1.23", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
@@ -49,8 +49,8 @@ config = { path = "../config" }
 refinery = { version = "0.9", features = ["tokio-postgres"] }
 
 # For hashing API keys and session tokens
-sha2 = "0.10"
-rand = "0.10.0"
+sha2 = "0.11"
+rand = "0.10.1"
 
 # For User-Agent normalization
 regex = "1.12"

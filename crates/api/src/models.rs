@@ -2882,9 +2882,9 @@ pub struct ModelHistoryEntry {
     #[serde(rename = "effectiveUntil")]
     pub effective_until: Option<String>,
     #[serde(rename = "changedByUserId")]
-    pub changed_by_user_id: Option<String>,
+    pub changed_by_user_id: Option<String>, // The authenticated user ID who made the change
     #[serde(rename = "changedByUserEmail")]
-    pub changed_by_user_email: Option<String>,
+    pub changed_by_user_email: Option<String>, // The email of the authenticated user who made the change
     #[serde(rename = "changeReason")]
     pub change_reason: Option<String>,
     #[serde(rename = "createdAt")]
@@ -3035,9 +3035,9 @@ pub struct OrgLimitsHistoryEntry {
     #[serde(rename = "changeReason")]
     pub change_reason: Option<String>,
     #[serde(rename = "changedByUserId")]
-    pub changed_by_user_id: Option<String>,
+    pub changed_by_user_id: Option<String>, // The authenticated user ID who made the change
     #[serde(rename = "changedByUserEmail")]
-    pub changed_by_user_email: Option<String>,
+    pub changed_by_user_email: Option<String>, // The email of the authenticated user who made the change
     #[serde(rename = "createdAt")]
     pub created_at: String,
 }

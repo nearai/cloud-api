@@ -76,22 +76,22 @@ pub async fn list_models(
             model_id: model.model_name.clone(),
             input_cost_per_token: DecimalPrice {
                 amount: model.input_cost_per_token,
-                scale: 9,
+                scale: 9, // Always scale 9 (nano-dollars)
                 currency: "USD".to_string(),
             },
             output_cost_per_token: DecimalPrice {
                 amount: model.output_cost_per_token,
-                scale: 9,
+                scale: 9, // Always scale 9 (nano-dollars)
                 currency: "USD".to_string(),
             },
             cost_per_image: DecimalPrice {
                 amount: model.cost_per_image,
-                scale: 9,
+                scale: 9, // Always scale 9 (nano-dollars)
                 currency: "USD".to_string(),
             },
             cache_read_cost_per_token: DecimalPrice {
                 amount: model.cache_read_cost_per_token,
-                scale: 9,
+                scale: 9, // Always scale 9 (nano-dollars)
                 currency: "USD".to_string(),
             },
             metadata: ModelMetadata {
@@ -181,22 +181,22 @@ pub async fn get_model_by_name(
         model_id: model.model_name,
         input_cost_per_token: DecimalPrice {
             amount: model.input_cost_per_token,
-            scale: 9,
+            scale: 9, // Always scale 9 (nano-dollars)
             currency: "USD".to_string(),
         },
         output_cost_per_token: DecimalPrice {
             amount: model.output_cost_per_token,
-            scale: 9,
+            scale: 9, // Always scale 9 (nano-dollars)
             currency: "USD".to_string(),
         },
         cost_per_image: DecimalPrice {
             amount: model.cost_per_image,
-            scale: 9,
+            scale: 9, // Always scale 9 (nano-dollars)
             currency: "USD".to_string(),
         },
         cache_read_cost_per_token: DecimalPrice {
             amount: model.cache_read_cost_per_token,
-            scale: 9,
+            scale: 9, // Always scale 9 (nano-dollars)
             currency: "USD".to_string(),
         },
         metadata: ModelMetadata {

@@ -444,6 +444,7 @@ pub async fn claim_credits(
             code: request.code,
             near_account_id: claimer_id,
             user_id,
+            organization_id: request.organization_id,
         })
         .await
         .map_err(map_error)?;

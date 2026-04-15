@@ -226,7 +226,17 @@ impl CreditEventServiceTrait for CreditEventServiceImpl {
             .await
             .map_err(|e| CreditEventError::InternalError(format!("Failed to list orgs: {e}")))?;
 
-        let (org_id, created_new) = if let Some(org) = orgs.into_iter().min_by_key(|o| o.created_at) {
+        let (org_id, created_new) = if let Some(requested_org_id) = request.organization_id {
+            let org = orgs
+                .into_iter()
+                .find(|o| o.id.0 == requested_org_id)
+                .ok_or_else(|| {
+                    CreditEventError::ValidationError(
+                        "User is not a member of the specified organization".to_string(),
+                    )
+                })?;
+            (org.id.0, false)
+        } else if let Some(org) = orgs.into_iter().min_by_key(|o| o.created_at) {
             (org.id.0, false)
         } else {
             let org_name = format!(

@@ -126,6 +126,7 @@ pub struct ClaimCreditsRequest {
     pub code: String,
     pub near_account_id: String,
     pub user_id: Uuid,
+    pub organization_id: Option<Uuid>,
 }
 
 #[derive(Debug, Clone)]

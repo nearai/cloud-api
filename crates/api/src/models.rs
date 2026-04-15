@@ -3687,6 +3687,11 @@ pub struct CreditEventCodeResponse {
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct ClaimCreditsRequest {
     pub code: String,
+    /// Optional organization ID to apply credits to. If omitted, credits are
+    /// applied to the user's oldest organization. If the user has no
+    /// organization, one will be auto-provisioned.
+    #[serde(rename = "organizationId")]
+    pub organization_id: Option<uuid::Uuid>,
 }
 
 /// Response for a successful credit claim

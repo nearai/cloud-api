@@ -135,6 +135,7 @@ pub struct EncryptionHeaders {
     pub client_pub_key: Option<String>,
     pub model_pub_key: Option<String>,
     pub encryption_version: Option<String>,
+    pub encrypt_all_fields: Option<String>,
 }
 
 /// Validate and extract encryption headers from HTTP request
@@ -168,6 +169,10 @@ pub fn validate_encryption_headers(
         .map(|s| s.to_string());
     let encryption_version = headers
         .get("x-encryption-version")
+        .and_then(|h| h.to_str().ok())
+        .map(|s| s.to_string());
+    let encrypt_all_fields = headers
+        .get("x-encrypt-all-fields")
         .and_then(|h| h.to_str().ok())
         .map(|s| s.to_string());
 
@@ -307,6 +312,7 @@ pub fn validate_encryption_headers(
         client_pub_key,
         model_pub_key,
         encryption_version,
+        encrypt_all_fields,
     })
 }
 

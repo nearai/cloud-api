@@ -215,7 +215,11 @@ pub trait InferenceProvider {
     ///
     /// Accepts the raw JSON request body and returns the raw JSON response bytes.
     /// No deserialization is performed — the cloud API proxies the request as-is.
-    async fn embeddings_raw(&self, body: bytes::Bytes) -> Result<bytes::Bytes, EmbeddingError>;
+    async fn embeddings_raw(
+        &self,
+        body: bytes::Bytes,
+        extra: std::collections::HashMap<String, serde_json::Value>,
+    ) -> Result<bytes::Bytes, EmbeddingError>;
 
     async fn get_signature(
         &self,

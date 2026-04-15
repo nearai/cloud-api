@@ -1204,6 +1204,7 @@ impl InferenceProviderPool {
         &self,
         model: &str,
         body: bytes::Bytes,
+        extra: std::collections::HashMap<String, serde_json::Value>,
     ) -> Result<bytes::Bytes, inference_providers::EmbeddingError> {
         tracing::debug!(model = %model, "Starting embeddings request");
 
@@ -1220,7 +1221,7 @@ impl InferenceProviderPool {
         // Try with each provider (with fallback)
         let mut last_error = None;
         for provider in providers {
-            match provider.embeddings_raw(body.clone()).await {
+            match provider.embeddings_raw(body.clone(), extra.clone()).await {
                 Ok(response) => {
                     tracing::info!(model = %model, "Embeddings completed successfully");
                     return Ok(response);
@@ -1545,6 +1546,11 @@ impl InferenceProviderPool {
         // This can happen when the initial pubkey fetch failed (e.g., transient network
         // error during startup) — since reused providers skip pubkey discovery, the keys
         // would be permanently lost without this recovery path.
+        //
+        // If the re-fetch also fails (e.g., the provider was permanently blocked because
+        // ALL attestation discovery calls failed on creation), evict the provider from the
+        // URL cache so it gets recreated from scratch on the next refresh cycle with a
+        // fresh bootstrap-mode TLS connection.
         {
             let mappings = self.provider_mappings.read().await;
             // Build a set of all provider pointers currently in pubkey mappings (O(N+M)
@@ -1573,6 +1579,7 @@ impl InferenceProviderPool {
                     models = ?needs_pubkey_refetch.iter().map(|(m, _, _)| m.as_str()).collect::<Vec<_>>(),
                     "Reused providers missing pubkey mappings — re-fetching signing keys"
                 );
+                let mut urls_to_evict = Vec::new();
                 for (model_name, url, provider) in &needs_pubkey_refetch {
                     let (keys, _, _) = Self::fetch_signing_public_keys_for_both_algorithms(
                         provider, model_name, url,
@@ -1582,8 +1589,9 @@ impl InferenceProviderPool {
                         warn!(
                             model = %model_name,
                             url = %url,
-                            "Failed to re-fetch signing keys for reused provider"
+                            "Failed to re-fetch signing keys for reused provider — evicting from cache for fresh recreation"
                         );
+                        urls_to_evict.push(url.clone());
                     } else {
                         info!(
                             model = %model_name,
@@ -1592,6 +1600,41 @@ impl InferenceProviderPool {
                         );
                         pub_key_updates.extend(keys);
                     }
+                }
+                // Evict failed providers from the URL cache so they go through
+                // needs_creation (with a fresh bootstrap TLS provider) next cycle.
+                // Also remove them from `reused` so the blocked provider doesn't get
+                // re-inserted into model_providers or new_url_cache below.
+                if !urls_to_evict.is_empty() {
+                    let evict_set: std::collections::HashSet<&str> =
+                        urls_to_evict.iter().map(|u| u.as_str()).collect();
+
+                    // Collect model names before modifying `reused`.
+                    let evicted_models: Vec<String> = needs_pubkey_refetch
+                        .iter()
+                        .filter(|(_, url, _)| evict_set.contains(url.as_str()))
+                        .map(|(model, _, _)| model.clone())
+                        .collect();
+
+                    reused.retain(|(_, url, _)| !evict_set.contains(url.as_str()));
+
+                    // Remove blocked providers from the active model_to_providers so
+                    // they don't serve requests during this cycle.
+                    {
+                        let mut mappings = self.provider_mappings.write().await;
+                        for model in &evicted_models {
+                            mappings.model_to_providers.remove(model);
+                        }
+                    }
+
+                    let mut cache = self.inference_url_providers.write().await;
+                    for url in &urls_to_evict {
+                        cache.remove(url);
+                    }
+                    info!(
+                        count = urls_to_evict.len(),
+                        "Evicted blocked providers from URL cache — will recreate next refresh"
+                    );
                 }
             }
         }
@@ -2680,5 +2723,83 @@ mod tests {
             }
             other => panic!("Expected HttpError, got: {:?}", other),
         }
+    }
+
+    /// Verify that when pubkey re-fetch fails for a reused provider (e.g., because
+    /// the provider's TLS connections are blocked), the provider is evicted from the
+    /// URL cache so it gets recreated from scratch on the next refresh cycle.
+    ///
+    /// Regression test for the staging deadlock: when all attestation discovery calls
+    /// fail during provider creation, block_connections() is called. The blocked
+    /// provider is cached, and on subsequent refreshes it's "reused" — but the
+    /// re-fetch goes through the same blocked provider, failing forever.
+    #[tokio::test]
+    async fn test_blocked_provider_evicted_from_cache_on_refetch_failure() {
+        use inference_providers::mock::MockProvider;
+
+        let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
+        let model_id = "test-blocked-model".to_string();
+        let url = "https://blocked-test.completions.near.ai".to_string();
+
+        // Create a mock provider and register it with pubkeys
+        let mock_provider = Arc::new(MockProvider::new());
+        pool.register_provider(model_id.clone(), mock_provider.clone())
+            .await;
+
+        // Seed the URL cache so it's "reused" on next load
+        {
+            let mut cache = pool.inference_url_providers.write().await;
+            cache.insert(
+                url.clone(),
+                mock_provider.clone() as Arc<InferenceProviderTrait>,
+            );
+        }
+
+        // Clear pubkey mappings (simulates initial fetch failure)
+        {
+            let mut mappings = pool.provider_mappings.write().await;
+            mappings.pubkey_to_providers.clear();
+        }
+
+        // Now make attestation fail (simulates blocked provider)
+        mock_provider.set_fail_attestation(true);
+
+        // Load — the provider is reused, pubkeys are missing, re-fetch fails
+        pool.load_inference_url_models(vec![(model_id.clone(), url.clone())])
+            .await;
+
+        // The URL should have been evicted from the cache
+        {
+            let cache = pool.inference_url_providers.read().await;
+            assert!(
+                !cache.contains_key(&url),
+                "Blocked provider URL should be evicted from cache after failed re-fetch, \
+                 but it's still present. This means the provider will be 'reused' forever \
+                 and never recreated."
+            );
+        }
+
+        // The evicted model should also be removed from model_to_providers
+        // so it doesn't serve requests with a blocked provider during this cycle.
+        {
+            let mappings = pool.provider_mappings.read().await;
+            assert!(
+                !mappings.model_to_providers.contains_key(&model_id),
+                "Evicted model should be removed from model_to_providers"
+            );
+        }
+
+        // Simulate next refresh cycle — now the URL is not in the cache,
+        // so it goes through needs_creation (fresh bootstrap TLS provider).
+        // The VLlmProvider creation will fail (test URL not reachable), but
+        // the important thing is it was NOT reused from the blocked cache.
+        let cache_before = {
+            let cache = pool.inference_url_providers.read().await;
+            cache.contains_key(&url)
+        };
+        assert!(
+            !cache_before,
+            "URL should still be absent from cache before second load"
+        );
     }
 }

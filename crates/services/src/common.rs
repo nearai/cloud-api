@@ -20,6 +20,8 @@ pub mod encryption_headers {
     pub const MODEL_PUB_KEY: &str = "x_model_pub_key";
     /// Key for encryption version in params.extra (corresponds to x-encryption-version HTTP header)
     pub const ENCRYPTION_VERSION: &str = "x_encryption_version";
+    /// Key for full field encryption opt-in (corresponds to x-encrypt-all-fields HTTP header)
+    pub const ENCRYPT_ALL_FIELDS: &str = "x_encrypt_all_fields";
 }
 
 pub fn generate_api_key() -> String {

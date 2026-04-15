@@ -1517,6 +1517,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         model_id: Uuid,
         model_name: &str,
         body: bytes::Bytes,
+        extra: std::collections::HashMap<String, serde_json::Value>,
     ) -> Result<bytes::Bytes, ports::CompletionError> {
         let counter = self
             .try_acquire_concurrent_slot(organization_id, model_id, model_name)
@@ -1524,7 +1525,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         let _guard = ConcurrentSlotGuard::new(counter);
 
         self.inference_provider_pool
-            .embeddings(model_name, body)
+            .embeddings(model_name, body, extra)
             .await
             .map_err(|e| match e {
                 inference_providers::EmbeddingError::RequestFailed(msg) => {

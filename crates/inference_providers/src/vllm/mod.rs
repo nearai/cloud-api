@@ -124,13 +124,18 @@ impl VLlmProvider {
 
         // Create persistent bucket clients — each maintains one connection
         // pinned to a specific backend via L4 TLS passthrough.
-        // pool_max_idle_per_host(1) keeps exactly one connection alive.
-        // With HTTP/2, concurrent requests multiplex on the same connection.
+        //
+        // Relies on HTTP/2 multiplexing: concurrent requests on the same bucket
+        // share one TLS connection → guaranteed same backend. CVM nginx (port 8444)
+        // negotiates h2 via ALPN. With HTTP/1.1 fallback, concurrent requests may
+        // open additional connections to different backends — signature fetches
+        // handle this with a retry fallback (see get_signature).
         let bucket_clients: Vec<Client> = (0..num_buckets)
             .map(|_| {
                 Client::builder()
                     .use_preconfigured_tls(tls_roots.build_config(fingerprint_state.clone()))
                     .pool_max_idle_per_host(1)
+                    .http2_adaptive_window(true)
                     .connect_timeout(Duration::from_secs(5))
                     .pool_idle_timeout(Duration::from_secs(300))
                     .read_timeout(Duration::from_secs(300))
@@ -322,44 +327,65 @@ impl InferenceProvider for VLlmProvider {
             .build_headers()
             .map_err(CompletionError::CompletionError)?;
 
-        // Use the bucket client for this chat_id if available.
-        // This ensures the signature fetch goes over the same TLS connection
-        // that served the completion (critical for L4 load-balanced backends).
+        // Use the bucket client for this chat_id to hit the same backend.
+        // With HTTP/2 (ALPN-negotiated), all requests multiplex on one connection.
+        // Under HTTP/1.1 fallback with concurrency, the bucket client may have
+        // opened a second connection to a different backend — if we get 404,
+        // retry once on the general-purpose client as a fallback.
         let bucket_id = self
             .signature_buckets
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .get(chat_id)
             .copied();
-        let client = match bucket_id {
+        let primary_client = match bucket_id {
             Some(id) => &self.bucket_clients[id],
             None => &self.client,
         };
 
-        let response = client
-            .get(&url)
-            .headers(headers)
-            .timeout(Duration::from_secs(self.config.timeout_seconds as u64))
-            .send()
-            .await
-            .map_err(|e| CompletionError::CompletionError(e.to_string()))?;
+        let timeout = Duration::from_secs(self.config.timeout_seconds as u64);
+        let clients_to_try: Vec<&Client> = if bucket_id.is_some() {
+            vec![primary_client, &self.client]
+        } else {
+            vec![primary_client]
+        };
 
-        if !response.status().is_success() {
+        let mut last_error = None;
+        for client in clients_to_try {
+            let response = client
+                .get(&url)
+                .headers(headers.clone())
+                .timeout(timeout)
+                .send()
+                .await
+                .map_err(|e| CompletionError::CompletionError(e.to_string()))?;
+
+            if response.status().is_success() {
+                let signature = response
+                    .json()
+                    .await
+                    .map_err(|e| CompletionError::CompletionError(e.to_string()))?;
+                return Ok(signature);
+            }
+
             let status = response.status().as_u16();
             let error_text = response
                 .text()
                 .await
                 .unwrap_or_else(|e| format!("Failed to read error response body: {e}"));
-            return Err(CompletionError::CompletionError(format!(
+            last_error = Some(format!(
                 "Signature fetch failed (HTTP {status}): {error_text}"
-            )));
+            ));
+
+            // Only retry on 404 (wrong backend) — other errors are definitive
+            if status != 404 {
+                break;
+            }
         }
 
-        let signature = response
-            .json()
-            .await
-            .map_err(|e| CompletionError::CompletionError(e.to_string()))?;
-        Ok(signature)
+        Err(CompletionError::CompletionError(
+            last_error.unwrap_or_else(|| "Signature fetch failed".to_string()),
+        ))
     }
 
     fn pin_chat_connection(&self, request_hash: &str, chat_id: &str) {

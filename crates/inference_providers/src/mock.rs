@@ -527,6 +527,8 @@ pub struct MockProvider {
     config: Arc<Mutex<MockConfig>>,
     /// Last chat completion params received (for test assertions)
     last_chat_params: Arc<Mutex<Option<ChatCompletionParams>>>,
+    /// When true, get_attestation_report returns an error (simulates blocked/broken backend)
+    fail_attestation: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl MockProvider {
@@ -547,6 +549,7 @@ impl MockProvider {
                 error_override: None,
             })),
             last_chat_params: Arc::new(Mutex::new(None)),
+            fail_attestation: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -563,6 +566,7 @@ impl MockProvider {
                 error_override: None,
             })),
             last_chat_params: Arc::new(Mutex::new(None)),
+            fail_attestation: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -577,7 +581,13 @@ impl MockProvider {
                 error_override: None,
             })),
             last_chat_params: Arc::new(Mutex::new(None)),
+            fail_attestation: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
+    }
+
+    /// Make get_attestation_report return an error (simulates blocked/broken backend).
+    pub fn set_fail_attestation(&self, fail: bool) {
+        self.fail_attestation.store(fail, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Get the last chat completion params received by the mock provider
@@ -1123,6 +1133,11 @@ impl crate::InferenceProvider for MockProvider {
         _signing_address: Option<String>,
         _include_tls_fingerprint: bool,
     ) -> Result<serde_json::Map<String, serde_json::Value>, AttestationError> {
+        if self.fail_attestation.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(AttestationError::FetchError(
+                "Mock attestation failure (simulating blocked backend)".to_string(),
+            ));
+        }
         let mut report = serde_json::Map::new();
         report.insert("model".to_string(), serde_json::Value::String(model));
         report.insert(

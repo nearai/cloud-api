@@ -1,9 +1,12 @@
-use crate::spki_verifier::FingerprintState;
+mod prefix_router;
+
+use crate::spki_verifier::{FingerprintState, SharedTlsRoots};
 use crate::{
-    models::StreamOptions, spki_verifier, sse_parser::new_sse_parser, ImageEditError,
-    ImageGenerationError, RerankError, ScoreError, *,
+    models::StreamOptions, sse_parser::new_sse_parser, ImageEditError, ImageGenerationError,
+    RerankError, ScoreError, *,
 };
 use async_trait::async_trait;
+use prefix_router::PrefixRouter;
 use reqwest::{header::HeaderValue, Client};
 use serde::Serialize;
 use std::collections::HashMap;
@@ -71,19 +74,21 @@ impl VLlmConfig {
 /// Supports both chat completions and text completions with streaming.
 pub struct VLlmProvider {
     config: VLlmConfig,
+    /// General-purpose client for non-completion requests (attestation, models, etc.)
     client: Client,
-    /// Dedicated per-completion clients for connection-pinned signature fetching.
-    /// With L4 TLS passthrough load balancing, each TLS connection is pinned to a
-    /// specific backend. Signature fetches must reuse the same connection that served
-    /// the completion, otherwise they hit a different backend and get 404.
-    ///
-    /// Flow: completion creates a dedicated Client → stored in `pending_clients[request_hash]`
-    /// → pool peeks chat_id from stream → calls `pin_chat_connection(request_hash, chat_id)`
-    /// → moves client to `signature_clients[chat_id]` → `get_signature` uses it.
-    pending_clients: Arc<std::sync::Mutex<HashMap<String, Client>>>,
-    signature_clients: Arc<std::sync::Mutex<HashMap<String, Client>>>,
+    /// Persistent clients indexed by prefix bucket ID. Each maintains a single
+    /// connection pinned to a specific backend via L4 TLS passthrough. Requests
+    /// with the same prompt prefix route to the same bucket → same backend →
+    /// prefix cache hit.
+    bucket_clients: Vec<Client>,
+    /// Prefix router: message-level trie mapping conversation prefixes to bucket IDs.
+    prefix_router: Arc<PrefixRouter>,
+    /// Maps request_hash → bucket_id during streaming (before chat_id is known).
+    pending_buckets: Arc<std::sync::Mutex<HashMap<String, usize>>>,
+    /// Maps chat_id → bucket_id for signature fetching on the correct backend.
+    signature_buckets: Arc<std::sync::Mutex<HashMap<String, usize>>>,
     /// TLS fingerprint verification state (Bootstrap → Pinned or Blocked).
-    /// Shared across the main client and all dedicated per-completion clients.
+    /// Shared across the main client and all bucket clients.
     fingerprint_state: Arc<std::sync::RwLock<FingerprintState>>,
 }
 
@@ -101,29 +106,51 @@ impl VLlmProvider {
         config: VLlmConfig,
         fingerprint_state: Arc<std::sync::RwLock<FingerprintState>>,
     ) -> Self {
-        let tls_config =
-            spki_verifier::build_rustls_config_with_verifier(fingerprint_state.clone());
+        // Load root certs once, share across all clients (~150KB instead of N×150KB)
+        let tls_roots = SharedTlsRoots::load();
 
-        // connect_timeout: 5s is generous for local-network backends. A backend behind a
-        // firewall-drop (not RST) is the worst case; 5s catches it without penalising
-        // fallback latency. Connection-refused is instant regardless.
-        // read_timeout guards against stalled backends: if no bytes arrive for this
-        // duration, the connection is dropped. Must be generous (300s) because under
-        // heavy load vLLM can stall between chunks during decode when KV cache is under
-        // pressure, causing premature stream termination and lost usage stats.
+        // General-purpose client for non-completion requests
         let client = Client::builder()
-            .use_preconfigured_tls(tls_config)
-            .connect_timeout(std::time::Duration::from_secs(5))
-            .pool_idle_timeout(std::time::Duration::from_secs(90))
-            .read_timeout(std::time::Duration::from_secs(300))
+            .use_preconfigured_tls(tls_roots.build_config(fingerprint_state.clone()))
+            .connect_timeout(Duration::from_secs(5))
+            .pool_idle_timeout(Duration::from_secs(90))
+            .read_timeout(Duration::from_secs(300))
             .build()
             .expect("Failed to create HTTP client");
+
+        // Prefix router determines which bucket to use for each completion
+        let prefix_router = Arc::new(PrefixRouter::new());
+        let num_buckets = prefix_router.num_buckets();
+
+        // Create persistent bucket clients — each maintains one connection
+        // pinned to a specific backend via L4 TLS passthrough.
+        //
+        // Relies on HTTP/2 multiplexing: concurrent requests on the same bucket
+        // share one TLS connection → guaranteed same backend. CVM nginx (port 8444)
+        // negotiates h2 via ALPN. With HTTP/1.1 fallback, concurrent requests may
+        // open additional connections to different backends — signature fetches
+        // handle this with a retry fallback (see get_signature).
+        let bucket_clients: Vec<Client> = (0..num_buckets)
+            .map(|_| {
+                Client::builder()
+                    .use_preconfigured_tls(tls_roots.build_config(fingerprint_state.clone()))
+                    .pool_max_idle_per_host(1)
+                    .http2_adaptive_window(true)
+                    .connect_timeout(Duration::from_secs(5))
+                    .pool_idle_timeout(Duration::from_secs(300))
+                    .read_timeout(Duration::from_secs(300))
+                    .build()
+                    .expect("Failed to create bucket HTTP client")
+            })
+            .collect();
 
         Self {
             config,
             client,
-            pending_clients: Arc::new(std::sync::Mutex::new(HashMap::new())),
-            signature_clients: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            bucket_clients,
+            prefix_router,
+            pending_buckets: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            signature_buckets: Arc::new(std::sync::Mutex::new(HashMap::new())),
             fingerprint_state,
         }
     }
@@ -136,23 +163,6 @@ impl VLlmProvider {
     /// Get a reference to the shared fingerprint state.
     pub fn fingerprint_state(&self) -> Arc<std::sync::RwLock<FingerprintState>> {
         self.fingerprint_state.clone()
-    }
-
-    /// Create a dedicated reqwest::Client for a single completion.
-    /// This client has its own connection pool, ensuring the TLS connection
-    /// used for the completion is reused for subsequent signature fetches.
-    /// Shares the same SPKI fingerprint verification as the main client.
-    fn create_dedicated_client(&self) -> Client {
-        let tls_config =
-            spki_verifier::build_rustls_config_with_verifier(self.fingerprint_state.clone());
-        Client::builder()
-            .use_preconfigured_tls(tls_config)
-            .pool_max_idle_per_host(1)
-            .connect_timeout(std::time::Duration::from_secs(5))
-            .pool_idle_timeout(std::time::Duration::from_secs(90))
-            .read_timeout(std::time::Duration::from_secs(300))
-            .build()
-            .expect("Failed to create dedicated HTTP client")
     }
 
     /// Add a verified SPKI fingerprint. Transitions Bootstrap → Pinned,
@@ -317,61 +327,83 @@ impl InferenceProvider for VLlmProvider {
             .build_headers()
             .map_err(CompletionError::CompletionError)?;
 
-        // Use the dedicated client for this chat_id if available.
-        // This ensures the signature fetch goes over the same TLS connection
-        // that served the completion (critical for L4 load-balanced backends).
-        // Clone rather than remove — get_signature is called once per algo
-        // (ecdsa + ed25519). Cleanup happens via unpin_chat_connection.
-        let dedicated_client = self
-            .signature_clients
+        // Use the bucket client for this chat_id to hit the same backend.
+        // With HTTP/2 (ALPN-negotiated), all requests multiplex on one connection.
+        // Under HTTP/1.1 fallback with concurrency, the bucket client may have
+        // opened a second connection to a different backend — if we get 404,
+        // retry once on the general-purpose client as a fallback.
+        let bucket_id = self
+            .signature_buckets
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .get(chat_id)
-            .cloned();
-        let client = dedicated_client.as_ref().unwrap_or(&self.client);
+            .copied();
+        let primary_client = match bucket_id {
+            Some(id) => &self.bucket_clients[id],
+            None => &self.client,
+        };
 
-        let response = client
-            .get(&url)
-            .headers(headers)
-            .timeout(Duration::from_secs(self.config.timeout_seconds as u64))
-            .send()
-            .await
-            .map_err(|e| CompletionError::CompletionError(e.to_string()))?;
+        let timeout = Duration::from_secs(self.config.timeout_seconds as u64);
+        let clients_to_try: Vec<&Client> = if bucket_id.is_some() {
+            vec![primary_client, &self.client]
+        } else {
+            vec![primary_client]
+        };
 
-        if !response.status().is_success() {
+        let mut last_error = None;
+        for client in clients_to_try {
+            let response = client
+                .get(&url)
+                .headers(headers.clone())
+                .timeout(timeout)
+                .send()
+                .await
+                .map_err(|e| CompletionError::CompletionError(e.to_string()))?;
+
+            if response.status().is_success() {
+                let signature = response
+                    .json()
+                    .await
+                    .map_err(|e| CompletionError::CompletionError(e.to_string()))?;
+                return Ok(signature);
+            }
+
             let status = response.status().as_u16();
             let error_text = response
                 .text()
                 .await
                 .unwrap_or_else(|e| format!("Failed to read error response body: {e}"));
-            return Err(CompletionError::CompletionError(format!(
+            last_error = Some(format!(
                 "Signature fetch failed (HTTP {status}): {error_text}"
-            )));
+            ));
+
+            // Only retry on 404 (wrong backend) — other errors are definitive
+            if status != 404 {
+                break;
+            }
         }
 
-        let signature = response
-            .json()
-            .await
-            .map_err(|e| CompletionError::CompletionError(e.to_string()))?;
-        Ok(signature)
+        Err(CompletionError::CompletionError(
+            last_error.unwrap_or_else(|| "Signature fetch failed".to_string()),
+        ))
     }
 
     fn pin_chat_connection(&self, request_hash: &str, chat_id: &str) {
-        if let Some(client) = self
-            .pending_clients
+        if let Some(bucket_id) = self
+            .pending_buckets
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(request_hash)
         {
-            self.signature_clients
+            self.signature_buckets
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .insert(chat_id.to_string(), client);
+                .insert(chat_id.to_string(), bucket_id);
         }
     }
 
     fn unpin_chat_connection(&self, chat_id: &str) {
-        self.signature_clients
+        self.signature_buckets
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(chat_id);
@@ -505,20 +537,22 @@ impl InferenceProvider for VLlmProvider {
         // Prepare encryption headers
         self.prepare_encryption_headers(&mut headers, &mut streaming_params.extra);
 
-        // Use a dedicated client for this completion so the signature fetch
-        // can reuse the same TLS connection (required for L4 load balancing).
-        let dedicated_client = self.create_dedicated_client();
+        // Route to a bucket client based on prompt prefix.
+        // The bucket client maintains a persistent TLS connection pinned to a
+        // specific backend via L4 passthrough → prefix cache hits.
+        let bucket_id = self.prefix_router.route(&streaming_params.messages);
+        let bucket_client = &self.bucket_clients[bucket_id];
         let response = self
-            .send_streaming_request(&url, headers, &streaming_params, Some(&dedicated_client))
+            .send_streaming_request(&url, headers, &streaming_params, Some(bucket_client))
             .await?;
 
-        // Store the dedicated client keyed by request_hash.
+        // Store the bucket ID keyed by request_hash.
         // The pool will call pin_chat_connection() after peeking the chat_id
-        // to move it to signature_clients[chat_id].
-        self.pending_clients
+        // to move it to signature_buckets[chat_id].
+        self.pending_buckets
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .insert(request_hash, dedicated_client);
+            .insert(request_hash, bucket_id);
 
         // Use the SSE parser to handle the stream properly
         let sse_stream = new_sse_parser(response.bytes_stream(), true);
@@ -545,9 +579,10 @@ impl InferenceProvider for VLlmProvider {
         // Prepare encryption headers
         self.prepare_encryption_headers(&mut headers, &mut non_streaming_params.extra);
 
-        // Use a dedicated client for connection pinning (same TLS connection for signature)
-        let dedicated_client = self.create_dedicated_client();
-        let response = dedicated_client
+        // Route to a bucket client based on prompt prefix (same as streaming path)
+        let bucket_id = self.prefix_router.route(&non_streaming_params.messages);
+        let bucket_client = &self.bucket_clients[bucket_id];
+        let response = bucket_client
             .post(&url)
             .headers(headers)
             .json(&non_streaming_params)
@@ -583,13 +618,13 @@ impl InferenceProvider for VLlmProvider {
             CompletionError::CompletionError(format!("Failed to parse response: {e}"))
         })?;
 
-        // Store the dedicated client for signature fetching.
+        // Store the bucket ID for signature fetching.
         // For non-streaming, we know the chat_id immediately.
         let chat_id = chat_completion_response.id.clone();
-        self.signature_clients
+        self.signature_buckets
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .insert(chat_id, dedicated_client);
+            .insert(chat_id, bucket_id);
 
         Ok(ChatCompletionResponseWithBytes {
             response: chat_completion_response,

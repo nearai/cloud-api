@@ -655,7 +655,7 @@ pub async fn update_organization_limits(
         source: updated_limits.source,
         spend_limit: SpendLimit {
             amount: updated_limits.spend_limit,
-            scale: 9,
+            scale: 9, // Always scale 9 (nano-dollars)
             currency: updated_limits.currency,
         },
         credit_expires_at: updated_limits.credit_expires_at.map(|dt| dt.to_rfc3339()),

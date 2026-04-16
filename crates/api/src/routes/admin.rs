@@ -256,22 +256,22 @@ pub async fn batch_upsert_models(
             model_id: model_name,
             input_cost_per_token: DecimalPrice {
                 amount: updated_model.input_cost_per_token,
-                scale: 9, // Always scale 9 (nano-dollars)
+                scale: 9,
                 currency: "USD".to_string(),
             },
             output_cost_per_token: DecimalPrice {
                 amount: updated_model.output_cost_per_token,
-                scale: 9, // Always scale 9 (nano-dollars)
+                scale: 9,
                 currency: "USD".to_string(),
             },
             cost_per_image: DecimalPrice {
                 amount: updated_model.cost_per_image,
-                scale: 9, // Always scale 9 (nano-dollars)
+                scale: 9,
                 currency: "USD".to_string(),
             },
             cache_read_cost_per_token: DecimalPrice {
                 amount: updated_model.cache_read_cost_per_token,
-                scale: 9, // Always scale 9 (nano-dollars)
+                scale: 9,
                 currency: "USD".to_string(),
             },
             metadata: ModelMetadata {
@@ -354,22 +354,22 @@ pub async fn list_models(
             model_id: model.model_name,
             input_cost_per_token: DecimalPrice {
                 amount: model.input_cost_per_token,
-                scale: 9, // Always scale 9 (nano-dollars)
+                scale: 9,
                 currency: "USD".to_string(),
             },
             output_cost_per_token: DecimalPrice {
                 amount: model.output_cost_per_token,
-                scale: 9, // Always scale 9 (nano-dollars)
+                scale: 9,
                 currency: "USD".to_string(),
             },
             cost_per_image: DecimalPrice {
                 amount: model.cost_per_image,
-                scale: 9, // Always scale 9 (nano-dollars)
+                scale: 9,
                 currency: "USD".to_string(),
             },
             cache_read_cost_per_token: DecimalPrice {
                 amount: model.cache_read_cost_per_token,
-                scale: 9, // Always scale 9 (nano-dollars)
+                scale: 9,
                 currency: "USD".to_string(),
             },
             metadata: ModelMetadata {
@@ -485,22 +485,22 @@ pub async fn get_model_history(
             model_id: h.model_id.to_string(),
             input_cost_per_token: DecimalPrice {
                 amount: h.input_cost_per_token,
-                scale: 9, // Always scale 9 (nano-dollars)
+                scale: 9,
                 currency: "USD".to_string(),
             },
             output_cost_per_token: DecimalPrice {
                 amount: h.output_cost_per_token,
-                scale: 9, // Always scale 9 (nano-dollars)
+                scale: 9,
                 currency: "USD".to_string(),
             },
             cost_per_image: DecimalPrice {
                 amount: h.cost_per_image,
-                scale: 9, // Always scale 9 (nano-dollars)
+                scale: 9,
                 currency: "USD".to_string(),
             },
             cache_read_cost_per_token: DecimalPrice {
                 amount: h.cache_read_cost_per_token,
-                scale: 9, // Always scale 9 (nano-dollars)
+                scale: 9,
                 currency: "USD".to_string(),
             },
             context_length: h.context_length,
@@ -655,7 +655,7 @@ pub async fn update_organization_limits(
         source: updated_limits.source,
         spend_limit: SpendLimit {
             amount: updated_limits.spend_limit,
-            scale: 9, // Always scale 9 (nano-dollars)
+            scale: 9,
             currency: updated_limits.currency,
         },
         credit_expires_at: updated_limits.credit_expires_at.map(|dt| dt.to_rfc3339()),
@@ -759,7 +759,7 @@ pub async fn get_organization_limits_history(
                 source: h.source,
                 spend_limit: SpendLimit {
                     amount: h.spend_limit,
-                    scale: 9, // Always scale 9 (nano-dollars)
+                    scale: 9,
                     currency: h.currency,
                 },
                 credit_expires_at: h.credit_expires_at.map(|dt| dt.to_rfc3339()),
@@ -943,7 +943,7 @@ pub async fn list_users(
                         description: org_info.description,
                         spend_limit: org_info.spend_limit.map(|amount| SpendLimit {
                             amount,
-                            scale: 9, // Always scale 9 (nano-dollars)
+                            scale: 9,
                             currency: "USD".to_string(),
                         }),
                         current_usage,
@@ -1087,7 +1087,7 @@ pub async fn list_organizations(
                 description: org.description,
                 spend_limit: org.spend_limit.map(|amount| SpendLimit {
                     amount,
-                    scale: 9, // Always scale 9 (nano-dollars)
+                    scale: 9,
                     currency: "USD".to_string(),
                 }),
                 current_usage,

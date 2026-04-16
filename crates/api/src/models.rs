@@ -2882,9 +2882,9 @@ pub struct ModelHistoryEntry {
     #[serde(rename = "effectiveUntil")]
     pub effective_until: Option<String>,
     #[serde(rename = "changedByUserId")]
-    pub changed_by_user_id: Option<String>, // The authenticated user ID who made the change
+    pub changed_by_user_id: Option<String>,
     #[serde(rename = "changedByUserEmail")]
-    pub changed_by_user_email: Option<String>, // The email of the authenticated user who made the change
+    pub changed_by_user_email: Option<String>,
     #[serde(rename = "changeReason")]
     pub change_reason: Option<String>,
     #[serde(rename = "createdAt")]
@@ -2954,8 +2954,7 @@ pub struct UpdateOrganizationLimitsRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
     #[serde(rename = "spendLimit")]
-    pub spend_limit: SpendLimitRequest,
-    /// When set, this credit grant expires at this time. ISO 8601 format.
+    pub spend_limit: SpendLimitRequest,. ISO 8601 format.
     #[serde(rename = "creditExpiresAt", skip_serializing_if = "Option::is_none")]
     pub credit_expires_at: Option<String>,
     #[serde(rename = "changedBy", skip_serializing_if = "Option::is_none")]
@@ -3005,7 +3004,6 @@ pub struct UpdateOrganizationLimitsResponse {
     pub source: Option<String>,
     #[serde(rename = "spendLimit")]
     pub spend_limit: SpendLimit,
-    /// When set, this credit grant expires at this time
     #[serde(rename = "creditExpiresAt", skip_serializing_if = "Option::is_none")]
     pub credit_expires_at: Option<String>,
     pub updated_at: String,
@@ -3023,7 +3021,6 @@ pub struct OrgLimitsHistoryEntry {
     pub source: Option<String>,
     #[serde(rename = "spendLimit")]
     pub spend_limit: SpendLimit,
-    /// When set, this credit grant expires at this time
     #[serde(rename = "creditExpiresAt", skip_serializing_if = "Option::is_none")]
     pub credit_expires_at: Option<String>,
     #[serde(rename = "effectiveFrom")]
@@ -3035,9 +3032,9 @@ pub struct OrgLimitsHistoryEntry {
     #[serde(rename = "changeReason")]
     pub change_reason: Option<String>,
     #[serde(rename = "changedByUserId")]
-    pub changed_by_user_id: Option<String>, // The authenticated user ID who made the change
+    pub changed_by_user_id: Option<String>,
     #[serde(rename = "changedByUserEmail")]
-    pub changed_by_user_email: Option<String>, // The email of the authenticated user who made the change
+    pub changed_by_user_email: Option<String>,
     #[serde(rename = "createdAt")]
     pub created_at: String,
 }

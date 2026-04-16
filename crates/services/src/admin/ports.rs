@@ -28,8 +28,8 @@ pub struct UpdateModelAdminRequest {
     pub inference_url: Option<String>,
     // User audit tracking for history
     pub change_reason: Option<String>,
-    pub changed_by_user_id: Option<uuid::Uuid>, // The authenticated user ID who made the change
-    pub changed_by_user_email: Option<String>, // The email of the authenticated user who made the change
+    pub changed_by_user_id: Option<uuid::Uuid>,
+    pub changed_by_user_email: Option<String>,
 }
 
 /// Batch update request format - Map of model name to update data
@@ -91,8 +91,8 @@ pub struct ModelHistoryEntry {
     pub inference_url: Option<String>,
     pub effective_from: chrono::DateTime<chrono::Utc>,
     pub effective_until: Option<chrono::DateTime<chrono::Utc>>,
-    pub changed_by_user_id: Option<uuid::Uuid>, // The authenticated user ID who made the change
-    pub changed_by_user_email: Option<String>, // The email of the authenticated user who made the change
+    pub changed_by_user_id: Option<uuid::Uuid>,
+    pub changed_by_user_email: Option<String>,
     pub change_reason: Option<String>,
     pub created_at: chrono::DateTime<chrono::Utc>,
 }
@@ -105,8 +105,7 @@ pub struct OrganizationLimitsUpdate {
     pub credit_type: String,
     pub source: Option<String>,
     pub currency: String,
-    /// When set, this credit grant expires at this time
-    pub credit_expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub credit_expires_at: Option<chrono::DateTime<chrono::Utc>>, // When set, this credit grant expires at this time
     pub changed_by: Option<String>,
     pub change_reason: Option<String>,
     pub changed_by_user_id: Option<uuid::Uuid>, // The authenticated user ID who made the change
@@ -122,7 +121,6 @@ pub struct OrganizationLimits {
     pub credit_type: String,
     pub source: Option<String>,
     pub currency: String,
-    /// When set, this credit grant expires at this time
     pub credit_expires_at: Option<chrono::DateTime<chrono::Utc>>,
     pub effective_from: chrono::DateTime<chrono::Utc>,
 }

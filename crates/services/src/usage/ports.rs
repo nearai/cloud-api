@@ -469,6 +469,8 @@ pub struct ModelPricing {
 #[derive(Debug, Clone)]
 pub struct OrganizationLimit {
     pub spend_limit: i64,
+    /// When set, this credit grant expires at this time
+    pub credit_expires_at: Option<DateTime<Utc>>,
 }
 
 /// Cost breakdown for a request

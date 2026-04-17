@@ -15,9 +15,21 @@ impl services::usage::ports::OrganizationLimitsRepository for OrganizationLimits
             return Ok(None);
         }
 
-        let total_spend_limit: i64 = limits.iter().map(|l| l.spend_limit).sum();
+        let now = chrono::Utc::now();
+
+        // Sum non-expired limits; expired limits are excluded
+        let total_spend_limit: i64 = limits
+            .iter()
+            .filter(|l| {
+                l.credit_expires_at
+                    .is_none_or(|expires_at| expires_at > now)
+            })
+            .map(|l| l.spend_limit)
+            .sum();
+
         Ok(Some(OrganizationLimit {
             spend_limit: total_spend_limit,
+            credit_expires_at: None, // Aggregated limits don't have a single expiry
         }))
     }
 }

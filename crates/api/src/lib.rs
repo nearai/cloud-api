@@ -22,6 +22,10 @@ use crate::{
             models, rerank, score,
         },
         conversations,
+        credit_events::{
+            claim_credits, create_credit_event, deactivate_credit_event, generate_promo_codes,
+            get_credit_event, list_credit_event_codes, list_credit_events, CreditEventAppState,
+        },
         health::health_check,
         models::{get_model_by_name, list_models, ModelsAppState},
         responses,
@@ -820,6 +824,16 @@ pub fn build_app_with_config(
         &auth_components.auth_state_middleware,
     );
 
+    // Build credit event routes
+    let credit_event_routes = build_credit_event_routes(
+        database.clone(),
+        &auth_components.auth_state_middleware,
+        domain_services.usage_service.clone(),
+        auth_components.auth_service.clone(),
+        domain_services.organization_service.clone(),
+        domain_services.workspace_service.clone(),
+    );
+
     // Build OpenAPI and documentation routes
     let openapi_routes = build_openapi_routes();
 
@@ -867,6 +881,7 @@ pub fn build_app_with_config(
                 .merge(billing_routes)
                 .merge(usage_recording_routes)
                 .merge(gateway_routes)
+                .merge(credit_event_routes)
                 .merge(health_routes),
         )
         .merge(openapi_routes)
@@ -1248,6 +1263,71 @@ pub fn build_billing_routes(
             auth_state_middleware.clone(),
             middleware::auth::auth_middleware_with_workspace_context,
         ))
+}
+
+/// Build credit event routes
+pub fn build_credit_event_routes(
+    database: Arc<Database>,
+    auth_state_middleware: &AuthState,
+    _usage_service: Arc<dyn services::usage::UsageServiceTrait + Send + Sync>,
+    auth_service: Arc<dyn services::auth::AuthServiceTrait>,
+    organization_service: Arc<dyn services::organization::OrganizationServiceTrait + Send + Sync>,
+    workspace_service: Arc<dyn services::workspace::WorkspaceServiceTrait + Send + Sync>,
+) -> Router {
+    use services::credit_events::ports::CreditEventRepositoryTrait;
+    use services::credit_events::CreditEventServiceImpl;
+
+    let credit_event_repo: Arc<dyn CreditEventRepositoryTrait> = Arc::new(
+        database::repositories::CreditEventRepository::new(database.pool().clone()),
+    );
+
+    let credit_event_service = Arc::new(CreditEventServiceImpl::new(
+        credit_event_repo as Arc<dyn CreditEventRepositoryTrait>,
+        auth_service,
+        organization_service,
+        workspace_service,
+    ));
+
+    let credit_event_app_state = CreditEventAppState {
+        credit_event_service,
+    };
+
+    // Admin routes (require admin auth)
+    let admin_event_routes = Router::new()
+        .route("/admin/credit-events", post(create_credit_event))
+        .route(
+            "/admin/credit-events/{event_id}",
+            axum::routing::patch(deactivate_credit_event),
+        )
+        .route(
+            "/admin/credit-events/{event_id}/codes",
+            post(generate_promo_codes).get(list_credit_event_codes),
+        )
+        .with_state(credit_event_app_state.clone())
+        .layer(from_fn_with_state(
+            auth_state_middleware.clone(),
+            crate::middleware::admin_middleware,
+        ));
+
+    // Public routes (no auth required for listing/getting)
+    let public_event_routes = Router::new()
+        .route("/credit-events", get(list_credit_events))
+        .route("/credit-events/{event_id}", get(get_credit_event))
+        .with_state(credit_event_app_state.clone());
+
+    // Claim route (requires session auth - NEAR wallet)
+    let claim_route = Router::new()
+        .route("/credit-events/{event_id}/claim", post(claim_credits))
+        .with_state(credit_event_app_state)
+        .layer(from_fn_with_state(
+            auth_state_middleware.clone(),
+            auth_middleware,
+        ));
+
+    Router::new()
+        .merge(admin_event_routes)
+        .merge(public_event_routes)
+        .merge(claim_route)
 }
 
 /// Build usage recording routes with auth, rate limiting, and usage check.

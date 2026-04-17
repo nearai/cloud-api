@@ -18,6 +18,7 @@ mod check_api_key;
 mod client_disconnect;
 mod concurrent_limit;
 mod conversations;
+mod credit_events;
 mod credit_types;
 mod duplicate_names;
 mod embeddings;

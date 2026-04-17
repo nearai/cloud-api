@@ -590,6 +590,19 @@ pub async fn update_organization_limits(
         credit_type: request.credit_type.to_string(),
         source: request.source,
         currency: request.spend_limit.currency.to_uppercase(),
+        credit_expires_at: request.credit_expires_at.map(|s| {
+            chrono::DateTime::parse_from_rfc3339(&s)
+                .map_err(|_| {
+                    (
+                        StatusCode::BAD_REQUEST,
+                        ResponseJson(ErrorResponse::new(
+                            "Invalid creditExpiresAt format, expected ISO 8601".to_string(),
+                            "validation_error".to_string(),
+                        )),
+                    )
+                })
+                .map(|dt| dt.to_utc())
+        }).transpose()?,
         changed_by: request.changed_by,
         change_reason: request.change_reason,
         changed_by_user_id: Some(admin_user_id),
@@ -645,6 +658,7 @@ pub async fn update_organization_limits(
             scale: 9, // Always scale 9 (nano-dollars)
             currency: updated_limits.currency,
         },
+        credit_expires_at: updated_limits.credit_expires_at.map(|dt| dt.to_rfc3339()),
         updated_at: updated_limits.effective_from.to_rfc3339(),
     };
 
@@ -748,6 +762,7 @@ pub async fn get_organization_limits_history(
                     scale: 9,
                     currency: h.currency,
                 },
+                credit_expires_at: h.credit_expires_at.map(|dt| dt.to_rfc3339()),
                 effective_from: h.effective_from.to_rfc3339(),
                 effective_until: h.effective_until.map(|dt| dt.to_rfc3339()),
                 changed_by: h.changed_by,

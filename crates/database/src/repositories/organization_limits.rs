@@ -74,14 +74,15 @@ impl OrganizationLimitsRepository {
                         credit_type,
                         source,
                         currency,
+                        credit_expires_at,
                         effective_from,
                         changed_by,
                         change_reason,
                         changed_by_user_id,
                         changed_by_user_email
-                    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
                     RETURNING id, organization_id, spend_limit, credit_type, source, currency,
-                              effective_from, effective_until,
+                              credit_expires_at, effective_from, effective_until,
                               changed_by, change_reason, changed_by_user_id, changed_by_user_email, created_at
                     "#,
                     &[
@@ -90,6 +91,7 @@ impl OrganizationLimitsRepository {
                         &request.credit_type,
                         &request.source,
                         &request.currency,
+                        &request.credit_expires_at,
                         &now,
                         &request.changed_by,
                         &request.change_reason,
@@ -125,7 +127,7 @@ impl OrganizationLimitsRepository {
                 .query(
                     r#"
                     SELECT id, organization_id, spend_limit, credit_type, source, currency,
-                           effective_from, effective_until,
+                           credit_expires_at, effective_from, effective_until,
                            changed_by, change_reason, changed_by_user_id, changed_by_user_email, created_at
                     FROM organization_limits_history
                     WHERE organization_id = $1 AND effective_until IS NULL
@@ -185,7 +187,7 @@ impl OrganizationLimitsRepository {
                 .query(
                     r#"
                     SELECT id, organization_id, spend_limit, credit_type, source, currency,
-                           effective_from, effective_until,
+                           credit_expires_at, effective_from, effective_until,
                            changed_by, change_reason, changed_by_user_id, changed_by_user_email, created_at
                     FROM organization_limits_history
                     WHERE organization_id = $1
@@ -214,6 +216,7 @@ impl OrganizationLimitsRepository {
             credit_type: row.get("credit_type"),
             source: row.get("source"),
             currency: row.get("currency"),
+            credit_expires_at: row.get("credit_expires_at"),
             effective_from: row.get("effective_from"),
             effective_until: row.get("effective_until"),
             changed_by: row.get("changed_by"),

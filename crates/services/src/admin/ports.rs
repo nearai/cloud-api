@@ -105,6 +105,7 @@ pub struct OrganizationLimitsUpdate {
     pub credit_type: String,
     pub source: Option<String>,
     pub currency: String,
+    pub credit_expires_at: Option<chrono::DateTime<chrono::Utc>>, // When set, this credit grant expires at this time
     pub changed_by: Option<String>,
     pub change_reason: Option<String>,
     pub changed_by_user_id: Option<uuid::Uuid>, // The authenticated user ID who made the change
@@ -120,6 +121,7 @@ pub struct OrganizationLimits {
     pub credit_type: String,
     pub source: Option<String>,
     pub currency: String,
+    pub credit_expires_at: Option<chrono::DateTime<chrono::Utc>>,
     pub effective_from: chrono::DateTime<chrono::Utc>,
 }
 
@@ -133,6 +135,7 @@ pub struct OrganizationLimitsHistoryEntry {
     pub credit_type: String,
     pub source: Option<String>,
     pub currency: String,
+    pub credit_expires_at: Option<chrono::DateTime<chrono::Utc>>,
     pub effective_from: chrono::DateTime<chrono::Utc>,
     pub effective_until: Option<chrono::DateTime<chrono::Utc>>,
     pub changed_by: Option<String>,

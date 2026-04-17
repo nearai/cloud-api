@@ -16,6 +16,15 @@ const NVIDIA_NRAS_URL: &str = "https://nras.attestation.nvidia.com/v3/attest/gpu
 /// this modest to avoid piling attestation work on inference backends.
 pub const ATTESTATION_DISCOVERY_PARALLELISM: usize = 5;
 
+/// Number of cumulative attestation calls per reused provider on each refresh.
+///
+/// Each cycle adds a small number of fresh-TCP discovery calls to a reused
+/// provider, which accumulates new backend fingerprints into the shared
+/// `FingerprintState`. Over several cycles this covers every backend behind
+/// the L4 LB, even when the initial discovery only hit one. Kept small so
+/// steady-state refresh load stays low.
+pub const CUMULATIVE_DISCOVERY_CALLS: usize = 2;
+
 /// Result of verifying an attestation report from an inference backend.
 #[derive(Debug, Clone)]
 pub struct VerifiedAttestation {

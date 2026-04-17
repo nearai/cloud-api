@@ -1,6 +1,7 @@
 use crate::attestation::AttestationVerifier;
 use crate::common::encryption_headers;
 use config::ExternalProvidersConfig;
+use inference_providers::spki_verifier::FingerprintState;
 use inference_providers::{
     models::{AttestationError, CompletionError},
     AudioTranscriptionError, AudioTranscriptionParams, AudioTranscriptionResponse,
@@ -10,7 +11,11 @@ use inference_providers::{
     RerankResponse, StreamingResult, StreamingResultExt, VLlmConfig, VLlmProvider,
 };
 use regex::Regex;
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+    time::Duration,
+};
 use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, info, warn};
 
@@ -26,6 +31,32 @@ pub trait ExternalModelsSource: Send + Sync {
     /// Returns (model_name, inference_url) pairs for active models with inference_url set.
     /// These models are routed directly to the URL, bypassing the discovery server.
     async fn fetch_inference_url_models(&self) -> Result<Vec<(String, String)>, String>;
+}
+
+/// Result of an attestation-discovery pass against a model URL.
+///
+/// `discover_model` mutates the shared `fingerprint_state` as a side effect
+/// (pinning new verified fingerprints). This struct summarizes what happened
+/// for the caller's logging and decision-making.
+#[derive(Debug)]
+struct DiscoveryOutcome {
+    /// Number of discovery HTTP calls that returned a response.
+    successful_calls: usize,
+    /// Number of discovery HTTP calls that failed (timeout, transport error, 4xx/5xx).
+    failed_calls: usize,
+    /// Number of previously-unknown verified fingerprints added to `fingerprint_state`
+    /// during this pass.
+    new_fingerprints: usize,
+    /// Total pinned fingerprints in `fingerprint_state` after this pass (cumulative).
+    total_pinned: usize,
+    /// Signing pubkeys extracted from verified reports, keyed by signing algorithm
+    /// ("ecdsa" / "ed25519"). Pubkeys are derived from the TEE compose hash so
+    /// they're identical across backends of the same model.
+    pubkeys_by_algo: HashMap<String, String>,
+    /// Raw attestation reports for downstream use (currently unused; retained so
+    /// future callers can run further verification without a second round-trip).
+    #[allow(dead_code)]
+    attestation_reports: Vec<serde_json::Map<String, serde_json::Value>>,
 }
 
 /// Combined provider mappings updated atomically to prevent race conditions
@@ -72,6 +103,12 @@ pub struct InferenceProviderPool {
     /// across refreshes, the existing provider (and its warm reqwest::Client with
     /// pooled TLS connections) is reused instead of creating a new one.
     inference_url_providers: Arc<RwLock<HashMap<String, Arc<InferenceProviderTrait>>>>,
+    /// Per-URL TLS fingerprint state, shared with the serving provider for that URL.
+    /// Updated by discovery (both initial and cumulative) so new backend fingerprints
+    /// are added over time without replacing the serving provider. Present only for
+    /// URLs whose serving provider was created by this pool via `load_inference_url_models`.
+    inference_url_fingerprint_states:
+        Arc<RwLock<HashMap<String, Arc<std::sync::RwLock<FingerprintState>>>>>,
     /// Attestation verifier for TDX quote, GPU evidence, and image hash verification.
     attestation_verifier: Arc<AttestationVerifier>,
 }
@@ -88,6 +125,7 @@ impl InferenceProviderPool {
             refresh_task_handle: Arc::new(Mutex::new(None)),
             provider_failure_counts: Arc::new(std::sync::RwLock::new(HashMap::new())),
             inference_url_providers: Arc::new(RwLock::new(HashMap::new())),
+            inference_url_fingerprint_states: Arc::new(RwLock::new(HashMap::new())),
             attestation_verifier: Arc::new(AttestationVerifier::from_env()),
         }
     }
@@ -373,6 +411,201 @@ impl InferenceProviderPool {
         }
 
         None
+    }
+
+    /// Run N attestation-discovery calls against a model URL, each on its own
+    /// reqwest::Client (fresh TCP connection), alternating signing algorithms
+    /// to harvest both ECDSA and Ed25519 signing pubkeys in the same pass.
+    ///
+    /// Why fresh clients per call: reqwest clients with HTTP/2 multiplex many
+    /// concurrent requests onto a single TCP connection, which hashes to a
+    /// single L4 backend. Separate clients force a separate TCP handshake per
+    /// call, letting each call land on a different backend. Over a few calls
+    /// this discovers the fingerprints of most/all backends behind the L4 LB.
+    ///
+    /// Why extract pubkeys here: the attestation report already contains
+    /// `signing_public_key` for the requested `signing_algo`. By alternating
+    /// algos across the N calls we get both keys in one pass — no separate
+    /// post-pin round trip needed. Pubkeys are derived from the TEE compose
+    /// hash, so they're identical across backends of the same model; the
+    /// first verified response per algo wins.
+    ///
+    /// Why staggered: 200ms offsets spread load and let each call's TLS
+    /// handshake complete before the next fires, encouraging backend
+    /// diversity via independent L4 hashes.
+    ///
+    /// Fingerprints are only pinned after attestation verification succeeds.
+    /// Existing fingerprints in `fingerprint_state` are preserved; new ones
+    /// are added. Calling this on an already-Pinned state with `num_calls=2`
+    /// is the cumulative-discovery path: it expands the pinned set over time
+    /// without disrupting in-flight requests.
+    ///
+    /// The caller owns the `fingerprint_state` Arc and decides when to
+    /// transition it to `Blocked` (e.g., when `outcome.total_pinned == 0`
+    /// on initial discovery).
+    async fn discover_model(
+        url: &str,
+        api_key: &Option<String>,
+        model_name: &str,
+        num_calls: usize,
+        fingerprint_state: Arc<std::sync::RwLock<FingerprintState>>,
+        verifier: &AttestationVerifier,
+    ) -> DiscoveryOutcome {
+        const PER_CALL_TIMEOUT: Duration = Duration::from_secs(10);
+        const STAGGER_MS: u64 = 200;
+        const ALGOS: [&str; 2] = ["ecdsa", "ed25519"];
+
+        let futures = (0..num_calls)
+            .map(|i| {
+                let url = url.to_string();
+                let api_key = api_key.clone();
+                let model = model_name.to_string();
+                let state = fingerprint_state.clone();
+                let algo = ALGOS[i % ALGOS.len()].to_string();
+                async move {
+                    if i > 0 {
+                        tokio::time::sleep(Duration::from_millis(STAGGER_MS * i as u64)).await;
+                    }
+                    // Fresh VLlmProvider → fresh reqwest::Client → fresh TCP
+                    // connection. Shares `fingerprint_state` with peer calls
+                    // and the serving provider, so pin updates propagate.
+                    let provider = VLlmProvider::new_with_fingerprint_state(
+                        VLlmConfig::new(url.clone(), api_key, None),
+                        state,
+                    );
+
+                    let nonce_bytes: [u8; 32] = rand::random();
+                    let nonce = hex::encode(nonce_bytes);
+
+                    let start = std::time::Instant::now();
+                    let res = tokio::time::timeout(
+                        PER_CALL_TIMEOUT,
+                        provider.get_attestation_report(
+                            model.clone(),
+                            Some(algo.clone()),
+                            Some(nonce.clone()),
+                            None,
+                            true,
+                        ),
+                    )
+                    .await;
+                    let elapsed_ms = start.elapsed().as_millis() as u64;
+
+                    match res {
+                        Ok(Ok(report)) => {
+                            debug!(
+                                model = %model,
+                                url = %url,
+                                algo = %algo,
+                                attempt = i,
+                                elapsed_ms,
+                                "Discovery call succeeded"
+                            );
+                            Some((report, nonce, algo))
+                        }
+                        Ok(Err(e)) => {
+                            debug!(
+                                model = %model,
+                                url = %url,
+                                algo = %algo,
+                                attempt = i,
+                                elapsed_ms,
+                                error = %e,
+                                "Discovery call failed"
+                            );
+                            None
+                        }
+                        Err(_) => {
+                            debug!(
+                                model = %model,
+                                url = %url,
+                                algo = %algo,
+                                attempt = i,
+                                elapsed_ms,
+                                "Discovery call timed out"
+                            );
+                            None
+                        }
+                    }
+                }
+            })
+            .collect::<Vec<_>>();
+
+        let results = futures::future::join_all(futures).await;
+
+        let mut successful_calls = 0usize;
+        let mut failed_calls = 0usize;
+        let mut new_fingerprints = 0usize;
+        let mut pubkeys_by_algo: HashMap<String, String> = HashMap::new();
+        let mut attestation_reports = Vec::new();
+        let mut verified_this_round: HashSet<String> = HashSet::new();
+
+        for r in results {
+            let Some((report, nonce, algo)) = r else {
+                failed_calls += 1;
+                continue;
+            };
+            successful_calls += 1;
+
+            match verifier.verify_attestation_report(&report, &nonce).await {
+                Ok(verified) => {
+                    if let Some(ref vfp) = verified.tls_cert_fingerprint {
+                        if verified_this_round.insert(vfp.clone()) {
+                            let added = {
+                                let mut state =
+                                    fingerprint_state.write().unwrap_or_else(|e| e.into_inner());
+                                let before = state.pinned_count();
+                                state.add_fingerprint(vfp.clone());
+                                state.pinned_count() > before
+                            };
+                            if added {
+                                new_fingerprints += 1;
+                                info!(
+                                    model = %model_name,
+                                    url = %url,
+                                    fingerprint = %vfp,
+                                    algo = %algo,
+                                    "Pinned new TLS SPKI fingerprint from attestation discovery"
+                                );
+                            }
+                        }
+                    }
+                    // Pubkey is trustworthy once the report is verified. Pubkeys
+                    // are derived from the TEE compose hash so they match
+                    // across all backends of the same model+algo; first-write
+                    // wins, later responses for the same algo are ignored.
+                    if let Some(pk) = report.get("signing_public_key").and_then(|v| v.as_str()) {
+                        pubkeys_by_algo
+                            .entry(algo.clone())
+                            .or_insert_with(|| pk.to_string());
+                    }
+                }
+                Err(e) => {
+                    warn!(
+                        model = %model_name,
+                        url = %url,
+                        algo = %algo,
+                        error = %e,
+                        "Attestation verification failed for discovered backend"
+                    );
+                }
+            }
+            attestation_reports.push(report);
+        }
+
+        let total_pinned = fingerprint_state
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .pinned_count();
+
+        DiscoveryOutcome {
+            successful_calls,
+            failed_calls,
+            new_fingerprints,
+            total_pinned,
+            pubkeys_by_algo,
+            attestation_reports,
+        }
     }
 
     async fn get_providers_for_model(
@@ -1392,8 +1625,11 @@ impl InferenceProviderPool {
         }
 
         // Phase 1: Create providers for new/changed URLs, probe attestation, and verify.
-        // Makes multiple parallel attestation calls per model to discover TLS fingerprints
-        // from different backends behind L4 load balancing.
+        // For each new URL: N discovery calls (each on a fresh reqwest::Client →
+        // fresh TCP connection → different L4 backend), alternating signing algos
+        // so we harvest ECDSA + Ed25519 signing pubkeys in the same pass (no
+        // separate post-pin round trip). The serving provider shares the
+        // per-URL `FingerprintState` with discovery, so every pin propagates.
         let verifier = self.attestation_verifier.clone();
         let discovery_parallelism =
             crate::attestation::verification::ATTESTATION_DISCOVERY_PARALLELISM;
@@ -1405,146 +1641,70 @@ impl InferenceProviderPool {
                 let api_key = api_key.clone();
                 let verifier = verifier.clone();
                 async move {
-                    // Create provider in bootstrap mode (accepts any valid cert)
-                    let vllm_provider = Arc::new(VLlmProvider::new(VLlmConfig::new(
-                        url.clone(),
-                        api_key,
-                        None,
-                    )));
-                    let serving_provider =
-                        vllm_provider.clone() as Arc<InferenceProviderTrait>;
+                    let state =
+                        Arc::new(std::sync::RwLock::new(FingerprintState::Bootstrap));
 
-                    // Step 1: Discover and verify TLS fingerprints FIRST.
-                    // Uses N parallel attestation calls to hit multiple backends behind
-                    // L4 load balancing. Each call generates a client-side nonce for
-                    // freshness (prevents replay of old attestation reports).
-                    // Stagger launches ~200ms apart to spread load and encourage
-                    // fresh TCP connections to different L4 backends. Each individual
-                    // call is bounded by a 10s hard timeout so a single slow/hanging
-                    // backend can't starve the whole discovery batch — previously,
-                    // `join_all` under a 30s outer timeout would discard all successful
-                    // results when even one call hung, blocking the provider entirely.
-                    const PER_CALL_TIMEOUT: Duration = Duration::from_secs(10);
-                    const STAGGER_MS: u64 = 200;
-                    let discovery_futures: Vec<_> = (0..discovery_parallelism)
-                        .map(|i| {
-                            let provider = serving_provider.clone();
-                            let model = model_name.clone();
-                            async move {
-                                if i > 0 {
-                                    tokio::time::sleep(Duration::from_millis(
-                                        STAGGER_MS * i as u64,
-                                    ))
-                                    .await;
-                                }
-                                // Generate client-side nonce for freshness
-                                let nonce_bytes: [u8; 32] = rand::random();
-                                let nonce = hex::encode(nonce_bytes);
-                                let report = tokio::time::timeout(
-                                    PER_CALL_TIMEOUT,
-                                    provider.get_attestation_report(
-                                        model,
-                                        None,
-                                        Some(nonce.clone()),
-                                        None,
-                                        true,
-                                    ),
-                                )
-                                .await
-                                .ok()?
-                                .ok()?;
-                                Some((report, nonce))
-                            }
-                        })
-                        .collect();
-
-                    // Outer cap is a safety net; per-call timeouts + stagger bound the
-                    // normal worst case (~STAGGER_MS * (N-1) + PER_CALL_TIMEOUT).
-                    let discovery_results = tokio::time::timeout(
-                        Duration::from_secs(30),
-                        futures::future::join_all(discovery_futures),
+                    let outcome = Self::discover_model(
+                        &url,
+                        &api_key,
+                        &model_name,
+                        discovery_parallelism,
+                        state.clone(),
+                        &verifier,
                     )
-                    .await
-                    .unwrap_or_default();
+                    .await;
 
-                    // Verify each unique attestation and accumulate fingerprints
-                    let mut pinned_count = 0u32;
-                    let mut seen_fingerprints = std::collections::HashSet::new();
-                    for (report, client_nonce) in discovery_results.into_iter().flatten() {
-                        let fp = report
-                            .get("tls_cert_fingerprint")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or_default()
-                            .to_string();
-                        if fp.is_empty() || !seen_fingerprints.insert(fp.clone()) {
-                            continue; // Skip empty or already-verified fingerprints
-                        }
-                        // Verify with the CLIENT-generated nonce (not the backend's)
-                        match verifier
-                            .verify_attestation_report(&report, &client_nonce)
-                            .await
-                        {
-                            Ok(verified) => {
-                                if let Some(ref vfp) = verified.tls_cert_fingerprint {
-                                    vllm_provider.add_verified_fingerprint(vfp.clone());
-                                    pinned_count += 1;
-                                }
-                            }
-                            Err(e) => {
-                                tracing::warn!(
-                                    model = %model_name,
-                                    url = %url,
-                                    fingerprint = %fp,
-                                    error = %e,
-                                    "Attestation verification failed for discovered backend"
-                                );
-                            }
-                        }
-                    }
+                    // Serving provider shares the same fingerprint_state — its
+                    // reqwest clients will verify future TLS handshakes against
+                    // whatever has been pinned so far (and pick up new pins as
+                    // cumulative discovery expands the set).
+                    let serving_provider =
+                        Arc::new(VLlmProvider::new_with_fingerprint_state(
+                            VLlmConfig::new(url.clone(), api_key.clone(), None),
+                            state.clone(),
+                        ));
 
-                    if pinned_count > 0 {
-                        tracing::info!(
+                    if outcome.total_pinned == 0 {
+                        // Fail closed: reject all TLS until a future refresh's
+                        // cumulative discovery pins at least one fingerprint.
+                        serving_provider.block_connections();
+                        warn!(
                             model = %model_name,
                             url = %url,
-                            pinned_fingerprints = pinned_count,
-                            unique_backends = seen_fingerprints.len(),
-                            "TLS SPKI fingerprints pinned from attestation discovery"
+                            successful_calls = outcome.successful_calls,
+                            failed_calls = outcome.failed_calls,
+                            "No TLS fingerprints pinned during initial discovery — provider will reject connections until attestation succeeds"
                         );
                     } else {
-                        // Fail closed: block connections so the provider exits bootstrap
-                        // mode and rejects all TLS until a future refresh succeeds.
-                        vllm_provider.block_connections();
-                        tracing::warn!(
+                        info!(
                             model = %model_name,
                             url = %url,
-                            "No TLS fingerprints pinned — provider will reject connections until attestation succeeds"
+                            calls = discovery_parallelism,
+                            successful_calls = outcome.successful_calls,
+                            failed_calls = outcome.failed_calls,
+                            new_fingerprints = outcome.new_fingerprints,
+                            total_pinned = outcome.total_pinned,
+                            pubkey_algos = ?outcome.pubkeys_by_algo.keys().collect::<Vec<_>>(),
+                            "Initial attestation discovery complete"
                         );
                     }
 
-                    // Step 2: Fetch signing public keys over a FRESH provider.
-                    // The bootstrap provider's reqwest pool may have pre-pin connections.
-                    // Creating a new VLlmProvider that shares the same fingerprint_state
-                    // ensures all new TLS connections are verified against pinned fingerprints.
-                    let pinned_provider = Arc::new(VLlmProvider::new_with_fingerprint_state(
-                        VLlmConfig::new(url.clone(), vllm_provider.config().api_key.clone(), None),
-                        vllm_provider.fingerprint_state(),
-                    ));
-                    let pinned_trait = pinned_provider.clone() as Arc<InferenceProviderTrait>;
-
-                    let (pub_keys, _, _) =
-                        Self::fetch_signing_public_keys_for_both_algorithms(
-                            &pinned_trait,
-                            &model_name,
-                            &url,
-                        )
-                        .await;
-
-                    let pub_keys: Vec<(String, Arc<InferenceProviderTrait>)> = pub_keys
-                        .into_iter()
-                        .map(|(key, _)| (key, pinned_trait.clone()))
+                    let serving_trait =
+                        serving_provider.clone() as Arc<InferenceProviderTrait>;
+                    let pub_keys: Vec<(String, Arc<InferenceProviderTrait>)> = outcome
+                        .pubkeys_by_algo
+                        .into_values()
+                        .map(|pk| (pk, serving_trait.clone()))
                         .collect();
 
-                    (model_name, url, pinned_trait as Arc<InferenceProviderTrait>, pub_keys, pinned_count)
+                    (
+                        model_name,
+                        url,
+                        serving_trait,
+                        pub_keys,
+                        outcome.total_pinned as u32,
+                        state,
+                    )
                 }
             })
             .collect();
@@ -1561,20 +1721,32 @@ impl InferenceProviderPool {
         let mut new_url_cache: HashMap<String, Arc<InferenceProviderTrait>> = HashMap::new();
 
         // Reused providers (URL unchanged — keep warm TLS connections).
-        // Check if any reused provider is missing pubkey mappings and re-fetch if so.
-        // This can happen when the initial pubkey fetch failed (e.g., transient network
-        // error during startup) — since reused providers skip pubkey discovery, the keys
-        // would be permanently lost without this recovery path.
         //
-        // If the re-fetch also fails (e.g., the provider was permanently blocked because
-        // ALL attestation discovery calls failed on creation), evict the provider from the
-        // URL cache so it gets recreated from scratch on the next refresh cycle with a
-        // fresh bootstrap-mode TLS connection.
+        // For providers whose per-URL `FingerprintState` is tracked (normal prod
+        // case), run a small cumulative-discovery pass: N fresh attestation calls
+        // with their own reqwest clients, hitting (hopefully) different L4 backends.
+        // This accumulates verified TLS fingerprints over time into the shared
+        // `FingerprintState`, and harvests signing pubkeys from any responses. A
+        // single initial discovery only sees the backend(s) the first few TCP
+        // connections happen to hash to; subsequent cycles cover the rest. Once a
+        // backend's fingerprint is pinned it stays pinned for the life of the
+        // provider (Pinned state only grows).
+        //
+        // Cumulative discovery also serves as PR #537's self-heal: if a provider
+        // has no pubkey mapping (lost during a failed initial fetch), the pubkeys
+        // harvested here backfill the mapping. If discovery turns up nothing at
+        // all AND the mapping is still missing, evict the URL so it's recreated
+        // from a fresh Bootstrap state next cycle.
+        //
+        // For reused providers WITHOUT tracked fingerprint state (e.g., mock
+        // providers injected directly into the cache by tests), fall back to the
+        // legacy per-algo refetch path which works against the trait object.
+        let cumulative_calls = crate::attestation::verification::CUMULATIVE_DISCOVERY_CALLS;
         {
+            // Snapshot known pubkey-mapped provider pointers to decide whether
+            // each reused provider needs pubkey backfill.
             let mappings = self.provider_mappings.read().await;
-            // Build a set of all provider pointers currently in pubkey mappings (O(N+M)
-            // instead of scanning all values per reused provider).
-            let mut known_ptrs: std::collections::HashSet<usize> = mappings
+            let mut known_ptrs: HashSet<usize> = mappings
                 .pubkey_to_providers
                 .values()
                 .flatten()
@@ -1582,79 +1754,172 @@ impl InferenceProviderPool {
                 .collect();
             drop(mappings);
 
-            let mut needs_pubkey_refetch = Vec::new();
+            // Snapshot tracked fingerprint states — releasing the lock before we
+            // await so we don't block other refresh operations.
+            let tracked_states: HashMap<String, Arc<std::sync::RwLock<FingerprintState>>> = {
+                let map = self.inference_url_fingerprint_states.read().await;
+                map.clone()
+            };
+
+            let mut urls_to_evict: Vec<String> = Vec::new();
+            let mut evicted_models: Vec<String> = Vec::new();
+
             for (model_name, url, provider) in &reused {
                 let ptr = Arc::as_ptr(provider) as *const () as usize;
-                // insert() returns true only if the pointer was NOT already present,
-                // which also deduplicates when multiple models share a provider.
-                if known_ptrs.insert(ptr) {
-                    needs_pubkey_refetch.push((model_name.clone(), url.clone(), provider.clone()));
+                let provider_has_pubkey_mapping = !known_ptrs.insert(ptr);
+
+                match tracked_states.get(url) {
+                    Some(state) => {
+                        let is_blocked = matches!(
+                            *state.read().unwrap_or_else(|e| e.into_inner()),
+                            FingerprintState::Blocked
+                        );
+                        if is_blocked {
+                            // Blocked state can't recover in-place: the shared
+                            // verifier rejects every TLS handshake, so any
+                            // cumulative call would fail. Evict to force a
+                            // fresh Bootstrap provider next cycle.
+                            warn!(
+                                model = %model_name,
+                                url = %url,
+                                "Reused provider is in Blocked state — evicting for fresh recreation"
+                            );
+                            urls_to_evict.push(url.clone());
+                            evicted_models.push(model_name.clone());
+                            continue;
+                        }
+
+                        let outcome = Self::discover_model(
+                            url,
+                            &api_key,
+                            model_name,
+                            cumulative_calls,
+                            state.clone(),
+                            &verifier,
+                        )
+                        .await;
+
+                        if outcome.new_fingerprints > 0 {
+                            info!(
+                                model = %model_name,
+                                url = %url,
+                                new_fingerprints = outcome.new_fingerprints,
+                                total_pinned = outcome.total_pinned,
+                                "Cumulative discovery expanded pinned backend set"
+                            );
+                        } else {
+                            debug!(
+                                model = %model_name,
+                                url = %url,
+                                calls = cumulative_calls,
+                                successful_calls = outcome.successful_calls,
+                                failed_calls = outcome.failed_calls,
+                                total_pinned = outcome.total_pinned,
+                                "Cumulative discovery cycle"
+                            );
+                        }
+
+                        // Backfill pubkeys only if the provider has no mapping yet.
+                        // Pubkeys are TEE-compose-derived, so once they exist they
+                        // don't need re-adding.
+                        if !provider_has_pubkey_mapping {
+                            if outcome.pubkeys_by_algo.is_empty() {
+                                if outcome.total_pinned == 0 {
+                                    warn!(
+                                        model = %model_name,
+                                        url = %url,
+                                        successful_calls = outcome.successful_calls,
+                                        failed_calls = outcome.failed_calls,
+                                        "Reused provider has no pubkey mapping and cumulative discovery found nothing — evicting for fresh recreation"
+                                    );
+                                    urls_to_evict.push(url.clone());
+                                    evicted_models.push(model_name.clone());
+                                } else {
+                                    // We pinned fingerprints but no response carried
+                                    // a signing_public_key. Keep the provider (non-E2EE
+                                    // still works); next cycle retries.
+                                    warn!(
+                                        model = %model_name,
+                                        url = %url,
+                                        total_pinned = outcome.total_pinned,
+                                        "Reused provider pinned fingerprints but no pubkeys harvested — E2EE routing will fail until next cycle"
+                                    );
+                                }
+                            } else {
+                                info!(
+                                    model = %model_name,
+                                    url = %url,
+                                    pub_keys = outcome.pubkeys_by_algo.len(),
+                                    "Backfilled signing keys for reused provider via cumulative discovery"
+                                );
+                                for pk in outcome.pubkeys_by_algo.into_values() {
+                                    pub_key_updates.push((pk, provider.clone()));
+                                }
+                            }
+                        }
+                    }
+                    None => {
+                        // Legacy path: no tracked fingerprint state (test-injected
+                        // mock, or pre-upgrade state). Only refetch pubkeys when
+                        // missing — never evict healthy reused providers just
+                        // because we don't track state for them.
+                        if !provider_has_pubkey_mapping {
+                            warn!(
+                                model = %model_name,
+                                url = %url,
+                                "Reused provider missing pubkey mapping and no tracked fingerprint state — falling back to legacy pubkey refetch"
+                            );
+                            let (keys, _, _) = Self::fetch_signing_public_keys_for_both_algorithms(
+                                provider, model_name, url,
+                            )
+                            .await;
+                            if keys.is_empty() {
+                                warn!(
+                                    model = %model_name,
+                                    url = %url,
+                                    "Legacy refetch failed — evicting from cache for fresh recreation"
+                                );
+                                urls_to_evict.push(url.clone());
+                                evicted_models.push(model_name.clone());
+                            } else {
+                                info!(
+                                    model = %model_name,
+                                    pub_keys = keys.len(),
+                                    "Legacy refetch recovered signing keys"
+                                );
+                                pub_key_updates.extend(keys);
+                            }
+                        }
+                    }
                 }
             }
 
-            if !needs_pubkey_refetch.is_empty() {
-                warn!(
-                    count = needs_pubkey_refetch.len(),
-                    models = ?needs_pubkey_refetch.iter().map(|(m, _, _)| m.as_str()).collect::<Vec<_>>(),
-                    "Reused providers missing pubkey mappings — re-fetching signing keys"
-                );
-                let mut urls_to_evict = Vec::new();
-                for (model_name, url, provider) in &needs_pubkey_refetch {
-                    let (keys, _, _) = Self::fetch_signing_public_keys_for_both_algorithms(
-                        provider, model_name, url,
-                    )
-                    .await;
-                    if keys.is_empty() {
-                        warn!(
-                            model = %model_name,
-                            url = %url,
-                            "Failed to re-fetch signing keys for reused provider — evicting from cache for fresh recreation"
-                        );
-                        urls_to_evict.push(url.clone());
-                    } else {
-                        info!(
-                            model = %model_name,
-                            pub_keys = keys.len(),
-                            "Re-fetched signing keys for reused provider"
-                        );
-                        pub_key_updates.extend(keys);
+            if !urls_to_evict.is_empty() {
+                let evict_set: HashSet<&str> = urls_to_evict.iter().map(|u| u.as_str()).collect();
+                reused.retain(|(_, url, _)| !evict_set.contains(url.as_str()));
+
+                {
+                    let mut mappings = self.provider_mappings.write().await;
+                    for model in &evicted_models {
+                        mappings.model_to_providers.remove(model);
                     }
                 }
-                // Evict failed providers from the URL cache so they go through
-                // needs_creation (with a fresh bootstrap TLS provider) next cycle.
-                // Also remove them from `reused` so the blocked provider doesn't get
-                // re-inserted into model_providers or new_url_cache below.
-                if !urls_to_evict.is_empty() {
-                    let evict_set: std::collections::HashSet<&str> =
-                        urls_to_evict.iter().map(|u| u.as_str()).collect();
-
-                    // Collect model names before modifying `reused`.
-                    let evicted_models: Vec<String> = needs_pubkey_refetch
-                        .iter()
-                        .filter(|(_, url, _)| evict_set.contains(url.as_str()))
-                        .map(|(model, _, _)| model.clone())
-                        .collect();
-
-                    reused.retain(|(_, url, _)| !evict_set.contains(url.as_str()));
-
-                    // Remove blocked providers from the active model_to_providers so
-                    // they don't serve requests during this cycle.
-                    {
-                        let mut mappings = self.provider_mappings.write().await;
-                        for model in &evicted_models {
-                            mappings.model_to_providers.remove(model);
-                        }
-                    }
-
+                {
                     let mut cache = self.inference_url_providers.write().await;
                     for url in &urls_to_evict {
                         cache.remove(url);
                     }
-                    info!(
-                        count = urls_to_evict.len(),
-                        "Evicted blocked providers from URL cache — will recreate next refresh"
-                    );
                 }
+                {
+                    let mut states = self.inference_url_fingerprint_states.write().await;
+                    for url in &urls_to_evict {
+                        states.remove(url);
+                    }
+                }
+                info!(
+                    count = urls_to_evict.len(),
+                    "Evicted blocked/dead providers from cache — will recreate next refresh"
+                );
             }
         }
 
@@ -1667,7 +1932,9 @@ impl InferenceProviderPool {
         }
 
         // Newly created providers
-        for (model_name, url, provider, pub_keys, pinned_count) in &new_results {
+        let mut new_fingerprint_states: HashMap<String, Arc<std::sync::RwLock<FingerprintState>>> =
+            HashMap::new();
+        for (model_name, url, provider, pub_keys, pinned_count, state) in &new_results {
             info!(
                 model = %model_name,
                 url = %url,
@@ -1681,6 +1948,7 @@ impl InferenceProviderPool {
                 .push(provider.clone());
             pub_key_updates.extend(pub_keys.iter().cloned());
             new_url_cache.insert(url.clone(), provider.clone());
+            new_fingerprint_states.insert(url.clone(), state.clone());
         }
 
         // Atomic update: replace model providers and rebuild pubkey mappings
@@ -1753,6 +2021,17 @@ impl InferenceProviderPool {
 
         // Update the URL→provider cache
         *self.inference_url_providers.write().await = new_url_cache;
+
+        // Merge newly-created URL → FingerprintState mappings into the pool's
+        // tracking map. Reused URLs keep their existing entries (we mutated
+        // the Arc in place during cumulative discovery). Evicted URLs were
+        // already removed above.
+        if !new_fingerprint_states.is_empty() {
+            let mut states = self.inference_url_fingerprint_states.write().await;
+            for (url, state) in new_fingerprint_states {
+                states.insert(url, state);
+            }
+        }
 
         info!(
             total = models.len(),
@@ -2820,5 +3099,71 @@ mod tests {
             !cache_before,
             "URL should still be absent from cache before second load"
         );
+    }
+
+    /// A reused provider whose per-URL `FingerprintState` is `Blocked` cannot
+    /// recover via cumulative discovery (every TLS handshake would be rejected
+    /// by the pinned verifier). The refresh must detect the Blocked state,
+    /// short-circuit before making network calls, and evict all three
+    /// tracking maps so the next cycle creates a fresh Bootstrap provider.
+    #[tokio::test]
+    async fn test_reused_provider_with_blocked_fingerprint_state_is_evicted() {
+        use inference_providers::mock::MockProvider;
+
+        let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
+        let model_id = "test-blocked-state-model".to_string();
+        let url = "https://blocked-state.completions.near.ai".to_string();
+
+        let mock = Arc::new(MockProvider::new());
+        pool.register_provider(model_id.clone(), mock.clone()).await;
+
+        // Seed URL cache, tracked fingerprint state (Blocked), and pubkey
+        // mappings — so the reused path has everything it needs and would
+        // otherwise not trip the legacy refetch branch.
+        {
+            let mut cache = pool.inference_url_providers.write().await;
+            cache.insert(url.clone(), mock.clone() as Arc<InferenceProviderTrait>);
+        }
+        {
+            let mut states = pool.inference_url_fingerprint_states.write().await;
+            states.insert(
+                url.clone(),
+                Arc::new(std::sync::RwLock::new(FingerprintState::Blocked)),
+            );
+        }
+        {
+            let mut mappings = pool.provider_mappings.write().await;
+            mappings
+                .pubkey_to_providers
+                .insert("pretend-pubkey".to_string(), vec![mock.clone()]);
+        }
+
+        pool.load_inference_url_models(vec![(model_id.clone(), url.clone())])
+            .await;
+
+        // Blocked URL evicted from URL cache
+        {
+            let cache = pool.inference_url_providers.read().await;
+            assert!(
+                !cache.contains_key(&url),
+                "URL with Blocked fingerprint state should be evicted from URL cache"
+            );
+        }
+        // Evicted from fingerprint state map too
+        {
+            let states = pool.inference_url_fingerprint_states.read().await;
+            assert!(
+                !states.contains_key(&url),
+                "URL with Blocked fingerprint state should be evicted from fingerprint_states map"
+            );
+        }
+        // Model removed from provider mappings
+        {
+            let mappings = pool.provider_mappings.read().await;
+            assert!(
+                !mappings.model_to_providers.contains_key(&model_id),
+                "Model backed by a Blocked provider should be removed from model_to_providers"
+            );
+        }
     }
 }

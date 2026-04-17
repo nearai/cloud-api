@@ -53,10 +53,6 @@ struct DiscoveryOutcome {
     /// ("ecdsa" / "ed25519"). Pubkeys are derived from the TEE compose hash so
     /// they're identical across backends of the same model.
     pubkeys_by_algo: HashMap<String, String>,
-    /// Raw attestation reports for downstream use (currently unused; retained so
-    /// future callers can run further verification without a second round-trip).
-    #[allow(dead_code)]
-    attestation_reports: Vec<serde_json::Map<String, serde_json::Value>>,
 }
 
 /// Combined provider mappings updated atomically to prevent race conditions
@@ -537,7 +533,6 @@ impl InferenceProviderPool {
         let mut failed_calls = 0usize;
         let mut new_fingerprints = 0usize;
         let mut pubkeys_by_algo: HashMap<String, String> = HashMap::new();
-        let mut attestation_reports = Vec::new();
         let mut verified_this_round: HashSet<String> = HashSet::new();
 
         for r in results {
@@ -590,7 +585,6 @@ impl InferenceProviderPool {
                     );
                 }
             }
-            attestation_reports.push(report);
         }
 
         let total_pinned = fingerprint_state
@@ -604,7 +598,6 @@ impl InferenceProviderPool {
             new_fingerprints,
             total_pinned,
             pubkeys_by_algo,
-            attestation_reports,
         }
     }
 
@@ -1761,136 +1754,239 @@ impl InferenceProviderPool {
                 map.clone()
             };
 
+            // Classify each reused provider and build parallel work queues.
+            // Running the N discovery/refetch calls concurrently keeps refresh
+            // latency bounded regardless of how many models are in the pool:
+            // with dozens of models and CUMULATIVE_DISCOVERY_CALLS=2 (~10s
+            // worst case per provider), a sequential loop could add minutes
+            // per cycle and starve the background refresh task.
+            #[derive(Debug)]
+            enum ReusedClassification {
+                /// Blocked state — short-circuit, no network call, evict.
+                EvictBlocked,
+                /// Cumulative discovery with the tracked fingerprint_state.
+                /// `backfill_pubkey` is true when the provider has no existing
+                /// pubkey mapping and should receive any pubkeys harvested.
+                Discover {
+                    state: Arc<std::sync::RwLock<FingerprintState>>,
+                    backfill_pubkey: bool,
+                },
+                /// Legacy refetch — no tracked fingerprint_state but provider
+                /// has no pubkey mapping either. Falls back to the per-algo
+                /// refetch path against the trait object (preserves the old
+                /// behavior for test-injected MockProviders).
+                LegacyRefetch,
+                /// No action — provider is healthy; nothing to do this cycle.
+                Skip,
+            }
+
+            use futures::FutureExt;
+
+            type DiscoveryTask = futures::future::BoxFuture<
+                'static,
+                (
+                    String,
+                    String,
+                    Arc<InferenceProviderTrait>,
+                    bool,
+                    DiscoveryOutcome,
+                ),
+            >;
+            type LegacyTask = futures::future::BoxFuture<
+                'static,
+                (String, String, Vec<(String, Arc<InferenceProviderTrait>)>),
+            >;
+
             let mut urls_to_evict: Vec<String> = Vec::new();
             let mut evicted_models: Vec<String> = Vec::new();
+            let mut discovery_tasks: Vec<DiscoveryTask> = Vec::new();
+            let mut legacy_tasks: Vec<LegacyTask> = Vec::new();
 
             for (model_name, url, provider) in &reused {
                 let ptr = Arc::as_ptr(provider) as *const () as usize;
                 let provider_has_pubkey_mapping = !known_ptrs.insert(ptr);
 
-                match tracked_states.get(url) {
+                let classification = match tracked_states.get(url) {
                     Some(state) => {
                         let is_blocked = matches!(
                             *state.read().unwrap_or_else(|e| e.into_inner()),
                             FingerprintState::Blocked
                         );
                         if is_blocked {
-                            // Blocked state can't recover in-place: the shared
-                            // verifier rejects every TLS handshake, so any
-                            // cumulative call would fail. Evict to force a
-                            // fresh Bootstrap provider next cycle.
-                            warn!(
-                                model = %model_name,
-                                url = %url,
-                                "Reused provider is in Blocked state — evicting for fresh recreation"
-                            );
-                            urls_to_evict.push(url.clone());
-                            evicted_models.push(model_name.clone());
-                            continue;
-                        }
-
-                        let outcome = Self::discover_model(
-                            url,
-                            &api_key,
-                            model_name,
-                            cumulative_calls,
-                            state.clone(),
-                            &verifier,
-                        )
-                        .await;
-
-                        if outcome.new_fingerprints > 0 {
-                            info!(
-                                model = %model_name,
-                                url = %url,
-                                new_fingerprints = outcome.new_fingerprints,
-                                total_pinned = outcome.total_pinned,
-                                "Cumulative discovery expanded pinned backend set"
-                            );
+                            ReusedClassification::EvictBlocked
                         } else {
-                            debug!(
-                                model = %model_name,
-                                url = %url,
-                                calls = cumulative_calls,
-                                successful_calls = outcome.successful_calls,
-                                failed_calls = outcome.failed_calls,
-                                total_pinned = outcome.total_pinned,
-                                "Cumulative discovery cycle"
-                            );
-                        }
-
-                        // Backfill pubkeys only if the provider has no mapping yet.
-                        // Pubkeys are TEE-compose-derived, so once they exist they
-                        // don't need re-adding.
-                        if !provider_has_pubkey_mapping {
-                            if outcome.pubkeys_by_algo.is_empty() {
-                                if outcome.total_pinned == 0 {
-                                    warn!(
-                                        model = %model_name,
-                                        url = %url,
-                                        successful_calls = outcome.successful_calls,
-                                        failed_calls = outcome.failed_calls,
-                                        "Reused provider has no pubkey mapping and cumulative discovery found nothing — evicting for fresh recreation"
-                                    );
-                                    urls_to_evict.push(url.clone());
-                                    evicted_models.push(model_name.clone());
-                                } else {
-                                    // We pinned fingerprints but no response carried
-                                    // a signing_public_key. Keep the provider (non-E2EE
-                                    // still works); next cycle retries.
-                                    warn!(
-                                        model = %model_name,
-                                        url = %url,
-                                        total_pinned = outcome.total_pinned,
-                                        "Reused provider pinned fingerprints but no pubkeys harvested — E2EE routing will fail until next cycle"
-                                    );
-                                }
-                            } else {
-                                info!(
-                                    model = %model_name,
-                                    url = %url,
-                                    pub_keys = outcome.pubkeys_by_algo.len(),
-                                    "Backfilled signing keys for reused provider via cumulative discovery"
-                                );
-                                for pk in outcome.pubkeys_by_algo.into_values() {
-                                    pub_key_updates.push((pk, provider.clone()));
-                                }
+                            ReusedClassification::Discover {
+                                state: state.clone(),
+                                backfill_pubkey: !provider_has_pubkey_mapping,
                             }
                         }
                     }
                     None => {
-                        // Legacy path: no tracked fingerprint state (test-injected
-                        // mock, or pre-upgrade state). Only refetch pubkeys when
-                        // missing — never evict healthy reused providers just
-                        // because we don't track state for them.
                         if !provider_has_pubkey_mapping {
-                            warn!(
-                                model = %model_name,
-                                url = %url,
-                                "Reused provider missing pubkey mapping and no tracked fingerprint state — falling back to legacy pubkey refetch"
-                            );
-                            let (keys, _, _) = Self::fetch_signing_public_keys_for_both_algorithms(
-                                provider, model_name, url,
-                            )
-                            .await;
-                            if keys.is_empty() {
-                                warn!(
-                                    model = %model_name,
-                                    url = %url,
-                                    "Legacy refetch failed — evicting from cache for fresh recreation"
-                                );
-                                urls_to_evict.push(url.clone());
-                                evicted_models.push(model_name.clone());
-                            } else {
-                                info!(
-                                    model = %model_name,
-                                    pub_keys = keys.len(),
-                                    "Legacy refetch recovered signing keys"
-                                );
-                                pub_key_updates.extend(keys);
-                            }
+                            ReusedClassification::LegacyRefetch
+                        } else {
+                            ReusedClassification::Skip
                         }
                     }
+                };
+
+                match classification {
+                    ReusedClassification::EvictBlocked => {
+                        warn!(
+                            model = %model_name,
+                            url = %url,
+                            "Reused provider is in Blocked state — evicting for fresh recreation"
+                        );
+                        urls_to_evict.push(url.clone());
+                        evicted_models.push(model_name.clone());
+                    }
+                    ReusedClassification::Discover {
+                        state,
+                        backfill_pubkey,
+                    } => {
+                        let model_name = model_name.clone();
+                        let url = url.clone();
+                        let provider = provider.clone();
+                        let api_key = api_key.clone();
+                        let verifier = verifier.clone();
+                        discovery_tasks.push(
+                            async move {
+                                let outcome = Self::discover_model(
+                                    &url,
+                                    &api_key,
+                                    &model_name,
+                                    cumulative_calls,
+                                    state,
+                                    &verifier,
+                                )
+                                .await;
+                                (model_name, url, provider, backfill_pubkey, outcome)
+                            }
+                            .boxed(),
+                        );
+                    }
+                    ReusedClassification::LegacyRefetch => {
+                        let model_name = model_name.clone();
+                        let url = url.clone();
+                        let provider = provider.clone();
+                        legacy_tasks.push(
+                            async move {
+                                let (keys, _, _) =
+                                    Self::fetch_signing_public_keys_for_both_algorithms(
+                                        &provider,
+                                        &model_name,
+                                        &url,
+                                    )
+                                    .await;
+                                (model_name, url, keys)
+                            }
+                            .boxed(),
+                        );
+                    }
+                    ReusedClassification::Skip => {}
+                }
+            }
+
+            use futures::stream::{self as fstream, StreamExt};
+
+            // Run both buckets in parallel. Concurrency cap (10) is smaller
+            // than the new-provider path's 20 because cumulative discovery
+            // isn't critical-path and we don't want to pile on during refresh.
+            //
+            // Drained manually with `while let Some(x) = stream.next().await`
+            // instead of `.collect::<Vec<_>>()` because the collector's HRTB
+            // inference trips on tuples containing trait objects like
+            // `Arc<dyn InferenceProvider + Send + Sync>` in this context.
+            let drive_discovery = async {
+                let mut stream = fstream::iter(discovery_tasks).buffer_unordered(10);
+                let mut out = Vec::new();
+                while let Some(x) = stream.next().await {
+                    out.push(x);
+                }
+                out
+            };
+            let drive_legacy = async {
+                let mut stream = fstream::iter(legacy_tasks).buffer_unordered(10);
+                let mut out = Vec::new();
+                while let Some(x) = stream.next().await {
+                    out.push(x);
+                }
+                out
+            };
+            let (discovery_results, legacy_results) = tokio::join!(drive_discovery, drive_legacy);
+
+            for (model_name, url, provider, backfill_pubkey, outcome) in discovery_results {
+                if outcome.new_fingerprints > 0 {
+                    info!(
+                        model = %model_name,
+                        url = %url,
+                        new_fingerprints = outcome.new_fingerprints,
+                        total_pinned = outcome.total_pinned,
+                        "Cumulative discovery expanded pinned backend set"
+                    );
+                } else {
+                    debug!(
+                        model = %model_name,
+                        url = %url,
+                        calls = cumulative_calls,
+                        successful_calls = outcome.successful_calls,
+                        failed_calls = outcome.failed_calls,
+                        total_pinned = outcome.total_pinned,
+                        "Cumulative discovery cycle"
+                    );
+                }
+
+                if !backfill_pubkey {
+                    continue;
+                }
+                if outcome.pubkeys_by_algo.is_empty() {
+                    if outcome.total_pinned == 0 {
+                        warn!(
+                            model = %model_name,
+                            url = %url,
+                            successful_calls = outcome.successful_calls,
+                            failed_calls = outcome.failed_calls,
+                            "Reused provider has no pubkey mapping and cumulative discovery found nothing — evicting for fresh recreation"
+                        );
+                        urls_to_evict.push(url);
+                        evicted_models.push(model_name);
+                    } else {
+                        warn!(
+                            model = %model_name,
+                            url = %url,
+                            total_pinned = outcome.total_pinned,
+                            "Reused provider pinned fingerprints but no pubkeys harvested — E2EE routing will fail until next cycle"
+                        );
+                    }
+                } else {
+                    info!(
+                        model = %model_name,
+                        url = %url,
+                        pub_keys = outcome.pubkeys_by_algo.len(),
+                        "Backfilled signing keys for reused provider via cumulative discovery"
+                    );
+                    for pk in outcome.pubkeys_by_algo.into_values() {
+                        pub_key_updates.push((pk, provider.clone()));
+                    }
+                }
+            }
+
+            for (model_name, url, keys) in legacy_results {
+                if keys.is_empty() {
+                    warn!(
+                        model = %model_name,
+                        url = %url,
+                        "Legacy refetch failed — evicting from cache for fresh recreation"
+                    );
+                    urls_to_evict.push(url);
+                    evicted_models.push(model_name);
+                } else {
+                    info!(
+                        model = %model_name,
+                        pub_keys = keys.len(),
+                        "Legacy refetch recovered signing keys"
+                    );
+                    pub_key_updates.extend(keys);
                 }
             }
 

@@ -10,7 +10,11 @@ const NVIDIA_NRAS_URL: &str = "https://nras.attestation.nvidia.com/v3/attest/gpu
 
 /// Number of parallel attestation calls per model to discover TLS fingerprints
 /// from multiple backends behind L4 load balancing.
-pub const ATTESTATION_DISCOVERY_PARALLELISM: usize = 10;
+///
+/// Each cloud-api instance runs its own discovery, so the effective load on a
+/// model is `PARALLELISM * cloud-api instance count` per refresh cycle. Keep
+/// this modest to avoid piling attestation work on inference backends.
+pub const ATTESTATION_DISCOVERY_PARALLELISM: usize = 5;
 
 /// Result of verifying an attestation report from an inference backend.
 #[derive(Debug, Clone)]

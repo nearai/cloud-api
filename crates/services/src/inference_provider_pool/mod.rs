@@ -1418,29 +1418,48 @@ impl InferenceProviderPool {
                     // Uses N parallel attestation calls to hit multiple backends behind
                     // L4 load balancing. Each call generates a client-side nonce for
                     // freshness (prevents replay of old attestation reports).
+                    // Stagger launches ~200ms apart to spread load and encourage
+                    // fresh TCP connections to different L4 backends. Each individual
+                    // call is bounded by a 10s hard timeout so a single slow/hanging
+                    // backend can't starve the whole discovery batch — previously,
+                    // `join_all` under a 30s outer timeout would discard all successful
+                    // results when even one call hung, blocking the provider entirely.
+                    const PER_CALL_TIMEOUT: Duration = Duration::from_secs(10);
+                    const STAGGER_MS: u64 = 200;
                     let discovery_futures: Vec<_> = (0..discovery_parallelism)
-                        .map(|_| {
+                        .map(|i| {
                             let provider = serving_provider.clone();
                             let model = model_name.clone();
                             async move {
+                                if i > 0 {
+                                    tokio::time::sleep(Duration::from_millis(
+                                        STAGGER_MS * i as u64,
+                                    ))
+                                    .await;
+                                }
                                 // Generate client-side nonce for freshness
                                 let nonce_bytes: [u8; 32] = rand::random();
                                 let nonce = hex::encode(nonce_bytes);
-                                let report = provider
-                                    .get_attestation_report(
+                                let report = tokio::time::timeout(
+                                    PER_CALL_TIMEOUT,
+                                    provider.get_attestation_report(
                                         model,
                                         None,
                                         Some(nonce.clone()),
                                         None,
                                         true,
-                                    )
-                                    .await
-                                    .ok()?;
+                                    ),
+                                )
+                                .await
+                                .ok()?
+                                .ok()?;
                                 Some((report, nonce))
                             }
                         })
                         .collect();
 
+                    // Outer cap is a safety net; per-call timeouts + stagger bound the
+                    // normal worst case (~STAGGER_MS * (N-1) + PER_CALL_TIMEOUT).
                     let discovery_results = tokio::time::timeout(
                         Duration::from_secs(30),
                         futures::future::join_all(discovery_futures),

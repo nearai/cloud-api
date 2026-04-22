@@ -393,6 +393,13 @@ impl CreditEventRepository {
                 return Err(RepositoryError::AlreadyExists);
             }
 
+            let claimed_code_event_id: Uuid = code_row.as_ref().unwrap().get("credit_event_id");
+            if claimed_code_event_id != event_id {
+                return Err(RepositoryError::ValidationFailed(
+                    "Code does not belong to the specified event".to_string(),
+                ));
+            }
+
             // Step 5: Insert claim record
             let claim_row = transaction
                 .query_one(

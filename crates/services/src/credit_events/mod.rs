@@ -11,14 +11,22 @@ use uuid::Uuid;
 fn generate_promo_code() -> String {
     use rand_core::OsRng;
     use rand_core::RngCore;
-    let mut buf = [0u8; 12];
+    let mut buf = [0u8; 16];
     OsRng.fill_bytes(&mut buf);
     const CHARSET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
-    let code: String = buf
-        .iter()
-        .map(|b| CHARSET[*b as usize % CHARSET.len()] as char)
-        .collect();
-    format!("NEAR-{code}")
+    let group = |slice: &[u8]| {
+        slice
+            .iter()
+            .map(|b| CHARSET[*b as usize % CHARSET.len()] as char)
+            .collect::<String>()
+    };
+    format!(
+        "NEAR-{}-{}-{}-{}",
+        group(&buf[0..4]),
+        group(&buf[4..8]),
+        group(&buf[8..12]),
+        group(&buf[12..16])
+    )
 }
 
 fn event_to_info(event: &CreditEventData) -> CreditEventInfo {
@@ -241,8 +249,8 @@ impl CreditEventServiceTrait for CreditEventServiceImpl {
         } else {
             let org_name = format!(
                 "{}-org-{}",
-                request.near_account_id.split('.').next().unwrap_or("user"),
-                &request.near_account_id[..4.min(request.near_account_id.len())]
+                request.near_account_id,
+                &request.user_id.to_string()[..8]
             );
             let org = self
                 .organization_service
@@ -273,7 +281,7 @@ impl CreditEventServiceTrait for CreditEventServiceImpl {
         // 5. Atomically claim code + add credits + increment claim count (single transaction)
         let credits = CreditAdditionParams {
             spend_limit: event.credit_amount,
-            credit_type: format!("event:{}", request.event_id),
+            credit_type: format!("event:{}:user:{}", request.event_id, request.user_id),
             source: Some("event_claim".to_string()),
             currency: event.currency.clone(),
             credit_expires_at: Some(event.credit_expires_at),
@@ -319,7 +327,9 @@ impl CreditEventServiceTrait for CreditEventServiceImpl {
                 .workspace_service
                 .list_api_keys_paginated(ws_id.clone(), UserId(request.user_id), 100, 0)
                 .await
-                .unwrap_or_default();
+                .map_err(|e| {
+                    CreditEventError::InternalError(format!("Failed to list API keys: {e}"))
+                })?;
             if keys.iter().any(|k| k.is_active) {
                 None
             } else {

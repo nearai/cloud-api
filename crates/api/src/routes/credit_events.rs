@@ -130,8 +130,11 @@ fn event_to_response(
 pub async fn create_credit_event(
     State(app_state): State<CreditEventAppState>,
     Extension(admin_user): Extension<AdminUser>,
-    ResponseJson(request): ResponseJson<CreateCreditEventRequest>,
-) -> Result<ResponseJson<CreditEventResponse>, (StatusCode, ResponseJson<ErrorResponse>)> {
+    Json(request): Json<CreateCreditEventRequest>,
+) -> Result<
+    (StatusCode, ResponseJson<CreditEventResponse>),
+    (StatusCode, ResponseJson<ErrorResponse>),
+> {
     let starts_at = match request.starts_at {
         Some(ref s) => Some(
             chrono::DateTime::parse_from_rfc3339(s)
@@ -194,7 +197,7 @@ pub async fn create_credit_event(
         .await
         .map_err(map_error)?;
 
-    Ok(ResponseJson(event_to_response(&event)))
+    Ok((StatusCode::CREATED, ResponseJson(event_to_response(&event))))
 }
 
 #[utoipa::path(
@@ -320,7 +323,7 @@ pub async fn generate_promo_codes(
     State(app_state): State<CreditEventAppState>,
     Extension(_admin_user): Extension<AdminUser>,
     Path(event_id): Path<String>,
-    ResponseJson(request): ResponseJson<GenerateCodesRequest>,
+    Json(request): Json<GenerateCodesRequest>,
 ) -> Result<ResponseJson<GenerateCodesResponse>, (StatusCode, ResponseJson<ErrorResponse>)> {
     let event_uuid = Uuid::parse_str(&event_id).map_err(|_| {
         (
@@ -435,14 +438,14 @@ pub async fn claim_credits(
     })?;
 
     let user_id = user.0.id;
-    let claimer_id = format!("user:{}", user_id);
+    let near_account_id = user.0.username.clone();
 
     let result = app_state
         .credit_event_service
         .claim_credits(services::credit_events::ports::ClaimCreditsRequest {
             event_id: event_uuid,
             code: request.code,
-            near_account_id: claimer_id,
+            near_account_id: near_account_id.clone(),
             user_id,
             organization_id: request.organization_id,
         })

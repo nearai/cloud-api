@@ -2954,7 +2954,7 @@ pub struct UpdateOrganizationLimitsRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
     #[serde(rename = "spendLimit")]
-    pub spend_limit: SpendLimitRequest,. ISO 8601 format.
+    pub spend_limit: SpendLimitRequest,
     #[serde(rename = "creditExpiresAt", skip_serializing_if = "Option::is_none")]
     pub credit_expires_at: Option<String>,
     #[serde(rename = "changedBy", skip_serializing_if = "Option::is_none")]
@@ -3698,6 +3698,7 @@ pub struct ClaimCreditsResponse {
     pub claim_id: String,
     #[serde(rename = "eventId")]
     pub event_id: String,
+    /// The username of the claimer. Will be a NEAR account ID when available.
     #[serde(rename = "nearAccountId")]
     pub near_account_id: String,
     #[serde(rename = "organizationId")]

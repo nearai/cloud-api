@@ -90,6 +90,8 @@ pub struct VLlmProvider {
     /// TLS fingerprint verification state (Bootstrap → Pinned or Blocked).
     /// Shared across the main client and all bucket clients.
     fingerprint_state: Arc<std::sync::RwLock<FingerprintState>>,
+    /// Shared TLS root certificates for building one-off clients on fingerprint retry.
+    tls_roots: SharedTlsRoots,
 }
 
 impl VLlmProvider {
@@ -152,6 +154,7 @@ impl VLlmProvider {
             pending_buckets: Arc::new(std::sync::Mutex::new(HashMap::new())),
             signature_buckets: Arc::new(std::sync::Mutex::new(HashMap::new())),
             fingerprint_state,
+            tls_roots,
         }
     }
 
@@ -189,6 +192,27 @@ impl VLlmProvider {
             .read()
             .unwrap_or_else(|e| e.into_inner())
             .pinned_count()
+    }
+
+    /// Check if a reqwest error is caused by a TLS SPKI fingerprint mismatch.
+    /// This indicates the L4 load balancer routed to a backend whose fingerprint
+    /// hasn't been discovered via attestation yet.
+    fn is_tls_fingerprint_error(error: &reqwest::Error) -> bool {
+        let msg = error.to_string();
+        msg.contains("does not match any attested fingerprint")
+            || msg.contains("TLS connections blocked")
+    }
+
+    /// Build a one-off reqwest Client with no connection pooling.
+    /// Forces a new TCP connection through L4, which routes to a (likely different) backend.
+    fn build_oneoff_client(&self) -> Client {
+        Client::builder()
+            .use_preconfigured_tls(self.tls_roots.build_config(self.fingerprint_state.clone()))
+            .pool_max_idle_per_host(0)
+            .connect_timeout(Duration::from_secs(5))
+            .read_timeout(Duration::from_secs(300))
+            .build()
+            .expect("Failed to create one-off HTTP client")
     }
 
     /// Build HTTP request headers
@@ -265,6 +289,10 @@ impl VLlmProvider {
         }
     }
 
+    /// Maximum retries when TLS fingerprint verification fails due to L4 routing
+    /// to a backend with an undiscovered fingerprint.
+    const TLS_FINGERPRINT_RETRIES: usize = 2;
+
     /// Send a streaming HTTP POST request with TTFB timeout protection.
     ///
     /// Uses `tokio::time::timeout` only around `.send()` so the timeout applies to TTFB only
@@ -273,6 +301,8 @@ impl VLlmProvider {
     /// kills long-running SSE streams at 30s.
     ///
     /// `client_override` allows using a dedicated client for connection pinning.
+    /// On TLS fingerprint mismatch (L4 routed to an undiscovered backend), retries
+    /// with a fresh non-pooled client to force a new TCP connection → new L4 route.
     async fn send_streaming_request<T: serde::Serialize + Send + Sync>(
         &self,
         url: &str,
@@ -280,33 +310,76 @@ impl VLlmProvider {
         params: &T,
         client_override: Option<&Client>,
     ) -> Result<reqwest::Response, CompletionError> {
-        let client = client_override.unwrap_or(&self.client);
-        let response = tokio::time::timeout(
-            Duration::from_secs(self.config.timeout_seconds as u64),
-            client.post(url).headers(headers).json(params).send(),
-        )
-        .await
-        .map_err(|_| CompletionError::HttpError {
-            status_code: 504,
-            message: "Timed out waiting for response headers from inference backend".to_string(),
-            is_external: false,
-        })?
-        .map_err(|e| CompletionError::CompletionError(e.to_string()))?;
+        let primary_client = client_override.unwrap_or(&self.client);
+        let timeout = Duration::from_secs(self.config.timeout_seconds as u64);
 
-        if !response.status().is_success() {
-            let status_code = response.status().as_u16();
-            let error_text = response
-                .text()
-                .await
-                .unwrap_or_else(|e| format!("Failed to read error response body: {e}"));
-            return Err(CompletionError::HttpError {
-                status_code,
-                message: crate::extract_error_message(&error_text),
-                is_external: false,
-            });
+        // Try primary client first. On TLS fingerprint mismatch, retry with fresh
+        // clients to get a different L4 route to an attested backend.
+        let mut last_tls_error = None;
+        for attempt in 0..=Self::TLS_FINGERPRINT_RETRIES {
+            let oneoff;
+            let client = if attempt == 0 {
+                primary_client
+            } else {
+                oneoff = self.build_oneoff_client();
+                &oneoff
+            };
+
+            match tokio::time::timeout(
+                timeout,
+                client
+                    .post(url)
+                    .headers(headers.clone())
+                    .json(params)
+                    .send(),
+            )
+            .await
+            {
+                Ok(Ok(response)) => {
+                    if !response.status().is_success() {
+                        let status_code = response.status().as_u16();
+                        let error_text = response
+                            .text()
+                            .await
+                            .unwrap_or_else(|e| format!("Failed to read error response body: {e}"));
+                        return Err(CompletionError::HttpError {
+                            status_code,
+                            message: crate::extract_error_message(&error_text),
+                            is_external: false,
+                        });
+                    }
+                    return Ok(response);
+                }
+                Ok(Err(e)) if Self::is_tls_fingerprint_error(&e) => {
+                    tracing::warn!(
+                        attempt = attempt + 1,
+                        max_retries = Self::TLS_FINGERPRINT_RETRIES,
+                        "TLS fingerprint mismatch (L4 routed to undiscovered backend), \
+                         retrying with fresh connection"
+                    );
+                    last_tls_error = Some(e);
+                    continue;
+                }
+                Ok(Err(e)) => {
+                    return Err(CompletionError::CompletionError(e.to_string()));
+                }
+                Err(_timeout) => {
+                    return Err(CompletionError::HttpError {
+                        status_code: 504,
+                        message: "Timed out waiting for response headers from inference backend"
+                            .to_string(),
+                        is_external: false,
+                    });
+                }
+            }
         }
 
-        Ok(response)
+        // All retries hit undiscovered backends
+        Err(CompletionError::CompletionError(
+            last_tls_error
+                .map(|e| e.to_string())
+                .unwrap_or_else(|| "TLS fingerprint verification failed".to_string()),
+        ))
     }
 }
 
@@ -579,17 +652,61 @@ impl InferenceProvider for VLlmProvider {
         // Prepare encryption headers
         self.prepare_encryption_headers(&mut headers, &mut non_streaming_params.extra);
 
-        // Route to a bucket client based on prompt prefix (same as streaming path)
+        // Route to a bucket client based on prompt prefix (same as streaming path).
+        // On TLS fingerprint mismatch (L4 routed to undiscovered backend), retry with
+        // a fresh non-pooled client to force a new L4 route.
         let bucket_id = self.prefix_router.route(&non_streaming_params.messages);
-        let bucket_client = &self.bucket_clients[bucket_id];
-        let response = bucket_client
-            .post(&url)
-            .headers(headers)
-            .json(&non_streaming_params)
-            .timeout(Duration::from_secs(self.config.timeout_seconds as u64))
-            .send()
-            .await
-            .map_err(|e| CompletionError::CompletionError(e.to_string()))?;
+        let timeout = Duration::from_secs(self.config.timeout_seconds as u64);
+        let response = {
+            let bucket_client = &self.bucket_clients[bucket_id];
+            let mut last_tls_error = None;
+            let mut result = None;
+            for attempt in 0..=Self::TLS_FINGERPRINT_RETRIES {
+                let oneoff;
+                let client = if attempt == 0 {
+                    bucket_client
+                } else {
+                    oneoff = self.build_oneoff_client();
+                    &oneoff
+                };
+                match client
+                    .post(&url)
+                    .headers(headers.clone())
+                    .json(&non_streaming_params)
+                    .timeout(timeout)
+                    .send()
+                    .await
+                {
+                    Ok(resp) => {
+                        result = Some(resp);
+                        break;
+                    }
+                    Err(e) if Self::is_tls_fingerprint_error(&e) => {
+                        tracing::warn!(
+                            attempt = attempt + 1,
+                            max_retries = Self::TLS_FINGERPRINT_RETRIES,
+                            "TLS fingerprint mismatch (L4 routed to undiscovered backend), \
+                             retrying with fresh connection"
+                        );
+                        last_tls_error = Some(e);
+                        continue;
+                    }
+                    Err(e) => {
+                        return Err(CompletionError::CompletionError(e.to_string()));
+                    }
+                }
+            }
+            match result {
+                Some(resp) => resp,
+                None => {
+                    return Err(CompletionError::CompletionError(
+                        last_tls_error
+                            .map(|e| e.to_string())
+                            .unwrap_or_else(|| "TLS fingerprint verification failed".to_string()),
+                    ));
+                }
+            }
+        };
 
         if !response.status().is_success() {
             let status = response.status();
@@ -1265,5 +1382,31 @@ mod tests {
             json.contains("some_valid_param"),
             "Non-encryption extra fields should still be serialized"
         );
+    }
+
+    #[test]
+    fn test_fingerprint_error_detection_strings() {
+        // Verify the string patterns that is_tls_fingerprint_error checks for.
+        // These match the error messages from SpkiFingerprintVerifier in spki_verifier.rs.
+        let mismatch_msg = "error sending request for url: error trying to connect: \
+            invalid peer certificate: TLS certificate SPKI fingerprint abc123 \
+            does not match any attested fingerprint";
+        assert!(mismatch_msg.contains("does not match any attested fingerprint"));
+
+        let blocked_msg = "error trying to connect: invalid peer certificate: \
+            TLS connections blocked: attestation verification failed";
+        assert!(blocked_msg.contains("TLS connections blocked"));
+
+        // Normal connection errors should NOT match
+        let normal_err = "error sending request: connection refused";
+        assert!(!normal_err.contains("does not match any attested fingerprint"));
+        assert!(!normal_err.contains("TLS connections blocked"));
+    }
+
+    #[test]
+    fn test_build_oneoff_client() {
+        let provider = create_test_provider();
+        // Should not panic
+        let _client = provider.build_oneoff_client();
     }
 }

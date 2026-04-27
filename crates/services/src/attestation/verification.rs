@@ -159,12 +159,20 @@ impl AttestationVerifier {
             AttestationVerificationError::InvalidFormat(format!("intel_quote hex decode: {e}"))
         })?;
 
-        let verified_report =
-            dcap_qvl::collateral::get_collateral_and_verify(&quote_bytes, self.pccs_url.as_deref())
-                .await
-                .map_err(|e| {
-                    AttestationVerificationError::TdxVerificationFailed(format!("{e:#}"))
-                })?;
+        let pccs_url = self
+            .pccs_url
+            .clone()
+            .unwrap_or_else(|| dcap_qvl::collateral::PHALA_PCCS_URL.to_string());
+        let collateral_client = dcap_qvl::collateral::CollateralClient::with_default_http(pccs_url)
+            .map_err(|e| {
+                AttestationVerificationError::TdxVerificationFailed(format!(
+                    "failed to build collateral client: {e:#}"
+                ))
+            })?;
+        let verified_report = collateral_client
+            .fetch_and_verify(&quote_bytes)
+            .await
+            .map_err(|e| AttestationVerificationError::TdxVerificationFailed(format!("{e:#}")))?;
 
         // Check TCB status
         let tcb_status = &verified_report.status;

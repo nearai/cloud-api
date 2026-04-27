@@ -247,12 +247,28 @@ impl VLlmProvider {
         for _attempt in 0..=Self::INLINE_VERIFY_RETRIES {
             match verifier.create_verified_client(&self.config.base_url).await {
                 Ok(client) => {
-                    *self.bucket_clients[bucket_id]
+                    // Double-check: another concurrent request may have filled
+                    // this bucket while we were verifying. Use its client if so
+                    // (avoids wasting the connection it established).
+                    let mut guard = self.bucket_clients[bucket_id]
                         .lock()
-                        .unwrap_or_else(|e| e.into_inner()) = Some(client.clone());
+                        .unwrap_or_else(|e| e.into_inner());
+                    if let Some(ref existing) = *guard {
+                        return Ok(existing.clone());
+                    }
+                    *guard = Some(client.clone());
                     return Ok(client);
                 }
                 Err(e) => {
+                    // Another request may have filled the bucket while we failed.
+                    let guard = self.bucket_clients[bucket_id]
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    if let Some(ref existing) = *guard {
+                        return Ok(existing.clone());
+                    }
+                    drop(guard);
+
                     tracing::warn!(
                         bucket = bucket_id,
                         error = %e,
@@ -270,9 +286,9 @@ impl VLlmProvider {
         )))
     }
 
-    /// Clear a bucket's client (e.g., after a connection error) so it will be
-    /// re-verified on next use.
-    #[allow(dead_code)]
+    /// Clear a bucket's client so it will be re-verified on next use.
+    /// Called on connection errors — prevents a stale client (whose H2
+    /// connection dropped) from persisting in Bootstrap mode on reconnect.
     fn clear_bucket(&self, bucket_id: usize) {
         *self.bucket_clients[bucket_id]
             .lock()
@@ -634,9 +650,27 @@ impl InferenceProvider for VLlmProvider {
         // pins the client.
         let bucket_id = self.prefix_router.route(&streaming_params.messages);
         let bucket_client = self.get_or_verify_bucket_client(bucket_id).await?;
-        let response = self
-            .send_streaming_request(&url, headers, &streaming_params, Some(&bucket_client))
-            .await?;
+        let response = match self
+            .send_streaming_request(
+                &url,
+                headers.clone(),
+                &streaming_params,
+                Some(&bucket_client),
+            )
+            .await
+        {
+            Ok(r) => r,
+            Err(CompletionError::CompletionError(ref msg))
+                if msg.contains("connection") || msg.contains("connect") =>
+            {
+                // Connection dropped — clear bucket so next request re-verifies.
+                self.clear_bucket(bucket_id);
+                let fresh = self.get_or_verify_bucket_client(bucket_id).await?;
+                self.send_streaming_request(&url, headers, &streaming_params, Some(&fresh))
+                    .await?
+            }
+            Err(e) => return Err(e),
+        };
 
         // Store the bucket ID for signature fetching.
         self.pending_buckets
@@ -673,14 +707,27 @@ impl InferenceProvider for VLlmProvider {
         let bucket_client = self.get_or_verify_bucket_client(bucket_id).await?;
         let timeout = Duration::from_secs(self.config.timeout_seconds as u64);
 
-        let response = bucket_client
-            .post(&url)
-            .headers(headers)
-            .json(&non_streaming_params)
-            .timeout(timeout)
-            .send()
-            .await
-            .map_err(|e| CompletionError::CompletionError(e.to_string()))?;
+        let send = |client: &Client, hdrs: reqwest::header::HeaderMap| {
+            client
+                .post(&url)
+                .headers(hdrs)
+                .json(&non_streaming_params)
+                .timeout(timeout)
+                .send()
+        };
+
+        let response = match send(&bucket_client, headers.clone()).await {
+            Ok(r) => r,
+            Err(e) if e.is_connect() || e.to_string().contains("connection") => {
+                // Connection dropped — clear bucket, re-verify, retry once.
+                self.clear_bucket(bucket_id);
+                let fresh = self.get_or_verify_bucket_client(bucket_id).await?;
+                send(&fresh, headers)
+                    .await
+                    .map_err(|e| CompletionError::CompletionError(e.to_string()))?
+            }
+            Err(e) => return Err(CompletionError::CompletionError(e.to_string())),
+        };
 
         if !response.status().is_success() {
             let status = response.status();
@@ -1368,7 +1415,7 @@ mod tests {
     }
 
     #[test]
-    fn test_lazy_buckets_start_empty_without_verifier() {
+    fn test_legacy_provider_eagerly_creates_buckets() {
         // Without a verifier, buckets are eagerly pre-created (legacy path)
         let provider = create_test_provider();
         let guard = provider.bucket_clients[0]

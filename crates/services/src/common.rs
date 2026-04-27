@@ -35,7 +35,7 @@ pub fn generate_api_key() -> String {
 pub fn hash_api_key(key: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(key.as_bytes());
-    format!("{:x}", hasher.finalize())
+    hex::encode(hasher.finalize())
 }
 
 pub fn extract_api_key_prefix(key: &str) -> String {

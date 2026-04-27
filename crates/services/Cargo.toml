@@ -11,7 +11,7 @@ async-trait = "0.1"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 serde_urlencoded = "0.7"
-uuid = { version = "1.22", features = ["v4", "v5", "serde"] }
+uuid = { version = "1.23", features = ["v4", "v5", "serde"] }
 opentelemetry = { version = "0.31", features = ["metrics"] }
 opentelemetry_sdk = { version = "0.31", features = ["rt-tokio", "metrics"] }
 chrono = { version = "0.4", features = ["serde"] }
@@ -33,31 +33,31 @@ url = "2.5"
 bytes = "1.11"
 tokio-stream = "0.1"
 # MCP protocol
-rmcp = { version = "1.2", features = [
+rmcp = { version = "1.5", features = [
     "client",
     "transport-streamable-http-client-reqwest",
 ] }
 hex = "0.4"
 # NEAR wallet authentication (NEP-413)
-near-api = "0.8.5"
+near-api = "0.8.6"
 dstack-sdk = "0.1.2"
 dstack-sdk-types = "0.1.2"
 ed25519-dalek = { version = "2.1", features = ["rand_core"] }
 k256 = { version = "0.13", features = ["ecdsa", "arithmetic"] }
-sha3 = "0.10"
+sha3 = "0.11"
 jsonwebtoken = { version = "10.3.0", features = ["rust_crypto"] }
 regex = "1.12"
 # AWS S3 for file storage
 aws-config = { version = "1.8", features = ["behavior-version-latest"] }
-aws-sdk-s3 = "1.125"
+aws-sdk-s3 = "1.131"
 # Encryption for file storage
 aes-gcm = "0.10"
 # HMAC for VPC signature verification
-hmac = "0.12"
-sha2 = "0.10"
+hmac = "0.13"
+sha2 = "0.11"
 x509-parser = "0.18"
-dcap-qvl = "0.3"
-moka = { version = "0.12.14", features = ["future"] }
+dcap-qvl = "0.4"
+moka = { version = "0.12.15", features = ["future"] }
 bloomfilter = "3.0.1"
 mockall = { version = "0.14", optional = true }
 base64 = "0.22"

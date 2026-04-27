@@ -113,6 +113,115 @@ pub struct InferenceProviderPool {
     attestation_verifier: Arc<AttestationVerifier>,
 }
 
+/// Backend verifier that creates verified reqwest clients by connecting to a backend,
+/// fetching its attestation report, and verifying the TDX quote + GPU evidence.
+/// Used by `VLlmProvider` for lazy bucket client creation.
+struct PoolBackendVerifier {
+    api_key: Option<String>,
+    model_name: String,
+    tls_roots: SharedTlsRoots,
+    attestation_verifier: Arc<AttestationVerifier>,
+    /// Shared fingerprint state — newly discovered fingerprints are pinned here
+    /// so other providers and discovery cycles benefit.
+    fingerprint_state: Arc<std::sync::RwLock<FingerprintState>>,
+}
+
+#[async_trait::async_trait]
+impl inference_providers::BackendVerifier for PoolBackendVerifier {
+    async fn create_verified_client(&self, base_url: &str) -> Result<reqwest::Client, String> {
+        // 1. Build a client with isolated Bootstrap state (accepts any WebPKI cert
+        //    for the initial connection to discover the backend's fingerprint).
+        let client_state = Arc::new(std::sync::RwLock::new(FingerprintState::Bootstrap));
+        let client = reqwest::Client::builder()
+            .use_preconfigured_tls(self.tls_roots.build_config(client_state.clone()))
+            .pool_max_idle_per_host(1)
+            .http2_adaptive_window(true)
+            .connect_timeout(Duration::from_secs(5))
+            .pool_idle_timeout(Duration::from_secs(300))
+            .read_timeout(Duration::from_secs(300))
+            .build()
+            .map_err(|e| format!("Failed to build HTTP client: {e}"))?;
+
+        // 2. Fetch attestation report — this establishes the H2 connection.
+        //    Nonce must be 32-byte hex (same format as discover_model).
+        let nonce_bytes: [u8; 32] = rand::random();
+        let nonce = hex::encode(nonce_bytes);
+
+        let qs = serde_urlencoded::to_string([
+            ("model", self.model_name.as_str()),
+            ("signing_algo", "ecdsa"),
+            ("nonce", &nonce),
+            ("include_tls_fingerprint", "true"),
+        ])
+        .map_err(|e| format!("Failed to build query string: {e}"))?;
+
+        let url = format!("{base_url}/v1/attestation/report?{qs}");
+        let mut request = client.get(&url);
+        if let Some(ref key) = self.api_key {
+            request = request.header("Authorization", format!("Bearer {key}"));
+        }
+        let response = tokio::time::timeout(Duration::from_secs(10), request.send())
+            .await
+            .map_err(|_| "Attestation request timed out".to_string())?
+            .map_err(|e| format!("Attestation request failed: {e}"))?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "unknown".to_string());
+            return Err(format!("Attestation HTTP {status}: {body}"));
+        }
+
+        let report: serde_json::Map<String, serde_json::Value> = response
+            .json()
+            .await
+            .map_err(|e| format!("Failed to parse attestation response: {e}"))?;
+
+        // 3. Verify the attestation report (TDX quote, GPU evidence, image hash).
+        let verified = self
+            .attestation_verifier
+            .verify_attestation_report(&report, &nonce)
+            .await
+            .map_err(|e| format!("Attestation verification failed: {e}"))?;
+
+        // 4. Pin the verified fingerprint in BOTH the shared state (so other
+        //    providers benefit) AND the client's own state (so reconnections
+        //    to a different backend are rejected — forces re-verification).
+        if let Some(ref fp) = verified.tls_cert_fingerprint {
+            // Shared state
+            {
+                let mut shared = self
+                    .fingerprint_state
+                    .write()
+                    .unwrap_or_else(|e| e.into_inner());
+                let before = shared.pinned_count();
+                shared.add_fingerprint(fp.clone());
+                if shared.pinned_count() > before {
+                    info!(
+                        fingerprint = %fp,
+                        "Inline verification pinned new TLS fingerprint"
+                    );
+                }
+            }
+            // Client's own state: Bootstrap → Pinned({fp}).
+            // If the H2 connection drops and reqwest silently reconnects,
+            // the new handshake must match this specific fingerprint.
+            // A reconnection to a different backend will fail, triggering
+            // clear_bucket → re-verification.
+            client_state
+                .write()
+                .unwrap_or_else(|e| e.into_inner())
+                .add_fingerprint(fp.clone());
+        }
+
+        // 5. Return the client — its H2 connection is to the verified backend,
+        //    and its TLS verifier only accepts that backend on reconnection.
+        Ok(client)
+    }
+}
+
 impl InferenceProviderPool {
     /// Create a new pool with optional API key for backend authentication
     pub fn new(api_key: Option<String>, external_configs: ExternalProvidersConfig) -> Self {
@@ -1737,14 +1846,22 @@ impl InferenceProviderPool {
                     )
                     .await;
 
-                    // Serving provider shares the same fingerprint_state — its
-                    // reqwest clients will verify future TLS handshakes against
-                    // whatever has been pinned so far (and pick up new pins as
-                    // cumulative discovery expands the set).
+                    // Serving provider with inline backend verification.
+                    // Bucket clients are created lazily: on first use, the verifier
+                    // connects to a backend, verifies attestation, and pins the
+                    // fingerprint. This eliminates failures from undiscovered backends.
+                    let backend_verifier = Arc::new(PoolBackendVerifier {
+                        api_key: api_key.clone(),
+                        model_name: model_name.clone(),
+                        tls_roots: tls_roots.clone(),
+                        attestation_verifier: verifier.clone(),
+                        fingerprint_state: state.clone(),
+                    });
                     let serving_provider =
-                        Arc::new(VLlmProvider::new_with_fingerprint_state(
+                        Arc::new(VLlmProvider::new_with_verifier(
                             VLlmConfig::new(url.clone(), api_key.clone(), None),
                             state.clone(),
+                            backend_verifier,
                         ));
 
                     if outcome.total_pinned == 0 {

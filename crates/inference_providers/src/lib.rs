@@ -53,6 +53,8 @@
 //! }
 //! ```
 
+use reqwest::Client;
+
 pub mod chunk_builder;
 pub mod external;
 pub mod mock;
@@ -94,6 +96,19 @@ pub use external::{
     AnthropicBackend, ExternalProvider, ExternalProviderConfig, GeminiBackend,
     OpenAiCompatibleBackend, ProviderConfig,
 };
+
+/// Creates a verified `reqwest::Client` with an H2 connection to a specific backend.
+///
+/// Used by `VLlmProvider` for inline backend verification: when a bucket needs a new
+/// client, the verifier connects to model-proxy, fetches the backend's attestation
+/// report, verifies it (TDX quote, GPU evidence, image hash), pins the TLS fingerprint,
+/// and returns the client with its established connection.
+#[async_trait::async_trait]
+pub trait BackendVerifier: Send + Sync {
+    /// Connect to `base_url`, verify the backend's attestation, and return a client
+    /// whose H2 connection is pinned to that verified backend.
+    async fn create_verified_client(&self, base_url: &str) -> Result<Client, String>;
+}
 
 /// Try to extract a human-readable error message from a JSON error response body.
 ///

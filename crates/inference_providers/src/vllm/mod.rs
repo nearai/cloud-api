@@ -76,11 +76,10 @@ pub struct VLlmProvider {
     config: VLlmConfig,
     /// General-purpose client for non-completion requests (attestation, models, etc.)
     client: Client,
-    /// Persistent clients indexed by prefix bucket ID. Each maintains a single
-    /// connection pinned to a specific backend via L4 TLS passthrough. Requests
-    /// with the same prompt prefix route to the same bucket → same backend →
-    /// prefix cache hit.
-    bucket_clients: Vec<Client>,
+    /// Lazily-filled bucket clients indexed by prefix bucket ID. Each slot starts
+    /// empty and is filled on first use via inline backend verification. Once filled,
+    /// the client maintains a persistent H2 connection to a specific verified backend.
+    bucket_clients: Vec<std::sync::Mutex<Option<Client>>>,
     /// Prefix router: message-level trie mapping conversation prefixes to bucket IDs.
     prefix_router: Arc<PrefixRouter>,
     /// Maps request_hash → bucket_id during streaming (before chat_id is known).
@@ -90,23 +89,47 @@ pub struct VLlmProvider {
     /// TLS fingerprint verification state (Bootstrap → Pinned or Blocked).
     /// Shared across the main client and all bucket clients.
     fingerprint_state: Arc<std::sync::RwLock<FingerprintState>>,
+    /// Creates verified clients for lazy bucket initialization.
+    /// When a bucket needs a client, the verifier connects to a backend,
+    /// verifies its attestation, pins the fingerprint, and returns the client.
+    backend_verifier: Option<Arc<dyn crate::BackendVerifier>>,
 }
 
 impl VLlmProvider {
-    /// Create a new vLLM provider with the given configuration
+    /// Create a new vLLM provider with the given configuration.
+    /// Without a `BackendVerifier`, bucket clients are pre-created eagerly
+    /// (legacy behavior for tests and non-TEE environments).
     pub fn new(config: VLlmConfig) -> Self {
         let fingerprint_state = Arc::new(std::sync::RwLock::new(FingerprintState::Bootstrap));
         Self::new_with_fingerprint_state(config, fingerprint_state)
     }
 
     /// Create a new vLLM provider sharing an existing fingerprint state.
-    /// Used to create a fresh connection pool after TLS pinning is established,
-    /// ensuring all new connections go through the SPKI verifier.
+    /// Without a `BackendVerifier`, bucket clients are pre-created eagerly.
     pub fn new_with_fingerprint_state(
         config: VLlmConfig,
         fingerprint_state: Arc<std::sync::RwLock<FingerprintState>>,
     ) -> Self {
-        // Load root certs once, share across all clients (~150KB instead of N×150KB)
+        Self::build(config, fingerprint_state, None)
+    }
+
+    /// Create a new vLLM provider with inline backend verification.
+    /// Bucket clients are created lazily: on first use, the verifier connects to
+    /// a backend, verifies attestation, pins the fingerprint, and returns a client
+    /// whose H2 connection is pinned to that verified backend.
+    pub fn new_with_verifier(
+        config: VLlmConfig,
+        fingerprint_state: Arc<std::sync::RwLock<FingerprintState>>,
+        verifier: Arc<dyn crate::BackendVerifier>,
+    ) -> Self {
+        Self::build(config, fingerprint_state, Some(verifier))
+    }
+
+    fn build(
+        config: VLlmConfig,
+        fingerprint_state: Arc<std::sync::RwLock<FingerprintState>>,
+        backend_verifier: Option<Arc<dyn crate::BackendVerifier>>,
+    ) -> Self {
         let tls_roots = SharedTlsRoots::load();
 
         // General-purpose client for non-completion requests
@@ -118,31 +141,31 @@ impl VLlmProvider {
             .build()
             .expect("Failed to create HTTP client");
 
-        // Prefix router determines which bucket to use for each completion
         let prefix_router = Arc::new(PrefixRouter::new());
         let num_buckets = prefix_router.num_buckets();
 
-        // Create persistent bucket clients — each maintains one connection
-        // pinned to a specific backend via L4 TLS passthrough.
-        //
-        // Relies on HTTP/2 multiplexing: concurrent requests on the same bucket
-        // share one TLS connection → guaranteed same backend. CVM nginx (port 8444)
-        // negotiates h2 via ALPN. With HTTP/1.1 fallback, concurrent requests may
-        // open additional connections to different backends — signature fetches
-        // handle this with a retry fallback (see get_signature).
-        let bucket_clients: Vec<Client> = (0..num_buckets)
-            .map(|_| {
-                Client::builder()
-                    .use_preconfigured_tls(tls_roots.build_config(fingerprint_state.clone()))
-                    .pool_max_idle_per_host(1)
-                    .http2_adaptive_window(true)
-                    .connect_timeout(Duration::from_secs(5))
-                    .pool_idle_timeout(Duration::from_secs(300))
-                    .read_timeout(Duration::from_secs(300))
-                    .build()
-                    .expect("Failed to create bucket HTTP client")
-            })
-            .collect();
+        // Bucket clients: lazily filled when a verifier is available (each bucket
+        // gets a verified client on first use), or eagerly pre-created (legacy).
+        let bucket_clients: Vec<std::sync::Mutex<Option<Client>>> = if backend_verifier.is_some() {
+            (0..num_buckets)
+                .map(|_| std::sync::Mutex::new(None))
+                .collect()
+        } else {
+            (0..num_buckets)
+                .map(|_| {
+                    let c = Client::builder()
+                        .use_preconfigured_tls(tls_roots.build_config(fingerprint_state.clone()))
+                        .pool_max_idle_per_host(1)
+                        .http2_adaptive_window(true)
+                        .connect_timeout(Duration::from_secs(5))
+                        .pool_idle_timeout(Duration::from_secs(300))
+                        .read_timeout(Duration::from_secs(300))
+                        .build()
+                        .expect("Failed to create bucket HTTP client");
+                    std::sync::Mutex::new(Some(c))
+                })
+                .collect()
+        };
 
         Self {
             config,
@@ -152,6 +175,7 @@ impl VLlmProvider {
             pending_buckets: Arc::new(std::sync::Mutex::new(HashMap::new())),
             signature_buckets: Arc::new(std::sync::Mutex::new(HashMap::new())),
             fingerprint_state,
+            backend_verifier,
         }
     }
 
@@ -191,11 +215,103 @@ impl VLlmProvider {
             .pinned_count()
     }
 
-    /// Check if an error message indicates a TLS SPKI fingerprint mismatch.
-    /// Matches the error strings produced by `SpkiFingerprintVerifier` in `spki_verifier.rs`.
-    fn is_tls_fingerprint_error_msg(msg: &str) -> bool {
-        msg.contains("does not match any attested fingerprint")
-            || msg.contains("TLS connections blocked")
+    /// Maximum inline-verification retries when creating a verified bucket client.
+    const INLINE_VERIFY_RETRIES: usize = 2;
+
+    /// Get the client for a bucket, creating and verifying it inline if needed.
+    /// On first use, connects to a backend via L4, fetches its attestation report,
+    /// verifies it, pins the fingerprint, and caches the client.
+    async fn get_or_verify_bucket_client(
+        &self,
+        bucket_id: usize,
+    ) -> Result<Client, CompletionError> {
+        // Fast path: bucket already has a verified client.
+        // reqwest::Client::clone is an Arc refcount bump — hold the lock briefly.
+        {
+            let guard = self.bucket_clients[bucket_id]
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if let Some(ref client) = *guard {
+                return Ok(client.clone());
+            }
+        }
+
+        // Slow path: inline verification.
+        let verifier = self.backend_verifier.as_ref().ok_or_else(|| {
+            CompletionError::CompletionError(
+                "No backend verifier configured for lazy bucket creation".to_string(),
+            )
+        })?;
+
+        let mut last_err = None;
+        for _attempt in 0..=Self::INLINE_VERIFY_RETRIES {
+            match verifier.create_verified_client(&self.config.base_url).await {
+                Ok(client) => {
+                    // Double-check: another concurrent request may have filled
+                    // this bucket while we were verifying. Use its client if so
+                    // (avoids wasting the connection it established).
+                    let mut guard = self.bucket_clients[bucket_id]
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    if let Some(ref existing) = *guard {
+                        return Ok(existing.clone());
+                    }
+                    *guard = Some(client.clone());
+                    return Ok(client);
+                }
+                Err(e) => {
+                    // Another request may have filled the bucket while we failed.
+                    let guard = self.bucket_clients[bucket_id]
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    if let Some(ref existing) = *guard {
+                        return Ok(existing.clone());
+                    }
+                    drop(guard);
+
+                    tracing::warn!(
+                        bucket = bucket_id,
+                        error = %e,
+                        "Inline backend verification failed, retrying"
+                    );
+                    last_err = Some(e);
+                }
+            }
+        }
+
+        Err(CompletionError::CompletionError(format!(
+            "Failed to create verified client after {} attempts: {}",
+            Self::INLINE_VERIFY_RETRIES + 1,
+            last_err.unwrap_or_default()
+        )))
+    }
+
+    /// Check if a CompletionError indicates a connection/transport failure
+    /// (as opposed to an HTTP-level error from the backend).
+    fn is_connection_error(err: &CompletionError) -> bool {
+        match err {
+            CompletionError::CompletionError(msg) => {
+                // reqwest connection errors contain these keywords.
+                // After send_streaming_request converts reqwest::Error to String,
+                // this is the only way to detect transport failures.
+                msg.contains("error sending request")
+                    || msg.contains("connection closed")
+                    || msg.contains("connection reset")
+                    || msg.contains("broken pipe")
+                    || msg.contains("does not match any attested fingerprint")
+                    || msg.contains("TLS connections blocked")
+            }
+            _ => false,
+        }
+    }
+
+    /// Clear a bucket's client so it will be re-verified on next use.
+    /// Called on connection errors — prevents a stale client (whose H2
+    /// connection dropped) from being reused with an unverified reconnection.
+    fn clear_bucket(&self, bucket_id: usize) {
+        *self.bucket_clients[bucket_id]
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
     }
 
     /// Build HTTP request headers
@@ -272,10 +388,6 @@ impl VLlmProvider {
         }
     }
 
-    /// Maximum retries with alternate bucket clients when TLS fingerprint
-    /// verification fails because L4 routed to an undiscovered backend.
-    const TLS_FINGERPRINT_RETRIES: usize = 2;
-
     /// Send a streaming HTTP POST request with TTFB timeout protection.
     ///
     /// Uses `tokio::time::timeout` only around `.send()` so the timeout applies to TTFB only
@@ -349,17 +461,19 @@ impl InferenceProvider for VLlmProvider {
             .unwrap_or_else(|e| e.into_inner())
             .get(chat_id)
             .copied();
-        let primary_client = match bucket_id {
-            Some(id) => &self.bucket_clients[id],
-            None => &self.client,
-        };
+        let bucket_client = bucket_id.and_then(|id| {
+            self.bucket_clients[id]
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
+        });
 
         let timeout = Duration::from_secs(self.config.timeout_seconds as u64);
-        let clients_to_try: Vec<&Client> = if bucket_id.is_some() {
-            vec![primary_client, &self.client]
-        } else {
-            vec![primary_client]
-        };
+        let mut clients_to_try: Vec<&Client> = Vec::new();
+        if let Some(ref bc) = bucket_client {
+            clients_to_try.push(bc);
+        }
+        clients_to_try.push(&self.client);
 
         let mut last_error = None;
         for client in clients_to_try {
@@ -549,59 +663,41 @@ impl InferenceProvider for VLlmProvider {
         self.prepare_encryption_headers(&mut headers, &mut streaming_params.extra);
 
         // Route to a bucket client based on prompt prefix.
-        // The bucket client maintains a persistent TLS connection pinned to a
-        // specific backend via L4 passthrough → prefix cache hits.
-        //
-        // On TLS fingerprint mismatch (L4 routed to an undiscovered backend),
-        // try alternate bucket clients which likely have warm connections to
-        // different (attested) backends.
+        // The bucket client maintains a persistent H2 connection to a verified backend
+        // via L4 passthrough → prefix cache hits. Buckets are lazily filled: on first
+        // use, inline verification connects to a backend, verifies attestation, and
+        // pins the client.
         let bucket_id = self.prefix_router.route(&streaming_params.messages);
-        let num_buckets = self.bucket_clients.len();
-        let mut last_err = None;
-
-        for attempt in 0..=Self::TLS_FINGERPRINT_RETRIES {
-            let effective_bucket = (bucket_id + attempt) % num_buckets;
-            let bucket_client = &self.bucket_clients[effective_bucket];
-
-            match self
-                .send_streaming_request(
-                    &url,
-                    headers.clone(),
-                    &streaming_params,
-                    Some(bucket_client),
-                )
-                .await
-            {
-                Ok(response) => {
-                    // Store the effective bucket ID for signature fetching.
-                    self.pending_buckets
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .insert(request_hash, effective_bucket);
-
-                    let sse_stream = new_sse_parser(response.bytes_stream(), true);
-                    return Ok(Box::pin(sse_stream));
-                }
-                Err(CompletionError::CompletionError(ref msg))
-                    if Self::is_tls_fingerprint_error_msg(msg) =>
-                {
-                    tracing::warn!(
-                        attempt = attempt + 1,
-                        bucket = effective_bucket,
-                        "TLS fingerprint mismatch, trying alternate bucket"
-                    );
-                    last_err = Some(CompletionError::CompletionError(msg.clone()));
-                    continue;
-                }
-                Err(e) => return Err(e),
-            }
-        }
-
-        Err(last_err.unwrap_or_else(|| {
-            CompletionError::CompletionError(
-                "TLS fingerprint verification failed after retries".to_string(),
+        let bucket_client = self.get_or_verify_bucket_client(bucket_id).await?;
+        let response = match self
+            .send_streaming_request(
+                &url,
+                headers.clone(),
+                &streaming_params,
+                Some(&bucket_client),
             )
-        }))
+            .await
+        {
+            Ok(r) => r,
+            Err(ref e) if Self::is_connection_error(e) => {
+                // Connection dropped or fingerprint mismatch on reconnect —
+                // clear bucket and re-verify with a fresh attestation.
+                self.clear_bucket(bucket_id);
+                let fresh = self.get_or_verify_bucket_client(bucket_id).await?;
+                self.send_streaming_request(&url, headers, &streaming_params, Some(&fresh))
+                    .await?
+            }
+            Err(e) => return Err(e),
+        };
+
+        // Store the bucket ID for signature fetching.
+        self.pending_buckets
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(request_hash, bucket_id);
+
+        let sse_stream = new_sse_parser(response.bytes_stream(), true);
+        Ok(Box::pin(sse_stream))
     }
 
     /// Performs a chat completion request
@@ -624,51 +720,37 @@ impl InferenceProvider for VLlmProvider {
         // Prepare encryption headers
         self.prepare_encryption_headers(&mut headers, &mut non_streaming_params.extra);
 
-        // Route to a bucket client based on prompt prefix (same as streaming path).
-        // On TLS fingerprint mismatch, try alternate bucket clients.
+        // Route to a verified bucket client based on prompt prefix.
         let bucket_id = self.prefix_router.route(&non_streaming_params.messages);
-        let num_buckets = self.bucket_clients.len();
+        let bucket_client = self.get_or_verify_bucket_client(bucket_id).await?;
         let timeout = Duration::from_secs(self.config.timeout_seconds as u64);
 
-        let (response, effective_bucket) = {
-            let mut last_err = None;
-            let mut result = None;
-            for attempt in 0..=Self::TLS_FINGERPRINT_RETRIES {
-                let eb = (bucket_id + attempt) % num_buckets;
-                match self.bucket_clients[eb]
-                    .post(&url)
-                    .headers(headers.clone())
-                    .json(&non_streaming_params)
-                    .timeout(timeout)
-                    .send()
+        let send = |client: &Client, hdrs: reqwest::header::HeaderMap| {
+            client
+                .post(&url)
+                .headers(hdrs)
+                .json(&non_streaming_params)
+                .timeout(timeout)
+                .send()
+        };
+
+        let response = match send(&bucket_client, headers.clone()).await {
+            Ok(r) => r,
+            Err(e)
+                if e.is_connect()
+                    || e.to_string()
+                        .contains("does not match any attested fingerprint")
+                    || e.to_string().contains("error sending request") =>
+            {
+                // Connection dropped or fingerprint mismatch on reconnect —
+                // clear bucket and re-verify with a fresh attestation.
+                self.clear_bucket(bucket_id);
+                let fresh = self.get_or_verify_bucket_client(bucket_id).await?;
+                send(&fresh, headers)
                     .await
-                {
-                    Ok(resp) => {
-                        result = Some((resp, eb));
-                        break;
-                    }
-                    Err(e) if Self::is_tls_fingerprint_error_msg(&e.to_string()) => {
-                        tracing::warn!(
-                            attempt = attempt + 1,
-                            bucket = eb,
-                            "TLS fingerprint mismatch, trying alternate bucket"
-                        );
-                        last_err = Some(e);
-                        continue;
-                    }
-                    Err(e) => return Err(CompletionError::CompletionError(e.to_string())),
-                }
+                    .map_err(|e| CompletionError::CompletionError(e.to_string()))?
             }
-            match result {
-                Some(r) => r,
-                None => {
-                    return Err(CompletionError::CompletionError(
-                        last_err
-                            .map(|e| e.to_string())
-                            .unwrap_or_else(|| "TLS fingerprint verification failed".to_string()),
-                    ));
-                }
-            }
+            Err(e) => return Err(CompletionError::CompletionError(e.to_string())),
         };
 
         if !response.status().is_success() {
@@ -704,7 +786,7 @@ impl InferenceProvider for VLlmProvider {
         self.signature_buckets
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .insert(chat_id, effective_bucket);
+            .insert(chat_id, bucket_id);
 
         Ok(ChatCompletionResponseWithBytes {
             response: chat_completion_response,
@@ -1348,50 +1430,102 @@ mod tests {
     }
 
     #[test]
-    fn test_is_tls_fingerprint_error_msg_detects_mismatch() {
-        // The exact error string from SpkiFingerprintVerifier (spki_verifier.rs:140-142)
-        // as wrapped by reqwest.
-        let msg = "error sending request for url (https://glm-5.completions.near.ai/v1/chat/completions): \
-            error trying to connect: invalid peer certificate: \
-            TLS certificate SPKI fingerprint abc123def456 does not match any attested fingerprint";
-        assert!(VLlmProvider::is_tls_fingerprint_error_msg(msg));
-    }
-
-    #[test]
-    fn test_is_tls_fingerprint_error_msg_detects_blocked() {
-        // The exact error string from SpkiFingerprintVerifier (spki_verifier.rs:128-130)
-        let msg = "error trying to connect: invalid peer certificate: \
-            TLS connections blocked: attestation verification failed";
-        assert!(VLlmProvider::is_tls_fingerprint_error_msg(msg));
-    }
-
-    #[test]
-    fn test_is_tls_fingerprint_error_msg_ignores_other_errors() {
-        // Connection errors should not trigger fingerprint retry
-        assert!(!VLlmProvider::is_tls_fingerprint_error_msg(
-            "error sending request: connection refused"
-        ));
-        assert!(!VLlmProvider::is_tls_fingerprint_error_msg(
-            "error sending request: timed out"
-        ));
-        assert!(!VLlmProvider::is_tls_fingerprint_error_msg(
-            "error trying to connect: dns error: failed to lookup address"
-        ));
-        // Partial matches should not trigger
-        assert!(!VLlmProvider::is_tls_fingerprint_error_msg(
-            "TLS certificate expired"
-        ));
-        assert!(!VLlmProvider::is_tls_fingerprint_error_msg(
-            "SPKI fingerprint computed"
-        ));
-    }
-
-    #[test]
     fn test_bucket_count_matches_prefix_router() {
         let provider = create_test_provider();
         assert_eq!(
             provider.bucket_clients.len(),
             provider.prefix_router.num_buckets()
         );
+    }
+
+    #[test]
+    fn test_legacy_provider_eagerly_creates_buckets() {
+        // Without a verifier, buckets are eagerly pre-created (legacy path)
+        let provider = create_test_provider();
+        let guard = provider.bucket_clients[0]
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        assert!(guard.is_some(), "Legacy provider should pre-create buckets");
+    }
+
+    #[test]
+    fn test_lazy_buckets_start_empty_with_verifier() {
+        use std::sync::Arc;
+        struct NoopVerifier;
+        #[async_trait::async_trait]
+        impl crate::BackendVerifier for NoopVerifier {
+            async fn create_verified_client(
+                &self,
+                _base_url: &str,
+            ) -> Result<reqwest::Client, String> {
+                Ok(reqwest::Client::new())
+            }
+        }
+
+        let provider = VLlmProvider::new_with_verifier(
+            VLlmConfig {
+                base_url: "http://localhost".to_string(),
+                api_key: None,
+                timeout_seconds: 30,
+            },
+            Arc::new(std::sync::RwLock::new(
+                crate::spki_verifier::FingerprintState::Bootstrap,
+            )),
+            Arc::new(NoopVerifier),
+        );
+        let guard = provider.bucket_clients[0]
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        assert!(
+            guard.is_none(),
+            "Verifier-backed provider should start with empty buckets"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_or_verify_fills_bucket() {
+        use std::sync::Arc;
+        struct NoopVerifier;
+        #[async_trait::async_trait]
+        impl crate::BackendVerifier for NoopVerifier {
+            async fn create_verified_client(
+                &self,
+                _base_url: &str,
+            ) -> Result<reqwest::Client, String> {
+                Ok(reqwest::Client::new())
+            }
+        }
+
+        let provider = VLlmProvider::new_with_verifier(
+            VLlmConfig {
+                base_url: "http://localhost".to_string(),
+                api_key: None,
+                timeout_seconds: 30,
+            },
+            Arc::new(std::sync::RwLock::new(
+                crate::spki_verifier::FingerprintState::Bootstrap,
+            )),
+            Arc::new(NoopVerifier),
+        );
+
+        // Bucket starts empty
+        assert!(provider.bucket_clients[0].lock().unwrap().is_none());
+
+        // get_or_verify fills it
+        let result = provider.get_or_verify_bucket_client(0).await;
+        assert!(result.is_ok());
+        assert!(provider.bucket_clients[0].lock().unwrap().is_some());
+
+        // Second call returns cached client (fast path)
+        let result2 = provider.get_or_verify_bucket_client(0).await;
+        assert!(result2.is_ok());
+    }
+
+    #[test]
+    fn test_clear_bucket() {
+        let provider = create_test_provider();
+        assert!(provider.bucket_clients[0].lock().unwrap().is_some());
+        provider.clear_bucket(0);
+        assert!(provider.bucket_clients[0].lock().unwrap().is_none());
     }
 }

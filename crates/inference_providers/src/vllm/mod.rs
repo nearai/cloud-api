@@ -286,9 +286,28 @@ impl VLlmProvider {
         )))
     }
 
+    /// Check if a CompletionError indicates a connection/transport failure
+    /// (as opposed to an HTTP-level error from the backend).
+    fn is_connection_error(err: &CompletionError) -> bool {
+        match err {
+            CompletionError::CompletionError(msg) => {
+                // reqwest connection errors contain these keywords.
+                // After send_streaming_request converts reqwest::Error to String,
+                // this is the only way to detect transport failures.
+                msg.contains("error sending request")
+                    || msg.contains("connection closed")
+                    || msg.contains("connection reset")
+                    || msg.contains("broken pipe")
+                    || msg.contains("does not match any attested fingerprint")
+                    || msg.contains("TLS connections blocked")
+            }
+            _ => false,
+        }
+    }
+
     /// Clear a bucket's client so it will be re-verified on next use.
     /// Called on connection errors — prevents a stale client (whose H2
-    /// connection dropped) from persisting in Bootstrap mode on reconnect.
+    /// connection dropped) from being reused with an unverified reconnection.
     fn clear_bucket(&self, bucket_id: usize) {
         *self.bucket_clients[bucket_id]
             .lock()
@@ -660,10 +679,9 @@ impl InferenceProvider for VLlmProvider {
             .await
         {
             Ok(r) => r,
-            Err(CompletionError::CompletionError(ref msg))
-                if msg.contains("connection") || msg.contains("connect") =>
-            {
-                // Connection dropped — clear bucket so next request re-verifies.
+            Err(ref e) if Self::is_connection_error(e) => {
+                // Connection dropped or fingerprint mismatch on reconnect —
+                // clear bucket and re-verify with a fresh attestation.
                 self.clear_bucket(bucket_id);
                 let fresh = self.get_or_verify_bucket_client(bucket_id).await?;
                 self.send_streaming_request(&url, headers, &streaming_params, Some(&fresh))
@@ -718,8 +736,14 @@ impl InferenceProvider for VLlmProvider {
 
         let response = match send(&bucket_client, headers.clone()).await {
             Ok(r) => r,
-            Err(e) if e.is_connect() || e.to_string().contains("connection") => {
-                // Connection dropped — clear bucket, re-verify, retry once.
+            Err(e)
+                if e.is_connect()
+                    || e.to_string()
+                        .contains("does not match any attested fingerprint")
+                    || e.to_string().contains("error sending request") =>
+            {
+                // Connection dropped or fingerprint mismatch on reconnect —
+                // clear bucket and re-verify with a fresh attestation.
                 self.clear_bucket(bucket_id);
                 let fresh = self.get_or_verify_bucket_client(bucket_id).await?;
                 send(&fresh, headers)

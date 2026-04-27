@@ -191,6 +191,13 @@ impl VLlmProvider {
             .pinned_count()
     }
 
+    /// Check if an error message indicates a TLS SPKI fingerprint mismatch.
+    /// Matches the error strings produced by `SpkiFingerprintVerifier` in `spki_verifier.rs`.
+    fn is_tls_fingerprint_error_msg(msg: &str) -> bool {
+        msg.contains("does not match any attested fingerprint")
+            || msg.contains("TLS connections blocked")
+    }
+
     /// Build HTTP request headers
     fn build_headers(&self) -> Result<reqwest::header::HeaderMap, String> {
         let mut headers = reqwest::header::HeaderMap::new();
@@ -264,6 +271,10 @@ impl VLlmProvider {
             }
         }
     }
+
+    /// Maximum retries with alternate bucket clients when TLS fingerprint
+    /// verification fails because L4 routed to an undiscovered backend.
+    const TLS_FINGERPRINT_RETRIES: usize = 2;
 
     /// Send a streaming HTTP POST request with TTFB timeout protection.
     ///
@@ -540,23 +551,57 @@ impl InferenceProvider for VLlmProvider {
         // Route to a bucket client based on prompt prefix.
         // The bucket client maintains a persistent TLS connection pinned to a
         // specific backend via L4 passthrough → prefix cache hits.
+        //
+        // On TLS fingerprint mismatch (L4 routed to an undiscovered backend),
+        // try alternate bucket clients which likely have warm connections to
+        // different (attested) backends.
         let bucket_id = self.prefix_router.route(&streaming_params.messages);
-        let bucket_client = &self.bucket_clients[bucket_id];
-        let response = self
-            .send_streaming_request(&url, headers, &streaming_params, Some(bucket_client))
-            .await?;
+        let num_buckets = self.bucket_clients.len();
+        let mut last_err = None;
 
-        // Store the bucket ID keyed by request_hash.
-        // The pool will call pin_chat_connection() after peeking the chat_id
-        // to move it to signature_buckets[chat_id].
-        self.pending_buckets
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(request_hash, bucket_id);
+        for attempt in 0..=Self::TLS_FINGERPRINT_RETRIES {
+            let effective_bucket = (bucket_id + attempt) % num_buckets;
+            let bucket_client = &self.bucket_clients[effective_bucket];
 
-        // Use the SSE parser to handle the stream properly
-        let sse_stream = new_sse_parser(response.bytes_stream(), true);
-        Ok(Box::pin(sse_stream))
+            match self
+                .send_streaming_request(
+                    &url,
+                    headers.clone(),
+                    &streaming_params,
+                    Some(bucket_client),
+                )
+                .await
+            {
+                Ok(response) => {
+                    // Store the effective bucket ID for signature fetching.
+                    self.pending_buckets
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .insert(request_hash, effective_bucket);
+
+                    let sse_stream = new_sse_parser(response.bytes_stream(), true);
+                    return Ok(Box::pin(sse_stream));
+                }
+                Err(CompletionError::CompletionError(ref msg))
+                    if Self::is_tls_fingerprint_error_msg(msg) =>
+                {
+                    tracing::warn!(
+                        attempt = attempt + 1,
+                        bucket = effective_bucket,
+                        "TLS fingerprint mismatch, trying alternate bucket"
+                    );
+                    last_err = Some(CompletionError::CompletionError(msg.clone()));
+                    continue;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+
+        Err(last_err.unwrap_or_else(|| {
+            CompletionError::CompletionError(
+                "TLS fingerprint verification failed after retries".to_string(),
+            )
+        }))
     }
 
     /// Performs a chat completion request
@@ -579,17 +624,52 @@ impl InferenceProvider for VLlmProvider {
         // Prepare encryption headers
         self.prepare_encryption_headers(&mut headers, &mut non_streaming_params.extra);
 
-        // Route to a bucket client based on prompt prefix (same as streaming path)
+        // Route to a bucket client based on prompt prefix (same as streaming path).
+        // On TLS fingerprint mismatch, try alternate bucket clients.
         let bucket_id = self.prefix_router.route(&non_streaming_params.messages);
-        let bucket_client = &self.bucket_clients[bucket_id];
-        let response = bucket_client
-            .post(&url)
-            .headers(headers)
-            .json(&non_streaming_params)
-            .timeout(Duration::from_secs(self.config.timeout_seconds as u64))
-            .send()
-            .await
-            .map_err(|e| CompletionError::CompletionError(e.to_string()))?;
+        let num_buckets = self.bucket_clients.len();
+        let timeout = Duration::from_secs(self.config.timeout_seconds as u64);
+
+        let (response, effective_bucket) = {
+            let mut last_err = None;
+            let mut result = None;
+            for attempt in 0..=Self::TLS_FINGERPRINT_RETRIES {
+                let eb = (bucket_id + attempt) % num_buckets;
+                match self.bucket_clients[eb]
+                    .post(&url)
+                    .headers(headers.clone())
+                    .json(&non_streaming_params)
+                    .timeout(timeout)
+                    .send()
+                    .await
+                {
+                    Ok(resp) => {
+                        result = Some((resp, eb));
+                        break;
+                    }
+                    Err(e) if Self::is_tls_fingerprint_error_msg(&e.to_string()) => {
+                        tracing::warn!(
+                            attempt = attempt + 1,
+                            bucket = eb,
+                            "TLS fingerprint mismatch, trying alternate bucket"
+                        );
+                        last_err = Some(e);
+                        continue;
+                    }
+                    Err(e) => return Err(CompletionError::CompletionError(e.to_string())),
+                }
+            }
+            match result {
+                Some(r) => r,
+                None => {
+                    return Err(CompletionError::CompletionError(
+                        last_err
+                            .map(|e| e.to_string())
+                            .unwrap_or_else(|| "TLS fingerprint verification failed".to_string()),
+                    ));
+                }
+            }
+        };
 
         if !response.status().is_success() {
             let status = response.status();
@@ -618,13 +698,13 @@ impl InferenceProvider for VLlmProvider {
             CompletionError::CompletionError(format!("Failed to parse response: {e}"))
         })?;
 
-        // Store the bucket ID for signature fetching.
+        // Store the effective bucket ID for signature fetching.
         // For non-streaming, we know the chat_id immediately.
         let chat_id = chat_completion_response.id.clone();
         self.signature_buckets
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .insert(chat_id, bucket_id);
+            .insert(chat_id, effective_bucket);
 
         Ok(ChatCompletionResponseWithBytes {
             response: chat_completion_response,
@@ -1264,6 +1344,54 @@ mod tests {
         assert!(
             json.contains("some_valid_param"),
             "Non-encryption extra fields should still be serialized"
+        );
+    }
+
+    #[test]
+    fn test_is_tls_fingerprint_error_msg_detects_mismatch() {
+        // The exact error string from SpkiFingerprintVerifier (spki_verifier.rs:140-142)
+        // as wrapped by reqwest.
+        let msg = "error sending request for url (https://glm-5.completions.near.ai/v1/chat/completions): \
+            error trying to connect: invalid peer certificate: \
+            TLS certificate SPKI fingerprint abc123def456 does not match any attested fingerprint";
+        assert!(VLlmProvider::is_tls_fingerprint_error_msg(msg));
+    }
+
+    #[test]
+    fn test_is_tls_fingerprint_error_msg_detects_blocked() {
+        // The exact error string from SpkiFingerprintVerifier (spki_verifier.rs:128-130)
+        let msg = "error trying to connect: invalid peer certificate: \
+            TLS connections blocked: attestation verification failed";
+        assert!(VLlmProvider::is_tls_fingerprint_error_msg(msg));
+    }
+
+    #[test]
+    fn test_is_tls_fingerprint_error_msg_ignores_other_errors() {
+        // Connection errors should not trigger fingerprint retry
+        assert!(!VLlmProvider::is_tls_fingerprint_error_msg(
+            "error sending request: connection refused"
+        ));
+        assert!(!VLlmProvider::is_tls_fingerprint_error_msg(
+            "error sending request: timed out"
+        ));
+        assert!(!VLlmProvider::is_tls_fingerprint_error_msg(
+            "error trying to connect: dns error: failed to lookup address"
+        ));
+        // Partial matches should not trigger
+        assert!(!VLlmProvider::is_tls_fingerprint_error_msg(
+            "TLS certificate expired"
+        ));
+        assert!(!VLlmProvider::is_tls_fingerprint_error_msg(
+            "SPKI fingerprint computed"
+        ));
+    }
+
+    #[test]
+    fn test_bucket_count_matches_prefix_router() {
+        let provider = create_test_provider();
+        assert_eq!(
+            provider.bucket_clients.len(),
+            provider.prefix_router.num_buckets()
         );
     }
 }

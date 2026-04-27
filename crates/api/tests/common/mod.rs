@@ -1045,7 +1045,7 @@ pub async fn list_models(
 pub fn compute_sha256(data: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(data.as_bytes());
-    format!("{:x}", hasher.finalize())
+    hex::encode(hasher.finalize())
 }
 
 /// Verify ECDSA signature with Ethereum signed message format.

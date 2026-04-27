@@ -77,7 +77,7 @@ fn map_response_error_to_status(error: &ServiceResponseError) -> StatusCode {
 fn compute_sha256(data: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(data);
-    format!("{:x}", hasher.finalize())
+    hex::encode(hasher.finalize())
 }
 
 impl From<ServiceResponseError> for ErrorResponse {

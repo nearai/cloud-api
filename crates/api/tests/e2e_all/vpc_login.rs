@@ -1,6 +1,6 @@
 use crate::common::*;
 use api::routes::auth_vpc::VpcLoginResponse;
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
 use std::fs;
 use std::path::PathBuf;

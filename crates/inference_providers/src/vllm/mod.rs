@@ -90,8 +90,6 @@ pub struct VLlmProvider {
     /// TLS fingerprint verification state (Bootstrap → Pinned or Blocked).
     /// Shared across the main client and all bucket clients.
     fingerprint_state: Arc<std::sync::RwLock<FingerprintState>>,
-    /// Shared TLS root certificates for building one-off clients on fingerprint retry.
-    tls_roots: SharedTlsRoots,
 }
 
 impl VLlmProvider {
@@ -154,7 +152,6 @@ impl VLlmProvider {
             pending_buckets: Arc::new(std::sync::Mutex::new(HashMap::new())),
             signature_buckets: Arc::new(std::sync::Mutex::new(HashMap::new())),
             fingerprint_state,
-            tls_roots,
         }
     }
 
@@ -199,22 +196,6 @@ impl VLlmProvider {
     fn is_tls_fingerprint_error_msg(msg: &str) -> bool {
         msg.contains("does not match any attested fingerprint")
             || msg.contains("TLS connections blocked")
-    }
-
-    /// Build a one-off reqwest Client with no connection pooling.
-    /// Forces a new TCP connection through L4, which routes to a (likely different) backend.
-    fn build_oneoff_client(&self) -> Result<Client, CompletionError> {
-        Client::builder()
-            .use_preconfigured_tls(self.tls_roots.build_config(self.fingerprint_state.clone()))
-            .pool_max_idle_per_host(0)
-            .connect_timeout(Duration::from_secs(5))
-            .read_timeout(Duration::from_secs(300))
-            .build()
-            .map_err(|e| {
-                CompletionError::CompletionError(format!(
-                    "Failed to create one-off HTTP client: {e}"
-                ))
-            })
     }
 
     /// Build HTTP request headers
@@ -291,8 +272,8 @@ impl VLlmProvider {
         }
     }
 
-    /// Maximum retries when TLS fingerprint verification fails due to L4 routing
-    /// to a backend with an undiscovered fingerprint.
+    /// Maximum retries with alternate bucket clients when TLS fingerprint
+    /// verification fails because L4 routed to an undiscovered backend.
     const TLS_FINGERPRINT_RETRIES: usize = 2;
 
     /// Send a streaming HTTP POST request with TTFB timeout protection.
@@ -303,8 +284,6 @@ impl VLlmProvider {
     /// kills long-running SSE streams at 30s.
     ///
     /// `client_override` allows using a dedicated client for connection pinning.
-    /// On TLS fingerprint mismatch (L4 routed to an undiscovered backend), retries
-    /// with a fresh non-pooled client to force a new TCP connection → new L4 route.
     async fn send_streaming_request<T: serde::Serialize + Send + Sync>(
         &self,
         url: &str,
@@ -312,91 +291,19 @@ impl VLlmProvider {
         params: &T,
         client_override: Option<&Client>,
     ) -> Result<reqwest::Response, CompletionError> {
-        let primary_client = client_override.unwrap_or(&self.client);
-        let timeout = Duration::from_secs(self.config.timeout_seconds as u64);
-
-        // First attempt with primary client (no clone needed).
-        match tokio::time::timeout(
-            timeout,
-            primary_client
-                .post(url)
-                .headers(headers.clone())
-                .json(params)
-                .send(),
+        let client = client_override.unwrap_or(&self.client);
+        let response = tokio::time::timeout(
+            Duration::from_secs(self.config.timeout_seconds as u64),
+            client.post(url).headers(headers).json(params).send(),
         )
         .await
-        {
-            Ok(Ok(response)) => {
-                return Self::check_response_status(response).await;
-            }
-            Ok(Err(e)) if Self::is_tls_fingerprint_error_msg(&e.to_string()) => {
-                tracing::warn!(
-                    attempt = 1,
-                    max_retries = Self::TLS_FINGERPRINT_RETRIES,
-                    "TLS fingerprint mismatch (L4 routed to undiscovered backend), \
-                     retrying with fresh connection"
-                );
-                // Fall through to retry loop
-            }
-            Ok(Err(e)) => return Err(CompletionError::CompletionError(e.to_string())),
-            Err(_timeout) => {
-                return Err(CompletionError::HttpError {
-                    status_code: 504,
-                    message: "Timed out waiting for response headers from inference backend"
-                        .to_string(),
-                    is_external: false,
-                });
-            }
-        }
+        .map_err(|_| CompletionError::HttpError {
+            status_code: 504,
+            message: "Timed out waiting for response headers from inference backend".to_string(),
+            is_external: false,
+        })?
+        .map_err(|e| CompletionError::CompletionError(e.to_string()))?;
 
-        // Retry with fresh non-pooled clients to get a different L4 route.
-        for attempt in 1..=Self::TLS_FINGERPRINT_RETRIES {
-            let oneoff = self.build_oneoff_client()?;
-            match tokio::time::timeout(
-                timeout,
-                oneoff
-                    .post(url)
-                    .headers(headers.clone())
-                    .json(params)
-                    .send(),
-            )
-            .await
-            {
-                Ok(Ok(response)) => {
-                    return Self::check_response_status(response).await;
-                }
-                Ok(Err(e)) if Self::is_tls_fingerprint_error_msg(&e.to_string()) => {
-                    tracing::warn!(
-                        attempt = attempt + 1,
-                        max_retries = Self::TLS_FINGERPRINT_RETRIES,
-                        "TLS fingerprint mismatch (L4 routed to undiscovered backend), \
-                         retrying with fresh connection"
-                    );
-                    continue;
-                }
-                Ok(Err(e)) => return Err(CompletionError::CompletionError(e.to_string())),
-                Err(_timeout) => {
-                    return Err(CompletionError::HttpError {
-                        status_code: 504,
-                        message: "Timed out waiting for response headers from inference backend"
-                            .to_string(),
-                        is_external: false,
-                    });
-                }
-            }
-        }
-
-        Err(CompletionError::CompletionError(
-            "TLS fingerprint verification failed after retries — \
-             all L4 routes hit undiscovered backends"
-                .to_string(),
-        ))
-    }
-
-    /// Check response status and return an error for non-2xx responses.
-    async fn check_response_status(
-        response: reqwest::Response,
-    ) -> Result<reqwest::Response, CompletionError> {
         if !response.status().is_success() {
             let status_code = response.status().as_u16();
             let error_text = response
@@ -409,6 +316,7 @@ impl VLlmProvider {
                 is_external: false,
             });
         }
+
         Ok(response)
     }
 }
@@ -643,23 +551,57 @@ impl InferenceProvider for VLlmProvider {
         // Route to a bucket client based on prompt prefix.
         // The bucket client maintains a persistent TLS connection pinned to a
         // specific backend via L4 passthrough → prefix cache hits.
+        //
+        // On TLS fingerprint mismatch (L4 routed to an undiscovered backend),
+        // try alternate bucket clients which likely have warm connections to
+        // different (attested) backends.
         let bucket_id = self.prefix_router.route(&streaming_params.messages);
-        let bucket_client = &self.bucket_clients[bucket_id];
-        let response = self
-            .send_streaming_request(&url, headers, &streaming_params, Some(bucket_client))
-            .await?;
+        let num_buckets = self.bucket_clients.len();
+        let mut last_err = None;
 
-        // Store the bucket ID keyed by request_hash.
-        // The pool will call pin_chat_connection() after peeking the chat_id
-        // to move it to signature_buckets[chat_id].
-        self.pending_buckets
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(request_hash, bucket_id);
+        for attempt in 0..=Self::TLS_FINGERPRINT_RETRIES {
+            let effective_bucket = (bucket_id + attempt) % num_buckets;
+            let bucket_client = &self.bucket_clients[effective_bucket];
 
-        // Use the SSE parser to handle the stream properly
-        let sse_stream = new_sse_parser(response.bytes_stream(), true);
-        Ok(Box::pin(sse_stream))
+            match self
+                .send_streaming_request(
+                    &url,
+                    headers.clone(),
+                    &streaming_params,
+                    Some(bucket_client),
+                )
+                .await
+            {
+                Ok(response) => {
+                    // Store the effective bucket ID for signature fetching.
+                    self.pending_buckets
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .insert(request_hash, effective_bucket);
+
+                    let sse_stream = new_sse_parser(response.bytes_stream(), true);
+                    return Ok(Box::pin(sse_stream));
+                }
+                Err(CompletionError::CompletionError(ref msg))
+                    if Self::is_tls_fingerprint_error_msg(msg) =>
+                {
+                    tracing::warn!(
+                        attempt = attempt + 1,
+                        bucket = effective_bucket,
+                        "TLS fingerprint mismatch, trying alternate bucket"
+                    );
+                    last_err = Some(CompletionError::CompletionError(msg.clone()));
+                    continue;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+
+        Err(last_err.unwrap_or_else(|| {
+            CompletionError::CompletionError(
+                "TLS fingerprint verification failed after retries".to_string(),
+            )
+        }))
     }
 
     /// Performs a chat completion request
@@ -683,59 +625,50 @@ impl InferenceProvider for VLlmProvider {
         self.prepare_encryption_headers(&mut headers, &mut non_streaming_params.extra);
 
         // Route to a bucket client based on prompt prefix (same as streaming path).
-        // On TLS fingerprint mismatch (L4 routed to undiscovered backend), retry with
-        // a fresh non-pooled client to force a new L4 route.
+        // On TLS fingerprint mismatch, try alternate bucket clients.
         let bucket_id = self.prefix_router.route(&non_streaming_params.messages);
+        let num_buckets = self.bucket_clients.len();
         let timeout = Duration::from_secs(self.config.timeout_seconds as u64);
 
-        let send_request = |client: &Client, hdrs: reqwest::header::HeaderMap| {
-            client
-                .post(&url)
-                .headers(hdrs)
-                .json(&non_streaming_params)
-                .timeout(timeout)
-                .send()
-        };
-
-        // First attempt with bucket client.
-        let response = match send_request(&self.bucket_clients[bucket_id], headers.clone()).await {
-            Ok(resp) => resp,
-            Err(e) if Self::is_tls_fingerprint_error_msg(&e.to_string()) => {
-                tracing::warn!(
-                    attempt = 1,
-                    max_retries = Self::TLS_FINGERPRINT_RETRIES,
-                    "TLS fingerprint mismatch (L4 routed to undiscovered backend), \
-                     retrying with fresh connection"
-                );
-                // Retry with fresh non-pooled clients.
-                let mut last_err = e;
-                let mut success = None;
-                for attempt in 1..=Self::TLS_FINGERPRINT_RETRIES {
-                    let oneoff = self.build_oneoff_client()?;
-                    match send_request(&oneoff, headers.clone()).await {
-                        Ok(resp) => {
-                            success = Some(resp);
-                            break;
-                        }
-                        Err(e) if Self::is_tls_fingerprint_error_msg(&e.to_string()) => {
-                            tracing::warn!(
-                                attempt = attempt + 1,
-                                max_retries = Self::TLS_FINGERPRINT_RETRIES,
-                                "TLS fingerprint mismatch (L4 routed to undiscovered backend), \
-                                 retrying with fresh connection"
-                            );
-                            last_err = e;
-                            continue;
-                        }
-                        Err(e) => return Err(CompletionError::CompletionError(e.to_string())),
+        let (response, effective_bucket) = {
+            let mut last_err = None;
+            let mut result = None;
+            for attempt in 0..=Self::TLS_FINGERPRINT_RETRIES {
+                let eb = (bucket_id + attempt) % num_buckets;
+                match self.bucket_clients[eb]
+                    .post(&url)
+                    .headers(headers.clone())
+                    .json(&non_streaming_params)
+                    .timeout(timeout)
+                    .send()
+                    .await
+                {
+                    Ok(resp) => {
+                        result = Some((resp, eb));
+                        break;
                     }
-                }
-                match success {
-                    Some(resp) => resp,
-                    None => return Err(CompletionError::CompletionError(last_err.to_string())),
+                    Err(e) if Self::is_tls_fingerprint_error_msg(&e.to_string()) => {
+                        tracing::warn!(
+                            attempt = attempt + 1,
+                            bucket = eb,
+                            "TLS fingerprint mismatch, trying alternate bucket"
+                        );
+                        last_err = Some(e);
+                        continue;
+                    }
+                    Err(e) => return Err(CompletionError::CompletionError(e.to_string())),
                 }
             }
-            Err(e) => return Err(CompletionError::CompletionError(e.to_string())),
+            match result {
+                Some(r) => r,
+                None => {
+                    return Err(CompletionError::CompletionError(
+                        last_err
+                            .map(|e| e.to_string())
+                            .unwrap_or_else(|| "TLS fingerprint verification failed".to_string()),
+                    ));
+                }
+            }
         };
 
         if !response.status().is_success() {
@@ -765,13 +698,13 @@ impl InferenceProvider for VLlmProvider {
             CompletionError::CompletionError(format!("Failed to parse response: {e}"))
         })?;
 
-        // Store the bucket ID for signature fetching.
+        // Store the effective bucket ID for signature fetching.
         // For non-streaming, we know the chat_id immediately.
         let chat_id = chat_completion_response.id.clone();
         self.signature_buckets
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .insert(chat_id, bucket_id);
+            .insert(chat_id, effective_bucket);
 
         Ok(ChatCompletionResponseWithBytes {
             response: chat_completion_response,
@@ -1454,8 +1387,11 @@ mod tests {
     }
 
     #[test]
-    fn test_build_oneoff_client_succeeds() {
+    fn test_bucket_count_matches_prefix_router() {
         let provider = create_test_provider();
-        assert!(provider.build_oneoff_client().is_ok());
+        assert_eq!(
+            provider.bucket_clients.len(),
+            provider.prefix_router.num_buckets()
+        );
     }
 }

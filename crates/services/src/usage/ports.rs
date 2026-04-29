@@ -169,6 +169,7 @@ impl StopReason {
             inference_providers::CompletionError::InvalidResponse(_) => StopReason::ProviderError,
             inference_providers::CompletionError::NoPubKeyProvider(_) => StopReason::ProviderError,
             inference_providers::CompletionError::Unknown(_) => StopReason::ProviderError,
+            inference_providers::CompletionError::Timeout { .. } => StopReason::Timeout,
         }
     }
 }

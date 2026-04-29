@@ -22,14 +22,16 @@ fn create_test_provider() -> Box<dyn InferenceProvider> {
         // Use real VLLM provider if explicitly requested
         use inference_providers::{VLlmConfig, VLlmProvider};
         let _ = dotenvy::dotenv();
+        let timeout = std::env::var("VLLM_TEST_TIMEOUT_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(30) as i64;
         let config = VLlmConfig {
             base_url: std::env::var("VLLM_BASE_URL")
                 .unwrap_or_else(|_| "http://localhost:8002".to_string()),
             api_key: std::env::var("VLLM_API_KEY").ok(),
-            timeout_seconds: std::env::var("VLLM_TEST_TIMEOUT_SECS")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(30) as i64,
+            completion_timeout_seconds: timeout,
+            control_timeout_seconds: timeout,
         };
         Box::new(VLlmProvider::new(config))
     } else {
@@ -691,7 +693,9 @@ async fn test_image_generation_real() {
     let config = VLlmConfig {
         base_url,
         api_key: std::env::var("VLLM_API_KEY").ok(),
-        timeout_seconds: 120, // Image generation can take longer
+        // Image generation can take longer.
+        completion_timeout_seconds: 120,
+        control_timeout_seconds: 30,
     };
     let provider = VLlmProvider::new(config);
 

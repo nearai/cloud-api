@@ -966,6 +966,16 @@ impl InferenceProviderPool {
             CompletionError::NoPubKeyProvider(msg) => {
                 CompletionError::NoPubKeyProvider(sanitize_and_format(&msg))
             }
+            // Timeout carries no caller-controlled string, so there's nothing to
+            // sanitize. Keep the structured fields intact so the route handler can
+            // surface a precise message.
+            CompletionError::Timeout {
+                operation,
+                timeout_seconds,
+            } => CompletionError::Timeout {
+                operation,
+                timeout_seconds,
+            },
         }
     }
 
@@ -1185,18 +1195,30 @@ impl InferenceProviderPool {
             // Retry on connection failures, server errors (5xx), and rate limits (429).
             // CompletionError::CompletionError can also contain non-transient errors
             // (e.g., JSON parse failures), so check for connection-related keywords.
+            //
+            // CompletionError::Timeout (per-call timeout fired against our own vLLM
+            // backend) is explicitly NOT retryable: the request was sent and the
+            // model is presumably still chewing on it. Retrying the same prompt at
+            // the same backend will hit the same wall — and 4× a long completion
+            // timeout is an expensive way to surface the same answer.
             let is_retryable = match &last_error {
                 Some(CompletionError::CompletionError(msg)) => {
-                    msg.contains("connection")
-                        || msg.contains("timed out")
-                        || msg.contains("timeout")
-                        || msg.contains("connect")
-                        || msg.contains("reset")
-                        || msg.contains("broken pipe")
+                    // Exclude reqwest's timeout signature so a timeout that slipped
+                    // through as a string-form error (e.g. from an external provider)
+                    // is also not retried.
+                    let lower = msg.to_lowercase();
+                    let is_timeout =
+                        lower.contains("operation timed out") || lower.contains("timed out after");
+                    !is_timeout
+                        && (lower.contains("connection")
+                            || lower.contains("connect")
+                            || lower.contains("reset")
+                            || lower.contains("broken pipe"))
                 }
                 Some(CompletionError::HttpError { status_code, .. }) => {
                     *status_code >= 500 || *status_code == 429
                 }
+                Some(CompletionError::Timeout { .. }) => false,
                 _ => false,
             };
 
@@ -3296,6 +3318,78 @@ mod tests {
             attempt_count.load(std::sync::atomic::Ordering::Relaxed),
             1,
             "Non-connection errors should not be retried"
+        );
+    }
+
+    /// Per-call timeouts surface as `CompletionError::Timeout` and must NOT
+    /// trigger the retry loop: re-sending the same request to the same backend
+    /// hits the same wall, and 4× a 600s timeout would be 40 minutes of waste.
+    #[tokio::test]
+    async fn test_timeout_error_does_not_retry() {
+        let (pool, model_id) = pool_with_mock_provider().await;
+
+        let attempt_count = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let count_clone = attempt_count.clone();
+
+        let result: Result<((), _), _> = pool
+            .retry_with_fallback(&model_id, "test_op", None, move |_provider| {
+                let count = count_clone.clone();
+                async move {
+                    count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    Err(CompletionError::Timeout {
+                        operation: "chat_completion",
+                        timeout_seconds: 600,
+                    })
+                }
+            })
+            .await;
+
+        assert!(result.is_err());
+        assert_eq!(
+            attempt_count.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "Timeout errors must short-circuit the retry loop"
+        );
+        // Variant must survive sanitization for the route handler to map it to 504.
+        match result.err().expect("Expected an error") {
+            CompletionError::Timeout {
+                operation,
+                timeout_seconds,
+            } => {
+                assert_eq!(operation, "chat_completion");
+                assert_eq!(timeout_seconds, 600);
+            }
+            other => panic!("Expected CompletionError::Timeout, got: {:?}", other),
+        }
+    }
+
+    /// A timeout that arrives via `CompletionError::CompletionError(msg)` (e.g. an
+    /// external provider that didn't get the new variant treatment) is also
+    /// non-retryable — same logic applies regardless of which variant wraps it.
+    #[tokio::test]
+    async fn test_string_form_timeout_does_not_retry() {
+        let (pool, model_id) = pool_with_mock_provider().await;
+
+        let attempt_count = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let count_clone = attempt_count.clone();
+
+        let result: Result<((), _), _> = pool
+            .retry_with_fallback(&model_id, "test_op", None, move |_provider| {
+                let count = count_clone.clone();
+                async move {
+                    count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    Err(CompletionError::CompletionError(
+                        "error sending request: operation timed out".to_string(),
+                    ))
+                }
+            })
+            .await;
+
+        assert!(result.is_err());
+        assert_eq!(
+            attempt_count.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "String-form 'operation timed out' errors must not be retried"
         );
     }
 

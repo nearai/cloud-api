@@ -204,6 +204,7 @@ fn completion_stream_error_category(e: &inference_providers::CompletionError) ->
         inference_providers::CompletionError::InvalidResponse(_) => "invalid_response",
         inference_providers::CompletionError::NoPubKeyProvider(_) => "stale_pubkey",
         inference_providers::CompletionError::Unknown(_) => "unknown",
+        inference_providers::CompletionError::Timeout { .. } => "timeout",
     }
 }
 

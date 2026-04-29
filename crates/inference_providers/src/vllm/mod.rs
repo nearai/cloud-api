@@ -50,21 +50,72 @@ mod encryption_headers {
     pub const ENCRYPT_ALL_FIELDS: &str = "x_encrypt_all_fields";
 }
 
-/// Configuration for vLLM provider
+/// Configuration for vLLM provider.
+///
+/// Two timeouts are kept independent because they have very different shapes:
+/// - **Completion** (chat/text completion, audio, image, embeddings, rerank, score):
+///   reasoning models routinely take several minutes per request. The timeout has
+///   to be generous enough that the model can finish its CoT before we give up.
+/// - **Control** (models list, attestation report, signature fetch, streaming TTFB):
+///   these are metadata or first-byte ops that should return promptly. A long timeout
+///   here just delays the user's error message when something is actually wrong.
+///
+/// Both are tunable per-deployment via env vars (see `VLlmConfig::new`).
 #[derive(Debug, Clone)]
 pub struct VLlmConfig {
     pub base_url: String,
     pub api_key: Option<String>,
-    pub timeout_seconds: i64,
+    /// Total per-request timeout for completion-style operations.
+    pub completion_timeout_seconds: i64,
+    /// Total per-request timeout for control-plane operations and streaming TTFB.
+    pub control_timeout_seconds: i64,
 }
 
 impl VLlmConfig {
+    /// Default completion timeout. Reasoning models can spend several minutes
+    /// on a single non-streaming request; 600s is a comfortable ceiling that
+    /// still surfaces genuinely stuck requests.
+    pub const DEFAULT_COMPLETION_TIMEOUT_SECS: i64 = 600;
+    /// Default control timeout. Metadata/TTFB ops should resolve quickly.
+    pub const DEFAULT_CONTROL_TIMEOUT_SECS: i64 = 90;
+
+    /// Construct a config. The `timeout_seconds` parameter, when supplied, sets
+    /// the **completion** timeout only (control stays at its default / env value).
+    /// When `None`, both timeouts are read from env vars:
+    /// `VLLM_PROVIDER_COMPLETION_TIMEOUT` and `VLLM_PROVIDER_CONTROL_TIMEOUT`.
     pub fn new(base_url: String, api_key: Option<String>, timeout_seconds: Option<i64>) -> Self {
+        let completion = timeout_seconds.unwrap_or_else(Self::completion_timeout_from_env);
+        let control = Self::control_timeout_from_env();
         Self {
             base_url,
             api_key,
-            timeout_seconds: timeout_seconds.unwrap_or(90),
+            completion_timeout_seconds: completion,
+            control_timeout_seconds: control,
         }
+    }
+
+    /// Read the completion timeout from env, falling back to the default.
+    pub fn completion_timeout_from_env() -> i64 {
+        std::env::var("VLLM_PROVIDER_COMPLETION_TIMEOUT")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(Self::DEFAULT_COMPLETION_TIMEOUT_SECS)
+    }
+
+    /// Read the control timeout from env, falling back to the default.
+    pub fn control_timeout_from_env() -> i64 {
+        std::env::var("VLLM_PROVIDER_CONTROL_TIMEOUT")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(Self::DEFAULT_CONTROL_TIMEOUT_SECS)
+    }
+
+    pub fn completion_timeout(&self) -> Duration {
+        Duration::from_secs(self.completion_timeout_seconds.max(0) as u64)
+    }
+
+    pub fn control_timeout(&self) -> Duration {
+        Duration::from_secs(self.control_timeout_seconds.max(0) as u64)
     }
 }
 
@@ -405,7 +456,7 @@ impl VLlmProvider {
     ) -> Result<reqwest::Response, CompletionError> {
         let client = client_override.unwrap_or(&self.client);
         let response = tokio::time::timeout(
-            Duration::from_secs(self.config.timeout_seconds as u64),
+            self.config.control_timeout(),
             client.post(url).headers(headers).json(params).send(),
         )
         .await
@@ -468,7 +519,7 @@ impl InferenceProvider for VLlmProvider {
                 .clone()
         });
 
-        let timeout = Duration::from_secs(self.config.timeout_seconds as u64);
+        let timeout = self.config.control_timeout();
         let mut clients_to_try: Vec<&Client> = Vec::new();
         if let Some(ref bc) = bucket_client {
             clients_to_try.push(bc);
@@ -575,7 +626,7 @@ impl InferenceProvider for VLlmProvider {
             .client
             .get(&url)
             .headers(headers)
-            .timeout(Duration::from_secs(self.config.timeout_seconds as u64))
+            .timeout(self.config.control_timeout())
             .send()
             .await
             .map_err(|e| AttestationError::FetchError(e.to_string()))?;
@@ -615,7 +666,7 @@ impl InferenceProvider for VLlmProvider {
             .client
             .get(&url)
             .headers(headers)
-            .timeout(Duration::from_secs(self.config.timeout_seconds as u64))
+            .timeout(self.config.control_timeout())
             .send()
             .await
             .map_err(|e| ListModelsError::FetchError(format!("{e:?}")))?;
@@ -723,7 +774,8 @@ impl InferenceProvider for VLlmProvider {
         // Route to a verified bucket client based on prompt prefix.
         let bucket_id = self.prefix_router.route(&non_streaming_params.messages);
         let bucket_client = self.get_or_verify_bucket_client(bucket_id).await?;
-        let timeout = Duration::from_secs(self.config.timeout_seconds as u64);
+        let timeout_secs = self.config.completion_timeout_seconds.max(0) as u64;
+        let timeout = Duration::from_secs(timeout_secs);
 
         let send = |client: &Client, hdrs: reqwest::header::HeaderMap| {
             client
@@ -732,6 +784,19 @@ impl InferenceProvider for VLlmProvider {
                 .json(&non_streaming_params)
                 .timeout(timeout)
                 .send()
+        };
+
+        // Distinguish timeout from other transport errors so the pool can refuse
+        // to retry timeouts (a re-send hits the same model with the same prompt).
+        let map_send_err = |e: reqwest::Error| -> CompletionError {
+            if e.is_timeout() {
+                CompletionError::Timeout {
+                    operation: "chat_completion",
+                    timeout_seconds: timeout_secs,
+                }
+            } else {
+                CompletionError::CompletionError(e.to_string())
+            }
         };
 
         let response = match send(&bucket_client, headers.clone()).await {
@@ -746,11 +811,9 @@ impl InferenceProvider for VLlmProvider {
                 // clear bucket and re-verify with a fresh attestation.
                 self.clear_bucket(bucket_id);
                 let fresh = self.get_or_verify_bucket_client(bucket_id).await?;
-                send(&fresh, headers)
-                    .await
-                    .map_err(|e| CompletionError::CompletionError(e.to_string()))?
+                send(&fresh, headers).await.map_err(map_send_err)?
             }
-            Err(e) => return Err(CompletionError::CompletionError(e.to_string())),
+            Err(e) => return Err(map_send_err(e)),
         };
 
         if !response.status().is_success() {
@@ -768,11 +831,7 @@ impl InferenceProvider for VLlmProvider {
         }
 
         // Get the raw bytes first for exact hash verification
-        let raw_bytes = response
-            .bytes()
-            .await
-            .map_err(|e| CompletionError::CompletionError(e.to_string()))?
-            .to_vec();
+        let raw_bytes = response.bytes().await.map_err(map_send_err)?.to_vec();
 
         // Parse the response from the raw bytes
         let chat_completion_response: ChatCompletionResponse = serde_json::from_slice(&raw_bytes)
@@ -931,9 +990,7 @@ impl InferenceProvider for VLlmProvider {
             .post(&url)
             .headers(headers)
             .multipart(form)
-            .timeout(std::time::Duration::from_secs(
-                self.config.timeout_seconds as u64,
-            ))
+            .timeout(self.config.completion_timeout())
             .send()
             .await
             .map_err(|e| {
@@ -1091,9 +1148,7 @@ impl InferenceProvider for VLlmProvider {
             .post(&url)
             .headers(headers)
             .json(&params)
-            .timeout(std::time::Duration::from_secs(
-                self.config.timeout_seconds as u64,
-            ))
+            .timeout(self.config.completion_timeout())
             .send()
             .await
             .map_err(to_score_error)?;
@@ -1125,9 +1180,7 @@ impl InferenceProvider for VLlmProvider {
             .post(&url)
             .headers(headers)
             .json(&params)
-            .timeout(std::time::Duration::from_secs(
-                self.config.timeout_seconds as u64,
-            ))
+            .timeout(self.config.completion_timeout())
             .send()
             .await
             .map_err(to_rerank_error)?;
@@ -1164,7 +1217,7 @@ impl InferenceProvider for VLlmProvider {
             .headers(headers)
             .header(reqwest::header::CONTENT_TYPE, "application/json")
             .body(body)
-            .timeout(Duration::from_secs(self.config.timeout_seconds as u64))
+            .timeout(self.config.completion_timeout())
             .send()
             .await
             .map_err(to_embedding_error)?;
@@ -1189,13 +1242,126 @@ impl InferenceProvider for VLlmProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
     fn create_test_provider() -> VLlmProvider {
         VLlmProvider::new(VLlmConfig {
             base_url: "http://localhost".to_string(),
             api_key: None,
-            timeout_seconds: 30,
+            completion_timeout_seconds: 30,
+            control_timeout_seconds: 30,
         })
+    }
+
+    /// Helper that scrubs both timeout env vars before/after a closure runs,
+    /// preventing parent shell exports from leaking into the test.
+    fn with_clean_timeout_env<R>(f: impl FnOnce() -> R) -> R {
+        let prev_completion = std::env::var("VLLM_PROVIDER_COMPLETION_TIMEOUT").ok();
+        let prev_control = std::env::var("VLLM_PROVIDER_CONTROL_TIMEOUT").ok();
+        std::env::remove_var("VLLM_PROVIDER_COMPLETION_TIMEOUT");
+        std::env::remove_var("VLLM_PROVIDER_CONTROL_TIMEOUT");
+        let result = f();
+        match prev_completion {
+            Some(v) => std::env::set_var("VLLM_PROVIDER_COMPLETION_TIMEOUT", v),
+            None => std::env::remove_var("VLLM_PROVIDER_COMPLETION_TIMEOUT"),
+        }
+        match prev_control {
+            Some(v) => std::env::set_var("VLLM_PROVIDER_CONTROL_TIMEOUT", v),
+            None => std::env::remove_var("VLLM_PROVIDER_CONTROL_TIMEOUT"),
+        }
+        result
+    }
+
+    #[test]
+    #[serial]
+    fn vllm_config_uses_default_timeouts_when_env_unset() {
+        with_clean_timeout_env(|| {
+            let cfg = VLlmConfig::new("http://x".to_string(), None, None);
+            assert_eq!(
+                cfg.completion_timeout_seconds,
+                VLlmConfig::DEFAULT_COMPLETION_TIMEOUT_SECS
+            );
+            assert_eq!(
+                cfg.control_timeout_seconds,
+                VLlmConfig::DEFAULT_CONTROL_TIMEOUT_SECS
+            );
+            assert_eq!(
+                cfg.completion_timeout(),
+                Duration::from_secs(VLlmConfig::DEFAULT_COMPLETION_TIMEOUT_SECS as u64)
+            );
+            assert_eq!(
+                cfg.control_timeout(),
+                Duration::from_secs(VLlmConfig::DEFAULT_CONTROL_TIMEOUT_SECS as u64)
+            );
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn vllm_config_reads_env_vars_when_present() {
+        with_clean_timeout_env(|| {
+            std::env::set_var("VLLM_PROVIDER_COMPLETION_TIMEOUT", "1234");
+            std::env::set_var("VLLM_PROVIDER_CONTROL_TIMEOUT", "42");
+            let cfg = VLlmConfig::new("http://x".to_string(), None, None);
+            assert_eq!(cfg.completion_timeout_seconds, 1234);
+            assert_eq!(cfg.control_timeout_seconds, 42);
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn vllm_config_positional_arg_overrides_completion_env() {
+        with_clean_timeout_env(|| {
+            std::env::set_var("VLLM_PROVIDER_COMPLETION_TIMEOUT", "1234");
+            std::env::set_var("VLLM_PROVIDER_CONTROL_TIMEOUT", "42");
+            // Positional `Some(N)` keeps the legacy meaning: it sets completion only,
+            // overriding the env. Control still reads from env.
+            let cfg = VLlmConfig::new("http://x".to_string(), None, Some(7));
+            assert_eq!(cfg.completion_timeout_seconds, 7);
+            assert_eq!(cfg.control_timeout_seconds, 42);
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn vllm_config_falls_back_to_default_on_unparseable_env() {
+        with_clean_timeout_env(|| {
+            std::env::set_var("VLLM_PROVIDER_COMPLETION_TIMEOUT", "not-a-number");
+            std::env::set_var("VLLM_PROVIDER_CONTROL_TIMEOUT", "");
+            let cfg = VLlmConfig::new("http://x".to_string(), None, None);
+            assert_eq!(
+                cfg.completion_timeout_seconds,
+                VLlmConfig::DEFAULT_COMPLETION_TIMEOUT_SECS
+            );
+            assert_eq!(
+                cfg.control_timeout_seconds,
+                VLlmConfig::DEFAULT_CONTROL_TIMEOUT_SECS
+            );
+        });
+    }
+
+    #[test]
+    fn vllm_config_negative_timeout_clamped_to_zero_duration() {
+        let cfg = VLlmConfig {
+            base_url: "http://x".to_string(),
+            api_key: None,
+            completion_timeout_seconds: -5,
+            control_timeout_seconds: -10,
+        };
+        // Conversion to Duration must not panic on negative values.
+        assert_eq!(cfg.completion_timeout(), Duration::ZERO);
+        assert_eq!(cfg.control_timeout(), Duration::ZERO);
+    }
+
+    #[test]
+    fn timeout_error_display_includes_operation_and_seconds() {
+        let err = CompletionError::Timeout {
+            operation: "chat_completion",
+            timeout_seconds: 600,
+        };
+        let s = err.to_string();
+        assert!(s.contains("chat_completion"), "got: {s}");
+        assert!(s.contains("600"), "got: {s}");
     }
 
     #[test]
@@ -1466,7 +1632,8 @@ mod tests {
             VLlmConfig {
                 base_url: "http://localhost".to_string(),
                 api_key: None,
-                timeout_seconds: 30,
+                completion_timeout_seconds: 30,
+                control_timeout_seconds: 30,
             },
             Arc::new(std::sync::RwLock::new(
                 crate::spki_verifier::FingerprintState::Bootstrap,
@@ -1500,7 +1667,8 @@ mod tests {
             VLlmConfig {
                 base_url: "http://localhost".to_string(),
                 api_key: None,
-                timeout_seconds: 30,
+                completion_timeout_seconds: 30,
+                control_timeout_seconds: 30,
             },
             Arc::new(std::sync::RwLock::new(
                 crate::spki_verifier::FingerprintState::Bootstrap,

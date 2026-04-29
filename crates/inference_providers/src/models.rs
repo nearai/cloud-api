@@ -725,6 +725,15 @@ pub enum CompletionError {
     /// Client should refresh their attestation report and retry.
     #[error("No provider found for encryption key: {0}")]
     NoPubKeyProvider(String),
+    /// The request exceeded the per-call timeout configured on the provider.
+    /// Distinct from connection errors: the request was sent and the server is
+    /// (probably) still working — retrying the same request would just hit the
+    /// same wall, so the pool treats this as non-retryable.
+    #[error("Request timed out after {timeout_seconds}s during {operation}")]
+    Timeout {
+        operation: &'static str,
+        timeout_seconds: u64,
+    },
 }
 
 /// Parameters for image generation requests

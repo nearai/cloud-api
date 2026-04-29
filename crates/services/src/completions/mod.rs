@@ -824,6 +824,25 @@ impl CompletionServiceImpl {
                         .to_string(),
                 }
             }
+            inference_providers::CompletionError::Timeout {
+                operation: op,
+                timeout_seconds,
+            } => {
+                tracing::error!(
+                    %organization_id,
+                    model,
+                    timeout_seconds,
+                    inference_op = op,
+                    "Provider per-call timeout during {}",
+                    operation
+                );
+                ports::CompletionError::ProviderError {
+                    status_code: 504,
+                    message:
+                        "The request timed out waiting for the model to respond. Please try again."
+                            .to_string(),
+                }
+            }
         }
     }
 
@@ -2543,6 +2562,33 @@ mod tests {
                 );
             }
             other => panic!("Expected ProviderError with 421, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_map_provider_error_timeout_becomes_504() {
+        let error = inference_providers::CompletionError::Timeout {
+            operation: "chat_completion",
+            timeout_seconds: 600,
+        };
+        let result =
+            CompletionServiceImpl::map_provider_error("test-model", &error, "test", Uuid::nil());
+        match result {
+            ports::CompletionError::ProviderError {
+                status_code,
+                message,
+            } => {
+                assert_eq!(
+                    status_code, 504,
+                    "Per-call timeout should surface as Gateway Timeout"
+                );
+                assert!(
+                    message.to_lowercase().contains("timed out"),
+                    "User-facing message should mention timeout, got: {}",
+                    message
+                );
+            }
+            other => panic!("Expected ProviderError with 504, got {:?}", other),
         }
     }
 }

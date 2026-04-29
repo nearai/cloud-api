@@ -131,6 +131,14 @@ impl inference_providers::BackendVerifier for PoolBackendVerifier {
     async fn create_verified_client(&self, base_url: &str) -> Result<reqwest::Client, String> {
         // 1. Build a client with isolated Bootstrap state (accepts any WebPKI cert
         //    for the initial connection to discover the backend's fingerprint).
+        // read_timeout is the per-chunk idle timeout; for non-streaming chat
+        // completion the connection sits silent the entire inference time, so
+        // it must match the configured completion budget — otherwise a long
+        // reasoning request fires read_timeout (~300s) before our `.timeout()`
+        // (default 600s). Track `VLLM_PROVIDER_COMPLETION_TIMEOUT` so the env
+        // override applies here too.
+        let read_timeout =
+            Duration::from_secs(VLlmConfig::completion_timeout_from_env().max(0) as u64);
         let client_state = Arc::new(std::sync::RwLock::new(FingerprintState::Bootstrap));
         let client = reqwest::Client::builder()
             .use_preconfigured_tls(self.tls_roots.build_config(client_state.clone()))
@@ -138,7 +146,7 @@ impl inference_providers::BackendVerifier for PoolBackendVerifier {
             .http2_adaptive_window(true)
             .connect_timeout(Duration::from_secs(5))
             .pool_idle_timeout(Duration::from_secs(300))
-            .read_timeout(Duration::from_secs(300))
+            .read_timeout(read_timeout)
             .build()
             .map_err(|e| format!("Failed to build HTTP client: {e}"))?;
 

@@ -183,12 +183,20 @@ impl VLlmProvider {
     ) -> Self {
         let tls_roots = SharedTlsRoots::load();
 
+        // reqwest's read_timeout is a per-chunk idle timeout. For non-streaming
+        // chat completion the connection is silent the entire inference time
+        // (server computes, then sends the body in one shot) — so read_timeout
+        // must be ≥ completion_timeout or it fires first and bypasses our
+        // configured per-request budget.
+        let completion_timeout = config.completion_timeout();
+        let control_timeout = config.control_timeout();
+
         // General-purpose client for non-completion requests
         let client = Client::builder()
             .use_preconfigured_tls(tls_roots.build_config(fingerprint_state.clone()))
             .connect_timeout(Duration::from_secs(5))
             .pool_idle_timeout(Duration::from_secs(90))
-            .read_timeout(Duration::from_secs(300))
+            .read_timeout(control_timeout)
             .build()
             .expect("Failed to create HTTP client");
 
@@ -210,7 +218,7 @@ impl VLlmProvider {
                         .http2_adaptive_window(true)
                         .connect_timeout(Duration::from_secs(5))
                         .pool_idle_timeout(Duration::from_secs(300))
-                        .read_timeout(Duration::from_secs(300))
+                        .read_timeout(completion_timeout)
                         .build()
                         .expect("Failed to create bucket HTTP client");
                     std::sync::Mutex::new(Some(c))

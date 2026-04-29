@@ -729,9 +729,12 @@ pub enum CompletionError {
     /// Distinct from connection errors: the request was sent and the server is
     /// (probably) still working — retrying the same request would just hit the
     /// same wall, so the pool treats this as non-retryable.
+    ///
+    /// `operation` is owned (not `&'static str`) so the `Deserialize` derive on
+    /// this enum stays usable from arbitrary input lifetimes.
     #[error("Request timed out after {timeout_seconds}s during {operation}")]
     Timeout {
-        operation: &'static str,
+        operation: String,
         timeout_seconds: u64,
     },
 }

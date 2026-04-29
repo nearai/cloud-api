@@ -2568,7 +2568,7 @@ mod tests {
     #[test]
     fn test_map_provider_error_timeout_becomes_504() {
         let error = inference_providers::CompletionError::Timeout {
-            operation: "chat_completion",
+            operation: "chat_completion".to_string(),
             timeout_seconds: 600,
         };
         let result =

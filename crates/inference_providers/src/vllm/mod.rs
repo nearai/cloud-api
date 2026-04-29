@@ -463,15 +463,21 @@ impl VLlmProvider {
         client_override: Option<&Client>,
     ) -> Result<reqwest::Response, CompletionError> {
         let client = client_override.unwrap_or(&self.client);
+        let ttfb_timeout_secs = self.config.control_timeout_seconds.max(0) as u64;
         let response = tokio::time::timeout(
             self.config.control_timeout(),
             client.post(url).headers(headers).json(params).send(),
         )
         .await
-        .map_err(|_| CompletionError::HttpError {
-            status_code: 504,
-            message: "Timed out waiting for response headers from inference backend".to_string(),
-            is_external: false,
+        // TTFB stalls indicate the same backend is stuck — surface as
+        // `Timeout` (non-retryable in the pool) for consistency with the
+        // non-streaming path. Pre-`Timeout` this was an `HttpError 504` and
+        // got retried up to 4× by the pool, burning 4 × control_timeout for
+        // no gain. We still don't surface fingerprint mismatches as Timeout
+        // — those land in the second `?` arm below.
+        .map_err(|_| CompletionError::Timeout {
+            operation: "chat_completion_stream".to_string(),
+            timeout_seconds: ttfb_timeout_secs,
         })?
         .map_err(|e| CompletionError::CompletionError(e.to_string()))?;
 
@@ -796,10 +802,12 @@ impl InferenceProvider for VLlmProvider {
 
         // Distinguish timeout from other transport errors so the pool can refuse
         // to retry timeouts (a re-send hits the same model with the same prompt).
+        // Connect-level timeouts are excluded: those usually indicate transient
+        // network blips and are worth retrying via the bucket-clear path below.
         let map_send_err = |e: reqwest::Error| -> CompletionError {
-            if e.is_timeout() {
+            if e.is_timeout() && !e.is_connect() {
                 CompletionError::Timeout {
-                    operation: "chat_completion",
+                    operation: "chat_completion".to_string(),
                     timeout_seconds: timeout_secs,
                 }
             } else {
@@ -810,13 +818,16 @@ impl InferenceProvider for VLlmProvider {
         let response = match send(&bucket_client, headers.clone()).await {
             Ok(r) => r,
             // Connection dropped or fingerprint mismatch on reconnect — clear
-            // bucket and re-verify with a fresh attestation. Critically, exclude
-            // timeout errors from this branch: in reqwest 0.12 a timeout error
-            // stringifies as "error sending request for url (...): operation
-            // timed out", which would otherwise match the substring check and
-            // burn another full timeout cycle on a doomed retry.
+            // bucket and re-verify with a fresh attestation. Two subtleties:
+            // - Read/request timeouts must NOT enter this branch: in reqwest
+            //   0.12 a per-request timeout stringifies as "error sending
+            //   request for url (...): operation timed out", which matches the
+            //   substring check; without `!is_timeout() || is_connect()` we'd
+            //   burn another full timeout cycle on a doomed retry.
+            // - Connect timeouts (`is_timeout && is_connect`) DO enter, since
+            //   they're worth retrying — likely network blip, fresh backend.
             Err(e)
-                if !e.is_timeout()
+                if (!e.is_timeout() || e.is_connect())
                     && (e.is_connect()
                         || e.to_string()
                             .contains("does not match any attested fingerprint")
@@ -1268,6 +1279,11 @@ mod tests {
 
     /// Helper that scrubs both timeout env vars before/after a closure runs,
     /// preventing parent shell exports from leaking into the test.
+    ///
+    /// TODO(rust 1.81+): `std::env::set_var` / `remove_var` become `unsafe` to
+    /// call (parallel-process env-mutation is not race-free). Either wrap with
+    /// `unsafe { ... }` and rely on `#[serial]` to serialize, or migrate to
+    /// the `temp-env` crate which encapsulates the unsafety.
     fn with_clean_timeout_env<R>(f: impl FnOnce() -> R) -> R {
         let prev_completion = std::env::var("VLLM_PROVIDER_COMPLETION_TIMEOUT").ok();
         let prev_control = std::env::var("VLLM_PROVIDER_CONTROL_TIMEOUT").ok();
@@ -1369,7 +1385,7 @@ mod tests {
     #[test]
     fn timeout_error_display_includes_operation_and_seconds() {
         let err = CompletionError::Timeout {
-            operation: "chat_completion",
+            operation: "chat_completion".to_string(),
             timeout_seconds: 600,
         };
         let s = err.to_string();
@@ -1728,12 +1744,15 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let accept_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let accept_count_clone = accept_count.clone();
-        tokio::spawn(async move {
+        let acceptor = tokio::spawn(async move {
+            // Park each accepted socket on the task — when the test returns and
+            // `acceptor` is aborted, sockets get dropped (and connections closed)
+            // without the leak that `mem::forget` would cause.
+            let mut held = Vec::new();
             loop {
                 if let Ok((sock, _)) = listener.accept().await {
                     accept_count_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                    // Hold the connection open until it's torn down by the timeout.
-                    std::mem::forget(sock);
+                    held.push(sock);
                 }
             }
         });
@@ -1827,5 +1846,9 @@ mod tests {
             1,
             "exactly one TCP connection should have been opened (no retry)"
         );
+
+        // Drop the acceptor task: this releases the held sockets cleanly so
+        // we don't leak file descriptors past the test.
+        acceptor.abort();
     }
 }

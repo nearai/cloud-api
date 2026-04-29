@@ -1209,15 +1209,19 @@ impl InferenceProviderPool {
             // model is presumably still chewing on it. Retrying the same prompt at
             // the same backend will hit the same wall — and 4× a long completion
             // timeout is an expensive way to surface the same answer.
+            //
+            // Connect-level timeouts ARE retryable, though: they indicate the
+            // request hadn't reached the backend yet, so a retry has a real shot
+            // at succeeding. reqwest stringifies these as
+            // "error sending request: operation timed out (connect)", so we look
+            // for "connect" alongside the timeout signature to keep them retryable.
             let is_retryable = match &last_error {
                 Some(CompletionError::CompletionError(msg)) => {
-                    // Exclude reqwest's timeout signature so a timeout that slipped
-                    // through as a string-form error (e.g. from an external provider)
-                    // is also not retried.
                     let lower = msg.to_lowercase();
-                    let is_timeout =
-                        lower.contains("operation timed out") || lower.contains("timed out after");
-                    !is_timeout
+                    let is_inference_timeout = (lower.contains("operation timed out")
+                        || lower.contains("timed out after"))
+                        && !lower.contains("connect");
+                    !is_inference_timeout
                         && (lower.contains("connection")
                             || lower.contains("connect")
                             || lower.contains("reset")
@@ -3345,7 +3349,7 @@ mod tests {
                 async move {
                     count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     Err(CompletionError::Timeout {
-                        operation: "chat_completion",
+                        operation: "chat_completion".to_string(),
                         timeout_seconds: 600,
                     })
                 }
@@ -3369,6 +3373,38 @@ mod tests {
             }
             other => panic!("Expected CompletionError::Timeout, got: {:?}", other),
         }
+    }
+
+    /// Connect-level timeouts surface as string-form errors containing both
+    /// "operation timed out" and "connect". They must remain retryable — the
+    /// request hadn't reached the backend yet, so a retry has a real shot at
+    /// succeeding (different bucket, fresh attestation).
+    #[tokio::test(start_paused = true)]
+    async fn test_connect_timeout_string_is_retryable() {
+        let (pool, model_id) = pool_with_mock_provider().await;
+
+        let attempt_count = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let count_clone = attempt_count.clone();
+
+        let result: Result<((), _), _> = pool
+            .retry_with_fallback(&model_id, "test_op", None, move |_provider| {
+                let count = count_clone.clone();
+                async move {
+                    count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    Err(CompletionError::CompletionError(
+                        "error sending request for url (https://x): operation timed out (connect)"
+                            .to_string(),
+                    ))
+                }
+            })
+            .await;
+
+        assert!(result.is_err());
+        assert_eq!(
+            attempt_count.load(std::sync::atomic::Ordering::Relaxed),
+            4,
+            "connect-timeout should retry the full 4 rounds (1 initial + 3 retries)"
+        );
     }
 
     /// A timeout that arrives via `CompletionError::CompletionError(msg)` (e.g. an

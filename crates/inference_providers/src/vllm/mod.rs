@@ -801,14 +801,19 @@ impl InferenceProvider for VLlmProvider {
 
         let response = match send(&bucket_client, headers.clone()).await {
             Ok(r) => r,
+            // Connection dropped or fingerprint mismatch on reconnect — clear
+            // bucket and re-verify with a fresh attestation. Critically, exclude
+            // timeout errors from this branch: in reqwest 0.12 a timeout error
+            // stringifies as "error sending request for url (...): operation
+            // timed out", which would otherwise match the substring check and
+            // burn another full timeout cycle on a doomed retry.
             Err(e)
-                if e.is_connect()
-                    || e.to_string()
-                        .contains("does not match any attested fingerprint")
-                    || e.to_string().contains("error sending request") =>
+                if !e.is_timeout()
+                    && (e.is_connect()
+                        || e.to_string()
+                            .contains("does not match any attested fingerprint")
+                        || e.to_string().contains("error sending request")) =>
             {
-                // Connection dropped or fingerprint mismatch on reconnect —
-                // clear bucket and re-verify with a fresh attestation.
                 self.clear_bucket(bucket_id);
                 let fresh = self.get_or_verify_bucket_client(bucket_id).await?;
                 send(&fresh, headers).await.map_err(map_send_err)?
@@ -1695,5 +1700,124 @@ mod tests {
         assert!(provider.bucket_clients[0].lock().unwrap().is_some());
         provider.clear_bucket(0);
         assert!(provider.bucket_clients[0].lock().unwrap().is_none());
+    }
+
+    /// Regression test: a non-streaming `chat_completion` that hits the
+    /// per-request timeout must NOT fall into the bucket-clear retry branch,
+    /// because reqwest 0.12 stringifies a timeout as "error sending request
+    /// for url (...): operation timed out" — a substring of the connect-retry
+    /// guard. Without the `!is_timeout()` guard, a timeout doubles end-to-end
+    /// latency before the pool's no-retry classifier sees `Timeout`.
+    #[tokio::test]
+    async fn test_timeout_does_not_trigger_bucket_clear_retry() {
+        use crate::{ChatCompletionParams, ChatMessage, InferenceProvider, MessageRole};
+        use std::sync::Arc;
+        use tokio::net::TcpListener;
+
+        // A listener that accepts TCP connections but never sends any HTTP
+        // bytes back — every request times out at the configured cap.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accept_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let accept_count_clone = accept_count.clone();
+        tokio::spawn(async move {
+            loop {
+                if let Ok((sock, _)) = listener.accept().await {
+                    accept_count_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    // Hold the connection open until it's torn down by the timeout.
+                    std::mem::forget(sock);
+                }
+            }
+        });
+
+        struct DirectClient;
+        #[async_trait::async_trait]
+        impl crate::BackendVerifier for DirectClient {
+            async fn create_verified_client(
+                &self,
+                _base_url: &str,
+            ) -> Result<reqwest::Client, String> {
+                Ok(reqwest::Client::builder()
+                    .build()
+                    .expect("client builds in test"))
+            }
+        }
+
+        let provider = VLlmProvider::new_with_verifier(
+            VLlmConfig {
+                base_url: format!("http://{addr}"),
+                api_key: None,
+                completion_timeout_seconds: 1,
+                control_timeout_seconds: 30,
+            },
+            Arc::new(std::sync::RwLock::new(
+                crate::spki_verifier::FingerprintState::Bootstrap,
+            )),
+            Arc::new(DirectClient),
+        );
+
+        let params = ChatCompletionParams {
+            model: "test-model".to_string(),
+            messages: vec![ChatMessage {
+                role: MessageRole::User,
+                content: Some(serde_json::Value::String("hi".to_string())),
+                name: None,
+                tool_call_id: None,
+                tool_calls: None,
+            }],
+            max_completion_tokens: Some(1),
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            n: None,
+            stream: None,
+            stop: None,
+            frequency_penalty: None,
+            presence_penalty: None,
+            logit_bias: None,
+            logprobs: None,
+            top_logprobs: None,
+            user: None,
+            seed: None,
+            tools: None,
+            tool_choice: None,
+            parallel_tool_calls: None,
+            metadata: None,
+            store: None,
+            stream_options: None,
+            modalities: None,
+            extra: std::collections::HashMap::new(),
+        };
+
+        let start = std::time::Instant::now();
+        let result = provider
+            .chat_completion(params, "test-hash".to_string())
+            .await;
+        let elapsed = start.elapsed();
+
+        // Must surface as Timeout, not as a generic CompletionError.
+        match result {
+            Err(CompletionError::Timeout {
+                operation,
+                timeout_seconds,
+            }) => {
+                assert_eq!(operation, "chat_completion");
+                assert_eq!(timeout_seconds, 1);
+            }
+            other => panic!("expected CompletionError::Timeout, got: {other:?}"),
+        }
+
+        // One timeout cycle is ~1s. A retry would be ~2s. Allow generous
+        // headroom for CI scheduler jitter but fail well before 2× to
+        // catch the regression.
+        assert!(
+            elapsed < Duration::from_millis(1700),
+            "chat_completion took {elapsed:?} — looks like the bucket-clear retry fired on timeout"
+        );
+        assert_eq!(
+            accept_count.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "exactly one TCP connection should have been opened (no retry)"
+        );
     }
 }

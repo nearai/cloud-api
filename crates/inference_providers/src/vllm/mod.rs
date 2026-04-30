@@ -347,7 +347,7 @@ impl VLlmProvider {
     /// verifies it, pins the fingerprint, and caches the client.
     ///
     /// Concurrent inline verifications are bounded by `verification_semaphore`
-    /// (Fix 4: prevents thundering-herd pressure on inference-proxy GPU evidence
+    /// (Fix 1: prevents thundering-herd pressure on inference-proxy GPU evidence
     /// collection when all buckets are empty at startup).
     ///
     /// If all verification attempts fail, falls back to `fallback_client` so the
@@ -384,6 +384,13 @@ impl VLlmProvider {
         //
         // The semaphore is never closed, so acquire() only returns Err on close —
         // treat that as a bug.
+        //
+        // Note on worst-case wait time: the permit is held for the entire retry
+        // loop (INLINE_VERIFY_RETRIES + 1 attempts × control_timeout each). With
+        // default values that is 3 × 90s = 270s per slot. Requests queueing behind
+        // a saturated semaphore of size N can wait up to (queue_depth / N) × 270s.
+        // In practice the first successful verification fills the bucket and all
+        // subsequent waiters take the fast path (re-check after acquiring permit).
         let _permit = self
             .verification_semaphore
             .acquire()
@@ -1918,9 +1925,6 @@ mod tests {
             }
         }
 
-        let fingerprint_state = Arc::new(std::sync::RwLock::new(
-            crate::spki_verifier::FingerprintState::Bootstrap,
-        ));
         let provider = VLlmProvider::new_with_verifier(
             VLlmConfig {
                 base_url: "http://localhost".to_string(),
@@ -1928,7 +1932,9 @@ mod tests {
                 completion_timeout_seconds: 30,
                 control_timeout_seconds: 30,
             },
-            fingerprint_state.clone(),
+            Arc::new(std::sync::RwLock::new(
+                crate::spki_verifier::FingerprintState::Bootstrap,
+            )),
             Arc::new(AlwaysFailVerifier),
         );
 
@@ -1947,6 +1953,51 @@ mod tests {
         assert!(
             provider.bucket_clients[0].lock().unwrap().is_none(),
             "fallback should not be stored in bucket"
+        );
+    }
+
+    /// Fix 2 + security guard: in Blocked state (explicit attestation failure),
+    /// `pinned_fingerprint_count()` returns 0, so the code takes the same safe
+    /// path as Bootstrap and returns Err rather than the fallback client.
+    #[tokio::test]
+    async fn test_fallback_err_in_blocked_state() {
+        use std::sync::Arc;
+        struct AlwaysFailVerifier;
+        #[async_trait::async_trait]
+        impl crate::BackendVerifier for AlwaysFailVerifier {
+            async fn create_verified_client(
+                &self,
+                _base_url: &str,
+            ) -> Result<reqwest::Client, String> {
+                Err("simulated attestation failure".to_string())
+            }
+        }
+
+        let provider = VLlmProvider::new_with_verifier(
+            VLlmConfig {
+                base_url: "http://localhost".to_string(),
+                api_key: None,
+                completion_timeout_seconds: 30,
+                control_timeout_seconds: 30,
+            },
+            Arc::new(std::sync::RwLock::new(
+                crate::spki_verifier::FingerprintState::Bootstrap,
+            )),
+            Arc::new(AlwaysFailVerifier),
+        );
+
+        // Transition to Blocked state (attestation explicitly failed).
+        provider.block_connections();
+        assert_eq!(provider.pinned_fingerprint_count(), 0);
+
+        // Bucket starts empty.
+        assert!(provider.bucket_clients[0].lock().unwrap().is_none());
+
+        // Blocked state has pinned_count == 0 → same safe path as Bootstrap → Err.
+        let result = provider.get_or_verify_bucket_client(0).await;
+        assert!(
+            result.is_err(),
+            "expected Err in Blocked state, got: {result:?}"
         );
     }
 

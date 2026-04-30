@@ -1006,9 +1006,9 @@ impl InferenceProviderPool {
         }
     }
 
-    /// Mirror of the `is_retryable` decision in `retry_with_fallback`, but
-    /// returns a label instead of a bool so the rationale is visible in logs.
-    /// Keep in sync with the match in `retry_with_fallback`.
+    /// Single source of truth for the retry decision: the inner retry loop
+    /// gates on `starts_with("retryable_")`, and the terminal error log emits
+    /// the label directly so the rationale is visible in production logs.
     fn classify_retry_decision(error: &CompletionError) -> &'static str {
         match error {
             CompletionError::CompletionError(msg) => {
@@ -1292,24 +1292,13 @@ impl InferenceProviderPool {
             // at succeeding. reqwest stringifies these as
             // "error sending request: operation timed out (connect)", so we look
             // for "connect" alongside the timeout signature to keep them retryable.
-            let is_retryable = match &last_error {
-                Some(CompletionError::CompletionError(msg)) => {
-                    let lower = msg.to_lowercase();
-                    let is_inference_timeout = (lower.contains("operation timed out")
-                        || lower.contains("timed out after"))
-                        && !lower.contains("connect");
-                    !is_inference_timeout
-                        && (lower.contains("connection")
-                            || lower.contains("connect")
-                            || lower.contains("reset")
-                            || lower.contains("broken pipe"))
-                }
-                Some(CompletionError::HttpError { status_code, .. }) => {
-                    *status_code >= 500 || *status_code == 429
-                }
-                Some(CompletionError::Timeout { .. }) => false,
-                _ => false,
-            };
+            //
+            // The actual classification lives in `classify_retry_decision` (used
+            // for both the retry gate and log labels) so the two can't drift.
+            let is_retryable = last_error
+                .as_ref()
+                .map(|e| Self::classify_retry_decision(e).starts_with("retryable_"))
+                .unwrap_or(false);
 
             if !is_retryable || retry_count >= MAX_RETRIES {
                 break;

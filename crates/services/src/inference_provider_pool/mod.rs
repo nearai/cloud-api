@@ -1033,12 +1033,20 @@ impl InferenceProviderPool {
                     "retryable_http_5xx"
                 } else if *status_code == 429 {
                     "retryable_http_429"
+                } else if *status_code == 408 {
+                    // 408 escapes the inner-loop early-return for 4xx so the next
+                    // provider is tried, but the outer is_retryable still returns
+                    // false (only 5xx/429 retry the round). Distinct label so this
+                    // shows up clearly in logs.
+                    "non_retryable_http_408"
                 } else {
                     "non_retryable_http"
                 }
             }
             CompletionError::Timeout { .. } => "non_retryable_explicit_timeout",
-            _ => "non_retryable_other",
+            CompletionError::NoPubKeyProvider(_) => "non_retryable_no_pubkey_provider",
+            CompletionError::InvalidResponse(_) => "non_retryable_invalid_response",
+            CompletionError::Unknown(_) => "non_retryable_unknown",
         }
     }
 
@@ -1167,6 +1175,17 @@ impl InferenceProviderPool {
         let mut total_attempts: usize = 0;
         let mut retry_count: usize = 0;
         let started_at = std::time::Instant::now();
+        // Snapshot the full model→providers count once. Reading it again at the
+        // failure path can race with a concurrent provider refresh, which would
+        // give an inconsistent number relative to `providers_tried`.
+        let model_provider_count = self
+            .provider_mappings
+            .read()
+            .await
+            .model_to_providers
+            .get(model_id)
+            .map(|v| v.len())
+            .unwrap_or(0);
 
         loop {
             // Try each provider in order until one succeeds
@@ -1335,15 +1354,7 @@ impl InferenceProviderPool {
             .as_ref()
             .map(Self::classify_retry_decision)
             .unwrap_or("none");
-        let elapsed_ms = started_at.elapsed().as_millis() as u64;
-        let model_provider_count = self
-            .provider_mappings
-            .read()
-            .await
-            .model_to_providers
-            .get(model_id)
-            .map(|v| v.len())
-            .unwrap_or(0);
+        let elapsed_ms = started_at.elapsed().as_millis();
         if let Some(pub_key) = model_pub_key {
             tracing::error!(
                 model_id = %model_id,
@@ -2714,6 +2725,175 @@ impl InferenceProviderPool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_classify_error_kind() {
+        let cases: &[(CompletionError, &str)] = &[
+            (
+                CompletionError::CompletionError("anything".to_string()),
+                "completion_error",
+            ),
+            (
+                CompletionError::HttpError {
+                    status_code: 502,
+                    message: String::new(),
+                    is_external: false,
+                },
+                "http_5xx",
+            ),
+            (
+                CompletionError::HttpError {
+                    status_code: 429,
+                    message: String::new(),
+                    is_external: false,
+                },
+                "http_429",
+            ),
+            (
+                CompletionError::HttpError {
+                    status_code: 408,
+                    message: String::new(),
+                    is_external: false,
+                },
+                "http_408",
+            ),
+            (
+                CompletionError::HttpError {
+                    status_code: 404,
+                    message: String::new(),
+                    is_external: false,
+                },
+                "http_4xx",
+            ),
+            (
+                CompletionError::HttpError {
+                    status_code: 200,
+                    message: String::new(),
+                    is_external: false,
+                },
+                "http_other",
+            ),
+            (
+                CompletionError::InvalidResponse(String::new()),
+                "invalid_response",
+            ),
+            (CompletionError::Unknown(String::new()), "unknown"),
+            (
+                CompletionError::NoPubKeyProvider(String::new()),
+                "no_pubkey_provider",
+            ),
+            (
+                CompletionError::Timeout {
+                    operation: String::new(),
+                    timeout_seconds: 0,
+                },
+                "timeout",
+            ),
+        ];
+        for (err, want) in cases {
+            assert_eq!(
+                InferenceProviderPool::classify_error_kind(err),
+                *want,
+                "wrong kind for {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_classify_retry_decision() {
+        // The "Failed to create verified client … Attestation request timed out"
+        // string is what we suspect is leaking through as non-retryable on prod;
+        // pin its label here so a later refactor can't silently change it.
+        assert_eq!(
+            InferenceProviderPool::classify_retry_decision(&CompletionError::CompletionError(
+                "Failed to create verified client after 3 attempts: Attestation request timed out"
+                    .to_string()
+            )),
+            "non_retryable_no_keyword_match",
+        );
+        // "operation timed out" without "connect" → inference timeout, non-retryable.
+        assert_eq!(
+            InferenceProviderPool::classify_retry_decision(&CompletionError::CompletionError(
+                "vLLM: operation timed out after 90s".to_string()
+            )),
+            "non_retryable_inference_timeout",
+        );
+        // Same string with "connect" present → retryable.
+        assert_eq!(
+            InferenceProviderPool::classify_retry_decision(&CompletionError::CompletionError(
+                "error sending request: operation timed out (connect)".to_string()
+            )),
+            "retryable_connection_keyword",
+        );
+        // Plain connection-keyword match.
+        assert_eq!(
+            InferenceProviderPool::classify_retry_decision(&CompletionError::CompletionError(
+                "connection reset by peer".to_string()
+            )),
+            "retryable_connection_keyword",
+        );
+        // HTTP statuses.
+        assert_eq!(
+            InferenceProviderPool::classify_retry_decision(&CompletionError::HttpError {
+                status_code: 503,
+                message: String::new(),
+                is_external: false,
+            }),
+            "retryable_http_5xx",
+        );
+        assert_eq!(
+            InferenceProviderPool::classify_retry_decision(&CompletionError::HttpError {
+                status_code: 429,
+                message: String::new(),
+                is_external: false,
+            }),
+            "retryable_http_429",
+        );
+        assert_eq!(
+            InferenceProviderPool::classify_retry_decision(&CompletionError::HttpError {
+                status_code: 408,
+                message: String::new(),
+                is_external: false,
+            }),
+            "non_retryable_http_408",
+        );
+        assert_eq!(
+            InferenceProviderPool::classify_retry_decision(&CompletionError::HttpError {
+                status_code: 404,
+                message: String::new(),
+                is_external: false,
+            }),
+            "non_retryable_http",
+        );
+        // Explicit timeout variant.
+        assert_eq!(
+            InferenceProviderPool::classify_retry_decision(&CompletionError::Timeout {
+                operation: "chat".to_string(),
+                timeout_seconds: 90,
+            }),
+            "non_retryable_explicit_timeout",
+        );
+        // Other variants are explicitly non-retryable (no catch-all so a new
+        // CompletionError variant fails to compile until classified here).
+        assert_eq!(
+            InferenceProviderPool::classify_retry_decision(&CompletionError::NoPubKeyProvider(
+                String::new()
+            )),
+            "non_retryable_no_pubkey_provider",
+        );
+        assert_eq!(
+            InferenceProviderPool::classify_retry_decision(&CompletionError::InvalidResponse(
+                String::new()
+            )),
+            "non_retryable_invalid_response",
+        );
+        assert_eq!(
+            InferenceProviderPool::classify_retry_decision(
+                &CompletionError::Unknown(String::new())
+            ),
+            "non_retryable_unknown",
+        );
+    }
 
     #[test]
     fn test_sanitize_error_message() {

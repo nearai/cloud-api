@@ -353,7 +353,10 @@ impl VLlmProvider {
     /// If all verification attempts fail, falls back to `fallback_client` so the
     /// request is served without prefix-cache routing rather than returning an
     /// error to the user (Fix 2: graceful degradation on attestation failure).
-    async fn get_or_verify_bucket_client(&self, bucket_id: usize) -> Result<Client, CompletionError> {
+    async fn get_or_verify_bucket_client(
+        &self,
+        bucket_id: usize,
+    ) -> Result<Client, CompletionError> {
         // Fast path: bucket already has a verified client.
         // reqwest::Client::clone is an Arc refcount bump — hold the lock briefly.
         {

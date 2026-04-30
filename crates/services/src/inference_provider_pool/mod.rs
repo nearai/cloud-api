@@ -987,6 +987,61 @@ impl InferenceProviderPool {
         }
     }
 
+    /// Stable label for a CompletionError variant, for log indexing.
+    /// Safe to log: contains no caller-controlled content.
+    fn classify_error_kind(error: &CompletionError) -> &'static str {
+        match error {
+            CompletionError::CompletionError(_) => "completion_error",
+            CompletionError::HttpError { status_code, .. } => match status_code {
+                500..=599 => "http_5xx",
+                429 => "http_429",
+                408 => "http_408",
+                400..=499 => "http_4xx",
+                _ => "http_other",
+            },
+            CompletionError::InvalidResponse(_) => "invalid_response",
+            CompletionError::Unknown(_) => "unknown",
+            CompletionError::NoPubKeyProvider(_) => "no_pubkey_provider",
+            CompletionError::Timeout { .. } => "timeout",
+        }
+    }
+
+    /// Mirror of the `is_retryable` decision in `retry_with_fallback`, but
+    /// returns a label instead of a bool so the rationale is visible in logs.
+    /// Keep in sync with the match in `retry_with_fallback`.
+    fn classify_retry_decision(error: &CompletionError) -> &'static str {
+        match error {
+            CompletionError::CompletionError(msg) => {
+                let lower = msg.to_lowercase();
+                let is_inference_timeout = (lower.contains("operation timed out")
+                    || lower.contains("timed out after"))
+                    && !lower.contains("connect");
+                if is_inference_timeout {
+                    "non_retryable_inference_timeout"
+                } else if lower.contains("connection")
+                    || lower.contains("connect")
+                    || lower.contains("reset")
+                    || lower.contains("broken pipe")
+                {
+                    "retryable_connection_keyword"
+                } else {
+                    "non_retryable_no_keyword_match"
+                }
+            }
+            CompletionError::HttpError { status_code, .. } => {
+                if *status_code >= 500 {
+                    "retryable_http_5xx"
+                } else if *status_code == 429 {
+                    "retryable_http_429"
+                } else {
+                    "non_retryable_http"
+                }
+            }
+            CompletionError::Timeout { .. } => "non_retryable_explicit_timeout",
+            _ => "non_retryable_other",
+        }
+    }
+
     /// Sanitize error message by removing sensitive information like IP addresses, URLs, and internal details
     fn sanitize_error_message(error: &str) -> String {
         let mut sanitized = error.to_string();
@@ -1111,6 +1166,7 @@ impl InferenceProviderPool {
         let mut last_error: Option<CompletionError> = None;
         let mut total_attempts: usize = 0;
         let mut retry_count: usize = 0;
+        let started_at = std::time::Instant::now();
 
         loop {
             // Try each provider in order until one succeeds
@@ -1185,10 +1241,12 @@ impl InferenceProviderPool {
                         }
 
                         // Log the failure for debugging (before sanitization strips details)
+                        let error_kind = Self::classify_error_kind(&e);
                         tracing::warn!(
                             model_id = %model_id,
                             attempt = attempt + 1,
                             retry = retry_count,
+                            error_kind,
                             error_detail = %e,
                             operation = operation_name,
                             "Provider failed, will try next provider if available"
@@ -1264,12 +1322,40 @@ impl InferenceProviderPool {
             );
             tokio::time::sleep(delay).await;
         }
+        // Pull the diagnostic fields once so both branches share them.
+        // These reveal *why* we stopped retrying — without them, the error log
+        // alone can't tell apart "1 attempt because non-retryable" from
+        // "1 attempt because only 1 provider matched the pubkey" from
+        // "exhausted MAX_RETRIES on a retryable error".
+        let error_kind = last_error
+            .as_ref()
+            .map(Self::classify_error_kind)
+            .unwrap_or("none");
+        let retry_decision = last_error
+            .as_ref()
+            .map(Self::classify_retry_decision)
+            .unwrap_or("none");
+        let elapsed_ms = started_at.elapsed().as_millis() as u64;
+        let model_provider_count = self
+            .provider_mappings
+            .read()
+            .await
+            .model_to_providers
+            .get(model_id)
+            .map(|v| v.len())
+            .unwrap_or(0);
         if let Some(pub_key) = model_pub_key {
             tracing::error!(
                 model_id = %model_id,
                 model_pub_key_prefix = %pub_key.chars().take(32).collect::<String>(),
                 providers_tried = providers.len(),
+                model_provider_count,
+                pubkey_filtered = true,
                 total_attempts,
+                retry_count,
+                error_kind,
+                retry_decision,
+                elapsed_ms,
                 operation = operation_name,
                 "All providers failed for model with public key"
             );
@@ -1277,7 +1363,13 @@ impl InferenceProviderPool {
             tracing::error!(
                 model_id = %model_id,
                 providers_tried = providers.len(),
+                model_provider_count,
+                pubkey_filtered = false,
                 total_attempts,
+                retry_count,
+                error_kind,
+                retry_decision,
+                elapsed_ms,
                 operation = operation_name,
                 "All providers failed for model"
             );

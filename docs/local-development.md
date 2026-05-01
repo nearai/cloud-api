@@ -15,7 +15,8 @@ real inference backends.
 - Rust (toolchain pinned in `rust-toolchain.toml`)
 - Docker & Docker Compose
 - `psql` is helpful but not required
-- A POSIX shell with `curl` and `jq`
+- A Bash-compatible shell with `curl` and `jq` (the §4 walkthrough uses
+  Bash array syntax)
 
 ## 2. Bring up the stack
 
@@ -70,34 +71,58 @@ The API has two mutually-exclusive auth methods:
 ### Mock session auth (no real OAuth)
 
 When `AUTH_MOCK=true`, the API accepts any session token starting with
-`rt_` provided the request also sends `User-Agent: Mock User Agent`. The
-seeded admin user (`admin@test.com`, ID `11111111-1111-1111-1111-111111111111`)
-is in the `near.ai` admin domain, so it can hit `/v1/admin/*` too.
+`rt_`. The mock service always returns the seeded user
+`admin@test.com`, but it derives the *user ID* from the token: if the
+suffix after `rt_` parses as a UUID, that UUID is used as the effective
+`user_id`; otherwise it falls back to the seeded admin
+(`11111111-1111-1111-1111-111111111111`).
+
+> **Heads-up**: a *random* UUID will pass auth but blow up the moment
+> you create an org — `organization_members.user_id` is a foreign key
+> on `users(id)`, and only the seeded UUID exists in `users`. Use one
+> of the two patterns below.
 
 Two ways to mint a token:
 
-1. **Reuse the seeded admin user** — any `rt_<random>` works:
+1. **Reuse the seeded admin user** — any `rt_<not-a-uuid>` falls back
+   to the seeded admin:
 
    ```bash
-   export SESSION="rt_$(uuidgen | tr 'A-Z' 'a-z')"
+   export SESSION="rt_local-dev-admin"
    ```
 
-2. **Impersonate a specific user ID** — embed the UUID after `rt_`:
+   Or use the seeded UUID explicitly:
 
    ```bash
    export SESSION="rt_11111111-1111-1111-1111-111111111111"
    ```
 
-All session-authenticated requests below use these two headers:
+2. **Impersonate a different user** — first INSERT the user into
+   `users`, then embed *that* UUID after `rt_`.
+
+#### Admin endpoints under mock auth
+
+The seeded mock user is `admin@test.com`. Admin access is granted by
+email domain via `AUTH_ADMIN_DOMAINS` (default: `near.ai,near.org`),
+so `admin@test.com` is **not** an admin out of the box. To exercise
+`/v1/admin/*` locally with mock auth, add `test.com`:
+
+```env
+AUTH_ADMIN_DOMAINS=near.ai,near.org,test.com
+```
+
+#### Headers used below
 
 ```
 Authorization: Bearer $SESSION
 User-Agent: Mock User Agent
 ```
 
-> If you skip the User-Agent, the mock validator returns 401. Real
-> browsers and the OAuth flow set their own user agents — mock auth is
-> deliberately scoped to this single sentinel string.
+The `User-Agent: Mock User Agent` header is **only** required for
+refresh-token endpoints (`POST /v1/users/me/access_tokens` and the
+auth callback). For ordinary management endpoints, mock auth accepts
+any `rt_…` Bearer regardless of User-Agent. Setting it everywhere is
+harmless and makes the curl examples uniform.
 
 ### Real OAuth (optional)
 
@@ -127,11 +152,11 @@ ORG_ID=$(curl -s "$BASE/v1/organizations" "${AUTH[@]}" \
   | jq -r .id)
 echo "org=$ORG_ID"
 
-# 3. Create a workspace inside the org
+# 3. Reuse the default workspace — `POST /v1/organizations` already
+#    creates one named `default`. Posting another with the same name
+#    would conflict on the (organization_id, name) unique index.
 WS_ID=$(curl -s "$BASE/v1/organizations/$ORG_ID/workspaces" "${AUTH[@]}" \
-  -H 'Content-Type: application/json' \
-  -d '{"name":"default","description":"manual testing"}' \
-  | jq -r .id)
+  | jq -r '.workspaces[] | select(.name == "default") | .id')
 echo "workspace=$WS_ID"
 
 # 4. Mint an API key — capture the plaintext `key` field, it is shown once.
@@ -146,12 +171,12 @@ echo "api_key=$API_KEY"
 curl -s "$BASE/v1/models" \
   -H "Authorization: Bearer $API_KEY" | jq .
 
-# 6. Make a chat completion (also requires backends).
+# 6. Make a chat completion (also requires backends — see §5).
 curl -s "$BASE/v1/chat/completions" \
   -H "Authorization: Bearer $API_KEY" \
   -H 'Content-Type: application/json' \
   -d '{
-    "model": "zai-org/GLM-5-FP8",
+    "model": "local/test-model",
     "messages": [{"role":"user","content":"hello"}],
     "max_tokens": 16
   }' | jq .
@@ -162,54 +187,64 @@ curl -s "$BASE/v1/chat/completions" \
 
 ## 5. Wiring up inference backends
 
-cloud-api itself doesn't run vLLM/SGLang — it routes to backends fronted
-by `model-proxy` (production) or any OpenAI-compatible server. Pick one:
+cloud-api itself doesn't run vLLM/SGLang — it loads model rows from the
+`models` table and forwards requests to whatever URL is in
+`models.inference_url`. The legacy discovery-server path was removed in
+PR #513, so `MODEL_DISCOVERY_SERVER_URL` / `MODEL_DISCOVERY_REFRESH_INTERVAL`
+in `env.example` are **no-ops** today; only `INFERENCE_API_KEY` (a.k.a.
+`MODEL_DISCOVERY_API_KEY`) is read, as the bearer token forwarded to
+the inference URL.
 
-### Option A — point at production backends (read-only)
+### Option A — exercise prod against the real cloud-api
 
-The fastest way to exercise the streaming path locally. Use a real prod
-or staging key for `MODEL_DISCOVERY_API_KEY`, but keep your local seed
-data isolated.
-
-```env
-MODEL_DISCOVERY_SERVER_URL=https://cloud-api.near.ai/v1/models
-MODEL_DISCOVERY_API_KEY=sk-…
-MODEL_DISCOVERY_REFRESH_INTERVAL=60
-```
-
-This points at production model metadata; chat completions still flow
-through your local cloud-api → production backend.
+The fastest way to test the streaming path is to skip local cloud-api
+entirely and `curl` `https://cloud-api.near.ai/v1/chat/completions`
+directly with a prod or staging API key. Use this when you only need to
+verify request/response shapes — no local server required.
 
 ### Option B — local OpenAI-compatible server
 
-Run vLLM, SGLang, or any OpenAI-compatible mock locally and add a model
-row pointing at it. Simplest path:
+Run vLLM, SGLang, or any OpenAI-compatible mock locally and insert a
+matching `models` row.
 
 ```bash
 # 1. Start a local OpenAI-compatible server on :8002
 #    (vLLM, SGLang, ollama-compat, etc.)
 
-# 2. Insert a model row that targets it
-#    See the latest crates/database/src/migrations/sql/V*__*models*.sql
-#    for the full column list — it changes faster than this doc does.
-psql "host=localhost user=postgres password=postgres dbname=platform_api" <<SQL
-INSERT INTO models (id, model_id, inference_url, …)
-VALUES (gen_random_uuid(), 'local/test-model', 'http://host.docker.internal:8002', …);
+# 2. Insert a model row that targets it. The columns below are the
+#    bare minimum — check `crates/database/src/migrations/sql/` for the
+#    latest schema (it drifts faster than this doc does).
+#
+#    URL: use http://localhost:8002 when cloud-api runs on the host
+#    (the default `make dev` flow). Use http://host.docker.internal:8002
+#    when cloud-api runs inside the docker-compose stack.
+psql "host=localhost user=postgres password=postgres dbname=platform_api" <<'SQL'
+INSERT INTO models (id, model_id, inference_url, is_active)
+VALUES (
+  gen_random_uuid(),
+  'local/test-model',
+  'http://localhost:8002',
+  true
+);
 SQL
 ```
 
-The exact column set depends on the latest migration — check
-`crates/database/src/migrations/sql/` and the `Model` struct in
-`crates/services/src/models/`. For most local work, Option A is enough.
-
 ### Option C — admin PATCH
 
-If you have admin access and want to populate models the same way prod
-does, use `PATCH /v1/admin/models`. This requires either an
-`@near.ai`-seeded user (which `AUTH_MOCK=true` gives you) or an admin
-JWT. The body shape is `HashMap<model_id, UpdateModelApiRequest>` —
-note that `inferenceUrl` is **camelCase**; the snake_case form is
-silently ignored.
+If you want to populate models the same way prod does, use
+`PATCH /v1/admin/models`. The body shape is
+`HashMap<model_id, UpdateModelApiRequest>` — note that `inferenceUrl`
+is **camelCase**; the snake_case form is silently ignored.
+
+Admin endpoints are gated by `AUTH_ADMIN_DOMAINS`. The default value
+(`near.ai,near.org`) excludes the seeded mock user `admin@test.com`,
+so for local testing add `test.com`:
+
+```env
+AUTH_ADMIN_DOMAINS=near.ai,near.org,test.com
+```
+
+Then:
 
 ```bash
 curl -s "$BASE/v1/admin/models" "${AUTH[@]}" \
@@ -219,13 +254,13 @@ curl -s "$BASE/v1/admin/models" "${AUTH[@]}" \
       "modelDisplayName": "Local Test",
       "modelDescription": "Local OpenAI-compatible backend",
       "contextLength": 8192,
-      "inferenceUrl": "http://host.docker.internal:8002"
+      "inferenceUrl": "http://localhost:8002"
     }
   }' | jq .
 ```
 
-Provider refresh runs every `MODEL_DISCOVERY_REFRESH_INTERVAL` seconds
-(300 by default). Drop it to 30–60 while iterating.
+Provider refresh runs every 300s by default
+(`EXTERNAL_PROVIDER_REFRESH_INTERVAL`). Lower it while iterating.
 
 ## 6. Useful endpoints to exercise
 
@@ -239,7 +274,7 @@ Provider refresh runs every `MODEL_DISCOVERY_REFRESH_INTERVAL` seconds
 | `POST /v1/chat/completions`                 | API key  | OpenAI-compatible. Add `"stream": true` for SSE             |
 | `POST /v1/responses`                        | API key  | Platform-specific event-streamed responses                  |
 | `POST /v1/conversations`                    | API key  | Conversation lifecycle                                      |
-| `GET  /v1/attestation/report`               | API key  | TEE attestation (returns 503 locally — no `dstack` socket)  |
+| `GET  /v1/attestation/report`               | API key  | TEE attestation (503 outside a CVM unless `DEV=true` in debug builds) |
 | `GET  /v1/signature/{chat_id}`              | API key  | Per-completion signature lookup                             |
 
 The Scalar UI at `http://localhost:3000/docs` lets you fire each of these
@@ -252,20 +287,29 @@ The seeder reads `crates/database/src/seed/` relative to the current
 directory. Run `make dev` from the repo root.
 
 **401 on management endpoints with mock auth**
-Confirm both headers are present: `Authorization: Bearer rt_…` *and*
-`User-Agent: Mock User Agent`. Either alone is rejected.
+Confirm `AUTH_MOCK=true` in the local env and that the Bearer token
+starts with `rt_`. The `User-Agent: Mock User Agent` header is only
+required for refresh-token endpoints (e.g. `POST /v1/users/me/access_tokens`).
+
+**403 on `/v1/admin/*` with mock auth**
+The seeded mock user is `admin@test.com`, which is **not** in the
+default `AUTH_ADMIN_DOMAINS=near.ai,near.org`. Add `test.com` to the
+list (see §5 Option C) and restart the server.
 
 **401 on API-key endpoints right after creating the key**
 The API key cache refreshes asynchronously. Wait ~10 seconds and retry.
 
 **`/v1/models` returns an empty list**
-No backends are wired up — see §5. The discovery loop logs at
-`MODEL_DISCOVERY_*` settings; bump `LOG_LEVEL=debug` to see refresh
-attempts.
+No backends are wired up — see §5. Bump `LOG_LEVEL=debug` to see
+provider refresh attempts.
 
 **`/v1/attestation/report` returns 503**
-Expected locally. Attestation requires `/var/run/dstack.sock` and a
-running dstack guest agent, which only exist inside the TEE.
+Expected when running outside a CVM/TEE — attestation calls into the
+dstack guest agent over `/var/run/dstack.sock`, which is only present
+in the TEE. For schema-level testing, debug builds (i.e. anything but
+`cargo build --release`) honor `DEV=true`, which short-circuits the
+dstack call and returns canned attestation data so the endpoint
+returns 200.
 
 **Postgres seed fails with `duplicate key value … users_email_key`**
 Another user already owns `admin@test.com`. Run:

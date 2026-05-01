@@ -565,26 +565,26 @@ impl AttestationVerifier {
 
         if parsed.verdict != "PASS" {
             let failed_checks = nras_failed_checks(&parsed.claims);
-            let gpu_arch = nras_str_claim(&parsed.claims, "x-nvidia-gpu-arch");
-            let driver_version = nras_str_claim(&parsed.claims, "x-nvidia-gpu-driver-version");
-            let vbios_version = nras_str_claim(&parsed.claims, "x-nvidia-gpu-vbios-version");
-            let detailed = parsed
-                .claims
-                .get("x-nvidia-attestation-detailed-result")
-                .map(|v| v.to_string())
-                .unwrap_or_default();
+            let gpu_arch = nras_str_claim(&parsed.claims, "x-nvidia-gpu-arch").unwrap_or("?");
+            let driver_version =
+                nras_str_claim(&parsed.claims, "x-nvidia-gpu-driver-version").unwrap_or("?");
+            let vbios_version =
+                nras_str_claim(&parsed.claims, "x-nvidia-gpu-vbios-version").unwrap_or("?");
+            let detailed_result = parsed.claims.get("x-nvidia-attestation-detailed-result");
 
             // Log full diagnostic context once. Caller already wraps the
             // returned error in a higher-level "Failed to create verified
             // client" message, so the structured fields here are the only
-            // place the per-claim breakdown surfaces.
+            // place the per-claim breakdown surfaces. `detailed_result` is
+            // logged via `?` so the JSON is Debug-formatted lazily — no
+            // allocation when the log is filtered out.
             tracing::warn!(
                 verdict = %parsed.verdict,
                 failed_checks = ?failed_checks,
-                gpu_arch = %gpu_arch.as_deref().unwrap_or("?"),
-                driver_version = %driver_version.as_deref().unwrap_or("?"),
-                vbios_version = %vbios_version.as_deref().unwrap_or("?"),
-                detailed_result = %detailed,
+                gpu_arch = %gpu_arch,
+                driver_version = %driver_version,
+                vbios_version = %vbios_version,
+                detailed_result = ?detailed_result,
                 "NVIDIA NRAS attestation failed"
             );
 
@@ -642,14 +642,21 @@ fn parse_nras_jwt(jwt: &str) -> Result<NrasJwtClaims, AttestationVerificationErr
         ))
     })?;
 
-    let claims = payload
-        .as_object()
-        .ok_or_else(|| {
-            AttestationVerificationError::GpuVerificationFailed(
+    // Pattern-match to take ownership of the inner Map without cloning, and
+    // enumerate the other variants explicitly so a future serde_json change
+    // forces us to reconsider the classification.
+    let claims = match payload {
+        serde_json::Value::Object(map) => map,
+        serde_json::Value::Null
+        | serde_json::Value::Bool(_)
+        | serde_json::Value::Number(_)
+        | serde_json::Value::String(_)
+        | serde_json::Value::Array(_) => {
+            return Err(AttestationVerificationError::GpuVerificationFailed(
                 "NRAS JWT payload is not a JSON object".to_string(),
-            )
-        })?
-        .clone();
+            ));
+        }
+    };
 
     let result = claims.get("x-nvidia-overall-att-result").ok_or_else(|| {
         AttestationVerificationError::GpuVerificationFailed(
@@ -661,7 +668,10 @@ fn parse_nras_jwt(jwt: &str) -> Result<NrasJwtClaims, AttestationVerificationErr
     let verdict = match result {
         serde_json::Value::Bool(b) => if *b { "PASS" } else { "FAIL" }.to_string(),
         serde_json::Value::String(s) => s.clone(),
-        other => other.to_string(),
+        serde_json::Value::Null
+        | serde_json::Value::Number(_)
+        | serde_json::Value::Array(_)
+        | serde_json::Value::Object(_) => result.to_string(),
     };
 
     Ok(NrasJwtClaims { verdict, claims })
@@ -672,9 +682,11 @@ fn parse_nras_jwt(jwt: &str) -> Result<NrasJwtClaims, AttestationVerificationErr
 /// NRAS exposes per-check booleans both as flat top-level claims
 /// (e.g. `x-nvidia-gpu-driver-rim-fetched`) and as a nested
 /// `x-nvidia-attestation-detailed-result` object — different NRAS versions
-/// emit one or the other, so we walk both. Returns sorted, deduped names so
-/// log lines are stable across runs.
+/// emit one or the other, so we walk both and emit the bare check name. The
+/// result is sorted and deduped so flat and nested forms collapse together
+/// when both are present.
 fn nras_failed_checks(claims: &serde_json::Map<String, serde_json::Value>) -> Vec<String> {
+    const DETAILED_KEY: &str = "x-nvidia-attestation-detailed-result";
     let mut out: Vec<String> = Vec::new();
     for (key, value) in claims {
         if key == "x-nvidia-overall-att-result" {
@@ -684,14 +696,21 @@ fn nras_failed_checks(claims: &serde_json::Map<String, serde_json::Value>) -> Ve
             serde_json::Value::Bool(false) if key.starts_with("x-nvidia-") => {
                 out.push(key.clone());
             }
-            serde_json::Value::Object(nested) if key.contains("detailed-result") => {
+            serde_json::Value::Object(nested) if key == DETAILED_KEY => {
                 for (nested_key, nested_value) in nested {
                     if matches!(nested_value, serde_json::Value::Bool(false)) {
-                        out.push(format!("{key}.{nested_key}"));
+                        out.push(nested_key.clone());
                     }
                 }
             }
-            _ => {}
+            // Listed explicitly so a future serde_json variant addition forces
+            // a compile-time decision rather than silently slipping through.
+            serde_json::Value::Null
+            | serde_json::Value::Bool(_)
+            | serde_json::Value::Number(_)
+            | serde_json::Value::String(_)
+            | serde_json::Value::Array(_)
+            | serde_json::Value::Object(_) => {}
         }
     }
     out.sort();
@@ -699,15 +718,13 @@ fn nras_failed_checks(claims: &serde_json::Map<String, serde_json::Value>) -> Ve
     out
 }
 
-/// Read a string-typed NRAS claim, if present.
-fn nras_str_claim(
-    claims: &serde_json::Map<String, serde_json::Value>,
+/// Read a string-typed NRAS claim, if present. Returns a borrow into the
+/// caller-owned claims map — no allocation on the failure path.
+fn nras_str_claim<'a>(
+    claims: &'a serde_json::Map<String, serde_json::Value>,
     key: &str,
-) -> Option<String> {
-    claims
-        .get(key)
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
+) -> Option<&'a str> {
+    claims.get(key).and_then(|v| v.as_str())
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -823,10 +840,52 @@ mod tests {
         assert_eq!(
             failed,
             vec![
-                "x-nvidia-attestation-detailed-result.x-nvidia-gpu-arch-check".to_string(),
-                "x-nvidia-attestation-detailed-result.x-nvidia-gpu-driver-rim-fetched".to_string(),
+                "x-nvidia-gpu-arch-check".to_string(),
+                "x-nvidia-gpu-driver-rim-fetched".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn nras_failed_checks_dedupes_flat_and_nested_overlap() {
+        // Some NRAS versions emit both forms simultaneously; make sure
+        // operators see one entry per failed check, not two.
+        let claims = json!({
+            "x-nvidia-overall-att-result": false,
+            "x-nvidia-gpu-driver-rim-fetched": false,
+            "x-nvidia-attestation-detailed-result": {
+                "x-nvidia-gpu-driver-rim-fetched": false,
+                "x-nvidia-gpu-vbios-rim-version-match": false,
+            },
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        let failed = nras_failed_checks(&claims);
+        assert_eq!(
+            failed,
+            vec![
+                "x-nvidia-gpu-driver-rim-fetched".to_string(),
+                "x-nvidia-gpu-vbios-rim-version-match".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn nras_failed_checks_ignores_other_objects_named_with_detailed_substring() {
+        // A future NRAS field that happens to contain "detailed-result" in
+        // its name should NOT be walked — we only descend into the exact
+        // canonical key. (This is the precision the reviewers asked for.)
+        let claims = json!({
+            "x-nvidia-overall-att-result": false,
+            "x-nvidia-some-other-detailed-result": {
+                "should-not-appear": false,
+            },
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        assert!(nras_failed_checks(&claims).is_empty());
     }
 
     #[test]

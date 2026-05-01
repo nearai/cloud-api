@@ -339,6 +339,47 @@ impl VLlmProvider {
             .pinned_count()
     }
 
+    /// Spawn background tasks to pre-warm all bucket clients.
+    ///
+    /// Each empty bucket gets a background task that calls
+    /// `get_or_verify_bucket_client`: it connects to a backend, verifies its
+    /// attestation, and caches the resulting HTTP client. By the time user
+    /// traffic arrives, most buckets are already filled and the inline
+    /// verification cost has been paid upfront rather than on first use.
+    ///
+    /// Concurrency is bounded by `verification_semaphore` (the same limit
+    /// that guards against thundering-herd pressure at startup), so the
+    /// pre-warm tasks and any concurrent user requests share a single pool
+    /// of attestation permits and don't amplify load on inference-proxy.
+    ///
+    /// No-op when the provider was created without a `BackendVerifier`
+    /// (legacy / non-TEE mode — buckets are eagerly pre-filled at
+    /// construction time and pre-warming is unnecessary).
+    pub fn pre_warm(self: Arc<Self>) {
+        if self.backend_verifier.is_none() {
+            return;
+        }
+        let num_buckets = self.bucket_clients.len();
+        tracing::info!(num_buckets = num_buckets, "Pre-warming bucket clients");
+        for bucket_id in 0..num_buckets {
+            let provider = self.clone();
+            tokio::spawn(async move {
+                match provider.get_or_verify_bucket_client(bucket_id).await {
+                    Ok(_) => {
+                        tracing::debug!(bucket = bucket_id, "Bucket pre-warm complete");
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            bucket = bucket_id,
+                            error = %e,
+                            "Bucket pre-warm failed; will retry inline on first use"
+                        );
+                    }
+                }
+            });
+        }
+    }
+
     /// Maximum inline-verification retries when creating a verified bucket client.
     const INLINE_VERIFY_RETRIES: usize = 2;
 
@@ -2199,5 +2240,112 @@ mod tests {
         // Drop the acceptor task: this releases the held sockets cleanly so
         // we don't leak file descriptors past the test.
         acceptor.abort();
+    }
+
+    /// pre_warm: spawns a background task per bucket that calls
+    /// get_or_verify_bucket_client. After awaiting all tasks, every bucket
+    /// should be filled and the verifier should have been called exactly once
+    /// per bucket (the semaphore double-check prevents duplicate calls for
+    /// the same bucket, but each bucket still needs its own client).
+    #[tokio::test]
+    async fn test_pre_warm_fills_all_buckets() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let call_count_clone = call_count.clone();
+
+        struct CountingVerifier {
+            count: Arc<AtomicUsize>,
+        }
+        #[async_trait::async_trait]
+        impl crate::BackendVerifier for CountingVerifier {
+            async fn create_verified_client(
+                &self,
+                _base_url: &str,
+            ) -> Result<reqwest::Client, String> {
+                self.count.fetch_add(1, Ordering::SeqCst);
+                Ok(reqwest::Client::new())
+            }
+        }
+
+        let provider = Arc::new(VLlmProvider::new_with_verifier_and_concurrency(
+            VLlmConfig {
+                base_url: "http://localhost".to_string(),
+                api_key: None,
+                completion_timeout_seconds: 30,
+                control_timeout_seconds: 30,
+            },
+            Arc::new(std::sync::RwLock::new(
+                crate::spki_verifier::FingerprintState::Bootstrap,
+            )),
+            Arc::new(CountingVerifier {
+                count: call_count_clone,
+            }),
+            64, // use default bucket count
+        ));
+
+        let num_buckets = provider.bucket_clients.len();
+
+        // All buckets start empty.
+        assert!(provider
+            .bucket_clients
+            .iter()
+            .all(|b| b.lock().unwrap().is_none()));
+
+        // pre_warm fires background tasks — wait for them all to finish.
+        provider.clone().pre_warm();
+        // Yield repeatedly until every bucket is filled or a generous
+        // timeout is exceeded.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let filled = provider
+                .bucket_clients
+                .iter()
+                .filter(|b| b.lock().unwrap().is_some())
+                .count();
+            if filled == num_buckets {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "pre_warm did not fill all {num_buckets} buckets within timeout; filled={filled}"
+            );
+            tokio::task::yield_now().await;
+        }
+
+        // Every bucket should be filled and the verifier called exactly once
+        // per bucket.
+        assert_eq!(
+            call_count.load(Ordering::SeqCst),
+            num_buckets,
+            "expected one verification call per bucket"
+        );
+    }
+
+    /// pre_warm is a no-op when no backend verifier is configured (legacy mode).
+    #[tokio::test]
+    async fn test_pre_warm_noop_without_verifier() {
+        let provider = Arc::new(VLlmProvider::new(VLlmConfig {
+            base_url: "http://localhost".to_string(),
+            api_key: None,
+            completion_timeout_seconds: 30,
+            control_timeout_seconds: 30,
+        }));
+
+        // In legacy mode buckets are eagerly pre-filled at construction.
+        assert!(provider
+            .bucket_clients
+            .iter()
+            .all(|b| b.lock().unwrap().is_some()));
+
+        // pre_warm should not panic and should not clear the pre-filled buckets.
+        provider.clone().pre_warm();
+        assert!(provider
+            .bucket_clients
+            .iter()
+            .all(|b| b.lock().unwrap().is_some()));
     }
 }

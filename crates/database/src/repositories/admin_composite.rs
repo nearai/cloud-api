@@ -246,8 +246,13 @@ impl AdminRepository for AdminCompositeRepository {
         .await
         .context("Failed to add deprecated model name as alias of successor")?;
 
-        // 2. Re-point any existing inbound aliases of the deprecated model at
-        //    the successor, so historical aliases keep resolving.
+        // 2. Re-point pre-existing **active** inbound aliases of the deprecated
+        //    model at the successor, so historical aliases keep resolving.
+        //    We deliberately leave inactive inbound aliases alone — they were
+        //    already not resolving, so silently re-pointing without
+        //    reactivating them would mask a no-op behind a misleading
+        //    "carried" count, and reactivating them could surface alias
+        //    names an operator had explicitly disabled.
         let aliases_carried = tx
             .execute(
                 r#"
@@ -255,6 +260,7 @@ impl AdminRepository for AdminCompositeRepository {
                 SET canonical_model_id = $1, updated_at = NOW()
                 WHERE canonical_model_id = $2
                   AND alias_name <> $3
+                  AND is_active = true
                 "#,
                 &[&successor_id, &deprecated_id, &deprecated_model_name],
             )
@@ -352,18 +358,14 @@ impl AdminRepository for AdminCompositeRepository {
         .await
         .context("Failed to insert history record for deprecation")?;
 
-        tx.commit().await?;
-
-        // Read the post-commit state of both models, JOINed with aliases so
-        // the response includes the merged alias list. ModelRepository's
-        // `get_by_internal_name` doesn't join `model_aliases`, and
-        // `get_active_model_by_name` filters to `is_active=true` (which the
-        // deprecated model isn't anymore) — so we run the SELECT inline.
-        let read_client = self
-            .pool
-            .get()
-            .await
-            .context("Failed to get database connection for post-commit read")?;
+        // 5. Read both models' post-write state (with merged alias lists)
+        //    INSIDE the transaction. If we did this after `tx.commit()`, a
+        //    transient connection pool failure would surface as a 500 even
+        //    though the deprecation was already committed — and a retry
+        //    would write a second `model_history` entry. Reading inside the
+        //    txn keeps the response build atomic with the writes: either
+        //    everything succeeds and the caller sees both models, or
+        //    nothing is committed and the caller can safely retry.
         let read_with_aliases = |row: &tokio_postgres::Row| ModelPricing {
             model_display_name: row.get("model_display_name"),
             model_description: row.get("model_description"),
@@ -418,19 +420,30 @@ impl AdminRepository for AdminCompositeRepository {
             GROUP BY m.id
         "#;
 
-        let deprecated_row = read_client
+        // The rows must exist — we just wrote to them in this same
+        // transaction. A `None` here would indicate driver corruption, not
+        // a routine race; bubble up as an error so the txn rolls back.
+        let deprecated_row_full = tx
             .query_opt(select_with_aliases_sql, &[&deprecated_model_name])
             .await?
-            .context("deprecated model disappeared after commit")?;
-        let successor_row = read_client
+            .context("deprecated model row missing in same transaction (driver bug?)")?;
+        let successor_row_full = tx
             .query_opt(select_with_aliases_sql, &[&successor_model_name])
             .await?
-            .context("successor model disappeared after commit")?;
-        Ok(Some(DeprecateModelOutcome {
-            deprecated: read_with_aliases(&deprecated_row),
-            successor: read_with_aliases(&successor_row),
-            aliases_carried: u32::try_from(aliases_carried).unwrap_or(u32::MAX),
-        }))
+            .context("successor model row missing in same transaction (driver bug?)")?;
+        let outcome = DeprecateModelOutcome {
+            deprecated: read_with_aliases(&deprecated_row_full),
+            successor: read_with_aliases(&successor_row_full),
+            // `aliases_carried` is u64 from `tx.execute`. The number of
+            // inbound aliases on a single model can never realistically
+            // exceed u32::MAX; saturate via `min` rather than `try_from` so
+            // the behavior is explicitly "cap at u32::MAX" and not the
+            // default "discard the value on overflow."
+            aliases_carried: aliases_carried.min(u32::MAX as u64) as u32,
+        };
+
+        tx.commit().await?;
+        Ok(Some(outcome))
     }
 
     async fn update_organization_limits(

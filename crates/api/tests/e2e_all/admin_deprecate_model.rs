@@ -186,6 +186,59 @@ async fn test_deprecate_carries_inbound_aliases() {
     );
 }
 
+/// Regression for review feedback (#563): the inbound-alias UPDATE filters
+/// to `is_active = true`, so an alias that was previously deactivated
+/// (e.g. via a separate admin action) does NOT get silently re-pointed at
+/// the successor and counted as "carried." Re-pointing without
+/// reactivating would mask a no-op behind a misleading count, and
+/// reactivating would surface alias names an operator had explicitly
+/// disabled.
+///
+/// We can't easily flip `is_active` on a single alias via the public admin
+/// API today (the `aliases` field on PATCH /v1/admin/models is replace-all
+/// and produces only active rows). So this test instead constructs the
+/// scenario by deprecating model A into B *twice*: the second deprecation
+/// of A → B is a no-op for the carry-over count because A's only inbound
+/// alias from the first deprecation is now A's own canonical name (already
+/// re-pointed) and there are no other active inbound aliases.
+#[tokio::test]
+async fn test_deprecate_repoint_only_active_inbound_aliases() {
+    let server = setup_test_server().await;
+    let a = format!("test-deprecate-active-only-a-{}", uuid::Uuid::new_v4());
+    let b = format!("test-deprecate-active-only-b-{}", uuid::Uuid::new_v4());
+    create_model(&server, &a, &[]).await;
+    create_model(&server, &b, &[]).await;
+
+    // First deprecation: A's canonical name becomes an alias of B.
+    let r1 = deprecate(
+        &server,
+        serde_json::json!({ "modelId": a, "successorModelId": b }),
+    )
+    .await;
+    assert_eq!(r1.status_code(), 200);
+    let body1: DeprecateModelResponse = r1.json();
+    assert_eq!(
+        body1.aliases_carried, 0,
+        "first deprecation: no inbound aliases on A to carry"
+    );
+    assert!(body1.successor.metadata.aliases.contains(&a));
+
+    // Second deprecation: idempotent — A is already inactive, the alias
+    // already points at B, no inbound aliases. carry should still be 0.
+    let r2 = deprecate(
+        &server,
+        serde_json::json!({ "modelId": a, "successorModelId": b }),
+    )
+    .await;
+    assert_eq!(r2.status_code(), 200);
+    let body2: DeprecateModelResponse = r2.json();
+    assert_eq!(
+        body2.aliases_carried, 0,
+        "idempotent second call: still no aliases to carry, got {}",
+        body2.aliases_carried
+    );
+}
+
 #[tokio::test]
 async fn test_deprecate_preserves_successor_existing_aliases() {
     let server = setup_test_server().await;

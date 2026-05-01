@@ -2871,16 +2871,26 @@ pub struct DeprecateModelRequest {
 }
 
 /// Response from a deprecation operation.
+///
+/// Both sides use the public `ModelWithPricing` shape (no `isActive` /
+/// timestamps). Confirmation that the deprecation took effect is implicit:
+/// the deprecated model is hidden from `GET /v1/admin/models` (default
+/// listing) and from public `GET /v1/models`. To inspect `isActive`
+/// directly, call `GET /v1/admin/models?include_inactive=true`.
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct DeprecateModelResponse {
-    /// State of the deprecated model after the operation (`isActive: false`).
+    /// State of the deprecated model after the operation (canonical name
+    /// echoed back in `modelId`; merged alias list reflects the moves).
     pub deprecated: ModelWithPricing,
-    /// State of the successor model after the operation, with the merged
-    /// alias list.
+    /// State of the successor model after the operation. Its `metadata.aliases`
+    /// includes the deprecated `modelId` plus any inbound aliases that were
+    /// re-pointed.
     pub successor: ModelWithPricing,
-    /// Number of pre-existing inbound aliases of the deprecated model that
-    /// were re-pointed at the successor (does not include the deprecated
-    /// model's own canonical name).
+    /// Number of pre-existing **active** inbound aliases of the deprecated
+    /// model that were re-pointed at the successor. Does not include the
+    /// deprecated model's own canonical name (which is added unconditionally
+    /// as a new alias) and does not include inactive inbound aliases (which
+    /// are left untouched — see repository docs).
     #[serde(rename = "aliasesCarried")]
     pub aliases_carried: u32,
 }

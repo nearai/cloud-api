@@ -278,15 +278,22 @@ pub trait AdminRepository: Send + Sync {
     /// Atomically deprecate `deprecated_model_name` in favor of `successor_model_name`.
     ///
     /// In a single transaction:
-    /// - Adds `deprecated_model_name` to `successor_model_name`'s alias list (deduped).
-    /// - Repoints any existing inbound aliases of the deprecated model at the
-    ///   successor, so historical aliases keep resolving.
-    /// - Sets the deprecated model's `is_active = false` and records a history
-    ///   entry with the supplied change reason.
+    /// - Adds `deprecated_model_name` to `successor_model_name`'s alias list
+    ///   (idempotent via `ON CONFLICT (alias_name) DO UPDATE`).
+    /// - Repoints any existing **active** inbound aliases of the deprecated
+    ///   model at the successor, so historical aliases keep resolving.
+    ///   Inactive inbound aliases are left untouched.
+    /// - Sets the deprecated model's `is_active = false` and records a
+    ///   `model_history` entry with the supplied change reason.
+    /// - Reads back both models' merged-alias state inside the same
+    ///   transaction so a successful commit is atomic with the response.
     ///
-    /// Returns `Ok(None)` if either model is not found, or `Ok(Some(outcome))`
-    /// describing the resulting state. Surface validation errors (self-target,
-    /// successor inactive) via the service layer before calling.
+    /// Returns `Ok(None)` for any of the "treat-as-not-found" conditions:
+    /// either model is missing, or the successor is not currently active.
+    /// (The successor-activeness check lives in the repository to keep the
+    /// reads inside the transaction; the service surfaces both as
+    /// `ModelNotFound`.) Self-target / empty-id validation is the
+    /// service layer's responsibility.
     async fn deprecate_model(
         &self,
         deprecated_model_name: &str,

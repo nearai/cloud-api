@@ -893,9 +893,14 @@ pub async fn deprecate_model(
     Extension(admin_user): Extension<AdminUser>,
     ResponseJson(req): ResponseJson<DeprecateModelRequest>,
 ) -> Result<ResponseJson<DeprecateModelResponse>, (StatusCode, ResponseJson<ErrorResponse>)> {
+    // Trim once at the boundary so the service, repo, log lines, provider
+    // unregister, and the response all see the same canonical names.
+    let model_id = req.model_id.trim().to_string();
+    let successor_model_id = req.successor_model_id.trim().to_string();
+
     debug!(
         "Deprecate model: model_id={}, successor_model_id={}",
-        req.model_id, req.successor_model_id
+        model_id, successor_model_id
     );
 
     let admin_user_id = admin_user.0.id;
@@ -904,15 +909,22 @@ pub async fn deprecate_model(
     let outcome = app_state
         .admin_service
         .deprecate_model(
-            &req.model_id,
-            &req.successor_model_id,
+            &model_id,
+            &successor_model_id,
             req.change_reason.clone(),
             Some(admin_user_id),
             Some(admin_user_email),
         )
         .await
         .map_err(|e| {
-            error!("Failed to deprecate model");
+            // Discriminant only — never log error message contents at this
+            // layer (could surface validation strings about user input).
+            error!(
+                error_kind = ?std::mem::discriminant(&e),
+                model_id = %model_id,
+                successor_model_id = %successor_model_id,
+                "Failed to deprecate model"
+            );
             match e {
                 services::admin::AdminError::InvalidDeprecation(msg) => (
                     StatusCode::BAD_REQUEST,
@@ -942,7 +954,7 @@ pub async fn deprecate_model(
     // from picking up a stale provider reference for the now-inactive model.
     app_state
         .inference_provider_pool
-        .unregister_provider(&req.model_id)
+        .unregister_provider(&model_id)
         .await;
 
     let to_api = |model_name: String, m: services::admin::ModelPricing| ModelWithPricing {
@@ -984,8 +996,8 @@ pub async fn deprecate_model(
     };
 
     Ok(ResponseJson(DeprecateModelResponse {
-        deprecated: to_api(req.model_id.clone(), outcome.deprecated),
-        successor: to_api(req.successor_model_id.clone(), outcome.successor),
+        deprecated: to_api(model_id, outcome.deprecated),
+        successor: to_api(successor_model_id, outcome.successor),
         aliases_carried: outcome.aliases_carried,
     }))
 }

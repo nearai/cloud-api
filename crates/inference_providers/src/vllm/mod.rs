@@ -216,8 +216,19 @@ impl VLlmProvider {
                         .use_preconfigured_tls(tls_roots.build_config(fingerprint_state.clone()))
                         .pool_max_idle_per_host(1)
                         .http2_adaptive_window(true)
+                        // H2 keepalive: send PINGs even on idle buckets so the
+                        // pinned TCP connection survives nginx `keepalive_timeout`
+                        // (default 75s) between chats. If we lose the connection
+                        // and reconnect, model-proxy's L4 LB may pick a different
+                        // backend → signature 404. PINGs prevent that.
+                        .http2_keep_alive_interval(Duration::from_secs(30))
+                        .http2_keep_alive_timeout(Duration::from_secs(10))
+                        .http2_keep_alive_while_idle(true)
+                        .tcp_keepalive(Duration::from_secs(30))
                         .connect_timeout(Duration::from_secs(5))
-                        .pool_idle_timeout(Duration::from_secs(300))
+                        // None = let H2 PINGs decide liveness; don't expire on
+                        // a wall-clock timer that fires regardless of health.
+                        .pool_idle_timeout(None)
                         .read_timeout(completion_timeout)
                         .build()
                         .expect("Failed to create bucket HTTP client");

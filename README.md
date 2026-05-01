@@ -37,6 +37,10 @@ A Rust-based cloud API for AI model inference, conversation management, and orga
    - Seeds the database with development data
    - Starts the API server on http://localhost:3000
 
+For an end-to-end walkthrough — mock auth, creating an org/workspace/API key,
+and exercising chat completions with `curl` — see
+[`docs/local-development.md`](docs/local-development.md).
+
 ## Testing
 
 ### Prerequisites for Testing

@@ -140,23 +140,16 @@ impl inference_providers::BackendVerifier for PoolBackendVerifier {
         let read_timeout =
             Duration::from_secs(VLlmConfig::completion_timeout_from_env().max(0) as u64);
         let client_state = Arc::new(std::sync::RwLock::new(FingerprintState::Bootstrap));
-        let client = reqwest::Client::builder()
+        let builder = reqwest::Client::builder()
             .use_preconfigured_tls(self.tls_roots.build_config(client_state.clone()))
             .pool_max_idle_per_host(1)
             .http2_adaptive_window(true)
-            // H2 keepalive: send PINGs even on idle buckets so the pinned TCP
-            // connection survives nginx `keepalive_timeout` (default 75s)
-            // between chats. If we lose the connection and reconnect, model-
-            // proxy's L4 LB may pick a different backend → signature 404.
-            // PINGs prevent that. Mirrored in vllm/mod.rs legacy bucket builder.
-            .http2_keep_alive_interval(Duration::from_secs(30))
-            .http2_keep_alive_timeout(Duration::from_secs(10))
-            .http2_keep_alive_while_idle(true)
-            .tcp_keepalive(Duration::from_secs(30))
             .connect_timeout(Duration::from_secs(5))
-            // None = let H2 PINGs decide liveness.
-            .pool_idle_timeout(None)
-            .read_timeout(read_timeout)
+            .read_timeout(read_timeout);
+        // Bucket clients need the H2 connection to stay sticky to a single
+        // backend across long idle gaps; see
+        // `inference_providers::bucket_keepalive`.
+        let client = inference_providers::bucket_keepalive::apply(builder)
             .build()
             .map_err(|e| format!("Failed to build HTTP client: {e}"))?;
 

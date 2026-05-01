@@ -12,6 +12,7 @@ use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::Semaphore;
 
 /// Convert any displayable error to ImageGenerationError::GenerationError
 fn to_image_gen_error<E: std::fmt::Display>(e: E) -> ImageGenerationError {
@@ -144,6 +145,17 @@ pub struct VLlmProvider {
     /// When a bucket needs a client, the verifier connects to a backend,
     /// verifies its attestation, pins the fingerprint, and returns the client.
     backend_verifier: Option<Arc<dyn crate::BackendVerifier>>,
+    /// Fallback client used when inline bucket verification exhausts all retries.
+    /// Has completion-timeout read settings so long-running inference requests
+    /// don't hit the 90s control-plane idle timeout. Does not pin TLS to a
+    /// specific backend — requests are served without prefix-cache routing but
+    /// are not dropped, ensuring inline verification failures degrade gracefully.
+    fallback_client: Client,
+    /// Bounds concurrent inline verifications to prevent thundering-herd pressure
+    /// on inference-proxy GPU evidence collection at startup (when all buckets are
+    /// empty and many requests arrive simultaneously). Configurable via the
+    /// `INLINE_VERIFY_CONCURRENCY` environment variable (default: 4).
+    verification_semaphore: Arc<Semaphore>,
 }
 
 impl VLlmProvider {
@@ -161,7 +173,12 @@ impl VLlmProvider {
         config: VLlmConfig,
         fingerprint_state: Arc<std::sync::RwLock<FingerprintState>>,
     ) -> Self {
-        Self::build(config, fingerprint_state, None)
+        Self::build(
+            config,
+            fingerprint_state,
+            None,
+            Self::inline_verify_concurrency_from_env(),
+        )
     }
 
     /// Create a new vLLM provider with inline backend verification.
@@ -173,13 +190,45 @@ impl VLlmProvider {
         fingerprint_state: Arc<std::sync::RwLock<FingerprintState>>,
         verifier: Arc<dyn crate::BackendVerifier>,
     ) -> Self {
-        Self::build(config, fingerprint_state, Some(verifier))
+        Self::build(
+            config,
+            fingerprint_state,
+            Some(verifier),
+            Self::inline_verify_concurrency_from_env(),
+        )
+    }
+
+    /// Test-only constructor that accepts an explicit `inline_verify_concurrency`
+    /// so tests can exercise the semaphore logic without mutating env vars.
+    #[cfg(test)]
+    fn new_with_verifier_and_concurrency(
+        config: VLlmConfig,
+        fingerprint_state: Arc<std::sync::RwLock<FingerprintState>>,
+        verifier: Arc<dyn crate::BackendVerifier>,
+        inline_verify_concurrency: usize,
+    ) -> Self {
+        Self::build(
+            config,
+            fingerprint_state,
+            Some(verifier),
+            inline_verify_concurrency,
+        )
+    }
+
+    /// Read `INLINE_VERIFY_CONCURRENCY` from the environment, falling back to 4.
+    fn inline_verify_concurrency_from_env() -> usize {
+        std::env::var("INLINE_VERIFY_CONCURRENCY")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(4)
+            .max(1)
     }
 
     fn build(
         config: VLlmConfig,
         fingerprint_state: Arc<std::sync::RwLock<FingerprintState>>,
         backend_verifier: Option<Arc<dyn crate::BackendVerifier>>,
+        inline_verify_concurrency: usize,
     ) -> Self {
         let tls_roots = SharedTlsRoots::load();
 
@@ -199,6 +248,20 @@ impl VLlmProvider {
             .read_timeout(control_timeout)
             .build()
             .expect("Failed to create HTTP client");
+
+        // Fallback client: like the general client but with completion-timeout
+        // read settings, so it can be used for long-running inference requests
+        // when inline bucket verification fails.
+        let fallback_client = Client::builder()
+            .use_preconfigured_tls(tls_roots.build_config(fingerprint_state.clone()))
+            .connect_timeout(Duration::from_secs(5))
+            .pool_idle_timeout(Duration::from_secs(90))
+            .read_timeout(completion_timeout)
+            .build()
+            .expect("Failed to create fallback HTTP client");
+
+        let inline_verify_concurrency = inline_verify_concurrency.max(1);
+        let verification_semaphore = Arc::new(Semaphore::new(inline_verify_concurrency));
 
         let prefix_router = Arc::new(PrefixRouter::new());
         let num_buckets = prefix_router.num_buckets();
@@ -232,6 +295,8 @@ impl VLlmProvider {
         Self {
             config,
             client,
+            fallback_client,
+            verification_semaphore,
             bucket_clients,
             prefix_router,
             pending_buckets: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -283,6 +348,14 @@ impl VLlmProvider {
     /// Get the client for a bucket, creating and verifying it inline if needed.
     /// On first use, connects to a backend via L4, fetches its attestation report,
     /// verifies it, pins the fingerprint, and caches the client.
+    ///
+    /// Concurrent inline verifications are bounded by `verification_semaphore`
+    /// (Fix 1: prevents thundering-herd pressure on inference-proxy GPU evidence
+    /// collection when all buckets are empty at startup).
+    ///
+    /// If all verification attempts fail, falls back to `fallback_client` so the
+    /// request is served without prefix-cache routing rather than returning an
+    /// error to the user (Fix 2: graceful degradation on attestation failure).
     async fn get_or_verify_bucket_client(
         &self,
         bucket_id: usize,
@@ -299,11 +372,47 @@ impl VLlmProvider {
         }
 
         // Slow path: inline verification.
-        let verifier = self.backend_verifier.as_ref().ok_or_else(|| {
-            CompletionError::CompletionError(
-                "No backend verifier configured for lazy bucket creation".to_string(),
-            )
-        })?;
+        let verifier = match self.backend_verifier.as_ref() {
+            Some(v) => v,
+            None => {
+                // No verifier configured (legacy/test mode) — bucket should have
+                // been pre-created eagerly; reaching here is a logic error.
+                return Err(CompletionError::CompletionError(
+                    "No backend verifier configured for lazy bucket creation".to_string(),
+                ));
+            }
+        };
+
+        // Acquire a semaphore permit before attempting attestation. This bounds
+        // the number of concurrent inline verifications, preventing thundering-herd
+        // pressure on inference-proxy GPU evidence collection at startup (when all
+        // buckets are empty and many requests arrive simultaneously).
+        //
+        // The semaphore is never closed, so acquire() only returns Err on close —
+        // treat that as a bug.
+        //
+        // Note on worst-case wait time: the permit is held for the entire retry
+        // loop (INLINE_VERIFY_RETRIES + 1 attempts × control_timeout each). With
+        // default values that is 3 × 90s = 270s per slot. Requests queueing behind
+        // a saturated semaphore of size N can wait up to (queue_depth / N) × 270s.
+        // In practice the first successful verification fills the bucket and all
+        // subsequent waiters take the fast path (re-check after acquiring permit).
+        let _permit = self
+            .verification_semaphore
+            .acquire()
+            .await
+            .expect("verification semaphore should never be closed");
+
+        // Re-check after acquiring the permit: a concurrent request that held the
+        // semaphore before us may have already filled this bucket.
+        {
+            let guard = self.bucket_clients[bucket_id]
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if let Some(ref client) = *guard {
+                return Ok(client.clone());
+            }
+        }
 
         let mut last_err = None;
         for _attempt in 0..=Self::INLINE_VERIFY_RETRIES {
@@ -341,11 +450,40 @@ impl VLlmProvider {
             }
         }
 
-        Err(CompletionError::CompletionError(format!(
-            "Failed to create verified client after {} attempts: {}",
+        // All retry attempts exhausted.
+        //
+        // Only fall back to the general-purpose client when at least one
+        // backend fingerprint has already been pinned (Pinned state). In that
+        // case the fallback_client's TLS verifier will still reject any backend
+        // whose SPKI fingerprint is unknown — so we degrade gracefully (no
+        // prefix-cache routing) without bypassing attestation.
+        //
+        // In Bootstrap state (pinned_count == 0) no fingerprints have been
+        // verified yet. fallback_client in Bootstrap mode would accept *any*
+        // WebPKI-valid cert, silently bypassing SPKI pinning and TEE attestation
+        // guarantees. Return Err instead so the pool can surface the failure.
+        let err_msg = format!(
+            "Inline backend verification failed after {} attempts: {}",
             Self::INLINE_VERIFY_RETRIES + 1,
             last_err.unwrap_or_default()
-        )))
+        );
+        if self.pinned_fingerprint_count() > 0 {
+            tracing::warn!(
+                bucket = bucket_id,
+                error = %err_msg,
+                "Inline backend verification exhausted retries; serving with fallback client"
+            );
+            Ok(self.fallback_client.clone())
+        } else {
+            // Bootstrap: no fingerprints pinned yet. Fail safely.
+            tracing::warn!(
+                bucket = bucket_id,
+                error = %err_msg,
+                "Inline backend verification exhausted retries in Bootstrap state; \
+                 refusing fallback to prevent unauthenticated connections"
+            );
+            Err(CompletionError::CompletionError(err_msg))
+        }
     }
 
     /// Check if a CompletionError indicates a connection/transport failure
@@ -1727,6 +1865,217 @@ mod tests {
         assert!(provider.bucket_clients[0].lock().unwrap().is_some());
         provider.clear_bucket(0);
         assert!(provider.bucket_clients[0].lock().unwrap().is_none());
+    }
+
+    /// Fix 2 + security guard: when a verifier always fails AND no fingerprints
+    /// have been pinned yet (Bootstrap state), get_or_verify_bucket_client must
+    /// return Err — using the fallback_client in Bootstrap state would accept any
+    /// WebPKI cert and silently bypass SPKI attestation in a TEE environment.
+    #[tokio::test]
+    async fn test_fallback_err_in_bootstrap_state() {
+        use std::sync::Arc;
+        struct AlwaysFailVerifier;
+        #[async_trait::async_trait]
+        impl crate::BackendVerifier for AlwaysFailVerifier {
+            async fn create_verified_client(
+                &self,
+                _base_url: &str,
+            ) -> Result<reqwest::Client, String> {
+                Err("simulated attestation timeout".to_string())
+            }
+        }
+
+        let provider = VLlmProvider::new_with_verifier(
+            VLlmConfig {
+                base_url: "http://localhost".to_string(),
+                api_key: None,
+                completion_timeout_seconds: 30,
+                control_timeout_seconds: 30,
+            },
+            Arc::new(std::sync::RwLock::new(
+                crate::spki_verifier::FingerprintState::Bootstrap,
+            )),
+            Arc::new(AlwaysFailVerifier),
+        );
+
+        // Bucket starts empty and no fingerprints are pinned.
+        assert!(provider.bucket_clients[0].lock().unwrap().is_none());
+        assert_eq!(provider.pinned_fingerprint_count(), 0);
+
+        // All attempts fail in Bootstrap state → must return Err (not fallback).
+        let result = provider.get_or_verify_bucket_client(0).await;
+        assert!(
+            result.is_err(),
+            "expected Err in Bootstrap state, got: {result:?}"
+        );
+
+        // Bucket remains empty.
+        assert!(provider.bucket_clients[0].lock().unwrap().is_none());
+    }
+
+    /// Fix 2: when a verifier always fails but at least one fingerprint has already
+    /// been pinned (Pinned state), the fallback_client is returned so the request
+    /// degrades gracefully instead of returning "All providers failed". The fallback
+    /// client's TLS verifier enforces SPKI pinning for any new connections.
+    #[tokio::test]
+    async fn test_fallback_ok_after_fingerprints_pinned() {
+        use std::sync::Arc;
+        struct AlwaysFailVerifier;
+        #[async_trait::async_trait]
+        impl crate::BackendVerifier for AlwaysFailVerifier {
+            async fn create_verified_client(
+                &self,
+                _base_url: &str,
+            ) -> Result<reqwest::Client, String> {
+                Err("simulated attestation timeout".to_string())
+            }
+        }
+
+        let provider = VLlmProvider::new_with_verifier(
+            VLlmConfig {
+                base_url: "http://localhost".to_string(),
+                api_key: None,
+                completion_timeout_seconds: 30,
+                control_timeout_seconds: 30,
+            },
+            Arc::new(std::sync::RwLock::new(
+                crate::spki_verifier::FingerprintState::Bootstrap,
+            )),
+            Arc::new(AlwaysFailVerifier),
+        );
+
+        // Simulate a prior discovery cycle that pinned a fingerprint.
+        provider.add_verified_fingerprint("deadbeef".to_string());
+        assert_eq!(provider.pinned_fingerprint_count(), 1);
+
+        // Bucket starts empty.
+        assert!(provider.bucket_clients[0].lock().unwrap().is_none());
+
+        // All attempts fail but fingerprints are pinned → fallback client returned.
+        let result = provider.get_or_verify_bucket_client(0).await;
+        assert!(result.is_ok(), "expected fallback Ok, got: {result:?}");
+
+        // Bucket remains empty — fallback is not stored as a verified bucket client.
+        assert!(
+            provider.bucket_clients[0].lock().unwrap().is_none(),
+            "fallback should not be stored in bucket"
+        );
+    }
+
+    /// Fix 2 + security guard: in Blocked state (explicit attestation failure),
+    /// `pinned_fingerprint_count()` returns 0, so the code takes the same safe
+    /// path as Bootstrap and returns Err rather than the fallback client.
+    #[tokio::test]
+    async fn test_fallback_err_in_blocked_state() {
+        use std::sync::Arc;
+        struct AlwaysFailVerifier;
+        #[async_trait::async_trait]
+        impl crate::BackendVerifier for AlwaysFailVerifier {
+            async fn create_verified_client(
+                &self,
+                _base_url: &str,
+            ) -> Result<reqwest::Client, String> {
+                Err("simulated attestation failure".to_string())
+            }
+        }
+
+        let provider = VLlmProvider::new_with_verifier(
+            VLlmConfig {
+                base_url: "http://localhost".to_string(),
+                api_key: None,
+                completion_timeout_seconds: 30,
+                control_timeout_seconds: 30,
+            },
+            Arc::new(std::sync::RwLock::new(
+                crate::spki_verifier::FingerprintState::Bootstrap,
+            )),
+            Arc::new(AlwaysFailVerifier),
+        );
+
+        // Transition to Blocked state (attestation explicitly failed).
+        provider.block_connections();
+        assert_eq!(provider.pinned_fingerprint_count(), 0);
+
+        // Bucket starts empty.
+        assert!(provider.bucket_clients[0].lock().unwrap().is_none());
+
+        // Blocked state has pinned_count == 0 → same safe path as Bootstrap → Err.
+        let result = provider.get_or_verify_bucket_client(0).await;
+        assert!(
+            result.is_err(),
+            "expected Err in Blocked state, got: {result:?}"
+        );
+    }
+
+    /// Fix 1: the semaphore serialises concurrent verifications so that only
+    /// N attempts run at once. When the first succeeds and fills the bucket,
+    /// later waiters take the fast path (bucket already filled) rather than
+    /// running their own verification.
+    ///
+    /// Uses `new_with_verifier_and_concurrency` to set concurrency=1 without
+    /// mutating env vars (which would be a data race in a parallel test suite).
+    #[tokio::test]
+    async fn test_semaphore_prevents_redundant_verification() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let call_count_clone = call_count.clone();
+
+        struct CountingVerifier {
+            count: Arc<AtomicUsize>,
+        }
+        #[async_trait::async_trait]
+        impl crate::BackendVerifier for CountingVerifier {
+            async fn create_verified_client(
+                &self,
+                _base_url: &str,
+            ) -> Result<reqwest::Client, String> {
+                self.count.fetch_add(1, Ordering::SeqCst);
+                Ok(reqwest::Client::new())
+            }
+        }
+
+        // concurrency=1 means verifications are fully serialised. Pass the value
+        // directly rather than via env var to avoid races with parallel tests.
+        let provider = Arc::new(VLlmProvider::new_with_verifier_and_concurrency(
+            VLlmConfig {
+                base_url: "http://localhost".to_string(),
+                api_key: None,
+                completion_timeout_seconds: 30,
+                control_timeout_seconds: 30,
+            },
+            Arc::new(std::sync::RwLock::new(
+                crate::spki_verifier::FingerprintState::Bootstrap,
+            )),
+            Arc::new(CountingVerifier {
+                count: call_count_clone,
+            }),
+            1, // inline_verify_concurrency
+        ));
+
+        // Spawn 8 concurrent requests all targeting bucket 0.
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let p = provider.clone();
+            handles.push(tokio::spawn(async move {
+                p.get_or_verify_bucket_client(0).await
+            }));
+        }
+        for h in handles {
+            assert!(h.await.unwrap().is_ok());
+        }
+
+        // With a serialised semaphore, only the first waiter verifies; all
+        // subsequent ones find the bucket already filled and skip verification.
+        assert_eq!(
+            call_count.load(Ordering::SeqCst),
+            1,
+            "only one verification call expected; redundant calls indicate the \
+             semaphore double-check is not working"
+        );
     }
 
     /// Regression test: a non-streaming `chat_completion` that hits the

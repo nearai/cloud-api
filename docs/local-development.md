@@ -24,10 +24,10 @@ real inference backends.
 docker compose up -d postgres
 
 cp env.example .env
-# The defaults in env.example match docker-compose.yml. The only change
-# you need for a hello-world session is to enable mock auth:
-#   AUTH_MOCK=true
-#   POSTGRES_PRIMARY_APP_ID=postgres-test    # already the default
+# env.example ships with AUTH_MOCK=false. Flip it for the walkthrough
+# below — the rest of the defaults already match docker-compose.yml:
+#   AUTH_MOCK=true                          ← change this
+#   POSTGRES_PRIMARY_APP_ID=postgres-test   ← already the default
 
 make dev
 ```
@@ -190,6 +190,8 @@ row pointing at it. Simplest path:
 #    (vLLM, SGLang, ollama-compat, etc.)
 
 # 2. Insert a model row that targets it
+#    See the latest crates/database/src/migrations/sql/V*__*models*.sql
+#    for the full column list — it changes faster than this doc does.
 psql "host=localhost user=postgres password=postgres dbname=platform_api" <<SQL
 INSERT INTO models (id, model_id, inference_url, …)
 VALUES (gen_random_uuid(), 'local/test-model', 'http://host.docker.internal:8002', …);
@@ -276,19 +278,11 @@ or `docker compose down -v` to wipe the volume.
 
 ## 8. Reproduction scripts
 
-The repo ships a few scripts that double as worked examples:
-
-- `repro_connection_retry.sh` — concurrent stress against
-  `/v1/chat/completions`
-- `repro_e2ee_stale_pubkey.sh` — exercises the E2EE pubkey rotation
-  bug-fix path
-- `repro_no_usage_stats.sh` — checks that streaming responses populate
-  usage data
-- `test_signature.sh` — completion → signature lookup roundtrip
-
-All of them accept `API_KEY` and `API_URL` env overrides, so you can
-point them at your local server:
+`test_signature.sh` at the repo root doubles as a worked example —
+completion → signature lookup roundtrip. It accepts positional
+`base_url` and `api_key` arguments so you can point it at the local
+server:
 
 ```bash
-API_KEY=$API_KEY API_URL=http://localhost:3000 ./test_signature.sh
+./test_signature.sh http://localhost:3000 "$API_KEY"
 ```

@@ -41,15 +41,16 @@ ignore = [
 
     # hickory-proto 0.25.2 CPU exhaustion via crafted DNS response.
     # Transitive dep: reqwest 0.12 -> hickory-resolver 0.25 -> hickory-proto 0.25.2.
-    # Cannot upgrade: reqwest 0.12 pins hickory to ^0.25; no 0.25.x patch exists
-    # (hickory team released 0.26.x instead of backporting). We only resolve
-    # admin-configured endpoints (no user-controlled hostnames), so exploitation
-    # requires DNS infrastructure compromise.
+    # Cannot upgrade: the fix landed in hickory-net 0.26.1 (the affected code was
+    # moved to a new crate in 0.26.0; no hickory-proto patch version exists).
+    # reqwest 0.12 would need to adopt hickory-net 0.26.x before we can upgrade.
+    # We only resolve admin-configured endpoints (no user-controlled hostnames),
+    # so exploitation requires DNS infrastructure compromise.
     # https://rustsec.org/advisories/RUSTSEC-2026-0119
     "RUSTSEC-2026-0119",
 
     # hickory-proto 0.25.2 NSEC3 CPU exhaustion (DNSSEC only).
-    # Same transitive dep chain as above; same upgrade blocker.
+    # Same transitive dep chain as above; same upgrade blocker (fix in hickory-net 0.26.1).
     # Not exploitable: DNSSEC validation is not enabled in our reqwest/hickory config.
     # https://rustsec.org/advisories/RUSTSEC-2026-0118
     "RUSTSEC-2026-0118",

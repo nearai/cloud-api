@@ -352,11 +352,21 @@ impl VLlmProvider {
     /// pre-warm tasks and any concurrent user requests share a single pool
     /// of attestation permits and don't amplify load on inference-proxy.
     ///
-    /// No-op when the provider was created without a `BackendVerifier`
-    /// (legacy / non-TEE mode — buckets are eagerly pre-filled at
-    /// construction time and pre-warming is unnecessary).
+    /// No-op in three cases:
+    /// - No `BackendVerifier` (legacy / non-TEE mode — buckets are eagerly
+    ///   pre-filled at construction time).
+    /// - Bootstrap state (`pinned_fingerprint_count() == 0`) — no verified
+    ///   fingerprints yet, so every task would fail the security guard in
+    ///   `get_or_verify_bucket_client` and log a spurious warn.
+    /// - Blocked state (also `pinned_fingerprint_count() == 0`) — provider
+    ///   has been explicitly blocked; attempting verification would only waste
+    ///   attestation round-trips and fill logs with noise.
     pub fn pre_warm(self: Arc<Self>) {
         if self.backend_verifier.is_none() {
+            return;
+        }
+        if self.pinned_fingerprint_count() == 0 {
+            tracing::debug!("Pre-warm skipped: no fingerprints pinned (Bootstrap or Blocked state)");
             return;
         }
         let num_buckets = self.bucket_clients.len();
@@ -2279,12 +2289,16 @@ mod tests {
                 control_timeout_seconds: 30,
             },
             Arc::new(std::sync::RwLock::new(
-                crate::spki_verifier::FingerprintState::Bootstrap,
+                // Need at least one pinned fingerprint so pre_warm doesn't
+                // skip due to the Bootstrap/Blocked guard (pinned_count > 0).
+                crate::spki_verifier::FingerprintState::Pinned(
+                    std::iter::once("dummy-fp".to_string()).collect(),
+                ),
             )),
             Arc::new(CountingVerifier {
                 count: call_count_clone,
             }),
-            64, // use default bucket count
+            4, // production-default semaphore concurrency — exercises throttling with 64 tasks
         ));
 
         let num_buckets = provider.bucket_clients.len();
@@ -2347,5 +2361,72 @@ mod tests {
             .bucket_clients
             .iter()
             .all(|b| b.lock().unwrap().is_some()));
+    }
+
+    /// pre_warm is a no-op when no fingerprints are pinned (Bootstrap or Blocked state).
+    /// Without this guard, pre_warm would spawn 64 tasks that each fail the security
+    /// check in get_or_verify_bucket_client and log spurious warnings.
+    #[tokio::test]
+    async fn test_pre_warm_skips_without_pinned_fingerprints() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+
+        struct CountingVerifier {
+            count: Arc<AtomicUsize>,
+        }
+        #[async_trait::async_trait]
+        impl crate::BackendVerifier for CountingVerifier {
+            async fn create_verified_client(
+                &self,
+                _base_url: &str,
+            ) -> Result<reqwest::Client, String> {
+                self.count.fetch_add(1, Ordering::SeqCst);
+                Ok(reqwest::Client::new())
+            }
+        }
+
+        for state in [
+            crate::spki_verifier::FingerprintState::Bootstrap,
+            crate::spki_verifier::FingerprintState::Blocked,
+        ] {
+            let call_count = Arc::new(AtomicUsize::new(0));
+            let provider = Arc::new(VLlmProvider::new_with_verifier_and_concurrency(
+                VLlmConfig {
+                    base_url: "http://localhost".to_string(),
+                    api_key: None,
+                    completion_timeout_seconds: 30,
+                    control_timeout_seconds: 30,
+                },
+                Arc::new(std::sync::RwLock::new(state)),
+                Arc::new(CountingVerifier {
+                    count: call_count.clone(),
+                }),
+                4,
+            ));
+
+            // pre_warm must not spawn any tasks when no fingerprints are pinned.
+            provider.clone().pre_warm();
+
+            // Yield to let any spuriously-spawned tasks run.
+            for _ in 0..10 {
+                tokio::task::yield_now().await;
+            }
+
+            assert_eq!(
+                call_count.load(Ordering::SeqCst),
+                0,
+                "pre_warm should not call the verifier in Bootstrap/Blocked state"
+            );
+            // All buckets must remain empty (no tasks ran).
+            assert!(
+                provider
+                    .bucket_clients
+                    .iter()
+                    .all(|b| b.lock().unwrap().is_none()),
+                "pre_warm should not fill any buckets in Bootstrap/Blocked state"
+            );
+        }
     }
 }

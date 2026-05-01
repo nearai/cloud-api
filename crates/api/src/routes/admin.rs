@@ -4,10 +4,11 @@ use crate::models::{
     AdminOrganizationResponse, AdminServiceResponse, AdminUserOrganizationDetails,
     AdminUserResponse, BatchUpdateModelApiRequest, CreateAdminAccessTokenRequest,
     CreateServiceRequest, CreditType, DecimalPrice, DecimalPriceRequest,
-    DeleteAdminAccessTokenRequest, DeleteModelRequest, ErrorResponse,
-    GetOrganizationConcurrentLimitResponse, ListOrganizationsAdminResponse, ListUsersResponse,
-    ModelArchitecture, ModelHistoryEntry, ModelHistoryResponse, ModelMetadata, ModelWithPricing,
-    OrgLimitsHistoryEntry, OrgLimitsHistoryResponse, OrganizationUsage, SpendLimit,
+    DeleteAdminAccessTokenRequest, DeleteModelRequest, DeprecateModelRequest,
+    DeprecateModelResponse, ErrorResponse, GetOrganizationConcurrentLimitResponse,
+    ListOrganizationsAdminResponse, ListUsersResponse, ModelArchitecture, ModelHistoryEntry,
+    ModelHistoryResponse, ModelMetadata, ModelWithPricing, OrgLimitsHistoryEntry,
+    OrgLimitsHistoryResponse, OrganizationUsage, SpendLimit,
     UpdateOrganizationConcurrentLimitRequest, UpdateOrganizationConcurrentLimitResponse,
     UpdateOrganizationLimitsRequest, UpdateOrganizationLimitsResponse, UpdateServiceRequest,
 };
@@ -852,6 +853,141 @@ pub async fn delete_model(
         .await;
 
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// Deprecate a model in favor of another (Admin only)
+///
+/// Atomically marks `modelId` as deprecated and routes its traffic to
+/// `successorModelId`:
+/// 1. Adds `modelId` as an alias of `successorModelId`, so existing clients
+///    sending `model: "<modelId>"` keep working — the alias resolver rewrites
+///    the request-side `model` field to the successor before backend dispatch,
+///    and the response's `model` field reflects the canonical (successor) name.
+/// 2. Re-points any pre-existing inbound aliases of `modelId` at the
+///    successor, so historical aliases keep resolving.
+/// 3. Sets `modelId.isActive = false` so it is hidden from public
+///    `GET /v1/models` and from `GET /v1/admin/models` unless
+///    `include_inactive=true`.
+/// 4. Records a `model_history` entry for audit purposes.
+///
+/// All steps run in a single DB transaction. If the successor is inactive or
+/// either model is missing, returns 404 without modifying state.
+#[utoipa::path(
+    post,
+    path = "/v1/admin/models/deprecate",
+    tag = "Admin",
+    request_body = DeprecateModelRequest,
+    responses(
+        (status = 200, description = "Model deprecated successfully", body = DeprecateModelResponse),
+        (status = 400, description = "Invalid request (e.g. self-deprecation, empty model id)", body = ErrorResponse),
+        (status = 404, description = "Either model not found, or successor is not active", body = ErrorResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    ),
+    security(
+        ("session_token" = [])
+    )
+)]
+pub async fn deprecate_model(
+    State(app_state): State<AdminAppState>,
+    Extension(admin_user): Extension<AdminUser>,
+    ResponseJson(req): ResponseJson<DeprecateModelRequest>,
+) -> Result<ResponseJson<DeprecateModelResponse>, (StatusCode, ResponseJson<ErrorResponse>)> {
+    debug!(
+        "Deprecate model: model_id={}, successor_model_id={}",
+        req.model_id, req.successor_model_id
+    );
+
+    let admin_user_id = admin_user.0.id;
+    let admin_user_email = admin_user.0.email.clone();
+
+    let outcome = app_state
+        .admin_service
+        .deprecate_model(
+            &req.model_id,
+            &req.successor_model_id,
+            req.change_reason.clone(),
+            Some(admin_user_id),
+            Some(admin_user_email),
+        )
+        .await
+        .map_err(|e| {
+            error!("Failed to deprecate model");
+            match e {
+                services::admin::AdminError::InvalidDeprecation(msg) => (
+                    StatusCode::BAD_REQUEST,
+                    ResponseJson(ErrorResponse::new(msg, "invalid_request".to_string())),
+                ),
+                services::admin::AdminError::ModelNotFound(msg) => (
+                    StatusCode::NOT_FOUND,
+                    ResponseJson(ErrorResponse::new(msg, "model_not_found".to_string())),
+                ),
+                services::admin::AdminError::Unauthorized(msg) => (
+                    StatusCode::UNAUTHORIZED,
+                    ResponseJson(ErrorResponse::new(msg, "unauthorized".to_string())),
+                ),
+                _ => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    ResponseJson(ErrorResponse::new(
+                        format!("Failed to deprecate model: {e}"),
+                        "internal_server_error".to_string(),
+                    )),
+                ),
+            }
+        })?;
+
+    // Stop sending live traffic to the deprecated provider. The alias
+    // resolver will route requests with the deprecated model_id to the
+    // successor on subsequent calls — so this prevents in-flight resolution
+    // from picking up a stale provider reference for the now-inactive model.
+    app_state
+        .inference_provider_pool
+        .unregister_provider(&req.model_id)
+        .await;
+
+    let to_api = |model_name: String, m: services::admin::ModelPricing| ModelWithPricing {
+        model_id: model_name,
+        input_cost_per_token: DecimalPrice {
+            amount: m.input_cost_per_token,
+            scale: 9,
+            currency: "USD".to_string(),
+        },
+        output_cost_per_token: DecimalPrice {
+            amount: m.output_cost_per_token,
+            scale: 9,
+            currency: "USD".to_string(),
+        },
+        cost_per_image: DecimalPrice {
+            amount: m.cost_per_image,
+            scale: 9,
+            currency: "USD".to_string(),
+        },
+        cache_read_cost_per_token: DecimalPrice {
+            amount: m.cache_read_cost_per_token,
+            scale: 9,
+            currency: "USD".to_string(),
+        },
+        metadata: ModelMetadata {
+            verifiable: m.verifiable,
+            context_length: m.context_length,
+            model_display_name: m.model_display_name,
+            model_description: m.model_description,
+            model_icon: m.model_icon,
+            owned_by: m.owned_by,
+            aliases: m.aliases,
+            provider_type: m.provider_type,
+            provider_config: crate::routes::common::redact_provider_config(m.provider_config),
+            attestation_supported: m.attestation_supported,
+            architecture: ModelArchitecture::from_options(m.input_modalities, m.output_modalities),
+            inference_url: m.inference_url,
+        },
+    };
+
+    Ok(ResponseJson(DeprecateModelResponse {
+        deprecated: to_api(req.model_id.clone(), outcome.deprecated),
+        successor: to_api(req.successor_model_id.clone(), outcome.successor),
+        aliases_carried: outcome.aliases_carried,
+    }))
 }
 
 /// List all registered users with pagination (Admin only)

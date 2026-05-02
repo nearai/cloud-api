@@ -405,8 +405,10 @@ pub async fn list_organization_invitations(
     Extension(user): Extension<AuthenticatedUser>,
     Path(org_id): Path<Uuid>,
     Query(params): Query<ListInvitationsParams>,
-) -> Result<Json<Vec<crate::models::OrganizationInvitationResponse>>, (StatusCode, Json<ErrorResponse>)>
-{
+) -> Result<
+    Json<Vec<crate::models::OrganizationInvitationResponse>>,
+    (StatusCode, Json<ErrorResponse>),
+> {
     debug!(
         "Listing invitations for organization: {} by user: {}",
         org_id, user.0.id
@@ -416,10 +418,18 @@ pub async fn list_organization_invitations(
     let requester_id = authenticated_user_to_user_id(user);
 
     let status = params.status.map(|s| match s {
-        crate::models::InvitationStatus::Pending => services::organization::InvitationStatus::Pending,
-        crate::models::InvitationStatus::Accepted => services::organization::InvitationStatus::Accepted,
-        crate::models::InvitationStatus::Declined => services::organization::InvitationStatus::Declined,
-        crate::models::InvitationStatus::Expired => services::organization::InvitationStatus::Expired,
+        crate::models::InvitationStatus::Pending => {
+            services::organization::InvitationStatus::Pending
+        }
+        crate::models::InvitationStatus::Accepted => {
+            services::organization::InvitationStatus::Accepted
+        }
+        crate::models::InvitationStatus::Declined => {
+            services::organization::InvitationStatus::Declined
+        }
+        crate::models::InvitationStatus::Expired => {
+            services::organization::InvitationStatus::Expired
+        }
     });
 
     match app_state

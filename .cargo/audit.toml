@@ -38,6 +38,22 @@ ignore = [
     # Same transitive dep chain as above.
     # https://rustsec.org/advisories/RUSTSEC-2026-0104
     "RUSTSEC-2026-0104",
+
+    # hickory-proto 0.25.2 CPU exhaustion via crafted DNS response.
+    # Transitive dep: reqwest 0.12 -> hickory-resolver 0.25 -> hickory-proto 0.25.2.
+    # Cannot upgrade: fix is in hickory-proto >= 0.26.1, but reqwest 0.12 pins
+    # hickory to ^0.25 and no 0.25.x backport exists. reqwest must adopt 0.26.x first.
+    # We only resolve admin-configured endpoints (no user-controlled hostnames),
+    # so exploitation requires DNS infrastructure compromise.
+    # https://rustsec.org/advisories/RUSTSEC-2026-0119
+    "RUSTSEC-2026-0119",
+
+    # hickory-proto 0.25.2 NSEC3 CPU exhaustion (DNSSEC only).
+    # Same transitive dep chain as above. Fix moved to hickory-net 0.26.1 (code
+    # restructured into new crate in 0.26.0; no 0.25.x backport exists).
+    # Not exploitable: DNSSEC validation is not enabled in our reqwest/hickory config.
+    # https://rustsec.org/advisories/RUSTSEC-2026-0118
+    "RUSTSEC-2026-0118",
 ]
 
 # Treat unmaintained crates as warnings (not errors)

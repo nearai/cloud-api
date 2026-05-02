@@ -375,7 +375,7 @@ pub struct ListMembersParams {
 /// Query parameters for listing organization invitations
 #[derive(Debug, Deserialize)]
 pub struct ListInvitationsParams {
-    pub status: Option<String>,
+    pub status: Option<crate::models::InvitationStatus>,
 }
 
 /// List organization invitations
@@ -387,12 +387,13 @@ pub struct ListInvitationsParams {
     tag = "Organization Members",
     params(
         ("org_id" = Uuid, Path, description = "Organization ID"),
-        ("status" = Option<String>, Query, description = "Filter by status (pending, accepted, declined, expired)")
+        ("status" = Option<crate::models::InvitationStatus>, Query, description = "Filter by status")
     ),
     responses(
         (status = 200, description = "List of organization invitations", body = Vec<crate::models::OrganizationInvitationResponse>),
         (status = 401, description = "Unauthorized", body = ErrorResponse),
         (status = 403, description = "Forbidden - not an admin or owner", body = ErrorResponse),
+        (status = 404, description = "Organization not found", body = ErrorResponse),
         (status = 500, description = "Internal server error", body = ErrorResponse)
     ),
     security(
@@ -414,12 +415,11 @@ pub async fn list_organization_invitations(
     let organization_id = OrganizationId(org_id);
     let requester_id = authenticated_user_to_user_id(user);
 
-    let status = params.status.and_then(|s| match s.as_str() {
-        "pending" => Some(services::organization::InvitationStatus::Pending),
-        "accepted" => Some(services::organization::InvitationStatus::Accepted),
-        "declined" => Some(services::organization::InvitationStatus::Declined),
-        "expired" => Some(services::organization::InvitationStatus::Expired),
-        _ => None,
+    let status = params.status.map(|s| match s {
+        crate::models::InvitationStatus::Pending => services::organization::InvitationStatus::Pending,
+        crate::models::InvitationStatus::Accepted => services::organization::InvitationStatus::Accepted,
+        crate::models::InvitationStatus::Declined => services::organization::InvitationStatus::Declined,
+        crate::models::InvitationStatus::Expired => services::organization::InvitationStatus::Expired,
     });
 
     match app_state
@@ -437,6 +437,13 @@ pub async fn list_organization_invitations(
         Err(OrganizationError::Unauthorized(msg)) => Err((
             StatusCode::FORBIDDEN,
             Json(ErrorResponse::new(msg, "forbidden".to_string())),
+        )),
+        Err(OrganizationError::NotFound) => Err((
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse::new(
+                "Organization not found".to_string(),
+                "not_found".to_string(),
+            )),
         )),
         Err(_) => {
             error!("Failed to list organization invitations");

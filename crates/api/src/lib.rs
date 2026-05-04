@@ -1337,7 +1337,7 @@ pub fn build_admin_routes(
     use crate::middleware::admin_middleware;
     use crate::routes::admin::{
         batch_upsert_models, create_admin_access_token, create_service, delete_admin_access_token,
-        delete_model, get_model_history, get_organization_concurrent_limit,
+        delete_model, deprecate_model, get_model_history, get_organization_concurrent_limit,
         get_organization_limits_history, get_organization_metrics, get_organization_timeseries,
         get_platform_metrics, list_admin_access_tokens, list_models as admin_list_models,
         list_organizations, list_users, update_organization_concurrent_limit,
@@ -1379,6 +1379,10 @@ pub fn build_admin_routes(
         .route(
             "/admin/models",
             axum::routing::get(admin_list_models).patch(batch_upsert_models),
+        )
+        .route(
+            "/admin/models/deprecate",
+            axum::routing::post(deprecate_model),
         )
         .route(
             "/admin/models/{model_name}",

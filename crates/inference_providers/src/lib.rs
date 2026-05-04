@@ -55,6 +55,7 @@
 
 use reqwest::Client;
 
+pub mod bucket_keepalive;
 pub mod chunk_builder;
 pub mod external;
 pub mod mock;

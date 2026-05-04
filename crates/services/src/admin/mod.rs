@@ -110,6 +110,48 @@ impl AdminService for AdminServiceImpl {
         Ok(())
     }
 
+    async fn deprecate_model(
+        &self,
+        deprecated_model_name: &str,
+        successor_model_name: &str,
+        change_reason: Option<String>,
+        changed_by_user_id: Option<uuid::Uuid>,
+        changed_by_user_email: Option<String>,
+    ) -> Result<DeprecateModelOutcome, AdminError> {
+        let deprecated = deprecated_model_name.trim();
+        let successor = successor_model_name.trim();
+
+        if deprecated.is_empty() || successor.is_empty() {
+            return Err(AdminError::InvalidDeprecation(
+                "modelId and successorModelId are required".to_string(),
+            ));
+        }
+        if deprecated == successor {
+            return Err(AdminError::InvalidDeprecation(
+                "modelId and successorModelId must differ".to_string(),
+            ));
+        }
+
+        let outcome = self
+            .repository
+            .deprecate_model(
+                deprecated,
+                successor,
+                change_reason,
+                changed_by_user_id,
+                changed_by_user_email,
+            )
+            .await
+            .map_err(|e| AdminError::InternalError(e.to_string()))?
+            .ok_or_else(|| {
+                AdminError::ModelNotFound(format!(
+                    "Either '{deprecated}' or '{successor}' was not found, or the successor is not active"
+                ))
+            })?;
+
+        Ok(outcome)
+    }
+
     async fn update_organization_limits(
         &self,
         organization_id: uuid::Uuid,

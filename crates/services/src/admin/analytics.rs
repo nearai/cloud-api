@@ -17,6 +17,7 @@ pub struct MetricsSummary {
     pub total_requests: i64,
     pub total_input_tokens: i64,
     pub total_output_tokens: i64,
+    pub total_cache_read_tokens: i64,
     /// Total cost in USD (converted from nano-dollars)
     pub total_cost_usd: f64,
     /// Number of unique API keys used in the period
@@ -50,6 +51,9 @@ pub struct ApiKeyMetrics {
 pub struct ModelMetrics {
     pub model_name: String,
     pub requests: i64,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub cache_read_tokens: i64,
     /// Average time to first token in milliseconds
     pub avg_ttft_ms: Option<f64>,
     /// 95th percentile time to first token in milliseconds
@@ -112,6 +116,7 @@ pub struct TimeSeriesPoint {
     pub requests: i64,
     pub input_tokens: i64,
     pub output_tokens: i64,
+    pub cache_read_tokens: i64,
     pub cost_usd: f64,
 }
 

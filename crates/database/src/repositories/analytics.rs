@@ -54,10 +54,11 @@ impl AnalyticsRepository for PgAnalyticsRepository {
         let summary_row = client
             .query_one(
                 r#"
-                SELECT 
+                SELECT
                     COUNT(*)::bigint as requests,
                     COALESCE(SUM(input_tokens), 0)::bigint as input_tokens,
                     COALESCE(SUM(output_tokens), 0)::bigint as output_tokens,
+                    COALESCE(SUM(cache_read_tokens), 0)::bigint as cache_read_tokens,
                     COALESCE(SUM(total_cost), 0)::bigint as cost_nano,
                     COUNT(DISTINCT api_key_id)::bigint as unique_api_keys
                 FROM organization_usage_log
@@ -74,8 +75,9 @@ impl AnalyticsRepository for PgAnalyticsRepository {
             total_requests: summary_row.get::<_, i64>(0),
             total_input_tokens: summary_row.get::<_, i64>(1),
             total_output_tokens: summary_row.get::<_, i64>(2),
-            total_cost_usd: nano_to_usd(summary_row.get::<_, i64>(3)),
-            unique_api_keys: summary_row.get::<_, i64>(4),
+            total_cache_read_tokens: summary_row.get::<_, i64>(3),
+            total_cost_usd: nano_to_usd(summary_row.get::<_, i64>(4)),
+            unique_api_keys: summary_row.get::<_, i64>(5),
         };
 
         // Get metrics by workspace
@@ -152,9 +154,12 @@ impl AnalyticsRepository for PgAnalyticsRepository {
         let model_rows = client
             .query(
                 r#"
-                SELECT 
+                SELECT
                     ul.model_name,
                     COUNT(*)::bigint as requests,
+                    COALESCE(SUM(ul.input_tokens), 0)::bigint as input_tokens,
+                    COALESCE(SUM(ul.output_tokens), 0)::bigint as output_tokens,
+                    COALESCE(SUM(ul.cache_read_tokens), 0)::bigint as cache_read_tokens,
                     COALESCE(SUM(ul.total_cost), 0)::bigint as cost_nano,
                     AVG(ul.ttft_ms)::double precision as avg_ttft_ms,
                     PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY ul.ttft_ms)::double precision as p95_ttft_ms,
@@ -177,11 +182,14 @@ impl AnalyticsRepository for PgAnalyticsRepository {
             .map(|row| ModelMetrics {
                 model_name: row.get(0),
                 requests: row.get(1),
-                avg_ttft_ms: row.get::<_, Option<f64>>(3),
-                p95_ttft_ms: row.get::<_, Option<f64>>(4),
-                avg_itl_ms: row.get::<_, Option<f64>>(5),
-                p95_itl_ms: row.get::<_, Option<f64>>(6),
-                cost_usd: nano_to_usd(row.get::<_, i64>(2)),
+                input_tokens: row.get(2),
+                output_tokens: row.get(3),
+                cache_read_tokens: row.get(4),
+                cost_usd: nano_to_usd(row.get::<_, i64>(5)),
+                avg_ttft_ms: row.get::<_, Option<f64>>(6),
+                p95_ttft_ms: row.get::<_, Option<f64>>(7),
+                avg_itl_ms: row.get::<_, Option<f64>>(8),
+                p95_itl_ms: row.get::<_, Option<f64>>(9),
             })
             .collect();
 
@@ -343,11 +351,12 @@ impl AnalyticsRepository for PgAnalyticsRepository {
         // Get time series data
         let query = format!(
             r#"
-            SELECT 
+            SELECT
                 DATE_TRUNC('{date_trunc}', created_at)::text as date,
                 COUNT(*)::bigint as requests,
                 COALESCE(SUM(input_tokens), 0)::bigint as input_tokens,
                 COALESCE(SUM(output_tokens), 0)::bigint as output_tokens,
+                COALESCE(SUM(cache_read_tokens), 0)::bigint as cache_read_tokens,
                 COALESCE(SUM(total_cost), 0)::bigint as cost_nano
             FROM organization_usage_log
             WHERE organization_id = $1
@@ -370,7 +379,8 @@ impl AnalyticsRepository for PgAnalyticsRepository {
                 requests: row.get(1),
                 input_tokens: row.get(2),
                 output_tokens: row.get(3),
-                cost_usd: nano_to_usd(row.get::<_, i64>(4)),
+                cache_read_tokens: row.get(4),
+                cost_usd: nano_to_usd(row.get::<_, i64>(5)),
             })
             .collect();
 

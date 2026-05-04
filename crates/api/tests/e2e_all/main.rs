@@ -6,6 +6,7 @@
 mod common;
 
 mod admin_analytics;
+mod admin_deprecate_model;
 mod admin_list_models;
 mod admin_services;
 mod api_keys;

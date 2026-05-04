@@ -1004,6 +1004,16 @@ pub async fn get_user_organization_metrics(
     let end = parse_datetime_or_default(&query.end, now)?;
     let start = parse_datetime_or_default(&query.start, end - Duration::days(30))?;
 
+    if start >= end {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            ResponseJson(ErrorResponse::new(
+                "start must be before end".to_string(),
+                "invalid_date_range".to_string(),
+            )),
+        ));
+    }
+
     let metrics = app_state
         .analytics_service
         .get_organization_metrics(organization_id, start, end)
@@ -1137,6 +1147,16 @@ pub async fn get_user_organization_timeseries(
     let now = Utc::now();
     let end = parse_datetime_or_default(&query.end, now)?;
     let start = parse_datetime_or_default(&query.start, end - Duration::days(30))?;
+
+    if start >= end {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            ResponseJson(ErrorResponse::new(
+                "start must be before end".to_string(),
+                "invalid_date_range".to_string(),
+            )),
+        ));
+    }
 
     let timeseries = app_state
         .analytics_service

@@ -865,7 +865,15 @@ fn validate_date_range(
     start: chrono::DateTime<Utc>,
     end: chrono::DateTime<Utc>,
 ) -> Result<(), UsageError> {
-    validate_date_range(start, end)?;
+    if start >= end {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            ResponseJson(ErrorResponse::new(
+                "start must be before end".to_string(),
+                "invalid_date_range".to_string(),
+            )),
+        ));
+    }
     if end - start > Duration::days(MAX_DATE_RANGE_DAYS) {
         return Err((
             StatusCode::BAD_REQUEST,

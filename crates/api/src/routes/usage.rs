@@ -980,6 +980,7 @@ pub async fn get_user_organization_metrics(
         )
         .await
         .map_err(|_| {
+            tracing::error!("Failed to check organization membership");
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 ResponseJson(ErrorResponse::new(
@@ -1102,6 +1103,7 @@ pub async fn get_user_organization_timeseries(
         )
         .await
         .map_err(|_| {
+            tracing::error!("Failed to check organization membership");
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 ResponseJson(ErrorResponse::new(

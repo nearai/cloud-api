@@ -84,12 +84,13 @@ impl AnalyticsRepository for PgAnalyticsRepository {
         let workspace_rows = client
             .query(
                 r#"
-                SELECT 
+                SELECT
                     w.id as workspace_id,
                     w.name as workspace_name,
                     COUNT(ul.id)::bigint as requests,
                     COALESCE(SUM(ul.input_tokens), 0)::bigint as input_tokens,
                     COALESCE(SUM(ul.output_tokens), 0)::bigint as output_tokens,
+                    COALESCE(SUM(ul.cache_read_tokens), 0)::bigint as cache_read_tokens,
                     COALESCE(SUM(ul.total_cost), 0)::bigint as cost_nano
                 FROM workspaces w
                 LEFT JOIN organization_usage_log ul ON ul.workspace_id = w.id 
@@ -112,7 +113,8 @@ impl AnalyticsRepository for PgAnalyticsRepository {
                 requests: row.get(2),
                 input_tokens: row.get(3),
                 output_tokens: row.get(4),
-                cost_usd: nano_to_usd(row.get::<_, i64>(5)),
+                cache_read_tokens: row.get(5),
+                cost_usd: nano_to_usd(row.get::<_, i64>(6)),
             })
             .collect();
 

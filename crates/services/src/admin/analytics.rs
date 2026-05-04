@@ -32,6 +32,7 @@ pub struct WorkspaceMetrics {
     pub requests: i64,
     pub input_tokens: i64,
     pub output_tokens: i64,
+    pub cache_read_tokens: i64,
     /// Cost in USD
     pub cost_usd: f64,
 }

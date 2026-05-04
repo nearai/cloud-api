@@ -869,6 +869,7 @@ pub struct UserWorkspaceMetrics {
     pub requests: i64,
     pub input_tokens: i64,
     pub output_tokens: i64,
+    pub cache_read_tokens: i64,
     pub cost_usd: f64,
 }
 
@@ -999,8 +1000,8 @@ pub async fn get_user_organization_metrics(
     }
 
     let now = Utc::now();
-    let start = parse_datetime_or_default(&query.start, now - Duration::days(30))?;
     let end = parse_datetime_or_default(&query.end, now)?;
+    let start = parse_datetime_or_default(&query.start, end - Duration::days(30))?;
 
     let metrics = app_state
         .analytics_service
@@ -1049,6 +1050,7 @@ pub async fn get_user_organization_metrics(
                 requests: w.requests,
                 input_tokens: w.input_tokens,
                 output_tokens: w.output_tokens,
+                cache_read_tokens: w.cache_read_tokens,
                 cost_usd: w.cost_usd,
             })
             .collect(),
@@ -1131,8 +1133,8 @@ pub async fn get_user_organization_timeseries(
     }
 
     let now = Utc::now();
-    let start = parse_datetime_or_default(&query.start, now - Duration::days(30))?;
     let end = parse_datetime_or_default(&query.end, now)?;
+    let start = parse_datetime_or_default(&query.start, end - Duration::days(30))?;
 
     let timeseries = app_state
         .analytics_service

@@ -140,13 +140,16 @@ impl inference_providers::BackendVerifier for PoolBackendVerifier {
         let read_timeout =
             Duration::from_secs(VLlmConfig::completion_timeout_from_env().max(0) as u64);
         let client_state = Arc::new(std::sync::RwLock::new(FingerprintState::Bootstrap));
-        let client = reqwest::Client::builder()
+        let builder = reqwest::Client::builder()
             .use_preconfigured_tls(self.tls_roots.build_config(client_state.clone()))
             .pool_max_idle_per_host(1)
             .http2_adaptive_window(true)
             .connect_timeout(Duration::from_secs(5))
-            .pool_idle_timeout(Duration::from_secs(300))
-            .read_timeout(read_timeout)
+            .read_timeout(read_timeout);
+        // Bucket clients need the H2 connection to stay sticky to a single
+        // backend across long idle gaps; see
+        // `inference_providers::bucket_keepalive`.
+        let client = inference_providers::bucket_keepalive::apply(builder)
             .build()
             .map_err(|e| format!("Failed to build HTTP client: {e}"))?;
 

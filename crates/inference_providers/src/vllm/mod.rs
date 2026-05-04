@@ -275,13 +275,16 @@ impl VLlmProvider {
         } else {
             (0..num_buckets)
                 .map(|_| {
-                    let c = Client::builder()
+                    let builder = Client::builder()
                         .use_preconfigured_tls(tls_roots.build_config(fingerprint_state.clone()))
                         .pool_max_idle_per_host(1)
                         .http2_adaptive_window(true)
                         .connect_timeout(Duration::from_secs(5))
-                        .pool_idle_timeout(Duration::from_secs(300))
-                        .read_timeout(completion_timeout)
+                        .read_timeout(completion_timeout);
+                    // Bucket clients need the H2 connection to stay sticky to a
+                    // single backend across long idle gaps; see
+                    // `crate::bucket_keepalive`.
+                    let c = crate::bucket_keepalive::apply(builder)
                         .build()
                         .expect("Failed to create bucket HTTP client");
                     std::sync::Mutex::new(Some(c))

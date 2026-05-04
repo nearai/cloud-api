@@ -9,6 +9,7 @@ use axum::{
     response::Json as ResponseJson,
     Extension, Json,
 };
+use chrono::{Duration, Utc};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 use uuid::Uuid;
@@ -838,4 +839,332 @@ pub async fn record_usage(
     };
 
     Ok(ResponseJson(response))
+}
+
+// ============= User-facing analytics endpoints =============
+
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct UserMetricsSummary {
+    pub total_requests: i64,
+    pub total_input_tokens: i64,
+    pub total_output_tokens: i64,
+    pub total_cache_read_tokens: i64,
+    pub total_cost_usd: f64,
+}
+
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct UserModelMetrics {
+    pub model_name: String,
+    pub requests: i64,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub cache_read_tokens: i64,
+    pub cost_usd: f64,
+}
+
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct UserWorkspaceMetrics {
+    pub workspace_id: String,
+    pub workspace_name: String,
+    pub requests: i64,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub cost_usd: f64,
+}
+
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct UserOrganizationMetrics {
+    pub organization_id: String,
+    pub period_start: String,
+    pub period_end: String,
+    pub summary: UserMetricsSummary,
+    pub by_model: Vec<UserModelMetrics>,
+    pub by_workspace: Vec<UserWorkspaceMetrics>,
+}
+
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct UserTimeSeriesPoint {
+    pub date: String,
+    pub requests: i64,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub cache_read_tokens: i64,
+    pub cost_usd: f64,
+}
+
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct UserTimeSeriesMetrics {
+    pub organization_id: String,
+    pub period_start: String,
+    pub period_end: String,
+    pub granularity: String,
+    pub data: Vec<UserTimeSeriesPoint>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct MetricsQuery {
+    pub start: Option<String>,
+    pub end: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct TimeSeriesQuery {
+    pub start: Option<String>,
+    pub end: Option<String>,
+    pub granularity: Option<String>,
+}
+
+fn parse_datetime_or_default(
+    value: &Option<String>,
+    default: chrono::DateTime<Utc>,
+) -> Result<chrono::DateTime<Utc>, (StatusCode, ResponseJson<ErrorResponse>)> {
+    match value {
+        Some(s) => chrono::DateTime::parse_from_rfc3339(s)
+            .map(|dt| dt.with_timezone(&Utc))
+            .map_err(|_| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    ResponseJson(ErrorResponse::new(
+                        "Invalid date format. Use ISO 8601 (e.g. 2024-01-01T00:00:00Z)."
+                            .to_string(),
+                        "invalid_date".to_string(),
+                    )),
+                )
+            }),
+        None => Ok(default),
+    }
+}
+
+#[utoipa::path(
+    get,
+    path = "/v1/organizations/{org_id}/usage/metrics",
+    tag = "Usage",
+    params(
+        ("org_id" = String, Path, description = "Organization ID"),
+        ("start" = Option<String>, Query, description = "Start date (ISO 8601, default: 30 days ago)"),
+        ("end" = Option<String>, Query, description = "End date (ISO 8601, default: now)")
+    ),
+    responses(
+        (status = 200, description = "Organization usage metrics", body = UserOrganizationMetrics),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 403, description = "Forbidden", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    ),
+    security(
+        ("session_token" = [])
+    )
+)]
+pub async fn get_user_organization_metrics(
+    State(app_state): State<AppState>,
+    Extension(user): Extension<AuthenticatedUser>,
+    Path(org_id): Path<String>,
+    Query(query): Query<MetricsQuery>,
+) -> Result<ResponseJson<UserOrganizationMetrics>, (StatusCode, ResponseJson<ErrorResponse>)> {
+    let organization_id = Uuid::parse_str(&org_id).map_err(|_| {
+        (
+            StatusCode::BAD_REQUEST,
+            ResponseJson(ErrorResponse::new(
+                "Invalid organization ID".to_string(),
+                "invalid_id".to_string(),
+            )),
+        )
+    })?;
+
+    let user_id = crate::conversions::authenticated_user_to_user_id(user);
+    let is_member = app_state
+        .organization_service
+        .is_member(
+            services::organization::OrganizationId(organization_id),
+            user_id,
+        )
+        .await
+        .map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ResponseJson(ErrorResponse::new(
+                    "Failed to verify organization access".to_string(),
+                    "internal_server_error".to_string(),
+                )),
+            )
+        })?;
+
+    if !is_member {
+        return Err((
+            StatusCode::FORBIDDEN,
+            ResponseJson(ErrorResponse::new(
+                "You are not authorized to access this organization's metrics.".to_string(),
+                "forbidden".to_string(),
+            )),
+        ));
+    }
+
+    let now = Utc::now();
+    let start = parse_datetime_or_default(&query.start, now - Duration::days(30))?;
+    let end = parse_datetime_or_default(&query.end, now)?;
+
+    let metrics = app_state
+        .analytics_service
+        .get_organization_metrics(organization_id, start, end)
+        .await
+        .map_err(|e| {
+            tracing::error!("Failed to get organization metrics: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ResponseJson(ErrorResponse::new(
+                    "Failed to retrieve organization metrics".to_string(),
+                    "internal_server_error".to_string(),
+                )),
+            )
+        })?;
+
+    Ok(ResponseJson(UserOrganizationMetrics {
+        organization_id: metrics.organization_id.to_string(),
+        period_start: metrics.period_start.to_rfc3339(),
+        period_end: metrics.period_end.to_rfc3339(),
+        summary: UserMetricsSummary {
+            total_requests: metrics.summary.total_requests,
+            total_input_tokens: metrics.summary.total_input_tokens,
+            total_output_tokens: metrics.summary.total_output_tokens,
+            total_cache_read_tokens: metrics.summary.total_cache_read_tokens,
+            total_cost_usd: metrics.summary.total_cost_usd,
+        },
+        by_model: metrics
+            .by_model
+            .into_iter()
+            .map(|m| UserModelMetrics {
+                model_name: m.model_name,
+                requests: m.requests,
+                input_tokens: m.input_tokens,
+                output_tokens: m.output_tokens,
+                cache_read_tokens: m.cache_read_tokens,
+                cost_usd: m.cost_usd,
+            })
+            .collect(),
+        by_workspace: metrics
+            .by_workspace
+            .into_iter()
+            .map(|w| UserWorkspaceMetrics {
+                workspace_id: w.workspace_id.to_string(),
+                workspace_name: w.workspace_name,
+                requests: w.requests,
+                input_tokens: w.input_tokens,
+                output_tokens: w.output_tokens,
+                cost_usd: w.cost_usd,
+            })
+            .collect(),
+    }))
+}
+
+#[utoipa::path(
+    get,
+    path = "/v1/organizations/{org_id}/usage/timeseries",
+    tag = "Usage",
+    params(
+        ("org_id" = String, Path, description = "Organization ID"),
+        ("start" = Option<String>, Query, description = "Start date (ISO 8601, default: 30 days ago)"),
+        ("end" = Option<String>, Query, description = "End date (ISO 8601, default: now)"),
+        ("granularity" = Option<String>, Query, description = "Time bucket size: hour, day, week (default: day)")
+    ),
+    responses(
+        (status = 200, description = "Organization usage timeseries", body = UserTimeSeriesMetrics),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 403, description = "Forbidden", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    ),
+    security(
+        ("session_token" = [])
+    )
+)]
+pub async fn get_user_organization_timeseries(
+    State(app_state): State<AppState>,
+    Extension(user): Extension<AuthenticatedUser>,
+    Path(org_id): Path<String>,
+    Query(query): Query<TimeSeriesQuery>,
+) -> Result<ResponseJson<UserTimeSeriesMetrics>, (StatusCode, ResponseJson<ErrorResponse>)> {
+    let organization_id = Uuid::parse_str(&org_id).map_err(|_| {
+        (
+            StatusCode::BAD_REQUEST,
+            ResponseJson(ErrorResponse::new(
+                "Invalid organization ID".to_string(),
+                "invalid_id".to_string(),
+            )),
+        )
+    })?;
+
+    let user_id = crate::conversions::authenticated_user_to_user_id(user);
+    let is_member = app_state
+        .organization_service
+        .is_member(
+            services::organization::OrganizationId(organization_id),
+            user_id,
+        )
+        .await
+        .map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ResponseJson(ErrorResponse::new(
+                    "Failed to verify organization access".to_string(),
+                    "internal_server_error".to_string(),
+                )),
+            )
+        })?;
+
+    if !is_member {
+        return Err((
+            StatusCode::FORBIDDEN,
+            ResponseJson(ErrorResponse::new(
+                "You are not authorized to access this organization's metrics.".to_string(),
+                "forbidden".to_string(),
+            )),
+        ));
+    }
+
+    let granularity = query.granularity.as_deref().unwrap_or("day");
+    if !["hour", "day", "week"].contains(&granularity) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            ResponseJson(ErrorResponse::new(
+                "Invalid granularity. Must be one of: hour, day, week.".to_string(),
+                "invalid_granularity".to_string(),
+            )),
+        ));
+    }
+
+    let now = Utc::now();
+    let start = parse_datetime_or_default(&query.start, now - Duration::days(30))?;
+    let end = parse_datetime_or_default(&query.end, now)?;
+
+    let timeseries = app_state
+        .analytics_service
+        .get_organization_timeseries(organization_id, start, end, granularity)
+        .await
+        .map_err(|e| {
+            tracing::error!("Failed to get organization timeseries: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ResponseJson(ErrorResponse::new(
+                    "Failed to retrieve organization timeseries".to_string(),
+                    "internal_server_error".to_string(),
+                )),
+            )
+        })?;
+
+    Ok(ResponseJson(UserTimeSeriesMetrics {
+        organization_id: timeseries.organization_id.to_string(),
+        period_start: timeseries.period_start.to_rfc3339(),
+        period_end: timeseries.period_end.to_rfc3339(),
+        granularity: timeseries.granularity,
+        data: timeseries
+            .data
+            .into_iter()
+            .map(|p| UserTimeSeriesPoint {
+                date: p.date,
+                requests: p.requests,
+                input_tokens: p.input_tokens,
+                output_tokens: p.output_tokens,
+                cache_read_tokens: p.cache_read_tokens,
+                cost_usd: p.cost_usd,
+            })
+            .collect(),
+    }))
 }

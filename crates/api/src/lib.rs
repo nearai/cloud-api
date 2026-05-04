@@ -702,6 +702,14 @@ pub fn build_app_with_config(
     domain_services: DomainServices,
     config: Arc<ApiConfig>,
 ) -> Router {
+    // Create analytics service (shared between user and admin routes)
+    let analytics_repository = Arc::new(database::repositories::PgAnalyticsRepository::new(
+        database.pool().clone(),
+    ));
+    let analytics_service = Arc::new(services::admin::AnalyticsService::new(
+        analytics_repository as Arc<dyn services::admin::AnalyticsRepository>,
+    ));
+
     // Create app state for completions and management routes
     let app_state = AppState {
         organization_service: domain_services.organization_service.clone(),
@@ -717,6 +725,7 @@ pub fn build_app_with_config(
         files_service: domain_services.files_service.clone(),
         inference_provider_pool: domain_services.inference_provider_pool.clone(),
         metrics_service: domain_services.metrics_service.clone(),
+        analytics_service: analytics_service.clone(),
         config: config.clone(),
     };
 
@@ -805,6 +814,7 @@ pub fn build_app_with_config(
         &auth_components.auth_state_middleware,
         config.clone(),
         app_state.inference_provider_pool.clone(),
+        analytics_service,
     );
 
     let invitation_routes =
@@ -1333,6 +1343,7 @@ pub fn build_admin_routes(
     auth_state_middleware: &AuthState,
     config: Arc<ApiConfig>,
     inference_provider_pool: Arc<services::inference_provider_pool::InferenceProviderPool>,
+    analytics_service: Arc<services::admin::AnalyticsService>,
 ) -> Router {
     use crate::middleware::admin_middleware;
     use crate::routes::admin::{
@@ -1343,10 +1354,8 @@ pub fn build_admin_routes(
         list_organizations, list_users, update_organization_concurrent_limit,
         update_organization_limits, update_service, AdminAppState,
     };
-    use database::repositories::{
-        AdminAccessTokenRepository, AdminCompositeRepository, PgAnalyticsRepository,
-    };
-    use services::admin::{AdminServiceImpl, AnalyticsService};
+    use database::repositories::{AdminAccessTokenRepository, AdminCompositeRepository};
+    use services::admin::AdminServiceImpl;
 
     // Create composite admin repository (handles models, organization limits, and users)
     let admin_repository = Arc::new(AdminCompositeRepository::new(database.pool().clone()));
@@ -1354,12 +1363,6 @@ pub fn build_admin_routes(
     // Create admin access token repository
     let admin_access_token_repository =
         Arc::new(AdminAccessTokenRepository::new(database.pool().clone()));
-
-    // Create analytics repository and service
-    let analytics_repository = Arc::new(PgAnalyticsRepository::new(database.pool().clone()));
-    let analytics_service = Arc::new(AnalyticsService::new(
-        analytics_repository as Arc<dyn services::admin::AnalyticsRepository>,
-    ));
 
     // Create admin service with composite repository
     let admin_service = Arc::new(AdminServiceImpl::new(

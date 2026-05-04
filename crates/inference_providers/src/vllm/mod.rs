@@ -342,6 +342,57 @@ impl VLlmProvider {
             .pinned_count()
     }
 
+    /// Spawn background tasks to pre-warm all bucket clients.
+    ///
+    /// Each empty bucket gets a background task that calls
+    /// `get_or_verify_bucket_client`: it connects to a backend, verifies its
+    /// attestation, and caches the resulting HTTP client. By the time user
+    /// traffic arrives, most buckets are already filled and the inline
+    /// verification cost has been paid upfront rather than on first use.
+    ///
+    /// Concurrency is bounded by `verification_semaphore` (the same limit
+    /// that guards against thundering-herd pressure at startup), so the
+    /// pre-warm tasks and any concurrent user requests share a single pool
+    /// of attestation permits and don't amplify load on inference-proxy.
+    ///
+    /// No-op in three cases:
+    /// - No `BackendVerifier` (legacy / non-TEE mode — buckets are eagerly
+    ///   pre-filled at construction time).
+    /// - Bootstrap state (`pinned_fingerprint_count() == 0`) — no verified
+    ///   fingerprints yet, so every task would fail the security guard in
+    ///   `get_or_verify_bucket_client` and log a spurious warn.
+    /// - Blocked state (also `pinned_fingerprint_count() == 0`) — provider
+    ///   has been explicitly blocked; attempting verification would only waste
+    ///   attestation round-trips and fill logs with noise.
+    pub fn pre_warm(self: Arc<Self>) {
+        if self.backend_verifier.is_none() {
+            return;
+        }
+        if self.pinned_fingerprint_count() == 0 {
+            tracing::debug!("Pre-warm skipped: no fingerprints pinned (Bootstrap or Blocked state)");
+            return;
+        }
+        let num_buckets = self.bucket_clients.len();
+        tracing::info!(num_buckets = num_buckets, "Pre-warming bucket clients");
+        for bucket_id in 0..num_buckets {
+            let provider = self.clone();
+            tokio::spawn(async move {
+                match provider.get_or_verify_bucket_client(bucket_id).await {
+                    Ok(_) => {
+                        tracing::debug!(bucket = bucket_id, "Bucket pre-warm complete");
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            bucket = bucket_id,
+                            error = %e,
+                            "Bucket pre-warm failed; will retry inline on first use"
+                        );
+                    }
+                }
+            });
+        }
+    }
+
     /// Maximum inline-verification retries when creating a verified bucket client.
     const INLINE_VERIFY_RETRIES: usize = 2;
 
@@ -2202,5 +2253,183 @@ mod tests {
         // Drop the acceptor task: this releases the held sockets cleanly so
         // we don't leak file descriptors past the test.
         acceptor.abort();
+    }
+
+    /// pre_warm: spawns a background task per bucket that calls
+    /// get_or_verify_bucket_client. After awaiting all tasks, every bucket
+    /// should be filled and the verifier should have been called exactly once
+    /// per bucket (the semaphore double-check prevents duplicate calls for
+    /// the same bucket, but each bucket still needs its own client).
+    #[tokio::test]
+    async fn test_pre_warm_fills_all_buckets() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let call_count_clone = call_count.clone();
+
+        struct CountingVerifier {
+            count: Arc<AtomicUsize>,
+        }
+        #[async_trait::async_trait]
+        impl crate::BackendVerifier for CountingVerifier {
+            async fn create_verified_client(
+                &self,
+                _base_url: &str,
+            ) -> Result<reqwest::Client, String> {
+                self.count.fetch_add(1, Ordering::SeqCst);
+                Ok(reqwest::Client::new())
+            }
+        }
+
+        let provider = Arc::new(VLlmProvider::new_with_verifier_and_concurrency(
+            VLlmConfig {
+                base_url: "http://localhost".to_string(),
+                api_key: None,
+                completion_timeout_seconds: 30,
+                control_timeout_seconds: 30,
+            },
+            Arc::new(std::sync::RwLock::new(
+                // Need at least one pinned fingerprint so pre_warm doesn't
+                // skip due to the Bootstrap/Blocked guard (pinned_count > 0).
+                crate::spki_verifier::FingerprintState::Pinned(
+                    std::iter::once("dummy-fp".to_string()).collect(),
+                ),
+            )),
+            Arc::new(CountingVerifier {
+                count: call_count_clone,
+            }),
+            4, // production-default semaphore concurrency — exercises throttling with 64 tasks
+        ));
+
+        let num_buckets = provider.bucket_clients.len();
+
+        // All buckets start empty.
+        assert!(provider
+            .bucket_clients
+            .iter()
+            .all(|b| b.lock().unwrap().is_none()));
+
+        // pre_warm fires background tasks — wait for them all to finish.
+        provider.clone().pre_warm();
+        // Yield repeatedly until every bucket is filled or a generous
+        // timeout is exceeded.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let filled = provider
+                .bucket_clients
+                .iter()
+                .filter(|b| b.lock().unwrap().is_some())
+                .count();
+            if filled == num_buckets {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "pre_warm did not fill all {num_buckets} buckets within timeout; filled={filled}"
+            );
+            tokio::task::yield_now().await;
+        }
+
+        // Every bucket should be filled and the verifier called exactly once
+        // per bucket.
+        assert_eq!(
+            call_count.load(Ordering::SeqCst),
+            num_buckets,
+            "expected one verification call per bucket"
+        );
+    }
+
+    /// pre_warm is a no-op when no backend verifier is configured (legacy mode).
+    #[tokio::test]
+    async fn test_pre_warm_noop_without_verifier() {
+        let provider = Arc::new(VLlmProvider::new(VLlmConfig {
+            base_url: "http://localhost".to_string(),
+            api_key: None,
+            completion_timeout_seconds: 30,
+            control_timeout_seconds: 30,
+        }));
+
+        // In legacy mode buckets are eagerly pre-filled at construction.
+        assert!(provider
+            .bucket_clients
+            .iter()
+            .all(|b| b.lock().unwrap().is_some()));
+
+        // pre_warm should not panic and should not clear the pre-filled buckets.
+        provider.clone().pre_warm();
+        assert!(provider
+            .bucket_clients
+            .iter()
+            .all(|b| b.lock().unwrap().is_some()));
+    }
+
+    /// pre_warm is a no-op when no fingerprints are pinned (Bootstrap or Blocked state).
+    /// Without this guard, pre_warm would spawn 64 tasks that each fail the security
+    /// check in get_or_verify_bucket_client and log spurious warnings.
+    #[tokio::test]
+    async fn test_pre_warm_skips_without_pinned_fingerprints() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+
+        struct CountingVerifier {
+            count: Arc<AtomicUsize>,
+        }
+        #[async_trait::async_trait]
+        impl crate::BackendVerifier for CountingVerifier {
+            async fn create_verified_client(
+                &self,
+                _base_url: &str,
+            ) -> Result<reqwest::Client, String> {
+                self.count.fetch_add(1, Ordering::SeqCst);
+                Ok(reqwest::Client::new())
+            }
+        }
+
+        for state in [
+            crate::spki_verifier::FingerprintState::Bootstrap,
+            crate::spki_verifier::FingerprintState::Blocked,
+        ] {
+            let call_count = Arc::new(AtomicUsize::new(0));
+            let provider = Arc::new(VLlmProvider::new_with_verifier_and_concurrency(
+                VLlmConfig {
+                    base_url: "http://localhost".to_string(),
+                    api_key: None,
+                    completion_timeout_seconds: 30,
+                    control_timeout_seconds: 30,
+                },
+                Arc::new(std::sync::RwLock::new(state)),
+                Arc::new(CountingVerifier {
+                    count: call_count.clone(),
+                }),
+                4,
+            ));
+
+            // pre_warm must not spawn any tasks when no fingerprints are pinned.
+            provider.clone().pre_warm();
+
+            // Yield to let any spuriously-spawned tasks run.
+            for _ in 0..10 {
+                tokio::task::yield_now().await;
+            }
+
+            assert_eq!(
+                call_count.load(Ordering::SeqCst),
+                0,
+                "pre_warm should not call the verifier in Bootstrap/Blocked state"
+            );
+            // All buckets must remain empty (no tasks ran).
+            assert!(
+                provider
+                    .bucket_clients
+                    .iter()
+                    .all(|b| b.lock().unwrap().is_none()),
+                "pre_warm should not fill any buckets in Bootstrap/Blocked state"
+            );
+        }
     }
 }

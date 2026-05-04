@@ -366,7 +366,9 @@ impl VLlmProvider {
             return;
         }
         if self.pinned_fingerprint_count() == 0 {
-            tracing::debug!("Pre-warm skipped: no fingerprints pinned (Bootstrap or Blocked state)");
+            tracing::debug!(
+                "Pre-warm skipped: no fingerprints pinned (Bootstrap or Blocked state)"
+            );
             return;
         }
         let num_buckets = self.bucket_clients.len();

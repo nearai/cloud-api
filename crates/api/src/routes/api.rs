@@ -69,6 +69,10 @@ pub fn build_management_router(app_state: AppState, auth_state: AuthState) -> Ro
             axum::routing::post(invite_organization_member_by_email),
         )
         .route(
+            "/{id}/members/invitations",
+            get(list_organization_invitations),
+        )
+        .route(
             "/{id}/members/{user_id}",
             put(update_organization_member).delete(remove_organization_member),
         )

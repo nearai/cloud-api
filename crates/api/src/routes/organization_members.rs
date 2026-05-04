@@ -1,8 +1,8 @@
 use crate::{
     conversions::{
         api_role_to_services_role, authenticated_user_to_user_id,
-        services_invitation_result_to_api, services_member_to_api_member,
-        services_member_with_user_to_api,
+        services_invitation_result_to_api, services_invitation_to_api,
+        services_member_to_api_member, services_member_with_user_to_api,
     },
     middleware::AuthenticatedUser,
     models::{ErrorResponse, ListOrganizationMembersResponse, PublicOrganizationMemberResponse},
@@ -370,6 +370,102 @@ pub struct ListMembersParams {
     pub limit: i64,
     #[serde(default)]
     pub offset: i64,
+}
+
+/// Query parameters for listing organization invitations
+#[derive(Debug, Deserialize)]
+pub struct ListInvitationsParams {
+    pub status: Option<crate::models::InvitationStatus>,
+}
+
+/// List organization invitations
+///
+/// Returns invitations for the organization. Only accessible to owners and admins.
+#[utoipa::path(
+    get,
+    path = "/v1/organizations/{org_id}/members/invitations",
+    tag = "Organization Members",
+    params(
+        ("org_id" = Uuid, Path, description = "Organization ID"),
+        ("status" = Option<crate::models::InvitationStatus>, Query, description = "Filter by status")
+    ),
+    responses(
+        (status = 200, description = "List of organization invitations", body = Vec<crate::models::OrganizationInvitationResponse>),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 403, description = "Forbidden - not an admin or owner", body = ErrorResponse),
+        (status = 404, description = "Organization not found", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    ),
+    security(
+        ("session_token" = [])
+    )
+)]
+pub async fn list_organization_invitations(
+    State(app_state): State<AppState>,
+    Extension(user): Extension<AuthenticatedUser>,
+    Path(org_id): Path<Uuid>,
+    Query(params): Query<ListInvitationsParams>,
+) -> Result<
+    Json<Vec<crate::models::OrganizationInvitationResponse>>,
+    (StatusCode, Json<ErrorResponse>),
+> {
+    debug!(
+        "Listing invitations for organization: {} by user: {}",
+        org_id, user.0.id
+    );
+
+    let organization_id = OrganizationId(org_id);
+    let requester_id = authenticated_user_to_user_id(user);
+
+    let status = params.status.map(|s| match s {
+        crate::models::InvitationStatus::Pending => {
+            services::organization::InvitationStatus::Pending
+        }
+        crate::models::InvitationStatus::Accepted => {
+            services::organization::InvitationStatus::Accepted
+        }
+        crate::models::InvitationStatus::Declined => {
+            services::organization::InvitationStatus::Declined
+        }
+        crate::models::InvitationStatus::Expired => {
+            services::organization::InvitationStatus::Expired
+        }
+    });
+
+    match app_state
+        .organization_service
+        .list_organization_invitations(organization_id, requester_id, status)
+        .await
+    {
+        Ok(invitations) => {
+            let responses: Vec<crate::models::OrganizationInvitationResponse> = invitations
+                .into_iter()
+                .map(services_invitation_to_api)
+                .collect();
+            Ok(Json(responses))
+        }
+        Err(OrganizationError::Unauthorized(msg)) => Err((
+            StatusCode::FORBIDDEN,
+            Json(ErrorResponse::new(msg, "forbidden".to_string())),
+        )),
+        Err(OrganizationError::NotFound) => Err((
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse::new(
+                "Organization not found".to_string(),
+                "not_found".to_string(),
+            )),
+        )),
+        Err(_) => {
+            error!("Failed to list organization invitations");
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse::new(
+                    "Failed to list organization invitations".to_string(),
+                    "internal_server_error".to_string(),
+                )),
+            ))
+        }
+    }
 }
 
 /// List organization members with limited user information

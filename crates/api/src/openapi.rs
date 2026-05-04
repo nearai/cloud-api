@@ -118,6 +118,8 @@ use utoipa::{Modify, OpenApi};
         crate::routes::usage::get_organization_usage_history,
         crate::routes::usage::get_api_key_usage_history,
         crate::routes::usage::record_usage,
+        crate::routes::usage::get_user_organization_metrics,
+        crate::routes::usage::get_user_organization_timeseries,
         // Gateway endpoints (model gateway integration)
         crate::routes::gateway::check_api_key,
         // Billing endpoints (HuggingFace integration)
@@ -234,6 +236,12 @@ use utoipa::{Modify, OpenApi};
             crate::routes::usage::ServiceUsageHistoryResponse,
             crate::routes::usage::ServiceUsageEntryResponse,
             crate::routes::usage::RecordUsageResponse,
+            crate::routes::usage::UserOrganizationMetrics,
+            crate::routes::usage::UserMetricsSummary,
+            crate::routes::usage::UserModelMetrics,
+            crate::routes::usage::UserWorkspaceMetrics,
+            crate::routes::usage::UserTimeSeriesMetrics,
+            crate::routes::usage::UserTimeSeriesPoint,
             // Gateway models
             crate::routes::gateway::CheckApiKeyResponse,
             // Billing models (HuggingFace integration)

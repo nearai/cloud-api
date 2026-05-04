@@ -541,14 +541,23 @@ impl AttestationVerifier {
             ));
         }
 
-        // Response is an array of [category, jwt_token] pairs
+        // NRAS response shape (verified against a real production response):
+        //   [
+        //     ["JWT", "<overall_eat>"],            // index 0: overall verdict
+        //     {"GPU-0": "<jwt>", ..., "GPU-N": "<jwt>"}  // index 1: per-GPU detail
+        //   ]
+        // The overall EAT contains only `x-nvidia-overall-att-result`,
+        // `x-nvidia-ver`, and submod digests — *no* per-check booleans or
+        // version metadata. All the diagnostic claims we want for failure
+        // logging (`x-nvidia-gpu-driver-rim-fetched`, driver/vbios version,
+        // `hwmodel`, etc.) live in the per-GPU EATs at index 1.
         let body: serde_json::Value = response.json().await.map_err(|e| {
             AttestationVerificationError::GpuVerificationFailed(format!(
                 "failed to parse NRAS response: {e}"
             ))
         })?;
 
-        let jwt_token = body
+        let overall_jwt = body
             .as_array()
             .and_then(|arr| arr.first())
             .and_then(|entry| entry.as_array())
@@ -559,67 +568,54 @@ impl AttestationVerifier {
                     "unexpected NRAS response format".to_string(),
                 )
             })?;
+        let verdict = parse_nras_overall(overall_jwt)?;
 
-        // Decode JWT payload (second segment, base64url-encoded)
-        let parsed = parse_nras_jwt(jwt_token)?;
+        if verdict != "PASS" {
+            // Walk the per-GPU EATs (body[1]) for diagnostic detail.
+            let gpus = parse_per_gpu_diagnostics(&body);
+            let agg = aggregate_gpu_diagnostics(&gpus);
 
-        if parsed.verdict != "PASS" {
-            let failed_checks = nras_failed_checks(&parsed.claims);
-            let gpu_arch = nras_str_claim(&parsed.claims, "x-nvidia-gpu-arch").unwrap_or("?");
-            let driver_version =
-                nras_str_claim(&parsed.claims, "x-nvidia-gpu-driver-version").unwrap_or("?");
-            let vbios_version =
-                nras_str_claim(&parsed.claims, "x-nvidia-gpu-vbios-version").unwrap_or("?");
-            let detailed_result = parsed.claims.get("x-nvidia-attestation-detailed-result");
-
-            // Log full diagnostic context once. Caller already wraps the
-            // returned error in a higher-level "Failed to create verified
-            // client" message, so the structured fields here are the only
-            // place the per-claim breakdown surfaces. `detailed_result` is
-            // logged via `?` so the JSON is Debug-formatted lazily — no
-            // allocation when the log is filtered out.
+            // Single structured warning with everything an operator needs to
+            // tell apart "NVIDIA hasn't published a RIM for this driver yet"
+            // from "our cert chain broke" from "GPU is in debug mode". Caller
+            // wraps the returned error string in a higher-level "Failed to
+            // create verified client" message, so this `warn!` is the only
+            // place the per-claim breakdown surfaces.
             tracing::warn!(
-                verdict = %parsed.verdict,
-                failed_checks = ?failed_checks,
-                gpu_arch = %gpu_arch,
-                driver_version = %driver_version,
-                vbios_version = %vbios_version,
-                detailed_result = ?detailed_result,
+                verdict = %verdict,
+                total_gpus = agg.total_gpus,
+                failed_gpus = agg.failed_gpus,
+                hwmodels = ?agg.hwmodels,
+                driver_versions = ?agg.driver_versions,
+                vbios_versions = ?agg.vbios_versions,
+                failed_checks = ?agg.failed_checks,
+                gpu_errors = ?agg.gpu_errors,
+                attestation_warnings = ?agg.warnings,
                 "NVIDIA NRAS attestation failed"
             );
 
-            let summary = if failed_checks.is_empty() {
-                format!(
-                    "NVIDIA attestation verdict: {} (expected PASS)",
-                    parsed.verdict
-                )
-            } else {
-                format!(
-                    "NVIDIA attestation verdict: {} (expected PASS); failed checks: [{}]",
-                    parsed.verdict,
-                    failed_checks.join(", ")
-                )
-            };
+            let summary = format_failure_summary(&verdict, &agg);
             return Err(AttestationVerificationError::GpuVerificationFailed(summary));
         }
 
-        Ok(Some(parsed.verdict))
+        Ok(Some(verdict))
     }
 }
 
-/// Parsed NRAS JWT: the overall verdict plus the full top-level claims map.
-#[derive(Debug)]
-struct NrasJwtClaims {
-    verdict: String,
-    claims: serde_json::Map<String, serde_json::Value>,
-}
-
-/// Decode a NRAS JWT payload and extract the overall verdict and full claims.
+/// Decode a NRAS JWT payload into its claims map.
 ///
-/// The JWT is unsigned (NRAS signs the response envelope, not the JWT body
-/// for our purposes — we trust the TLS connection to NRAS), so we just
+/// Used for both the overall EAT and per-GPU EATs — the two have *different*
+/// claim schemas (overall has `x-nvidia-overall-att-result`; per-GPU has the
+/// per-check booleans and version metadata) so this stays schema-agnostic.
+/// Schema-specific extraction lives in `parse_nras_overall` and
+/// `parse_per_gpu_diagnostics`.
+///
+/// The JWT is unsigned by us (NRAS signs the response envelope, not the JWT
+/// body for our purposes — we trust the TLS connection to NRAS), so we just
 /// base64url-decode the payload segment and parse it as JSON.
-fn parse_nras_jwt(jwt: &str) -> Result<NrasJwtClaims, AttestationVerificationError> {
+fn decode_nras_jwt_claims(
+    jwt: &str,
+) -> Result<serde_json::Map<String, serde_json::Value>, AttestationVerificationError> {
     let parts: Vec<&str> = jwt.split('.').collect();
     if parts.len() < 2 {
         return Err(AttestationVerificationError::GpuVerificationFailed(
@@ -645,18 +641,25 @@ fn parse_nras_jwt(jwt: &str) -> Result<NrasJwtClaims, AttestationVerificationErr
     // Pattern-match to take ownership of the inner Map without cloning, and
     // enumerate the other variants explicitly so a future serde_json change
     // forces us to reconsider the classification.
-    let claims = match payload {
-        serde_json::Value::Object(map) => map,
+    match payload {
+        serde_json::Value::Object(map) => Ok(map),
         serde_json::Value::Null
         | serde_json::Value::Bool(_)
         | serde_json::Value::Number(_)
         | serde_json::Value::String(_)
-        | serde_json::Value::Array(_) => {
-            return Err(AttestationVerificationError::GpuVerificationFailed(
-                "NRAS JWT payload is not a JSON object".to_string(),
-            ));
-        }
-    };
+        | serde_json::Value::Array(_) => Err(AttestationVerificationError::GpuVerificationFailed(
+            "NRAS JWT payload is not a JSON object".to_string(),
+        )),
+    }
+}
+
+/// Decode the overall NRAS EAT and return the verdict string.
+///
+/// Only valid for `body[0][1]` — per-GPU EATs do *not* contain
+/// `x-nvidia-overall-att-result` (they have the per-check booleans instead),
+/// so calling this on a per-GPU JWT will return a "verdict not found" error.
+fn parse_nras_overall(jwt: &str) -> Result<String, AttestationVerificationError> {
+    let claims = decode_nras_jwt_claims(jwt)?;
 
     let result = claims.get("x-nvidia-overall-att-result").ok_or_else(|| {
         AttestationVerificationError::GpuVerificationFailed(
@@ -674,35 +677,20 @@ fn parse_nras_jwt(jwt: &str) -> Result<NrasJwtClaims, AttestationVerificationErr
         | serde_json::Value::Object(_) => result.to_string(),
     };
 
-    Ok(NrasJwtClaims { verdict, claims })
+    Ok(verdict)
 }
 
-/// Collect the names of any NRAS sub-checks that returned `false`.
+/// Collect the names of `x-nvidia-gpu-*` boolean checks that returned `false`
+/// in a single per-GPU claims map. Sorted for stable log output.
 ///
-/// NRAS exposes per-check booleans both as flat top-level claims
-/// (e.g. `x-nvidia-gpu-driver-rim-fetched`) and as a nested
-/// `x-nvidia-attestation-detailed-result` object — different NRAS versions
-/// emit one or the other, so we walk both and emit the bare check name. The
-/// result is sorted and deduped so flat and nested forms collapse together
-/// when both are present.
+/// We only consider keys with the `x-nvidia-gpu-` prefix because NRAS also
+/// emits non-check booleans (e.g. `secboot`) whose `false` value is a piece
+/// of state, not a check failure.
 fn nras_failed_checks(claims: &serde_json::Map<String, serde_json::Value>) -> Vec<String> {
-    const DETAILED_KEY: &str = "x-nvidia-attestation-detailed-result";
-    let mut out: Vec<String> = Vec::new();
-    for (key, value) in claims {
-        if key == "x-nvidia-overall-att-result" {
-            continue;
-        }
-        match value {
-            serde_json::Value::Bool(false) if key.starts_with("x-nvidia-") => {
-                out.push(key.clone());
-            }
-            serde_json::Value::Object(nested) if key == DETAILED_KEY => {
-                for (nested_key, nested_value) in nested {
-                    if matches!(nested_value, serde_json::Value::Bool(false)) {
-                        out.push(nested_key.clone());
-                    }
-                }
-            }
+    let mut out: Vec<String> = claims
+        .iter()
+        .filter_map(|(key, value)| match value {
+            serde_json::Value::Bool(false) if key.starts_with("x-nvidia-gpu-") => Some(key.clone()),
             // Listed explicitly so a future serde_json variant addition forces
             // a compile-time decision rather than silently slipping through.
             serde_json::Value::Null
@@ -710,11 +698,10 @@ fn nras_failed_checks(claims: &serde_json::Map<String, serde_json::Value>) -> Ve
             | serde_json::Value::Number(_)
             | serde_json::Value::String(_)
             | serde_json::Value::Array(_)
-            | serde_json::Value::Object(_) => {}
-        }
-    }
+            | serde_json::Value::Object(_) => None,
+        })
+        .collect();
     out.sort();
-    out.dedup();
     out
 }
 
@@ -725,6 +712,222 @@ fn nras_str_claim<'a>(
     key: &str,
 ) -> Option<&'a str> {
     claims.get(key).and_then(|v| v.as_str())
+}
+
+/// `x-nvidia-error-details` payload that appears on per-GPU JWTs when
+/// NRAS rejected that GPU's evidence (e.g. signature mismatch, nonce
+/// mismatch). Only emitted when there's a hard rejection — happy-path
+/// JWTs use the boolean `x-nvidia-gpu-*` claims instead.
+#[derive(Debug, Default, Clone)]
+struct NrasGpuError {
+    /// Numeric code (e.g. 4010 for `NONCE_NOT_MATCHING`, 4013 for
+    /// `INVALID_EVIDENCE_SIGNATURE`).
+    code: Option<i64>,
+    /// Short machine-readable identifier (e.g. `NONCE_NOT_MATCHING`).
+    message: Option<String>,
+    /// Long human-readable description.
+    description: Option<String>,
+}
+
+impl NrasGpuError {
+    /// One-line label for log lists: prefer the short message, fall back to
+    /// description, fall back to the code.
+    fn short_label(&self) -> String {
+        if let Some(m) = &self.message {
+            return m.clone();
+        }
+        if let Some(d) = &self.description {
+            return d.clone();
+        }
+        if let Some(c) = self.code {
+            return format!("code:{c}");
+        }
+        "unknown_error".to_string()
+    }
+
+    fn is_present(&self) -> bool {
+        self.code.is_some() || self.message.is_some() || self.description.is_some()
+    }
+}
+
+fn parse_nras_gpu_error(claims: &serde_json::Map<String, serde_json::Value>) -> NrasGpuError {
+    let Some(obj) = claims
+        .get("x-nvidia-error-details")
+        .and_then(|v| v.as_object())
+    else {
+        return NrasGpuError::default();
+    };
+    NrasGpuError {
+        code: obj.get("code").and_then(|v| v.as_i64()),
+        message: obj
+            .get("message")
+            .and_then(|v| v.as_str())
+            .map(String::from),
+        description: obj
+            .get("description")
+            .and_then(|v| v.as_str())
+            .map(String::from),
+    }
+}
+
+/// Diagnostic claims extracted from one GPU's EAT JWT.
+///
+/// NRAS uses one of two per-GPU JWT shapes depending on whether the GPU's
+/// evidence verified successfully:
+///
+/// - **Pass shape:** `hwmodel`, `x-nvidia-gpu-driver-version`,
+///   `x-nvidia-gpu-vbios-version`, and the 17 `x-nvidia-gpu-*` boolean
+///   checks (some of which may be `false` even on an overall-PASS verdict).
+/// - **Fail shape:** none of the above — just the JWT envelope plus an
+///   `x-nvidia-error-details` object carrying a code, short message, and
+///   description (e.g. `4013 / INVALID_EVIDENCE_SIGNATURE`).
+///
+/// We extract whichever is present; both are valuable for triage.
+#[derive(Debug, Default, Clone)]
+struct GpuDiagnostic {
+    gpu_id: String,
+    hwmodel: Option<String>,
+    driver_version: Option<String>,
+    vbios_version: Option<String>,
+    warning: Option<String>,
+    failed_checks: Vec<String>,
+    error: NrasGpuError,
+}
+
+impl GpuDiagnostic {
+    /// A GPU "failed" if it has either a hard error from NRAS or any
+    /// `x-nvidia-gpu-*: false` boolean check.
+    fn is_failed(&self) -> bool {
+        self.error.is_present() || !self.failed_checks.is_empty()
+    }
+}
+
+/// Parse the per-GPU EAT JWTs from `body[1]` of an NRAS response.
+///
+/// Returns one `GpuDiagnostic` per successfully parsed GPU JWT, sorted by
+/// `gpu_id` so log output is stable. JWTs that fail to parse are skipped —
+/// we already know the overall verdict at this point and the goal here is
+/// best-effort diagnostic, not validation.
+fn parse_per_gpu_diagnostics(body: &serde_json::Value) -> Vec<GpuDiagnostic> {
+    let Some(arr) = body.as_array() else {
+        return Vec::new();
+    };
+    let Some(map) = arr.get(1).and_then(|v| v.as_object()) else {
+        return Vec::new();
+    };
+
+    let mut out: Vec<GpuDiagnostic> = map
+        .iter()
+        .filter_map(|(gpu_id, jwt_value)| {
+            let jwt = jwt_value.as_str()?;
+            // Per-GPU JWTs do NOT contain `x-nvidia-overall-att-result`, so
+            // decode claims directly instead of going through
+            // `parse_nras_overall` (which would error on every GPU).
+            let claims = decode_nras_jwt_claims(jwt).ok()?;
+            Some(GpuDiagnostic {
+                gpu_id: gpu_id.clone(),
+                hwmodel: nras_str_claim(&claims, "hwmodel").map(String::from),
+                driver_version: nras_str_claim(&claims, "x-nvidia-gpu-driver-version")
+                    .map(String::from),
+                vbios_version: nras_str_claim(&claims, "x-nvidia-gpu-vbios-version")
+                    .map(String::from),
+                warning: nras_str_claim(&claims, "x-nvidia-attestation-warning").map(String::from),
+                failed_checks: nras_failed_checks(&claims),
+                error: parse_nras_gpu_error(&claims),
+            })
+        })
+        .collect();
+    out.sort_by(|a, b| a.gpu_id.cmp(&b.gpu_id));
+    out
+}
+
+/// Aggregated view across every GPU in an NRAS response, formatted for
+/// inclusion in a single log line. Distinct sets are used for metadata so
+/// heterogeneous-GPU hosts surface the variance instead of hiding it behind
+/// "the first GPU's value".
+#[derive(Debug, Default)]
+struct AggregatedGpuDiagnostics {
+    total_gpus: usize,
+    failed_gpus: usize,
+    hwmodels: Vec<String>,
+    driver_versions: Vec<String>,
+    vbios_versions: Vec<String>,
+    warnings: Vec<String>,
+    /// Union of `x-nvidia-gpu-*: false` check names across all GPUs.
+    failed_checks: Vec<String>,
+    /// Union of NRAS error labels (e.g. `NONCE_NOT_MATCHING`,
+    /// `INVALID_EVIDENCE_SIGNATURE`) extracted from per-GPU
+    /// `x-nvidia-error-details` objects. Distinct from `failed_checks`
+    /// because the two come from different (mutually exclusive) JWT shapes.
+    gpu_errors: Vec<String>,
+}
+
+fn aggregate_gpu_diagnostics(gpus: &[GpuDiagnostic]) -> AggregatedGpuDiagnostics {
+    use std::collections::BTreeSet;
+    let mut hwmodels = BTreeSet::new();
+    let mut drivers = BTreeSet::new();
+    let mut vbios = BTreeSet::new();
+    let mut warnings = BTreeSet::new();
+    let mut checks = BTreeSet::new();
+    let mut errors = BTreeSet::new();
+    let mut failed_gpu_count = 0;
+
+    for g in gpus {
+        if g.is_failed() {
+            failed_gpu_count += 1;
+        }
+        if let Some(s) = &g.hwmodel {
+            hwmodels.insert(s.clone());
+        }
+        if let Some(s) = &g.driver_version {
+            drivers.insert(s.clone());
+        }
+        if let Some(s) = &g.vbios_version {
+            vbios.insert(s.clone());
+        }
+        if let Some(s) = &g.warning {
+            warnings.insert(s.clone());
+        }
+        for c in &g.failed_checks {
+            checks.insert(c.clone());
+        }
+        if g.error.is_present() {
+            errors.insert(g.error.short_label());
+        }
+    }
+
+    AggregatedGpuDiagnostics {
+        total_gpus: gpus.len(),
+        failed_gpus: failed_gpu_count,
+        hwmodels: hwmodels.into_iter().collect(),
+        driver_versions: drivers.into_iter().collect(),
+        vbios_versions: vbios.into_iter().collect(),
+        warnings: warnings.into_iter().collect(),
+        failed_checks: checks.into_iter().collect(),
+        gpu_errors: errors.into_iter().collect(),
+    }
+}
+
+fn format_failure_summary(verdict: &str, agg: &AggregatedGpuDiagnostics) -> String {
+    let base = format!("NVIDIA attestation verdict: {verdict} (expected PASS)");
+    if agg.total_gpus == 0 {
+        // No per-GPU detail to add.
+        return base;
+    }
+    let mut s = format!(
+        "{base}; {}/{} GPU(s) failed",
+        agg.failed_gpus, agg.total_gpus
+    );
+    if !agg.failed_checks.is_empty() {
+        s.push_str(&format!(
+            "; failed checks: [{}]",
+            agg.failed_checks.join(", ")
+        ));
+    }
+    if !agg.gpu_errors.is_empty() {
+        s.push_str(&format!("; gpu errors: [{}]", agg.gpu_errors.join(", ")));
+    }
+    s
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -765,138 +968,613 @@ mod tests {
         format!("{header}.{body}.")
     }
 
-    #[test]
-    fn parse_nras_jwt_pass_boolean() {
-        let jwt = make_jwt(json!({
-            "x-nvidia-overall-att-result": true,
-            "x-nvidia-gpu-arch": "HOPPER",
-        }));
-        let parsed = parse_nras_jwt(&jwt).unwrap();
-        assert_eq!(parsed.verdict, "PASS");
-        assert_eq!(
-            parsed
-                .claims
-                .get("x-nvidia-gpu-arch")
-                .and_then(|v| v.as_str()),
-            Some("HOPPER")
-        );
+    /// Build a fake NRAS response in the wire format observed in production:
+    ///   [["JWT", overall_eat], {"GPU-0": jwt, ...}]
+    fn make_nras_response(
+        overall: serde_json::Value,
+        per_gpu: Vec<(&str, serde_json::Value)>,
+    ) -> serde_json::Value {
+        let gpus: serde_json::Map<String, serde_json::Value> = per_gpu
+            .into_iter()
+            .map(|(id, claims)| (id.to_string(), serde_json::Value::String(make_jwt(claims))))
+            .collect();
+        json!([["JWT", make_jwt(overall)], serde_json::Value::Object(gpus),])
     }
 
-    #[test]
-    fn parse_nras_jwt_fail_string() {
-        let jwt = make_jwt(json!({"x-nvidia-overall-att-result": "FAIL"}));
-        let parsed = parse_nras_jwt(&jwt).unwrap();
-        assert_eq!(parsed.verdict, "FAIL");
-    }
-
-    #[test]
-    fn parse_nras_jwt_missing_verdict() {
-        let jwt = make_jwt(json!({"x-nvidia-gpu-arch": "HOPPER"}));
-        let err = parse_nras_jwt(&jwt).unwrap_err();
-        let msg = err.to_string();
-        assert!(
-            msg.contains("x-nvidia-overall-att-result not found"),
-            "{msg}"
-        );
-    }
-
-    #[test]
-    fn nras_failed_checks_collects_flat_booleans() {
-        let claims = json!({
-            "x-nvidia-overall-att-result": false,
-            "x-nvidia-gpu-driver-rim-fetched": false,
+    /// Realistic per-GPU claims, modeled on a captured production NRAS
+    /// response. `failed` flips a subset of the boolean checks to `false`.
+    ///
+    /// Important: real per-GPU EATs do **not** contain
+    /// `x-nvidia-overall-att-result` — that claim only appears in the
+    /// overall EAT at `body[0][1]`. Including it here would mask the bug
+    /// class where code accidentally reuses an "overall verdict"-style
+    /// parser on per-GPU JWTs (which is exactly the miss this PR fixes).
+    fn realistic_gpu_claims(
+        driver: &str,
+        vbios: &str,
+        hwmodel: &str,
+        failed: &[&str],
+    ) -> serde_json::Value {
+        let mut obj = json!({
+            "iss": "https://nras.attestation.nvidia.com",
+            "eat_nonce": "deadbeef",
+            "iat": 1_777_893_228_i64,
+            "exp": 1_777_896_828_i64,
+            "nbf": 1_777_893_228_i64,
+            "ueid": "1",
+            "jti": "2144daf6-da5e-454c-a7ee-ae7694d07bf4",
+            "hwmodel": hwmodel,
+            "oemid": "5703",
+            "dbgstat": "disabled",
+            "secboot": true,
+            "measres": "success",
+            "x-nvidia-gpu-driver-version": driver,
+            "x-nvidia-gpu-vbios-version": vbios,
+            "x-nvidia-attestation-warning": null,
+            // The 17 boolean checks observed in the captured response,
+            // all PASS by default.
+            "x-nvidia-gpu-arch-check": true,
             "x-nvidia-gpu-attestation-report-cert-chain-validated": true,
-            "x-nvidia-gpu-vbios-rim-version-match": false,
-            "x-nvidia-gpu-arch": "HOPPER",
-            "iat": 123,
-        })
-        .as_object()
-        .unwrap()
-        .clone();
-        let failed = nras_failed_checks(&claims);
-        assert_eq!(
-            failed,
-            vec![
-                "x-nvidia-gpu-driver-rim-fetched".to_string(),
-                "x-nvidia-gpu-vbios-rim-version-match".to_string(),
-            ]
+            "x-nvidia-gpu-attestation-report-nonce-match": true,
+            "x-nvidia-gpu-attestation-report-parsed": true,
+            "x-nvidia-gpu-attestation-report-signature-verified": true,
+            "x-nvidia-gpu-driver-rim-cert-validated": true,
+            "x-nvidia-gpu-driver-rim-fetched": true,
+            "x-nvidia-gpu-driver-rim-measurements-available": true,
+            "x-nvidia-gpu-driver-rim-schema-validated": true,
+            "x-nvidia-gpu-driver-rim-signature-verified": true,
+            "x-nvidia-gpu-vbios-index-no-conflict": true,
+            "x-nvidia-gpu-vbios-rim-cert-validated": true,
+            "x-nvidia-gpu-vbios-rim-fetched": true,
+            "x-nvidia-gpu-vbios-rim-measurements-available": true,
+            "x-nvidia-gpu-vbios-rim-schema-validated": true,
+            "x-nvidia-gpu-vbios-rim-signature-verified": true,
+        });
+        let map = obj.as_object_mut().expect("object");
+        for f in failed {
+            map.insert((*f).to_string(), json!(false));
+        }
+        obj
+    }
+
+    #[test]
+    fn parse_nras_overall_pass_boolean() {
+        let jwt = make_jwt(json!({"x-nvidia-overall-att-result": true}));
+        assert_eq!(parse_nras_overall(&jwt).unwrap(), "PASS");
+    }
+
+    #[test]
+    fn parse_nras_overall_fail_string() {
+        let jwt = make_jwt(json!({"x-nvidia-overall-att-result": "FAIL"}));
+        assert_eq!(parse_nras_overall(&jwt).unwrap(), "FAIL");
+    }
+
+    #[test]
+    fn parse_nras_overall_fail_boolean() {
+        let jwt = make_jwt(json!({"x-nvidia-overall-att-result": false}));
+        assert_eq!(parse_nras_overall(&jwt).unwrap(), "FAIL");
+    }
+
+    #[test]
+    fn parse_nras_overall_missing_verdict_errors() {
+        // A per-GPU EAT lacks `x-nvidia-overall-att-result` — feeding one
+        // to the overall parser must fail loudly so callers don't silently
+        // dispatch the wrong parser. (The previous version of this PR did
+        // exactly that for per-GPU JWTs.)
+        let jwt = make_jwt(realistic_gpu_claims(
+            "570.172.08",
+            "96.00.CF.00.02",
+            "GH100",
+            &[],
+        ));
+        let err = parse_nras_overall(&jwt).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("x-nvidia-overall-att-result not found"),
+            "{err}"
         );
     }
 
     #[test]
-    fn nras_failed_checks_walks_nested_detailed_result() {
-        let claims = json!({
-            "x-nvidia-overall-att-result": false,
-            "x-nvidia-attestation-detailed-result": {
-                "x-nvidia-gpu-driver-rim-fetched": false,
-                "x-nvidia-gpu-vbios-rim-cert-validated": true,
-                "x-nvidia-gpu-arch-check": false,
-            },
-        })
-        .as_object()
-        .unwrap()
-        .clone();
-        let failed = nras_failed_checks(&claims);
+    fn decode_nras_jwt_claims_works_for_per_gpu_eat() {
+        // Per-GPU EAT — no `x-nvidia-overall-att-result`. The claims
+        // decoder must accept it.
+        let jwt = make_jwt(realistic_gpu_claims(
+            "570.172.08",
+            "96.00.CF.00.02",
+            "GH100",
+            &["x-nvidia-gpu-driver-rim-fetched"],
+        ));
+        let claims = decode_nras_jwt_claims(&jwt).expect("decode");
         assert_eq!(
-            failed,
-            vec![
-                "x-nvidia-gpu-arch-check".to_string(),
-                "x-nvidia-gpu-driver-rim-fetched".to_string(),
-            ]
+            claims
+                .get("x-nvidia-gpu-driver-rim-fetched")
+                .and_then(|v| v.as_bool()),
+            Some(false)
+        );
+        assert_eq!(
+            claims.get("hwmodel").and_then(|v| v.as_str()),
+            Some("GH100")
         );
     }
 
     #[test]
-    fn nras_failed_checks_dedupes_flat_and_nested_overlap() {
-        // Some NRAS versions emit both forms simultaneously; make sure
-        // operators see one entry per failed check, not two.
+    fn nras_failed_checks_only_collects_x_nvidia_gpu_booleans() {
+        // Mix of real-shape claims: x-nvidia-gpu-* booleans (the only ones
+        // we should pick up), other booleans like `secboot`, string
+        // metadata, and a non-x-nvidia-gpu boolean like `measres` (which
+        // is actually a string in real NRAS but the test pins behavior
+        // even if the schema drifts).
         let claims = json!({
             "x-nvidia-overall-att-result": false,
             "x-nvidia-gpu-driver-rim-fetched": false,
-            "x-nvidia-attestation-detailed-result": {
-                "x-nvidia-gpu-driver-rim-fetched": false,
-                "x-nvidia-gpu-vbios-rim-version-match": false,
-            },
+            "x-nvidia-gpu-vbios-rim-cert-validated": false,
+            "x-nvidia-gpu-arch-check": true,
+            "secboot": false,
+            "x-nvidia-gpu-driver-version": "570.172.08",
+            "x-nvidia-attestation-warning": null,
         })
         .as_object()
         .unwrap()
         .clone();
-        let failed = nras_failed_checks(&claims);
         assert_eq!(
-            failed,
+            nras_failed_checks(&claims),
             vec![
                 "x-nvidia-gpu-driver-rim-fetched".to_string(),
-                "x-nvidia-gpu-vbios-rim-version-match".to_string(),
+                "x-nvidia-gpu-vbios-rim-cert-validated".to_string(),
             ]
         );
-    }
-
-    #[test]
-    fn nras_failed_checks_ignores_other_objects_named_with_detailed_substring() {
-        // A future NRAS field that happens to contain "detailed-result" in
-        // its name should NOT be walked — we only descend into the exact
-        // canonical key. (This is the precision the reviewers asked for.)
-        let claims = json!({
-            "x-nvidia-overall-att-result": false,
-            "x-nvidia-some-other-detailed-result": {
-                "should-not-appear": false,
-            },
-        })
-        .as_object()
-        .unwrap()
-        .clone();
-        assert!(nras_failed_checks(&claims).is_empty());
     }
 
     #[test]
     fn nras_failed_checks_empty_when_all_pass() {
-        let claims = json!({
-            "x-nvidia-overall-att-result": true,
-            "x-nvidia-gpu-driver-rim-fetched": true,
-        })
-        .as_object()
-        .unwrap()
-        .clone();
+        let claims = realistic_gpu_claims("570.172.08", "96.00.CF.00.02", "GH100", &[])
+            .as_object()
+            .unwrap()
+            .clone();
         assert!(nras_failed_checks(&claims).is_empty());
+    }
+
+    #[test]
+    fn parse_per_gpu_diagnostics_extracts_versions_and_failed_checks() {
+        // Two GPUs: one healthy, one with two failed checks. Same driver
+        // and hwmodel, different VBIOS to exercise the distinct-set
+        // aggregation path.
+        let body = make_nras_response(
+            json!({"x-nvidia-overall-att-result": false}),
+            vec![
+                (
+                    "GPU-0",
+                    realistic_gpu_claims("570.172.08", "96.00.CF.00.02", "GH100", &[]),
+                ),
+                (
+                    "GPU-1",
+                    realistic_gpu_claims(
+                        "570.172.08",
+                        "96.00.CF.00.99",
+                        "GH100",
+                        &[
+                            "x-nvidia-gpu-driver-rim-fetched",
+                            "x-nvidia-gpu-vbios-rim-fetched",
+                        ],
+                    ),
+                ),
+            ],
+        );
+        let gpus = parse_per_gpu_diagnostics(&body);
+        assert_eq!(gpus.len(), 2);
+        // Sorted by gpu_id.
+        assert_eq!(gpus[0].gpu_id, "GPU-0");
+        assert_eq!(gpus[1].gpu_id, "GPU-1");
+        assert_eq!(gpus[0].failed_checks.len(), 0);
+        assert_eq!(
+            gpus[1].failed_checks,
+            vec![
+                "x-nvidia-gpu-driver-rim-fetched".to_string(),
+                "x-nvidia-gpu-vbios-rim-fetched".to_string(),
+            ]
+        );
+        assert_eq!(gpus[0].driver_version.as_deref(), Some("570.172.08"));
+        assert_eq!(gpus[1].vbios_version.as_deref(), Some("96.00.CF.00.99"));
+        assert_eq!(gpus[0].hwmodel.as_deref(), Some("GH100"));
+    }
+
+    #[test]
+    fn parse_per_gpu_diagnostics_returns_empty_when_body_shape_unexpected() {
+        // body missing index 1
+        assert!(parse_per_gpu_diagnostics(&json!([["JWT", "x.y.z"]])).is_empty());
+        // body[1] not an object
+        assert!(parse_per_gpu_diagnostics(&json!([["JWT", "x.y.z"], "wat"])).is_empty());
+        // body not an array
+        assert!(parse_per_gpu_diagnostics(&json!({"foo": "bar"})).is_empty());
+    }
+
+    #[test]
+    fn parse_per_gpu_diagnostics_skips_unparseable_jwt_entries() {
+        // GPU-0's JWT is malformed; GPU-1 is valid. We should still get
+        // GPU-1 back (best-effort diagnostic).
+        let body = json!([
+            ["JWT", "x.y.z"],
+            {
+                "GPU-0": "not-a-jwt",
+                "GPU-1": make_jwt(realistic_gpu_claims("570.172.08", "96.00.CF.00.02", "GH100", &["x-nvidia-gpu-driver-rim-fetched"])),
+            }
+        ]);
+        let gpus = parse_per_gpu_diagnostics(&body);
+        assert_eq!(gpus.len(), 1);
+        assert_eq!(gpus[0].gpu_id, "GPU-1");
+        assert_eq!(gpus[0].failed_checks.len(), 1);
+    }
+
+    #[test]
+    fn aggregate_gpu_diagnostics_dedupes_metadata_and_unions_failed_checks() {
+        let gpus = vec![
+            GpuDiagnostic {
+                gpu_id: "GPU-0".into(),
+                hwmodel: Some("GH100".into()),
+                driver_version: Some("570.172.08".into()),
+                vbios_version: Some("96.00.CF.00.02".into()),
+                warning: None,
+                failed_checks: vec!["x-nvidia-gpu-driver-rim-fetched".into()],
+                error: NrasGpuError::default(),
+            },
+            GpuDiagnostic {
+                gpu_id: "GPU-1".into(),
+                hwmodel: Some("GH100".into()), // same hwmodel — should dedupe
+                driver_version: Some("570.172.08".into()), // same driver
+                vbios_version: Some("96.00.CF.00.99".into()), // distinct vbios
+                warning: Some("clock skew".into()),
+                failed_checks: vec![
+                    "x-nvidia-gpu-driver-rim-fetched".into(), // overlap with GPU-0
+                    "x-nvidia-gpu-vbios-rim-fetched".into(),
+                ],
+                error: NrasGpuError::default(),
+            },
+            GpuDiagnostic {
+                gpu_id: "GPU-2".into(),
+                hwmodel: Some("GH100".into()),
+                driver_version: Some("570.172.08".into()),
+                vbios_version: Some("96.00.CF.00.02".into()),
+                warning: None,
+                failed_checks: vec![], // not failed
+                error: NrasGpuError::default(),
+            },
+        ];
+        let agg = aggregate_gpu_diagnostics(&gpus);
+        assert_eq!(agg.total_gpus, 3);
+        assert_eq!(agg.failed_gpus, 2);
+        assert_eq!(agg.hwmodels, vec!["GH100".to_string()]);
+        assert_eq!(agg.driver_versions, vec!["570.172.08".to_string()]);
+        assert_eq!(
+            agg.vbios_versions,
+            vec!["96.00.CF.00.02".to_string(), "96.00.CF.00.99".to_string()]
+        );
+        assert_eq!(agg.warnings, vec!["clock skew".to_string()]);
+        assert_eq!(
+            agg.failed_checks,
+            vec![
+                "x-nvidia-gpu-driver-rim-fetched".to_string(),
+                "x-nvidia-gpu-vbios-rim-fetched".to_string(),
+            ]
+        );
+        assert!(agg.gpu_errors.is_empty());
+    }
+
+    #[test]
+    fn aggregate_gpu_diagnostics_counts_error_only_gpus_as_failed_and_dedupes_errors() {
+        // Mirrors the real-world FAIL shape: failing GPUs have ONLY the
+        // x-nvidia-error-details payload — no version metadata, no
+        // boolean checks. Same error code on multiple GPUs (e.g. the
+        // captured nonce-mismatch case where every GPU got 4010) should
+        // collapse to one entry in `gpu_errors`.
+        let make_err = |id: &str, msg: &str| GpuDiagnostic {
+            gpu_id: id.into(),
+            error: NrasGpuError {
+                code: Some(4010),
+                message: Some(msg.into()),
+                description: None,
+            },
+            ..GpuDiagnostic::default()
+        };
+        let gpus = vec![
+            make_err("GPU-0", "NONCE_NOT_MATCHING"),
+            make_err("GPU-1", "NONCE_NOT_MATCHING"),
+            make_err("GPU-2", "NONCE_NOT_MATCHING"),
+        ];
+        let agg = aggregate_gpu_diagnostics(&gpus);
+        assert_eq!(agg.total_gpus, 3);
+        assert_eq!(agg.failed_gpus, 3);
+        assert!(agg.failed_checks.is_empty());
+        assert_eq!(agg.gpu_errors, vec!["NONCE_NOT_MATCHING".to_string()]);
+        // No version metadata extracted from error-only GPUs — that's
+        // expected and documented.
+        assert!(agg.hwmodels.is_empty());
+        assert!(agg.driver_versions.is_empty());
+    }
+
+    #[test]
+    fn format_failure_summary_includes_gpu_count_and_checks() {
+        let agg = AggregatedGpuDiagnostics {
+            total_gpus: 8,
+            failed_gpus: 2,
+            failed_checks: vec![
+                "x-nvidia-gpu-driver-rim-fetched".into(),
+                "x-nvidia-gpu-vbios-rim-fetched".into(),
+            ],
+            ..Default::default()
+        };
+        let s = format_failure_summary("FAIL", &agg);
+        assert_eq!(
+            s,
+            "NVIDIA attestation verdict: FAIL (expected PASS); 2/8 GPU(s) failed; \
+             failed checks: [x-nvidia-gpu-driver-rim-fetched, x-nvidia-gpu-vbios-rim-fetched]"
+        );
+    }
+
+    #[test]
+    fn format_failure_summary_handles_no_per_gpu_detail() {
+        // body[1] missing entirely → no per-GPU diagnostic available.
+        let agg = AggregatedGpuDiagnostics::default();
+        assert_eq!(
+            format_failure_summary("FAIL", &agg),
+            "NVIDIA attestation verdict: FAIL (expected PASS)"
+        );
+    }
+
+    /// Realistic per-GPU FAIL claims, modeled on a captured production
+    /// NRAS response from a tampered-evidence rejection. NRAS strips
+    /// every diagnostic claim and replaces them with a single
+    /// `x-nvidia-error-details` object — no `hwmodel`, no driver/vbios
+    /// version, no per-check booleans.
+    fn realistic_failed_gpu_claims(
+        code: i64,
+        message: &str,
+        description: &str,
+    ) -> serde_json::Value {
+        json!({
+            "iss": "https://nras.attestation.nvidia.com",
+            "iat": 1_777_896_875_i64,
+            "exp": 1_777_900_475_i64,
+            "nbf": 1_777_896_875_i64,
+            "jti": "deadbeef",
+            "x-nvidia-error-details": {
+                "code": code,
+                "fieldName": null,
+                "httpStatus": "400 BAD_REQUEST",
+                "description": description,
+                "message": message,
+            }
+        })
+    }
+
+    #[test]
+    fn parse_per_gpu_diagnostics_extracts_error_details() {
+        // 8 GPUs, all rejected with NONCE_NOT_MATCHING — the captured
+        // shape from the production-style nonce mismatch case.
+        let per_gpu: Vec<(&str, serde_json::Value)> = (0..8)
+            .map(|i| {
+                let id = [
+                    "GPU-0", "GPU-1", "GPU-2", "GPU-3", "GPU-4", "GPU-5", "GPU-6", "GPU-7",
+                ][i];
+                (
+                    id,
+                    realistic_failed_gpu_claims(
+                        4010,
+                        "NONCE_NOT_MATCHING",
+                        "Nonce from request is not matching with evidence nonce ",
+                    ),
+                )
+            })
+            .collect();
+        let body = make_nras_response(json!({"x-nvidia-overall-att-result": false}), per_gpu);
+        let gpus = parse_per_gpu_diagnostics(&body);
+        assert_eq!(gpus.len(), 8);
+        for g in &gpus {
+            assert!(g.is_failed(), "{}", g.gpu_id);
+            assert_eq!(g.error.code, Some(4010));
+            assert_eq!(g.error.message.as_deref(), Some("NONCE_NOT_MATCHING"));
+            assert!(g.failed_checks.is_empty());
+            assert!(g.hwmodel.is_none());
+        }
+        let agg = aggregate_gpu_diagnostics(&gpus);
+        assert_eq!(agg.failed_gpus, 8);
+        assert_eq!(agg.gpu_errors, vec!["NONCE_NOT_MATCHING".to_string()]);
+    }
+
+    #[test]
+    fn parse_per_gpu_diagnostics_handles_mixed_pass_and_fail_gpus() {
+        // The captured tampered-evidence case: GPU-0 fails with a
+        // signature error, GPU-1 through GPU-7 pass. Aggregate should
+        // report 1/8 failed plus the error label, while still picking up
+        // metadata from the passing GPUs.
+        let mut per_gpu: Vec<(&str, serde_json::Value)> = vec![(
+            "GPU-0",
+            realistic_failed_gpu_claims(
+                4013,
+                "INVALID_EVIDENCE_SIGNATURE",
+                "Attestation Report Signature is Invalid",
+            ),
+        )];
+        for id in [
+            "GPU-1", "GPU-2", "GPU-3", "GPU-4", "GPU-5", "GPU-6", "GPU-7",
+        ] {
+            per_gpu.push((
+                id,
+                realistic_gpu_claims("570.172.08", "96.00.CF.00.02", "GH100", &[]),
+            ));
+        }
+        let body = make_nras_response(json!({"x-nvidia-overall-att-result": false}), per_gpu);
+        let agg = aggregate_gpu_diagnostics(&parse_per_gpu_diagnostics(&body));
+        assert_eq!(agg.total_gpus, 8);
+        assert_eq!(agg.failed_gpus, 1);
+        assert_eq!(
+            agg.gpu_errors,
+            vec!["INVALID_EVIDENCE_SIGNATURE".to_string()]
+        );
+        assert_eq!(agg.hwmodels, vec!["GH100".to_string()]);
+        assert_eq!(agg.driver_versions, vec!["570.172.08".to_string()]);
+    }
+
+    #[test]
+    fn nras_gpu_error_short_label_prefers_message_then_description_then_code() {
+        let with_msg = NrasGpuError {
+            code: Some(4010),
+            message: Some("NONCE_NOT_MATCHING".into()),
+            description: Some("Nonce mismatch".into()),
+        };
+        assert_eq!(with_msg.short_label(), "NONCE_NOT_MATCHING");
+
+        let without_msg = NrasGpuError {
+            code: Some(9999),
+            message: None,
+            description: Some("Some new error NRAS hasn't given us a short name for".into()),
+        };
+        assert_eq!(
+            without_msg.short_label(),
+            "Some new error NRAS hasn't given us a short name for"
+        );
+
+        let bare = NrasGpuError {
+            code: Some(1234),
+            message: None,
+            description: None,
+        };
+        assert_eq!(bare.short_label(), "code:1234");
+
+        let empty = NrasGpuError::default();
+        assert_eq!(empty.short_label(), "unknown_error");
+        assert!(!empty.is_present());
+    }
+
+    #[test]
+    fn format_failure_summary_includes_gpu_errors() {
+        let agg = AggregatedGpuDiagnostics {
+            total_gpus: 8,
+            failed_gpus: 8,
+            gpu_errors: vec!["NONCE_NOT_MATCHING".into()],
+            ..Default::default()
+        };
+        let s = format_failure_summary("FAIL", &agg);
+        assert_eq!(
+            s,
+            "NVIDIA attestation verdict: FAIL (expected PASS); 8/8 GPU(s) failed; \
+             gpu errors: [NONCE_NOT_MATCHING]"
+        );
+    }
+
+    #[test]
+    fn end_to_end_fail_pipeline_produces_actionable_summary() {
+        // Mimic a realistic FAIL scenario: 8 GPUs, 2 of them with the same
+        // RIM-fetch failure (the most common production pattern when NVIDIA
+        // hasn't published a RIM for a new driver version yet).
+        let mut per_gpu = Vec::new();
+        for i in 0..8 {
+            let id = format!("GPU-{i}");
+            let claims = if i < 2 {
+                realistic_gpu_claims(
+                    "570.999.00",
+                    "96.00.CF.00.02",
+                    "GH100",
+                    &["x-nvidia-gpu-driver-rim-fetched"],
+                )
+            } else {
+                realistic_gpu_claims("570.999.00", "96.00.CF.00.02", "GH100", &[])
+            };
+            per_gpu.push((id, claims));
+        }
+        let body = make_nras_response(
+            json!({"x-nvidia-overall-att-result": false}),
+            per_gpu
+                .iter()
+                .map(|(s, c)| (s.as_str(), c.clone()))
+                .collect(),
+        );
+        let gpus = parse_per_gpu_diagnostics(&body);
+        let agg = aggregate_gpu_diagnostics(&gpus);
+        assert_eq!(agg.total_gpus, 8);
+        assert_eq!(agg.failed_gpus, 2);
+        assert_eq!(agg.driver_versions, vec!["570.999.00".to_string()]);
+        assert_eq!(agg.hwmodels, vec!["GH100".to_string()]);
+        let summary = format_failure_summary("FAIL", &agg);
+        assert_eq!(
+            summary,
+            "NVIDIA attestation verdict: FAIL (expected PASS); 2/8 GPU(s) failed; \
+             failed checks: [x-nvidia-gpu-driver-rim-fetched]"
+        );
+    }
+
+    /// Local-only sanity check against a captured production NRAS response.
+    /// Skipped in CI — set `NRAS_FIXTURE` to a JSON file containing the raw
+    /// NRAS response body to run.
+    ///
+    /// Catches the bug class where the parser compiles, runs, but silently
+    /// drops every real field (the empty-fields outcome that #561 and #569
+    /// each produced before reaching staging). Asserts that *something*
+    /// from each useful claim type is extracted: either pass-shape metadata
+    /// or fail-shape error details, depending on what the real response
+    /// contains. An empty result for both is the bug.
+    #[test]
+    #[ignore]
+    fn parse_per_gpu_diagnostics_against_captured_response() {
+        let path = match std::env::var("NRAS_FIXTURE") {
+            Ok(v) => v,
+            Err(_) => {
+                eprintln!("skipped: NRAS_FIXTURE env var not set");
+                return;
+            }
+        };
+        let body: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let gpus = parse_per_gpu_diagnostics(&body);
+        let agg = aggregate_gpu_diagnostics(&gpus);
+        eprintln!("captured: total_gpus={}", agg.total_gpus);
+        eprintln!("captured: failed_gpus={}", agg.failed_gpus);
+        eprintln!("captured: hwmodels={:?}", agg.hwmodels);
+        eprintln!("captured: driver_versions={:?}", agg.driver_versions);
+        eprintln!("captured: vbios_versions={:?}", agg.vbios_versions);
+        eprintln!("captured: failed_checks={:?}", agg.failed_checks);
+        eprintln!("captured: gpu_errors={:?}", agg.gpu_errors);
+
+        assert!(agg.total_gpus > 0, "expected ≥1 GPU in real response");
+
+        // At least one diagnostic surface must be populated. Pass-shape
+        // GPUs give us metadata; fail-shape GPUs give us errors. Both
+        // empty is the silent-drop bug we're guarding against.
+        let has_pass_metadata = !agg.hwmodels.is_empty()
+            && !agg.driver_versions.is_empty()
+            && !agg.vbios_versions.is_empty();
+        let has_fail_errors = !agg.gpu_errors.is_empty();
+        assert!(
+            has_pass_metadata || has_fail_errors,
+            "captured response yielded neither pass-shape metadata nor fail-shape errors — \
+             parser is silently dropping real fields"
+        );
+
+        // Cross-checks based on what's present.
+        if agg.failed_gpus > 0 && !has_fail_errors {
+            // Some failures use the boolean-check shape instead of
+            // error-details. That's fine — failed_checks should be
+            // non-empty in that case.
+            assert!(
+                !agg.failed_checks.is_empty(),
+                "failed_gpus={} but neither gpu_errors nor failed_checks populated",
+                agg.failed_gpus
+            );
+        }
+    }
+
+    #[test]
+    fn format_failure_summary_omits_check_list_when_unknown_but_keeps_count() {
+        // Some failure modes (e.g. missing claims) yield 0 failed checks
+        // but we still know the GPU count from body[1].
+        let agg = AggregatedGpuDiagnostics {
+            total_gpus: 8,
+            failed_gpus: 0,
+            ..Default::default()
+        };
+        assert_eq!(
+            format_failure_summary("FAIL", &agg),
+            "NVIDIA attestation verdict: FAIL (expected PASS); 0/8 GPU(s) failed"
+        );
     }
 }

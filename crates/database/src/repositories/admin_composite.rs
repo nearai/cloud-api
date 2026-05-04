@@ -4,12 +4,13 @@ use crate::repositories::{
     ModelAliasRepository, ModelRepository, OrganizationLimitsRepository, ServiceRepository,
     UserRepository,
 };
-use anyhow::Result;
+use anyhow::{Context, Result};
 use async_trait::async_trait;
 use services::admin::{
-    AdminModelInfo, AdminOrganizationInfo, AdminRepository, ModelHistoryEntry, ModelPricing,
-    OrganizationLimits, OrganizationLimitsHistoryEntry, OrganizationLimitsUpdate,
-    PlatformServiceInfo, UpdateModelAdminRequest, UserInfo, UserOrganizationInfo,
+    AdminModelInfo, AdminOrganizationInfo, AdminRepository, DeprecateModelOutcome,
+    ModelHistoryEntry, ModelPricing, OrganizationLimits, OrganizationLimitsHistoryEntry,
+    OrganizationLimitsUpdate, PlatformServiceInfo, UpdateModelAdminRequest, UserInfo,
+    UserOrganizationInfo,
 };
 use services::service_usage::ports::ServiceUnit;
 use std::sync::Arc;
@@ -183,6 +184,266 @@ impl AdminRepository for AdminCompositeRepository {
                 changed_by_user_email,
             )
             .await
+    }
+
+    async fn deprecate_model(
+        &self,
+        deprecated_model_name: &str,
+        successor_model_name: &str,
+        change_reason: Option<String>,
+        changed_by_user_id: Option<Uuid>,
+        changed_by_user_email: Option<String>,
+    ) -> Result<Option<DeprecateModelOutcome>> {
+        // All writes happen in a single transaction so a partial failure can
+        // not leave the catalog in a half-deprecated state (e.g., alias
+        // added but model still active).
+        let mut client = self
+            .pool
+            .get()
+            .await
+            .context("Failed to get database connection")?;
+        let tx = client.transaction().await?;
+
+        // Fetch both models. Successor must be active; deprecated may or may
+        // not be (idempotent re-deprecation is acceptable).
+        let deprecated_row = tx
+            .query_opt(
+                "SELECT id, is_active FROM models WHERE model_name = $1",
+                &[&deprecated_model_name],
+            )
+            .await?;
+        let successor_row = tx
+            .query_opt(
+                "SELECT id, is_active FROM models WHERE model_name = $1",
+                &[&successor_model_name],
+            )
+            .await?;
+
+        let (Some(d), Some(s)) = (deprecated_row, successor_row) else {
+            return Ok(None);
+        };
+        let deprecated_id: Uuid = d.get("id");
+        let successor_id: Uuid = s.get("id");
+        let successor_active: bool = s.get("is_active");
+        if !successor_active {
+            // Treat inactive successor like "not found" for the caller — the
+            // service layer surfaces this as ModelNotFound.
+            return Ok(None);
+        }
+
+        // 1. Add deprecated model_name as an alias of successor (idempotent).
+        tx.execute(
+            r#"
+            INSERT INTO model_aliases (alias_name, canonical_model_id, is_active)
+            VALUES ($1, $2, true)
+            ON CONFLICT (alias_name) DO UPDATE
+            SET canonical_model_id = EXCLUDED.canonical_model_id,
+                is_active = true,
+                updated_at = NOW()
+            "#,
+            &[&deprecated_model_name, &successor_id],
+        )
+        .await
+        .context("Failed to add deprecated model name as alias of successor")?;
+
+        // 2. Re-point pre-existing **active** inbound aliases of the deprecated
+        //    model at the successor, so historical aliases keep resolving.
+        //    We deliberately leave inactive inbound aliases alone — they were
+        //    already not resolving, so silently re-pointing without
+        //    reactivating them would mask a no-op behind a misleading
+        //    "carried" count, and reactivating them could surface alias
+        //    names an operator had explicitly disabled.
+        let aliases_carried = tx
+            .execute(
+                r#"
+                UPDATE model_aliases
+                SET canonical_model_id = $1, updated_at = NOW()
+                WHERE canonical_model_id = $2
+                  AND alias_name <> $3
+                  AND is_active = true
+                "#,
+                &[&successor_id, &deprecated_id, &deprecated_model_name],
+            )
+            .await
+            .context("Failed to repoint inbound aliases to successor")?;
+
+        // 3. Mark the deprecated model inactive (and capture a row snapshot
+        //    for the history entry).
+        let updated = tx
+            .query_opt(
+                r#"
+                UPDATE models
+                SET is_active = false, updated_at = NOW()
+                WHERE id = $1
+                RETURNING id, model_name, model_display_name, model_description, model_icon,
+                          input_cost_per_token, output_cost_per_token, cost_per_image,
+                          cache_read_cost_per_token, context_length, verifiable, is_active,
+                          owned_by, created_at, updated_at, provider_type, provider_config,
+                          attestation_supported, input_modalities, output_modalities, inference_url
+                "#,
+                &[&deprecated_id],
+            )
+            .await
+            .context("Failed to deactivate deprecated model")?;
+        let Some(deprecated_row_after) = updated else {
+            // The row vanished between fetch and update — bail.
+            tx.rollback().await.ok();
+            return Ok(None);
+        };
+
+        // 4. Record a history entry for the deprecation. Inline the writes
+        //    rather than calling the `&Client`-typed helper on
+        //    ModelRepository so they participate in this transaction.
+        let reason = change_reason
+            .clone()
+            .or_else(|| Some(format!("Deprecated in favor of '{successor_model_name}'")));
+        tx.execute(
+            "UPDATE model_history SET effective_until = NOW() WHERE model_id = $1 AND effective_until IS NULL",
+            &[&deprecated_id],
+        )
+        .await
+        .context("Failed to close previous history record")?;
+        tx.execute(
+            r#"
+            INSERT INTO model_history (
+                model_id, input_cost_per_token, output_cost_per_token, cost_per_image,
+                cache_read_cost_per_token, context_length, model_name, model_display_name,
+                model_description, model_icon, verifiable, is_active, owned_by, provider_type,
+                provider_config, attestation_supported, input_modalities, output_modalities,
+                inference_url, effective_from, effective_until, changed_by_user_id,
+                changed_by_user_email, change_reason, created_at
+            ) VALUES (
+                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19,
+                NOW(), NULL, $20, $21, $22, NOW()
+            )
+            "#,
+            &[
+                &deprecated_id,
+                &deprecated_row_after.get::<_, i64>("input_cost_per_token"),
+                &deprecated_row_after.get::<_, i64>("output_cost_per_token"),
+                &deprecated_row_after.get::<_, i64>("cost_per_image"),
+                &deprecated_row_after.get::<_, i64>("cache_read_cost_per_token"),
+                &deprecated_row_after.get::<_, i32>("context_length"),
+                &deprecated_row_after.get::<_, String>("model_name"),
+                &deprecated_row_after.get::<_, String>("model_display_name"),
+                &deprecated_row_after.get::<_, String>("model_description"),
+                &deprecated_row_after.get::<_, Option<String>>("model_icon"),
+                &deprecated_row_after.get::<_, bool>("verifiable"),
+                &deprecated_row_after.get::<_, bool>("is_active"),
+                &deprecated_row_after.get::<_, String>("owned_by"),
+                &deprecated_row_after.try_get::<_, String>("provider_type").ok(),
+                &deprecated_row_after
+                    .try_get::<_, serde_json::Value>("provider_config")
+                    .ok(),
+                &deprecated_row_after
+                    .try_get::<_, bool>("attestation_supported")
+                    .ok(),
+                &deprecated_row_after
+                    .try_get::<_, Option<serde_json::Value>>("input_modalities")
+                    .ok()
+                    .flatten(),
+                &deprecated_row_after
+                    .try_get::<_, Option<serde_json::Value>>("output_modalities")
+                    .ok()
+                    .flatten(),
+                &deprecated_row_after
+                    .try_get::<_, Option<String>>("inference_url")
+                    .ok()
+                    .flatten(),
+                &changed_by_user_id,
+                &changed_by_user_email,
+                &reason,
+            ],
+        )
+        .await
+        .context("Failed to insert history record for deprecation")?;
+
+        // 5. Read both models' post-write state (with merged alias lists)
+        //    INSIDE the transaction. If we did this after `tx.commit()`, a
+        //    transient connection pool failure would surface as a 500 even
+        //    though the deprecation was already committed — and a retry
+        //    would write a second `model_history` entry. Reading inside the
+        //    txn keeps the response build atomic with the writes: either
+        //    everything succeeds and the caller sees both models, or
+        //    nothing is committed and the caller can safely retry.
+        let read_with_aliases = |row: &tokio_postgres::Row| ModelPricing {
+            model_display_name: row.get("model_display_name"),
+            model_description: row.get("model_description"),
+            model_icon: row.get("model_icon"),
+            input_cost_per_token: row.get("input_cost_per_token"),
+            output_cost_per_token: row.get("output_cost_per_token"),
+            cost_per_image: row.get("cost_per_image"),
+            cache_read_cost_per_token: row.get("cache_read_cost_per_token"),
+            context_length: row.get("context_length"),
+            verifiable: row.get("verifiable"),
+            is_active: row.get("is_active"),
+            aliases: row
+                .try_get::<_, Option<Vec<String>>>("aliases")
+                .ok()
+                .flatten()
+                .unwrap_or_default(),
+            owned_by: row.get("owned_by"),
+            provider_type: row
+                .try_get::<_, String>("provider_type")
+                .unwrap_or_else(|_| "vllm".to_string()),
+            provider_config: row.try_get("provider_config").ok().flatten(),
+            attestation_supported: row.try_get("attestation_supported").unwrap_or(true),
+            input_modalities: row
+                .try_get::<_, Option<serde_json::Value>>("input_modalities")
+                .ok()
+                .flatten()
+                .and_then(|v| serde_json::from_value(v).ok()),
+            output_modalities: row
+                .try_get::<_, Option<serde_json::Value>>("output_modalities")
+                .ok()
+                .flatten()
+                .and_then(|v| serde_json::from_value(v).ok()),
+            inference_url: row.try_get("inference_url").ok().flatten(),
+        };
+
+        let select_with_aliases_sql = r#"
+            SELECT
+                m.model_display_name, m.model_description, m.model_icon,
+                m.input_cost_per_token, m.output_cost_per_token, m.cost_per_image,
+                m.cache_read_cost_per_token, m.context_length, m.verifiable,
+                m.is_active, m.owned_by, m.provider_type, m.provider_config,
+                m.attestation_supported, m.input_modalities, m.output_modalities,
+                m.inference_url,
+                COALESCE(
+                    array_agg(ma.alias_name) FILTER (WHERE ma.alias_name IS NOT NULL),
+                    '{}'
+                ) AS aliases
+            FROM models m
+            LEFT JOIN model_aliases ma
+                ON ma.canonical_model_id = m.id AND ma.is_active = true
+            WHERE m.model_name = $1
+            GROUP BY m.id
+        "#;
+
+        // The rows must exist — we just wrote to them in this same
+        // transaction. A `None` here would indicate driver corruption, not
+        // a routine race; bubble up as an error so the txn rolls back.
+        let deprecated_row_full = tx
+            .query_opt(select_with_aliases_sql, &[&deprecated_model_name])
+            .await?
+            .context("deprecated model row missing in same transaction (driver bug?)")?;
+        let successor_row_full = tx
+            .query_opt(select_with_aliases_sql, &[&successor_model_name])
+            .await?
+            .context("successor model row missing in same transaction (driver bug?)")?;
+        let outcome = DeprecateModelOutcome {
+            deprecated: read_with_aliases(&deprecated_row_full),
+            successor: read_with_aliases(&successor_row_full),
+            // `aliases_carried` is u64 from `tx.execute`. The number of
+            // inbound aliases on a single model can never realistically
+            // exceed u32::MAX; saturate via `min` rather than `try_from` so
+            // the behavior is explicitly "cap at u32::MAX" and not the
+            // default "discard the value on overflow."
+            aliases_carried: aliases_carried.min(u32::MAX as u64) as u32,
+        };
+
+        tx.commit().await?;
+        Ok(Some(outcome))
     }
 
     async fn update_organization_limits(

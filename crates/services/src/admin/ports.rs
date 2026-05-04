@@ -226,10 +226,26 @@ pub enum AdminError {
     InvalidPricing(String),
     #[error("Invalid limits data: {0}")]
     InvalidLimits(String),
+    #[error("Invalid deprecation request: {0}")]
+    InvalidDeprecation(String),
     #[error("Unauthorized: {0}")]
     Unauthorized(String),
     #[error("Internal error: {0}")]
     InternalError(String),
+}
+
+/// Outcome of a `deprecate_model` operation.
+#[derive(Debug, Clone)]
+pub struct DeprecateModelOutcome {
+    /// State of the deprecated model after the operation (`is_active = false`).
+    pub deprecated: ModelPricing,
+    /// State of the successor model after the operation, including the
+    /// merged alias list.
+    pub successor: ModelPricing,
+    /// Number of pre-existing aliases of the deprecated model that were
+    /// re-pointed at the successor (does not include the deprecated model's
+    /// own canonical name).
+    pub aliases_carried: u32,
 }
 
 /// Repository trait for admin operations on models and organizations
@@ -258,6 +274,34 @@ pub trait AdminRepository: Send + Sync {
         changed_by_user_id: Option<uuid::Uuid>,
         changed_by_user_email: Option<String>,
     ) -> Result<bool, anyhow::Error>;
+
+    /// Atomically deprecate `deprecated_model_name` in favor of `successor_model_name`.
+    ///
+    /// In a single transaction:
+    /// - Adds `deprecated_model_name` to `successor_model_name`'s alias list
+    ///   (idempotent via `ON CONFLICT (alias_name) DO UPDATE`).
+    /// - Repoints any existing **active** inbound aliases of the deprecated
+    ///   model at the successor, so historical aliases keep resolving.
+    ///   Inactive inbound aliases are left untouched.
+    /// - Sets the deprecated model's `is_active = false` and records a
+    ///   `model_history` entry with the supplied change reason.
+    /// - Reads back both models' merged-alias state inside the same
+    ///   transaction so a successful commit is atomic with the response.
+    ///
+    /// Returns `Ok(None)` for any of the "treat-as-not-found" conditions:
+    /// either model is missing, or the successor is not currently active.
+    /// (The successor-activeness check lives in the repository to keep the
+    /// reads inside the transaction; the service surfaces both as
+    /// `ModelNotFound`.) Self-target / empty-id validation is the
+    /// service layer's responsibility.
+    async fn deprecate_model(
+        &self,
+        deprecated_model_name: &str,
+        successor_model_name: &str,
+        change_reason: Option<String>,
+        changed_by_user_id: Option<uuid::Uuid>,
+        changed_by_user_email: Option<String>,
+    ) -> Result<Option<DeprecateModelOutcome>, anyhow::Error>;
 
     /// Update organization limits (creates new history entry, closes previous)
     async fn update_organization_limits(
@@ -411,6 +455,20 @@ pub trait AdminService: Send + Sync {
         changed_by_user_id: Option<uuid::Uuid>,
         changed_by_user_email: Option<String>,
     ) -> Result<(), AdminError>;
+
+    /// Deprecate one model in favor of another (admin only). Atomic: in a
+    /// single DB transaction, the deprecated model's name is added as an
+    /// alias of the successor, any inbound aliases of the deprecated model
+    /// are re-pointed at the successor, and the deprecated model is marked
+    /// `is_active = false`.
+    async fn deprecate_model(
+        &self,
+        deprecated_model_name: &str,
+        successor_model_name: &str,
+        change_reason: Option<String>,
+        changed_by_user_id: Option<uuid::Uuid>,
+        changed_by_user_email: Option<String>,
+    ) -> Result<DeprecateModelOutcome, AdminError>;
 
     /// Update organization limits (admin only)
     async fn update_organization_limits(

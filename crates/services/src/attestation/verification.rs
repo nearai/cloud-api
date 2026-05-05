@@ -36,6 +36,11 @@ pub const CUMULATIVE_DISCOVERY_CALLS: usize = 2;
 /// delay. At 2 s/model the burst is spread across tens of seconds rather than
 /// a single wall-clock instant, while still completing well within the 5-minute
 /// refresh interval even for large pools.
+///
+/// Note: the cumulative discovery loop runs inside `buffer_unordered(10)`, so
+/// tasks at index >= 10 begin their sleep only after a concurrency slot opens.
+/// Their effective wall-clock delay is therefore ≥ i × STAGGER_MS, making the
+/// spread more conservative (not less) for pools larger than 10 models.
 pub const MODEL_DISCOVERY_STAGGER_MS: u64 = 2_000;
 
 /// Result of verifying an attestation report from an inference backend.

@@ -2231,7 +2231,7 @@ impl InferenceProviderPool {
                             async move {
                                 if stagger_idx > 0 {
                                     tokio::time::sleep(Duration::from_millis(
-                                        model_stagger_ms * stagger_idx as u64,
+                                        model_stagger_ms.saturating_mul(stagger_idx as u64),
                                     ))
                                     .await;
                                 }

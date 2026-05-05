@@ -2219,8 +2219,22 @@ impl InferenceProviderPool {
                         let api_key = api_key.clone();
                         let verifier = verifier.clone();
                         let tls_roots = tls_roots.clone();
+                        // Stagger index: model i waits i × MODEL_DISCOVERY_STAGGER_MS before
+                        // firing its first discovery call. This spreads the per-refresh burst
+                        // across time instead of hitting all backends simultaneously, preventing
+                        // GPU evidence worker saturation on dense hosts (e.g. multiple models
+                        // on the same inference host).
+                        let stagger_idx = discovery_tasks.len();
+                        let model_stagger_ms =
+                            crate::attestation::verification::MODEL_DISCOVERY_STAGGER_MS;
                         discovery_tasks.push(
                             async move {
+                                if stagger_idx > 0 {
+                                    tokio::time::sleep(Duration::from_millis(
+                                        model_stagger_ms * stagger_idx as u64,
+                                    ))
+                                    .await;
+                                }
                                 let outcome = Self::discover_model(
                                     &url,
                                     &api_key,

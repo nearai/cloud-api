@@ -2016,6 +2016,10 @@ impl InferenceProviderPool {
                             pubkey_algos = ?outcome.pubkeys_by_algo.keys().collect::<Vec<_>>(),
                             "Initial attestation discovery complete"
                         );
+                        // Pre-warm all bucket clients in the background so the
+                        // inline verification cost is paid at startup rather than
+                        // on the first request to each bucket.
+                        serving_provider.clone().pre_warm();
                     }
 
                     let serving_trait =

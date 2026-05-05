@@ -11,8 +11,67 @@ use axum::{
 };
 use chrono::{Duration, Utc};
 use serde::{Deserialize, Serialize};
+use services::organization::OrganizationError;
 use utoipa::ToSchema;
 use uuid::Uuid;
+
+type UsageError = (StatusCode, ResponseJson<ErrorResponse>);
+
+async fn check_org_membership(
+    app_state: &AppState,
+    user: AuthenticatedUser,
+    org_id: &str,
+) -> Result<Uuid, UsageError> {
+    let organization_id = Uuid::parse_str(org_id).map_err(|_| {
+        (
+            StatusCode::BAD_REQUEST,
+            ResponseJson(ErrorResponse::new(
+                "Invalid organization ID".to_string(),
+                "invalid_id".to_string(),
+            )),
+        )
+    })?;
+
+    let user_id = crate::conversions::authenticated_user_to_user_id(user);
+    let is_member = app_state
+        .organization_service
+        .is_member(
+            services::organization::OrganizationId(organization_id),
+            user_id,
+        )
+        .await
+        .map_err(|e| match e {
+            OrganizationError::NotFound => (
+                StatusCode::NOT_FOUND,
+                ResponseJson(ErrorResponse::new(
+                    "Organization not found".to_string(),
+                    "not_found".to_string(),
+                )),
+            ),
+            _ => {
+                tracing::error!("Failed to check organization membership");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    ResponseJson(ErrorResponse::new(
+                        "Failed to verify organization access".to_string(),
+                        "internal_server_error".to_string(),
+                    )),
+                )
+            }
+        })?;
+
+    if !is_member {
+        return Err((
+            StatusCode::FORBIDDEN,
+            ResponseJson(ErrorResponse::new(
+                "You are not authorized to access this organization.".to_string(),
+                "forbidden".to_string(),
+            )),
+        ));
+    }
+
+    Ok(organization_id)
+}
 
 /// Get organization balance response
 /// All costs use fixed scale of 9 (nano-dollars) and USD currency
@@ -160,45 +219,7 @@ pub async fn get_organization_balance(
         user.0.id
     );
 
-    let organization_id = Uuid::parse_str(&org_id).map_err(|_| {
-        (
-            StatusCode::BAD_REQUEST,
-            ResponseJson(ErrorResponse::new(
-                "Invalid organization ID".to_string(),
-                "invalid_id".to_string(),
-            )),
-        )
-    })?;
-
-    // Check if user is a member of this organization
-    let user_id = crate::conversions::authenticated_user_to_user_id(user);
-    let is_member = app_state
-        .organization_service
-        .is_member(
-            services::organization::OrganizationId(organization_id),
-            user_id,
-        )
-        .await
-        .map_err(|_| {
-            tracing::error!("Failed to check organization membership");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                ResponseJson(ErrorResponse::new(
-                    "Failed to verify organization access".to_string(),
-                    "internal_server_error".to_string(),
-                )),
-            )
-        })?;
-
-    if !is_member {
-        return Err((
-            StatusCode::FORBIDDEN,
-            ResponseJson(ErrorResponse::new(
-                "You are not authorized to access this organization's usage balance.".to_string(),
-                "forbidden".to_string(),
-            )),
-        ));
-    }
+    let organization_id = check_org_membership(&app_state, user, &org_id).await?;
 
     let balance = app_state
         .usage_service
@@ -329,45 +350,7 @@ pub async fn get_organization_usage_history(
     // Validate pagination parameters
     crate::routes::common::validate_limit_offset(query.limit, query.offset)?;
 
-    let organization_id = Uuid::parse_str(&org_id).map_err(|_| {
-        (
-            StatusCode::BAD_REQUEST,
-            ResponseJson(ErrorResponse::new(
-                "Invalid organization ID".to_string(),
-                "invalid_id".to_string(),
-            )),
-        )
-    })?;
-
-    // Check if user is a member of this organization
-    let user_id = crate::conversions::authenticated_user_to_user_id(user);
-    let is_member = app_state
-        .organization_service
-        .is_member(
-            services::organization::OrganizationId(organization_id),
-            user_id,
-        )
-        .await
-        .map_err(|_| {
-            tracing::error!("Failed to check organization membership");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                ResponseJson(ErrorResponse::new(
-                    "Failed to verify organization access".to_string(),
-                    "internal_server_error".to_string(),
-                )),
-            )
-        })?;
-
-    if !is_member {
-        return Err((
-            StatusCode::FORBIDDEN,
-            ResponseJson(ErrorResponse::new(
-                "You are not authorized to access this organization's usage history.".to_string(),
-                "forbidden".to_string(),
-            )),
-        ));
-    }
+    let organization_id = check_org_membership(&app_state, user, &org_id).await?;
 
     let (history, total) = app_state
         .usage_service
@@ -456,46 +439,7 @@ pub async fn get_service_usage_history(
     // Validate pagination parameters
     crate::routes::common::validate_limit_offset(query.limit, query.offset)?;
 
-    let organization_id = Uuid::parse_str(&org_id).map_err(|_| {
-        (
-            StatusCode::BAD_REQUEST,
-            ResponseJson(ErrorResponse::new(
-                "Invalid organization ID".to_string(),
-                "invalid_id".to_string(),
-            )),
-        )
-    })?;
-
-    // Check if user is a member of this organization
-    let user_id = crate::conversions::authenticated_user_to_user_id(user);
-    let is_member = app_state
-        .organization_service
-        .is_member(
-            services::organization::OrganizationId(organization_id),
-            user_id,
-        )
-        .await
-        .map_err(|_| {
-            tracing::error!("Failed to check organization membership");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                ResponseJson(ErrorResponse::new(
-                    "Failed to verify organization access".to_string(),
-                    "internal_server_error".to_string(),
-                )),
-            )
-        })?;
-
-    if !is_member {
-        return Err((
-            StatusCode::FORBIDDEN,
-            ResponseJson(ErrorResponse::new(
-                "You are not authorized to access this organization's service usage history."
-                    .to_string(),
-                "forbidden".to_string(),
-            )),
-        ));
-    }
+    let organization_id = check_org_membership(&app_state, user, &org_id).await?;
 
     let service_name = query.service_name.as_deref();
 
@@ -915,6 +859,33 @@ pub struct TimeSeriesQuery {
     pub granularity: Option<String>,
 }
 
+const MAX_DATE_RANGE_DAYS: i64 = 366;
+
+fn validate_date_range(
+    start: chrono::DateTime<Utc>,
+    end: chrono::DateTime<Utc>,
+) -> Result<(), UsageError> {
+    if start >= end {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            ResponseJson(ErrorResponse::new(
+                "start must be before end".to_string(),
+                "invalid_date_range".to_string(),
+            )),
+        ));
+    }
+    if end - start > Duration::days(MAX_DATE_RANGE_DAYS) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            ResponseJson(ErrorResponse::new(
+                format!("Date range must not exceed {MAX_DATE_RANGE_DAYS} days."),
+                "date_range_too_large".to_string(),
+            )),
+        ));
+    }
+    Ok(())
+}
+
 fn parse_datetime_or_default(
     value: &Option<String>,
     default: chrono::DateTime<Utc>,
@@ -961,58 +932,13 @@ pub async fn get_user_organization_metrics(
     Path(org_id): Path<String>,
     Query(query): Query<MetricsQuery>,
 ) -> Result<ResponseJson<UserOrganizationMetrics>, (StatusCode, ResponseJson<ErrorResponse>)> {
-    let organization_id = Uuid::parse_str(&org_id).map_err(|_| {
-        (
-            StatusCode::BAD_REQUEST,
-            ResponseJson(ErrorResponse::new(
-                "Invalid organization ID".to_string(),
-                "invalid_id".to_string(),
-            )),
-        )
-    })?;
-
-    let user_id = crate::conversions::authenticated_user_to_user_id(user);
-    let is_member = app_state
-        .organization_service
-        .is_member(
-            services::organization::OrganizationId(organization_id),
-            user_id,
-        )
-        .await
-        .map_err(|_| {
-            tracing::error!("Failed to check organization membership");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                ResponseJson(ErrorResponse::new(
-                    "Failed to verify organization access".to_string(),
-                    "internal_server_error".to_string(),
-                )),
-            )
-        })?;
-
-    if !is_member {
-        return Err((
-            StatusCode::FORBIDDEN,
-            ResponseJson(ErrorResponse::new(
-                "You are not authorized to access this organization's metrics.".to_string(),
-                "forbidden".to_string(),
-            )),
-        ));
-    }
+    let organization_id = check_org_membership(&app_state, user, &org_id).await?;
 
     let now = Utc::now();
     let end = parse_datetime_or_default(&query.end, now)?;
     let start = parse_datetime_or_default(&query.start, end - Duration::days(30))?;
 
-    if start >= end {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            ResponseJson(ErrorResponse::new(
-                "start must be before end".to_string(),
-                "invalid_date_range".to_string(),
-            )),
-        ));
-    }
+    validate_date_range(start, end)?;
 
     let metrics = app_state
         .analytics_service
@@ -1094,44 +1020,7 @@ pub async fn get_user_organization_timeseries(
     Path(org_id): Path<String>,
     Query(query): Query<TimeSeriesQuery>,
 ) -> Result<ResponseJson<UserTimeSeriesMetrics>, (StatusCode, ResponseJson<ErrorResponse>)> {
-    let organization_id = Uuid::parse_str(&org_id).map_err(|_| {
-        (
-            StatusCode::BAD_REQUEST,
-            ResponseJson(ErrorResponse::new(
-                "Invalid organization ID".to_string(),
-                "invalid_id".to_string(),
-            )),
-        )
-    })?;
-
-    let user_id = crate::conversions::authenticated_user_to_user_id(user);
-    let is_member = app_state
-        .organization_service
-        .is_member(
-            services::organization::OrganizationId(organization_id),
-            user_id,
-        )
-        .await
-        .map_err(|_| {
-            tracing::error!("Failed to check organization membership");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                ResponseJson(ErrorResponse::new(
-                    "Failed to verify organization access".to_string(),
-                    "internal_server_error".to_string(),
-                )),
-            )
-        })?;
-
-    if !is_member {
-        return Err((
-            StatusCode::FORBIDDEN,
-            ResponseJson(ErrorResponse::new(
-                "You are not authorized to access this organization's metrics.".to_string(),
-                "forbidden".to_string(),
-            )),
-        ));
-    }
+    let organization_id = check_org_membership(&app_state, user, &org_id).await?;
 
     let granularity = query.granularity.as_deref().unwrap_or("day");
     if !["hour", "day", "week"].contains(&granularity) {
@@ -1148,15 +1037,7 @@ pub async fn get_user_organization_timeseries(
     let end = parse_datetime_or_default(&query.end, now)?;
     let start = parse_datetime_or_default(&query.start, end - Duration::days(30))?;
 
-    if start >= end {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            ResponseJson(ErrorResponse::new(
-                "start must be before end".to_string(),
-                "invalid_date_range".to_string(),
-            )),
-        ));
-    }
+    validate_date_range(start, end)?;
 
     let timeseries = app_state
         .analytics_service

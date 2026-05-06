@@ -169,6 +169,14 @@ pub trait UserRepository: Send + Sync {
 
     async fn get_by_email(&self, email: &str) -> anyhow::Result<Option<User>>;
 
+    async fn get_by_provider(
+        &self,
+        auth_provider: &str,
+        provider_user_id: &str,
+    ) -> anyhow::Result<Option<User>>;
+
+    async fn update_email(&self, id: UserId, email: String) -> anyhow::Result<()>;
+
     async fn update(
         &self,
         id: UserId,

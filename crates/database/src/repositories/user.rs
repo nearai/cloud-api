@@ -47,13 +47,6 @@ impl UserRepository {
                 auth_provider, provider_user_id
             )
             VALUES ($1, $2, $3, $4, $5, $6, $7, true, $8, $9)
-            ON CONFLICT (email) DO UPDATE SET
-                username = EXCLUDED.username,
-                display_name = EXCLUDED.display_name,
-                avatar_url = EXCLUDED.avatar_url,
-                updated_at = EXCLUDED.updated_at,
-                auth_provider = EXCLUDED.auth_provider,
-                provider_user_id = EXCLUDED.provider_user_id
             RETURNING *
             "#,
                     &[
@@ -530,6 +523,37 @@ impl services::auth::UserRepository for UserRepository {
     async fn get_by_email(&self, email: &str) -> anyhow::Result<Option<services::auth::User>> {
         let maybe_user = self.get_by_email(email).await?;
         Ok(maybe_user.map(db_user_to_service_user))
+    }
+
+    async fn get_by_provider(
+        &self,
+        auth_provider: &str,
+        provider_user_id: &str,
+    ) -> anyhow::Result<Option<services::auth::User>> {
+        let maybe_user = self
+            .get_by_provider(auth_provider, provider_user_id)
+            .await?;
+        Ok(maybe_user.map(db_user_to_service_user))
+    }
+
+    async fn update_email(&self, id: services::auth::UserId, email: String) -> anyhow::Result<()> {
+        retry_db!("update_user_email", {
+            let client = self
+                .pool
+                .get()
+                .await
+                .context("Failed to get database connection")
+                .map_err(RepositoryError::PoolError)?;
+
+            client
+                .execute(
+                    "UPDATE users SET email = $2, updated_at = NOW() WHERE id = $1",
+                    &[&id.0, &email],
+                )
+                .await
+                .map_err(map_db_error)
+        })?;
+        Ok(())
     }
 
     async fn update(

@@ -87,7 +87,28 @@ pub async fn list_organizations(
                     .await
                 {
                     Ok(Some(role)) => crate::conversions::services_role_to_api_role(role),
-                    _ => continue,
+                    Ok(None) => {
+                        // User is not a member — should not happen since
+                        // list_organizations_for_user only returns orgs the user belongs to
+                        error!("get_user_role returned None for user in listed org");
+                        return Err((
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(ErrorResponse::new(
+                                "Failed to list organizations for user".to_string(),
+                                "internal_server_error".to_string(),
+                            )),
+                        ));
+                    }
+                    Err(e) => {
+                        error!("Failed to get user role while listing organizations: {e}");
+                        return Err((
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(ErrorResponse::new(
+                                "Failed to list organizations for user".to_string(),
+                                "internal_server_error".to_string(),
+                            )),
+                        ));
+                    }
                 };
                 org_responses
                     .push(crate::conversions::services_org_to_api_org(org, role));
@@ -318,8 +339,8 @@ pub async fn get_organization(
                 )),
             ));
         }
-        Err(_) => {
-            error!("Failed to get user role");
+        Err(e) => {
+            error!("Failed to get user role: {e}");
             return Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse::new(
@@ -346,8 +367,8 @@ pub async fn get_organization(
                 )),
             ))
         }
-        Err(_) => {
-            error!("Failed to get organization");
+        Err(e) => {
+            error!("Failed to get organization: {e}");
             Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse::new(

@@ -532,6 +532,37 @@ impl services::auth::UserRepository for UserRepository {
         Ok(maybe_user.map(db_user_to_service_user))
     }
 
+    async fn get_by_provider(
+        &self,
+        auth_provider: &str,
+        provider_user_id: &str,
+    ) -> anyhow::Result<Option<services::auth::User>> {
+        let maybe_user = self
+            .get_by_provider(auth_provider, provider_user_id)
+            .await?;
+        Ok(maybe_user.map(db_user_to_service_user))
+    }
+
+    async fn update_email(&self, id: services::auth::UserId, email: String) -> anyhow::Result<()> {
+        retry_db!("update_user_email", {
+            let client = self
+                .pool
+                .get()
+                .await
+                .context("Failed to get database connection")
+                .map_err(RepositoryError::PoolError)?;
+
+            client
+                .execute(
+                    "UPDATE users SET email = $2, updated_at = NOW() WHERE id = $1",
+                    &[&id.0, &email],
+                )
+                .await
+                .map_err(map_db_error)
+        })?;
+        Ok(())
+    }
+
     async fn update(
         &self,
         id: services::auth::UserId,

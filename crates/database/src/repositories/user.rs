@@ -47,13 +47,6 @@ impl UserRepository {
                 auth_provider, provider_user_id
             )
             VALUES ($1, $2, $3, $4, $5, $6, $7, true, $8, $9)
-            ON CONFLICT (email) DO UPDATE SET
-                username = EXCLUDED.username,
-                display_name = EXCLUDED.display_name,
-                avatar_url = EXCLUDED.avatar_url,
-                updated_at = EXCLUDED.updated_at,
-                auth_provider = EXCLUDED.auth_provider,
-                provider_user_id = EXCLUDED.provider_user_id
             RETURNING *
             "#,
                     &[

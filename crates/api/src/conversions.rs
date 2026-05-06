@@ -330,6 +330,7 @@ pub fn services_user_to_api_user_with_relations(
 /// Convert services Organization to API OrganizationResponse
 pub fn services_org_to_api_org(
     org: services::organization::ports::Organization,
+    role: crate::models::MemberRole,
 ) -> crate::models::OrganizationResponse {
     crate::models::OrganizationResponse {
         id: org.id.0.to_string(),
@@ -337,6 +338,7 @@ pub fn services_org_to_api_org(
         description: org.description,
         owner_id: org.owner_id.0.to_string(),
         settings: org.settings,
+        role,
         is_active: org.is_active,
         created_at: org.created_at,
         updated_at: org.updated_at,

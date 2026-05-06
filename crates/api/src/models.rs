@@ -1981,6 +1981,7 @@ pub struct OrganizationResponse {
     pub description: Option<String>,
     pub owner_id: String,
     pub settings: serde_json::Value,
+    pub role: MemberRole,
     pub is_active: bool,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,

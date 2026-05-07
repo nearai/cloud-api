@@ -26,31 +26,35 @@ ignore = [
     # https://rustsec.org/advisories/RUSTSEC-2024-0388
     "RUSTSEC-2024-0388",
 
-    # rustls-webpki 0.101.7 name constraint bugs - transitive dep from aws-smithy-http-client
-    # -> rustls 0.21.x. Requires cert misissuance to exploit, very low risk.
-    # Cannot update: locked by AWS SDK's rustls 0.21 dependency.
+    # rustls-webpki 0.101.7 — all four advisories below share the same root cause:
+    # transitive dep from aws-smithy-http-client -> hyper-rustls 0.24 -> rustls 0.21.x.
+    # Cannot update: locked by AWS SDK's legacy rustls 0.21 dependency.
     # Our direct rustls-webpki 0.103.x is patched (0.103.13).
+    #
+    # CRL distribution point matching — requires compromised issuing authority.
+    # https://rustsec.org/advisories/RUSTSEC-2026-0049
+    "RUSTSEC-2026-0049",
+    # Name constraint bugs — require cert misissuance to exploit, very low risk.
     # https://rustsec.org/advisories/RUSTSEC-2026-0098
     "RUSTSEC-2026-0098",
     # https://rustsec.org/advisories/RUSTSEC-2026-0099
     "RUSTSEC-2026-0099",
-    # rustls-webpki 0.101.7 CRL parsing panic - we don't use CRLs.
-    # Same transitive dep chain as above.
+    # CRL parsing panic — we don't use CRLs.
     # https://rustsec.org/advisories/RUSTSEC-2026-0104
     "RUSTSEC-2026-0104",
 
-    # hickory-proto 0.25.2 CPU exhaustion via crafted DNS response.
-    # Transitive dep: reqwest 0.12 -> hickory-resolver 0.25 -> hickory-proto 0.25.2.
-    # Cannot upgrade: fix is in hickory-proto >= 0.26.1, but reqwest 0.12 pins
-    # hickory to ^0.25 and no 0.25.x backport exists. reqwest must adopt 0.26.x first.
+    # hickory-proto 0.25.2 — both advisories below share the same root cause:
+    # dstack-sdk 0.1.2 and dcap-qvl 0.4.0 explicitly enable reqwest's `hickory-dns`
+    # feature, pulling in hickory-resolver 0.25 -> hickory-proto 0.25.2. Due to Cargo
+    # feature unification this cannot be overridden from our Cargo.toml. Fix requires
+    # upstream to drop `hickory-dns` or upgrade to reqwest 0.13+.
     # We only resolve admin-configured endpoints (no user-controlled hostnames),
     # so exploitation requires DNS infrastructure compromise.
+    #
+    # CPU exhaustion via O(n²) name compression during message encoding.
     # https://rustsec.org/advisories/RUSTSEC-2026-0119
     "RUSTSEC-2026-0119",
-
-    # hickory-proto 0.25.2 NSEC3 CPU exhaustion (DNSSEC only).
-    # Same transitive dep chain as above. Fix moved to hickory-net 0.26.1 (code
-    # restructured into new crate in 0.26.0; no 0.25.x backport exists).
+    # NSEC3 closest-encloser unbounded loop (DNSSEC only).
     # Not exploitable: DNSSEC validation is not enabled in our reqwest/hickory config.
     # https://rustsec.org/advisories/RUSTSEC-2026-0118
     "RUSTSEC-2026-0118",

@@ -1,4 +1,6 @@
-use crate::models::{InvitationStatus, OrganizationInvitation, OrganizationRole};
+use crate::models::{
+    InvitationEmailStatus, InvitationStatus, OrganizationInvitation, OrganizationRole,
+};
 use crate::pool::DbPool;
 use crate::repositories::utils::map_db_error;
 use crate::retry_db;
@@ -7,8 +9,9 @@ use async_trait::async_trait;
 use chrono::{Duration, Utc};
 use services::common::RepositoryError;
 use services::organization::ports::{
-    CreateInvitationRequest, InvitationStatus as ServicesInvitationStatus,
-    OrganizationInvitation as ServicesInvitation, OrganizationInvitationRepository,
+    CreateInvitationRequest, InvitationEmailStatus as ServicesInvitationEmailStatus,
+    InvitationStatus as ServicesInvitationStatus, OrganizationInvitation as ServicesInvitation,
+    OrganizationInvitationRepository,
 };
 use tracing::debug;
 use uuid::Uuid;
@@ -30,12 +33,8 @@ impl PgOrganizationInvitationRepository {
             OrganizationRole::Member => services::organization::MemberRole::Member,
         };
 
-        let status = match db_inv.status {
-            InvitationStatus::Pending => ServicesInvitationStatus::Pending,
-            InvitationStatus::Accepted => ServicesInvitationStatus::Accepted,
-            InvitationStatus::Declined => ServicesInvitationStatus::Declined,
-            InvitationStatus::Expired => ServicesInvitationStatus::Expired,
-        };
+        let status = self.db_to_domain_status(db_inv.status);
+        let email_status = self.db_to_domain_email_status(db_inv.email_status);
 
         Ok(ServicesInvitation {
             id: db_inv.id,
@@ -48,7 +47,53 @@ impl PgOrganizationInvitationRepository {
             created_at: db_inv.created_at,
             expires_at: db_inv.expires_at,
             responded_at: db_inv.responded_at,
+            email_status,
+            email_sent_at: db_inv.email_sent_at,
+            email_last_error: db_inv.email_last_error,
+            email_message_id: db_inv.email_message_id,
         })
+    }
+
+    fn row_to_db_invitation(&self, row: &tokio_postgres::Row) -> Result<OrganizationInvitation> {
+        Ok(OrganizationInvitation {
+            id: row.get("id"),
+            organization_id: row.get("organization_id"),
+            email: row.get("email"),
+            role: serde_json::from_value(serde_json::json!(row.get::<_, String>("role")))?,
+            invited_by_user_id: row.get("invited_by_user_id"),
+            status: serde_json::from_value(serde_json::json!(row.get::<_, String>("status")))?,
+            token: row.get("token"),
+            created_at: row.get("created_at"),
+            expires_at: row.get("expires_at"),
+            responded_at: row.get("responded_at"),
+            email_status: serde_json::from_value(serde_json::json!(
+                row.get::<_, String>("email_status")
+            ))?,
+            email_sent_at: row.get("email_sent_at"),
+            email_last_error: row.get("email_last_error"),
+            email_message_id: row.get("email_message_id"),
+        })
+    }
+
+    fn db_to_domain_status(&self, status: InvitationStatus) -> ServicesInvitationStatus {
+        match status {
+            InvitationStatus::Pending => ServicesInvitationStatus::Pending,
+            InvitationStatus::Accepted => ServicesInvitationStatus::Accepted,
+            InvitationStatus::Declined => ServicesInvitationStatus::Declined,
+            InvitationStatus::Expired => ServicesInvitationStatus::Expired,
+        }
+    }
+
+    fn db_to_domain_email_status(
+        &self,
+        status: InvitationEmailStatus,
+    ) -> ServicesInvitationEmailStatus {
+        match status {
+            InvitationEmailStatus::NotAttempted => ServicesInvitationEmailStatus::NotAttempted,
+            InvitationEmailStatus::Sent => ServicesInvitationEmailStatus::Sent,
+            InvitationEmailStatus::Failed => ServicesInvitationEmailStatus::Failed,
+            InvitationEmailStatus::Skipped => ServicesInvitationEmailStatus::Skipped,
+        }
     }
 
     /// Convert domain role to database role
@@ -128,7 +173,8 @@ impl OrganizationInvitationRepository for PgOrganizationInvitationRepository {
                      (organization_id, email, role, invited_by_user_id, token, expires_at)
                      VALUES ($1, $2, $3, $4, $5, $6)
                      RETURNING id, organization_id, email, role, invited_by_user_id, status, token,
-                               created_at, expires_at, responded_at",
+                               created_at, expires_at, responded_at, email_status, email_sent_at,
+                               email_last_error, email_message_id",
                     &[
                         &org_id,
                         &request.email,
@@ -142,18 +188,7 @@ impl OrganizationInvitationRepository for PgOrganizationInvitationRepository {
                 .map_err(map_db_error)
         })?;
 
-        let db_inv = OrganizationInvitation {
-            id: row.get("id"),
-            organization_id: row.get("organization_id"),
-            email: row.get("email"),
-            role: serde_json::from_value(serde_json::json!(row.get::<_, String>("role")))?,
-            invited_by_user_id: row.get("invited_by_user_id"),
-            status: serde_json::from_value(serde_json::json!(row.get::<_, String>("status")))?,
-            token: row.get("token"),
-            created_at: row.get("created_at"),
-            expires_at: row.get("expires_at"),
-            responded_at: row.get("responded_at"),
-        };
+        let db_inv = self.row_to_db_invitation(&row)?;
 
         self.db_to_domain(db_inv)
     }
@@ -170,7 +205,8 @@ impl OrganizationInvitationRepository for PgOrganizationInvitationRepository {
             client
                 .query_opt(
                     "SELECT id, organization_id, email, role, invited_by_user_id, status, token,
-                            created_at, expires_at, responded_at
+                            created_at, expires_at, responded_at, email_status, email_sent_at,
+                            email_last_error, email_message_id
                      FROM organization_invitations
                      WHERE id = $1",
                     &[&id],
@@ -181,20 +217,7 @@ impl OrganizationInvitationRepository for PgOrganizationInvitationRepository {
 
         match row {
             Some(r) => {
-                let db_inv = OrganizationInvitation {
-                    id: r.get("id"),
-                    organization_id: r.get("organization_id"),
-                    email: r.get("email"),
-                    role: serde_json::from_value(serde_json::json!(r.get::<_, String>("role")))?,
-                    invited_by_user_id: r.get("invited_by_user_id"),
-                    status: serde_json::from_value(
-                        serde_json::json!(r.get::<_, String>("status")),
-                    )?,
-                    token: r.get("token"),
-                    created_at: r.get("created_at"),
-                    expires_at: r.get("expires_at"),
-                    responded_at: r.get("responded_at"),
-                };
+                let db_inv = self.row_to_db_invitation(&r)?;
                 Ok(Some(self.db_to_domain(db_inv)?))
             }
             None => Ok(None),
@@ -213,7 +236,8 @@ impl OrganizationInvitationRepository for PgOrganizationInvitationRepository {
             client
                 .query_opt(
                     "SELECT id, organization_id, email, role, invited_by_user_id, status, token,
-                            created_at, expires_at, responded_at
+                            created_at, expires_at, responded_at, email_status, email_sent_at,
+                            email_last_error, email_message_id
                      FROM organization_invitations
                      WHERE token = $1",
                     &[&token],
@@ -224,20 +248,7 @@ impl OrganizationInvitationRepository for PgOrganizationInvitationRepository {
 
         match row {
             Some(r) => {
-                let db_inv = OrganizationInvitation {
-                    id: r.get("id"),
-                    organization_id: r.get("organization_id"),
-                    email: r.get("email"),
-                    role: serde_json::from_value(serde_json::json!(r.get::<_, String>("role")))?,
-                    invited_by_user_id: r.get("invited_by_user_id"),
-                    status: serde_json::from_value(
-                        serde_json::json!(r.get::<_, String>("status")),
-                    )?,
-                    token: r.get("token"),
-                    created_at: r.get("created_at"),
-                    expires_at: r.get("expires_at"),
-                    responded_at: r.get("responded_at"),
-                };
+                let db_inv = self.row_to_db_invitation(&r)?;
                 Ok(Some(self.db_to_domain(db_inv)?))
             }
             None => Ok(None),
@@ -263,7 +274,8 @@ impl OrganizationInvitationRepository for PgOrganizationInvitationRepository {
                 client
                     .query(
                         "SELECT id, organization_id, email, role, invited_by_user_id, status, token,
-                                created_at, expires_at, responded_at
+                            created_at, expires_at, responded_at, email_status, email_sent_at,
+                            email_last_error, email_message_id
                          FROM organization_invitations
                          WHERE organization_id = $1 AND status = $2
                          ORDER BY created_at DESC",
@@ -275,7 +287,8 @@ impl OrganizationInvitationRepository for PgOrganizationInvitationRepository {
                 client
                     .query(
                         "SELECT id, organization_id, email, role, invited_by_user_id, status, token,
-                                created_at, expires_at, responded_at
+                            created_at, expires_at, responded_at, email_status, email_sent_at,
+                            email_last_error, email_message_id
                          FROM organization_invitations
                          WHERE organization_id = $1
                          ORDER BY created_at DESC",
@@ -288,18 +301,7 @@ impl OrganizationInvitationRepository for PgOrganizationInvitationRepository {
 
         let mut invitations = Vec::new();
         for r in rows {
-            let db_inv = OrganizationInvitation {
-                id: r.get("id"),
-                organization_id: r.get("organization_id"),
-                email: r.get("email"),
-                role: serde_json::from_value(serde_json::json!(r.get::<_, String>("role")))?,
-                invited_by_user_id: r.get("invited_by_user_id"),
-                status: serde_json::from_value(serde_json::json!(r.get::<_, String>("status")))?,
-                token: r.get("token"),
-                created_at: r.get("created_at"),
-                expires_at: r.get("expires_at"),
-                responded_at: r.get("responded_at"),
-            };
+            let db_inv = self.row_to_db_invitation(&r)?;
             invitations.push(self.db_to_domain(db_inv)?);
         }
 
@@ -325,7 +327,8 @@ impl OrganizationInvitationRepository for PgOrganizationInvitationRepository {
                 client
                     .query(
                         "SELECT id, organization_id, email, role, invited_by_user_id, status, token,
-                                created_at, expires_at, responded_at
+                            created_at, expires_at, responded_at, email_status, email_sent_at,
+                            email_last_error, email_message_id
                          FROM organization_invitations
                          WHERE email = $1 AND status = $2
                          ORDER BY created_at DESC",
@@ -337,7 +340,8 @@ impl OrganizationInvitationRepository for PgOrganizationInvitationRepository {
                 client
                     .query(
                         "SELECT id, organization_id, email, role, invited_by_user_id, status, token,
-                                created_at, expires_at, responded_at
+                            created_at, expires_at, responded_at, email_status, email_sent_at,
+                            email_last_error, email_message_id
                          FROM organization_invitations
                          WHERE email = $1
                          ORDER BY created_at DESC",
@@ -350,18 +354,7 @@ impl OrganizationInvitationRepository for PgOrganizationInvitationRepository {
 
         let mut invitations = Vec::new();
         for r in rows {
-            let db_inv = OrganizationInvitation {
-                id: r.get("id"),
-                organization_id: r.get("organization_id"),
-                email: r.get("email"),
-                role: serde_json::from_value(serde_json::json!(r.get::<_, String>("role")))?,
-                invited_by_user_id: r.get("invited_by_user_id"),
-                status: serde_json::from_value(serde_json::json!(r.get::<_, String>("status")))?,
-                token: r.get("token"),
-                created_at: r.get("created_at"),
-                expires_at: r.get("expires_at"),
-                responded_at: r.get("responded_at"),
-            };
+            let db_inv = self.row_to_db_invitation(&r)?;
             invitations.push(self.db_to_domain(db_inv)?);
         }
 
@@ -389,26 +382,110 @@ impl OrganizationInvitationRepository for PgOrganizationInvitationRepository {
                      SET status = $1, responded_at = NOW()
                      WHERE id = $2
                      RETURNING id, organization_id, email, role, invited_by_user_id, status, token,
-                               created_at, expires_at, responded_at",
+                               created_at, expires_at, responded_at, email_status, email_sent_at,
+                               email_last_error, email_message_id",
                     &[&db_status.to_string(), &id],
                 )
                 .await
                 .map_err(map_db_error)
         })?;
 
-        let db_inv = OrganizationInvitation {
-            id: row.get("id"),
-            organization_id: row.get("organization_id"),
-            email: row.get("email"),
-            role: serde_json::from_value(serde_json::json!(row.get::<_, String>("role")))?,
-            invited_by_user_id: row.get("invited_by_user_id"),
-            status: serde_json::from_value(serde_json::json!(row.get::<_, String>("status")))?,
-            token: row.get("token"),
-            created_at: row.get("created_at"),
-            expires_at: row.get("expires_at"),
-            responded_at: row.get("responded_at"),
-        };
+        let db_inv = self.row_to_db_invitation(&row)?;
 
+        self.db_to_domain(db_inv)
+    }
+
+    async fn record_email_sent(
+        &self,
+        id: Uuid,
+        message_id: Option<String>,
+    ) -> Result<ServicesInvitation> {
+        let row = retry_db!("record_organization_invitation_email_sent", {
+            let client = self
+                .pool
+                .get()
+                .await
+                .context("Failed to get database connection")
+                .map_err(RepositoryError::PoolError)?;
+
+            client
+                .query_one(
+                    "UPDATE organization_invitations
+                     SET email_status = 'sent',
+                         email_sent_at = NOW(),
+                         email_last_error = NULL,
+                         email_message_id = $2
+                     WHERE id = $1
+                     RETURNING id, organization_id, email, role, invited_by_user_id, status, token,
+                               created_at, expires_at, responded_at, email_status, email_sent_at,
+                               email_last_error, email_message_id",
+                    &[&id, &message_id],
+                )
+                .await
+                .map_err(map_db_error)
+        })?;
+
+        let db_inv = self.row_to_db_invitation(&row)?;
+        self.db_to_domain(db_inv)
+    }
+
+    async fn record_email_failed(&self, id: Uuid, error: String) -> Result<ServicesInvitation> {
+        let row = retry_db!("record_organization_invitation_email_failed", {
+            let client = self
+                .pool
+                .get()
+                .await
+                .context("Failed to get database connection")
+                .map_err(RepositoryError::PoolError)?;
+
+            client
+                .query_one(
+                    "UPDATE organization_invitations
+                     SET email_status = 'failed',
+                         email_sent_at = NULL,
+                         email_last_error = $2,
+                         email_message_id = NULL
+                     WHERE id = $1
+                     RETURNING id, organization_id, email, role, invited_by_user_id, status, token,
+                               created_at, expires_at, responded_at, email_status, email_sent_at,
+                               email_last_error, email_message_id",
+                    &[&id, &error],
+                )
+                .await
+                .map_err(map_db_error)
+        })?;
+
+        let db_inv = self.row_to_db_invitation(&row)?;
+        self.db_to_domain(db_inv)
+    }
+
+    async fn record_email_skipped(&self, id: Uuid) -> Result<ServicesInvitation> {
+        let row = retry_db!("record_organization_invitation_email_skipped", {
+            let client = self
+                .pool
+                .get()
+                .await
+                .context("Failed to get database connection")
+                .map_err(RepositoryError::PoolError)?;
+
+            client
+                .query_one(
+                    "UPDATE organization_invitations
+                     SET email_status = 'skipped',
+                         email_sent_at = NULL,
+                         email_last_error = NULL,
+                         email_message_id = NULL
+                     WHERE id = $1
+                     RETURNING id, organization_id, email, role, invited_by_user_id, status, token,
+                               created_at, expires_at, responded_at, email_status, email_sent_at,
+                               email_last_error, email_message_id",
+                    &[&id],
+                )
+                .await
+                .map_err(map_db_error)
+        })?;
+
+        let db_inv = self.row_to_db_invitation(&row)?;
         self.db_to_domain(db_inv)
     }
 

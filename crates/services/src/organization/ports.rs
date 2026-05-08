@@ -72,6 +72,16 @@ impl MemberRole {
     }
 }
 
+impl std::fmt::Display for MemberRole {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            MemberRole::Owner => write!(f, "owner"),
+            MemberRole::Admin => write!(f, "admin"),
+            MemberRole::Member => write!(f, "member"),
+        }
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum OrganizationError {
     #[error("Organization not found")]
@@ -138,6 +148,8 @@ pub struct InvitationResult {
     pub success: bool,
     pub member: Option<OrganizationMember>,
     pub error: Option<String>,
+    pub email_sent: bool,
+    pub email_error: Option<String>,
 }
 
 /// Batch invitation response
@@ -159,6 +171,16 @@ pub enum InvitationStatus {
     Expired,
 }
 
+/// Invitation email delivery status
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum InvitationEmailStatus {
+    NotAttempted,
+    Sent,
+    Failed,
+    Skipped,
+}
+
 /// Organization invitation
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OrganizationInvitation {
@@ -172,6 +194,10 @@ pub struct OrganizationInvitation {
     pub created_at: DateTime<Utc>,
     pub expires_at: DateTime<Utc>,
     pub responded_at: Option<DateTime<Utc>>,
+    pub email_status: InvitationEmailStatus,
+    pub email_sent_at: Option<DateTime<Utc>>,
+    pub email_last_error: Option<String>,
+    pub email_message_id: Option<String>,
 }
 
 /// Create invitation request
@@ -295,6 +321,19 @@ pub trait OrganizationInvitationRepository: Send + Sync {
         id: Uuid,
         status: InvitationStatus,
     ) -> Result<OrganizationInvitation>;
+
+    /// Record a successful invitation email delivery
+    async fn record_email_sent(
+        &self,
+        id: Uuid,
+        message_id: Option<String>,
+    ) -> Result<OrganizationInvitation>;
+
+    /// Record a failed invitation email delivery
+    async fn record_email_failed(&self, id: Uuid, error: String) -> Result<OrganizationInvitation>;
+
+    /// Record a skipped invitation email delivery
+    async fn record_email_skipped(&self, id: Uuid) -> Result<OrganizationInvitation>;
 
     /// Delete invitation
     async fn delete(&self, id: Uuid) -> Result<bool>;

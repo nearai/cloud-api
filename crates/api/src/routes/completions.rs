@@ -2362,6 +2362,314 @@ pub async fn embeddings(
     }
 }
 
+/// Privacy classification endpoint (passthrough)
+///
+/// Proxies privacy classification requests to a token-classification model
+/// (e.g. `openai/privacy-filter`) that returns PII spans with categories and scores.
+/// Only the `model` field is read from the request for routing; the rest is forwarded as-is.
+///
+/// These documentation-only types approximate the request and response bodies
+/// for OpenAPI schema generation. The runtime handler still accepts a raw
+/// `Bytes` body and forwards it transparently to the provider.
+#[derive(utoipa::ToSchema, serde::Serialize, serde::Deserialize)]
+struct PrivacyClassifyRequestDoc {
+    /// ID of the model to use for privacy classification.
+    model: String,
+    /// Text or list of texts to classify. Either a string or array of strings.
+    #[serde(default)]
+    input: serde_json::Value,
+    /// Optional minimum confidence score for returned spans (0.0–1.0).
+    #[serde(default)]
+    threshold: Option<f64>,
+}
+
+#[derive(utoipa::ToSchema, serde::Serialize, serde::Deserialize)]
+struct PrivacyClassifyResponseDoc {
+    /// Model identifier that produced the classification.
+    #[serde(default)]
+    model: String,
+    /// Per-input classification results; each entry contains `spans` and per-input `usage`.
+    #[serde(default)]
+    data: serde_json::Value,
+}
+
+#[utoipa::path(
+    post,
+    path = "/v1/privacy/classify",
+    tag = "Privacy",
+    request_body = PrivacyClassifyRequestDoc,
+    responses(
+        (status = 200, description = "Privacy classification completed successfully", body = PrivacyClassifyResponseDoc),
+        (status = 400, description = "Invalid request", body = ErrorResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 404, description = "Model not found", body = ErrorResponse),
+        (status = 429, description = "Rate limit exceeded", body = ErrorResponse),
+        (status = 500, description = "Server error", body = ErrorResponse)
+    ),
+    security(
+        ("api_key" = [])
+    )
+)]
+pub async fn privacy_classify(
+    State(app_state): State<AppState>,
+    Extension(api_key): Extension<AuthenticatedApiKey>,
+    Extension(_body_hash): Extension<RequestBodyHash>,
+    headers: header::HeaderMap,
+    body: Bytes,
+) -> axum::response::Response {
+    // Minimal deserialization: extract only the model name for routing
+    #[derive(serde::Deserialize)]
+    struct ModelExtract {
+        model: String,
+    }
+
+    let model_name = match serde_json::from_slice::<ModelExtract>(&body) {
+        Ok(extract) => extract.model,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                ResponseJson(ErrorResponse::new(
+                    format!("Invalid request body: {e}"),
+                    "invalid_request_error".to_string(),
+                )),
+            )
+                .into_response();
+        }
+    };
+
+    debug!(
+        "Privacy classify request: model={}, org={}, workspace={}",
+        model_name, api_key.organization.id, api_key.workspace.id.0
+    );
+
+    let model = match app_state
+        .models_service
+        .get_model_by_name(&model_name)
+        .await
+    {
+        Ok(model) => model,
+        Err(services::models::ModelsError::NotFound(_)) => {
+            return (
+                StatusCode::NOT_FOUND,
+                ResponseJson(ErrorResponse::new(
+                    format!("Model '{}' not found", model_name),
+                    "not_found_error".to_string(),
+                )),
+            )
+                .into_response();
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "Failed to resolve model for privacy classify");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ResponseJson(ErrorResponse::new(
+                    "Failed to resolve model".to_string(),
+                    "server_error".to_string(),
+                )),
+            )
+                .into_response();
+        }
+    };
+    let model_id = model.id;
+    let organization_id = api_key.organization.id.0;
+
+    let encryption_headers = match crate::routes::common::validate_encryption_headers(&headers) {
+        Ok(headers) => headers,
+        Err(err) => return err.into_response(),
+    };
+    let mut extra = std::collections::HashMap::new();
+    insert_encryption_headers(&encryption_headers, &mut extra);
+
+    match app_state
+        .completion_service
+        .try_privacy_classify(organization_id, model_id, &model_name, body, extra)
+        .await
+    {
+        Ok(response_bytes) => {
+            // Privacy filter response shape:
+            //   { "model": "...", "data": [{ "index": i, "spans": [...], "usage": { "input_tokens": N } }, ...] }
+            // Sum per-item input_tokens for billing.
+            #[derive(serde::Deserialize)]
+            struct UsageExtract {
+                #[serde(default)]
+                data: Vec<DataEntry>,
+            }
+            #[derive(serde::Deserialize)]
+            struct DataEntry {
+                #[serde(default)]
+                usage: Option<UsageFields>,
+            }
+            #[derive(serde::Deserialize)]
+            struct UsageFields {
+                input_tokens: Option<i32>,
+            }
+
+            let mut token_count = serde_json::from_slice::<UsageExtract>(&response_bytes)
+                .ok()
+                .map(|u| {
+                    u.data
+                        .into_iter()
+                        .filter_map(|d| d.usage.and_then(|x| x.input_tokens))
+                        .sum::<i32>()
+                })
+                .unwrap_or(0);
+
+            const MAX_REASONABLE_TOKENS: i32 = 1_000_000;
+            let mut token_anomaly_detected = false;
+
+            if token_count > MAX_REASONABLE_TOKENS {
+                tracing::error!(
+                    token_count = token_count,
+                    max_expected = MAX_REASONABLE_TOKENS,
+                    model = %model_name,
+                    organization_id = %organization_id,
+                    "Provider returned unreasonable token count for privacy classify - capping"
+                );
+                token_anomaly_detected = true;
+                let model_tag = format!("model:{}", model_name);
+                let reason_tag = format!(
+                    "reason:{}",
+                    services::metrics::consts::REASON_TOKEN_OVERFLOW
+                );
+                let anomaly_tags = [model_tag.as_str(), reason_tag.as_str()];
+                app_state.metrics_service.record_count(
+                    services::metrics::consts::METRIC_PROVIDER_TOKEN_ANOMALIES,
+                    1,
+                    &anomaly_tags,
+                );
+                token_count = MAX_REASONABLE_TOKENS;
+            }
+
+            if token_count == 0 {
+                tracing::warn!(
+                    model = %model_name,
+                    organization_id = %organization_id,
+                    "Provider returned zero tokens for privacy classify"
+                );
+                token_anomaly_detected = true;
+                let model_tag = format!("model:{}", model_name);
+                let reason_tag =
+                    format!("reason:{}", services::metrics::consts::REASON_MISSING_USAGE);
+                let zero_tokens_tags = [model_tag.as_str(), reason_tag.as_str()];
+                app_state.metrics_service.record_count(
+                    services::metrics::consts::METRIC_PROVIDER_ZERO_TOKENS,
+                    1,
+                    &zero_tokens_tags,
+                );
+            }
+
+            if token_anomaly_detected {
+                tracing::info!(
+                    model = %model_name,
+                    organization_id = %organization_id,
+                    final_token_count = token_count,
+                    "Token count anomaly: Provider data quality issue detected. Recommendation: Check provider logs and configuration."
+                );
+            }
+
+            let workspace_id = api_key.workspace.id.0;
+            let api_key_id = match Uuid::parse_str(&api_key.api_key.id.0) {
+                Ok(id) => id,
+                Err(e) => {
+                    tracing::error!(error = %e, "Invalid API key ID for usage tracking");
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        ResponseJson(ErrorResponse::new(
+                            "Failed to record usage".to_string(),
+                            "server_error".to_string(),
+                        )),
+                    )
+                        .into_response();
+                }
+            };
+
+            let inference_id = uuid::Uuid::new_v4();
+            let usage_request = services::usage::RecordUsageServiceRequest {
+                organization_id,
+                workspace_id,
+                api_key_id,
+                model_id,
+                input_tokens: token_count,
+                output_tokens: 0,
+                cache_read_tokens: 0,
+                inference_type: services::usage::ports::InferenceType::PrivacyClassify,
+                ttft_ms: None,
+                avg_itl_ms: None,
+                inference_id: Some(inference_id),
+                provider_request_id: None,
+                stop_reason: Some(services::usage::StopReason::Completed),
+                response_id: None,
+                image_count: None,
+            };
+
+            if let Err(e) = app_state.usage_service.record_usage(usage_request).await {
+                tracing::error!(error = %e, "Failed to record privacy classify usage");
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    ResponseJson(ErrorResponse::new(
+                        "Failed to record usage - please retry".to_string(),
+                        "server_error".to_string(),
+                    )),
+                )
+                    .into_response();
+            }
+
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(response_bytes))
+                .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+        }
+        Err(e) => {
+            let (status_code, error_type, message) = match e {
+                services::completions::ports::CompletionError::RateLimitExceeded(msg) => {
+                    tracing::warn!("Concurrent request limit exceeded for privacy classify");
+                    (StatusCode::TOO_MANY_REQUESTS, "rate_limit_error", msg)
+                }
+                services::completions::ports::CompletionError::ProviderError {
+                    status_code,
+                    ..
+                } => {
+                    tracing::error!("Privacy classify provider error");
+                    let http_status = StatusCode::from_u16(status_code)
+                        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+                    (
+                        http_status,
+                        "server_error",
+                        "Privacy classify request failed. Please try again later.".to_string(),
+                    )
+                }
+                services::completions::ports::CompletionError::InvalidModel(msg) => {
+                    tracing::warn!("Privacy classify model not found");
+                    (StatusCode::NOT_FOUND, "not_found_error", msg)
+                }
+                services::completions::ports::CompletionError::ServiceOverloaded(_) => {
+                    tracing::warn!("Privacy classify service overloaded");
+                    (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "service_overloaded",
+                        "The service is temporarily overloaded. Please retry with exponential backoff.".to_string(),
+                    )
+                }
+                _ => {
+                    tracing::error!("Unexpected privacy classify error");
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "server_error",
+                        "Privacy classify request failed".to_string(),
+                    )
+                }
+            };
+
+            (
+                status_code,
+                ResponseJson(ErrorResponse::new(message, error_type.to_string())),
+            )
+                .into_response()
+        }
+    }
+}
+
 /// Text similarity scoring endpoint
 ///
 /// Scores the similarity between two texts using a scoring/ranking model.

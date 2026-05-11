@@ -11,9 +11,9 @@ use crate::{
     CompletionParams, EmbeddingError, FinishReason, FunctionCallDelta, ImageData, ImageEditError,
     ImageEditParams, ImageEditResponseWithBytes, ImageGenerationError, ImageGenerationParams,
     ImageGenerationResponse, ImageGenerationResponseWithBytes, ListModelsError, MessageRole,
-    ModelInfo, ModelsResponse, RerankError, RerankParams, RerankResponse, RerankResult,
-    RerankUsage, SSEEvent, ScoreError, ScoreParams, ScoreResponse, ScoreResult, ScoreUsage,
-    StreamChunk, StreamingResult, TokenUsage, ToolCallDelta, TranscriptionSegment,
+    ModelInfo, ModelsResponse, PrivacyClassifyError, RerankError, RerankParams, RerankResponse,
+    RerankResult, RerankUsage, SSEEvent, ScoreError, ScoreParams, ScoreResponse, ScoreResult,
+    ScoreUsage, StreamChunk, StreamingResult, TokenUsage, ToolCallDelta, TranscriptionSegment,
     TranscriptionWord,
 };
 use async_trait::async_trait;
@@ -1085,6 +1085,24 @@ impl crate::InferenceProvider for MockProvider {
         });
         let bytes = serde_json::to_vec(&response_json)
             .map_err(|e| EmbeddingError::RequestFailed(e.to_string()))?;
+        Ok(bytes::Bytes::from(bytes))
+    }
+
+    async fn privacy_classify_raw(
+        &self,
+        _body: bytes::Bytes,
+        _extra: std::collections::HashMap<String, serde_json::Value>,
+    ) -> Result<bytes::Bytes, PrivacyClassifyError> {
+        let response_json = serde_json::json!({
+            "model": "mock-privacy-filter",
+            "data": [{
+                "index": 0,
+                "spans": [],
+                "usage": {"input_tokens": 10}
+            }]
+        });
+        let bytes = serde_json::to_vec(&response_json)
+            .map_err(|e| PrivacyClassifyError::RequestFailed(e.to_string()))?;
         Ok(bytes::Bytes::from(bytes))
     }
 

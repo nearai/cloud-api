@@ -170,6 +170,16 @@ pub trait CompletionServiceTrait: Send + Sync {
         extra: std::collections::HashMap<String, serde_json::Value>,
     ) -> Result<bytes::Bytes, CompletionError>;
 
+    /// Execute a privacy classification request as a raw passthrough with concurrent request limiting.
+    async fn try_privacy_classify(
+        &self,
+        organization_id: Uuid,
+        model_id: Uuid,
+        model_name: &str,
+        body: bytes::Bytes,
+        extra: std::collections::HashMap<String, serde_json::Value>,
+    ) -> Result<bytes::Bytes, CompletionError>;
+
     /// Execute a score request with proper concurrent request limiting.
     ///
     /// Each organization has a per-model concurrent request limit (default: 64).

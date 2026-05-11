@@ -23,6 +23,7 @@ use utoipa::{Modify, OpenApi};
         (name = "Audio", description = "Audio transcription endpoints"),
         (name = "Rerank", description = "Document reranking endpoints"),
         (name = "Score", description = "Text similarity scoring endpoints"),
+        (name = "Privacy", description = "Privacy classification (PII span detection) endpoints"),
         (name = "Models", description = "Public model catalog and information"),
         (name = "Conversations", description = "Conversation management"),
         (name = "Responses", description = "Response handling and streaming"),
@@ -48,6 +49,7 @@ use utoipa::{Modify, OpenApi};
         crate::routes::completions::image_edits,
         crate::routes::completions::rerank,
         crate::routes::completions::score,
+        crate::routes::completions::privacy_classify,
         // crate::routes::completions::completions,
         crate::routes::completions::models,
         // Model endpoints (public model catalog)

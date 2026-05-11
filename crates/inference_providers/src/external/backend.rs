@@ -8,8 +8,8 @@ use crate::{
     AudioTranscriptionError, AudioTranscriptionParams, AudioTranscriptionResponse,
     ChatCompletionParams, ChatCompletionResponseWithBytes, CompletionError, EmbeddingError,
     ImageEditError, ImageEditParams, ImageEditResponseWithBytes, ImageGenerationError,
-    ImageGenerationParams, ImageGenerationResponseWithBytes, RerankError, RerankParams,
-    RerankResponse, ScoreError, ScoreParams, ScoreResponse, StreamingResult,
+    ImageGenerationParams, ImageGenerationResponseWithBytes, PrivacyClassifyError, RerankError,
+    RerankParams, RerankResponse, ScoreError, ScoreParams, ScoreResponse, StreamingResult,
 };
 use async_trait::async_trait;
 use std::collections::HashMap;
@@ -181,6 +181,22 @@ pub trait ExternalBackend: Send + Sync {
     ) -> Result<bytes::Bytes, EmbeddingError> {
         Err(EmbeddingError::RequestFailed(format!(
             "Embeddings are not supported by the {} backend.",
+            self.backend_type()
+        )))
+    }
+
+    /// Performs a privacy classification request as a raw passthrough.
+    ///
+    /// Default implementation returns an error indicating privacy classification
+    /// is not supported by external providers.
+    async fn privacy_classify_raw(
+        &self,
+        _config: &BackendConfig,
+        _body: bytes::Bytes,
+        _extra: std::collections::HashMap<String, serde_json::Value>,
+    ) -> Result<bytes::Bytes, PrivacyClassifyError> {
+        Err(PrivacyClassifyError::RequestFailed(format!(
+            "Privacy classification is not supported by the {} backend.",
             self.backend_type()
         )))
     }

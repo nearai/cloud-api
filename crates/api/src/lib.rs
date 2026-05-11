@@ -55,6 +55,10 @@ use utoipa::OpenApi;
 // Audio transcription file size limit (25 MB for OpenAI Whisper API compatibility)
 const AUDIO_TRANSCRIPTION_MAX_BODY_SIZE: usize = 25 * 1024 * 1024; // 25 MB
 
+// Privacy classify input is text only, model context is small (e.g. 512 tokens).
+// Cap at 256 KB so the route doesn't inherit the 25 MB audio-transcription limit.
+const PRIVACY_CLASSIFY_MAX_BODY_SIZE: usize = 256 * 1024; // 256 KB
+
 /// Service initialization components
 #[derive(Clone)]
 pub struct AuthComponents {
@@ -979,7 +983,12 @@ pub fn build_completion_routes(
         .route("/rerank", post(rerank))
         .route("/embeddings", post(embeddings))
         .route("/score", post(score))
-        .route("/privacy/classify", post(privacy_classify))
+        // Override the router-level audio limit (25 MB) for privacy/classify: this is a
+        // text-only endpoint, so a 256 KB cap is more appropriate.
+        .route(
+            "/privacy/classify",
+            post(privacy_classify).layer(DefaultBodyLimit::max(PRIVACY_CLASSIFY_MAX_BODY_SIZE)),
+        )
         .layer(DefaultBodyLimit::max(AUDIO_TRANSCRIPTION_MAX_BODY_SIZE))
         .with_state(app_state.clone())
         .layer(from_fn_with_state(

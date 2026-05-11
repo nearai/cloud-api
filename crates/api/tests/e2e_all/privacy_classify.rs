@@ -164,6 +164,34 @@ async fn test_privacy_classify_invalid_request() {
 }
 
 #[tokio::test]
+async fn test_privacy_classify_body_size_limit() {
+    let server = setup_test_server().await;
+
+    setup_privacy_filter_model(&server).await;
+    let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
+    let api_key = get_api_key_for_org(&server, org.id).await;
+
+    // ~300 KB payload, above the 256 KB per-route cap.
+    let oversized_input = "x".repeat(300 * 1024);
+
+    let response = server
+        .post("/v1/privacy/classify")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .add_header("User-Agent", MOCK_USER_AGENT)
+        .json(&serde_json::json!({
+            "model": "openai/privacy-filter",
+            "input": oversized_input,
+        }))
+        .await;
+
+    assert_eq!(
+        response.status_code(),
+        413,
+        "Should reject body larger than 256 KB cap"
+    );
+}
+
+#[tokio::test]
 async fn test_privacy_classify_costs_deducted() {
     let server = setup_test_server().await;
 

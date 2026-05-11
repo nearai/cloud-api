@@ -1090,11 +1090,16 @@ impl crate::InferenceProvider for MockProvider {
 
     async fn privacy_classify_raw(
         &self,
-        _body: bytes::Bytes,
+        body: bytes::Bytes,
         _extra: std::collections::HashMap<String, serde_json::Value>,
     ) -> Result<bytes::Bytes, PrivacyClassifyError> {
+        // Echo the requested model so round-trip assertions in tests are meaningful.
+        let model = serde_json::from_slice::<serde_json::Value>(&body)
+            .ok()
+            .and_then(|v| v.get("model").and_then(|m| m.as_str()).map(str::to_string))
+            .unwrap_or_else(|| "mock-privacy-filter".to_string());
         let response_json = serde_json::json!({
-            "model": "mock-privacy-filter",
+            "model": model,
             "data": [{
                 "index": 0,
                 "spans": [],

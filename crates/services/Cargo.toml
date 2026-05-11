@@ -12,8 +12,8 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 serde_urlencoded = "0.7"
 uuid = { version = "1.23", features = ["v4", "v5", "serde"] }
-opentelemetry = { version = "0.31", features = ["metrics"] }
-opentelemetry_sdk = { version = "0.31", features = ["rt-tokio", "metrics"] }
+opentelemetry = { version = "0.32", features = ["metrics"] }
+opentelemetry_sdk = { version = "0.32", features = ["rt-tokio", "metrics"] }
 chrono = { version = "0.4", features = ["serde"] }
 anyhow = "1.0"
 tokio = { version = "1", features = ["full"] }
@@ -25,7 +25,7 @@ thiserror = "2.0"
 config = { path = "../config" }
 rand = "0.10"
 rand_core = { version = "0.6", features = ["getrandom"] }
-utoipa = "5.3"
+utoipa = "5.5"
 # OAuth2 authentication
 oauth2 = { version = "5", features = ["reqwest"] }
 reqwest = { version = "0.12", features = ["json", "stream"] }
@@ -33,7 +33,7 @@ url = "2.5"
 bytes = "1.11"
 tokio-stream = "0.1"
 # MCP protocol
-rmcp = { version = "1.5", features = [
+rmcp = { version = "1.6", features = [
     "client",
     "transport-streamable-http-client-reqwest",
 ] }
@@ -45,11 +45,11 @@ dstack-sdk-types = "0.1.2"
 ed25519-dalek = { version = "2.1", features = ["rand_core"] }
 k256 = { version = "0.13", features = ["ecdsa", "arithmetic"] }
 sha3 = "0.11"
-jsonwebtoken = { version = "10.3.0", features = ["rust_crypto"] }
+jsonwebtoken = { version = "10.4.0", features = ["rust_crypto"] }
 regex = "1.12"
 # AWS S3 for file storage
 aws-config = { version = "1.8", features = ["behavior-version-latest"] }
-aws-sdk-s3 = "1.131"
+aws-sdk-s3 = "1.132"
 # Encryption for file storage
 aes-gcm = "0.10"
 # HMAC for VPC signature verification

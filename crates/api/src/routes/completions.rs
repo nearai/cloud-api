@@ -2504,15 +2504,21 @@ pub async fn privacy_classify(
                 input_tokens: Option<i32>,
             }
 
-            let mut token_count = serde_json::from_slice::<UsageExtract>(&response_bytes)
+            // Sum into i64 with saturating arithmetic and clamp to i32. The provider
+            // controls both the number of data entries and per-entry input_tokens, so a
+            // naive `sum::<i32>()` could wrap silently in release builds before the
+            // MAX_REASONABLE_TOKENS check, recording negative usage.
+            let token_sum_i64: i64 = serde_json::from_slice::<UsageExtract>(&response_bytes)
                 .ok()
                 .map(|u| {
                     u.data
                         .into_iter()
                         .filter_map(|d| d.usage.and_then(|x| x.input_tokens))
-                        .sum::<i32>()
+                        .filter(|t| *t >= 0)
+                        .fold(0i64, |acc, t| acc.saturating_add(t as i64))
                 })
                 .unwrap_or(0);
+            let mut token_count = token_sum_i64.clamp(0, i32::MAX as i64) as i32;
 
             const MAX_REASONABLE_TOKENS: i32 = 1_000_000;
             let mut token_anomaly_detected = false;

@@ -641,5 +641,8 @@ mod tests {
         assert_eq!(response.candidates.len(), 1);
         assert_eq!(response.candidates[0].content.role, "model");
         assert!(response.candidates[0].content.parts.is_empty());
+        let (text, tool_calls) = extract_response_content(&response.candidates[0].content.parts);
+        assert!(text.is_none());
+        assert!(tool_calls.is_none());
     }
 }

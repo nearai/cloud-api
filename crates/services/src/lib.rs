@@ -1,6 +1,7 @@
 pub mod admin;
 pub mod attestation;
 pub mod auth;
+pub mod auto_redact;
 pub mod common;
 pub mod completions;
 pub mod conversations;

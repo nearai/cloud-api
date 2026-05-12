@@ -10,6 +10,7 @@ use axum::{
     response::{IntoResponse, Json as ResponseJson, Response},
 };
 use futures::stream::StreamExt;
+use services::auto_redact::{self, AutoRedactError, RedactionMap, StreamUnredact};
 use services::common::encryption_headers as service_encryption_headers;
 use services::completions::{
     hash_inference_id_to_uuid,
@@ -285,6 +286,124 @@ fn convert_chat_request_to_service(
     }
 }
 
+/// Decide whether to enable auto-redact based on the request, mutate the
+/// service request to scrub the body field, and (if enabled) run the PII
+/// detector + rewrite messages in place. Returns the placeholder map for
+/// downstream un-redact; an empty map is also returned when auto-redact is
+/// off.
+async fn maybe_redact(
+    headers: &header::HeaderMap,
+    service_request: &mut ServiceCompletionRequest,
+    pool: &services::inference_provider_pool::InferenceProviderPool,
+) -> Result<(bool, RedactionMap), AutoRedactError> {
+    let header_values: Vec<&str> = headers
+        .get_all(auto_redact::AUTO_REDACT_HEADER)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .collect();
+    let body_field = service_request
+        .extra
+        .get(auto_redact::AUTO_REDACT_BODY_FIELD);
+    let enabled = auto_redact::is_enabled(header_values.iter().copied(), body_field);
+
+    // Always strip the body field so providers with strict JSON schemas
+    // (e.g. Anthropic) don't 400 on unknown keys.
+    auto_redact::strip_body_field(&mut service_request.extra);
+
+    if !enabled {
+        return Ok((false, RedactionMap::new()));
+    }
+
+    let map = auto_redact::redact_messages(
+        &mut service_request.messages,
+        auto_redact::DEFAULT_PII_MODEL,
+        pool,
+    )
+    .await?;
+    Ok((true, map))
+}
+
+/// Convert an [`AutoRedactError`] into the user-facing error response.
+/// Detector-unavailable is 503 (fail-closed per design); internal errors
+/// are 500.
+fn auto_redact_error_response(err: AutoRedactError) -> Response {
+    match err {
+        AutoRedactError::DetectorUnavailable(msg) => {
+            tracing::error!(error = %msg, "auto_redact detector unavailable");
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                ResponseJson(ErrorResponse::new(
+                    "PII redaction service is unavailable. Retry, or omit auto_redact to send the prompt as-is.".to_string(),
+                    "auto_redact_unavailable".to_string(),
+                )),
+            )
+                .into_response()
+        }
+        AutoRedactError::Internal(msg) => {
+            tracing::error!(error = %msg, "auto_redact internal error");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ResponseJson(ErrorResponse::new(
+                    "PII redaction failed".to_string(),
+                    "internal_server_error".to_string(),
+                )),
+            )
+                .into_response()
+        }
+    }
+}
+
+/// Walk a non-streaming chat response's text fields and substitute
+/// placeholders with their originals. Mutates in place.
+fn unredact_chat_response_in_place(
+    response: &mut inference_providers::ChatCompletionResponse,
+    map: &RedactionMap,
+) {
+    for choice in &mut response.choices {
+        if let Some(content) = &mut choice.message.content {
+            *content = map.unredact(content);
+        }
+        if let Some(reasoning) = &mut choice.message.reasoning_content {
+            *reasoning = map.unredact(reasoning);
+        }
+        if let Some(reasoning) = &mut choice.message.reasoning {
+            *reasoning = map.unredact(reasoning);
+        }
+    }
+}
+
+/// Apply streaming un-redact to a single parsed chunk, mutating any text
+/// deltas (content + reasoning) in place. Stateful: the [`StreamUnredact`]
+/// instance carries the sliding tail buffer across calls.
+fn unredact_chunk_in_place(
+    chunk: &mut inference_providers::StreamChunk,
+    content_un: &mut StreamUnredact,
+    reasoning_un: &mut StreamUnredact,
+) {
+    match chunk {
+        inference_providers::StreamChunk::Chat(c) => {
+            for choice in &mut c.choices {
+                if let Some(delta) = &mut choice.delta {
+                    if let Some(content) = &mut delta.content {
+                        *content = content_un.process(content);
+                    }
+                    if let Some(reasoning) = &mut delta.reasoning_content {
+                        *reasoning = reasoning_un.process(reasoning);
+                    }
+                    if let Some(reasoning) = &mut delta.reasoning {
+                        *reasoning = reasoning_un.process(reasoning);
+                    }
+                }
+            }
+        }
+        inference_providers::StreamChunk::Text(c) => {
+            for choice in &mut c.choices {
+                choice.text = content_un.process(&choice.text);
+            }
+        }
+    }
+}
+
 // Convert HTTP CompletionRequest to service CompletionRequest
 fn convert_text_request_to_service(
     request: &CompletionRequest,
@@ -387,6 +506,21 @@ pub async fn chat_completions(
     // Add validated headers to service_request.extra
     insert_encryption_headers(&encryption_headers, &mut service_request.extra);
 
+    // Auto-redact (opt-in via x-auto-redact header or auto_redact body field).
+    // On success this may rewrite service_request.messages to substitute
+    // placeholders for PII; the returned map drives the response un-redact.
+    let (auto_redact_enabled, redaction_map) = match maybe_redact(
+        &headers,
+        &mut service_request,
+        &app_state.inference_provider_pool,
+    )
+    .await
+    {
+        Ok(out) => out,
+        Err(e) => return auto_redact_error_response(e),
+    };
+    let redaction_map = Arc::new(redaction_map);
+
     // Check if streaming is requested
     if request.stream == Some(true) {
         // Call the streaming completion service
@@ -426,6 +560,15 @@ pub async fn chat_completions(
                 let request_model = request.model.clone();
                 let organization_id = api_key.organization.id.0;
 
+                // Per-stream un-redact state. When auto-redact is off,
+                // these short-circuit to passthrough (no allocation).
+                let content_unredact = Arc::new(tokio::sync::Mutex::new(StreamUnredact::new(
+                    redaction_map.clone(),
+                )));
+                let reasoning_unredact = Arc::new(tokio::sync::Mutex::new(StreamUnredact::new(
+                    redaction_map.clone(),
+                )));
+
                 // Convert to raw bytes stream with proper SSE formatting
                 let byte_stream = peekable_stream
                     .then(move |result| {
@@ -433,15 +576,26 @@ pub async fn chat_completions(
                         let chat_id_inner = chat_id_clone.clone();
                         let error_count_inner = error_count_clone.clone();
                         let model_for_err = request_model.clone();
+                        let content_un = content_unredact.clone();
+                        let reasoning_un = reasoning_unredact.clone();
                         async move {
                             match result {
-                                Ok(event) => {
+                                Ok(mut event) => {
                                     // Extract chat_id from the parsed chunk
                                     {
                                         let mut cid = chat_id_inner.lock().await;
                                         if cid.is_none() {
                                             *cid = Some(extract_chat_id_from_chunk(&event.chunk));
                                         }
+                                    }
+
+                                    // Auto-redact: swap any minted placeholders in this
+                                    // chunk's text deltas back to their originals before
+                                    // we serialize and send.
+                                    if auto_redact_enabled {
+                                        let mut c = content_un.lock().await;
+                                        let mut r = reasoning_un.lock().await;
+                                        unredact_chunk_in_place(&mut event.chunk, &mut c, &mut r);
                                     }
 
                                     // Serialize the parsed chunk (normalized to OpenAI format)
@@ -538,13 +692,41 @@ pub async fn chat_completions(
             .create_chat_completion(service_request)
             .await
         {
-            Ok(response_with_bytes) => {
+            Ok(mut response_with_bytes) => {
                 // Extract inference ID from response ID (reuse same hashing as usage tracking)
                 let inference_id =
                     Some(hash_inference_id_to_uuid(&response_with_bytes.response.id));
 
-                // Return the exact bytes from the provider for hash verification
-                // This ensures clients can hash the response and compare with attestation endpoints
+                // When auto-redact is enabled, we substitute placeholders back to
+                // originals and re-serialize. The provider's raw_bytes are over the
+                // redacted form; we deliberately drop that signed payload because
+                // the client opted into munging the response.
+                let body_bytes = if auto_redact_enabled {
+                    unredact_chat_response_in_place(
+                        &mut response_with_bytes.response,
+                        &redaction_map,
+                    );
+                    match serde_json::to_vec(&response_with_bytes.response) {
+                        Ok(b) => b,
+                        Err(e) => {
+                            tracing::error!(error = %e, "failed to re-serialize unredacted chat response");
+                            return (
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                ResponseJson(ErrorResponse::new(
+                                    "Failed to assemble response".to_string(),
+                                    "internal_server_error".to_string(),
+                                )),
+                            )
+                                .into_response();
+                        }
+                    }
+                } else {
+                    // Return the exact bytes from the provider for hash verification.
+                    // This ensures clients can hash the response and compare with
+                    // attestation endpoints.
+                    response_with_bytes.raw_bytes
+                };
+
                 let mut response_builder = Response::builder()
                     .status(StatusCode::OK)
                     .header(header::CONTENT_TYPE, "application/json");
@@ -556,9 +738,7 @@ pub async fn chat_completions(
                         .header("Access-Control-Expose-Headers", HEADER_INFERENCE_ID);
                 }
 
-                response_builder
-                    .body(Body::from(response_with_bytes.raw_bytes))
-                    .unwrap()
+                response_builder.body(Body::from(body_bytes)).unwrap()
             }
             Err(domain_error) => {
                 let status_code = map_domain_error_to_status(&domain_error);

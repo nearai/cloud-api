@@ -11,9 +11,9 @@ use crate::{
     CompletionParams, EmbeddingError, FinishReason, FunctionCallDelta, ImageData, ImageEditError,
     ImageEditParams, ImageEditResponseWithBytes, ImageGenerationError, ImageGenerationParams,
     ImageGenerationResponse, ImageGenerationResponseWithBytes, ListModelsError, MessageRole,
-    ModelInfo, ModelsResponse, RerankError, RerankParams, RerankResponse, RerankResult,
-    RerankUsage, SSEEvent, ScoreError, ScoreParams, ScoreResponse, ScoreResult, ScoreUsage,
-    StreamChunk, StreamingResult, TokenUsage, ToolCallDelta, TranscriptionSegment,
+    ModelInfo, ModelsResponse, PrivacyClassifyError, RerankError, RerankParams, RerankResponse,
+    RerankResult, RerankUsage, SSEEvent, ScoreError, ScoreParams, ScoreResponse, ScoreResult,
+    ScoreUsage, StreamChunk, StreamingResult, TokenUsage, ToolCallDelta, TranscriptionSegment,
     TranscriptionWord,
 };
 use async_trait::async_trait;
@@ -1085,6 +1085,29 @@ impl crate::InferenceProvider for MockProvider {
         });
         let bytes = serde_json::to_vec(&response_json)
             .map_err(|e| EmbeddingError::RequestFailed(e.to_string()))?;
+        Ok(bytes::Bytes::from(bytes))
+    }
+
+    async fn privacy_classify_raw(
+        &self,
+        body: bytes::Bytes,
+        _extra: std::collections::HashMap<String, serde_json::Value>,
+    ) -> Result<bytes::Bytes, PrivacyClassifyError> {
+        // Echo the requested model so round-trip assertions in tests are meaningful.
+        let model = serde_json::from_slice::<serde_json::Value>(&body)
+            .ok()
+            .and_then(|v| v.get("model").and_then(|m| m.as_str()).map(str::to_string))
+            .unwrap_or_else(|| "mock-privacy-filter".to_string());
+        let response_json = serde_json::json!({
+            "model": model,
+            "data": [{
+                "index": 0,
+                "spans": [],
+                "usage": {"input_tokens": 10}
+            }]
+        });
+        let bytes = serde_json::to_vec(&response_json)
+            .map_err(|e| PrivacyClassifyError::RequestFailed(e.to_string()))?;
         Ok(bytes::Bytes::from(bytes))
     }
 

@@ -34,8 +34,8 @@ use crate::{
     ChatSignature, CompletionError, CompletionParams, EmbeddingError, ImageEditError,
     ImageEditParams, ImageEditResponseWithBytes, ImageGenerationError, ImageGenerationParams,
     ImageGenerationResponseWithBytes, InferenceProvider, ListModelsError, ModelsResponse,
-    RerankError, RerankParams, RerankResponse, ScoreError, ScoreParams, ScoreResponse,
-    StreamingResult,
+    PrivacyClassifyError, RerankError, RerankParams, RerankResponse, ScoreError, ScoreParams,
+    ScoreResponse, StreamingResult,
 };
 use async_trait::async_trait;
 use backend::{BackendConfig, ExternalBackend};
@@ -362,6 +362,16 @@ impl InferenceProvider for ExternalProvider {
         extra: std::collections::HashMap<String, serde_json::Value>,
     ) -> Result<bytes::Bytes, EmbeddingError> {
         self.backend.embeddings_raw(&self.config, body, extra).await
+    }
+
+    async fn privacy_classify_raw(
+        &self,
+        body: bytes::Bytes,
+        extra: std::collections::HashMap<String, serde_json::Value>,
+    ) -> Result<bytes::Bytes, PrivacyClassifyError> {
+        self.backend
+            .privacy_classify_raw(&self.config, body, extra)
+            .await
     }
 }
 

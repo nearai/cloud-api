@@ -3,7 +3,7 @@ mod prefix_router;
 use crate::spki_verifier::{FingerprintState, SharedTlsRoots};
 use crate::{
     models::StreamOptions, sse_parser::new_sse_parser, ImageEditError, ImageGenerationError,
-    RerankError, ScoreError, *,
+    PrivacyClassifyError, RerankError, ScoreError, *,
 };
 use async_trait::async_trait;
 use prefix_router::PrefixRouter;
@@ -32,6 +32,11 @@ fn to_score_error<E: std::fmt::Display>(e: E) -> ScoreError {
 /// Convert any displayable error to EmbeddingError::RequestFailed
 fn to_embedding_error<E: std::fmt::Display>(e: E) -> EmbeddingError {
     EmbeddingError::RequestFailed(e.to_string())
+}
+
+/// Convert any displayable error to PrivacyClassifyError::RequestFailed
+fn to_privacy_classify_error<E: std::fmt::Display>(e: E) -> PrivacyClassifyError {
+    PrivacyClassifyError::RequestFailed(e.to_string())
 }
 
 /// Encryption header keys used in params.extra for passing encryption information
@@ -1453,6 +1458,43 @@ impl InferenceProvider for VLlmProvider {
         }
 
         let raw_bytes = response.bytes().await.map_err(to_embedding_error)?;
+        Ok(raw_bytes)
+    }
+
+    async fn privacy_classify_raw(
+        &self,
+        body: bytes::Bytes,
+        mut extra: std::collections::HashMap<String, serde_json::Value>,
+    ) -> Result<bytes::Bytes, PrivacyClassifyError> {
+        let url = format!("{}/v1/privacy/classify", self.config.base_url);
+
+        let mut headers = self.build_headers().map_err(to_privacy_classify_error)?;
+        self.prepare_encryption_headers(&mut headers, &mut extra);
+
+        let response = self
+            .client
+            .post(&url)
+            .headers(headers)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(body)
+            .timeout(self.config.completion_timeout())
+            .send()
+            .await
+            .map_err(to_privacy_classify_error)?;
+
+        if !response.status().is_success() {
+            let status_code = response.status().as_u16();
+            let message = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "Unknown error".to_string());
+            return Err(PrivacyClassifyError::HttpError {
+                status_code,
+                message,
+            });
+        }
+
+        let raw_bytes = response.bytes().await.map_err(to_privacy_classify_error)?;
         Ok(raw_bytes)
     }
 }

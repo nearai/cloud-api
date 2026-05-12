@@ -80,9 +80,18 @@ pub struct GeminiFunctionResponse {
 }
 
 /// Gemini content format
+///
+/// `role` and `parts` are marked `#[serde(default)]` because Google's
+/// `generateContent` response omits one or both fields when generation ends
+/// with `finishReason: MAX_TOKENS` before producing any output tokens
+/// (observed in `gemini-3-flash-preview` returning `content: {}` and
+/// `gemini-2.5-flash` returning `content: {"role": "model"}`). The strict
+/// schema rejected these payloads and surfaced as 502s to clients.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GeminiContent {
+    #[serde(default)]
     pub role: String,
+    #[serde(default)]
     pub parts: Vec<GeminiPart>,
 }
 
@@ -584,5 +593,53 @@ mod tests {
             Some(crate::FinishReason::Length)
         );
         assert_eq!(map_finish_reason(None), None);
+    }
+
+    // Regression: Google returns truncated content when MAX_TOKENS hits with
+    // no output. The strict schema previously rejected both variants and
+    // surfaced as 502s. Captured from live `gemini-3-flash-preview` and
+    // `gemini-2.5-flash` responses.
+
+    #[test]
+    fn test_parse_response_with_empty_content_on_max_tokens() {
+        let json = r#"{
+            "candidates": [{
+                "content": {},
+                "finishReason": "MAX_TOKENS",
+                "index": 0
+            }],
+            "usageMetadata": {
+                "promptTokenCount": 5,
+                "totalTokenCount": 5
+            }
+        }"#;
+
+        let response: GeminiResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(response.candidates.len(), 1);
+        assert_eq!(response.candidates[0].content.role, "");
+        assert!(response.candidates[0].content.parts.is_empty());
+        let (text, tool_calls) = extract_response_content(&response.candidates[0].content.parts);
+        assert!(text.is_none());
+        assert!(tool_calls.is_none());
+    }
+
+    #[test]
+    fn test_parse_response_with_role_only_content_on_max_tokens() {
+        let json = r#"{
+            "candidates": [{
+                "content": {"role": "model"},
+                "finishReason": "MAX_TOKENS",
+                "index": 0
+            }],
+            "usageMetadata": {
+                "promptTokenCount": 5,
+                "totalTokenCount": 5
+            }
+        }"#;
+
+        let response: GeminiResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(response.candidates.len(), 1);
+        assert_eq!(response.candidates[0].content.role, "model");
+        assert!(response.candidates[0].content.parts.is_empty());
     }
 }

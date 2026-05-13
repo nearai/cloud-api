@@ -1169,6 +1169,9 @@ impl crate::InferenceProvider for MockProvider {
             _ => Vec::new(),
         };
 
+        // Per-item usage matches the original mock contract (10 tokens) so
+        // tests asserting on billing math don't have to track input length.
+        // Only the `spans` field is computed from the input.
         let data: Vec<serde_json::Value> = inputs
             .iter()
             .enumerate()
@@ -1177,7 +1180,7 @@ impl crate::InferenceProvider for MockProvider {
                 serde_json::json!({
                     "index": i,
                     "spans": spans,
-                    "usage": {"input_tokens": text.split_whitespace().count() as i32}
+                    "usage": {"input_tokens": 10}
                 })
             })
             .collect();

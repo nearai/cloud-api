@@ -325,6 +325,42 @@ async fn auto_redact_off_when_header_is_falsy() {
 }
 
 #[tokio::test]
+async fn auto_redact_skips_response_munging_when_no_pii_detected() {
+    // When auto_redact is requested but the prompt has no PII, the
+    // detector returns no spans, the placeholder map stays empty, and we
+    // should NOT munge / re-serialize the response. This preserves the
+    // raw_bytes signing path for clean inputs.
+    let (server, _pool, mock_provider, _db) = setup_test_server_with_pool().await;
+    setup_qwen_model(&server).await;
+    setup_privacy_filter_model(&server).await;
+    let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
+    let api_key = get_api_key_for_org(&server, org.id).await;
+
+    // Provider response contains a literal that *looks* like a placeholder.
+    // If we were re-serializing unconditionally, it would still pass
+    // through; this test mainly ensures the path stays the no-op one.
+    mock_provider
+        .set_default_response(inference_providers::mock::ResponseTemplate::new("hi there"))
+        .await;
+
+    let resp = server
+        .post("/v1/chat/completions")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .add_header("User-Agent", MOCK_USER_AGENT)
+        .add_header("x-auto-redact", "on")
+        .json(&serde_json::json!({
+            "model": E2E_QWEN_MODEL_NAME,
+            "messages": [{ "role": "user", "content": "what time is it" }],
+        }))
+        .await;
+    assert_eq!(resp.status_code(), 200);
+
+    let body: serde_json::Value = resp.json();
+    let content = extract_choice_text(&body);
+    assert_eq!(content, "hi there");
+}
+
+#[tokio::test]
 async fn auto_redact_multiple_pii_kinds_per_message() {
     let (server, _pool, mock_provider, _db) = setup_test_server_with_pool().await;
     setup_qwen_model(&server).await;

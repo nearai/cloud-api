@@ -85,8 +85,6 @@ struct RawSpan {
     category: String,
     start: usize,
     end: usize,
-    #[serde(default)]
-    text: String,
 }
 
 fn parse_response(bytes: &[u8], expected_len: usize) -> Result<Vec<Vec<Span>>, AutoRedactError> {
@@ -99,16 +97,13 @@ fn parse_response(bytes: &[u8], expected_len: usize) -> Result<Vec<Vec<Span>>, A
             // Defensive: model returned an index beyond what we asked for.
             continue;
         }
-        out[item.index] = item
-            .spans
-            .into_iter()
-            .map(|s| Span {
-                category: s.category,
-                start: s.start,
-                end: s.end,
-                text: s.text,
-            })
-            .collect();
+        // Extend rather than replace: the detector may legitimately split
+        // detections for the same input across multiple data entries.
+        out[item.index].extend(item.spans.into_iter().map(|s| Span {
+            category: s.category,
+            start: s.start,
+            end: s.end,
+        }));
     }
     Ok(out)
 }

@@ -1,8 +1,7 @@
 //! Auto-redact PII in completions requests before they reach a provider,
 //! then un-redact in the response so the client sees the original text.
 //!
-//! See `docs/auto-redact.md` (TBD) for the end-to-end design. Quick
-//! summary:
+//! End-to-end flow:
 //!
 //! ```text
 //! client → cloud-api (TEE)
@@ -122,7 +121,10 @@ pub async fn redact_messages(
 
     let mut redacted = Vec::with_capacity(texts.len());
     for (text, spans) in texts.iter().zip(spans_per_text.iter()) {
-        redacted.push(apply::redact_one(text, spans, &mut map));
+        // redact_one returns Err on malformed spans (out-of-range or non
+        // UTF-8 char boundary). Propagate so the handler fails closed
+        // rather than silently passing raw PII upstream.
+        redacted.push(apply::redact_one(text, spans, &mut map)?);
     }
     apply::write_back(messages, &refs, redacted);
     Ok(map)

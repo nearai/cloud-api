@@ -94,7 +94,6 @@ pub struct Span {
     pub category: String,
     pub start: usize,
     pub end: usize,
-    pub text: String,
 }
 
 /// Apply detected spans to a text fragment, replacing each PII span with a
@@ -102,9 +101,20 @@ pub struct Span {
 /// `start`; overlapping spans are resolved by preferring the earlier one
 /// (the later one is silently dropped — privacy-filter doesn't emit
 /// overlaps in practice).
-pub fn redact_one(text: &str, spans: &[Span], map: &mut super::RedactionMap) -> String {
+///
+/// **Fail-closed on malformed input.** If the detector returns spans whose
+/// byte offsets don't land on UTF-8 char boundaries, or whose bounds are
+/// outside the input, this returns `Err(AutoRedactError::Internal)` rather
+/// than silently passing the raw text through (which would leak PII to the
+/// upstream provider).
+pub fn redact_one(
+    text: &str,
+    spans: &[Span],
+    map: &mut super::RedactionMap,
+) -> Result<String, super::AutoRedactError> {
+    use super::AutoRedactError;
     if spans.is_empty() {
-        return text.to_string();
+        return Ok(text.to_string());
     }
     let bytes = text.as_bytes();
     let mut sorted: Vec<&Span> = spans.iter().collect();
@@ -118,31 +128,39 @@ pub fn redact_one(text: &str, spans: &[Span], map: &mut super::RedactionMap) -> 
             continue;
         }
         if span.end > bytes.len() || span.start > span.end {
-            // Malformed span — skip rather than panic on slice.
-            continue;
+            return Err(AutoRedactError::Internal(format!(
+                "malformed span: start={} end={} text_len={}",
+                span.start,
+                span.end,
+                bytes.len()
+            )));
         }
-        // Append the text between the previous span and this one.
-        if let Ok(s) = std::str::from_utf8(&bytes[cursor..span.start]) {
-            out.push_str(s);
-        } else {
-            // Non-UTF8 boundary; refuse to redact this fragment safely.
-            return text.to_string();
+        // Slicing the &str requires char-boundary offsets. We must use the
+        // `&str` path (not `from_utf8` on byte slices) so a span boundary
+        // that falls inside a multi-byte UTF-8 sequence fails closed.
+        if !text.is_char_boundary(cursor)
+            || !text.is_char_boundary(span.start)
+            || !text.is_char_boundary(span.end)
+        {
+            return Err(AutoRedactError::Internal(
+                "PII span boundary is not a UTF-8 char boundary".to_string(),
+            ));
         }
-        // Prefer the model's own `text` field when it's a clean UTF-8 slice
-        // of the input; fall back to the raw slice otherwise.
-        let original = std::str::from_utf8(&bytes[span.start..span.end])
-            .map(str::to_string)
-            .unwrap_or_else(|_| span.text.clone());
-        let placeholder = map.lookup_or_mint(&span.category, &original);
+        out.push_str(&text[cursor..span.start]);
+        let original = &text[span.start..span.end];
+        let placeholder = map.lookup_or_mint(&span.category, original);
         out.push_str(&placeholder);
         cursor = span.end;
     }
     if cursor < bytes.len() {
-        if let Ok(s) = std::str::from_utf8(&bytes[cursor..]) {
-            out.push_str(s);
+        if !text.is_char_boundary(cursor) {
+            return Err(AutoRedactError::Internal(
+                "PII span tail boundary is not a UTF-8 char boundary".to_string(),
+            ));
         }
+        out.push_str(&text[cursor..]);
     }
-    out
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -234,16 +252,14 @@ mod tests {
                 category: "private_email".into(),
                 start: 6,
                 end: 23,
-                text: "alice@example.com".into(),
             },
             Span {
                 category: "private_email".into(),
                 start: 27,
                 end: 42,
-                text: "bob@example.com".into(),
             },
         ];
-        let out = redact_one(text, &spans, &mut map);
+        let out = redact_one(text, &spans, &mut map).unwrap();
         assert_eq!(out, "Email <email1> or <email2>");
     }
 
@@ -256,17 +272,47 @@ mod tests {
                 category: "private_email".into(),
                 start: 3,
                 end: 14,
-                text: "alice@x.com".into(),
             },
             Span {
                 category: "private_email".into(),
                 start: 18,
                 end: 29,
-                text: "alice@x.com".into(),
             },
         ];
-        let out = redact_one(text, &spans, &mut map);
+        let out = redact_one(text, &spans, &mut map).unwrap();
         assert_eq!(out, "to <email1> or <email1> again");
+    }
+
+    #[test]
+    fn redact_one_fails_closed_on_non_char_boundary() {
+        let mut map = RedactionMap::new();
+        // "héllo" — `é` is 2 bytes (0xC3 0xA9). A span that ends inside
+        // the multi-byte sequence must be rejected, not silently passed
+        // through (which would leak the original text).
+        let text = "héllo";
+        let spans = vec![Span {
+            category: "private_name".into(),
+            start: 0,
+            end: 2,
+        }];
+        let err = redact_one(text, &spans, &mut map).unwrap_err();
+        assert!(
+            matches!(err, super::super::AutoRedactError::Internal(_)),
+            "expected Internal error on non-char boundary"
+        );
+    }
+
+    #[test]
+    fn redact_one_fails_closed_on_out_of_range_span() {
+        let mut map = RedactionMap::new();
+        let text = "short";
+        let spans = vec![Span {
+            category: "private_email".into(),
+            start: 0,
+            end: 999,
+        }];
+        let err = redact_one(text, &spans, &mut map).unwrap_err();
+        assert!(matches!(err, super::super::AutoRedactError::Internal(_)));
     }
 
     #[test]
@@ -279,23 +325,21 @@ mod tests {
                 category: "private_name".into(),
                 start: 0,
                 end: 5,
-                text: "Hello".into(),
             },
             Span {
                 category: "private_name".into(),
                 start: 2,
                 end: 7,
-                text: "llo w".into(),
             },
         ];
-        let out = redact_one(text, &spans, &mut map);
+        let out = redact_one(text, &spans, &mut map).unwrap();
         assert_eq!(out, "<name1> world");
     }
 
     #[test]
     fn redact_one_empty_spans_passthrough() {
         let mut map = RedactionMap::new();
-        let out = redact_one("nothing private", &[], &mut map);
+        let out = redact_one("nothing private", &[], &mut map).unwrap();
         assert_eq!(out, "nothing private");
         assert!(map.is_empty());
     }

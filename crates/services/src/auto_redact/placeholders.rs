@@ -5,8 +5,10 @@ use std::sync::LazyLock;
 /// Maximum byte length of any placeholder we mint. Bounds the streaming
 /// unredact tail buffer so we never split a placeholder across SSE chunks.
 ///
-/// `<account_number999>` is 19 bytes. We round up to 32 to leave headroom
-/// for any future category prefix.
+/// Today's longest minted placeholder is `<address9999>` (14 bytes) — see
+/// [`placeholder_prefix`]. We round up to 32 to leave headroom for any
+/// future category prefix; if a future prefix is longer than 30 chars,
+/// bump this.
 pub const MAX_PLACEHOLDER_LEN: usize = 32;
 
 /// Matches any well-formed placeholder we could have minted: `<` + lowercase

@@ -115,6 +115,41 @@ impl RedactionMap {
             })
             .into_owned()
     }
+
+    /// Like [`unredact`], but used when the *text being substituted into is
+    /// itself a JSON-encoded string* (e.g. `tool_calls[*].function.arguments`).
+    /// Each replacement original is JSON-escaped before insertion so PII
+    /// containing `"`, `\`, control chars, or non-ASCII never corrupts the
+    /// surrounding JSON.
+    ///
+    /// Unknown placeholder-shaped tokens are left literal, same as `unredact`.
+    pub fn unredact_json_string(&self, text: &str) -> String {
+        if self.is_empty() {
+            return text.to_string();
+        }
+        PLACEHOLDER_RE
+            .replace_all(text, |caps: &regex::Captures<'_>| {
+                let whole = &caps[0];
+                match self.placeholder_to_original.get(whole) {
+                    Some(original) => json_escape_inner(original),
+                    None => whole.to_string(),
+                }
+            })
+            .into_owned()
+    }
+}
+
+/// JSON-escape a string for embedding *inside* a JSON string literal — i.e.
+/// the chars between the surrounding `"..."` quotes. Returns the body only.
+///
+/// Uses `serde_json::to_string` to get a fully-escaped JSON string, then
+/// strips the outer quotes. Falls back to the raw input only if serialization
+/// fails (impossible for `&str`).
+fn json_escape_inner(s: &str) -> String {
+    match serde_json::to_string(s) {
+        Ok(quoted) if quoted.len() >= 2 => quoted[1..quoted.len() - 1].to_string(),
+        _ => s.to_string(),
+    }
 }
 
 #[cfg(test)]
@@ -186,5 +221,53 @@ mod tests {
         map.lookup_or_mint("private_phone", "+1-555-0100");
         let out = map.unredact("<email1><phone1>");
         assert_eq!(out, "a@b.com+1-555-0100");
+    }
+
+    #[test]
+    fn unredact_json_string_escapes_quotes() {
+        let mut map = RedactionMap::new();
+        // A name with a literal double-quote — JSON would break if we just
+        // substituted it raw into a JSON string context.
+        map.lookup_or_mint("private_name", r#"Patrick O"Brien"#);
+        let args = r#"{"to":"<name1>","subject":"hi"}"#;
+        let out = map.unredact_json_string(args);
+        assert_eq!(out, r#"{"to":"Patrick O\"Brien","subject":"hi"}"#);
+        // Round-trip parseable.
+        let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(parsed["to"], "Patrick O\"Brien");
+    }
+
+    #[test]
+    fn unredact_json_string_escapes_backslash() {
+        let mut map = RedactionMap::new();
+        map.lookup_or_mint("private_address", r"C:\Users\bob");
+        let args = r#"{"path":"<address1>"}"#;
+        let out = map.unredact_json_string(args);
+        let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(parsed["path"], r"C:\Users\bob");
+    }
+
+    #[test]
+    fn unredact_json_string_escapes_newline() {
+        let mut map = RedactionMap::new();
+        map.lookup_or_mint("private_address", "Line 1\nLine 2");
+        let args = r#"{"addr":"<address1>"}"#;
+        let out = map.unredact_json_string(args);
+        // The substituted value must use \n (escaped), not a literal newline,
+        // otherwise the JSON is invalid.
+        assert!(!out.contains('\n'));
+        let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(parsed["addr"], "Line 1\nLine 2");
+    }
+
+    #[test]
+    fn unredact_json_string_safe_for_simple_pii() {
+        let mut map = RedactionMap::new();
+        map.lookup_or_mint("private_email", "alice@example.com");
+        let args = r#"{"to":"<email1>","subject":"Welcome"}"#;
+        let out = map.unredact_json_string(args);
+        // No special chars in the original, so output matches the plain
+        // unredact for backwards compat.
+        assert_eq!(out, r#"{"to":"alice@example.com","subject":"Welcome"}"#);
     }
 }

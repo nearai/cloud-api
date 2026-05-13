@@ -409,6 +409,76 @@ async fn auto_redact_multiple_pii_kinds_per_message() {
 }
 
 #[tokio::test]
+async fn auto_redact_unredacts_tool_call_arguments_streaming() {
+    // Streaming agentic flow: ensure the per-(choice_idx, tc_idx) sliding-
+    // tail state un-redacts placeholders that arrive in tool-call argument
+    // fragments. The mock streams arguments split by spaces; the assertion
+    // is on the assembled output.
+    let (server, _pool, mock_provider, _db) = setup_test_server_with_pool().await;
+    setup_qwen_model(&server).await;
+    setup_privacy_filter_model(&server).await;
+    let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
+    let api_key = get_api_key_for_org(&server, org.id).await;
+
+    mock_provider
+        .set_default_response(
+            inference_providers::mock::ResponseTemplate::new("").with_tool_calls(vec![
+                inference_providers::mock::ToolCall::new(
+                    "send_email",
+                    // Spaces around the placeholder force the mock to emit
+                    // multiple chunks; our streaming un-redact must reassemble.
+                    r#"{ "to" : "<email1>" , "subject" : "Welcome" }"#,
+                ),
+            ]),
+        )
+        .await;
+
+    let resp = server
+        .post("/v1/chat/completions")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .add_header("User-Agent", MOCK_USER_AGENT)
+        .add_header("x-auto-redact", "on")
+        .json(&serde_json::json!({
+            "model": E2E_QWEN_MODEL_NAME,
+            "messages": [{"role":"user","content":"Email alice@example.com a welcome note"}],
+            "stream": true,
+        }))
+        .await;
+    assert_eq!(resp.status_code(), 200);
+
+    // Reassemble the streamed tool-call argument fragments and parse the
+    // result as JSON. The `to` field must be the original email.
+    let body_text = resp.text();
+    let mut assembled = String::new();
+    for line in body_text.lines() {
+        let payload = match line.strip_prefix("data: ") {
+            Some(p) => p,
+            None => continue,
+        };
+        if payload == "[DONE]" {
+            continue;
+        }
+        let Ok(chunk) = serde_json::from_str::<serde_json::Value>(payload) else {
+            continue;
+        };
+        if let Some(args) = chunk
+            .pointer("/choices/0/delta/tool_calls/0/function/arguments")
+            .and_then(|v| v.as_str())
+        {
+            assembled.push_str(args);
+        }
+    }
+    let parsed: serde_json::Value = serde_json::from_str(assembled.trim()).unwrap_or_else(|e| {
+        panic!("assembled args should be valid JSON; got: {assembled:?}, err: {e}")
+    });
+    assert_eq!(parsed["to"], "alice@example.com");
+    assert!(
+        !assembled.contains("<email1>"),
+        "placeholder must not leak in streamed args; got: {assembled:?}"
+    );
+}
+
+#[tokio::test]
 async fn auto_redact_unredacts_tool_call_arguments() {
     // Agentic flow: the user's prompt contains PII, the model emits a tool
     // call whose JSON arguments echo the (now-redacted) PII. The un-redact

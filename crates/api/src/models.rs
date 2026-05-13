@@ -2506,12 +2506,14 @@ pub struct AcceptInvitationResponse {
 // Model Listing API Models
 // ============================================
 
-/// Response for model list endpoint
+/// Response for model list endpoint.
+///
+/// Pagination has been dropped from `/v1/model/list` — there are only a
+/// few dozen models in the system and the full list is cached in-process.
+/// `total` is preserved as a convenience field set to `models.len()`.
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct ModelListResponse {
     pub models: Vec<ModelWithPricing>,
-    pub limit: i64,
-    pub offset: i64,
     pub total: i64,
 }
 

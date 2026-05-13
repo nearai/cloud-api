@@ -3,60 +3,44 @@ use crate::models::{
     ModelWithPricing,
 };
 use axum::{
-    extract::{Path, Query, State},
+    extract::{Path, State},
     http::StatusCode,
     response::Json as ResponseJson,
 };
-use serde::Deserialize;
 use services::models::ModelsServiceTrait;
 use std::sync::Arc;
 use tracing::{debug, error};
-use utoipa::IntoParams;
 
 #[derive(Clone)]
 pub struct ModelsAppState {
     pub models_service: Arc<dyn ModelsServiceTrait + Send + Sync>,
 }
 
-/// Query parameters for model listing
-#[derive(Debug, Deserialize, IntoParams)]
-pub struct ModelListQuery {
-    #[serde(default = "crate::routes::common::default_limit")]
-    pub limit: i64,
-    #[serde(default)]
-    pub offset: i64,
-}
-
 /// List models with pricing
 ///
 /// Get all available models with pricing information. Public endpoint.
+///
+/// Pagination has been removed: the model catalog has a few dozen entries
+/// and the response is cached in-process. Any `limit` / `offset` query
+/// parameters are ignored.
 #[utoipa::path(
     get,
     path = "/v1/model/list",
     tag = "Models",
-    params(ModelListQuery),
     responses(
         (status = 200, description = "List of models with pricing", body = ModelListResponse),
-        (status = 400, description = "Invalid pagination parameters", body = ErrorResponse),
         (status = 500, description = "Server error", body = ErrorResponse)
     )
 )]
 pub async fn list_models(
     State(app_state): State<ModelsAppState>,
-    Query(query): Query<ModelListQuery>,
 ) -> Result<ResponseJson<ModelListResponse>, (StatusCode, ResponseJson<ErrorResponse>)> {
-    debug!(
-        "Model list request: limit={}, offset={}",
-        query.limit, query.offset
-    );
+    debug!("Model list request");
 
-    // Validate pagination parameters
-    crate::routes::common::validate_limit_offset(query.limit, query.offset)?;
-
-    // Get all models from the service
-    let (models, total) = app_state
+    // Get all models from the service (served from in-process cache when warm)
+    let models = app_state
         .models_service
-        .get_models_with_pricing(query.limit, query.offset)
+        .get_models_with_pricing()
         .await
         .map_err(|_| {
             error!("Failed to get models");
@@ -116,11 +100,10 @@ pub async fn list_models(
         })
         .collect();
 
+    let total = api_models.len() as i64;
     let response = ModelListResponse {
         models: api_models,
         total,
-        limit: query.limit,
-        offset: query.offset,
     };
 
     Ok(ResponseJson(response))

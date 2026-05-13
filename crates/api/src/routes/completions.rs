@@ -1011,9 +1011,9 @@ pub async fn models(
 ) -> Result<ResponseJson<ModelsResponse>, (StatusCode, ResponseJson<ErrorResponse>)> {
     debug!("Models list request from key: {:?}", api_key.id);
 
-    let (models, _total) = app_state
+    let models = app_state
         .models_service
-        .get_models_with_pricing(1000, 0)
+        .get_models_with_pricing()
         .await
         .map_err(|e| {
             (

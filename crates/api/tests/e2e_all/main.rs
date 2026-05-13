@@ -13,6 +13,7 @@ mod api_keys;
 mod audio_image;
 mod audio_transcriptions;
 mod auth_tokens;
+mod auto_redact;
 mod billing_and_models;
 mod chat_encryption;
 mod check_api_key;

@@ -24,6 +24,60 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::{Mutex, RwLock};
 
+/// Lightweight PII detector used only by [`MockProvider::privacy_classify_raw`]
+/// to simulate the privacy-filter model in tests. Matches obvious shapes:
+/// email, US-style phone, SSN-like sequences. Not used in production.
+///
+/// The output mirrors the privacy-filter response shape (per-span object
+/// with `category`, `start`, `end`, `score`, `text`).
+fn detect_simple_pii_spans(text: &str) -> Vec<serde_json::Value> {
+    use std::sync::LazyLock;
+    static EMAIL_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
+        regex::Regex::new(r"\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b").unwrap()
+    });
+    static SSN_RE: LazyLock<regex::Regex> =
+        LazyLock::new(|| regex::Regex::new(r"\b\d{3}-\d{2}-\d{4}\b").unwrap());
+    static PHONE_RE: LazyLock<regex::Regex> =
+        LazyLock::new(|| regex::Regex::new(r"\+?\d[\d\-\s]{7,}\d").unwrap());
+
+    let mut out: Vec<serde_json::Value> = Vec::new();
+    for m in EMAIL_RE.find_iter(text) {
+        out.push(serde_json::json!({
+            "category": "private_email",
+            "start": m.start(),
+            "end": m.end(),
+            "score": 0.99,
+            "text": m.as_str(),
+        }));
+    }
+    for m in SSN_RE.find_iter(text) {
+        out.push(serde_json::json!({
+            "category": "account_number",
+            "start": m.start(),
+            "end": m.end(),
+            "score": 0.99,
+            "text": m.as_str(),
+        }));
+    }
+    for m in PHONE_RE.find_iter(text) {
+        // Skip if this match is already covered by SSN (which also matches
+        // a 3-2-4 digit pattern); SSN is the more specific category.
+        let overlaps_ssn = SSN_RE
+            .find_iter(text)
+            .any(|s| !(m.end() <= s.start() || m.start() >= s.end()));
+        if !overlaps_ssn {
+            out.push(serde_json::json!({
+                "category": "private_phone",
+                "start": m.start(),
+                "end": m.end(),
+                "score": 0.99,
+                "text": m.as_str(),
+            }));
+        }
+    }
+    out
+}
+
 fn compute_sha256_hex(data: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(data);
@@ -1094,17 +1148,46 @@ impl crate::InferenceProvider for MockProvider {
         _extra: std::collections::HashMap<String, serde_json::Value>,
     ) -> Result<bytes::Bytes, PrivacyClassifyError> {
         // Echo the requested model so round-trip assertions in tests are meaningful.
-        let model = serde_json::from_slice::<serde_json::Value>(&body)
-            .ok()
-            .and_then(|v| v.get("model").and_then(|m| m.as_str()).map(str::to_string))
+        let parsed: serde_json::Value =
+            serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null);
+        let model = parsed
+            .get("model")
+            .and_then(|m| m.as_str())
+            .map(str::to_string)
             .unwrap_or_else(|| "mock-privacy-filter".to_string());
+
+        // Materialize the inputs into a Vec<String> regardless of whether the
+        // caller sent a single string or an array. We mirror the privacy-
+        // filter contract here so the auto_redact pipeline can be exercised
+        // without a live PII model.
+        let inputs: Vec<String> = match parsed.get("input") {
+            Some(serde_json::Value::String(s)) => vec![s.clone()],
+            Some(serde_json::Value::Array(arr)) => arr
+                .iter()
+                .map(|v| v.as_str().unwrap_or("").to_string())
+                .collect(),
+            _ => Vec::new(),
+        };
+
+        // Per-item usage matches the original mock contract (10 tokens) so
+        // tests asserting on billing math don't have to track input length.
+        // Only the `spans` field is computed from the input.
+        let data: Vec<serde_json::Value> = inputs
+            .iter()
+            .enumerate()
+            .map(|(i, text)| {
+                let spans = detect_simple_pii_spans(text);
+                serde_json::json!({
+                    "index": i,
+                    "spans": spans,
+                    "usage": {"input_tokens": 10}
+                })
+            })
+            .collect();
+
         let response_json = serde_json::json!({
             "model": model,
-            "data": [{
-                "index": 0,
-                "spans": [],
-                "usage": {"input_tokens": 10}
-            }]
+            "data": data,
         });
         let bytes = serde_json::to_vec(&response_json)
             .map_err(|e| PrivacyClassifyError::RequestFailed(e.to_string()))?;

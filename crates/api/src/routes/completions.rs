@@ -10,6 +10,7 @@ use axum::{
     response::{IntoResponse, Json as ResponseJson, Response},
 };
 use futures::stream::StreamExt;
+use services::auto_redact::{self, AutoRedactError, RedactionMap, StreamUnredact};
 use services::common::encryption_headers as service_encryption_headers;
 use services::completions::{
     hash_inference_id_to_uuid,
@@ -285,6 +286,224 @@ fn convert_chat_request_to_service(
     }
 }
 
+/// Decide whether to enable auto-redact based on the request, mutate the
+/// service request to scrub the body field, and (if enabled) run the PII
+/// detector + rewrite messages in place. Returns the placeholder map for
+/// downstream un-redact; an empty map is also returned when auto-redact is
+/// off.
+async fn maybe_redact(
+    headers: &header::HeaderMap,
+    service_request: &mut ServiceCompletionRequest,
+    pool: &services::inference_provider_pool::InferenceProviderPool,
+) -> Result<(bool, RedactionMap), AutoRedactError> {
+    let header_values: Vec<&str> = headers
+        .get_all(auto_redact::AUTO_REDACT_HEADER)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .collect();
+    let body_field = service_request
+        .extra
+        .get(auto_redact::AUTO_REDACT_BODY_FIELD);
+    let enabled = auto_redact::is_enabled(header_values.iter().copied(), body_field);
+
+    // Always strip the body field so providers with strict JSON schemas
+    // (e.g. Anthropic) don't 400 on unknown keys.
+    auto_redact::strip_body_field(&mut service_request.extra);
+
+    if !enabled {
+        return Ok((false, RedactionMap::new()));
+    }
+
+    let map = auto_redact::redact_messages(
+        &mut service_request.messages,
+        auto_redact::DEFAULT_PII_MODEL,
+        pool,
+    )
+    .await?;
+    Ok((true, map))
+}
+
+/// Convert an [`AutoRedactError`] into the user-facing error response.
+/// Detector-unavailable is 503 (fail-closed per design); internal errors
+/// are 500.
+fn auto_redact_error_response(err: AutoRedactError) -> Response {
+    match err {
+        AutoRedactError::DetectorUnavailable(msg) => {
+            tracing::error!(error = %msg, "auto_redact detector unavailable");
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                ResponseJson(ErrorResponse::new(
+                    "PII redaction service is unavailable. Retry, or omit auto_redact to send the prompt as-is.".to_string(),
+                    "auto_redact_unavailable".to_string(),
+                )),
+            )
+                .into_response()
+        }
+        AutoRedactError::Internal(msg) => {
+            tracing::error!(error = %msg, "auto_redact internal error");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ResponseJson(ErrorResponse::new(
+                    "PII redaction failed".to_string(),
+                    "internal_server_error".to_string(),
+                )),
+            )
+                .into_response()
+        }
+    }
+}
+
+/// Walk a non-streaming chat response's text fields and substitute
+/// placeholders with their originals. Mutates in place.
+fn unredact_chat_response_in_place(
+    response: &mut inference_providers::ChatCompletionResponse,
+    map: &RedactionMap,
+) {
+    for choice in &mut response.choices {
+        if let Some(content) = &mut choice.message.content {
+            *content = map.unredact(content);
+        }
+        if let Some(reasoning) = &mut choice.message.reasoning_content {
+            *reasoning = map.unredact(reasoning);
+        }
+        if let Some(reasoning) = &mut choice.message.reasoning {
+            *reasoning = map.unredact(reasoning);
+        }
+    }
+}
+
+/// Per-choice, per-field streaming un-redact state. For `n > 1`
+/// completions the provider may interleave chunks for different choice
+/// indices; each choice needs its own sliding tail buffer or split
+/// placeholders get cross-contaminated. The three text fields (`content`,
+/// `reasoning_content`, `reasoning`) are kept independent for the same
+/// reason — a model may emit them concurrently.
+#[derive(Default)]
+struct StreamUnredactStates {
+    content: std::collections::HashMap<i64, StreamUnredact>,
+    reasoning_content: std::collections::HashMap<i64, StreamUnredact>,
+    reasoning: std::collections::HashMap<i64, StreamUnredact>,
+}
+
+fn unredact_field(
+    states: &mut std::collections::HashMap<i64, StreamUnredact>,
+    map: &Arc<RedactionMap>,
+    idx: i64,
+    text: &mut String,
+) {
+    let s = states
+        .entry(idx)
+        .or_insert_with(|| StreamUnredact::new(map.clone()));
+    *text = s.process(text);
+}
+
+/// Apply streaming un-redact to a single parsed chunk, mutating any text
+/// deltas (content + reasoning) in place. Stateful: per-choice tail
+/// buffers carry across calls via `states`.
+fn unredact_chunk_in_place(
+    chunk: &mut inference_providers::StreamChunk,
+    states: &mut StreamUnredactStates,
+    map: &Arc<RedactionMap>,
+) {
+    match chunk {
+        inference_providers::StreamChunk::Chat(c) => {
+            for choice in &mut c.choices {
+                let idx = choice.index;
+                if let Some(delta) = &mut choice.delta {
+                    if let Some(content) = &mut delta.content {
+                        unredact_field(&mut states.content, map, idx, content);
+                    }
+                    if let Some(rc) = &mut delta.reasoning_content {
+                        unredact_field(&mut states.reasoning_content, map, idx, rc);
+                    }
+                    if let Some(r) = &mut delta.reasoning {
+                        unredact_field(&mut states.reasoning, map, idx, r);
+                    }
+                }
+            }
+        }
+        inference_providers::StreamChunk::Text(c) => {
+            for choice in &mut c.choices {
+                let idx = choice.index;
+                unredact_field(&mut states.content, map, idx, &mut choice.text);
+            }
+        }
+    }
+}
+
+/// Snapshot of metadata from the first chunk we see in a stream, used to
+/// build a synthetic flush chunk at end-of-stream with matching id/model.
+/// Layout: `(id, model, created, system_fingerprint)`.
+type ChunkTemplate = Option<(String, String, i64, Option<String>)>;
+
+/// Drain a per-field state map at end-of-stream, emitting a synthetic
+/// final SSE chunk for each choice index that still has bytes held in its
+/// tail buffer. Without this, an upstream stream that ends mid-placeholder
+/// would silently truncate the client's view of the response.
+fn build_flush_chunks(states: &mut StreamUnredactStates, template: &ChunkTemplate) -> Vec<Bytes> {
+    let Some((id, model, created, system_fingerprint)) = template else {
+        return Vec::new();
+    };
+
+    let mut pending: std::collections::BTreeMap<i64, (String, String, String)> =
+        std::collections::BTreeMap::new();
+    for (idx, st) in states.content.drain() {
+        let text = st.flush();
+        if !text.is_empty() {
+            pending.entry(idx).or_default().0 = text;
+        }
+    }
+    for (idx, st) in states.reasoning_content.drain() {
+        let text = st.flush();
+        if !text.is_empty() {
+            pending.entry(idx).or_default().1 = text;
+        }
+    }
+    for (idx, st) in states.reasoning.drain() {
+        let text = st.flush();
+        if !text.is_empty() {
+            pending.entry(idx).or_default().2 = text;
+        }
+    }
+
+    let mut out = Vec::with_capacity(pending.len());
+    for (idx, (content, rc, r)) in pending {
+        let chunk = inference_providers::models::ChatCompletionChunk {
+            id: id.clone(),
+            object: "chat.completion.chunk".to_string(),
+            created: *created,
+            model: model.clone(),
+            system_fingerprint: system_fingerprint.clone(),
+            choices: vec![inference_providers::models::ChatChoice {
+                index: idx,
+                delta: Some(inference_providers::models::ChatDelta {
+                    role: None,
+                    content: if content.is_empty() {
+                        None
+                    } else {
+                        Some(content)
+                    },
+                    name: None,
+                    tool_call_id: None,
+                    tool_calls: None,
+                    reasoning_content: if rc.is_empty() { None } else { Some(rc) },
+                    reasoning: if r.is_empty() { None } else { Some(r) },
+                }),
+                logprobs: None,
+                finish_reason: None,
+                token_ids: None,
+            }],
+            usage: None,
+            prompt_token_ids: None,
+            modality: None,
+        };
+        if let Ok(s) = serde_json::to_string(&chunk) {
+            out.push(Bytes::from(format!("data: {s}\n\n")));
+        }
+    }
+    out
+}
+
 // Convert HTTP CompletionRequest to service CompletionRequest
 fn convert_text_request_to_service(
     request: &CompletionRequest,
@@ -387,6 +606,27 @@ pub async fn chat_completions(
     // Add validated headers to service_request.extra
     insert_encryption_headers(&encryption_headers, &mut service_request.extra);
 
+    // Auto-redact (opt-in via x-auto-redact header or auto_redact body field).
+    // On success this may rewrite service_request.messages to substitute
+    // placeholders for PII; the returned map drives the response un-redact.
+    let (auto_redact_requested, redaction_map) = match maybe_redact(
+        &headers,
+        &mut service_request,
+        &app_state.inference_provider_pool,
+    )
+    .await
+    {
+        Ok(out) => out,
+        Err(e) => return auto_redact_error_response(e),
+    };
+    // Treat auto-redact as effectively *enabled* only when the detector
+    // actually minted placeholders. A request that opts in but contains no
+    // PII has nothing to substitute, so we skip the response re-serialize
+    // (preserves raw-bytes signing) and the streaming wrap (preserves the
+    // existing debug log path).
+    let auto_redact_enabled = auto_redact_requested && !redaction_map.is_empty();
+    let redaction_map = Arc::new(redaction_map);
+
     // Check if streaming is requested
     if request.stream == Some(true) {
         // Call the streaming completion service
@@ -426,6 +666,22 @@ pub async fn chat_completions(
                 let request_model = request.model.clone();
                 let organization_id = api_key.organization.id.0;
 
+                // Per-stream un-redact state, keyed by choice index so n>1
+                // completions don't cross-contaminate sliding tails. When
+                // auto-redact is off, the map stays empty and we skip the
+                // mutex hop entirely.
+                let unredact_states: Arc<tokio::sync::Mutex<StreamUnredactStates>> =
+                    Arc::new(tokio::sync::Mutex::new(StreamUnredactStates::default()));
+                // Capture the first chunk's metadata so the end-of-stream
+                // flush can synthesize a final SSE chunk with matching
+                // id/model/created.
+                let chunk_template: Arc<tokio::sync::Mutex<ChunkTemplate>> =
+                    Arc::new(tokio::sync::Mutex::new(None));
+                let chunk_template_for_chain = chunk_template.clone();
+                let unredact_states_for_chain = unredact_states.clone();
+                let accumulated_for_chain = accumulated_bytes.clone();
+                let redaction_map_for_chunks = redaction_map.clone();
+
                 // Convert to raw bytes stream with proper SSE formatting
                 let byte_stream = peekable_stream
                     .then(move |result| {
@@ -433,15 +689,43 @@ pub async fn chat_completions(
                         let chat_id_inner = chat_id_clone.clone();
                         let error_count_inner = error_count_clone.clone();
                         let model_for_err = request_model.clone();
+                        let states = unredact_states.clone();
+                        let template = chunk_template.clone();
+                        let map = redaction_map_for_chunks.clone();
                         async move {
                             match result {
-                                Ok(event) => {
+                                Ok(mut event) => {
                                     // Extract chat_id from the parsed chunk
                                     {
                                         let mut cid = chat_id_inner.lock().await;
                                         if cid.is_none() {
                                             *cid = Some(extract_chat_id_from_chunk(&event.chunk));
                                         }
+                                    }
+
+                                    if auto_redact_enabled {
+                                        // Cache a template for the synthetic
+                                        // flush chunk we may emit at end-of-stream.
+                                        {
+                                            let mut t = template.lock().await;
+                                            if t.is_none() {
+                                                if let inference_providers::StreamChunk::Chat(c) =
+                                                    &event.chunk
+                                                {
+                                                    *t = Some((
+                                                        c.id.clone(),
+                                                        c.model.clone(),
+                                                        c.created,
+                                                        c.system_fingerprint.clone(),
+                                                    ));
+                                                }
+                                            }
+                                        }
+
+                                        // Swap minted placeholders in this
+                                        // chunk's text deltas back to originals.
+                                        let mut s = states.lock().await;
+                                        unredact_chunk_in_place(&mut event.chunk, &mut s, &map);
                                     }
 
                                     // Serialize the parsed chunk (normalized to OpenAI format)
@@ -455,7 +739,14 @@ pub async fn chat_completions(
                                             );
                                             "{}".to_string()
                                         });
-                                    tracing::debug!("Completion stream event: {}", json_data);
+                                    // Suppress per-chunk debug logging when
+                                    // auto_redact is enabled: the chunk now
+                                    // holds the user's original PII (we just
+                                    // un-redacted it). Logging it would
+                                    // defeat the privacy guarantee at debug.
+                                    if !auto_redact_enabled {
+                                        tracing::debug!("Completion stream event: {}", json_data);
+                                    }
                                     // Format as SSE event with proper newlines
                                     let sse_bytes = Bytes::from(format!("data: {json_data}\n\n"));
                                     accumulated_inner.lock().await.extend_from_slice(&sse_bytes);
@@ -480,9 +771,23 @@ pub async fn chat_completions(
                         }
                     })
                     .chain(futures::stream::once({
+                        // End-of-stream tail: emit any flush chunks (held
+                        // tail bytes that the sliding window didn't get to
+                        // resolve) inline with [DONE]. They're framed as
+                        // separate SSE events by `\n\n` so the client sees
+                        // them as distinct deltas.
                         let organization_id = api_key.organization.id.0;
                         let model_name = request.model.clone();
                         async move {
+                            let mut combined: Vec<u8> = Vec::new();
+                            if auto_redact_enabled {
+                                let mut states = unredact_states_for_chain.lock().await;
+                                let template = chunk_template_for_chain.lock().await.clone();
+                                for bytes in build_flush_chunks(&mut states, &template) {
+                                    combined.extend_from_slice(&bytes);
+                                }
+                            }
+
                             let error_count_final =
                                 stream_error_count.load(std::sync::atomic::Ordering::Relaxed);
                             if error_count_final > 1 {
@@ -494,13 +799,13 @@ pub async fn chat_completions(
                                 );
                             }
 
-                            let done_bytes = Bytes::from_static(b"data: [DONE]\n\n");
-                            accumulated_bytes
+                            combined.extend_from_slice(b"data: [DONE]\n\n");
+                            let final_bytes = Bytes::from(combined);
+                            accumulated_for_chain
                                 .lock()
                                 .await
-                                .extend_from_slice(&done_bytes);
-
-                            Ok::<Bytes, Infallible>(done_bytes)
+                                .extend_from_slice(&final_bytes);
+                            Ok::<Bytes, Infallible>(final_bytes)
                         }
                     }));
 
@@ -538,13 +843,41 @@ pub async fn chat_completions(
             .create_chat_completion(service_request)
             .await
         {
-            Ok(response_with_bytes) => {
+            Ok(mut response_with_bytes) => {
                 // Extract inference ID from response ID (reuse same hashing as usage tracking)
                 let inference_id =
                     Some(hash_inference_id_to_uuid(&response_with_bytes.response.id));
 
-                // Return the exact bytes from the provider for hash verification
-                // This ensures clients can hash the response and compare with attestation endpoints
+                // When auto-redact is enabled, we substitute placeholders back to
+                // originals and re-serialize. The provider's raw_bytes are over the
+                // redacted form; we deliberately drop that signed payload because
+                // the client opted into munging the response.
+                let body_bytes = if auto_redact_enabled {
+                    unredact_chat_response_in_place(
+                        &mut response_with_bytes.response,
+                        &redaction_map,
+                    );
+                    match serde_json::to_vec(&response_with_bytes.response) {
+                        Ok(b) => b,
+                        Err(e) => {
+                            tracing::error!(error = %e, "failed to re-serialize unredacted chat response");
+                            return (
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                ResponseJson(ErrorResponse::new(
+                                    "Failed to assemble response".to_string(),
+                                    "internal_server_error".to_string(),
+                                )),
+                            )
+                                .into_response();
+                        }
+                    }
+                } else {
+                    // Return the exact bytes from the provider for hash verification.
+                    // This ensures clients can hash the response and compare with
+                    // attestation endpoints.
+                    response_with_bytes.raw_bytes
+                };
+
                 let mut response_builder = Response::builder()
                     .status(StatusCode::OK)
                     .header(header::CONTENT_TYPE, "application/json");
@@ -556,9 +889,7 @@ pub async fn chat_completions(
                         .header("Access-Control-Expose-Headers", HEADER_INFERENCE_ID);
                 }
 
-                response_builder
-                    .body(Body::from(response_with_bytes.raw_bytes))
-                    .unwrap()
+                response_builder.body(Body::from(body_bytes)).unwrap()
             }
             Err(domain_error) => {
                 let status_code = map_domain_error_to_status(&domain_error);

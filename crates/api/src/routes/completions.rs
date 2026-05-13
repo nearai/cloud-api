@@ -375,6 +375,12 @@ fn unredact_chat_response_in_place(
         if let Some(reasoning) = &mut choice.message.reasoning {
             *reasoning = map.unredact(reasoning);
         }
+        if let Some(refusal) = &mut choice.message.refusal {
+            // A safety-tuned model may produce a refusal that quotes our
+            // placeholders back ("I can't email <email1>"). Without
+            // un-redacting, the placeholder leaks to the client.
+            *refusal = map.unredact(refusal);
+        }
         if let Some(tool_calls) = &mut choice.message.tool_calls {
             for tc in tool_calls {
                 if let Some(args) = &mut tc.function.arguments {

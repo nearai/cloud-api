@@ -44,6 +44,14 @@ pub const AUTO_REDACT_BODY_FIELD: &str = "auto_redact";
 /// backend (see nearai/infra#86).
 pub const DEFAULT_PII_MODEL: &str = "openai/privacy-filter";
 
+/// Wall-clock budget for the entire redact step (detector call + apply).
+/// The provider pool retries internally with per-attempt timeouts up to
+/// `completion_timeout()` (default 600s) across multiple providers, so the
+/// worst-case path without this outer bound is many minutes. Auto-redact
+/// is in the critical request path, so we cap it tightly: a hung detector
+/// must surface as a 503 quickly, not hold the user's request hostage.
+pub const REDACT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
 #[derive(Debug, thiserror::Error)]
 pub enum AutoRedactError {
     /// The PII detector is unreachable, timed out, or returned a non-2xx
@@ -95,9 +103,29 @@ fn value_enables(v: &serde_json::Value) -> bool {
 /// to contain placeholders instead, and return the placeholder→original
 /// mapping. Empty mapping means no PII was detected.
 ///
-/// On detector failure, returns [`AutoRedactError::DetectorUnavailable`]
-/// without mutating `messages`. Callers must fail closed.
+/// On detector failure or timeout (see [`REDACT_TIMEOUT`]), returns
+/// [`AutoRedactError::DetectorUnavailable`] without mutating `messages`.
+/// Callers must fail closed.
 pub async fn redact_messages(
+    messages: &mut [CompletionMessage],
+    pii_model: &str,
+    pool: &InferenceProviderPool,
+) -> Result<RedactionMap, AutoRedactError> {
+    match tokio::time::timeout(
+        REDACT_TIMEOUT,
+        redact_messages_inner(messages, pii_model, pool),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(_elapsed) => Err(AutoRedactError::DetectorUnavailable(format!(
+            "PII detector exceeded {}s budget",
+            REDACT_TIMEOUT.as_secs()
+        ))),
+    }
+}
+
+async fn redact_messages_inner(
     messages: &mut [CompletionMessage],
     pii_model: &str,
     pool: &InferenceProviderPool,

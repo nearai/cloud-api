@@ -49,7 +49,11 @@ use services::{
     web_search::WebSearchService,
 };
 use std::sync::Arc;
-use tower_http::cors::{AllowOrigin, Any, CorsLayer};
+use tower_http::{
+    compression::CompressionLayer,
+    cors::{AllowOrigin, Any, CorsLayer},
+    set_header::SetResponseHeaderLayer,
+};
 use utoipa::OpenApi;
 
 // Audio transcription file size limit (25 MB for OpenAI Whisper API compatibility)
@@ -838,8 +842,12 @@ pub fn build_app_with_config(
     // Build OpenAPI and documentation routes
     let openapi_routes = build_openapi_routes();
 
-    // Build health check route (public, no auth required)
-    let health_routes = Router::new().route("/health", get(health_check));
+    // Build health check route (public, no auth required).
+    // Short cache window: enough to absorb thundering-herd from monitors that
+    // hammer /v1/health, but short enough that real outages surface quickly.
+    let health_routes = Router::new()
+        .route("/health", get(health_check))
+        .layer(cache_control_layer("public, max-age=5"));
 
     // Create metrics state for HTTP metrics middleware
     let metrics_state = middleware::MetricsState {
@@ -892,6 +900,13 @@ pub fn build_app_with_config(
             metrics_state,
             middleware::http_metrics_middleware,
         ))
+        // Response compression (gzip + brotli). Applied after metrics so it sees
+        // all routes. `CompressionLayer` auto-detects the response Content-Type
+        // and skips `text/event-stream` (SSE), so streaming chat completions and
+        // /v1/responses remain unaffected. Signed-response payloads (attestation
+        // endpoints) sign the *request* body hash, not the HTTP response body,
+        // so compression is safe for them as well.
+        .layer(CompressionLayer::new())
 }
 
 /// Build VPC authentication routes
@@ -1332,6 +1347,13 @@ pub fn build_model_routes(models_service: Arc<dyn ModelsServiceTrait>) -> Router
         .route("/model/list", get(list_models))
         .route("/model/{model_name}", get(get_model_by_name))
         .with_state(models_app_state)
+        // Public, anonymous, identical-for-all-clients responses that change
+        // only when an admin updates the model catalog. 30s fresh window plus
+        // 120s stale-while-revalidate lets CDNs/browsers serve cached copies
+        // instantly while refreshing in the background.
+        .layer(cache_control_layer(
+            "public, max-age=30, stale-while-revalidate=120",
+        ))
 }
 
 /// Build public services routes (no auth) — GET /v1/services, GET /v1/services/{service_name}
@@ -1346,6 +1368,21 @@ pub fn build_services_routes(pool: database::DbPool) -> Router {
         .route("/services", get(list_services))
         .route("/services/{service_name}", get(get_service_by_name))
         .with_state(state)
+        // Same rationale as `/v1/model/*` — public, anonymous, admin-write speed.
+        .layer(cache_control_layer(
+            "public, max-age=30, stale-while-revalidate=120",
+        ))
+}
+
+/// Build a `Cache-Control`-setting middleware layer for a route group.
+///
+/// Used only on public, anonymous endpoints whose responses do not vary by
+/// user/API-key/session. Do NOT add to authenticated or user-specific routes.
+fn cache_control_layer(value: &'static str) -> SetResponseHeaderLayer<axum::http::HeaderValue> {
+    SetResponseHeaderLayer::if_not_present(
+        axum::http::header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static(value),
+    )
 }
 
 /// Build admin routes (authenticated endpoints)
@@ -1460,10 +1497,18 @@ pub fn build_admin_routes(
 
 /// Build OpenAPI documentation routes
 pub fn build_openapi_routes() -> Router {
-    Router::new().route("/docs", get(swagger_ui_handler)).route(
-        "/api-docs/openapi.json",
-        get(|| async { axum::Json(ApiDoc::openapi()) }),
-    )
+    Router::new()
+        .route("/docs", get(swagger_ui_handler))
+        .route(
+            "/api-docs/openapi.json",
+            get(|| async { axum::Json(ApiDoc::openapi()) }),
+        )
+        // OpenAPI spec + Scalar UI HTML change only on deploy. 5 min fresh +
+        // 1 h SWR keeps the docs snappy while still picking up new builds
+        // within ~5 minutes.
+        .layer(cache_control_layer(
+            "public, max-age=300, stale-while-revalidate=3600",
+        ))
 }
 
 /// Serve Scalar API Documentation UI

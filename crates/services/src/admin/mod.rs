@@ -47,7 +47,14 @@ impl AdminService for AdminServiceImpl {
             Self::validate_model_request(model_name, request, Arc::clone(&self.repository)).await?;
         }
 
-        // Upsert all models
+        // Upsert all models. Each row is committed independently, so we
+        // invalidate the public `/v1/model/list` cache after EACH successful
+        // write rather than only at the end of the loop. If a later row fails
+        // and we bail out, the rows already committed must not stay hidden
+        // behind a 30 s-stale cached response.
+        //
+        // The cache has capacity 1 (single "all" key), so per-row invalidation
+        // is essentially free.
         let mut results = std::collections::HashMap::new();
         for (model_name, request) in models {
             let pricing = self
@@ -56,10 +63,8 @@ impl AdminService for AdminServiceImpl {
                 .await
                 .map_err(|e| AdminError::InternalError(e.to_string()))?;
             results.insert(model_name, pricing);
+            self.models_service.invalidate_models_cache().await;
         }
-
-        // Invalidate the public `/v1/model/list` cache since model rows changed.
-        self.models_service.invalidate_models_cache().await;
 
         Ok(results)
     }

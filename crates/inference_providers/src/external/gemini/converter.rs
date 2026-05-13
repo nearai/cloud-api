@@ -80,9 +80,17 @@ pub struct GeminiFunctionResponse {
 }
 
 /// Gemini content format
+///
+/// Both `role` and `parts` are marked `#[serde(default)]` because Google's
+/// `generateContent` response may omit either field when no usable output
+/// was produced (typically when `finishReason` is `MAX_TOKENS`, `SAFETY`, or
+/// `RECITATION`). Defaulting to empty values lets the parser succeed and the
+/// downstream code treat it as an empty completion.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GeminiContent {
+    #[serde(default)]
     pub role: String,
+    #[serde(default)]
     pub parts: Vec<GeminiPart>,
 }
 
@@ -141,10 +149,16 @@ pub struct GeminiRequest {
 // =============================================================================
 
 /// Gemini response candidate
+///
+/// `content` is `Option` because Google omits the field entirely on some
+/// terminal-only responses (e.g. safety-blocked candidates that return only
+/// `finishReason`). Consumers must treat a missing `content` the same as a
+/// content with empty `parts`.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GeminiCandidate {
-    pub content: GeminiContent,
+    #[serde(default)]
+    pub content: Option<GeminiContent>,
     pub finish_reason: Option<String>,
 }
 
@@ -415,8 +429,13 @@ impl SSEEventParser for GeminiEventParser {
         let is_first = state.chunk_index == 0;
         state.chunk_index += 1;
 
-        // Extract text and function calls from parts
-        let (text, tool_calls) = extract_response_content(&candidate.content.parts);
+        // Extract text and function calls from parts. `content` may be absent
+        // entirely (e.g. safety-blocked candidates); treat it as empty parts.
+        let parts: &[GeminiPart] = candidate
+            .content
+            .as_ref()
+            .map_or(&[], |c| c.parts.as_slice());
+        let (text, tool_calls) = extract_response_content(parts);
 
         // Determine finish reason
         let has_function_call = tool_calls.is_some();
@@ -564,7 +583,8 @@ mod tests {
         }"#;
 
         let response: GeminiResponse = serde_json::from_str(json).unwrap();
-        let (text, tool_calls) = extract_response_content(&response.candidates[0].content.parts);
+        let content = response.candidates[0].content.as_ref().unwrap();
+        let (text, tool_calls) = extract_response_content(&content.parts);
 
         assert!(text.is_none());
         assert!(tool_calls.is_some());
@@ -584,5 +604,100 @@ mod tests {
             Some(crate::FinishReason::Length)
         );
         assert_eq!(map_finish_reason(None), None);
+    }
+
+    // Regression: Google may omit response fields when no usable output is
+    // produced (typically MAX_TOKENS / SAFETY / RECITATION). The strict schema
+    // previously rejected these payloads and surfaced as 502s. The four tests
+    // below cover every shape we have observed or that the reviewer flagged.
+
+    /// Payload captured from `gemini-3-flash-preview`: `content` is `{}`.
+    #[test]
+    fn test_parse_response_with_empty_content_on_max_tokens() {
+        let json = r#"{
+            "candidates": [{
+                "content": {},
+                "finishReason": "MAX_TOKENS",
+                "index": 0
+            }],
+            "usageMetadata": {
+                "promptTokenCount": 5,
+                "totalTokenCount": 5
+            }
+        }"#;
+
+        let response: GeminiResponse = serde_json::from_str(json).unwrap();
+        let content = response.candidates[0].content.as_ref().unwrap();
+        assert_eq!(content.role, "");
+        assert!(content.parts.is_empty());
+        let (text, tool_calls) = extract_response_content(&content.parts);
+        assert!(text.is_none());
+        assert!(tool_calls.is_none());
+    }
+
+    /// Payload captured from `gemini-2.5-flash`: `parts` omitted, `role` present.
+    #[test]
+    fn test_parse_response_with_role_only_content_on_max_tokens() {
+        let json = r#"{
+            "candidates": [{
+                "content": {"role": "model"},
+                "finishReason": "MAX_TOKENS",
+                "index": 0
+            }],
+            "usageMetadata": {
+                "promptTokenCount": 5,
+                "totalTokenCount": 5
+            }
+        }"#;
+
+        let response: GeminiResponse = serde_json::from_str(json).unwrap();
+        let content = response.candidates[0].content.as_ref().unwrap();
+        assert_eq!(content.role, "model");
+        assert!(content.parts.is_empty());
+        let (text, tool_calls) = extract_response_content(&content.parts);
+        assert!(text.is_none());
+        assert!(tool_calls.is_none());
+    }
+
+    /// Reviewer-flagged variant: `content` field absent entirely on the
+    /// candidate (observed in safety-blocked responses).
+    #[test]
+    fn test_parse_response_with_missing_content_field() {
+        let json = r#"{
+            "candidates": [{
+                "finishReason": "SAFETY",
+                "index": 0
+            }],
+            "usageMetadata": {
+                "promptTokenCount": 8,
+                "totalTokenCount": 8
+            }
+        }"#;
+
+        let response: GeminiResponse = serde_json::from_str(json).unwrap();
+        assert!(response.candidates[0].content.is_none());
+        assert_eq!(
+            response.candidates[0].finish_reason.as_deref(),
+            Some("SAFETY")
+        );
+    }
+
+    /// `content: null` — the explicit-null form.
+    #[test]
+    fn test_parse_response_with_null_content() {
+        let json = r#"{
+            "candidates": [{
+                "content": null,
+                "finishReason": "SAFETY",
+                "index": 0
+            }],
+            "usageMetadata": {
+                "promptTokenCount": 8,
+                "totalTokenCount": 8
+            }
+        }"#;
+
+        let response: GeminiResponse = serde_json::from_str(json).unwrap();
+        assert!(response.candidates[0].content.is_none());
     }
 }

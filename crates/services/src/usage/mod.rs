@@ -193,8 +193,10 @@ impl UsageServiceTrait for UsageServiceImpl {
                     })?;
                 (duration_cost, 0, duration_cost)
             }
-            ports::InferenceType::Rerank | ports::InferenceType::Embedding => {
-                // For rerank/embedding: use input tokens as the billing unit.
+            ports::InferenceType::Rerank
+            | ports::InferenceType::Embedding
+            | ports::InferenceType::PrivacyClassify => {
+                // For rerank/embedding/privacy_classify: use input tokens as the billing unit.
                 // Cache pricing is intentionally NOT applied, even if
                 // cache_read_cost_per_token is configured on the model.
                 // Use checked arithmetic to prevent integer overflow in billing-critical path

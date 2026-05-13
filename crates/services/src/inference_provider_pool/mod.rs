@@ -1793,6 +1793,49 @@ impl InferenceProviderPool {
         ))
     }
 
+    pub async fn privacy_classify(
+        &self,
+        model: &str,
+        body: bytes::Bytes,
+        extra: std::collections::HashMap<String, serde_json::Value>,
+    ) -> Result<bytes::Bytes, inference_providers::PrivacyClassifyError> {
+        tracing::debug!(model = %model, "Starting privacy classify request");
+
+        let providers = match self.get_providers_with_fallback(model, None).await {
+            Some(p) => p,
+            None => {
+                return Err(inference_providers::PrivacyClassifyError::RequestFailed(
+                    format!("Model '{}' not found in provider pool", model),
+                ));
+            }
+        };
+
+        let mut last_error = None;
+        for provider in providers {
+            match provider
+                .privacy_classify_raw(body.clone(), extra.clone())
+                .await
+            {
+                Ok(response) => {
+                    tracing::info!(model = %model, "Privacy classify completed successfully");
+                    return Ok(response);
+                }
+                Err(e) => {
+                    tracing::warn!(model = %model, error = %e, "Privacy classify failed with provider, trying next");
+                    last_error = Some(e);
+                }
+            }
+        }
+
+        let error_msg = last_error
+            .map(|e| Self::sanitize_error_message(&e.to_string()))
+            .unwrap_or_else(|| "No providers available for privacy classify".to_string());
+
+        Err(inference_providers::PrivacyClassifyError::RequestFailed(
+            error_msg,
+        ))
+    }
+
     pub async fn score(
         &self,
         params: inference_providers::ScoreParams,
@@ -2219,8 +2262,22 @@ impl InferenceProviderPool {
                         let api_key = api_key.clone();
                         let verifier = verifier.clone();
                         let tls_roots = tls_roots.clone();
+                        // Stagger index: model i waits i × MODEL_DISCOVERY_STAGGER_MS before
+                        // firing its first discovery call. This spreads the per-refresh burst
+                        // across time instead of hitting all backends simultaneously, preventing
+                        // GPU evidence worker saturation on dense hosts (e.g. multiple models
+                        // on the same inference host).
+                        let stagger_idx = discovery_tasks.len();
+                        let model_stagger_ms =
+                            crate::attestation::verification::MODEL_DISCOVERY_STAGGER_MS;
                         discovery_tasks.push(
                             async move {
+                                if stagger_idx > 0 {
+                                    tokio::time::sleep(Duration::from_millis(
+                                        model_stagger_ms.saturating_mul(stagger_idx as u64),
+                                    ))
+                                    .await;
+                                }
                                 let outcome = Self::discover_model(
                                     &url,
                                     &api_key,

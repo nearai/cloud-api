@@ -25,6 +25,24 @@ pub const ATTESTATION_DISCOVERY_PARALLELISM: usize = 5;
 /// steady-state refresh load stays low.
 pub const CUMULATIVE_DISCOVERY_CALLS: usize = 2;
 
+/// Inter-model stagger for cumulative discovery on each refresh cycle (milliseconds).
+///
+/// When the provider pool refreshes, it runs cumulative attestation discovery
+/// for every reused model. Without staggering, all models fire their first
+/// discovery call at t=0, creating a burst that saturates the GPU evidence
+/// worker on dense hosts (e.g. gpu04 runs 8+ model instances).
+///
+/// With this stagger, model i starts its discovery after `i * MODEL_DISCOVERY_STAGGER_MS`
+/// delay. At 2 s/model the burst is spread across tens of seconds rather than
+/// a single wall-clock instant, while still completing well within the 5-minute
+/// refresh interval even for large pools.
+///
+/// Note: the cumulative discovery loop runs inside `buffer_unordered(10)`, so
+/// tasks at index >= 10 begin their sleep only after a concurrency slot opens.
+/// Their effective wall-clock delay is therefore ≥ i × STAGGER_MS, making the
+/// spread more conservative (not less) for pools larger than 10 models.
+pub const MODEL_DISCOVERY_STAGGER_MS: u64 = 2_000;
+
 /// Result of verifying an attestation report from an inference backend.
 #[derive(Debug, Clone)]
 pub struct VerifiedAttestation {

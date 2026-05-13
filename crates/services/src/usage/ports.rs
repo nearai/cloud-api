@@ -23,6 +23,8 @@ pub enum InferenceType {
     Score,
     /// Text embeddings
     Embedding,
+    /// Privacy classification (PII span detection)
+    PrivacyClassify,
 }
 
 impl InferenceType {
@@ -37,6 +39,7 @@ impl InferenceType {
             InferenceType::Rerank => "rerank",
             InferenceType::Score => "score",
             InferenceType::Embedding => "embedding",
+            InferenceType::PrivacyClassify => "privacy_classify",
         }
     }
 }
@@ -60,6 +63,7 @@ impl std::str::FromStr for InferenceType {
             "rerank" => Ok(InferenceType::Rerank),
             "score" => Ok(InferenceType::Score),
             "embedding" => Ok(InferenceType::Embedding),
+            "privacy_classify" => Ok(InferenceType::PrivacyClassify),
             _ => Err(format!("Unknown inference type: {}", s)),
         }
     }

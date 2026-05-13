@@ -1053,6 +1053,27 @@ impl InferenceProviderPool {
         }
     }
 
+    /// Category label for a privacy-filter error, safe to log. Drops the
+    /// upstream response body (which `HttpError.message` carries verbatim)
+    /// so a misbehaving filter that echoes its input doesn't route customer
+    /// PII into application logs.
+    fn privacy_classify_error_category(
+        err: &inference_providers::PrivacyClassifyError,
+    ) -> &'static str {
+        use inference_providers::PrivacyClassifyError as E;
+        match err {
+            E::HttpError { status_code, .. } => match status_code {
+                401 | 403 => "unauthorized",
+                429 => "rate_limited",
+                503 => "unavailable",
+                500..=599 => "server_error",
+                400..=499 => "client_error",
+                _ => "http_other",
+            },
+            E::RequestFailed(_) => "request_failed",
+        }
+    }
+
     /// Sanitize error message by removing sensitive information like IP addresses, URLs, and internal details
     fn sanitize_error_message(error: &str) -> String {
         let mut sanitized = error.to_string();
@@ -1817,18 +1838,38 @@ impl InferenceProviderPool {
                 .await
             {
                 Ok(response) => {
-                    tracing::info!(model = %model, "Privacy classify completed successfully");
+                    tracing::debug!(model = %model, "Privacy classify completed successfully");
                     return Ok(response);
                 }
                 Err(e) => {
-                    tracing::warn!(model = %model, error = %e, "Privacy classify failed with provider, trying next");
+                    // Privacy-filter error messages may embed the upstream
+                    // response body (HttpError carries the verbatim text).
+                    // A misbehaving filter that echoes its input would
+                    // route customer PII straight to application logs.
+                    // Log only the category + status code.
+                    tracing::warn!(
+                        model = %model,
+                        error_category = %Self::privacy_classify_error_category(&e),
+                        "Privacy classify failed with provider, trying next"
+                    );
                     last_error = Some(e);
                 }
             }
         }
 
+        // Final user-facing error: only the status code escapes; no
+        // upstream response body. (`sanitize_error_message` would still
+        // include the body via Display, so we route around it.)
         let error_msg = last_error
-            .map(|e| Self::sanitize_error_message(&e.to_string()))
+            .as_ref()
+            .map(|e| match e {
+                inference_providers::PrivacyClassifyError::HttpError { status_code, .. } => {
+                    format!("PII detector returned HTTP {status_code}")
+                }
+                inference_providers::PrivacyClassifyError::RequestFailed(_) => {
+                    "PII detector unreachable".to_string()
+                }
+            })
             .unwrap_or_else(|| "No providers available for privacy classify".to_string());
 
         Err(inference_providers::PrivacyClassifyError::RequestFailed(

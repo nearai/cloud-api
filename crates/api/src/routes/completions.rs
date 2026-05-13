@@ -355,6 +355,12 @@ fn auto_redact_error_response(err: AutoRedactError) -> Response {
 
 /// Walk a non-streaming chat response's text fields and substitute
 /// placeholders with their originals. Mutates in place.
+///
+/// Covers content + reasoning fields and the JSON-encoded
+/// `tool_calls[*].function.arguments` string. The latter is critical for
+/// agentic flows where the model emits a tool call whose arguments echo
+/// the user's PII — without un-redacting them, the placeholder leaks to
+/// the client.
 fn unredact_chat_response_in_place(
     response: &mut inference_providers::ChatCompletionResponse,
     map: &RedactionMap,
@@ -369,20 +375,32 @@ fn unredact_chat_response_in_place(
         if let Some(reasoning) = &mut choice.message.reasoning {
             *reasoning = map.unredact(reasoning);
         }
+        if let Some(tool_calls) = &mut choice.message.tool_calls {
+            for tc in tool_calls {
+                if let Some(args) = &mut tc.function.arguments {
+                    *args = map.unredact(args);
+                }
+            }
+        }
     }
 }
 
 /// Per-choice, per-field streaming un-redact state. For `n > 1`
 /// completions the provider may interleave chunks for different choice
 /// indices; each choice needs its own sliding tail buffer or split
-/// placeholders get cross-contaminated. The three text fields (`content`,
+/// placeholders get cross-contaminated. The text fields (`content`,
 /// `reasoning_content`, `reasoning`) are kept independent for the same
 /// reason — a model may emit them concurrently.
+///
+/// `tool_call_arguments` is keyed by `(choice_index, tool_call_index)`
+/// because a single response can have multiple parallel tool calls, each
+/// with its own arguments JSON stream.
 #[derive(Default)]
 struct StreamUnredactStates {
     content: std::collections::HashMap<i64, StreamUnredact>,
     reasoning_content: std::collections::HashMap<i64, StreamUnredact>,
     reasoning: std::collections::HashMap<i64, StreamUnredact>,
+    tool_call_arguments: std::collections::HashMap<(i64, i64), StreamUnredact>,
 }
 
 fn unredact_field(
@@ -418,6 +436,24 @@ fn unredact_chunk_in_place(
                     }
                     if let Some(r) = &mut delta.reasoning {
                         unredact_field(&mut states.reasoning, map, idx, r);
+                    }
+                    if let Some(tcs) = &mut delta.tool_calls {
+                        for tc in tcs {
+                            // Per-tool-call streaming state keyed by
+                            // (choice_index, tool_call_index). If the
+                            // provider omits index (rare), fall back to 0
+                            // so the first call still gets its own state.
+                            let tc_idx = tc.index.unwrap_or(0);
+                            if let Some(func) = &mut tc.function {
+                                if let Some(args) = &mut func.arguments {
+                                    let s = states
+                                        .tool_call_arguments
+                                        .entry((idx, tc_idx))
+                                        .or_insert_with(|| StreamUnredact::new(map.clone()));
+                                    *args = s.process(args);
+                                }
+                            }
+                        }
                     }
                 }
             }

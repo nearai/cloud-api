@@ -407,3 +407,70 @@ async fn auto_redact_multiple_pii_kinds_per_message() {
         );
     }
 }
+
+#[tokio::test]
+async fn auto_redact_unredacts_tool_call_arguments() {
+    // Agentic flow: the user's prompt contains PII, the model emits a tool
+    // call whose JSON arguments echo the (now-redacted) PII. The un-redact
+    // path must walk tool_calls[*].function.arguments and substitute the
+    // placeholders back to originals so the client sees real values when
+    // executing the tool call.
+    let (server, _pool, mock_provider, _db) = setup_test_server_with_pool().await;
+    setup_qwen_model(&server).await;
+    setup_privacy_filter_model(&server).await;
+    let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
+    let api_key = get_api_key_for_org(&server, org.id).await;
+
+    // Mock emits a send_email tool call whose `to` field is the minted
+    // placeholder for the user's email. After un-redact, the client should
+    // see the original.
+    mock_provider
+        .set_default_response(
+            inference_providers::mock::ResponseTemplate::new("").with_tool_calls(vec![
+                inference_providers::mock::ToolCall::new(
+                    "send_email",
+                    r#"{"to":"<email1>","subject":"Welcome","body":"Hi there"}"#,
+                ),
+            ]),
+        )
+        .await;
+
+    let resp = server
+        .post("/v1/chat/completions")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .add_header("User-Agent", MOCK_USER_AGENT)
+        .add_header("x-auto-redact", "on")
+        .json(&serde_json::json!({
+            "model": E2E_QWEN_MODEL_NAME,
+            "messages": [{
+                "role": "user",
+                "content": "Send a welcome email to alice@example.com"
+            }],
+        }))
+        .await;
+    assert_eq!(resp.status_code(), 200);
+
+    // Provider must NOT have seen the original email.
+    let params = mock_provider.last_chat_params().await.unwrap();
+    let seen = serde_json::to_string(&params.messages).unwrap();
+    assert!(
+        !seen.contains("alice@example.com"),
+        "raw email leaked to provider: {seen}"
+    );
+    assert!(seen.contains("<email1>"));
+
+    // Client must see the un-redacted email in tool_calls[0].function.arguments.
+    let body: serde_json::Value = resp.json();
+    let args = body
+        .pointer("/choices/0/message/tool_calls/0/function/arguments")
+        .and_then(|v| v.as_str())
+        .expect("tool_calls[0].function.arguments must be present");
+    assert!(
+        args.contains("alice@example.com"),
+        "tool_call arguments should be un-redacted; got {args}"
+    );
+    assert!(
+        !args.contains("<email1>"),
+        "placeholder should be swapped back; got {args}"
+    );
+}

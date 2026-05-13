@@ -16,12 +16,95 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use converter::{
     convert_messages, convert_tools, extract_response_content, map_finish_reason_string,
-    GeminiEventParser, GeminiGenerationConfig, GeminiParserState, GeminiRequest, GeminiResponse,
+    GeminiEventParser, GeminiGenerationConfig, GeminiParserState, GeminiPart, GeminiRequest,
+    GeminiResponse,
 };
 use futures_util::Stream;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
+
+/// Convert a parsed Gemini `generateContent` response into the OpenAI-shaped
+/// response we expose to clients.
+///
+/// Centralised so the empty/missing-content handling has a single source of
+/// truth and can be exercised end-to-end in unit tests without an HTTP layer.
+/// Emits a `tracing::warn!` when a candidate has no usable content (parts
+/// empty or `content` missing) and the finish reason is *not* `MAX_TOKENS` —
+/// that combination is the silent-regression case worth flagging: under the
+/// old strict schema it would have surfaced as a 502, and we want Datadog to
+/// catch it if Google ships a real upstream regression that produces empty
+/// responses with `STOP`/`SAFETY`/etc.
+fn convert_to_openai_response(
+    gemini_response: GeminiResponse,
+    model: &str,
+) -> Result<ChatCompletionResponse, CompletionError> {
+    if gemini_response.candidates.is_empty() {
+        return Err(CompletionError::CompletionError(
+            "No candidates in Gemini response".to_string(),
+        ));
+    }
+
+    let candidate = &gemini_response.candidates[0];
+    let parts: &[GeminiPart] = candidate
+        .content
+        .as_ref()
+        .map_or(&[], |c| c.parts.as_slice());
+    let (content, tool_calls) = extract_response_content(parts);
+
+    if content.is_none() && tool_calls.is_none() {
+        let fr = candidate.finish_reason.as_deref().unwrap_or("");
+        if fr != "MAX_TOKENS" {
+            tracing::warn!(
+                model = %model,
+                finish_reason = %fr,
+                "Gemini returned a candidate with no usable content and finish_reason != MAX_TOKENS"
+            );
+        }
+    }
+
+    // Determine finish reason - tool_calls if we have function calls
+    let finish_reason = if tool_calls.is_some() {
+        Some("tool_calls".to_string())
+    } else {
+        map_finish_reason_string(candidate.finish_reason.as_ref())
+    };
+
+    Ok(ChatCompletionResponse {
+        id: format!("gemini-{}", Uuid::new_v4()),
+        object: "chat.completion".to_string(),
+        created: chrono::Utc::now().timestamp(),
+        model: model.to_string(),
+        choices: vec![ChatCompletionResponseChoice {
+            index: 0,
+            message: ChatResponseMessage {
+                role: MessageRole::Assistant,
+                content,
+                refusal: None,
+                annotations: None,
+                audio: None,
+                function_call: None,
+                tool_calls,
+                reasoning_content: None,
+                reasoning: None,
+            },
+            logprobs: None,
+            finish_reason,
+            token_ids: None,
+        }],
+        service_tier: None,
+        system_fingerprint: None,
+        usage: TokenUsage {
+            prompt_tokens: gemini_response.usage_metadata.prompt_token_count,
+            completion_tokens: gemini_response.usage_metadata.candidates_token_count,
+            total_tokens: gemini_response.usage_metadata.total_token_count,
+            prompt_tokens_details: None,
+        },
+        prompt_logprobs: None,
+        prompt_token_ids: None,
+        kv_transfer_params: None,
+    })
+}
 
 /// Gemini backend - handles HTTP communication with Google's Gemini API
 pub struct GeminiBackend {
@@ -270,56 +353,7 @@ impl ExternalBackend for GeminiBackend {
             CompletionError::CompletionError(format!("Failed to parse response: {e}"))
         })?;
 
-        if gemini_response.candidates.is_empty() {
-            return Err(CompletionError::CompletionError(
-                "No candidates in Gemini response".to_string(),
-            ));
-        }
-
-        let candidate = &gemini_response.candidates[0];
-        let (content, tool_calls) = extract_response_content(&candidate.content.parts);
-
-        // Determine finish reason - tool_calls if we have function calls
-        let finish_reason = if tool_calls.is_some() {
-            Some("tool_calls".to_string())
-        } else {
-            map_finish_reason_string(candidate.finish_reason.as_ref())
-        };
-
-        let openai_response = ChatCompletionResponse {
-            id: format!("gemini-{}", Uuid::new_v4()),
-            object: "chat.completion".to_string(),
-            created: chrono::Utc::now().timestamp(),
-            model: model.to_string(),
-            choices: vec![ChatCompletionResponseChoice {
-                index: 0,
-                message: ChatResponseMessage {
-                    role: MessageRole::Assistant,
-                    content,
-                    refusal: None,
-                    annotations: None,
-                    audio: None,
-                    function_call: None,
-                    tool_calls,
-                    reasoning_content: None,
-                    reasoning: None,
-                },
-                logprobs: None,
-                finish_reason,
-                token_ids: None,
-            }],
-            service_tier: None,
-            system_fingerprint: None,
-            usage: TokenUsage {
-                prompt_tokens: gemini_response.usage_metadata.prompt_token_count,
-                completion_tokens: gemini_response.usage_metadata.candidates_token_count,
-                total_tokens: gemini_response.usage_metadata.total_token_count,
-                prompt_tokens_details: None,
-            },
-            prompt_logprobs: None,
-            prompt_token_ids: None,
-            kv_transfer_params: None,
-        };
+        let openai_response = convert_to_openai_response(gemini_response, model)?;
 
         // Serialize our normalized response. We intentionally overwrite fields
         // like `usage` (and any future cost-related fields derived from it) instead of passing
@@ -468,5 +502,79 @@ mod tests {
 
         assert_eq!(events.len(), 1);
         assert!(events[0].is_ok());
+    }
+
+    // End-to-end conversion: a MAX_TOKENS-with-empty-content payload from Google
+    // produces an OpenAI-shaped response with `content: null` and
+    // `finish_reason: "length"`. Locks in the user-visible contract.
+    #[test]
+    fn test_convert_to_openai_response_max_tokens_empty_content() {
+        let json = r#"{
+            "candidates": [{
+                "content": {},
+                "finishReason": "MAX_TOKENS",
+                "index": 0
+            }],
+            "usageMetadata": {
+                "promptTokenCount": 7,
+                "candidatesTokenCount": 0,
+                "totalTokenCount": 7
+            }
+        }"#;
+        let response: GeminiResponse = serde_json::from_str(json).unwrap();
+        let openai = convert_to_openai_response(response, "google/gemini-3-pro").unwrap();
+
+        assert_eq!(openai.choices.len(), 1);
+        let choice = &openai.choices[0];
+        assert!(choice.message.content.is_none());
+        assert!(choice.message.tool_calls.is_none());
+        assert_eq!(choice.finish_reason.as_deref(), Some("length"));
+        assert_eq!(openai.usage.prompt_tokens, 7);
+        assert_eq!(openai.usage.completion_tokens, 0);
+        assert_eq!(openai.model, "google/gemini-3-pro");
+    }
+
+    // Same contract when the entire `content` field is absent (safety-block shape).
+    #[test]
+    fn test_convert_to_openai_response_missing_content() {
+        let json = r#"{
+            "candidates": [{
+                "finishReason": "SAFETY",
+                "index": 0
+            }],
+            "usageMetadata": {
+                "promptTokenCount": 9,
+                "totalTokenCount": 9
+            }
+        }"#;
+        let response: GeminiResponse = serde_json::from_str(json).unwrap();
+        let openai = convert_to_openai_response(response, "google/gemini-3-pro").unwrap();
+        let choice = &openai.choices[0];
+        assert!(choice.message.content.is_none());
+        assert!(choice.message.tool_calls.is_none());
+        // SAFETY maps to "content_filter" via map_finish_reason_string.
+        assert!(choice.finish_reason.is_some());
+    }
+
+    // Normal STOP response with text round-trips into a populated content field.
+    #[test]
+    fn test_convert_to_openai_response_normal_stop() {
+        let json = r#"{
+            "candidates": [{
+                "content": {"role": "model", "parts": [{"text": "Hi!"}]},
+                "finishReason": "STOP",
+                "index": 0
+            }],
+            "usageMetadata": {
+                "promptTokenCount": 3,
+                "candidatesTokenCount": 2,
+                "totalTokenCount": 5
+            }
+        }"#;
+        let response: GeminiResponse = serde_json::from_str(json).unwrap();
+        let openai = convert_to_openai_response(response, "google/gemini-3-pro").unwrap();
+        let choice = &openai.choices[0];
+        assert_eq!(choice.message.content.as_deref(), Some("Hi!"));
+        assert_eq!(choice.finish_reason.as_deref(), Some("stop"));
     }
 }

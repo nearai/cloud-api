@@ -67,20 +67,24 @@ impl ModelsServiceTrait for ModelsServiceImpl {
     }
 
     async fn get_models_with_pricing(&self) -> Result<Vec<ModelWithPricing>, ModelsError> {
-        if let Some(cached) = self.models_list_cache.get(&MODELS_LIST_CACHE_KEY).await {
-            return Ok((*cached).clone());
-        }
-
-        let models = self
-            .models_repository
-            .get_all_active_models()
+        // Use `try_get_with` to coalesce concurrent loads: when the cache is
+        // empty (cold start, after TTL expiry, or after an admin invalidation),
+        // moka guarantees that only ONE caller runs the async loader and any
+        // other callers waiting on the same key receive the same result.
+        // Without this, every cache miss would let N concurrent requests all
+        // hit the DB with the same JOIN+GROUP BY query — defeating most of
+        // the cache win and producing periodic spikes every 30 s.
+        let repo = self.models_repository.clone();
+        let arc = self
+            .models_list_cache
+            .try_get_with(MODELS_LIST_CACHE_KEY, async move {
+                repo.get_all_active_models()
+                    .await
+                    .map(Arc::new)
+                    .map_err(|e| ModelsError::InternalError(e.to_string()))
+            })
             .await
-            .map_err(|e| ModelsError::InternalError(e.to_string()))?;
-
-        let arc = Arc::new(models);
-        self.models_list_cache
-            .insert(MODELS_LIST_CACHE_KEY, arc.clone())
-            .await;
+            .map_err(|e: Arc<ModelsError>| ModelsError::InternalError(e.to_string()))?;
         Ok((*arc).clone())
     }
 

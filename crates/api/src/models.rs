@@ -2508,12 +2508,19 @@ pub struct AcceptInvitationResponse {
 
 /// Response for model list endpoint.
 ///
-/// Pagination has been dropped from `/v1/model/list` — there are only a
-/// few dozen models in the system and the full list is cached in-process.
-/// `total` is preserved as a convenience field set to `models.len()`.
+/// The full catalog (a few dozen entries) is loaded once and cached
+/// in-process for a short TTL; `limit` / `offset` slice the cached list
+/// in memory, so successive pages are consistent within a cache window
+/// and DB load is independent of caller pagination.
+///
+/// `limit` and `offset` echo back the request values (defaults: 100, 0).
+/// `total` is the full catalog size, used by clients to compute page
+/// counts.
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct ModelListResponse {
     pub models: Vec<ModelWithPricing>,
+    pub limit: i64,
+    pub offset: i64,
     pub total: i64,
 }
 

@@ -428,7 +428,11 @@ impl InvitationEmailConfig {
 
         let from_email = non_empty_env("INVITATION_EMAIL_FROM");
         let reply_to = non_empty_env("INVITATION_EMAIL_REPLY_TO");
-        let resend_api_key = read_optional_secret_env("RESEND_API_KEY_FILE", "RESEND_API_KEY")?;
+        let resend_api_key = if enabled {
+            read_optional_secret_env("RESEND_API_KEY_FILE", "RESEND_API_KEY")?
+        } else {
+            None
+        };
         let frontend_base_url = non_empty_env("CLOUD_UI_BASE_URL");
 
         if enabled {
@@ -630,6 +634,19 @@ mod tests {
         assert!(config.from_email.is_none());
         assert!(config.resend_api_key.is_none());
         assert!(config.invitations_url().is_none());
+    }
+
+    #[test]
+    #[serial]
+    fn test_invitation_email_config_does_not_read_resend_key_file_when_disabled() {
+        clear_invitation_email_env();
+        std::env::set_var("RESEND_API_KEY_FILE", "/missing/resend-api-key");
+
+        let config = InvitationEmailConfig::from_env().unwrap();
+
+        assert!(!config.enabled);
+        assert!(config.resend_api_key.is_none());
+        clear_invitation_email_env();
     }
 
     #[test]

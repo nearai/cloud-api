@@ -15,6 +15,12 @@ pub struct OrganizationServiceImpl {
     invitations_url: Option<String>,
 }
 
+#[derive(Debug, Clone, Default)]
+struct InvitationSenderDetails {
+    name: Option<String>,
+    email: Option<String>,
+}
+
 impl OrganizationServiceImpl {
     pub fn new(
         repository: Arc<dyn OrganizationRepository>,
@@ -709,8 +715,8 @@ impl OrganizationServiceImpl {
     async fn send_invitation_email(
         &self,
         org: &Organization,
-        requester_id: UserId,
         invitation: &ports::OrganizationInvitation,
+        sender_details: &InvitationSenderDetails,
     ) -> (bool, Option<String>) {
         let Some(invitations_url) = self.invitations_url.clone() else {
             match self
@@ -728,26 +734,12 @@ impl OrganizationServiceImpl {
             return (false, None);
         };
 
-        let inviter = self.user_repository.get_by_id(requester_id.clone()).await;
-        let (inviter_name, inviter_email) = match inviter {
-            Ok(Some(user)) => (user.display_name.or(Some(user.username)), Some(user.email)),
-            Ok(None) => (None, None),
-            Err(err) => {
-                tracing::warn!(
-                    invitation_id = %invitation.id,
-                    inviter_id = %requester_id.0,
-                    "Failed to load inviter details for invitation email: {err}"
-                );
-                (None, None)
-            }
-        };
-
         let email = InvitationEmail {
             recipient_email: invitation.email.clone(),
             organization_name: org.name.clone(),
             role: invitation.role.to_string(),
-            inviter_name,
-            inviter_email,
+            inviter_name: sender_details.name.clone(),
+            inviter_email: sender_details.email.clone(),
             expires_at: invitation.expires_at,
             invitations_url,
         };
@@ -802,6 +794,26 @@ impl OrganizationServiceImpl {
         }
     }
 
+    async fn load_invitation_sender_details(
+        &self,
+        requester_id: &UserId,
+    ) -> InvitationSenderDetails {
+        match self.user_repository.get_by_id(requester_id.clone()).await {
+            Ok(Some(user)) => InvitationSenderDetails {
+                name: user.display_name.or(Some(user.username)),
+                email: Some(user.email),
+            },
+            Ok(None) => InvitationSenderDetails::default(),
+            Err(err) => {
+                tracing::warn!(
+                    inviter_id = %requester_id.0,
+                    "Failed to load inviter details for invitation email: {err}"
+                );
+                InvitationSenderDetails::default()
+            }
+        }
+    }
+
     /// Create invitations for users (supports unregistered users, private helper)
     async fn create_invitations_impl(
         &self,
@@ -833,6 +845,11 @@ impl OrganizationServiceImpl {
         let mut results = Vec::new();
         let mut successful = 0;
         let mut failed = 0;
+        let sender_details = if self.invitations_url.is_some() {
+            self.load_invitation_sender_details(&requester_id).await
+        } else {
+            InvitationSenderDetails::default()
+        };
 
         for (email, role) in invitations {
             // Check if user is already a member
@@ -869,7 +886,7 @@ impl OrganizationServiceImpl {
             {
                 Ok(invitation) => {
                     let (email_sent, email_error) = self
-                        .send_invitation_email(&org, requester_id.clone(), &invitation)
+                        .send_invitation_email(&org, &invitation, &sender_details)
                         .await;
                     successful += 1;
                     results.push(ports::InvitationResult {
@@ -1581,6 +1598,7 @@ mod tests {
 
     struct StubUserRepo {
         inviter: User,
+        get_by_id_calls: Mutex<usize>,
     }
 
     #[async_trait]
@@ -1608,6 +1626,7 @@ mod tests {
         }
 
         async fn get_by_id(&self, _: UserId) -> anyhow::Result<Option<User>> {
+            *self.get_by_id_calls.lock().unwrap() += 1;
             Ok(Some(self.inviter.clone()))
         }
 
@@ -1809,6 +1828,7 @@ mod tests {
         OrganizationServiceImpl,
         Arc<StubInvitationRepo>,
         Arc<StubEmailSender>,
+        Arc<StubUserRepo>,
     ) {
         let owner_id = UserId(Uuid::new_v4());
         let org_id = OrganizationId(Uuid::new_v4());
@@ -1843,20 +1863,24 @@ mod tests {
             outcome,
             sent_to: Mutex::new(Vec::new()),
         });
+        let user_repo = Arc::new(StubUserRepo {
+            inviter,
+            get_by_id_calls: Mutex::new(0),
+        });
         let service = OrganizationServiceImpl::new_with_email_sender(
             Arc::new(StubOrgRepo { org }) as Arc<dyn OrganizationRepository>,
-            Arc::new(StubUserRepo { inviter }) as Arc<dyn UserRepository>,
+            user_repo.clone() as Arc<dyn UserRepository>,
             invitation_repo.clone() as Arc<dyn OrganizationInvitationRepository>,
             email_sender.clone() as Arc<dyn EmailSender>,
             invitations_url,
         );
 
-        (service, invitation_repo, email_sender)
+        (service, invitation_repo, email_sender, user_repo)
     }
 
     #[tokio::test]
     async fn create_invitations_records_sent_email_status() {
-        let (service, invitation_repo, email_sender) = make_service(
+        let (service, invitation_repo, email_sender, user_repo) = make_service(
             Ok(EmailDeliveryOutcome::Sent {
                 message_id: Some("resend-email-id".to_string()),
             }),
@@ -1889,11 +1913,48 @@ mod tests {
         let stored = invitation_repo.records.lock().unwrap()[0].clone();
         assert_eq!(stored.email_status, InvitationEmailStatus::Sent);
         assert_eq!(stored.email_message_id.as_deref(), Some("resend-email-id"));
+        assert_eq!(*user_repo.get_by_id_calls.lock().unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn create_invitations_loads_inviter_once_for_batch() {
+        let (service, _, email_sender, user_repo) = make_service(
+            Ok(EmailDeliveryOutcome::Sent {
+                message_id: Some("resend-email-id".to_string()),
+            }),
+            Some("https://cloud.example.com/dashboard/invitations".to_string()),
+        );
+        let org = service
+            .repository
+            .get_by_id(Uuid::nil())
+            .await
+            .unwrap()
+            .unwrap();
+
+        let response = service
+            .create_invitations(
+                org.id,
+                org.owner_id,
+                vec![
+                    ("one@example.com".to_string(), MemberRole::Admin),
+                    ("two@example.com".to_string(), MemberRole::Member),
+                ],
+                168,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.successful, 2);
+        assert_eq!(
+            email_sender.sent_to.lock().unwrap().as_slice(),
+            &["one@example.com".to_string(), "two@example.com".to_string()]
+        );
+        assert_eq!(*user_repo.get_by_id_calls.lock().unwrap(), 1);
     }
 
     #[tokio::test]
     async fn create_invitations_keeps_invite_when_email_fails() {
-        let (service, invitation_repo, _) = make_service(
+        let (service, invitation_repo, _, _) = make_service(
             Err(EmailError::new("Resend failed\nwith details")),
             Some("https://cloud.example.com/dashboard/invitations".to_string()),
         );
@@ -1931,7 +1992,7 @@ mod tests {
 
     #[tokio::test]
     async fn create_invitations_skips_email_without_invitations_url() {
-        let (service, invitation_repo, email_sender) = make_service(
+        let (service, invitation_repo, email_sender, user_repo) = make_service(
             Ok(EmailDeliveryOutcome::Sent {
                 message_id: Some("resend-email-id".to_string()),
             }),
@@ -1960,5 +2021,6 @@ mod tests {
         assert!(email_sender.sent_to.lock().unwrap().is_empty());
         let stored = invitation_repo.records.lock().unwrap()[0].clone();
         assert_eq!(stored.email_status, InvitationEmailStatus::Skipped);
+        assert_eq!(*user_repo.get_by_id_calls.lock().unwrap(), 0);
     }
 }

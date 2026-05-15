@@ -2,9 +2,10 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use config::InvitationEmailConfig;
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 const RESEND_EMAILS_URL: &str = "https://api.resend.com/emails";
+const RESEND_SEND_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Debug, Clone)]
 pub struct InvitationEmail {
@@ -108,14 +109,22 @@ impl ResendTransport for ReqwestResendTransport {
         api_key: &str,
         request: ResendSendEmailRequest,
     ) -> Result<ResendSendEmailResponse, EmailError> {
-        let response = self
-            .client
-            .post(&self.endpoint)
-            .bearer_auth(api_key)
-            .json(&request)
-            .send()
-            .await
-            .map_err(|err| EmailError::new(format!("Resend send_email request failed: {err}")))?;
+        let response = tokio::time::timeout(
+            RESEND_SEND_TIMEOUT,
+            self.client
+                .post(&self.endpoint)
+                .bearer_auth(api_key)
+                .json(&request)
+                .send(),
+        )
+        .await
+        .map_err(|_| {
+            EmailError::new(format!(
+                "Resend send_email timed out after {} seconds",
+                RESEND_SEND_TIMEOUT.as_secs()
+            ))
+        })?
+        .map_err(|err| EmailError::new(format!("Resend send_email request failed: {err}")))?;
 
         let status = response.status();
         if !status.is_success() {

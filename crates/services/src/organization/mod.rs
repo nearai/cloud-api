@@ -210,6 +210,26 @@ impl OrganizationServiceImpl {
             .map_err(Self::map_repository_error)
     }
 
+    async fn list_organizations_with_roles_for_user_impl(
+        &self,
+        user_id: UserId,
+        limit: i64,
+        offset: i64,
+        order_by: Option<OrganizationOrderBy>,
+        order_direction: Option<OrganizationOrderDirection>,
+    ) -> Result<Vec<OrganizationWithRole>, OrganizationError> {
+        self.repository
+            .list_organizations_with_roles_by_user(
+                user_id.0,
+                limit,
+                offset,
+                order_by,
+                order_direction,
+            )
+            .await
+            .map_err(Self::map_repository_error)
+    }
+
     /// Add a member to an organization (private helper)
     async fn add_member_impl(
         &self,
@@ -1205,6 +1225,24 @@ impl OrganizationServiceTrait for OrganizationServiceImpl {
             .await
     }
 
+    async fn list_organizations_with_roles_for_user(
+        &self,
+        user_id: UserId,
+        limit: i64,
+        offset: i64,
+        order_by: Option<OrganizationOrderBy>,
+        order_direction: Option<OrganizationOrderDirection>,
+    ) -> Result<Vec<OrganizationWithRole>, OrganizationError> {
+        self.list_organizations_with_roles_for_user_impl(
+            user_id,
+            limit,
+            offset,
+            order_by,
+            order_direction,
+        )
+        .await
+    }
+
     async fn count_organizations_for_user(
         &self,
         user_id: UserId,
@@ -1592,6 +1630,17 @@ mod tests {
             _: Option<OrganizationOrderBy>,
             _: Option<OrganizationOrderDirection>,
         ) -> Result<Vec<Organization>, RepositoryError> {
+            unimplemented!()
+        }
+
+        async fn list_organizations_with_roles_by_user(
+            &self,
+            _: Uuid,
+            _: i64,
+            _: i64,
+            _: Option<OrganizationOrderBy>,
+            _: Option<OrganizationOrderDirection>,
+        ) -> Result<Vec<OrganizationWithRole>, RepositoryError> {
             unimplemented!()
         }
     }

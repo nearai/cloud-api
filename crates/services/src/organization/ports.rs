@@ -34,6 +34,12 @@ pub struct Organization {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OrganizationWithRole {
+    pub organization: Organization,
+    pub role: MemberRole,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OrganizationMember {
     pub organization_id: OrganizationId,
     pub user_id: UserId,
@@ -282,6 +288,15 @@ pub trait OrganizationRepository: Send + Sync {
         order_by: Option<OrganizationOrderBy>,
         order_direction: Option<OrganizationOrderDirection>,
     ) -> Result<Vec<Organization>, RepositoryError>;
+
+    async fn list_organizations_with_roles_by_user(
+        &self,
+        user_id: Uuid,
+        limit: i64,
+        offset: i64,
+        order_by: Option<OrganizationOrderBy>,
+        order_direction: Option<OrganizationOrderDirection>,
+    ) -> Result<Vec<OrganizationWithRole>, RepositoryError>;
 }
 
 /// Repository trait for organization invitations
@@ -384,6 +399,15 @@ pub trait OrganizationServiceTrait: Send + Sync {
         order_by: Option<OrganizationOrderBy>,
         order_direction: Option<OrganizationOrderDirection>,
     ) -> Result<Vec<Organization>, OrganizationError>;
+
+    async fn list_organizations_with_roles_for_user(
+        &self,
+        user_id: UserId,
+        limit: i64,
+        offset: i64,
+        order_by: Option<OrganizationOrderBy>,
+        order_direction: Option<OrganizationOrderDirection>,
+    ) -> Result<Vec<OrganizationWithRole>, OrganizationError>;
 
     /// Count organizations accessible to a user
     async fn count_organizations_for_user(&self, user_id: UserId)

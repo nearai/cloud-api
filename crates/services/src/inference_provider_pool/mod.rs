@@ -53,6 +53,25 @@ struct DiscoveryOutcome {
     /// ("ecdsa" / "ed25519"). Pubkeys are derived from the TEE compose hash so
     /// they're identical across backends of the same model.
     pubkeys_by_algo: HashMap<String, String>,
+    /// Per-call verified TLS fingerprints observed in this pass, in launch
+    /// order (by `attempt` index — `futures::future::join_all` preserves the
+    /// input order, not completion order). Same fingerprint appearing multiple
+    /// times means the L4 LB routed several calls to the same backend —
+    /// exactly the signal needed to debug why cumulative discovery isn't
+    /// expanding the pin set. Length equals `successful_calls - verify_failures`.
+    observed_fingerprints: Vec<String>,
+    /// Per-call failure reasons that prevented a fingerprint observation, in
+    /// launch order. Each entry is `"{category}: {detail}"` where category
+    /// is one of: `client_build`, `query_encode`, `connect`, `send_timeout`,
+    /// `request`, `send`, `timeout`, `status`, `malformed_json`, `verify`.
+    /// Note: post-HTTP verify failures are included here even though the
+    /// underlying call succeeded HTTP-wise, so
+    /// `failure_reasons.len() == failed_calls + verify_failures`.
+    failure_reasons: Vec<String>,
+    /// Number of HTTP-successful calls whose attestation verification failed
+    /// (TDX quote rejection, report-data mismatch, etc.). These are *not*
+    /// counted in `failed_calls`, which only covers transport-layer failures.
+    verify_failures: usize,
 }
 
 /// Combined provider mappings updated atomically to prevent race conditions
@@ -640,7 +659,7 @@ impl InferenceProviderPool {
                                 error = %e,
                                 "Failed to build discovery client"
                             );
-                            return None;
+                            return Err(format!("client_build: {e}"));
                         }
                     };
 
@@ -654,7 +673,7 @@ impl InferenceProviderPool {
                         include_tls_fingerprint: Some(true),
                     }) {
                         Ok(q) => q,
-                        Err(_) => return None,
+                        Err(e) => return Err(format!("query_encode: {e}")),
                     };
                     let request_url = format!("{}/v1/attestation/report?{}", url, qs);
 
@@ -679,7 +698,18 @@ impl InferenceProviderPool {
                                 error = %e,
                                 "Discovery call failed"
                             );
-                            return None;
+                            // Categorize so the outcome aggregate stays readable at INFO.
+                            // reqwest's full error is verbose; classify common causes.
+                            let category = if e.is_connect() {
+                                "connect"
+                            } else if e.is_timeout() {
+                                "send_timeout"
+                            } else if e.is_request() {
+                                "request"
+                            } else {
+                                "send"
+                            };
+                            return Err(format!("{category}: {e}"));
                         }
                         Err(_) => {
                             debug!(
@@ -690,21 +720,22 @@ impl InferenceProviderPool {
                                 elapsed_ms,
                                 "Discovery call timed out"
                             );
-                            return None;
+                            return Err(format!("timeout: {elapsed_ms}ms"));
                         }
                     };
 
                     if !resp.status().is_success() {
+                        let status = resp.status().as_u16();
                         debug!(
                             model = %model,
                             url = %url,
                             algo = %algo,
                             attempt = i,
-                            status = resp.status().as_u16(),
+                            status = status,
                             elapsed_ms,
                             "Discovery call returned non-2xx"
                         );
-                        return None;
+                        return Err(format!("status: {status}"));
                     }
                     let report: serde_json::Map<String, serde_json::Value> = match resp.json().await
                     {
@@ -718,7 +749,7 @@ impl InferenceProviderPool {
                                 error = %e,
                                 "Discovery call returned malformed JSON"
                             );
-                            return None;
+                            return Err(format!("malformed_json: {e}"));
                         }
                     };
                     debug!(
@@ -729,7 +760,7 @@ impl InferenceProviderPool {
                         elapsed_ms,
                         "Discovery call succeeded"
                     );
-                    Some((report, nonce, algo))
+                    Ok((report, nonce, algo))
                 }
             })
             .collect::<Vec<_>>();
@@ -741,17 +772,25 @@ impl InferenceProviderPool {
         let mut new_fingerprints = 0usize;
         let mut pubkeys_by_algo: HashMap<String, String> = HashMap::new();
         let mut verified_this_round: HashSet<String> = HashSet::new();
+        let mut observed_fingerprints: Vec<String> = Vec::new();
+        let mut failure_reasons: Vec<String> = Vec::new();
+        let mut verify_failures = 0usize;
 
         for r in results {
-            let Some((report, nonce, algo)) = r else {
-                failed_calls += 1;
-                continue;
+            let (report, nonce, algo) = match r {
+                Ok(t) => t,
+                Err(reason) => {
+                    failed_calls += 1;
+                    failure_reasons.push(reason);
+                    continue;
+                }
             };
             successful_calls += 1;
 
             match verifier.verify_attestation_report(&report, &nonce).await {
                 Ok(verified) => {
                     if let Some(ref vfp) = verified.tls_cert_fingerprint {
+                        observed_fingerprints.push(vfp.clone());
                         if verified_this_round.insert(vfp.clone()) {
                             let added = {
                                 let mut state =
@@ -790,6 +829,8 @@ impl InferenceProviderPool {
                         error = %e,
                         "Attestation verification failed for discovered backend"
                     );
+                    failure_reasons.push(format!("verify: {e}"));
+                    verify_failures += 1;
                 }
             }
         }
@@ -805,6 +846,9 @@ impl InferenceProviderPool {
             new_fingerprints,
             total_pinned,
             pubkeys_by_algo,
+            observed_fingerprints,
+            failure_reasons,
+            verify_failures,
         }
     }
 
@@ -2086,6 +2130,8 @@ impl InferenceProviderPool {
                             url = %url,
                             successful_calls = outcome.successful_calls,
                             failed_calls = outcome.failed_calls,
+                            verify_failures = outcome.verify_failures,
+                            failure_reasons = ?outcome.failure_reasons,
                             "No TLS fingerprints pinned during initial discovery — provider will reject connections until attestation succeeds"
                         );
                     } else {
@@ -2095,9 +2141,12 @@ impl InferenceProviderPool {
                             calls = discovery_parallelism,
                             successful_calls = outcome.successful_calls,
                             failed_calls = outcome.failed_calls,
+                            verify_failures = outcome.verify_failures,
                             new_fingerprints = outcome.new_fingerprints,
                             total_pinned = outcome.total_pinned,
                             pubkey_algos = ?outcome.pubkeys_by_algo.keys().collect::<Vec<_>>(),
+                            observed_fingerprints = ?outcome.observed_fingerprints,
+                            failure_reasons = ?outcome.failure_reasons,
                             "Initial attestation discovery complete"
                         );
                         // Pre-warm all bucket clients in the background so the
@@ -2391,17 +2440,30 @@ impl InferenceProviderPool {
                         url = %url,
                         new_fingerprints = outcome.new_fingerprints,
                         total_pinned = outcome.total_pinned,
+                        verify_failures = outcome.verify_failures,
+                        observed_fingerprints = ?outcome.observed_fingerprints,
+                        failure_reasons = ?outcome.failure_reasons,
                         "Cumulative discovery expanded pinned backend set"
                     );
                 } else {
-                    debug!(
+                    // Promoted from DEBUG to INFO so production can observe
+                    // *why* the pin set isn't growing: every cycle records the
+                    // fingerprints the L4 LB routed to (showing whether load
+                    // balancing is collapsing onto already-pinned backends) and
+                    // any per-call failure reasons (TLS reject, timeout, 5xx,
+                    // etc.). Frequency is bounded by the refresh interval
+                    // (default 300s) × model count, so volume stays modest.
+                    info!(
                         model = %model_name,
                         url = %url,
                         calls = cumulative_calls,
                         successful_calls = outcome.successful_calls,
                         failed_calls = outcome.failed_calls,
+                        verify_failures = outcome.verify_failures,
                         total_pinned = outcome.total_pinned,
-                        "Cumulative discovery cycle"
+                        observed_fingerprints = ?outcome.observed_fingerprints,
+                        failure_reasons = ?outcome.failure_reasons,
+                        "Cumulative discovery cycle (no new fingerprints)"
                     );
                 }
 

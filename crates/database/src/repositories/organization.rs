@@ -884,9 +884,13 @@ impl OrganizationRepository for PgOrganizationRepository {
                     SELECT o.*, om.role AS member_role, owner_om.user_id AS owner_user_id
                     FROM organizations o
                     INNER JOIN organization_members om ON o.id = om.organization_id
-                    INNER JOIN organization_members owner_om
-                        ON owner_om.organization_id = o.id
-                        AND owner_om.role = 'owner'
+                    LEFT JOIN LATERAL (
+                        SELECT user_id
+                        FROM organization_members
+                        WHERE organization_id = o.id AND role = 'owner'
+                        ORDER BY joined_at ASC
+                        LIMIT 1
+                    ) owner_om ON true
                     WHERE om.user_id = $1 AND o.is_active = true
                     ORDER BY o.{order_by_column} {order_dir}
                     LIMIT $2 OFFSET $3
@@ -904,11 +908,17 @@ impl OrganizationRepository for PgOrganizationRepository {
                     .role_str_to_domain_role(row.get::<_, String>("member_role").as_str())
                     .map_err(RepositoryError::DataConversionError)?;
                 let owner_id = row
-                    .try_get::<_, Uuid>("owner_user_id")
+                    .try_get::<_, Option<Uuid>>("owner_user_id")
                     .map_err(|err| RepositoryError::DataConversionError(err.into()))?;
                 let db_org = self
                     .row_to_db_organization(row)
                     .map_err(RepositoryError::DataConversionError)?;
+                let owner_id = owner_id.ok_or_else(|| {
+                    RepositoryError::DataConversionError(anyhow::anyhow!(
+                        "Organization has no owner: {}",
+                        db_org.id
+                    ))
+                })?;
                 let organization = self
                     .db_to_domain_organization_with_owner(db_org, owner_id)
                     .map_err(RepositoryError::DataConversionError)?;

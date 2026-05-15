@@ -53,15 +53,25 @@ struct DiscoveryOutcome {
     /// ("ecdsa" / "ed25519"). Pubkeys are derived from the TEE compose hash so
     /// they're identical across backends of the same model.
     pubkeys_by_algo: HashMap<String, String>,
-    /// Per-call verified TLS fingerprints observed in this pass, in call order.
-    /// Order is the order in which discovery's parallel calls returned (not the
-    /// order they were launched). Same fingerprint appears multiple times when
-    /// the L4 LB routed several calls to the same backend — exactly the signal
-    /// needed to debug why cumulative discovery isn't expanding the pin set.
+    /// Per-call verified TLS fingerprints observed in this pass, in launch
+    /// order (by `attempt` index — `futures::future::join_all` preserves the
+    /// input order, not completion order). Same fingerprint appearing multiple
+    /// times means the L4 LB routed several calls to the same backend —
+    /// exactly the signal needed to debug why cumulative discovery isn't
+    /// expanding the pin set. Length equals `successful_calls - verify_failures`.
     observed_fingerprints: Vec<String>,
     /// Per-call failure reasons that prevented a fingerprint observation, in
-    /// the order they occurred. Empty when all calls succeeded.
+    /// launch order. Each entry is `"{category}: {detail}"` where category
+    /// is one of: `client_build`, `query_encode`, `connect`, `send_timeout`,
+    /// `request`, `send`, `timeout`, `status`, `malformed_json`, `verify`.
+    /// Note: post-HTTP verify failures are included here even though the
+    /// underlying call succeeded HTTP-wise, so
+    /// `failure_reasons.len() == failed_calls + verify_failures`.
     failure_reasons: Vec<String>,
+    /// Number of HTTP-successful calls whose attestation verification failed
+    /// (TDX quote rejection, report-data mismatch, etc.). These are *not*
+    /// counted in `failed_calls`, which only covers transport-layer failures.
+    verify_failures: usize,
 }
 
 /// Combined provider mappings updated atomically to prevent race conditions
@@ -764,6 +774,7 @@ impl InferenceProviderPool {
         let mut verified_this_round: HashSet<String> = HashSet::new();
         let mut observed_fingerprints: Vec<String> = Vec::new();
         let mut failure_reasons: Vec<String> = Vec::new();
+        let mut verify_failures = 0usize;
 
         for r in results {
             let (report, nonce, algo) = match r {
@@ -819,6 +830,7 @@ impl InferenceProviderPool {
                         "Attestation verification failed for discovered backend"
                     );
                     failure_reasons.push(format!("verify: {e}"));
+                    verify_failures += 1;
                 }
             }
         }
@@ -836,6 +848,7 @@ impl InferenceProviderPool {
             pubkeys_by_algo,
             observed_fingerprints,
             failure_reasons,
+            verify_failures,
         }
     }
 
@@ -2117,6 +2130,7 @@ impl InferenceProviderPool {
                             url = %url,
                             successful_calls = outcome.successful_calls,
                             failed_calls = outcome.failed_calls,
+                            verify_failures = outcome.verify_failures,
                             failure_reasons = ?outcome.failure_reasons,
                             "No TLS fingerprints pinned during initial discovery — provider will reject connections until attestation succeeds"
                         );
@@ -2127,6 +2141,7 @@ impl InferenceProviderPool {
                             calls = discovery_parallelism,
                             successful_calls = outcome.successful_calls,
                             failed_calls = outcome.failed_calls,
+                            verify_failures = outcome.verify_failures,
                             new_fingerprints = outcome.new_fingerprints,
                             total_pinned = outcome.total_pinned,
                             pubkey_algos = ?outcome.pubkeys_by_algo.keys().collect::<Vec<_>>(),
@@ -2425,6 +2440,7 @@ impl InferenceProviderPool {
                         url = %url,
                         new_fingerprints = outcome.new_fingerprints,
                         total_pinned = outcome.total_pinned,
+                        verify_failures = outcome.verify_failures,
                         observed_fingerprints = ?outcome.observed_fingerprints,
                         failure_reasons = ?outcome.failure_reasons,
                         "Cumulative discovery expanded pinned backend set"
@@ -2443,6 +2459,7 @@ impl InferenceProviderPool {
                         calls = cumulative_calls,
                         successful_calls = outcome.successful_calls,
                         failed_calls = outcome.failed_calls,
+                        verify_failures = outcome.verify_failures,
                         total_pinned = outcome.total_pinned,
                         observed_fingerprints = ?outcome.observed_fingerprints,
                         failure_reasons = ?outcome.failure_reasons,

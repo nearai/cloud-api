@@ -1,6 +1,7 @@
 pub mod ports;
 use super::auth::ports::{UserId, UserRepository};
 use super::common::RepositoryError;
+use crate::email::{EmailDeliveryOutcome, EmailSender, InvitationEmail, NoopEmailSender};
 use anyhow::Result;
 use async_trait::async_trait;
 pub use ports::*;
@@ -10,6 +11,14 @@ pub struct OrganizationServiceImpl {
     repository: Arc<dyn OrganizationRepository>,
     user_repository: Arc<dyn UserRepository>,
     invitation_repository: Arc<dyn ports::OrganizationInvitationRepository>,
+    email_sender: Arc<dyn EmailSender>,
+    invitations_url: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct InvitationSenderDetails {
+    name: Option<String>,
+    email: Option<String>,
 }
 
 impl OrganizationServiceImpl {
@@ -18,10 +27,28 @@ impl OrganizationServiceImpl {
         user_repository: Arc<dyn UserRepository>,
         invitation_repository: Arc<dyn ports::OrganizationInvitationRepository>,
     ) -> Self {
+        Self::new_with_email_sender(
+            repository,
+            user_repository,
+            invitation_repository,
+            Arc::new(NoopEmailSender),
+            None,
+        )
+    }
+
+    pub fn new_with_email_sender(
+        repository: Arc<dyn OrganizationRepository>,
+        user_repository: Arc<dyn UserRepository>,
+        invitation_repository: Arc<dyn ports::OrganizationInvitationRepository>,
+        email_sender: Arc<dyn EmailSender>,
+        invitations_url: Option<String>,
+    ) -> Self {
         Self {
             repository,
             user_repository,
             invitation_repository,
+            email_sender,
+            invitations_url,
         }
     }
 
@@ -502,6 +529,8 @@ impl OrganizationServiceImpl {
                                 success: true,
                                 member: Some(member),
                                 error: None,
+                                email_sent: false,
+                                email_error: None,
                             });
                         }
                         Err(e) => {
@@ -516,6 +545,8 @@ impl OrganizationServiceImpl {
                                 success: false,
                                 member: None,
                                 error: Some(error_msg),
+                                email_sent: false,
+                                email_error: None,
                             });
                         }
                     }
@@ -527,6 +558,8 @@ impl OrganizationServiceImpl {
                         success: false,
                         member: None,
                         error: Some("User not found".to_string()),
+                        email_sent: false,
+                        email_error: None,
                     });
                 }
                 Err(e) => {
@@ -536,6 +569,8 @@ impl OrganizationServiceImpl {
                         success: false,
                         member: None,
                         error: Some(format!("Failed to lookup user: {e}")),
+                        email_sent: false,
+                        email_error: None,
                     });
                 }
             }
@@ -677,6 +712,108 @@ impl OrganizationServiceImpl {
             .map_err(Self::map_repository_error)
     }
 
+    async fn send_invitation_email(
+        &self,
+        org: &Organization,
+        invitation: &ports::OrganizationInvitation,
+        sender_details: &InvitationSenderDetails,
+    ) -> (bool, Option<String>) {
+        let Some(invitations_url) = self.invitations_url.clone() else {
+            match self
+                .invitation_repository
+                .record_email_skipped(invitation.id)
+                .await
+            {
+                Ok(_) => {}
+                Err(err) => tracing::warn!(
+                    invitation_id = %invitation.id,
+                    organization_id = %invitation.organization_id.0,
+                    "Failed to record skipped invitation email status: {err}"
+                ),
+            }
+            return (false, None);
+        };
+
+        let email = InvitationEmail {
+            recipient_email: invitation.email.clone(),
+            organization_name: org.name.clone(),
+            role: invitation.role.to_string(),
+            inviter_name: sender_details.name.clone(),
+            inviter_email: sender_details.email.clone(),
+            expires_at: invitation.expires_at,
+            invitations_url,
+        };
+
+        match self.email_sender.send_invitation(&email).await {
+            Ok(EmailDeliveryOutcome::Sent { message_id }) => {
+                match self
+                    .invitation_repository
+                    .record_email_sent(invitation.id, message_id)
+                    .await
+                {
+                    Ok(_) => {}
+                    Err(err) => tracing::warn!(
+                        invitation_id = %invitation.id,
+                        organization_id = %invitation.organization_id.0,
+                        "Failed to record sent invitation email status: {err}"
+                    ),
+                }
+                (true, None)
+            }
+            Ok(EmailDeliveryOutcome::Skipped) => {
+                match self
+                    .invitation_repository
+                    .record_email_skipped(invitation.id)
+                    .await
+                {
+                    Ok(_) => {}
+                    Err(err) => tracing::warn!(
+                        invitation_id = %invitation.id,
+                        organization_id = %invitation.organization_id.0,
+                        "Failed to record skipped invitation email status: {err}"
+                    ),
+                }
+                (false, None)
+            }
+            Err(err) => {
+                let sanitized_error = err.sanitized_message();
+                match self
+                    .invitation_repository
+                    .record_email_failed(invitation.id, sanitized_error.clone())
+                    .await
+                {
+                    Ok(_) => {}
+                    Err(record_err) => tracing::warn!(
+                        invitation_id = %invitation.id,
+                        organization_id = %invitation.organization_id.0,
+                        "Failed to record failed invitation email status: {record_err}"
+                    ),
+                }
+                (false, Some(sanitized_error))
+            }
+        }
+    }
+
+    async fn load_invitation_sender_details(
+        &self,
+        requester_id: &UserId,
+    ) -> InvitationSenderDetails {
+        match self.user_repository.get_by_id(requester_id.clone()).await {
+            Ok(Some(user)) => InvitationSenderDetails {
+                name: user.display_name.or(Some(user.username)),
+                email: Some(user.email),
+            },
+            Ok(None) => InvitationSenderDetails::default(),
+            Err(err) => {
+                tracing::warn!(
+                    inviter_id = %requester_id.0,
+                    "Failed to load inviter details for invitation email: {err}"
+                );
+                InvitationSenderDetails::default()
+            }
+        }
+    }
+
     /// Create invitations for users (supports unregistered users, private helper)
     async fn create_invitations_impl(
         &self,
@@ -708,6 +845,11 @@ impl OrganizationServiceImpl {
         let mut results = Vec::new();
         let mut successful = 0;
         let mut failed = 0;
+        let sender_details = if self.invitations_url.is_some() {
+            self.load_invitation_sender_details(&requester_id).await
+        } else {
+            InvitationSenderDetails::default()
+        };
 
         for (email, role) in invitations {
             // Check if user is already a member
@@ -723,6 +865,8 @@ impl OrganizationServiceImpl {
                         success: false,
                         member: None,
                         error: Some("User is already a member".to_string()),
+                        email_sent: false,
+                        email_error: None,
                     });
                     continue;
                 }
@@ -740,13 +884,18 @@ impl OrganizationServiceImpl {
                 .create(organization_id.0, request, requester_id.0)
                 .await
             {
-                Ok(_invitation) => {
+                Ok(invitation) => {
+                    let (email_sent, email_error) = self
+                        .send_invitation_email(&org, &invitation, &sender_details)
+                        .await;
                     successful += 1;
                     results.push(ports::InvitationResult {
                         email,
                         success: true,
                         member: None,
                         error: None,
+                        email_sent,
+                        email_error,
                     });
                 }
                 Err(e) => {
@@ -756,6 +905,8 @@ impl OrganizationServiceImpl {
                         success: false,
                         member: None,
                         error: Some(format!("Failed to create invitation: {e}")),
+                        email_sent: false,
+                        email_error: None,
                     });
                 }
             }
@@ -1341,5 +1492,535 @@ impl OrganizationServiceTrait for OrganizationServiceImpl {
             .map_err(Self::map_repository_error)?;
 
         Ok(system_prompt)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::auth::ports::{User, UserRole};
+    use crate::email::{EmailDeliveryOutcome, EmailError};
+    use std::sync::Mutex;
+    use uuid::Uuid;
+
+    struct StubOrgRepo {
+        org: Organization,
+    }
+
+    #[async_trait]
+    impl OrganizationRepository for StubOrgRepo {
+        async fn create(
+            &self,
+            _: CreateOrganizationRequest,
+            _: Uuid,
+        ) -> Result<Organization, RepositoryError> {
+            unimplemented!()
+        }
+
+        async fn get_by_id(&self, _: Uuid) -> Result<Option<Organization>, RepositoryError> {
+            Ok(Some(self.org.clone()))
+        }
+
+        async fn get_by_name(&self, _: &str) -> Result<Option<Organization>, RepositoryError> {
+            unimplemented!()
+        }
+
+        async fn get_member(
+            &self,
+            _: Uuid,
+            _: Uuid,
+        ) -> Result<Option<OrganizationMember>, RepositoryError> {
+            Ok(None)
+        }
+
+        async fn update(
+            &self,
+            _: Uuid,
+            _: UpdateOrganizationRequest,
+        ) -> Result<Organization, RepositoryError> {
+            unimplemented!()
+        }
+
+        async fn delete(&self, _: Uuid) -> Result<bool, RepositoryError> {
+            unimplemented!()
+        }
+
+        async fn add_member(
+            &self,
+            _: Uuid,
+            _: AddOrganizationMemberRequest,
+            _: Uuid,
+        ) -> Result<OrganizationMember, RepositoryError> {
+            unimplemented!()
+        }
+
+        async fn update_member(
+            &self,
+            _: Uuid,
+            _: Uuid,
+            _: UpdateOrganizationMemberRequest,
+        ) -> Result<OrganizationMember, RepositoryError> {
+            unimplemented!()
+        }
+
+        async fn remove_member(&self, _: Uuid, _: Uuid) -> Result<bool, RepositoryError> {
+            unimplemented!()
+        }
+
+        async fn list_members_paginated(
+            &self,
+            _: Uuid,
+            _: i64,
+            _: i64,
+        ) -> Result<Vec<OrganizationMember>, RepositoryError> {
+            unimplemented!()
+        }
+
+        async fn get_member_count(&self, _: Uuid) -> Result<i64, RepositoryError> {
+            unimplemented!()
+        }
+
+        async fn count_organizations_by_user(&self, _: Uuid) -> Result<i64, RepositoryError> {
+            unimplemented!()
+        }
+
+        async fn list_organizations_by_user(
+            &self,
+            _: Uuid,
+            _: i64,
+            _: i64,
+            _: Option<OrganizationOrderBy>,
+            _: Option<OrganizationOrderDirection>,
+        ) -> Result<Vec<Organization>, RepositoryError> {
+            unimplemented!()
+        }
+    }
+
+    struct StubUserRepo {
+        inviter: User,
+        get_by_id_calls: Mutex<usize>,
+    }
+
+    #[async_trait]
+    impl UserRepository for StubUserRepo {
+        async fn create(
+            &self,
+            _: String,
+            _: String,
+            _: Option<String>,
+            _: Option<String>,
+        ) -> anyhow::Result<User> {
+            unimplemented!()
+        }
+
+        async fn create_from_oauth(
+            &self,
+            _: String,
+            _: String,
+            _: Option<String>,
+            _: Option<String>,
+            _: String,
+            _: String,
+        ) -> anyhow::Result<User> {
+            unimplemented!()
+        }
+
+        async fn get_by_id(&self, _: UserId) -> anyhow::Result<Option<User>> {
+            *self.get_by_id_calls.lock().unwrap() += 1;
+            Ok(Some(self.inviter.clone()))
+        }
+
+        async fn get_by_email(&self, _: &str) -> anyhow::Result<Option<User>> {
+            Ok(None)
+        }
+
+        async fn get_by_provider(&self, _: &str, _: &str) -> anyhow::Result<Option<User>> {
+            unimplemented!()
+        }
+
+        async fn update_email(&self, _: UserId, _: String) -> anyhow::Result<()> {
+            unimplemented!()
+        }
+
+        async fn update(
+            &self,
+            _: UserId,
+            _: Option<String>,
+            _: Option<String>,
+        ) -> anyhow::Result<Option<User>> {
+            unimplemented!()
+        }
+
+        async fn update_last_login(&self, _: UserId) -> anyhow::Result<()> {
+            unimplemented!()
+        }
+
+        async fn update_tokens_revoked_at(&self, _: UserId) -> anyhow::Result<()> {
+            unimplemented!()
+        }
+
+        async fn delete(&self, _: UserId) -> anyhow::Result<bool> {
+            unimplemented!()
+        }
+
+        async fn list(&self, _: i64, _: i64) -> anyhow::Result<Vec<User>> {
+            unimplemented!()
+        }
+    }
+
+    struct StubInvitationRepo {
+        records: Mutex<Vec<OrganizationInvitation>>,
+    }
+
+    impl StubInvitationRepo {
+        fn latest(&self, id: Uuid) -> OrganizationInvitation {
+            self.records
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|invitation| invitation.id == id)
+                .unwrap()
+                .clone()
+        }
+
+        fn update_email_status(
+            &self,
+            id: Uuid,
+            email_status: InvitationEmailStatus,
+            email_last_error: Option<String>,
+            email_message_id: Option<String>,
+        ) -> OrganizationInvitation {
+            let mut records = self.records.lock().unwrap();
+            let invitation = records
+                .iter_mut()
+                .find(|invitation| invitation.id == id)
+                .unwrap();
+            invitation.email_status = email_status;
+            invitation.email_sent_at = if invitation.email_status == InvitationEmailStatus::Sent {
+                Some(chrono::Utc::now())
+            } else {
+                None
+            };
+            invitation.email_last_error = email_last_error;
+            invitation.email_message_id = email_message_id;
+            invitation.clone()
+        }
+    }
+
+    #[async_trait]
+    impl OrganizationInvitationRepository for StubInvitationRepo {
+        async fn create(
+            &self,
+            org_id: Uuid,
+            request: CreateInvitationRequest,
+            invited_by: Uuid,
+        ) -> anyhow::Result<OrganizationInvitation> {
+            let invitation = OrganizationInvitation {
+                id: Uuid::new_v4(),
+                organization_id: OrganizationId(org_id),
+                email: request.email,
+                role: request.role,
+                invited_by_user_id: UserId(invited_by),
+                status: InvitationStatus::Pending,
+                token: "token".to_string(),
+                created_at: chrono::Utc::now(),
+                expires_at: chrono::Utc::now() + chrono::Duration::hours(request.expires_in_hours),
+                responded_at: None,
+                email_status: InvitationEmailStatus::NotAttempted,
+                email_sent_at: None,
+                email_last_error: None,
+                email_message_id: None,
+            };
+            self.records.lock().unwrap().push(invitation.clone());
+            Ok(invitation)
+        }
+
+        async fn get_by_id(&self, id: Uuid) -> anyhow::Result<Option<OrganizationInvitation>> {
+            Ok(Some(self.latest(id)))
+        }
+
+        async fn get_by_token(&self, _: &str) -> anyhow::Result<Option<OrganizationInvitation>> {
+            unimplemented!()
+        }
+
+        async fn list_by_organization(
+            &self,
+            _: Uuid,
+            _: Option<InvitationStatus>,
+        ) -> anyhow::Result<Vec<OrganizationInvitation>> {
+            unimplemented!()
+        }
+
+        async fn list_by_email(
+            &self,
+            _: &str,
+            _: Option<InvitationStatus>,
+        ) -> anyhow::Result<Vec<OrganizationInvitation>> {
+            unimplemented!()
+        }
+
+        async fn update_status(
+            &self,
+            id: Uuid,
+            status: InvitationStatus,
+        ) -> anyhow::Result<OrganizationInvitation> {
+            let mut records = self.records.lock().unwrap();
+            let invitation = records
+                .iter_mut()
+                .find(|invitation| invitation.id == id)
+                .unwrap();
+            invitation.status = status;
+            Ok(invitation.clone())
+        }
+
+        async fn record_email_sent(
+            &self,
+            id: Uuid,
+            message_id: Option<String>,
+        ) -> anyhow::Result<OrganizationInvitation> {
+            Ok(self.update_email_status(id, InvitationEmailStatus::Sent, None, message_id))
+        }
+
+        async fn record_email_failed(
+            &self,
+            id: Uuid,
+            error: String,
+        ) -> anyhow::Result<OrganizationInvitation> {
+            Ok(self.update_email_status(id, InvitationEmailStatus::Failed, Some(error), None))
+        }
+
+        async fn record_email_skipped(&self, id: Uuid) -> anyhow::Result<OrganizationInvitation> {
+            Ok(self.update_email_status(id, InvitationEmailStatus::Skipped, None, None))
+        }
+
+        async fn delete(&self, _: Uuid) -> anyhow::Result<bool> {
+            unimplemented!()
+        }
+
+        async fn mark_expired(&self) -> anyhow::Result<usize> {
+            unimplemented!()
+        }
+    }
+
+    struct StubEmailSender {
+        outcome: Result<EmailDeliveryOutcome, EmailError>,
+        sent_to: Mutex<Vec<String>>,
+    }
+
+    #[async_trait]
+    impl EmailSender for StubEmailSender {
+        async fn send_invitation(
+            &self,
+            email: &InvitationEmail,
+        ) -> Result<EmailDeliveryOutcome, EmailError> {
+            self.sent_to
+                .lock()
+                .unwrap()
+                .push(email.recipient_email.clone());
+            self.outcome.clone()
+        }
+    }
+
+    fn make_service(
+        outcome: Result<EmailDeliveryOutcome, EmailError>,
+        invitations_url: Option<String>,
+    ) -> (
+        OrganizationServiceImpl,
+        Arc<StubInvitationRepo>,
+        Arc<StubEmailSender>,
+        Arc<StubUserRepo>,
+    ) {
+        let owner_id = UserId(Uuid::new_v4());
+        let org_id = OrganizationId(Uuid::new_v4());
+        let org = Organization {
+            id: org_id,
+            name: "Example Org".to_string(),
+            description: None,
+            owner_id: owner_id.clone(),
+            settings: serde_json::json!({}),
+            is_active: true,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        let inviter = User {
+            id: owner_id,
+            email: "owner@example.com".to_string(),
+            username: "owner".to_string(),
+            display_name: Some("Owner".to_string()),
+            avatar_url: None,
+            auth_provider: "test".to_string(),
+            role: UserRole::User,
+            is_active: true,
+            last_login: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            tokens_revoked_at: None,
+        };
+        let invitation_repo = Arc::new(StubInvitationRepo {
+            records: Mutex::new(Vec::new()),
+        });
+        let email_sender = Arc::new(StubEmailSender {
+            outcome,
+            sent_to: Mutex::new(Vec::new()),
+        });
+        let user_repo = Arc::new(StubUserRepo {
+            inviter,
+            get_by_id_calls: Mutex::new(0),
+        });
+        let service = OrganizationServiceImpl::new_with_email_sender(
+            Arc::new(StubOrgRepo { org }) as Arc<dyn OrganizationRepository>,
+            user_repo.clone() as Arc<dyn UserRepository>,
+            invitation_repo.clone() as Arc<dyn OrganizationInvitationRepository>,
+            email_sender.clone() as Arc<dyn EmailSender>,
+            invitations_url,
+        );
+
+        (service, invitation_repo, email_sender, user_repo)
+    }
+
+    #[tokio::test]
+    async fn create_invitations_records_sent_email_status() {
+        let (service, invitation_repo, email_sender, user_repo) = make_service(
+            Ok(EmailDeliveryOutcome::Sent {
+                message_id: Some("resend-email-id".to_string()),
+            }),
+            Some("https://cloud.example.com/dashboard/invitations".to_string()),
+        );
+        let org = service
+            .repository
+            .get_by_id(Uuid::nil())
+            .await
+            .unwrap()
+            .unwrap();
+
+        let response = service
+            .create_invitations(
+                org.id,
+                org.owner_id,
+                vec![("invitee@example.com".to_string(), MemberRole::Admin)],
+                168,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.successful, 1);
+        assert!(response.results[0].email_sent);
+        assert_eq!(response.results[0].email_error, None);
+        assert_eq!(
+            email_sender.sent_to.lock().unwrap().as_slice(),
+            &["invitee@example.com".to_string()]
+        );
+        let stored = invitation_repo.records.lock().unwrap()[0].clone();
+        assert_eq!(stored.email_status, InvitationEmailStatus::Sent);
+        assert_eq!(stored.email_message_id.as_deref(), Some("resend-email-id"));
+        assert_eq!(*user_repo.get_by_id_calls.lock().unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn create_invitations_loads_inviter_once_for_batch() {
+        let (service, _, email_sender, user_repo) = make_service(
+            Ok(EmailDeliveryOutcome::Sent {
+                message_id: Some("resend-email-id".to_string()),
+            }),
+            Some("https://cloud.example.com/dashboard/invitations".to_string()),
+        );
+        let org = service
+            .repository
+            .get_by_id(Uuid::nil())
+            .await
+            .unwrap()
+            .unwrap();
+
+        let response = service
+            .create_invitations(
+                org.id,
+                org.owner_id,
+                vec![
+                    ("one@example.com".to_string(), MemberRole::Admin),
+                    ("two@example.com".to_string(), MemberRole::Member),
+                ],
+                168,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.successful, 2);
+        assert_eq!(
+            email_sender.sent_to.lock().unwrap().as_slice(),
+            &["one@example.com".to_string(), "two@example.com".to_string()]
+        );
+        assert_eq!(*user_repo.get_by_id_calls.lock().unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn create_invitations_keeps_invite_when_email_fails() {
+        let (service, invitation_repo, _, _) = make_service(
+            Err(EmailError::new("Resend failed\nwith details")),
+            Some("https://cloud.example.com/dashboard/invitations".to_string()),
+        );
+        let org = service
+            .repository
+            .get_by_id(Uuid::nil())
+            .await
+            .unwrap()
+            .unwrap();
+
+        let response = service
+            .create_invitations(
+                org.id,
+                org.owner_id,
+                vec![("invitee@example.com".to_string(), MemberRole::Member)],
+                168,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.successful, 1);
+        assert!(response.results[0].success);
+        assert!(!response.results[0].email_sent);
+        assert_eq!(
+            response.results[0].email_error.as_deref(),
+            Some("Resend failed with details")
+        );
+        let stored = invitation_repo.records.lock().unwrap()[0].clone();
+        assert_eq!(stored.email_status, InvitationEmailStatus::Failed);
+        assert_eq!(
+            stored.email_last_error.as_deref(),
+            Some("Resend failed with details")
+        );
+    }
+
+    #[tokio::test]
+    async fn create_invitations_skips_email_without_invitations_url() {
+        let (service, invitation_repo, email_sender, user_repo) = make_service(
+            Ok(EmailDeliveryOutcome::Sent {
+                message_id: Some("resend-email-id".to_string()),
+            }),
+            None,
+        );
+        let org = service
+            .repository
+            .get_by_id(Uuid::nil())
+            .await
+            .unwrap()
+            .unwrap();
+
+        let response = service
+            .create_invitations(
+                org.id,
+                org.owner_id,
+                vec![("invitee@example.com".to_string(), MemberRole::Member)],
+                168,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.successful, 1);
+        assert!(!response.results[0].email_sent);
+        assert!(response.results[0].email_error.is_none());
+        assert!(email_sender.sent_to.lock().unwrap().is_empty());
+        let stored = invitation_repo.records.lock().unwrap()[0].clone();
+        assert_eq!(stored.email_status, InvitationEmailStatus::Skipped);
+        assert_eq!(*user_repo.get_by_id_calls.lock().unwrap(), 0);
     }
 }

@@ -68,7 +68,7 @@ pub async fn list_organizations(
 
     match app_state
         .organization_service
-        .list_organizations_for_user(
+        .list_organizations_with_roles_for_user(
             user_id.clone(),
             params.limit,
             params.offset,
@@ -79,40 +79,15 @@ pub async fn list_organizations(
     {
         Ok(organizations) => {
             debug!("Found {} organizations for user", organizations.len());
-            let mut org_responses: Vec<OrganizationResponse> = Vec::new();
-            for org in organizations {
-                let role = match app_state
-                    .organization_service
-                    .get_user_role(org.id.clone(), user_id.clone())
-                    .await
-                {
-                    Ok(Some(role)) => crate::conversions::services_role_to_api_role(role),
-                    Ok(None) => {
-                        // User is not a member — should not happen since
-                        // list_organizations_for_user only returns orgs the user belongs to
-                        error!("get_user_role returned None for user in listed org");
-                        return Err((
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            Json(ErrorResponse::new(
-                                "Failed to list organizations for user".to_string(),
-                                "internal_server_error".to_string(),
-                            )),
-                        ));
-                    }
-                    Err(e) => {
-                        error!("Failed to get user role while listing organizations: {e}");
-                        return Err((
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            Json(ErrorResponse::new(
-                                "Failed to list organizations for user".to_string(),
-                                "internal_server_error".to_string(),
-                            )),
-                        ));
-                    }
-                };
-                org_responses
-                    .push(crate::conversions::services_org_to_api_org(org, role));
-            }
+            let org_responses: Vec<OrganizationResponse> = organizations
+                .into_iter()
+                .map(|org_with_role| {
+                    crate::conversions::services_org_to_api_org(
+                        org_with_role.organization,
+                        crate::conversions::services_role_to_api_role(org_with_role.role),
+                    )
+                })
+                .collect();
 
             Ok(Json(ListOrganizationsResponse {
                 organizations: org_responses,
@@ -545,16 +520,36 @@ pub async fn update_organization(
         .await
     {
         Ok(updated_org) => {
-            let role = app_state
+            let role = match app_state
                 .organization_service
                 .get_user_role(organization_id, user_id)
                 .await
-                .ok()
-                .flatten()
-                .map(crate::conversions::services_role_to_api_role)
-                .unwrap_or(crate::models::MemberRole::Owner);
+            {
+                Ok(Some(role)) => crate::conversions::services_role_to_api_role(role),
+                Ok(None) => {
+                    error!("Updated organization but caller role was not found");
+                    return Err((
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(ErrorResponse::new(
+                            "Failed to update organization".to_string(),
+                            "internal_server_error".to_string(),
+                        )),
+                    ));
+                }
+                Err(e) => {
+                    error!("Failed to get user role after organization update: {e}");
+                    return Err((
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(ErrorResponse::new(
+                            "Failed to update organization".to_string(),
+                            "internal_server_error".to_string(),
+                        )),
+                    ));
+                }
+            };
             Ok(Json(crate::conversions::services_org_to_api_org(
-                updated_org, role,
+                updated_org,
+                role,
             )))
         }
         Err(OrganizationError::NotFound) => Err((

@@ -21,6 +21,13 @@ pub enum TextRef {
     Whole { msg_idx: usize },
     /// `messages[msg_idx].content[part_idx]["text"]` is a text part.
     Part { msg_idx: usize, part_idx: usize },
+    /// `messages[msg_idx].tool_calls[tc_idx].arguments` — a JSON-encoded
+    /// string from a prior assistant turn. In agent loops the user resubmits
+    /// the model's previous tool_call as part of conversation history, and
+    /// it can echo PII from the original prompt. We redact the whole
+    /// arguments string as opaque text; minted placeholders (`<emailN>`,
+    /// `<phoneN>`, …) are pure ASCII and don't need JSON-escaping.
+    ToolCallArg { msg_idx: usize, tc_idx: usize },
 }
 
 /// Pull every text fragment from `messages` along with a reference for
@@ -54,6 +61,20 @@ pub fn collect_text_fragments(messages: &[CompletionMessage]) -> (Vec<TextRef>, 
             // Null / number / bool / object: ignore.
             _ => {}
         }
+
+        // Also walk this message's tool_calls. An assistant message
+        // resubmitted as conversation history can carry PII verbatim in
+        // its `arguments` string (e.g. `{"to":"alice@example.com"}` from a
+        // prior turn). Without this, agent loops leak the original email
+        // upstream on every follow-up.
+        if let Some(tcs) = &msg.tool_calls {
+            for (tc_idx, tc) in tcs.iter().enumerate() {
+                if !tc.arguments.is_empty() {
+                    refs.push(TextRef::ToolCallArg { msg_idx, tc_idx });
+                    texts.push(tc.arguments.clone());
+                }
+            }
+        }
     }
 
     (refs, texts)
@@ -80,6 +101,13 @@ pub fn write_back(messages: &mut [CompletionMessage], refs: &[TextRef], redacted
                         if let Some(obj) = part.as_object_mut() {
                             obj.insert("text".to_string(), serde_json::Value::String(new_text));
                         }
+                    }
+                }
+            }
+            TextRef::ToolCallArg { msg_idx, tc_idx } => {
+                if let Some(tcs) = &mut messages[*msg_idx].tool_calls {
+                    if let Some(tc) = tcs.get_mut(*tc_idx) {
+                        tc.arguments = new_text;
                     }
                 }
             }
@@ -342,5 +370,69 @@ mod tests {
         let out = redact_one("nothing private", &[], &mut map).unwrap();
         assert_eq!(out, "nothing private");
         assert!(map.is_empty());
+    }
+
+    #[test]
+    fn collect_walks_assistant_tool_call_arguments() {
+        // Agent-loop scenario: an assistant message carries a tool_call
+        // whose arguments JSON echoes the user's PII from a prior turn.
+        // Without walking this, the original email re-leaks upstream on
+        // every follow-up.
+        let messages = vec![
+            CompletionMessage {
+                role: "user".to_string(),
+                content: json!("Send a note to alice@example.com"),
+                tool_call_id: None,
+                tool_calls: None,
+            },
+            CompletionMessage {
+                role: "assistant".to_string(),
+                content: json!(null),
+                tool_call_id: None,
+                tool_calls: Some(vec![crate::completions::ports::CompletionToolCall {
+                    id: "call_1".to_string(),
+                    name: "send_email".to_string(),
+                    arguments: r#"{"to":"alice@example.com"}"#.to_string(),
+                    thought_signature: None,
+                }]),
+            },
+        ];
+        let (refs, texts) = collect_text_fragments(&messages);
+        assert_eq!(texts.len(), 2);
+        assert_eq!(texts[0], "Send a note to alice@example.com");
+        assert_eq!(texts[1], r#"{"to":"alice@example.com"}"#);
+        assert!(matches!(refs[0], TextRef::Whole { msg_idx: 0 }));
+        assert!(matches!(
+            refs[1],
+            TextRef::ToolCallArg {
+                msg_idx: 1,
+                tc_idx: 0
+            }
+        ));
+    }
+
+    #[test]
+    fn write_back_updates_tool_call_arguments() {
+        let mut messages = vec![CompletionMessage {
+            role: "assistant".to_string(),
+            content: json!(null),
+            tool_call_id: None,
+            tool_calls: Some(vec![crate::completions::ports::CompletionToolCall {
+                id: "call_1".to_string(),
+                name: "send_email".to_string(),
+                arguments: r#"{"to":"alice@example.com"}"#.to_string(),
+                thought_signature: None,
+            }]),
+        }];
+        write_back(
+            &mut messages,
+            &[TextRef::ToolCallArg {
+                msg_idx: 0,
+                tc_idx: 0,
+            }],
+            vec![r#"{"to":"<email1>"}"#.to_string()],
+        );
+        let tcs = messages[0].tool_calls.as_ref().unwrap();
+        assert_eq!(tcs[0].arguments, r#"{"to":"<email1>"}"#);
     }
 }

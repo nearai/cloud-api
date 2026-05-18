@@ -61,7 +61,13 @@ jobs:
           echo "PROMOTE_SOURCE=${SOURCE}" >> "$GITHUB_ENV"
           skopeo copy "docker://${SOURCE}" "docker://${{ env.IMAGE }}:prod"
 
-      - name: Output digest
+      # Resolve the underlying digest of what we just promoted, and try to
+      # recover the source git short-sha by finding the matching
+      # staging-YYYYMMDD-<shortsha> tag pushed by build.yml. Falls back to
+      # "unknown" if no matching staging tag exists (e.g. promoted by
+      # arbitrary digest input).
+      - name: Resolve source digest and SHA
+        id: resolve
         run: |
           DIGEST=$(skopeo inspect docker://${{ env.IMAGE }}:prod | jq -r '.Digest')
           if [ -z "$DIGEST" ] || [ "$DIGEST" = "null" ]; then
@@ -69,25 +75,77 @@ jobs:
             exit 1
           fi
           echo "IMAGE_DIGEST=${DIGEST}" >> "$GITHUB_ENV"
+
+          # Search staging-* tags for one whose digest matches
+          SHORT_SHA="unknown"
+          PAGE_URL="https://hub.docker.com/v2/namespaces/${{ vars.DOCKER_REGISTRY_USER }}/repositories/cloud-api/tags?page_size=100"
+          while [ -n "$PAGE_URL" ] && [ "$PAGE_URL" != "null" ]; do
+            RESP=$(curl -fsS "$PAGE_URL")
+            MATCH=$(echo "$RESP" | jq -r --arg d "$DIGEST" '.results[] | select(.digest==$d) | select(.name | test("^staging-[0-9]{8}-[0-9a-f]{7}$")) | .name' | head -n1)
+            if [ -n "$MATCH" ]; then
+              SHORT_SHA=$(echo "$MATCH" | sed -E 's/^staging-[0-9]{8}-//')
+              break
+            fi
+            PAGE_URL=$(echo "$RESP" | jq -r '.next')
+          done
+          # If no matching staging-* tag was found (e.g. promotion by arbitrary
+          # digest input), fall back to first 7 hex chars of the image digest so
+          # the stamped tag is still unique and immutable. Prevents same-day
+          # collisions overwriting an earlier 'prod-YYYYMMDD-unknown' tag.
+          if [ "$SHORT_SHA" = "unknown" ]; then
+            SHORT_SHA=$(echo "${DIGEST}" | sed 's/^sha256://' | cut -c1-7)
+            echo "No matching staging-* tag found; using digest-derived suffix: ${SHORT_SHA}"
+          fi
+          echo "SOURCE_SHORT_SHA=${SHORT_SHA}" >> "$GITHUB_ENV"
+          echo "Resolved source short-sha: ${SHORT_SHA}"
+
+      # Immutable rollback tag — format: prod-YYYYMMDD-<shortsha>.
+      # Provides addressable history for cvm-ansible-playbooks rollback workflow.
+      # Copy from the resolved digest (not the :prod tag) to avoid any
+      # eventual-consistency race after the previous :prod write.
+      - name: Push stamped prod tag
+        run: |
+          set -euo pipefail
+          STAMP=$(date -u +%Y%m%d)
+          STAMPED_TAG="prod-${STAMP}-${SOURCE_SHORT_SHA}"
+          STAMPED_REF="${{ env.IMAGE }}:${STAMPED_TAG}"
+          skopeo copy "docker://${{ env.IMAGE }}@${IMAGE_DIGEST}" "docker://${STAMPED_REF}"
+          echo "PROD_STAMPED_TAG=${STAMPED_TAG}" >> "$GITHUB_ENV"
+          echo "PROD_STAMPED_REF=${STAMPED_REF}" >> "$GITHUB_ENV"
+
+      - name: Output digest summary
+        run: |
           echo "## Promotion: ${PROMOTE_SOURCE} → prod" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "- digest: \`${DIGEST}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- digest: \`${IMAGE_DIGEST}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- stamped tag: \`${PROD_STAMPED_REF}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- source short-sha: \`${SOURCE_SHORT_SHA}\`" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Create GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          TAG="prod-$(date -u +%Y%m%d-%H%M%S)"
-          gh release create "$TAG" \
-            --title "Production Release ${TAG}" \
-            --notes "$(cat <<EOF
+          # GH release tag mirrors the stamped docker tag for easy correlation.
+          # Use edit-or-create to make manual retries idempotent (same-day
+          # re-runs of promote.yml won't fail on duplicate tag).
+          TAG="${PROD_STAMPED_TAG}"
+          NOTES=$(cat <<EOF
           ## Production Promotion
 
           - **Image**: \`${{ env.IMAGE }}:prod\`
+          - **Stamped image**: \`${PROD_STAMPED_REF}\`
           - **Digest**: \`${IMAGE_DIGEST}\`
           - **Promoted from**: \`${PROMOTE_SOURCE}\`
+          - **Source short-sha**: \`${SOURCE_SHORT_SHA}\`
           - **Sigstore**: https://search.sigstore.dev/?hash=${IMAGE_DIGEST}
           EOF
-          )" \
-            --latest
+          )
+          # --latest only on create. On edit we preserve whatever latest state
+          # the release already had (avoids re-marking an older same-day release
+          # as latest when re-running for an idempotent retry).
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release edit "$TAG" --title "Production Release ${TAG}" --notes "$NOTES"
+          else
+            gh release create "$TAG" --title "Production Release ${TAG}" --notes "$NOTES" --latest
+          fi
           echo "- release: [\`${TAG}\`](${{ github.server_url }}/${{ github.repository }}/releases/tag/${TAG})" >> "$GITHUB_STEP_SUMMARY"

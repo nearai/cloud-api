@@ -105,8 +105,14 @@ jobs:
         if: env.ALSO_TAG_STAGING == 'true'
         run: |
           STAGING_REF="${{ env.REGISTRY }}/${{ env.IMAGE_REPOSITORY }}:staging"
+          # Immutable date+sha staging tag for rollback (format: staging-YYYYMMDD-<shortsha>)
+          SHORT_SHA=$(echo "${GITHUB_SHA}" | cut -c1-7)
+          STAMP=$(date -u +%Y%m%d)
+          STAGING_STAMPED_REF="${{ env.REGISTRY }}/${{ env.IMAGE_REPOSITORY }}:staging-${STAMP}-${SHORT_SHA}"
           skopeo copy oci-archive:./oci.tar "docker://${STAGING_REF}"
+          skopeo copy oci-archive:./oci.tar "docker://${STAGING_STAMPED_REF}"
           echo "STAGING_REFERENCE=${STAGING_REF}" >> "$GITHUB_ENV"
+          echo "STAGING_STAMPED_REFERENCE=${STAGING_STAMPED_REF}" >> "$GITHUB_ENV"
 
       - name: Trigger staging deployment
         if: env.ALSO_TAG_STAGING == 'true'
@@ -126,5 +132,6 @@ jobs:
             echo "- sigstore: https://search.sigstore.dev/?hash=${{ env.IMAGE_DIGEST }}"
             if [[ "${{ env.ALSO_TAG_STAGING }}" == 'true' ]]; then
               echo "- staging: \`${{ env.STAGING_REFERENCE }}\`"
+              echo "- staging (stamped): \`${{ env.STAGING_STAMPED_REFERENCE }}\`"
             fi
           } >> "$GITHUB_STEP_SUMMARY"

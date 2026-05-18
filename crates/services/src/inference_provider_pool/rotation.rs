@@ -132,7 +132,9 @@ pub(super) async fn fetch_backend_count(
             } else {
                 "count_send"
             };
-            return CountFetch::Err(format!("{category}: {e}"));
+            // Strip the URL from the display string — keeps `failure_reasons`
+            // low-cardinality for DD ingestion. Full error stays at DEBUG.
+            return CountFetch::Err(format!("{category}: {}", e.without_url()));
         }
     };
     let status = res.status();
@@ -141,7 +143,7 @@ pub(super) async fn fetch_backend_count(
     }
     match res.json::<CountResponse>().await {
         Ok(payload) => CountFetch::Ok(payload.healthy),
-        Err(e) => CountFetch::Err(format!("count_decode: {e}")),
+        Err(e) => CountFetch::Err(format!("count_decode: {}", e.without_url())),
     }
 }
 

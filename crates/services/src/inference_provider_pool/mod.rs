@@ -784,7 +784,11 @@ impl InferenceProviderPool {
                     // Authoritatively no healthy backends right now. Don't issue
                     // calls; don't replace the pin set (transient registry hiccup
                     // shouldn't evict verified state). Provider-level fail-closed
-                    // paths handle the no-backend case at request time.
+                    // paths handle the no-backend case at request time. Record
+                    // `count_zero` so DD can distinguish this from a count-fetch
+                    // failure (which would carry a `count_*:` reason instead).
+                    failure_reasons
+                        .push("count_zero: proxy reports 0 healthy backends".to_string());
                     return Self::empty_outcome(&fingerprint_state, 0, failure_reasons);
                 }
                 rotation::CountFetch::Ok(n) => n,
@@ -793,6 +797,28 @@ impl InferenceProviderPool {
                     return Self::empty_outcome(&fingerprint_state, 0, failure_reasons);
                 }
             };
+
+        // Defense-in-depth: cap the fan-out. A bogus registry reading (race
+        // during a deploy, partial split) could otherwise spawn an unbounded
+        // number of fresh-TCP TLS handshakes per cycle per model. The cap is
+        // far above any realistic backend pool; hitting it is logged so it
+        // surfaces in ops without silently dropping coverage.
+        const MAX_ROTATION_FANOUT: usize = 256;
+        let backend_count = if backend_count > MAX_ROTATION_FANOUT {
+            warn!(
+                model = %model_name,
+                url = %url,
+                reported = backend_count,
+                capped_at = MAX_ROTATION_FANOUT,
+                "backend count from proxy exceeds sanity cap, truncating fan-out"
+            );
+            failure_reasons.push(format!(
+                "count_capped: proxy reported {backend_count} > {MAX_ROTATION_FANOUT}"
+            ));
+            MAX_ROTATION_FANOUT
+        } else {
+            backend_count
+        };
 
         // Step 2: fan out one attestation call per backend index, in
         // parallel (no stagger — each call lands on a distinct backend, so
@@ -876,7 +902,12 @@ impl InferenceProviderPool {
                             } else {
                                 "send"
                             };
-                            return Err(format!("{category}: {e}"));
+                            // reqwest::Error's Display embeds the request URL,
+                            // which includes our random per-call `nonce` query
+                            // param. Stripping it keeps `failure_reasons` low-
+                            // cardinality for DD ingestion; the full error
+                            // remains at DEBUG above.
+                            return Err(format!("{category}: {}", e.without_url()));
                         }
                         Err(_) => {
                             debug!(
@@ -913,7 +944,7 @@ impl InferenceProviderPool {
                                 error = %e,
                                 "Discovery call returned malformed JSON"
                             );
-                            return Err(format!("malformed_json: {e}"));
+                            return Err(format!("malformed_json: {}", e.without_url()));
                         }
                     };
                     debug!(
@@ -3144,18 +3175,12 @@ mod tests {
 
     #[test]
     fn pin_update_verify_failure_blocks_replacement() {
-        // The HTTP call succeeded but attestation verification rejected
-        // it. Even if we saw `backend_count` distinct verified fingerprints
-        // among the *other* calls, we treat the cycle as partial — a
-        // verification failure on a real backend means we can't confidently
-        // say the healthy set matches our observations.
-        let (update, after) = run_pin_update(
-            Some(&["a", "b", "c", "d", "e"]),
-            &["a", "b", "c", "d"],
-            4,
-            0,
-            1,
-        );
+        // Realistic per-cycle shape: 4 fan-outs, 3 verified, 1 verify
+        // failure. backend_count == verified.len() can't both hold when
+        // verify_failures > 0, so the policy must treat this as partial
+        // and keep the stale 'e' from a previous cycle pinned.
+        let (update, after) =
+            run_pin_update(Some(&["a", "b", "c", "d", "e"]), &["a", "b", "c"], 4, 0, 1);
         assert!(!update.replaced);
         assert_eq!(
             update.total_pinned, 5,

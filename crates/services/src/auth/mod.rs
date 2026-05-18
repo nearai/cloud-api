@@ -560,7 +560,8 @@ mod tests {
         InvitationStatus, MemberRole, Organization, OrganizationError, OrganizationId,
         OrganizationInvitation, OrganizationMember, OrganizationMemberWithUser,
         OrganizationOrderBy, OrganizationOrderDirection, OrganizationRepository,
-        OrganizationServiceTrait, UpdateOrganizationMemberRequest, UpdateOrganizationRequest,
+        OrganizationServiceTrait, OrganizationWithRole, UpdateOrganizationMemberRequest,
+        UpdateOrganizationRequest,
     };
     use crate::workspace::{
         ApiKey, ApiKeyId, ApiKeyRepository, CreateApiKeyRequest, Workspace, WorkspaceId,
@@ -857,6 +858,17 @@ mod tests {
         ) -> Result<Vec<Organization>, RepositoryError> {
             unimplemented!()
         }
+
+        async fn list_organizations_with_roles_by_user(
+            &self,
+            _: Uuid,
+            _: i64,
+            _: i64,
+            _: Option<OrganizationOrderBy>,
+            _: Option<OrganizationOrderDirection>,
+        ) -> Result<Vec<OrganizationWithRole>, RepositoryError> {
+            unimplemented!()
+        }
     }
 
     struct StubWorkspaceRepo;
@@ -963,6 +975,16 @@ mod tests {
             _: Option<OrganizationOrderBy>,
             _: Option<OrganizationOrderDirection>,
         ) -> Result<Vec<Organization>, OrganizationError> {
+            unimplemented!()
+        }
+        async fn list_organizations_with_roles_for_user(
+            &self,
+            _: UserId,
+            _: i64,
+            _: i64,
+            _: Option<OrganizationOrderBy>,
+            _: Option<OrganizationOrderDirection>,
+        ) -> Result<Vec<OrganizationWithRole>, OrganizationError> {
             unimplemented!()
         }
         async fn count_organizations_for_user(&self, _: UserId) -> Result<i64, OrganizationError> {

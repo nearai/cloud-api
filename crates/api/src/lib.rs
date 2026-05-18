@@ -142,13 +142,21 @@ pub fn init_auth_services(database: Arc<Database>, config: &ApiConfig) -> AuthCo
         database.pool().clone(),
     ))
         as Arc<dyn services::organization::ports::OrganizationInvitationRepository>;
+    let email_sender = services::email::sender_from_config(&config.invitation_email)
+        .expect("Failed to initialize invitation email sender");
+    let invitations_url = config.invitation_email.invitations_url();
 
     // Create organization service early (needed by AuthService)
-    let organization_service = Arc::new(services::organization::OrganizationServiceImpl::new(
-        organization_repo.clone() as Arc<dyn services::organization::ports::OrganizationRepository>,
-        user_repository.clone(),
-        invitation_repo,
-    ))
+    let organization_service = Arc::new(
+        services::organization::OrganizationServiceImpl::new_with_email_sender(
+            organization_repo.clone()
+                as Arc<dyn services::organization::ports::OrganizationRepository>,
+            user_repository.clone(),
+            invitation_repo,
+            email_sender,
+            invitations_url,
+        ),
+    )
         as Arc<dyn services::organization::OrganizationServiceTrait + Send + Sync>;
 
     let auth_service: Arc<dyn AuthServiceTrait> = if config.auth.mock {
@@ -1673,6 +1681,7 @@ mod tests {
                 encryption_key: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
                     .to_string(), // Mock 256-bit hex key
             },
+            invitation_email: config::InvitationEmailConfig::default(),
             otlp: config::OtlpConfig {
                 endpoint: "http://localhost:4317".to_string(),
                 protocol: "grpc".to_string(),
@@ -1771,6 +1780,7 @@ mod tests {
                 encryption_key: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
                     .to_string(), // Mock 256-bit hex key
             },
+            invitation_email: config::InvitationEmailConfig::default(),
             otlp: config::OtlpConfig {
                 endpoint: "http://localhost:4317".to_string(),
                 protocol: "grpc".to_string(),

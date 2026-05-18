@@ -55,6 +55,14 @@ impl PgOrganizationRepository {
             .await?
             .ok_or_else(|| anyhow::anyhow!("Organization has no owner: {}", db_org.id))?;
 
+        self.db_to_domain_organization_with_owner(db_org, owner_id)
+    }
+
+    fn db_to_domain_organization_with_owner(
+        &self,
+        db_org: DbOrganization,
+        owner_id: Uuid,
+    ) -> Result<Organization> {
         Ok(Organization {
             id: OrganizationId::from(db_org.id),
             name: db_org.name,
@@ -65,6 +73,15 @@ impl PgOrganizationRepository {
             created_at: db_org.created_at,
             updated_at: db_org.updated_at,
         })
+    }
+
+    fn role_str_to_domain_role(&self, role_str: &str) -> Result<MemberRole> {
+        match role_str {
+            "owner" => Ok(MemberRole::Owner),
+            "admin" => Ok(MemberRole::Admin),
+            "member" => Ok(MemberRole::Member),
+            _ => bail!("Invalid role: {role_str}"),
+        }
     }
 
     /// Convert database OrganizationMember to domain OrganizationMember
@@ -830,6 +847,85 @@ impl OrganizationRepository for PgOrganizationRepository {
         }
 
         Ok(organizations)
+    }
+
+    async fn list_organizations_with_roles_by_user(
+        &self,
+        user_id: Uuid,
+        limit: i64,
+        offset: i64,
+        order_by: Option<OrganizationOrderBy>,
+        order_direction: Option<OrganizationOrderDirection>,
+    ) -> Result<Vec<OrganizationWithRole>, RepositoryError> {
+        let order_by = order_by.unwrap_or(OrganizationOrderBy::CreatedAt);
+        let order_direction = order_direction.unwrap_or(OrganizationOrderDirection::Asc);
+
+        let order_by_column = match order_by {
+            OrganizationOrderBy::CreatedAt => "created_at",
+        };
+
+        let order_dir = match order_direction {
+            OrganizationOrderDirection::Asc => "ASC",
+            OrganizationOrderDirection::Desc => "DESC",
+        };
+
+        let rows = retry_db!("list_organizations_with_roles_by_user", {
+            let client = self
+                .pool
+                .get()
+                .await
+                .context("Failed to get database connection")
+                .map_err(RepositoryError::PoolError)?;
+
+            client
+                .query(
+                    &format!(
+                        "
+                    SELECT o.*, om.role AS member_role, owner_om.user_id AS owner_user_id
+                    FROM organizations o
+                    INNER JOIN organization_members om ON o.id = om.organization_id
+                    LEFT JOIN LATERAL (
+                        SELECT user_id
+                        FROM organization_members
+                        WHERE organization_id = o.id AND role = 'owner'
+                        ORDER BY joined_at ASC
+                        LIMIT 1
+                    ) owner_om ON true
+                    WHERE om.user_id = $1 AND o.is_active = true
+                    ORDER BY o.{order_by_column} {order_dir}
+                    LIMIT $2 OFFSET $3
+                "
+                    ),
+                    &[&user_id, &limit, &offset],
+                )
+                .await
+                .map_err(map_db_error)
+        })?;
+
+        rows.into_iter()
+            .map(|row| {
+                let role = self
+                    .role_str_to_domain_role(row.get::<_, String>("member_role").as_str())
+                    .map_err(RepositoryError::DataConversionError)?;
+                let owner_id = row
+                    .try_get::<_, Option<Uuid>>("owner_user_id")
+                    .map_err(|err| RepositoryError::DataConversionError(err.into()))?;
+                let db_org = self
+                    .row_to_db_organization(row)
+                    .map_err(RepositoryError::DataConversionError)?;
+                let owner_id = owner_id.ok_or_else(|| {
+                    RepositoryError::DataConversionError(anyhow::anyhow!(
+                        "Organization has no owner: {}",
+                        db_org.id
+                    ))
+                })?;
+                let organization = self
+                    .db_to_domain_organization_with_owner(db_org, owner_id)
+                    .map_err(RepositoryError::DataConversionError)?;
+
+                Ok(OrganizationWithRole { organization, role })
+            })
+            .collect()
     }
 }
 

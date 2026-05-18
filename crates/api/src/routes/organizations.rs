@@ -68,8 +68,8 @@ pub async fn list_organizations(
 
     match app_state
         .organization_service
-        .list_organizations_for_user(
-            user_id,
+        .list_organizations_with_roles_for_user(
+            user_id.clone(),
             params.limit,
             params.offset,
             params.order_by.map(From::from),
@@ -81,7 +81,12 @@ pub async fn list_organizations(
             debug!("Found {} organizations for user", organizations.len());
             let org_responses: Vec<OrganizationResponse> = organizations
                 .into_iter()
-                .map(crate::conversions::services_org_to_api_org)
+                .map(|org_with_role| {
+                    crate::conversions::services_org_to_api_org(
+                        org_with_role.organization,
+                        crate::conversions::services_role_to_api_role(org_with_role.role),
+                    )
+                })
                 .collect();
 
             Ok(Json(ListOrganizationsResponse {
@@ -216,7 +221,10 @@ pub async fn create_organization(
                 }
             }
 
-            Ok(Json(crate::conversions::services_org_to_api_org(org)))
+            Ok(Json(crate::conversions::services_org_to_api_org(
+                org,
+                crate::models::MemberRole::Owner,
+            )))
         }
         Err(OrganizationError::InvalidParams(msg)) => {
             debug!("Invalid organization creation params: {}", msg);
@@ -281,46 +289,49 @@ pub async fn get_organization(
 
     let user_id = crate::conversions::authenticated_user_to_user_id(user);
 
-    // Check if user is a member or can access the organization
-    match app_state
+    // Get user's role (also verifies membership)
+    let role = match app_state
         .organization_service
-        .is_member(organization_id.clone(), user_id)
+        .get_user_role(organization_id.clone(), user_id)
         .await
     {
-        Ok(true) => {
-            // User is a member, get the organization
-            match app_state
-                .organization_service
-                .get_organization(organization_id)
-                .await
-            {
-                Ok(org) => Ok(Json(crate::conversions::services_org_to_api_org(org))),
-                Err(OrganizationError::NotFound) => Err((
-                    StatusCode::NOT_FOUND,
-                    Json(ErrorResponse::new(
-                        "Organization not found".to_string(),
-                        "not_found".to_string(),
-                    )),
+        Ok(Some(role)) => crate::conversions::services_role_to_api_role(role),
+        Ok(None) => {
+            return Err((
+                StatusCode::FORBIDDEN,
+                Json(ErrorResponse::new(
+                    "Not the organization member".to_string(),
+                    "forbidden".to_string(),
                 )),
-                Err(_) => {
-                    error!("Failed to get organization");
-                    Err((
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(ErrorResponse::new(
-                            "Failed to get organization".to_string(),
-                            "internal_server_error".to_string(),
-                        )),
-                    ))
-                }
-            }
+            ));
         }
-        Ok(false) => Err((
-            StatusCode::FORBIDDEN,
-            Json(ErrorResponse::new(
-                "Not the organization member".to_string(),
-                "forbidden".to_string(),
-            )),
-        )),
+        Err(OrganizationError::NotFound) => {
+            return Err((
+                StatusCode::NOT_FOUND,
+                Json(ErrorResponse::new(
+                    "Organization not found".to_string(),
+                    "not_found".to_string(),
+                )),
+            ));
+        }
+        Err(e) => {
+            error!("Failed to get user role: {e}");
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse::new(
+                    "Failed to get organization".to_string(),
+                    "internal_server_error".to_string(),
+                )),
+            ));
+        }
+    };
+
+    match app_state
+        .organization_service
+        .get_organization(organization_id)
+        .await
+    {
+        Ok(org) => Ok(Json(crate::conversions::services_org_to_api_org(org, role))),
         Err(OrganizationError::NotFound) => {
             tracing::warn!("Organization not found");
             Err((
@@ -332,11 +343,11 @@ pub async fn get_organization(
             ))
         }
         Err(e) => {
-            error!("Failed to check organization membership: {}", e);
+            error!("Failed to get organization: {e}");
             Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse::new(
-                    "Failed to check organization membership".to_string(),
+                    "Failed to get organization".to_string(),
                     "internal_server_error".to_string(),
                 )),
             ))
@@ -499,8 +510,8 @@ pub async fn update_organization(
     match app_state
         .organization_service
         .update_organization(
-            organization_id,
-            user_id,
+            organization_id.clone(),
+            user_id.clone(),
             request.name,
             request.description,
             request.rate_limit,
@@ -508,9 +519,39 @@ pub async fn update_organization(
         )
         .await
     {
-        Ok(updated_org) => Ok(Json(crate::conversions::services_org_to_api_org(
-            updated_org,
-        ))),
+        Ok(updated_org) => {
+            let role = match app_state
+                .organization_service
+                .get_user_role(organization_id, user_id)
+                .await
+            {
+                Ok(Some(role)) => crate::conversions::services_role_to_api_role(role),
+                Ok(None) => {
+                    error!("Updated organization but caller role was not found");
+                    return Err((
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(ErrorResponse::new(
+                            "Failed to update organization".to_string(),
+                            "internal_server_error".to_string(),
+                        )),
+                    ));
+                }
+                Err(e) => {
+                    error!("Failed to get user role after organization update: {e}");
+                    return Err((
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(ErrorResponse::new(
+                            "Failed to update organization".to_string(),
+                            "internal_server_error".to_string(),
+                        )),
+                    ));
+                }
+            };
+            Ok(Json(crate::conversions::services_org_to_api_org(
+                updated_org,
+                role,
+            )))
+        }
         Err(OrganizationError::NotFound) => Err((
             StatusCode::NOT_FOUND,
             Json(ErrorResponse::new(

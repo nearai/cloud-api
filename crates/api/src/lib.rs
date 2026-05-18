@@ -27,10 +27,12 @@ use crate::{
         responses,
     },
 };
-use axum::http::HeaderValue;
+use axum::extract::{Request, State};
+use axum::http::{header::CACHE_CONTROL, HeaderValue};
+use axum::response::Response;
 use axum::{
     extract::DefaultBodyLimit,
-    middleware::{from_fn, from_fn_with_state},
+    middleware::{from_fn, from_fn_with_state, Next},
     response::Html,
     routing::{get, post},
     Router,
@@ -49,7 +51,10 @@ use services::{
     web_search::WebSearchService,
 };
 use std::sync::Arc;
-use tower_http::cors::{AllowOrigin, Any, CorsLayer};
+use tower_http::{
+    compression::CompressionLayer,
+    cors::{AllowOrigin, Any, CorsLayer},
+};
 use utoipa::OpenApi;
 
 // Audio transcription file size limit (25 MB for OpenAI Whisper API compatibility)
@@ -828,6 +833,7 @@ pub fn build_app_with_config(
         config.clone(),
         app_state.inference_provider_pool.clone(),
         analytics_service,
+        domain_services.models_service.clone(),
     );
 
     let invitation_routes =
@@ -846,8 +852,12 @@ pub fn build_app_with_config(
     // Build OpenAPI and documentation routes
     let openapi_routes = build_openapi_routes();
 
-    // Build health check route (public, no auth required)
-    let health_routes = Router::new().route("/health", get(health_check));
+    // Build health check route (public, no auth required).
+    // Short cache window: enough to absorb thundering-herd from monitors that
+    // hammer /v1/health, but short enough that real outages surface quickly.
+    let health_routes = Router::new()
+        .route("/health", get(health_check))
+        .layer(cache_control_layer("public, max-age=5"));
 
     // Create metrics state for HTTP metrics middleware
     let metrics_state = middleware::MetricsState {
@@ -900,6 +910,13 @@ pub fn build_app_with_config(
             metrics_state,
             middleware::http_metrics_middleware,
         ))
+        // Response compression (gzip + brotli). Applied after metrics so it sees
+        // all routes. `CompressionLayer` auto-detects the response Content-Type
+        // and skips `text/event-stream` (SSE), so streaming chat completions and
+        // /v1/responses remain unaffected. Signed-response payloads (attestation
+        // endpoints) sign the *request* body hash, not the HTTP response body,
+        // so compression is safe for them as well.
+        .layer(CompressionLayer::new())
 }
 
 /// Build VPC authentication routes
@@ -1340,6 +1357,13 @@ pub fn build_model_routes(models_service: Arc<dyn ModelsServiceTrait>) -> Router
         .route("/model/list", get(list_models))
         .route("/model/{model_name}", get(get_model_by_name))
         .with_state(models_app_state)
+        // Public, anonymous, identical-for-all-clients responses that change
+        // only when an admin updates the model catalog. 30s fresh window plus
+        // 120s stale-while-revalidate lets CDNs/browsers serve cached copies
+        // instantly while refreshing in the background.
+        .layer(cache_control_layer(
+            "public, max-age=30, stale-while-revalidate=120",
+        ))
 }
 
 /// Build public services routes (no auth) — GET /v1/services, GET /v1/services/{service_name}
@@ -1354,6 +1378,55 @@ pub fn build_services_routes(pool: database::DbPool) -> Router {
         .route("/services", get(list_services))
         .route("/services/{service_name}", get(get_service_by_name))
         .with_state(state)
+        // Same rationale as `/v1/model/*` — public, anonymous, admin-write speed.
+        .layer(cache_control_layer(
+            "public, max-age=30, stale-while-revalidate=120",
+        ))
+}
+
+/// Middleware: only insert `Cache-Control` on successful (2xx) responses, and
+/// only if the handler did not already set one.
+///
+/// Setting `Cache-Control` on 4xx/5xx is unsafe: cooperating intermediaries
+/// (Cloudflare "Cache Everything", Fastly, browsers) may pin transient errors
+/// for the declared TTL. Gating on success ensures a single DB blip on
+/// `list_models` doesn't pin a 500 for ~2.5 minutes, and that a temporary
+/// "not found" on `get_model_by_name` clears the moment the model is added.
+async fn cache_control_on_success(
+    State(value): State<HeaderValue>,
+    req: Request,
+    next: Next,
+) -> Response {
+    let mut res = next.run(req).await;
+    if res.status().is_success() && !res.headers().contains_key(CACHE_CONTROL) {
+        res.headers_mut().insert(CACHE_CONTROL, value);
+    }
+    res
+}
+
+// Type aliases for `cache_control_layer`'s return type. They name the
+// otherwise-unnameable function-pointer + future combination so the helper's
+// signature stays readable (and satisfies clippy::type_complexity).
+type CacheControlFuture =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Response> + Send + 'static>>;
+type CacheControlShim = fn(State<HeaderValue>, Request, Next) -> CacheControlFuture;
+type CacheControlLayer =
+    axum::middleware::FromFnLayer<CacheControlShim, HeaderValue, (State<HeaderValue>, Request)>;
+
+/// Build a `Cache-Control`-setting middleware layer for a route group.
+///
+/// Used only on public, anonymous endpoints whose responses do not vary by
+/// user/API-key/session. Do NOT add to authenticated or user-specific routes.
+///
+/// Only applies the header on success — see [`cache_control_on_success`].
+fn cache_control_layer(value: &'static str) -> CacheControlLayer {
+    // Coerce the async fn to a function pointer with a fully-nameable type so
+    // the helper's return type doesn't leak unnameable opaque generics.
+    fn shim(state: State<HeaderValue>, req: Request, next: Next) -> CacheControlFuture {
+        Box::pin(cache_control_on_success(state, req, next))
+    }
+    let f: CacheControlShim = shim;
+    from_fn_with_state(HeaderValue::from_static(value), f)
 }
 
 /// Build admin routes (authenticated endpoints)
@@ -1363,6 +1436,7 @@ pub fn build_admin_routes(
     config: Arc<ApiConfig>,
     inference_provider_pool: Arc<services::inference_provider_pool::InferenceProviderPool>,
     analytics_service: Arc<services::admin::AnalyticsService>,
+    models_service: Arc<services::models::ModelsServiceImpl>,
 ) -> Router {
     use crate::middleware::admin_middleware;
     use crate::routes::admin::{
@@ -1383,9 +1457,15 @@ pub fn build_admin_routes(
     let admin_access_token_repository =
         Arc::new(AdminAccessTokenRepository::new(database.pool().clone()));
 
-    // Create admin service with composite repository
+    // Create admin service with composite repository.
+    //
+    // The admin service holds a reference to the `models_service` so it can
+    // invalidate the public `/v1/model/list` cache after admin writes
+    // (`upsert`, `delete`, `deprecate`) that mutate the `models` or
+    // `model_aliases` tables.
     let admin_service = Arc::new(AdminServiceImpl::new(
         admin_repository as Arc<dyn services::admin::AdminRepository>,
+        models_service as Arc<dyn services::models::ModelsServiceTrait>,
     )) as Arc<dyn services::admin::AdminService + Send + Sync>;
 
     let admin_app_state = AdminAppState {
@@ -1468,10 +1548,18 @@ pub fn build_admin_routes(
 
 /// Build OpenAPI documentation routes
 pub fn build_openapi_routes() -> Router {
-    Router::new().route("/docs", get(swagger_ui_handler)).route(
-        "/api-docs/openapi.json",
-        get(|| async { axum::Json(ApiDoc::openapi()) }),
-    )
+    Router::new()
+        .route("/docs", get(swagger_ui_handler))
+        .route(
+            "/api-docs/openapi.json",
+            get(|| async { axum::Json(ApiDoc::openapi()) }),
+        )
+        // OpenAPI spec + Scalar UI HTML change only on deploy. 5 min fresh +
+        // 1 h SWR keeps the docs snappy while still picking up new builds
+        // within ~5 minutes.
+        .layer(cache_control_layer(
+            "public, max-age=300, stale-while-revalidate=3600",
+        ))
 }
 
 /// Serve Scalar API Documentation UI
@@ -1813,5 +1901,129 @@ mod tests {
         let config = test_cors_config();
         assert!(is_origin_allowed("https://preview-example.com", &config));
         assert!(is_origin_allowed("https://staging-example.com", &config));
+    }
+
+    // --- cache_control_layer tests -------------------------------------------
+    //
+    // These ensure the middleware only attaches a Cache-Control header to
+    // successful (2xx) responses, never to 4xx/5xx errors. Without this guard
+    // a transient DB failure or 404 could be pinned in CDNs and browsers for
+    // the declared TTL.
+
+    use axum::body::Body;
+    use axum::http::{Request as HttpRequest, StatusCode};
+    use axum::response::IntoResponse;
+    use axum::routing::get;
+    use tower::ServiceExt;
+
+    fn cache_test_app() -> Router {
+        async fn ok_handler() -> impl IntoResponse {
+            (StatusCode::OK, "ok")
+        }
+        async fn ok_with_header() -> Response {
+            let mut res = (StatusCode::OK, "ok").into_response();
+            res.headers_mut()
+                .insert(CACHE_CONTROL, HeaderValue::from_static("private, no-store"));
+            res
+        }
+        async fn internal_error() -> impl IntoResponse {
+            (StatusCode::INTERNAL_SERVER_ERROR, "boom")
+        }
+        async fn not_found() -> impl IntoResponse {
+            (StatusCode::NOT_FOUND, "missing")
+        }
+
+        Router::new()
+            .route("/ok", get(ok_handler))
+            .route("/ok-with-header", get(ok_with_header))
+            .route("/err500", get(internal_error))
+            .route("/err404", get(not_found))
+            .layer(cache_control_layer("public, max-age=30"))
+    }
+
+    #[tokio::test]
+    async fn cache_control_set_on_2xx() {
+        let app = cache_test_app();
+        let res = app
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/ok")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(
+            res.headers()
+                .get(CACHE_CONTROL)
+                .map(|v| v.to_str().unwrap()),
+            Some("public, max-age=30"),
+        );
+    }
+
+    #[tokio::test]
+    async fn cache_control_not_overridden_when_handler_sets_it() {
+        let app = cache_test_app();
+        let res = app
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/ok-with-header")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(
+            res.headers()
+                .get(CACHE_CONTROL)
+                .map(|v| v.to_str().unwrap()),
+            Some("private, no-store"),
+        );
+    }
+
+    #[tokio::test]
+    async fn cache_control_not_set_on_5xx() {
+        // The key bug-fix invariant: a 500 must NOT carry a cacheable
+        // Cache-Control header, or intermediaries may pin the failure.
+        let app = cache_test_app();
+        let res = app
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/err500")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(
+            res.headers().get(CACHE_CONTROL).is_none(),
+            "Cache-Control must not be set on 5xx responses, got: {:?}",
+            res.headers().get(CACHE_CONTROL),
+        );
+    }
+
+    #[tokio::test]
+    async fn cache_control_not_set_on_4xx() {
+        // Same risk for transient 404s — admin adds a model 5s later, we must
+        // not be serving "missing" from cache for 30s.
+        let app = cache_test_app();
+        let res = app
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/err404")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+        assert!(
+            res.headers().get(CACHE_CONTROL).is_none(),
+            "Cache-Control must not be set on 4xx responses, got: {:?}",
+            res.headers().get(CACHE_CONTROL),
+        );
     }
 }

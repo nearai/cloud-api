@@ -58,30 +58,12 @@ impl ModelRepository {
         Self { pool }
     }
 
-    pub async fn get_all_active_models_count(&self) -> Result<i64> {
-        let row = retry_db!("get_all_active_models_count", {
-            let client = self
-                .pool
-                .get()
-                .await
-                .context("Failed to get database connection")
-                .map_err(RepositoryError::PoolError)?;
-
-            client
-                .query_one(
-                    r#"
-                    SELECT COUNT(*) as count FROM models WHERE is_active = true
-                    "#,
-                    &[],
-                )
-                .await
-                .map_err(map_db_error)
-        })?;
-        Ok(row.get::<_, i64>("count"))
-    }
-
-    /// Get all active models with pricing information
-    pub async fn get_all_active_models(&self, limit: i64, offset: i64) -> Result<Vec<Model>> {
+    /// Get all active models with pricing information.
+    ///
+    /// Returns every active model — the list is small (~tens of entries) and
+    /// the result is cached in the service layer, so pagination is unused on
+    /// the public `/v1/model/list` endpoint.
+    pub async fn get_all_active_models(&self) -> Result<Vec<Model>> {
         let rows = retry_db!("get_all_active_models", {
             let client = self
                 .pool
@@ -105,9 +87,8 @@ impl ModelRepository {
                     WHERE m.is_active = true
                     GROUP BY m.id
                     ORDER BY m.model_name ASC
-                    LIMIT $1 OFFSET $2
                     "#,
-                    &[&limit, &offset],
+                    &[],
                 )
                 .await
                 .map_err(map_db_error)
@@ -1244,16 +1225,8 @@ impl services::inference_provider_pool::ExternalModelsSource for ModelRepository
 // Implement ModelsRepository trait from services
 #[async_trait]
 impl services::models::ModelsRepository for ModelRepository {
-    async fn get_all_active_models_count(&self) -> Result<i64> {
-        self.get_all_active_models_count().await
-    }
-
-    async fn get_all_active_models(
-        &self,
-        limit: i64,
-        offset: i64,
-    ) -> Result<Vec<services::models::ModelWithPricing>> {
-        let models = self.get_all_active_models(limit, offset).await?;
+    async fn get_all_active_models(&self) -> Result<Vec<services::models::ModelWithPricing>> {
+        let models = self.get_all_active_models().await?;
         Ok(models
             .into_iter()
             .map(|m| services::models::ModelWithPricing {

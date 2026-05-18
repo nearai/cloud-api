@@ -2523,7 +2523,16 @@ pub struct AcceptInvitationResponse {
 // Model Listing API Models
 // ============================================
 
-/// Response for model list endpoint
+/// Response for model list endpoint.
+///
+/// The full catalog (a few dozen entries) is loaded once and cached
+/// in-process for a short TTL; `limit` / `offset` slice the cached list
+/// in memory, so successive pages are consistent within a cache window
+/// and DB load is independent of caller pagination.
+///
+/// `limit` and `offset` echo back the request values (defaults: 100, 0).
+/// `total` is the full catalog size, used by clients to compute page
+/// counts.
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct ModelListResponse {
     pub models: Vec<ModelWithPricing>,

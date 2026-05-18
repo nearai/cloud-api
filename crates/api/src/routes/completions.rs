@@ -417,11 +417,18 @@ fn unredact_field(
     map: &Arc<RedactionMap>,
     idx: i64,
     text: &mut String,
+    finalize: bool,
 ) {
     let s = states
         .entry(idx)
         .or_insert_with(|| StreamUnredact::new(map.clone()));
-    *text = s.process(text);
+    // Finalize drains the tail (no further chunks coming for this
+    // choice/field); regular path holds up to max_dummy_len bytes.
+    *text = if finalize {
+        s.drain(text)
+    } else {
+        s.process(text)
+    };
 }
 
 /// Apply streaming un-redact to a single parsed chunk, mutating any text
@@ -436,15 +443,22 @@ fn unredact_chunk_in_place(
         inference_providers::StreamChunk::Chat(c) => {
             for choice in &mut c.choices {
                 let idx = choice.index;
+                // A chunk carrying `finish_reason` is the last chunk
+                // we'll see for this choice. Drain the held tail into
+                // its fields rather than relying on the end-of-stream
+                // flush (which emits a synthetic chunk AFTER the
+                // finish_reason, missed by clients that stop reading
+                // on finish_reason without waiting for `[DONE]`).
+                let finalize = choice.finish_reason.is_some();
                 if let Some(delta) = &mut choice.delta {
                     if let Some(content) = &mut delta.content {
-                        unredact_field(&mut states.content, map, idx, content);
+                        unredact_field(&mut states.content, map, idx, content, finalize);
                     }
                     if let Some(rc) = &mut delta.reasoning_content {
-                        unredact_field(&mut states.reasoning_content, map, idx, rc);
+                        unredact_field(&mut states.reasoning_content, map, idx, rc, finalize);
                     }
                     if let Some(r) = &mut delta.reasoning {
-                        unredact_field(&mut states.reasoning, map, idx, r);
+                        unredact_field(&mut states.reasoning, map, idx, r, finalize);
                     }
                     if let Some(tcs) = &mut delta.tool_calls {
                         for (pos, tc) in tcs.iter_mut().enumerate() {
@@ -464,7 +478,11 @@ fn unredact_chunk_in_place(
                                         .or_insert_with(|| {
                                             StreamUnredact::new_for_json_string(map.clone())
                                         });
-                                    *args = s.process(args);
+                                    *args = if finalize {
+                                        s.drain(args)
+                                    } else {
+                                        s.process(args)
+                                    };
                                 }
                             }
                         }
@@ -475,7 +493,8 @@ fn unredact_chunk_in_place(
         inference_providers::StreamChunk::Text(c) => {
             for choice in &mut c.choices {
                 let idx = choice.index;
-                unredact_field(&mut states.content, map, idx, &mut choice.text);
+                let finalize = choice.finish_reason.is_some();
+                unredact_field(&mut states.content, map, idx, &mut choice.text, finalize);
             }
         }
     }

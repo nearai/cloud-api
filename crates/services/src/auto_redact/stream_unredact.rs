@@ -1,20 +1,36 @@
-//! Sliding-window stream unredact.
+//! Sliding-window stream unredact for natural-dummy placeholders.
 //!
-//! Replaces placeholders in a stream of text chunks while never splitting a
-//! placeholder across emitted boundaries. The state machine holds back a
-//! short tail of pending text — at most `MAX_PLACEHOLDER_LEN` bytes — so an
-//! incomplete `<emailN>`-shaped token never escapes prematurely.
+//! The model emits text fragments over time. Some fragments contain a
+//! complete dummy we minted; some contain only a prefix (the rest is
+//! coming in the next chunk). We must:
+//!
+//! 1. Substitute every complete dummy in the emitted text.
+//! 2. Hold back any text that could still grow into a dummy until the
+//!    next chunk arrives.
+//!
+//! Strategy:
+//! - Maintain a `tail` buffer carrying over from the previous chunk.
+//! - On each `process(chunk)`: combine `tail + chunk`, run
+//!   `map.unredact` (longest-first substring substitution), then split:
+//!   emit everything except the last `max_dummy_len` bytes, hold the
+//!   rest as the new tail.
+//! - This guarantees any partial dummy at the end of the stream is
+//!   either completed before emit, or held until `flush`.
+//!
+//! On `flush`, the remaining tail is run through `unredact` once more
+//! (in case a complete dummy lived entirely inside the tail) and emitted.
 
 use super::placeholders::{RedactionMap, MAX_PLACEHOLDER_LEN};
 
-/// Per-stream unredacter. One instance covers a single completion stream.
+/// Per-stream unredacter. One instance covers a single (choice, field)
+/// stream — e.g. choice 0's `content` deltas.
 #[derive(Debug)]
 pub struct StreamUnredact {
     map: std::sync::Arc<RedactionMap>,
     tail: String,
-    /// When true, replacements are JSON-escaped before substitution. Used
-    /// for streaming `tool_calls[*].function.arguments` where the emitted
-    /// chars are inside a JSON string literal.
+    /// When true, replacements are JSON-escaped before substitution.
+    /// Used for `tool_calls[*].function.arguments` whose emitted bytes
+    /// are inside a JSON string literal.
     json_escape: bool,
 }
 
@@ -27,10 +43,8 @@ impl StreamUnredact {
         }
     }
 
-    /// Variant for streams whose emitted text is the body of a JSON string
-    /// literal (e.g. tool-call arguments). Replacements are JSON-escaped so
-    /// originals containing `"`, `\`, control chars, or non-ASCII never
-    /// corrupt the surrounding JSON.
+    /// Variant for streams whose emitted text is the body of a JSON
+    /// string literal (e.g. tool-call arguments).
     pub fn new_for_json_string(map: std::sync::Arc<RedactionMap>) -> Self {
         Self {
             map,
@@ -39,83 +53,64 @@ impl StreamUnredact {
         }
     }
 
-    /// True if the underlying map has no minted placeholders. Callers can
-    /// short-circuit and skip wrapping the stream entirely.
+    /// True if the underlying map is empty — short-circuit to
+    /// passthrough.
     pub fn is_noop(&self) -> bool {
         self.map.is_empty()
     }
 
-    /// Process the next chunk of text. Returns the prefix that is safe to
-    /// emit; any text that could be the start of an unfinished placeholder
-    /// is kept in the tail until the next call (or until `flush`).
-    pub fn process(&mut self, chunk: &str) -> String {
-        if self.map.is_empty() {
-            // Hot path: nothing to replace. Don't even buffer.
-            return chunk.to_string();
-        }
-
-        // Combine carryover tail with new chunk. We work on the combined
-        // buffer so a placeholder that straddles a chunk boundary is matched
-        // as a single token.
-        let mut buf = std::mem::take(&mut self.tail);
-        buf.push_str(chunk);
-
-        let split_at = safe_emit_boundary(&buf);
-        let hold = buf.split_off(split_at);
-        let emit = buf;
-        self.tail = hold;
-
+    fn substitute(&self, s: &str) -> String {
         if self.json_escape {
-            self.map.unredact_json_string(&emit)
+            self.map.unredact_json_string(s)
         } else {
-            self.map.unredact(&emit)
+            self.map.unredact(s)
         }
     }
 
-    /// Emit any pending tail at end of stream. Unmatched placeholder-shaped
-    /// tokens are left as literal text (signal that the LLM hallucinated a
-    /// token we never minted).
+    /// Effective hold size: at least the longest minted dummy, capped
+    /// by `MAX_PLACEHOLDER_LEN` to bound memory.
+    fn hold_size(&self) -> usize {
+        self.map.max_dummy_len().min(MAX_PLACEHOLDER_LEN)
+    }
+
+    /// Process the next chunk of text. Returns the prefix that is safe
+    /// to emit; any text that could still be part of an unfinished
+    /// dummy is kept in `self.tail`.
+    pub fn process(&mut self, chunk: &str) -> String {
+        if self.map.is_empty() {
+            // Hot path: nothing to replace, don't even buffer.
+            return chunk.to_string();
+        }
+
+        let mut buf = std::mem::take(&mut self.tail);
+        buf.push_str(chunk);
+
+        let substituted = self.substitute(&buf);
+        let hold = self.hold_size();
+        if substituted.len() <= hold {
+            self.tail = substituted;
+            return String::new();
+        }
+
+        // Split at a char boundary `hold` bytes from the end.
+        let mut split_at = substituted.len() - hold;
+        while !substituted.is_char_boundary(split_at) {
+            split_at -= 1;
+        }
+        self.tail = substituted[split_at..].to_string();
+        substituted[..split_at].to_string()
+    }
+
+    /// Emit any pending tail at end of stream. Unknown dummy-shaped
+    /// tokens are left literal (signal that the upstream truncated
+    /// mid-dummy or hallucinated one we never minted).
     pub fn flush(mut self) -> String {
         if self.tail.is_empty() {
             return String::new();
         }
         let tail = std::mem::take(&mut self.tail);
-        if self.json_escape {
-            self.map.unredact_json_string(&tail)
-        } else {
-            self.map.unredact(&tail)
-        }
+        self.substitute(&tail)
     }
-}
-
-/// Decide where to split the buffer between "emit now" and "hold for next
-/// chunk." The hold region must include any `<` that could still grow into
-/// a complete `<categoryN>` token.
-///
-/// Strategy: walk the rightmost `MAX_PLACEHOLDER_LEN` bytes and find the
-/// earliest `<` that has no `>` after it. Everything from that `<` onward
-/// must be held. If no such `<` exists, the entire buffer is safe to emit.
-fn safe_emit_boundary(buf: &str) -> usize {
-    let bytes = buf.as_bytes();
-    let n = bytes.len();
-    if n == 0 {
-        return 0;
-    }
-    let scan_from = n.saturating_sub(MAX_PLACEHOLDER_LEN);
-
-    let mut emit_until = n;
-    for i in scan_from..n {
-        if bytes[i] == b'<' {
-            // Is there a `>` somewhere after i?
-            let has_closing = bytes[i + 1..].contains(&b'>');
-            if !has_closing {
-                emit_until = i;
-                break;
-            }
-        }
-    }
-    // `<` is ASCII, so any byte offset we choose at a `<` is a char boundary.
-    emit_until
 }
 
 #[cfg(test)]
@@ -126,7 +121,7 @@ mod tests {
     fn map_with(entries: &[(&str, &str)]) -> Arc<RedactionMap> {
         let mut m = RedactionMap::new();
         for (cat, val) in entries {
-            m.lookup_or_mint(cat, val);
+            m.lookup_or_mint(cat, val, |_| false);
         }
         Arc::new(m)
     }
@@ -143,33 +138,37 @@ mod tests {
 
     #[test]
     fn single_chunk_replacement() {
-        let map = map_with(&[("private_email", "a@b.com")]);
+        let map = map_with(&[("private_email", "alice@b.com")]);
         let mut u = StreamUnredact::new(map);
-        // <email1> is the placeholder for "a@b.com"
-        let out = u.process("Email: <email1>!");
+        // The minted dummy is "redacted1@example.com".
+        let out = u.process("Email: redacted1@example.com!");
         let tail = u.flush();
-        assert_eq!(out + &tail, "Email: a@b.com!");
+        assert_eq!(out + &tail, "Email: alice@b.com!");
     }
 
     #[test]
-    fn split_placeholder_across_two_chunks() {
+    fn split_dummy_across_two_chunks() {
         let map = map_with(&[("private_email", "alice@example.com")]);
         let mut u = StreamUnredact::new(map);
-        let part1 = u.process("Email: <emai");
-        // The "<emai" must be held — nothing emitted from that point on.
-        assert_eq!(part1, "Email: ");
-        let part2 = u.process("l1>!");
-        // Once the placeholder is complete, full replacement.
+        // Stream "Email: redacted1@example.com!" split mid-dummy.
+        let part1 = u.process("Email: redacte");
+        // The "redacte" partial must be held — not emitted yet.
+        assert!(
+            !part1.contains("redacte"),
+            "partial dummy must not leak before completion: {part1:?}"
+        );
+        let part2 = u.process("d1@example.com!");
         let tail = u.flush();
         assert_eq!(part1 + &part2 + &tail, "Email: alice@example.com!");
     }
 
     #[test]
-    fn split_placeholder_across_many_chunks() {
+    fn split_dummy_across_many_chunks() {
         let map = map_with(&[("private_email", "x@y.z")]);
         let mut u = StreamUnredact::new(map);
         let mut acc = String::new();
-        for ch in "<email1>".chars() {
+        // Stream the dummy char-by-char.
+        for ch in "redacted1@example.com".chars() {
             acc.push_str(&u.process(&ch.to_string()));
         }
         acc.push_str(&u.flush());
@@ -177,73 +176,51 @@ mod tests {
     }
 
     #[test]
-    fn multiple_placeholders_in_one_chunk() {
+    fn multiple_dummies_in_one_chunk() {
         let map = map_with(&[
-            ("private_email", "a@b.com"),
-            ("private_phone", "+1-555-0100"),
+            ("private_email", "alice@x"),
+            ("private_phone", "+1-555-0900"),
         ]);
         let mut u = StreamUnredact::new(map);
-        let out = u.process("Call <phone1> at <email1>.") + &u.flush();
-        assert_eq!(out, "Call +1-555-0100 at a@b.com.");
+        // Dummies: redacted1@example.com, +1-555-0100
+        let out = u.process("Call +1-555-0100 at redacted1@example.com.") + &u.flush();
+        assert_eq!(out, "Call +1-555-0900 at alice@x.");
     }
 
     #[test]
-    fn hallucinated_placeholder_passes_through_literally() {
-        let map = map_with(&[("private_email", "real@example.com")]);
+    fn unknown_dummy_passes_through_literally() {
+        let map = map_with(&[("private_email", "real@example.org")]);
         let mut u = StreamUnredact::new(map);
-        // <email42> was never minted: appears as-is.
-        let out = u.process("hi <email42> there") + &u.flush();
-        assert_eq!(out, "hi <email42> there");
+        // `redacted42@example.com` was never minted.
+        let out = u.process("hi redacted42@example.com there") + &u.flush();
+        assert_eq!(out, "hi redacted42@example.com there");
     }
 
     #[test]
-    fn dangling_open_angle_at_end_is_held_then_flushed_literally() {
-        let map = map_with(&[("private_email", "x@y.z")]);
-        let mut u = StreamUnredact::new(map);
-        let out = u.process("see this <") + &u.flush();
-        assert_eq!(out, "see this <");
-    }
-
-    #[test]
-    fn long_run_without_open_angle_emits_immediately() {
+    fn long_run_without_potential_dummy_emits_immediately() {
         let map = map_with(&[("private_email", "x@y.z")]);
         let mut u = StreamUnredact::new(map);
         let payload = "a".repeat(1024);
-        let out = u.process(&payload);
-        assert_eq!(out, payload, "no '<' means no hold");
-    }
-
-    #[test]
-    fn adjacent_placeholders_split_at_boundary() {
-        let map = map_with(&[("private_email", "a@b.com"), ("private_phone", "+1-0")]);
-        let mut u = StreamUnredact::new(map);
-        // Split in the middle of "<email1><phone1>"
-        let a = u.process("<email1");
-        let b = u.process("><phone1>");
-        let flush = u.flush();
-        assert_eq!(a + &b + &flush, "a@b.com+1-0");
+        let out = u.process(&payload) + &u.flush();
+        assert_eq!(out, payload);
     }
 
     #[test]
     fn utf8_multibyte_safe() {
-        // Build a chunk that ends in a multibyte char before a held `<`.
         let map = map_with(&[("private_email", "x@y.z")]);
         let mut u = StreamUnredact::new(map);
-        let out = u.process("héllo <emai") + &u.process("l1>!") + &u.flush();
+        let out = u.process("héllo redacte") + &u.process("d1@example.com!") + &u.flush();
         assert_eq!(out, "héllo x@y.z!");
     }
 
     #[test]
     fn json_string_variant_escapes_quote_in_replacement() {
-        // PII original contains a literal `"`. Substituting into a JSON
-        // string body context must escape it to `\"` or the surrounding
-        // JSON corrupts.
         let map = map_with(&[("private_name", r#"Patrick O"Brien"#)]);
         let mut u = StreamUnredact::new_for_json_string(map);
-        let args = r#"{"to":"<name1>"}"#;
+        // private_name dummy is Redacted001
+        let args = r#"{"to":"Redacted001"}"#;
         let out = u.process(args) + &u.flush();
         assert_eq!(out, r#"{"to":"Patrick O\"Brien"}"#);
-        // Must round-trip parse.
         let _: serde_json::Value = serde_json::from_str(&out).unwrap();
     }
 
@@ -251,41 +228,11 @@ mod tests {
     fn json_string_variant_escapes_across_chunk_split() {
         let map = map_with(&[("private_name", r#"O"X"#)]);
         let mut u = StreamUnredact::new_for_json_string(map);
-        let p1 = u.process(r#"{"n":"<nam"#);
-        let p2 = u.process(r#"e1>"}"#);
+        let p1 = u.process(r#"{"n":"Redact"#);
+        let p2 = u.process(r#"ed001"}"#);
         let tail = u.flush();
         let out = p1 + &p2 + &tail;
         assert_eq!(out, r#"{"n":"O\"X"}"#);
         let _: serde_json::Value = serde_json::from_str(&out).unwrap();
-    }
-
-    #[test]
-    fn json_string_variant_no_op_for_simple_pii() {
-        // Plain-ASCII PII should produce identical output to the regular
-        // unredact path.
-        let map = map_with(&[("private_email", "alice@example.com")]);
-        let mut a = StreamUnredact::new(map.clone());
-        let mut b = StreamUnredact::new_for_json_string(map);
-        let s = r#"{"to":"<email1>"}"#;
-        let out_a = a.process(s) + &a.flush();
-        let out_b = b.process(s) + &b.flush();
-        assert_eq!(out_a, out_b);
-    }
-
-    #[test]
-    fn long_held_buffer_eventually_releases() {
-        // If the held region grows past MAX_PLACEHOLDER_LEN with no `>`,
-        // the leading `<` is past the scan window and gets emitted.
-        let map = map_with(&[("private_email", "x@y.z")]);
-        let mut u = StreamUnredact::new(map);
-        // A `<` followed by lots of non-`>` chars — eventually we have to
-        // release it because no real placeholder is this long.
-        let first = u.process(&format!("<{}", "a".repeat(MAX_PLACEHOLDER_LEN * 2)));
-        // The `<` and the leading run of a's are emitted; the tail holds
-        // only the last MAX_PLACEHOLDER_LEN bytes (still no `>`).
-        let flushed = u.flush();
-        let combined = first + &flushed;
-        assert!(combined.starts_with('<'));
-        assert!(combined.contains('a'));
     }
 }

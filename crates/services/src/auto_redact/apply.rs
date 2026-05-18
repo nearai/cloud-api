@@ -25,8 +25,9 @@ pub enum TextRef {
     /// string from a prior assistant turn. In agent loops the user resubmits
     /// the model's previous tool_call as part of conversation history, and
     /// it can echo PII from the original prompt. We redact the whole
-    /// arguments string as opaque text; minted placeholders (`<emailN>`,
-    /// `<phoneN>`, …) are pure ASCII and don't need JSON-escaping.
+    /// arguments string as opaque text; minted dummies are category-shaped
+    /// realistic values (e.g. `redacted1@example.com`) that fit inside
+    /// the JSON string without needing JSON-escaping.
     ToolCallArg { msg_idx: usize, tc_idx: usize },
 }
 
@@ -124,33 +125,62 @@ pub struct Span {
     pub end: usize,
 }
 
-/// Apply detected spans to a text fragment, replacing each PII span with a
-/// placeholder minted (or reused) on `map`. Spans must be sorted by
-/// `start`; overlapping spans are resolved by preferring the earlier one
-/// (the later one is silently dropped — privacy-filter doesn't emit
-/// overlaps in practice).
+/// Fold contiguous same-category spans into one. The privacy-filter
+/// frequently returns one PII as multiple adjacent spans (e.g.
+/// `alice@example.com` → `(0..16, private_email, "alice@example")` +
+/// `(16..20, private_email, ".com")`). Without merging, the model
+/// receives two placeholders for a single logical entity, which can
+/// cause it to issue two parallel tool calls (one per placeholder) or
+/// to strip the dummy text. Merging produces one dummy per entity.
 ///
-/// **Fail-closed on malformed input.** If the detector returns spans whose
-/// byte offsets don't land on UTF-8 char boundaries, or whose bounds are
-/// outside the input, this returns `Err(AutoRedactError::Internal)` rather
-/// than silently passing the raw text through (which would leak PII to the
-/// upstream provider).
+/// Spans are merged when:
+/// - Same `category`
+/// - `prev.end == curr.start` (strictly contiguous, no gap)
+fn merge_adjacent_same_category(mut spans: Vec<Span>) -> Vec<Span> {
+    if spans.len() < 2 {
+        return spans;
+    }
+    spans.sort_by_key(|s| s.start);
+    let mut merged: Vec<Span> = Vec::with_capacity(spans.len());
+    for span in spans {
+        match merged.last_mut() {
+            Some(prev) if prev.category == span.category && prev.end == span.start => {
+                prev.end = span.end;
+            }
+            _ => merged.push(span),
+        }
+    }
+    merged
+}
+
+/// Apply detected spans to a text fragment, replacing each PII span with
+/// a placeholder minted (or reused) on `map`. Adjacent same-category
+/// spans are merged into one before minting.
+///
+/// `haystack` is the concatenation of every input text in the request;
+/// minting refuses any dummy that already appears as a substring of it.
+///
+/// **Fail-closed on malformed input.** If the detector returns spans
+/// whose byte offsets don't land on UTF-8 char boundaries, or whose
+/// bounds are outside the input, this returns
+/// `Err(AutoRedactError::Internal)` rather than silently passing the
+/// raw text through (which would leak PII to the upstream provider).
 pub fn redact_one(
     text: &str,
     spans: &[Span],
     map: &mut super::RedactionMap,
+    haystack: &str,
 ) -> Result<String, super::AutoRedactError> {
     use super::AutoRedactError;
     if spans.is_empty() {
         return Ok(text.to_string());
     }
+    let merged = merge_adjacent_same_category(spans.to_vec());
     let bytes = text.as_bytes();
-    let mut sorted: Vec<&Span> = spans.iter().collect();
-    sorted.sort_by_key(|s| s.start);
 
     let mut out = String::with_capacity(text.len());
     let mut cursor = 0usize;
-    for span in sorted {
+    for span in merged {
         if span.start < cursor {
             // Overlapping with the previous span: drop the offending one.
             continue;
@@ -163,9 +193,6 @@ pub fn redact_one(
                 bytes.len()
             )));
         }
-        // Slicing the &str requires char-boundary offsets. We must use the
-        // `&str` path (not `from_utf8` on byte slices) so a span boundary
-        // that falls inside a multi-byte UTF-8 sequence fails closed.
         if !text.is_char_boundary(cursor)
             || !text.is_char_boundary(span.start)
             || !text.is_char_boundary(span.end)
@@ -176,8 +203,8 @@ pub fn redact_one(
         }
         out.push_str(&text[cursor..span.start]);
         let original = &text[span.start..span.end];
-        let placeholder = map.lookup_or_mint(&span.category, original);
-        out.push_str(&placeholder);
+        let dummy = map.lookup_or_mint(&span.category, original, |c| haystack.contains(c));
+        out.push_str(&dummy);
         cursor = span.end;
     }
     if cursor < bytes.len() {
@@ -287,8 +314,8 @@ mod tests {
                 end: 42,
             },
         ];
-        let out = redact_one(text, &spans, &mut map).unwrap();
-        assert_eq!(out, "Email <email1> or <email2>");
+        let out = redact_one(text, &spans, &mut map, text).unwrap();
+        assert_eq!(out, "Email redacted1@example.com or redacted2@example.com");
     }
 
     #[test]
@@ -307,8 +334,11 @@ mod tests {
                 end: 29,
             },
         ];
-        let out = redact_one(text, &spans, &mut map).unwrap();
-        assert_eq!(out, "to <email1> or <email1> again");
+        let out = redact_one(text, &spans, &mut map, text).unwrap();
+        assert_eq!(
+            out,
+            "to redacted1@example.com or redacted1@example.com again"
+        );
     }
 
     #[test]
@@ -323,7 +353,7 @@ mod tests {
             start: 0,
             end: 2,
         }];
-        let err = redact_one(text, &spans, &mut map).unwrap_err();
+        let err = redact_one(text, &spans, &mut map, text).unwrap_err();
         assert!(
             matches!(err, super::super::AutoRedactError::Internal(_)),
             "expected Internal error on non-char boundary"
@@ -339,7 +369,7 @@ mod tests {
             start: 0,
             end: 999,
         }];
-        let err = redact_one(text, &spans, &mut map).unwrap_err();
+        let err = redact_one(text, &spans, &mut map, text).unwrap_err();
         assert!(matches!(err, super::super::AutoRedactError::Internal(_)));
     }
 
@@ -360,14 +390,82 @@ mod tests {
                 end: 7,
             },
         ];
-        let out = redact_one(text, &spans, &mut map).unwrap();
-        assert_eq!(out, "<name1> world");
+        let out = redact_one(text, &spans, &mut map, text).unwrap();
+        assert_eq!(out, "Redacted001 world");
+    }
+
+    #[test]
+    fn redact_one_merges_adjacent_same_category_spans() {
+        // privacy-filter often returns two adjacent spans for one email
+        // (e.g. local-part + ".com"). The result should be a single
+        // minted dummy, not two.
+        let mut map = RedactionMap::new();
+        let text = "Email alice.chen@gmail.com today";
+        let spans = vec![
+            Span {
+                category: "private_email".into(),
+                start: 6,
+                end: 22, // "alice.chen@gmail"
+            },
+            Span {
+                category: "private_email".into(),
+                start: 22,
+                end: 26, // ".com"
+            },
+        ];
+        let out = redact_one(text, &spans, &mut map, text).unwrap();
+        assert_eq!(out, "Email redacted1@example.com today");
+        assert_eq!(map.len(), 1, "merge must produce a single dummy");
+    }
+
+    #[test]
+    fn redact_one_does_not_merge_different_categories() {
+        let mut map = RedactionMap::new();
+        // Use a UK-style phone so the original doesn't collide with our
+        // minted `+1-555-01XX` dummy format and bump the ordinal.
+        let text = "info: alice@x.com+44-20-7946-0958 stuff";
+        let spans = vec![
+            Span {
+                category: "private_email".into(),
+                start: 6,
+                end: 17, // "alice@x.com"
+            },
+            Span {
+                category: "private_phone".into(),
+                start: 17,
+                end: 33, // "+44-20-7946-0958"
+            },
+        ];
+        let out = redact_one(text, &spans, &mut map, text).unwrap();
+        // adjacent but DIFFERENT category — two distinct dummies, no merge
+        assert_eq!(out, "info: redacted1@example.com+1-555-0100 stuff");
+        assert_eq!(map.len(), 2);
+    }
+
+    #[test]
+    fn redact_one_does_not_merge_with_gap() {
+        let mut map = RedactionMap::new();
+        let text = "alice@x.com and bob@y.org";
+        let spans = vec![
+            Span {
+                category: "private_email".into(),
+                start: 0,
+                end: 11,
+            },
+            Span {
+                category: "private_email".into(),
+                start: 16,
+                end: 25,
+            },
+        ];
+        let out = redact_one(text, &spans, &mut map, text).unwrap();
+        assert_eq!(out, "redacted1@example.com and redacted2@example.com");
     }
 
     #[test]
     fn redact_one_empty_spans_passthrough() {
         let mut map = RedactionMap::new();
-        let out = redact_one("nothing private", &[], &mut map).unwrap();
+        let out = redact_one("nothing private", &[], &mut map, "nothing private").unwrap();
         assert_eq!(out, "nothing private");
         assert!(map.is_empty());
     }

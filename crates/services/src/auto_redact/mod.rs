@@ -25,7 +25,7 @@ mod placeholders;
 mod stream_unredact;
 
 pub use apply::TextRef;
-pub use placeholders::{RedactionMap, MAX_PLACEHOLDER_LEN, PLACEHOLDER_RE};
+pub use placeholders::{RedactionMap, MAX_PLACEHOLDER_LEN};
 pub use stream_unredact::StreamUnredact;
 
 use crate::completions::ports::CompletionMessage;
@@ -136,13 +136,11 @@ async fn redact_messages_inner(
     }
 
     let mut map = RedactionMap::new();
-    // Reserve any placeholder-shaped literals already in the input so we
-    // never mint a placeholder that collides with the user's own text.
-    for t in &texts {
-        for caps in PLACEHOLDER_RE.find_iter(t) {
-            map.reserve_literal(caps.as_str());
-        }
-    }
+    // Concatenated haystack of every input fragment. Minting a dummy
+    // refuses any candidate that already appears as a substring here,
+    // preventing collisions when the user's own text happens to contain
+    // a string we'd otherwise mint.
+    let haystack: String = texts.join("\u{0001}");
 
     let spans_per_text = detect::detect_pii(&texts, pii_model, pool).await?;
     debug_assert_eq!(spans_per_text.len(), texts.len());
@@ -152,7 +150,7 @@ async fn redact_messages_inner(
         // redact_one returns Err on malformed spans (out-of-range or non
         // UTF-8 char boundary). Propagate so the handler fails closed
         // rather than silently passing raw PII upstream.
-        redacted.push(apply::redact_one(text, spans, &mut map)?);
+        redacted.push(apply::redact_one(text, spans, &mut map, &haystack)?);
     }
     apply::write_back(messages, &refs, redacted);
     Ok(map)

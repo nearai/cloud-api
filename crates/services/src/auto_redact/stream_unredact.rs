@@ -111,6 +111,21 @@ impl StreamUnredact {
         let tail = std::mem::take(&mut self.tail);
         self.substitute(&tail)
     }
+
+    /// Like [`process`], but emits everything (no held tail) — for use
+    /// when this chunk carries `finish_reason` and there will be no
+    /// further upstream chunks. Holding a tail past finish_reason means
+    /// clients that stop reading on finish_reason miss the bytes, even
+    /// though we'd otherwise emit them via the end-of-stream flush.
+    /// After this call the tail is empty.
+    pub fn drain(&mut self, chunk: &str) -> String {
+        if self.map.is_empty() {
+            return chunk.to_string();
+        }
+        let mut buf = std::mem::take(&mut self.tail);
+        buf.push_str(chunk);
+        self.substitute(&buf)
+    }
 }
 
 #[cfg(test)]

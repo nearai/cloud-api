@@ -314,12 +314,14 @@ async fn auto_redact_avoids_collision_with_dummy_shaped_input() {
     let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
     let api_key = get_api_key_for_org(&server, org.id).await;
 
-    // Mock response echoes back the *forwarded* form (with our minted
-    // dummies). The un-redact path must reverse the substitution so the
-    // client sees the original text.
+    // Mock response references both minted dummies. The un-redact map
+    // must substitute them back to the originals, including the user's
+    // dummy-shaped literal which became its own original after the
+    // mint loop bumped the ordinal.
     mock_provider
         .set_default_response(inference_providers::mock::ResponseTemplate::new(
-            "Acknowledged: forwarding now.",
+            "Acknowledged: previously redacted2@example.com and \
+             now redacted3@example.com.",
         ))
         .await;
 
@@ -368,13 +370,27 @@ async fn auto_redact_avoids_collision_with_dummy_shaped_input() {
         "expected two distinct dummies, found {dummies:?} in: {seen}"
     );
 
-    // Client must see BOTH originals back.
+    // The mock response embeds both forwarded dummies. After un-redact,
+    // the client must see BOTH original strings — including the user's
+    // own `redacted1@example.com` literal — substituted back.
     let body: serde_json::Value = resp.json();
-    let _content = extract_choice_text(&body);
-    // Mock response had no dummy in it ("Acknowledged: forwarding now.")
-    // — so the un-redact is a no-op on the response itself. This test's
-    // load-bearing assertion is on the forwarded prompt, not the
-    // response content.
+    let content = extract_choice_text(&body);
+    assert!(
+        content.contains("redacted1@example.com"),
+        "un-redact must restore the user's literal redacted1@example.com; got: {content}"
+    );
+    assert!(
+        content.contains("alice@example.com"),
+        "un-redact must restore the real PII alice@example.com; got: {content}"
+    );
+    assert!(
+        !content.contains("redacted2@example.com"),
+        "minted dummy redacted2@example.com leaked to client: {content}"
+    );
+    assert!(
+        !content.contains("redacted3@example.com"),
+        "minted dummy redacted3@example.com leaked to client: {content}"
+    );
 }
 
 /// Large input (~512 KB of filler with PII at the edges) with auto-redact

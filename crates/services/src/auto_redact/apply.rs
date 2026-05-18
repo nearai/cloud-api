@@ -125,18 +125,23 @@ pub struct Span {
     pub end: usize,
 }
 
-/// Fold contiguous same-category spans into one. The privacy-filter
-/// frequently returns one PII as multiple adjacent spans (e.g.
-/// `alice@example.com` → `(0..16, private_email, "alice@example")` +
+/// Fold contiguous *or overlapping* same-category spans into one.
+///
+/// The privacy-filter frequently returns one PII as multiple adjacent
+/// spans (e.g. `alice@example.com` → `(0..16, private_email)` +
 /// `(16..20, private_email, ".com")`). Without merging, the model
 /// receives two placeholders for a single logical entity, which can
 /// cause it to issue two parallel tool calls (one per placeholder) or
-/// to strip the dummy text. Merging produces one dummy per entity.
+/// to strip the dummy text.
 ///
-/// Spans are merged when:
-/// - Same `category`
-/// - `prev.end == curr.start` (strictly contiguous, no gap)
-fn merge_adjacent_same_category(mut spans: Vec<Span>) -> Vec<Span> {
+/// Overlap is also handled: if the detector returns `(0..10)` and
+/// `(5..15)` of the same category, naïvely keeping both would drop the
+/// second via the cursor-overlap check in `redact_one`, leaking the
+/// `10..15` region uncovered. Merging unions them into `(0..15)`.
+///
+/// Different-category overlaps fall through to `redact_one`'s
+/// cursor-overlap dropper (the second is silently discarded).
+fn merge_overlapping_same_category(mut spans: Vec<Span>) -> Vec<Span> {
     if spans.len() < 2 {
         return spans;
     }
@@ -144,8 +149,10 @@ fn merge_adjacent_same_category(mut spans: Vec<Span>) -> Vec<Span> {
     let mut merged: Vec<Span> = Vec::with_capacity(spans.len());
     for span in spans {
         match merged.last_mut() {
-            Some(prev) if prev.category == span.category && prev.end == span.start => {
-                prev.end = span.end;
+            // Same category, AND either contiguous (`prev.end == span.start`)
+            // or overlapping (`prev.end > span.start`). Union the bounds.
+            Some(prev) if prev.category == span.category && prev.end >= span.start => {
+                prev.end = prev.end.max(span.end);
             }
             _ => merged.push(span),
         }
@@ -175,7 +182,7 @@ pub fn redact_one(
     if spans.is_empty() {
         return Ok(text.to_string());
     }
-    let merged = merge_adjacent_same_category(spans.to_vec());
+    let merged = merge_overlapping_same_category(spans.to_vec());
     let bytes = text.as_bytes();
 
     let mut out = String::with_capacity(text.len());
@@ -374,10 +381,12 @@ mod tests {
     }
 
     #[test]
-    fn redact_one_drops_overlapping_span() {
+    fn redact_one_drops_different_category_overlap() {
+        // Different-category overlapping spans aren't merged (it would
+        // be ambiguous which category wins). The cursor-overlap check
+        // in `redact_one` drops the second.
         let mut map = RedactionMap::new();
         let text = "Hello world";
-        // Two spans where the second overlaps the first.
         let spans = vec![
             Span {
                 category: "private_name".into(),
@@ -385,13 +394,15 @@ mod tests {
                 end: 5,
             },
             Span {
-                category: "private_name".into(),
+                category: "private_email".into(),
                 start: 2,
                 end: 7,
             },
         ];
         let out = redact_one(text, &spans, &mut map, text).unwrap();
+        // Only the name span got redacted; the overlapping email is dropped.
         assert_eq!(out, "Redacted001 world");
+        assert_eq!(map.len(), 1);
     }
 
     #[test]
@@ -440,6 +451,37 @@ mod tests {
         // adjacent but DIFFERENT category — two distinct dummies, no merge
         assert_eq!(out, "info: redacted1@example.com+1-555-0100 stuff");
         assert_eq!(map.len(), 2);
+    }
+
+    #[test]
+    fn redact_one_merges_overlapping_same_category_spans() {
+        // Detector returns two overlapping same-category spans. Without
+        // overlap-merging, the second would be dropped by the cursor
+        // check and the portion of the PII unique to the second
+        // (covering bytes past the first span's end) would leak.
+        let mut map = RedactionMap::new();
+        let text = "Send to alice@x.com today";
+        // Span1 covers "alice@x" (8..15); span2 covers "e@x.com" (12..19).
+        // They overlap on "e@x" but together cover the full email
+        // "alice@x.com" (8..19).
+        let spans = vec![
+            Span {
+                category: "private_email".into(),
+                start: 8,
+                end: 15,
+            },
+            Span {
+                category: "private_email".into(),
+                start: 12,
+                end: 19,
+            },
+        ];
+        let out = redact_one(text, &spans, &mut map, text).unwrap();
+        // After overlap-merge: one dummy covers bytes 8..19 (the full
+        // email). Without the fix: only 8..15 is redacted, leaking
+        // ".com" to the provider.
+        assert_eq!(out, "Send to redacted1@example.com today");
+        assert_eq!(map.len(), 1);
     }
 
     #[test]

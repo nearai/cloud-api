@@ -31,12 +31,16 @@ fn mint_dummy(category: &str, ordinal: u32) -> String {
     match category {
         "private_email" => format!("redacted{ordinal}@example.com"),
         "private_phone" => {
-            // 555-0100 through 555-0199 is RFC 2606 fictional. We
-            // extend by stepping the third digit when ordinals exceed
-            // 99 — still in the `555-0XXX` unassigned space.
-            let hundreds = (ordinal - 1) / 100 + 1;
-            let suffix = (ordinal - 1) % 100;
-            format!("+1-555-0{hundreds}{suffix:02}")
+            // RFC 2606 reserves only 555-0100..555-0199 (100 numbers)
+            // as fictional. Cap phone ordinals at 100 to stay strictly
+            // inside that range; anything past 100 falls back to a
+            // generic dummy so we never produce a real-NANP-shape number.
+            if (1..=100).contains(&ordinal) {
+                let suffix = ordinal - 1;
+                format!("+1-555-01{suffix:02}")
+            } else {
+                format!("redacted_pii_{ordinal}")
+            }
         }
         "account_number" => format!("000-00-{ordinal:04}"),
         "private_address" => format!("{ordinal}00 Redacted Way"),
@@ -99,8 +103,11 @@ impl RedactionMap {
             let n = *n_ref;
             *n_ref += 1;
             let candidate = mint_dummy(category, n);
-            // Don't mint a dummy that collides with input text, an
-            // existing dummy, or a reserved literal. Loop until clean.
+            // Refuse a candidate that already appears in the input
+            // haystack or matches a dummy we've already minted. The
+            // haystack check makes the round-trip invariant safe:
+            // no original PII string can contain a minted dummy, so
+            // un-redact's longest-first substring replace is correct.
             if would_collide(&candidate) || self.entries.iter().any(|(d, _)| d == &candidate) {
                 continue;
             }
@@ -108,8 +115,8 @@ impl RedactionMap {
         };
 
         // Insert sorted by descending length so unredact iterates
-        // longest-first (handles `redacted_secret_1` containing
-        // `redacted_pii_1` as a substring, etc.).
+        // longest-first (handles e.g. `redacted_pii_1` being a prefix
+        // of `redacted_pii_10` — see `unredact_longest_first` test).
         let pos = self.entries.partition_point(|(d, _)| d.len() > dummy.len());
         self.entries
             .insert(pos, (dummy.clone(), original.to_string()));

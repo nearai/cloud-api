@@ -18,18 +18,30 @@ pub struct ModelsAppState {
     pub models_service: Arc<dyn ModelsServiceTrait + Send + Sync>,
 }
 
-/// Query parameters for model listing
+/// Query parameters for model listing.
+///
+/// Both fields are optional. Pagination is applied to a short-lived
+/// in-process cache of the full model catalog, so successive pages
+/// are consistent within the cache TTL window and DB load does not
+/// scale with caller pagination.
 #[derive(Debug, Deserialize, IntoParams)]
 pub struct ModelListQuery {
-    #[serde(default = "crate::routes::common::default_limit")]
-    pub limit: i64,
-    #[serde(default)]
-    pub offset: i64,
+    /// Maximum number of models to return. Defaults to 100. Must be
+    /// non-negative; values are capped only by the catalog size.
+    pub limit: Option<i64>,
+    /// Number of models to skip from the start of the catalog.
+    /// Defaults to 0. Must be non-negative.
+    pub offset: Option<i64>,
 }
 
 /// List models with pricing
 ///
 /// Get all available models with pricing information. Public endpoint.
+///
+/// The full model catalog (a few dozen entries) is loaded once and cached
+/// in-process for a short TTL. `limit` / `offset` slice the cached list
+/// in memory, so pagination is consistent across pages within a single
+/// cache window and adds essentially no DB load.
 #[utoipa::path(
     get,
     path = "/v1/model/list",
@@ -45,18 +57,36 @@ pub async fn list_models(
     State(app_state): State<ModelsAppState>,
     Query(query): Query<ModelListQuery>,
 ) -> Result<ResponseJson<ModelListResponse>, (StatusCode, ResponseJson<ErrorResponse>)> {
-    debug!(
-        "Model list request: limit={}, offset={}",
-        query.limit, query.offset
-    );
+    let limit = query.limit.unwrap_or(100);
+    let offset = query.offset.unwrap_or(0);
 
-    // Validate pagination parameters
-    crate::routes::common::validate_limit_offset(query.limit, query.offset)?;
+    debug!("Model list request: limit={}, offset={}", limit, offset);
 
-    // Get all models from the service
-    let (models, total) = app_state
+    // Reject negative values; an upper bound is unnecessary because the
+    // catalog is small and slicing is bounded by Vec length.
+    if limit < 0 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            ResponseJson(ErrorResponse::new(
+                "Limit must be non-negative".to_string(),
+                "invalid_parameter".to_string(),
+            )),
+        ));
+    }
+    if offset < 0 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            ResponseJson(ErrorResponse::new(
+                "Offset must be non-negative".to_string(),
+                "invalid_parameter".to_string(),
+            )),
+        ));
+    }
+
+    // Get all models from the service (served from in-process cache when warm).
+    let all_models = app_state
         .models_service
-        .get_models_with_pricing(query.limit, query.offset)
+        .get_models_with_pricing()
         .await
         .map_err(|_| {
             error!("Failed to get models");
@@ -69,11 +99,18 @@ pub async fn list_models(
             )
         })?;
 
-    // Convert to API models
-    let api_models: Vec<ModelWithPricing> = models
-        .iter()
+    let total = all_models.len() as i64;
+    let offset_usize = offset as usize;
+    let limit_usize = limit as usize;
+
+    // Convert to API models, slicing the cached list in memory. This is
+    // sub-microsecond for the ~few-dozen-element catalog.
+    let api_models: Vec<ModelWithPricing> = all_models
+        .into_iter()
+        .skip(offset_usize)
+        .take(limit_usize)
         .map(|model| ModelWithPricing {
-            model_id: model.model_name.clone(),
+            model_id: model.model_name,
             input_cost_per_token: DecimalPrice {
                 amount: model.input_cost_per_token,
                 scale: 9,
@@ -97,19 +134,19 @@ pub async fn list_models(
             metadata: ModelMetadata {
                 verifiable: model.verifiable,
                 context_length: model.context_length,
-                model_display_name: model.model_display_name.clone(),
-                model_description: model.model_description.clone(),
-                model_icon: model.model_icon.clone(),
-                owned_by: model.owned_by.clone(),
-                aliases: model.aliases.clone(),
-                provider_type: model.provider_type.clone(),
+                model_display_name: model.model_display_name,
+                model_description: model.model_description,
+                model_icon: model.model_icon,
+                owned_by: model.owned_by,
+                aliases: model.aliases,
+                provider_type: model.provider_type,
                 provider_config: crate::routes::common::redact_provider_config(
-                    model.provider_config.clone(),
+                    model.provider_config,
                 ),
                 attestation_supported: model.attestation_supported,
                 architecture: ModelArchitecture::from_options(
-                    model.input_modalities.clone(),
-                    model.output_modalities.clone(),
+                    model.input_modalities,
+                    model.output_modalities,
                 ),
                 inference_url: None, // Redacted: internal infrastructure URL, admin-only
             },
@@ -118,9 +155,9 @@ pub async fn list_models(
 
     let response = ModelListResponse {
         models: api_models,
+        limit,
+        offset,
         total,
-        limit: query.limit,
-        offset: query.offset,
     };
 
     Ok(ResponseJson(response))

@@ -833,6 +833,7 @@ pub fn build_app_with_config(
         config.clone(),
         app_state.inference_provider_pool.clone(),
         analytics_service,
+        domain_services.models_service.clone(),
     );
 
     let invitation_routes =
@@ -1435,6 +1436,7 @@ pub fn build_admin_routes(
     config: Arc<ApiConfig>,
     inference_provider_pool: Arc<services::inference_provider_pool::InferenceProviderPool>,
     analytics_service: Arc<services::admin::AnalyticsService>,
+    models_service: Arc<services::models::ModelsServiceImpl>,
 ) -> Router {
     use crate::middleware::admin_middleware;
     use crate::routes::admin::{
@@ -1455,9 +1457,15 @@ pub fn build_admin_routes(
     let admin_access_token_repository =
         Arc::new(AdminAccessTokenRepository::new(database.pool().clone()));
 
-    // Create admin service with composite repository
+    // Create admin service with composite repository.
+    //
+    // The admin service holds a reference to the `models_service` so it can
+    // invalidate the public `/v1/model/list` cache after admin writes
+    // (`upsert`, `delete`, `deprecate`) that mutate the `models` or
+    // `model_aliases` tables.
     let admin_service = Arc::new(AdminServiceImpl::new(
         admin_repository as Arc<dyn services::admin::AdminRepository>,
+        models_service as Arc<dyn services::models::ModelsServiceTrait>,
     )) as Arc<dyn services::admin::AdminService + Send + Sync>;
 
     let admin_app_state = AdminAppState {

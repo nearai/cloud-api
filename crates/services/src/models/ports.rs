@@ -69,15 +69,8 @@ pub enum ModelsError {
 /// Repository trait for accessing model data
 #[async_trait]
 pub trait ModelsRepository: Send + Sync {
-    /// Get all active models count
-    async fn get_all_active_models_count(&self) -> Result<i64, anyhow::Error>;
-
     /// Get all active models with pricing
-    async fn get_all_active_models(
-        &self,
-        limit: i64,
-        offset: i64,
-    ) -> Result<Vec<ModelWithPricing>, anyhow::Error>;
+    async fn get_all_active_models(&self) -> Result<Vec<ModelWithPricing>, anyhow::Error>;
 
     /// Get a specific model by name
     async fn get_model_by_name(
@@ -102,12 +95,11 @@ pub trait ModelsServiceTrait: Send + Sync {
     /// Get basic model info (from inference providers)
     async fn get_models(&self) -> Result<Vec<ModelInfo>, ModelsError>;
 
-    /// Get models with pricing and metadata (from database)
-    async fn get_models_with_pricing(
-        &self,
-        limit: i64,
-        offset: i64,
-    ) -> Result<(Vec<ModelWithPricing>, i64), ModelsError>;
+    /// Get models with pricing and metadata (from database).
+    ///
+    /// Implementations are expected to cache the result with a short TTL since
+    /// this endpoint is publicly accessible and called frequently.
+    async fn get_models_with_pricing(&self) -> Result<Vec<ModelWithPricing>, ModelsError>;
 
     /// Get a specific model by name
     async fn get_model_by_name(&self, model_name: &str) -> Result<ModelWithPricing, ModelsError>;
@@ -122,4 +114,8 @@ pub trait ModelsServiceTrait: Send + Sync {
     /// Get list of configured model names (canonical names) from database
     /// Returns only active models that have been configured with pricing
     async fn get_configured_model_names(&self) -> Result<Vec<String>, ModelsError>;
+
+    /// Invalidate any cached model list / metadata. Called by admin writes
+    /// that mutate the `models` or `model_aliases` tables.
+    async fn invalidate_models_cache(&self);
 }

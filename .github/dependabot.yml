@@ -9,6 +9,13 @@ updates:
       rust-dependencies:
         patterns:
           - "*"
+    ignore:
+      # deadpool 0.13 cannot be adopted until deadpool-postgres releases a
+      # 0.13-compatible version (latest is 0.14.1, still requires deadpool ^0.12).
+      # Bumping our direct dep produces a split lockfile and breaks type
+      # compatibility on PoolConfig.queue_mode / Runtime::Tokio1.
+      - dependency-name: "deadpool"
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
     commit-message:
       prefix: "deps"
 

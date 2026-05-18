@@ -330,6 +330,7 @@ pub fn services_user_to_api_user_with_relations(
 /// Convert services Organization to API OrganizationResponse
 pub fn services_org_to_api_org(
     org: services::organization::ports::Organization,
+    role: crate::models::MemberRole,
 ) -> crate::models::OrganizationResponse {
     crate::models::OrganizationResponse {
         id: org.id.0.to_string(),
@@ -337,6 +338,7 @@ pub fn services_org_to_api_org(
         description: org.description,
         owner_id: org.owner_id.0.to_string(),
         settings: org.settings,
+        role,
         is_active: org.is_active,
         created_at: org.created_at,
         updated_at: org.updated_at,
@@ -600,8 +602,10 @@ pub fn services_invitation_result_to_api(
     crate::models::InvitationResult {
         email: result.email,
         success: result.success,
+        email_sent: result.email_sent,
         member: result.member.map(services_member_to_api_member),
         error: result.error,
+        email_error: result.email_error,
     }
 }
 
@@ -625,6 +629,25 @@ pub fn services_invitation_status_to_api(
     }
 }
 
+pub fn services_invitation_email_status_to_api(
+    status: services::organization::InvitationEmailStatus,
+) -> crate::models::InvitationEmailStatus {
+    match status {
+        services::organization::InvitationEmailStatus::NotAttempted => {
+            crate::models::InvitationEmailStatus::NotAttempted
+        }
+        services::organization::InvitationEmailStatus::Sent => {
+            crate::models::InvitationEmailStatus::Sent
+        }
+        services::organization::InvitationEmailStatus::Failed => {
+            crate::models::InvitationEmailStatus::Failed
+        }
+        services::organization::InvitationEmailStatus::Skipped => {
+            crate::models::InvitationEmailStatus::Skipped
+        }
+    }
+}
+
 /// Convert services OrganizationInvitation to API OrganizationInvitationResponse
 pub fn services_invitation_to_api(
     invitation: services::organization::OrganizationInvitation,
@@ -639,6 +662,10 @@ pub fn services_invitation_to_api(
         created_at: invitation.created_at,
         expires_at: invitation.expires_at,
         responded_at: invitation.responded_at,
+        email_status: services_invitation_email_status_to_api(invitation.email_status),
+        email_sent_at: invitation.email_sent_at,
+        email_last_error: invitation.email_last_error,
+        email_message_id: invitation.email_message_id,
     }
 }
 

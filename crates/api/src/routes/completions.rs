@@ -355,6 +355,12 @@ fn auto_redact_error_response(err: AutoRedactError) -> Response {
 
 /// Walk a non-streaming chat response's text fields and substitute
 /// placeholders with their originals. Mutates in place.
+///
+/// Covers content + reasoning fields and the JSON-encoded
+/// `tool_calls[*].function.arguments` string. The latter is critical for
+/// agentic flows where the model emits a tool call whose arguments echo
+/// the user's PII — without un-redacting them, the placeholder leaks to
+/// the client.
 fn unredact_chat_response_in_place(
     response: &mut inference_providers::ChatCompletionResponse,
     map: &RedactionMap,
@@ -369,20 +375,41 @@ fn unredact_chat_response_in_place(
         if let Some(reasoning) = &mut choice.message.reasoning {
             *reasoning = map.unredact(reasoning);
         }
+        if let Some(refusal) = &mut choice.message.refusal {
+            // A safety-tuned model may produce a refusal that quotes our
+            // placeholders back ("I can't email <email1>"). Without
+            // un-redacting, the placeholder leaks to the client.
+            *refusal = map.unredact(refusal);
+        }
+        if let Some(tool_calls) = &mut choice.message.tool_calls {
+            for tc in tool_calls {
+                if let Some(args) = &mut tc.function.arguments {
+                    // arguments is itself a JSON-encoded string. JSON-escape
+                    // each replacement so PII containing `"`, `\`, or
+                    // control chars doesn't corrupt the surrounding JSON.
+                    *args = map.unredact_json_string(args);
+                }
+            }
+        }
     }
 }
 
 /// Per-choice, per-field streaming un-redact state. For `n > 1`
 /// completions the provider may interleave chunks for different choice
 /// indices; each choice needs its own sliding tail buffer or split
-/// placeholders get cross-contaminated. The three text fields (`content`,
+/// placeholders get cross-contaminated. The text fields (`content`,
 /// `reasoning_content`, `reasoning`) are kept independent for the same
 /// reason — a model may emit them concurrently.
+///
+/// `tool_call_arguments` is keyed by `(choice_index, tool_call_index)`
+/// because a single response can have multiple parallel tool calls, each
+/// with its own arguments JSON stream.
 #[derive(Default)]
 struct StreamUnredactStates {
     content: std::collections::HashMap<i64, StreamUnredact>,
     reasoning_content: std::collections::HashMap<i64, StreamUnredact>,
     reasoning: std::collections::HashMap<i64, StreamUnredact>,
+    tool_call_arguments: std::collections::HashMap<(i64, i64), StreamUnredact>,
 }
 
 fn unredact_field(
@@ -419,6 +446,29 @@ fn unredact_chunk_in_place(
                     if let Some(r) = &mut delta.reasoning {
                         unredact_field(&mut states.reasoning, map, idx, r);
                     }
+                    if let Some(tcs) = &mut delta.tool_calls {
+                        for (pos, tc) in tcs.iter_mut().enumerate() {
+                            // Per-tool-call streaming state keyed by
+                            // (choice_index, tool_call_index). Use the
+                            // delta's index if present; otherwise fall
+                            // back to the *position* in this chunk so two
+                            // parallel indexless tool calls don't collide.
+                            let tc_idx = tc.index.unwrap_or(pos as i64);
+                            if let Some(func) = &mut tc.function {
+                                if let Some(args) = &mut func.arguments {
+                                    // arguments is JSON-encoded; substitute
+                                    // with JSON-escaped originals.
+                                    let s = states
+                                        .tool_call_arguments
+                                        .entry((idx, tc_idx))
+                                        .or_insert_with(|| {
+                                            StreamUnredact::new_for_json_string(map.clone())
+                                        });
+                                    *args = s.process(args);
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -445,6 +495,9 @@ fn build_flush_chunks(states: &mut StreamUnredactStates, template: &ChunkTemplat
         return Vec::new();
     };
 
+    let mut out: Vec<Bytes> = Vec::new();
+
+    // --- Pass 1: content / reasoning_content / reasoning ---
     let mut pending: std::collections::BTreeMap<i64, (String, String, String)> =
         std::collections::BTreeMap::new();
     for (idx, st) in states.content.drain() {
@@ -465,8 +518,6 @@ fn build_flush_chunks(states: &mut StreamUnredactStates, template: &ChunkTemplat
             pending.entry(idx).or_default().2 = text;
         }
     }
-
-    let mut out = Vec::with_capacity(pending.len());
     for (idx, (content, rc, r)) in pending {
         let chunk = inference_providers::models::ChatCompletionChunk {
             id: id.clone(),
@@ -501,6 +552,67 @@ fn build_flush_chunks(states: &mut StreamUnredactStates, template: &ChunkTemplat
             out.push(Bytes::from(format!("data: {s}\n\n")));
         }
     }
+
+    // --- Pass 2: tool_call_arguments ---
+    // Each held tail becomes a synthetic tool-call delta with just the
+    // arguments fragment. The placeholder may be incomplete (the LLM was
+    // cut off mid-`<email1>`), in which case the literal bytes are emitted
+    // — visible signal of truncation, but no silent loss of held bytes
+    // and no leaking placeholder we never minted.
+    let mut tc_drain: Vec<((i64, i64), String)> = states
+        .tool_call_arguments
+        .drain()
+        .filter_map(|(key, st)| {
+            let text = st.flush();
+            if text.is_empty() {
+                None
+            } else {
+                Some((key, text))
+            }
+        })
+        .collect();
+    // Stable ordering: choice index ascending, then tool_call index.
+    tc_drain.sort_by_key(|((c, t), _)| (*c, *t));
+    for ((choice_idx, tc_idx), args) in tc_drain {
+        let chunk = inference_providers::models::ChatCompletionChunk {
+            id: id.clone(),
+            object: "chat.completion.chunk".to_string(),
+            created: *created,
+            model: model.clone(),
+            system_fingerprint: system_fingerprint.clone(),
+            choices: vec![inference_providers::models::ChatChoice {
+                index: choice_idx,
+                delta: Some(inference_providers::models::ChatDelta {
+                    role: None,
+                    content: None,
+                    name: None,
+                    tool_call_id: None,
+                    tool_calls: Some(vec![inference_providers::models::ToolCallDelta {
+                        id: None,
+                        type_: None,
+                        index: Some(tc_idx),
+                        function: Some(inference_providers::models::FunctionCallDelta {
+                            name: None,
+                            arguments: Some(args),
+                        }),
+                        thought_signature: None,
+                    }]),
+                    reasoning_content: None,
+                    reasoning: None,
+                }),
+                logprobs: None,
+                finish_reason: None,
+                token_ids: None,
+            }],
+            usage: None,
+            prompt_token_ids: None,
+            modality: None,
+        };
+        if let Ok(s) = serde_json::to_string(&chunk) {
+            out.push(Bytes::from(format!("data: {s}\n\n")));
+        }
+    }
+
     out
 }
 

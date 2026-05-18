@@ -5,6 +5,7 @@ pub mod auto_redact;
 pub mod common;
 pub mod completions;
 pub mod conversations;
+pub mod email;
 pub mod files;
 pub mod id_prefixes;
 pub mod inference_provider_pool;

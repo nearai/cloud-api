@@ -1981,6 +1981,7 @@ pub struct OrganizationResponse {
     pub description: Option<String>,
     pub owner_id: String,
     pub settings: serde_json::Value,
+    pub role: MemberRole,
     pub is_active: bool,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -2152,10 +2153,13 @@ pub struct OrganizationSettingsResponse {
 pub struct InvitationResult {
     pub email: String,
     pub success: bool,
+    pub email_sent: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub member: Option<OrganizationMemberResponse>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub email_error: Option<String>,
 }
 
 /// Response for batch invitation requests
@@ -2472,6 +2476,15 @@ pub enum InvitationStatus {
     Expired,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum InvitationEmailStatus {
+    NotAttempted,
+    Sent,
+    Failed,
+    Skipped,
+}
+
 /// Organization invitation response
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct OrganizationInvitationResponse {
@@ -2484,6 +2497,10 @@ pub struct OrganizationInvitationResponse {
     pub created_at: DateTime<Utc>,
     pub expires_at: DateTime<Utc>,
     pub responded_at: Option<DateTime<Utc>>,
+    pub email_status: InvitationEmailStatus,
+    pub email_sent_at: Option<DateTime<Utc>>,
+    pub email_last_error: Option<String>,
+    pub email_message_id: Option<String>,
 }
 
 /// Organization invitation with organization details

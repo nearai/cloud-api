@@ -34,6 +34,12 @@ pub struct Organization {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OrganizationWithRole {
+    pub organization: Organization,
+    pub role: MemberRole,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OrganizationMember {
     pub organization_id: OrganizationId,
     pub user_id: UserId,
@@ -69,6 +75,16 @@ impl MemberRole {
 
     pub fn can_manage_mcp_connectors(&self) -> bool {
         matches!(self, MemberRole::Owner | MemberRole::Admin)
+    }
+}
+
+impl std::fmt::Display for MemberRole {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            MemberRole::Owner => write!(f, "owner"),
+            MemberRole::Admin => write!(f, "admin"),
+            MemberRole::Member => write!(f, "member"),
+        }
     }
 }
 
@@ -138,6 +154,8 @@ pub struct InvitationResult {
     pub success: bool,
     pub member: Option<OrganizationMember>,
     pub error: Option<String>,
+    pub email_sent: bool,
+    pub email_error: Option<String>,
 }
 
 /// Batch invitation response
@@ -159,6 +177,16 @@ pub enum InvitationStatus {
     Expired,
 }
 
+/// Invitation email delivery status
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum InvitationEmailStatus {
+    NotAttempted,
+    Sent,
+    Failed,
+    Skipped,
+}
+
 /// Organization invitation
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OrganizationInvitation {
@@ -172,6 +200,10 @@ pub struct OrganizationInvitation {
     pub created_at: DateTime<Utc>,
     pub expires_at: DateTime<Utc>,
     pub responded_at: Option<DateTime<Utc>>,
+    pub email_status: InvitationEmailStatus,
+    pub email_sent_at: Option<DateTime<Utc>>,
+    pub email_last_error: Option<String>,
+    pub email_message_id: Option<String>,
 }
 
 /// Create invitation request
@@ -256,6 +288,15 @@ pub trait OrganizationRepository: Send + Sync {
         order_by: Option<OrganizationOrderBy>,
         order_direction: Option<OrganizationOrderDirection>,
     ) -> Result<Vec<Organization>, RepositoryError>;
+
+    async fn list_organizations_with_roles_by_user(
+        &self,
+        user_id: Uuid,
+        limit: i64,
+        offset: i64,
+        order_by: Option<OrganizationOrderBy>,
+        order_direction: Option<OrganizationOrderDirection>,
+    ) -> Result<Vec<OrganizationWithRole>, RepositoryError>;
 }
 
 /// Repository trait for organization invitations
@@ -295,6 +336,19 @@ pub trait OrganizationInvitationRepository: Send + Sync {
         id: Uuid,
         status: InvitationStatus,
     ) -> Result<OrganizationInvitation>;
+
+    /// Record a successful invitation email delivery
+    async fn record_email_sent(
+        &self,
+        id: Uuid,
+        message_id: Option<String>,
+    ) -> Result<OrganizationInvitation>;
+
+    /// Record a failed invitation email delivery
+    async fn record_email_failed(&self, id: Uuid, error: String) -> Result<OrganizationInvitation>;
+
+    /// Record a skipped invitation email delivery
+    async fn record_email_skipped(&self, id: Uuid) -> Result<OrganizationInvitation>;
 
     /// Delete invitation
     async fn delete(&self, id: Uuid) -> Result<bool>;
@@ -345,6 +399,15 @@ pub trait OrganizationServiceTrait: Send + Sync {
         order_by: Option<OrganizationOrderBy>,
         order_direction: Option<OrganizationOrderDirection>,
     ) -> Result<Vec<Organization>, OrganizationError>;
+
+    async fn list_organizations_with_roles_for_user(
+        &self,
+        user_id: UserId,
+        limit: i64,
+        offset: i64,
+        order_by: Option<OrganizationOrderBy>,
+        order_direction: Option<OrganizationOrderDirection>,
+    ) -> Result<Vec<OrganizationWithRole>, OrganizationError>;
 
     /// Count organizations accessible to a user
     async fn count_organizations_for_user(&self, user_id: UserId)

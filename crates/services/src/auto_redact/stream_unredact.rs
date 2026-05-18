@@ -12,6 +12,10 @@ use super::placeholders::{RedactionMap, MAX_PLACEHOLDER_LEN};
 pub struct StreamUnredact {
     map: std::sync::Arc<RedactionMap>,
     tail: String,
+    /// When true, replacements are JSON-escaped before substitution. Used
+    /// for streaming `tool_calls[*].function.arguments` where the emitted
+    /// chars are inside a JSON string literal.
+    json_escape: bool,
 }
 
 impl StreamUnredact {
@@ -19,6 +23,19 @@ impl StreamUnredact {
         Self {
             map,
             tail: String::new(),
+            json_escape: false,
+        }
+    }
+
+    /// Variant for streams whose emitted text is the body of a JSON string
+    /// literal (e.g. tool-call arguments). Replacements are JSON-escaped so
+    /// originals containing `"`, `\`, control chars, or non-ASCII never
+    /// corrupt the surrounding JSON.
+    pub fn new_for_json_string(map: std::sync::Arc<RedactionMap>) -> Self {
+        Self {
+            map,
+            tail: String::new(),
+            json_escape: true,
         }
     }
 
@@ -48,7 +65,11 @@ impl StreamUnredact {
         let emit = buf;
         self.tail = hold;
 
-        self.map.unredact(&emit)
+        if self.json_escape {
+            self.map.unredact_json_string(&emit)
+        } else {
+            self.map.unredact(&emit)
+        }
     }
 
     /// Emit any pending tail at end of stream. Unmatched placeholder-shaped
@@ -59,7 +80,11 @@ impl StreamUnredact {
             return String::new();
         }
         let tail = std::mem::take(&mut self.tail);
-        self.map.unredact(&tail)
+        if self.json_escape {
+            self.map.unredact_json_string(&tail)
+        } else {
+            self.map.unredact(&tail)
+        }
     }
 }
 
@@ -206,6 +231,45 @@ mod tests {
         let mut u = StreamUnredact::new(map);
         let out = u.process("héllo <emai") + &u.process("l1>!") + &u.flush();
         assert_eq!(out, "héllo x@y.z!");
+    }
+
+    #[test]
+    fn json_string_variant_escapes_quote_in_replacement() {
+        // PII original contains a literal `"`. Substituting into a JSON
+        // string body context must escape it to `\"` or the surrounding
+        // JSON corrupts.
+        let map = map_with(&[("private_name", r#"Patrick O"Brien"#)]);
+        let mut u = StreamUnredact::new_for_json_string(map);
+        let args = r#"{"to":"<name1>"}"#;
+        let out = u.process(args) + &u.flush();
+        assert_eq!(out, r#"{"to":"Patrick O\"Brien"}"#);
+        // Must round-trip parse.
+        let _: serde_json::Value = serde_json::from_str(&out).unwrap();
+    }
+
+    #[test]
+    fn json_string_variant_escapes_across_chunk_split() {
+        let map = map_with(&[("private_name", r#"O"X"#)]);
+        let mut u = StreamUnredact::new_for_json_string(map);
+        let p1 = u.process(r#"{"n":"<nam"#);
+        let p2 = u.process(r#"e1>"}"#);
+        let tail = u.flush();
+        let out = p1 + &p2 + &tail;
+        assert_eq!(out, r#"{"n":"O\"X"}"#);
+        let _: serde_json::Value = serde_json::from_str(&out).unwrap();
+    }
+
+    #[test]
+    fn json_string_variant_no_op_for_simple_pii() {
+        // Plain-ASCII PII should produce identical output to the regular
+        // unredact path.
+        let map = map_with(&[("private_email", "alice@example.com")]);
+        let mut a = StreamUnredact::new(map.clone());
+        let mut b = StreamUnredact::new_for_json_string(map);
+        let s = r#"{"to":"<email1>"}"#;
+        let out_a = a.process(s) + &a.flush();
+        let out_b = b.process(s) + &b.flush();
+        assert_eq!(out_a, out_b);
     }
 
     #[test]

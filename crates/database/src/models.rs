@@ -62,6 +62,10 @@ pub struct OrganizationInvitation {
     pub created_at: DateTime<Utc>,
     pub expires_at: DateTime<Utc>,
     pub responded_at: Option<DateTime<Utc>>,
+    pub email_status: InvitationEmailStatus,
+    pub email_sent_at: Option<DateTime<Utc>>,
+    pub email_last_error: Option<String>,
+    pub email_message_id: Option<String>,
 }
 
 /// Invitation status
@@ -81,6 +85,27 @@ impl std::fmt::Display for InvitationStatus {
             InvitationStatus::Accepted => write!(f, "accepted"),
             InvitationStatus::Declined => write!(f, "declined"),
             InvitationStatus::Expired => write!(f, "expired"),
+        }
+    }
+}
+
+/// Email delivery status for organization invitations
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum InvitationEmailStatus {
+    NotAttempted,
+    Sent,
+    Failed,
+    Skipped,
+}
+
+impl std::fmt::Display for InvitationEmailStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            InvitationEmailStatus::NotAttempted => write!(f, "not_attempted"),
+            InvitationEmailStatus::Sent => write!(f, "sent"),
+            InvitationEmailStatus::Failed => write!(f, "failed"),
+            InvitationEmailStatus::Skipped => write!(f, "skipped"),
         }
     }
 }

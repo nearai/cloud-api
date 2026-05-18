@@ -191,6 +191,7 @@ use utoipa::{Modify, OpenApi};
             MemberRole,
             // Organization Invitation models
             InvitationStatus,
+            InvitationEmailStatus,
             OrganizationInvitationResponse,
             OrganizationInvitationWithOrgResponse,
             AcceptInvitationResponse,

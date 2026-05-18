@@ -10,6 +10,7 @@ pub struct ApiConfig {
     pub auth: AuthConfig,
     pub database: DatabaseConfig,
     pub s3: S3Config,
+    pub invitation_email: InvitationEmailConfig,
     pub otlp: OtlpConfig,
     pub cors: CorsConfig,
     pub external_providers: ExternalProvidersConfig,
@@ -28,6 +29,7 @@ impl ApiConfig {
             auth: AuthConfig::from_env()?,
             database: DatabaseConfig::from_env()?,
             s3: S3Config::from_env()?,
+            invitation_email: InvitationEmailConfig::from_env()?,
             otlp: OtlpConfig::from_env()?,
             cors: CorsConfig::default(),
             external_providers: ExternalProvidersConfig::from_env(),
@@ -407,6 +409,90 @@ impl S3Config {
     }
 }
 
+/// Email notification configuration for organization invitations.
+#[derive(Debug, Clone, Default)]
+pub struct InvitationEmailConfig {
+    pub enabled: bool,
+    pub from_email: Option<String>,
+    pub reply_to: Option<String>,
+    pub resend_api_key: Option<String>,
+    pub frontend_base_url: Option<String>,
+}
+
+impl InvitationEmailConfig {
+    pub fn from_env() -> Result<Self, String> {
+        let enabled = env::var("INVITATION_EMAIL_ENABLED")
+            .ok()
+            .and_then(|v| v.parse::<bool>().ok())
+            .unwrap_or(false);
+
+        let from_email = non_empty_env("INVITATION_EMAIL_FROM");
+        let reply_to = non_empty_env("INVITATION_EMAIL_REPLY_TO");
+        let resend_api_key = if enabled {
+            read_optional_secret_env("RESEND_API_KEY_FILE", "RESEND_API_KEY")?
+        } else {
+            None
+        };
+        let frontend_base_url = non_empty_env("CLOUD_UI_BASE_URL");
+
+        if enabled {
+            if from_email.is_none() {
+                return Err(
+                    "INVITATION_EMAIL_FROM must be set when INVITATION_EMAIL_ENABLED=true"
+                        .to_string(),
+                );
+            }
+            if resend_api_key.is_none() {
+                return Err(
+                    "RESEND_API_KEY or RESEND_API_KEY_FILE must be set when INVITATION_EMAIL_ENABLED=true"
+                        .to_string(),
+                );
+            }
+            if frontend_base_url.is_none() {
+                return Err(
+                    "CLOUD_UI_BASE_URL must be set when INVITATION_EMAIL_ENABLED=true".to_string(),
+                );
+            }
+        }
+
+        Ok(Self {
+            enabled,
+            from_email,
+            reply_to,
+            resend_api_key,
+            frontend_base_url,
+        })
+    }
+
+    pub fn invitations_url(&self) -> Option<String> {
+        self.frontend_base_url
+            .as_ref()
+            .map(|base_url| format!("{}/dashboard/invitations", base_url.trim_end_matches('/')))
+    }
+}
+
+fn non_empty_env(key: &str) -> Option<String> {
+    env::var(key)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn read_optional_secret_env(file_key: &str, value_key: &str) -> Result<Option<String>, String> {
+    if let Some(path) = non_empty_env(file_key) {
+        let value = std::fs::read_to_string(&path)
+            .map_err(|e| format!("Failed to read {file_key}: {e}"))?
+            .trim()
+            .to_string();
+        if value.is_empty() {
+            return Err(format!("{file_key} cannot be empty"));
+        }
+        return Ok(Some(value));
+    }
+
+    Ok(non_empty_env(value_key))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -535,6 +621,120 @@ mod tests {
         assert_eq!(config.exact_matches.len(), 1);
         assert_eq!(config.wildcard_suffixes.len(), 1);
         std::env::remove_var("CORS_ALLOWED_ORIGINS");
+    }
+
+    #[test]
+    #[serial]
+    fn test_invitation_email_config_defaults_disabled() {
+        clear_invitation_email_env();
+
+        let config = InvitationEmailConfig::from_env().unwrap();
+
+        assert!(!config.enabled);
+        assert!(config.from_email.is_none());
+        assert!(config.resend_api_key.is_none());
+        assert!(config.invitations_url().is_none());
+    }
+
+    #[test]
+    #[serial]
+    fn test_invitation_email_config_does_not_read_resend_key_file_when_disabled() {
+        clear_invitation_email_env();
+        std::env::set_var("RESEND_API_KEY_FILE", "/missing/resend-api-key");
+
+        let config = InvitationEmailConfig::from_env().unwrap();
+
+        assert!(!config.enabled);
+        assert!(config.resend_api_key.is_none());
+        clear_invitation_email_env();
+    }
+
+    #[test]
+    #[serial]
+    fn test_invitation_email_config_requires_from_when_enabled() {
+        clear_invitation_email_env();
+        std::env::set_var("INVITATION_EMAIL_ENABLED", "true");
+        std::env::set_var("CLOUD_UI_BASE_URL", "https://cloud.example.com");
+
+        let error = InvitationEmailConfig::from_env().unwrap_err();
+
+        assert!(error.contains("INVITATION_EMAIL_FROM"));
+        clear_invitation_email_env();
+    }
+
+    #[test]
+    #[serial]
+    fn test_invitation_email_config_requires_resend_api_key_when_enabled() {
+        clear_invitation_email_env();
+        std::env::set_var("INVITATION_EMAIL_ENABLED", "true");
+        std::env::set_var("INVITATION_EMAIL_FROM", "no-reply@example.com");
+        std::env::set_var("CLOUD_UI_BASE_URL", "https://cloud.example.com");
+
+        let error = InvitationEmailConfig::from_env().unwrap_err();
+
+        assert!(error.contains("RESEND_API_KEY"));
+        clear_invitation_email_env();
+    }
+
+    #[test]
+    #[serial]
+    fn test_invitation_email_config_requires_frontend_url_when_enabled() {
+        clear_invitation_email_env();
+        std::env::set_var("INVITATION_EMAIL_ENABLED", "true");
+        std::env::set_var("INVITATION_EMAIL_FROM", "no-reply@example.com");
+        std::env::set_var("RESEND_API_KEY", "re_test");
+
+        let error = InvitationEmailConfig::from_env().unwrap_err();
+
+        assert!(error.contains("CLOUD_UI_BASE_URL"));
+        clear_invitation_email_env();
+    }
+
+    #[test]
+    #[serial]
+    fn test_invitation_email_config_builds_inbox_url() {
+        clear_invitation_email_env();
+        std::env::set_var("INVITATION_EMAIL_ENABLED", "true");
+        std::env::set_var("INVITATION_EMAIL_FROM", "no-reply@example.com");
+        std::env::set_var("RESEND_API_KEY", "re_test");
+        std::env::set_var("CLOUD_UI_BASE_URL", "https://cloud.example.com/");
+
+        let config = InvitationEmailConfig::from_env().unwrap();
+
+        assert_eq!(config.resend_api_key.as_deref(), Some("re_test"));
+        assert_eq!(
+            config.invitations_url().as_deref(),
+            Some("https://cloud.example.com/dashboard/invitations")
+        );
+        clear_invitation_email_env();
+    }
+
+    #[test]
+    #[serial]
+    fn test_invitation_email_config_reads_resend_api_key_file() {
+        clear_invitation_email_env();
+        let path =
+            std::env::temp_dir().join(format!("cloud-api-resend-key-{}", std::process::id()));
+        std::fs::write(&path, " re_file_test \n").unwrap();
+        std::env::set_var("INVITATION_EMAIL_ENABLED", "true");
+        std::env::set_var("INVITATION_EMAIL_FROM", "no-reply@example.com");
+        std::env::set_var("RESEND_API_KEY_FILE", &path);
+        std::env::set_var("CLOUD_UI_BASE_URL", "https://cloud.example.com/");
+
+        let config = InvitationEmailConfig::from_env().unwrap();
+
+        assert_eq!(config.resend_api_key.as_deref(), Some("re_file_test"));
+        clear_invitation_email_env();
+        std::fs::remove_file(path).unwrap();
+    }
+
+    fn clear_invitation_email_env() {
+        std::env::remove_var("INVITATION_EMAIL_ENABLED");
+        std::env::remove_var("INVITATION_EMAIL_FROM");
+        std::env::remove_var("INVITATION_EMAIL_REPLY_TO");
+        std::env::remove_var("RESEND_API_KEY");
+        std::env::remove_var("RESEND_API_KEY_FILE");
+        std::env::remove_var("CLOUD_UI_BASE_URL");
     }
 }
 

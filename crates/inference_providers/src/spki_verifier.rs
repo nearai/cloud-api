@@ -57,6 +57,24 @@ impl FingerprintState {
         // Don't block if already Pinned — keep existing verified fingerprints
     }
 
+    /// Replace the pinned set wholesale.
+    ///
+    /// Called once per discovery cycle when the cycle achieved complete
+    /// coverage (every healthy backend produced exactly one verified
+    /// fingerprint). Lets the pin set track the *current* healthy set rather
+    /// than accumulating every backend the proxy ever routed to — when a
+    /// backend goes unhealthy or its cert rotates, its old fingerprint is
+    /// dropped within one refresh interval.
+    ///
+    /// Transitions Bootstrap → Pinned and Blocked → Pinned, matching
+    /// `add_fingerprint`. An empty `fps` is permitted; callers treat that as
+    /// "no healthy backends right now" and the provider-level fail-closed
+    /// path keeps connections rejected until a future cycle re-pins
+    /// something.
+    pub fn replace_with(&mut self, fps: HashSet<String>) {
+        *self = FingerprintState::Pinned(fps);
+    }
+
     /// Number of pinned fingerprints (0 for Bootstrap/Blocked).
     pub fn pinned_count(&self) -> usize {
         match self {
@@ -265,5 +283,66 @@ mod tests {
         state.add_fingerprint("abc".to_string());
         assert!(matches!(state, FingerprintState::Pinned(_)));
         assert_eq!(state.pinned_count(), 1);
+    }
+
+    #[test]
+    fn test_replace_with_from_bootstrap() {
+        let mut state = FingerprintState::Bootstrap;
+        let mut fps = HashSet::new();
+        fps.insert("a".to_string());
+        fps.insert("b".to_string());
+        state.replace_with(fps);
+        assert!(matches!(state, FingerprintState::Pinned(_)));
+        assert_eq!(state.pinned_count(), 2);
+    }
+
+    #[test]
+    fn test_replace_with_shrinks_pinned() {
+        let mut state = FingerprintState::Bootstrap;
+        for fp in ["a", "b", "c", "d", "e"] {
+            state.add_fingerprint(fp.to_string());
+        }
+        assert_eq!(state.pinned_count(), 5);
+
+        // Backend went away — pin set tracks the new healthy set.
+        let mut shrunk = HashSet::new();
+        shrunk.insert("a".to_string());
+        shrunk.insert("b".to_string());
+        shrunk.insert("c".to_string());
+        shrunk.insert("d".to_string());
+        state.replace_with(shrunk);
+        assert_eq!(state.pinned_count(), 4);
+        if let FingerprintState::Pinned(set) = &state {
+            assert!(set.contains("a"));
+            assert!(!set.contains("e"), "evicted fingerprint must be gone");
+        } else {
+            panic!("expected Pinned");
+        }
+    }
+
+    #[test]
+    fn test_replace_with_from_blocked() {
+        // Blocked → Pinned mirrors add_fingerprint's recovery path.
+        let mut state = FingerprintState::Bootstrap;
+        state.block();
+        assert!(matches!(state, FingerprintState::Blocked));
+
+        let mut fps = HashSet::new();
+        fps.insert("recovered".to_string());
+        state.replace_with(fps);
+        assert!(matches!(state, FingerprintState::Pinned(_)));
+        assert_eq!(state.pinned_count(), 1);
+    }
+
+    #[test]
+    fn test_replace_with_empty_set_is_permitted() {
+        // Caller may pass an empty set to express "no healthy backends".
+        // The provider-level fail-closed path is responsible for rejecting
+        // connections; FingerprintState just stores the (empty) Pinned set.
+        let mut state = FingerprintState::Bootstrap;
+        state.add_fingerprint("a".to_string());
+        state.replace_with(HashSet::new());
+        assert!(matches!(state, FingerprintState::Pinned(_)));
+        assert_eq!(state.pinned_count(), 0);
     }
 }

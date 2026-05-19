@@ -115,8 +115,9 @@ pub trait BackendVerifier: Send + Sync {
 ///
 /// Supports common formats:
 ///   - OpenAI/Anthropic: `{"error": {"message": "..."}}`
+///   - vLLM flat: `{"object": "error", "message": "...", "type": "..."}`
 ///   - vLLM/FastAPI: `{"detail": "..."}`
-///   - Falls back to the raw body if neither matches
+///   - Falls back to the raw body if none match
 pub fn extract_error_message(body: &str) -> String {
     if let Ok(json) = serde_json::from_str::<serde_json::Value>(body) {
         // OpenAI/Anthropic format: {"error": {"message": "..."}}
@@ -127,13 +128,20 @@ pub fn extract_error_message(body: &str) -> String {
         {
             return msg.to_string();
         }
-        // vLLM/FastAPI format: {"detail": "..."}
+        // vLLM flat format: {"object":"error","message":"...","type":"..."}
+        // Distinguished from envelope JSON by the top-level `message` field
+        // (we don't want to pick up `message` fields nested deep elsewhere).
+        if let Some(msg) = json.get("message").and_then(|m| m.as_str()) {
+            return msg.to_string();
+        }
+        // FastAPI format: {"detail": "..."}
         if let Some(detail) = json.get("detail").and_then(|d| d.as_str()) {
             return detail.to_string();
         }
     }
     body.to_string()
 }
+
 
 /// Type alias for streaming completion results
 ///
@@ -281,4 +289,51 @@ pub trait InferenceProvider {
         params: AudioTranscriptionParams,
         request_hash: String,
     ) -> Result<AudioTranscriptionResponse, AudioTranscriptionError>;
+}
+
+#[cfg(test)]
+mod extract_error_message_tests {
+    use super::extract_error_message;
+
+    #[test]
+    fn test_openai_nested_format() {
+        let body = r#"{"error":{"message":"Invalid API key","type":"auth_error"}}"#;
+        assert_eq!(extract_error_message(body), "Invalid API key");
+    }
+
+    #[test]
+    fn test_vllm_flat_format() {
+        // vLLM/sglang emit this shape for validation errors.
+        let body = r#"{"object":"error","message":"dimensions parameter is not supported for this model","type":"BadRequestError","param":null,"code":400}"#;
+        assert_eq!(
+            extract_error_message(body),
+            "dimensions parameter is not supported for this model"
+        );
+    }
+
+    #[test]
+    fn test_fastapi_detail_format() {
+        let body = r#"{"detail":"Validation failed"}"#;
+        assert_eq!(extract_error_message(body), "Validation failed");
+    }
+
+    #[test]
+    fn test_unknown_json_falls_back_to_body() {
+        let body = r#"{"weird_shape":true}"#;
+        assert_eq!(extract_error_message(body), body);
+    }
+
+    #[test]
+    fn test_non_json_falls_back_to_body() {
+        let body = "plain text error";
+        assert_eq!(extract_error_message(body), body);
+    }
+
+    #[test]
+    fn test_prefers_nested_error_over_flat_message() {
+        // If both shapes are present, prefer the explicit error envelope.
+        let body =
+            r#"{"error":{"message":"from envelope"},"message":"from flat","type":"whatever"}"#;
+        assert_eq!(extract_error_message(body), "from envelope");
+    }
 }

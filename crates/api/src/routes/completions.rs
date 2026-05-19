@@ -2905,16 +2905,30 @@ pub async fn embeddings(
                 }
                 services::completions::ports::CompletionError::ProviderError {
                     status_code,
-                    ..
+                    message,
                 } => {
-                    tracing::error!("Embeddings provider error");
                     let http_status = StatusCode::from_u16(status_code)
                         .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-                    (
-                        http_status,
-                        "server_error",
-                        "Embeddings request failed. Please try again later.".to_string(),
-                    )
+                    // For client errors (4xx), surface the upstream message so users
+                    // see *why* their request was rejected (e.g. "dimensions parameter
+                    // is not supported for this model") instead of a generic "try
+                    // again later" that trains them into useless retries.
+                    // For 5xx, keep a generic message — the upstream body is more
+                    // likely to be a stack trace or internal detail.
+                    if http_status.is_client_error() {
+                        tracing::warn!(
+                            status = status_code,
+                            "Embeddings rejected by upstream with client error"
+                        );
+                        (http_status, "invalid_request_error", message)
+                    } else {
+                        tracing::error!(status = status_code, "Embeddings provider error");
+                        (
+                            http_status,
+                            "server_error",
+                            "Embeddings request failed. Please try again later.".to_string(),
+                        )
+                    }
                 }
                 services::completions::ports::CompletionError::InvalidModel(msg) => {
                     tracing::warn!("Embeddings model not found");

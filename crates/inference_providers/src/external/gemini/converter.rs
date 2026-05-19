@@ -299,14 +299,93 @@ pub fn convert_messages(
     (system_instruction, contents)
 }
 
-/// Convert OpenAI tools to Gemini format
+/// JSON Schema keywords that Gemini's OpenAPI subset does not accept.
+///
+/// Gemini rejects requests containing these with 400 "Unknown name 'X'". The
+/// list is conservative — only keywords known to produce hard rejects when
+/// present in `function_declarations[*].parameters`. See:
+/// https://ai.google.dev/api/caching#Schema
+///
+/// Notably `additionalProperties` is rejected even though it is valid OpenAPI;
+/// Gemini's subset omits it entirely. Schema generators (TypeBox, zod,
+/// pydantic) emit it by default, so OpenAI-compatible clients routing through
+/// us would otherwise fail every tool-using request.
+const GEMINI_UNSUPPORTED_SCHEMA_KEYS: &[&str] = &[
+    // OpenAPI / JSON Schema keywords Gemini does not implement
+    "additionalProperties",
+    "patternProperties",
+    "unevaluatedProperties",
+    "unevaluatedItems",
+    "propertyNames",
+    "dependencies",
+    "dependentRequired",
+    "dependentSchemas",
+    "if",
+    "then",
+    "else",
+    "not",
+    "const",
+    "examples",
+    "readOnly",
+    "writeOnly",
+    "contentMediaType",
+    "contentEncoding",
+    "contentSchema",
+    // JSON Schema meta-keywords
+    "$schema",
+    "$id",
+    "$ref",
+    "$defs",
+    "$anchor",
+    "$dynamicAnchor",
+    "$dynamicRef",
+    "$vocabulary",
+    "$comment",
+    "definitions",
+];
+
+/// Recursively strip schema keywords that Gemini does not accept.
+///
+/// Walks `value` in-place. At each object, removes keys listed in
+/// `GEMINI_UNSUPPORTED_SCHEMA_KEYS`, then recurses into the surviving values
+/// and any array elements. This handles nested schemas (e.g. inside
+/// `properties`, `items`, `anyOf`) at arbitrary depth.
+fn sanitize_schema_for_gemini(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(map) => {
+            for key in GEMINI_UNSUPPORTED_SCHEMA_KEYS {
+                map.remove(*key);
+            }
+            for v in map.values_mut() {
+                sanitize_schema_for_gemini(v);
+            }
+        }
+        serde_json::Value::Array(arr) => {
+            for v in arr.iter_mut() {
+                sanitize_schema_for_gemini(v);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Convert OpenAI tools to Gemini format.
+///
+/// Sanitizes each tool's `parameters` JSON Schema by stripping keywords that
+/// Gemini's OpenAPI subset does not support (see `sanitize_schema_for_gemini`).
+/// Without this, schemas containing `additionalProperties` and similar
+/// keywords cause Gemini to reject the request with 400 "Unknown name".
 pub fn convert_tools(tools: &[ToolDefinition]) -> Vec<GeminiTools> {
     let declarations: Vec<GeminiFunctionDeclaration> = tools
         .iter()
-        .map(|tool| GeminiFunctionDeclaration {
-            name: tool.function.name.clone(),
-            description: tool.function.description.clone(),
-            parameters: tool.function.parameters.clone(),
+        .map(|tool| {
+            let mut parameters = tool.function.parameters.clone();
+            sanitize_schema_for_gemini(&mut parameters);
+            GeminiFunctionDeclaration {
+                name: tool.function.name.clone(),
+                description: tool.function.description.clone(),
+                parameters,
+            }
         })
         .collect();
 
@@ -558,6 +637,174 @@ mod tests {
         assert_eq!(gemini_tools.len(), 1);
         assert_eq!(gemini_tools[0].function_declarations.len(), 1);
         assert_eq!(gemini_tools[0].function_declarations[0].name, "web_search");
+    }
+
+    #[test]
+    fn test_sanitize_schema_strips_top_level_unsupported_keys() {
+        // Schema generators like TypeBox/zod emit `additionalProperties: false`
+        // at the root by default. Gemini rejects this. Reproduces the original
+        // bug report from pi-coding-agent's `edit` tool.
+        let mut schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": {"type": "string"}
+            },
+            "required": ["path"],
+            "additionalProperties": false,
+            "$schema": "http://json-schema.org/draft-07/schema#"
+        });
+        sanitize_schema_for_gemini(&mut schema);
+        let obj = schema.as_object().unwrap();
+        assert!(!obj.contains_key("additionalProperties"));
+        assert!(!obj.contains_key("$schema"));
+        assert!(obj.contains_key("type"));
+        assert!(obj.contains_key("properties"));
+        assert!(obj.contains_key("required"));
+    }
+
+    #[test]
+    fn test_sanitize_schema_strips_nested_unsupported_keys() {
+        // Reproduces the exact path Gemini complained about:
+        //   tools[0].function_declarations[2].parameters.properties[1].value.items
+        // `additionalProperties` lives both at the root AND inside an array's
+        // `items` schema. Both must be removed.
+        let mut schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "edits": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "oldText": {"type": "string"},
+                            "newText": {"type": "string"}
+                        },
+                        "required": ["oldText", "newText"],
+                        "additionalProperties": false
+                    }
+                }
+            },
+            "required": ["edits"],
+            "additionalProperties": false
+        });
+        sanitize_schema_for_gemini(&mut schema);
+        // Recursively assert no `additionalProperties` survives anywhere
+        fn assert_no_unsupported(v: &serde_json::Value) {
+            match v {
+                serde_json::Value::Object(map) => {
+                    for key in GEMINI_UNSUPPORTED_SCHEMA_KEYS {
+                        assert!(
+                            !map.contains_key(*key),
+                            "unsupported key '{}' survived sanitization",
+                            key
+                        );
+                    }
+                    for v in map.values() {
+                        assert_no_unsupported(v);
+                    }
+                }
+                serde_json::Value::Array(arr) => {
+                    for v in arr {
+                        assert_no_unsupported(v);
+                    }
+                }
+                _ => {}
+            }
+        }
+        assert_no_unsupported(&schema);
+
+        // And verify the structural keys are still there
+        let edits = &schema["properties"]["edits"];
+        assert_eq!(edits["type"], "array");
+        let items = &edits["items"];
+        assert_eq!(items["type"], "object");
+        assert!(items["properties"]["oldText"].is_object());
+    }
+
+    #[test]
+    fn test_sanitize_schema_handles_anyof_oneof_arrays() {
+        // Schema generators sometimes wrap fields in anyOf/oneOf; ensure we
+        // recurse into array siblings of `properties` correctly.
+        let mut schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "value": {
+                    "anyOf": [
+                        {"type": "string", "const": "a"},
+                        {"type": "object", "additionalProperties": false}
+                    ]
+                }
+            }
+        });
+        sanitize_schema_for_gemini(&mut schema);
+        let any_of = &schema["properties"]["value"]["anyOf"];
+        assert!(any_of.is_array());
+        // `const` removed from first variant
+        assert!(!any_of[0].as_object().unwrap().contains_key("const"));
+        // `additionalProperties` removed from second variant
+        assert!(!any_of[1]
+            .as_object()
+            .unwrap()
+            .contains_key("additionalProperties"));
+    }
+
+    #[test]
+    fn test_sanitize_schema_preserves_supported_keys() {
+        // Sanity check: keys Gemini accepts must survive verbatim.
+        let mut schema = serde_json::json!({
+            "type": "object",
+            "description": "A point",
+            "properties": {
+                "x": {"type": "number", "minimum": 0, "maximum": 100},
+                "label": {"type": "string", "enum": ["a", "b"]}
+            },
+            "required": ["x"]
+        });
+        let before = schema.clone();
+        sanitize_schema_for_gemini(&mut schema);
+        assert_eq!(before, schema, "clean schema should pass through unchanged");
+    }
+
+    #[test]
+    fn test_convert_tools_sanitizes_parameters() {
+        // End-to-end: convert_tools must produce Gemini-clean schemas. This is
+        // the regression test for the pi-coding-agent bug —
+        // `additionalProperties` would survive into the request body and
+        // Gemini would 400.
+        let tools = vec![ToolDefinition {
+            type_: "function".to_string(),
+            function: crate::FunctionDefinition {
+                name: "edit".to_string(),
+                description: Some("Edit a file".to_string()),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string"},
+                        "edits": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "oldText": {"type": "string"},
+                                    "newText": {"type": "string"}
+                                },
+                                "additionalProperties": false
+                            }
+                        }
+                    },
+                    "required": ["path", "edits"],
+                    "additionalProperties": false
+                }),
+            },
+        }];
+        let gemini_tools = convert_tools(&tools);
+        let params = &gemini_tools[0].function_declarations[0].parameters;
+        let serialized = serde_json::to_string(params).unwrap();
+        assert!(
+            !serialized.contains("additionalProperties"),
+            "serialized parameters must not contain `additionalProperties`; got: {}",
+            serialized
+        );
     }
 
     #[test]

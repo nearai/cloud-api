@@ -310,37 +310,41 @@ pub fn convert_messages(
 /// Gemini's subset omits it entirely. Schema generators (TypeBox, zod,
 /// pydantic) emit it by default, so OpenAI-compatible clients routing through
 /// us would otherwise fail every tool-using request.
+// Note: `not` is intentionally omitted. Gemini's schema reference suggests it
+// may be accepted in some forms, and stripping it would silently change the
+// caller's intended semantics (negation vs no constraint). If a request with
+// `not` is rejected by Gemini in practice, add it here.
 const GEMINI_UNSUPPORTED_SCHEMA_KEYS: &[&str] = &[
-    // OpenAPI / JSON Schema keywords Gemini does not implement
+    // OpenAPI / JSON Schema validation keywords Gemini does not implement
+    // (alphabetized within group)
     "additionalProperties",
-    "patternProperties",
-    "unevaluatedProperties",
-    "unevaluatedItems",
-    "propertyNames",
+    "const",
+    "contentEncoding",
+    "contentMediaType",
+    "contentSchema",
     "dependencies",
     "dependentRequired",
     "dependentSchemas",
-    "if",
-    "then",
     "else",
-    "not",
-    "const",
     "examples",
+    "if",
+    "patternProperties",
+    "propertyNames",
     "readOnly",
+    "then",
+    "unevaluatedItems",
+    "unevaluatedProperties",
     "writeOnly",
-    "contentMediaType",
-    "contentEncoding",
-    "contentSchema",
-    // JSON Schema meta-keywords
-    "$schema",
-    "$id",
-    "$ref",
-    "$defs",
+    // JSON Schema meta-keywords (alphabetized within group)
     "$anchor",
+    "$comment",
+    "$defs",
     "$dynamicAnchor",
     "$dynamicRef",
+    "$id",
+    "$ref",
+    "$schema",
     "$vocabulary",
-    "$comment",
     "definitions",
 ];
 

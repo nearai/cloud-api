@@ -251,18 +251,32 @@ impl ImageGenerationRequest {
             }
         }
 
-        // Validate size format if provided (should be "WxH" with numeric values)
-        // Dimension validation is delegated to the inference provider
+        // Validate size format and bounds if provided (should be "WxH" with numeric values).
+        // Bounds are intentionally generous — the inference provider may reject sizes
+        // it doesn't support, but pathological sizes (1x1, 99999x99999) should fail
+        // fast at the API boundary with HTTP 400 instead of forwarding to upstream
+        // which crashes with a generic HTTP 500 after seconds of work.
         if let Some(ref size) = self.size {
+            const MIN_IMAGE_DIM: u32 = 64;
+            const MAX_IMAGE_DIM: u32 = 2048;
             let parts: Vec<&str> = size.split('x').collect();
             if parts.len() != 2 {
                 return Err("size must be in format 'WIDTHxHEIGHT' (e.g., '1024x1024')".to_string());
             }
-            // Validate that both parts are numeric and greater than zero
             match (parts[0].parse::<u32>(), parts[1].parse::<u32>()) {
                 (Ok(w), Ok(h)) => {
                     if w == 0 || h == 0 {
                         return Err("size dimensions must be greater than zero".to_string());
+                    }
+                    if w < MIN_IMAGE_DIM || h < MIN_IMAGE_DIM {
+                        return Err(format!(
+                            "size dimensions must be at least {MIN_IMAGE_DIM}x{MIN_IMAGE_DIM}"
+                        ));
+                    }
+                    if w > MAX_IMAGE_DIM || h > MAX_IMAGE_DIM {
+                        return Err(format!(
+                            "size dimensions must be at most {MAX_IMAGE_DIM}x{MAX_IMAGE_DIM}"
+                        ));
                     }
                 }
                 _ => {
@@ -356,18 +370,32 @@ impl ImageEditRequest {
             return Err("image must be a valid PNG or JPEG file".to_string());
         }
 
-        // Validate size format if provided (should be "WxH" with numeric values)
-        // Dimension validation is delegated to the inference provider
+        // Validate size format and bounds if provided (should be "WxH" with numeric values).
+        // Bounds are intentionally generous — the inference provider may reject sizes
+        // it doesn't support, but pathological sizes (1x1, 99999x99999) should fail
+        // fast at the API boundary with HTTP 400 instead of forwarding to upstream
+        // which crashes with a generic HTTP 500 after seconds of work.
         if let Some(ref size) = self.size {
+            const MIN_IMAGE_DIM: u32 = 64;
+            const MAX_IMAGE_DIM: u32 = 2048;
             let parts: Vec<&str> = size.split('x').collect();
             if parts.len() != 2 {
                 return Err("size must be in format 'WIDTHxHEIGHT' (e.g., '1024x1024')".to_string());
             }
-            // Validate that both parts are numeric and greater than zero
             match (parts[0].parse::<u32>(), parts[1].parse::<u32>()) {
                 (Ok(w), Ok(h)) => {
                     if w == 0 || h == 0 {
                         return Err("size dimensions must be greater than zero".to_string());
+                    }
+                    if w < MIN_IMAGE_DIM || h < MIN_IMAGE_DIM {
+                        return Err(format!(
+                            "size dimensions must be at least {MIN_IMAGE_DIM}x{MIN_IMAGE_DIM}"
+                        ));
+                    }
+                    if w > MAX_IMAGE_DIM || h > MAX_IMAGE_DIM {
+                        return Err(format!(
+                            "size dimensions must be at most {MAX_IMAGE_DIM}x{MAX_IMAGE_DIM}"
+                        ));
                     }
                 }
                 _ => {
@@ -3560,6 +3588,83 @@ mod tests {
     #[test]
     fn test_is_basic_valid_email_rejects_multiple_ats() {
         assert!(!is_basic_valid_email("user@domain@example.com"));
+    }
+
+    // ── ImageGenerationRequest size validation ──
+
+    fn image_gen_req_with_size(size: Option<&str>) -> ImageGenerationRequest {
+        ImageGenerationRequest {
+            model: "black-forest-labs/FLUX.2-klein-4B".to_string(),
+            prompt: "x".to_string(),
+            n: Some(1),
+            size: size.map(str::to_string),
+            response_format: None,
+            quality: None,
+            style: None,
+        }
+    }
+
+    #[test]
+    fn test_image_gen_valid_size_passes() {
+        for s in ["64x64", "512x512", "1024x1024", "2048x2048", "1024x768"] {
+            assert!(
+                image_gen_req_with_size(Some(s)).validate().is_ok(),
+                "expected {s} to pass validation"
+            );
+        }
+    }
+
+    #[test]
+    fn test_image_gen_no_size_passes() {
+        assert!(image_gen_req_with_size(None).validate().is_ok());
+    }
+
+    #[test]
+    fn test_image_gen_rejects_too_small_size() {
+        // Pathological sizes that previously reached upstream and 500'd after seconds.
+        for s in ["1x1", "16x16", "63x64", "64x63"] {
+            let err = image_gen_req_with_size(Some(s))
+                .validate()
+                .expect_err(&format!("expected {s} to fail validation"));
+            assert!(
+                err.contains("at least 64x64"),
+                "expected too-small error for {s}, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_image_gen_rejects_too_large_size() {
+        for s in ["2049x2048", "2048x2049", "99999x99999", "4096x4096"] {
+            let err = image_gen_req_with_size(Some(s))
+                .validate()
+                .expect_err(&format!("expected {s} to fail validation"));
+            assert!(
+                err.contains("at most 2048x2048"),
+                "expected too-large error for {s}, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_image_gen_rejects_zero_dimension() {
+        let err = image_gen_req_with_size(Some("0x512"))
+            .validate()
+            .unwrap_err();
+        assert!(
+            err.contains("greater than zero"),
+            "expected greater-than-zero error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_image_gen_rejects_bad_size_format() {
+        for s in ["foo", "1024", "1024x", "ax1024", "1024 x 1024"] {
+            assert!(
+                image_gen_req_with_size(Some(s)).validate().is_err(),
+                "expected {s:?} to fail validation"
+            );
+        }
     }
 }
 

@@ -142,7 +142,6 @@ pub fn extract_error_message(body: &str) -> String {
     body.to_string()
 }
 
-
 /// Type alias for streaming completion results
 ///
 /// This represents a stream of SSE events where each event contains:

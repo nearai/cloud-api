@@ -314,6 +314,17 @@ pub fn convert_messages(
 // may be accepted in some forms, and stripping it would silently change the
 // caller's intended semantics (negation vs no constraint). If a request with
 // `not` is rejected by Gemini in practice, add it here.
+//
+// TODO(follow-up): stripping `$ref` and `$defs` silently degrades
+// pydantic-style schemas with nested models to untyped objects (the model loses
+// all argument type signal for referenced fields). A future enhancement could
+// inline `$defs`/`$ref` before stripping to preserve fidelity.
+//
+// TODO(follow-up): `{"const": X}` could be rewritten to `{"enum": [X]}` rather
+// than stripped — Gemini accepts `enum`, preserving the original constraint.
+// Same pattern would apply to `{"type": [..., "null"]}` unions which OpenAI
+// clients sometimes emit but Gemini's OpenAPI subset doesn't accept.
+// Both are out of scope for this PR (which just stops the 400s).
 const GEMINI_UNSUPPORTED_SCHEMA_KEYS: &[&str] = &[
     // OpenAPI / JSON Schema validation keywords Gemini does not implement
     // (alphabetized within group)
@@ -354,13 +365,40 @@ const GEMINI_UNSUPPORTED_SCHEMA_KEYS: &[&str] = &[
 /// `GEMINI_UNSUPPORTED_SCHEMA_KEYS`, then recurses into the surviving values
 /// and any array elements. This handles nested schemas (e.g. inside
 /// `properties`, `items`, `anyOf`) at arbitrary depth.
+///
+/// Special case: keys inside `properties` (and equivalent maps like `$defs`,
+/// `definitions`, `patternProperties`, `dependentSchemas`) are **user-defined
+/// parameter names**, not schema keywords. A tool can legitimately have a
+/// parameter named `const` or `examples`. We must NOT strip those keys — we
+/// only descend into their *values* (which are sub-schemas). Without this,
+/// `{"properties": {"const": {"type": "string"}}}` would lose the `const`
+/// parameter entirely. Reported by gemini-code-assist on PR #610.
 fn sanitize_schema_for_gemini(value: &mut serde_json::Value) {
+    // Maps whose keys are user-defined names (not schema keywords). For these,
+    // we only sanitize the values, never the key set.
+    const USER_NAMED_KEY_MAPS: &[&str] = &[
+        "properties",
+        "$defs",
+        "definitions",
+        "patternProperties",
+        "dependentSchemas",
+    ];
+
     match value {
         serde_json::Value::Object(map) => {
             for key in GEMINI_UNSUPPORTED_SCHEMA_KEYS {
                 map.remove(*key);
             }
-            for v in map.values_mut() {
+            for (k, v) in map.iter_mut() {
+                if USER_NAMED_KEY_MAPS.contains(&k.as_str()) {
+                    // The map's keys are parameter names; only recurse into values.
+                    if let Some(inner) = v.as_object_mut() {
+                        for inner_v in inner.values_mut() {
+                            sanitize_schema_for_gemini(inner_v);
+                        }
+                        continue;
+                    }
+                }
                 sanitize_schema_for_gemini(v);
             }
         }
@@ -750,6 +788,66 @@ mod tests {
             .as_object()
             .unwrap()
             .contains_key("additionalProperties"));
+    }
+
+    #[test]
+    fn test_sanitize_schema_does_not_strip_parameter_names_matching_keywords() {
+        // Regression: if a tool's `properties` map has a key that happens to
+        // match an unsupported schema keyword (e.g. a parameter literally named
+        // `const` or `examples`), the sanitizer must NOT remove it — those are
+        // parameter names, not schema keywords. Reported by gemini-code-assist
+        // on PR #610.
+        let mut schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "const": { "type": "string", "description": "A parameter literally named const" },
+                "examples": { "type": "array", "items": {"type": "string"} },
+                "if": { "type": "boolean" },
+                "normal_param": { "type": "string" }
+            },
+            "required": ["const", "examples", "if", "normal_param"]
+        });
+        sanitize_schema_for_gemini(&mut schema);
+        let props = schema["properties"].as_object().unwrap();
+        assert!(
+            props.contains_key("const"),
+            "parameter named 'const' was incorrectly stripped from properties"
+        );
+        assert!(
+            props.contains_key("examples"),
+            "parameter named 'examples' was incorrectly stripped from properties"
+        );
+        assert!(
+            props.contains_key("if"),
+            "parameter named 'if' was incorrectly stripped from properties"
+        );
+        assert!(props.contains_key("normal_param"));
+        // required[] entries are strings, never recursed into — always preserved
+        let required = schema["required"].as_array().unwrap();
+        assert_eq!(required.len(), 4);
+    }
+
+    #[test]
+    fn test_sanitize_schema_still_strips_unsupported_keywords_inside_property_schemas() {
+        // Companion to the test above: the FIX must not over-correct. Inside
+        // each property's own schema, unsupported keywords (e.g. const at the
+        // value level) MUST still be stripped.
+        let mut schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "const": "delete"  // schema keyword inside a property's value
+                }
+            }
+        });
+        sanitize_schema_for_gemini(&mut schema);
+        let action = &schema["properties"]["action"];
+        assert_eq!(action["type"], "string");
+        assert!(
+            !action.as_object().unwrap().contains_key("const"),
+            "`const` inside a property's schema should still be stripped"
+        );
     }
 
     #[test]

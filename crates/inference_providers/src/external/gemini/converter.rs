@@ -376,6 +376,13 @@ const GEMINI_UNSUPPORTED_SCHEMA_KEYS: &[&str] = &[
 fn sanitize_schema_for_gemini(value: &mut serde_json::Value) {
     // Maps whose keys are user-defined names (not schema keywords). For these,
     // we only sanitize the values, never the key set.
+    //
+    // Note: only `properties` is currently functionally active here. The other
+    // four are themselves in `GEMINI_UNSUPPORTED_SCHEMA_KEYS` and get stripped
+    // before the iter_mut() loop below ever sees them. They are listed here
+    // defensively so that if a future Gemini revision starts accepting them
+    // and they are removed from the unsupported list, the user-name protection
+    // automatically applies without a separate code change.
     const USER_NAMED_KEY_MAPS: &[&str] = &[
         "properties",
         "$defs",
@@ -398,6 +405,9 @@ fn sanitize_schema_for_gemini(value: &mut serde_json::Value) {
                         }
                         continue;
                     }
+                    // Fall through to regular recursion if the value isn't an
+                    // object (malformed schema); the general path handles
+                    // non-objects safely via the `_ => {}` arm.
                 }
                 sanitize_schema_for_gemini(v);
             }
@@ -825,6 +835,39 @@ mod tests {
         // required[] entries are strings, never recursed into — always preserved
         let required = schema["required"].as_array().unwrap();
         assert_eq!(required.len(), 4);
+    }
+
+    #[test]
+    fn test_sanitize_schema_preserves_parameter_names_nested_deeply() {
+        // The user-named-key protection must apply at every level of nesting,
+        // not just at the outermost `properties`. Verifies that a parameter
+        // named `if` nested two levels deep inside another object parameter
+        // survives sanitization.
+        let mut schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "outer_param": {
+                    "type": "object",
+                    "properties": {
+                        "if": { "type": "string" },
+                        "const": { "type": "boolean" }
+                    },
+                    "required": ["if"]
+                }
+            }
+        });
+        sanitize_schema_for_gemini(&mut schema);
+        let inner_props = schema["properties"]["outer_param"]["properties"]
+            .as_object()
+            .unwrap();
+        assert!(
+            inner_props.contains_key("if"),
+            "deeply-nested parameter 'if' was incorrectly stripped"
+        );
+        assert!(
+            inner_props.contains_key("const"),
+            "deeply-nested parameter 'const' was incorrectly stripped"
+        );
     }
 
     #[test]

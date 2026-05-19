@@ -61,7 +61,7 @@ sha2 = "0.11"
 base64 = "0.22.1"
 dotenvy = "0.15.7"
 k256 = { version = "0.13", features = ["ecdsa", "arithmetic"] }
-sha3 = "0.11"
+sha3 = "0.12"
 hmac = "0.13"
 tokio-postgres = "0.7"
 deadpool-postgres = { version = "0.14", features = ["rt_tokio_1"] }

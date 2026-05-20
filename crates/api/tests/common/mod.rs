@@ -19,11 +19,12 @@ use database::Database;
 pub use services::auth::ports::MOCK_USER_AGENT;
 use services::auth::AccessTokenClaims;
 use services::responses::tools::{
-    WebSearchError, WebSearchParams, WebSearchProviderTrait, WebSearchResult,
+    WebContextSearchParams, WebContextSearchProviderTrait, WebSearchError, WebSearchParams,
+    WebSearchProviderTrait, WebSearchResult,
 };
 use services::usage::ModelPricing;
 use sha2::{Digest, Sha256};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 #[cfg(test)]
 use ed25519_dalek::{Signature as Ed25519Signature, VerifyingKey as Ed25519VerifyingKey};
@@ -244,25 +245,72 @@ impl WebSearchProviderTrait for MockWebSearchProvider {
     }
 }
 
-async fn build_test_server_components_with_mock_web_search(
+/// Mock web context search provider for Responses e2e tests.
+pub struct MockWebContextSearchProvider {
+    results: Vec<WebSearchResult>,
+    last_params: Arc<Mutex<Option<WebContextSearchParams>>>,
+}
+
+impl MockWebContextSearchProvider {
+    pub fn new(results: Vec<WebSearchResult>) -> Self {
+        Self {
+            results,
+            last_params: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    pub fn default_results() -> Self {
+        Self::new(vec![WebSearchResult {
+            title: "Mock Context Result".to_string(),
+            url: "https://example.com/context".to_string(),
+            snippet: "Longer source context from mock Brave LLM Context search.".to_string(),
+        }])
+    }
+
+    pub fn last_params(&self) -> Arc<Mutex<Option<WebContextSearchParams>>> {
+        self.last_params.clone()
+    }
+}
+
+#[async_trait]
+impl WebContextSearchProviderTrait for MockWebContextSearchProvider {
+    async fn search_context(
+        &self,
+        params: WebContextSearchParams,
+    ) -> Result<Vec<WebSearchResult>, WebSearchError> {
+        let mut guard = self
+            .last_params
+            .lock()
+            .expect("mock context search params lock poisoned");
+        *guard = Some(params);
+        Ok(self.results.clone())
+    }
+}
+
+async fn build_test_server_components_with_search_providers(
     database: Arc<Database>,
     config: ApiConfig,
     web_search_provider: Arc<dyn WebSearchProviderTrait>,
-) -> axum_test::TestServer {
+    web_context_search_provider: Option<Arc<dyn WebContextSearchProviderTrait>>,
+) -> (
+    axum_test::TestServer,
+    Arc<inference_providers::mock::MockProvider>,
+) {
     assert_mock_user_in_db(&database).await;
 
     let auth_components = init_auth_services(database.clone(), &config);
 
-    let (inference_provider_pool, _mock_provider) =
+    let (inference_provider_pool, mock_provider) =
         api::init_inference_providers_with_mocks(&config).await;
     let metrics_service = Arc::new(services::metrics::MockMetricsService);
-    let domain_services = api::init_domain_services_with_pool_and_web_search_provider(
+    let domain_services = api::init_domain_services_with_pool_and_search_providers(
         database.clone(),
         &config,
         auth_components.organization_service.clone(),
         inference_provider_pool,
         metrics_service,
         web_search_provider,
+        web_context_search_provider,
     )
     .await;
 
@@ -272,7 +320,17 @@ async fn build_test_server_components_with_mock_web_search(
         domain_services,
         Arc::new(config),
     );
-    axum_test::TestServer::new(app)
+    (axum_test::TestServer::new(app), mock_provider)
+}
+
+async fn build_test_server_components_with_mock_web_search(
+    database: Arc<Database>,
+    config: ApiConfig,
+    web_search_provider: Arc<dyn WebSearchProviderTrait>,
+) -> axum_test::TestServer {
+    build_test_server_components_with_search_providers(database, config, web_search_provider, None)
+        .await
+        .0
 }
 
 /// Setup test server with mock web search provider (no Brave API calls). Use for web search billing tests.
@@ -298,6 +356,25 @@ pub async fn setup_test_server_with_web_search_provider(
     )
     .await;
     (server, infra.database)
+}
+
+pub async fn setup_test_server_with_search_providers(
+    web_search_provider: Arc<dyn WebSearchProviderTrait>,
+    web_context_search_provider: Option<Arc<dyn WebContextSearchProviderTrait>>,
+) -> (
+    axum_test::TestServer,
+    Arc<Database>,
+    Arc<inference_providers::mock::MockProvider>,
+) {
+    let infra = setup_test_infrastructure().await;
+    let (server, mock_provider) = build_test_server_components_with_search_providers(
+        infra.database.clone(),
+        infra.config,
+        web_search_provider,
+        web_context_search_provider,
+    )
+    .await;
+    (server, infra.database, mock_provider)
 }
 
 pub async fn setup_test_server() -> axum_test::TestServer {

@@ -28,6 +28,11 @@ pub use apply::TextRef;
 pub use placeholders::{RedactionMap, MAX_PLACEHOLDER_LEN};
 pub use stream_unredact::StreamUnredact;
 
+/// Default minimum confidence score for spans the privacy-filter returns.
+/// Re-exported so the `/v1/privacy/redact` handler can fill in the same
+/// threshold the auto-redact path uses when the client omits it.
+pub const DEFAULT_THRESHOLD_PUBLIC: f64 = detect::DEFAULT_THRESHOLD;
+
 use crate::completions::ports::CompletionMessage;
 use crate::inference_provider_pool::InferenceProviderPool;
 
@@ -154,6 +159,32 @@ async fn redact_messages_inner(
     }
     apply::write_back(messages, &refs, redacted);
     Ok(map)
+}
+
+/// Apply privacy-filter spans (parsed from a raw classify response) to a
+/// batch of texts. Returns one redacted string per input text, in the
+/// same order. Used by the `/v1/privacy/redact` endpoint after a passthrough
+/// classify call: the handler already has the response bytes for billing,
+/// and this function consumes them to perform the redaction locally.
+///
+/// Fails closed (returns `AutoRedactError::Internal`) on malformed spans
+/// or non-UTF-8 boundaries, so the caller must surface 5xx rather than
+/// pass the raw text through.
+pub fn apply_detected_spans(
+    texts: &[String],
+    response_bytes: &[u8],
+) -> Result<Vec<String>, AutoRedactError> {
+    let spans_per_text = detect::parse_response(response_bytes, texts.len())?;
+    let mut map = RedactionMap::new();
+    // Same haystack rule as redact_messages_inner: a minted dummy must
+    // not appear in any input fragment, so substring substitution stays
+    // unambiguous.
+    let haystack: String = texts.join("\u{0001}");
+    let mut out = Vec::with_capacity(texts.len());
+    for (text, spans) in texts.iter().zip(spans_per_text.iter()) {
+        out.push(apply::redact_one(text, spans, &mut map, &haystack)?);
+    }
+    Ok(out)
 }
 
 /// Strip the `auto_redact` field from a `ServiceCompletionRequest.extra`

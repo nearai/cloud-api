@@ -19,7 +19,7 @@ use crate::{
         billing::{get_billing_costs, BillingRouteState},
         completions::{
             audio_transcriptions, chat_completions, embeddings, image_edits, image_generations,
-            models, privacy_classify, rerank, score,
+            models, privacy_classify, privacy_redact, rerank, score,
         },
         conversations,
         health::health_check,
@@ -1013,6 +1013,12 @@ pub fn build_completion_routes(
         .route(
             "/privacy/classify",
             post(privacy_classify).layer(DefaultBodyLimit::max(PRIVACY_CLASSIFY_MAX_BODY_SIZE)),
+        )
+        // /privacy/redact runs a classify call under the hood, so the same
+        // 256 KB cap applies.
+        .route(
+            "/privacy/redact",
+            post(privacy_redact).layer(DefaultBodyLimit::max(PRIVACY_CLASSIFY_MAX_BODY_SIZE)),
         )
         .layer(DefaultBodyLimit::max(AUDIO_TRANSCRIPTION_MAX_BODY_SIZE))
         .with_state(app_state.clone())

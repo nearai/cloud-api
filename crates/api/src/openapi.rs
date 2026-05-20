@@ -50,6 +50,7 @@ use utoipa::{Modify, OpenApi};
         crate::routes::completions::rerank,
         crate::routes::completions::score,
         crate::routes::completions::privacy_classify,
+        crate::routes::completions::privacy_redact,
         // crate::routes::completions::completions,
         crate::routes::completions::models,
         // Model endpoints (public model catalog)

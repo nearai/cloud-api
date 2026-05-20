@@ -433,7 +433,14 @@ impl PoolBackendVerifier {
         // Drain the body so reqwest can reuse the underlying H2 connection
         // (see CLAUDE.md note on draining bytes before drop in the inference-proxy
         // / cloud-api auth retry pattern).
-        let _ = response.bytes().await;
+        //
+        // The drain is bounded by a separate 5s timeout (not the request.send()
+        // timeout above, which only covers headers). /v1/models returns a tiny
+        // static payload (~1 KB) that is typically already in the TCP receive
+        // buffer by the time headers arrive, so this completes instantly in
+        // practice. The explicit timeout guards against a misbehaving backend
+        // that sends headers quickly but stalls on the body.
+        let _ = tokio::time::timeout(Duration::from_secs(5), response.bytes()).await;
 
         Ok(client)
     }

@@ -420,28 +420,38 @@ impl PoolBackendVerifier {
         if let Some(ref key) = self.api_key {
             request = request.header("Authorization", format!("Bearer {key}"));
         }
-        let response = tokio::time::timeout(Duration::from_secs(5), request.send())
-            .await
-            .map_err(|_| "Fast-path probe timed out".to_string())?
-            .map_err(|e| format!("Fast-path probe failed: {e}"))?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-            return Err(format!("Fast-path probe HTTP {status}"));
-        }
-
-        // Drain the body so reqwest can reuse the underlying H2 connection
-        // (see CLAUDE.md note on draining bytes before drop in the inference-proxy
-        // / cloud-api auth retry pattern).
+        // Wrap the entire probe — request send, status check, and body drain —
+        // in a single 5-second timeout. A single budget is simpler and more
+        // correct than two separate timeouts: any stall anywhere in the probe
+        // should abort and fall through to the slow path within 5 s total.
         //
-        // The drain is bounded by a separate 5s timeout (not the request.send()
-        // timeout above, which only covers headers). /v1/models returns a tiny
-        // static payload (~1 KB) that is typically already in the TCP receive
-        // buffer by the time headers arrive, so this completes instantly in
-        // practice. The explicit timeout guards against a misbehaving backend
-        // that sends headers quickly but stalls on the body.
-        let _ = tokio::time::timeout(Duration::from_secs(5), response.bytes()).await;
+        // Body drain is required so reqwest can return the H2 stream to the
+        // connection pool for the subsequent inference request. /v1/models
+        // returns a tiny static payload (~1 KB) so this completes instantly
+        // in practice.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let response = request
+                .send()
+                .await
+                .map_err(|e| format!("Fast-path probe failed: {e}"))?;
+            if !response.status().is_success() {
+                let status = response.status();
+                return Err(format!("Fast-path probe HTTP {status}"));
+            }
+            response
+                .bytes()
+                .await
+                .map_err(|e| format!("Failed to drain probe body: {e}"))?;
+            Ok(())
+        })
+        .await
+        .map_err(|_| "Fast-path probe timed out".to_string())??;
 
+        // No fingerprint is added to the shared `fingerprint_state` here —
+        // the snapshot was already derived from it, so there is nothing new
+        // to pin. Discovery (every ~5 min) remains the sole writer of the
+        // shared state; contrast with the slow path's lines above that call
+        // `shared.add_fingerprint` after a fresh attestation.
         Ok(client)
     }
 }

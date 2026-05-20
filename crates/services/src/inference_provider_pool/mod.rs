@@ -236,6 +236,43 @@ struct PoolBackendVerifier {
 #[async_trait::async_trait]
 impl inference_providers::BackendVerifier for PoolBackendVerifier {
     async fn create_verified_client(&self, base_url: &str) -> Result<reqwest::Client, String> {
+        // Fast path: if discovery has already pinned fingerprints for this
+        // model's backends, skip the per-bucket attestation round-trip. The
+        // shared `fingerprint_state` is updated every discovery cycle (~5 min)
+        // with fresh GPU evidence; that cadence is the right freshness signal
+        // for the attestation chain. Per-bucket re-attestation is redundant
+        // work that adds ~1-3s of cold-bucket tail latency for no security
+        // benefit — TLS SPKI pinning already proves backend identity continuity.
+        //
+        // The probe uses `GET /v1/models` (cheap static response) rather than
+        // `/v1/attestation/report` (triggers backend-side GPU evidence
+        // collection and signing).
+        let pinned_snapshot = {
+            let guard = self
+                .fingerprint_state
+                .read()
+                .unwrap_or_else(|e| e.into_inner());
+            guard.clone()
+        };
+        if pinned_snapshot.pinned_count() > 0 {
+            match self
+                .try_pinned_fast_path(base_url, pinned_snapshot)
+                .await
+            {
+                Ok(client) => return Ok(client),
+                Err(reason) => {
+                    tracing::debug!(
+                        reason = %reason,
+                        "Fast-path TLS probe failed, falling back to full attestation"
+                    );
+                }
+            }
+        }
+
+        // Slow path: no pinned fingerprints yet, or the fast-path probe failed
+        // (unknown backend, TLS rejection, or HTTP error). Run the full
+        // attestation chain.
+        //
         // 1. Build a client with isolated Bootstrap state (accepts any WebPKI cert
         //    for the initial connection to discover the backend's fingerprint).
         // read_timeout is the per-chunk idle timeout; for non-streaming chat
@@ -336,6 +373,68 @@ impl inference_providers::BackendVerifier for PoolBackendVerifier {
 
         // 5. Return the client — its H2 connection is to the verified backend,
         //    and its TLS verifier only accepts that backend on reconnection.
+        Ok(client)
+    }
+}
+
+impl PoolBackendVerifier {
+    /// Fast path for `create_verified_client` when discovery has already pinned
+    /// fingerprints for this model's backends.
+    ///
+    /// Builds a client seeded with the snapshot of known-good fingerprints,
+    /// then sends a cheap `GET /v1/models` request to validate via TLS handshake
+    /// that the backend's cert SPKI is in the pinned set. On success, returns
+    /// the established client without fetching attestation. On TLS rejection
+    /// (unknown backend) or HTTP error, returns Err so the caller can fall
+    /// back to the full attestation path.
+    ///
+    /// The H2 connection sits inside the returned client's pool. Subsequent
+    /// requests on the same `reqwest::Client` reuse it. If the H2 connection
+    /// drops and reqwest reconnects, the TLS verifier accepts any cert whose
+    /// SPKI is in the snapshot — meaning a reconnect *can* land on a different
+    /// attested backend. This is a deliberate relaxation of the prior
+    /// "narrowed to one fingerprint per bucket" behavior: both backends are
+    /// attested, so a cross-backend reconnect is secure even if it costs a
+    /// prefix-cache miss on that one request. Avoiding the attestation chain
+    /// on every cold-bucket-fill is worth that tradeoff.
+    async fn try_pinned_fast_path(
+        &self,
+        base_url: &str,
+        pinned_snapshot: FingerprintState,
+    ) -> Result<reqwest::Client, String> {
+        let read_timeout =
+            Duration::from_secs(VLlmConfig::completion_timeout_from_env().max(0) as u64);
+        let client_state = Arc::new(std::sync::RwLock::new(pinned_snapshot));
+        let builder = reqwest::Client::builder()
+            .use_preconfigured_tls(self.tls_roots.build_config(client_state))
+            .pool_max_idle_per_host(1)
+            .http2_adaptive_window(true)
+            .connect_timeout(Duration::from_secs(5))
+            .read_timeout(read_timeout);
+        let client = inference_providers::bucket_keepalive::apply(builder)
+            .build()
+            .map_err(|e| format!("Failed to build HTTP client: {e}"))?;
+
+        let url = format!("{base_url}/v1/models");
+        let mut request = client.get(&url);
+        if let Some(ref key) = self.api_key {
+            request = request.header("Authorization", format!("Bearer {key}"));
+        }
+        let response = tokio::time::timeout(Duration::from_secs(5), request.send())
+            .await
+            .map_err(|_| "Fast-path probe timed out".to_string())?
+            .map_err(|e| format!("Fast-path probe failed: {e}"))?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            return Err(format!("Fast-path probe HTTP {status}"));
+        }
+
+        // Drain the body so reqwest can reuse the underlying H2 connection
+        // (see CLAUDE.md note on draining bytes before drop in the inference-proxy
+        // / cloud-api auth retry pattern).
+        let _ = response.bytes().await;
+
         Ok(client)
     }
 }

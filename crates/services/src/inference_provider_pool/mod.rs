@@ -255,10 +255,7 @@ impl inference_providers::BackendVerifier for PoolBackendVerifier {
             guard.clone()
         };
         if pinned_snapshot.pinned_count() > 0 {
-            match self
-                .try_pinned_fast_path(base_url, pinned_snapshot)
-                .await
-            {
+            match self.try_pinned_fast_path(base_url, pinned_snapshot).await {
                 Ok(client) => return Ok(client),
                 Err(reason) => {
                     tracing::debug!(

@@ -96,6 +96,67 @@ impl WebSearchParams {
     }
 }
 
+/// Parameters for context-optimized web search
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct WebContextSearchParams {
+    /// The user's search query term (required)
+    pub query: String,
+
+    /// The search query country (2 character country code, e.g., "US", "GB")
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub country: Option<String>,
+
+    /// The search language preference (2+ character language code, e.g., "en", "es")
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub search_lang: Option<String>,
+
+    /// Freshness filter: "pd" (24h), "pw" (7d), "pm" (31d), "py" (365d), or "YYYY-MM-DDtoYYYY-MM-DD"
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub freshness: Option<String>,
+
+    /// Whether Brave should apply spellcheck to the query
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub spellcheck: Option<bool>,
+
+    /// Maximum number of search results Brave should consider
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub count: Option<u32>,
+
+    /// Maximum number of URLs to include in the context response
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub maximum_number_of_urls: Option<u32>,
+
+    /// Approximate maximum number of tokens to include in context
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub maximum_number_of_tokens: Option<u32>,
+
+    /// Maximum number of snippets to include across all URLs
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub maximum_number_of_snippets: Option<u32>,
+
+    /// Maximum number of tokens to include per URL
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub maximum_number_of_tokens_per_url: Option<u32>,
+
+    /// Maximum number of snippets to include per URL
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub maximum_number_of_snippets_per_url: Option<u32>,
+
+    /// Relevance threshold mode: "disabled", "strict", "balanced", or "lenient"
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_threshold_mode: Option<String>,
+}
+
+impl WebContextSearchParams {
+    /// Create a new WebContextSearchParams with just a query
+    pub fn new(query: impl Into<String>) -> Self {
+        Self {
+            query: query.into(),
+            ..Default::default()
+        }
+    }
+}
+
 /// Result from a file search
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileSearchResult {
@@ -119,6 +180,16 @@ pub trait WebSearchProviderTrait: Send + Sync {
     /// Perform a web search with the given parameters
     async fn search(&self, params: WebSearchParams)
         -> Result<Vec<WebSearchResult>, WebSearchError>;
+}
+
+/// Context-optimized web search provider trait
+#[async_trait]
+pub trait WebContextSearchProviderTrait: Send + Sync {
+    /// Perform a context-optimized web search with the given parameters
+    async fn search_context(
+        &self,
+        params: WebContextSearchParams,
+    ) -> Result<Vec<WebSearchResult>, WebSearchError>;
 }
 
 #[derive(Debug, thiserror::Error)]

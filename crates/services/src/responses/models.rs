@@ -271,6 +271,8 @@ pub enum ResponseTool {
         #[serde(skip_serializing_if = "Option::is_none")]
         user_location: Option<UserLocation>,
     },
+    #[serde(rename = "web_context_search")]
+    WebContextSearch {},
     #[serde(rename = "file_search")]
     FileSearch {},
     #[serde(rename = "code_interpreter")]

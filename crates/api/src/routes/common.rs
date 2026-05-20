@@ -4,6 +4,16 @@ use services::completions::CompletionError;
 use services::organization::OrganizationError;
 use uuid::Uuid;
 
+/// HTTP 529 "Site Is Overloaded" — non-standard but widely used (Cloudflare,
+/// Anthropic) for "all backends exhausted; please retry with exponential
+/// backoff." Surfaced when `retry_with_fallback` has tried every inference
+/// backend for a model and they all rejected with 5xx — typically SGLang
+/// `--max-queued-requests` 503s under load. 503 stays reserved for narrower
+/// per-handler "this dependency is down" cases.
+pub fn status_overloaded() -> StatusCode {
+    StatusCode::from_u16(529).expect("529 is a valid HTTP status code")
+}
+
 /// Map domain errors to HTTP status codes
 pub fn map_domain_error_to_status(error: &CompletionError) -> StatusCode {
     match error {
@@ -14,7 +24,7 @@ pub fn map_domain_error_to_status(error: &CompletionError) -> StatusCode {
         CompletionError::ProviderError { status_code, .. } => {
             StatusCode::from_u16(*status_code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR)
         }
-        CompletionError::ServiceOverloaded(_) => StatusCode::SERVICE_UNAVAILABLE,
+        CompletionError::ServiceOverloaded(_) => status_overloaded(),
         CompletionError::InternalError(_) => StatusCode::INTERNAL_SERVER_ERROR,
     }
 }
@@ -539,10 +549,7 @@ mod tests {
     #[test]
     fn test_map_domain_error_service_overloaded() {
         let error = CompletionError::ServiceOverloaded("overloaded".to_string());
-        assert_eq!(
-            map_domain_error_to_status(&error),
-            StatusCode::SERVICE_UNAVAILABLE
-        );
+        assert_eq!(map_domain_error_to_status(&error).as_u16(), 529);
     }
 
     #[test]

@@ -25,6 +25,10 @@ pub const CODE_INTERPRETER_TOOL_NAME: &str = "code_interpreter";
 /// Tool name for computer use
 pub const COMPUTER_TOOL_NAME: &str = "computer";
 
+fn is_search_tool_name(tool_name: &str) -> bool {
+    tool_name == super::WEB_SEARCH_TOOL_NAME || tool_name == super::WEB_CONTEXT_SEARCH_TOOL_NAME
+}
+
 /// Extract tool names from request tools configuration
 ///
 /// Returns a list of tool names that can be used to infer tool names when
@@ -37,6 +41,9 @@ pub fn get_tool_names(request: &CreateResponseRequest) -> Vec<String> {
             match tool {
                 ResponseTool::WebSearch { .. } => {
                     names.push(super::WEB_SEARCH_TOOL_NAME.to_string());
+                }
+                ResponseTool::WebContextSearch {} => {
+                    names.push(super::WEB_CONTEXT_SEARCH_TOOL_NAME.to_string());
                 }
                 ResponseTool::FileSearch {} => {
                     names.push(super::FILE_SEARCH_TOOL_NAME.to_string());
@@ -116,6 +123,25 @@ pub fn prepare_tools(request: &CreateResponseRequest) -> Vec<inference_providers
                                 \n- Use 'safesearch' when dealing with sensitive topics".to_string()
                             ),
                             parameters: super::web_search_parameters_schema(),
+                        },
+                    });
+                }
+                ResponseTool::WebContextSearch {} => {
+                    tool_definitions.push(inference_providers::ToolDefinition {
+                        type_: "function".to_string(),
+                        function: inference_providers::FunctionDefinition {
+                            name: super::WEB_CONTEXT_SEARCH_TOOL_NAME.to_string(),
+                            description: Some(
+                                "Search the web and return extracted source context optimized for grounding model answers. \
+                                Use this when deeper source passages are more useful than short search-result snippets. \
+                                \n\nIMPORTANT PARAMETERS TO CONSIDER:\
+                                \n- Use 'freshness' for time-sensitive queries (news, recent events, current trends)\
+                                \n- Use 'country' for location-specific information\
+                                \n- Use 'count' and 'maximum_number_of_urls' to control breadth\
+                                \n- Use 'maximum_number_of_tokens', 'maximum_number_of_snippets', and per-URL limits to control context size\
+                                \n- Use 'context_threshold_mode' as disabled, strict, balanced, or lenient".to_string()
+                            ),
+                            parameters: super::web_context_search_parameters_schema(),
                         },
                     });
                 }
@@ -415,8 +441,8 @@ fn parse_tool_args(tool_name: &str, args_str: &str) -> ParseArgsResult {
         return ParseArgsResult::Ok(args);
     }
 
-    // Only attempt repair for web_search
-    if tool_name != super::WEB_SEARCH_TOOL_NAME {
+    // Only attempt repair for server-side search tools.
+    if !is_search_tool_name(tool_name) {
         return ParseArgsResult::Failed;
     }
 
@@ -644,8 +670,69 @@ pub fn convert_tool_calls(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::responses::models::CreateResponseRequest;
     use crate::responses::service_helpers::ToolCallAccumulatorEntry;
     use std::collections::HashMap;
+
+    fn request_with_tools(tools: Vec<ResponseTool>) -> CreateResponseRequest {
+        CreateResponseRequest {
+            model: "test".to_string(),
+            input: None,
+            instructions: None,
+            conversation: None,
+            previous_response_id: None,
+            max_output_tokens: None,
+            max_tool_calls: None,
+            temperature: None,
+            top_p: None,
+            stream: None,
+            store: None,
+            background: None,
+            tools: Some(tools),
+            tool_choice: None,
+            parallel_tool_calls: None,
+            reasoning: None,
+            include: None,
+            metadata: None,
+            safety_identifier: None,
+            prompt_cache_key: None,
+        }
+    }
+
+    #[test]
+    fn test_get_tool_names_includes_web_context_search() {
+        let request = request_with_tools(vec![ResponseTool::WebContextSearch {}]);
+
+        let names = get_tool_names(&request);
+
+        assert_eq!(
+            names,
+            vec![crate::responses::tools::WEB_CONTEXT_SEARCH_TOOL_NAME.to_string()]
+        );
+    }
+
+    #[test]
+    fn test_prepare_tools_includes_web_context_search_definition() {
+        let request = request_with_tools(vec![ResponseTool::WebContextSearch {}]);
+
+        let tools = prepare_tools(&request);
+
+        assert_eq!(tools.len(), 1);
+        assert_eq!(
+            tools[0].function.name,
+            crate::responses::tools::WEB_CONTEXT_SEARCH_TOOL_NAME
+        );
+        assert_eq!(
+            tools[0]
+                .function
+                .parameters
+                .get("required")
+                .and_then(|value| value.as_array())
+                .and_then(|values| values.first())
+                .and_then(|value| value.as_str()),
+            Some("query")
+        );
+    }
 
     #[test]
     fn test_try_repair_json_valid_json() {
@@ -845,6 +932,26 @@ mod tests {
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].id, Some("call_456".to_string()));
         assert_eq!(result[0].tool_type, "web_search");
+        assert_eq!(result[0].query, "Bitcoin price");
+    }
+
+    #[test]
+    fn test_convert_tool_calls_repairs_context_search_truncated_json() {
+        let mut accumulator = HashMap::new();
+        accumulator.insert(
+            0,
+            ToolCallAccumulatorEntry {
+                id: Some("call_context".to_string()),
+                name: Some("web_context_search".to_string()),
+                arguments: r#"{"query": "Bitcoin price", "freshness":"#.to_string(),
+                thought_signature: None,
+            },
+        );
+
+        let result = convert_tool_calls(accumulator, "test-model", &[], &[]);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].id, Some("call_context".to_string()));
+        assert_eq!(result[0].tool_type, "web_context_search");
         assert_eq!(result[0].query, "Bitcoin price");
     }
 

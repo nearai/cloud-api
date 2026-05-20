@@ -1143,6 +1143,8 @@ pub enum ResponseTool {
     },
     #[serde(rename = "web_search")]
     WebSearch {},
+    #[serde(rename = "web_context_search")]
+    WebContextSearch {},
     #[serde(rename = "file_search")]
     FileSearch {},
     #[serde(rename = "code_interpreter")]

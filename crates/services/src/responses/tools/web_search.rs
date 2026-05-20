@@ -4,7 +4,7 @@
 
 use async_trait::async_trait;
 use serde_json::{json, Value};
-use std::sync::Arc;
+use std::{sync::Arc, time::Instant};
 
 use super::executor::{ToolEventContext, ToolExecutionContext, ToolExecutor, ToolOutput};
 use super::ports::{WebSearchParams, WebSearchProviderTrait, WebSearchResult};
@@ -300,12 +300,42 @@ impl ToolExecutor for WebSearchToolExecutor {
         _context: &ToolExecutionContext<'_>,
     ) -> Result<ToolOutput, ResponseError> {
         let search_params = Self::parse_params(tool_call);
+        let started_at = Instant::now();
+        let tool_call_id = tool_call.id.as_deref().unwrap_or("unknown");
 
-        let sources = self
-            .provider
-            .search(search_params)
-            .await
-            .map_err(|e| ResponseError::InternalError(format!("Web search failed: {e}")))?;
+        tracing::info!(
+            tool_name = WEB_SEARCH_TOOL_NAME,
+            tool_call_id,
+            model = %_context.request.model,
+            requested_count = search_params.count.unwrap_or(WEB_SEARCH_MAX_COUNT),
+            "Web search tool started"
+        );
+
+        let sources = self.provider.search(search_params).await.map_err(|error| {
+            let error_category = super::web_search_error_category(&error);
+            tracing::warn!(
+                tool_name = WEB_SEARCH_TOOL_NAME,
+                tool_call_id,
+                model = %_context.request.model,
+                error_category,
+                elapsed_ms = started_at.elapsed().as_millis() as u64,
+                "Web search tool failed"
+            );
+            ResponseError::InternalError(format!("Web search failed: {error_category}"))
+        })?;
+
+        let (snippet_count, total_snippet_chars) = super::web_search_result_stats(&sources);
+        tracing::info!(
+            tool_name = WEB_SEARCH_TOOL_NAME,
+            tool_call_id,
+            model = %_context.request.model,
+            result_count = sources.len(),
+            snippet_count,
+            total_snippet_chars,
+            empty_result = sources.is_empty(),
+            elapsed_ms = started_at.elapsed().as_millis() as u64,
+            "Web search tool completed"
+        );
 
         Ok(ToolOutput::WebSearch { sources })
     }

@@ -1824,9 +1824,9 @@ pub async fn audio_transcriptions(
                 services::completions::ports::CompletionError::ServiceOverloaded(_) => {
                     tracing::warn!("Audio transcription service overloaded");
                     (
-                        StatusCode::SERVICE_UNAVAILABLE,
+                        crate::routes::common::status_overloaded(),
                         "service_overloaded",
-                        "The service is temporarily overloaded. Please retry with exponential backoff.".to_string(),
+                        "All inference backends are overloaded. Please retry with exponential backoff.".to_string(),
                     )
                 }
                 _ => {
@@ -2485,9 +2485,9 @@ pub async fn rerank(
                 services::completions::ports::CompletionError::ServiceOverloaded(_) => {
                     tracing::warn!("Rerank service overloaded");
                     (
-                        StatusCode::SERVICE_UNAVAILABLE,
+                        crate::routes::common::status_overloaded(),
                         "service_overloaded",
-                        "The service is temporarily overloaded. Please retry with exponential backoff.".to_string(),
+                        "All inference backends are overloaded. Please retry with exponential backoff.".to_string(),
                     )
                 }
                 _ => {
@@ -2781,9 +2781,9 @@ pub async fn embeddings(
                 services::completions::ports::CompletionError::ServiceOverloaded(_) => {
                     tracing::warn!("Embeddings service overloaded");
                     (
-                        StatusCode::SERVICE_UNAVAILABLE,
+                        crate::routes::common::status_overloaded(),
                         "service_overloaded",
-                        "The service is temporarily overloaded. Please retry with exponential backoff.".to_string(),
+                        "All inference backends are overloaded. Please retry with exponential backoff.".to_string(),
                     )
                 }
                 _ => {
@@ -3095,9 +3095,9 @@ pub async fn privacy_classify(
                 services::completions::ports::CompletionError::ServiceOverloaded(_) => {
                     tracing::warn!("Privacy classify service overloaded");
                     (
-                        StatusCode::SERVICE_UNAVAILABLE,
+                        crate::routes::common::status_overloaded(),
                         "service_overloaded",
-                        "The service is temporarily overloaded. Please retry with exponential backoff.".to_string(),
+                        "All inference backends are overloaded. Please retry with exponential backoff.".to_string(),
                     )
                 }
                 _ => {
@@ -3378,9 +3378,9 @@ pub async fn score(
                 services::completions::ports::CompletionError::ServiceOverloaded(_) => {
                     tracing::warn!("Score service overloaded");
                     (
-                        StatusCode::SERVICE_UNAVAILABLE,
+                        crate::routes::common::status_overloaded(),
                         "service_overloaded",
-                        "The service is temporarily overloaded. Please retry with exponential backoff.".to_string(),
+                        "All inference backends are overloaded. Please retry with exponential backoff.".to_string(),
                     )
                 }
                 _ => {

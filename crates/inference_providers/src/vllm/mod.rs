@@ -1728,10 +1728,22 @@ mod tests {
 
         provider.prepare_tracing_headers(&mut headers, &mut extra);
 
-        assert!(!extra.contains_key(tracing_headers::REQUEST_ID), "x_request_id should be removed");
-        assert!(!extra.contains_key(tracing_headers::ORG_ID), "x_org_id should be removed");
-        assert!(!extra.contains_key(tracing_headers::WORKSPACE_ID), "x_workspace_id should be removed");
-        assert!(extra.contains_key("other_field"), "unrelated fields must be preserved");
+        assert!(
+            !extra.contains_key(tracing_headers::REQUEST_ID),
+            "x_request_id should be removed"
+        );
+        assert!(
+            !extra.contains_key(tracing_headers::ORG_ID),
+            "x_org_id should be removed"
+        );
+        assert!(
+            !extra.contains_key(tracing_headers::WORKSPACE_ID),
+            "x_workspace_id should be removed"
+        );
+        assert!(
+            extra.contains_key("other_field"),
+            "unrelated fields must be preserved"
+        );
     }
 
     #[test]
@@ -1754,9 +1766,18 @@ mod tests {
 
         provider.prepare_tracing_headers(&mut headers, &mut extra);
 
-        assert_eq!(headers.get("X-Request-Id").and_then(|v| v.to_str().ok()), Some("550e8400-e29b-41d4-a716-446655440000"));
-        assert_eq!(headers.get("X-Org-Id").and_then(|v| v.to_str().ok()), Some("aaaa-bbbb"));
-        assert_eq!(headers.get("X-Workspace-Id").and_then(|v| v.to_str().ok()), Some("cccc-dddd"));
+        assert_eq!(
+            headers.get("X-Request-Id").and_then(|v| v.to_str().ok()),
+            Some("550e8400-e29b-41d4-a716-446655440000")
+        );
+        assert_eq!(
+            headers.get("X-Org-Id").and_then(|v| v.to_str().ok()),
+            Some("aaaa-bbbb")
+        );
+        assert_eq!(
+            headers.get("X-Workspace-Id").and_then(|v| v.to_str().ok()),
+            Some("cccc-dddd")
+        );
     }
 
     #[test]

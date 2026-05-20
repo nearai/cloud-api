@@ -5,6 +5,7 @@ pub mod function;
 pub mod mcp;
 pub mod ports;
 pub mod tool_config;
+pub mod web_context_search;
 pub mod web_search;
 
 // Executor framework
@@ -24,6 +25,10 @@ pub use tool_config::{
 
 // Tool executors
 pub use file_search::{FileSearchToolExecutor, FILE_SEARCH_TOOL_NAME};
+pub use web_context_search::{
+    web_context_search_parameters_schema, WebContextSearchToolExecutor,
+    WEB_CONTEXT_SEARCH_TOOL_NAME,
+};
 pub use web_search::{
     web_search_parameters_schema, FormattedWebSearchResult, WebSearchToolExecutor,
     CITATION_INSTRUCTION, WEB_SEARCH_TOOL_NAME,
@@ -40,6 +45,7 @@ pub use mcp::{MockMcpClient, MockMcpClientFactory};
 
 // Provider traits and types
 pub use ports::{
-    FileSearchProviderTrait, FileSearchResult, WebSearchError, WebSearchParams,
-    WebSearchProviderTrait, WebSearchResult,
+    FileSearchProviderTrait, FileSearchResult, WebContextSearchParams,
+    WebContextSearchProviderTrait, WebSearchError, WebSearchParams, WebSearchProviderTrait,
+    WebSearchResult,
 };

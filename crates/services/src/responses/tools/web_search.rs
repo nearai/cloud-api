@@ -4,10 +4,10 @@
 
 use async_trait::async_trait;
 use serde_json::{json, Value};
-use std::sync::Arc;
+use std::{sync::Arc, time::Instant};
 
 use super::executor::{ToolEventContext, ToolExecutionContext, ToolExecutor, ToolOutput};
-use super::ports::{WebSearchParams, WebSearchProviderTrait, WebSearchResult};
+use super::ports::{WebSearchError, WebSearchParams, WebSearchProviderTrait, WebSearchResult};
 use crate::responses::errors::ResponseError;
 use crate::responses::models::{ResponseItemStatus, ResponseOutputItem, WebSearchAction};
 use crate::responses::service_helpers::ToolCallInfo;
@@ -34,6 +34,28 @@ fn create_web_search_item(
 }
 
 pub const WEB_SEARCH_TOOL_NAME: &str = "web_search";
+
+fn source_stats(sources: &[WebSearchResult]) -> (usize, usize) {
+    sources
+        .iter()
+        .fold((0, 0), |(snippet_count, total_chars), source| {
+            let has_snippet = !source.snippet.trim().is_empty();
+            (
+                snippet_count + usize::from(has_snippet),
+                total_chars + source.snippet.chars().count(),
+            )
+        })
+}
+
+fn search_error_category(error: &WebSearchError) -> &'static str {
+    match error {
+        WebSearchError::WebSearchRequestFailed(message) if message.starts_with("HTTP ") => {
+            "upstream_status"
+        }
+        WebSearchError::WebSearchRequestFailed(_) => "request",
+        WebSearchError::WebSearchResponseParsingFailed(_) => "parse",
+    }
+}
 
 /// Shared JSON Schema for Brave-backed web search parameters.
 /// Keep this in one place so MCP tool exposure and model-facing tool definitions stay aligned.
@@ -300,12 +322,42 @@ impl ToolExecutor for WebSearchToolExecutor {
         _context: &ToolExecutionContext<'_>,
     ) -> Result<ToolOutput, ResponseError> {
         let search_params = Self::parse_params(tool_call);
+        let started_at = Instant::now();
+        let tool_call_id = tool_call.id.as_deref().unwrap_or("unknown");
 
-        let sources = self
-            .provider
-            .search(search_params)
-            .await
-            .map_err(|e| ResponseError::InternalError(format!("Web search failed: {e}")))?;
+        tracing::info!(
+            tool_name = WEB_SEARCH_TOOL_NAME,
+            tool_call_id,
+            model = %_context.request.model,
+            requested_count = search_params.count.unwrap_or(WEB_SEARCH_MAX_COUNT),
+            "Web search tool started"
+        );
+
+        let sources = self.provider.search(search_params).await.map_err(|error| {
+            let error_category = search_error_category(&error);
+            tracing::warn!(
+                tool_name = WEB_SEARCH_TOOL_NAME,
+                tool_call_id,
+                model = %_context.request.model,
+                error_category,
+                elapsed_ms = started_at.elapsed().as_millis() as u64,
+                "Web search tool failed"
+            );
+            ResponseError::InternalError(format!("Web search failed: {error_category}"))
+        })?;
+
+        let (snippet_count, total_snippet_chars) = source_stats(&sources);
+        tracing::info!(
+            tool_name = WEB_SEARCH_TOOL_NAME,
+            tool_call_id,
+            model = %_context.request.model,
+            result_count = sources.len(),
+            snippet_count,
+            total_snippet_chars,
+            empty_result = sources.is_empty(),
+            elapsed_ms = started_at.elapsed().as_millis() as u64,
+            "Web search tool completed"
+        );
 
         Ok(ToolOutput::WebSearch { sources })
     }

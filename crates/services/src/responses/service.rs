@@ -58,6 +58,7 @@ pub struct ResponseServiceImpl {
     pub conversation_service: Arc<dyn ConversationServiceTrait>,
     pub completion_service: Arc<dyn CompletionServiceTrait>,
     pub web_search_provider: Option<Arc<dyn tools::WebSearchProviderTrait>>,
+    pub web_context_search_provider: Option<Arc<dyn tools::WebContextSearchProviderTrait>>,
     pub file_search_provider: Option<Arc<dyn tools::FileSearchProviderTrait>>,
     pub file_service: Arc<dyn FileServiceTrait>,
     pub organization_service: Arc<dyn crate::organization::OrganizationServiceTrait>,
@@ -82,6 +83,7 @@ impl ResponseServiceImpl {
         conversation_service: Arc<dyn ConversationServiceTrait>,
         completion_service: Arc<dyn CompletionServiceTrait>,
         web_search_provider: Option<Arc<dyn tools::WebSearchProviderTrait>>,
+        web_context_search_provider: Option<Arc<dyn tools::WebContextSearchProviderTrait>>,
         file_search_provider: Option<Arc<dyn tools::FileSearchProviderTrait>>,
         file_service: Arc<dyn FileServiceTrait>,
         organization_service: Arc<dyn crate::organization::OrganizationServiceTrait>,
@@ -93,6 +95,7 @@ impl ResponseServiceImpl {
             conversation_service,
             completion_service,
             web_search_provider,
+            web_context_search_provider,
             file_search_provider,
             file_service,
             organization_service,
@@ -109,6 +112,7 @@ impl ResponseServiceImpl {
         conversation_service: Arc<dyn ConversationServiceTrait>,
         completion_service: Arc<dyn CompletionServiceTrait>,
         web_search_provider: Option<Arc<dyn tools::WebSearchProviderTrait>>,
+        web_context_search_provider: Option<Arc<dyn tools::WebContextSearchProviderTrait>>,
         file_search_provider: Option<Arc<dyn tools::FileSearchProviderTrait>>,
         file_service: Arc<dyn FileServiceTrait>,
         organization_service: Arc<dyn crate::organization::OrganizationServiceTrait>,
@@ -121,6 +125,7 @@ impl ResponseServiceImpl {
             conversation_service,
             completion_service,
             web_search_provider,
+            web_context_search_provider,
             file_search_provider,
             file_service,
             organization_service,
@@ -173,6 +178,7 @@ impl ports::ResponseServiceTrait for ResponseServiceImpl {
         let completion_service = self.completion_service.clone();
         let conversation_service = self.conversation_service.clone();
         let web_search_provider = self.web_search_provider.clone();
+        let web_context_search_provider = self.web_context_search_provider.clone();
         let file_search_provider = self.file_search_provider.clone();
         let file_service = self.file_service.clone();
         let organization_service = self.organization_service.clone();
@@ -186,6 +192,10 @@ impl ports::ResponseServiceTrait for ResponseServiceImpl {
             let mut tool_registry = tools::ToolRegistry::new();
             if let Some(provider) = web_search_provider {
                 tool_registry.register(Arc::new(tools::WebSearchToolExecutor::new(provider)));
+            }
+            if let Some(provider) = web_context_search_provider {
+                tool_registry
+                    .register(Arc::new(tools::WebContextSearchToolExecutor::new(provider)));
             }
             if let Some(provider) = file_search_provider {
                 tool_registry.register(Arc::new(tools::FileSearchToolExecutor::new(provider)));

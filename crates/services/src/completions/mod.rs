@@ -2194,6 +2194,45 @@ mod tests {
         );
     }
 
+    /// Mirrors the cache shape used by `CompletionServiceImpl::org_concurrent_limits`
+    /// and `get_org_concurrent_limit`: `moka::future::Cache<Uuid, u32>` populated
+    /// via `get_with` (load-on-miss with the closure return becoming the cached
+    /// value). Asserts that `Cache::invalidate(&key)` forces the next `get_with`
+    /// call to re-run its loader — which is exactly the contract
+    /// `invalidate_org_concurrent_limit` relies on for admin PATCHes to take
+    /// effect immediately instead of waiting for the 5-minute TTL.
+    #[tokio::test]
+    async fn test_org_concurrent_limit_cache_invalidates() {
+        let cache: Cache<Uuid, u32> = Cache::builder()
+            .time_to_live(Duration::from_secs(ORG_LIMIT_CACHE_TTL_SECS))
+            .max_capacity(10_000)
+            .build();
+
+        let org_id = Uuid::new_v4();
+
+        // First load: repo returns 64 (default).
+        let v = cache.get_with(org_id, async { 64u32 }).await;
+        assert_eq!(v, 64);
+
+        // Second call with a different loader return — should still hit the
+        // cached 64 because the entry is alive.
+        let v = cache.get_with(org_id, async { 2u32 }).await;
+        assert_eq!(
+            v, 64,
+            "stale cached value should survive without invalidate"
+        );
+
+        // Simulate admin PATCH writing a new limit to the DB and the service
+        // invalidating the cache. After this, the next get_with must re-load.
+        cache.invalidate(&org_id).await;
+
+        let v = cache.get_with(org_id, async { 2u32 }).await;
+        assert_eq!(
+            v, 2,
+            "after invalidate, next get_with should run the loader and pick up the new value"
+        );
+    }
+
     #[tokio::test]
     async fn test_intercept_stream_decrements_on_drop() {
         // Test that InterceptStream decrements the counter when dropped

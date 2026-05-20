@@ -9,6 +9,7 @@ pub use analytics::{
 pub use ports::{PlatformServiceInfo, *};
 use std::sync::Arc;
 
+use crate::completions::CompletionServiceTrait;
 use crate::models::ModelsServiceTrait;
 
 pub struct AdminServiceImpl {
@@ -16,16 +17,22 @@ pub struct AdminServiceImpl {
     /// Used solely to invalidate the public `/v1/model/list` cache after
     /// admin writes that mutate the `models` or `model_aliases` tables.
     models_service: Arc<dyn ModelsServiceTrait>,
+    /// Used to invalidate the per-org concurrent-limit cache after a PATCH
+    /// to `/v1/admin/organizations/{org_id}/concurrent-limit`, so admin
+    /// changes take effect immediately instead of waiting for the 5-minute TTL.
+    completion_service: Arc<dyn CompletionServiceTrait>,
 }
 
 impl AdminServiceImpl {
     pub fn new(
         repository: Arc<dyn AdminRepository>,
         models_service: Arc<dyn ModelsServiceTrait>,
+        completion_service: Arc<dyn CompletionServiceTrait>,
     ) -> Self {
         Self {
             repository,
             models_service,
+            completion_service,
         }
     }
 }
@@ -309,7 +316,16 @@ impl AdminService for AdminServiceImpl {
                 } else {
                     AdminError::InternalError(error_msg)
                 }
-            })
+            })?;
+
+        // Drop the cached limit so the next request reads the freshly-written
+        // value. Without this, admin PATCHes only take effect after the
+        // 5-minute TTL expires.
+        self.completion_service
+            .invalidate_org_concurrent_limit(organization_id)
+            .await;
+
+        Ok(())
     }
 
     async fn get_organization_concurrent_limit(

@@ -551,6 +551,31 @@ pub async fn init_domain_services_with_pool_and_web_search_provider(
     metrics_service: Arc<dyn services::metrics::MetricsServiceTrait>,
     web_search_provider: Arc<dyn services::responses::tools::WebSearchProviderTrait>,
 ) -> DomainServices {
+    init_domain_services_with_pool_and_search_providers(
+        database,
+        config,
+        organization_service,
+        inference_provider_pool,
+        metrics_service,
+        web_search_provider,
+        None,
+    )
+    .await
+}
+
+/// Like `init_domain_services_with_pool_and_web_search_provider`, but also lets tests
+/// inject a Responses-only context-search provider.
+pub async fn init_domain_services_with_pool_and_search_providers(
+    database: Arc<Database>,
+    config: &ApiConfig,
+    organization_service: Arc<dyn services::organization::OrganizationServiceTrait + Send + Sync>,
+    inference_provider_pool: Arc<services::inference_provider_pool::InferenceProviderPool>,
+    metrics_service: Arc<dyn services::metrics::MetricsServiceTrait>,
+    web_search_provider: Arc<dyn services::responses::tools::WebSearchProviderTrait>,
+    web_context_search_provider: Option<
+        Arc<dyn services::responses::tools::WebContextSearchProviderTrait>,
+    >,
+) -> DomainServices {
     let mut domain_services = init_domain_services_with_pool(
         database.clone(),
         config,
@@ -573,7 +598,7 @@ pub async fn init_domain_services_with_pool_and_web_search_provider(
         domain_services.conversation_service.clone(),
         domain_services.completion_service.clone(),
         Some(web_search_provider.clone()),
-        None,
+        web_context_search_provider,
         None,
         domain_services.files_service.clone(),
         organization_service,

@@ -56,7 +56,8 @@ where
     attestation_service: Arc<dyn AttestationServiceTrait>,
     usage_service: Arc<dyn UsageServiceTrait + Send + Sync>,
     metrics_service: Arc<dyn MetricsServiceTrait>,
-    // IDs for usage tracking (database)
+    // IDs for usage tracking (database) and tracing
+    request_id: Uuid,
     organization_id: Uuid,
     workspace_id: Uuid,
     api_key_id: Uuid,
@@ -149,6 +150,7 @@ where
 
     /// Record usage and metrics. Called from Drop to ensure it always runs.
     fn record_usage_and_metrics(&self) {
+        let request_id = self.request_id;
         let organization_id = self.organization_id;
         let workspace_id = self.workspace_id;
         let api_key_id = self.api_key_id;
@@ -158,6 +160,7 @@ where
         // Create span with context BEFORE any early returns so all error logs have context
         let _span = tracing::error_span!(
             "stream_drop",
+            %request_id,
             %organization_id,
             %workspace_id,
             %api_key_id,
@@ -228,6 +231,7 @@ where
         // Create span with full context for async task
         let span = tracing::info_span!(
             "record_usage",
+            %request_id,
             %organization_id,
             %workspace_id,
             %api_key_id,
@@ -961,6 +965,7 @@ impl CompletionServiceImpl {
     async fn handle_stream_with_context(
         &self,
         llm_stream: StreamingResult,
+        request_id: Uuid,
         organization_id: Uuid,
         workspace_id: Uuid,
         api_key_id: Uuid,
@@ -989,6 +994,7 @@ impl CompletionServiceImpl {
             attestation_service: self.attestation_service.clone(),
             usage_service: self.usage_service.clone(),
             metrics_service: self.metrics_service.clone(),
+            request_id,
             organization_id,
             workspace_id,
             api_key_id,
@@ -1029,6 +1035,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         // Extract context for usage tracking
         let organization_id = request.organization_id;
         let workspace_id = request.workspace_id;
+        let request_id = request.request_id;
         let api_key_id = match uuid::Uuid::parse_str(&request.api_key_id) {
             Ok(id) => id,
             Err(e) => {
@@ -1044,6 +1051,21 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         // Extract tools from extra if present (Responses API puts them there)
         let mut extra = request.extra.clone();
         let (tools, tool_choice) = Self::extract_tools_from_extra(&mut extra);
+
+        // Inject tracing correlation IDs into extra so the inference provider
+        // forwards them as X-Request-Id / X-Org-Id / X-Workspace-Id headers.
+        extra.insert(
+            "x_request_id".to_string(),
+            serde_json::Value::String(request_id.to_string()),
+        );
+        extra.insert(
+            "x_org_id".to_string(),
+            serde_json::Value::String(organization_id.to_string()),
+        );
+        extra.insert(
+            "x_workspace_id".to_string(),
+            serde_json::Value::String(workspace_id.to_string()),
+        );
 
         let mut chat_params = inference_providers::ChatCompletionParams {
             model: request.model.clone(),
@@ -1165,6 +1187,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         let event_stream = self
             .handle_stream_with_context(
                 llm_stream,
+                request_id,
                 organization_id,
                 workspace_id,
                 api_key_id,
@@ -1187,11 +1210,29 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         request: ports::CompletionRequest,
     ) -> Result<inference_providers::ChatCompletionResponseWithBytes, ports::CompletionError> {
         let service_start_time = Instant::now();
+        let organization_id = request.organization_id;
+        let workspace_id = request.workspace_id;
+        let request_id = request.request_id;
         let chat_messages = Self::prepare_chat_messages(&request.messages);
 
         // Extract tools from extra if present (Responses API puts them there)
         let mut extra = request.extra.clone();
         let (tools, tool_choice) = Self::extract_tools_from_extra(&mut extra);
+
+        // Inject tracing correlation IDs into extra so the inference provider
+        // forwards them as X-Request-Id / X-Org-Id / X-Workspace-Id headers.
+        extra.insert(
+            "x_request_id".to_string(),
+            serde_json::Value::String(request_id.to_string()),
+        );
+        extra.insert(
+            "x_org_id".to_string(),
+            serde_json::Value::String(organization_id.to_string()),
+        );
+        extra.insert(
+            "x_workspace_id".to_string(),
+            serde_json::Value::String(workspace_id.to_string()),
+        );
 
         let mut chat_params = inference_providers::ChatCompletionParams {
             model: request.model.clone(),
@@ -1775,6 +1816,7 @@ mod tests {
             attestation_service,
             usage_service,
             metrics_service: metrics_service.clone(),
+            request_id: Uuid::new_v4(),
             organization_id,
             workspace_id,
             api_key_id,
@@ -1931,6 +1973,7 @@ mod tests {
             attestation_service,
             usage_service: usage_service.clone(),
             metrics_service: metrics_service.clone(),
+            request_id: Uuid::new_v4(),
             organization_id,
             workspace_id,
             api_key_id,
@@ -2048,6 +2091,7 @@ mod tests {
             attestation_service,
             usage_service: usage_service.clone(),
             metrics_service: metrics_service.clone(),
+            request_id: Uuid::new_v4(),
             organization_id,
             workspace_id,
             api_key_id,
@@ -2251,6 +2295,7 @@ mod tests {
                 attestation_service,
                 usage_service,
                 metrics_service,
+                request_id: Uuid::new_v4(),
                 organization_id: Uuid::new_v4(),
                 workspace_id: Uuid::new_v4(),
                 api_key_id: Uuid::new_v4(),

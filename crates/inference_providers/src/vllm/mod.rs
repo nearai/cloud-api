@@ -39,6 +39,21 @@ fn to_privacy_classify_error<E: std::fmt::Display>(e: E) -> PrivacyClassifyError
     PrivacyClassifyError::RequestFailed(e.to_string())
 }
 
+/// Tracing header keys used in params.extra for propagating request correlation IDs.
+///
+/// These are injected by cloud-api's completion service before calling the inference
+/// provider and are forwarded verbatim as HTTP headers to the downstream vllm-proxy /
+/// inference-proxy. The values are low-sensitivity org metadata (not user content)
+/// so forwarding them is consistent with the TEE trust model.
+mod tracing_headers {
+    /// UUIDv4 generated per request by cloud-api. Join key across all hops.
+    pub const REQUEST_ID: &str = "x_request_id";
+    /// Organization UUID of the authenticated API key owner.
+    pub const ORG_ID: &str = "x_org_id";
+    /// Workspace UUID of the authenticated API key.
+    pub const WORKSPACE_ID: &str = "x_workspace_id";
+}
+
 /// Encryption header keys used in params.extra for passing encryption information
 mod encryption_headers {
     /// Key for signing algorithm (x-signing-algo header)
@@ -646,6 +661,50 @@ impl VLlmProvider {
         }
     }
 
+    /// Prepare tracing headers by extracting correlation IDs from `extra` and forwarding
+    /// as HTTP headers. Removes the keys from `extra` so they don't leak into the JSON body.
+    ///
+    /// Must be called **after** `prepare_encryption_headers` (or at least independently).
+    /// Silently skips any key whose value is not a valid ASCII header value.
+    fn prepare_tracing_headers(
+        &self,
+        headers: &mut reqwest::header::HeaderMap,
+        extra: &mut std::collections::HashMap<String, serde_json::Value>,
+    ) {
+        // X-Request-Id — join key across all hops
+        if let Some(id) = extra
+            .remove(tracing_headers::REQUEST_ID)
+            .as_ref()
+            .and_then(|v| v.as_str())
+        {
+            if let Ok(value) = HeaderValue::from_str(id) {
+                headers.insert("X-Request-Id", value);
+            }
+        }
+
+        // X-Org-Id — organisation that owns the API key
+        if let Some(org) = extra
+            .remove(tracing_headers::ORG_ID)
+            .as_ref()
+            .and_then(|v| v.as_str())
+        {
+            if let Ok(value) = HeaderValue::from_str(org) {
+                headers.insert("X-Org-Id", value);
+            }
+        }
+
+        // X-Workspace-Id — workspace of the API key
+        if let Some(ws) = extra
+            .remove(tracing_headers::WORKSPACE_ID)
+            .as_ref()
+            .and_then(|v| v.as_str())
+        {
+            if let Ok(value) = HeaderValue::from_str(ws) {
+                headers.insert("X-Workspace-Id", value);
+            }
+        }
+    }
+
     /// Send a streaming HTTP POST request with TTFB timeout protection.
     ///
     /// Uses `tokio::time::timeout` only around `.send()` so the timeout applies to TTFB only
@@ -923,6 +982,8 @@ impl InferenceProvider for VLlmProvider {
             .map_err(|e| CompletionError::CompletionError(format!("Invalid request hash: {e}")))?;
         headers.insert("X-Request-Hash", request_hash_value);
 
+        // Prepare tracing headers (request_id, org_id, workspace_id)
+        self.prepare_tracing_headers(&mut headers, &mut streaming_params.extra);
         // Prepare encryption headers
         self.prepare_encryption_headers(&mut headers, &mut streaming_params.extra);
 
@@ -981,6 +1042,8 @@ impl InferenceProvider for VLlmProvider {
             .map_err(|e| CompletionError::CompletionError(format!("Invalid request hash: {e}")))?;
         headers.insert("X-Request-Hash", request_hash_value);
 
+        // Prepare tracing headers (request_id, org_id, workspace_id)
+        self.prepare_tracing_headers(&mut headers, &mut non_streaming_params.extra);
         // Prepare encryption headers
         self.prepare_encryption_headers(&mut headers, &mut non_streaming_params.extra);
 

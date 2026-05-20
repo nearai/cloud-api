@@ -1347,6 +1347,7 @@ impl ResponseServiceImpl {
 
             // Create completion request (names not included - tracked via database analytics)
             let completion_request = CompletionRequest {
+                request_id: uuid::Uuid::new_v4(),
                 model: process_context.request.model.clone(),
                 messages: messages.clone(),
                 max_tokens: process_context.request.max_output_tokens,
@@ -2908,6 +2909,7 @@ impl ResponseServiceImpl {
         let title_model = std::env::var("TITLE_GENERATION_MODEL")
             .unwrap_or_else(|_| "Qwen/Qwen3-30B-A3B-Instruct-2507".to_string());
         let completion_request = crate::completions::ports::CompletionRequest {
+            request_id: uuid::Uuid::new_v4(),
             model: title_model,
             messages: vec![crate::completions::ports::CompletionMessage {
                 role: "user".to_string(),

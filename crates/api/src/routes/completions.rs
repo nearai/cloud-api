@@ -245,8 +245,10 @@ fn convert_chat_request_to_service(
     organization_id: Uuid,
     workspace_id: Uuid,
     body_hash: RequestBodyHash,
+    request_id: Uuid,
 ) -> ServiceCompletionRequest {
     ServiceCompletionRequest {
+        request_id,
         model: request.model.clone(),
         messages: request
             .messages
@@ -624,8 +626,10 @@ fn convert_text_request_to_service(
     organization_id: Uuid,
     workspace_id: Uuid,
     body_hash: RequestBodyHash,
+    request_id: Uuid,
 ) -> ServiceCompletionRequest {
     ServiceCompletionRequest {
+        request_id,
         model: request.model.clone(),
         messages: vec![CompletionMessage {
             role: "user".to_string(),
@@ -699,6 +703,21 @@ pub async fn chat_completions(
             .into_response();
     }
 
+    // Generate a per-request correlation ID. Reuse the client's X-Request-Id if
+    // present and parseable as a UUID; otherwise generate a fresh one. This ID
+    // propagates downstream as X-Request-Id on every outbound inference call.
+    let request_id = headers
+        .get("x-request-id")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| Uuid::parse_str(s).ok())
+        .unwrap_or_else(Uuid::new_v4);
+
+    // Attach request_id + org/workspace to the tracing span so every log line
+    // from this request automatically carries them.
+    tracing::Span::current().record("request_id", request_id.to_string());
+    tracing::Span::current().record("org_id", api_key.organization.id.0.to_string());
+    tracing::Span::current().record("workspace_id", api_key.workspace.id.0.to_string());
+
     // Convert HTTP request to service parameters
     // Note: Names are not passed - high-cardinality data is tracked via database, not metrics
     let mut service_request = convert_chat_request_to_service(
@@ -708,6 +727,7 @@ pub async fn chat_completions(
         api_key.organization.id.0,
         api_key.workspace.id.0,
         body_hash,
+        request_id,
     );
 
     // Extract and validate encryption headers if present
@@ -1072,6 +1092,9 @@ pub async fn completions(
             .into_response();
     }
 
+    // Generate correlation ID
+    let request_id = Uuid::new_v4();
+
     // Convert HTTP request to service parameters
     // Note: Names are not passed - high-cardinality data is tracked via database, not metrics
     let service_request = convert_text_request_to_service(
@@ -1081,6 +1104,7 @@ pub async fn completions(
         api_key.organization.id.0,
         api_key.workspace.id.0,
         body_hash,
+        request_id,
     );
 
     // Call the completion service - it handles usage tracking internally

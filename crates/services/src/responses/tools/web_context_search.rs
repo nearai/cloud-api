@@ -8,9 +8,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use super::executor::{ToolEventContext, ToolExecutionContext, ToolExecutor, ToolOutput};
-use super::ports::{
-    WebContextSearchParams, WebContextSearchProviderTrait, WebSearchError, WebSearchResult,
-};
+use super::ports::{WebContextSearchParams, WebContextSearchProviderTrait};
 use crate::responses::errors::ResponseError;
 use crate::responses::models::{ResponseItemStatus, ResponseOutputItem, WebSearchAction};
 use crate::responses::service_helpers::ToolCallInfo;
@@ -48,30 +46,9 @@ fn normalize_threshold_mode(value: Option<&str>) -> String {
     match value {
         Some("disabled") => "disabled".to_string(),
         Some("strict") => "strict".to_string(),
+        Some("balanced") => "balanced".to_string(),
         Some("lenient") => "lenient".to_string(),
         _ => DEFAULT_THRESHOLD_MODE.to_string(),
-    }
-}
-
-fn source_stats(sources: &[WebSearchResult]) -> (usize, usize) {
-    sources
-        .iter()
-        .fold((0, 0), |(snippet_count, total_chars), source| {
-            let has_snippet = !source.snippet.trim().is_empty();
-            (
-                snippet_count + usize::from(has_snippet),
-                total_chars + source.snippet.chars().count(),
-            )
-        })
-}
-
-fn search_error_category(error: &WebSearchError) -> &'static str {
-    match error {
-        WebSearchError::WebSearchRequestFailed(message) if message.starts_with("HTTP ") => {
-            "upstream_status"
-        }
-        WebSearchError::WebSearchRequestFailed(_) => "request",
-        WebSearchError::WebSearchResponseParsingFailed(_) => "parse",
     }
 }
 
@@ -80,6 +57,7 @@ fn create_web_context_search_item(
     query: &str,
     status: ResponseItemStatus,
 ) -> ResponseOutputItem {
+    // Reuse the standard Responses web-search event shape so clients and citations stay compatible.
     ResponseOutputItem::WebSearchCall {
         id: event_ctx.tool_call_id.to_string(),
         response_id: event_ctx.stream_ctx.response_id_str.clone(),
@@ -197,7 +175,18 @@ impl WebContextSearchToolExecutor {
     }
 
     fn parse_params(tool_call: &ToolCallInfo) -> WebContextSearchParams {
-        let mut search_params = WebContextSearchParams::new(tool_call.query.clone());
+        let mut search_params = WebContextSearchParams {
+            query: tool_call.query.clone(),
+            spellcheck: Some(DEFAULT_SPELLCHECK),
+            count: Some(DEFAULT_COUNT),
+            maximum_number_of_urls: Some(DEFAULT_MAX_URLS),
+            maximum_number_of_tokens: Some(DEFAULT_MAX_TOKENS),
+            maximum_number_of_snippets: Some(DEFAULT_MAX_SNIPPETS),
+            maximum_number_of_tokens_per_url: Some(DEFAULT_MAX_TOKENS_PER_URL),
+            maximum_number_of_snippets_per_url: Some(DEFAULT_MAX_SNIPPETS_PER_URL),
+            context_threshold_mode: Some(DEFAULT_THRESHOLD_MODE.to_string()),
+            ..Default::default()
+        };
 
         if let Some(params) = &tool_call.params {
             if let Some(country) = params.get("country").and_then(|v| v.as_str()) {
@@ -210,68 +199,67 @@ impl WebContextSearchToolExecutor {
                 search_params.freshness = Some(freshness.to_string());
             }
 
-            search_params.spellcheck = Some(
-                params
-                    .get("spellcheck")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(DEFAULT_SPELLCHECK),
-            );
-            search_params.count = Some(clamp_nonzero(
-                params.get("count").and_then(|v| v.as_u64()),
-                DEFAULT_COUNT,
-                MAX_COUNT,
-            ));
-            search_params.maximum_number_of_urls = Some(clamp_nonzero(
-                params
-                    .get("maximum_number_of_urls")
-                    .and_then(|v| v.as_u64()),
-                DEFAULT_MAX_URLS,
-                MAX_URLS,
-            ));
-            search_params.maximum_number_of_tokens = Some(clamp_range(
-                params
-                    .get("maximum_number_of_tokens")
-                    .and_then(|v| v.as_u64()),
-                DEFAULT_MAX_TOKENS,
-                MIN_TOKENS,
-                MAX_TOKENS,
-            ));
-            search_params.maximum_number_of_snippets = Some(clamp_nonzero(
-                params
-                    .get("maximum_number_of_snippets")
-                    .and_then(|v| v.as_u64()),
-                DEFAULT_MAX_SNIPPETS,
-                MAX_SNIPPETS,
-            ));
-            search_params.maximum_number_of_tokens_per_url = Some(clamp_range(
-                params
-                    .get("maximum_number_of_tokens_per_url")
-                    .and_then(|v| v.as_u64()),
-                DEFAULT_MAX_TOKENS_PER_URL,
-                MIN_TOKENS_PER_URL,
-                MAX_TOKENS_PER_URL,
-            ));
-            search_params.maximum_number_of_snippets_per_url = Some(clamp_nonzero(
-                params
-                    .get("maximum_number_of_snippets_per_url")
-                    .and_then(|v| v.as_u64()),
-                DEFAULT_MAX_SNIPPETS_PER_URL,
-                MAX_SNIPPETS_PER_URL,
-            ));
-            search_params.context_threshold_mode = Some(normalize_threshold_mode(
-                params
-                    .get("context_threshold_mode")
-                    .and_then(|v| v.as_str()),
-            ));
-        } else {
-            search_params.spellcheck = Some(DEFAULT_SPELLCHECK);
-            search_params.count = Some(DEFAULT_COUNT);
-            search_params.maximum_number_of_urls = Some(DEFAULT_MAX_URLS);
-            search_params.maximum_number_of_tokens = Some(DEFAULT_MAX_TOKENS);
-            search_params.maximum_number_of_snippets = Some(DEFAULT_MAX_SNIPPETS);
-            search_params.maximum_number_of_tokens_per_url = Some(DEFAULT_MAX_TOKENS_PER_URL);
-            search_params.maximum_number_of_snippets_per_url = Some(DEFAULT_MAX_SNIPPETS_PER_URL);
-            search_params.context_threshold_mode = Some(DEFAULT_THRESHOLD_MODE.to_string());
+            if let Some(value) = params.get("spellcheck").and_then(|v| v.as_bool()) {
+                search_params.spellcheck = Some(value);
+            }
+            if let Some(value) = params.get("count").and_then(|v| v.as_u64()) {
+                search_params.count = Some(clamp_nonzero(Some(value), DEFAULT_COUNT, MAX_COUNT));
+            }
+            if let Some(value) = params
+                .get("maximum_number_of_urls")
+                .and_then(|v| v.as_u64())
+            {
+                search_params.maximum_number_of_urls =
+                    Some(clamp_nonzero(Some(value), DEFAULT_MAX_URLS, MAX_URLS));
+            }
+            if let Some(value) = params
+                .get("maximum_number_of_tokens")
+                .and_then(|v| v.as_u64())
+            {
+                search_params.maximum_number_of_tokens = Some(clamp_range(
+                    Some(value),
+                    DEFAULT_MAX_TOKENS,
+                    MIN_TOKENS,
+                    MAX_TOKENS,
+                ));
+            }
+            if let Some(value) = params
+                .get("maximum_number_of_snippets")
+                .and_then(|v| v.as_u64())
+            {
+                search_params.maximum_number_of_snippets = Some(clamp_nonzero(
+                    Some(value),
+                    DEFAULT_MAX_SNIPPETS,
+                    MAX_SNIPPETS,
+                ));
+            }
+            if let Some(value) = params
+                .get("maximum_number_of_tokens_per_url")
+                .and_then(|v| v.as_u64())
+            {
+                search_params.maximum_number_of_tokens_per_url = Some(clamp_range(
+                    Some(value),
+                    DEFAULT_MAX_TOKENS_PER_URL,
+                    MIN_TOKENS_PER_URL,
+                    MAX_TOKENS_PER_URL,
+                ));
+            }
+            if let Some(value) = params
+                .get("maximum_number_of_snippets_per_url")
+                .and_then(|v| v.as_u64())
+            {
+                search_params.maximum_number_of_snippets_per_url = Some(clamp_nonzero(
+                    Some(value),
+                    DEFAULT_MAX_SNIPPETS_PER_URL,
+                    MAX_SNIPPETS_PER_URL,
+                ));
+            }
+            if let Some(mode) = params
+                .get("context_threshold_mode")
+                .and_then(|v| v.as_str())
+            {
+                search_params.context_threshold_mode = Some(normalize_threshold_mode(Some(mode)));
+            }
         }
 
         search_params
@@ -328,7 +316,7 @@ impl ToolExecutor for WebContextSearchToolExecutor {
             .search_context(search_params)
             .await
             .map_err(|error| {
-                let error_category = search_error_category(&error);
+                let error_category = super::web_search_error_category(&error);
                 tracing::warn!(
                     tool_name = WEB_CONTEXT_SEARCH_TOOL_NAME,
                     tool_call_id,
@@ -340,7 +328,7 @@ impl ToolExecutor for WebContextSearchToolExecutor {
                 ResponseError::InternalError(format!("Web context search failed: {error_category}"))
             })?;
 
-        let (snippet_count, total_snippet_chars) = source_stats(&sources);
+        let (snippet_count, total_snippet_chars) = super::web_search_result_stats(&sources);
         tracing::info!(
             tool_name = WEB_CONTEXT_SEARCH_TOOL_NAME,
             tool_call_id,
@@ -403,6 +391,7 @@ impl ToolExecutor for WebContextSearchToolExecutor {
 mod tests {
     use super::*;
     use crate::responses::models::CreateResponseRequest;
+    use crate::responses::tools::{WebSearchError, WebSearchResult};
     use std::sync::{Arc as StdArc, Mutex};
 
     struct MockWebContextSearchProvider {

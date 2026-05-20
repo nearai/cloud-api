@@ -8,6 +8,7 @@ static BRAVE_LLM_CONTEXT_API_URL: &str = "https://api.search.brave.com/res/v1/ll
 
 pub struct BraveWebSearchProvider {
     pub api_key: String,
+    pub llm_context_api_key: String,
     pub client: reqwest::Client,
 }
 
@@ -22,8 +23,11 @@ impl BraveWebSearchProvider {
         let api_key = std::env::var("BRAVE_SEARCH_PRO_API_KEY").unwrap_or_else(|_| {
             panic!("BRAVE_SEARCH_PRO_API_KEY is not set");
         });
+        let llm_context_api_key =
+            std::env::var("BRAVE_LLM_CONTEXT_API_KEY").unwrap_or_else(|_| api_key.clone());
         Self {
             api_key,
+            llm_context_api_key,
             client: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(30))
                 .build()
@@ -31,10 +35,10 @@ impl BraveWebSearchProvider {
         }
     }
 
-    fn brave_get_builder(&self, url: &'static str) -> reqwest::RequestBuilder {
+    fn brave_get_builder(&self, url: &'static str, api_key: &str) -> reqwest::RequestBuilder {
         self.client
             .get(url)
-            .header("X-Subscription-Token", &self.api_key)
+            .header("X-Subscription-Token", api_key)
             .header("Accept", "application/json")
     }
 }
@@ -53,18 +57,6 @@ fn request_error_category(error: &reqwest::Error) -> &'static str {
     } else {
         "unknown"
     }
-}
-
-fn result_stats(results: &[WebSearchResult]) -> (usize, usize) {
-    results
-        .iter()
-        .fold((0, 0), |(snippet_count, total_chars), result| {
-            let has_snippet = !result.snippet.trim().is_empty();
-            (
-                snippet_count + usize::from(has_snippet),
-                total_chars + result.snippet.chars().count(),
-            )
-        })
 }
 
 /// Root response from Brave Search API
@@ -138,6 +130,7 @@ pub fn context_response_to_web_results(response: BraveContextResponse) -> Vec<We
                 .filter(|snippet| !snippet.is_empty())
                 .collect::<Vec<_>>();
             if snippets.is_empty() {
+                // Title/URL-only context entries cannot ground the citation path.
                 return None;
             }
 
@@ -171,80 +164,54 @@ impl WebSearchProviderTrait for BraveWebSearchProvider {
         let started_at = Instant::now();
         let requested_count = params.count;
 
-        // Build query parameters dynamically
         let mut query_params = vec![("q", params.query.clone())];
 
-        // Add optional parameters
-        let country;
         if let Some(ref c) = params.country {
-            country = c.clone();
-            query_params.push(("country", country));
+            query_params.push(("country", c.clone()));
         }
 
-        let search_lang;
         if let Some(ref sl) = params.search_lang {
-            search_lang = sl.clone();
-            query_params.push(("search_lang", search_lang));
+            query_params.push(("search_lang", sl.clone()));
         }
 
-        let ui_lang;
         if let Some(ref ul) = params.ui_lang {
-            ui_lang = ul.clone();
-            query_params.push(("ui_lang", ui_lang));
+            query_params.push(("ui_lang", ul.clone()));
         }
 
-        let count;
         if let Some(c) = params.count {
-            count = c.to_string();
-            query_params.push(("count", count));
+            query_params.push(("count", c.to_string()));
         }
 
-        let offset;
         if let Some(o) = params.offset {
-            offset = o.to_string();
-            query_params.push(("offset", offset));
+            query_params.push(("offset", o.to_string()));
         }
 
-        let safesearch;
         if let Some(ref ss) = params.safesearch {
-            safesearch = ss.clone();
-            query_params.push(("safesearch", safesearch));
+            query_params.push(("safesearch", ss.clone()));
         }
 
-        let freshness;
         if let Some(ref f) = params.freshness {
-            freshness = f.clone();
-            query_params.push(("freshness", freshness));
+            query_params.push(("freshness", f.clone()));
         }
 
-        let text_decorations;
         if let Some(td) = params.text_decorations {
-            text_decorations = td.to_string();
-            query_params.push(("text_decorations", text_decorations));
+            query_params.push(("text_decorations", td.to_string()));
         }
 
-        let spellcheck;
         if let Some(sc) = params.spellcheck {
-            spellcheck = sc.to_string();
-            query_params.push(("spellcheck", spellcheck));
+            query_params.push(("spellcheck", sc.to_string()));
         }
 
-        let units;
         if let Some(ref u) = params.units {
-            units = u.clone();
-            query_params.push(("units", units));
+            query_params.push(("units", u.clone()));
         }
 
-        let extra_snippets;
         if let Some(es) = params.extra_snippets {
-            extra_snippets = es.to_string();
-            query_params.push(("extra_snippets", extra_snippets));
+            query_params.push(("extra_snippets", es.to_string()));
         }
 
-        let summary;
         if let Some(s) = params.summary {
-            summary = s.to_string();
-            query_params.push(("summary", summary));
+            query_params.push(("summary", s.to_string()));
         }
 
         if let Some(ref rf) = params.result_filter {
@@ -264,7 +231,7 @@ impl WebSearchProviderTrait for BraveWebSearchProvider {
         }
 
         let response = self
-            .brave_get_builder(BRAVE_WEB_SEARCH_API_URL)
+            .brave_get_builder(BRAVE_WEB_SEARCH_API_URL, &self.api_key)
             .query(&query_params)
             .send()
             .await
@@ -306,6 +273,7 @@ impl WebSearchProviderTrait for BraveWebSearchProvider {
         // Parse JSON
         let brave_response: BraveSearchResponse =
             serde_json::from_str(&response_text).map_err(|e| {
+                // serde_json::Error Display contains category and location only, not the body.
                 tracing::error!(
                     endpoint = "web_search",
                     error = %e,
@@ -330,7 +298,7 @@ impl WebSearchProviderTrait for BraveWebSearchProvider {
             })
             .unwrap_or_default();
 
-        let (snippet_count, total_snippet_chars) = result_stats(&results);
+        let (snippet_count, total_snippet_chars) = super::web_search_result_stats(&results);
         tracing::debug!(
             endpoint = "web_search",
             status = 200_u16,
@@ -370,70 +338,44 @@ impl WebContextSearchProviderTrait for BraveWebSearchProvider {
 
         let mut query_params = vec![("q", params.query.clone())];
 
-        let country;
         if let Some(ref c) = params.country {
-            country = c.clone();
-            query_params.push(("country", country));
+            query_params.push(("country", c.clone()));
         }
 
-        let search_lang;
         if let Some(ref sl) = params.search_lang {
-            search_lang = sl.clone();
-            query_params.push(("search_lang", search_lang));
+            query_params.push(("search_lang", sl.clone()));
         }
 
-        let freshness;
         if let Some(ref f) = params.freshness {
-            freshness = f.clone();
-            query_params.push(("freshness", freshness));
+            query_params.push(("freshness", f.clone()));
         }
 
-        let spellcheck;
         if let Some(value) = params.spellcheck {
-            spellcheck = value.to_string();
-            query_params.push(("spellcheck", spellcheck));
+            query_params.push(("spellcheck", value.to_string()));
         }
 
-        let count;
         if let Some(c) = params.count {
-            count = c.to_string();
-            query_params.push(("count", count));
+            query_params.push(("count", c.to_string()));
         }
 
-        let maximum_number_of_urls;
         if let Some(value) = params.maximum_number_of_urls {
-            maximum_number_of_urls = value.to_string();
-            query_params.push(("maximum_number_of_urls", maximum_number_of_urls));
+            query_params.push(("maximum_number_of_urls", value.to_string()));
         }
 
-        let maximum_number_of_tokens;
         if let Some(value) = params.maximum_number_of_tokens {
-            maximum_number_of_tokens = value.to_string();
-            query_params.push(("maximum_number_of_tokens", maximum_number_of_tokens));
+            query_params.push(("maximum_number_of_tokens", value.to_string()));
         }
 
-        let maximum_number_of_snippets;
         if let Some(value) = params.maximum_number_of_snippets {
-            maximum_number_of_snippets = value.to_string();
-            query_params.push(("maximum_number_of_snippets", maximum_number_of_snippets));
+            query_params.push(("maximum_number_of_snippets", value.to_string()));
         }
 
-        let maximum_number_of_tokens_per_url;
         if let Some(value) = params.maximum_number_of_tokens_per_url {
-            maximum_number_of_tokens_per_url = value.to_string();
-            query_params.push((
-                "maximum_number_of_tokens_per_url",
-                maximum_number_of_tokens_per_url,
-            ));
+            query_params.push(("maximum_number_of_tokens_per_url", value.to_string()));
         }
 
-        let maximum_number_of_snippets_per_url;
         if let Some(value) = params.maximum_number_of_snippets_per_url {
-            maximum_number_of_snippets_per_url = value.to_string();
-            query_params.push((
-                "maximum_number_of_snippets_per_url",
-                maximum_number_of_snippets_per_url,
-            ));
+            query_params.push(("maximum_number_of_snippets_per_url", value.to_string()));
         }
 
         if let Some(ref mode) = threshold_mode {
@@ -441,7 +383,7 @@ impl WebContextSearchProviderTrait for BraveWebSearchProvider {
         }
 
         let response = self
-            .brave_get_builder(BRAVE_LLM_CONTEXT_API_URL)
+            .brave_get_builder(BRAVE_LLM_CONTEXT_API_URL, &self.llm_context_api_key)
             .query(&query_params)
             .send()
             .await
@@ -481,6 +423,7 @@ impl WebContextSearchProviderTrait for BraveWebSearchProvider {
 
         let context_response: BraveContextResponse =
             serde_json::from_str(&response_text).map_err(|e| {
+                // serde_json::Error Display contains category and location only, not the body.
                 tracing::error!(
                     endpoint = "llm_context",
                     error = %e,
@@ -491,7 +434,7 @@ impl WebContextSearchProviderTrait for BraveWebSearchProvider {
             })?;
 
         let results = context_response_to_web_results(context_response);
-        let (snippet_count, total_snippet_chars) = result_stats(&results);
+        let (snippet_count, total_snippet_chars) = super::web_search_result_stats(&results);
         tracing::debug!(
             endpoint = "llm_context",
             status = 200_u16,

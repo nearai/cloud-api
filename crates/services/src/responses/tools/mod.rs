@@ -8,6 +8,28 @@ pub mod tool_config;
 pub mod web_context_search;
 pub mod web_search;
 
+fn web_search_result_stats(results: &[ports::WebSearchResult]) -> (usize, usize) {
+    results
+        .iter()
+        .fold((0, 0), |(snippet_count, total_chars), result| {
+            let has_snippet = !result.snippet.trim().is_empty();
+            (
+                snippet_count + usize::from(has_snippet),
+                total_chars + result.snippet.chars().count(),
+            )
+        })
+}
+
+fn web_search_error_category(error: &ports::WebSearchError) -> &'static str {
+    match error {
+        ports::WebSearchError::WebSearchRequestFailed(message) if message.starts_with("HTTP ") => {
+            "upstream_status"
+        }
+        ports::WebSearchError::WebSearchRequestFailed(_) => "request",
+        ports::WebSearchError::WebSearchResponseParsingFailed(_) => "parse",
+    }
+}
+
 // Executor framework
 pub use executor::{
     FunctionCallInfo, ToolEventContext, ToolExecutionContext, ToolExecutionResult, ToolExecutor,

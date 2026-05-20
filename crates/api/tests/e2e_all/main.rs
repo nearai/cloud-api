@@ -49,4 +49,5 @@ mod usage_chat_completions;
 mod usage_recording;
 mod usage_responses;
 mod vpc_login;
+mod web_context_search;
 mod web_search_citations;

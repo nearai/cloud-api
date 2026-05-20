@@ -45,6 +45,7 @@ use std::sync::Arc;
 pub use anthropic::AnthropicBackend;
 pub use backend::BackendConfig as ExternalBackendConfig;
 pub use gemini::GeminiBackend;
+pub use openai_compatible::OpenAiCompatibleBackend;
 
 /// Strip cloud-api internal tracing keys from `extra` before forwarding params
 /// to external providers.
@@ -59,7 +60,6 @@ fn strip_internal_tracing_keys(extra: &mut std::collections::HashMap<String, ser
     extra.remove("x_org_id");
     extra.remove("x_workspace_id");
 }
-pub use openai_compatible::OpenAiCompatibleBackend;
 
 /// Provider configuration stored in database
 ///

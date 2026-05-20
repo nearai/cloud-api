@@ -712,11 +712,21 @@ pub async fn chat_completions(
         .and_then(|s| Uuid::parse_str(s).ok())
         .unwrap_or_else(Uuid::new_v4);
 
-    // Attach request_id + org/workspace to the tracing span so every log line
-    // from this request automatically carries them.
-    tracing::Span::current().record("request_id", request_id.to_string());
-    tracing::Span::current().record("org_id", api_key.organization.id.0.to_string());
-    tracing::Span::current().record("workspace_id", api_key.workspace.id.0.to_string());
+    // Record correlation IDs on the current tracing span so every log line
+    // within this request carries them in Datadog.
+    //
+    // We use tracing::field macros on a fresh span rather than Span::current().record()
+    // (which silently no-ops on spans without the field pre-declared).
+    // The span is created here and its fields are set immediately; axum's tower
+    // middleware span automatically becomes the parent.
+    let span = tracing::info_span!(
+        "chat_completions",
+        request_id = %request_id,
+        org_id = %api_key.organization.id.0,
+        workspace_id = %api_key.workspace.id.0,
+        model = %request.model,
+    );
+    let _span_guard = span.enter();
 
     // Convert HTTP request to service parameters
     // Note: Names are not passed - high-cardinality data is tracked via database, not metrics

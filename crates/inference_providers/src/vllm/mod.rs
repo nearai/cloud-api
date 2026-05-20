@@ -664,8 +664,8 @@ impl VLlmProvider {
     /// Prepare tracing headers by extracting correlation IDs from `extra` and forwarding
     /// as HTTP headers. Removes the keys from `extra` so they don't leak into the JSON body.
     ///
-    /// Must be called **after** `prepare_encryption_headers` (or at least independently).
     /// Silently skips any key whose value is not a valid ASCII header value.
+    /// Independent of `prepare_encryption_headers` — call order does not matter.
     fn prepare_tracing_headers(
         &self,
         headers: &mut reqwest::header::HeaderMap,
@@ -1181,7 +1181,8 @@ impl InferenceProvider for VLlmProvider {
             HeaderValue::from_str(&request_hash).map_err(to_image_gen_error)?,
         );
 
-        // Forward encryption headers from extra to HTTP headers
+        // Forward tracing and encryption headers from extra to HTTP headers
+        self.prepare_tracing_headers(&mut headers, &mut params.extra);
         self.prepare_encryption_headers(&mut headers, &mut params.extra);
 
         let response = self
@@ -1260,7 +1261,8 @@ impl InferenceProvider for VLlmProvider {
         let mut headers = self
             .build_headers()
             .map_err(|e| AudioTranscriptionError::TranscriptionError(e.to_string()))?;
-        // Forward encryption headers from extra to HTTP headers
+        // Forward tracing and encryption headers from extra to HTTP headers
+        self.prepare_tracing_headers(&mut headers, &mut params.extra);
         self.prepare_encryption_headers(&mut headers, &mut params.extra);
         // Remove Content-Type header - reqwest will set it automatically for multipart
         headers.remove("Content-Type");
@@ -1423,6 +1425,7 @@ impl InferenceProvider for VLlmProvider {
         let url = format!("{}/v1/score", self.config.base_url);
 
         let mut headers = self.build_headers().map_err(to_score_error)?;
+        self.prepare_tracing_headers(&mut headers, &mut params.extra);
         self.prepare_encryption_headers(&mut headers, &mut params.extra);
         headers.insert(
             "X-Request-Hash",
@@ -1459,6 +1462,7 @@ impl InferenceProvider for VLlmProvider {
         let url = format!("{}/v1/rerank", self.config.base_url);
 
         let mut headers = self.build_headers().map_err(to_rerank_error)?;
+        self.prepare_tracing_headers(&mut headers, &mut params.extra);
         self.prepare_encryption_headers(&mut headers, &mut params.extra);
 
         let response = self
@@ -1495,6 +1499,7 @@ impl InferenceProvider for VLlmProvider {
         let url = format!("{}/v1/embeddings", self.config.base_url);
 
         let mut headers = self.build_headers().map_err(to_embedding_error)?;
+        self.prepare_tracing_headers(&mut headers, &mut extra);
         self.prepare_encryption_headers(&mut headers, &mut extra);
 
         let response = self
@@ -1532,6 +1537,7 @@ impl InferenceProvider for VLlmProvider {
         let url = format!("{}/v1/privacy/classify", self.config.base_url);
 
         let mut headers = self.build_headers().map_err(to_privacy_classify_error)?;
+        self.prepare_tracing_headers(&mut headers, &mut extra);
         self.prepare_encryption_headers(&mut headers, &mut extra);
 
         let response = self
@@ -1690,6 +1696,75 @@ mod tests {
         let s = err.to_string();
         assert!(s.contains("chat_completion"), "got: {s}");
         assert!(s.contains("600"), "got: {s}");
+    }
+
+    #[test]
+    fn test_prepare_tracing_headers_removes_keys_from_extra() {
+        let provider = create_test_provider();
+        let mut headers = reqwest::header::HeaderMap::new();
+        let mut extra = std::collections::HashMap::new();
+        extra.insert(
+            tracing_headers::REQUEST_ID.to_string(),
+            serde_json::Value::String("550e8400-e29b-41d4-a716-446655440000".to_string()),
+        );
+        extra.insert(
+            tracing_headers::ORG_ID.to_string(),
+            serde_json::Value::String("org-uuid".to_string()),
+        );
+        extra.insert(
+            tracing_headers::WORKSPACE_ID.to_string(),
+            serde_json::Value::String("ws-uuid".to_string()),
+        );
+        extra.insert(
+            "other_field".to_string(),
+            serde_json::Value::String("keep-me".to_string()),
+        );
+
+        provider.prepare_tracing_headers(&mut headers, &mut extra);
+
+        assert!(!extra.contains_key(tracing_headers::REQUEST_ID), "x_request_id should be removed");
+        assert!(!extra.contains_key(tracing_headers::ORG_ID), "x_org_id should be removed");
+        assert!(!extra.contains_key(tracing_headers::WORKSPACE_ID), "x_workspace_id should be removed");
+        assert!(extra.contains_key("other_field"), "unrelated fields must be preserved");
+    }
+
+    #[test]
+    fn test_prepare_tracing_headers_forwards_to_http_headers() {
+        let provider = create_test_provider();
+        let mut headers = reqwest::header::HeaderMap::new();
+        let mut extra = std::collections::HashMap::new();
+        extra.insert(
+            tracing_headers::REQUEST_ID.to_string(),
+            serde_json::Value::String("550e8400-e29b-41d4-a716-446655440000".to_string()),
+        );
+        extra.insert(
+            tracing_headers::ORG_ID.to_string(),
+            serde_json::Value::String("aaaa-bbbb".to_string()),
+        );
+        extra.insert(
+            tracing_headers::WORKSPACE_ID.to_string(),
+            serde_json::Value::String("cccc-dddd".to_string()),
+        );
+
+        provider.prepare_tracing_headers(&mut headers, &mut extra);
+
+        assert_eq!(headers.get("X-Request-Id").and_then(|v| v.to_str().ok()), Some("550e8400-e29b-41d4-a716-446655440000"));
+        assert_eq!(headers.get("X-Org-Id").and_then(|v| v.to_str().ok()), Some("aaaa-bbbb"));
+        assert_eq!(headers.get("X-Workspace-Id").and_then(|v| v.to_str().ok()), Some("cccc-dddd"));
+    }
+
+    #[test]
+    fn test_prepare_tracing_headers_absent_keys_are_noop() {
+        let provider = create_test_provider();
+        let mut headers = reqwest::header::HeaderMap::new();
+        let mut extra: std::collections::HashMap<String, serde_json::Value> =
+            std::collections::HashMap::new();
+
+        provider.prepare_tracing_headers(&mut headers, &mut extra);
+
+        assert!(headers.get("X-Request-Id").is_none());
+        assert!(headers.get("X-Org-Id").is_none());
+        assert!(headers.get("X-Workspace-Id").is_none());
     }
 
     #[test]

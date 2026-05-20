@@ -665,7 +665,8 @@ fn convert_text_request_to_service(
         (status = 400, description = "Invalid request parameters", body = ErrorResponse),
         (status = 401, description = "Invalid or missing API key", body = ErrorResponse),
         (status = 402, description = "Insufficient credits", body = ErrorResponse),
-        (status = 500, description = "Server error", body = ErrorResponse)
+        (status = 500, description = "Server error", body = ErrorResponse),
+        (status = 529, description = "All inference backends overloaded; retry with exponential backoff", body = ErrorResponse)
     ),
     security(
         ("api_key" = [])
@@ -1027,7 +1028,8 @@ pub async fn chat_completions(
         (status = 200, description = "Completion generated successfully", body = ChatCompletionResponse),
         (status = 400, description = "Invalid request parameters", body = ErrorResponse),
         (status = 401, description = "Invalid or missing API key", body = ErrorResponse),
-        (status = 500, description = "Server error", body = ErrorResponse)
+        (status = 500, description = "Server error", body = ErrorResponse),
+        (status = 529, description = "All inference backends overloaded; retry with exponential backoff", body = ErrorResponse)
     ),
     security(
         ("api_key" = [])
@@ -1280,7 +1282,8 @@ mod tests {
         (status = 200, description = "Image generated successfully", body = ImageGenerationResponse),
         (status = 400, description = "Invalid request parameters", body = ErrorResponse),
         (status = 401, description = "Invalid or missing API key", body = ErrorResponse),
-        (status = 500, description = "Server error", body = ErrorResponse)
+        (status = 500, description = "Server error", body = ErrorResponse),
+        (status = 529, description = "All inference backends overloaded; retry with exponential backoff", body = ErrorResponse)
     ),
     security(
         ("api_key" = [])
@@ -1533,6 +1536,7 @@ pub async fn image_generations(
         (status = 401, description = "Unauthorized (missing or invalid API key)", body = ErrorResponse),
         (status = 404, description = "Model not found", body = ErrorResponse),
         (status = 500, description = "Server error", body = ErrorResponse),
+        (status = 529, description = "All inference backends overloaded; retry with exponential backoff", body = ErrorResponse),
     ),
     security(("ApiKeyAuth" = []))
 )]
@@ -1865,7 +1869,8 @@ pub async fn audio_transcriptions(
         (status = 401, description = "Invalid or missing API key", body = ErrorResponse),
         (status = 404, description = "Model not found", body = ErrorResponse),
         (status = 413, description = "Payload too large", body = ErrorResponse),
-        (status = 500, description = "Server error", body = ErrorResponse)
+        (status = 500, description = "Server error", body = ErrorResponse),
+        (status = 529, description = "All inference backends overloaded; retry with exponential backoff", body = ErrorResponse)
     ),
     security(
         ("api_key" = [])
@@ -2248,6 +2253,7 @@ pub async fn image_edits(
         (status = 404, description = "Model not found", body = ErrorResponse),
         (status = 429, description = "Concurrent request limit exceeded for the organization. Max concurrent requests per model: 64 (configurable)", body = ErrorResponse),
         (status = 500, description = "Server error (billing failure, provider error)", body = ErrorResponse),
+        (status = 529, description = "All inference backends overloaded; retry with exponential backoff", body = ErrorResponse),
     ),
     security(("ApiKeyAuth" = []))
 )]
@@ -2545,7 +2551,8 @@ struct EmbeddingsResponseDoc {
         (status = 401, description = "Unauthorized", body = ErrorResponse),
         (status = 404, description = "Model not found", body = ErrorResponse),
         (status = 429, description = "Rate limit exceeded", body = ErrorResponse),
-        (status = 500, description = "Server error", body = ErrorResponse)
+        (status = 500, description = "Server error", body = ErrorResponse),
+        (status = 529, description = "All inference backends overloaded; retry with exponential backoff", body = ErrorResponse)
     ),
     security(
         ("api_key" = [])
@@ -2847,6 +2854,7 @@ struct PrivacyClassifyResponseDoc {
         (status = 401, description = "Unauthorized", body = ErrorResponse),
         (status = 404, description = "Model not found", body = ErrorResponse),
         (status = 429, description = "Rate limit exceeded", body = ErrorResponse),
+        (status = 529, description = "All inference backends overloaded; retry with exponential backoff", body = ErrorResponse),
         (status = 500, description = "Server error", body = ErrorResponse)
     ),
     security(
@@ -3137,6 +3145,7 @@ pub async fn privacy_classify(
         (status = 404, description = "Model not found", body = ErrorResponse),
         (status = 429, description = "Concurrent request limit exceeded for the organization. Max concurrent requests per model: 64 (configurable)", body = ErrorResponse),
         (status = 500, description = "Server error (billing failure, provider error)", body = ErrorResponse),
+        (status = 529, description = "All inference backends overloaded; retry with exponential backoff", body = ErrorResponse),
     ),
     security(("ApiKeyAuth" = []))
 )]

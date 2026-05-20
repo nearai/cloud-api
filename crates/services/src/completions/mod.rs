@@ -1694,6 +1694,10 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
     ) -> std::sync::Arc<crate::inference_provider_pool::InferenceProviderPool> {
         self.inference_provider_pool.clone()
     }
+
+    async fn invalidate_org_concurrent_limit(&self, org_id: Uuid) {
+        self.org_concurrent_limits.invalidate(&org_id).await;
+    }
 }
 
 pub use ports::*;

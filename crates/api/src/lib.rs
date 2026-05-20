@@ -834,6 +834,7 @@ pub fn build_app_with_config(
         app_state.inference_provider_pool.clone(),
         analytics_service,
         domain_services.models_service.clone(),
+        domain_services.completion_service.clone(),
     );
 
     let invitation_routes =
@@ -1437,6 +1438,7 @@ pub fn build_admin_routes(
     inference_provider_pool: Arc<services::inference_provider_pool::InferenceProviderPool>,
     analytics_service: Arc<services::admin::AnalyticsService>,
     models_service: Arc<services::models::ModelsServiceImpl>,
+    completion_service: Arc<services::CompletionServiceImpl>,
 ) -> Router {
     use crate::middleware::admin_middleware;
     use crate::routes::admin::{
@@ -1462,10 +1464,13 @@ pub fn build_admin_routes(
     // The admin service holds a reference to the `models_service` so it can
     // invalidate the public `/v1/model/list` cache after admin writes
     // (`upsert`, `delete`, `deprecate`) that mutate the `models` or
-    // `model_aliases` tables.
+    // `model_aliases` tables. It also holds the `completion_service` so it
+    // can invalidate the per-org concurrent-limit cache after a PATCH to
+    // `/v1/admin/organizations/{org_id}/concurrent-limit`.
     let admin_service = Arc::new(AdminServiceImpl::new(
         admin_repository as Arc<dyn services::admin::AdminRepository>,
         models_service as Arc<dyn services::models::ModelsServiceTrait>,
+        completion_service.clone() as Arc<dyn services::completions::CompletionServiceTrait>,
     )) as Arc<dyn services::admin::AdminService + Send + Sync>;
 
     let admin_app_state = AdminAppState {

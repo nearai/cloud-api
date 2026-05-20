@@ -45,7 +45,13 @@ fn to_privacy_classify_error<E: std::fmt::Display>(e: E) -> PrivacyClassifyError
 /// provider and are forwarded verbatim as HTTP headers to the downstream vllm-proxy /
 /// inference-proxy. The values are low-sensitivity org metadata (not user content)
 /// so forwarding them is consistent with the TEE trust model.
-mod tracing_headers {
+/// Keys used in `ChatCompletionParams.extra` for tracing correlation headers.
+///
+/// Values are the snake_case map keys that `prepare_tracing_headers` reads and
+/// strips; the corresponding HTTP header names are `X-Request-Id`, `X-Org-Id`,
+/// and `X-Workspace-Id`. Exposed as `pub(crate)` so `external/mod.rs` can use
+/// the same constants instead of hardcoding the strings.
+pub(crate) mod tracing_headers {
     /// UUIDv4 generated per request by cloud-api. Join key across all hops.
     pub const REQUEST_ID: &str = "x_request_id";
     /// Organization UUID of the authenticated API key owner.

@@ -56,9 +56,10 @@ pub use openai_compatible::OpenAiCompatibleBackend;
 /// are serialised as top-level JSON body fields — unknown fields that strict
 /// providers (Anthropic, Gemini) may reject with a 400/422.
 fn strip_internal_tracing_keys(extra: &mut std::collections::HashMap<String, serde_json::Value>) {
-    extra.remove("x_request_id");
-    extra.remove("x_org_id");
-    extra.remove("x_workspace_id");
+    use crate::vllm::tracing_headers;
+    extra.remove(tracing_headers::REQUEST_ID);
+    extra.remove(tracing_headers::ORG_ID);
+    extra.remove(tracing_headers::WORKSPACE_ID);
 }
 
 /// Provider configuration stored in database

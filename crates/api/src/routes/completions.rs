@@ -19,7 +19,7 @@ use services::completions::{
 use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::debug;
+use tracing::{debug, Instrument};
 use utoipa;
 use uuid::Uuid;
 
@@ -712,13 +712,14 @@ pub async fn chat_completions(
         .and_then(|s| Uuid::parse_str(s).ok())
         .unwrap_or_else(Uuid::new_v4);
 
-    // Record correlation IDs on the current tracing span so every log line
-    // within this request carries them in Datadog.
+    // Create a span carrying correlation IDs so every log line within this
+    // request carries request_id/org_id/workspace_id in Datadog.
     //
-    // We use tracing::field macros on a fresh span rather than Span::current().record()
-    // (which silently no-ops on spans without the field pre-declared).
-    // The span is created here and its fields are set immediately; axum's tower
-    // middleware span automatically becomes the parent.
+    // NOTE: we do NOT call span.enter() here. In async code, Span::enter()
+    // stores the guard in a thread-local; when the future yields at an .await
+    // the guard stays entered on that thread, so any other task scheduled on
+    // the same thread incorrectly inherits this span as its parent, corrupting
+    // log context. Use .instrument(span) on the inner async block instead.
     let span = tracing::info_span!(
         "chat_completions",
         request_id = %request_id,
@@ -726,7 +727,25 @@ pub async fn chat_completions(
         workspace_id = %api_key.workspace.id.0,
         model = %request.model,
     );
-    let _span_guard = span.enter();
+
+    chat_completions_inner(app_state, api_key, body_hash, headers, request, request_id)
+        .instrument(span)
+        .await
+}
+
+// Inner async fn so .instrument(span) wraps all awaits in the handler.
+// Split from `chat_completions` only to correctly scope the tracing span:
+// using span.enter() in an async fn risks the guard outliving an .await yield,
+// causing other tasks on the same thread to inherit this span's context.
+#[allow(clippy::too_many_arguments)]
+async fn chat_completions_inner(
+    app_state: crate::routes::api::AppState,
+    api_key: crate::middleware::auth::AuthenticatedApiKey,
+    body_hash: crate::middleware::RequestBodyHash,
+    headers: header::HeaderMap,
+    request: ChatCompletionRequest,
+    request_id: Uuid,
+) -> axum::response::Response {
 
     // Convert HTTP request to service parameters
     // Note: Names are not passed - high-cardinality data is tracked via database, not metrics
@@ -1080,6 +1099,8 @@ pub async fn completions(
         request.model, request.stream, api_key.organization.id, api_key.workspace.id.0
     );
 
+    // This endpoint is not yet implemented — it returns immediately without
+    // any async work, so no tracing span is needed here.
     return (
         StatusCode::NOT_IMPLEMENTED,
         ResponseJson(ErrorResponse::new(

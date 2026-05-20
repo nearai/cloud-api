@@ -496,6 +496,33 @@ const ORG_LIMIT_CACHE_TTL_SECS: u64 = 300;
 const CONCURRENT_COUNT_TTL_SECS: u64 = 600;
 
 impl CompletionServiceImpl {
+    /// Inject tracing correlation IDs into the `extra` map that is forwarded
+    /// to `ChatCompletionParams`. The inference provider reads these keys and
+    /// emits them as `X-Request-Id` / `X-Org-Id` / `X-Workspace-Id` HTTP
+    /// headers on the outbound call to the vLLM/SGLang backend.
+    ///
+    /// The key names must match the constants in
+    /// `inference_providers::vllm::tracing_headers`.
+    fn inject_tracing_headers(
+        extra: &mut std::collections::HashMap<String, serde_json::Value>,
+        request_id: Uuid,
+        organization_id: Uuid,
+        workspace_id: Uuid,
+    ) {
+        extra.insert(
+            "x_request_id".to_string(),
+            serde_json::Value::String(request_id.to_string()),
+        );
+        extra.insert(
+            "x_org_id".to_string(),
+            serde_json::Value::String(organization_id.to_string()),
+        );
+        extra.insert(
+            "x_workspace_id".to_string(),
+            serde_json::Value::String(workspace_id.to_string()),
+        );
+    }
+
     pub fn new(
         inference_provider_pool: Arc<InferenceProviderPool>,
         attestation_service: Arc<dyn AttestationServiceTrait>,
@@ -1054,18 +1081,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
 
         // Inject tracing correlation IDs into extra so the inference provider
         // forwards them as X-Request-Id / X-Org-Id / X-Workspace-Id headers.
-        extra.insert(
-            "x_request_id".to_string(),
-            serde_json::Value::String(request_id.to_string()),
-        );
-        extra.insert(
-            "x_org_id".to_string(),
-            serde_json::Value::String(organization_id.to_string()),
-        );
-        extra.insert(
-            "x_workspace_id".to_string(),
-            serde_json::Value::String(workspace_id.to_string()),
-        );
+        Self::inject_tracing_headers(&mut extra, request_id, organization_id, workspace_id);
 
         let mut chat_params = inference_providers::ChatCompletionParams {
             model: request.model.clone(),
@@ -1221,18 +1237,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
 
         // Inject tracing correlation IDs into extra so the inference provider
         // forwards them as X-Request-Id / X-Org-Id / X-Workspace-Id headers.
-        extra.insert(
-            "x_request_id".to_string(),
-            serde_json::Value::String(request_id.to_string()),
-        );
-        extra.insert(
-            "x_org_id".to_string(),
-            serde_json::Value::String(organization_id.to_string()),
-        );
-        extra.insert(
-            "x_workspace_id".to_string(),
-            serde_json::Value::String(workspace_id.to_string()),
-        );
+        Self::inject_tracing_headers(&mut extra, request_id, organization_id, workspace_id);
 
         let mut chat_params = inference_providers::ChatCompletionParams {
             model: request.model.clone(),

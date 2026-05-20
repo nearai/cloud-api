@@ -689,15 +689,16 @@ impl MockProvider {
 
     /// Set an error override — when set, all chat completion calls return this error
     /// instead of generating a response. Pass `None` to clear the override.
-    /// Override the embeddings response with an error (useful for testing error paths).
-    pub async fn set_embedding_error_override(&self, error: Option<EmbeddingError>) {
-        let mut config = self.config.lock().await;
-        config.embedding_error_override = error;
-    }
-
     pub async fn set_error_override(&self, error: Option<CompletionError>) {
         let mut config = self.config.lock().await;
         config.error_override = error;
+    }
+
+    /// Override the embeddings response with an error (useful for testing error paths).
+    /// Pass `None` to clear the override.
+    pub async fn set_embedding_error_override(&self, error: Option<EmbeddingError>) {
+        let mut config = self.config.lock().await;
+        config.embedding_error_override = error;
     }
 
     /// Generate a completion ID

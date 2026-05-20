@@ -20,12 +20,6 @@ ignore = [
     # https://rustsec.org/advisories/RUSTSEC-2024-0436
     "RUSTSEC-2024-0436",
 
-    # derivative is unmaintained - transitive dependency from dstack-sdk -> alloy -> ruint -> ark-ff.
-    # This is informational only (no security issue). We cannot update it directly.
-    # Tracking: waiting for upstream crates to migrate to derive_more or similar.
-    # https://rustsec.org/advisories/RUSTSEC-2024-0388
-    "RUSTSEC-2024-0388",
-
     # rustls-webpki 0.101.7 — all four advisories below share the same root cause:
     # transitive dep from aws-smithy-http-client -> hyper-rustls 0.24 -> rustls 0.21.x.
     # Cannot update: locked by AWS SDK's legacy rustls 0.21 dependency.

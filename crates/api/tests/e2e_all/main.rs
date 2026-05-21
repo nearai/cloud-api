@@ -39,6 +39,7 @@ mod oauth_frontend_callback;
 mod org_system_prompt;
 mod pagination_validation;
 mod privacy_classify;
+mod privacy_redact;
 mod provider_errors;
 mod repositories;
 mod rerank;

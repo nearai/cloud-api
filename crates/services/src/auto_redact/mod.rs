@@ -156,6 +156,32 @@ async fn redact_messages_inner(
     Ok(map)
 }
 
+/// Apply privacy-filter spans (parsed from a raw classify response) to a
+/// batch of texts. Returns one redacted string per input text, in the
+/// same order. Used by the `/v1/privacy/redact` endpoint after a passthrough
+/// classify call: the handler already has the response bytes for billing,
+/// and this function consumes them to perform the redaction locally.
+///
+/// Fails closed (returns `AutoRedactError::Internal`) on malformed spans
+/// or non-UTF-8 boundaries, so the caller must surface 5xx rather than
+/// pass the raw text through.
+pub fn apply_detected_spans(
+    texts: &[String],
+    response_bytes: &[u8],
+) -> Result<Vec<String>, AutoRedactError> {
+    let spans_per_text = detect::parse_response(response_bytes, texts.len())?;
+    let mut map = RedactionMap::new();
+    // Same haystack rule as redact_messages_inner: a minted dummy must
+    // not appear in any input fragment, so substring substitution stays
+    // unambiguous.
+    let haystack: String = texts.join("\u{0001}");
+    let mut out = Vec::with_capacity(texts.len());
+    for (text, spans) in texts.iter().zip(spans_per_text.iter()) {
+        out.push(apply::redact_one(text, spans, &mut map, &haystack)?);
+    }
+    Ok(out)
+}
+
 /// Strip the `auto_redact` field from a `ServiceCompletionRequest.extra`
 /// map so it isn't forwarded to the upstream provider (Anthropic and
 /// others 422 on unknown fields under strict mode).

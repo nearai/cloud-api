@@ -87,7 +87,9 @@ pub use models::{
     ScoreError, ScoreParams, ScoreResponse, ScoreResult, ScoreUsage, StreamChunk, StreamOptions,
     TokenUsage, ToolChoice, ToolDefinition, TranscriptionSegment, TranscriptionWord,
 };
-pub use sse_parser::{new_sse_parser, BufferedSSEParser, SSEEvent, SSEEventParser, SSEParser};
+pub use sse_parser::{
+    new_external_sse_parser, new_sse_parser, BufferedSSEParser, SSEEvent, SSEEventParser, SSEParser,
+};
 pub use vllm::{VLlmConfig, VLlmProvider};
 
 // Chunk builder for external provider parsers

@@ -197,11 +197,28 @@ where
 #[derive(Default)]
 pub struct OpenAIParserState {
     pub(crate) is_chat: bool,
+    /// Tags `HttpError` events surfaced from in-stream `{"error":{...}}`
+    /// frames so `map_provider_error` can distinguish our own vLLM/SGLang
+    /// (`false`) from a third-party OpenAI-compatible upstream (`true`).
+    /// The (status, external) tuple drives different user-facing messages
+    /// — e.g. a 404 from a third-party provider is a `ProviderError 502`,
+    /// while a 404 from our own vLLM is `InvalidModel`.
+    pub(crate) is_external: bool,
 }
 
 impl OpenAIParserState {
     pub fn new(is_chat: bool) -> Self {
-        Self { is_chat }
+        Self {
+            is_chat,
+            is_external: false,
+        }
+    }
+
+    pub fn new_with_external(is_chat: bool, is_external: bool) -> Self {
+        Self {
+            is_chat,
+            is_external,
+        }
     }
 }
 
@@ -249,7 +266,7 @@ impl SSEEventParser for OpenAIEventParser {
                     return Err(CompletionError::HttpError {
                         status_code,
                         message,
-                        is_external: false,
+                        is_external: state.is_external,
                     });
                 }
                 let chunk = if state.is_chat {
@@ -293,12 +310,25 @@ impl SSEEventParser for OpenAIEventParser {
 /// Type alias for backward compatibility.
 pub type SSEParser<S> = BufferedSSEParser<S, OpenAIEventParser>;
 
-/// Create a new SSE parser for OpenAI/vLLM format
+/// Create a new SSE parser for OpenAI/vLLM format (our own vLLM/SGLang).
+/// In-stream error frames are tagged `is_external: false`.
 pub fn new_sse_parser<S>(stream: S, is_chat: bool) -> SSEParser<S>
 where
     S: Stream<Item = Result<Bytes, reqwest::Error>> + Unpin,
 {
     BufferedSSEParser::new(stream, OpenAIParserState::new(is_chat))
+}
+
+/// Create a new SSE parser for a third-party OpenAI-compatible upstream
+/// (the `external::openai_compatible` provider). In-stream error frames
+/// surface as `HttpError { is_external: true }` so `map_provider_error`
+/// applies the external-provider taxonomy (e.g. 404 → `ProviderError 502`
+/// rather than `InvalidModel`).
+pub fn new_external_sse_parser<S>(stream: S, is_chat: bool) -> SSEParser<S>
+where
+    S: Stream<Item = Result<Bytes, reqwest::Error>> + Unpin,
+{
+    BufferedSSEParser::new(stream, OpenAIParserState::new_with_external(is_chat, true))
 }
 
 #[cfg(test)]
@@ -598,6 +628,35 @@ mod tests {
                 assert_eq!(*status_code, 502, "Missing code should default to 502");
             }
             other => panic!("Expected HttpError 502, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_external_sse_parser_tags_error_chunks_as_external() {
+        // External (third-party OpenAI-compatible) providers route through
+        // `new_external_sse_parser` so their in-stream error chunks surface
+        // with `is_external: true`. This matters for `map_provider_error`:
+        // a 404 from a third-party provider should map to `ProviderError
+        // 502` (their model is unavailable), not `InvalidModel` (which is
+        // the meaning of 404 from our own vLLM infrastructure).
+        let packet = "data: {\"error\":{\"message\":\"model not found\",\"type\":\"not_found\",\"code\":404}}\n\n";
+        let mock_stream =
+            futures_util::stream::iter(vec![Ok::<_, reqwest::Error>(bytes::Bytes::from(packet))]);
+        let parser = new_external_sse_parser(mock_stream, true);
+        let events: Vec<_> = parser.collect().await;
+        match &events[0] {
+            Err(CompletionError::HttpError {
+                status_code,
+                is_external,
+                ..
+            }) => {
+                assert_eq!(*status_code, 404);
+                assert!(
+                    *is_external,
+                    "External provider error chunks must be tagged is_external: true"
+                );
+            }
+            other => panic!("Expected HttpError 404 with is_external: true, got: {other:?}"),
         }
     }
 

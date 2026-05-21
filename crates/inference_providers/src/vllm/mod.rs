@@ -966,18 +966,32 @@ impl VLlmProvider {
             {
                 Ok(r) => r,
                 Err(e) => match &e {
+                    // 4xx other than 429 is a real client error (bad request,
+                    // invalid params) — every backend would reject it the
+                    // same way, so surface immediately rather than burn the
+                    // remaining indices on a doomed request.
                     CompletionError::HttpError { status_code, .. }
-                        if Self::is_rotation_retryable_status(*status_code) =>
+                        if !Self::is_rotation_retryable_status(*status_code) =>
                     {
+                        return Err(e);
+                    }
+                    // Everything else (retryable HttpError 5xx/429,
+                    // `Timeout` from `send_streaming_request`'s TTFB guard,
+                    // generic `CompletionError` for TLS/TCP/transport
+                    // failures) is per-backend by construction: model-proxy
+                    // PR #27 pins each `-iN` SNI to one backend, so the
+                    // failure at index N tells us nothing about index N+1.
+                    // Mirror the non-streaming sibling and try the next
+                    // index instead of giving up.
+                    _ => {
                         tracing::debug!(
                             index,
-                            status_code = *status_code,
-                            "Rotation-SNI stream attempt returned 5xx/429, trying next backend"
+                            error = %e,
+                            "Rotation-SNI stream attempt failed, trying next backend"
                         );
                         last_error = e;
                         continue;
                     }
-                    _ => return Err(e),
                 },
             };
             let parser = new_sse_parser(response.bytes_stream(), true);
@@ -1360,7 +1374,24 @@ impl InferenceProvider for VLlmProvider {
         //     forwards verbatim): peek catches it via the parser's typed
         //     `HttpError` and we route to the same rotation fallback.
         //   - Otherwise: pin bucket, return peekable as the live stream.
+        //
+        // We only peek when rotation is actually possible
+        // (`rotation_count() > 0`): the peek blocks until the first SSE
+        // chunk arrives, so on the happy path it adds first-byte latency
+        // to every streaming request. When rotation can't help (cold-start
+        // before discovery's first cycle, or non-rotation URLs like
+        // `localhost`), skip the peek so a first-chunk error still surfaces
+        // through the route layer's `sse_error_frame` path (PR #629) and
+        // happy-path streams return HTTP 200 as soon as the headers arrive.
         match canonical_send {
+            Ok(response) if self.rotation_count() == 0 => {
+                self.pending_buckets
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(request_hash, bucket_id);
+                let sse_stream = new_sse_parser(response.bytes_stream(), true);
+                Ok(Box::pin(sse_stream))
+            }
             Ok(response) => {
                 let parser = new_sse_parser(response.bytes_stream(), true);
                 let stream: StreamingResult = Box::pin(parser);
@@ -1386,14 +1417,10 @@ impl InferenceProvider for VLlmProvider {
                         Ok(Box::pin(peekable))
                     }
                     Some(status_code) => {
+                        // rotation_count() > 0 is guaranteed by the arm
+                        // guard above, so the fallback will actually iterate
+                        // at least one alternative backend.
                         drop(peekable);
-                        if self.rotation_count() == 0 {
-                            return Err(CompletionError::HttpError {
-                                status_code,
-                                message: "Upstream stream emitted an error event".to_string(),
-                                is_external: false,
-                            });
-                        }
                         self.try_chat_completion_stream_rotation(
                             &streaming_params,
                             &headers,

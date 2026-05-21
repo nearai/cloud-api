@@ -16,6 +16,14 @@ use serde::Deserialize;
 use tracing::debug;
 use url::Url;
 
+/// Hard cap on rotation fan-out, shared between the discovery cycle (which
+/// caps `/backends/count` before issuing per-index attestation probes) and
+/// the traffic-time fallback path (which caps how many indices we walk on a
+/// 5xx). Far above any realistic backend pool; hitting it means a registry
+/// reading is bogus and we're defending against unbounded fresh-TCP
+/// handshakes per request.
+pub const MAX_FANOUT: usize = 256;
+
 /// Pieces of an inference URL that the rotation path needs.
 ///
 /// `host` is the original SNI/Host the provider was registered with

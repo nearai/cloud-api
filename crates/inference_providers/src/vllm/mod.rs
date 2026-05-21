@@ -758,18 +758,16 @@ impl VLlmProvider {
         Ok(response)
     }
 
-    /// Hard cap on rotation fan-out. Mirrors `MAX_ROTATION_FANOUT` in the
-    /// discovery path: a bogus `/backends/count` reading shouldn't let one
-    /// 5xx burn an unbounded number of fresh-TCP handshakes.
-    const MAX_ROTATION_FANOUT: usize = 256;
-
     /// Status codes that warrant a rotation-SNI retry. Mirrors the pool's
-    /// `classify_retry_decision` ("retryable_http_5xx" + 429), but evaluated
-    /// here so the rotation fallback fires *before* the canonical 5xx
-    /// escapes to the pool's same-provider backoff loop (which would only
-    /// re-hit the sticky bucket → same overloaded backend).
+    /// `classify_retry_decision` ("retryable_http_5xx" + 429 + 408), but
+    /// evaluated here so the rotation fallback fires *before* the canonical
+    /// 5xx escapes to the pool's same-provider backoff loop (which would
+    /// only re-hit the sticky bucket → same overloaded backend). 408 is
+    /// included because the pool already treats it as "next-provider-
+    /// worthy" — keeping the gates in sync avoids a taxonomy mismatch
+    /// where the pool would retry on 408 but rotation wouldn't.
     fn is_rotation_retryable_status(status_code: u16) -> bool {
-        status_code == 429 || (500..=599).contains(&status_code)
+        status_code == 408 || status_code == 429 || (500..=599).contains(&status_code)
     }
 
     /// Healthy backend count clamped to the rotation fan-out cap. Returns 0
@@ -782,7 +780,7 @@ impl VLlmProvider {
         }
         self.last_backend_count
             .load(Ordering::Relaxed)
-            .min(Self::MAX_ROTATION_FANOUT)
+            .min(crate::rotation::MAX_FANOUT)
     }
 
     /// Build the absolute URL `https://<canonical>-i<index>.<base><path>` for
@@ -831,6 +829,15 @@ impl VLlmProvider {
         canonical_err: CompletionError,
     ) -> Result<ChatCompletionResponseWithBytes, CompletionError> {
         let count = self.rotation_count();
+        // `last_error` tracks only HttpError-shaped failures so the pool's
+        // `classify_retry_decision` sees a typed `retryable_http_5xx` (or
+        // 429) at the end. Transport-level failures from the rotation loop
+        // (Timeout, generic CompletionError) are logged but never overwrite
+        // `last_error`: if every rotation index produced only transport
+        // errors, we fall back to `canonical_err` (always an HttpError 5xx/
+        // 429 by call-site construction) instead of returning a misleading
+        // `CompletionError(...)` that would classify as
+        // `retryable_connection_keyword`.
         let mut last_error = canonical_err;
         for index in 0..count as u64 {
             let url = match self.rotation_url(index, "/v1/chat/completions") {
@@ -840,7 +847,10 @@ impl VLlmProvider {
             let client = match self.build_rotation_client() {
                 Ok(c) => c,
                 Err(e) => {
-                    last_error = e;
+                    tracing::debug!(
+                        index, error = %e,
+                        "Rotation-SNI chat_completion client build failed, trying next backend"
+                    );
                     continue;
                 }
             };
@@ -854,20 +864,16 @@ impl VLlmProvider {
             let response = match send_res {
                 Ok(r) => r,
                 Err(e) => {
-                    // Connect / network errors against this index — try the
-                    // next backend; treat as retryable since the rotation
-                    // listener pins to one backend by design (model-proxy
-                    // PR #27).
-                    last_error = if e.is_timeout() && !e.is_connect() {
-                        CompletionError::Timeout {
-                            operation: "chat_completion".to_string(),
-                            timeout_seconds: timeout.as_secs(),
-                        }
-                    } else {
-                        CompletionError::CompletionError(format_error_chain(&e))
-                    };
+                    // Connect / network / TTFB-timeout errors against this
+                    // index — try the next backend. The rotation listener
+                    // pins to one backend by design (model-proxy PR #27),
+                    // so failure at index N tells us nothing about N+1.
+                    // We log the error but DON'T overwrite `last_error`:
+                    // see the field comment above.
                     tracing::debug!(
-                        index, error = %last_error,
+                        index, error = %format_error_chain(&e),
+                        is_timeout = e.is_timeout(),
+                        is_connect = e.is_connect(),
                         "Rotation-SNI chat_completion attempt errored, trying next backend"
                     );
                     continue;
@@ -888,12 +894,12 @@ impl VLlmProvider {
                     tracing::debug!(
                         index,
                         status_code,
-                        "Rotation-SNI chat_completion backend still 5xx, trying next"
+                        "Rotation-SNI chat_completion backend still 5xx/429/408, trying next"
                     );
                     last_error = err;
                     continue;
                 }
-                // 4xx (other than 429) means the request itself is bad —
+                // 4xx (other than 408/429) means the request itself is bad —
                 // surface immediately rather than burn the rest of the
                 // rotation set on the same client error.
                 return Err(err);
@@ -947,6 +953,14 @@ impl VLlmProvider {
         canonical_err: CompletionError,
     ) -> Result<StreamingResult, CompletionError> {
         let count = self.rotation_count();
+        // See the non-streaming sibling for the design: `last_error` only
+        // tracks HttpError-shaped failures from rotation indices, so the
+        // pool's `classify_retry_decision` sees the right `retryable_http_*`
+        // label at the end. Transport-level failures (Timeout, generic
+        // CompletionError) are logged but never overwrite `last_error`;
+        // if rotation produces only transport errors, we fall back to
+        // `canonical_err` (always HttpError 5xx/429 by call-site
+        // construction).
         let mut last_error = canonical_err;
         for index in 0..count as u64 {
             let url = match self.rotation_url(index, "/v1/chat/completions") {
@@ -956,7 +970,10 @@ impl VLlmProvider {
             let client = match self.build_rotation_client() {
                 Ok(c) => c,
                 Err(e) => {
-                    last_error = e;
+                    tracing::debug!(
+                        index, error = %e,
+                        "Rotation-SNI stream client build failed, trying next backend"
+                    );
                     continue;
                 }
             };
@@ -966,30 +983,37 @@ impl VLlmProvider {
             {
                 Ok(r) => r,
                 Err(e) => match &e {
-                    // 4xx other than 429 is a real client error (bad request,
-                    // invalid params) — every backend would reject it the
-                    // same way, so surface immediately rather than burn the
-                    // remaining indices on a doomed request.
+                    // 4xx other than 408/429 is a real client error (bad
+                    // request, invalid params) — every backend would reject
+                    // it the same way, so surface immediately rather than
+                    // burn the remaining indices on a doomed request.
                     CompletionError::HttpError { status_code, .. }
                         if !Self::is_rotation_retryable_status(*status_code) =>
                     {
                         return Err(e);
                     }
-                    // Everything else (retryable HttpError 5xx/429,
-                    // `Timeout` from `send_streaming_request`'s TTFB guard,
-                    // generic `CompletionError` for TLS/TCP/transport
-                    // failures) is per-backend by construction: model-proxy
-                    // PR #27 pins each `-iN` SNI to one backend, so the
-                    // failure at index N tells us nothing about index N+1.
-                    // Mirror the non-streaming sibling and try the next
-                    // index instead of giving up.
+                    // Retryable HttpError (5xx/429/408) — update last_error
+                    // so the trace label stays accurate at end-of-rotation.
+                    CompletionError::HttpError { .. } => {
+                        tracing::debug!(
+                            index, error = %e,
+                            "Rotation-SNI stream attempt returned 5xx/429/408, trying next backend"
+                        );
+                        last_error = e;
+                        continue;
+                    }
+                    // Transport-level failures (`Timeout` from
+                    // `send_streaming_request`'s TTFB guard, generic
+                    // `CompletionError` for TLS/TCP). Per-backend by
+                    // construction: model-proxy PR #27 pins each `-iN` SNI
+                    // to one backend, so failure at index N tells us nothing
+                    // about index N+1. Log but DON'T overwrite last_error.
                     _ => {
                         tracing::debug!(
                             index,
                             error = %e,
-                            "Rotation-SNI stream attempt failed, trying next backend"
+                            "Rotation-SNI stream attempt failed transport, trying next backend"
                         );
-                        last_error = e;
                         continue;
                     }
                 },
@@ -3033,20 +3057,25 @@ mod tests {
     }
 
     #[test]
-    fn rotation_retryable_status_covers_5xx_and_429() {
+    fn rotation_retryable_status_covers_5xx_429_and_408() {
         // Mirrors `classify_retry_decision` in the pool ("retryable_http_5xx"
-        // + 429). Keeping these in sync is load-bearing: if the rotation
-        // gate diverges, a 503 that the pool considers retryable could
-        // bypass rotation and burn the pool's 3-round backoff against the
-        // same overloaded bucket.
+        // + 429 + 408). Keeping these in sync is load-bearing: if the
+        // rotation gate diverges, a 503 that the pool considers retryable
+        // could bypass rotation and burn the pool's 3-round backoff against
+        // the same overloaded bucket. 408 is included because the pool
+        // already treats it as next-provider-worthy in the chat_completion
+        // closure — and other indices may succeed where the sticky bucket
+        // timed out.
+        assert!(VLlmProvider::is_rotation_retryable_status(408));
         assert!(VLlmProvider::is_rotation_retryable_status(429));
         assert!(VLlmProvider::is_rotation_retryable_status(500));
         assert!(VLlmProvider::is_rotation_retryable_status(503));
         assert!(VLlmProvider::is_rotation_retryable_status(599));
         assert!(!VLlmProvider::is_rotation_retryable_status(200));
         assert!(!VLlmProvider::is_rotation_retryable_status(400));
+        assert!(!VLlmProvider::is_rotation_retryable_status(401));
         assert!(!VLlmProvider::is_rotation_retryable_status(404));
-        assert!(!VLlmProvider::is_rotation_retryable_status(408));
+        assert!(!VLlmProvider::is_rotation_retryable_status(422));
     }
 
     #[test]
@@ -3103,7 +3132,7 @@ mod tests {
             control_timeout_seconds: 30,
         });
         provider.set_backend_count(10_000);
-        assert_eq!(provider.rotation_count(), VLlmProvider::MAX_ROTATION_FANOUT);
+        assert_eq!(provider.rotation_count(), crate::rotation::MAX_FANOUT);
     }
 
     #[test]

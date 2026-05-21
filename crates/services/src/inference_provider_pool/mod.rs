@@ -925,22 +925,22 @@ impl InferenceProviderPool {
 
         // Defense-in-depth: cap the fan-out. A bogus registry reading (race
         // during a deploy, partial split) could otherwise spawn an unbounded
-        // number of fresh-TCP TLS handshakes per cycle per model. The cap is
-        // far above any realistic backend pool; hitting it is logged so it
-        // surfaces in ops without silently dropping coverage.
-        const MAX_ROTATION_FANOUT: usize = 256;
-        let backend_count = if backend_count > MAX_ROTATION_FANOUT {
+        // number of fresh-TCP TLS handshakes per cycle per model. Shared
+        // with VLlmProvider's traffic-time rotation gate so the cap is
+        // defined exactly once.
+        let backend_count = if backend_count > rotation::MAX_FANOUT {
             warn!(
                 model = %model_name,
                 url = %url,
                 reported = backend_count,
-                capped_at = MAX_ROTATION_FANOUT,
+                capped_at = rotation::MAX_FANOUT,
                 "backend count from proxy exceeds sanity cap, truncating fan-out"
             );
             failure_reasons.push(format!(
-                "count_capped: proxy reported {backend_count} > {MAX_ROTATION_FANOUT}"
+                "count_capped: proxy reported {backend_count} > {}",
+                rotation::MAX_FANOUT
             ));
-            MAX_ROTATION_FANOUT
+            rotation::MAX_FANOUT
         } else {
             backend_count
         };

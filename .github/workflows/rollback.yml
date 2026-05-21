@@ -1,0 +1,218 @@
+name: Rollback Image
+
+permissions:
+  contents: write
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_tag:
+        description: "Target prod tag to roll back to (e.g. prod-20260101-abc1234). Leave empty to auto-resolve to the most recent prod-* tag whose digest differs from current :prod."
+        required: false
+        type: string
+        default: ""
+      confirm:
+        description: "Type ROLLBACK to confirm production rollback"
+        required: true
+        type: string
+
+env:
+  REGISTRY: docker.io
+  IMAGE_NAME: cloud-api
+  IMAGE: docker.io/${{ vars.DOCKER_REGISTRY_USER }}/cloud-api
+
+jobs:
+  preflight:
+    name: Validate confirmation
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check confirm input
+        run: |
+          if [ "${{ inputs.confirm }}" != "ROLLBACK" ]; then
+            echo "::error::Confirmation failed. Set 'confirm' input to ROLLBACK to proceed (got: '${{ inputs.confirm }}')."
+            exit 1
+          fi
+
+  rollback-prod:
+    name: Roll back :prod
+    needs: preflight
+    runs-on: ubuntu-latest
+    environment: production
+    outputs:
+      target_tag: ${{ steps.resolve.outputs.target_tag }}
+      target_digest: ${{ steps.resolve.outputs.target_digest }}
+      previous_digest: ${{ steps.resolve.outputs.previous_digest }}
+      audit_tag: ${{ steps.resolve.outputs.audit_tag }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Log in to Docker registry
+        uses: docker/login-action@9f4a8ea54ed9055d5f86c993e1f2ffa674f98344
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ vars.DOCKER_REGISTRY_USER }}
+          password: ${{ secrets.DOCKER_REGISTRY_TOKEN }}
+
+      - name: Install skopeo and jq
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y skopeo jq
+
+      # Resolve target prod-* tag (auto or explicit) and capture the digest
+      # currently published as :prod so the deploy step has an addressable
+      # 'before' state and the workflow summary records both digests.
+      - name: Resolve target tag and digest
+        id: resolve
+        run: |
+          set -euo pipefail
+          TARGET_TAG="${{ inputs.target_tag }}"
+
+          CURRENT_DIGEST=$(skopeo inspect "docker://${{ env.IMAGE }}:prod" | jq -r '.Digest')
+          if [ -z "$CURRENT_DIGEST" ] || [ "$CURRENT_DIGEST" = "null" ]; then
+            echo "::error::Failed to inspect current :prod digest"
+            exit 1
+          fi
+          echo "previous_digest=${CURRENT_DIGEST}" >> "$GITHUB_OUTPUT"
+          echo "Current :prod digest: ${CURRENT_DIGEST}"
+
+          if [ -z "$TARGET_TAG" ]; then
+            echo "No target_tag provided; auto-resolving previous prod-* tag"
+            # Paginate Docker Hub tags. Bound iterations and per-call time so a
+            # malformed cursor or stuck pagination can't hang the workflow.
+            TAGS_JSON=""
+            PAGE_URL="https://hub.docker.com/v2/namespaces/${{ vars.DOCKER_REGISTRY_USER }}/repositories/${{ env.IMAGE_NAME }}/tags?page_size=100"
+            MAX_PAGES=50
+            PAGE_COUNT=0
+            while [ -n "$PAGE_URL" ] && [ "$PAGE_URL" != "null" ] && [ "$PAGE_COUNT" -lt "$MAX_PAGES" ]; do
+              RESP=$(curl -fsS --max-time 30 --retry 2 --retry-delay 2 "$PAGE_URL")
+              TAGS_JSON="${TAGS_JSON}$(echo "$RESP" | jq -c '.results[]')"$'\n'
+              PAGE_URL=$(echo "$RESP" | jq -r '.next')
+              PAGE_COUNT=$((PAGE_COUNT + 1))
+            done
+            if [ "$PAGE_COUNT" -ge "$MAX_PAGES" ]; then
+              echo "::warning::Reached MAX_PAGES=${MAX_PAGES} while listing tags; auto-resolve may have missed older candidates."
+            fi
+            # Sort by Docker Hub last_updated (push time). Same-day promotions
+            # share the YYYYMMDD prefix and tiebreak by short-sha, which is not
+            # chronological, so name sort alone would pick the wrong one.
+            TARGET_TAG=$(echo "$TAGS_JSON" | jq -rs --arg cur "$CURRENT_DIGEST" '
+              [.[] | select(.name | test("^prod-[0-9]{8}-[0-9a-f]{7}$")) | {name, digest, last_updated}]
+              | sort_by(.last_updated // .name) | reverse
+              | map(select(.digest != $cur)) | .[0].name // empty
+            ')
+            if [ -z "$TARGET_TAG" ]; then
+              echo "::error::No previous prod-* tag found whose digest differs from current :prod. Specify target_tag explicitly."
+              exit 1
+            fi
+            echo "Auto-resolved previous tag: ${TARGET_TAG}"
+          fi
+
+          if ! echo "$TARGET_TAG" | grep -Eq '^prod-[0-9]{8}-[0-9a-f]{7}$'; then
+            echo "::error::target_tag '${TARGET_TAG}' does not match expected format prod-YYYYMMDD-<shortsha>"
+            exit 1
+          fi
+
+          TARGET_DIGEST=$(skopeo inspect "docker://${{ env.IMAGE }}:${TARGET_TAG}" 2>/dev/null | jq -r '.Digest' || true)
+          if [ -z "$TARGET_DIGEST" ] || [ "$TARGET_DIGEST" = "null" ]; then
+            echo "::error::Tag ${TARGET_TAG} not found on Docker Hub"
+            exit 1
+          fi
+          if [ "$TARGET_DIGEST" = "$CURRENT_DIGEST" ]; then
+            echo "::error::Target tag ${TARGET_TAG} already matches current :prod digest (${CURRENT_DIGEST}). Nothing to do."
+            exit 1
+          fi
+
+          STAMP=$(date -u +%Y%m%d-%H%M%S)
+          AUDIT_TAG="prod-rollback-${STAMP}-from-${TARGET_TAG#prod-}"
+
+          echo "target_tag=${TARGET_TAG}" >> "$GITHUB_OUTPUT"
+          echo "target_digest=${TARGET_DIGEST}" >> "$GITHUB_OUTPUT"
+          echo "audit_tag=${AUDIT_TAG}" >> "$GITHUB_OUTPUT"
+          echo "Resolved target: ${TARGET_TAG} @ ${TARGET_DIGEST}"
+          echo "Audit tag: ${AUDIT_TAG}"
+
+      # Copy from the resolved digest (not the tag) so the bytes pushed to
+      # :prod and the audit tag are provably identical, regardless of any
+      # concurrent registry write that might race the source tag.
+      - name: Re-tag :prod and push audit tag
+        run: |
+          set -euo pipefail
+          TARGET_DIGEST="${{ steps.resolve.outputs.target_digest }}"
+          AUDIT_TAG="${{ steps.resolve.outputs.audit_tag }}"
+          skopeo copy "docker://${{ env.IMAGE }}@${TARGET_DIGEST}" "docker://${{ env.IMAGE }}:prod"
+          skopeo copy "docker://${{ env.IMAGE }}@${TARGET_DIGEST}" "docker://${{ env.IMAGE }}:${AUDIT_TAG}"
+
+      - name: Output digest summary
+        run: |
+          {
+            echo "## Rollback: :prod → ${{ steps.resolve.outputs.target_tag }}"
+            echo ""
+            echo "- target tag: \`${{ steps.resolve.outputs.target_tag }}\`"
+            echo "- target digest: \`${{ steps.resolve.outputs.target_digest }}\`"
+            echo "- previous :prod digest: \`${{ steps.resolve.outputs.previous_digest }}\`"
+            echo "- audit tag: \`${{ steps.resolve.outputs.audit_tag }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # GH release tag mirrors the audit docker tag for easy correlation.
+      # edit-or-create keeps same-second re-runs idempotent. Never marks the
+      # rollback release as 'latest' — :prod has moved backwards, so the GH
+      # 'latest' pointer should keep pointing at the most recent forward
+      # promotion's release, not this one.
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${{ steps.resolve.outputs.audit_tag }}"
+          NOTES=$(cat <<EOF
+          ## Production Rollback
+
+          - **Image**: \`${{ env.IMAGE }}:prod\`
+          - **Rolled back to**: \`${{ env.IMAGE }}:${{ steps.resolve.outputs.target_tag }}\`
+          - **Audit tag**: \`${{ env.IMAGE }}:${TAG}\`
+          - **New :prod digest**: \`${{ steps.resolve.outputs.target_digest }}\`
+          - **Previous :prod digest**: \`${{ steps.resolve.outputs.previous_digest }}\`
+          - **Sigstore**: https://search.sigstore.dev/?hash=${{ steps.resolve.outputs.target_digest }}
+          EOF
+          )
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release edit "$TAG" --title "Production Rollback ${TAG}" --notes "$NOTES"
+          else
+            gh release create "$TAG" --title "Production Rollback ${TAG}" --notes "$NOTES"
+          fi
+          echo "- release: [\`${TAG}\`](${{ github.server_url }}/${{ github.repository }}/releases/tag/${TAG})" >> "$GITHUB_STEP_SUMMARY"
+
+  trigger-redeploy:
+    name: Trigger cvm-ansible-playbooks redeploy
+    needs: rollback-prod
+    runs-on: ubuntu-latest
+    steps:
+      # cvm-ansible-playbooks `Update Cloud API Prod` re-reads :prod from
+      # Docker Hub, which we just re-pointed at the rolled-back digest. We
+      # trigger its existing workflow_dispatch (not repository_dispatch) so
+      # this rollback workflow stays self-contained — no change required in
+      # cvm-ansible-playbooks. REPOSITORY_DISPATCH_TOKEN is already used by
+      # build.yml for cross-repo dispatch into the same target repo.
+      - name: Dispatch Update Cloud API Prod
+        env:
+          GH_TOKEN: ${{ secrets.REPOSITORY_DISPATCH_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh workflow run update_cloud_api_prod.yml \
+            --repo nearai/cvm-ansible-playbooks \
+            --ref main
+
+      - name: Summary
+        run: |
+          {
+            echo "## Redeploy dispatched"
+            echo ""
+            echo "- target tag: \`${{ needs.rollback-prod.outputs.target_tag }}\`"
+            echo "- target digest: \`${{ needs.rollback-prod.outputs.target_digest }}\`"
+            echo "- audit tag: \`${{ needs.rollback-prod.outputs.audit_tag }}\`"
+            echo ""
+            echo "Triggered \`Update Cloud API Prod\` on \`nearai/cvm-ansible-playbooks\`."
+            echo "Track the deploy: https://github.com/nearai/cvm-ansible-playbooks/actions/workflows/update_cloud_api_prod.yml"
+            echo ""
+            echo "Verify when deploy completes: https://cloud-api.near.ai/v1/health"
+          } >> "$GITHUB_STEP_SUMMARY"

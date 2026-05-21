@@ -211,6 +211,10 @@ fn completion_stream_error_category(e: &inference_providers::CompletionError) ->
 
 /// Returns an OpenAI-compatible `error.type` for a stream-level completion error.
 /// Used in the `data: {"error":{...}}` SSE frame so clients can branch on the type.
+///
+/// Match is intentionally exhaustive (no `_` arm): a new `CompletionError`
+/// variant must force a compile error here so the OpenAI mapping is reviewed
+/// explicitly instead of silently defaulting to `server_error`.
 fn completion_stream_error_openai_type(e: &inference_providers::CompletionError) -> &'static str {
     match e {
         inference_providers::CompletionError::HttpError { status_code, .. } => match *status_code {
@@ -218,7 +222,11 @@ fn completion_stream_error_openai_type(e: &inference_providers::CompletionError)
             400..=499 => "invalid_request_error",
             _ => "server_error",
         },
-        _ => "server_error",
+        inference_providers::CompletionError::CompletionError(_)
+        | inference_providers::CompletionError::InvalidResponse(_)
+        | inference_providers::CompletionError::Unknown(_)
+        | inference_providers::CompletionError::NoPubKeyProvider(_)
+        | inference_providers::CompletionError::Timeout { .. } => "server_error",
     }
 }
 

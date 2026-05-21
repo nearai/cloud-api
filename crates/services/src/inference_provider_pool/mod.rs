@@ -254,9 +254,16 @@ impl inference_providers::BackendVerifier for PoolBackendVerifier {
                 .unwrap_or_else(|e| e.into_inner());
             guard.clone()
         };
-        if pinned_snapshot.pinned_count() > 0 {
+        let pinned_count = pinned_snapshot.pinned_count();
+        if pinned_count > 0 {
             match self.try_pinned_fast_path(base_url, pinned_snapshot).await {
-                Ok(client) => return Ok(client),
+                Ok(client) => {
+                    tracing::debug!(
+                        pinned_count,
+                        "Fast-path TLS probe succeeded, skipping attestation"
+                    );
+                    return Ok(client);
+                }
                 Err(reason) => {
                     tracing::debug!(
                         reason = %reason,
@@ -272,26 +279,9 @@ impl inference_providers::BackendVerifier for PoolBackendVerifier {
         //
         // 1. Build a client with isolated Bootstrap state (accepts any WebPKI cert
         //    for the initial connection to discover the backend's fingerprint).
-        // read_timeout is the per-chunk idle timeout; for non-streaming chat
-        // completion the connection sits silent the entire inference time, so
-        // it must match the configured completion budget — otherwise a long
-        // reasoning request fires read_timeout (~300s) before our `.timeout()`
-        // (default 600s). Track `VLLM_PROVIDER_COMPLETION_TIMEOUT` so the env
-        // override applies here too.
-        let read_timeout =
-            Duration::from_secs(VLlmConfig::completion_timeout_from_env().max(0) as u64);
         let client_state = Arc::new(std::sync::RwLock::new(FingerprintState::Bootstrap));
-        let builder = reqwest::Client::builder()
-            .use_preconfigured_tls(self.tls_roots.build_config(client_state.clone()))
-            .pool_max_idle_per_host(1)
-            .http2_adaptive_window(true)
-            .connect_timeout(Duration::from_secs(5))
-            .read_timeout(read_timeout);
-        // Bucket clients need the H2 connection to stay sticky to a single
-        // backend across long idle gaps; see
-        // `inference_providers::bucket_keepalive`.
-        let client = inference_providers::bucket_keepalive::apply(builder)
-            .build()
+        let client = self
+            .build_bucket_client(client_state.clone())
             .map_err(|e| format!("Failed to build HTTP client: {e}"))?;
 
         // 2. Fetch attestation report — this establishes the H2 connection.
@@ -375,6 +365,32 @@ impl inference_providers::BackendVerifier for PoolBackendVerifier {
 }
 
 impl PoolBackendVerifier {
+    /// Build a bucket-flavored `reqwest::Client` with TLS verification driven
+    /// by the supplied `FingerprintState`. Centralizing this here means the
+    /// fast and slow paths can't drift on pool/timeout/keepalive settings.
+    ///
+    /// `read_timeout` is the per-chunk idle timeout; for non-streaming chat
+    /// completion the connection sits silent the entire inference time, so it
+    /// must match the configured completion budget — otherwise a long
+    /// reasoning request fires `read_timeout` (~300s) before our `.timeout()`
+    /// (default 600s). `VLLM_PROVIDER_COMPLETION_TIMEOUT` env override applies
+    /// here too. `bucket_keepalive::apply` keeps the H2 connection sticky to
+    /// a single backend across long idle gaps.
+    fn build_bucket_client(
+        &self,
+        state: Arc<std::sync::RwLock<FingerprintState>>,
+    ) -> Result<reqwest::Client, reqwest::Error> {
+        let read_timeout =
+            Duration::from_secs(VLlmConfig::completion_timeout_from_env().max(0) as u64);
+        let builder = reqwest::Client::builder()
+            .use_preconfigured_tls(self.tls_roots.build_config(state))
+            .pool_max_idle_per_host(1)
+            .http2_adaptive_window(true)
+            .connect_timeout(Duration::from_secs(5))
+            .read_timeout(read_timeout);
+        inference_providers::bucket_keepalive::apply(builder).build()
+    }
+
     /// Fast path for `create_verified_client` when discovery has already pinned
     /// fingerprints for this model's backends.
     ///
@@ -399,19 +415,16 @@ impl PoolBackendVerifier {
         base_url: &str,
         pinned_snapshot: FingerprintState,
     ) -> Result<reqwest::Client, String> {
-        let read_timeout =
-            Duration::from_secs(VLlmConfig::completion_timeout_from_env().max(0) as u64);
         let client_state = Arc::new(std::sync::RwLock::new(pinned_snapshot));
-        let builder = reqwest::Client::builder()
-            .use_preconfigured_tls(self.tls_roots.build_config(client_state))
-            .pool_max_idle_per_host(1)
-            .http2_adaptive_window(true)
-            .connect_timeout(Duration::from_secs(5))
-            .read_timeout(read_timeout);
-        let client = inference_providers::bucket_keepalive::apply(builder)
-            .build()
+        let client = self
+            .build_bucket_client(client_state)
             .map_err(|e| format!("Failed to build HTTP client: {e}"))?;
 
+        // `/v1/models` is assumed to accept the same bearer token used for
+        // inference (or to be unauthenticated). If a backend ever required a
+        // different key here, the probe would 401 and we'd fall back to the
+        // slow path — same outcome, just slower. The probe's value comes from
+        // the TLS handshake, not the response body.
         let url = format!("{base_url}/v1/models");
         let mut request = client.get(&url);
         if let Some(ref key) = self.api_key {
@@ -4537,5 +4550,219 @@ mod tests {
                 "Model backed by a Blocked provider should be removed from model_to_providers"
             );
         }
+    }
+
+    // -------------------------------------------------------------------
+    // Fast-path tests for `PoolBackendVerifier`
+    //
+    // The fast path runs an HTTP probe against `/v1/models` and returns
+    // the client without re-attestation when the TLS handshake succeeds.
+    // These tests use plain HTTP (the rustls verifier is only consulted
+    // for HTTPS URLs, so the TLS-pinning layer is short-circuited) and a
+    // hand-rolled TCP responder — same pattern as
+    // `crates/inference_providers/src/vllm/mod.rs`. The goal is to verify
+    // the control flow (Bootstrap → skip fast path; pinned + 200 → return;
+    // pinned + 5xx → fall back; pinned + hang → time out and fall back),
+    // not the TLS verifier itself which has its own tests.
+    // -------------------------------------------------------------------
+
+    use inference_providers::spki_verifier::SharedTlsRoots;
+    use inference_providers::BackendVerifier as _;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    /// Behavior of the mock HTTP server when `/v1/models` is hit.
+    #[derive(Clone, Copy)]
+    enum ModelsBehavior {
+        /// Reply with the given status code and body.
+        Reply(u16, &'static str),
+        /// Accept the TCP connection but never reply — exercises the
+        /// 5-second probe timeout.
+        Hang,
+    }
+
+    struct FastPathTestServer {
+        addr: std::net::SocketAddr,
+        models_hits: Arc<AtomicUsize>,
+        attestation_hits: Arc<AtomicUsize>,
+        _acceptor: tokio::task::JoinHandle<()>,
+    }
+
+    /// Spawn a minimal HTTP/1.1 responder. `/v1/attestation/report` always
+    /// returns 500 (so the slow-path call from the Bootstrap test errors
+    /// out quickly); `/v1/models` is governed by `models_behavior`.
+    async fn start_fast_path_server(models_behavior: ModelsBehavior) -> FastPathTestServer {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let models_hits = Arc::new(AtomicUsize::new(0));
+        let attestation_hits = Arc::new(AtomicUsize::new(0));
+        let m = models_hits.clone();
+        let a = attestation_hits.clone();
+        let acceptor = tokio::spawn(async move {
+            // Sockets that we choose to leave hanging — kept alive so the
+            // peer reads "no data yet" rather than an immediate EOF.
+            let mut held = Vec::new();
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                let mut buf = [0u8; 1024];
+                let n = match sock.read(&mut buf).await {
+                    Ok(n) if n > 0 => n,
+                    _ => continue,
+                };
+                let head = String::from_utf8_lossy(&buf[..n.min(256)]);
+                let path = head
+                    .lines()
+                    .next()
+                    .and_then(|l| l.split_whitespace().nth(1))
+                    .unwrap_or("");
+                if path.starts_with("/v1/models") {
+                    m.fetch_add(1, AtomicOrdering::SeqCst);
+                    match models_behavior {
+                        ModelsBehavior::Reply(status, body) => {
+                            let resp = format!(
+                                "HTTP/1.1 {status} X\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                                body.len(),
+                                body
+                            );
+                            let _ = sock.write_all(resp.as_bytes()).await;
+                        }
+                        ModelsBehavior::Hang => {
+                            held.push(sock);
+                        }
+                    }
+                } else if path.starts_with("/v1/attestation") {
+                    a.fetch_add(1, AtomicOrdering::SeqCst);
+                    let body = "{\"error\":\"test\"}";
+                    let resp = format!(
+                        "HTTP/1.1 500 X\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                }
+            }
+        });
+        FastPathTestServer {
+            addr,
+            models_hits,
+            attestation_hits,
+            _acceptor: acceptor,
+        }
+    }
+
+    fn pinned_state(fps: &[&str]) -> FingerprintState {
+        let mut s = FingerprintState::Bootstrap;
+        for fp in fps {
+            s.add_fingerprint((*fp).to_string());
+        }
+        s
+    }
+
+    fn make_verifier(state: FingerprintState) -> PoolBackendVerifier {
+        PoolBackendVerifier {
+            api_key: None,
+            model_name: "test-model".to_string(),
+            tls_roots: SharedTlsRoots::load(),
+            attestation_verifier: Arc::new(AttestationVerifier::new(HashSet::new(), None, false)),
+            fingerprint_state: Arc::new(std::sync::RwLock::new(state)),
+        }
+    }
+
+    #[tokio::test]
+    async fn fast_path_returns_client_on_200() {
+        let server = start_fast_path_server(ModelsBehavior::Reply(200, "{}")).await;
+        let verifier = make_verifier(pinned_state(&["aa", "bb"]));
+        let base_url = format!("http://{}", server.addr);
+        let result = verifier
+            .try_pinned_fast_path(&base_url, pinned_state(&["aa", "bb"]))
+            .await;
+        assert!(result.is_ok(), "expected Ok, got {result:?}");
+        assert_eq!(server.models_hits.load(AtomicOrdering::SeqCst), 1);
+        assert_eq!(server.attestation_hits.load(AtomicOrdering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn fast_path_returns_err_on_http_5xx() {
+        let server = start_fast_path_server(ModelsBehavior::Reply(503, "down")).await;
+        let verifier = make_verifier(pinned_state(&["aa"]));
+        let base_url = format!("http://{}", server.addr);
+        let result = verifier
+            .try_pinned_fast_path(&base_url, pinned_state(&["aa"]))
+            .await;
+        let err = result.expect_err("expected Err on HTTP 503");
+        assert!(
+            err.contains("503"),
+            "err should mention status code, got: {err}"
+        );
+        assert_eq!(server.models_hits.load(AtomicOrdering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn create_verified_client_skips_fast_path_in_bootstrap() {
+        // Bootstrap state → fast path must not be invoked, slow path runs
+        // instead. We don't care that the slow path fails (mock /v1/attestation
+        // returns 500); we only assert which endpoint(s) were hit.
+        let server = start_fast_path_server(ModelsBehavior::Reply(200, "{}")).await;
+        let verifier = make_verifier(FingerprintState::Bootstrap);
+        let base_url = format!("http://{}", server.addr);
+        let _ = verifier.create_verified_client(&base_url).await;
+        assert_eq!(
+            server.models_hits.load(AtomicOrdering::SeqCst),
+            0,
+            "fast path probe must not run when fingerprint_state is Bootstrap"
+        );
+        assert!(
+            server.attestation_hits.load(AtomicOrdering::SeqCst) >= 1,
+            "slow path should have attempted /v1/attestation/report"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_verified_client_uses_fast_path_when_pinned() {
+        let server = start_fast_path_server(ModelsBehavior::Reply(200, "{}")).await;
+        let verifier = make_verifier(pinned_state(&["aa"]));
+        let base_url = format!("http://{}", server.addr);
+        let client = verifier
+            .create_verified_client(&base_url)
+            .await
+            .expect("fast path should succeed");
+        // Successful fast path means the slow path is never reached.
+        assert_eq!(server.models_hits.load(AtomicOrdering::SeqCst), 1);
+        assert_eq!(
+            server.attestation_hits.load(AtomicOrdering::SeqCst),
+            0,
+            "slow path must not run when fast path succeeds"
+        );
+        drop(client);
+    }
+
+    /// Probe must time out within ~5 s when the backend accepts the
+    /// connection but never replies, and the error message must surface
+    /// the timeout reason so the fallback debug log is informative.
+    #[tokio::test]
+    async fn fast_path_returns_err_on_timeout() {
+        let server = start_fast_path_server(ModelsBehavior::Hang).await;
+        let verifier = make_verifier(pinned_state(&["aa"]));
+        let base_url = format!("http://{}", server.addr);
+        let start = std::time::Instant::now();
+        let result = verifier
+            .try_pinned_fast_path(&base_url, pinned_state(&["aa"]))
+            .await;
+        let elapsed = start.elapsed();
+        let err = result.expect_err("expected Err on hanging probe");
+        assert!(
+            err.contains("timed out"),
+            "err should mention timeout, got: {err}"
+        );
+        // The probe budget is 5 s. Allow scheduler jitter but make sure
+        // we're not waiting on a longer timeout by mistake.
+        assert!(
+            elapsed < Duration::from_secs(7),
+            "probe should give up within ~5s, took {elapsed:?}"
+        );
+        assert_eq!(server.models_hits.load(AtomicOrdering::SeqCst), 1);
     }
 }

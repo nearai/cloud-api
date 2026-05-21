@@ -209,6 +209,42 @@ fn completion_stream_error_category(e: &inference_providers::CompletionError) ->
     }
 }
 
+/// Returns an OpenAI-compatible `error.type` for a stream-level completion error.
+/// Used in the `data: {"error":{...}}` SSE frame so clients can branch on the type.
+///
+/// Match is intentionally exhaustive (no `_` arm): a new `CompletionError`
+/// variant must force a compile error here so the OpenAI mapping is reviewed
+/// explicitly instead of silently defaulting to `server_error`.
+fn completion_stream_error_openai_type(e: &inference_providers::CompletionError) -> &'static str {
+    match e {
+        inference_providers::CompletionError::HttpError { status_code, .. } => match *status_code {
+            429 => "rate_limit_exceeded",
+            400..=499 => "invalid_request_error",
+            _ => "server_error",
+        },
+        inference_providers::CompletionError::CompletionError(_)
+        | inference_providers::CompletionError::InvalidResponse(_)
+        | inference_providers::CompletionError::Unknown(_)
+        | inference_providers::CompletionError::NoPubKeyProvider(_)
+        | inference_providers::CompletionError::Timeout { .. } => "server_error",
+    }
+}
+
+/// Build an OpenAI-compatible SSE error frame.
+///
+/// Format: `data: {"error":{"message":"...","type":"..."}}\n\n`. Replaces the
+/// historical `data: error: <msg>\n\n` shape that was not valid JSON and broke
+/// clients (opencode, vercel/ai-sdk) parsing the `data:` payload as JSON.
+fn sse_error_frame(e: &inference_providers::CompletionError) -> Bytes {
+    let payload = serde_json::json!({
+        "error": {
+            "message": e.to_string(),
+            "type": completion_stream_error_openai_type(e),
+        }
+    });
+    Bytes::from(format!("data: {payload}\n\n"))
+}
+
 // Helper function to extract inference ID from a parsed stream chunk
 fn extract_inference_id_from_chunk(chunk: &inference_providers::StreamChunk) -> Uuid {
     let id = match chunk {
@@ -876,9 +912,7 @@ pub async fn chat_completions(
                                             "Completion stream error"
                                         );
                                     }
-                                    Ok::<Bytes, Infallible>(Bytes::from(format!(
-                                        "data: error: {e}\n\n"
-                                    )))
+                                    Ok::<Bytes, Infallible>(sse_error_frame(&e))
                                 }
                             }
                         }
@@ -1266,6 +1300,107 @@ mod tests {
         assert!(
             id_pos < choices_pos,
             "id should appear before choices (struct field order)"
+        );
+    }
+
+    #[test]
+    fn test_sse_error_frame_is_valid_json() {
+        // Every stream-error variant must produce a frame whose `data:` payload
+        // parses as JSON of shape {"error": {"message": ..., "type": ...}}.
+        // The historical `data: error: <msg>\n\n` format broke clients that
+        // parse the data payload as JSON (opencode, vercel/ai-sdk).
+        let cases = vec![
+            inference_providers::CompletionError::CompletionError("boom".into()),
+            inference_providers::CompletionError::HttpError {
+                status_code: 503,
+                message: "overloaded".into(),
+                is_external: false,
+            },
+            inference_providers::CompletionError::HttpError {
+                status_code: 429,
+                message: "rate limit".into(),
+                is_external: false,
+            },
+            inference_providers::CompletionError::HttpError {
+                status_code: 400,
+                message: "bad request".into(),
+                is_external: false,
+            },
+            inference_providers::CompletionError::InvalidResponse("Failed to parse event".into()),
+            inference_providers::CompletionError::NoPubKeyProvider("abc".into()),
+            inference_providers::CompletionError::Unknown("mystery".into()),
+            inference_providers::CompletionError::Timeout {
+                operation: "completion".into(),
+                timeout_seconds: 30,
+            },
+        ];
+
+        for e in &cases {
+            let frame = sse_error_frame(e);
+            let text = std::str::from_utf8(&frame).expect("frame is utf-8");
+            assert!(
+                text.starts_with("data: "),
+                "frame missing 'data: ' prefix: {text:?}"
+            );
+            assert!(
+                text.ends_with("\n\n"),
+                "frame missing SSE terminator: {text:?}"
+            );
+            let payload = text
+                .strip_prefix("data: ")
+                .and_then(|s| s.strip_suffix("\n\n"))
+                .expect("frame must have data: prefix and \\n\\n suffix");
+            let json: serde_json::Value = serde_json::from_str(payload).unwrap_or_else(|err| {
+                panic!("frame payload not valid JSON for {e:?}: err={err}, payload={payload}")
+            });
+            let obj = json.get("error").expect("payload has error key");
+            assert!(obj
+                .get("message")
+                .and_then(|v| v.as_str())
+                .is_some_and(|s| !s.is_empty()));
+            assert!(obj
+                .get("type")
+                .and_then(|v| v.as_str())
+                .is_some_and(|s| !s.is_empty()));
+        }
+    }
+
+    #[test]
+    fn test_completion_stream_error_openai_type_http_status_mapping() {
+        let rate_limited = inference_providers::CompletionError::HttpError {
+            status_code: 429,
+            message: "rl".into(),
+            is_external: false,
+        };
+        assert_eq!(
+            completion_stream_error_openai_type(&rate_limited),
+            "rate_limit_exceeded"
+        );
+
+        let client_err = inference_providers::CompletionError::HttpError {
+            status_code: 400,
+            message: "bad".into(),
+            is_external: false,
+        };
+        assert_eq!(
+            completion_stream_error_openai_type(&client_err),
+            "invalid_request_error"
+        );
+
+        let server_err = inference_providers::CompletionError::HttpError {
+            status_code: 503,
+            message: "down".into(),
+            is_external: false,
+        };
+        assert_eq!(
+            completion_stream_error_openai_type(&server_err),
+            "server_error"
+        );
+
+        let parse_err = inference_providers::CompletionError::InvalidResponse("bad chunk".into());
+        assert_eq!(
+            completion_stream_error_openai_type(&parse_err),
+            "server_error"
         );
     }
 }

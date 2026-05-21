@@ -684,7 +684,8 @@ fn convert_text_request_to_service(
         (status = 400, description = "Invalid request parameters", body = ErrorResponse),
         (status = 401, description = "Invalid or missing API key", body = ErrorResponse),
         (status = 402, description = "Insufficient credits", body = ErrorResponse),
-        (status = 500, description = "Server error", body = ErrorResponse)
+        (status = 500, description = "Server error", body = ErrorResponse),
+        (status = 529, description = "All inference backends overloaded; retry with exponential backoff", body = ErrorResponse)
     ),
     security(
         ("api_key" = [])
@@ -1046,7 +1047,8 @@ pub async fn chat_completions(
         (status = 200, description = "Completion generated successfully", body = ChatCompletionResponse),
         (status = 400, description = "Invalid request parameters", body = ErrorResponse),
         (status = 401, description = "Invalid or missing API key", body = ErrorResponse),
-        (status = 500, description = "Server error", body = ErrorResponse)
+        (status = 500, description = "Server error", body = ErrorResponse),
+        (status = 529, description = "All inference backends overloaded; retry with exponential backoff", body = ErrorResponse)
     ),
     security(
         ("api_key" = [])
@@ -1299,7 +1301,8 @@ mod tests {
         (status = 200, description = "Image generated successfully", body = ImageGenerationResponse),
         (status = 400, description = "Invalid request parameters", body = ErrorResponse),
         (status = 401, description = "Invalid or missing API key", body = ErrorResponse),
-        (status = 500, description = "Server error", body = ErrorResponse)
+        (status = 500, description = "Server error", body = ErrorResponse),
+        (status = 529, description = "All inference backends overloaded; retry with exponential backoff", body = ErrorResponse)
     ),
     security(
         ("api_key" = [])
@@ -1552,6 +1555,7 @@ pub async fn image_generations(
         (status = 401, description = "Unauthorized (missing or invalid API key)", body = ErrorResponse),
         (status = 404, description = "Model not found", body = ErrorResponse),
         (status = 500, description = "Server error", body = ErrorResponse),
+        (status = 529, description = "All inference backends overloaded; retry with exponential backoff", body = ErrorResponse),
     ),
     security(("ApiKeyAuth" = []))
 )]
@@ -1843,9 +1847,9 @@ pub async fn audio_transcriptions(
                 services::completions::ports::CompletionError::ServiceOverloaded(_) => {
                     tracing::warn!("Audio transcription service overloaded");
                     (
-                        StatusCode::SERVICE_UNAVAILABLE,
+                        crate::routes::common::status_overloaded(),
                         "service_overloaded",
-                        "The service is temporarily overloaded. Please retry with exponential backoff.".to_string(),
+                        "All inference backends are overloaded. Please retry with exponential backoff.".to_string(),
                     )
                 }
                 _ => {
@@ -1884,7 +1888,8 @@ pub async fn audio_transcriptions(
         (status = 401, description = "Invalid or missing API key", body = ErrorResponse),
         (status = 404, description = "Model not found", body = ErrorResponse),
         (status = 413, description = "Payload too large", body = ErrorResponse),
-        (status = 500, description = "Server error", body = ErrorResponse)
+        (status = 500, description = "Server error", body = ErrorResponse),
+        (status = 529, description = "All inference backends overloaded; retry with exponential backoff", body = ErrorResponse)
     ),
     security(
         ("api_key" = [])
@@ -2267,6 +2272,7 @@ pub async fn image_edits(
         (status = 404, description = "Model not found", body = ErrorResponse),
         (status = 429, description = "Concurrent request limit exceeded for the organization. Max concurrent requests per model: 64 (configurable)", body = ErrorResponse),
         (status = 500, description = "Server error (billing failure, provider error)", body = ErrorResponse),
+        (status = 529, description = "All inference backends overloaded; retry with exponential backoff", body = ErrorResponse),
     ),
     security(("ApiKeyAuth" = []))
 )]
@@ -2504,9 +2510,9 @@ pub async fn rerank(
                 services::completions::ports::CompletionError::ServiceOverloaded(_) => {
                     tracing::warn!("Rerank service overloaded");
                     (
-                        StatusCode::SERVICE_UNAVAILABLE,
+                        crate::routes::common::status_overloaded(),
                         "service_overloaded",
-                        "The service is temporarily overloaded. Please retry with exponential backoff.".to_string(),
+                        "All inference backends are overloaded. Please retry with exponential backoff.".to_string(),
                     )
                 }
                 _ => {
@@ -2564,7 +2570,8 @@ struct EmbeddingsResponseDoc {
         (status = 401, description = "Unauthorized", body = ErrorResponse),
         (status = 404, description = "Model not found", body = ErrorResponse),
         (status = 429, description = "Rate limit exceeded", body = ErrorResponse),
-        (status = 500, description = "Server error", body = ErrorResponse)
+        (status = 500, description = "Server error", body = ErrorResponse),
+        (status = 529, description = "All inference backends overloaded; retry with exponential backoff", body = ErrorResponse)
     ),
     security(
         ("api_key" = [])
@@ -2800,9 +2807,9 @@ pub async fn embeddings(
                 services::completions::ports::CompletionError::ServiceOverloaded(_) => {
                     tracing::warn!("Embeddings service overloaded");
                     (
-                        StatusCode::SERVICE_UNAVAILABLE,
+                        crate::routes::common::status_overloaded(),
                         "service_overloaded",
-                        "The service is temporarily overloaded. Please retry with exponential backoff.".to_string(),
+                        "All inference backends are overloaded. Please retry with exponential backoff.".to_string(),
                     )
                 }
                 _ => {
@@ -2866,6 +2873,7 @@ struct PrivacyClassifyResponseDoc {
         (status = 401, description = "Unauthorized", body = ErrorResponse),
         (status = 404, description = "Model not found", body = ErrorResponse),
         (status = 429, description = "Rate limit exceeded", body = ErrorResponse),
+        (status = 529, description = "All inference backends overloaded; retry with exponential backoff", body = ErrorResponse),
         (status = 500, description = "Server error", body = ErrorResponse)
     ),
     security(
@@ -3114,9 +3122,9 @@ pub async fn privacy_classify(
                 services::completions::ports::CompletionError::ServiceOverloaded(_) => {
                     tracing::warn!("Privacy classify service overloaded");
                     (
-                        StatusCode::SERVICE_UNAVAILABLE,
+                        crate::routes::common::status_overloaded(),
                         "service_overloaded",
-                        "The service is temporarily overloaded. Please retry with exponential backoff.".to_string(),
+                        "All inference backends are overloaded. Please retry with exponential backoff.".to_string(),
                     )
                 }
                 _ => {
@@ -3656,6 +3664,7 @@ pub async fn privacy_redact(
         (status = 404, description = "Model not found", body = ErrorResponse),
         (status = 429, description = "Concurrent request limit exceeded for the organization. Max concurrent requests per model: 64 (configurable)", body = ErrorResponse),
         (status = 500, description = "Server error (billing failure, provider error)", body = ErrorResponse),
+        (status = 529, description = "All inference backends overloaded; retry with exponential backoff", body = ErrorResponse),
     ),
     security(("ApiKeyAuth" = []))
 )]
@@ -3897,9 +3906,9 @@ pub async fn score(
                 services::completions::ports::CompletionError::ServiceOverloaded(_) => {
                     tracing::warn!("Score service overloaded");
                     (
-                        StatusCode::SERVICE_UNAVAILABLE,
+                        crate::routes::common::status_overloaded(),
                         "service_overloaded",
-                        "The service is temporarily overloaded. Please retry with exponential backoff.".to_string(),
+                        "All inference backends are overloaded. Please retry with exponential backoff.".to_string(),
                     )
                 }
                 _ => {

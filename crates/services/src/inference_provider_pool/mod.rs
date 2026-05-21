@@ -1,3 +1,5 @@
+mod rotation;
+
 use crate::attestation::AttestationVerifier;
 use crate::common::encryption_headers;
 use config::ExternalProvidersConfig;
@@ -36,10 +38,16 @@ pub trait ExternalModelsSource: Send + Sync {
 /// Result of an attestation-discovery pass against a model URL.
 ///
 /// `discover_model` mutates the shared `fingerprint_state` as a side effect
-/// (pinning new verified fingerprints). This struct summarizes what happened
-/// for the caller's logging and decision-making.
+/// (pinning verified fingerprints — additively on partial coverage, replacing
+/// the set on complete coverage). This struct summarizes what happened for
+/// the caller's logging and decision-making.
 #[derive(Debug)]
 struct DiscoveryOutcome {
+    /// Healthy backend count reported by `GET /backends/count` this cycle.
+    /// `0` means we couldn't get a count (model-proxy unreachable, 404, etc.)
+    /// — see `failure_reasons` for the category. `discover_model` returns
+    /// without issuing any rotation calls in that case.
+    backend_count: usize,
     /// Number of discovery HTTP calls that returned a response.
     successful_calls: usize,
     /// Number of discovery HTTP calls that failed (timeout, transport error, 4xx/5xx).
@@ -47,31 +55,111 @@ struct DiscoveryOutcome {
     /// Number of previously-unknown verified fingerprints added to `fingerprint_state`
     /// during this pass.
     new_fingerprints: usize,
-    /// Total pinned fingerprints in `fingerprint_state` after this pass (cumulative).
+    /// Total pinned fingerprints in `fingerprint_state` after this pass.
     total_pinned: usize,
     /// Signing pubkeys extracted from verified reports, keyed by signing algorithm
     /// ("ecdsa" / "ed25519"). Pubkeys are derived from the TEE compose hash so
     /// they're identical across backends of the same model.
     pubkeys_by_algo: HashMap<String, String>,
     /// Per-call verified TLS fingerprints observed in this pass, in launch
-    /// order (by `attempt` index — `futures::future::join_all` preserves the
-    /// input order, not completion order). Same fingerprint appearing multiple
-    /// times means the L4 LB routed several calls to the same backend —
-    /// exactly the signal needed to debug why cumulative discovery isn't
-    /// expanding the pin set. Length equals `successful_calls - verify_failures`.
+    /// order (by index — `futures::future::join_all` preserves the input
+    /// order, not completion order). With rotation, each index lands on a
+    /// distinct backend, so under complete coverage every entry is unique
+    /// and `observed_fingerprints.len() == backend_count`.
     observed_fingerprints: Vec<String>,
     /// Per-call failure reasons that prevented a fingerprint observation, in
     /// launch order. Each entry is `"{category}: {detail}"` where category
-    /// is one of: `client_build`, `query_encode`, `connect`, `send_timeout`,
-    /// `request`, `send`, `timeout`, `status`, `malformed_json`, `verify`.
+    /// is one of: `count_connect`, `count_timeout`, `count_send`,
+    /// `count_status`, `count_decode`, `client_build`, `query_encode`,
+    /// `connect`, `send_timeout`, `request`, `send`, `timeout`, `status`,
+    /// `malformed_json`, `verify`.
     /// Note: post-HTTP verify failures are included here even though the
     /// underlying call succeeded HTTP-wise, so
-    /// `failure_reasons.len() == failed_calls + verify_failures`.
+    /// `failure_reasons.len() == failed_calls + verify_failures` plus at
+    /// most one `count_*` entry per cycle.
     failure_reasons: Vec<String>,
     /// Number of HTTP-successful calls whose attestation verification failed
     /// (TDX quote rejection, report-data mismatch, etc.). These are *not*
     /// counted in `failed_calls`, which only covers transport-layer failures.
     verify_failures: usize,
+    /// True when this cycle achieved complete coverage of every healthy
+    /// backend (no failures, every index produced a verified fingerprint,
+    /// no duplicate fingerprints across indices) and the pin set was
+    /// REPLACED rather than augmented. Lets a backend that went unhealthy
+    /// or had its cert rotated drop out of the pin set within one refresh
+    /// interval. `false` on any partial cycle to avoid evicting fingerprints
+    /// we just couldn't reconfirm.
+    replaced_state: bool,
+}
+
+/// Outcome of applying the cycle's verified fingerprints to a
+/// `FingerprintState`. Split into its own type so the policy is testable
+/// without spinning up a real attestation pipeline.
+struct PinUpdate {
+    /// Fingerprints that weren't in the pin set before this cycle.
+    newly_pinned: Vec<String>,
+    /// Fingerprints that were pinned before this cycle but are no longer
+    /// pinned after the replacement. Empty in the additive path.
+    evicted: Vec<String>,
+    /// Pinned count after the update.
+    total_pinned: usize,
+    /// True iff the cycle achieved complete coverage and the pin set was
+    /// replaced wholesale (vs. additively merged).
+    replaced: bool,
+}
+
+/// Apply this cycle's verified fingerprint set to the shared pin state.
+///
+/// Rule: replace the pin set with `verified` iff this cycle achieved
+/// **complete coverage** — every healthy backend produced exactly one
+/// verified fingerprint and no failures occurred. Otherwise additively
+/// merge (only grow). This is what lets a backend that just went unhealthy
+/// drop out of the pin set within one refresh interval, without false
+/// evictions on transient per-call hiccups.
+fn apply_pin_update(
+    state: &Arc<std::sync::RwLock<FingerprintState>>,
+    verified: &HashSet<String>,
+    backend_count: usize,
+    failed_calls: usize,
+    verify_failures: usize,
+) -> PinUpdate {
+    let complete_coverage = backend_count > 0
+        && failed_calls == 0
+        && verify_failures == 0
+        && verified.len() == backend_count;
+
+    let mut state = state.write().unwrap_or_else(|e| e.into_inner());
+    let before: HashSet<String> = match &*state {
+        FingerprintState::Pinned(set) => set.clone(),
+        _ => HashSet::new(),
+    };
+
+    if complete_coverage {
+        let newly_pinned: Vec<String> = verified.difference(&before).cloned().collect();
+        let evicted: Vec<String> = before.difference(verified).cloned().collect();
+        state.replace_with(verified.clone());
+        PinUpdate {
+            newly_pinned,
+            evicted,
+            total_pinned: state.pinned_count(),
+            replaced: true,
+        }
+    } else {
+        let mut newly_pinned: Vec<String> = Vec::new();
+        for fp in verified {
+            let before_count = state.pinned_count();
+            state.add_fingerprint(fp.clone());
+            if state.pinned_count() > before_count {
+                newly_pinned.push(fp.clone());
+            }
+        }
+        PinUpdate {
+            newly_pinned,
+            evicted: Vec::new(),
+            total_pinned: state.pinned_count(),
+            replaced: false,
+        }
+    }
 }
 
 /// Combined provider mappings updated atomically to prevent race conditions
@@ -148,28 +236,52 @@ struct PoolBackendVerifier {
 #[async_trait::async_trait]
 impl inference_providers::BackendVerifier for PoolBackendVerifier {
     async fn create_verified_client(&self, base_url: &str) -> Result<reqwest::Client, String> {
+        // Fast path: if discovery has already pinned fingerprints for this
+        // model's backends, skip the per-bucket attestation round-trip. The
+        // shared `fingerprint_state` is updated every discovery cycle (~5 min)
+        // with fresh GPU evidence; that cadence is the right freshness signal
+        // for the attestation chain. Per-bucket re-attestation is redundant
+        // work that adds ~1-3s of cold-bucket tail latency for no security
+        // benefit — TLS SPKI pinning already proves backend identity continuity.
+        //
+        // The probe uses `GET /v1/models` (cheap static response) rather than
+        // `/v1/attestation/report` (triggers backend-side GPU evidence
+        // collection and signing).
+        let pinned_snapshot = {
+            let guard = self
+                .fingerprint_state
+                .read()
+                .unwrap_or_else(|e| e.into_inner());
+            guard.clone()
+        };
+        let pinned_count = pinned_snapshot.pinned_count();
+        if pinned_count > 0 {
+            match self.try_pinned_fast_path(base_url, pinned_snapshot).await {
+                Ok(client) => {
+                    tracing::debug!(
+                        pinned_count,
+                        "Fast-path TLS probe succeeded, skipping attestation"
+                    );
+                    return Ok(client);
+                }
+                Err(reason) => {
+                    tracing::debug!(
+                        reason = %reason,
+                        "Fast-path TLS probe failed, falling back to full attestation"
+                    );
+                }
+            }
+        }
+
+        // Slow path: no pinned fingerprints yet, or the fast-path probe failed
+        // (unknown backend, TLS rejection, or HTTP error). Run the full
+        // attestation chain.
+        //
         // 1. Build a client with isolated Bootstrap state (accepts any WebPKI cert
         //    for the initial connection to discover the backend's fingerprint).
-        // read_timeout is the per-chunk idle timeout; for non-streaming chat
-        // completion the connection sits silent the entire inference time, so
-        // it must match the configured completion budget — otherwise a long
-        // reasoning request fires read_timeout (~300s) before our `.timeout()`
-        // (default 600s). Track `VLLM_PROVIDER_COMPLETION_TIMEOUT` so the env
-        // override applies here too.
-        let read_timeout =
-            Duration::from_secs(VLlmConfig::completion_timeout_from_env().max(0) as u64);
         let client_state = Arc::new(std::sync::RwLock::new(FingerprintState::Bootstrap));
-        let builder = reqwest::Client::builder()
-            .use_preconfigured_tls(self.tls_roots.build_config(client_state.clone()))
-            .pool_max_idle_per_host(1)
-            .http2_adaptive_window(true)
-            .connect_timeout(Duration::from_secs(5))
-            .read_timeout(read_timeout);
-        // Bucket clients need the H2 connection to stay sticky to a single
-        // backend across long idle gaps; see
-        // `inference_providers::bucket_keepalive`.
-        let client = inference_providers::bucket_keepalive::apply(builder)
-            .build()
+        let client = self
+            .build_bucket_client(client_state.clone())
             .map_err(|e| format!("Failed to build HTTP client: {e}"))?;
 
         // 2. Fetch attestation report — this establishes the H2 connection.
@@ -248,6 +360,108 @@ impl inference_providers::BackendVerifier for PoolBackendVerifier {
 
         // 5. Return the client — its H2 connection is to the verified backend,
         //    and its TLS verifier only accepts that backend on reconnection.
+        Ok(client)
+    }
+}
+
+impl PoolBackendVerifier {
+    /// Build a bucket-flavored `reqwest::Client` with TLS verification driven
+    /// by the supplied `FingerprintState`. Centralizing this here means the
+    /// fast and slow paths can't drift on pool/timeout/keepalive settings.
+    ///
+    /// `read_timeout` is the per-chunk idle timeout; for non-streaming chat
+    /// completion the connection sits silent the entire inference time, so it
+    /// must match the configured completion budget — otherwise a long
+    /// reasoning request fires `read_timeout` (~300s) before our `.timeout()`
+    /// (default 600s). `VLLM_PROVIDER_COMPLETION_TIMEOUT` env override applies
+    /// here too. `bucket_keepalive::apply` keeps the H2 connection sticky to
+    /// a single backend across long idle gaps.
+    fn build_bucket_client(
+        &self,
+        state: Arc<std::sync::RwLock<FingerprintState>>,
+    ) -> Result<reqwest::Client, reqwest::Error> {
+        let read_timeout =
+            Duration::from_secs(VLlmConfig::completion_timeout_from_env().max(0) as u64);
+        let builder = reqwest::Client::builder()
+            .use_preconfigured_tls(self.tls_roots.build_config(state))
+            .pool_max_idle_per_host(1)
+            .http2_adaptive_window(true)
+            .connect_timeout(Duration::from_secs(5))
+            .read_timeout(read_timeout);
+        inference_providers::bucket_keepalive::apply(builder).build()
+    }
+
+    /// Fast path for `create_verified_client` when discovery has already pinned
+    /// fingerprints for this model's backends.
+    ///
+    /// Builds a client seeded with the snapshot of known-good fingerprints,
+    /// then sends a cheap `GET /v1/models` request to validate via TLS handshake
+    /// that the backend's cert SPKI is in the pinned set. On success, returns
+    /// the established client without fetching attestation. On TLS rejection
+    /// (unknown backend) or HTTP error, returns Err so the caller can fall
+    /// back to the full attestation path.
+    ///
+    /// The H2 connection sits inside the returned client's pool. Subsequent
+    /// requests on the same `reqwest::Client` reuse it. If the H2 connection
+    /// drops and reqwest reconnects, the TLS verifier accepts any cert whose
+    /// SPKI is in the snapshot — meaning a reconnect *can* land on a different
+    /// attested backend. This is a deliberate relaxation of the prior
+    /// "narrowed to one fingerprint per bucket" behavior: both backends are
+    /// attested, so a cross-backend reconnect is secure even if it costs a
+    /// prefix-cache miss on that one request. Avoiding the attestation chain
+    /// on every cold-bucket-fill is worth that tradeoff.
+    async fn try_pinned_fast_path(
+        &self,
+        base_url: &str,
+        pinned_snapshot: FingerprintState,
+    ) -> Result<reqwest::Client, String> {
+        let client_state = Arc::new(std::sync::RwLock::new(pinned_snapshot));
+        let client = self
+            .build_bucket_client(client_state)
+            .map_err(|e| format!("Failed to build HTTP client: {e}"))?;
+
+        // `/v1/models` is assumed to accept the same bearer token used for
+        // inference (or to be unauthenticated). If a backend ever required a
+        // different key here, the probe would 401 and we'd fall back to the
+        // slow path — same outcome, just slower. The probe's value comes from
+        // the TLS handshake, not the response body.
+        let url = format!("{base_url}/v1/models");
+        let mut request = client.get(&url);
+        if let Some(ref key) = self.api_key {
+            request = request.header("Authorization", format!("Bearer {key}"));
+        }
+        // Wrap the entire probe — request send, status check, and body drain —
+        // in a single 5-second timeout. A single budget is simpler and more
+        // correct than two separate timeouts: any stall anywhere in the probe
+        // should abort and fall through to the slow path within 5 s total.
+        //
+        // Body drain is required so reqwest can return the H2 stream to the
+        // connection pool for the subsequent inference request. /v1/models
+        // returns a tiny static payload (~1 KB) so this completes instantly
+        // in practice.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let response = request
+                .send()
+                .await
+                .map_err(|e| format!("Fast-path probe failed: {e}"))?;
+            if !response.status().is_success() {
+                let status = response.status();
+                return Err(format!("Fast-path probe HTTP {status}"));
+            }
+            response
+                .bytes()
+                .await
+                .map_err(|e| format!("Failed to drain probe body: {e}"))?;
+            Ok(())
+        })
+        .await
+        .map_err(|_| "Fast-path probe timed out".to_string())??;
+
+        // No fingerprint is added to the shared `fingerprint_state` here —
+        // the snapshot was already derived from it, so there is nothing new
+        // to pin. Discovery (every ~5 min) remains the sole writer of the
+        // shared state; contrast with the slow path's lines above that call
+        // `shared.add_fingerprint` after a fresh attestation.
         Ok(client)
     }
 }
@@ -561,8 +775,14 @@ impl InferenceProviderPool {
     /// Why a fresh client per call: reqwest with HTTP/2 multiplexes many
     /// concurrent requests onto a single TCP connection, which hashes to a
     /// single L4 backend. Separate clients force separate TCP handshakes,
-    /// letting each call land on a different backend. Over a few calls this
-    /// discovers the fingerprints of most/all backends behind the L4 LB.
+    /// letting each call land on a different backend.
+    ///
+    /// Why rotation SNI per call: model-proxy publishes `<canonical>-i<N>.<base>`
+    /// (see model-proxy PR #27). A fresh-TCP probe to that SNI is routed
+    /// deterministically to `backends_sorted_by_address[N % healthy_count]`,
+    /// bypassing the least-connections LB. We fetch the healthy count from
+    /// `/backends/count`, then fan out one call per backend index. One cycle
+    /// = full coverage.
     ///
     /// Why an isolated Bootstrap state per call: if discovery calls shared
     /// the caller's `fingerprint_state`, the first call that completed and
@@ -571,38 +791,65 @@ impl InferenceProviderPool {
     /// rejected inside the SPKI verifier (fingerprint not in `{A}`). Each
     /// call therefore uses its own `Bootstrap` state for the TLS verifier,
     /// and verified fingerprints are merged into the caller's shared
-    /// accumulator *after* the HTTP call returns.
+    /// accumulator *after* the HTTP calls return.
     ///
     /// Why extract pubkeys here: the attestation report already contains
     /// `signing_public_key` for the requested `signing_algo`. Alternating
-    /// algos across the N calls yields both keys in one pass — no separate
-    /// post-pin round-trip. Pubkeys are derived from the TEE compose hash
-    /// so they're identical across backends of the same model; the first
-    /// verified response per algo wins.
+    /// algos across the N calls yields both keys in one pass. Pubkeys are
+    /// derived from the TEE compose hash so they're identical across
+    /// backends of the same model+algo; the first verified response per
+    /// algo wins.
     ///
-    /// Why staggered: 200ms offsets spread load and encourage separate L4
-    /// hashes by giving each call its own TCP handshake window.
-    ///
-    /// Fingerprints are only pinned after attestation verification succeeds.
-    /// Existing fingerprints in `fingerprint_state` are preserved; new ones
-    /// are added. Calling this with `num_calls=2` on an already-`Pinned`
-    /// state is the cumulative-discovery path: it expands the pinned set
-    /// over time without disrupting in-flight requests.
+    /// Rapid eviction: when every healthy backend produced exactly one
+    /// verified fingerprint, the pin set is REPLACED with the observed set
+    /// — a backend that just went unhealthy or had its cert rotated is
+    /// dropped from the pin set within one refresh interval. On partial
+    /// coverage (any failure, or fewer distinct fingerprints than the
+    /// reported healthy count) we fall back to additive merging so a
+    /// transient hiccup doesn't evict verified fingerprints we just
+    /// couldn't reconfirm.
     ///
     /// The caller owns the `fingerprint_state` Arc and decides when to
     /// transition it to `Blocked` (e.g., when `outcome.total_pinned == 0`
     /// on initial discovery).
+    /// Build a DiscoveryOutcome representing "cycle bailed before issuing any
+    /// rotation calls" (URL didn't parse, count fetch failed, etc.). Reads
+    /// the current `total_pinned` from the shared state so callers see what
+    /// remains pinned, but reports `successful_calls == 0` and never
+    /// replaces the pin set.
+    fn empty_outcome(
+        fingerprint_state: &Arc<std::sync::RwLock<FingerprintState>>,
+        backend_count: usize,
+        failure_reasons: Vec<String>,
+    ) -> DiscoveryOutcome {
+        let total_pinned = fingerprint_state
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .pinned_count();
+        DiscoveryOutcome {
+            backend_count,
+            successful_calls: 0,
+            failed_calls: 0,
+            new_fingerprints: 0,
+            total_pinned,
+            pubkeys_by_algo: HashMap::new(),
+            observed_fingerprints: Vec::new(),
+            failure_reasons,
+            verify_failures: 0,
+            replaced_state: false,
+        }
+    }
+
     async fn discover_model(
         url: &str,
         api_key: &Option<String>,
         model_name: &str,
-        num_calls: usize,
         fingerprint_state: Arc<std::sync::RwLock<FingerprintState>>,
         tls_roots: &SharedTlsRoots,
         verifier: &AttestationVerifier,
     ) -> DiscoveryOutcome {
         const PER_CALL_TIMEOUT: Duration = Duration::from_secs(10);
-        const STAGGER_MS: u64 = 200;
+        const COUNT_TIMEOUT: Duration = Duration::from_secs(3);
         const ALGOS: [&str; 2] = ["ecdsa", "ed25519"];
 
         /// Query parameters for `/v1/attestation/report`. Matches
@@ -618,31 +865,102 @@ impl InferenceProviderPool {
             include_tls_fingerprint: Option<bool>,
         }
 
-        let futures = (0..num_calls)
+        let mut failure_reasons: Vec<String> = Vec::new();
+
+        // Pre-flight: parse the URL into its rotation parts. If the URL
+        // doesn't conform (one-label host, IP literal, etc.) we can't issue
+        // rotation calls; record the reason and return a no-op outcome.
+        let url_parsed = match url::Url::parse(url) {
+            Ok(u) => u,
+            Err(e) => {
+                failure_reasons.push(format!("url_parse: {e}"));
+                return Self::empty_outcome(&fingerprint_state, 0, failure_reasons);
+            }
+        };
+        let parts = match rotation::split_inference_url(&url_parsed) {
+            Some(p) => p,
+            None => {
+                failure_reasons.push("url_parse: host is not a child of a multi-label base".into());
+                return Self::empty_outcome(&fingerprint_state, 0, failure_reasons);
+            }
+        };
+
+        // Step 1: fetch the healthy backend count.
+        //
+        // The count endpoint terminates TLS at completions.near.ai (model-proxy
+        // base domain) with a normal Let's Encrypt cert, so an unpinned
+        // (Bootstrap) verifier is appropriate — there's no per-backend SPKI
+        // to bind to here. We reuse the existing tls_roots so we don't build
+        // yet another crypto provider.
+        let count_state = Arc::new(std::sync::RwLock::new(FingerprintState::Bootstrap));
+        let count_client = match reqwest::Client::builder()
+            .use_preconfigured_tls(tls_roots.build_config(count_state))
+            .connect_timeout(Duration::from_secs(3))
+            .build()
+        {
+            Ok(c) => c,
+            Err(e) => {
+                failure_reasons.push(format!("count_client_build: {e}"));
+                return Self::empty_outcome(&fingerprint_state, 0, failure_reasons);
+            }
+        };
+        let backend_count =
+            match rotation::fetch_backend_count(&count_client, &parts, COUNT_TIMEOUT).await {
+                rotation::CountFetch::Ok(0) => {
+                    // Authoritatively no healthy backends right now. Don't issue
+                    // calls; don't replace the pin set (transient registry hiccup
+                    // shouldn't evict verified state). Provider-level fail-closed
+                    // paths handle the no-backend case at request time. Record
+                    // `count_zero` so DD can distinguish this from a count-fetch
+                    // failure (which would carry a `count_*:` reason instead).
+                    failure_reasons
+                        .push("count_zero: proxy reports 0 healthy backends".to_string());
+                    return Self::empty_outcome(&fingerprint_state, 0, failure_reasons);
+                }
+                rotation::CountFetch::Ok(n) => n,
+                rotation::CountFetch::Err(reason) => {
+                    failure_reasons.push(reason);
+                    return Self::empty_outcome(&fingerprint_state, 0, failure_reasons);
+                }
+            };
+
+        // Defense-in-depth: cap the fan-out. A bogus registry reading (race
+        // during a deploy, partial split) could otherwise spawn an unbounded
+        // number of fresh-TCP TLS handshakes per cycle per model. The cap is
+        // far above any realistic backend pool; hitting it is logged so it
+        // surfaces in ops without silently dropping coverage.
+        const MAX_ROTATION_FANOUT: usize = 256;
+        let backend_count = if backend_count > MAX_ROTATION_FANOUT {
+            warn!(
+                model = %model_name,
+                url = %url,
+                reported = backend_count,
+                capped_at = MAX_ROTATION_FANOUT,
+                "backend count from proxy exceeds sanity cap, truncating fan-out"
+            );
+            failure_reasons.push(format!(
+                "count_capped: proxy reported {backend_count} > {MAX_ROTATION_FANOUT}"
+            ));
+            MAX_ROTATION_FANOUT
+        } else {
+            backend_count
+        };
+
+        // Step 2: fan out one attestation call per backend index, in
+        // parallel (no stagger — each call lands on a distinct backend, so
+        // per-backend pressure is exactly one attestation per cycle).
+        let futures = (0..backend_count)
             .map(|i| {
-                let url = url.to_string();
+                let parts = parts.clone();
                 let api_key = api_key.clone();
                 let model = model_name.to_string();
                 let tls_roots = tls_roots.clone();
                 let algo = ALGOS[i % ALGOS.len()].to_string();
                 async move {
-                    if i > 0 {
-                        tokio::time::sleep(Duration::from_millis(STAGGER_MS * i as u64)).await;
-                    }
-
-                    // Isolated Bootstrap state per call. Critical: peers share
-                    // neither the TLS verifier state nor connection pools, so
-                    // if peer #0 pins backend A's fingerprint during its
-                    // verifier callback, this call's handshake (to backend B
-                    // via a different L4 hash) isn't rejected for not matching
-                    // {A}. Verified fingerprints are merged into the caller's
-                    // shared accumulator below, outside the per-call future.
+                    // Isolated Bootstrap state per call — see function doc.
                     let local_state = Arc::new(std::sync::RwLock::new(FingerprintState::Bootstrap));
                     let rustls_config = tls_roots.build_config(local_state);
 
-                    // Minimal client for one attestation round-trip — no bucket
-                    // clients, no prefix router. ~1 reqwest::Client instead of
-                    // the ~129 a full VLlmProvider would spin up.
                     let client = match reqwest::Client::builder()
                         .use_preconfigured_tls(rustls_config)
                         .connect_timeout(Duration::from_secs(5))
@@ -653,9 +971,8 @@ impl InferenceProviderPool {
                         Err(e) => {
                             debug!(
                                 model = %model,
-                                url = %url,
+                                index = i,
                                 algo = %algo,
-                                attempt = i,
                                 error = %e,
                                 "Failed to build discovery client"
                             );
@@ -663,9 +980,14 @@ impl InferenceProviderPool {
                         }
                     };
 
+                    let mut request_url = match rotation::rotation_base_url(&parts, i as u64) {
+                        Some(u) => u,
+                        None => return Err("rotation_url_build: failed".to_string()),
+                    };
+                    request_url.set_path("/v1/attestation/report");
+
                     let nonce_bytes: [u8; 32] = rand::random();
                     let nonce = hex::encode(nonce_bytes);
-
                     let qs = match serde_urlencoded::to_string(&Query {
                         model: &model,
                         signing_algo: Some(&algo),
@@ -675,9 +997,9 @@ impl InferenceProviderPool {
                         Ok(q) => q,
                         Err(e) => return Err(format!("query_encode: {e}")),
                     };
-                    let request_url = format!("{}/v1/attestation/report?{}", url, qs);
+                    request_url.set_query(Some(&qs));
 
-                    let mut req = client.get(&request_url);
+                    let mut req = client.get(request_url.clone());
                     if let Some(key) = api_key.as_ref() {
                         req = req.header("Authorization", format!("Bearer {}", key));
                     }
@@ -691,15 +1013,12 @@ impl InferenceProviderPool {
                         Ok(Err(e)) => {
                             debug!(
                                 model = %model,
-                                url = %url,
+                                index = i,
                                 algo = %algo,
-                                attempt = i,
                                 elapsed_ms,
                                 error = %e,
                                 "Discovery call failed"
                             );
-                            // Categorize so the outcome aggregate stays readable at INFO.
-                            // reqwest's full error is verbose; classify common causes.
                             let category = if e.is_connect() {
                                 "connect"
                             } else if e.is_timeout() {
@@ -709,14 +1028,18 @@ impl InferenceProviderPool {
                             } else {
                                 "send"
                             };
-                            return Err(format!("{category}: {e}"));
+                            // reqwest::Error's Display embeds the request URL,
+                            // which includes our random per-call `nonce` query
+                            // param. Stripping it keeps `failure_reasons` low-
+                            // cardinality for DD ingestion; the full error
+                            // remains at DEBUG above.
+                            return Err(format!("{category}: {}", e.without_url()));
                         }
                         Err(_) => {
                             debug!(
                                 model = %model,
-                                url = %url,
+                                index = i,
                                 algo = %algo,
-                                attempt = i,
                                 elapsed_ms,
                                 "Discovery call timed out"
                             );
@@ -728,9 +1051,8 @@ impl InferenceProviderPool {
                         let status = resp.status().as_u16();
                         debug!(
                             model = %model,
-                            url = %url,
+                            index = i,
                             algo = %algo,
-                            attempt = i,
                             status = status,
                             elapsed_ms,
                             "Discovery call returned non-2xx"
@@ -743,20 +1065,18 @@ impl InferenceProviderPool {
                         Err(e) => {
                             debug!(
                                 model = %model,
-                                url = %url,
+                                index = i,
                                 algo = %algo,
-                                attempt = i,
                                 error = %e,
                                 "Discovery call returned malformed JSON"
                             );
-                            return Err(format!("malformed_json: {e}"));
+                            return Err(format!("malformed_json: {}", e.without_url()));
                         }
                     };
                     debug!(
                         model = %model,
-                        url = %url,
+                        index = i,
                         algo = %algo,
-                        attempt = i,
                         elapsed_ms,
                         "Discovery call succeeded"
                     );
@@ -769,11 +1089,9 @@ impl InferenceProviderPool {
 
         let mut successful_calls = 0usize;
         let mut failed_calls = 0usize;
-        let mut new_fingerprints = 0usize;
         let mut pubkeys_by_algo: HashMap<String, String> = HashMap::new();
         let mut verified_this_round: HashSet<String> = HashSet::new();
         let mut observed_fingerprints: Vec<String> = Vec::new();
-        let mut failure_reasons: Vec<String> = Vec::new();
         let mut verify_failures = 0usize;
 
         for r in results {
@@ -791,25 +1109,7 @@ impl InferenceProviderPool {
                 Ok(verified) => {
                     if let Some(ref vfp) = verified.tls_cert_fingerprint {
                         observed_fingerprints.push(vfp.clone());
-                        if verified_this_round.insert(vfp.clone()) {
-                            let added = {
-                                let mut state =
-                                    fingerprint_state.write().unwrap_or_else(|e| e.into_inner());
-                                let before = state.pinned_count();
-                                state.add_fingerprint(vfp.clone());
-                                state.pinned_count() > before
-                            };
-                            if added {
-                                new_fingerprints += 1;
-                                info!(
-                                    model = %model_name,
-                                    url = %url,
-                                    fingerprint = %vfp,
-                                    algo = %algo,
-                                    "Pinned new TLS SPKI fingerprint from attestation discovery"
-                                );
-                            }
-                        }
+                        verified_this_round.insert(vfp.clone());
                     }
                     // Pubkey is trustworthy once the report is verified. Pubkeys
                     // are derived from the TEE compose hash so they match
@@ -835,12 +1135,35 @@ impl InferenceProviderPool {
             }
         }
 
-        let total_pinned = fingerprint_state
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .pinned_count();
+        let update = apply_pin_update(
+            &fingerprint_state,
+            &verified_this_round,
+            backend_count,
+            failed_calls,
+            verify_failures,
+        );
+        for fp in &update.newly_pinned {
+            info!(
+                model = %model_name,
+                url = %url,
+                fingerprint = %fp,
+                "Pinned new TLS SPKI fingerprint from attestation discovery"
+            );
+        }
+        for fp in &update.evicted {
+            info!(
+                model = %model_name,
+                url = %url,
+                fingerprint = %fp,
+                "Evicted TLS SPKI fingerprint — backend no longer in healthy set"
+            );
+        }
+        let new_fingerprints = update.newly_pinned.len();
+        let total_pinned = update.total_pinned;
+        let replaced_state = update.replaced;
 
         DiscoveryOutcome {
+            backend_count,
             successful_calls,
             failed_calls,
             new_fingerprints,
@@ -849,6 +1172,7 @@ impl InferenceProviderPool {
             observed_fingerprints,
             failure_reasons,
             verify_failures,
+            replaced_state,
         }
     }
 
@@ -2071,15 +2395,12 @@ impl InferenceProviderPool {
         }
 
         // Phase 1: Create providers for new/changed URLs, probe attestation, and verify.
-        // For each new URL: N discovery calls (each on a fresh reqwest::Client →
-        // fresh TCP connection → different L4 backend), alternating signing algos
-        // so we harvest ECDSA + Ed25519 signing pubkeys in the same pass (no
-        // separate post-pin round trip). The serving provider shares the
-        // per-URL `FingerprintState` with discovery, so every pin propagates.
+        // Discovery uses rotation SNI (model-proxy PR #27): fetch the healthy
+        // backend count, then fan out one fresh-TCP call per backend index.
+        // One cycle = full coverage. The serving provider shares the per-URL
+        // `FingerprintState` with discovery, so every pin propagates.
         let verifier = self.attestation_verifier.clone();
         let tls_roots = self.tls_roots.clone();
-        let discovery_parallelism =
-            crate::attestation::verification::ATTESTATION_DISCOVERY_PARALLELISM;
         let endpoint_futures: Vec<_> = needs_creation
             .iter()
             .map(|(model_name, url)| {
@@ -2096,7 +2417,6 @@ impl InferenceProviderPool {
                         &url,
                         &api_key,
                         &model_name,
-                        discovery_parallelism,
                         state.clone(),
                         &tls_roots,
                         &verifier,
@@ -2138,12 +2458,13 @@ impl InferenceProviderPool {
                         info!(
                             model = %model_name,
                             url = %url,
-                            calls = discovery_parallelism,
+                            backend_count = outcome.backend_count,
                             successful_calls = outcome.successful_calls,
                             failed_calls = outcome.failed_calls,
                             verify_failures = outcome.verify_failures,
                             new_fingerprints = outcome.new_fingerprints,
                             total_pinned = outcome.total_pinned,
+                            replaced_state = outcome.replaced_state,
                             pubkey_algos = ?outcome.pubkeys_by_algo.keys().collect::<Vec<_>>(),
                             observed_fingerprints = ?outcome.observed_fingerprints,
                             failure_reasons = ?outcome.failure_reasons,
@@ -2207,7 +2528,6 @@ impl InferenceProviderPool {
         // For reused providers WITHOUT tracked fingerprint state (e.g., mock
         // providers injected directly into the cache by tests), fall back to the
         // legacy per-algo refetch path which works against the trait object.
-        let cumulative_calls = crate::attestation::verification::CUMULATIVE_DISCOVERY_CALLS;
         {
             // Snapshot `pubkey_to_providers` as an immutable set of `(pubkey,
             // provider_ptr)` pairs. Using pairs (not just pointers) is key:
@@ -2250,11 +2570,10 @@ impl InferenceProviderPool {
             };
 
             // Classify each reused provider and build parallel work queues.
-            // Running the N discovery/refetch calls concurrently keeps refresh
-            // latency bounded regardless of how many models are in the pool:
-            // with dozens of models and CUMULATIVE_DISCOVERY_CALLS=2 (~10s
-            // worst case per provider), a sequential loop could add minutes
-            // per cycle and starve the background refresh task.
+            // Running the per-provider discovery/refetch calls concurrently
+            // keeps refresh latency bounded regardless of pool size — with
+            // dozens of models, a sequential loop could add minutes per
+            // cycle and starve the background refresh task.
             #[derive(Debug)]
             enum ReusedClassification {
                 /// Blocked state — short-circuit, no network call, evict.
@@ -2352,27 +2671,16 @@ impl InferenceProviderPool {
                         let api_key = api_key.clone();
                         let verifier = verifier.clone();
                         let tls_roots = tls_roots.clone();
-                        // Stagger index: model i waits i × MODEL_DISCOVERY_STAGGER_MS before
-                        // firing its first discovery call. This spreads the per-refresh burst
-                        // across time instead of hitting all backends simultaneously, preventing
-                        // GPU evidence worker saturation on dense hosts (e.g. multiple models
-                        // on the same inference host).
-                        let stagger_idx = discovery_tasks.len();
-                        let model_stagger_ms =
-                            crate::attestation::verification::MODEL_DISCOVERY_STAGGER_MS;
+                        // No inter-model stagger: rotation routes each call
+                        // to a distinct backend, so per-backend GPU evidence
+                        // pressure per cycle is exactly one attestation,
+                        // regardless of how many models refresh together.
                         discovery_tasks.push(
                             async move {
-                                if stagger_idx > 0 {
-                                    tokio::time::sleep(Duration::from_millis(
-                                        model_stagger_ms.saturating_mul(stagger_idx as u64),
-                                    ))
-                                    .await;
-                                }
                                 let outcome = Self::discover_model(
                                     &url,
                                     &api_key,
                                     &model_name,
-                                    cumulative_calls,
                                     state,
                                     &tls_roots,
                                     &verifier,
@@ -2434,33 +2742,29 @@ impl InferenceProviderPool {
             let (discovery_results, legacy_results) = tokio::join!(drive_discovery, drive_legacy);
 
             for (model_name, url, provider, outcome) in discovery_results {
-                if outcome.new_fingerprints > 0 {
+                if outcome.new_fingerprints > 0 || outcome.replaced_state {
                     info!(
                         model = %model_name,
                         url = %url,
+                        backend_count = outcome.backend_count,
                         new_fingerprints = outcome.new_fingerprints,
                         total_pinned = outcome.total_pinned,
                         verify_failures = outcome.verify_failures,
+                        replaced_state = outcome.replaced_state,
                         observed_fingerprints = ?outcome.observed_fingerprints,
                         failure_reasons = ?outcome.failure_reasons,
                         "Cumulative discovery expanded pinned backend set"
                     );
                 } else {
-                    // Promoted from DEBUG to INFO so production can observe
-                    // *why* the pin set isn't growing: every cycle records the
-                    // fingerprints the L4 LB routed to (showing whether load
-                    // balancing is collapsing onto already-pinned backends) and
-                    // any per-call failure reasons (TLS reject, timeout, 5xx,
-                    // etc.). Frequency is bounded by the refresh interval
-                    // (default 300s) × model count, so volume stays modest.
                     info!(
                         model = %model_name,
                         url = %url,
-                        calls = cumulative_calls,
+                        backend_count = outcome.backend_count,
                         successful_calls = outcome.successful_calls,
                         failed_calls = outcome.failed_calls,
                         verify_failures = outcome.verify_failures,
                         total_pinned = outcome.total_pinned,
+                        replaced_state = outcome.replaced_state,
                         observed_fingerprints = ?outcome.observed_fingerprints,
                         failure_reasons = ?outcome.failure_reasons,
                         "Cumulative discovery cycle (no new fingerprints)"
@@ -2881,6 +3185,155 @@ impl InferenceProviderPool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Helper for `apply_pin_update` tests: build a state, run the policy,
+    /// return the (PinUpdate, current pinned-set) pair.
+    fn run_pin_update(
+        initial: Option<&[&str]>,
+        observed: &[&str],
+        backend_count: usize,
+        failed_calls: usize,
+        verify_failures: usize,
+    ) -> (PinUpdate, HashSet<String>) {
+        let state = Arc::new(std::sync::RwLock::new(FingerprintState::Bootstrap));
+        if let Some(initial) = initial {
+            let mut guard = state.write().unwrap();
+            for fp in initial {
+                guard.add_fingerprint((*fp).to_string());
+            }
+        }
+        let verified: HashSet<String> = observed.iter().map(|s| (*s).to_string()).collect();
+        let update = apply_pin_update(
+            &state,
+            &verified,
+            backend_count,
+            failed_calls,
+            verify_failures,
+        );
+        let after = match &*state.read().unwrap() {
+            FingerprintState::Pinned(s) => s.clone(),
+            _ => HashSet::new(),
+        };
+        (update, after)
+    }
+
+    #[test]
+    fn pin_update_complete_coverage_replaces_set() {
+        // Steady state: pin set already has 5 fingerprints, cycle reconfirms
+        // all 5. Coverage is complete → replace (no-op replacement).
+        let (update, after) = run_pin_update(
+            Some(&["a", "b", "c", "d", "e"]),
+            &["a", "b", "c", "d", "e"],
+            5,
+            0,
+            0,
+        );
+        assert!(update.replaced);
+        assert_eq!(update.total_pinned, 5);
+        assert!(update.newly_pinned.is_empty());
+        assert!(update.evicted.is_empty());
+        assert_eq!(after.len(), 5);
+    }
+
+    #[test]
+    fn pin_update_complete_coverage_evicts_dead_backend() {
+        // Backend "e" just went unhealthy → count drops to 4, cycle observes
+        // 4 distinct fingerprints, full coverage → replace → "e" is gone.
+        let (update, after) = run_pin_update(
+            Some(&["a", "b", "c", "d", "e"]),
+            &["a", "b", "c", "d"],
+            4,
+            0,
+            0,
+        );
+        assert!(update.replaced);
+        assert_eq!(update.total_pinned, 4);
+        assert!(update.newly_pinned.is_empty());
+        assert_eq!(update.evicted, vec!["e".to_string()]);
+        assert!(!after.contains("e"));
+        assert!(after.contains("a"));
+    }
+
+    #[test]
+    fn pin_update_partial_cycle_keeps_existing_fingerprints() {
+        // One backend failed mid-cycle (failed_calls=1). We observed 4 of 5
+        // healthy. Cannot safely evict the missing one — additive merge.
+        let (update, after) = run_pin_update(
+            Some(&["a", "b", "c", "d", "e"]),
+            &["a", "b", "c", "d"],
+            5,
+            1,
+            0,
+        );
+        assert!(!update.replaced);
+        assert_eq!(update.total_pinned, 5, "no eviction on partial cycle");
+        assert!(after.contains("e"));
+    }
+
+    #[test]
+    fn pin_update_partial_cycle_with_new_fingerprint_grows_additively() {
+        // A previously-unknown backend showed up mid-cycle (perhaps the
+        // count grew). One other call failed, so coverage is partial — but
+        // we still pin the new fingerprint we did verify.
+        let (update, after) = run_pin_update(Some(&["a", "b"]), &["a", "b", "f"], 4, 1, 0);
+        assert!(!update.replaced);
+        assert_eq!(update.newly_pinned, vec!["f".to_string()]);
+        assert_eq!(update.total_pinned, 3);
+        assert!(after.contains("f"));
+    }
+
+    #[test]
+    fn pin_update_duplicate_observations_are_not_complete_coverage() {
+        // backend_count=5 but the proxy routed two of our calls to the same
+        // backend (e.g. registry race during a deploy). We only see 4
+        // distinct fingerprints — fall back to additive so we don't drop
+        // the missing one.
+        let (update, _after) = run_pin_update(
+            Some(&["a", "b", "c", "d", "e"]),
+            &["a", "a", "b", "c", "d"],
+            5,
+            0,
+            0,
+        );
+        assert!(!update.replaced);
+        assert_eq!(update.total_pinned, 5);
+    }
+
+    #[test]
+    fn pin_update_verify_failure_blocks_replacement() {
+        // Realistic per-cycle shape: 4 fan-outs, 3 verified, 1 verify
+        // failure. backend_count == verified.len() can't both hold when
+        // verify_failures > 0, so the policy must treat this as partial
+        // and keep the stale 'e' from a previous cycle pinned.
+        let (update, after) =
+            run_pin_update(Some(&["a", "b", "c", "d", "e"]), &["a", "b", "c"], 4, 0, 1);
+        assert!(!update.replaced);
+        assert_eq!(
+            update.total_pinned, 5,
+            "stale 'e' is kept; we couldn't verify the cycle was complete"
+        );
+        assert!(after.contains("e"));
+    }
+
+    #[test]
+    fn pin_update_zero_backend_count_is_partial() {
+        // backend_count=0 means we couldn't get a count or proxy reports
+        // no healthy backends — never replace.
+        let (update, after) = run_pin_update(Some(&["a", "b"]), &[], 0, 0, 0);
+        assert!(!update.replaced);
+        assert_eq!(after.len(), 2, "must not evict on zero-count cycle");
+    }
+
+    #[test]
+    fn pin_update_from_bootstrap_first_full_coverage() {
+        // First-ever discovery: state starts Bootstrap, all calls succeed,
+        // full coverage. Result is Pinned with exactly the observed set.
+        let (update, after) = run_pin_update(None, &["a", "b", "c"], 3, 0, 0);
+        assert!(update.replaced);
+        assert_eq!(update.newly_pinned.len(), 3);
+        assert!(update.evicted.is_empty());
+        assert_eq!(after.len(), 3);
+    }
 
     #[test]
     fn test_classify_error_kind() {
@@ -4097,5 +4550,219 @@ mod tests {
                 "Model backed by a Blocked provider should be removed from model_to_providers"
             );
         }
+    }
+
+    // -------------------------------------------------------------------
+    // Fast-path tests for `PoolBackendVerifier`
+    //
+    // The fast path runs an HTTP probe against `/v1/models` and returns
+    // the client without re-attestation when the TLS handshake succeeds.
+    // These tests use plain HTTP (the rustls verifier is only consulted
+    // for HTTPS URLs, so the TLS-pinning layer is short-circuited) and a
+    // hand-rolled TCP responder — same pattern as
+    // `crates/inference_providers/src/vllm/mod.rs`. The goal is to verify
+    // the control flow (Bootstrap → skip fast path; pinned + 200 → return;
+    // pinned + 5xx → fall back; pinned + hang → time out and fall back),
+    // not the TLS verifier itself which has its own tests.
+    // -------------------------------------------------------------------
+
+    use inference_providers::spki_verifier::SharedTlsRoots;
+    use inference_providers::BackendVerifier as _;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    /// Behavior of the mock HTTP server when `/v1/models` is hit.
+    #[derive(Clone, Copy)]
+    enum ModelsBehavior {
+        /// Reply with the given status code and body.
+        Reply(u16, &'static str),
+        /// Accept the TCP connection but never reply — exercises the
+        /// 5-second probe timeout.
+        Hang,
+    }
+
+    struct FastPathTestServer {
+        addr: std::net::SocketAddr,
+        models_hits: Arc<AtomicUsize>,
+        attestation_hits: Arc<AtomicUsize>,
+        _acceptor: tokio::task::JoinHandle<()>,
+    }
+
+    /// Spawn a minimal HTTP/1.1 responder. `/v1/attestation/report` always
+    /// returns 500 (so the slow-path call from the Bootstrap test errors
+    /// out quickly); `/v1/models` is governed by `models_behavior`.
+    async fn start_fast_path_server(models_behavior: ModelsBehavior) -> FastPathTestServer {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let models_hits = Arc::new(AtomicUsize::new(0));
+        let attestation_hits = Arc::new(AtomicUsize::new(0));
+        let m = models_hits.clone();
+        let a = attestation_hits.clone();
+        let acceptor = tokio::spawn(async move {
+            // Sockets that we choose to leave hanging — kept alive so the
+            // peer reads "no data yet" rather than an immediate EOF.
+            let mut held = Vec::new();
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                let mut buf = [0u8; 1024];
+                let n = match sock.read(&mut buf).await {
+                    Ok(n) if n > 0 => n,
+                    _ => continue,
+                };
+                let head = String::from_utf8_lossy(&buf[..n.min(256)]);
+                let path = head
+                    .lines()
+                    .next()
+                    .and_then(|l| l.split_whitespace().nth(1))
+                    .unwrap_or("");
+                if path.starts_with("/v1/models") {
+                    m.fetch_add(1, AtomicOrdering::SeqCst);
+                    match models_behavior {
+                        ModelsBehavior::Reply(status, body) => {
+                            let resp = format!(
+                                "HTTP/1.1 {status} X\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                                body.len(),
+                                body
+                            );
+                            let _ = sock.write_all(resp.as_bytes()).await;
+                        }
+                        ModelsBehavior::Hang => {
+                            held.push(sock);
+                        }
+                    }
+                } else if path.starts_with("/v1/attestation") {
+                    a.fetch_add(1, AtomicOrdering::SeqCst);
+                    let body = "{\"error\":\"test\"}";
+                    let resp = format!(
+                        "HTTP/1.1 500 X\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                }
+            }
+        });
+        FastPathTestServer {
+            addr,
+            models_hits,
+            attestation_hits,
+            _acceptor: acceptor,
+        }
+    }
+
+    fn pinned_state(fps: &[&str]) -> FingerprintState {
+        let mut s = FingerprintState::Bootstrap;
+        for fp in fps {
+            s.add_fingerprint((*fp).to_string());
+        }
+        s
+    }
+
+    fn make_verifier(state: FingerprintState) -> PoolBackendVerifier {
+        PoolBackendVerifier {
+            api_key: None,
+            model_name: "test-model".to_string(),
+            tls_roots: SharedTlsRoots::load(),
+            attestation_verifier: Arc::new(AttestationVerifier::new(HashSet::new(), None, false)),
+            fingerprint_state: Arc::new(std::sync::RwLock::new(state)),
+        }
+    }
+
+    #[tokio::test]
+    async fn fast_path_returns_client_on_200() {
+        let server = start_fast_path_server(ModelsBehavior::Reply(200, "{}")).await;
+        let verifier = make_verifier(pinned_state(&["aa", "bb"]));
+        let base_url = format!("http://{}", server.addr);
+        let result = verifier
+            .try_pinned_fast_path(&base_url, pinned_state(&["aa", "bb"]))
+            .await;
+        assert!(result.is_ok(), "expected Ok, got {result:?}");
+        assert_eq!(server.models_hits.load(AtomicOrdering::SeqCst), 1);
+        assert_eq!(server.attestation_hits.load(AtomicOrdering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn fast_path_returns_err_on_http_5xx() {
+        let server = start_fast_path_server(ModelsBehavior::Reply(503, "down")).await;
+        let verifier = make_verifier(pinned_state(&["aa"]));
+        let base_url = format!("http://{}", server.addr);
+        let result = verifier
+            .try_pinned_fast_path(&base_url, pinned_state(&["aa"]))
+            .await;
+        let err = result.expect_err("expected Err on HTTP 503");
+        assert!(
+            err.contains("503"),
+            "err should mention status code, got: {err}"
+        );
+        assert_eq!(server.models_hits.load(AtomicOrdering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn create_verified_client_skips_fast_path_in_bootstrap() {
+        // Bootstrap state → fast path must not be invoked, slow path runs
+        // instead. We don't care that the slow path fails (mock /v1/attestation
+        // returns 500); we only assert which endpoint(s) were hit.
+        let server = start_fast_path_server(ModelsBehavior::Reply(200, "{}")).await;
+        let verifier = make_verifier(FingerprintState::Bootstrap);
+        let base_url = format!("http://{}", server.addr);
+        let _ = verifier.create_verified_client(&base_url).await;
+        assert_eq!(
+            server.models_hits.load(AtomicOrdering::SeqCst),
+            0,
+            "fast path probe must not run when fingerprint_state is Bootstrap"
+        );
+        assert!(
+            server.attestation_hits.load(AtomicOrdering::SeqCst) >= 1,
+            "slow path should have attempted /v1/attestation/report"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_verified_client_uses_fast_path_when_pinned() {
+        let server = start_fast_path_server(ModelsBehavior::Reply(200, "{}")).await;
+        let verifier = make_verifier(pinned_state(&["aa"]));
+        let base_url = format!("http://{}", server.addr);
+        let client = verifier
+            .create_verified_client(&base_url)
+            .await
+            .expect("fast path should succeed");
+        // Successful fast path means the slow path is never reached.
+        assert_eq!(server.models_hits.load(AtomicOrdering::SeqCst), 1);
+        assert_eq!(
+            server.attestation_hits.load(AtomicOrdering::SeqCst),
+            0,
+            "slow path must not run when fast path succeeds"
+        );
+        drop(client);
+    }
+
+    /// Probe must time out within ~5 s when the backend accepts the
+    /// connection but never replies, and the error message must surface
+    /// the timeout reason so the fallback debug log is informative.
+    #[tokio::test]
+    async fn fast_path_returns_err_on_timeout() {
+        let server = start_fast_path_server(ModelsBehavior::Hang).await;
+        let verifier = make_verifier(pinned_state(&["aa"]));
+        let base_url = format!("http://{}", server.addr);
+        let start = std::time::Instant::now();
+        let result = verifier
+            .try_pinned_fast_path(&base_url, pinned_state(&["aa"]))
+            .await;
+        let elapsed = start.elapsed();
+        let err = result.expect_err("expected Err on hanging probe");
+        assert!(
+            err.contains("timed out"),
+            "err should mention timeout, got: {err}"
+        );
+        // The probe budget is 5 s. Allow scheduler jitter but make sure
+        // we're not waiting on a longer timeout by mistake.
+        assert!(
+            elapsed < Duration::from_secs(7),
+            "probe should give up within ~5s, took {elapsed:?}"
+        );
+        assert_eq!(server.models_hits.load(AtomicOrdering::SeqCst), 1);
     }
 }

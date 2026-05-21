@@ -396,8 +396,13 @@ pub async fn init_domain_services_with_pool(
         org_limit_repository,
     ));
 
-    let web_search_provider =
+    let brave_search_provider =
         Arc::new(services::responses::tools::brave::BraveWebSearchProvider::new());
+    let web_search_provider: Arc<dyn services::responses::tools::WebSearchProviderTrait> =
+        brave_search_provider.clone();
+    let web_context_search_provider: Arc<
+        dyn services::responses::tools::WebContextSearchProviderTrait,
+    > = brave_search_provider;
 
     // Create session repository for user service
     let session_repo = Arc::new(database::SessionRepository::new(database.pool().clone()))
@@ -441,6 +446,7 @@ pub async fn init_domain_services_with_pool(
         conversation_service.clone(),
         completion_service.clone(),
         Some(web_search_provider.clone()), // web_search_provider
+        Some(web_context_search_provider), // web_context_search_provider
         None,                              // file_search_provider
         files_service.clone(),             // file_service
         organization_service.clone(),
@@ -508,8 +514,13 @@ pub async fn init_domain_services_with_mcp_factory(
     ))
         as Arc<dyn services::responses::ports::ResponseItemRepositoryTrait>;
 
-    let web_search_provider =
+    let brave_search_provider =
         Arc::new(services::responses::tools::brave::BraveWebSearchProvider::new());
+    let web_search_provider: Arc<dyn services::responses::tools::WebSearchProviderTrait> =
+        brave_search_provider.clone();
+    let web_context_search_provider: Arc<
+        dyn services::responses::tools::WebContextSearchProviderTrait,
+    > = brave_search_provider;
 
     let response_service = Arc::new(services::ResponseService::with_mcp_client_factory(
         response_repo,
@@ -518,6 +529,7 @@ pub async fn init_domain_services_with_mcp_factory(
         domain_services.conversation_service.clone(),
         domain_services.completion_service.clone(),
         Some(web_search_provider),
+        Some(web_context_search_provider),
         None,
         domain_services.files_service.clone(), // Reuse files_service from base
         organization_service,
@@ -538,6 +550,31 @@ pub async fn init_domain_services_with_pool_and_web_search_provider(
     inference_provider_pool: Arc<services::inference_provider_pool::InferenceProviderPool>,
     metrics_service: Arc<dyn services::metrics::MetricsServiceTrait>,
     web_search_provider: Arc<dyn services::responses::tools::WebSearchProviderTrait>,
+) -> DomainServices {
+    init_domain_services_with_pool_and_search_providers(
+        database,
+        config,
+        organization_service,
+        inference_provider_pool,
+        metrics_service,
+        web_search_provider,
+        None,
+    )
+    .await
+}
+
+/// Like `init_domain_services_with_pool_and_web_search_provider`, but also lets tests
+/// inject a Responses-only context-search provider.
+pub async fn init_domain_services_with_pool_and_search_providers(
+    database: Arc<Database>,
+    config: &ApiConfig,
+    organization_service: Arc<dyn services::organization::OrganizationServiceTrait + Send + Sync>,
+    inference_provider_pool: Arc<services::inference_provider_pool::InferenceProviderPool>,
+    metrics_service: Arc<dyn services::metrics::MetricsServiceTrait>,
+    web_search_provider: Arc<dyn services::responses::tools::WebSearchProviderTrait>,
+    web_context_search_provider: Option<
+        Arc<dyn services::responses::tools::WebContextSearchProviderTrait>,
+    >,
 ) -> DomainServices {
     let mut domain_services = init_domain_services_with_pool(
         database.clone(),
@@ -561,6 +598,7 @@ pub async fn init_domain_services_with_pool_and_web_search_provider(
         domain_services.conversation_service.clone(),
         domain_services.completion_service.clone(),
         Some(web_search_provider.clone()),
+        web_context_search_provider,
         None,
         domain_services.files_service.clone(),
         organization_service,
@@ -834,6 +872,7 @@ pub fn build_app_with_config(
         app_state.inference_provider_pool.clone(),
         analytics_service,
         domain_services.models_service.clone(),
+        domain_services.completion_service.clone(),
     );
 
     let invitation_routes =
@@ -1443,6 +1482,7 @@ pub fn build_admin_routes(
     inference_provider_pool: Arc<services::inference_provider_pool::InferenceProviderPool>,
     analytics_service: Arc<services::admin::AnalyticsService>,
     models_service: Arc<services::models::ModelsServiceImpl>,
+    completion_service: Arc<services::CompletionServiceImpl>,
 ) -> Router {
     use crate::middleware::admin_middleware;
     use crate::routes::admin::{
@@ -1468,10 +1508,13 @@ pub fn build_admin_routes(
     // The admin service holds a reference to the `models_service` so it can
     // invalidate the public `/v1/model/list` cache after admin writes
     // (`upsert`, `delete`, `deprecate`) that mutate the `models` or
-    // `model_aliases` tables.
+    // `model_aliases` tables. It also holds the `completion_service` so it
+    // can invalidate the per-org concurrent-limit cache after a PATCH to
+    // `/v1/admin/organizations/{org_id}/concurrent-limit`.
     let admin_service = Arc::new(AdminServiceImpl::new(
         admin_repository as Arc<dyn services::admin::AdminRepository>,
         models_service as Arc<dyn services::models::ModelsServiceTrait>,
+        completion_service.clone() as Arc<dyn services::completions::CompletionServiceTrait>,
     )) as Arc<dyn services::admin::AdminService + Send + Sync>;
 
     let admin_app_state = AdminAppState {

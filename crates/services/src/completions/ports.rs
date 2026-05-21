@@ -205,4 +205,12 @@ pub trait CompletionServiceTrait: Send + Sync {
     fn get_inference_provider_pool(
         &self,
     ) -> std::sync::Arc<crate::inference_provider_pool::InferenceProviderPool>;
+
+    /// Drop the cached concurrent-limit entry for an organization so the next
+    /// request reads the freshly-written value from the repository.
+    ///
+    /// Called by the admin service after a successful PATCH of
+    /// `organizations.concurrent_limit` so admin changes take effect
+    /// immediately instead of waiting for the 5-minute TTL.
+    async fn invalidate_org_concurrent_limit(&self, org_id: Uuid);
 }

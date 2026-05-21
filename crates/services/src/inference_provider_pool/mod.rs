@@ -1,8 +1,7 @@
-mod rotation;
-
 use crate::attestation::AttestationVerifier;
 use crate::common::encryption_headers;
 use config::ExternalProvidersConfig;
+use inference_providers::rotation;
 use inference_providers::spki_verifier::{FingerprintState, SharedTlsRoots};
 use inference_providers::{
     models::{AttestationError, CompletionError},
@@ -2441,6 +2440,12 @@ impl InferenceProviderPool {
                             backend_verifier,
                         ));
 
+                    // Seed the provider's backend_count cache so traffic-time
+                    // rotation-SNI fallback knows how many indices to iterate
+                    // on the first 5xx — without this, the very first 5xx
+                    // before any refresh cycle would skip rotation entirely.
+                    serving_provider.set_backend_count(outcome.backend_count);
+
                     if outcome.total_pinned == 0 {
                         // Fail closed: reject all TLS until a future refresh's
                         // cumulative discovery pins at least one fingerprint.
@@ -2770,6 +2775,14 @@ impl InferenceProviderPool {
                         "Cumulative discovery cycle (no new fingerprints)"
                     );
                 }
+
+                // Refresh the provider's backend_count cache so the
+                // rotation-SNI traffic fallback uses the latest known healthy
+                // count. A `count_zero` cycle yields 0 — that's still a
+                // useful update because it disables rotation fallback for
+                // this provider until the next cycle proves at least one
+                // backend healthy again.
+                provider.set_backend_count(outcome.backend_count);
 
                 let ptr = Arc::as_ptr(&provider) as *const () as usize;
                 let provider_has_any_pubkey_mapping = mapped_ptrs.contains(&ptr);

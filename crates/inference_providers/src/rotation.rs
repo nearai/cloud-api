@@ -1,11 +1,12 @@
-//! Rotation-SNI helpers for backend-deterministic attestation discovery.
+//! Rotation-SNI helpers for backend-deterministic routing.
 //!
 //! Model-proxy publishes a synthetic SNI scheme `<canonical>-i<N>.<base>` that
 //! routes a fresh-TCP connection to backend `N % healthy_count`, bypassing the
 //! least-connections LB that otherwise collapses our probes onto a stable
-//! subset. Cloud-api combines this with `GET /backends/count?domain=<host>` to
-//! learn the live healthy count per cycle and iterate every backend in one
-//! pass.
+//! subset. Combined with `GET /backends/count?domain=<host>` to learn the live
+//! healthy count, callers can iterate every backend in one pass — used by both
+//! attestation discovery (deterministic per-backend probing) and traffic-time
+//! fallback (retry on a different backend when the sticky one returns 5xx).
 //!
 //! See model-proxy PR #27.
 
@@ -22,7 +23,7 @@ use url::Url;
 /// DNS label (`glm-5-1`), and `base` is everything after that
 /// (`completions.near.ai`).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct UrlParts {
+pub struct UrlParts {
     pub host: String,
     pub canonical_label: String,
     pub base: String,
@@ -36,10 +37,8 @@ pub(super) struct UrlParts {
 ///
 /// Returns `None` when the URL's host doesn't look like a child of a single
 /// base domain (one-label hostnames, IP literals, missing host). Callers
-/// treat that as "skip rotation for this URL" — there is no other path in
-/// this PR, so the discovery cycle records zero observations and the
-/// existing fail-closed eviction logic runs.
-pub(super) fn split_inference_url(url: &Url) -> Option<UrlParts> {
+/// treat that as "skip rotation for this URL".
+pub fn split_inference_url(url: &Url) -> Option<UrlParts> {
     let host = url.host_str()?;
     // IP literals (`url::Host::Ipv4` / `Ipv6`) parse into `host_str` too, so
     // gate on the URL host *type*: only Domain is meaningful for SNI rotation.
@@ -64,13 +63,13 @@ pub(super) fn split_inference_url(url: &Url) -> Option<UrlParts> {
 }
 
 /// Build the rotation URL for index `i`:
-/// `https://<canonical>-i<i>.<base>/v1/attestation/report?...`
+/// `https://<canonical>-i<i>.<base>/`
 ///
-/// The caller appends the query string itself; this helper only builds the
-/// authority part. Returns `None` only if URL construction fails (which
-/// requires a malformed `UrlParts`, an unreachable state given that
+/// The caller appends path + query themselves; this helper builds the
+/// authority. Returns `None` only if URL construction fails (which requires
+/// a malformed `UrlParts`, an unreachable state given that
 /// `split_inference_url` validated the inputs).
-pub(super) fn rotation_base_url(parts: &UrlParts, index: u64) -> Option<Url> {
+pub fn rotation_base_url(parts: &UrlParts, index: u64) -> Option<Url> {
     let host = format!("{}-i{}.{}", parts.canonical_label, index, parts.base);
     let authority = match parts.port {
         Some(p) => format!("{}://{}:{}", parts.scheme, host, p),
@@ -81,7 +80,7 @@ pub(super) fn rotation_base_url(parts: &UrlParts, index: u64) -> Option<Url> {
 
 /// Build the count endpoint URL for this provider's base:
 /// `https://<base>/backends/count?domain=<host>`
-pub(super) fn count_url(parts: &UrlParts) -> Option<Url> {
+pub fn count_url(parts: &UrlParts) -> Option<Url> {
     let authority = match parts.port {
         Some(p) => format!("{}://{}:{}", parts.scheme, parts.base, p),
         None => format!("{}://{}", parts.scheme, parts.base),
@@ -104,15 +103,14 @@ struct CountResponse {
 ///
 /// `Ok(healthy)` means model-proxy authoritatively reported the live healthy
 /// count for this domain. `Err(reason)` means we couldn't get a count and
-/// must skip the rotation cycle; the reason is recorded in
-/// `DiscoveryOutcome::failure_reasons` for observability and the cycle ends
-/// with zero observations.
-pub(super) enum CountFetch {
+/// the caller should skip this cycle; the reason is suitable for low-
+/// cardinality observability ingestion.
+pub enum CountFetch {
     Ok(usize),
     Err(String),
 }
 
-pub(super) async fn fetch_backend_count(
+pub async fn fetch_backend_count(
     client: &reqwest::Client,
     parts: &UrlParts,
     timeout: Duration,

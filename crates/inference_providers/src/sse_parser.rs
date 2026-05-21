@@ -225,6 +225,33 @@ impl SSEEventParser for OpenAIEventParser {
         // Parse JSON data
         match serde_json::from_str::<serde_json::Value>(data) {
             Ok(json) => {
+                // SGLang / vLLM emit an in-stream error frame when an abort
+                // fires AFTER the HTTP 200 headers were sent (queue-full,
+                // priority-disabled, waiting timeout, etc.):
+                //   data: {"error":{"message":"...","type":"...","code":503}}
+                // Surface it as a typed `HttpError` so VLlmProvider's
+                // rotation-SNI fallback can classify by upstream status
+                // (5xx → try a different backend) instead of treating it as
+                // a generic `InvalidResponse`, which would terminate the
+                // stream silently with a `server_error` SSE frame.
+                if let Some(err_obj) = json.get("error").and_then(|v| v.as_object()) {
+                    let status_code = err_obj
+                        .get("code")
+                        .and_then(|v| v.as_u64())
+                        .and_then(|n| u16::try_from(n).ok())
+                        .filter(|&n| (100..=599).contains(&n))
+                        .unwrap_or(502);
+                    let message = err_obj
+                        .get("message")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("Upstream stream emitted an error event")
+                        .to_string();
+                    return Err(CompletionError::HttpError {
+                        status_code,
+                        message,
+                        is_external: false,
+                    });
+                }
                 let chunk = if state.is_chat {
                     match serde_json::from_value::<ChatCompletionChunk>(json) {
                         Ok(chunk) => StreamChunk::Chat(chunk),
@@ -514,5 +541,84 @@ mod tests {
         // correctly reassembled é since bytes are buffered until newline.
         assert_eq!(events.len(), 1, "Expected 1 event, got {}", events.len());
         assert!(events[0].is_ok(), "The event should be parsed successfully");
+    }
+
+    #[tokio::test]
+    async fn test_sse_parser_propagates_error_chunk_as_http_error() {
+        // SGLang `--max-queued-requests` abort emits an in-stream error frame
+        // *after* HTTP 200 headers. Previously the parser couldn't classify
+        // this and surfaced `InvalidResponse("Failed to parse event")`, which
+        // hid the upstream status from VLlmProvider's rotation fallback.
+        // The fix promotes any `{"error":{"code":N,...}}` chunk to a typed
+        // `HttpError { status_code: N }` so the rotation path can recognize
+        // it as 5xx and walk to a different backend.
+        let packet = "data: {\"error\":{\"object\":\"error\",\"message\":\"The request queue is full.\",\"type\":\"SERVICE_UNAVAILABLE\",\"code\":503}}\n\ndata: [DONE]\n\n";
+        let mock_stream =
+            futures_util::stream::iter(vec![Ok::<_, reqwest::Error>(bytes::Bytes::from(packet))]);
+        let parser = new_sse_parser(mock_stream, true);
+        let events: Vec<_> = parser.collect().await;
+        assert_eq!(
+            events.len(),
+            1,
+            "Expected exactly one error event before stream termination, got {}",
+            events.len()
+        );
+        match &events[0] {
+            Err(CompletionError::HttpError {
+                status_code,
+                message,
+                is_external,
+            }) => {
+                assert_eq!(*status_code, 503);
+                assert!(
+                    message.contains("queue is full"),
+                    "Expected upstream message to round-trip, got: {message}"
+                );
+                assert!(
+                    !*is_external,
+                    "Internal vLLM/SGLang errors must not leak as external"
+                );
+            }
+            other => panic!("Expected HttpError 503, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_sse_parser_error_chunk_without_numeric_code_falls_back_to_502() {
+        // Defensive: not every upstream emits `code`. A `{"error":{...}}` with
+        // no `code` field still indicates an upstream problem — surface it as
+        // 502 so rotation fallback considers it retryable (5xx).
+        let packet = "data: {\"error\":{\"message\":\"something went wrong\",\"type\":\"server_error\"}}\n\n";
+        let mock_stream =
+            futures_util::stream::iter(vec![Ok::<_, reqwest::Error>(bytes::Bytes::from(packet))]);
+        let parser = new_sse_parser(mock_stream, true);
+        let events: Vec<_> = parser.collect().await;
+        match &events[0] {
+            Err(CompletionError::HttpError { status_code, .. }) => {
+                assert_eq!(*status_code, 502, "Missing code should default to 502");
+            }
+            other => panic!("Expected HttpError 502, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_sse_parser_ignores_non_object_error_field() {
+        // A chunk like `{"id":..., "error": null}` would historically have
+        // failed `ChatCompletionChunk` deserialization and surfaced as
+        // `InvalidResponse`. With the new branch we MUST only intercept on
+        // `error` being an *object* — otherwise a legitimate streaming
+        // response with a null/missing-error semantic would be misclassified
+        // as 502.
+        let packet = "data: {\"id\":\"1\",\"object\":\"chat.completion.chunk\",\"created\":1234567890,\"model\":\"test\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"},\"finish_reason\":null}],\"error\":null}\n\n";
+        let mock_stream =
+            futures_util::stream::iter(vec![Ok::<_, reqwest::Error>(bytes::Bytes::from(packet))]);
+        let parser = new_sse_parser(mock_stream, true);
+        let events: Vec<_> = parser.collect().await;
+        assert_eq!(events.len(), 1);
+        assert!(
+            events[0].is_ok(),
+            "null `error` field must not trigger the error path: got {:?}",
+            events[0]
+        );
     }
 }

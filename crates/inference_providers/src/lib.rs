@@ -60,6 +60,7 @@ pub mod chunk_builder;
 pub mod external;
 pub mod mock;
 pub mod models;
+pub mod rotation;
 pub mod spki_verifier;
 pub mod sse_parser;
 pub mod vllm;
@@ -262,6 +263,13 @@ pub trait InferenceProvider {
 
     /// Clean up the dedicated client for a chat_id after signature fetching.
     fn unpin_chat_connection(&self, _chat_id: &str) {}
+
+    /// Update the provider's view of how many healthy backends sit behind its
+    /// canonical SNI. Discovery calls this after each cycle so the traffic-
+    /// time fallback path knows how many rotation-SNI indices to iterate when
+    /// the sticky backend returns a 5xx. Default is a no-op — only providers
+    /// that participate in model-proxy rotation (vLLM) override it.
+    fn set_backend_count(&self, _count: usize) {}
 
     async fn get_attestation_report(
         &self,

@@ -1953,13 +1953,13 @@ impl InferenceProvider for VLlmProvider {
 
         if !response.status().is_success() {
             let status_code = response.status().as_u16();
-            let message = response
+            let error_text = response
                 .text()
                 .await
                 .unwrap_or_else(|_| "Unknown error".to_string());
             return Err(EmbeddingError::HttpError {
                 status_code,
-                message,
+                message: crate::extract_error_message(&error_text),
             });
         }
 

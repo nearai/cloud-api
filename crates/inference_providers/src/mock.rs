@@ -552,6 +552,8 @@ struct MockConfig {
     default_response: ResponseTemplate,
     /// When set, all chat completion calls return this error instead of generating a response
     error_override: Option<CompletionError>,
+    /// When set, all embeddings calls return this error instead of generating a response
+    embedding_error_override: Option<EmbeddingError>,
 }
 
 /// Builder for configuring a single expectation
@@ -601,6 +603,7 @@ impl MockProvider {
                 expectations: Vec::new(),
                 default_response: ResponseTemplate::new("1. 2. 3."),
                 error_override: None,
+                embedding_error_override: None,
             })),
             last_chat_params: Arc::new(Mutex::new(None)),
             fail_attestation: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -618,6 +621,7 @@ impl MockProvider {
                 expectations: Vec::new(),
                 default_response: ResponseTemplate::new("1. 2. 3."),
                 error_override: None,
+                embedding_error_override: None,
             })),
             last_chat_params: Arc::new(Mutex::new(None)),
             fail_attestation: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -633,6 +637,7 @@ impl MockProvider {
                 expectations: Vec::new(),
                 default_response: ResponseTemplate::new("1. 2. 3."),
                 error_override: None,
+                embedding_error_override: None,
             })),
             last_chat_params: Arc::new(Mutex::new(None)),
             fail_attestation: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -687,6 +692,13 @@ impl MockProvider {
     pub async fn set_error_override(&self, error: Option<CompletionError>) {
         let mut config = self.config.lock().await;
         config.error_override = error;
+    }
+
+    /// Override the embeddings response with an error (useful for testing error paths).
+    /// Pass `None` to clear the override.
+    pub async fn set_embedding_error_override(&self, error: Option<EmbeddingError>) {
+        let mut config = self.config.lock().await;
+        config.embedding_error_override = error;
     }
 
     /// Generate a completion ID
@@ -1123,6 +1135,12 @@ impl crate::InferenceProvider for MockProvider {
         _body: bytes::Bytes,
         _extra: std::collections::HashMap<String, serde_json::Value>,
     ) -> Result<bytes::Bytes, EmbeddingError> {
+        {
+            let config = self.config.lock().await;
+            if let Some(ref error) = config.embedding_error_override {
+                return Err(error.clone());
+            }
+        }
         let embedding: Vec<f64> = vec![0.0; 384];
         let response_json = serde_json::json!({
             "object": "list",

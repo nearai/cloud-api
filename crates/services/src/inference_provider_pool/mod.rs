@@ -2172,13 +2172,27 @@ impl InferenceProviderPool {
             }
         }
 
-        let error_msg = last_error
-            .map(|e| Self::sanitize_error_message(&e.to_string()))
-            .unwrap_or_else(|| "No providers available for embeddings".to_string());
-
-        Err(inference_providers::EmbeddingError::RequestFailed(
-            error_msg,
-        ))
+        // Preserve the HttpError variant so the caller can see the upstream
+        // status code and propagate a meaningful response (e.g. 400 for a
+        // client-side parameter error). Collapsing to RequestFailed loses the
+        // status code and forces every upstream error to surface as 502.
+        Err(match last_error {
+            Some(inference_providers::EmbeddingError::HttpError {
+                status_code,
+                message,
+            }) => inference_providers::EmbeddingError::HttpError {
+                status_code,
+                message: Self::sanitize_error_message(&message),
+            },
+            Some(inference_providers::EmbeddingError::RequestFailed(msg)) => {
+                inference_providers::EmbeddingError::RequestFailed(Self::sanitize_error_message(
+                    &msg,
+                ))
+            }
+            None => inference_providers::EmbeddingError::RequestFailed(
+                "No providers available for embeddings".to_string(),
+            ),
+        })
     }
 
     pub async fn privacy_classify(
@@ -4777,5 +4791,80 @@ mod tests {
             "probe should give up within ~5s, took {elapsed:?}"
         );
         assert_eq!(server.models_hits.load(AtomicOrdering::SeqCst), 1);
+    }
+
+    // ==================== Embeddings Error Propagation Tests ====================
+
+    #[tokio::test]
+    async fn test_embeddings_preserves_http_error_status_code() {
+        // Upstream rejects an embedding request with HTTP 400 (e.g. unsupported
+        // `dimensions` param). The pool MUST preserve the HttpError variant so
+        // the route can return HTTP 400 — not collapse it to RequestFailed,
+        // which previously caused every upstream error to surface as HTTP 502.
+        use inference_providers::mock::MockProvider;
+
+        let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
+        let model_id = "Qwen/Qwen3-Embedding-0.6B".to_string();
+        let mock = Arc::new(MockProvider::new_accept_all());
+        mock.set_embedding_error_override(Some(inference_providers::EmbeddingError::HttpError {
+            status_code: 400,
+            message: "dimensions parameter is not supported for this model".to_string(),
+        }))
+        .await;
+        pool.register_provider(model_id.clone(), mock).await;
+
+        let body = bytes::Bytes::from(
+            r#"{"model":"Qwen/Qwen3-Embedding-0.6B","input":"hi","dimensions":256}"#,
+        );
+        let result = pool
+            .embeddings(&model_id, body, std::collections::HashMap::new())
+            .await;
+
+        match result {
+            Err(inference_providers::EmbeddingError::HttpError {
+                status_code,
+                message,
+            }) => {
+                assert_eq!(status_code, 400);
+                assert!(
+                    message.contains("dimensions parameter is not supported"),
+                    "Expected upstream message to be preserved, got: {message}"
+                );
+            }
+            other => panic!("Expected HttpError(400, ...), got: {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_embeddings_request_failed_stays_request_failed() {
+        // Non-HTTP errors (e.g. network/connection failure) should still
+        // surface as RequestFailed so the route maps them to 502.
+        use inference_providers::mock::MockProvider;
+
+        let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
+        let model_id = "Qwen/Qwen3-Embedding-0.6B".to_string();
+        let mock = Arc::new(MockProvider::new_accept_all());
+        mock.set_embedding_error_override(Some(
+            inference_providers::EmbeddingError::RequestFailed(
+                "connection reset by peer".to_string(),
+            ),
+        ))
+        .await;
+        pool.register_provider(model_id.clone(), mock).await;
+
+        let result = pool
+            .embeddings(
+                &model_id,
+                bytes::Bytes::from(r#"{"model":"x","input":"hi"}"#),
+                std::collections::HashMap::new(),
+            )
+            .await;
+
+        match result {
+            Err(inference_providers::EmbeddingError::RequestFailed(msg)) => {
+                assert!(msg.contains("connection reset"));
+            }
+            other => panic!("Expected RequestFailed, got: {:?}", other),
+        }
     }
 }

@@ -1266,6 +1266,92 @@ mod tests {
     }
 
     #[test]
+    fn test_classify_provider_error_404_surfaces_message() {
+        let (status, error_type, message) =
+            classify_provider_error(404, "model 'foo' not found".to_string());
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(error_type, "not_found_error");
+        assert_eq!(message, "model 'foo' not found");
+    }
+
+    #[test]
+    fn test_classify_provider_error_429_surfaces_message() {
+        let (status, error_type, message) =
+            classify_provider_error(429, "too many concurrent requests".to_string());
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(error_type, "rate_limit_error");
+        assert_eq!(message, "too many concurrent requests");
+    }
+
+    #[test]
+    fn test_classify_provider_error_400_surfaces_message() {
+        let (status, error_type, message) = classify_provider_error(
+            400,
+            "dimensions is not supported for this model".to_string(),
+        );
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(error_type, "invalid_request_error");
+        assert_eq!(message, "dimensions is not supported for this model");
+    }
+
+    #[test]
+    fn test_classify_provider_error_422_preserves_upstream_status() {
+        let (status, error_type, message) =
+            classify_provider_error(422, "validation failed".to_string());
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(error_type, "invalid_request_error");
+        assert_eq!(message, "validation failed");
+    }
+
+    #[test]
+    fn test_classify_provider_error_401_masked_as_5xx() {
+        // 401 from upstream means *our* credentials are wrong — the client
+        // did nothing to cause it, so we must not echo the auth error.
+        let (status, error_type, message) =
+            classify_provider_error(401, "Invalid API key 'sk-***'".to_string());
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(error_type, "server_error");
+        assert!(
+            !message.contains("sk-"),
+            "must not leak upstream credentials in surfaced message"
+        );
+        assert!(message.contains("try again later"));
+    }
+
+    #[test]
+    fn test_classify_provider_error_403_masked_as_5xx() {
+        let (status, error_type, message) =
+            classify_provider_error(403, "Forbidden: backend ACL denied".to_string());
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(error_type, "server_error");
+        assert_eq!(
+            message,
+            "Embeddings request failed. Please try again later."
+        );
+    }
+
+    #[test]
+    fn test_classify_provider_error_407_masked_as_5xx() {
+        let (status, error_type, _) =
+            classify_provider_error(407, "proxy auth required".to_string());
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(error_type, "server_error");
+    }
+
+    #[test]
+    fn test_classify_provider_error_5xx_masked() {
+        // 5xx bodies may contain stack traces or internal details — never echo.
+        let (status, error_type, message) = classify_provider_error(
+            502,
+            "RuntimeError: traceback...internal-host:9000".to_string(),
+        );
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(error_type, "server_error");
+        assert!(!message.contains("traceback"));
+        assert!(!message.contains("internal-host"));
+    }
+
+    #[test]
     fn test_stream_chunk_serialization_preserves_field_order() {
         // Verify that StreamChunk::Chat serializes with struct field order
         // (not alphabetical), matching what serde_json::to_string produces.
@@ -2675,6 +2761,49 @@ struct EmbeddingsResponseDoc {
     data: serde_json::Value,
 }
 
+/// Classify an upstream provider HTTP error into the (status, error_type, message)
+/// triple we surface to the client.
+///
+/// Rules:
+/// - 401/403/407 from upstream mean *our* credentials to the backend are wrong
+///   (or our backend's auth config is broken). The client did nothing to cause
+///   it, so we return 500 with a generic message instead of echoing an auth
+///   failure that would be misleading.
+/// - 404 → 404 not_found_error (e.g. model not found at this provider).
+/// - 429 → 429 rate_limit_error.
+/// - Other 4xx → preserve upstream status with `invalid_request_error`. The
+///   upstream message is surfaced so the user can see *why* their request was
+///   rejected (e.g. "dimensions is not supported for this model").
+/// - 5xx (and anything else) → 500 server_error with a generic message. The
+///   upstream body may contain stack traces or internal details we don't want
+///   to leak.
+fn classify_provider_error(
+    upstream_status: u16,
+    upstream_message: String,
+) -> (StatusCode, &'static str, String) {
+    let generic = || {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "server_error",
+            "Embeddings request failed. Please try again later.".to_string(),
+        )
+    };
+    match upstream_status {
+        401 | 403 | 407 => generic(),
+        404 => (StatusCode::NOT_FOUND, "not_found_error", upstream_message),
+        429 => (
+            StatusCode::TOO_MANY_REQUESTS,
+            "rate_limit_error",
+            upstream_message,
+        ),
+        s if (400..=499).contains(&s) => {
+            let http_status = StatusCode::from_u16(s).unwrap_or(StatusCode::BAD_REQUEST);
+            (http_status, "invalid_request_error", upstream_message)
+        }
+        _ => generic(),
+    }
+}
+
 #[utoipa::path(
     post,
     path = "/v1/embeddings",
@@ -2905,16 +3034,18 @@ pub async fn embeddings(
                 }
                 services::completions::ports::CompletionError::ProviderError {
                     status_code,
-                    ..
+                    message,
                 } => {
-                    tracing::error!("Embeddings provider error");
-                    let http_status = StatusCode::from_u16(status_code)
-                        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-                    (
-                        http_status,
-                        "server_error",
-                        "Embeddings request failed. Please try again later.".to_string(),
-                    )
+                    let classified = classify_provider_error(status_code, message);
+                    if classified.0.is_client_error() {
+                        tracing::warn!(
+                            upstream_status = status_code,
+                            "Embeddings rejected by upstream with client error"
+                        );
+                    } else {
+                        tracing::error!(upstream_status = status_code, "Embeddings provider error");
+                    }
+                    classified
                 }
                 services::completions::ports::CompletionError::InvalidModel(msg) => {
                     tracing::warn!("Embeddings model not found");

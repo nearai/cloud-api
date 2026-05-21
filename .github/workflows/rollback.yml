@@ -27,9 +27,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Check confirm input
+        env:
+          CONFIRM: ${{ inputs.confirm }}
         run: |
-          if [ "${{ inputs.confirm }}" != "ROLLBACK" ]; then
-            echo "::error::Confirmation failed. Set 'confirm' input to ROLLBACK to proceed (got: '${{ inputs.confirm }}')."
+          if [ "$CONFIRM" != "ROLLBACK" ]; then
+            echo "::error::Confirmation failed. Set 'confirm' input to ROLLBACK to proceed."
             exit 1
           fi
 
@@ -64,9 +66,11 @@ jobs:
       # 'before' state and the workflow summary records both digests.
       - name: Resolve target tag and digest
         id: resolve
+        env:
+          TARGET_TAG_INPUT: ${{ inputs.target_tag }}
         run: |
           set -euo pipefail
-          TARGET_TAG="${{ inputs.target_tag }}"
+          TARGET_TAG="$TARGET_TAG_INPUT"
 
           CURRENT_DIGEST=$(skopeo inspect "docker://${{ env.IMAGE }}:prod" | jq -r '.Digest')
           if [ -z "$CURRENT_DIGEST" ] || [ "$CURRENT_DIGEST" = "null" ]; then
@@ -135,13 +139,20 @@ jobs:
       # Copy from the resolved digest (not the tag) so the bytes pushed to
       # :prod and the audit tag are provably identical, regardless of any
       # concurrent registry write that might race the source tag.
-      - name: Re-tag :prod and push audit tag
+      #
+      # Separated into two steps so a failure pushing the audit tag does not
+      # prevent the redeploy job from running — :prod is already re-pointed at
+      # this stage and the fleet must be redeployed regardless.
+      - name: Re-tag :prod
+        id: retag-prod
         run: |
           set -euo pipefail
-          TARGET_DIGEST="${{ steps.resolve.outputs.target_digest }}"
-          AUDIT_TAG="${{ steps.resolve.outputs.audit_tag }}"
-          skopeo copy "docker://${{ env.IMAGE }}@${TARGET_DIGEST}" "docker://${{ env.IMAGE }}:prod"
-          skopeo copy "docker://${{ env.IMAGE }}@${TARGET_DIGEST}" "docker://${{ env.IMAGE }}:${AUDIT_TAG}"
+          skopeo copy "docker://${{ env.IMAGE }}@${{ steps.resolve.outputs.target_digest }}" "docker://${{ env.IMAGE }}:prod"
+
+      - name: Push audit tag
+        run: |
+          set -euo pipefail
+          skopeo copy "docker://${{ env.IMAGE }}@${{ steps.resolve.outputs.target_digest }}" "docker://${{ env.IMAGE }}:${{ steps.resolve.outputs.audit_tag }}"
 
       - name: Output digest summary
         run: |
@@ -185,6 +196,9 @@ jobs:
   trigger-redeploy:
     name: Trigger cvm-ansible-playbooks redeploy
     needs: rollback-prod
+    # Run as long as :prod was successfully re-tagged (retag-prod step passed),
+    # even if the audit-tag step or the GH release step subsequently failed.
+    if: ${{ !cancelled() && needs.rollback-prod.outputs.target_digest != '' }}
     runs-on: ubuntu-latest
     steps:
       # cvm-ansible-playbooks `Update Cloud API Prod` re-reads :prod from

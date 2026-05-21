@@ -19,7 +19,7 @@ use services::completions::{
 use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::debug;
+use tracing::{debug, Instrument};
 use utoipa;
 use uuid::Uuid;
 
@@ -281,8 +281,10 @@ fn convert_chat_request_to_service(
     organization_id: Uuid,
     workspace_id: Uuid,
     body_hash: RequestBodyHash,
+    request_id: Uuid,
 ) -> ServiceCompletionRequest {
     ServiceCompletionRequest {
+        request_id,
         model: request.model.clone(),
         messages: request
             .messages
@@ -660,8 +662,10 @@ fn convert_text_request_to_service(
     organization_id: Uuid,
     workspace_id: Uuid,
     body_hash: RequestBodyHash,
+    request_id: Uuid,
 ) -> ServiceCompletionRequest {
     ServiceCompletionRequest {
+        request_id,
         model: request.model.clone(),
         messages: vec![CompletionMessage {
             role: "user".to_string(),
@@ -735,6 +739,49 @@ pub async fn chat_completions(
             .into_response();
     }
 
+    // Generate a per-request correlation ID. Reuse the client's X-Request-Id if
+    // present and parseable as a UUID; otherwise generate a fresh one. This ID
+    // propagates downstream as X-Request-Id on every outbound inference call.
+    let request_id = headers
+        .get("x-request-id")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| Uuid::parse_str(s).ok())
+        .unwrap_or_else(Uuid::new_v4);
+
+    // Create a span carrying correlation IDs so every log line within this
+    // request carries request_id/org_id/workspace_id in Datadog.
+    //
+    // NOTE: we do NOT call span.enter() here. In async code, Span::enter()
+    // stores the guard in a thread-local; when the future yields at an .await
+    // the guard stays entered on that thread, so any other task scheduled on
+    // the same thread incorrectly inherits this span as its parent, corrupting
+    // log context. Use .instrument(span) on the inner async block instead.
+    let span = tracing::info_span!(
+        "chat_completions",
+        request_id = %request_id,
+        org_id = %api_key.organization.id.0,
+        workspace_id = %api_key.workspace.id.0,
+        model = %request.model,
+    );
+
+    chat_completions_inner(app_state, api_key, body_hash, headers, request, request_id)
+        .instrument(span)
+        .await
+}
+
+// Inner async fn so .instrument(span) wraps all awaits in the handler.
+// Split from `chat_completions` only to correctly scope the tracing span:
+// using span.enter() in an async fn risks the guard outliving an .await yield,
+// causing other tasks on the same thread to inherit this span's context.
+#[allow(clippy::too_many_arguments)]
+async fn chat_completions_inner(
+    app_state: crate::routes::api::AppState,
+    api_key: crate::middleware::auth::AuthenticatedApiKey,
+    body_hash: crate::middleware::RequestBodyHash,
+    headers: header::HeaderMap,
+    request: ChatCompletionRequest,
+    request_id: Uuid,
+) -> axum::response::Response {
     // Convert HTTP request to service parameters
     // Note: Names are not passed - high-cardinality data is tracked via database, not metrics
     let mut service_request = convert_chat_request_to_service(
@@ -744,6 +791,7 @@ pub async fn chat_completions(
         api_key.organization.id.0,
         api_key.workspace.id.0,
         body_hash,
+        request_id,
     );
 
     // Extract and validate encryption headers if present
@@ -1084,6 +1132,8 @@ pub async fn completions(
         request.model, request.stream, api_key.organization.id, api_key.workspace.id.0
     );
 
+    // This endpoint is not yet implemented — it returns immediately without
+    // any async work, so no tracing span is needed here.
     return (
         StatusCode::NOT_IMPLEMENTED,
         ResponseJson(ErrorResponse::new(
@@ -1106,6 +1156,9 @@ pub async fn completions(
             .into_response();
     }
 
+    // Generate correlation ID
+    let request_id = Uuid::new_v4();
+
     // Convert HTTP request to service parameters
     // Note: Names are not passed - high-cardinality data is tracked via database, not metrics
     let service_request = convert_text_request_to_service(
@@ -1115,6 +1168,7 @@ pub async fn completions(
         api_key.organization.id.0,
         api_key.workspace.id.0,
         body_hash,
+        request_id,
     );
 
     // Call the completion service - it handles usage tracking internally

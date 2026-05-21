@@ -28,11 +28,6 @@ pub use apply::TextRef;
 pub use placeholders::{RedactionMap, MAX_PLACEHOLDER_LEN};
 pub use stream_unredact::StreamUnredact;
 
-/// Default minimum confidence score for spans the privacy-filter returns.
-/// Re-exported so the `/v1/privacy/redact` handler can fill in the same
-/// threshold the auto-redact path uses when the client omits it.
-pub const DEFAULT_THRESHOLD_PUBLIC: f64 = detect::DEFAULT_THRESHOLD;
-
 use crate::completions::ports::CompletionMessage;
 use crate::inference_provider_pool::InferenceProviderPool;
 

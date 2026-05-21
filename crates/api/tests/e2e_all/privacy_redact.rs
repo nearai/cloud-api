@@ -240,6 +240,60 @@ async fn test_privacy_redact_non_string_array_element_rejected() {
 }
 
 #[tokio::test]
+async fn test_privacy_redact_rejects_out_of_range_threshold() {
+    let server = setup_test_server().await;
+
+    setup_privacy_filter_model(&server).await;
+    let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
+    let api_key = get_api_key_for_org(&server, org.id).await;
+
+    for bad in [-0.1, 1.5, f64::NAN] {
+        let response = server
+            .post("/v1/privacy/redact")
+            .add_header("Authorization", format!("Bearer {api_key}"))
+            .add_header("User-Agent", MOCK_USER_AGENT)
+            .json(&serde_json::json!({
+                "model": "openai/privacy-filter",
+                "input": "hi",
+                "threshold": bad,
+            }))
+            .await;
+        assert_eq!(
+            response.status_code(),
+            400,
+            "threshold={bad:?} should be rejected",
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_privacy_redact_accepts_valid_threshold() {
+    let server = setup_test_server().await;
+
+    setup_privacy_filter_model(&server).await;
+    let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
+    let api_key = get_api_key_for_org(&server, org.id).await;
+
+    for good in [0.0, 0.5, 1.0] {
+        let response = server
+            .post("/v1/privacy/redact")
+            .add_header("Authorization", format!("Bearer {api_key}"))
+            .add_header("User-Agent", MOCK_USER_AGENT)
+            .json(&serde_json::json!({
+                "model": "openai/privacy-filter",
+                "input": "hi",
+                "threshold": good,
+            }))
+            .await;
+        assert_eq!(
+            response.status_code(),
+            200,
+            "threshold={good} should be accepted",
+        );
+    }
+}
+
+#[tokio::test]
 async fn test_privacy_redact_body_size_limit() {
     let server = setup_test_server().await;
 

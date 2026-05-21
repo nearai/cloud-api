@@ -3275,6 +3275,24 @@ pub async fn privacy_redact(
             .into_response();
     }
 
+    if let Some(t) = parsed.threshold {
+        // Boundary validation: range-check before forwarding upstream so a
+        // bad value surfaces as a 400 here, not a confusing 5xx from the
+        // model. NaN must be rejected explicitly — `0.0..=1.0` would let
+        // it slip through because all comparisons against NaN are false
+        // (so `!contains` is false too).
+        if t.is_nan() || !(0.0..=1.0).contains(&t) {
+            return (
+                StatusCode::BAD_REQUEST,
+                ResponseJson(ErrorResponse::new(
+                    "threshold must be a number in [0.0, 1.0]".to_string(),
+                    "invalid_request_error".to_string(),
+                )),
+            )
+                .into_response();
+        }
+    }
+
     let model_name = parsed.model;
 
     debug!(
@@ -3328,11 +3346,17 @@ pub async fn privacy_redact(
     // through: the redact endpoint accepts the same wire shape as classify,
     // but we want a single canonical form (array input) for the upstream
     // call so downstream parsing always yields one data entry per text.
-    let upstream_body = serde_json::json!({
+    //
+    // Threshold passes through verbatim — only include it if the client
+    // sent one. Injecting a default here would diverge from /privacy/classify
+    // (which is a pure passthrough and lets the model pick its own default).
+    let mut upstream_body = serde_json::json!({
         "model": &model_name,
         "input": &texts,
-        "threshold": parsed.threshold.unwrap_or(services::auto_redact::DEFAULT_THRESHOLD_PUBLIC),
     });
+    if let Some(t) = parsed.threshold {
+        upstream_body["threshold"] = serde_json::json!(t);
+    }
     let upstream_bytes = match serde_json::to_vec(&upstream_body) {
         Ok(b) => bytes::Bytes::from(b),
         Err(e) => {
@@ -3408,12 +3432,13 @@ pub async fn privacy_redact(
         }
     };
 
-    // Apply spans locally. Fail-closed: malformed spans return 500 rather
-    // than leak raw text through.
+    // Apply spans locally. `apply_detected_spans` only does in-process work
+    // (JSON parse + UTF-8 boundary checks), so only `Internal` can fire here
+    // — handle every variant uniformly as a 500.
     let redacted = match services::auto_redact::apply_detected_spans(&texts, &response_bytes) {
         Ok(r) => r,
-        Err(AutoRedactError::Internal(msg)) => {
-            tracing::error!(error = %msg, "Privacy redact apply failed");
+        Err(e) => {
+            tracing::error!(error = %e, "Privacy redact apply failed");
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 ResponseJson(ErrorResponse::new(
@@ -3423,24 +3448,11 @@ pub async fn privacy_redact(
             )
                 .into_response();
         }
-        Err(AutoRedactError::DetectorUnavailable(msg)) => {
-            tracing::error!(error = %msg, "Privacy redact detector unavailable");
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                ResponseJson(ErrorResponse::new(
-                    "PII detector unavailable".to_string(),
-                    "service_unavailable".to_string(),
-                )),
-            )
-                .into_response();
-        }
     };
 
     // Pull per-entry usage from the upstream response (same shape as
     // classify) so we can both bill the org and surface per-entry
-    // input_tokens to the client. Also tracks the maximum data.index
-    // returned by the provider so the anomaly check below can flag any
-    // out-of-range index — defense in depth against a buggy provider.
+    // input_tokens to the client.
     #[derive(serde::Deserialize)]
     struct UsageExtract {
         #[serde(default)]
@@ -3461,18 +3473,26 @@ pub async fn privacy_redact(
     let parsed_usage: UsageExtract =
         serde_json::from_slice(&response_bytes).unwrap_or(UsageExtract { data: Vec::new() });
 
+    // Dedupe by index *before* summing. A buggy provider that returns two
+    // entries with the same `index` would otherwise be billed twice while
+    // the client only sees the last entry's `usage` in the response —
+    // that's a billing/UI inconsistency. Last-write-wins keeps the bill
+    // and the surfaced per-entry usage in sync.
     let mut per_index_usage: std::collections::HashMap<usize, UsageFields> =
         std::collections::HashMap::new();
-    let token_sum_i64: i64 = parsed_usage
-        .data
-        .iter()
-        .filter(|d| d.index < texts.len())
-        .filter_map(|d| d.usage.map(|u| (d.index, u)))
-        .map(|(idx, u)| {
-            per_index_usage.insert(idx, u);
-            u.input_tokens.filter(|t| *t >= 0).unwrap_or(0) as i64
-        })
-        .fold(0i64, i64::saturating_add);
+    for d in &parsed_usage.data {
+        if d.index >= texts.len() {
+            continue;
+        }
+        if let Some(u) = d.usage {
+            per_index_usage.insert(d.index, u);
+        }
+    }
+    let token_sum_i64: i64 = per_index_usage
+        .values()
+        .filter_map(|u| u.input_tokens)
+        .filter(|t| *t >= 0)
+        .fold(0i64, |acc, t| acc.saturating_add(t as i64));
     let mut token_count = token_sum_i64.clamp(0, i32::MAX as i64) as i32;
 
     const MAX_REASONABLE_TOKENS: i32 = 1_000_000;

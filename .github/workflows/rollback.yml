@@ -150,6 +150,7 @@ jobs:
           skopeo copy "docker://${{ env.IMAGE }}@${{ steps.resolve.outputs.target_digest }}" "docker://${{ env.IMAGE }}:prod"
 
       - name: Push audit tag
+        continue-on-error: true
         run: |
           set -euo pipefail
           skopeo copy "docker://${{ env.IMAGE }}@${{ steps.resolve.outputs.target_digest }}" "docker://${{ env.IMAGE }}:${{ steps.resolve.outputs.audit_tag }}"
@@ -196,9 +197,11 @@ jobs:
   trigger-redeploy:
     name: Trigger cvm-ansible-playbooks redeploy
     needs: rollback-prod
-    # Run as long as :prod was successfully re-tagged (retag-prod step passed),
-    # even if the audit-tag step or the GH release step subsequently failed.
-    if: ${{ !cancelled() && needs.rollback-prod.outputs.target_digest != '' }}
+    # Default GHA behaviour: run only when rollback-prod succeeds.
+    # The audit-tag step uses continue-on-error so it cannot fail the job,
+    # ensuring a transient registry blip on the audit copy doesn't block the
+    # redeploy. The :prod retag step has no continue-on-error, so a retag
+    # failure correctly blocks the redeploy.
     runs-on: ubuntu-latest
     steps:
       # cvm-ansible-playbooks `Update Cloud API Prod` re-reads :prod from

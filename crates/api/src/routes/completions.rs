@@ -431,6 +431,108 @@ fn unredact_field(
     };
 }
 
+/// Drain held tails for `idx` into the finish chunk's delta. Removes the
+/// state entries from `states` so [`build_flush_chunks`] emits nothing
+/// for this choice. Used only on chunks that carry `finish_reason` — see
+/// [`unredact_chunk_in_place`] for the rationale.
+///
+/// For each text field: if the chunk already carries the field, the
+/// previous inline `drain` call has already emptied that state's tail and
+/// `flush` returns `""`, so we just remove the now-empty entry. If the
+/// chunk did NOT carry the field, we remove the state and attach its
+/// flushed tail to a freshly populated field on the chunk's delta.
+fn finalize_choice_in_place(
+    choice: &mut inference_providers::models::ChatChoice,
+    idx: i64,
+    states: &mut StreamUnredactStates,
+) {
+    fn merge_into(field: &mut Option<String>, tail: String) {
+        if tail.is_empty() {
+            return;
+        }
+        match field {
+            // The inline drain path already produced the substituted
+            // value, so the flushed tail is empty when we get here and
+            // this branch shouldn't normally fire. Guard anyway.
+            Some(existing) => existing.push_str(&tail),
+            None => *field = Some(tail),
+        }
+    }
+
+    let delta = choice
+        .delta
+        .get_or_insert(inference_providers::models::ChatDelta {
+            role: None,
+            content: None,
+            name: None,
+            tool_call_id: None,
+            tool_calls: None,
+            reasoning_content: None,
+            reasoning: None,
+        });
+
+    if let Some(s) = states.content.remove(&idx) {
+        merge_into(&mut delta.content, s.flush());
+    }
+    if let Some(s) = states.reasoning_content.remove(&idx) {
+        merge_into(&mut delta.reasoning_content, s.flush());
+    }
+    if let Some(s) = states.reasoning.remove(&idx) {
+        merge_into(&mut delta.reasoning, s.flush());
+    }
+
+    // Tool-call arguments are keyed by `(choice_idx, tc_idx)`. Take every
+    // entry for this choice; sort by tc_idx so the synthesized order is
+    // stable; merge each non-empty tail into `delta.tool_calls`. If the
+    // chunk already carries a matching tc_idx (inline-drained path), the
+    // flushed tail is empty and the loop is a no-op for that entry.
+    let mut tc_keys: Vec<(i64, i64)> = states
+        .tool_call_arguments
+        .keys()
+        .filter(|(c, _)| *c == idx)
+        .copied()
+        .collect();
+    tc_keys.sort_unstable();
+    for key in tc_keys {
+        let Some(s) = states.tool_call_arguments.remove(&key) else {
+            continue;
+        };
+        let tail = s.flush();
+        if tail.is_empty() {
+            continue;
+        }
+        let (_, tc_idx) = key;
+        let tool_calls = delta.tool_calls.get_or_insert_with(Vec::new);
+        // Reuse the existing ToolCallDelta entry for this tc_idx if the
+        // chunk already had one, so we don't emit two deltas for the
+        // same logical tool call.
+        let entry = tool_calls.iter_mut().find(|tc| tc.index == Some(tc_idx));
+        match entry {
+            Some(tc) => {
+                let func =
+                    tc.function
+                        .get_or_insert(inference_providers::models::FunctionCallDelta {
+                            name: None,
+                            arguments: None,
+                        });
+                merge_into(&mut func.arguments, tail);
+            }
+            None => {
+                tool_calls.push(inference_providers::models::ToolCallDelta {
+                    id: None,
+                    type_: None,
+                    index: Some(tc_idx),
+                    function: Some(inference_providers::models::FunctionCallDelta {
+                        name: None,
+                        arguments: Some(tail),
+                    }),
+                    thought_signature: None,
+                });
+            }
+        }
+    }
+}
+
 /// Apply streaming un-redact to a single parsed chunk, mutating any text
 /// deltas (content + reasoning) in place. Stateful: per-choice tail
 /// buffers carry across calls via `states`.
@@ -487,6 +589,17 @@ fn unredact_chunk_in_place(
                             }
                         }
                     }
+                }
+                if finalize {
+                    // Catch every per-choice state whose field was *absent*
+                    // from this chunk's delta — those are the held tails
+                    // the inline path can't see. Without this, a finish
+                    // chunk with `delta: {}` leaves the tail in `states`
+                    // and build_flush_chunks emits it AFTER the finish
+                    // event (invisible to clients that stop on
+                    // finish_reason). The inline-drained entries above
+                    // are already empty; this loop just removes them.
+                    finalize_choice_in_place(choice, idx, states);
                 }
             }
         }
@@ -1247,6 +1360,157 @@ mod tests {
         assert!(
             !result.is_nil(),
             "empty provider ID should still produce a non-nil UUID"
+        );
+    }
+
+    fn empty_delta() -> inference_providers::models::ChatDelta {
+        inference_providers::models::ChatDelta {
+            role: None,
+            content: None,
+            name: None,
+            tool_call_id: None,
+            tool_calls: None,
+            reasoning_content: None,
+            reasoning: None,
+        }
+    }
+
+    fn make_chat_chunk_with_choice(
+        delta: Option<inference_providers::models::ChatDelta>,
+        finish_reason: Option<inference_providers::models::FinishReason>,
+    ) -> inference_providers::StreamChunk {
+        inference_providers::StreamChunk::Chat(inference_providers::models::ChatCompletionChunk {
+            id: "x".to_string(),
+            object: "chat.completion.chunk".to_string(),
+            created: 0,
+            model: "m".to_string(),
+            system_fingerprint: None,
+            choices: vec![inference_providers::models::ChatChoice {
+                index: 0,
+                delta,
+                logprobs: None,
+                finish_reason,
+                token_ids: None,
+            }],
+            usage: None,
+            prompt_token_ids: None,
+            modality: None,
+        })
+    }
+
+    #[test]
+    fn finish_chunk_with_empty_delta_drains_held_tail_in_place() {
+        // Reproduces the bug Pierre flagged on PR #599:
+        // when a content chunk pushes bytes into the per-choice tail and
+        // the next chunk is a finish chunk with `delta: {}` + `finish_reason`,
+        // the previous code only drained states whose corresponding delta
+        // field was present on the finish chunk. The held tail then leaked
+        // out *after* the finish chunk via build_flush_chunks — invisible
+        // to clients that stop reading on finish_reason.
+        //
+        // Fix: when finish_reason is present, drain ALL per-choice states
+        // into the finish chunk's delta in place, even if the delta field
+        // was absent. Assert: (a) the tail is on the finish chunk;
+        // (b) `states.content` is empty so build_flush_chunks emits nothing.
+        use services::auto_redact::RedactionMap;
+
+        let mut m = RedactionMap::new();
+        m.lookup_or_mint("private_email", "alice@example.com", |_| false);
+        let map = Arc::new(m);
+        let mut states = StreamUnredactStates::default();
+
+        // Chunk 1: content shorter than hold_size — sits in the tail.
+        let mut chunk1 = make_chat_chunk_with_choice(
+            Some(inference_providers::models::ChatDelta {
+                content: Some("hi redact".to_string()),
+                ..empty_delta()
+            }),
+            None,
+        );
+        unredact_chunk_in_place(&mut chunk1, &mut states, &map);
+
+        // Chunk 2: empty delta + finish_reason.
+        let mut chunk2 = make_chat_chunk_with_choice(
+            Some(empty_delta()),
+            Some(inference_providers::models::FinishReason::Stop),
+        );
+        unredact_chunk_in_place(&mut chunk2, &mut states, &map);
+
+        let inference_providers::StreamChunk::Chat(c2) = &chunk2 else {
+            panic!("expected Chat chunk");
+        };
+        let drained_content = c2.choices[0]
+            .delta
+            .as_ref()
+            .and_then(|d| d.content.as_deref())
+            .unwrap_or("");
+        assert_eq!(
+            drained_content, "hi redact",
+            "held tail must be attached to the finish chunk's delta.content, not emitted after",
+        );
+        assert!(
+            !states.content.contains_key(&0),
+            "after drain the state must be removed so build_flush_chunks emits nothing for this choice",
+        );
+    }
+
+    #[test]
+    fn finish_chunk_with_empty_delta_drains_tool_call_arguments_in_place() {
+        // Same bug as above, for tool-call arguments. A tool_calls fragment
+        // leaves a partial JSON in the per-(choice,tc_idx) state; the next
+        // chunk carries `finish_reason: tool_calls` with empty delta. The
+        // held bytes must come out on THAT chunk, not after.
+        use services::auto_redact::RedactionMap;
+
+        let mut m = RedactionMap::new();
+        m.lookup_or_mint("private_email", "alice@example.com", |_| false);
+        let map = Arc::new(m);
+        let mut states = StreamUnredactStates::default();
+
+        // Chunk 1: tool_call args fragment that fits inside hold_size.
+        let mut chunk1 = make_chat_chunk_with_choice(
+            Some(inference_providers::models::ChatDelta {
+                tool_calls: Some(vec![inference_providers::models::ToolCallDelta {
+                    id: None,
+                    type_: None,
+                    index: Some(0),
+                    function: Some(inference_providers::models::FunctionCallDelta {
+                        name: None,
+                        arguments: Some(r#"{"to":"x"}"#.to_string()),
+                    }),
+                    thought_signature: None,
+                }]),
+                ..empty_delta()
+            }),
+            None,
+        );
+        unredact_chunk_in_place(&mut chunk1, &mut states, &map);
+
+        // Chunk 2: empty delta + finish_reason=tool_calls.
+        let mut chunk2 = make_chat_chunk_with_choice(
+            Some(empty_delta()),
+            Some(inference_providers::models::FinishReason::ToolCalls),
+        );
+        unredact_chunk_in_place(&mut chunk2, &mut states, &map);
+
+        let inference_providers::StreamChunk::Chat(c2) = &chunk2 else {
+            panic!("expected Chat chunk");
+        };
+        let tool_calls = c2.choices[0]
+            .delta
+            .as_ref()
+            .and_then(|d| d.tool_calls.as_ref())
+            .expect("finish chunk must carry the drained tool_calls");
+        assert_eq!(tool_calls.len(), 1);
+        let args = tool_calls[0]
+            .function
+            .as_ref()
+            .and_then(|f| f.arguments.as_deref())
+            .unwrap_or("");
+        assert_eq!(args, r#"{"to":"x"}"#);
+        assert!(
+            states.tool_call_arguments.is_empty(),
+            "after drain the tool_call state must be removed",
         );
     }
 

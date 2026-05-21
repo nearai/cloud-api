@@ -1,13 +1,22 @@
 use crate::common::*;
 
 /// Happy path: valid API key with credits returns 200 and the body carries the
-/// authoritative `org_id` + `workspace_id` so downstream gateways don't have to
-/// trust caller-supplied tenant headers.
+/// authoritative `organization_id` + `workspace_id` so downstream gateways
+/// don't have to trust caller-supplied tenant headers.
 #[tokio::test]
 async fn test_check_api_key_valid() {
     let server = setup_test_server().await;
     let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
     let org_id = org.id.clone();
+    // `get_api_key_for_org` creates a key in the org's first workspace; capture
+    // that workspace id so we can assert the response surfaces *that* workspace,
+    // not just *some* UUID.
+    let expected_workspace_id = list_workspaces(&server, org_id.clone())
+        .await
+        .first()
+        .expect("org should have at least one workspace")
+        .id
+        .clone();
     let api_key = get_api_key_for_org(&server, org.id).await;
 
     let response = server
@@ -25,16 +34,14 @@ async fn test_check_api_key_valid() {
     let body: serde_json::Value = response.json();
     assert_eq!(body["valid"], true);
     assert_eq!(
-        body["org_id"].as_str().unwrap(),
+        body["organization_id"].as_str().unwrap(),
         org_id,
-        "response org_id must match the org the API key belongs to"
+        "response organization_id must match the org the API key belongs to"
     );
-    let workspace_id = body["workspace_id"]
-        .as_str()
-        .expect("response must include workspace_id");
-    assert!(
-        uuid::Uuid::parse_str(workspace_id).is_ok(),
-        "workspace_id must be a valid UUID, got {workspace_id}"
+    assert_eq!(
+        body["workspace_id"].as_str().unwrap(),
+        expected_workspace_id,
+        "response workspace_id must match the workspace the API key was created in"
     );
 }
 

@@ -5,7 +5,7 @@ use utoipa::ToSchema;
 
 /// Response from the check_api_key endpoint.
 ///
-/// `org_id` and `workspace_id` are returned so downstream gateways
+/// `organization_id` and `workspace_id` are returned so downstream gateways
 /// (e.g. inference-proxy) have a server-side authoritative tenant
 /// identifier and don't have to trust caller-supplied `X-Org-Id`
 /// headers when populating logs / usage records.
@@ -14,7 +14,7 @@ pub struct CheckApiKeyResponse {
     /// Whether the API key is valid and authorized
     pub valid: bool,
     /// Organization the API key belongs to
-    pub org_id: String,
+    pub organization_id: String,
     /// Workspace the API key belongs to
     pub workspace_id: String,
 }
@@ -46,7 +46,7 @@ pub async fn check_api_key(
 ) -> Result<ResponseJson<CheckApiKeyResponse>, (StatusCode, ResponseJson<ErrorResponse>)> {
     Ok(ResponseJson(CheckApiKeyResponse {
         valid: true,
-        org_id: api_key.organization.id.to_string(),
+        organization_id: api_key.organization.id.to_string(),
         workspace_id: api_key.workspace.id.to_string(),
     }))
 }

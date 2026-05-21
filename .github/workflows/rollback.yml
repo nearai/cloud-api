@@ -16,6 +16,14 @@ on:
         required: true
         type: string
 
+# Serialize all :prod image mutations (rollback and promote) so two concurrent
+# runs — or a rollback racing a Thursday promotion — cannot split-brain the
+# :prod tag and the audit tags. cancel-in-progress: false queues rather than
+# cancels so neither operation is silently lost.
+concurrency:
+  group: prod-image-mutation
+  cancel-in-progress: false
+
 env:
   REGISTRY: docker.io
   IMAGE_NAME: cloud-api
@@ -72,9 +80,9 @@ jobs:
           set -euo pipefail
           TARGET_TAG="$TARGET_TAG_INPUT"
 
-          CURRENT_DIGEST=$(skopeo inspect "docker://${{ env.IMAGE }}:prod" | jq -r '.Digest')
+          CURRENT_DIGEST=$(skopeo inspect "docker://${{ env.IMAGE }}:prod" 2>/dev/null | jq -r '.Digest' || true)
           if [ -z "$CURRENT_DIGEST" ] || [ "$CURRENT_DIGEST" = "null" ]; then
-            echo "::error::Failed to inspect current :prod digest"
+            echo "::error::Failed to inspect current :prod digest (tag may not exist)"
             exit 1
           fi
           echo "previous_digest=${CURRENT_DIGEST}" >> "$GITHUB_OUTPUT"

@@ -39,6 +39,26 @@ fn to_privacy_classify_error<E: std::fmt::Display>(e: E) -> PrivacyClassifyError
     PrivacyClassifyError::RequestFailed(e.to_string())
 }
 
+/// Format an error including its full `source()` chain.
+///
+/// `reqwest::Error`'s `Display` impl returns only the outer wrapper
+/// (e.g. `"error sending request for url (...)"`). The underlying cause —
+/// `"connection closed before message completed"`, `"broken pipe"`,
+/// hyper/h2 stream resets, rustls handshake errors — lives in
+/// `source()` and is otherwise discarded when we convert to
+/// `CompletionError::CompletionError(String)`. Walk the chain so the
+/// transport-level reason ends up in logs.
+fn format_error_chain<E: std::error::Error>(e: &E) -> String {
+    let mut out = e.to_string();
+    let mut source: Option<&dyn std::error::Error> = e.source();
+    while let Some(err) = source {
+        out.push_str(": caused by: ");
+        out.push_str(&err.to_string());
+        source = err.source();
+    }
+    out
+}
+
 /// Encryption header keys used in params.extra for passing encryption information
 mod encryption_headers {
     /// Key for signing algorithm (x-signing-algo header)
@@ -678,7 +698,7 @@ impl VLlmProvider {
             operation: "chat_completion_stream".to_string(),
             timeout_seconds: ttfb_timeout_secs,
         })?
-        .map_err(|e| CompletionError::CompletionError(e.to_string()))?;
+        .map_err(|e| CompletionError::CompletionError(format_error_chain(&e)))?;
 
         if !response.status().is_success() {
             let status_code = response.status().as_u16();
@@ -747,13 +767,13 @@ impl InferenceProvider for VLlmProvider {
                 .timeout(timeout)
                 .send()
                 .await
-                .map_err(|e| CompletionError::CompletionError(e.to_string()))?;
+                .map_err(|e| CompletionError::CompletionError(format_error_chain(&e)))?;
 
             if response.status().is_success() {
                 let signature = response
                     .json()
                     .await
-                    .map_err(|e| CompletionError::CompletionError(e.to_string()))?;
+                    .map_err(|e| CompletionError::CompletionError(format_error_chain(&e)))?;
                 return Ok(signature);
             }
 
@@ -1010,7 +1030,7 @@ impl InferenceProvider for VLlmProvider {
                     timeout_seconds: timeout_secs,
                 }
             } else {
-                CompletionError::CompletionError(e.to_string())
+                CompletionError::CompletionError(format_error_chain(&e))
             }
         };
 
@@ -1503,6 +1523,55 @@ impl InferenceProvider for VLlmProvider {
 mod tests {
     use super::*;
     use serial_test::serial;
+
+    #[derive(Debug)]
+    struct ChainedErr {
+        msg: &'static str,
+        source: Option<Box<dyn std::error::Error + 'static>>,
+    }
+
+    impl std::fmt::Display for ChainedErr {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str(self.msg)
+        }
+    }
+
+    impl std::error::Error for ChainedErr {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            self.source.as_deref()
+        }
+    }
+
+    #[test]
+    fn format_error_chain_flat_error() {
+        let e = ChainedErr {
+            msg: "outer",
+            source: None,
+        };
+        assert_eq!(format_error_chain(&e), "outer");
+    }
+
+    #[test]
+    fn format_error_chain_walks_all_sources() {
+        let inner = ChainedErr {
+            msg: "broken pipe",
+            source: None,
+        };
+        let middle = ChainedErr {
+            msg: "connection closed before message completed",
+            source: Some(Box::new(inner)),
+        };
+        let outer = ChainedErr {
+            msg: "error sending request for url (https://x/v1/signature/y)",
+            source: Some(Box::new(middle)),
+        };
+        assert_eq!(
+            format_error_chain(&outer),
+            "error sending request for url (https://x/v1/signature/y)\
+             : caused by: connection closed before message completed\
+             : caused by: broken pipe"
+        );
+    }
 
     fn create_test_provider() -> VLlmProvider {
         VLlmProvider::new(VLlmConfig {

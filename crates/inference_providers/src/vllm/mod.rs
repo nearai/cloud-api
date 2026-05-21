@@ -10,6 +10,7 @@ use prefix_router::PrefixRouter;
 use reqwest::{header::HeaderValue, Client};
 use serde::Serialize;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Semaphore;
@@ -181,6 +182,33 @@ pub struct VLlmProvider {
     /// empty and many requests arrive simultaneously). Configurable via the
     /// `INLINE_VERIFY_CONCURRENCY` environment variable (default: 4).
     verification_semaphore: Arc<Semaphore>,
+    /// Cached TLS roots for building per-attempt rotation clients. Reused for
+    /// the rotation-SNI fallback path so the fingerprint pin set stays
+    /// consistent with the bucket clients.
+    tls_roots: SharedTlsRoots,
+    /// Most recent healthy backend count reported by discovery. Used by the
+    /// rotation-SNI retry path to bound the number of distinct backends to
+    /// fan out to when the sticky bucket returns 5xx. Discovery writes via
+    /// `set_backend_count`; the chat paths read with `Ordering::Relaxed`
+    /// (best-effort — a stale read just means we try one too few or one too
+    /// many indices, both safe because the proxy wraps `index % healthy`).
+    last_backend_count: AtomicUsize,
+    /// Pre-parsed rotation parts derived from `config.base_url` at
+    /// construction time, so we don't reparse on every retry. `None` for
+    /// URLs that don't fit the rotation scheme (one-label host, IP literal,
+    /// etc.) — in that case the rotation fallback is a no-op and the
+    /// canonical-SNI error propagates as before.
+    rotation_parts: Option<crate::rotation::UrlParts>,
+    /// Maps request_hash → rotation index when the streaming canonical attempt
+    /// fell over and a rotation-SNI attempt served the response instead.
+    /// `pin_chat_connection` promotes this to `signature_rotation` once the
+    /// chat_id is known, so `get_signature` can reuse the same rotation SNI.
+    pending_rotation: Arc<std::sync::Mutex<HashMap<String, u64>>>,
+    /// Maps chat_id → rotation index for the signature fetch path. Populated
+    /// either by the non-streaming chat_completion (chat_id known at send
+    /// time) or by `pin_chat_connection` once the stream's first chunk
+    /// yields a chat_id.
+    signature_rotation: Arc<std::sync::Mutex<HashMap<String, u64>>>,
 }
 
 impl VLlmProvider {
@@ -317,6 +345,15 @@ impl VLlmProvider {
                 .collect()
         };
 
+        // Pre-parse the base URL into rotation parts once. URLs that don't fit
+        // the rotation scheme (one-label host, IP literal, etc.) yield `None`,
+        // disabling rotation fallback for that provider — the canonical-SNI
+        // attempt's error simply propagates as it did before.
+        let rotation_parts = url::Url::parse(&config.base_url)
+            .ok()
+            .as_ref()
+            .and_then(crate::rotation::split_inference_url);
+
         Self {
             config,
             client,
@@ -328,6 +365,11 @@ impl VLlmProvider {
             signature_buckets: Arc::new(std::sync::Mutex::new(HashMap::new())),
             fingerprint_state,
             backend_verifier,
+            tls_roots,
+            last_backend_count: AtomicUsize::new(0),
+            rotation_parts,
+            pending_rotation: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            signature_rotation: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
     }
 
@@ -715,6 +757,308 @@ impl VLlmProvider {
 
         Ok(response)
     }
+
+    /// Status codes that warrant a rotation-SNI retry. Mirrors the pool's
+    /// `classify_retry_decision` ("retryable_http_5xx" + 429 + 408), but
+    /// evaluated here so the rotation fallback fires *before* the canonical
+    /// 5xx escapes to the pool's same-provider backoff loop (which would
+    /// only re-hit the sticky bucket → same overloaded backend). 408 is
+    /// included because the pool already treats it as "next-provider-
+    /// worthy" — keeping the gates in sync avoids a taxonomy mismatch
+    /// where the pool would retry on 408 but rotation wouldn't.
+    fn is_rotation_retryable_status(status_code: u16) -> bool {
+        status_code == 408 || status_code == 429 || (500..=599).contains(&status_code)
+    }
+
+    /// Healthy backend count clamped to the rotation fan-out cap. Returns 0
+    /// when rotation is disabled (URL doesn't fit the rotation scheme, or
+    /// discovery hasn't reported a count yet) — callers use that as the
+    /// signal to skip the rotation fallback and propagate the original error.
+    fn rotation_count(&self) -> usize {
+        if self.rotation_parts.is_none() {
+            return 0;
+        }
+        self.last_backend_count
+            .load(Ordering::Relaxed)
+            .min(crate::rotation::MAX_FANOUT)
+    }
+
+    /// Build the absolute URL `https://<canonical>-i<index>.<base><path>` for
+    /// a rotation attempt at the given backend index. Returns `None` only if
+    /// rotation parts are missing — callers should already have filtered via
+    /// `rotation_count() > 0`.
+    fn rotation_url(&self, index: u64, path: &str) -> Option<String> {
+        let parts = self.rotation_parts.as_ref()?;
+        let mut url = crate::rotation::rotation_base_url(parts, index)?;
+        url.set_path(path);
+        Some(url.to_string())
+    }
+
+    /// Build a one-shot reqwest client used for a single rotation-SNI
+    /// attempt. We disable connection pooling (`pool_max_idle_per_host(0)`)
+    /// so a follow-up attempt at index N+1 can't accidentally reuse the
+    /// TLS/H2 connection that landed on index N — defeating the whole point
+    /// of the rotation. Shares the per-provider fingerprint state so the
+    /// same pinned SPKI set is enforced for every backend.
+    fn build_rotation_client(&self) -> Result<Client, CompletionError> {
+        Client::builder()
+            .use_preconfigured_tls(self.tls_roots.build_config(self.fingerprint_state.clone()))
+            .pool_max_idle_per_host(0)
+            .http2_adaptive_window(true)
+            .connect_timeout(Duration::from_secs(5))
+            .read_timeout(self.config.completion_timeout())
+            .build()
+            .map_err(|e| CompletionError::CompletionError(format!("rotation_client_build: {e}")))
+    }
+
+    /// Iterate every healthy backend by index until one returns a 2xx (or
+    /// every backend has been exhausted). Called by `chat_completion` after
+    /// the sticky bucket's canonical-SNI attempt returns 5xx/429: with H2
+    /// pooling disabled on each per-index client, every attempt lands on a
+    /// distinct backend, so a single overloaded SGLang can't poison the
+    /// whole request.
+    ///
+    /// `canonical_err` is the error that triggered the fallback; if all
+    /// rotation indices return retryable failures it surfaces as the final
+    /// error to preserve the original `status_code` for `map_provider_error`.
+    async fn try_chat_completion_rotation(
+        &self,
+        params: &ChatCompletionParams,
+        headers: &reqwest::header::HeaderMap,
+        timeout: Duration,
+        canonical_err: CompletionError,
+    ) -> Result<ChatCompletionResponseWithBytes, CompletionError> {
+        let count = self.rotation_count();
+        // `last_error` tracks only HttpError-shaped failures so the pool's
+        // `classify_retry_decision` sees a typed `retryable_http_5xx` (or
+        // 429) at the end. Transport-level failures from the rotation loop
+        // (Timeout, generic CompletionError) are logged but never overwrite
+        // `last_error`: if every rotation index produced only transport
+        // errors, we fall back to `canonical_err` (always an HttpError 5xx/
+        // 429 by call-site construction) instead of returning a misleading
+        // `CompletionError(...)` that would classify as
+        // `retryable_connection_keyword`.
+        let mut last_error = canonical_err;
+        for index in 0..count as u64 {
+            let url = match self.rotation_url(index, "/v1/chat/completions") {
+                Some(u) => u,
+                None => continue,
+            };
+            let client = match self.build_rotation_client() {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::debug!(
+                        index, error = %e,
+                        "Rotation-SNI chat_completion client build failed, trying next backend"
+                    );
+                    continue;
+                }
+            };
+            let send_res = client
+                .post(&url)
+                .headers(headers.clone())
+                .json(params)
+                .timeout(timeout)
+                .send()
+                .await;
+            let response = match send_res {
+                Ok(r) => r,
+                Err(e) => {
+                    // Connect / network / TTFB-timeout errors against this
+                    // index — try the next backend. The rotation listener
+                    // pins to one backend by design (model-proxy PR #27),
+                    // so failure at index N tells us nothing about N+1.
+                    // We log the error but DON'T overwrite `last_error`:
+                    // see the field comment above.
+                    tracing::debug!(
+                        index, error = %format_error_chain(&e),
+                        is_timeout = e.is_timeout(),
+                        is_connect = e.is_connect(),
+                        "Rotation-SNI chat_completion attempt errored, trying next backend"
+                    );
+                    continue;
+                }
+            };
+            if !response.status().is_success() {
+                let status_code = response.status().as_u16();
+                let error_text = response
+                    .text()
+                    .await
+                    .unwrap_or_else(|e| format!("Failed to read error response body: {e}"));
+                let err = CompletionError::HttpError {
+                    status_code,
+                    message: crate::extract_error_message(&error_text),
+                    is_external: false,
+                };
+                if Self::is_rotation_retryable_status(status_code) {
+                    tracing::debug!(
+                        index,
+                        status_code,
+                        "Rotation-SNI chat_completion backend still 5xx/429/408, trying next"
+                    );
+                    last_error = err;
+                    continue;
+                }
+                // 4xx (other than 408/429) means the request itself is bad —
+                // surface immediately rather than burn the rest of the
+                // rotation set on the same client error.
+                return Err(err);
+            }
+
+            let raw_bytes = response
+                .bytes()
+                .await
+                .map_err(|e| CompletionError::CompletionError(format_error_chain(&e)))?
+                .to_vec();
+            let chat_completion_response: ChatCompletionResponse =
+                serde_json::from_slice(&raw_bytes).map_err(|e| {
+                    CompletionError::CompletionError(format!("Failed to parse response: {e}"))
+                })?;
+
+            let chat_id = chat_completion_response.id.clone();
+            self.signature_rotation
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(chat_id, index);
+            tracing::info!(
+                index,
+                "Rotation-SNI chat_completion served by alternative backend"
+            );
+            return Ok(ChatCompletionResponseWithBytes {
+                response: chat_completion_response,
+                raw_bytes,
+            });
+        }
+        Err(last_error)
+    }
+
+    /// Streaming sibling of `try_chat_completion_rotation`. Two failure modes
+    /// land here:
+    ///   - The canonical send returned HTTP 5xx/429 outright (e.g. nginx 502
+    ///     when the inference-proxy container is restarting).
+    ///   - The canonical send returned HTTP 200 but the first SSE chunk was
+    ///     a `{"error":{"code":...}}` frame, which the parser now surfaces as
+    ///     a typed `HttpError` (the SGLang queue-full path that inference-
+    ///     proxy's SseTransformer forwards verbatim).
+    ///
+    /// We iterate every backend by rotation index until one returns a 200
+    /// whose first SSE chunk is a real content event. Bytes already sent to
+    /// the client are zero (peek happens before any chunk forwarding), so
+    /// retrying the whole stream is safe.
+    async fn try_chat_completion_stream_rotation(
+        &self,
+        params: &ChatCompletionParams,
+        headers: &reqwest::header::HeaderMap,
+        request_hash: &str,
+        canonical_err: CompletionError,
+    ) -> Result<StreamingResult, CompletionError> {
+        let count = self.rotation_count();
+        // See the non-streaming sibling for the design: `last_error` only
+        // tracks HttpError-shaped failures from rotation indices, so the
+        // pool's `classify_retry_decision` sees the right `retryable_http_*`
+        // label at the end. Transport-level failures (Timeout, generic
+        // CompletionError) are logged but never overwrite `last_error`;
+        // if rotation produces only transport errors, we fall back to
+        // `canonical_err` (always HttpError 5xx/429 by call-site
+        // construction).
+        let mut last_error = canonical_err;
+        for index in 0..count as u64 {
+            let url = match self.rotation_url(index, "/v1/chat/completions") {
+                Some(u) => u,
+                None => continue,
+            };
+            let client = match self.build_rotation_client() {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::debug!(
+                        index, error = %e,
+                        "Rotation-SNI stream client build failed, trying next backend"
+                    );
+                    continue;
+                }
+            };
+            let response = match self
+                .send_streaming_request(&url, headers.clone(), params, Some(&client))
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => match &e {
+                    // 4xx other than 408/429 is a real client error (bad
+                    // request, invalid params) — every backend would reject
+                    // it the same way, so surface immediately rather than
+                    // burn the remaining indices on a doomed request.
+                    CompletionError::HttpError { status_code, .. }
+                        if !Self::is_rotation_retryable_status(*status_code) =>
+                    {
+                        return Err(e);
+                    }
+                    // Retryable HttpError (5xx/429/408) — update last_error
+                    // so the trace label stays accurate at end-of-rotation.
+                    CompletionError::HttpError { .. } => {
+                        tracing::debug!(
+                            index, error = %e,
+                            "Rotation-SNI stream attempt returned 5xx/429/408, trying next backend"
+                        );
+                        last_error = e;
+                        continue;
+                    }
+                    // Transport-level failures (`Timeout` from
+                    // `send_streaming_request`'s TTFB guard, generic
+                    // `CompletionError` for TLS/TCP). Per-backend by
+                    // construction: model-proxy PR #27 pins each `-iN` SNI
+                    // to one backend, so failure at index N tells us nothing
+                    // about index N+1. Log but DON'T overwrite last_error.
+                    _ => {
+                        tracing::debug!(
+                            index,
+                            error = %e,
+                            "Rotation-SNI stream attempt failed transport, trying next backend"
+                        );
+                        continue;
+                    }
+                },
+            };
+            let parser = new_sse_parser(response.bytes_stream(), true);
+            let stream: StreamingResult = Box::pin(parser);
+            let mut peekable = StreamingResultExt::peekable(stream);
+            let first_chunk_status =
+                if let Some(Err(CompletionError::HttpError { status_code, .. })) =
+                    peekable.peek().await
+                {
+                    if Self::is_rotation_retryable_status(*status_code) {
+                        Some(*status_code)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+            if let Some(status_code) = first_chunk_status {
+                tracing::debug!(
+                    index,
+                    status_code,
+                    "Rotation-SNI stream attempt: first chunk was an error, trying next backend"
+                );
+                last_error = CompletionError::HttpError {
+                    status_code,
+                    message: "Upstream stream emitted an error event".to_string(),
+                    is_external: false,
+                };
+                drop(peekable);
+                continue;
+            }
+            self.pending_rotation
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(request_hash.to_string(), index);
+            tracing::info!(
+                index,
+                "Rotation-SNI chat_completion_stream served by alternative backend"
+            );
+            return Ok(Box::pin(peekable));
+        }
+        Err(last_error)
+    }
 }
 
 #[async_trait]
@@ -724,15 +1068,62 @@ impl InferenceProvider for VLlmProvider {
         chat_id: &str,
         signing_algo: Option<String>,
     ) -> Result<ChatSignature, CompletionError> {
-        let url = format!(
-            "{}/v1/signature/{}?signing_algo={}",
-            self.config.base_url,
-            chat_id,
-            signing_algo.unwrap_or_else(|| "ecdsa".to_string())
-        );
+        let signing_algo = signing_algo.unwrap_or_else(|| "ecdsa".to_string());
+        let path_and_query = format!("/v1/signature/{chat_id}?signing_algo={signing_algo}");
+        let canonical_url = format!("{}{}", self.config.base_url, path_and_query);
         let headers = self
             .build_headers()
             .map_err(CompletionError::CompletionError)?;
+        let timeout = self.config.control_timeout();
+
+        // If this chat_id was served by a rotation-SNI fallback (sticky bucket
+        // returned 5xx, so we walked backends by index until one took the
+        // request), the signature lives on that *specific* backend — neither
+        // the bucket-pinned client nor the general LB client can find it. We
+        // build a one-shot rotation client targeting the same index and use
+        // it FIRST; the existing bucket/general fallback runs only if that
+        // attempt also misses.
+        let rotation_index = self
+            .signature_rotation
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(chat_id)
+            .copied();
+        if let Some(index) = rotation_index {
+            if let Some(rotation_url) = self.rotation_url(index, "") {
+                let rotation_url =
+                    format!("{}{}", rotation_url.trim_end_matches('/'), path_and_query);
+                if let Ok(client) = self.build_rotation_client() {
+                    match client
+                        .get(&rotation_url)
+                        .headers(headers.clone())
+                        .timeout(timeout)
+                        .send()
+                        .await
+                    {
+                        Ok(response) if response.status().is_success() => {
+                            return response.json().await.map_err(|e| {
+                                CompletionError::CompletionError(format_error_chain(&e))
+                            });
+                        }
+                        Ok(response) => {
+                            tracing::debug!(
+                                index,
+                                status = response.status().as_u16(),
+                                "Rotation-SNI signature fetch did not return 2xx, falling back to bucket/general"
+                            );
+                        }
+                        Err(e) => {
+                            tracing::debug!(
+                                index,
+                                error = %format_error_chain(&e),
+                                "Rotation-SNI signature fetch errored, falling back to bucket/general"
+                            );
+                        }
+                    }
+                }
+            }
+        }
 
         // Use the bucket client for this chat_id to hit the same backend.
         // With HTTP/2 (ALPN-negotiated), all requests multiplex on one connection.
@@ -752,7 +1143,6 @@ impl InferenceProvider for VLlmProvider {
                 .clone()
         });
 
-        let timeout = self.config.control_timeout();
         let mut clients_to_try: Vec<&Client> = Vec::new();
         if let Some(ref bc) = bucket_client {
             clients_to_try.push(bc);
@@ -762,7 +1152,7 @@ impl InferenceProvider for VLlmProvider {
         let mut last_error = None;
         for client in clients_to_try {
             let response = client
-                .get(&url)
+                .get(&canonical_url)
                 .headers(headers.clone())
                 .timeout(timeout)
                 .send()
@@ -809,6 +1199,24 @@ impl InferenceProvider for VLlmProvider {
                 .unwrap_or_else(|e| e.into_inner())
                 .insert(chat_id.to_string(), bucket_id);
         }
+        // Streaming attempts that fell over to a rotation index left the
+        // index in `pending_rotation` keyed by request_hash; promote it
+        // alongside the bucket-side mapping so `get_signature` knows which
+        // SNI to use. Empty chat_id (orphan-cleanup case) only clears the
+        // pending entry without writing into signature_rotation.
+        if let Some(index) = self
+            .pending_rotation
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(request_hash)
+        {
+            if !chat_id.is_empty() {
+                self.signature_rotation
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(chat_id.to_string(), index);
+            }
+        }
     }
 
     fn unpin_chat_connection(&self, chat_id: &str) {
@@ -816,6 +1224,14 @@ impl InferenceProvider for VLlmProvider {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(chat_id);
+        self.signature_rotation
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(chat_id);
+    }
+
+    fn set_backend_count(&self, count: usize) {
+        self.last_backend_count.store(count, Ordering::Relaxed);
     }
 
     async fn get_attestation_report(
@@ -953,7 +1369,7 @@ impl InferenceProvider for VLlmProvider {
         // pins the client.
         let bucket_id = self.prefix_router.route(&streaming_params.messages);
         let bucket_client = self.get_or_verify_bucket_client(bucket_id).await?;
-        let response = match self
+        let canonical_send = match self
             .send_streaming_request(
                 &url,
                 headers.clone(),
@@ -962,26 +1378,103 @@ impl InferenceProvider for VLlmProvider {
             )
             .await
         {
-            Ok(r) => r,
+            Ok(r) => Ok(r),
             Err(ref e) if Self::is_connection_error(e) => {
                 // Connection dropped or fingerprint mismatch on reconnect —
                 // clear bucket and re-verify with a fresh attestation.
                 self.clear_bucket(bucket_id);
                 let fresh = self.get_or_verify_bucket_client(bucket_id).await?;
-                self.send_streaming_request(&url, headers, &streaming_params, Some(&fresh))
-                    .await?
+                self.send_streaming_request(&url, headers.clone(), &streaming_params, Some(&fresh))
+                    .await
             }
-            Err(e) => return Err(e),
+            Err(e) => Err(e),
         };
 
-        // Store the bucket ID for signature fetching.
-        self.pending_buckets
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(request_hash, bucket_id);
-
-        let sse_stream = new_sse_parser(response.bytes_stream(), true);
-        Ok(Box::pin(sse_stream))
+        // Decision tree before exposing the stream:
+        //   - HTTP-level 5xx/429 (status arrived in response headers): try
+        //     rotation-SNI backends in order.
+        //   - HTTP 200 + first SSE chunk is `{"error":{"code":N,...}}`
+        //     (SGLang queue-full path, which inference-proxy's SseTransformer
+        //     forwards verbatim): peek catches it via the parser's typed
+        //     `HttpError` and we route to the same rotation fallback.
+        //   - Otherwise: pin bucket, return peekable as the live stream.
+        //
+        // We only peek when rotation is actually possible
+        // (`rotation_count() > 0`): the peek blocks until the first SSE
+        // chunk arrives, so on the happy path it adds first-byte latency
+        // to every streaming request. When rotation can't help (cold-start
+        // before discovery's first cycle, or non-rotation URLs like
+        // `localhost`), skip the peek so a first-chunk error still surfaces
+        // through the route layer's `sse_error_frame` path (PR #629) and
+        // happy-path streams return HTTP 200 as soon as the headers arrive.
+        match canonical_send {
+            Ok(response) if self.rotation_count() == 0 => {
+                self.pending_buckets
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(request_hash, bucket_id);
+                let sse_stream = new_sse_parser(response.bytes_stream(), true);
+                Ok(Box::pin(sse_stream))
+            }
+            Ok(response) => {
+                let parser = new_sse_parser(response.bytes_stream(), true);
+                let stream: StreamingResult = Box::pin(parser);
+                let mut peekable = StreamingResultExt::peekable(stream);
+                let first_chunk_status =
+                    if let Some(Err(CompletionError::HttpError { status_code, .. })) =
+                        peekable.peek().await
+                    {
+                        if Self::is_rotation_retryable_status(*status_code) {
+                            Some(*status_code)
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
+                match first_chunk_status {
+                    None => {
+                        self.pending_buckets
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .insert(request_hash, bucket_id);
+                        Ok(Box::pin(peekable))
+                    }
+                    Some(status_code) => {
+                        // rotation_count() > 0 is guaranteed by the arm
+                        // guard above, so the fallback will actually iterate
+                        // at least one alternative backend.
+                        drop(peekable);
+                        self.try_chat_completion_stream_rotation(
+                            &streaming_params,
+                            &headers,
+                            &request_hash,
+                            CompletionError::HttpError {
+                                status_code,
+                                message: "Upstream stream emitted an error event".to_string(),
+                                is_external: false,
+                            },
+                        )
+                        .await
+                    }
+                }
+            }
+            Err(canonical_err) => match &canonical_err {
+                CompletionError::HttpError { status_code, .. }
+                    if Self::is_rotation_retryable_status(*status_code)
+                        && self.rotation_count() > 0 =>
+                {
+                    self.try_chat_completion_stream_rotation(
+                        &streaming_params,
+                        &headers,
+                        &request_hash,
+                        canonical_err,
+                    )
+                    .await
+                }
+                _ => Err(canonical_err),
+            },
+        }
     }
 
     /// Performs a chat completion request
@@ -1054,7 +1547,7 @@ impl InferenceProvider for VLlmProvider {
             {
                 self.clear_bucket(bucket_id);
                 let fresh = self.get_or_verify_bucket_client(bucket_id).await?;
-                send(&fresh, headers).await.map_err(map_send_err)?
+                send(&fresh, headers.clone()).await.map_err(map_send_err)?
             }
             Err(e) => return Err(map_send_err(e)),
         };
@@ -1066,11 +1559,28 @@ impl InferenceProvider for VLlmProvider {
                 .text()
                 .await
                 .unwrap_or_else(|e| format!("Failed to read error response body: {e}"));
-            return Err(CompletionError::HttpError {
+            let canonical_err = CompletionError::HttpError {
                 status_code,
                 message: crate::extract_error_message(&error_text),
                 is_external: false,
-            });
+            };
+            // The sticky bucket landed on a backend whose queue is full (or
+            // is otherwise reporting 5xx/429). Walk each backend by index via
+            // model-proxy's rotation SNI before surfacing the error: with H2
+            // pooling disabled on the rotation client, every attempt lands
+            // on a distinct backend. If one is healthy, the request succeeds
+            // and we record the index for signature retrieval.
+            if Self::is_rotation_retryable_status(status_code) && self.rotation_count() > 0 {
+                return self
+                    .try_chat_completion_rotation(
+                        &non_streaming_params,
+                        &headers,
+                        timeout,
+                        canonical_err,
+                    )
+                    .await;
+            }
+            return Err(canonical_err);
         }
 
         // Get the raw bytes first for exact hash verification
@@ -2544,5 +3054,155 @@ mod tests {
                 "pre_warm should not fill any buckets in Bootstrap/Blocked state"
             );
         }
+    }
+
+    #[test]
+    fn rotation_retryable_status_covers_5xx_429_and_408() {
+        // Mirrors `classify_retry_decision` in the pool ("retryable_http_5xx"
+        // + 429 + 408). Keeping these in sync is load-bearing: if the
+        // rotation gate diverges, a 503 that the pool considers retryable
+        // could bypass rotation and burn the pool's 3-round backoff against
+        // the same overloaded bucket. 408 is included because the pool
+        // already treats it as next-provider-worthy in the chat_completion
+        // closure — and other indices may succeed where the sticky bucket
+        // timed out.
+        assert!(VLlmProvider::is_rotation_retryable_status(408));
+        assert!(VLlmProvider::is_rotation_retryable_status(429));
+        assert!(VLlmProvider::is_rotation_retryable_status(500));
+        assert!(VLlmProvider::is_rotation_retryable_status(503));
+        assert!(VLlmProvider::is_rotation_retryable_status(599));
+        assert!(!VLlmProvider::is_rotation_retryable_status(200));
+        assert!(!VLlmProvider::is_rotation_retryable_status(400));
+        assert!(!VLlmProvider::is_rotation_retryable_status(401));
+        assert!(!VLlmProvider::is_rotation_retryable_status(404));
+        assert!(!VLlmProvider::is_rotation_retryable_status(422));
+    }
+
+    #[test]
+    fn rotation_disabled_for_non_rotation_url() {
+        // `localhost` is one-label → `split_inference_url` returns `None`, so
+        // `rotation_parts` stays `None`, `rotation_count()` is forced to 0
+        // even if discovery somehow wrote a non-zero count, and the
+        // canonical-SNI 5xx propagates unchanged.
+        let provider = create_test_provider();
+        provider.set_backend_count(5);
+        assert_eq!(
+            provider.rotation_count(),
+            0,
+            "rotation must stay disabled for URLs that don't fit the <canonical>.<multi-label-base> shape"
+        );
+        assert!(provider.rotation_url(0, "/v1/chat/completions").is_none());
+    }
+
+    #[test]
+    fn rotation_url_uses_canonical_label_and_index() {
+        let provider = VLlmProvider::new(VLlmConfig {
+            base_url: "https://glm-5-1.completions.near.ai".to_string(),
+            api_key: None,
+            completion_timeout_seconds: 30,
+            control_timeout_seconds: 30,
+        });
+        provider.set_backend_count(3);
+        assert_eq!(provider.rotation_count(), 3);
+        let url0 = provider
+            .rotation_url(0, "/v1/chat/completions")
+            .expect("rotation URL build");
+        let url2 = provider
+            .rotation_url(2, "/v1/chat/completions")
+            .expect("rotation URL build");
+        assert_eq!(
+            url0,
+            "https://glm-5-1-i0.completions.near.ai/v1/chat/completions"
+        );
+        assert_eq!(
+            url2,
+            "https://glm-5-1-i2.completions.near.ai/v1/chat/completions"
+        );
+    }
+
+    #[test]
+    fn rotation_count_clamps_to_max_fanout() {
+        // Defensive: a bogus `/backends/count` reading (race during deploy,
+        // partial registry split) shouldn't let one 5xx burn unbounded
+        // fresh-TCP handshakes. Mirrors the discovery path's cap.
+        let provider = VLlmProvider::new(VLlmConfig {
+            base_url: "https://glm-5-1.completions.near.ai".to_string(),
+            api_key: None,
+            completion_timeout_seconds: 30,
+            control_timeout_seconds: 30,
+        });
+        provider.set_backend_count(10_000);
+        assert_eq!(provider.rotation_count(), crate::rotation::MAX_FANOUT);
+    }
+
+    #[test]
+    fn rotation_count_returns_zero_when_discovery_has_not_run() {
+        // First request after startup, before discovery's first cycle: count
+        // is 0, so rotation is skipped and the canonical 5xx propagates
+        // as it did pre-this-PR. No false positives.
+        let provider = VLlmProvider::new(VLlmConfig {
+            base_url: "https://glm-5-1.completions.near.ai".to_string(),
+            api_key: None,
+            completion_timeout_seconds: 30,
+            control_timeout_seconds: 30,
+        });
+        assert_eq!(provider.rotation_count(), 0);
+    }
+
+    #[test]
+    fn pin_chat_connection_promotes_pending_rotation_to_signature_rotation() {
+        // The streaming fallback stores `request_hash → index` in
+        // `pending_rotation` because the chat_id isn't known at send time.
+        // Once the first chunk yields a chat_id, `pin_chat_connection`
+        // must promote that mapping into `signature_rotation` so the
+        // signature fetch reuses the same rotation index. Without this
+        // promotion the signature endpoint would land on the LB-chosen
+        // backend and 404.
+        let provider = create_test_provider();
+        provider
+            .pending_rotation
+            .lock()
+            .unwrap()
+            .insert("req-hash-abc".to_string(), 2);
+        provider.pin_chat_connection("req-hash-abc", "chatcmpl-xyz");
+        let stored = provider
+            .signature_rotation
+            .lock()
+            .unwrap()
+            .get("chatcmpl-xyz")
+            .copied();
+        assert_eq!(stored, Some(2));
+        // Pending entry should be drained so a future `request_hash` reuse
+        // can't accidentally surface the stale index.
+        assert!(provider.pending_rotation.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn pin_chat_connection_with_empty_chat_id_drains_pending_without_writing_signature() {
+        // The pool's orphan-cleanup path (`provider.pin_chat_connection(hash, "")`)
+        // must drop the pending mapping without leaking an entry under an
+        // empty chat_id key — otherwise every orphan request would
+        // collide on the same `""` signature_rotation slot.
+        let provider = create_test_provider();
+        provider
+            .pending_rotation
+            .lock()
+            .unwrap()
+            .insert("req-hash-orphan".to_string(), 1);
+        provider.pin_chat_connection("req-hash-orphan", "");
+        assert!(provider.pending_rotation.lock().unwrap().is_empty());
+        assert!(provider.signature_rotation.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn unpin_chat_connection_clears_signature_rotation() {
+        let provider = create_test_provider();
+        provider
+            .signature_rotation
+            .lock()
+            .unwrap()
+            .insert("chat-1".to_string(), 4);
+        provider.unpin_chat_connection("chat-1");
+        assert!(provider.signature_rotation.lock().unwrap().is_empty());
     }
 }

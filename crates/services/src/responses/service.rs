@@ -246,6 +246,7 @@ impl ports::ResponseServiceTrait for ResponseServiceImpl {
                     annotation_index: None,
                     annotation: None,
                     conversation_title: None,
+                    usage: None,
                 };
                 let result = tx.send(error_event).await;
                 if let Err(e) = result {
@@ -3021,6 +3022,7 @@ impl ResponseServiceImpl {
             annotation_index: None,
             annotation: None,
             conversation_title: Some(title),
+            usage: None,
         };
 
         let _ = tx.send(event).await;
@@ -3178,6 +3180,7 @@ impl ResponseServiceImpl {
             annotation_index: None,
             annotation: None,
             conversation_title: None,
+            usage: None,
         };
         use futures_util::SinkExt;
         let _ = emitter.tx.clone().send(event).await;
@@ -3207,6 +3210,7 @@ impl ResponseServiceImpl {
             annotation_index: None,
             annotation: None,
             conversation_title: None,
+            usage: Some(final_response.usage.clone()),
         };
         let _ = emitter.tx.clone().send(completion_event).await;
 

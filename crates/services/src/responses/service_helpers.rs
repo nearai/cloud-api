@@ -120,6 +120,7 @@ impl EventEmitter {
             annotation_index: None,
             annotation: None,
             conversation_title: None,
+            usage: None,
         };
         self.send(event).await
     }
@@ -146,6 +147,7 @@ impl EventEmitter {
             annotation_index: None,
             annotation: None,
             conversation_title: None,
+            usage: None,
         };
         self.send(event).await
     }
@@ -156,6 +158,7 @@ impl EventEmitter {
         ctx: &mut ResponseStreamContext,
         response: models::ResponseObject,
     ) -> Result<(), errors::ResponseError> {
+        let usage = response.usage.clone();
         let event = models::ResponseStreamEvent {
             event_type: "response.completed".to_string(),
             sequence_number: Some(ctx.next_sequence()),
@@ -172,6 +175,7 @@ impl EventEmitter {
             annotation_index: None,
             annotation: None,
             conversation_title: None,
+            usage: Some(usage),
         };
         self.send(event).await
     }
@@ -199,6 +203,7 @@ impl EventEmitter {
             annotation_index: None,
             annotation: None,
             conversation_title: None,
+            usage: None,
         };
         self.send(event).await
     }
@@ -226,6 +231,7 @@ impl EventEmitter {
             annotation_index: None,
             annotation: None,
             conversation_title: None,
+            usage: None,
         };
         self.send(event).await
     }
@@ -253,6 +259,7 @@ impl EventEmitter {
             annotation_index: None,
             annotation: None,
             conversation_title: None,
+            usage: None,
         };
         self.send(event).await
     }
@@ -280,6 +287,7 @@ impl EventEmitter {
             annotation_index: None,
             annotation: None,
             conversation_title: None,
+            usage: None,
         };
         self.send(event).await
     }
@@ -307,6 +315,7 @@ impl EventEmitter {
             annotation_index: None,
             annotation: None,
             conversation_title: None,
+            usage: None,
         };
         self.send(event).await
     }
@@ -334,6 +343,7 @@ impl EventEmitter {
             annotation_index: None,
             annotation: None,
             conversation_title: None,
+            usage: None,
         };
         self.send(event).await
     }
@@ -361,6 +371,7 @@ impl EventEmitter {
             annotation_index: Some(0), // Start with index 0 for first annotation
             annotation: Some(annotation),
             conversation_title: None,
+            usage: None,
         };
         self.send(event).await
     }
@@ -409,6 +420,7 @@ impl EventEmitter {
             annotation_index: None,
             annotation: None,
             conversation_title: None,
+            usage: None,
         };
         self.send(event).await
     }

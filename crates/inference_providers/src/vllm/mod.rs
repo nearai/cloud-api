@@ -124,8 +124,13 @@ impl VLlmConfig {
     /// on a single non-streaming request; 600s is a comfortable ceiling that
     /// still surfaces genuinely stuck requests.
     pub const DEFAULT_COMPLETION_TIMEOUT_SECS: i64 = 600;
-    /// Default control timeout. Metadata/TTFB ops should resolve quickly.
-    pub const DEFAULT_CONTROL_TIMEOUT_SECS: i64 = 90;
+    /// Default control timeout. Covers TTFB on streaming requests, attestation
+    /// report fetches, models-list and signature lookups. Reasoning models
+    /// (GLM-5.1, Qwen3.5) can delay TTFB by minutes when the backend queues a
+    /// request behind a long thinking phase, and attestation TDX-quote + GPU
+    /// evidence collection can also cross 90s under load. 300s gives enough
+    /// headroom for those without masking a sustained backend stall.
+    pub const DEFAULT_CONTROL_TIMEOUT_SECS: i64 = 300;
 
     /// Construct a config. The `timeout_seconds` parameter, when supplied, sets
     /// the **completion** timeout only (control stays at its default / env value).

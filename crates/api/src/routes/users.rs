@@ -1,6 +1,7 @@
 use crate::{
     conversions::{
-        authenticated_user_to_user_id, services_invitation_to_api, services_member_to_api_member,
+        authenticated_user_to_user_id, services_invitation_to_api,
+        services_invitation_to_api_with_org, services_member_to_api_member,
         services_user_to_api_user,
     },
     middleware::AuthenticatedUser,
@@ -473,7 +474,7 @@ pub async fn create_access_token(
     path = "/v1/users/me/invitations",
     tag = "Users",
     responses(
-        (status = 200, description = "List of pending invitations", body = Vec<crate::models::OrganizationInvitationResponse>),
+        (status = 200, description = "List of pending invitations", body = Vec<crate::models::OrganizationInvitationWithOrgResponse>),
         (status = 401, description = "Unauthorized", body = ErrorResponse),
         (status = 500, description = "Internal server error", body = ErrorResponse)
     ),
@@ -485,7 +486,7 @@ pub async fn list_user_invitations(
     State(app_state): State<AppState>,
     Extension(user): Extension<AuthenticatedUser>,
 ) -> Result<
-    Json<Vec<crate::models::OrganizationInvitationResponse>>,
+    Json<Vec<crate::models::OrganizationInvitationWithOrgResponse>>,
     (StatusCode, Json<ErrorResponse>),
 > {
     debug!("Listing invitations for user: {}", user.0.email);
@@ -496,9 +497,9 @@ pub async fn list_user_invitations(
         .await
     {
         Ok(invitations) => {
-            let responses: Vec<crate::models::OrganizationInvitationResponse> = invitations
+            let responses = invitations
                 .into_iter()
-                .map(services_invitation_to_api)
+                .map(services_invitation_to_api_with_org)
                 .collect();
             Ok(Json(responses))
         }

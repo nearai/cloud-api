@@ -29,6 +29,7 @@ mod external_providers;
 mod files;
 mod function_tools;
 mod general;
+mod invitations;
 mod mcp;
 mod mcp_server;
 mod message_metadata;

@@ -247,7 +247,11 @@ async fn test_privacy_redact_rejects_out_of_range_threshold() {
     let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
     let api_key = get_api_key_for_org(&server, org.id).await;
 
-    for bad in [-0.1, 1.5, f64::NAN] {
+    // NaN intentionally excluded: standard JSON has no NaN token, and
+    // `serde_json::json!(f64::NAN)` collapses to `null`, which our handler
+    // treats as "threshold absent". The handler still range-checks for NaN
+    // defensively in case the field arrives via a non-standard path.
+    for bad in [-0.1, 1.5] {
         let response = server
             .post("/v1/privacy/redact")
             .add_header("Authorization", format!("Bearer {api_key}"))
@@ -261,7 +265,7 @@ async fn test_privacy_redact_rejects_out_of_range_threshold() {
         assert_eq!(
             response.status_code(),
             400,
-            "threshold={bad:?} should be rejected",
+            "threshold={bad} should be rejected",
         );
     }
 }

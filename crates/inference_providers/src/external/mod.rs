@@ -47,6 +47,21 @@ pub use backend::BackendConfig as ExternalBackendConfig;
 pub use gemini::GeminiBackend;
 pub use openai_compatible::OpenAiCompatibleBackend;
 
+/// Strip cloud-api internal tracing keys from `extra` before forwarding params
+/// to external providers.
+///
+/// These keys (`x_request_id`, `x_org_id`, `x_workspace_id`) are injected by the
+/// completion service so the vLLM provider can forward them as HTTP headers.
+/// External providers use `#[serde(flatten)]` on `extra`, so any remaining keys
+/// are serialised as top-level JSON body fields — unknown fields that strict
+/// providers (Anthropic, Gemini) may reject with a 400/422.
+fn strip_internal_tracing_keys(extra: &mut std::collections::HashMap<String, serde_json::Value>) {
+    use crate::vllm::tracing_headers;
+    extra.remove(tracing_headers::REQUEST_ID);
+    extra.remove(tracing_headers::ORG_ID);
+    extra.remove(tracing_headers::WORKSPACE_ID);
+}
+
 /// Provider configuration stored in database
 ///
 /// This enum represents the JSON configuration stored in the `provider_config`
@@ -235,9 +250,12 @@ impl InferenceProvider for ExternalProvider {
     /// Performs a streaming chat completion request
     async fn chat_completion_stream(
         &self,
-        params: ChatCompletionParams,
+        mut params: ChatCompletionParams,
         _request_hash: String,
     ) -> Result<StreamingResult, CompletionError> {
+        // Strip cloud-api internal tracing keys — they must not be forwarded
+        // to external providers as JSON body fields (extra is #[serde(flatten)]).
+        strip_internal_tracing_keys(&mut params.extra);
         self.backend
             .chat_completion_stream(&self.config, &self.model_name, params)
             .await
@@ -246,9 +264,12 @@ impl InferenceProvider for ExternalProvider {
     /// Performs a non-streaming chat completion request
     async fn chat_completion(
         &self,
-        params: ChatCompletionParams,
+        mut params: ChatCompletionParams,
         _request_hash: String,
     ) -> Result<ChatCompletionResponseWithBytes, CompletionError> {
+        // Strip cloud-api internal tracing keys — they must not be forwarded
+        // to external providers as JSON body fields (extra is #[serde(flatten)]).
+        strip_internal_tracing_keys(&mut params.extra);
         self.backend
             .chat_completion(&self.config, &self.model_name, params)
             .await

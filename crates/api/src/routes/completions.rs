@@ -19,7 +19,7 @@ use services::completions::{
 use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::debug;
+use tracing::{debug, Instrument};
 use utoipa;
 use uuid::Uuid;
 
@@ -281,8 +281,10 @@ fn convert_chat_request_to_service(
     organization_id: Uuid,
     workspace_id: Uuid,
     body_hash: RequestBodyHash,
+    request_id: Uuid,
 ) -> ServiceCompletionRequest {
     ServiceCompletionRequest {
+        request_id,
         model: request.model.clone(),
         messages: request
             .messages
@@ -660,8 +662,10 @@ fn convert_text_request_to_service(
     organization_id: Uuid,
     workspace_id: Uuid,
     body_hash: RequestBodyHash,
+    request_id: Uuid,
 ) -> ServiceCompletionRequest {
     ServiceCompletionRequest {
+        request_id,
         model: request.model.clone(),
         messages: vec![CompletionMessage {
             role: "user".to_string(),
@@ -735,6 +739,49 @@ pub async fn chat_completions(
             .into_response();
     }
 
+    // Generate a per-request correlation ID. Reuse the client's X-Request-Id if
+    // present and parseable as a UUID; otherwise generate a fresh one. This ID
+    // propagates downstream as X-Request-Id on every outbound inference call.
+    let request_id = headers
+        .get("x-request-id")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| Uuid::parse_str(s).ok())
+        .unwrap_or_else(Uuid::new_v4);
+
+    // Create a span carrying correlation IDs so every log line within this
+    // request carries request_id/org_id/workspace_id in Datadog.
+    //
+    // NOTE: we do NOT call span.enter() here. In async code, Span::enter()
+    // stores the guard in a thread-local; when the future yields at an .await
+    // the guard stays entered on that thread, so any other task scheduled on
+    // the same thread incorrectly inherits this span as its parent, corrupting
+    // log context. Use .instrument(span) on the inner async block instead.
+    let span = tracing::info_span!(
+        "chat_completions",
+        request_id = %request_id,
+        org_id = %api_key.organization.id.0,
+        workspace_id = %api_key.workspace.id.0,
+        model = %request.model,
+    );
+
+    chat_completions_inner(app_state, api_key, body_hash, headers, request, request_id)
+        .instrument(span)
+        .await
+}
+
+// Inner async fn so .instrument(span) wraps all awaits in the handler.
+// Split from `chat_completions` only to correctly scope the tracing span:
+// using span.enter() in an async fn risks the guard outliving an .await yield,
+// causing other tasks on the same thread to inherit this span's context.
+#[allow(clippy::too_many_arguments)]
+async fn chat_completions_inner(
+    app_state: crate::routes::api::AppState,
+    api_key: crate::middleware::auth::AuthenticatedApiKey,
+    body_hash: crate::middleware::RequestBodyHash,
+    headers: header::HeaderMap,
+    request: ChatCompletionRequest,
+    request_id: Uuid,
+) -> axum::response::Response {
     // Convert HTTP request to service parameters
     // Note: Names are not passed - high-cardinality data is tracked via database, not metrics
     let mut service_request = convert_chat_request_to_service(
@@ -744,6 +791,7 @@ pub async fn chat_completions(
         api_key.organization.id.0,
         api_key.workspace.id.0,
         body_hash,
+        request_id,
     );
 
     // Extract and validate encryption headers if present
@@ -1084,6 +1132,8 @@ pub async fn completions(
         request.model, request.stream, api_key.organization.id, api_key.workspace.id.0
     );
 
+    // This endpoint is not yet implemented — it returns immediately without
+    // any async work, so no tracing span is needed here.
     return (
         StatusCode::NOT_IMPLEMENTED,
         ResponseJson(ErrorResponse::new(
@@ -1106,6 +1156,9 @@ pub async fn completions(
             .into_response();
     }
 
+    // Generate correlation ID
+    let request_id = Uuid::new_v4();
+
     // Convert HTTP request to service parameters
     // Note: Names are not passed - high-cardinality data is tracked via database, not metrics
     let service_request = convert_text_request_to_service(
@@ -1115,6 +1168,7 @@ pub async fn completions(
         api_key.organization.id.0,
         api_key.workspace.id.0,
         body_hash,
+        request_id,
     );
 
     // Call the completion service - it handles usage tracking internally
@@ -1263,6 +1317,92 @@ mod tests {
             !result.is_nil(),
             "empty provider ID should still produce a non-nil UUID"
         );
+    }
+
+    #[test]
+    fn test_classify_provider_error_404_surfaces_message() {
+        let (status, error_type, message) =
+            classify_provider_error(404, "model 'foo' not found".to_string());
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(error_type, "not_found_error");
+        assert_eq!(message, "model 'foo' not found");
+    }
+
+    #[test]
+    fn test_classify_provider_error_429_surfaces_message() {
+        let (status, error_type, message) =
+            classify_provider_error(429, "too many concurrent requests".to_string());
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(error_type, "rate_limit_error");
+        assert_eq!(message, "too many concurrent requests");
+    }
+
+    #[test]
+    fn test_classify_provider_error_400_surfaces_message() {
+        let (status, error_type, message) = classify_provider_error(
+            400,
+            "dimensions is not supported for this model".to_string(),
+        );
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(error_type, "invalid_request_error");
+        assert_eq!(message, "dimensions is not supported for this model");
+    }
+
+    #[test]
+    fn test_classify_provider_error_422_preserves_upstream_status() {
+        let (status, error_type, message) =
+            classify_provider_error(422, "validation failed".to_string());
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(error_type, "invalid_request_error");
+        assert_eq!(message, "validation failed");
+    }
+
+    #[test]
+    fn test_classify_provider_error_401_masked_as_5xx() {
+        // 401 from upstream means *our* credentials are wrong — the client
+        // did nothing to cause it, so we must not echo the auth error.
+        let (status, error_type, message) =
+            classify_provider_error(401, "Invalid API key 'sk-***'".to_string());
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(error_type, "server_error");
+        assert!(
+            !message.contains("sk-"),
+            "must not leak upstream credentials in surfaced message"
+        );
+        assert!(message.contains("try again later"));
+    }
+
+    #[test]
+    fn test_classify_provider_error_403_masked_as_5xx() {
+        let (status, error_type, message) =
+            classify_provider_error(403, "Forbidden: backend ACL denied".to_string());
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(error_type, "server_error");
+        assert_eq!(
+            message,
+            "Embeddings request failed. Please try again later."
+        );
+    }
+
+    #[test]
+    fn test_classify_provider_error_407_masked_as_5xx() {
+        let (status, error_type, _) =
+            classify_provider_error(407, "proxy auth required".to_string());
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(error_type, "server_error");
+    }
+
+    #[test]
+    fn test_classify_provider_error_5xx_masked() {
+        // 5xx bodies may contain stack traces or internal details — never echo.
+        let (status, error_type, message) = classify_provider_error(
+            502,
+            "RuntimeError: traceback...internal-host:9000".to_string(),
+        );
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(error_type, "server_error");
+        assert!(!message.contains("traceback"));
+        assert!(!message.contains("internal-host"));
     }
 
     #[test]
@@ -2675,6 +2815,49 @@ struct EmbeddingsResponseDoc {
     data: serde_json::Value,
 }
 
+/// Classify an upstream provider HTTP error into the (status, error_type, message)
+/// triple we surface to the client.
+///
+/// Rules:
+/// - 401/403/407 from upstream mean *our* credentials to the backend are wrong
+///   (or our backend's auth config is broken). The client did nothing to cause
+///   it, so we return 500 with a generic message instead of echoing an auth
+///   failure that would be misleading.
+/// - 404 → 404 not_found_error (e.g. model not found at this provider).
+/// - 429 → 429 rate_limit_error.
+/// - Other 4xx → preserve upstream status with `invalid_request_error`. The
+///   upstream message is surfaced so the user can see *why* their request was
+///   rejected (e.g. "dimensions is not supported for this model").
+/// - 5xx (and anything else) → 500 server_error with a generic message. The
+///   upstream body may contain stack traces or internal details we don't want
+///   to leak.
+fn classify_provider_error(
+    upstream_status: u16,
+    upstream_message: String,
+) -> (StatusCode, &'static str, String) {
+    let generic = || {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "server_error",
+            "Embeddings request failed. Please try again later.".to_string(),
+        )
+    };
+    match upstream_status {
+        401 | 403 | 407 => generic(),
+        404 => (StatusCode::NOT_FOUND, "not_found_error", upstream_message),
+        429 => (
+            StatusCode::TOO_MANY_REQUESTS,
+            "rate_limit_error",
+            upstream_message,
+        ),
+        s if (400..=499).contains(&s) => {
+            let http_status = StatusCode::from_u16(s).unwrap_or(StatusCode::BAD_REQUEST);
+            (http_status, "invalid_request_error", upstream_message)
+        }
+        _ => generic(),
+    }
+}
+
 #[utoipa::path(
     post,
     path = "/v1/embeddings",
@@ -2905,16 +3088,18 @@ pub async fn embeddings(
                 }
                 services::completions::ports::CompletionError::ProviderError {
                     status_code,
-                    ..
+                    message,
                 } => {
-                    tracing::error!("Embeddings provider error");
-                    let http_status = StatusCode::from_u16(status_code)
-                        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-                    (
-                        http_status,
-                        "server_error",
-                        "Embeddings request failed. Please try again later.".to_string(),
-                    )
+                    let classified = classify_provider_error(status_code, message);
+                    if classified.0.is_client_error() {
+                        tracing::warn!(
+                            upstream_status = status_code,
+                            "Embeddings rejected by upstream with client error"
+                        );
+                    } else {
+                        tracing::error!(upstream_status = status_code, "Embeddings provider error");
+                    }
+                    classified
                 }
                 services::completions::ports::CompletionError::InvalidModel(msg) => {
                     tracing::warn!("Embeddings model not found");

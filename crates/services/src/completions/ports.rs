@@ -49,6 +49,9 @@ pub enum CompletionError {
 // Request/Response models
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompletionRequest {
+    /// UUIDv4 correlation ID generated (or echoed) by the API layer.
+    /// Propagated downstream as `X-Request-Id` so every hop can join on it.
+    pub request_id: uuid::Uuid,
     pub model: String,
     pub messages: Vec<CompletionMessage>,
     pub max_tokens: Option<i64>,

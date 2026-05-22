@@ -3,11 +3,20 @@ use axum::{http::StatusCode, response::Json as ResponseJson, Extension};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
-/// Response from the check_api_key endpoint
+/// Response from the check_api_key endpoint.
+///
+/// `organization_id` and `workspace_id` are returned so downstream gateways
+/// (e.g. inference-proxy) have a server-side authoritative tenant
+/// identifier and don't have to trust caller-supplied `X-Org-Id`
+/// headers when populating logs / usage records.
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct CheckApiKeyResponse {
     /// Whether the API key is valid and authorized
     pub valid: bool,
+    /// Organization the API key belongs to
+    pub organization_id: String,
+    /// Workspace the API key belongs to
+    pub workspace_id: String,
 }
 
 /// Check API key validity
@@ -33,7 +42,11 @@ pub struct CheckApiKeyResponse {
     )
 )]
 pub async fn check_api_key(
-    Extension(_api_key): Extension<AuthenticatedApiKey>,
+    Extension(api_key): Extension<AuthenticatedApiKey>,
 ) -> Result<ResponseJson<CheckApiKeyResponse>, (StatusCode, ResponseJson<ErrorResponse>)> {
-    Ok(ResponseJson(CheckApiKeyResponse { valid: true }))
+    Ok(ResponseJson(CheckApiKeyResponse {
+        valid: true,
+        organization_id: api_key.organization.id.to_string(),
+        workspace_id: api_key.workspace.id.to_string(),
+    }))
 }

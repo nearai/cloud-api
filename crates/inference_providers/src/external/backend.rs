@@ -26,7 +26,7 @@ pub struct BackendConfig {
     pub timeout_seconds: i64,
     /// Provider-specific extra configuration (e.g., organization_id, version)
     pub extra: HashMap<String, String>,
-    /// Extra fields injected into every outgoing request body (e.g., OpenRouter `provider` preferences)
+    /// Extra fields injected into outgoing JSON request bodies (e.g., OpenRouter `provider` preferences)
     pub extra_request_body: HashMap<String, serde_json::Value>,
 }
 

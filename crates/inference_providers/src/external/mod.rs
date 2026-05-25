@@ -62,6 +62,20 @@ fn strip_internal_tracing_keys(extra: &mut std::collections::HashMap<String, ser
     extra.remove(tracing_headers::WORKSPACE_ID);
 }
 
+fn merge_json_defaults(target: &mut serde_json::Value, defaults: &serde_json::Value) {
+    if let (serde_json::Value::Object(target), serde_json::Value::Object(defaults)) =
+        (target, defaults)
+    {
+        for (key, default_value) in defaults {
+            if let Some(target_value) = target.get_mut(key) {
+                merge_json_defaults(target_value, default_value);
+            } else {
+                target.insert(key.clone(), default_value.clone());
+            }
+        }
+    }
+}
+
 /// Provider configuration stored in database
 ///
 /// This enum represents the JSON configuration stored in the `provider_config`
@@ -80,7 +94,7 @@ pub enum ProviderConfig {
         /// Optional model name override (e.g., "gpt-5.2" when our model ID is "openai/gpt-5.2")
         #[serde(default)]
         model_name: Option<String>,
-        /// Extra fields injected into every outgoing request body.
+        /// Extra fields injected into outgoing JSON request bodies.
         /// Useful for provider-specific parameters like OpenRouter's `provider` preferences.
         #[serde(default)]
         extra_request_body: Option<std::collections::HashMap<String, serde_json::Value>>,
@@ -244,12 +258,16 @@ impl ExternalProvider {
 
     /// Inject provider-level default fields into the request body.
     /// Per-request fields from the user take precedence over provider defaults.
-    fn inject_extra_request_body(&self, params: &mut ChatCompletionParams) {
+    fn inject_extra_request_body(
+        &self,
+        extra: &mut std::collections::HashMap<String, serde_json::Value>,
+    ) {
         for (key, value) in &self.config.extra_request_body {
-            params
-                .extra
-                .entry(key.clone())
-                .or_insert_with(|| value.clone());
+            if let Some(target_value) = extra.get_mut(key) {
+                merge_json_defaults(target_value, value);
+            } else {
+                extra.insert(key.clone(), value.clone());
+            }
         }
     }
 }
@@ -273,7 +291,7 @@ impl InferenceProvider for ExternalProvider {
         _request_hash: String,
     ) -> Result<StreamingResult, CompletionError> {
         strip_internal_tracing_keys(&mut params.extra);
-        self.inject_extra_request_body(&mut params);
+        self.inject_extra_request_body(&mut params.extra);
         self.backend
             .chat_completion_stream(&self.config, &self.model_name, params)
             .await
@@ -286,7 +304,7 @@ impl InferenceProvider for ExternalProvider {
         _request_hash: String,
     ) -> Result<ChatCompletionResponseWithBytes, CompletionError> {
         strip_internal_tracing_keys(&mut params.extra);
-        self.inject_extra_request_body(&mut params);
+        self.inject_extra_request_body(&mut params.extra);
         self.backend
             .chat_completion(&self.config, &self.model_name, params)
             .await
@@ -344,9 +362,10 @@ impl InferenceProvider for ExternalProvider {
     /// - Not supported by Anthropic (will return error)
     async fn image_generation(
         &self,
-        params: ImageGenerationParams,
+        mut params: ImageGenerationParams,
         _request_hash: String,
     ) -> Result<ImageGenerationResponseWithBytes, ImageGenerationError> {
+        self.inject_extra_request_body(&mut params.extra);
         self.backend
             .image_generation(&self.config, &self.model_name, params)
             .await
@@ -380,15 +399,17 @@ impl InferenceProvider for ExternalProvider {
 
     async fn score(
         &self,
-        params: ScoreParams,
+        mut params: ScoreParams,
         _request_hash: String,
     ) -> Result<ScoreResponse, ScoreError> {
+        self.inject_extra_request_body(&mut params.extra);
         self.backend
             .score(&self.config, &self.model_name, params)
             .await
     }
 
-    async fn rerank(&self, params: RerankParams) -> Result<RerankResponse, RerankError> {
+    async fn rerank(&self, mut params: RerankParams) -> Result<RerankResponse, RerankError> {
+        self.inject_extra_request_body(&mut params.extra);
         self.backend
             .rerank(&self.config, &self.model_name, params)
             .await
@@ -397,16 +418,18 @@ impl InferenceProvider for ExternalProvider {
     async fn embeddings_raw(
         &self,
         body: bytes::Bytes,
-        extra: std::collections::HashMap<String, serde_json::Value>,
+        mut extra: std::collections::HashMap<String, serde_json::Value>,
     ) -> Result<bytes::Bytes, EmbeddingError> {
+        self.inject_extra_request_body(&mut extra);
         self.backend.embeddings_raw(&self.config, body, extra).await
     }
 
     async fn privacy_classify_raw(
         &self,
         body: bytes::Bytes,
-        extra: std::collections::HashMap<String, serde_json::Value>,
+        mut extra: std::collections::HashMap<String, serde_json::Value>,
     ) -> Result<bytes::Bytes, PrivacyClassifyError> {
+        self.inject_extra_request_body(&mut extra);
         self.backend
             .privacy_classify_raw(&self.config, body, extra)
             .await
@@ -416,6 +439,7 @@ impl InferenceProvider for ExternalProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
 
     // ==================== ProviderConfig Deserialization Tests ====================
 
@@ -922,7 +946,7 @@ mod tests {
                 base_url: "https://openrouter.ai/api/v1".to_string(),
                 organization_id: None,
                 model_name: None,
-                extra_request_body: Some(std::collections::HashMap::from([(
+                extra_request_body: Some(HashMap::from([(
                     "provider".to_string(),
                     serde_json::json!({"order": ["Chutes"], "allow_fallbacks": true}),
                 )])),
@@ -933,36 +957,11 @@ mod tests {
 
         let provider = ExternalProvider::new(config);
 
-        let mut params = ChatCompletionParams {
-            model: "test".to_string(),
-            messages: vec![],
-            max_completion_tokens: None,
-            max_tokens: None,
-            temperature: None,
-            top_p: None,
-            n: None,
-            stream: None,
-            stop: None,
-            frequency_penalty: None,
-            presence_penalty: None,
-            logit_bias: None,
-            logprobs: None,
-            top_logprobs: None,
-            user: None,
-            seed: None,
-            tools: None,
-            tool_choice: None,
-            parallel_tool_calls: None,
-            metadata: None,
-            store: None,
-            stream_options: None,
-            modalities: None,
-            extra: std::collections::HashMap::new(),
-        };
+        let mut extra = HashMap::new();
 
-        provider.inject_extra_request_body(&mut params);
-        assert!(params.extra.contains_key("provider"));
-        let provider_val = params.extra.get("provider").unwrap();
+        provider.inject_extra_request_body(&mut extra);
+        assert!(extra.contains_key("provider"));
+        let provider_val = extra.get("provider").unwrap();
         assert_eq!(
             provider_val.get("order").unwrap().as_array().unwrap()[0],
             "Chutes"
@@ -977,9 +976,13 @@ mod tests {
                 base_url: "https://openrouter.ai/api/v1".to_string(),
                 organization_id: None,
                 model_name: None,
-                extra_request_body: Some(std::collections::HashMap::from([(
+                extra_request_body: Some(HashMap::from([(
                     "provider".to_string(),
-                    serde_json::json!({"order": ["Chutes"]}),
+                    serde_json::json!({
+                        "order": ["Chutes"],
+                        "allow_fallbacks": true,
+                        "data_collection": "deny"
+                    }),
                 )])),
             },
             api_key: "test-key".to_string(),
@@ -988,42 +991,65 @@ mod tests {
 
         let provider = ExternalProvider::new(config);
 
-        let mut params = ChatCompletionParams {
-            model: "test".to_string(),
-            messages: vec![],
-            max_completion_tokens: None,
-            max_tokens: None,
-            temperature: None,
-            top_p: None,
-            n: None,
-            stream: None,
-            stop: None,
-            frequency_penalty: None,
-            presence_penalty: None,
-            logit_bias: None,
-            logprobs: None,
-            top_logprobs: None,
-            user: None,
-            seed: None,
-            tools: None,
-            tool_choice: None,
-            parallel_tool_calls: None,
-            metadata: None,
-            store: None,
-            stream_options: None,
-            modalities: None,
-            extra: std::collections::HashMap::from([(
-                "provider".to_string(),
-                serde_json::json!({"order": ["DeepInfra"]}),
-            )]),
-        };
+        let mut extra = HashMap::from([(
+            "provider".to_string(),
+            serde_json::json!({"order": ["DeepInfra"]}),
+        )]);
 
-        provider.inject_extra_request_body(&mut params);
-        // User's value should take precedence over provider config default
-        let provider_val = params.extra.get("provider").unwrap();
+        provider.inject_extra_request_body(&mut extra);
+        // User's nested value should take precedence while missing defaults are preserved.
+        let provider_val = extra.get("provider").unwrap();
         assert_eq!(
             provider_val.get("order").unwrap().as_array().unwrap()[0],
             "DeepInfra"
         );
+        assert_eq!(provider_val.get("allow_fallbacks").unwrap(), true);
+        assert_eq!(provider_val.get("data_collection").unwrap(), "deny");
+    }
+
+    #[test]
+    fn test_inject_extra_request_body_deep_merges_nested_defaults() {
+        let config = ExternalProviderConfig {
+            model_name: "test-model".to_string(),
+            provider_config: ProviderConfig::OpenAiCompatible {
+                base_url: "https://openrouter.ai/api/v1".to_string(),
+                organization_id: None,
+                model_name: None,
+                extra_request_body: Some(HashMap::from([(
+                    "provider".to_string(),
+                    serde_json::json!({
+                        "preferences": {
+                            "privacy": {
+                                "data_collection": "deny",
+                                "training": false
+                            },
+                            "latency": "low"
+                        }
+                    }),
+                )])),
+            },
+            api_key: "test-key".to_string(),
+            timeout_seconds: 30,
+        };
+
+        let provider = ExternalProvider::new(config);
+        let mut extra = HashMap::from([(
+            "provider".to_string(),
+            serde_json::json!({
+                "preferences": {
+                    "privacy": {
+                        "training": true
+                    }
+                }
+            }),
+        )]);
+
+        provider.inject_extra_request_body(&mut extra);
+        let preferences = extra.get("provider").unwrap().get("preferences").unwrap();
+        let privacy = preferences.get("privacy").unwrap();
+
+        assert_eq!(privacy.get("data_collection").unwrap(), "deny");
+        assert_eq!(privacy.get("training").unwrap(), true);
+        assert_eq!(preferences.get("latency").unwrap(), "low");
     }
 }

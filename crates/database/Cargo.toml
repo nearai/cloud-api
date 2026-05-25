@@ -20,7 +20,7 @@ deadpool = "0.12"
 
 # TLS support for PostgreSQL connections (required for remote databases like DigitalOcean)
 # Documentation: https://docs.rs/tokio-postgres-rustls/latest/tokio_postgres_rustls/
-tokio-postgres-rustls = "0.13"
+tokio-postgres-rustls = "0.14"
 # Rustls with ring crypto provider
 rustls = { version = "0.23", features = ["ring"] }
 # Platform-native certificate verifier with OS integration and revocation support

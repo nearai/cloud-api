@@ -276,6 +276,7 @@ mod tests {
             api_key: "test-key".to_string(),
             timeout_seconds: 30,
             extra: std::collections::HashMap::new(),
+            extra_request_body: std::collections::HashMap::new(),
         };
 
         let headers = backend.build_headers(&config).unwrap();
@@ -301,6 +302,7 @@ mod tests {
             api_key: "test-key".to_string(),
             timeout_seconds: 30,
             extra,
+            extra_request_body: std::collections::HashMap::new(),
         };
 
         let headers = backend.build_headers(&config).unwrap();
@@ -414,6 +416,7 @@ mod tests {
             api_key: "test-key".to_string(),
             timeout_seconds: 30,
             extra: std::collections::HashMap::new(),
+            extra_request_body: std::collections::HashMap::new(),
         };
 
         let params = crate::ImageGenerationParams {

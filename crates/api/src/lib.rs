@@ -22,6 +22,9 @@ use crate::{
             models, privacy_classify, rerank, score,
         },
         conversations,
+        feature_requests::{
+            list_admin_feature_requests, submit_feature_request, FeatureRequestsRouteState,
+        },
         health::health_check,
         models::{get_model_by_name, list_models, ModelsAppState},
         responses,
@@ -883,6 +886,11 @@ pub fn build_app_with_config(
     let files_routes =
         build_files_routes(app_state.clone(), &auth_components.auth_state_middleware);
 
+    let feature_request_routes = build_feature_request_routes(
+        database.pool().clone(),
+        &auth_components.auth_state_middleware,
+    );
+
     let billing_routes = build_billing_routes(
         domain_services.usage_service.clone(),
         &auth_components.auth_state_middleware,
@@ -936,6 +944,7 @@ pub fn build_app_with_config(
                 .merge(invitation_routes)
                 .merge(auth_vpc_routes)
                 .merge(files_routes)
+                .merge(feature_request_routes)
                 .merge(billing_routes)
                 .merge(usage_recording_routes)
                 .merge(gateway_routes)
@@ -1317,6 +1326,36 @@ pub fn build_files_routes(app_state: AppState, auth_state_middleware: &AuthState
             auth_state_middleware.clone(),
             auth_middleware_with_api_key,
         ))
+}
+
+/// Build feature request routes for user submissions and admin aggregation.
+pub fn build_feature_request_routes(
+    pool: database::DbPool,
+    auth_state_middleware: &AuthState,
+) -> Router {
+    use crate::middleware::{admin_middleware, auth_middleware};
+
+    let state = FeatureRequestsRouteState {
+        repository: Arc::new(database::repositories::FeatureRequestRepository::new(pool)),
+    };
+
+    let user_routes = Router::new()
+        .route("/feature-requests", post(submit_feature_request))
+        .with_state(state.clone())
+        .layer(from_fn_with_state(
+            auth_state_middleware.clone(),
+            auth_middleware,
+        ));
+
+    let admin_routes = Router::new()
+        .route("/admin/feature-requests", get(list_admin_feature_requests))
+        .with_state(state)
+        .layer(from_fn_with_state(
+            auth_state_middleware.clone(),
+            admin_middleware,
+        ));
+
+    Router::new().merge(user_routes).merge(admin_routes)
 }
 
 /// Build billing routes with API key auth (HuggingFace billing integration)

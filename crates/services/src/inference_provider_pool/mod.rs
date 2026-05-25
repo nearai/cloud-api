@@ -1392,6 +1392,8 @@ impl InferenceProviderPool {
                     || lower.contains("connect")
                     || lower.contains("reset")
                     || lower.contains("broken pipe")
+                    || lower.contains("decoding response body")
+                    || lower.contains("body error")
                 {
                     "retryable_connection_keyword"
                 } else {
@@ -3465,6 +3467,12 @@ mod tests {
         assert_eq!(
             InferenceProviderPool::classify_retry_decision(&CompletionError::CompletionError(
                 "connection reset by peer".to_string()
+            )),
+            "retryable_connection_keyword",
+        );
+        assert_eq!(
+            InferenceProviderPool::classify_retry_decision(&CompletionError::CompletionError(
+                "error decoding response body".to_string()
             )),
             "retryable_connection_keyword",
         );

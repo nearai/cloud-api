@@ -495,10 +495,11 @@ pub async fn setup_unique_test_session(database: &Arc<Database>) -> (String, Str
     // Session ID format: rt_{uuid} (with dashes so it can be parsed by MockAuthService)
     let session_id = format!("rt_{user_id_str}");
     let email = format!("test-{user_id_str}@test.com");
+    let provider_user_id = format!("mock_user-{user_id_str}");
 
     let pool = database.pool();
     let client = pool.get().await.expect("Failed to get database connection");
-    let _ = client.execute(
+    client.execute(
         "INSERT INTO users (id, email, username, display_name, avatar_url, auth_provider, provider_user_id, created_at, updated_at)
          VALUES ($1, $2, $3, $4, $5, $6, $7, NOW(), NOW())
          ON CONFLICT (id) DO NOTHING",
@@ -509,9 +510,9 @@ pub async fn setup_unique_test_session(database: &Arc<Database>) -> (String, Str
             &Some("Test User".to_string()),
             &Some("https://example.com/avatar.jpg".to_string()),
             &"mock",
-            &"mock_user",
+            &provider_user_id,
         ],
-    ).await;
+    ).await.expect("Failed to create unique test user");
 
     (session_id, email)
 }

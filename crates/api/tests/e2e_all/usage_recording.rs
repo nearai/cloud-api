@@ -477,6 +477,127 @@ async fn test_record_chat_completion_usage_with_cached_tokens() {
     assert_eq!(body["total_cost"], 180_000_000i64);
 }
 
+/// Pins the invariant that a `POST /v1/usage` submission keyed by a
+/// provider-style id (`chatcmpl-…`) does not share an `inference_id` with
+/// the internal chat-completion pipeline's record for the same provider id.
+/// Both writes must land independently in usage history; the per-org
+/// idempotency constraint on `inference_id` applies only within each source.
+#[tokio::test]
+async fn test_external_usage_record_does_not_collide_with_internal_pipeline() {
+    use inference_providers::StreamChunk;
+
+    let server = setup_test_server().await;
+    setup_qwen_model(&server).await;
+    let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
+    let api_key = get_api_key_for_org(&server, org.id.clone()).await;
+
+    // Drive a streaming completion so we can capture the provider-assigned
+    // chat id from the SSE chunks (same id the internal pipeline will key
+    // its billing record under after stream finalize).
+    let stream_resp = server
+        .post("/v1/chat/completions")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .json(&serde_json::json!({
+            "model": "Qwen/Qwen3-30B-A3B-Instruct-2507",
+            "messages": [{ "role": "user", "content": "hello" }],
+            "stream": true
+        }))
+        .await;
+    assert_eq!(stream_resp.status_code(), 200);
+
+    let body = stream_resp.text();
+    let provider_id = body
+        .lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .filter(|data| data.trim() != "[DONE]")
+        .find_map(|data| match serde_json::from_str::<StreamChunk>(data) {
+            Ok(StreamChunk::Chat(c)) => Some(c.id),
+            _ => None,
+        })
+        .expect("stream should contain at least one chat chunk with an id");
+    assert!(
+        provider_id.starts_with("chatcmpl-"),
+        "mock provider should emit chatcmpl-style ids, got {provider_id:?}",
+    );
+
+    // Submit POST /v1/usage carrying the same provider id. The namespace
+    // prefix on external ids must keep this from sharing an inference_id
+    // slot with the internal pipeline's record.
+    let external_resp = server
+        .post("/v1/usage")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .json(&serde_json::json!({
+            "type": "chat_completion",
+            "model": "Qwen/Qwen3-30B-A3B-Instruct-2507",
+            "input_tokens": 1,
+            "output_tokens": 1,
+            "id": provider_id,
+        }))
+        .await;
+    assert_eq!(
+        external_resp.status_code(),
+        200,
+        "external usage submission should succeed: {}",
+        external_resp.text()
+    );
+
+    // Let the streaming pipeline's spawn_blocking finalize task land.
+    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+
+    let history_resp = server
+        .get(&format!(
+            "/v1/organizations/{}/usage/history?limit=10&offset=0",
+            org.id
+        ))
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .add_header("User-Agent", MOCK_USER_AGENT)
+        .await;
+    assert_eq!(history_resp.status_code(), 200);
+    let history: api::routes::usage::UsageHistoryResponse = history_resp.json();
+
+    // Both records must land: one from the external submission, one from
+    // the internal pipeline. If they share an inference_id, the second
+    // INSERT silently no-ops via ON CONFLICT … DO NOTHING and only one
+    // row survives.
+    let entries_for_id: Vec<_> = history
+        .data
+        .iter()
+        .filter(|e| e.provider_request_id.as_deref() == Some(provider_id.as_str()))
+        .collect();
+    assert_eq!(
+        entries_for_id.len(),
+        2,
+        "expected one internal + one external record for provider id {provider_id:?}, got {} \
+         (full history: {:?})",
+        entries_for_id.len(),
+        history.data,
+    );
+
+    // The two entries must have distinct inference_ids (different namespaces)
+    // and the external one must be the cheap 1+1 token record.
+    let inference_ids: std::collections::HashSet<_> = entries_for_id
+        .iter()
+        .filter_map(|e| e.inference_id.clone())
+        .collect();
+    assert_eq!(
+        inference_ids.len(),
+        2,
+        "internal and external records must use disjoint inference_ids"
+    );
+    assert!(
+        entries_for_id
+            .iter()
+            .any(|e| e.input_tokens == 1 && e.output_tokens == 1),
+        "external 1+1-token record should be present"
+    );
+    assert!(
+        entries_for_id
+            .iter()
+            .any(|e| e.input_tokens > 1 || e.output_tokens > 1),
+        "internal pipeline record (with real token counts) should be present"
+    );
+}
+
 /// Test that cache_read_tokens greater than input_tokens are rejected by validation.
 #[tokio::test]
 async fn test_record_chat_completion_usage_cache_read_capped_to_input() {

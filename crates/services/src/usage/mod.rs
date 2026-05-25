@@ -8,6 +8,14 @@ pub use ports::*;
 use std::sync::Arc;
 use uuid::Uuid;
 
+/// Namespace prefix applied to external `id`s submitted via `POST /v1/usage`
+/// before hashing into an `inference_id`. Keeps externally-submitted records
+/// in a disjoint `inference_id` space from records written by the internal
+/// inference pipeline (which hashes the raw provider id, e.g. `chatcmpl-…`,
+/// `msg_…`), so the per-(org, inference_id) idempotency constraint can never
+/// conflate the two sources.
+const EXTERNAL_USAGE_ID_NAMESPACE: &str = "api:";
+
 /// Compute token-based cost with cache-aware input pricing for token-based chat-style models.
 ///
 /// Important: This helper is intended for chat/LLM-style models where cache-read pricing
@@ -376,12 +384,16 @@ impl UsageServiceTrait for UsageServiceImpl {
             })?;
 
         // Derive inference tracking fields from the required external `id`.
-        // Stored as provider_request_id and hashed to a deterministic UUID v5
-        // for inference_id (same logic as the inference pipeline).
-        // The inference_id serves as the idempotency key: duplicate calls with
-        // the same id within the same org return the existing record.
+        // The raw value is stored verbatim as `provider_request_id`, but
+        // hashed with the `api:` namespace prefix into `inference_id` so
+        // externally-submitted records live in a disjoint id space from the
+        // internal pipeline (which hashes the raw provider id). Idempotency
+        // within this endpoint is preserved because the prefix is
+        // deterministic for a given external `id`.
         let provider_request_id = Some(external_id.clone());
-        let inference_id = Some(crate::completions::hash_inference_id_to_uuid(&external_id));
+        let inference_id = Some(crate::completions::hash_inference_id_to_uuid(&format!(
+            "{EXTERNAL_USAGE_ID_NAMESPACE}{external_id}"
+        )));
 
         // Build internal request and delegate.
         // Internal metrics (ttft_ms, avg_itl_ms, stop_reason) are not exposed
@@ -775,5 +787,49 @@ mod tests {
         let huge_cost: i64 = 10_000_000_000; // 10B nano-dollars per token
         let result = huge_tokens.checked_mul(huge_cost);
         assert!(result.is_none(), "1T tokens * 10B cost should overflow");
+    }
+
+    /// `POST /v1/usage` and the internal inference pipeline both feed
+    /// caller-visible ids through the same UUID v5 hash. To keep the two
+    /// sources from sharing an `inference_id` (which the DB treats as the
+    /// per-org idempotency key), externally-submitted ids get a constant
+    /// namespace prefix before hashing. This test pins that invariant.
+    #[test]
+    fn test_external_id_hash_cannot_collide_with_internal_pipeline() {
+        use crate::completions::hash_inference_id_to_uuid;
+
+        // Real provider id formats observed in production responses.
+        let provider_ids = [
+            "chatcmpl-9e51f8ac5b4f4a01",
+            "msg_01A47sZNMt7DYxzNVKKjLe8A",
+            "resp_01abcd",
+            "id-without-prefix",
+        ];
+
+        for raw_id in provider_ids {
+            let internal_uuid = hash_inference_id_to_uuid(raw_id);
+            let external_uuid = hash_inference_id_to_uuid(&format!(
+                "{}{}",
+                super::EXTERNAL_USAGE_ID_NAMESPACE,
+                raw_id
+            ));
+            assert_ne!(
+                internal_uuid, external_uuid,
+                "external POST /v1/usage with id={raw_id:?} must hash to a different \
+                 inference_id than the internal pipeline writes for the same provider id"
+            );
+        }
+
+        // Two external submissions of the same id must still collide so the
+        // endpoint's idempotency contract is preserved.
+        let dup_a = hash_inference_id_to_uuid(&format!(
+            "{}chatcmpl-9e51f8ac5b4f4a01",
+            super::EXTERNAL_USAGE_ID_NAMESPACE
+        ));
+        let dup_b = hash_inference_id_to_uuid(&format!(
+            "{}chatcmpl-9e51f8ac5b4f4a01",
+            super::EXTERNAL_USAGE_ID_NAMESPACE
+        ));
+        assert_eq!(dup_a, dup_b);
     }
 }

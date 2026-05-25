@@ -54,6 +54,21 @@ pub struct ModelWithPricing {
 
     /// Base URL for the model's inference endpoint
     pub inference_url: Option<String>,
+
+    // OpenRouter-compatibility fields
+    // (https://openrouter.ai/docs/guides/community/for-providers)
+    /// HuggingFace identifier (e.g. "Qwen/Qwen3-VL-30B-A3B-Instruct"). NULL when not on HF.
+    pub hugging_face_id: Option<String>,
+    /// Quantization label: int4/int8/fp4/fp6/fp8/fp16/bf16/fp32.
+    pub quantization: Option<String>,
+    /// Maximum number of output tokens the model can produce in a single response.
+    pub max_output_length: Option<i32>,
+    /// Sampling parameters accepted by the model (OpenRouter vocabulary).
+    pub supported_sampling_parameters: Vec<String>,
+    /// Feature capabilities (OpenRouter vocabulary: tools, json_mode, ...).
+    pub supported_features: Vec<String>,
+    /// When the model row was created — used as OpenRouter's `created` unix timestamp.
+    pub created_at: chrono::DateTime<chrono::Utc>,
 }
 
 #[derive(Debug, thiserror::Error)]

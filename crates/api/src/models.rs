@@ -703,14 +703,28 @@ pub struct ModelsResponse {
     pub data: Vec<ModelInfo>,
 }
 
-/// Model pricing information (HuggingFace compatible format)
-/// Price is in US dollars per million tokens
+/// Model pricing information.
+///
+/// `input` / `output` are the legacy HuggingFace-style fields (USD per million
+/// tokens, as floats). The remaining fields match OpenRouter's provider spec
+/// (USD per single token, serialized as strings to avoid float precision
+/// issues): https://openrouter.ai/docs/guides/community/for-providers
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct ModelPricing {
-    /// Price per million input tokens in USD
+    /// Price per million input tokens in USD (legacy field, kept for back-compat).
     pub input: f64,
-    /// Price per million output tokens in USD
+    /// Price per million output tokens in USD (legacy field, kept for back-compat).
     pub output: f64,
+    /// OpenRouter: USD per input token, as a string.
+    pub prompt: String,
+    /// OpenRouter: USD per output token, as a string.
+    pub completion: String,
+    /// OpenRouter: USD per image, as a string ("0" when not applicable).
+    pub image: String,
+    /// OpenRouter: USD per request, as a string ("0" when not applicable).
+    pub request: String,
+    /// OpenRouter: USD per cached input token, as a string ("0" when not applicable).
+    pub input_cache_read: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
@@ -719,15 +733,41 @@ pub struct ModelInfo {
     pub object: String,
     pub created: i64,
     pub owned_by: String,
-    /// Pricing information (HuggingFace compatible)
+    /// Human-readable model name (OpenRouter `name`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// HuggingFace identifier (OpenRouter `hugging_face_id`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hugging_face_id: Option<String>,
+    /// Quantization label (OpenRouter `quantization`):
+    /// int4/int8/fp4/fp6/fp8/fp16/bf16/fp32.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quantization: Option<String>,
+    /// Pricing information (HuggingFace + OpenRouter compatible).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pricing: Option<ModelPricing>,
-    /// Context length in tokens
+    /// Context length in tokens.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context_length: Option<i32>,
-    /// Model architecture (input/output modalities)
+    /// Maximum output tokens (OpenRouter `max_output_length`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_output_length: Option<i32>,
+    /// Model architecture (input/output modalities), legacy nested camelCase shape.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub architecture: Option<ModelArchitecture>,
+    /// OpenRouter `input_modalities`: flat snake_case duplicate of architecture.input.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_modalities: Option<Vec<String>>,
+    /// OpenRouter `output_modalities`: flat snake_case duplicate of architecture.output.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_modalities: Option<Vec<String>>,
+    /// Sampling parameters accepted by the model (OpenRouter `supported_sampling_parameters`).
+    pub supported_sampling_parameters: Vec<String>,
+    /// Feature capabilities (OpenRouter `supported_features`).
+    pub supported_features: Vec<String>,
+    /// Human-readable description (OpenRouter `description`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -2869,6 +2909,24 @@ pub struct UpdateModelApiRequest {
     /// Base URL for the model's inference endpoint
     #[serde(rename = "inferenceUrl", skip_serializing_if = "Option::is_none")]
     pub inference_url: Option<String>,
+    /// HuggingFace identifier (required by OpenRouter when the model is on HF).
+    #[serde(rename = "huggingFaceId", skip_serializing_if = "Option::is_none")]
+    pub hugging_face_id: Option<String>,
+    /// Quantization label (int4/int8/fp4/fp6/fp8/fp16/bf16/fp32).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quantization: Option<String>,
+    /// Maximum number of output tokens the model can produce in a single response.
+    #[serde(rename = "maxOutputLength", skip_serializing_if = "Option::is_none")]
+    pub max_output_length: Option<i32>,
+    /// Sampling parameters accepted by the model (OpenRouter vocabulary).
+    #[serde(
+        rename = "supportedSamplingParameters",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub supported_sampling_parameters: Option<Vec<String>>,
+    /// Feature capabilities (OpenRouter vocabulary).
+    #[serde(rename = "supportedFeatures", skip_serializing_if = "Option::is_none")]
+    pub supported_features: Option<Vec<String>>,
     #[serde(rename = "changeReason", skip_serializing_if = "Option::is_none")]
     pub change_reason: Option<String>,
 }

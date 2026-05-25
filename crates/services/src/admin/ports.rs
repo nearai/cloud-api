@@ -26,6 +26,12 @@ pub struct UpdateModelAdminRequest {
     pub output_modalities: Option<Vec<String>>,
     /// Base URL for the model's inference endpoint
     pub inference_url: Option<String>,
+    // OpenRouter-compatibility fields
+    pub hugging_face_id: Option<String>,
+    pub quantization: Option<String>,
+    pub max_output_length: Option<i32>,
+    pub supported_sampling_parameters: Option<Vec<String>>,
+    pub supported_features: Option<Vec<String>>,
     // User audit tracking for history
     pub change_reason: Option<String>,
     pub changed_by_user_id: Option<uuid::Uuid>,
@@ -66,6 +72,12 @@ pub struct ModelPricing {
     pub output_modalities: Option<Vec<String>>,
     /// Base URL for the model's inference endpoint
     pub inference_url: Option<String>,
+    // OpenRouter-compatibility fields
+    pub hugging_face_id: Option<String>,
+    pub quantization: Option<String>,
+    pub max_output_length: Option<i32>,
+    pub supported_sampling_parameters: Vec<String>,
+    pub supported_features: Vec<String>,
 }
 
 /// Model history entry - includes pricing, context length, and other model attributes
@@ -89,6 +101,12 @@ pub struct ModelHistoryEntry {
     pub input_modalities: Option<Vec<String>>,
     pub output_modalities: Option<Vec<String>>,
     pub inference_url: Option<String>,
+    // OpenRouter-compatibility snapshot
+    pub hugging_face_id: Option<String>,
+    pub quantization: Option<String>,
+    pub max_output_length: Option<i32>,
+    pub supported_sampling_parameters: Vec<String>,
+    pub supported_features: Vec<String>,
     pub effective_from: chrono::DateTime<chrono::Utc>,
     pub effective_until: Option<chrono::DateTime<chrono::Utc>>,
     pub changed_by_user_id: Option<uuid::Uuid>,
@@ -199,6 +217,12 @@ pub struct AdminModelInfo {
     pub output_modalities: Option<Vec<String>>,
     /// Base URL for the model's inference endpoint
     pub inference_url: Option<String>,
+    // OpenRouter-compatibility fields
+    pub hugging_face_id: Option<String>,
+    pub quantization: Option<String>,
+    pub max_output_length: Option<i32>,
+    pub supported_sampling_parameters: Vec<String>,
+    pub supported_features: Vec<String>,
 }
 
 /// Organization information for admin listing (includes spend limit and usage)

@@ -383,6 +383,22 @@ pub async fn setup_test_server() -> axum_test::TestServer {
     server
 }
 
+/// Variant of `setup_test_server` that runs an arbitrary mutator against
+/// the test `ApiConfig` before the test server is built. Use when a test
+/// needs to flip a config knob — e.g. to enable the
+/// `/v1/internal/usage` endpoint by setting `internal_usage_token` —
+/// without racing other tests via process-wide env vars.
+pub async fn setup_test_server_with_config<F>(mutate: F) -> axum_test::TestServer
+where
+    F: FnOnce(&mut config::ApiConfig),
+{
+    let mut infra = setup_test_infrastructure().await;
+    mutate(&mut infra.config);
+    let (server, _pool, _mock) =
+        build_test_server_components(infra.database.clone(), infra.config).await;
+    server
+}
+
 pub async fn setup_test_server_with_database() -> (axum_test::TestServer, Arc<Database>) {
     let (server, _, _, database) = setup_test_server_with_pool().await;
     (server, database)

@@ -676,14 +676,14 @@ async fn test_internal_usage_returns_503_when_disabled() {
     );
 }
 
-/// `POST /v1/internal/usage` returns 401 when the deployment is configured
-/// but the request omits or mismatches the service token. Today we can
-/// only e2e-test the *missing-header* shape because flipping the config
-/// at runtime in the shared test harness would race other tests; the
-/// `wrong-token` shape is covered by the `verify_internal_usage_token`
-/// unit tests in the route file.
+/// `POST /v1/internal/usage` returns 503 even when the request omits the
+/// `Authorization` header — the disabled-endpoint check runs *before*
+/// the missing-header check, so callers see a single fail-closed
+/// response regardless of what they sent. (The 401-on-mismatch path
+/// is covered by `verify_internal_usage_token`'s unit tests; flipping
+/// the harness config at runtime would race other tests.)
 #[tokio::test]
-async fn test_internal_usage_returns_503_without_authorization() {
+async fn test_internal_usage_503_takes_precedence_over_missing_auth() {
     let server = setup_test_server().await;
 
     let response = server
@@ -700,7 +700,119 @@ async fn test_internal_usage_returns_503_without_authorization() {
         }))
         .await;
 
-    // With no token configured, the disabled-503 check fires before the
-    // missing-header-401 path can run. Documents the current ordering.
     assert_eq!(response.status_code(), 503);
+}
+
+/// Defense against extractor-ordering regressions: when the endpoint is
+/// disabled, a request with a malformed body must still return 503 (not
+/// 400/422). The handler takes raw `Bytes` and runs the token check
+/// before attempting to deserialize, so body shape can't leak through
+/// to unauthenticated callers.
+#[tokio::test]
+async fn test_internal_usage_503_takes_precedence_over_bad_body() {
+    let server = setup_test_server().await;
+
+    let response = server
+        .post("/v1/internal/usage")
+        .add_header("Authorization", "Bearer anything")
+        .add_header("Content-Type", "application/json")
+        .text("{not valid json")
+        .await;
+
+    assert_eq!(
+        response.status_code(),
+        503,
+        "Disabled endpoint must short-circuit before body parsing: {}",
+        response.text()
+    );
+}
+
+/// Happy path with `internal_usage_token` configured: a valid request
+/// produces a row identical to what the legacy `/v1/usage` endpoint
+/// would write. Exercises the actual `serde(flatten)` of
+/// `RecordUsageApiRequest` under the wrapper — guards against
+/// "wire-format works in production for the first time after a config
+/// flip on staging."
+///
+/// `api_key_id` comes from the workspace's `create_api_key` response so
+/// the FK to `api_keys` resolves. This avoids depending on whatever
+/// shape `/v1/check_api_key` is returning at the time the test runs
+/// (PR #664 adds `api_key_id` there; until that lands the field is
+/// just absent).
+#[tokio::test]
+async fn test_internal_usage_records_with_valid_token() {
+    const TOKEN: &str = "test-internal-secret";
+    let server = setup_test_server_with_config(|c| {
+        c.internal_usage_token = Some(TOKEN.to_string());
+    })
+    .await;
+
+    setup_qwen_model(&server).await;
+    let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
+    let workspaces = list_workspaces(&server, org.id.clone()).await;
+    let workspace_id = workspaces.first().unwrap().id.clone();
+    let api_key_resp = create_api_key_in_workspace(
+        &server,
+        workspace_id.clone(),
+        "internal-usage-happy-path".to_string(),
+    )
+    .await;
+
+    let response = server
+        .post("/v1/internal/usage")
+        .add_header("Authorization", format!("Bearer {TOKEN}"))
+        .json(&serde_json::json!({
+            "organization_id": org.id,
+            "workspace_id": workspace_id,
+            "api_key_id": api_key_resp.id,
+            "type": "chat_completion",
+            "model": "Qwen/Qwen3-30B-A3B-Instruct-2507",
+            "input_tokens": 100,
+            "output_tokens": 50,
+            "id": "test-internal-happy-path"
+        }))
+        .await;
+
+    assert_eq!(
+        response.status_code(),
+        200,
+        "Authenticated internal request should succeed: {}",
+        response.text()
+    );
+
+    let body: serde_json::Value = response.json();
+    assert_eq!(body["type"], "chat_completion");
+    assert_eq!(body["input_tokens"], 100);
+    assert_eq!(body["output_tokens"], 50);
+    // Cost shape matches the legacy endpoint (uses same service-layer call).
+    assert_eq!(body["total_cost"], 200_000_000i64);
+}
+
+/// `/v1/internal/usage` returns 401 when configured but called with the
+/// wrong token. Pairs with the happy-path test; unit tests cover the
+/// `verify_internal_usage_token` function directly but this asserts the
+/// route handler wires it correctly.
+#[tokio::test]
+async fn test_internal_usage_returns_401_on_wrong_token() {
+    let server = setup_test_server_with_config(|c| {
+        c.internal_usage_token = Some("expected-secret".to_string());
+    })
+    .await;
+
+    let response = server
+        .post("/v1/internal/usage")
+        .add_header("Authorization", "Bearer wrong-secret")
+        .json(&serde_json::json!({
+            "organization_id": "00000000-0000-0000-0000-000000000000",
+            "workspace_id": "00000000-0000-0000-0000-000000000000",
+            "api_key_id": "00000000-0000-0000-0000-000000000000",
+            "type": "chat_completion",
+            "model": "Qwen/Qwen3-30B-A3B-Instruct-2507",
+            "input_tokens": 1,
+            "output_tokens": 1,
+            "id": "test-internal-wrong-token"
+        }))
+        .await;
+
+    assert_eq!(response.status_code(), 401);
 }

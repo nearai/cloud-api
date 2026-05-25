@@ -825,15 +825,19 @@ fn build_record_usage_response(entry: services::usage::UsageLogEntry) -> RecordU
 /// Internal endpoints aren't surfaced in the public OpenAPI doc anyway.
 #[derive(Debug, Deserialize)]
 pub struct RecordUsageInternalRequest {
-    /// UUID of the organization to bill. Verified to match the
-    /// `workspace_id` / `api_key_id` via the existing service-layer
-    /// lookup; mismatched IDs trip the standard validation path and
-    /// return 400.
+    /// UUID of the organization to bill. **Trusted as provided** —
+    /// `record_usage_from_api` does not cross-validate that this org
+    /// owns the supplied `workspace_id` or `api_key_id`, matching the
+    /// stated threat model (any holder of `CLOUD_API_USAGE_TOKEN` is
+    /// allowed to write rows on behalf of any tenant). Reporters must
+    /// supply mutually consistent values; cloud-api enforces only
+    /// existence of the model named in the inner `usage` payload.
     pub organization_id: String,
-    /// UUID of the workspace the usage belongs to.
+    /// UUID of the workspace the usage belongs to. Trusted as provided
+    /// (see `organization_id`).
     pub workspace_id: String,
     /// UUID of the API key the usage should be attributed to (for
-    /// per-key analytics).
+    /// per-key analytics). Trusted as provided.
     pub api_key_id: String,
     /// The standard usage payload, identical to `POST /v1/usage`.
     #[serde(flatten)]
@@ -886,9 +890,26 @@ fn verify_internal_usage_token(
 pub async fn record_usage_internal(
     State(app_state): State<AppState>,
     headers: HeaderMap,
-    Json(request): Json<RecordUsageInternalRequest>,
+    body: axum::body::Bytes,
 ) -> Result<ResponseJson<RecordUsageResponse>, UsageError> {
+    // Auth before body deserialization. Axum extractors run in signature
+    // order, so passing `Json<…>` directly would parse the body before
+    // any auth check — meaning a disabled-endpoint + malformed-body
+    // request would return 422 instead of 503, and unauthenticated
+    // callers could probe the body schema via parse errors. We take
+    // raw `Bytes` and deserialize only after `verify_internal_usage_token`
+    // succeeds, preserving the fail-closed posture.
     verify_internal_usage_token(&headers, app_state.config.internal_usage_token.as_deref())?;
+
+    let request: RecordUsageInternalRequest = serde_json::from_slice(&body).map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            ResponseJson(ErrorResponse::new(
+                format!("Invalid request body: {e}"),
+                "validation_error".to_string(),
+            )),
+        )
+    })?;
 
     let parse_uuid = |raw: &str, field: &'static str| {
         Uuid::parse_str(raw).map_err(|_| {

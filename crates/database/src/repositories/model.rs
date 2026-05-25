@@ -527,8 +527,11 @@ impl ModelRepository {
                             hugging_face_id = COALESCE(EXCLUDED.hugging_face_id, models.hugging_face_id),
                             quantization = COALESCE(EXCLUDED.quantization, models.quantization),
                             max_output_length = COALESCE(EXCLUDED.max_output_length, models.max_output_length),
-                            supported_sampling_parameters = EXCLUDED.supported_sampling_parameters,
-                            supported_features = EXCLUDED.supported_features,
+                            -- Use the raw params here (not EXCLUDED), since EXCLUDED is the
+                            -- COALESCEd empty-array default for new rows. Referencing the
+                            -- param directly preserves existing values on partial updates.
+                            supported_sampling_parameters = COALESCE($23, models.supported_sampling_parameters),
+                            supported_features = COALESCE($24, models.supported_features),
                             updated_at = NOW()
                         RETURNING id, model_name, model_display_name, model_description, model_icon,
                                   input_cost_per_token, output_cost_per_token, cost_per_image, cache_read_cost_per_token,

@@ -1234,17 +1234,28 @@ pub async fn models(
     Ok(ResponseJson(response))
 }
 
-/// Convert nano-dollars per token (DB scale 9) to a USD-per-token string
-/// suitable for OpenRouter (e.g. 8_000 → "0.000008"). Strings are required
-/// by the OpenRouter provider spec to avoid float precision issues.
+/// Convert a nano-USD amount (DB scale 9 — used for per-token, per-image, and
+/// per-request prices) to a USD string suitable for OpenRouter
+/// (e.g. 8_000 → "0.000008"). Strings are required by the OpenRouter provider
+/// spec to avoid float precision issues, so this uses pure integer arithmetic.
+/// Pricing is non-negative throughout the system; a defensive `abs()` keeps
+/// the formatter total in the unexpected case.
 fn nano_dollars_to_per_token_string(nano_dollars: i64) -> String {
-    let usd = (nano_dollars as f64) / 1_000_000_000.0;
-    if usd == 0.0 {
+    if nano_dollars == 0 {
         return "0".to_string();
     }
-    let mut s = format!("{usd:.9}");
-    if s.contains('.') {
-        s = s.trim_end_matches('0').trim_end_matches('.').to_string();
+    let n = nano_dollars.unsigned_abs();
+    let dollars = n / 1_000_000_000;
+    let nanos = n % 1_000_000_000;
+    let mut s = if nanos == 0 {
+        format!("{dollars}")
+    } else {
+        let frac = format!("{nanos:09}");
+        let frac = frac.trim_end_matches('0');
+        format!("{dollars}.{frac}")
+    };
+    if nano_dollars < 0 {
+        s.insert(0, '-');
     }
     s
 }
@@ -1304,6 +1315,55 @@ fn model_with_pricing_to_info(model: services::models::ModelWithPricing) -> Mode
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nano_dollars_zero_renders_as_bare_zero() {
+        assert_eq!(nano_dollars_to_per_token_string(0), "0");
+    }
+
+    #[test]
+    fn nano_dollars_one_keeps_full_nine_decimal_places() {
+        // 1 nano-USD = $0.000000001 — boundary for our scale.
+        assert_eq!(nano_dollars_to_per_token_string(1), "0.000000001");
+    }
+
+    #[test]
+    fn nano_dollars_typical_per_token_price_trims_trailing_zeros() {
+        // $0.000008 per token, e.g. Claude Sonnet input.
+        assert_eq!(nano_dollars_to_per_token_string(8_000), "0.000008");
+        // $0.000024 per token, e.g. Claude Sonnet output.
+        assert_eq!(nano_dollars_to_per_token_string(24_000), "0.000024");
+    }
+
+    #[test]
+    fn nano_dollars_whole_dollar_amount_omits_decimal_point() {
+        // 1_000_000_000 nano-USD = $1 exactly. Must NOT render as "1." or "1.0".
+        assert_eq!(nano_dollars_to_per_token_string(1_000_000_000), "1");
+        assert_eq!(nano_dollars_to_per_token_string(5_000_000_000), "5");
+    }
+
+    #[test]
+    fn nano_dollars_mixed_integer_and_fraction() {
+        // $1.500000000 → "1.5" after trim.
+        assert_eq!(nano_dollars_to_per_token_string(1_500_000_000), "1.5");
+        // $1.000000001 → all 9 frac digits preserved (no trailing zeros to trim).
+        assert_eq!(
+            nano_dollars_to_per_token_string(1_000_000_001),
+            "1.000000001"
+        );
+    }
+
+    #[test]
+    fn nano_dollars_max_i64_does_not_lose_precision() {
+        // Integer arithmetic must remain exact at the upper bound, unlike the
+        // previous f64-based implementation.
+        // i64::MAX = 9_223_372_036_854_775_807 nano-USD
+        //         = 9_223_372_036.854775807 USD
+        assert_eq!(
+            nano_dollars_to_per_token_string(i64::MAX),
+            "9223372036.854775807"
+        );
+    }
 
     fn make_chat_chunk(id: &str) -> inference_providers::StreamChunk {
         inference_providers::StreamChunk::Chat(inference_providers::models::ChatCompletionChunk {

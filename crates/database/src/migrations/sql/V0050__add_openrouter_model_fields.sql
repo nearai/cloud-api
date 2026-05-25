@@ -4,7 +4,10 @@
 -- (https://openrouter.ai/docs/guides/community/for-providers) so that
 -- `GET /v1/models` can expose them without inventing data at the route layer.
 --
--- All columns are nullable / default empty; existing rows keep working and
+-- Scalar columns (`hugging_face_id`, `quantization`, `max_output_length`)
+-- are nullable. Array columns (`supported_sampling_parameters`,
+-- `supported_features`) are NOT NULL with an empty-array default so callers
+-- can treat them as always-present lists. Existing rows keep working and
 -- admin endpoints can backfill values per-model.
 
 -- HuggingFace identifier (e.g. "Qwen/Qwen3-VL-30B-A3B-Instruct"). Required by

@@ -541,19 +541,32 @@ async fn test_external_usage_record_does_not_collide_with_internal_pipeline() {
         external_resp.text()
     );
 
-    // Let the streaming pipeline's spawn_blocking finalize task land.
-    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-
-    let history_resp = server
-        .get(&format!(
-            "/v1/organizations/{}/usage/history?limit=10&offset=0",
-            org.id
-        ))
-        .add_header("Authorization", format!("Bearer {}", get_session_id()))
-        .add_header("User-Agent", MOCK_USER_AGENT)
-        .await;
-    assert_eq!(history_resp.status_code(), 200);
-    let history: api::routes::usage::UsageHistoryResponse = history_resp.json();
+    // Poll usage history until both records land. The internal pipeline's
+    // record is written from a spawn_blocking finalize task, so it can
+    // arrive a few hundred ms after the stream closes. Polling avoids the
+    // flake risk of a fixed sleep on slow CI.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let history = loop {
+        let resp = server
+            .get(&format!(
+                "/v1/organizations/{}/usage/history?limit=10&offset=0",
+                org.id
+            ))
+            .add_header("Authorization", format!("Bearer {}", get_session_id()))
+            .add_header("User-Agent", MOCK_USER_AGENT)
+            .await;
+        assert_eq!(resp.status_code(), 200);
+        let history: api::routes::usage::UsageHistoryResponse = resp.json();
+        let matching = history
+            .data
+            .iter()
+            .filter(|e| e.provider_request_id.as_deref() == Some(provider_id.as_str()))
+            .count();
+        if matching >= 2 || std::time::Instant::now() >= deadline {
+            break history;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    };
 
     // Both records must land: one from the external submission, one from
     // the internal pipeline. If they share an inference_id, the second

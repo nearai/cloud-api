@@ -121,12 +121,7 @@ impl FeatureRequestRepository {
                     INSERT INTO feature_request_targets (kind, key, title)
                     VALUES ($1, $2, $3)
                     ON CONFLICT (kind, key) DO UPDATE
-                    SET title = EXCLUDED.title,
-                        updated_at = CASE
-                            WHEN feature_request_targets.title IS DISTINCT FROM EXCLUDED.title
-                            THEN NOW()
-                            ELSE feature_request_targets.updated_at
-                        END
+                    SET title = feature_request_targets.title
                     RETURNING id, kind, key, title, status, created_at, updated_at
                     "#,
                     &[&params.kind, &params.key, &params.title],

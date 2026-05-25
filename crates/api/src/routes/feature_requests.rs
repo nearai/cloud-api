@@ -205,7 +205,7 @@ pub async fn submit_feature_request(
 #[utoipa::path(
     get,
     path = "/v1/admin/feature-requests",
-    tag = "Admin",
+    tag = "Feature Requests",
     params(AdminFeatureRequestListQuery),
     responses(
         (status = 200, description = "Aggregated feature requests", body = AdminFeatureRequestListResponse),
@@ -348,6 +348,7 @@ fn summary_to_response(summary: FeatureRequestSummary) -> AdminFeatureRequestSum
 }
 
 fn internal_error(error: anyhow::Error) -> (StatusCode, ResponseJson<ErrorResponse>) {
+    // PRIVACY: keep context here generic; request titles, notes, and sources can contain user data.
     error!("Feature request operation failed: {:?}", error);
     (
         StatusCode::INTERNAL_SERVER_ERROR,

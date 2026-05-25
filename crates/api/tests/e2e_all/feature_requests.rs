@@ -4,6 +4,7 @@ use crate::common::*;
 async fn test_feature_request_submit_dedupes_by_user_and_admin_lists() {
     let (server, database) = setup_test_server_with_database().await;
     let request_key = format!("missing-model-{}", uuid::Uuid::new_v4());
+    let request_title = format!("Missing Model {}", uuid::Uuid::new_v4());
 
     let first = server
         .post("/v1/feature-requests")
@@ -12,7 +13,7 @@ async fn test_feature_request_submit_dedupes_by_user_and_admin_lists() {
         .json(&serde_json::json!({
             "kind": "model",
             "key": request_key,
-            "title": request_key,
+            "title": request_title,
             "note": "Need it for evals",
             "source": "models_page"
         }))
@@ -28,7 +29,7 @@ async fn test_feature_request_submit_dedupes_by_user_and_admin_lists() {
         .json(&serde_json::json!({
             "kind": "model",
             "key": request_key,
-            "title": request_key,
+            "title": "A later voter should not replace the title",
             "note": "Updated use case",
             "source": "models_page"
         }))
@@ -45,7 +46,7 @@ async fn test_feature_request_submit_dedupes_by_user_and_admin_lists() {
         .json(&serde_json::json!({
             "kind": "model",
             "key": request_key,
-            "title": request_key,
+            "title": "Another later voter should not replace the title",
             "note": "Another user also needs this",
             "source": "models_page"
         }))
@@ -68,6 +69,7 @@ async fn test_feature_request_submit_dedupes_by_user_and_admin_lists() {
         .iter()
         .find(|item| item["target"]["key"] == request_key.to_ascii_lowercase())
         .expect("submitted request should be listed");
+    assert_eq!(found["target"]["title"], request_title);
     assert_eq!(found["uniqueUserCount"], 2);
     assert_eq!(found["recentVotes"].as_array().unwrap().len(), 2);
 }

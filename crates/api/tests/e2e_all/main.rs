@@ -26,6 +26,7 @@ mod duplicate_names;
 mod embeddings;
 mod error_msg;
 mod external_providers;
+mod feature_requests;
 mod files;
 mod function_tools;
 mod general;

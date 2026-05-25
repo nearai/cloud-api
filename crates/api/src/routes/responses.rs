@@ -398,6 +398,7 @@ pub async fn create_response(
                 let mut content = String::new();
                 let mut status = ResponseStatus::InProgress;
                 let mut final_response: Option<ResponseObject> = None;
+                let mut tracked_usage: Option<Usage> = None;
 
                 let mut stream = Box::pin(stream);
                 let mut event_count = 0;
@@ -436,6 +437,9 @@ pub async fn create_response(
                         }
                         "response.completed" => {
                             status = ResponseStatus::Completed;
+                            if event.usage.is_some() {
+                                tracked_usage = event.usage.clone();
+                            }
                             tracing::debug!(
                                 "Non-streaming: response.completed event, accumulated_content_len={}",
                                 content.len()
@@ -479,6 +483,9 @@ pub async fn create_response(
                         }
                         "response.failed" => {
                             status = ResponseStatus::Failed;
+                            if event.usage.is_some() {
+                                tracked_usage = event.usage.clone();
+                            }
                         }
                         _ => {
                             // Handle other events as needed
@@ -557,7 +564,7 @@ pub async fn create_response(
                         top_logprobs: 0,
                         top_p: request.top_p.unwrap_or(1.0),
                         truncation: "disabled".to_string(),
-                        usage: Usage::new(0, 0), // TODO: Get actual usage from stream
+                        usage: tracked_usage.unwrap_or_else(|| Usage::new(0, 0)),
                         user: None,
                         metadata: request.metadata,
                     }

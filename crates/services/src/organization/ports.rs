@@ -206,6 +206,14 @@ pub struct OrganizationInvitation {
     pub email_message_id: Option<String>,
 }
 
+/// Organization invitation with display details needed by invitees
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OrganizationInvitationWithDetails {
+    pub invitation: OrganizationInvitation,
+    pub organization_name: String,
+    pub invited_by_display_name: Option<String>,
+}
+
 /// Create invitation request
 #[derive(Debug, Clone)]
 pub struct CreateInvitationRequest {
@@ -329,6 +337,13 @@ pub trait OrganizationInvitationRepository: Send + Sync {
         email: &str,
         status: Option<InvitationStatus>,
     ) -> Result<Vec<OrganizationInvitation>>;
+
+    /// List invitations for a user by email, enriched with organization and inviter details
+    async fn list_by_email_with_details(
+        &self,
+        email: &str,
+        status: Option<InvitationStatus>,
+    ) -> Result<Vec<OrganizationInvitationWithDetails>>;
 
     /// Update invitation status
     async fn update_status(
@@ -522,7 +537,7 @@ pub trait OrganizationServiceTrait: Send + Sync {
     async fn list_user_invitations(
         &self,
         email: &str,
-    ) -> Result<Vec<OrganizationInvitation>, OrganizationError>;
+    ) -> Result<Vec<OrganizationInvitationWithDetails>, OrganizationError>;
 
     /// Get invitation by token (public, for viewing before auth)
     async fn get_invitation_by_token(

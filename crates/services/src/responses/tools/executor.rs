@@ -39,6 +39,7 @@ impl<'a> ToolEventContext<'a> {
             annotation_index: None,
             annotation: None,
             conversation_title: None,
+            usage: None,
         };
         self.emitter.send_raw(event).await
     }

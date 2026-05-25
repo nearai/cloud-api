@@ -991,6 +991,8 @@ pub struct ResponseStreamEvent {
     pub annotation: Option<TextAnnotation>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub conversation_title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage: Option<Usage>,
 }
 
 /// Input item list for responses

@@ -945,9 +945,9 @@ impl OrganizationServiceImpl {
     async fn list_user_invitations_impl(
         &self,
         email: &str,
-    ) -> Result<Vec<ports::OrganizationInvitation>, OrganizationError> {
+    ) -> Result<Vec<ports::OrganizationInvitationWithDetails>, OrganizationError> {
         self.invitation_repository
-            .list_by_email(email, Some(ports::InvitationStatus::Pending))
+            .list_by_email_with_details(email, Some(ports::InvitationStatus::Pending))
             .await
             .map_err(|e| {
                 OrganizationError::InternalError(format!("Failed to list invitations: {e}"))
@@ -1384,7 +1384,7 @@ impl OrganizationServiceTrait for OrganizationServiceImpl {
     async fn list_user_invitations(
         &self,
         email: &str,
-    ) -> Result<Vec<OrganizationInvitation>, OrganizationError> {
+    ) -> Result<Vec<OrganizationInvitationWithDetails>, OrganizationError> {
         self.list_user_invitations_impl(email).await
     }
 
@@ -1805,6 +1805,14 @@ mod tests {
             _: &str,
             _: Option<InvitationStatus>,
         ) -> anyhow::Result<Vec<OrganizationInvitation>> {
+            unimplemented!()
+        }
+
+        async fn list_by_email_with_details(
+            &self,
+            _: &str,
+            _: Option<InvitationStatus>,
+        ) -> anyhow::Result<Vec<OrganizationInvitationWithDetails>> {
             unimplemented!()
         }
 

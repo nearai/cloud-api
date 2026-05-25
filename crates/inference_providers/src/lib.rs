@@ -60,6 +60,7 @@ pub mod chunk_builder;
 pub mod external;
 pub mod mock;
 pub mod models;
+pub mod rotation;
 pub mod spki_verifier;
 pub mod sse_parser;
 pub mod vllm;
@@ -86,7 +87,9 @@ pub use models::{
     ScoreError, ScoreParams, ScoreResponse, ScoreResult, ScoreUsage, StreamChunk, StreamOptions,
     TokenUsage, ToolChoice, ToolDefinition, TranscriptionSegment, TranscriptionWord,
 };
-pub use sse_parser::{new_sse_parser, BufferedSSEParser, SSEEvent, SSEEventParser, SSEParser};
+pub use sse_parser::{
+    new_external_sse_parser, new_sse_parser, BufferedSSEParser, SSEEvent, SSEEventParser, SSEParser,
+};
 pub use vllm::{VLlmConfig, VLlmProvider};
 
 // Chunk builder for external provider parsers
@@ -115,8 +118,9 @@ pub trait BackendVerifier: Send + Sync {
 ///
 /// Supports common formats:
 ///   - OpenAI/Anthropic: `{"error": {"message": "..."}}`
+///   - vLLM flat: `{"object": "error", "message": "...", "type": "..."}`
 ///   - vLLM/FastAPI: `{"detail": "..."}`
-///   - Falls back to the raw body if neither matches
+///   - Falls back to the raw body if none match
 pub fn extract_error_message(body: &str) -> String {
     if let Ok(json) = serde_json::from_str::<serde_json::Value>(body) {
         // OpenAI/Anthropic format: {"error": {"message": "..."}}
@@ -127,7 +131,13 @@ pub fn extract_error_message(body: &str) -> String {
         {
             return msg.to_string();
         }
-        // vLLM/FastAPI format: {"detail": "..."}
+        // vLLM flat format: {"object":"error","message":"...","type":"..."}
+        // Distinguished from envelope JSON by the top-level `message` field
+        // (we don't want to pick up `message` fields nested deep elsewhere).
+        if let Some(msg) = json.get("message").and_then(|m| m.as_str()) {
+            return msg.to_string();
+        }
+        // FastAPI format: {"detail": "..."}
         if let Some(detail) = json.get("detail").and_then(|d| d.as_str()) {
             return detail.to_string();
         }
@@ -263,6 +273,13 @@ pub trait InferenceProvider {
     /// Clean up the dedicated client for a chat_id after signature fetching.
     fn unpin_chat_connection(&self, _chat_id: &str) {}
 
+    /// Update the provider's view of how many healthy backends sit behind its
+    /// canonical SNI. Discovery calls this after each cycle so the traffic-
+    /// time fallback path knows how many rotation-SNI indices to iterate when
+    /// the sticky backend returns a 5xx. Default is a no-op — only providers
+    /// that participate in model-proxy rotation (vLLM) override it.
+    fn set_backend_count(&self, _count: usize) {}
+
     async fn get_attestation_report(
         &self,
         model: String,
@@ -281,4 +298,51 @@ pub trait InferenceProvider {
         params: AudioTranscriptionParams,
         request_hash: String,
     ) -> Result<AudioTranscriptionResponse, AudioTranscriptionError>;
+}
+
+#[cfg(test)]
+mod extract_error_message_tests {
+    use super::extract_error_message;
+
+    #[test]
+    fn test_openai_nested_format() {
+        let body = r#"{"error":{"message":"Invalid API key","type":"auth_error"}}"#;
+        assert_eq!(extract_error_message(body), "Invalid API key");
+    }
+
+    #[test]
+    fn test_vllm_flat_format() {
+        // vLLM/sglang emit this shape for validation errors.
+        let body = r#"{"object":"error","message":"dimensions parameter is not supported for this model","type":"BadRequestError","param":null,"code":400}"#;
+        assert_eq!(
+            extract_error_message(body),
+            "dimensions parameter is not supported for this model"
+        );
+    }
+
+    #[test]
+    fn test_fastapi_detail_format() {
+        let body = r#"{"detail":"Validation failed"}"#;
+        assert_eq!(extract_error_message(body), "Validation failed");
+    }
+
+    #[test]
+    fn test_unknown_json_falls_back_to_body() {
+        let body = r#"{"weird_shape":true}"#;
+        assert_eq!(extract_error_message(body), body);
+    }
+
+    #[test]
+    fn test_non_json_falls_back_to_body() {
+        let body = "plain text error";
+        assert_eq!(extract_error_message(body), body);
+    }
+
+    #[test]
+    fn test_prefers_nested_error_over_flat_message() {
+        // If both shapes are present, prefer the explicit error envelope.
+        let body =
+            r#"{"error":{"message":"from envelope"},"message":"from flat","type":"whatever"}"#;
+        assert_eq!(extract_error_message(body), "from envelope");
+    }
 }

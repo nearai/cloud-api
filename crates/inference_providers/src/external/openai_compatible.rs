@@ -11,7 +11,7 @@
 
 use super::backend::{BackendConfig, ExternalBackend};
 use crate::{
-    models::StreamOptions, sse_parser::new_sse_parser, AudioTranscriptionError,
+    models::StreamOptions, sse_parser::new_external_sse_parser, AudioTranscriptionError,
     AudioTranscriptionParams, AudioTranscriptionResponse, ChatCompletionParams,
     ChatCompletionResponse, ChatCompletionResponseWithBytes, CompletionError, ImageGenerationError,
     ImageGenerationParams, ImageGenerationResponse, ImageGenerationResponseWithBytes,
@@ -129,8 +129,11 @@ impl ExternalBackend for OpenAiCompatibleBackend {
             });
         }
 
-        // Use the SSE parser to handle the stream
-        let sse_stream = new_sse_parser(response.bytes_stream(), true);
+        // Use the SSE parser to handle the stream. External upstream → any
+        // in-stream `{"error":{...}}` frame surfaces as
+        // `HttpError { is_external: true }` so `map_provider_error` applies
+        // the third-party taxonomy (e.g. 404 → `ProviderError 502`).
+        let sse_stream = new_external_sse_parser(response.bytes_stream(), true);
         Ok(Box::pin(sse_stream))
     }
 

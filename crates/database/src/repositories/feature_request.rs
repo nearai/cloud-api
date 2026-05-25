@@ -4,6 +4,7 @@ use crate::retry_db;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use services::common::RepositoryError;
+use std::collections::HashMap;
 use tokio_postgres::Row;
 use uuid::Uuid;
 
@@ -121,7 +122,11 @@ impl FeatureRequestRepository {
                     VALUES ($1, $2, $3)
                     ON CONFLICT (kind, key) DO UPDATE
                     SET title = EXCLUDED.title,
-                        updated_at = NOW()
+                        updated_at = CASE
+                            WHEN feature_request_targets.title IS DISTINCT FROM EXCLUDED.title
+                            THEN NOW()
+                            ELSE feature_request_targets.updated_at
+                        END
                     RETURNING id, kind, key, title, status, created_at, updated_at
                     "#,
                     &[&params.kind, &params.key, &params.title],
@@ -238,10 +243,18 @@ impl FeatureRequestRepository {
             Ok::<_, RepositoryError>((rows, total))
         })?;
 
+        let target_ids = rows
+            .iter()
+            .map(|row| row.get::<_, Uuid>("id"))
+            .collect::<Vec<_>>();
+        let mut recent_votes_by_target = self.list_recent_votes_for_targets(&target_ids, 3).await?;
+
         let mut summaries = Vec::with_capacity(rows.len());
         for row in rows {
             let target = Self::row_to_target(&row);
-            let recent_votes = self.list_recent_votes(target.id, 3).await?;
+            let recent_votes = recent_votes_by_target
+                .remove(&target.id)
+                .unwrap_or_default();
             summaries.push(FeatureRequestSummary {
                 target,
                 unique_user_count: row.get("unique_user_count"),
@@ -254,11 +267,15 @@ impl FeatureRequestRepository {
         Ok((summaries, total))
     }
 
-    async fn list_recent_votes(
+    async fn list_recent_votes_for_targets(
         &self,
-        target_id: Uuid,
+        target_ids: &[Uuid],
         limit: i64,
-    ) -> Result<Vec<FeatureRequestVoteSummary>> {
+    ) -> Result<HashMap<Uuid, Vec<FeatureRequestVoteSummary>>> {
+        if target_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+
         let rows = retry_db!("list_recent_feature_request_votes", {
             let client = self
                 .pool
@@ -270,41 +287,65 @@ impl FeatureRequestRepository {
             client
                 .query(
                     r#"
+                    WITH ranked_votes AS (
+                        SELECT
+                            v.target_id,
+                            v.user_id,
+                            u.email AS user_email,
+                            u.display_name AS user_display_name,
+                            v.organization_id,
+                            o.name AS organization_name,
+                            v.note,
+                            v.source,
+                            v.updated_at,
+                            ROW_NUMBER() OVER (
+                                PARTITION BY v.target_id
+                                ORDER BY v.updated_at DESC
+                            ) AS row_number
+                        FROM feature_request_votes v
+                        JOIN users u ON u.id = v.user_id
+                        LEFT JOIN organizations o ON o.id = v.organization_id
+                        WHERE v.target_id = ANY($1::UUID[])
+                    )
                     SELECT
-                        v.user_id,
-                        u.email AS user_email,
-                        u.display_name AS user_display_name,
-                        v.organization_id,
-                        o.name AS organization_name,
-                        v.note,
-                        v.source,
-                        v.updated_at
-                    FROM feature_request_votes v
-                    JOIN users u ON u.id = v.user_id
-                    LEFT JOIN organizations o ON o.id = v.organization_id
-                    WHERE v.target_id = $1
-                    ORDER BY v.updated_at DESC
-                    LIMIT $2
+                        target_id,
+                        user_id,
+                        user_email,
+                        user_display_name,
+                        organization_id,
+                        organization_name,
+                        note,
+                        source,
+                        updated_at
+                    FROM ranked_votes
+                    WHERE row_number <= $2
+                    ORDER BY target_id, updated_at DESC
                     "#,
-                    &[&target_id, &limit],
+                    &[&target_ids, &limit],
                 )
                 .await
                 .map_err(map_db_error)
         })?;
 
-        Ok(rows
-            .iter()
-            .map(|row| FeatureRequestVoteSummary {
-                user_id: row.get("user_id"),
-                user_email: row.get("user_email"),
-                user_display_name: row.get("user_display_name"),
-                organization_id: row.get("organization_id"),
-                organization_name: row.get("organization_name"),
-                note: row.get("note"),
-                source: row.get("source"),
-                updated_at: row.get("updated_at"),
-            })
-            .collect())
+        let mut recent_votes_by_target: HashMap<Uuid, Vec<FeatureRequestVoteSummary>> =
+            HashMap::new();
+        for row in rows {
+            recent_votes_by_target
+                .entry(row.get("target_id"))
+                .or_default()
+                .push(FeatureRequestVoteSummary {
+                    user_id: row.get("user_id"),
+                    user_email: row.get("user_email"),
+                    user_display_name: row.get("user_display_name"),
+                    organization_id: row.get("organization_id"),
+                    organization_name: row.get("organization_name"),
+                    note: row.get("note"),
+                    source: row.get("source"),
+                    updated_at: row.get("updated_at"),
+                });
+        }
+
+        Ok(recent_votes_by_target)
     }
 
     fn row_to_target(row: &Row) -> FeatureRequestTarget {

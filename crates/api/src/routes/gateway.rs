@@ -53,6 +53,9 @@ pub async fn check_api_key(
         valid: true,
         organization_id: api_key.organization.id.to_string(),
         workspace_id: api_key.workspace.id.to_string(),
-        api_key_id: api_key.api_key.id.0.clone(),
+        // `ApiKeyId.0` is already a `String` and `api_key` is owned via
+        // `Extension`, so move it directly. The other two still need
+        // `to_string()` because they wrap `Uuid`.
+        api_key_id: api_key.api_key.id.0,
     }))
 }

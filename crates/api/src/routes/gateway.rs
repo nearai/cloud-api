@@ -5,10 +5,12 @@ use utoipa::ToSchema;
 
 /// Response from the check_api_key endpoint.
 ///
-/// `organization_id` and `workspace_id` are returned so downstream gateways
-/// (e.g. inference-proxy) have a server-side authoritative tenant
-/// identifier and don't have to trust caller-supplied `X-Org-Id`
-/// headers when populating logs / usage records.
+/// `organization_id`, `workspace_id`, and `api_key_id` are returned so
+/// downstream gateways (e.g. inference-proxy) have a server-side
+/// authoritative subject identity and don't have to trust caller-supplied
+/// headers when populating logs / usage records / billing reports. In
+/// particular, this lets a trusted gateway report usage to cloud-api with
+/// a shared service token instead of forwarding the user's `sk-…`.
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct CheckApiKeyResponse {
     /// Whether the API key is valid and authorized
@@ -17,6 +19,9 @@ pub struct CheckApiKeyResponse {
     pub organization_id: String,
     /// Workspace the API key belongs to
     pub workspace_id: String,
+    /// UUID of the API key itself. Used by trusted gateways to attribute
+    /// per-key usage rows without holding the raw `sk-…` value.
+    pub api_key_id: String,
 }
 
 /// Check API key validity
@@ -48,5 +53,6 @@ pub async fn check_api_key(
         valid: true,
         organization_id: api_key.organization.id.to_string(),
         workspace_id: api_key.workspace.id.to_string(),
+        api_key_id: api_key.api_key.id.0.clone(),
     }))
 }

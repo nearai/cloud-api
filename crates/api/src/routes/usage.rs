@@ -5,13 +5,14 @@ use crate::{
 };
 use axum::{
     extract::{Path, Query, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::Json as ResponseJson,
     Extension, Json,
 };
 use chrono::{Duration, Utc};
 use serde::{Deserialize, Serialize};
 use services::organization::OrganizationError;
+use subtle::ConstantTimeEq;
 use utoipa::ToSchema;
 use uuid::Uuid;
 
@@ -748,10 +749,17 @@ pub async fn record_usage(
             }
         })?;
 
-    // Use the *returned entry's* inference_type to determine response format,
-    // not the incoming request type. When idempotency returns an existing record
-    // the request type may differ from the stored record's actual type.
-    let response = match entry.inference_type {
+    Ok(ResponseJson(build_record_usage_response(entry)))
+}
+
+/// Build the public `RecordUsageResponse` from a service-layer `UsageLogEntry`.
+///
+/// The variant is chosen by the *returned entry's* `inference_type` rather
+/// than the caller's request type so that an idempotent duplicate (which
+/// returns the existing row, possibly recorded under a different type) is
+/// still serialized correctly.
+fn build_record_usage_response(entry: services::usage::UsageLogEntry) -> RecordUsageResponse {
+    match entry.inference_type {
         services::usage::InferenceType::ImageGeneration
         | services::usage::InferenceType::ImageEdit => RecordUsageResponse::ImageGeneration {
             id: entry.id.to_string(),
@@ -780,9 +788,157 @@ pub async fn record_usage(
             total_cost_display: format_amount(entry.total_cost),
             created_at: entry.created_at.to_rfc3339(),
         },
-    };
+    }
+}
 
-    Ok(ResponseJson(response))
+// =====================================================================
+// POST /v1/internal/usage — Service-token-authenticated usage recording
+// =====================================================================
+//
+// This endpoint is the locked-down replacement for `POST /v1/usage` aimed
+// at trusted infrastructure reporters (today: inference-proxy). Instead of
+// accepting an `sk-…` API key — which lets any holder of that key submit
+// arbitrary usage rows on the org's behalf — it requires a shared
+// `CLOUD_API_USAGE_TOKEN` service secret and carries the subject identity
+// (`organization_id`, `workspace_id`, `api_key_id`) in the body.
+//
+// Threat model:
+// - Anyone holding `CLOUD_API_USAGE_TOKEN` can submit usage rows for any
+//   org. The token therefore lives only on trusted infrastructure
+//   (inference-proxy CVMs) and is rotated alongside other service secrets.
+// - The legacy `POST /v1/usage` endpoint stays available so the rollout
+//   can be staged. Once all reporters have switched, that endpoint can be
+//   restricted or removed (separate PR).
+//
+// The body shape is the existing `RecordUsageApiRequest` flattened under a
+// wrapper that adds the three identity fields. The actual usage payload
+// is identical to the legacy endpoint so reporters keep one builder.
+
+/// Request body for `POST /v1/internal/usage`. The `usage` field is
+/// flattened, so the on-the-wire shape is the legacy `RecordUsageApiRequest`
+/// JSON with three extra top-level keys.
+///
+/// `ToSchema` is intentionally not derived: `RecordUsageApiRequest`
+/// doesn't implement `PartialSchema` (its OpenAPI doc is hand-rolled on
+/// the legacy handler via `request_body = serde_json::Value`), and
+/// `#[serde(flatten)]` requires the inner type to be a known schema.
+/// Internal endpoints aren't surfaced in the public OpenAPI doc anyway.
+#[derive(Debug, Deserialize)]
+pub struct RecordUsageInternalRequest {
+    /// UUID of the organization to bill. Verified to match the
+    /// `workspace_id` / `api_key_id` via the existing service-layer
+    /// lookup; mismatched IDs trip the standard validation path and
+    /// return 400.
+    pub organization_id: String,
+    /// UUID of the workspace the usage belongs to.
+    pub workspace_id: String,
+    /// UUID of the API key the usage should be attributed to (for
+    /// per-key analytics).
+    pub api_key_id: String,
+    /// The standard usage payload, identical to `POST /v1/usage`.
+    #[serde(flatten)]
+    pub usage: services::usage::RecordUsageApiRequest,
+}
+
+/// Validate the `Authorization: Bearer …` header against the configured
+/// `internal_usage_token` in constant time. Returns:
+/// - `Ok(())` on match.
+/// - `Err(503)` if the endpoint is disabled (token not configured).
+/// - `Err(401)` if the header is missing or doesn't match.
+fn verify_internal_usage_token(
+    headers: &HeaderMap,
+    expected: Option<&str>,
+) -> Result<(), UsageError> {
+    let expected = expected.ok_or_else(|| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            ResponseJson(ErrorResponse::new(
+                "Internal usage endpoint is not configured on this deployment".to_string(),
+                "endpoint_disabled".to_string(),
+            )),
+        )
+    })?;
+    let provided = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|h| h.strip_prefix("Bearer "));
+    let unauthorized = || {
+        (
+            StatusCode::UNAUTHORIZED,
+            ResponseJson(ErrorResponse::new(
+                "Invalid or missing service token".to_string(),
+                "unauthorized".to_string(),
+            )),
+        )
+    };
+    let provided = provided.ok_or_else(unauthorized)?;
+    if provided.as_bytes().ct_eq(expected.as_bytes()).into() {
+        Ok(())
+    } else {
+        Err(unauthorized())
+    }
+}
+
+/// Record usage from a trusted internal reporter.
+///
+/// Auth: `Authorization: Bearer <CLOUD_API_USAGE_TOKEN>`. The endpoint is
+/// disabled (503) until that env var is set on the cloud-api side.
+pub async fn record_usage_internal(
+    State(app_state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<RecordUsageInternalRequest>,
+) -> Result<ResponseJson<RecordUsageResponse>, UsageError> {
+    verify_internal_usage_token(&headers, app_state.config.internal_usage_token.as_deref())?;
+
+    let parse_uuid = |raw: &str, field: &'static str| {
+        Uuid::parse_str(raw).map_err(|_| {
+            (
+                StatusCode::BAD_REQUEST,
+                ResponseJson(ErrorResponse::new(
+                    format!("Invalid {field}: must be a UUID"),
+                    "validation_error".to_string(),
+                )),
+            )
+        })
+    };
+    let organization_id = parse_uuid(&request.organization_id, "organization_id")?;
+    let workspace_id = parse_uuid(&request.workspace_id, "workspace_id")?;
+    let api_key_id = parse_uuid(&request.api_key_id, "api_key_id")?;
+
+    let entry = app_state
+        .usage_service
+        .record_usage_from_api(organization_id, workspace_id, api_key_id, request.usage)
+        .await
+        .map_err(|e| match &e {
+            services::usage::UsageError::ModelNotFound(_) => (
+                StatusCode::NOT_FOUND,
+                ResponseJson(ErrorResponse::new(e.to_string(), "not_found".to_string())),
+            ),
+            services::usage::UsageError::ValidationError(_) => (
+                StatusCode::BAD_REQUEST,
+                ResponseJson(ErrorResponse::new(
+                    e.to_string(),
+                    "validation_error".to_string(),
+                )),
+            ),
+            _ => {
+                tracing::error!(
+                    %organization_id,
+                    %workspace_id,
+                    %api_key_id,
+                    "Failed to record internal usage"
+                );
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    ResponseJson(ErrorResponse::new(
+                        "Failed to record usage".to_string(),
+                        "internal_server_error".to_string(),
+                    )),
+                )
+            }
+        })?;
+
+    Ok(ResponseJson(build_record_usage_response(entry)))
 }
 
 // ============= User-facing analytics endpoints =============
@@ -1072,4 +1228,64 @@ pub async fn get_user_organization_timeseries(
             })
             .collect(),
     }))
+}
+
+#[cfg(test)]
+mod internal_usage_tests {
+    use super::*;
+    use axum::http::HeaderValue;
+
+    fn headers_with_bearer(token: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert(
+            "authorization",
+            HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
+        );
+        h
+    }
+
+    #[test]
+    fn verify_returns_503_when_endpoint_unconfigured() {
+        // Default deployment posture: feature disabled until the operator
+        // sets CLOUD_API_USAGE_TOKEN. Reporters fall back to the legacy
+        // /v1/usage path when they observe this.
+        let h = headers_with_bearer("anything");
+        let err = verify_internal_usage_token(&h, None).unwrap_err();
+        assert_eq!(err.0, StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[test]
+    fn verify_returns_401_on_missing_header() {
+        let err = verify_internal_usage_token(&HeaderMap::new(), Some("svc")).unwrap_err();
+        assert_eq!(err.0, StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn verify_returns_401_on_wrong_token() {
+        let h = headers_with_bearer("not-the-right-one");
+        let err = verify_internal_usage_token(&h, Some("the-actual-secret")).unwrap_err();
+        assert_eq!(err.0, StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn verify_returns_401_on_missing_bearer_prefix() {
+        let mut h = HeaderMap::new();
+        h.insert("authorization", HeaderValue::from_static("svc-token"));
+        let err = verify_internal_usage_token(&h, Some("svc-token")).unwrap_err();
+        assert_eq!(err.0, StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn verify_accepts_matching_token() {
+        let h = headers_with_bearer("the-actual-secret");
+        assert!(verify_internal_usage_token(&h, Some("the-actual-secret")).is_ok());
+    }
+
+    #[test]
+    fn verify_rejects_close_but_not_equal_tokens() {
+        // Sanity that we're comparing the whole string, not a prefix.
+        let h = headers_with_bearer("svc-token-tampered");
+        let err = verify_internal_usage_token(&h, Some("svc-token")).unwrap_err();
+        assert_eq!(err.0, StatusCode::UNAUTHORIZED);
+    }
 }

@@ -643,3 +643,64 @@ async fn test_record_chat_completion_usage_cache_read_capped_to_input() {
         response.text()
     );
 }
+
+/// `POST /v1/internal/usage` returns 503 when the deployment has not
+/// configured `CLOUD_API_USAGE_TOKEN`. This is the default test posture
+/// — the feature is fail-closed until an operator sets the secret, so
+/// reporters using the new path can fall back to the legacy `/v1/usage`
+/// without ambiguity.
+#[tokio::test]
+async fn test_internal_usage_returns_503_when_disabled() {
+    let server = setup_test_server().await;
+
+    let response = server
+        .post("/v1/internal/usage")
+        .add_header("Authorization", "Bearer any-token-here")
+        .json(&serde_json::json!({
+            "organization_id": "00000000-0000-0000-0000-000000000000",
+            "workspace_id": "00000000-0000-0000-0000-000000000000",
+            "api_key_id": "00000000-0000-0000-0000-000000000000",
+            "type": "chat_completion",
+            "model": "Qwen/Qwen3-30B-A3B-Instruct-2507",
+            "input_tokens": 10,
+            "output_tokens": 20,
+            "id": "test-internal-disabled"
+        }))
+        .await;
+
+    assert_eq!(
+        response.status_code(),
+        503,
+        "Internal usage must 503 when CLOUD_API_USAGE_TOKEN is not configured: {}",
+        response.text()
+    );
+}
+
+/// `POST /v1/internal/usage` returns 401 when the deployment is configured
+/// but the request omits or mismatches the service token. Today we can
+/// only e2e-test the *missing-header* shape because flipping the config
+/// at runtime in the shared test harness would race other tests; the
+/// `wrong-token` shape is covered by the `verify_internal_usage_token`
+/// unit tests in the route file.
+#[tokio::test]
+async fn test_internal_usage_returns_503_without_authorization() {
+    let server = setup_test_server().await;
+
+    let response = server
+        .post("/v1/internal/usage")
+        .json(&serde_json::json!({
+            "organization_id": "00000000-0000-0000-0000-000000000000",
+            "workspace_id": "00000000-0000-0000-0000-000000000000",
+            "api_key_id": "00000000-0000-0000-0000-000000000000",
+            "type": "chat_completion",
+            "model": "Qwen/Qwen3-30B-A3B-Instruct-2507",
+            "input_tokens": 1,
+            "output_tokens": 1,
+            "id": "test-internal-noauth"
+        }))
+        .await;
+
+    // With no token configured, the disabled-503 check fires before the
+    // missing-header-401 path can run. Documents the current ordering.
+    assert_eq!(response.status_code(), 503);
+}

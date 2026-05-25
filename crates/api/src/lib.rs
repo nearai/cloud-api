@@ -832,6 +832,8 @@ pub fn build_app_with_config(
         rate_limit_state.clone(),
     );
 
+    let internal_routes = build_internal_routes(app_state.clone());
+
     let response_routes = build_response_routes(
         domain_services.response_service,
         domain_services.attestation_service.clone(),
@@ -948,6 +950,7 @@ pub fn build_app_with_config(
                 .merge(billing_routes)
                 .merge(usage_recording_routes)
                 .merge(gateway_routes)
+                .merge(internal_routes)
                 .merge(health_routes),
         )
         .merge(openapi_routes)
@@ -1427,6 +1430,21 @@ pub fn build_gateway_routes(
         ))
 }
 
+/// Build internal-only routes authenticated by the shared
+/// `CLOUD_API_USAGE_TOKEN` service secret rather than the standard `sk-…`
+/// API-key middleware. Mounted under `/v1/internal/*` after the global
+/// `/v1` nest. Today's only route is `POST /internal/usage` (for
+/// inference-proxy's service-token reporter); future internal endpoints
+/// can be added here without touching the sk-auth stack.
+pub fn build_internal_routes(app_state: AppState) -> Router {
+    Router::new()
+        .route(
+            "/internal/usage",
+            post(crate::routes::usage::record_usage_internal),
+        )
+        .with_state(app_state)
+}
+
 pub fn build_model_routes(models_service: Arc<dyn ModelsServiceTrait>) -> Router {
     let models_app_state = ModelsAppState { models_service };
 
@@ -1734,6 +1752,7 @@ mod tests {
                 port: 0, // Use port 0 for testing to get a random available port
             },
             inference_api_key: Some("test-key".to_string()),
+            internal_usage_token: None,
             logging: config::LoggingConfig {
                 level: "info".to_string(),
                 format: "compact".to_string(),
@@ -1833,6 +1852,7 @@ mod tests {
                 port: 0,
             },
             inference_api_key: Some("test-key".to_string()),
+            internal_usage_token: None,
             logging: config::LoggingConfig {
                 level: "info".to_string(),
                 format: "compact".to_string(),

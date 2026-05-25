@@ -542,6 +542,7 @@ dependencies = [
  "services",
  "sha2 0.11.0",
  "sha3 0.12.0",
+ "subtle",
  "thiserror 2.0.18",
  "tokio",
  "tokio-postgres",

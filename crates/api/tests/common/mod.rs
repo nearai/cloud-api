@@ -60,6 +60,7 @@ pub fn test_config() -> ApiConfig {
             .or_else(|_| std::env::var("MODEL_DISCOVERY_API_KEY"))
             .ok()
             .or(Some("test_api_key".to_string())),
+        internal_usage_token: None,
         logging: config::LoggingConfig {
             level: "debug".to_string(),
             format: "compact".to_string(),

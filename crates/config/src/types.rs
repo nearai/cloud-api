@@ -5,6 +5,11 @@ pub struct ApiConfig {
     pub server: ServerConfig,
     /// API key for authenticating with inference backends (vLLM/SGLang via inference_url)
     pub inference_api_key: Option<String>,
+    /// Shared secret accepted by `POST /v1/internal/usage` from trusted
+    /// reporters (e.g. inference-proxy). When `None`, the endpoint is
+    /// disabled and returns 503. Reporters can still authenticate to the
+    /// legacy `POST /v1/usage` with an `sk-…` key while this is unset.
+    pub internal_usage_token: Option<String>,
     pub logging: LoggingConfig,
     pub dstack_client: DstackClientConfig,
     pub auth: AuthConfig,
@@ -24,6 +29,13 @@ impl ApiConfig {
             inference_api_key: env::var("INFERENCE_API_KEY")
                 .or_else(|_| env::var("MODEL_DISCOVERY_API_KEY"))
                 .ok(),
+            // Same env-var name on both sides (inference-proxy and
+            // cloud-api). Operators set both to the same secret string;
+            // unsetting either side disables the new reporting path
+            // without breaking anything.
+            internal_usage_token: env::var("CLOUD_API_USAGE_TOKEN")
+                .ok()
+                .filter(|s| !s.is_empty()),
             logging: LoggingConfig::from_env()?,
             dstack_client: DstackClientConfig::from_env()?,
             auth: AuthConfig::from_env()?,

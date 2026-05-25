@@ -134,11 +134,15 @@ pub fn prepare_tools(request: &CreateResponseRequest) -> Vec<inference_providers
                             description: Some(
                                 "Search the web and return extracted source context optimized for grounding model answers. \
                                 Use this when deeper source passages are more useful than short search-result snippets. \
+                                \n\nBUDGET GUIDANCE — set 'maximum_number_of_tokens' based on query complexity:\
+                                \n- ~2048: simple factual lookups, single-answer questions\
+                                \n- ~4096: moderate queries needing context from several sources\
+                                \n- ~8192: complex research, multi-faceted or comparative topics\
                                 \n\nIMPORTANT PARAMETERS TO CONSIDER:\
                                 \n- Use 'freshness' for time-sensitive queries (news, recent events, current trends)\
                                 \n- Use 'country' for location-specific information\
                                 \n- Use 'count' and 'maximum_number_of_urls' to control breadth\
-                                \n- Use 'maximum_number_of_tokens', 'maximum_number_of_snippets', and per-URL limits to control context size\
+                                \n- Use 'maximum_number_of_snippets' and per-URL limits to control depth\
                                 \n- Use 'context_threshold_mode' as disabled, strict, balanced, or lenient".to_string()
                             ),
                             parameters: super::web_context_search_parameters_schema(),

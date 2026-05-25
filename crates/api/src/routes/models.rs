@@ -149,6 +149,11 @@ pub async fn list_models(
                     model.output_modalities,
                 ),
                 inference_url: None, // Redacted: internal infrastructure URL, admin-only
+                hugging_face_id: model.hugging_face_id,
+                quantization: model.quantization,
+                max_output_length: model.max_output_length,
+                supported_sampling_parameters: model.supported_sampling_parameters,
+                supported_features: model.supported_features,
             },
         })
         .collect();
@@ -252,6 +257,11 @@ pub async fn get_model_by_name(
                 model.output_modalities,
             ),
             inference_url: None, // Redacted: internal infrastructure URL, admin-only
+            hugging_face_id: model.hugging_face_id,
+            quantization: model.quantization,
+            max_output_length: model.max_output_length,
+            supported_sampling_parameters: model.supported_sampling_parameters,
+            supported_features: model.supported_features,
         },
     };
 

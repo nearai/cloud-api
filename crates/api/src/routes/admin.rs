@@ -97,6 +97,91 @@ pub async fn batch_upsert_models(
         validate_price(&request.output_cost_per_token, "outputCostPerToken")?;
         validate_price(&request.cost_per_image, "costPerImage")?;
         validate_price(&request.cache_read_cost_per_token, "cacheReadCostPerToken")?;
+
+        // OpenRouter vocabulary checks. The provider spec at
+        // https://openrouter.ai/docs/guides/community/for-providers enumerates
+        // valid values for each field; rejecting unknowns at the write path
+        // keeps `GET /v1/models` honest, since these flow into the catalog
+        // OpenRouter consumes.
+        if let Some(q) = &request.quantization {
+            const VALID_QUANTIZATIONS: &[&str] =
+                &["int4", "int8", "fp4", "fp6", "fp8", "fp16", "bf16", "fp32"];
+            if !VALID_QUANTIZATIONS.contains(&q.as_str()) {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    ResponseJson(ErrorResponse::new(
+                        format!(
+                            "model '{model_name}': quantization: '{q}' is not in OpenRouter's vocabulary ({})",
+                            VALID_QUANTIZATIONS.join(", ")
+                        ),
+                        "invalid_request".to_string(),
+                    )),
+                ));
+            }
+        }
+        if let Some(max_out) = request.max_output_length {
+            if max_out <= 0 {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    ResponseJson(ErrorResponse::new(
+                        format!("model '{model_name}': maxOutputLength must be positive"),
+                        "invalid_request".to_string(),
+                    )),
+                ));
+            }
+        }
+        if let Some(params) = &request.supported_sampling_parameters {
+            const VALID_SAMPLING_PARAMS: &[&str] = &[
+                "temperature",
+                "top_p",
+                "top_k",
+                "min_p",
+                "top_a",
+                "frequency_penalty",
+                "presence_penalty",
+                "repetition_penalty",
+                "stop",
+                "seed",
+                "max_tokens",
+                "logit_bias",
+            ];
+            for p in params {
+                if !VALID_SAMPLING_PARAMS.contains(&p.as_str()) {
+                    return Err((
+                        StatusCode::BAD_REQUEST,
+                        ResponseJson(ErrorResponse::new(
+                            format!(
+                                "model '{model_name}': supportedSamplingParameters: '{p}' is not in OpenRouter's vocabulary"
+                            ),
+                            "invalid_request".to_string(),
+                        )),
+                    ));
+                }
+            }
+        }
+        if let Some(features) = &request.supported_features {
+            const VALID_FEATURES: &[&str] = &[
+                "tools",
+                "json_mode",
+                "structured_outputs",
+                "logprobs",
+                "web_search",
+                "reasoning",
+            ];
+            for f in features {
+                if !VALID_FEATURES.contains(&f.as_str()) {
+                    return Err((
+                        StatusCode::BAD_REQUEST,
+                        ResponseJson(ErrorResponse::new(
+                            format!(
+                                "model '{model_name}': supportedFeatures: '{f}' is not in OpenRouter's vocabulary"
+                            ),
+                            "invalid_request".to_string(),
+                        )),
+                    ));
+                }
+            }
+        }
     }
 
     // Extract admin user context for audit tracking
@@ -298,6 +383,11 @@ pub async fn batch_upsert_models(
                     updated_model.output_modalities,
                 ),
                 inference_url: updated_model.inference_url,
+                hugging_face_id: updated_model.hugging_face_id,
+                quantization: updated_model.quantization,
+                max_output_length: updated_model.max_output_length,
+                supported_sampling_parameters: updated_model.supported_sampling_parameters,
+                supported_features: updated_model.supported_features,
             },
         })
         .collect();
@@ -396,6 +486,11 @@ pub async fn list_models(
                     model.output_modalities,
                 ),
                 inference_url: model.inference_url,
+                hugging_face_id: model.hugging_face_id,
+                quantization: model.quantization,
+                max_output_length: model.max_output_length,
+                supported_sampling_parameters: model.supported_sampling_parameters,
+                supported_features: model.supported_features,
             },
             is_active: model.is_active,
             created_at: model.created_at,
@@ -526,6 +621,11 @@ pub async fn get_model_history(
             input_modalities: h.input_modalities,
             output_modalities: h.output_modalities,
             inference_url: h.inference_url,
+            hugging_face_id: h.hugging_face_id,
+            quantization: h.quantization,
+            max_output_length: h.max_output_length,
+            supported_sampling_parameters: h.supported_sampling_parameters,
+            supported_features: h.supported_features,
         })
         .collect();
 
@@ -997,6 +1097,11 @@ pub async fn deprecate_model(
             attestation_supported: m.attestation_supported,
             architecture: ModelArchitecture::from_options(m.input_modalities, m.output_modalities),
             inference_url: m.inference_url,
+            hugging_face_id: m.hugging_face_id,
+            quantization: m.quantization,
+            max_output_length: m.max_output_length,
+            supported_sampling_parameters: m.supported_sampling_parameters,
+            supported_features: m.supported_features,
         },
     };
 

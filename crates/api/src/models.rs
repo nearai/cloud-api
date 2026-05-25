@@ -2858,6 +2858,30 @@ pub struct ModelMetadata {
     /// Base URL for the model's inference endpoint
     #[serde(rename = "inferenceUrl", skip_serializing_if = "Option::is_none")]
     pub inference_url: Option<String>,
+
+    /// HuggingFace identifier (OpenRouter `hugging_face_id`).
+    #[serde(rename = "huggingFaceId", skip_serializing_if = "Option::is_none")]
+    pub hugging_face_id: Option<String>,
+    /// Quantization label (int4/int8/fp4/fp6/fp8/fp16/bf16/fp32).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quantization: Option<String>,
+    /// Maximum output tokens per response (OpenRouter `max_output_length`).
+    #[serde(rename = "maxOutputLength", skip_serializing_if = "Option::is_none")]
+    pub max_output_length: Option<i32>,
+    /// Sampling parameters accepted by the model (OpenRouter `supported_sampling_parameters`).
+    #[serde(
+        rename = "supportedSamplingParameters",
+        skip_serializing_if = "Vec::is_empty",
+        default
+    )]
+    pub supported_sampling_parameters: Vec<String>,
+    /// Feature capabilities (OpenRouter `supported_features`).
+    #[serde(
+        rename = "supportedFeatures",
+        skip_serializing_if = "Vec::is_empty",
+        default
+    )]
+    pub supported_features: Vec<String>,
 }
 
 /// Request to update model pricing (admin endpoint)
@@ -3038,6 +3062,24 @@ pub struct ModelHistoryEntry {
     /// Base URL for the model's inference endpoint
     #[serde(rename = "inferenceUrl", skip_serializing_if = "Option::is_none")]
     pub inference_url: Option<String>,
+    #[serde(rename = "huggingFaceId", skip_serializing_if = "Option::is_none")]
+    pub hugging_face_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quantization: Option<String>,
+    #[serde(rename = "maxOutputLength", skip_serializing_if = "Option::is_none")]
+    pub max_output_length: Option<i32>,
+    #[serde(
+        rename = "supportedSamplingParameters",
+        skip_serializing_if = "Vec::is_empty",
+        default
+    )]
+    pub supported_sampling_parameters: Vec<String>,
+    #[serde(
+        rename = "supportedFeatures",
+        skip_serializing_if = "Vec::is_empty",
+        default
+    )]
+    pub supported_features: Vec<String>,
 }
 
 /// Model history response - complete history of model changes

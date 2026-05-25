@@ -368,6 +368,7 @@ mod tests {
             api_key: "sk-test-key-123".to_string(),
             timeout_seconds: 30,
             extra: HashMap::new(),
+            extra_request_body: HashMap::new(),
         };
 
         let headers = backend.build_headers(&config).unwrap();
@@ -393,6 +394,7 @@ mod tests {
             api_key: "sk-test-key".to_string(),
             timeout_seconds: 30,
             extra,
+            extra_request_body: HashMap::new(),
         };
 
         let headers = backend.build_headers(&config).unwrap();
@@ -415,6 +417,7 @@ mod tests {
             api_key: "sk-test-key".to_string(),
             timeout_seconds: 30,
             extra: HashMap::new(),
+            extra_request_body: HashMap::new(),
         };
 
         let headers = backend.build_headers(&config).unwrap();

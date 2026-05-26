@@ -8,6 +8,18 @@ pub use ports::*;
 use std::sync::Arc;
 use uuid::Uuid;
 
+/// Dedicated UUID v5 namespace for `inference_id`s derived from external `id`s
+/// submitted via `POST /v1/usage`. The internal inference pipeline hashes
+/// provider request ids under `Uuid::NAMESPACE_DNS`; using a different
+/// namespace UUID here makes the two `inference_id` spaces mathematically
+/// disjoint regardless of input — no shape of provider id (even one that
+/// happens to mimic a previous string-prefix scheme) can ever collide with
+/// an externally-submitted record's hash.
+///
+/// Generated once via `uuid5(NAMESPACE_DNS, "external-usage.cloud-api.near.ai")`
+/// and embedded as a constant so the value never drifts.
+const EXTERNAL_USAGE_ID_NAMESPACE: Uuid = Uuid::from_u128(0x1966acaf_9f95_5dab_b8f0_03a51c091314);
+
 /// Compute token-based cost with cache-aware input pricing for token-based chat-style models.
 ///
 /// Important: This helper is intended for chat/LLM-style models where cache-read pricing
@@ -376,12 +388,17 @@ impl UsageServiceTrait for UsageServiceImpl {
             })?;
 
         // Derive inference tracking fields from the required external `id`.
-        // Stored as provider_request_id and hashed to a deterministic UUID v5
-        // for inference_id (same logic as the inference pipeline).
-        // The inference_id serves as the idempotency key: duplicate calls with
-        // the same id within the same org return the existing record.
+        // The raw value is stored verbatim as `provider_request_id`, but
+        // hashed under a dedicated UUID v5 namespace into `inference_id` so
+        // externally-submitted records live in a disjoint id space from the
+        // internal pipeline (which hashes the raw provider id under
+        // `NAMESPACE_DNS`). Idempotency within this endpoint is preserved
+        // because v5 is deterministic for a given (namespace, name) pair.
         let provider_request_id = Some(external_id.clone());
-        let inference_id = Some(crate::completions::hash_inference_id_to_uuid(&external_id));
+        let inference_id = Some(Uuid::new_v5(
+            &EXTERNAL_USAGE_ID_NAMESPACE,
+            external_id.as_bytes(),
+        ));
 
         // Build internal request and delegate.
         // Internal metrics (ttft_ms, avg_itl_ms, stop_reason) are not exposed
@@ -775,5 +792,69 @@ mod tests {
         let huge_cost: i64 = 10_000_000_000; // 10B nano-dollars per token
         let result = huge_tokens.checked_mul(huge_cost);
         assert!(result.is_none(), "1T tokens * 10B cost should overflow");
+    }
+
+    /// `POST /v1/usage` and the internal inference pipeline both derive
+    /// `inference_id` (the DB's per-org idempotency key) by feeding
+    /// caller-visible ids into UUID v5. To keep the two sources from
+    /// sharing a slot, externally-submitted ids are hashed under a
+    /// dedicated namespace UUID. This test pins that invariant against
+    /// the namespace each side uses today.
+    #[test]
+    fn test_external_id_hash_cannot_collide_with_internal_pipeline() {
+        use crate::completions::hash_inference_id_to_uuid;
+        use uuid::Uuid;
+
+        // Real provider id formats observed in production responses, plus
+        // a few adversarial shapes designed to defeat a naive string-prefix
+        // scheme (e.g. an upstream id that already looks like our prefix).
+        let provider_ids = [
+            "chatcmpl-9e51f8ac5b4f4a01",
+            "msg_01A47sZNMt7DYxzNVKKjLe8A",
+            "resp_01abcd",
+            "id-without-prefix",
+            // Adversarial: an upstream provider id that mirrors the
+            // previous string-prefix scheme. With a dedicated namespace
+            // UUID this is still safe; under a `"api:" + id` scheme,
+            // internal `"api:foo"` and external `"foo"` would collide.
+            "api:foo",
+            "api:chatcmpl-9e51f8ac5b4f4a01",
+        ];
+
+        for raw_id in provider_ids {
+            // Internal pipeline: hash_inference_id_to_uuid (NAMESPACE_DNS).
+            let internal_uuid = hash_inference_id_to_uuid(raw_id);
+            // External submission: dedicated namespace UUID.
+            let external_uuid =
+                Uuid::new_v5(&super::EXTERNAL_USAGE_ID_NAMESPACE, raw_id.as_bytes());
+            assert_ne!(
+                internal_uuid, external_uuid,
+                "external POST /v1/usage with id={raw_id:?} must hash to a different \
+                 inference_id than the internal pipeline writes for the same provider id"
+            );
+        }
+
+        // Cross-direction regression: an external submission of `"foo"`
+        // must not collide with an internal pipeline record whose raw
+        // provider id is `"api:foo"` (the shape that would have broken
+        // the earlier string-prefix scheme).
+        let internal_with_legacy_prefix = hash_inference_id_to_uuid("api:foo");
+        let external_plain = Uuid::new_v5(&super::EXTERNAL_USAGE_ID_NAMESPACE, b"foo");
+        assert_ne!(
+            internal_with_legacy_prefix, external_plain,
+            "internal raw=\"api:foo\" and external id=\"foo\" must hash to disjoint inference_ids"
+        );
+
+        // Two external submissions of the same id must still collide so
+        // the endpoint's idempotency contract is preserved.
+        let dup_a = Uuid::new_v5(
+            &super::EXTERNAL_USAGE_ID_NAMESPACE,
+            b"chatcmpl-9e51f8ac5b4f4a01",
+        );
+        let dup_b = Uuid::new_v5(
+            &super::EXTERNAL_USAGE_ID_NAMESPACE,
+            b"chatcmpl-9e51f8ac5b4f4a01",
+        );
+        assert_eq!(dup_a, dup_b);
     }
 }

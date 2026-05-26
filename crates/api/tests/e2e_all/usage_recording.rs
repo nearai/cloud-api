@@ -477,6 +477,140 @@ async fn test_record_chat_completion_usage_with_cached_tokens() {
     assert_eq!(body["total_cost"], 180_000_000i64);
 }
 
+/// Pins the invariant that a `POST /v1/usage` submission keyed by a
+/// provider-style id (`chatcmpl-…`) does not share an `inference_id` with
+/// the internal chat-completion pipeline's record for the same provider id.
+/// Both writes must land independently in usage history; the per-org
+/// idempotency constraint on `inference_id` applies only within each source.
+#[tokio::test]
+async fn test_external_usage_record_does_not_collide_with_internal_pipeline() {
+    use inference_providers::StreamChunk;
+
+    let server = setup_test_server().await;
+    setup_qwen_model(&server).await;
+    let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
+    let api_key = get_api_key_for_org(&server, org.id.clone()).await;
+
+    // Drive a streaming completion so we can capture the provider-assigned
+    // chat id from the SSE chunks (same id the internal pipeline will key
+    // its billing record under after stream finalize).
+    let stream_resp = server
+        .post("/v1/chat/completions")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .json(&serde_json::json!({
+            "model": "Qwen/Qwen3-30B-A3B-Instruct-2507",
+            "messages": [{ "role": "user", "content": "hello" }],
+            "stream": true
+        }))
+        .await;
+    assert_eq!(stream_resp.status_code(), 200);
+
+    let body = stream_resp.text();
+    let provider_id = body
+        .lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .filter(|data| data.trim() != "[DONE]")
+        .find_map(|data| match serde_json::from_str::<StreamChunk>(data) {
+            Ok(StreamChunk::Chat(c)) => Some(c.id),
+            _ => None,
+        })
+        .expect("stream should contain at least one chat chunk with an id");
+    assert!(
+        provider_id.starts_with("chatcmpl-"),
+        "mock provider should emit chatcmpl-style ids, got {provider_id:?}",
+    );
+
+    // Submit POST /v1/usage carrying the same provider id. The namespace
+    // prefix on external ids must keep this from sharing an inference_id
+    // slot with the internal pipeline's record.
+    let external_resp = server
+        .post("/v1/usage")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .json(&serde_json::json!({
+            "type": "chat_completion",
+            "model": "Qwen/Qwen3-30B-A3B-Instruct-2507",
+            "input_tokens": 1,
+            "output_tokens": 1,
+            "id": provider_id,
+        }))
+        .await;
+    assert_eq!(
+        external_resp.status_code(),
+        200,
+        "external usage submission should succeed: {}",
+        external_resp.text()
+    );
+
+    // Poll usage history until both records land. The internal pipeline's
+    // record is written from a spawn_blocking finalize task, so it can
+    // arrive a few hundred ms after the stream closes. Polling avoids the
+    // flake risk of a fixed sleep on slow CI.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let history = loop {
+        let resp = server
+            .get(&format!(
+                "/v1/organizations/{}/usage/history?limit=10&offset=0",
+                org.id
+            ))
+            .add_header("Authorization", format!("Bearer {}", get_session_id()))
+            .add_header("User-Agent", MOCK_USER_AGENT)
+            .await;
+        assert_eq!(resp.status_code(), 200);
+        let history: api::routes::usage::UsageHistoryResponse = resp.json();
+        let matching = history
+            .data
+            .iter()
+            .filter(|e| e.provider_request_id.as_deref() == Some(provider_id.as_str()))
+            .count();
+        if matching >= 2 || std::time::Instant::now() >= deadline {
+            break history;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    };
+
+    // Both records must land: one from the external submission, one from
+    // the internal pipeline. If they share an inference_id, the second
+    // INSERT silently no-ops via ON CONFLICT … DO NOTHING and only one
+    // row survives.
+    let entries_for_id: Vec<_> = history
+        .data
+        .iter()
+        .filter(|e| e.provider_request_id.as_deref() == Some(provider_id.as_str()))
+        .collect();
+    assert_eq!(
+        entries_for_id.len(),
+        2,
+        "expected one internal + one external record for provider id {provider_id:?}, got {} \
+         (full history: {:?})",
+        entries_for_id.len(),
+        history.data,
+    );
+
+    // The two entries must have distinct inference_ids (different namespaces)
+    // and the external one must be the cheap 1+1 token record.
+    let inference_ids: std::collections::HashSet<_> = entries_for_id
+        .iter()
+        .filter_map(|e| e.inference_id.clone())
+        .collect();
+    assert_eq!(
+        inference_ids.len(),
+        2,
+        "internal and external records must use disjoint inference_ids"
+    );
+    assert!(
+        entries_for_id
+            .iter()
+            .any(|e| e.input_tokens == 1 && e.output_tokens == 1),
+        "external 1+1-token record should be present"
+    );
+    assert!(
+        entries_for_id
+            .iter()
+            .any(|e| e.input_tokens > 1 || e.output_tokens > 1),
+        "internal pipeline record (with real token counts) should be present"
+    );
+}
+
 /// Test that cache_read_tokens greater than input_tokens are rejected by validation.
 #[tokio::test]
 async fn test_record_chat_completion_usage_cache_read_capped_to_input() {
@@ -508,4 +642,177 @@ async fn test_record_chat_completion_usage_cache_read_capped_to_input() {
         "Usage recording with cache_read_tokens > input_tokens should return 400: {}",
         response.text()
     );
+}
+
+/// `POST /v1/internal/usage` returns 503 when the deployment has not
+/// configured `CLOUD_API_USAGE_TOKEN`. This is the default test posture
+/// — the feature is fail-closed until an operator sets the secret, so
+/// reporters using the new path can fall back to the legacy `/v1/usage`
+/// without ambiguity.
+#[tokio::test]
+async fn test_internal_usage_returns_503_when_disabled() {
+    let server = setup_test_server().await;
+
+    let response = server
+        .post("/v1/internal/usage")
+        .add_header("Authorization", "Bearer any-token-here")
+        .json(&serde_json::json!({
+            "organization_id": "00000000-0000-0000-0000-000000000000",
+            "workspace_id": "00000000-0000-0000-0000-000000000000",
+            "api_key_id": "00000000-0000-0000-0000-000000000000",
+            "type": "chat_completion",
+            "model": "Qwen/Qwen3-30B-A3B-Instruct-2507",
+            "input_tokens": 10,
+            "output_tokens": 20,
+            "id": "test-internal-disabled"
+        }))
+        .await;
+
+    assert_eq!(
+        response.status_code(),
+        503,
+        "Internal usage must 503 when CLOUD_API_USAGE_TOKEN is not configured: {}",
+        response.text()
+    );
+}
+
+/// `POST /v1/internal/usage` returns 503 even when the request omits the
+/// `Authorization` header — the disabled-endpoint check runs *before*
+/// the missing-header check, so callers see a single fail-closed
+/// response regardless of what they sent. (The 401-on-mismatch path
+/// is covered by `verify_internal_usage_token`'s unit tests; flipping
+/// the harness config at runtime would race other tests.)
+#[tokio::test]
+async fn test_internal_usage_503_takes_precedence_over_missing_auth() {
+    let server = setup_test_server().await;
+
+    let response = server
+        .post("/v1/internal/usage")
+        .json(&serde_json::json!({
+            "organization_id": "00000000-0000-0000-0000-000000000000",
+            "workspace_id": "00000000-0000-0000-0000-000000000000",
+            "api_key_id": "00000000-0000-0000-0000-000000000000",
+            "type": "chat_completion",
+            "model": "Qwen/Qwen3-30B-A3B-Instruct-2507",
+            "input_tokens": 1,
+            "output_tokens": 1,
+            "id": "test-internal-noauth"
+        }))
+        .await;
+
+    assert_eq!(response.status_code(), 503);
+}
+
+/// Defense against extractor-ordering regressions: when the endpoint is
+/// disabled, a request with a malformed body must still return 503 (not
+/// 400/422). The handler takes raw `Bytes` and runs the token check
+/// before attempting to deserialize, so body shape can't leak through
+/// to unauthenticated callers.
+#[tokio::test]
+async fn test_internal_usage_503_takes_precedence_over_bad_body() {
+    let server = setup_test_server().await;
+
+    let response = server
+        .post("/v1/internal/usage")
+        .add_header("Authorization", "Bearer anything")
+        .add_header("Content-Type", "application/json")
+        .text("{not valid json")
+        .await;
+
+    assert_eq!(
+        response.status_code(),
+        503,
+        "Disabled endpoint must short-circuit before body parsing: {}",
+        response.text()
+    );
+}
+
+/// Happy path with `internal_usage_token` configured: a valid request
+/// produces a row identical to what the legacy `/v1/usage` endpoint
+/// would write. Exercises the actual `serde(flatten)` of
+/// `RecordUsageApiRequest` under the wrapper — guards against
+/// "wire-format works in production for the first time after a config
+/// flip on staging."
+///
+/// `api_key_id` comes from the workspace's `create_api_key` response so
+/// the FK to `api_keys` resolves. This avoids depending on whatever
+/// shape `/v1/check_api_key` is returning at the time the test runs
+/// (PR #664 adds `api_key_id` there; until that lands the field is
+/// just absent).
+#[tokio::test]
+async fn test_internal_usage_records_with_valid_token() {
+    const TOKEN: &str = "test-internal-secret";
+    let server = setup_test_server_with_config(|c| {
+        c.internal_usage_token = Some(TOKEN.to_string());
+    })
+    .await;
+
+    setup_qwen_model(&server).await;
+    let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
+    let workspaces = list_workspaces(&server, org.id.clone()).await;
+    let workspace_id = workspaces.first().unwrap().id.clone();
+    let api_key_resp = create_api_key_in_workspace(
+        &server,
+        workspace_id.clone(),
+        "internal-usage-happy-path".to_string(),
+    )
+    .await;
+
+    let response = server
+        .post("/v1/internal/usage")
+        .add_header("Authorization", format!("Bearer {TOKEN}"))
+        .json(&serde_json::json!({
+            "organization_id": org.id,
+            "workspace_id": workspace_id,
+            "api_key_id": api_key_resp.id,
+            "type": "chat_completion",
+            "model": "Qwen/Qwen3-30B-A3B-Instruct-2507",
+            "input_tokens": 100,
+            "output_tokens": 50,
+            "id": "test-internal-happy-path"
+        }))
+        .await;
+
+    assert_eq!(
+        response.status_code(),
+        200,
+        "Authenticated internal request should succeed: {}",
+        response.text()
+    );
+
+    let body: serde_json::Value = response.json();
+    assert_eq!(body["type"], "chat_completion");
+    assert_eq!(body["input_tokens"], 100);
+    assert_eq!(body["output_tokens"], 50);
+    // Cost shape matches the legacy endpoint (uses same service-layer call).
+    assert_eq!(body["total_cost"], 200_000_000i64);
+}
+
+/// `/v1/internal/usage` returns 401 when configured but called with the
+/// wrong token. Pairs with the happy-path test; unit tests cover the
+/// `verify_internal_usage_token` function directly but this asserts the
+/// route handler wires it correctly.
+#[tokio::test]
+async fn test_internal_usage_returns_401_on_wrong_token() {
+    let server = setup_test_server_with_config(|c| {
+        c.internal_usage_token = Some("expected-secret".to_string());
+    })
+    .await;
+
+    let response = server
+        .post("/v1/internal/usage")
+        .add_header("Authorization", "Bearer wrong-secret")
+        .json(&serde_json::json!({
+            "organization_id": "00000000-0000-0000-0000-000000000000",
+            "workspace_id": "00000000-0000-0000-0000-000000000000",
+            "api_key_id": "00000000-0000-0000-0000-000000000000",
+            "type": "chat_completion",
+            "model": "Qwen/Qwen3-30B-A3B-Instruct-2507",
+            "input_tokens": 1,
+            "output_tokens": 1,
+            "id": "test-internal-wrong-token"
+        }))
+        .await;
+
+    assert_eq!(response.status_code(), 401);
 }

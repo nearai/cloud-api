@@ -669,6 +669,17 @@ pub fn services_invitation_to_api(
     }
 }
 
+/// Convert services OrganizationInvitationWithDetails to API OrganizationInvitationWithOrgResponse
+pub fn services_invitation_to_api_with_org(
+    invitation: services::organization::OrganizationInvitationWithDetails,
+) -> crate::models::OrganizationInvitationWithOrgResponse {
+    crate::models::OrganizationInvitationWithOrgResponse {
+        organization_name: invitation.organization_name,
+        invited_by_display_name: invitation.invited_by_display_name,
+        invitation: services_invitation_to_api(invitation.invitation),
+    }
+}
+
 /// Convert database::User to AdminUserResponse (for owners/admins only)  
 pub fn db_user_to_admin_user(user: &database::User) -> AdminUserResponse {
     AdminUserResponse {

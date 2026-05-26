@@ -300,7 +300,7 @@ fn convert_chat_request_to_service(
                             id: tc.id.clone(),
                             name: tc.function.name.clone(),
                             arguments: tc.function.arguments.clone(),
-                            thought_signature: None,
+                            thought_signature: tc.thought_signature.clone(),
                         })
                         .collect()
                 }),

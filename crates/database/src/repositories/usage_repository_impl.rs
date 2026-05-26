@@ -1,6 +1,9 @@
 use crate::models::RecordUsageRequest;
 use crate::repositories::OrganizationUsageRepository;
-use services::usage::ports::{InferenceCost, OrganizationBalanceInfo, UsageLogEntry};
+use chrono::{DateTime, Utc};
+use services::usage::ports::{
+    InferenceCost, OrganizationBalanceInfo, UsageByModelEntry, UsageLogEntry,
+};
 use uuid::Uuid;
 
 /// Trait implementation adapter for UsageRepository
@@ -200,5 +203,27 @@ impl services::usage::ports::UsageRepository for OrganizationUsageRepository {
     ) -> anyhow::Result<Option<services::usage::StopReason>> {
         self.get_stop_reason_by_provider_request_id(provider_request_id)
             .await
+    }
+
+    async fn get_usage_by_model(
+        &self,
+        organization_id: Uuid,
+        start_date: DateTime<Utc>,
+    ) -> anyhow::Result<Vec<UsageByModelEntry>> {
+        let rows = self
+            .get_usage_by_model_since(organization_id, start_date)
+            .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(|r| UsageByModelEntry {
+                model: r.model,
+                input_tokens: r.input_tokens,
+                output_tokens: r.output_tokens,
+                total_tokens: r.total_tokens,
+                total_cost: r.total_cost,
+                request_count: r.request_count,
+            })
+            .collect())
     }
 }

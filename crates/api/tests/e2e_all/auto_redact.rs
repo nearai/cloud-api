@@ -91,7 +91,7 @@ async fn auto_redact_header_redacts_prompt_and_restores_response() {
     // un-redact path puts the original back.
     mock_provider
         .set_default_response(inference_providers::mock::ResponseTemplate::new(
-            "I'll email <email1> shortly.",
+            "I'll email redacted1@example.com shortly.",
         ))
         .await;
 
@@ -121,7 +121,7 @@ async fn auto_redact_header_redacts_prompt_and_restores_response() {
         "provider saw raw PII: {seen}"
     );
     assert!(
-        seen.contains("<email1>"),
+        seen.contains("redacted1@example.com"),
         "provider should see placeholder: {seen}"
     );
 
@@ -133,7 +133,7 @@ async fn auto_redact_header_redacts_prompt_and_restores_response() {
         "client should see un-redacted response; got {content}"
     );
     assert!(
-        !content.contains("<email1>"),
+        !content.contains("redacted1@example.com"),
         "placeholder should have been swapped back; got {content}"
     );
 }
@@ -148,7 +148,7 @@ async fn auto_redact_body_field_equivalent_to_header() {
 
     mock_provider
         .set_default_response(inference_providers::mock::ResponseTemplate::new(
-            "noted <email1>",
+            "noted redacted1@example.com",
         ))
         .await;
 
@@ -168,7 +168,7 @@ async fn auto_redact_body_field_equivalent_to_header() {
     let params = mock_provider.last_chat_params().await.unwrap();
     let seen = serde_json::to_string(&params.messages).unwrap();
     assert!(!seen.contains("bob@example.com"));
-    assert!(seen.contains("<email1>"));
+    assert!(seen.contains("redacted1@example.com"));
 
     // The body field must be stripped from extra so it isn't forwarded
     // upstream — providers like Anthropic 422 on unknown fields.
@@ -195,12 +195,12 @@ async fn auto_redact_streaming_splits_placeholder_across_chunks() {
     let api_key = get_api_key_for_org(&server, org.id).await;
 
     // The MockProvider's default streaming behavior emits the response
-    // character-by-character, so a placeholder like `<email1>` will be
+    // character-by-character, so a placeholder like `redacted1@example.com` will be
     // split across SSE chunks — exactly the case the StreamUnredact tail
     // is designed for.
     mock_provider
         .set_default_response(inference_providers::mock::ResponseTemplate::new(
-            "Sending to <email1> now.",
+            "Sending to redacted1@example.com now.",
         ))
         .await;
 
@@ -249,7 +249,7 @@ async fn auto_redact_streaming_splits_placeholder_across_chunks() {
         "streamed content should be un-redacted; got: {assembled:?}"
     );
     assert!(
-        !assembled.contains("<email1>"),
+        !assembled.contains("redacted1@example.com"),
         "no placeholder should leak to client; got: {assembled:?}"
     );
 }
@@ -370,7 +370,7 @@ async fn auto_redact_multiple_pii_kinds_per_message() {
 
     mock_provider
         .set_default_response(inference_providers::mock::ResponseTemplate::new(
-            "Got it — emailing <email1> and texting <phone1>; SSN <account1> on file.",
+            "Got it — emailing redacted1@example.com and texting +1-555-0100; SSN 000-00-0001 on file.",
         ))
         .await;
 
@@ -394,9 +394,9 @@ async fn auto_redact_multiple_pii_kinds_per_message() {
     for raw in ["alice@example.com", "+1-555-123-4567", "555-66-7777"] {
         assert!(!seen.contains(raw), "raw {raw} leaked to provider: {seen}");
     }
-    assert!(seen.contains("<email1>"));
-    assert!(seen.contains("<phone1>"));
-    assert!(seen.contains("<account1>"));
+    assert!(seen.contains("redacted1@example.com"));
+    assert!(seen.contains("+1-555-0100"));
+    assert!(seen.contains("000-00-0001"));
 
     let body: serde_json::Value = resp.json();
     let content = extract_choice_text(&body);
@@ -460,13 +460,13 @@ async fn auto_redact_redacts_input_tool_call_arguments() {
         !seen.contains("bob@example.com"),
         "raw email leaked to provider via input tool_call args: {seen}"
     );
-    assert!(seen.contains("<email1>"));
+    assert!(seen.contains("redacted1@example.com"));
 }
 
 #[tokio::test]
 async fn auto_redact_unredacts_refusal_field() {
     // A safety-tuned model may quote our placeholders back in a refusal
-    // ("I can't email <email1>"). Without un-redacting message.refusal,
+    // ("I can't email redacted1@example.com"). Without un-redacting message.refusal,
     // the placeholder leaks to the client.
     let (server, _pool, mock_provider, _db) = setup_test_server_with_pool().await;
     setup_qwen_model(&server).await;
@@ -483,7 +483,7 @@ async fn auto_redact_unredacts_refusal_field() {
     // to a refusal-flavored string and assert on it being unredacted.
     mock_provider
         .set_default_response(inference_providers::mock::ResponseTemplate::new(
-            "I can't email <email1> per policy.",
+            "I can't email redacted1@example.com per policy.",
         ))
         .await;
 
@@ -504,7 +504,7 @@ async fn auto_redact_unredacts_refusal_field() {
     // content un-redact already covered; here we mainly verify the
     // refusal-path code compiles + runs without breaking content path.
     assert!(content.contains("charlie@example.com"));
-    assert!(!content.contains("<email1>"));
+    assert!(!content.contains("redacted1@example.com"));
 }
 
 #[tokio::test]
@@ -526,7 +526,7 @@ async fn auto_redact_unredacts_tool_call_arguments_streaming() {
                     "send_email",
                     // Spaces around the placeholder force the mock to emit
                     // multiple chunks; our streaming un-redact must reassemble.
-                    r#"{ "to" : "<email1>" , "subject" : "Welcome" }"#,
+                    r#"{ "to" : "redacted1@example.com" , "subject" : "Welcome" }"#,
                 ),
             ]),
         )
@@ -572,7 +572,7 @@ async fn auto_redact_unredacts_tool_call_arguments_streaming() {
     });
     assert_eq!(parsed["to"], "alice@example.com");
     assert!(
-        !assembled.contains("<email1>"),
+        !assembled.contains("redacted1@example.com"),
         "placeholder must not leak in streamed args; got: {assembled:?}"
     );
 }
@@ -598,7 +598,7 @@ async fn auto_redact_unredacts_tool_call_arguments() {
             inference_providers::mock::ResponseTemplate::new("").with_tool_calls(vec![
                 inference_providers::mock::ToolCall::new(
                     "send_email",
-                    r#"{"to":"<email1>","subject":"Welcome","body":"Hi there"}"#,
+                    r#"{"to":"redacted1@example.com","subject":"Welcome","body":"Hi there"}"#,
                 ),
             ]),
         )
@@ -626,7 +626,7 @@ async fn auto_redact_unredacts_tool_call_arguments() {
         !seen.contains("alice@example.com"),
         "raw email leaked to provider: {seen}"
     );
-    assert!(seen.contains("<email1>"));
+    assert!(seen.contains("redacted1@example.com"));
 
     // Client must see the un-redacted email in tool_calls[0].function.arguments.
     let body: serde_json::Value = resp.json();
@@ -639,7 +639,7 @@ async fn auto_redact_unredacts_tool_call_arguments() {
         "tool_call arguments should be un-redacted; got {args}"
     );
     assert!(
-        !args.contains("<email1>"),
+        !args.contains("redacted1@example.com"),
         "placeholder should be swapped back; got {args}"
     );
 }

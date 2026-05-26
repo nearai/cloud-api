@@ -12,6 +12,7 @@ use services::organization::ports::{
     CreateInvitationRequest, InvitationEmailStatus as ServicesInvitationEmailStatus,
     InvitationStatus as ServicesInvitationStatus, OrganizationInvitation as ServicesInvitation,
     OrganizationInvitationRepository,
+    OrganizationInvitationWithDetails as ServicesInvitationWithDetails,
 };
 use tracing::debug;
 use uuid::Uuid;
@@ -72,6 +73,19 @@ impl PgOrganizationInvitationRepository {
             email_sent_at: row.get("email_sent_at"),
             email_last_error: row.get("email_last_error"),
             email_message_id: row.get("email_message_id"),
+        })
+    }
+
+    fn row_to_domain_invitation_with_details(
+        &self,
+        row: &tokio_postgres::Row,
+    ) -> Result<ServicesInvitationWithDetails> {
+        let db_inv = self.row_to_db_invitation(row)?;
+
+        Ok(ServicesInvitationWithDetails {
+            invitation: self.db_to_domain(db_inv)?,
+            organization_name: row.get("organization_name"),
+            invited_by_display_name: row.get("invited_by_display_name"),
         })
     }
 
@@ -356,6 +370,66 @@ impl OrganizationInvitationRepository for PgOrganizationInvitationRepository {
         for r in rows {
             let db_inv = self.row_to_db_invitation(&r)?;
             invitations.push(self.db_to_domain(db_inv)?);
+        }
+
+        Ok(invitations)
+    }
+
+    async fn list_by_email_with_details(
+        &self,
+        email: &str,
+        status: Option<ServicesInvitationStatus>,
+    ) -> Result<Vec<ServicesInvitationWithDetails>> {
+        let db_status = status.map(|s| self.domain_to_db_status(s));
+
+        let rows = retry_db!("list_organization_invitations_by_email_with_details", {
+            let client = self
+                .pool
+                .get()
+                .await
+                .context("Failed to get database connection")
+                .map_err(RepositoryError::PoolError)?;
+
+            if let Some(ref db_status) = db_status {
+                client
+                    .query(
+                        "SELECT i.id, i.organization_id, i.email, i.role, i.invited_by_user_id,
+                            i.status, i.token, i.created_at, i.expires_at, i.responded_at,
+                            i.email_status, i.email_sent_at, i.email_last_error,
+                            i.email_message_id, o.name AS organization_name,
+                            u.display_name AS invited_by_display_name
+                         FROM organization_invitations i
+                         JOIN organizations o ON o.id = i.organization_id
+                         LEFT JOIN users u ON u.id = i.invited_by_user_id
+                         WHERE i.email = $1 AND i.status = $2
+                         ORDER BY i.created_at DESC",
+                        &[&email, &db_status.to_string()],
+                    )
+                    .await
+                    .map_err(map_db_error)
+            } else {
+                client
+                    .query(
+                        "SELECT i.id, i.organization_id, i.email, i.role, i.invited_by_user_id,
+                            i.status, i.token, i.created_at, i.expires_at, i.responded_at,
+                            i.email_status, i.email_sent_at, i.email_last_error,
+                            i.email_message_id, o.name AS organization_name,
+                            u.display_name AS invited_by_display_name
+                         FROM organization_invitations i
+                         JOIN organizations o ON o.id = i.organization_id
+                         LEFT JOIN users u ON u.id = i.invited_by_user_id
+                         WHERE i.email = $1
+                         ORDER BY i.created_at DESC",
+                        &[&email],
+                    )
+                    .await
+                    .map_err(map_db_error)
+            }
+        })?;
+
+        let mut invitations = Vec::new();
+        for r in rows {
+            invitations.push(self.row_to_domain_invitation_with_details(&r)?);
         }
 
         Ok(invitations)

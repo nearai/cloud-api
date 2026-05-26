@@ -43,6 +43,15 @@ async fn test_check_api_key_valid() {
         expected_workspace_id,
         "response workspace_id must match the workspace the API key was created in"
     );
+    // `api_key_id` lets trusted gateways (inference-proxy) report usage
+    // with a shared service token without forwarding the user's `sk-…`.
+    let api_key_id = body["api_key_id"]
+        .as_str()
+        .expect("response must include api_key_id");
+    assert!(
+        uuid::Uuid::parse_str(api_key_id).is_ok(),
+        "api_key_id must be a UUID, got {api_key_id:?}"
+    );
 }
 
 /// Invalid API key returns 401.

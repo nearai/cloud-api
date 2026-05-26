@@ -114,8 +114,8 @@ impl From<ChatCompletionRequest> for ChatCompletionParams {
             store: None,
             stream_options: None,
             modalities,
-            return_hidden_states: None,
-            layers: None,
+            return_hidden_states: extra.remove("return_hidden_states").and_then(|v| v.as_bool()),
+            layers: extra.remove("layers").and_then(|v| serde_json::from_value(v).ok()),
             extra,
         }
     }

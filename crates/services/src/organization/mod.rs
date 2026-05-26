@@ -848,9 +848,7 @@ impl OrganizationServiceImpl {
             .repository
             .get_member(organization_id.0, requester_id.0)
             .await
-            .map_err(|e| {
-                OrganizationError::InternalError(format!("Failed to check membership: {e}"))
-            })?
+            .map_err(Self::map_repository_error)?
             .ok_or_else(|| {
                 OrganizationError::Unauthorized(
                     "User is not a member of this organization".to_string(),

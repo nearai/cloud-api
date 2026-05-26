@@ -60,6 +60,7 @@ pub fn test_config() -> ApiConfig {
             .or_else(|_| std::env::var("MODEL_DISCOVERY_API_KEY"))
             .ok()
             .or(Some("test_api_key".to_string())),
+        internal_usage_token: None,
         logging: config::LoggingConfig {
             level: "debug".to_string(),
             format: "compact".to_string(),
@@ -379,6 +380,22 @@ pub async fn setup_test_server_with_search_providers(
 
 pub async fn setup_test_server() -> axum_test::TestServer {
     let (server, _, _, _) = setup_test_server_with_pool().await;
+    server
+}
+
+/// Variant of `setup_test_server` that runs an arbitrary mutator against
+/// the test `ApiConfig` before the test server is built. Use when a test
+/// needs to flip a config knob — e.g. to enable the
+/// `/v1/internal/usage` endpoint by setting `internal_usage_token` —
+/// without racing other tests via process-wide env vars.
+pub async fn setup_test_server_with_config<F>(mutate: F) -> axum_test::TestServer
+where
+    F: FnOnce(&mut config::ApiConfig),
+{
+    let mut infra = setup_test_infrastructure().await;
+    mutate(&mut infra.config);
+    let (server, _pool, _mock) =
+        build_test_server_components(infra.database.clone(), infra.config).await;
     server
 }
 

@@ -202,6 +202,10 @@ impl ports::ResponseServiceTrait for ResponseServiceImpl {
             }
             // Note: MCP executor is added later after connecting to servers
 
+            // Shared tracker so the outer error handler can read accumulated
+            // usage after `ctx` is dropped on Err from process_response_stream.
+            let usage_tracker = crate::responses::service_helpers::UsageTracker::new();
+
             let context = ProcessStreamContext {
                 request,
                 user_id,
@@ -226,10 +230,20 @@ impl ports::ResponseServiceTrait for ResponseServiceImpl {
                 tool_registry,
             };
 
-            if let Err(e) = Self::process_response_stream(tx.clone(), context).await {
+            if let Err(e) =
+                Self::process_response_stream(tx.clone(), context, usage_tracker.clone()).await
+            {
                 tracing::error!("Error processing response stream: {:?}", e);
 
-                // Send error event
+                // Attach accumulated usage so downstream (e.g. non-streaming
+                // route fallback, billing) can bill for partial work done
+                // before the failure.
+                let usage = if usage_tracker.has_data() {
+                    Some(usage_tracker.snapshot())
+                } else {
+                    None
+                };
+
                 let error_event = models::ResponseStreamEvent {
                     event_type: "response.failed".to_string(),
                     sequence_number: None,
@@ -246,6 +260,7 @@ impl ports::ResponseServiceTrait for ResponseServiceImpl {
                     annotation_index: None,
                     annotation: None,
                     conversation_title: None,
+                    usage,
                 };
                 let result = tx.send(error_event).await;
                 if let Err(e) = result {
@@ -882,6 +897,7 @@ impl ResponseServiceImpl {
     async fn process_response_stream(
         tx: futures::channel::mpsc::UnboundedSender<models::ResponseStreamEvent>,
         mut context: ProcessStreamContext,
+        usage_tracker: Arc<crate::responses::service_helpers::UsageTracker>,
     ) -> Result<(), errors::ResponseError> {
         tracing::info!("Starting response stream processing");
 
@@ -963,6 +979,7 @@ impl ResponseServiceImpl {
             initial_response.previous_response_id.clone(),
             initial_response.created_at,
             context.request.model.clone(),
+            usage_tracker,
         );
         let mut emitter = crate::responses::service_helpers::EventEmitter::new(tx);
 
@@ -1347,6 +1364,7 @@ impl ResponseServiceImpl {
 
             // Create completion request (names not included - tracked via database analytics)
             let completion_request = CompletionRequest {
+                request_id: uuid::Uuid::new_v4(),
                 model: process_context.request.model.clone(),
                 messages: messages.clone(),
                 max_tokens: process_context.request.max_output_tokens,
@@ -2908,6 +2926,7 @@ impl ResponseServiceImpl {
         let title_model = std::env::var("TITLE_GENERATION_MODEL")
             .unwrap_or_else(|_| "Qwen/Qwen3-30B-A3B-Instruct-2507".to_string());
         let completion_request = crate::completions::ports::CompletionRequest {
+            request_id: uuid::Uuid::new_v4(),
             model: title_model,
             messages: vec![crate::completions::ports::CompletionMessage {
                 role: "user".to_string(),
@@ -3019,6 +3038,7 @@ impl ResponseServiceImpl {
             annotation_index: None,
             annotation: None,
             conversation_title: Some(title),
+            usage: None,
         };
 
         let _ = tx.send(event).await;
@@ -3176,6 +3196,7 @@ impl ResponseServiceImpl {
             annotation_index: None,
             annotation: None,
             conversation_title: None,
+            usage: None,
         };
         use futures_util::SinkExt;
         let _ = emitter.tx.clone().send(event).await;
@@ -3205,6 +3226,7 @@ impl ResponseServiceImpl {
             annotation_index: None,
             annotation: None,
             conversation_title: None,
+            usage: Some(final_response.usage.clone()),
         };
         let _ = emitter.tx.clone().send(completion_event).await;
 

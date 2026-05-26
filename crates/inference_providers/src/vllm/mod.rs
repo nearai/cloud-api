@@ -124,8 +124,13 @@ impl VLlmConfig {
     /// on a single non-streaming request; 600s is a comfortable ceiling that
     /// still surfaces genuinely stuck requests.
     pub const DEFAULT_COMPLETION_TIMEOUT_SECS: i64 = 600;
-    /// Default control timeout. Metadata/TTFB ops should resolve quickly.
-    pub const DEFAULT_CONTROL_TIMEOUT_SECS: i64 = 90;
+    /// Default control timeout. Covers TTFB on streaming requests, attestation
+    /// report fetches, models-list and signature lookups. Reasoning models
+    /// (GLM-5.1, Qwen3.5) can delay TTFB by minutes when the backend queues a
+    /// request behind a long thinking phase, and attestation TDX-quote + GPU
+    /// evidence collection can also cross 90s under load. 300s gives enough
+    /// headroom for those without masking a sustained backend stall.
+    pub const DEFAULT_CONTROL_TIMEOUT_SECS: i64 = 300;
 
     /// Construct a config. The `timeout_seconds` parameter, when supplied, sets
     /// the **completion** timeout only (control stays at its default / env value).
@@ -194,9 +199,10 @@ pub struct VLlmProvider {
     backend_verifier: Option<Arc<dyn crate::BackendVerifier>>,
     /// Fallback client used when inline bucket verification exhausts all retries.
     /// Has completion-timeout read settings so long-running inference requests
-    /// don't hit the 90s control-plane idle timeout. Does not pin TLS to a
-    /// specific backend — requests are served without prefix-cache routing but
-    /// are not dropped, ensuring inline verification failures degrade gracefully.
+    /// don't hit the shorter control_timeout (read budget) used by the general
+    /// client. Does not pin TLS to a specific backend — requests are served
+    /// without prefix-cache routing but are not dropped, ensuring inline
+    /// verification failures degrade gracefully.
     fallback_client: Client,
     /// Bounds concurrent inline verifications to prevent thundering-herd pressure
     /// on inference-proxy GPU evidence collection at startup (when all buckets are
@@ -534,8 +540,8 @@ impl VLlmProvider {
         //
         // Note on worst-case wait time: the permit is held for the entire retry
         // loop (INLINE_VERIFY_RETRIES + 1 attempts × control_timeout each). With
-        // default values that is 3 × 90s = 270s per slot. Requests queueing behind
-        // a saturated semaphore of size N can wait up to (queue_depth / N) × 270s.
+        // default values that is 3 × 300s = 900s per slot. Requests queueing behind
+        // a saturated semaphore of size N can wait up to (queue_depth / N) × 900s.
         // In practice the first successful verification fills the bucket and all
         // subsequent waiters take the fast path (re-check after acquiring permit).
         let _permit = self

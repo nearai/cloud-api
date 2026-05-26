@@ -9,11 +9,6 @@ ignore = [
     # https://rustsec.org/advisories/RUSTSEC-2023-0071
     "RUSTSEC-2023-0071",
 
-    # ruint reciprocal_mg10 OOB - no fix available.
-    # The affected function is unused in alloy (ref: recmo/uint#550, alloy-rs/alloy#3416).
-    # https://rustsec.org/advisories/RUSTSEC-2025-0137
-    "RUSTSEC-2025-0137",
-    
     # paste is unmaintained - transitive dependency from dstack-sdk -> alloy -> alloy-primitives.
     # This is informational only (no security issue). We cannot update it directly.
     # Tracking: waiting for upstream crates to migrate to pastey.
@@ -43,21 +38,6 @@ ignore = [
     # https://rustsec.org/advisories/RUSTSEC-2026-0104
     "RUSTSEC-2026-0104",
 
-    # hickory-proto 0.25.2 — both advisories below share the same root cause:
-    # dstack-sdk 0.1.2 and dcap-qvl 0.4.0 explicitly enable reqwest's `hickory-dns`
-    # feature, pulling in hickory-resolver 0.25 -> hickory-proto 0.25.2. Due to Cargo
-    # feature unification this cannot be overridden from our Cargo.toml. Fix requires
-    # upstream to drop `hickory-dns` or upgrade to reqwest 0.13+.
-    # We only resolve admin-configured endpoints (no user-controlled hostnames),
-    # so exploitation requires DNS infrastructure compromise.
-    #
-    # CPU exhaustion via O(n²) name compression during message encoding.
-    # https://rustsec.org/advisories/RUSTSEC-2026-0119
-    "RUSTSEC-2026-0119",
-    # NSEC3 closest-encloser unbounded loop (DNSSEC only).
-    # Not exploitable: DNSSEC validation is not enabled in our reqwest/hickory config.
-    # https://rustsec.org/advisories/RUSTSEC-2026-0118
-    "RUSTSEC-2026-0118",
 ]
 
 # Treat unmaintained crates as warnings (not errors)

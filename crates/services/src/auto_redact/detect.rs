@@ -87,7 +87,10 @@ struct RawSpan {
     end: usize,
 }
 
-fn parse_response(bytes: &[u8], expected_len: usize) -> Result<Vec<Vec<Span>>, AutoRedactError> {
+pub(super) fn parse_response(
+    bytes: &[u8],
+    expected_len: usize,
+) -> Result<Vec<Vec<Span>>, AutoRedactError> {
     let parsed: DetectResponse = serde_json::from_slice(bytes)
         .map_err(|e| AutoRedactError::Internal(format!("decode detect resp: {e}")))?;
 

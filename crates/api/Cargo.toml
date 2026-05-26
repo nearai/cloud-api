@@ -38,11 +38,13 @@ thiserror = "2.0"
 # Body hashing middleware dependencies
 sha2 = "0.11"
 hex = "0.4"
+# Constant-time comparison for service-token auth on /v1/internal/usage
+subtle = "2.6"
 bytes = "1.11"
 http-body-util = "0.1"
 # AWS S3 for file storage
 aws-config = { version = "1.8", features = ["behavior-version-latest"] }
-aws-sdk-s3 = "1.131"
+aws-sdk-s3 = "1.133"
 # NEAR wallet authentication
 near-api = "0.8.6"
 base64 = "0.22"

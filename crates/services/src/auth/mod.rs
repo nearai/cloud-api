@@ -558,10 +558,10 @@ mod tests {
     use crate::organization::{
         AddOrganizationMemberRequest, BatchInvitationResponse, CreateOrganizationRequest,
         InvitationStatus, MemberRole, Organization, OrganizationError, OrganizationId,
-        OrganizationInvitation, OrganizationMember, OrganizationMemberWithUser,
-        OrganizationOrderBy, OrganizationOrderDirection, OrganizationRepository,
-        OrganizationServiceTrait, OrganizationWithRole, UpdateOrganizationMemberRequest,
-        UpdateOrganizationRequest,
+        OrganizationInvitation, OrganizationInvitationWithDetails, OrganizationMember,
+        OrganizationMemberWithUser, OrganizationOrderBy, OrganizationOrderDirection,
+        OrganizationRepository, OrganizationServiceTrait, OrganizationWithRole,
+        UpdateOrganizationMemberRequest, UpdateOrganizationRequest,
     };
     use crate::workspace::{
         ApiKey, ApiKeyId, ApiKeyRepository, CreateApiKeyRequest, Workspace, WorkspaceId,
@@ -1094,7 +1094,7 @@ mod tests {
         async fn list_user_invitations(
             &self,
             _: &str,
-        ) -> Result<Vec<OrganizationInvitation>, OrganizationError> {
+        ) -> Result<Vec<OrganizationInvitationWithDetails>, OrganizationError> {
             unimplemented!()
         }
         async fn get_invitation_by_token(

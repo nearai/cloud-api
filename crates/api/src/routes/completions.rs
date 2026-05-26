@@ -19,7 +19,7 @@ use services::completions::{
 use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::debug;
+use tracing::{debug, Instrument};
 use utoipa;
 use uuid::Uuid;
 
@@ -281,8 +281,10 @@ fn convert_chat_request_to_service(
     organization_id: Uuid,
     workspace_id: Uuid,
     body_hash: RequestBodyHash,
+    request_id: Uuid,
 ) -> ServiceCompletionRequest {
     ServiceCompletionRequest {
+        request_id,
         model: request.model.clone(),
         messages: request
             .messages
@@ -453,11 +455,120 @@ fn unredact_field(
     map: &Arc<RedactionMap>,
     idx: i64,
     text: &mut String,
+    finalize: bool,
 ) {
     let s = states
         .entry(idx)
         .or_insert_with(|| StreamUnredact::new(map.clone()));
-    *text = s.process(text);
+    // Finalize drains the tail (no further chunks coming for this
+    // choice/field); regular path holds up to max_dummy_len bytes.
+    *text = if finalize {
+        s.drain(text)
+    } else {
+        s.process(text)
+    };
+}
+
+/// Drain held tails for `idx` into the finish chunk's delta. Removes the
+/// state entries from `states` so [`build_flush_chunks`] emits nothing
+/// for this choice. Used only on chunks that carry `finish_reason` — see
+/// [`unredact_chunk_in_place`] for the rationale.
+///
+/// For each text field: if the chunk already carries the field, the
+/// previous inline `drain` call has already emptied that state's tail and
+/// `flush` returns `""`, so we just remove the now-empty entry. If the
+/// chunk did NOT carry the field, we remove the state and attach its
+/// flushed tail to a freshly populated field on the chunk's delta.
+fn finalize_choice_in_place(
+    choice: &mut inference_providers::models::ChatChoice,
+    idx: i64,
+    states: &mut StreamUnredactStates,
+) {
+    fn merge_into(field: &mut Option<String>, tail: String) {
+        if tail.is_empty() {
+            return;
+        }
+        match field {
+            // The inline drain path already produced the substituted
+            // value, so the flushed tail is empty when we get here and
+            // this branch shouldn't normally fire. Guard anyway.
+            Some(existing) => existing.push_str(&tail),
+            None => *field = Some(tail),
+        }
+    }
+
+    let delta = choice
+        .delta
+        .get_or_insert(inference_providers::models::ChatDelta {
+            role: None,
+            content: None,
+            name: None,
+            tool_call_id: None,
+            tool_calls: None,
+            reasoning_content: None,
+            reasoning: None,
+        });
+
+    if let Some(s) = states.content.remove(&idx) {
+        merge_into(&mut delta.content, s.flush());
+    }
+    if let Some(s) = states.reasoning_content.remove(&idx) {
+        merge_into(&mut delta.reasoning_content, s.flush());
+    }
+    if let Some(s) = states.reasoning.remove(&idx) {
+        merge_into(&mut delta.reasoning, s.flush());
+    }
+
+    // Tool-call arguments are keyed by `(choice_idx, tc_idx)`. Take every
+    // entry for this choice; sort by tc_idx so the synthesized order is
+    // stable; merge each non-empty tail into `delta.tool_calls`. If the
+    // chunk already carries a matching tc_idx (inline-drained path), the
+    // flushed tail is empty and the loop is a no-op for that entry.
+    let mut tc_keys: Vec<(i64, i64)> = states
+        .tool_call_arguments
+        .keys()
+        .filter(|(c, _)| *c == idx)
+        .copied()
+        .collect();
+    tc_keys.sort_unstable();
+    for key in tc_keys {
+        let Some(s) = states.tool_call_arguments.remove(&key) else {
+            continue;
+        };
+        let tail = s.flush();
+        if tail.is_empty() {
+            continue;
+        }
+        let (_, tc_idx) = key;
+        let tool_calls = delta.tool_calls.get_or_insert_with(Vec::new);
+        // Reuse the existing ToolCallDelta entry for this tc_idx if the
+        // chunk already had one, so we don't emit two deltas for the
+        // same logical tool call.
+        let entry = tool_calls.iter_mut().find(|tc| tc.index == Some(tc_idx));
+        match entry {
+            Some(tc) => {
+                let func =
+                    tc.function
+                        .get_or_insert(inference_providers::models::FunctionCallDelta {
+                            name: None,
+                            arguments: None,
+                        });
+                merge_into(&mut func.arguments, tail);
+            }
+            None => {
+                tool_calls.push(inference_providers::models::ToolCallDelta {
+                    id: None,
+                    type_: None,
+                    index: Some(tc_idx),
+                    function: Some(inference_providers::models::FunctionCallDelta {
+                        name: None,
+                        arguments: Some(tail),
+                    }),
+                    thought_signature: None,
+                });
+            }
+        }
+    }
 }
 
 /// Apply streaming un-redact to a single parsed chunk, mutating any text
@@ -472,15 +583,22 @@ fn unredact_chunk_in_place(
         inference_providers::StreamChunk::Chat(c) => {
             for choice in &mut c.choices {
                 let idx = choice.index;
+                // A chunk carrying `finish_reason` is the last chunk
+                // we'll see for this choice. Drain the held tail into
+                // its fields rather than relying on the end-of-stream
+                // flush (which emits a synthetic chunk AFTER the
+                // finish_reason, missed by clients that stop reading
+                // on finish_reason without waiting for `[DONE]`).
+                let finalize = choice.finish_reason.is_some();
                 if let Some(delta) = &mut choice.delta {
                     if let Some(content) = &mut delta.content {
-                        unredact_field(&mut states.content, map, idx, content);
+                        unredact_field(&mut states.content, map, idx, content, finalize);
                     }
                     if let Some(rc) = &mut delta.reasoning_content {
-                        unredact_field(&mut states.reasoning_content, map, idx, rc);
+                        unredact_field(&mut states.reasoning_content, map, idx, rc, finalize);
                     }
                     if let Some(r) = &mut delta.reasoning {
-                        unredact_field(&mut states.reasoning, map, idx, r);
+                        unredact_field(&mut states.reasoning, map, idx, r, finalize);
                     }
                     if let Some(tcs) = &mut delta.tool_calls {
                         for (pos, tc) in tcs.iter_mut().enumerate() {
@@ -500,18 +618,34 @@ fn unredact_chunk_in_place(
                                         .or_insert_with(|| {
                                             StreamUnredact::new_for_json_string(map.clone())
                                         });
-                                    *args = s.process(args);
+                                    *args = if finalize {
+                                        s.drain(args)
+                                    } else {
+                                        s.process(args)
+                                    };
                                 }
                             }
                         }
                     }
+                }
+                if finalize {
+                    // Catch every per-choice state whose field was *absent*
+                    // from this chunk's delta — those are the held tails
+                    // the inline path can't see. Without this, a finish
+                    // chunk with `delta: {}` leaves the tail in `states`
+                    // and build_flush_chunks emits it AFTER the finish
+                    // event (invisible to clients that stop on
+                    // finish_reason). The inline-drained entries above
+                    // are already empty; this loop just removes them.
+                    finalize_choice_in_place(choice, idx, states);
                 }
             }
         }
         inference_providers::StreamChunk::Text(c) => {
             for choice in &mut c.choices {
                 let idx = choice.index;
-                unredact_field(&mut states.content, map, idx, &mut choice.text);
+                let finalize = choice.finish_reason.is_some();
+                unredact_field(&mut states.content, map, idx, &mut choice.text, finalize);
             }
         }
     }
@@ -660,8 +794,10 @@ fn convert_text_request_to_service(
     organization_id: Uuid,
     workspace_id: Uuid,
     body_hash: RequestBodyHash,
+    request_id: Uuid,
 ) -> ServiceCompletionRequest {
     ServiceCompletionRequest {
+        request_id,
         model: request.model.clone(),
         messages: vec![CompletionMessage {
             role: "user".to_string(),
@@ -735,6 +871,49 @@ pub async fn chat_completions(
             .into_response();
     }
 
+    // Generate a per-request correlation ID. Reuse the client's X-Request-Id if
+    // present and parseable as a UUID; otherwise generate a fresh one. This ID
+    // propagates downstream as X-Request-Id on every outbound inference call.
+    let request_id = headers
+        .get("x-request-id")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| Uuid::parse_str(s).ok())
+        .unwrap_or_else(Uuid::new_v4);
+
+    // Create a span carrying correlation IDs so every log line within this
+    // request carries request_id/org_id/workspace_id in Datadog.
+    //
+    // NOTE: we do NOT call span.enter() here. In async code, Span::enter()
+    // stores the guard in a thread-local; when the future yields at an .await
+    // the guard stays entered on that thread, so any other task scheduled on
+    // the same thread incorrectly inherits this span as its parent, corrupting
+    // log context. Use .instrument(span) on the inner async block instead.
+    let span = tracing::info_span!(
+        "chat_completions",
+        request_id = %request_id,
+        org_id = %api_key.organization.id.0,
+        workspace_id = %api_key.workspace.id.0,
+        model = %request.model,
+    );
+
+    chat_completions_inner(app_state, api_key, body_hash, headers, request, request_id)
+        .instrument(span)
+        .await
+}
+
+// Inner async fn so .instrument(span) wraps all awaits in the handler.
+// Split from `chat_completions` only to correctly scope the tracing span:
+// using span.enter() in an async fn risks the guard outliving an .await yield,
+// causing other tasks on the same thread to inherit this span's context.
+#[allow(clippy::too_many_arguments)]
+async fn chat_completions_inner(
+    app_state: crate::routes::api::AppState,
+    api_key: crate::middleware::auth::AuthenticatedApiKey,
+    body_hash: crate::middleware::RequestBodyHash,
+    headers: header::HeaderMap,
+    request: ChatCompletionRequest,
+    request_id: Uuid,
+) -> axum::response::Response {
     // Convert HTTP request to service parameters
     // Note: Names are not passed - high-cardinality data is tracked via database, not metrics
     let mut service_request = convert_chat_request_to_service(
@@ -744,6 +923,7 @@ pub async fn chat_completions(
         api_key.organization.id.0,
         api_key.workspace.id.0,
         body_hash,
+        request_id,
     );
 
     // Extract and validate encryption headers if present
@@ -1084,6 +1264,8 @@ pub async fn completions(
         request.model, request.stream, api_key.organization.id, api_key.workspace.id.0
     );
 
+    // This endpoint is not yet implemented — it returns immediately without
+    // any async work, so no tracing span is needed here.
     return (
         StatusCode::NOT_IMPLEMENTED,
         ResponseJson(ErrorResponse::new(
@@ -1106,6 +1288,9 @@ pub async fn completions(
             .into_response();
     }
 
+    // Generate correlation ID
+    let request_id = Uuid::new_v4();
+
     // Convert HTTP request to service parameters
     // Note: Names are not passed - high-cardinality data is tracked via database, not metrics
     let service_request = convert_text_request_to_service(
@@ -1115,6 +1300,7 @@ pub async fn completions(
         api_key.organization.id.0,
         api_key.workspace.id.0,
         body_hash,
+        request_id,
     );
 
     // Call the completion service - it handles usage tracking internally
@@ -1146,18 +1332,16 @@ pub async fn completions(
     tag = "Chat",
     responses(
         (status = 200, description = "List of available models", body = ModelsResponse),
-        (status = 401, description = "Invalid or missing API key", body = ErrorResponse),
         (status = 500, description = "Server error", body = ErrorResponse)
     ),
     security(
-        ("api_key" = [])
+        ()
     )
 )]
 pub async fn models(
     State(app_state): State<AppState>,
-    Extension(api_key): Extension<services::workspace::ApiKey>,
 ) -> Result<ResponseJson<ModelsResponse>, (StatusCode, ResponseJson<ErrorResponse>)> {
-    debug!("Models list request from key: {:?}", api_key.id);
+    debug!("Models list request");
 
     let models = app_state
         .models_service
@@ -1175,36 +1359,141 @@ pub async fn models(
 
     let response = ModelsResponse {
         object: "list".to_string(),
-        data: models
-            .into_iter()
-            .map(|model| {
-                // Convert nano-dollars per token (scale 9) to dollars per million tokens
-                // Formula: nano_dollars_per_token * 0.001 = dollars_per_million
-                let pricing = ModelPricing {
-                    input: (model.input_cost_per_token as f64) * 0.001,
-                    output: (model.output_cost_per_token as f64) * 0.001,
-                };
-                ModelInfo {
-                    id: model.model_name.clone(),
-                    object: "model".to_string(),
-                    created: 0, // No timestamp available in ModelWithPricing
-                    owned_by: model.owned_by,
-                    pricing: Some(pricing),
-                    context_length: Some(model.context_length),
-                    architecture: ModelArchitecture::from_options(
-                        model.input_modalities,
-                        model.output_modalities,
-                    ),
-                }
-            })
-            .collect(),
+        data: models.into_iter().map(model_with_pricing_to_info).collect(),
     };
     Ok(ResponseJson(response))
+}
+
+/// Convert a nano-USD amount (DB scale 9 — used for per-token, per-image, and
+/// per-request prices) to a USD string suitable for OpenRouter
+/// (e.g. 8_000 → "0.000008"). Strings are required by the OpenRouter provider
+/// spec to avoid float precision issues, so this uses pure integer arithmetic.
+/// Pricing is non-negative throughout the system; a defensive `abs()` keeps
+/// the formatter total in the unexpected case.
+fn nano_dollars_to_per_token_string(nano_dollars: i64) -> String {
+    if nano_dollars == 0 {
+        return "0".to_string();
+    }
+    let n = nano_dollars.unsigned_abs();
+    let dollars = n / 1_000_000_000;
+    let nanos = n % 1_000_000_000;
+    let mut s = if nanos == 0 {
+        format!("{dollars}")
+    } else {
+        let frac = format!("{nanos:09}");
+        let frac = frac.trim_end_matches('0');
+        format!("{dollars}.{frac}")
+    };
+    if nano_dollars < 0 {
+        s.insert(0, '-');
+    }
+    s
+}
+
+fn model_with_pricing_to_info(model: services::models::ModelWithPricing) -> ModelInfo {
+    // Legacy HuggingFace-style fields: USD per million tokens.
+    // nano_dollars_per_token * 0.001 = USD per million.
+    let input_per_million = (model.input_cost_per_token as f64) * 0.001;
+    let output_per_million = (model.output_cost_per_token as f64) * 0.001;
+
+    let pricing = ModelPricing {
+        input: input_per_million,
+        output: output_per_million,
+        prompt: nano_dollars_to_per_token_string(model.input_cost_per_token),
+        completion: nano_dollars_to_per_token_string(model.output_cost_per_token),
+        image: nano_dollars_to_per_token_string(model.cost_per_image),
+        request: "0".to_string(),
+        input_cache_read: nano_dollars_to_per_token_string(model.cache_read_cost_per_token),
+    };
+
+    let architecture = ModelArchitecture::from_options(
+        model.input_modalities.clone(),
+        model.output_modalities.clone(),
+    );
+
+    let name = if model.model_display_name.is_empty() {
+        None
+    } else {
+        Some(model.model_display_name)
+    };
+    let description = if model.model_description.is_empty() {
+        None
+    } else {
+        Some(model.model_description)
+    };
+
+    ModelInfo {
+        id: model.model_name,
+        object: "model".to_string(),
+        created: model.created_at.timestamp(),
+        owned_by: model.owned_by,
+        name,
+        hugging_face_id: model.hugging_face_id,
+        quantization: model.quantization,
+        pricing: Some(pricing),
+        context_length: Some(model.context_length),
+        max_output_length: model.max_output_length,
+        architecture,
+        input_modalities: model.input_modalities,
+        output_modalities: model.output_modalities,
+        supported_sampling_parameters: model.supported_sampling_parameters,
+        supported_features: model.supported_features,
+        description,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nano_dollars_zero_renders_as_bare_zero() {
+        assert_eq!(nano_dollars_to_per_token_string(0), "0");
+    }
+
+    #[test]
+    fn nano_dollars_one_keeps_full_nine_decimal_places() {
+        // 1 nano-USD = $0.000000001 — boundary for our scale.
+        assert_eq!(nano_dollars_to_per_token_string(1), "0.000000001");
+    }
+
+    #[test]
+    fn nano_dollars_typical_per_token_price_trims_trailing_zeros() {
+        // $0.000008 per token, e.g. Claude Sonnet input.
+        assert_eq!(nano_dollars_to_per_token_string(8_000), "0.000008");
+        // $0.000024 per token, e.g. Claude Sonnet output.
+        assert_eq!(nano_dollars_to_per_token_string(24_000), "0.000024");
+    }
+
+    #[test]
+    fn nano_dollars_whole_dollar_amount_omits_decimal_point() {
+        // 1_000_000_000 nano-USD = $1 exactly. Must NOT render as "1." or "1.0".
+        assert_eq!(nano_dollars_to_per_token_string(1_000_000_000), "1");
+        assert_eq!(nano_dollars_to_per_token_string(5_000_000_000), "5");
+    }
+
+    #[test]
+    fn nano_dollars_mixed_integer_and_fraction() {
+        // $1.500000000 → "1.5" after trim.
+        assert_eq!(nano_dollars_to_per_token_string(1_500_000_000), "1.5");
+        // $1.000000001 → all 9 frac digits preserved (no trailing zeros to trim).
+        assert_eq!(
+            nano_dollars_to_per_token_string(1_000_000_001),
+            "1.000000001"
+        );
+    }
+
+    #[test]
+    fn nano_dollars_max_i64_does_not_lose_precision() {
+        // Integer arithmetic must remain exact at the upper bound, unlike the
+        // previous f64-based implementation.
+        // i64::MAX = 9_223_372_036_854_775_807 nano-USD
+        //         = 9_223_372_036.854775807 USD
+        assert_eq!(
+            nano_dollars_to_per_token_string(i64::MAX),
+            "9223372036.854775807"
+        );
+    }
 
     fn make_chat_chunk(id: &str) -> inference_providers::StreamChunk {
         inference_providers::StreamChunk::Chat(inference_providers::models::ChatCompletionChunk {
@@ -1262,6 +1551,157 @@ mod tests {
         assert!(
             !result.is_nil(),
             "empty provider ID should still produce a non-nil UUID"
+        );
+    }
+
+    fn empty_delta() -> inference_providers::models::ChatDelta {
+        inference_providers::models::ChatDelta {
+            role: None,
+            content: None,
+            name: None,
+            tool_call_id: None,
+            tool_calls: None,
+            reasoning_content: None,
+            reasoning: None,
+        }
+    }
+
+    fn make_chat_chunk_with_choice(
+        delta: Option<inference_providers::models::ChatDelta>,
+        finish_reason: Option<inference_providers::models::FinishReason>,
+    ) -> inference_providers::StreamChunk {
+        inference_providers::StreamChunk::Chat(inference_providers::models::ChatCompletionChunk {
+            id: "x".to_string(),
+            object: "chat.completion.chunk".to_string(),
+            created: 0,
+            model: "m".to_string(),
+            system_fingerprint: None,
+            choices: vec![inference_providers::models::ChatChoice {
+                index: 0,
+                delta,
+                logprobs: None,
+                finish_reason,
+                token_ids: None,
+            }],
+            usage: None,
+            prompt_token_ids: None,
+            modality: None,
+        })
+    }
+
+    #[test]
+    fn finish_chunk_with_empty_delta_drains_held_tail_in_place() {
+        // Reproduces the bug Pierre flagged on PR #599:
+        // when a content chunk pushes bytes into the per-choice tail and
+        // the next chunk is a finish chunk with `delta: {}` + `finish_reason`,
+        // the previous code only drained states whose corresponding delta
+        // field was present on the finish chunk. The held tail then leaked
+        // out *after* the finish chunk via build_flush_chunks — invisible
+        // to clients that stop reading on finish_reason.
+        //
+        // Fix: when finish_reason is present, drain ALL per-choice states
+        // into the finish chunk's delta in place, even if the delta field
+        // was absent. Assert: (a) the tail is on the finish chunk;
+        // (b) `states.content` is empty so build_flush_chunks emits nothing.
+        use services::auto_redact::RedactionMap;
+
+        let mut m = RedactionMap::new();
+        m.lookup_or_mint("private_email", "alice@example.com", |_| false);
+        let map = Arc::new(m);
+        let mut states = StreamUnredactStates::default();
+
+        // Chunk 1: content shorter than hold_size — sits in the tail.
+        let mut chunk1 = make_chat_chunk_with_choice(
+            Some(inference_providers::models::ChatDelta {
+                content: Some("hi redact".to_string()),
+                ..empty_delta()
+            }),
+            None,
+        );
+        unredact_chunk_in_place(&mut chunk1, &mut states, &map);
+
+        // Chunk 2: empty delta + finish_reason.
+        let mut chunk2 = make_chat_chunk_with_choice(
+            Some(empty_delta()),
+            Some(inference_providers::models::FinishReason::Stop),
+        );
+        unredact_chunk_in_place(&mut chunk2, &mut states, &map);
+
+        let inference_providers::StreamChunk::Chat(c2) = &chunk2 else {
+            panic!("expected Chat chunk");
+        };
+        let drained_content = c2.choices[0]
+            .delta
+            .as_ref()
+            .and_then(|d| d.content.as_deref())
+            .unwrap_or("");
+        assert_eq!(
+            drained_content, "hi redact",
+            "held tail must be attached to the finish chunk's delta.content, not emitted after",
+        );
+        assert!(
+            !states.content.contains_key(&0),
+            "after drain the state must be removed so build_flush_chunks emits nothing for this choice",
+        );
+    }
+
+    #[test]
+    fn finish_chunk_with_empty_delta_drains_tool_call_arguments_in_place() {
+        // Same bug as above, for tool-call arguments. A tool_calls fragment
+        // leaves a partial JSON in the per-(choice,tc_idx) state; the next
+        // chunk carries `finish_reason: tool_calls` with empty delta. The
+        // held bytes must come out on THAT chunk, not after.
+        use services::auto_redact::RedactionMap;
+
+        let mut m = RedactionMap::new();
+        m.lookup_or_mint("private_email", "alice@example.com", |_| false);
+        let map = Arc::new(m);
+        let mut states = StreamUnredactStates::default();
+
+        // Chunk 1: tool_call args fragment that fits inside hold_size.
+        let mut chunk1 = make_chat_chunk_with_choice(
+            Some(inference_providers::models::ChatDelta {
+                tool_calls: Some(vec![inference_providers::models::ToolCallDelta {
+                    id: None,
+                    type_: None,
+                    index: Some(0),
+                    function: Some(inference_providers::models::FunctionCallDelta {
+                        name: None,
+                        arguments: Some(r#"{"to":"x"}"#.to_string()),
+                    }),
+                    thought_signature: None,
+                }]),
+                ..empty_delta()
+            }),
+            None,
+        );
+        unredact_chunk_in_place(&mut chunk1, &mut states, &map);
+
+        // Chunk 2: empty delta + finish_reason=tool_calls.
+        let mut chunk2 = make_chat_chunk_with_choice(
+            Some(empty_delta()),
+            Some(inference_providers::models::FinishReason::ToolCalls),
+        );
+        unredact_chunk_in_place(&mut chunk2, &mut states, &map);
+
+        let inference_providers::StreamChunk::Chat(c2) = &chunk2 else {
+            panic!("expected Chat chunk");
+        };
+        let tool_calls = c2.choices[0]
+            .delta
+            .as_ref()
+            .and_then(|d| d.tool_calls.as_ref())
+            .expect("finish chunk must carry the drained tool_calls");
+        assert_eq!(tool_calls.len(), 1);
+        let args = tool_calls[0]
+            .function
+            .as_ref()
+            .and_then(|f| f.arguments.as_deref())
+            .unwrap_or("");
+        assert_eq!(args, r#"{"to":"x"}"#);
+        assert!(
+            states.tool_call_arguments.is_empty(),
+            "after drain the tool_call state must be removed",
         );
     }
 
@@ -3391,6 +3831,506 @@ pub async fn privacy_classify(
                 .into_response()
         }
     }
+}
+
+/// Privacy redaction endpoint
+///
+/// Sends each input text through the privacy-filter model and returns it
+/// rewritten with realistic-looking dummies in place of detected PII
+/// (e.g. `redacted1@example.com`, `+1-555-0100`, `Redacted001`). Useful as
+/// a one-shot sanitizer ahead of calling a third-party LLM. The original
+/// PII is **never** echoed back; only the redacted form is returned.
+///
+/// Internally this is a `/v1/privacy/classify` call plus local span-apply
+/// — same billing (one input_tokens charge per input), same concurrency
+/// limits, same model routing.
+#[derive(utoipa::ToSchema, serde::Serialize, serde::Deserialize)]
+struct PrivacyRedactRequestDoc {
+    /// ID of the model to use for redaction (typically `openai/privacy-filter`).
+    model: String,
+    /// Text or list of texts to redact. Either a string or array of strings.
+    #[serde(default)]
+    input: serde_json::Value,
+    /// Optional minimum confidence score for redacted spans (0.0–1.0).
+    #[serde(default)]
+    threshold: Option<f64>,
+}
+
+#[derive(utoipa::ToSchema, serde::Serialize, serde::Deserialize)]
+struct PrivacyRedactDataEntryDoc {
+    /// Index of this entry into the input list (matches input order).
+    index: usize,
+    /// Input text rewritten with placeholders in place of detected PII.
+    redacted: String,
+    /// Per-input usage (input_tokens billed for this entry).
+    #[serde(default)]
+    usage: serde_json::Value,
+}
+
+#[derive(utoipa::ToSchema, serde::Serialize, serde::Deserialize)]
+struct PrivacyRedactResponseDoc {
+    /// Model identifier that produced the redaction.
+    #[serde(default)]
+    model: String,
+    /// Per-input redaction results.
+    data: Vec<PrivacyRedactDataEntryDoc>,
+}
+
+#[utoipa::path(
+    post,
+    path = "/v1/privacy/redact",
+    tag = "Privacy",
+    request_body = PrivacyRedactRequestDoc,
+    responses(
+        (status = 200, description = "Privacy redaction completed successfully", body = PrivacyRedactResponseDoc),
+        (status = 400, description = "Invalid request", body = ErrorResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 404, description = "Model not found", body = ErrorResponse),
+        (status = 429, description = "Rate limit exceeded", body = ErrorResponse),
+        (status = 500, description = "Server error", body = ErrorResponse)
+    ),
+    security(
+        ("api_key" = [])
+    )
+)]
+pub async fn privacy_redact(
+    State(app_state): State<AppState>,
+    Extension(api_key): Extension<AuthenticatedApiKey>,
+    Extension(_body_hash): Extension<RequestBodyHash>,
+    headers: header::HeaderMap,
+    body: Bytes,
+) -> axum::response::Response {
+    #[derive(serde::Deserialize)]
+    struct RedactRequest {
+        model: String,
+        #[serde(default)]
+        input: serde_json::Value,
+        #[serde(default)]
+        threshold: Option<f64>,
+    }
+
+    let parsed = match serde_json::from_slice::<RedactRequest>(&body) {
+        Ok(req) => req,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                ResponseJson(ErrorResponse::new(
+                    format!("Invalid request body: {e}"),
+                    "invalid_request_error".to_string(),
+                )),
+            )
+                .into_response();
+        }
+    };
+
+    // Normalize input into Vec<String>. Accept either a single string or
+    // an array of strings — matches the privacy-filter request shape and
+    // the classify endpoint's behavior.
+    let texts: Vec<String> = match &parsed.input {
+        serde_json::Value::String(s) => vec![s.clone()],
+        serde_json::Value::Array(items) => {
+            let mut out = Vec::with_capacity(items.len());
+            for (i, item) in items.iter().enumerate() {
+                match item.as_str() {
+                    Some(s) => out.push(s.to_string()),
+                    None => {
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            ResponseJson(ErrorResponse::new(
+                                format!("input[{i}] must be a string"),
+                                "invalid_request_error".to_string(),
+                            )),
+                        )
+                            .into_response();
+                    }
+                }
+            }
+            out
+        }
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                ResponseJson(ErrorResponse::new(
+                    "input must be a string or array of strings".to_string(),
+                    "invalid_request_error".to_string(),
+                )),
+            )
+                .into_response();
+        }
+    };
+
+    if texts.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            ResponseJson(ErrorResponse::new(
+                "input must not be empty".to_string(),
+                "invalid_request_error".to_string(),
+            )),
+        )
+            .into_response();
+    }
+
+    if let Some(t) = parsed.threshold {
+        // Boundary validation: range-check before forwarding upstream so a
+        // bad value surfaces as a 400 here, not a confusing 5xx from the
+        // model. NaN must be rejected explicitly — `0.0..=1.0` would let
+        // it slip through because all comparisons against NaN are false
+        // (so `!contains` is false too).
+        if t.is_nan() || !(0.0..=1.0).contains(&t) {
+            return (
+                StatusCode::BAD_REQUEST,
+                ResponseJson(ErrorResponse::new(
+                    "threshold must be a number in [0.0, 1.0]".to_string(),
+                    "invalid_request_error".to_string(),
+                )),
+            )
+                .into_response();
+        }
+    }
+
+    let model_name = parsed.model;
+
+    debug!(
+        "Privacy redact request: model={}, org={}, workspace={}, n_inputs={}",
+        model_name,
+        api_key.organization.id,
+        api_key.workspace.id.0,
+        texts.len()
+    );
+
+    let model = match app_state
+        .models_service
+        .get_model_by_name(&model_name)
+        .await
+    {
+        Ok(model) => model,
+        Err(services::models::ModelsError::NotFound(_)) => {
+            return (
+                StatusCode::NOT_FOUND,
+                ResponseJson(ErrorResponse::new(
+                    format!("Model '{}' not found", model_name),
+                    "not_found_error".to_string(),
+                )),
+            )
+                .into_response();
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "Failed to resolve model for privacy redact");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ResponseJson(ErrorResponse::new(
+                    "Failed to resolve model".to_string(),
+                    "server_error".to_string(),
+                )),
+            )
+                .into_response();
+        }
+    };
+    let model_id = model.id;
+    let organization_id = api_key.organization.id.0;
+
+    let encryption_headers = match crate::routes::common::validate_encryption_headers(&headers) {
+        Ok(headers) => headers,
+        Err(err) => return err.into_response(),
+    };
+    let mut extra = std::collections::HashMap::new();
+    insert_encryption_headers(&encryption_headers, &mut extra);
+
+    // Forward a normalized classify request to the upstream model. We
+    // deliberately rebuild the body rather than passing the client body
+    // through: the redact endpoint accepts the same wire shape as classify,
+    // but we want a single canonical form (array input) for the upstream
+    // call so downstream parsing always yields one data entry per text.
+    //
+    // Threshold passes through verbatim — only include it if the client
+    // sent one. Injecting a default here would diverge from /privacy/classify
+    // (which is a pure passthrough and lets the model pick its own default).
+    let mut upstream_body = serde_json::json!({
+        "model": &model_name,
+        "input": &texts,
+    });
+    if let Some(t) = parsed.threshold {
+        upstream_body["threshold"] = serde_json::json!(t);
+    }
+    let upstream_bytes = match serde_json::to_vec(&upstream_body) {
+        Ok(b) => bytes::Bytes::from(b),
+        Err(e) => {
+            tracing::error!(error = %e, "Failed to encode upstream redact body");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ResponseJson(ErrorResponse::new(
+                    "Failed to encode upstream request".to_string(),
+                    "server_error".to_string(),
+                )),
+            )
+                .into_response();
+        }
+    };
+
+    let response_bytes = match app_state
+        .completion_service
+        .try_privacy_classify(
+            organization_id,
+            model_id,
+            &model_name,
+            upstream_bytes,
+            extra,
+        )
+        .await
+    {
+        Ok(b) => b,
+        Err(e) => {
+            let (status_code, error_type, message) = match e {
+                services::completions::ports::CompletionError::RateLimitExceeded(msg) => {
+                    tracing::warn!("Concurrent request limit exceeded for privacy redact");
+                    (StatusCode::TOO_MANY_REQUESTS, "rate_limit_error", msg)
+                }
+                services::completions::ports::CompletionError::ProviderError {
+                    status_code,
+                    ..
+                } => {
+                    tracing::error!("Privacy redact provider error");
+                    let http_status = StatusCode::from_u16(status_code)
+                        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+                    (
+                        http_status,
+                        "server_error",
+                        "Privacy redact request failed. Please try again later.".to_string(),
+                    )
+                }
+                services::completions::ports::CompletionError::InvalidModel(msg) => {
+                    tracing::warn!("Privacy redact model not found");
+                    (StatusCode::NOT_FOUND, "not_found_error", msg)
+                }
+                services::completions::ports::CompletionError::ServiceOverloaded(_) => {
+                    tracing::warn!("Privacy redact service overloaded");
+                    (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "service_overloaded",
+                        "The service is temporarily overloaded. Please retry with exponential backoff.".to_string(),
+                    )
+                }
+                _ => {
+                    tracing::error!("Unexpected privacy redact error");
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "server_error",
+                        "Privacy redact request failed".to_string(),
+                    )
+                }
+            };
+            return (
+                status_code,
+                ResponseJson(ErrorResponse::new(message, error_type.to_string())),
+            )
+                .into_response();
+        }
+    };
+
+    // Apply spans locally. `apply_detected_spans` only does in-process work
+    // (JSON parse + UTF-8 boundary checks), so only `Internal` can fire here
+    // — handle every variant uniformly as a 500.
+    let redacted = match services::auto_redact::apply_detected_spans(&texts, &response_bytes) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!(error = %e, "Privacy redact apply failed");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ResponseJson(ErrorResponse::new(
+                    "Failed to apply redactions".to_string(),
+                    "server_error".to_string(),
+                )),
+            )
+                .into_response();
+        }
+    };
+
+    // Pull per-entry usage from the upstream response (same shape as
+    // classify) so we can both bill the org and surface per-entry
+    // input_tokens to the client.
+    #[derive(serde::Deserialize)]
+    struct UsageExtract {
+        #[serde(default)]
+        data: Vec<DataEntry>,
+    }
+    #[derive(serde::Deserialize)]
+    struct DataEntry {
+        #[serde(default)]
+        index: usize,
+        #[serde(default)]
+        usage: Option<UsageFields>,
+    }
+    #[derive(serde::Deserialize, Clone, Copy)]
+    struct UsageFields {
+        input_tokens: Option<i32>,
+    }
+
+    let parsed_usage: UsageExtract =
+        serde_json::from_slice(&response_bytes).unwrap_or(UsageExtract { data: Vec::new() });
+
+    // Dedupe by index *before* summing. A buggy provider that returns two
+    // entries with the same `index` would otherwise be billed twice while
+    // the client only sees the last entry's `usage` in the response —
+    // that's a billing/UI inconsistency. Last-write-wins keeps the bill
+    // and the surfaced per-entry usage in sync.
+    let mut per_index_usage: std::collections::HashMap<usize, UsageFields> =
+        std::collections::HashMap::new();
+    for d in &parsed_usage.data {
+        if d.index >= texts.len() {
+            continue;
+        }
+        if let Some(u) = d.usage {
+            per_index_usage.insert(d.index, u);
+        }
+    }
+    let token_sum_i64: i64 = per_index_usage
+        .values()
+        .filter_map(|u| u.input_tokens)
+        .filter(|t| *t >= 0)
+        .fold(0i64, |acc, t| acc.saturating_add(t as i64));
+    let mut token_count = token_sum_i64.clamp(0, i32::MAX as i64) as i32;
+
+    const MAX_REASONABLE_TOKENS: i32 = 1_000_000;
+    let mut token_anomaly_detected = false;
+    if token_count > MAX_REASONABLE_TOKENS {
+        tracing::error!(
+            token_count = token_count,
+            max_expected = MAX_REASONABLE_TOKENS,
+            model = %model_name,
+            organization_id = %organization_id,
+            "Provider returned unreasonable token count for privacy redact - capping"
+        );
+        token_anomaly_detected = true;
+        let model_tag = format!("model:{}", model_name);
+        let reason_tag = format!(
+            "reason:{}",
+            services::metrics::consts::REASON_TOKEN_OVERFLOW
+        );
+        let anomaly_tags = [model_tag.as_str(), reason_tag.as_str()];
+        app_state.metrics_service.record_count(
+            services::metrics::consts::METRIC_PROVIDER_TOKEN_ANOMALIES,
+            1,
+            &anomaly_tags,
+        );
+        token_count = MAX_REASONABLE_TOKENS;
+    }
+    if token_count == 0 {
+        tracing::warn!(
+            model = %model_name,
+            organization_id = %organization_id,
+            "Provider returned zero tokens for privacy redact"
+        );
+        token_anomaly_detected = true;
+        let model_tag = format!("model:{}", model_name);
+        let reason_tag = format!("reason:{}", services::metrics::consts::REASON_MISSING_USAGE);
+        let zero_tokens_tags = [model_tag.as_str(), reason_tag.as_str()];
+        app_state.metrics_service.record_count(
+            services::metrics::consts::METRIC_PROVIDER_ZERO_TOKENS,
+            1,
+            &zero_tokens_tags,
+        );
+    }
+    if token_anomaly_detected {
+        tracing::info!(
+            model = %model_name,
+            organization_id = %organization_id,
+            final_token_count = token_count,
+            "Token count anomaly: Provider data quality issue detected."
+        );
+    }
+
+    let workspace_id = api_key.workspace.id.0;
+    let api_key_id = match Uuid::parse_str(&api_key.api_key.id.0) {
+        Ok(id) => id,
+        Err(e) => {
+            tracing::error!(error = %e, "Invalid API key ID for usage tracking");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ResponseJson(ErrorResponse::new(
+                    "Failed to record usage".to_string(),
+                    "server_error".to_string(),
+                )),
+            )
+                .into_response();
+        }
+    };
+
+    let inference_id = uuid::Uuid::new_v4();
+    let usage_request = services::usage::RecordUsageServiceRequest {
+        organization_id,
+        workspace_id,
+        api_key_id,
+        model_id,
+        input_tokens: token_count,
+        output_tokens: 0,
+        cache_read_tokens: 0,
+        // Redact reuses the privacy-filter classifier under the hood, so
+        // bill it the same way. If we ever want analytics to distinguish
+        // redact vs classify, add a separate InferenceType variant and a
+        // DB-schema-compatible migration.
+        inference_type: services::usage::ports::InferenceType::PrivacyClassify,
+        ttft_ms: None,
+        avg_itl_ms: None,
+        inference_id: Some(inference_id),
+        provider_request_id: None,
+        stop_reason: Some(services::usage::StopReason::Completed),
+        response_id: None,
+        image_count: None,
+    };
+
+    if let Err(e) = app_state.usage_service.record_usage(usage_request).await {
+        tracing::error!(error = %e, "Failed to record privacy redact usage");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            ResponseJson(ErrorResponse::new(
+                "Failed to record usage - please retry".to_string(),
+                "server_error".to_string(),
+            )),
+        )
+            .into_response();
+    }
+
+    let data: Vec<serde_json::Value> = redacted
+        .into_iter()
+        .enumerate()
+        .map(|(idx, redacted_text)| {
+            let usage_json = per_index_usage
+                .get(&idx)
+                .and_then(|u| u.input_tokens)
+                .map(|t| serde_json::json!({ "input_tokens": t }))
+                .unwrap_or_else(|| serde_json::json!({}));
+            serde_json::json!({
+                "index": idx,
+                "redacted": redacted_text,
+                "usage": usage_json,
+            })
+        })
+        .collect();
+
+    let body = serde_json::json!({
+        "model": model_name,
+        "data": data,
+    });
+    let body_bytes = match serde_json::to_vec(&body) {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::error!(error = %e, "Failed to encode privacy redact response");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ResponseJson(ErrorResponse::new(
+                    "Failed to encode response".to_string(),
+                    "server_error".to_string(),
+                )),
+            )
+                .into_response();
+        }
+    };
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(body_bytes))
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
 
 /// Text similarity scoring endpoint

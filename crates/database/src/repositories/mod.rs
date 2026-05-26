@@ -4,6 +4,7 @@ pub mod analytics;
 pub mod api_key;
 pub mod attestation;
 pub mod conversation;
+pub mod feature_request;
 pub mod file;
 pub mod mcp_connector;
 pub mod model;
@@ -34,6 +35,10 @@ pub use analytics::PgAnalyticsRepository;
 pub use api_key::ApiKeyRepository;
 pub use attestation::PgAttestationRepository;
 pub use conversation::PgConversationRepository;
+pub use feature_request::{
+    FeatureRequestRepository, FeatureRequestSummary, FeatureRequestTarget,
+    FeatureRequestVoteSummary, SubmitFeatureRequestParams, SubmitFeatureRequestResult,
+};
 pub use file::FileRepository;
 pub use mcp_connector::McpConnectorRepository;
 pub use model::ModelRepository;

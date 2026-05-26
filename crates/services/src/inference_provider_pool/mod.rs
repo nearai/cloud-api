@@ -1,8 +1,7 @@
-mod rotation;
-
 use crate::attestation::AttestationVerifier;
 use crate::common::encryption_headers;
 use config::ExternalProvidersConfig;
+use inference_providers::rotation;
 use inference_providers::spki_verifier::{FingerprintState, SharedTlsRoots};
 use inference_providers::{
     models::{AttestationError, CompletionError},
@@ -926,22 +925,22 @@ impl InferenceProviderPool {
 
         // Defense-in-depth: cap the fan-out. A bogus registry reading (race
         // during a deploy, partial split) could otherwise spawn an unbounded
-        // number of fresh-TCP TLS handshakes per cycle per model. The cap is
-        // far above any realistic backend pool; hitting it is logged so it
-        // surfaces in ops without silently dropping coverage.
-        const MAX_ROTATION_FANOUT: usize = 256;
-        let backend_count = if backend_count > MAX_ROTATION_FANOUT {
+        // number of fresh-TCP TLS handshakes per cycle per model. Shared
+        // with VLlmProvider's traffic-time rotation gate so the cap is
+        // defined exactly once.
+        let backend_count = if backend_count > rotation::MAX_FANOUT {
             warn!(
                 model = %model_name,
                 url = %url,
                 reported = backend_count,
-                capped_at = MAX_ROTATION_FANOUT,
+                capped_at = rotation::MAX_FANOUT,
                 "backend count from proxy exceeds sanity cap, truncating fan-out"
             );
             failure_reasons.push(format!(
-                "count_capped: proxy reported {backend_count} > {MAX_ROTATION_FANOUT}"
+                "count_capped: proxy reported {backend_count} > {}",
+                rotation::MAX_FANOUT
             ));
-            MAX_ROTATION_FANOUT
+            rotation::MAX_FANOUT
         } else {
             backend_count
         };
@@ -1393,6 +1392,8 @@ impl InferenceProviderPool {
                     || lower.contains("connect")
                     || lower.contains("reset")
                     || lower.contains("broken pipe")
+                    || lower.contains("decoding response body")
+                    || lower.contains("body error")
                 {
                     "retryable_connection_keyword"
                 } else {
@@ -2173,13 +2174,27 @@ impl InferenceProviderPool {
             }
         }
 
-        let error_msg = last_error
-            .map(|e| Self::sanitize_error_message(&e.to_string()))
-            .unwrap_or_else(|| "No providers available for embeddings".to_string());
-
-        Err(inference_providers::EmbeddingError::RequestFailed(
-            error_msg,
-        ))
+        // Preserve the HttpError variant so the caller can see the upstream
+        // status code and propagate a meaningful response (e.g. 400 for a
+        // client-side parameter error). Collapsing to RequestFailed loses the
+        // status code and forces every upstream error to surface as 502.
+        Err(match last_error {
+            Some(inference_providers::EmbeddingError::HttpError {
+                status_code,
+                message,
+            }) => inference_providers::EmbeddingError::HttpError {
+                status_code,
+                message: Self::sanitize_error_message(&message),
+            },
+            Some(inference_providers::EmbeddingError::RequestFailed(msg)) => {
+                inference_providers::EmbeddingError::RequestFailed(Self::sanitize_error_message(
+                    &msg,
+                ))
+            }
+            None => inference_providers::EmbeddingError::RequestFailed(
+                "No providers available for embeddings".to_string(),
+            ),
+        })
     }
 
     pub async fn privacy_classify(
@@ -2440,6 +2455,12 @@ impl InferenceProviderPool {
                             state.clone(),
                             backend_verifier,
                         ));
+
+                    // Seed the provider's backend_count cache so traffic-time
+                    // rotation-SNI fallback knows how many indices to iterate
+                    // on the first 5xx — without this, the very first 5xx
+                    // before any refresh cycle would skip rotation entirely.
+                    serving_provider.set_backend_count(outcome.backend_count);
 
                     if outcome.total_pinned == 0 {
                         // Fail closed: reject all TLS until a future refresh's
@@ -2770,6 +2791,14 @@ impl InferenceProviderPool {
                         "Cumulative discovery cycle (no new fingerprints)"
                     );
                 }
+
+                // Refresh the provider's backend_count cache so the
+                // rotation-SNI traffic fallback uses the latest known healthy
+                // count. A `count_zero` cycle yields 0 — that's still a
+                // useful update because it disables rotation fallback for
+                // this provider until the next cycle proves at least one
+                // backend healthy again.
+                provider.set_backend_count(outcome.backend_count);
 
                 let ptr = Arc::as_ptr(&provider) as *const () as usize;
                 let provider_has_any_pubkey_mapping = mapped_ptrs.contains(&ptr);
@@ -3438,6 +3467,12 @@ mod tests {
         assert_eq!(
             InferenceProviderPool::classify_retry_decision(&CompletionError::CompletionError(
                 "connection reset by peer".to_string()
+            )),
+            "retryable_connection_keyword",
+        );
+        assert_eq!(
+            InferenceProviderPool::classify_retry_decision(&CompletionError::CompletionError(
+                "error decoding response body".to_string()
             )),
             "retryable_connection_keyword",
         );
@@ -4764,5 +4799,80 @@ mod tests {
             "probe should give up within ~5s, took {elapsed:?}"
         );
         assert_eq!(server.models_hits.load(AtomicOrdering::SeqCst), 1);
+    }
+
+    // ==================== Embeddings Error Propagation Tests ====================
+
+    #[tokio::test]
+    async fn test_embeddings_preserves_http_error_status_code() {
+        // Upstream rejects an embedding request with HTTP 400 (e.g. unsupported
+        // `dimensions` param). The pool MUST preserve the HttpError variant so
+        // the route can return HTTP 400 — not collapse it to RequestFailed,
+        // which previously caused every upstream error to surface as HTTP 502.
+        use inference_providers::mock::MockProvider;
+
+        let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
+        let model_id = "Qwen/Qwen3-Embedding-0.6B".to_string();
+        let mock = Arc::new(MockProvider::new_accept_all());
+        mock.set_embedding_error_override(Some(inference_providers::EmbeddingError::HttpError {
+            status_code: 400,
+            message: "dimensions parameter is not supported for this model".to_string(),
+        }))
+        .await;
+        pool.register_provider(model_id.clone(), mock).await;
+
+        let body = bytes::Bytes::from(
+            r#"{"model":"Qwen/Qwen3-Embedding-0.6B","input":"hi","dimensions":256}"#,
+        );
+        let result = pool
+            .embeddings(&model_id, body, std::collections::HashMap::new())
+            .await;
+
+        match result {
+            Err(inference_providers::EmbeddingError::HttpError {
+                status_code,
+                message,
+            }) => {
+                assert_eq!(status_code, 400);
+                assert!(
+                    message.contains("dimensions parameter is not supported"),
+                    "Expected upstream message to be preserved, got: {message}"
+                );
+            }
+            other => panic!("Expected HttpError(400, ...), got: {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_embeddings_request_failed_stays_request_failed() {
+        // Non-HTTP errors (e.g. network/connection failure) should still
+        // surface as RequestFailed so the route maps them to 502.
+        use inference_providers::mock::MockProvider;
+
+        let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
+        let model_id = "Qwen/Qwen3-Embedding-0.6B".to_string();
+        let mock = Arc::new(MockProvider::new_accept_all());
+        mock.set_embedding_error_override(Some(
+            inference_providers::EmbeddingError::RequestFailed(
+                "connection reset by peer".to_string(),
+            ),
+        ))
+        .await;
+        pool.register_provider(model_id.clone(), mock).await;
+
+        let result = pool
+            .embeddings(
+                &model_id,
+                bytes::Bytes::from(r#"{"model":"x","input":"hi"}"#),
+                std::collections::HashMap::new(),
+            )
+            .await;
+
+        match result {
+            Err(inference_providers::EmbeddingError::RequestFailed(msg)) => {
+                assert!(msg.contains("connection reset"));
+            }
+            other => panic!("Expected RequestFailed, got: {:?}", other),
+        }
     }
 }

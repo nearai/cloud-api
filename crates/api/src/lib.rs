@@ -22,6 +22,9 @@ use crate::{
             models, privacy_classify, privacy_redact, rerank, score,
         },
         conversations,
+        feature_requests::{
+            list_admin_feature_requests, submit_feature_request, FeatureRequestsRouteState,
+        },
         health::health_check,
         models::{get_model_by_name, list_models, ModelsAppState},
         responses,
@@ -829,6 +832,8 @@ pub fn build_app_with_config(
         rate_limit_state.clone(),
     );
 
+    let internal_routes = build_internal_routes(app_state.clone());
+
     let response_routes = build_response_routes(
         domain_services.response_service,
         domain_services.attestation_service.clone(),
@@ -883,6 +888,11 @@ pub fn build_app_with_config(
     let files_routes =
         build_files_routes(app_state.clone(), &auth_components.auth_state_middleware);
 
+    let feature_request_routes = build_feature_request_routes(
+        database.pool().clone(),
+        &auth_components.auth_state_middleware,
+    );
+
     let billing_routes = build_billing_routes(
         domain_services.usage_service.clone(),
         &auth_components.auth_state_middleware,
@@ -936,9 +946,11 @@ pub fn build_app_with_config(
                 .merge(invitation_routes)
                 .merge(auth_vpc_routes)
                 .merge(files_routes)
+                .merge(feature_request_routes)
                 .merge(billing_routes)
                 .merge(usage_recording_routes)
                 .merge(gateway_routes)
+                .merge(internal_routes)
                 .merge(health_routes),
         )
         .merge(openapi_routes)
@@ -1325,6 +1337,36 @@ pub fn build_files_routes(app_state: AppState, auth_state_middleware: &AuthState
         ))
 }
 
+/// Build feature request routes for user submissions and admin aggregation.
+pub fn build_feature_request_routes(
+    pool: database::DbPool,
+    auth_state_middleware: &AuthState,
+) -> Router {
+    use crate::middleware::{admin_middleware, auth_middleware};
+
+    let state = FeatureRequestsRouteState {
+        repository: Arc::new(database::repositories::FeatureRequestRepository::new(pool)),
+    };
+
+    let user_routes = Router::new()
+        .route("/feature-requests", post(submit_feature_request))
+        .with_state(state.clone())
+        .layer(from_fn_with_state(
+            auth_state_middleware.clone(),
+            auth_middleware,
+        ));
+
+    let admin_routes = Router::new()
+        .route("/admin/feature-requests", get(list_admin_feature_requests))
+        .with_state(state)
+        .layer(from_fn_with_state(
+            auth_state_middleware.clone(),
+            admin_middleware,
+        ));
+
+    Router::new().merge(user_routes).merge(admin_routes)
+}
+
 /// Build billing routes with API key auth (HuggingFace billing integration)
 pub fn build_billing_routes(
     usage_service: Arc<dyn services::usage::UsageServiceTrait + Send + Sync>,
@@ -1392,6 +1434,21 @@ pub fn build_gateway_routes(
             auth_state_middleware.clone(),
             middleware::auth::auth_middleware_with_workspace_context,
         ))
+}
+
+/// Build internal-only routes authenticated by the shared
+/// `CLOUD_API_USAGE_TOKEN` service secret rather than the standard `sk-…`
+/// API-key middleware. Mounted under `/v1/internal/*` after the global
+/// `/v1` nest. Today's only route is `POST /internal/usage` (for
+/// inference-proxy's service-token reporter); future internal endpoints
+/// can be added here without touching the sk-auth stack.
+pub fn build_internal_routes(app_state: AppState) -> Router {
+    Router::new()
+        .route(
+            "/internal/usage",
+            post(crate::routes::usage::record_usage_internal),
+        )
+        .with_state(app_state)
 }
 
 pub fn build_model_routes(models_service: Arc<dyn ModelsServiceTrait>) -> Router {
@@ -1701,6 +1758,7 @@ mod tests {
                 port: 0, // Use port 0 for testing to get a random available port
             },
             inference_api_key: Some("test-key".to_string()),
+            internal_usage_token: None,
             logging: config::LoggingConfig {
                 level: "info".to_string(),
                 format: "compact".to_string(),
@@ -1800,6 +1858,7 @@ mod tests {
                 port: 0,
             },
             inference_api_key: Some("test-key".to_string()),
+            internal_usage_token: None,
             logging: config::LoggingConfig {
                 level: "info".to_string(),
                 format: "compact".to_string(),

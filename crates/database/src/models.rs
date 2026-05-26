@@ -457,6 +457,18 @@ pub struct Model {
     /// Base URL for the model's inference endpoint (e.g., "http://localhost:8000")
     pub inference_url: Option<String>,
 
+    /// HuggingFace identifier (e.g. "Qwen/Qwen3-VL-30B-A3B-Instruct").
+    /// Required by OpenRouter when the model is hosted on HF; NULL otherwise.
+    pub hugging_face_id: Option<String>,
+    /// Quantization label (int4/int8/fp4/fp6/fp8/fp16/bf16/fp32).
+    pub quantization: Option<String>,
+    /// Maximum number of output tokens the model can produce in a single response.
+    pub max_output_length: Option<i32>,
+    /// Sampling parameters accepted by the model (OpenRouter vocabulary).
+    pub supported_sampling_parameters: Vec<String>,
+    /// Feature capabilities (OpenRouter vocabulary: tools, json_mode, ...).
+    pub supported_features: Vec<String>,
+
     // Tracking fields
     pub is_active: bool,
     pub owned_by: String,
@@ -489,6 +501,12 @@ pub struct UpdateModelPricingRequest {
     pub output_modalities: Option<Vec<String>>,
     /// Base URL for the model's inference endpoint
     pub inference_url: Option<String>,
+    // OpenRouter-compatibility fields
+    pub hugging_face_id: Option<String>,
+    pub quantization: Option<String>,
+    pub max_output_length: Option<i32>,
+    pub supported_sampling_parameters: Option<Vec<String>>,
+    pub supported_features: Option<Vec<String>>,
     // User audit tracking for history
     pub change_reason: Option<String>,
     pub changed_by_user_id: Option<Uuid>,
@@ -529,6 +547,13 @@ pub struct ModelHistory {
 
     /// Base URL for the model's inference endpoint
     pub inference_url: Option<String>,
+
+    // OpenRouter-compatibility snapshot
+    pub hugging_face_id: Option<String>,
+    pub quantization: Option<String>,
+    pub max_output_length: Option<i32>,
+    pub supported_sampling_parameters: Vec<String>,
+    pub supported_features: Vec<String>,
 
     // Temporal fields
     pub effective_from: DateTime<Utc>,

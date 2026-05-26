@@ -82,6 +82,11 @@ impl AdminRepository for AdminCompositeRepository {
             input_modalities: request.input_modalities,
             output_modalities: request.output_modalities,
             inference_url: request.inference_url,
+            hugging_face_id: request.hugging_face_id,
+            quantization: request.quantization,
+            max_output_length: request.max_output_length,
+            supported_sampling_parameters: request.supported_sampling_parameters,
+            supported_features: request.supported_features,
             change_reason: request.change_reason,
             changed_by_user_id: request.changed_by_user_id,
             changed_by_user_email: request.changed_by_user_email,
@@ -118,6 +123,11 @@ impl AdminRepository for AdminCompositeRepository {
             input_modalities: model.input_modalities,
             output_modalities: model.output_modalities,
             inference_url: model.inference_url,
+            hugging_face_id: model.hugging_face_id,
+            quantization: model.quantization,
+            max_output_length: model.max_output_length,
+            supported_sampling_parameters: model.supported_sampling_parameters,
+            supported_features: model.supported_features,
         })
     }
 
@@ -157,6 +167,11 @@ impl AdminRepository for AdminCompositeRepository {
                 input_modalities: h.input_modalities,
                 output_modalities: h.output_modalities,
                 inference_url: h.inference_url,
+                hugging_face_id: h.hugging_face_id,
+                quantization: h.quantization,
+                max_output_length: h.max_output_length,
+                supported_sampling_parameters: h.supported_sampling_parameters,
+                supported_features: h.supported_features,
                 effective_from: h.effective_from,
                 effective_until: h.effective_until,
                 changed_by_user_id: h.changed_by_user_id,
@@ -399,6 +414,13 @@ impl AdminRepository for AdminCompositeRepository {
                 .flatten()
                 .and_then(|v| serde_json::from_value(v).ok()),
             inference_url: row.try_get("inference_url").ok().flatten(),
+            hugging_face_id: row.try_get("hugging_face_id").ok().flatten(),
+            quantization: row.try_get("quantization").ok().flatten(),
+            max_output_length: row.try_get("max_output_length").ok().flatten(),
+            supported_sampling_parameters: row
+                .try_get("supported_sampling_parameters")
+                .unwrap_or_default(),
+            supported_features: row.try_get("supported_features").unwrap_or_default(),
         };
 
         let select_with_aliases_sql = r#"
@@ -409,6 +431,8 @@ impl AdminRepository for AdminCompositeRepository {
                 m.is_active, m.owned_by, m.provider_type, m.provider_config,
                 m.attestation_supported, m.input_modalities, m.output_modalities,
                 m.inference_url,
+                m.hugging_face_id, m.quantization, m.max_output_length,
+                m.supported_sampling_parameters, m.supported_features,
                 COALESCE(
                     array_agg(ma.alias_name) FILTER (WHERE ma.alias_name IS NOT NULL),
                     '{}'
@@ -625,6 +649,11 @@ impl AdminRepository for AdminCompositeRepository {
                 input_modalities: m.input_modalities,
                 output_modalities: m.output_modalities,
                 inference_url: m.inference_url,
+                hugging_face_id: m.hugging_face_id,
+                quantization: m.quantization,
+                max_output_length: m.max_output_length,
+                supported_sampling_parameters: m.supported_sampling_parameters,
+                supported_features: m.supported_features,
             })
             .collect();
 

@@ -60,6 +60,7 @@ pub fn test_config() -> ApiConfig {
             .or_else(|_| std::env::var("MODEL_DISCOVERY_API_KEY"))
             .ok()
             .or(Some("test_api_key".to_string())),
+        internal_usage_token: None,
         logging: config::LoggingConfig {
             level: "debug".to_string(),
             format: "compact".to_string(),
@@ -382,6 +383,22 @@ pub async fn setup_test_server() -> axum_test::TestServer {
     server
 }
 
+/// Variant of `setup_test_server` that runs an arbitrary mutator against
+/// the test `ApiConfig` before the test server is built. Use when a test
+/// needs to flip a config knob — e.g. to enable the
+/// `/v1/internal/usage` endpoint by setting `internal_usage_token` —
+/// without racing other tests via process-wide env vars.
+pub async fn setup_test_server_with_config<F>(mutate: F) -> axum_test::TestServer
+where
+    F: FnOnce(&mut config::ApiConfig),
+{
+    let mut infra = setup_test_infrastructure().await;
+    mutate(&mut infra.config);
+    let (server, _pool, _mock) =
+        build_test_server_components(infra.database.clone(), infra.config).await;
+    server
+}
+
 pub async fn setup_test_server_with_database() -> (axum_test::TestServer, Arc<Database>) {
     let (server, _, _, database) = setup_test_server_with_pool().await;
     (server, database)
@@ -495,10 +512,11 @@ pub async fn setup_unique_test_session(database: &Arc<Database>) -> (String, Str
     // Session ID format: rt_{uuid} (with dashes so it can be parsed by MockAuthService)
     let session_id = format!("rt_{user_id_str}");
     let email = format!("test-{user_id_str}@test.com");
+    let provider_user_id = format!("mock_user-{user_id_str}");
 
     let pool = database.pool();
     let client = pool.get().await.expect("Failed to get database connection");
-    let _ = client.execute(
+    client.execute(
         "INSERT INTO users (id, email, username, display_name, avatar_url, auth_provider, provider_user_id, created_at, updated_at)
          VALUES ($1, $2, $3, $4, $5, $6, $7, NOW(), NOW())
          ON CONFLICT (id) DO NOTHING",
@@ -509,9 +527,9 @@ pub async fn setup_unique_test_session(database: &Arc<Database>) -> (String, Str
             &Some("Test User".to_string()),
             &Some("https://example.com/avatar.jpg".to_string()),
             &"mock",
-            &"mock_user",
+            &provider_user_id,
         ],
-    ).await;
+    ).await.expect("Failed to create unique test user");
 
     (session_id, email)
 }

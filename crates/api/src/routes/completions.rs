@@ -19,7 +19,7 @@ use services::completions::{
 use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::debug;
+use tracing::{debug, Instrument};
 use utoipa;
 use uuid::Uuid;
 
@@ -209,6 +209,42 @@ fn completion_stream_error_category(e: &inference_providers::CompletionError) ->
     }
 }
 
+/// Returns an OpenAI-compatible `error.type` for a stream-level completion error.
+/// Used in the `data: {"error":{...}}` SSE frame so clients can branch on the type.
+///
+/// Match is intentionally exhaustive (no `_` arm): a new `CompletionError`
+/// variant must force a compile error here so the OpenAI mapping is reviewed
+/// explicitly instead of silently defaulting to `server_error`.
+fn completion_stream_error_openai_type(e: &inference_providers::CompletionError) -> &'static str {
+    match e {
+        inference_providers::CompletionError::HttpError { status_code, .. } => match *status_code {
+            429 => "rate_limit_exceeded",
+            400..=499 => "invalid_request_error",
+            _ => "server_error",
+        },
+        inference_providers::CompletionError::CompletionError(_)
+        | inference_providers::CompletionError::InvalidResponse(_)
+        | inference_providers::CompletionError::Unknown(_)
+        | inference_providers::CompletionError::NoPubKeyProvider(_)
+        | inference_providers::CompletionError::Timeout { .. } => "server_error",
+    }
+}
+
+/// Build an OpenAI-compatible SSE error frame.
+///
+/// Format: `data: {"error":{"message":"...","type":"..."}}\n\n`. Replaces the
+/// historical `data: error: <msg>\n\n` shape that was not valid JSON and broke
+/// clients (opencode, vercel/ai-sdk) parsing the `data:` payload as JSON.
+fn sse_error_frame(e: &inference_providers::CompletionError) -> Bytes {
+    let payload = serde_json::json!({
+        "error": {
+            "message": e.to_string(),
+            "type": completion_stream_error_openai_type(e),
+        }
+    });
+    Bytes::from(format!("data: {payload}\n\n"))
+}
+
 // Helper function to extract inference ID from a parsed stream chunk
 fn extract_inference_id_from_chunk(chunk: &inference_providers::StreamChunk) -> Uuid {
     let id = match chunk {
@@ -245,8 +281,10 @@ fn convert_chat_request_to_service(
     organization_id: Uuid,
     workspace_id: Uuid,
     body_hash: RequestBodyHash,
+    request_id: Uuid,
 ) -> ServiceCompletionRequest {
     ServiceCompletionRequest {
+        request_id,
         model: request.model.clone(),
         messages: request
             .messages
@@ -756,8 +794,10 @@ fn convert_text_request_to_service(
     organization_id: Uuid,
     workspace_id: Uuid,
     body_hash: RequestBodyHash,
+    request_id: Uuid,
 ) -> ServiceCompletionRequest {
     ServiceCompletionRequest {
+        request_id,
         model: request.model.clone(),
         messages: vec![CompletionMessage {
             role: "user".to_string(),
@@ -831,6 +871,49 @@ pub async fn chat_completions(
             .into_response();
     }
 
+    // Generate a per-request correlation ID. Reuse the client's X-Request-Id if
+    // present and parseable as a UUID; otherwise generate a fresh one. This ID
+    // propagates downstream as X-Request-Id on every outbound inference call.
+    let request_id = headers
+        .get("x-request-id")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| Uuid::parse_str(s).ok())
+        .unwrap_or_else(Uuid::new_v4);
+
+    // Create a span carrying correlation IDs so every log line within this
+    // request carries request_id/org_id/workspace_id in Datadog.
+    //
+    // NOTE: we do NOT call span.enter() here. In async code, Span::enter()
+    // stores the guard in a thread-local; when the future yields at an .await
+    // the guard stays entered on that thread, so any other task scheduled on
+    // the same thread incorrectly inherits this span as its parent, corrupting
+    // log context. Use .instrument(span) on the inner async block instead.
+    let span = tracing::info_span!(
+        "chat_completions",
+        request_id = %request_id,
+        org_id = %api_key.organization.id.0,
+        workspace_id = %api_key.workspace.id.0,
+        model = %request.model,
+    );
+
+    chat_completions_inner(app_state, api_key, body_hash, headers, request, request_id)
+        .instrument(span)
+        .await
+}
+
+// Inner async fn so .instrument(span) wraps all awaits in the handler.
+// Split from `chat_completions` only to correctly scope the tracing span:
+// using span.enter() in an async fn risks the guard outliving an .await yield,
+// causing other tasks on the same thread to inherit this span's context.
+#[allow(clippy::too_many_arguments)]
+async fn chat_completions_inner(
+    app_state: crate::routes::api::AppState,
+    api_key: crate::middleware::auth::AuthenticatedApiKey,
+    body_hash: crate::middleware::RequestBodyHash,
+    headers: header::HeaderMap,
+    request: ChatCompletionRequest,
+    request_id: Uuid,
+) -> axum::response::Response {
     // Convert HTTP request to service parameters
     // Note: Names are not passed - high-cardinality data is tracked via database, not metrics
     let mut service_request = convert_chat_request_to_service(
@@ -840,6 +923,7 @@ pub async fn chat_completions(
         api_key.organization.id.0,
         api_key.workspace.id.0,
         body_hash,
+        request_id,
     );
 
     // Extract and validate encryption headers if present
@@ -1008,9 +1092,7 @@ pub async fn chat_completions(
                                             "Completion stream error"
                                         );
                                     }
-                                    Ok::<Bytes, Infallible>(Bytes::from(format!(
-                                        "data: error: {e}\n\n"
-                                    )))
+                                    Ok::<Bytes, Infallible>(sse_error_frame(&e))
                                 }
                             }
                         }
@@ -1182,6 +1264,8 @@ pub async fn completions(
         request.model, request.stream, api_key.organization.id, api_key.workspace.id.0
     );
 
+    // This endpoint is not yet implemented — it returns immediately without
+    // any async work, so no tracing span is needed here.
     return (
         StatusCode::NOT_IMPLEMENTED,
         ResponseJson(ErrorResponse::new(
@@ -1204,6 +1288,9 @@ pub async fn completions(
             .into_response();
     }
 
+    // Generate correlation ID
+    let request_id = Uuid::new_v4();
+
     // Convert HTTP request to service parameters
     // Note: Names are not passed - high-cardinality data is tracked via database, not metrics
     let service_request = convert_text_request_to_service(
@@ -1213,6 +1300,7 @@ pub async fn completions(
         api_key.organization.id.0,
         api_key.workspace.id.0,
         body_hash,
+        request_id,
     );
 
     // Call the completion service - it handles usage tracking internally
@@ -1273,36 +1361,141 @@ pub async fn models(
 
     let response = ModelsResponse {
         object: "list".to_string(),
-        data: models
-            .into_iter()
-            .map(|model| {
-                // Convert nano-dollars per token (scale 9) to dollars per million tokens
-                // Formula: nano_dollars_per_token * 0.001 = dollars_per_million
-                let pricing = ModelPricing {
-                    input: (model.input_cost_per_token as f64) * 0.001,
-                    output: (model.output_cost_per_token as f64) * 0.001,
-                };
-                ModelInfo {
-                    id: model.model_name.clone(),
-                    object: "model".to_string(),
-                    created: 0, // No timestamp available in ModelWithPricing
-                    owned_by: model.owned_by,
-                    pricing: Some(pricing),
-                    context_length: Some(model.context_length),
-                    architecture: ModelArchitecture::from_options(
-                        model.input_modalities,
-                        model.output_modalities,
-                    ),
-                }
-            })
-            .collect(),
+        data: models.into_iter().map(model_with_pricing_to_info).collect(),
     };
     Ok(ResponseJson(response))
+}
+
+/// Convert a nano-USD amount (DB scale 9 — used for per-token, per-image, and
+/// per-request prices) to a USD string suitable for OpenRouter
+/// (e.g. 8_000 → "0.000008"). Strings are required by the OpenRouter provider
+/// spec to avoid float precision issues, so this uses pure integer arithmetic.
+/// Pricing is non-negative throughout the system; a defensive `abs()` keeps
+/// the formatter total in the unexpected case.
+fn nano_dollars_to_per_token_string(nano_dollars: i64) -> String {
+    if nano_dollars == 0 {
+        return "0".to_string();
+    }
+    let n = nano_dollars.unsigned_abs();
+    let dollars = n / 1_000_000_000;
+    let nanos = n % 1_000_000_000;
+    let mut s = if nanos == 0 {
+        format!("{dollars}")
+    } else {
+        let frac = format!("{nanos:09}");
+        let frac = frac.trim_end_matches('0');
+        format!("{dollars}.{frac}")
+    };
+    if nano_dollars < 0 {
+        s.insert(0, '-');
+    }
+    s
+}
+
+fn model_with_pricing_to_info(model: services::models::ModelWithPricing) -> ModelInfo {
+    // Legacy HuggingFace-style fields: USD per million tokens.
+    // nano_dollars_per_token * 0.001 = USD per million.
+    let input_per_million = (model.input_cost_per_token as f64) * 0.001;
+    let output_per_million = (model.output_cost_per_token as f64) * 0.001;
+
+    let pricing = ModelPricing {
+        input: input_per_million,
+        output: output_per_million,
+        prompt: nano_dollars_to_per_token_string(model.input_cost_per_token),
+        completion: nano_dollars_to_per_token_string(model.output_cost_per_token),
+        image: nano_dollars_to_per_token_string(model.cost_per_image),
+        request: "0".to_string(),
+        input_cache_read: nano_dollars_to_per_token_string(model.cache_read_cost_per_token),
+    };
+
+    let architecture = ModelArchitecture::from_options(
+        model.input_modalities.clone(),
+        model.output_modalities.clone(),
+    );
+
+    let name = if model.model_display_name.is_empty() {
+        None
+    } else {
+        Some(model.model_display_name)
+    };
+    let description = if model.model_description.is_empty() {
+        None
+    } else {
+        Some(model.model_description)
+    };
+
+    ModelInfo {
+        id: model.model_name,
+        object: "model".to_string(),
+        created: model.created_at.timestamp(),
+        owned_by: model.owned_by,
+        name,
+        hugging_face_id: model.hugging_face_id,
+        quantization: model.quantization,
+        pricing: Some(pricing),
+        context_length: Some(model.context_length),
+        max_output_length: model.max_output_length,
+        architecture,
+        input_modalities: model.input_modalities,
+        output_modalities: model.output_modalities,
+        supported_sampling_parameters: model.supported_sampling_parameters,
+        supported_features: model.supported_features,
+        description,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nano_dollars_zero_renders_as_bare_zero() {
+        assert_eq!(nano_dollars_to_per_token_string(0), "0");
+    }
+
+    #[test]
+    fn nano_dollars_one_keeps_full_nine_decimal_places() {
+        // 1 nano-USD = $0.000000001 — boundary for our scale.
+        assert_eq!(nano_dollars_to_per_token_string(1), "0.000000001");
+    }
+
+    #[test]
+    fn nano_dollars_typical_per_token_price_trims_trailing_zeros() {
+        // $0.000008 per token, e.g. Claude Sonnet input.
+        assert_eq!(nano_dollars_to_per_token_string(8_000), "0.000008");
+        // $0.000024 per token, e.g. Claude Sonnet output.
+        assert_eq!(nano_dollars_to_per_token_string(24_000), "0.000024");
+    }
+
+    #[test]
+    fn nano_dollars_whole_dollar_amount_omits_decimal_point() {
+        // 1_000_000_000 nano-USD = $1 exactly. Must NOT render as "1." or "1.0".
+        assert_eq!(nano_dollars_to_per_token_string(1_000_000_000), "1");
+        assert_eq!(nano_dollars_to_per_token_string(5_000_000_000), "5");
+    }
+
+    #[test]
+    fn nano_dollars_mixed_integer_and_fraction() {
+        // $1.500000000 → "1.5" after trim.
+        assert_eq!(nano_dollars_to_per_token_string(1_500_000_000), "1.5");
+        // $1.000000001 → all 9 frac digits preserved (no trailing zeros to trim).
+        assert_eq!(
+            nano_dollars_to_per_token_string(1_000_000_001),
+            "1.000000001"
+        );
+    }
+
+    #[test]
+    fn nano_dollars_max_i64_does_not_lose_precision() {
+        // Integer arithmetic must remain exact at the upper bound, unlike the
+        // previous f64-based implementation.
+        // i64::MAX = 9_223_372_036_854_775_807 nano-USD
+        //         = 9_223_372_036.854775807 USD
+        assert_eq!(
+            nano_dollars_to_per_token_string(i64::MAX),
+            "9223372036.854775807"
+        );
+    }
 
     fn make_chat_chunk(id: &str) -> inference_providers::StreamChunk {
         inference_providers::StreamChunk::Chat(inference_providers::models::ChatCompletionChunk {
@@ -1515,6 +1708,92 @@ mod tests {
     }
 
     #[test]
+    fn test_classify_provider_error_404_surfaces_message() {
+        let (status, error_type, message) =
+            classify_provider_error(404, "model 'foo' not found".to_string());
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(error_type, "not_found_error");
+        assert_eq!(message, "model 'foo' not found");
+    }
+
+    #[test]
+    fn test_classify_provider_error_429_surfaces_message() {
+        let (status, error_type, message) =
+            classify_provider_error(429, "too many concurrent requests".to_string());
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(error_type, "rate_limit_error");
+        assert_eq!(message, "too many concurrent requests");
+    }
+
+    #[test]
+    fn test_classify_provider_error_400_surfaces_message() {
+        let (status, error_type, message) = classify_provider_error(
+            400,
+            "dimensions is not supported for this model".to_string(),
+        );
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(error_type, "invalid_request_error");
+        assert_eq!(message, "dimensions is not supported for this model");
+    }
+
+    #[test]
+    fn test_classify_provider_error_422_preserves_upstream_status() {
+        let (status, error_type, message) =
+            classify_provider_error(422, "validation failed".to_string());
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(error_type, "invalid_request_error");
+        assert_eq!(message, "validation failed");
+    }
+
+    #[test]
+    fn test_classify_provider_error_401_masked_as_5xx() {
+        // 401 from upstream means *our* credentials are wrong — the client
+        // did nothing to cause it, so we must not echo the auth error.
+        let (status, error_type, message) =
+            classify_provider_error(401, "Invalid API key 'sk-***'".to_string());
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(error_type, "server_error");
+        assert!(
+            !message.contains("sk-"),
+            "must not leak upstream credentials in surfaced message"
+        );
+        assert!(message.contains("try again later"));
+    }
+
+    #[test]
+    fn test_classify_provider_error_403_masked_as_5xx() {
+        let (status, error_type, message) =
+            classify_provider_error(403, "Forbidden: backend ACL denied".to_string());
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(error_type, "server_error");
+        assert_eq!(
+            message,
+            "Embeddings request failed. Please try again later."
+        );
+    }
+
+    #[test]
+    fn test_classify_provider_error_407_masked_as_5xx() {
+        let (status, error_type, _) =
+            classify_provider_error(407, "proxy auth required".to_string());
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(error_type, "server_error");
+    }
+
+    #[test]
+    fn test_classify_provider_error_5xx_masked() {
+        // 5xx bodies may contain stack traces or internal details — never echo.
+        let (status, error_type, message) = classify_provider_error(
+            502,
+            "RuntimeError: traceback...internal-host:9000".to_string(),
+        );
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(error_type, "server_error");
+        assert!(!message.contains("traceback"));
+        assert!(!message.contains("internal-host"));
+    }
+
+    #[test]
     fn test_stream_chunk_serialization_preserves_field_order() {
         // Verify that StreamChunk::Chat serializes with struct field order
         // (not alphabetical), matching what serde_json::to_string produces.
@@ -1549,6 +1828,107 @@ mod tests {
         assert!(
             id_pos < choices_pos,
             "id should appear before choices (struct field order)"
+        );
+    }
+
+    #[test]
+    fn test_sse_error_frame_is_valid_json() {
+        // Every stream-error variant must produce a frame whose `data:` payload
+        // parses as JSON of shape {"error": {"message": ..., "type": ...}}.
+        // The historical `data: error: <msg>\n\n` format broke clients that
+        // parse the data payload as JSON (opencode, vercel/ai-sdk).
+        let cases = vec![
+            inference_providers::CompletionError::CompletionError("boom".into()),
+            inference_providers::CompletionError::HttpError {
+                status_code: 503,
+                message: "overloaded".into(),
+                is_external: false,
+            },
+            inference_providers::CompletionError::HttpError {
+                status_code: 429,
+                message: "rate limit".into(),
+                is_external: false,
+            },
+            inference_providers::CompletionError::HttpError {
+                status_code: 400,
+                message: "bad request".into(),
+                is_external: false,
+            },
+            inference_providers::CompletionError::InvalidResponse("Failed to parse event".into()),
+            inference_providers::CompletionError::NoPubKeyProvider("abc".into()),
+            inference_providers::CompletionError::Unknown("mystery".into()),
+            inference_providers::CompletionError::Timeout {
+                operation: "completion".into(),
+                timeout_seconds: 30,
+            },
+        ];
+
+        for e in &cases {
+            let frame = sse_error_frame(e);
+            let text = std::str::from_utf8(&frame).expect("frame is utf-8");
+            assert!(
+                text.starts_with("data: "),
+                "frame missing 'data: ' prefix: {text:?}"
+            );
+            assert!(
+                text.ends_with("\n\n"),
+                "frame missing SSE terminator: {text:?}"
+            );
+            let payload = text
+                .strip_prefix("data: ")
+                .and_then(|s| s.strip_suffix("\n\n"))
+                .expect("frame must have data: prefix and \\n\\n suffix");
+            let json: serde_json::Value = serde_json::from_str(payload).unwrap_or_else(|err| {
+                panic!("frame payload not valid JSON for {e:?}: err={err}, payload={payload}")
+            });
+            let obj = json.get("error").expect("payload has error key");
+            assert!(obj
+                .get("message")
+                .and_then(|v| v.as_str())
+                .is_some_and(|s| !s.is_empty()));
+            assert!(obj
+                .get("type")
+                .and_then(|v| v.as_str())
+                .is_some_and(|s| !s.is_empty()));
+        }
+    }
+
+    #[test]
+    fn test_completion_stream_error_openai_type_http_status_mapping() {
+        let rate_limited = inference_providers::CompletionError::HttpError {
+            status_code: 429,
+            message: "rl".into(),
+            is_external: false,
+        };
+        assert_eq!(
+            completion_stream_error_openai_type(&rate_limited),
+            "rate_limit_exceeded"
+        );
+
+        let client_err = inference_providers::CompletionError::HttpError {
+            status_code: 400,
+            message: "bad".into(),
+            is_external: false,
+        };
+        assert_eq!(
+            completion_stream_error_openai_type(&client_err),
+            "invalid_request_error"
+        );
+
+        let server_err = inference_providers::CompletionError::HttpError {
+            status_code: 503,
+            message: "down".into(),
+            is_external: false,
+        };
+        assert_eq!(
+            completion_stream_error_openai_type(&server_err),
+            "server_error"
+        );
+
+        let parse_err = inference_providers::CompletionError::InvalidResponse("bad chunk".into());
+        assert_eq!(
+            completion_stream_error_openai_type(&parse_err),
+            "server_error"
         );
     }
 }
@@ -2823,6 +3203,49 @@ struct EmbeddingsResponseDoc {
     data: serde_json::Value,
 }
 
+/// Classify an upstream provider HTTP error into the (status, error_type, message)
+/// triple we surface to the client.
+///
+/// Rules:
+/// - 401/403/407 from upstream mean *our* credentials to the backend are wrong
+///   (or our backend's auth config is broken). The client did nothing to cause
+///   it, so we return 500 with a generic message instead of echoing an auth
+///   failure that would be misleading.
+/// - 404 → 404 not_found_error (e.g. model not found at this provider).
+/// - 429 → 429 rate_limit_error.
+/// - Other 4xx → preserve upstream status with `invalid_request_error`. The
+///   upstream message is surfaced so the user can see *why* their request was
+///   rejected (e.g. "dimensions is not supported for this model").
+/// - 5xx (and anything else) → 500 server_error with a generic message. The
+///   upstream body may contain stack traces or internal details we don't want
+///   to leak.
+fn classify_provider_error(
+    upstream_status: u16,
+    upstream_message: String,
+) -> (StatusCode, &'static str, String) {
+    let generic = || {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "server_error",
+            "Embeddings request failed. Please try again later.".to_string(),
+        )
+    };
+    match upstream_status {
+        401 | 403 | 407 => generic(),
+        404 => (StatusCode::NOT_FOUND, "not_found_error", upstream_message),
+        429 => (
+            StatusCode::TOO_MANY_REQUESTS,
+            "rate_limit_error",
+            upstream_message,
+        ),
+        s if (400..=499).contains(&s) => {
+            let http_status = StatusCode::from_u16(s).unwrap_or(StatusCode::BAD_REQUEST);
+            (http_status, "invalid_request_error", upstream_message)
+        }
+        _ => generic(),
+    }
+}
+
 #[utoipa::path(
     post,
     path = "/v1/embeddings",
@@ -3053,16 +3476,18 @@ pub async fn embeddings(
                 }
                 services::completions::ports::CompletionError::ProviderError {
                     status_code,
-                    ..
+                    message,
                 } => {
-                    tracing::error!("Embeddings provider error");
-                    let http_status = StatusCode::from_u16(status_code)
-                        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-                    (
-                        http_status,
-                        "server_error",
-                        "Embeddings request failed. Please try again later.".to_string(),
-                    )
+                    let classified = classify_provider_error(status_code, message);
+                    if classified.0.is_client_error() {
+                        tracing::warn!(
+                            upstream_status = status_code,
+                            "Embeddings rejected by upstream with client error"
+                        );
+                    } else {
+                        tracing::error!(upstream_status = status_code, "Embeddings provider error");
+                    }
+                    classified
                 }
                 services::completions::ports::CompletionError::InvalidModel(msg) => {
                     tracing::warn!("Embeddings model not found");

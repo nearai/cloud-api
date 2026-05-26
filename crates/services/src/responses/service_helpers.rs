@@ -6,7 +6,54 @@
 use crate::conversations::models::ConversationId;
 use crate::responses::{errors, models};
 use futures::channel::mpsc::UnboundedSender;
+use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::Arc;
 use uuid::Uuid;
+
+/// Atomically-updated mirror of `ResponseStreamContext`'s token counters.
+///
+/// `process_response_stream` owns `ctx` and drops it when it returns. The outer
+/// `tokio::spawn` task that emits `response.failed` on error needs visibility
+/// into accumulated usage after `ctx` is gone, so `ctx` writes through this
+/// shared handle on every update; the outer scope reads it via `snapshot`.
+#[derive(Default)]
+pub struct UsageTracker {
+    input_tokens: AtomicI32,
+    output_tokens: AtomicI32,
+    cached_tokens: AtomicI32,
+    reasoning_tokens: AtomicI32,
+}
+
+impl UsageTracker {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    pub fn set_chunk_usage(&self, input: i32, output: i32, cached: i32) {
+        self.input_tokens.store(input, Ordering::Relaxed);
+        self.output_tokens.store(output, Ordering::Relaxed);
+        self.cached_tokens.store(cached, Ordering::Relaxed);
+    }
+
+    pub fn add_reasoning(&self, tokens: i32) {
+        self.reasoning_tokens.fetch_add(tokens, Ordering::Relaxed);
+    }
+
+    pub fn snapshot(&self) -> models::Usage {
+        models::Usage::new_with_reasoning_and_cache(
+            self.input_tokens.load(Ordering::Relaxed),
+            self.output_tokens.load(Ordering::Relaxed),
+            self.reasoning_tokens.load(Ordering::Relaxed),
+            self.cached_tokens.load(Ordering::Relaxed),
+        )
+    }
+
+    pub fn has_data(&self) -> bool {
+        self.input_tokens.load(Ordering::Relaxed) > 0
+            || self.output_tokens.load(Ordering::Relaxed) > 0
+            || self.reasoning_tokens.load(Ordering::Relaxed) > 0
+    }
+}
 
 /// Context for processing a response stream
 ///
@@ -29,9 +76,13 @@ pub struct ResponseStreamContext {
     pub previous_response_id: Option<String>,
     pub created_at: i64,
     pub model: String,
+    /// Shared mirror of token counters so the outer error handler can read
+    /// accumulated usage even after `ctx` is dropped.
+    pub usage_tracker: Arc<UsageTracker>,
 }
 
 impl ResponseStreamContext {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         response_id: models::ResponseId,
         api_key_id: Uuid,
@@ -40,6 +91,7 @@ impl ResponseStreamContext {
         previous_response_id: Option<String>,
         created_at: i64,
         model: String,
+        usage_tracker: Arc<UsageTracker>,
     ) -> Self {
         Self {
             response_id,
@@ -55,6 +107,7 @@ impl ResponseStreamContext {
             previous_response_id,
             model,
             created_at,
+            usage_tracker,
         }
     }
 
@@ -75,11 +128,14 @@ impl ResponseStreamContext {
         self.total_input_tokens = input_tokens;
         self.total_output_tokens = output_tokens;
         self.total_cached_tokens = cached_tokens;
+        self.usage_tracker
+            .set_chunk_usage(input_tokens, output_tokens, cached_tokens);
     }
 
     /// Add reasoning tokens from detected reasoning content
     pub fn add_reasoning_tokens(&mut self, tokens: i32) {
         self.reasoning_tokens += tokens;
+        self.usage_tracker.add_reasoning(tokens);
     }
 
     /// Estimate token count from text (rough approximation: chars / 4)
@@ -120,6 +176,7 @@ impl EventEmitter {
             annotation_index: None,
             annotation: None,
             conversation_title: None,
+            usage: None,
         };
         self.send(event).await
     }
@@ -146,6 +203,7 @@ impl EventEmitter {
             annotation_index: None,
             annotation: None,
             conversation_title: None,
+            usage: None,
         };
         self.send(event).await
     }
@@ -156,6 +214,7 @@ impl EventEmitter {
         ctx: &mut ResponseStreamContext,
         response: models::ResponseObject,
     ) -> Result<(), errors::ResponseError> {
+        let usage = response.usage.clone();
         let event = models::ResponseStreamEvent {
             event_type: "response.completed".to_string(),
             sequence_number: Some(ctx.next_sequence()),
@@ -172,6 +231,7 @@ impl EventEmitter {
             annotation_index: None,
             annotation: None,
             conversation_title: None,
+            usage: Some(usage),
         };
         self.send(event).await
     }
@@ -199,6 +259,7 @@ impl EventEmitter {
             annotation_index: None,
             annotation: None,
             conversation_title: None,
+            usage: None,
         };
         self.send(event).await
     }
@@ -226,6 +287,7 @@ impl EventEmitter {
             annotation_index: None,
             annotation: None,
             conversation_title: None,
+            usage: None,
         };
         self.send(event).await
     }
@@ -253,6 +315,7 @@ impl EventEmitter {
             annotation_index: None,
             annotation: None,
             conversation_title: None,
+            usage: None,
         };
         self.send(event).await
     }
@@ -280,6 +343,7 @@ impl EventEmitter {
             annotation_index: None,
             annotation: None,
             conversation_title: None,
+            usage: None,
         };
         self.send(event).await
     }
@@ -307,6 +371,7 @@ impl EventEmitter {
             annotation_index: None,
             annotation: None,
             conversation_title: None,
+            usage: None,
         };
         self.send(event).await
     }
@@ -334,6 +399,7 @@ impl EventEmitter {
             annotation_index: None,
             annotation: None,
             conversation_title: None,
+            usage: None,
         };
         self.send(event).await
     }
@@ -361,6 +427,7 @@ impl EventEmitter {
             annotation_index: Some(0), // Start with index 0 for first annotation
             annotation: Some(annotation),
             conversation_title: None,
+            usage: None,
         };
         self.send(event).await
     }
@@ -409,6 +476,7 @@ impl EventEmitter {
             annotation_index: None,
             annotation: None,
             conversation_title: None,
+            usage: None,
         };
         self.send(event).await
     }
@@ -520,3 +588,86 @@ pub struct ToolCallAccumulatorEntry {
 /// Accumulator for streaming tool calls
 /// Maps tool call index -> accumulated entry data
 pub type ToolCallAccumulator = std::collections::HashMap<i64, ToolCallAccumulatorEntry>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_ctx(tracker: Arc<UsageTracker>) -> ResponseStreamContext {
+        ResponseStreamContext::new(
+            models::ResponseId(uuid::Uuid::new_v4()),
+            uuid::Uuid::new_v4(),
+            None,
+            "resp_abc".to_string(),
+            None,
+            0,
+            "test-model".to_string(),
+            tracker,
+        )
+    }
+
+    #[test]
+    fn usage_tracker_starts_empty() {
+        let tracker = UsageTracker::new();
+        assert!(!tracker.has_data());
+        let snap = tracker.snapshot();
+        assert_eq!(snap.input_tokens, 0);
+        assert_eq!(snap.output_tokens, 0);
+        assert_eq!(snap.total_tokens, 0);
+    }
+
+    #[test]
+    fn ctx_update_usage_mirrors_to_tracker() {
+        let tracker = UsageTracker::new();
+        let mut ctx = make_ctx(tracker.clone());
+
+        ctx.update_usage(11, 22, 3);
+        ctx.add_reasoning_tokens(7);
+
+        let snap = tracker.snapshot();
+        assert_eq!(snap.input_tokens, 11);
+        assert_eq!(snap.output_tokens, 22);
+        assert_eq!(snap.total_tokens, 33);
+        assert_eq!(
+            snap.output_tokens_details
+                .as_ref()
+                .unwrap()
+                .reasoning_tokens,
+            7
+        );
+        assert_eq!(snap.input_tokens_details.as_ref().unwrap().cached_tokens, 3);
+        assert!(tracker.has_data());
+    }
+
+    #[test]
+    fn ctx_update_usage_overwrites_per_chunk_in_tracker() {
+        let tracker = UsageTracker::new();
+        let mut ctx = make_ctx(tracker.clone());
+
+        ctx.update_usage(5, 5, 0);
+        ctx.update_usage(50, 100, 10); // last chunk wins, matching ctx semantics
+
+        let snap = tracker.snapshot();
+        assert_eq!(snap.input_tokens, 50);
+        assert_eq!(snap.output_tokens, 100);
+    }
+
+    #[test]
+    fn ctx_add_reasoning_tokens_accumulates_in_tracker() {
+        let tracker = UsageTracker::new();
+        let mut ctx = make_ctx(tracker.clone());
+
+        ctx.add_reasoning_tokens(3);
+        ctx.add_reasoning_tokens(4);
+
+        let snap = tracker.snapshot();
+        assert_eq!(
+            snap.output_tokens_details
+                .as_ref()
+                .unwrap()
+                .reasoning_tokens,
+            7
+        );
+        assert!(tracker.has_data());
+    }
+}

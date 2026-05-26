@@ -3,11 +3,25 @@ use axum::{http::StatusCode, response::Json as ResponseJson, Extension};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
-/// Response from the check_api_key endpoint
+/// Response from the check_api_key endpoint.
+///
+/// `organization_id`, `workspace_id`, and `api_key_id` are returned so
+/// downstream gateways (e.g. inference-proxy) have a server-side
+/// authoritative subject identity and don't have to trust caller-supplied
+/// headers when populating logs / usage records / billing reports. In
+/// particular, this lets a trusted gateway report usage to cloud-api with
+/// a shared service token instead of forwarding the user's `sk-…`.
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct CheckApiKeyResponse {
     /// Whether the API key is valid and authorized
     pub valid: bool,
+    /// Organization the API key belongs to
+    pub organization_id: String,
+    /// Workspace the API key belongs to
+    pub workspace_id: String,
+    /// UUID of the API key itself. Used by trusted gateways to attribute
+    /// per-key usage rows without holding the raw `sk-…` value.
+    pub api_key_id: String,
 }
 
 /// Check API key validity
@@ -33,7 +47,15 @@ pub struct CheckApiKeyResponse {
     )
 )]
 pub async fn check_api_key(
-    Extension(_api_key): Extension<AuthenticatedApiKey>,
+    Extension(api_key): Extension<AuthenticatedApiKey>,
 ) -> Result<ResponseJson<CheckApiKeyResponse>, (StatusCode, ResponseJson<ErrorResponse>)> {
-    Ok(ResponseJson(CheckApiKeyResponse { valid: true }))
+    Ok(ResponseJson(CheckApiKeyResponse {
+        valid: true,
+        organization_id: api_key.organization.id.to_string(),
+        workspace_id: api_key.workspace.id.to_string(),
+        // `ApiKeyId.0` is already a `String` and `api_key` is owned via
+        // `Extension`, so move it directly. The other two still need
+        // `to_string()` because they wrap `Uuid`.
+        api_key_id: api_key.api_key.id.0,
+    }))
 }

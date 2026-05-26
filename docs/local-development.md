@@ -41,7 +41,7 @@ on `http://localhost:3000`. Useful endpoints once it's up:
 | `GET  /health`                | Liveness probe                       |
 | `GET  /docs`                  | Scalar UI (interactive)              |
 | `GET  /api-docs/openapi.json` | Machine-readable OpenAPI spec        |
-| `GET  /v1/models`             | Model catalog (requires API key)     |
+| `GET  /v1/models`             | Public model catalog                 |
 | `POST /v1/chat/completions`   | OpenAI-compatible inference          |
 
 To pull down everything:
@@ -270,7 +270,7 @@ Provider refresh runs every 300s by default
 | `POST /v1/organizations`                    | session  | Body: `{"name": "...", "description": "..."}`               |
 | `POST /v1/organizations/{id}/workspaces`    | session  | Same body shape                                             |
 | `POST /v1/workspaces/{id}/api-keys`         | session  | Returns plaintext `key` — store it, it isn't shown again    |
-| `GET  /v1/models`                           | API key  | Catalog visible to the workspace                            |
+| `GET  /v1/models`                           | public   | OpenAI-compatible model catalog with pricing metadata       |
 | `POST /v1/chat/completions`                 | API key  | OpenAI-compatible. Add `"stream": true` for SSE             |
 | `POST /v1/responses`                        | API key  | Platform-specific event-streamed responses                  |
 | `POST /v1/conversations`                    | API key  | Conversation lifecycle                                      |

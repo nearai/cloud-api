@@ -284,15 +284,15 @@ async fn test_vpc_login_api_key_works() {
 
     let body = response.json::<VpcLoginResponse>();
 
-    // Try to use the API key to list models
-    let models_response = server
-        .get("/v1/models")
+    // Try to use the API key on an authenticated endpoint
+    let auth_response = server
+        .get("/v1/files?limit=1")
         .add_header("Authorization", format!("Bearer {}", body.api_key))
         .add_header("User-Agent", MOCK_USER_AGENT)
         .await;
 
     assert_eq!(
-        models_response.status_code(),
+        auth_response.status_code(),
         200,
         "API key from VPC login should work for authenticated requests"
     );

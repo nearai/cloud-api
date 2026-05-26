@@ -1112,13 +1112,10 @@ pub fn build_completion_routes(
     let metadata_routes = Router::new()
         .route("/models", get(models))
         .with_state(app_state)
-        .layer(from_fn_with_state(
-            rate_limit_state.clone(),
-            middleware::api_key_rate_limit_middleware,
-        ))
-        .layer(from_fn_with_state(
-            auth_state_middleware.clone(),
-            auth_middleware_with_api_key,
+        // Public, OpenAI-compatible model catalog. The response is identical for
+        // all clients and changes only when an admin updates the catalog.
+        .layer(cache_control_layer(
+            "public, max-age=30, stale-while-revalidate=120",
         ));
 
     Router::new()

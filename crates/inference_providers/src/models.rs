@@ -18,7 +18,7 @@ pub struct ChatMessage {
 
 /// Delta message in streaming chat completions
 /// All fields are optional as they may not be present in every chunk
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ChatDelta {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub role: Option<MessageRole>,
@@ -34,6 +34,17 @@ pub struct ChatDelta {
     pub reasoning_content: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<String>,
+    /// Preserve any additional fields the upstream emits that we don't
+    /// have an explicit slot for. Without this, serde silently drops
+    /// unknown delta fields on deserialize and they never reach the
+    /// client. Specifically: the inference-proxy's server-side agent
+    /// loop (nearai/inference-proxy#144) emits a synthetic
+    /// `delta.nearai_tool_result` chunk between iterations carrying
+    /// the tool's grounded output — without flatten this chunk is
+    /// stripped before it leaves cloud-api, even though the
+    /// `tool_calls` and final `content` make it through.
+    #[serde(flatten)]
+    pub extra: std::collections::HashMap<String, serde_json::Value>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1196,6 +1207,54 @@ mod tests {
         assert_eq!(choice.index, 0);
         assert_eq!(choice.finish_reason.as_deref(), Some("stop"));
         assert!(choice.message.content.is_some());
+    }
+
+    #[test]
+    fn chat_delta_preserves_unknown_fields_round_trip() {
+        // Regression for the inference-proxy agent-loop path
+        // (nearai/inference-proxy#144): the proxy emits a synthetic
+        // `delta.nearai_tool_result` chunk between iterations. Without
+        // the flattened `extra` catch-all, serde silently drops it on
+        // deserialize and clients never see the tool grounding.
+        let json_chunk = r#"{
+            "id": "chatcmpl-abc",
+            "object": "chat.completion.chunk",
+            "created": 1,
+            "model": "zai-org/GLM-5.1-FP8",
+            "choices": [{
+                "index": 0,
+                "delta": {
+                    "nearai_tool_result": {
+                        "tool_call_id": "call_1",
+                        "name": "web_context_search",
+                        "status": "ok",
+                        "output": "[1] result..."
+                    }
+                }
+            }]
+        }"#;
+
+        let chunk: ChatCompletionChunk = serde_json::from_str(json_chunk).unwrap();
+        let delta = chunk.choices[0]
+            .delta
+            .as_ref()
+            .expect("delta should deserialize");
+
+        // The synthetic field is preserved verbatim in the catch-all.
+        let tool_result = delta
+            .extra
+            .get("nearai_tool_result")
+            .expect("nearai_tool_result must survive deserialization");
+        assert_eq!(tool_result["tool_call_id"], "call_1");
+        assert_eq!(tool_result["name"], "web_context_search");
+        assert_eq!(tool_result["status"], "ok");
+
+        // And round-trips on re-serialization so clients see the
+        // same shape we got from upstream.
+        let reserialized = serde_json::to_string(&chunk).unwrap();
+        assert!(reserialized.contains("\"nearai_tool_result\""));
+        assert!(reserialized.contains("\"web_context_search\""));
+        assert!(reserialized.contains("\"call_1\""));
     }
 }
 

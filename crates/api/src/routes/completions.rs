@@ -1332,18 +1332,16 @@ pub async fn completions(
     tag = "Chat",
     responses(
         (status = 200, description = "List of available models", body = ModelsResponse),
-        (status = 401, description = "Invalid or missing API key", body = ErrorResponse),
         (status = 500, description = "Server error", body = ErrorResponse)
     ),
     security(
-        ("api_key" = [])
+        ()
     )
 )]
 pub async fn models(
     State(app_state): State<AppState>,
-    Extension(api_key): Extension<services::workspace::ApiKey>,
 ) -> Result<ResponseJson<ModelsResponse>, (StatusCode, ResponseJson<ErrorResponse>)> {
-    debug!("Models list request from key: {:?}", api_key.id);
+    debug!("Models list request");
 
     let models = app_state
         .models_service

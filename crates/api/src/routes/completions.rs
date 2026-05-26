@@ -1333,6 +1333,9 @@ pub async fn completions(
     responses(
         (status = 200, description = "List of available models", body = ModelsResponse),
         (status = 500, description = "Server error", body = ErrorResponse)
+    ),
+    security(
+        ()
     )
 )]
 pub async fn models(

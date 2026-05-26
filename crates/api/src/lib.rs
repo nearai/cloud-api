@@ -1744,6 +1744,18 @@ mod tests {
         assert!(spec.servers.is_none() || spec.servers.as_ref().unwrap().is_empty());
     }
 
+    #[test]
+    fn test_openapi_models_endpoint_is_public() {
+        let spec = serde_json::to_value(ApiDoc::openapi()).unwrap();
+        let models_get = &spec["paths"]["/v1/models"]["get"];
+
+        assert_eq!(
+            models_get["security"],
+            serde_json::json!([{}]),
+            "/v1/models must explicitly override global OpenAPI security"
+        );
+    }
+
     /// Example of how to set up the application for E2E testing
     #[tokio::test]
     #[ignore] // Remove ignore to run with a real database and Patroni cluster

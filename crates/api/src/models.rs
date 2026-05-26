@@ -2561,6 +2561,50 @@ pub struct OrganizationInvitationWithOrgResponse {
     pub invited_by_display_name: Option<String>,
 }
 
+/// Admin view of invitation email delivery metadata.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct AdminInvitationEmailDeliveryResponse {
+    pub organization_id: String,
+    pub organization_name: String,
+    pub invitation_id: String,
+    pub recipient_email: String,
+    pub role: MemberRole,
+    pub invitation_status: InvitationStatus,
+    pub email_status: InvitationEmailStatus,
+    pub email_sent_at: Option<DateTime<Utc>>,
+    pub email_last_error: Option<String>,
+    pub email_message_id: Option<String>,
+    pub invited_by_user_id: String,
+    pub invited_by_email: Option<String>,
+    pub invited_by_display_name: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
+    pub responded_at: Option<DateTime<Utc>>,
+}
+
+/// Paginated admin invitation email delivery response.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ListAdminInvitationEmailDeliveriesResponse {
+    pub deliveries: Vec<AdminInvitationEmailDeliveryResponse>,
+    pub total: i64,
+    pub limit: i64,
+    pub offset: i64,
+}
+
+/// Admin invitation email resend result.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct AdminInvitationEmailResendResultResponse {
+    pub invitation_id: String,
+    pub recipient_email: String,
+    pub success: bool,
+    pub email_sent: bool,
+    pub email_status: InvitationEmailStatus,
+    pub email_sent_at: Option<DateTime<Utc>>,
+    pub email_message_id: Option<String>,
+    pub email_last_error: Option<String>,
+    pub error: Option<String>,
+}
+
 /// Accept invitation response
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct AcceptInvitationResponse {

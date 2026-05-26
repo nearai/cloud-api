@@ -214,6 +214,40 @@ pub struct OrganizationInvitationWithDetails {
     pub invited_by_display_name: Option<String>,
 }
 
+/// Filters for admin invitation email delivery oversight.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct InvitationEmailDeliveryFilters {
+    pub organization_id: Option<OrganizationId>,
+    pub recipient_email: Option<String>,
+    pub email_status: Option<InvitationEmailStatus>,
+    pub invitation_status: Option<InvitationStatus>,
+    pub created_after: Option<DateTime<Utc>>,
+    pub created_before: Option<DateTime<Utc>>,
+}
+
+/// Invitation email delivery row enriched for admin oversight.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OrganizationInvitationEmailDelivery {
+    pub invitation: OrganizationInvitation,
+    pub organization_name: String,
+    pub invited_by_email: Option<String>,
+    pub invited_by_display_name: Option<String>,
+}
+
+/// Result of an admin invitation email resend attempt.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InvitationEmailResendResult {
+    pub invitation_id: Uuid,
+    pub recipient_email: String,
+    pub success: bool,
+    pub email_sent: bool,
+    pub email_status: InvitationEmailStatus,
+    pub email_sent_at: Option<DateTime<Utc>>,
+    pub email_message_id: Option<String>,
+    pub email_last_error: Option<String>,
+    pub error: Option<String>,
+}
+
 /// Create invitation request
 #[derive(Debug, Clone)]
 pub struct CreateInvitationRequest {
@@ -344,6 +378,14 @@ pub trait OrganizationInvitationRepository: Send + Sync {
         email: &str,
         status: Option<InvitationStatus>,
     ) -> Result<Vec<OrganizationInvitationWithDetails>>;
+
+    /// List invitation email deliveries for admin oversight.
+    async fn list_email_deliveries(
+        &self,
+        filters: InvitationEmailDeliveryFilters,
+        limit: i64,
+        offset: i64,
+    ) -> Result<(Vec<OrganizationInvitationEmailDelivery>, i64)>;
 
     /// Update invitation status
     async fn update_status(
@@ -575,6 +617,20 @@ pub trait OrganizationServiceTrait: Send + Sync {
         requester_id: UserId,
         status: Option<InvitationStatus>,
     ) -> Result<Vec<OrganizationInvitation>, OrganizationError>;
+
+    /// List invitation email deliveries across organizations (platform admin route).
+    async fn list_invitation_email_deliveries(
+        &self,
+        filters: InvitationEmailDeliveryFilters,
+        limit: i64,
+        offset: i64,
+    ) -> Result<(Vec<OrganizationInvitationEmailDelivery>, i64), OrganizationError>;
+
+    /// Resend a single invitation email (platform admin route).
+    async fn resend_invitation_email(
+        &self,
+        invitation_id: Uuid,
+    ) -> Result<InvitationEmailResendResult, OrganizationError>;
 
     /// Get organization system prompt
     async fn get_system_prompt(

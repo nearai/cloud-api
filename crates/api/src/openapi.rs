@@ -143,6 +143,8 @@ use utoipa::{Modify, OpenApi};
         crate::routes::admin::get_organization_metrics,
         crate::routes::admin::get_platform_metrics,
         crate::routes::admin::get_organization_timeseries,
+        crate::routes::admin::list_invitation_email_deliveries,
+        crate::routes::admin::resend_invitation_email,
         crate::routes::admin::list_users,
         crate::routes::admin::create_admin_access_token,
         crate::routes::admin::list_admin_access_tokens,
@@ -232,6 +234,9 @@ use utoipa::{Modify, OpenApi};
             // Organization concurrent limit models (Admin)
             UpdateOrganizationConcurrentLimitRequest, UpdateOrganizationConcurrentLimitResponse,
             GetOrganizationConcurrentLimitResponse,
+            // Invitation email delivery models (Admin)
+            AdminInvitationEmailDeliveryResponse, ListAdminInvitationEmailDeliveriesResponse,
+            AdminInvitationEmailResendResultResponse,
             // User models (Admin)
             ListUsersResponse, AdminUserResponse,
             // Admin access token models

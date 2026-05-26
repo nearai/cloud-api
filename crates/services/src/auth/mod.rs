@@ -557,8 +557,9 @@ mod tests {
     use crate::common::RepositoryError;
     use crate::organization::{
         AddOrganizationMemberRequest, BatchInvitationResponse, CreateOrganizationRequest,
-        InvitationStatus, MemberRole, Organization, OrganizationError, OrganizationId,
-        OrganizationInvitation, OrganizationInvitationWithDetails, OrganizationMember,
+        InvitationEmailDeliveryFilters, InvitationEmailResendResult, InvitationStatus, MemberRole,
+        Organization, OrganizationError, OrganizationId, OrganizationInvitation,
+        OrganizationInvitationEmailDelivery, OrganizationInvitationWithDetails, OrganizationMember,
         OrganizationMemberWithUser, OrganizationOrderBy, OrganizationOrderDirection,
         OrganizationRepository, OrganizationServiceTrait, OrganizationWithRole,
         UpdateOrganizationMemberRequest, UpdateOrganizationRequest,
@@ -1128,6 +1129,20 @@ mod tests {
             _: UserId,
             _: Option<InvitationStatus>,
         ) -> Result<Vec<OrganizationInvitation>, OrganizationError> {
+            unimplemented!()
+        }
+        async fn list_invitation_email_deliveries(
+            &self,
+            _: InvitationEmailDeliveryFilters,
+            _: i64,
+            _: i64,
+        ) -> Result<(Vec<OrganizationInvitationEmailDelivery>, i64), OrganizationError> {
+            unimplemented!()
+        }
+        async fn resend_invitation_email(
+            &self,
+            _: Uuid,
+        ) -> Result<InvitationEmailResendResult, OrganizationError> {
             unimplemented!()
         }
         async fn get_system_prompt(

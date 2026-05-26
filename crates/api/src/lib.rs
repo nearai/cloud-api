@@ -874,10 +874,13 @@ pub fn build_app_with_config(
         database.clone(),
         &auth_components.auth_state_middleware,
         config.clone(),
-        app_state.inference_provider_pool.clone(),
-        analytics_service,
-        domain_services.models_service.clone(),
-        domain_services.completion_service.clone(),
+        AdminRouteDependencies {
+            inference_provider_pool: app_state.inference_provider_pool.clone(),
+            analytics_service,
+            models_service: domain_services.models_service.clone(),
+            completion_service: domain_services.completion_service.clone(),
+            organization_service: domain_services.organization_service.clone(),
+        },
     );
 
     let invitation_routes =
@@ -1529,23 +1532,30 @@ fn cache_control_layer(value: &'static str) -> CacheControlLayer {
 }
 
 /// Build admin routes (authenticated endpoints)
+pub struct AdminRouteDependencies {
+    pub inference_provider_pool: Arc<services::inference_provider_pool::InferenceProviderPool>,
+    pub analytics_service: Arc<services::admin::AnalyticsService>,
+    pub models_service: Arc<services::models::ModelsServiceImpl>,
+    pub completion_service: Arc<services::CompletionServiceImpl>,
+    pub organization_service:
+        Arc<dyn services::organization::OrganizationServiceTrait + Send + Sync>,
+}
+
 pub fn build_admin_routes(
     database: Arc<Database>,
     auth_state_middleware: &AuthState,
     config: Arc<ApiConfig>,
-    inference_provider_pool: Arc<services::inference_provider_pool::InferenceProviderPool>,
-    analytics_service: Arc<services::admin::AnalyticsService>,
-    models_service: Arc<services::models::ModelsServiceImpl>,
-    completion_service: Arc<services::CompletionServiceImpl>,
+    dependencies: AdminRouteDependencies,
 ) -> Router {
     use crate::middleware::admin_middleware;
     use crate::routes::admin::{
         batch_upsert_models, create_admin_access_token, create_service, delete_admin_access_token,
         delete_model, deprecate_model, get_model_history, get_organization_concurrent_limit,
         get_organization_limits_history, get_organization_metrics, get_organization_timeseries,
-        get_platform_metrics, list_admin_access_tokens, list_models as admin_list_models,
-        list_organizations, list_users, update_organization_concurrent_limit,
-        update_organization_limits, update_service, AdminAppState,
+        get_platform_metrics, list_admin_access_tokens, list_invitation_email_deliveries,
+        list_models as admin_list_models, list_organizations, list_users, resend_invitation_email,
+        update_organization_concurrent_limit, update_organization_limits, update_service,
+        AdminAppState,
     };
     use database::repositories::{AdminAccessTokenRepository, AdminCompositeRepository};
     use services::admin::AdminServiceImpl;
@@ -1567,17 +1577,19 @@ pub fn build_admin_routes(
     // `/v1/admin/organizations/{org_id}/concurrent-limit`.
     let admin_service = Arc::new(AdminServiceImpl::new(
         admin_repository as Arc<dyn services::admin::AdminRepository>,
-        models_service as Arc<dyn services::models::ModelsServiceTrait>,
-        completion_service.clone() as Arc<dyn services::completions::CompletionServiceTrait>,
+        dependencies.models_service as Arc<dyn services::models::ModelsServiceTrait>,
+        dependencies.completion_service.clone()
+            as Arc<dyn services::completions::CompletionServiceTrait>,
     )) as Arc<dyn services::admin::AdminService + Send + Sync>;
 
     let admin_app_state = AdminAppState {
         admin_service,
-        analytics_service,
+        analytics_service: dependencies.analytics_service,
+        organization_service: dependencies.organization_service,
         auth_service: auth_state_middleware.auth_service.clone(),
         config,
         admin_access_token_repository,
-        inference_provider_pool,
+        inference_provider_pool: dependencies.inference_provider_pool,
     };
 
     Router::new()
@@ -1623,6 +1635,14 @@ pub fn build_admin_routes(
         .route(
             "/admin/platform/metrics",
             axum::routing::get(get_platform_metrics),
+        )
+        .route(
+            "/admin/invitation-email-deliveries",
+            axum::routing::get(list_invitation_email_deliveries),
+        )
+        .route(
+            "/admin/invitation-email-deliveries/{invitation_id}/resend",
+            axum::routing::post(resend_invitation_email),
         )
         .route("/admin/users", axum::routing::get(list_users))
         .route(

@@ -1138,6 +1138,8 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
             store: request.store,
             stream_options: None,
             modalities: None,
+            return_hidden_states: None,
+            layers: None,
             extra,
         };
 
@@ -1294,6 +1296,8 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
             store: request.store,
             stream_options: None,
             modalities: None,
+            return_hidden_states: None,
+            layers: None,
             extra,
         };
 
@@ -1808,6 +1812,7 @@ mod tests {
                 prompt_token_ids: None,
                 system_fingerprint: None,
                 modality: None,
+                extra: Default::default(),
             }),
         };
 
@@ -1834,6 +1839,7 @@ mod tests {
                 prompt_token_ids: None,
                 system_fingerprint: None,
                 modality: None,
+                extra: Default::default(),
             }),
         };
 
@@ -1946,6 +1952,7 @@ mod tests {
                 prompt_token_ids: None,
                 system_fingerprint: None,
                 modality: None,
+                extra: Default::default(),
             }),
         };
 
@@ -1961,6 +1968,7 @@ mod tests {
                 prompt_token_ids: None,
                 system_fingerprint: None,
                 modality: None,
+                extra: Default::default(),
             }),
         };
 
@@ -1987,6 +1995,7 @@ mod tests {
                 prompt_token_ids: None,
                 modality: None,
                 system_fingerprint: None,
+                extra: Default::default(),
             }),
         };
 
@@ -2110,6 +2119,7 @@ mod tests {
                 prompt_token_ids: None,
                 modality: None,
                 system_fingerprint: None,
+                extra: Default::default(),
             }),
         };
 

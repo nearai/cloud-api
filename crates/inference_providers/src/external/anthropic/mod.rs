@@ -247,6 +247,7 @@ impl ExternalBackend for AnthropicBackend {
             prompt_logprobs: None,
             prompt_token_ids: None,
             kv_transfer_params: None,
+            extra: Default::default(),
         };
 
         // Serialize our normalized response. We intentionally overwrite fields
@@ -344,6 +345,8 @@ mod tests {
             store: None,
             stream_options: None,
             modalities: None,
+            return_hidden_states: None,
+            layers: None,
             extra: std::collections::HashMap::new(),
         }
     }

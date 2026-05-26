@@ -3648,6 +3648,8 @@ mod tests {
             store: None,
             stream_options: None,
             modalities: None,
+            return_hidden_states: None,
+            layers: None,
             extra: std::collections::HashMap::new(),
         };
 

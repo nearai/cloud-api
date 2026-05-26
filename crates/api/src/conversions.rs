@@ -114,6 +114,8 @@ impl From<ChatCompletionRequest> for ChatCompletionParams {
             store: None,
             stream_options: None,
             modalities,
+            return_hidden_states: None,
+            layers: None,
             extra,
         }
     }

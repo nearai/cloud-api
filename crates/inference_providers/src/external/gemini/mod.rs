@@ -103,6 +103,7 @@ fn convert_to_openai_response(
         prompt_logprobs: None,
         prompt_token_ids: None,
         kv_transfer_params: None,
+        extra: Default::default(),
     })
 }
 

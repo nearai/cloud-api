@@ -719,6 +719,7 @@ fn build_flush_chunks(states: &mut StreamUnredactStates, template: &ChunkTemplat
             usage: None,
             prompt_token_ids: None,
             modality: None,
+            extra: Default::default(),
         };
         if let Ok(s) = serde_json::to_string(&chunk) {
             out.push(Bytes::from(format!("data: {s}\n\n")));
@@ -780,6 +781,7 @@ fn build_flush_chunks(states: &mut StreamUnredactStates, template: &ChunkTemplat
             usage: None,
             prompt_token_ids: None,
             modality: None,
+            extra: Default::default(),
         };
         if let Ok(s) = serde_json::to_string(&chunk) {
             out.push(Bytes::from(format!("data: {s}\n\n")));
@@ -1509,6 +1511,7 @@ mod tests {
             usage: None,
             prompt_token_ids: None,
             modality: None,
+            extra: Default::default(),
         })
     }
 
@@ -1590,6 +1593,7 @@ mod tests {
             usage: None,
             prompt_token_ids: None,
             modality: None,
+            extra: Default::default(),
         })
     }
 
@@ -1810,6 +1814,7 @@ mod tests {
             usage: Some(inference_providers::models::TokenUsage::new(10, 5)),
             prompt_token_ids: None,
             modality: None,
+            extra: Default::default(),
         };
 
         let stream_chunk = inference_providers::StreamChunk::Chat(chunk.clone());

@@ -251,6 +251,16 @@ pub struct ChatCompletionParams {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub modalities: Option<Vec<String>>,
 
+    /// Request per-layer hidden state activations from the backend.
+    /// Supported by sglang; may not be supported by all backends.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub return_hidden_states: Option<bool>,
+
+    /// Optional subset of layers to return (0-indexed). When empty or
+    /// omitted while return_hidden_states is true, all layers are returned.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub layers: Option<Vec<i64>>,
+
     #[serde(flatten)]
     pub extra: std::collections::HashMap<String, serde_json::Value>,
 }
@@ -436,6 +446,10 @@ pub struct ChatCompletionChunk {
     /// Modality indicator for Qwen3-Omni streaming ("text" or "audio")
     #[serde(skip_serializing_if = "Option::is_none")]
     pub modality: Option<String>,
+
+    /// Additional provider-specific response fields.
+    #[serde(flatten)]
+    pub extra: std::collections::HashMap<String, serde_json::Value>,
 }
 
 /// Text completion streaming chunk (matches OpenAI legacy format)
@@ -606,6 +620,10 @@ pub struct ChatCompletionResponse {
     /// KV cache transfer parameters
     #[serde(skip_serializing_if = "Option::is_none")]
     pub kv_transfer_params: Option<serde_json::Value>,
+
+    /// Additional provider-specific response fields.
+    #[serde(flatten)]
+    pub extra: std::collections::HashMap<String, serde_json::Value>,
 }
 
 /// Wrapper for chat completion response that includes raw bytes.
@@ -1083,7 +1101,7 @@ pub enum AudioTranscriptionError {
 /// # Examples
 ///
 /// ```
-/// # use inference_providers::detect_audio_content_type;
+/// # use inference_providers::models::detect_audio_content_type;
 /// assert_eq!(detect_audio_content_type("speech.mp3"), "audio/mpeg");
 /// assert_eq!(detect_audio_content_type("recording.wav"), "audio/wav");
 /// assert_eq!(detect_audio_content_type("unknown.xyz"), "application/octet-stream");
@@ -1255,6 +1273,63 @@ mod tests {
         assert!(reserialized.contains("\"nearai_tool_result\""));
         assert!(reserialized.contains("\"web_context_search\""));
         assert!(reserialized.contains("\"call_1\""));
+    }
+
+    #[test]
+    fn chat_completion_chunk_preserves_unknown_fields_round_trip() {
+        let json_chunk = r#"{
+            "id": "chatcmpl-hidden",
+            "object": "chat.completion.chunk",
+            "created": 1,
+            "model": "sglang-model",
+            "choices": [],
+            "hidden_states": {
+                "0": [[0.1, 0.2]],
+                "1": [[0.3, 0.4]]
+            }
+        }"#;
+
+        let chunk: ChatCompletionChunk = serde_json::from_str(json_chunk).unwrap();
+        let hidden_states = chunk
+            .extra
+            .get("hidden_states")
+            .expect("hidden_states must survive chunk deserialization");
+        assert_eq!(hidden_states["0"][0][0], 0.1);
+
+        let reserialized = serde_json::to_string(&chunk).unwrap();
+        assert!(reserialized.contains("\"hidden_states\""));
+        assert!(reserialized.contains("\"0\""));
+    }
+
+    #[test]
+    fn chat_completion_response_preserves_unknown_fields_round_trip() {
+        let json_response = r#"{
+            "id": "chatcmpl-hidden",
+            "object": "chat.completion",
+            "created": 1,
+            "model": "sglang-model",
+            "choices": [],
+            "usage": {
+                "prompt_tokens": 1,
+                "completion_tokens": 1,
+                "total_tokens": 2
+            },
+            "hidden_states": {
+                "0": [[0.1, 0.2]],
+                "1": [[0.3, 0.4]]
+            }
+        }"#;
+
+        let response: ChatCompletionResponse = serde_json::from_str(json_response).unwrap();
+        let hidden_states = response
+            .extra
+            .get("hidden_states")
+            .expect("hidden_states must survive response deserialization");
+        assert_eq!(hidden_states["1"][0][1], 0.4);
+
+        let reserialized = serde_json::to_string(&response).unwrap();
+        assert!(reserialized.contains("\"hidden_states\""));
+        assert!(reserialized.contains("\"1\""));
     }
 }
 

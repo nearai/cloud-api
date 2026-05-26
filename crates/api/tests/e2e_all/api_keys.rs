@@ -241,7 +241,7 @@ async fn test_deleted_api_key_cannot_be_used() {
 
     // Verify key works before deletion
     let response = server
-        .get("/v1/models")
+        .get("/v1/files?limit=1")
         .add_header("Authorization", format!("Bearer {api_key}"))
         .await;
 
@@ -267,7 +267,7 @@ async fn test_deleted_api_key_cannot_be_used() {
 
     // Try to use the deleted API key - should fail
     let response = server
-        .get("/v1/models")
+        .get("/v1/files?limit=1")
         .add_header("Authorization", format!("Bearer {api_key}"))
         .await;
 
@@ -746,7 +746,7 @@ async fn test_api_key_authentication() {
 
     // Test valid API key
     let response = server
-        .get("/v1/models")
+        .get("/v1/files?limit=1")
         .add_header("Authorization", format!("Bearer {api_key}"))
         .await;
 
@@ -758,7 +758,7 @@ async fn test_api_key_authentication() {
 
     // Test invalid API key
     let response = server
-        .get("/v1/models")
+        .get("/v1/files?limit=1")
         .add_header("Authorization", "Bearer invalid_key_12345")
         .await;
 
@@ -769,7 +769,7 @@ async fn test_api_key_authentication() {
     );
 
     // Test missing API key
-    let response = server.get("/v1/models").await;
+    let response = server.get("/v1/files?limit=1").await;
 
     assert_eq!(
         response.status_code(),

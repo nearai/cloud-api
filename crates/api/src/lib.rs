@@ -1112,13 +1112,10 @@ pub fn build_completion_routes(
     let metadata_routes = Router::new()
         .route("/models", get(models))
         .with_state(app_state)
-        .layer(from_fn_with_state(
-            rate_limit_state.clone(),
-            middleware::api_key_rate_limit_middleware,
-        ))
-        .layer(from_fn_with_state(
-            auth_state_middleware.clone(),
-            auth_middleware_with_api_key,
+        // Public, OpenAI-compatible model catalog. The response is identical for
+        // all clients and changes only when an admin updates the catalog.
+        .layer(cache_control_layer(
+            "public, max-age=30, stale-while-revalidate=120",
         ));
 
     Router::new()
@@ -1745,6 +1742,18 @@ mod tests {
 
         // Verify servers are not hardcoded (will be set dynamically on client)
         assert!(spec.servers.is_none() || spec.servers.as_ref().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_openapi_models_endpoint_is_public() {
+        let spec = serde_json::to_value(ApiDoc::openapi()).unwrap();
+        let models_get = &spec["paths"]["/v1/models"]["get"];
+
+        assert_eq!(
+            models_get["security"],
+            serde_json::json!([{}]),
+            "/v1/models must explicitly override global OpenAPI security"
+        );
     }
 
     /// Example of how to set up the application for E2E testing

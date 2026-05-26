@@ -333,23 +333,22 @@ async fn test_create_api_key_duplicate_name_conflict_message() {
 }
 
 // ============================================
-// Models error message tests
+// Models public endpoint tests
 // ============================================
 
 #[tokio::test]
-async fn test_models_missing_auth_header_message() {
+async fn test_models_no_auth_required() {
     let server = setup_test_server().await;
 
     let response = server.get("/v1/models").await;
 
-    assert_eq!(response.status_code(), 401);
-    let err = response.json::<api::models::ErrorResponse>();
-    assert_eq!(err.error.r#type, "missing_auth_header");
-    assert_eq!(err.error.message, "Missing authorization header");
+    assert_eq!(response.status_code(), 200);
+    let models = response.json::<api::models::ModelsResponse>();
+    assert_eq!(models.object, "list");
 }
 
 #[tokio::test]
-async fn test_models_invalid_auth_header_format_message() {
+async fn test_models_invalid_auth_header_ignored() {
     let server = setup_test_server().await;
 
     let response = server
@@ -357,14 +356,13 @@ async fn test_models_invalid_auth_header_format_message() {
         .add_header("Authorization", "Token abc")
         .await;
 
-    assert_eq!(response.status_code(), 401);
-    let err = response.json::<api::models::ErrorResponse>();
-    assert_eq!(err.error.r#type, "invalid_auth_header");
-    assert_eq!(err.error.message, "Invalid authorization header format");
+    assert_eq!(response.status_code(), 200);
+    let models = response.json::<api::models::ModelsResponse>();
+    assert_eq!(models.object, "list");
 }
 
 #[tokio::test]
-async fn test_models_invalid_api_key_message() {
+async fn test_models_invalid_api_key_ignored() {
     let server = setup_test_server().await;
 
     let response = server
@@ -372,8 +370,7 @@ async fn test_models_invalid_api_key_message() {
         .add_header("Authorization", "Bearer invalid_key_123")
         .await;
 
-    assert_eq!(response.status_code(), 401);
-    let err = response.json::<api::models::ErrorResponse>();
-    assert_eq!(err.error.r#type, "invalid_api_key");
-    assert_eq!(err.error.message, "Invalid or expired API key");
+    assert_eq!(response.status_code(), 200);
+    let models = response.json::<api::models::ModelsResponse>();
+    assert_eq!(models.object, "list");
 }

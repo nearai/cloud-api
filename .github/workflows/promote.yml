@@ -20,6 +20,14 @@ on:
         required: false
         type: string
 
+# Serialize all :prod image mutations (promote and rollback) so two concurrent
+# runs — or a promotion racing a rollback — cannot split-brain the :prod tag
+# and the audit tags. cancel-in-progress: false queues rather than cancels so
+# neither operation is silently lost.
+concurrency:
+  group: prod-image-mutation
+  cancel-in-progress: false
+
 env:
   REGISTRY: docker.io
   IMAGE_NAME: cloud-api

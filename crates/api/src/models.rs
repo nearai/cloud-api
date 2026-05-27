@@ -139,6 +139,11 @@ pub struct ToolCall {
     #[serde(rename = "type")]
     pub type_: String,
     pub function: FunctionCall,
+    /// Gemini-3 thought_signature. The client must echo this verbatim on
+    /// the next turn or Gemini rejects the request with
+    /// "Function call is missing a thought_signature".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thought_signature: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]

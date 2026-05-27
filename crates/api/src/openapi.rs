@@ -119,6 +119,7 @@ use utoipa::{Modify, OpenApi};
         // Usage endpoints
         crate::routes::usage::get_organization_balance,
         crate::routes::usage::get_organization_usage_history,
+        crate::routes::usage::get_organization_usage_by_model,
         crate::routes::usage::get_api_key_usage_history,
         crate::routes::usage::record_usage,
         crate::routes::usage::get_user_organization_metrics,
@@ -240,6 +241,8 @@ use utoipa::{Modify, OpenApi};
             crate::routes::usage::OrganizationBalanceResponse,
             crate::routes::usage::UsageHistoryResponse,
             crate::routes::usage::UsageHistoryEntryResponse,
+            crate::routes::usage::UsageByModelResponse,
+            crate::routes::usage::UsageByModelEntryResponse,
             crate::routes::usage::ServiceUsageHistoryResponse,
             crate::routes::usage::ServiceUsageEntryResponse,
             crate::routes::usage::RecordUsageResponse,

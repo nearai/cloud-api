@@ -300,7 +300,7 @@ fn convert_chat_request_to_service(
                             id: tc.id.clone(),
                             name: tc.function.name.clone(),
                             arguments: tc.function.arguments.clone(),
-                            thought_signature: None,
+                            thought_signature: tc.thought_signature.clone(),
                         })
                         .collect()
                 }),
@@ -507,6 +507,7 @@ fn finalize_choice_in_place(
             tool_calls: None,
             reasoning_content: None,
             reasoning: None,
+            extra: Default::default(),
         });
 
     if let Some(s) = states.content.remove(&idx) {
@@ -709,6 +710,7 @@ fn build_flush_chunks(states: &mut StreamUnredactStates, template: &ChunkTemplat
                     tool_calls: None,
                     reasoning_content: if rc.is_empty() { None } else { Some(rc) },
                     reasoning: if r.is_empty() { None } else { Some(r) },
+                    extra: Default::default(),
                 }),
                 logprobs: None,
                 finish_reason: None,
@@ -769,6 +771,7 @@ fn build_flush_chunks(states: &mut StreamUnredactStates, template: &ChunkTemplat
                     }]),
                     reasoning_content: None,
                     reasoning: None,
+                    extra: Default::default(),
                 }),
                 logprobs: None,
                 finish_reason: None,
@@ -1563,6 +1566,7 @@ mod tests {
             tool_calls: None,
             reasoning_content: None,
             reasoning: None,
+            extra: Default::default(),
         }
     }
 

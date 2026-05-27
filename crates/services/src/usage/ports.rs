@@ -276,6 +276,14 @@ pub trait UsageServiceTrait: Send + Sync {
         organization_id: Uuid,
         inference_ids: Vec<Uuid>,
     ) -> Result<Vec<InferenceCost>, UsageError>;
+
+    /// Get per-model usage aggregation for an organization since `start_date`.
+    /// Returns one row per model: summed tokens, summed cost (nano-dollars), and request count.
+    async fn get_usage_by_model(
+        &self,
+        organization_id: Uuid,
+        start_date: DateTime<Utc>,
+    ) -> Result<Vec<UsageByModelEntry>, UsageError>;
 }
 
 // ============================================
@@ -335,6 +343,13 @@ pub trait UsageRepository: Send + Sync {
         &self,
         provider_request_id: &str,
     ) -> anyhow::Result<Option<StopReason>>;
+
+    /// Get per-model usage aggregation for an organization since `start_date`.
+    async fn get_usage_by_model(
+        &self,
+        organization_id: Uuid,
+        start_date: DateTime<Utc>,
+    ) -> anyhow::Result<Vec<UsageByModelEntry>>;
 }
 
 #[async_trait::async_trait]
@@ -513,6 +528,18 @@ pub struct OrganizationBalanceInfo {
     pub total_requests: i64,
     pub total_tokens: i64,
     pub updated_at: DateTime<Utc>,
+}
+
+/// Per-model usage aggregation over a time window.
+/// Cost is in nano-dollars (scale 9).
+#[derive(Debug, Clone)]
+pub struct UsageByModelEntry {
+    pub model: String,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub total_tokens: i64,
+    pub total_cost: i64,
+    pub request_count: i64,
 }
 
 /// Usage log entry

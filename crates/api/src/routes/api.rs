@@ -114,6 +114,10 @@ pub fn build_management_router(app_state: AppState, auth_state: AuthState) -> Ro
             get(crate::routes::usage::get_organization_usage_history),
         )
         .route(
+            "/{id}/usage/by-model",
+            get(crate::routes::usage::get_organization_usage_by_model),
+        )
+        .route(
             "/{id}/service-usage/history",
             get(crate::routes::usage::get_service_usage_history),
         )

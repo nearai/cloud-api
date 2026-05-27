@@ -31,7 +31,7 @@ impl From<crate::models::Message> for ChatMessage {
                         arguments: Some(tc.function.arguments),
                     },
                     index: None,
-                    thought_signature: None,
+                    thought_signature: tc.thought_signature,
                 })
                 .collect()
         });
@@ -167,6 +167,7 @@ impl From<ChatMessage> for crate::models::Message {
                             name: tc.function.name?,
                             arguments: tc.function.arguments.unwrap_or_default(),
                         },
+                        thought_signature: tc.thought_signature,
                     })
                 })
                 .collect()
@@ -740,6 +741,98 @@ mod tests {
 
         let domain_msg: ChatMessage = http_msg.into();
         assert!(matches!(domain_msg.role, MessageRole::System));
+    }
+
+    /// Regression: a Gemini-3 multi-turn request includes `thought_signature`
+    /// on each assistant `tool_calls[*]`. If the API drops it, Gemini rejects
+    /// the next turn with 400 "Function call is missing a thought_signature".
+    /// Confirms the signature survives `Message -> ChatMessage`.
+    #[test]
+    fn test_tool_call_thought_signature_inbound_roundtrip() {
+        let sig = "Ep8BCpwBAQw51sfQQgKQ2k...".to_string();
+        let http_msg = crate::models::Message {
+            role: "assistant".to_string(),
+            content: None,
+            name: None,
+            tool_call_id: None,
+            tool_calls: Some(vec![crate::models::ToolCall {
+                id: "call_abc".to_string(),
+                type_: "function".to_string(),
+                function: crate::models::FunctionCall {
+                    name: "bash".to_string(),
+                    arguments: "{\"cmd\":\"ls\"}".to_string(),
+                },
+                thought_signature: Some(sig.clone()),
+            }]),
+        };
+
+        let domain_msg: ChatMessage = http_msg.into();
+        let tcs = domain_msg.tool_calls.expect("tool_calls preserved");
+        assert_eq!(tcs.len(), 1);
+        assert_eq!(tcs[0].thought_signature.as_deref(), Some(sig.as_str()));
+    }
+
+    /// Absence of `thought_signature` (older models, non-Gemini providers)
+    /// must remain valid — the field is optional.
+    #[test]
+    fn test_tool_call_without_thought_signature_still_works() {
+        let http_msg = crate::models::Message {
+            role: "assistant".to_string(),
+            content: None,
+            name: None,
+            tool_call_id: None,
+            tool_calls: Some(vec![crate::models::ToolCall {
+                id: "call_xyz".to_string(),
+                type_: "function".to_string(),
+                function: crate::models::FunctionCall {
+                    name: "bash".to_string(),
+                    arguments: "{}".to_string(),
+                },
+                thought_signature: None,
+            }]),
+        };
+
+        let domain_msg: ChatMessage = http_msg.into();
+        let tcs = domain_msg.tool_calls.expect("tool_calls preserved");
+        assert!(tcs[0].thought_signature.is_none());
+    }
+
+    /// Outbound (`ChatMessage -> Message`) must also propagate the signature.
+    /// Not on the live response path (which streams raw provider bytes), but
+    /// other internal callers convert through this impl.
+    #[test]
+    fn test_tool_call_thought_signature_outbound_roundtrip() {
+        let sig = "test-signature-bytes".to_string();
+        let domain_msg = ChatMessage {
+            role: MessageRole::Assistant,
+            content: None,
+            name: None,
+            tool_call_id: None,
+            tool_calls: Some(vec![inference_providers::models::ToolCall {
+                id: Some("call_abc".to_string()),
+                type_: Some("function".to_string()),
+                function: inference_providers::models::FunctionCall {
+                    name: Some("bash".to_string()),
+                    arguments: Some("{}".to_string()),
+                },
+                index: None,
+                thought_signature: Some(sig.clone()),
+            }]),
+        };
+
+        let http_msg: crate::models::Message = domain_msg.into();
+        let tcs = http_msg.tool_calls.expect("tool_calls preserved");
+        assert_eq!(tcs[0].thought_signature.as_deref(), Some(sig.as_str()));
+    }
+
+    /// Verify that omitting the field on the wire deserializes as `None`
+    /// (i.e. the field is genuinely optional, not just skippable on
+    /// serialization).
+    #[test]
+    fn test_tool_call_deserializes_without_thought_signature() {
+        let json = r#"{"id":"call_a","type":"function","function":{"name":"f","arguments":"{}"}}"#;
+        let tc: crate::models::ToolCall = serde_json::from_str(json).unwrap();
+        assert!(tc.thought_signature.is_none());
     }
 
     #[test]

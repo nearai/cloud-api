@@ -385,6 +385,55 @@ impl OrganizationUsageRepository {
         })
     }
 
+    /// Aggregate usage by model for an organization since `start_date`.
+    pub async fn get_usage_by_model_since(
+        &self,
+        organization_id: Uuid,
+        start_date: chrono::DateTime<Utc>,
+    ) -> Result<Vec<UsageByModel>> {
+        let rows = retry_db!("get_organization_usage_by_model", {
+            let client = self
+                .pool
+                .get()
+                .await
+                .context("Failed to get database connection")
+                .map_err(RepositoryError::PoolError)?;
+
+            client
+                .query(
+                    r#"
+                    SELECT
+                        model_name,
+                        COALESCE(SUM(input_tokens), 0)::BIGINT  AS input_tokens,
+                        COALESCE(SUM(output_tokens), 0)::BIGINT AS output_tokens,
+                        COALESCE(SUM(total_tokens), 0)::BIGINT  AS total_tokens,
+                        COALESCE(SUM(total_cost), 0)::BIGINT    AS total_cost,
+                        COUNT(*)::BIGINT                        AS request_count
+                    FROM organization_usage_log
+                    WHERE organization_id = $1
+                      AND created_at >= $2
+                    GROUP BY model_name
+                    ORDER BY total_cost DESC
+                    "#,
+                    &[&organization_id, &start_date],
+                )
+                .await
+                .map_err(map_db_error)
+        })?;
+
+        Ok(rows
+            .into_iter()
+            .map(|row| UsageByModel {
+                model: row.get("model_name"),
+                input_tokens: row.get("input_tokens"),
+                output_tokens: row.get("output_tokens"),
+                total_tokens: row.get("total_tokens"),
+                total_cost: row.get("total_cost"),
+                request_count: row.get("request_count"),
+            })
+            .collect())
+    }
+
     fn row_to_usage_log(&self, row: &Row, was_inserted: bool) -> Result<OrganizationUsageLog> {
         // Parse stop_reason from string to enum
         let stop_reason_str: Option<String> = row.get("stop_reason");
@@ -552,4 +601,14 @@ pub struct UsageStats {
     pub request_count: i64,
     pub total_tokens: i64,
     pub total_cost: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct UsageByModel {
+    pub model: String,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub total_tokens: i64,
+    pub total_cost: i64,
+    pub request_count: i64,
 }

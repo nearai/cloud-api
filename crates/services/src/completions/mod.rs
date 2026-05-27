@@ -555,22 +555,48 @@ impl CompletionServiceImpl {
         }
     }
 
-    /// Extract tools and tool_choice from extra HashMap if present.
-    /// This handles the case where the Responses API places tools in request.extra.
-    /// Returns (tools, tool_choice) and removes them from extra to avoid duplication.
+    /// Extract tools and tool_choice from the extra HashMap if present and
+    /// parseable as the typed `ToolDefinition` / `ToolChoice` shapes.
+    ///
+    /// Returns `(tools, tool_choice)` and only removes the corresponding
+    /// key from `extra` when parsing succeeds. If parsing fails — for
+    /// example because the client sent a non-standard tool type like
+    /// NEAR's `{"type":"web_context_search"}`, which the upstream
+    /// inference-proxy handles natively but doesn't fit the
+    /// function-tool shape — the original value is left in `extra` so it
+    /// flows through to the upstream request body verbatim via the
+    /// `#[serde(flatten)]` on `ChatCompletionParams.extra`. This means
+    /// cloud-api never silently drops tool definitions it doesn't
+    /// recognise; the upstream gets to decide.
     fn extract_tools_from_extra(
         extra: &mut std::collections::HashMap<String, serde_json::Value>,
     ) -> (
         Option<Vec<inference_providers::ToolDefinition>>,
         Option<inference_providers::ToolChoice>,
     ) {
-        let tools = extra.remove("tools").and_then(|v| {
-            serde_json::from_value::<Vec<inference_providers::ToolDefinition>>(v).ok()
-        });
+        let tools = match extra.get("tools").cloned() {
+            Some(raw) => {
+                match serde_json::from_value::<Vec<inference_providers::ToolDefinition>>(raw) {
+                    Ok(parsed) => {
+                        extra.remove("tools");
+                        Some(parsed)
+                    }
+                    Err(_) => None,
+                }
+            }
+            None => None,
+        };
 
-        let tool_choice = extra
-            .remove("tool_choice")
-            .and_then(|v| serde_json::from_value::<inference_providers::ToolChoice>(v).ok());
+        let tool_choice = match extra.get("tool_choice").cloned() {
+            Some(raw) => match serde_json::from_value::<inference_providers::ToolChoice>(raw) {
+                Ok(parsed) => {
+                    extra.remove("tool_choice");
+                    Some(parsed)
+                }
+                Err(_) => None,
+            },
+            None => None,
+        };
 
         (tools, tool_choice)
     }
@@ -2731,5 +2757,109 @@ mod tests {
             }
             other => panic!("Expected ProviderError with 504, got {:?}", other),
         }
+    }
+
+    // ── extract_tools_from_extra ───────────────────────────────────
+
+    #[test]
+    fn extract_tools_consumes_function_shaped_tools() {
+        let mut extra = std::collections::HashMap::new();
+        extra.insert(
+            "tools".to_string(),
+            serde_json::json!([{
+                "type": "function",
+                "function": {
+                    "name": "calc",
+                    "description": "add",
+                    "parameters": {"type": "object", "properties": {}}
+                }
+            }]),
+        );
+        extra.insert("tool_choice".to_string(), serde_json::json!("auto"));
+
+        let (tools, tool_choice) = CompletionServiceImpl::extract_tools_from_extra(&mut extra);
+
+        assert!(tools.is_some(), "function tool should parse");
+        assert_eq!(tools.unwrap().len(), 1);
+        assert!(tool_choice.is_some(), "tool_choice 'auto' should parse");
+        // Successfully-parsed keys are consumed from extra so they aren't
+        // also serialized via the flatten — would otherwise produce
+        // duplicate keys in the upstream JSON.
+        assert!(!extra.contains_key("tools"));
+        assert!(!extra.contains_key("tool_choice"));
+    }
+
+    #[test]
+    fn extract_tools_passes_through_unknown_tool_types() {
+        // NEAR's `web_context_search` is a namespaced tool type handled
+        // natively by the inference-proxy inside the CVM. It has no
+        // `function` field, so it doesn't fit our typed `ToolDefinition`.
+        // The helper must NOT silently drop it — leaving it in `extra`
+        // lets it flow through to the upstream request body verbatim
+        // via the flattened serialization.
+        let mut extra = std::collections::HashMap::new();
+        extra.insert(
+            "tools".to_string(),
+            serde_json::json!([{"type": "web_context_search"}]),
+        );
+
+        let (tools, tool_choice) = CompletionServiceImpl::extract_tools_from_extra(&mut extra);
+
+        assert!(
+            tools.is_none(),
+            "non-function-shaped tools shouldn't bind the typed field"
+        );
+        assert!(tool_choice.is_none());
+        // The raw value MUST still be in extra so it survives serialization
+        // through to the upstream request body.
+        let preserved = extra.get("tools").expect("tools must remain in extra");
+        assert_eq!(
+            preserved,
+            &serde_json::json!([{"type": "web_context_search"}])
+        );
+    }
+
+    #[test]
+    fn extract_tools_passes_through_mixed_unknown_in_array() {
+        // If one of the tools in the array can't be parsed as a function
+        // tool, we conservatively leave the whole array in `extra` rather
+        // than silently dropping some entries — cloud-api isn't the right
+        // layer to decide which tools the upstream can handle.
+        let mut extra = std::collections::HashMap::new();
+        extra.insert(
+            "tools".to_string(),
+            serde_json::json!([
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "calc",
+                        "description": "add",
+                        "parameters": {"type": "object", "properties": {}}
+                    }
+                },
+                {"type": "web_context_search"}
+            ]),
+        );
+
+        let (tools, _) = CompletionServiceImpl::extract_tools_from_extra(&mut extra);
+
+        assert!(tools.is_none());
+        assert!(extra.contains_key("tools"));
+    }
+
+    #[test]
+    fn extract_tools_passes_through_unknown_tool_choice() {
+        // Symmetric to tools: a non-standard tool_choice string survives
+        // for upstream interpretation.
+        let mut extra = std::collections::HashMap::new();
+        extra.insert(
+            "tool_choice".to_string(),
+            serde_json::json!({"weird": "shape"}),
+        );
+
+        let (_, tool_choice) = CompletionServiceImpl::extract_tools_from_extra(&mut extra);
+
+        assert!(tool_choice.is_none());
+        assert!(extra.contains_key("tool_choice"));
     }
 }

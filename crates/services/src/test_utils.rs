@@ -230,6 +230,14 @@ impl UsageServiceTrait for MockUsageService {
     ) -> Result<Vec<crate::usage::InferenceCost>, UsageError> {
         Ok(vec![])
     }
+
+    async fn get_usage_by_model(
+        &self,
+        _organization_id: Uuid,
+        _start_date: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Vec<crate::usage::UsageByModelEntry>, UsageError> {
+        Ok(vec![])
+    }
 }
 
 /// A usage service that captures requests for testing
@@ -411,6 +419,14 @@ impl UsageServiceTrait for CapturingUsageService {
         _organization_id: Uuid,
         _inference_ids: Vec<Uuid>,
     ) -> Result<Vec<crate::usage::InferenceCost>, UsageError> {
+        Ok(vec![])
+    }
+
+    async fn get_usage_by_model(
+        &self,
+        _organization_id: Uuid,
+        _start_date: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Vec<crate::usage::UsageByModelEntry>, UsageError> {
         Ok(vec![])
     }
 }

@@ -799,6 +799,25 @@ fn convert_text_request_to_service(
     body_hash: RequestBodyHash,
     request_id: Uuid,
 ) -> ServiceCompletionRequest {
+    // presence_penalty / frequency_penalty are standard sampling params the chat
+    // backend accepts but the service request has no typed slot for, so forward
+    // them through `extra` rather than dropping them. echo / logprobs / best_of
+    // are rejected upstream (see unsupported_completion_param) — they have no
+    // equivalent under the translate-to-chat path — so they never reach here set.
+    let mut extra = request.extra.clone();
+    if let Some(presence_penalty) = request.presence_penalty {
+        extra.insert(
+            "presence_penalty".to_string(),
+            serde_json::json!(presence_penalty),
+        );
+    }
+    if let Some(frequency_penalty) = request.frequency_penalty {
+        extra.insert(
+            "frequency_penalty".to_string(),
+            serde_json::json!(frequency_penalty),
+        );
+    }
+
     ServiceCompletionRequest {
         request_id,
         model: request.model.clone(),
@@ -822,8 +841,31 @@ fn convert_text_request_to_service(
         store: None,
         body_hash: body_hash.hash.clone(),
         response_id: None, // Direct text completions API calls don't have a response_id
-        extra: request.extra.clone(),
+        extra,
     }
+}
+
+/// Legacy text-completion parameters that have no equivalent under this
+/// endpoint's translate-to-chat implementation. Returns the offending parameter
+/// name when the request sets one to a non-default value so the caller can
+/// reject with a 400 rather than silently returning OpenAI-incompatible
+/// semantics. `presence_penalty` / `frequency_penalty` are intentionally absent
+/// — they are forwarded to the provider (see convert_text_request_to_service).
+fn unsupported_completion_param(request: &CompletionRequest) -> Option<&'static str> {
+    if request.echo == Some(true) {
+        // echo prepends the prompt to the completion; no chat equivalent.
+        return Some("echo");
+    }
+    if request.logprobs.is_some() {
+        // Legacy `logprobs` is an int (top-N tokens); the mapper always returns
+        // null and chat logprobs are a different shape.
+        return Some("logprobs");
+    }
+    if request.best_of.is_some_and(|b| b > 1) {
+        // Server-side best-of-N selection is not plumbed through.
+        return Some("best_of");
+    }
+    None
 }
 
 /// Create chat completion
@@ -1366,6 +1408,21 @@ async fn completions_inner(
             ResponseJson(ErrorResponse::new(
                 "Auto-redact is not supported on /v1/completions; use /v1/chat/completions"
                     .to_string(),
+                "unsupported_parameter".to_string(),
+            )),
+        )
+            .into_response();
+    }
+
+    // Reject advertised-but-unmappable legacy params instead of silently
+    // dropping them and returning OpenAI-incompatible semantics.
+    if let Some(param) = unsupported_completion_param(&request) {
+        return (
+            StatusCode::BAD_REQUEST,
+            ResponseJson(ErrorResponse::new(
+                format!(
+                    "Parameter '{param}' is not supported on /v1/completions; use /v1/chat/completions"
+                ),
                 "unsupported_parameter".to_string(),
             )),
         )
@@ -2290,6 +2347,83 @@ mod tests {
             req.extra.get("auto_redact"),
             Some(&serde_json::Value::Bool(true))
         );
+    }
+
+    fn parse_completion_request(json: &str) -> CompletionRequest {
+        serde_json::from_str(json).unwrap()
+    }
+
+    #[test]
+    fn unsupported_params_are_rejected() {
+        assert_eq!(
+            unsupported_completion_param(&parse_completion_request(
+                r#"{"model":"m","prompt":"p","echo":true}"#
+            )),
+            Some("echo")
+        );
+        assert_eq!(
+            unsupported_completion_param(&parse_completion_request(
+                r#"{"model":"m","prompt":"p","logprobs":5}"#
+            )),
+            Some("logprobs")
+        );
+        assert_eq!(
+            unsupported_completion_param(&parse_completion_request(
+                r#"{"model":"m","prompt":"p","best_of":3}"#
+            )),
+            Some("best_of")
+        );
+    }
+
+    #[test]
+    fn supported_and_default_params_are_accepted() {
+        // echo:false, best_of:1, and penalties are not rejected.
+        assert_eq!(
+            unsupported_completion_param(&parse_completion_request(
+                r#"{"model":"m","prompt":"p","echo":false,"best_of":1,"presence_penalty":0.5,"frequency_penalty":-0.2}"#
+            )),
+            None
+        );
+        assert_eq!(
+            unsupported_completion_param(&parse_completion_request(
+                r#"{"model":"m","prompt":"p"}"#
+            )),
+            None
+        );
+    }
+
+    #[test]
+    fn convert_forwards_penalties_into_extra() {
+        let req = parse_completion_request(
+            r#"{"model":"m","prompt":"p","presence_penalty":0.5,"frequency_penalty":-0.2}"#,
+        );
+        let body_hash = RequestBodyHash {
+            hash: String::new(),
+            body_bytes: Bytes::new(),
+        };
+        let svc = convert_text_request_to_service(
+            &req,
+            Uuid::nil(),
+            "key".to_string(),
+            Uuid::nil(),
+            Uuid::nil(),
+            body_hash,
+            Uuid::nil(),
+        );
+        // Compare with tolerance: the typed field is f32, so the forwarded JSON
+        // number widens to f64 (e.g. -0.2f32 -> -0.20000000298).
+        let presence = svc
+            .extra
+            .get("presence_penalty")
+            .and_then(|v| v.as_f64())
+            .unwrap();
+        let frequency = svc
+            .extra
+            .get("frequency_penalty")
+            .and_then(|v| v.as_f64())
+            .unwrap();
+        assert!((presence - 0.5).abs() < 1e-6);
+        assert!((frequency + 0.2).abs() < 1e-6);
     }
 }
 

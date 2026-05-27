@@ -1139,6 +1139,113 @@ async fn test_get_organization_balance() {
 }
 
 #[tokio::test]
+async fn test_admin_get_organization_balance() {
+    let server = setup_test_server().await;
+    let org = setup_org_with_credits(&server, 5000000000i64).await; // $5.00 USD
+
+    let response = server
+        .get(format!("/v1/admin/organizations/{}/usage/balance", org.id).as_str())
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .await;
+
+    assert_eq!(response.status_code(), 200);
+
+    let balance =
+        serde_json::from_str::<api::routes::usage::OrganizationBalanceResponse>(&response.text())
+            .expect("Failed to parse admin balance response");
+
+    assert_eq!(balance.organization_id, org.id);
+    assert_eq!(balance.total_spent, 0);
+    assert_eq!(balance.spend_limit, Some(5000000000i64));
+    assert_eq!(balance.remaining, Some(5000000000i64));
+    assert_eq!(balance.total_requests, 0);
+    assert_eq!(balance.total_tokens, 0);
+}
+
+#[tokio::test]
+async fn test_admin_get_organization_balance_missing_org_returns_404() {
+    let server = setup_test_server().await;
+    let fake_org_id = uuid::Uuid::new_v4();
+
+    let response = server
+        .get(format!("/v1/admin/organizations/{fake_org_id}/usage/balance").as_str())
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .await;
+
+    assert_eq!(response.status_code(), 404);
+}
+
+#[tokio::test]
+async fn test_admin_get_organization_balance_invalid_org_id_returns_400() {
+    let server = setup_test_server().await;
+
+    let response = server
+        .get("/v1/admin/organizations/not-a-uuid/usage/balance")
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .await;
+
+    assert_eq!(response.status_code(), 400);
+}
+
+#[tokio::test]
+async fn test_admin_get_organization_balance_accepts_admin_access_token() {
+    let server = setup_test_server().await;
+    let org = setup_org_with_credits(&server, 5000000000i64).await; // $5.00 USD
+    let user_agent = "BillingService/1.0";
+
+    let create_request = serde_json::json!({
+        "expires_in_hours": 24,
+        "name": "Billing Service Test Token",
+        "reason": "Testing admin balance endpoint for billing service",
+    });
+
+    let create_response = server
+        .post("/v1/admin/access-tokens")
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .add_header("User-Agent", user_agent)
+        .json(&create_request)
+        .await;
+
+    assert_eq!(create_response.status_code(), 200);
+    let token_response = create_response.json::<api::models::AdminAccessTokenResponse>();
+
+    let response = server
+        .get(format!("/v1/admin/organizations/{}/usage/balance", org.id).as_str())
+        .add_header(
+            "Authorization",
+            format!("Bearer {}", token_response.access_token),
+        )
+        .add_header("User-Agent", user_agent)
+        .await;
+
+    assert_eq!(response.status_code(), 200);
+
+    let balance =
+        serde_json::from_str::<api::routes::usage::OrganizationBalanceResponse>(&response.text())
+            .expect("Failed to parse admin balance response");
+
+    assert_eq!(balance.organization_id, org.id);
+    assert_eq!(balance.spend_limit, Some(5000000000i64));
+    assert_eq!(balance.remaining, Some(5000000000i64));
+}
+
+#[tokio::test]
+async fn test_admin_get_organization_balance_rejects_non_admin() {
+    let server = setup_test_server_with_config(|config| {
+        config.auth.admin_domains = vec!["near.ai".to_string()];
+    })
+    .await;
+    let org = create_org(&server).await;
+
+    let response = server
+        .get(format!("/v1/admin/organizations/{}/usage/balance", org.id).as_str())
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .await;
+
+    assert_eq!(response.status_code(), 403);
+}
+
+#[tokio::test]
 async fn test_get_organization_usage_history() {
     let server = setup_test_server().await;
     let org = create_org(&server).await;

@@ -11,12 +11,12 @@ use axum::{
 };
 use chrono::{Duration, Utc};
 use serde::{Deserialize, Serialize};
-use services::organization::OrganizationError;
+use services::{organization::OrganizationError, usage::UsageServiceTrait};
 use subtle::ConstantTimeEq;
 use utoipa::ToSchema;
 use uuid::Uuid;
 
-type UsageError = (StatusCode, ResponseJson<ErrorResponse>);
+pub(crate) type UsageError = (StatusCode, ResponseJson<ErrorResponse>);
 
 async fn check_org_membership(
     app_state: &AppState,
@@ -93,6 +93,82 @@ pub struct OrganizationBalanceResponse {
     pub total_requests: i64,
     pub total_tokens: i64,
     pub updated_at: String,
+}
+
+pub async fn compute_organization_balance_response(
+    usage_service: &(dyn UsageServiceTrait + Send + Sync),
+    organization_id: Uuid,
+) -> Result<OrganizationBalanceResponse, UsageError> {
+    let (balance, limit) = tokio::try_join!(
+        usage_service.get_balance(organization_id),
+        usage_service.get_limit(organization_id)
+    )
+    .map_err(|e| {
+        tracing::error!("Failed to get organization balance or limit: {:?}", e);
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            ResponseJson(ErrorResponse::new(
+                "Failed to retrieve balance or limit".to_string(),
+                "internal_server_error".to_string(),
+            )),
+        )
+    })?;
+
+    match balance {
+        Some(balance) => {
+            let (spend_limit, spend_limit_display, remaining, remaining_display) =
+                if let Some(limit_info) = limit {
+                    let remaining_amount = limit_info.spend_limit - balance.total_spent;
+                    (
+                        Some(limit_info.spend_limit),
+                        Some(format_amount(limit_info.spend_limit)),
+                        Some(remaining_amount),
+                        Some(format_amount(remaining_amount)),
+                    )
+                } else {
+                    (None, None, None, None)
+                };
+
+            Ok(OrganizationBalanceResponse {
+                organization_id: balance.organization_id.to_string(),
+                total_spent: balance.total_spent,
+                total_spent_display: format_amount(balance.total_spent),
+                spend_limit,
+                spend_limit_display,
+                remaining,
+                remaining_display,
+                last_usage_at: balance.last_usage_at.map(|dt| dt.to_rfc3339()),
+                total_requests: balance.total_requests,
+                total_tokens: balance.total_tokens,
+                updated_at: balance.updated_at.to_rfc3339(),
+            })
+        }
+        None => {
+            if let Some(limit_info) = limit {
+                Ok(OrganizationBalanceResponse {
+                    organization_id: organization_id.to_string(),
+                    total_spent: 0,
+                    total_spent_display: format_amount(0),
+                    spend_limit: Some(limit_info.spend_limit),
+                    spend_limit_display: Some(format_amount(limit_info.spend_limit)),
+                    remaining: Some(limit_info.spend_limit),
+                    remaining_display: Some(format_amount(limit_info.spend_limit)),
+                    last_usage_at: None,
+                    total_requests: 0,
+                    total_tokens: 0,
+                    updated_at: Utc::now().to_rfc3339(),
+                })
+            } else {
+                Err((
+                    StatusCode::NOT_FOUND,
+                    ResponseJson(ErrorResponse::new(
+                        "No usage data or limit found for organization".to_string(),
+                        "not_found".to_string(),
+                    )),
+                ))
+            }
+        }
+    }
 }
 
 /// Usage history entry
@@ -222,94 +298,9 @@ pub async fn get_organization_balance(
 
     let organization_id = check_org_membership(&app_state, user, &org_id).await?;
 
-    let balance = app_state
-        .usage_service
-        .get_balance(organization_id)
+    compute_organization_balance_response(&*app_state.usage_service, organization_id)
         .await
-        .map_err(|_| {
-            tracing::error!("Failed to get balance");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                ResponseJson(ErrorResponse::new(
-                    "Failed to retrieve balance".to_string(),
-                    "internal_server_error".to_string(),
-                )),
-            )
-        })?;
-
-    // Get spending limit
-    let limit = app_state
-        .usage_service
-        .get_limit(organization_id)
-        .await
-        .map_err(|_| {
-            tracing::error!("Failed to get limit");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                ResponseJson(ErrorResponse::new(
-                    "Failed to retrieve limit".to_string(),
-                    "internal_server_error".to_string(),
-                )),
-            )
-        })?;
-
-    match balance {
-        Some(balance) => {
-            let (spend_limit, spend_limit_display, remaining, remaining_display) =
-                if let Some(limit_info) = limit {
-                    let remaining_amount = limit_info.spend_limit - balance.total_spent;
-                    (
-                        Some(limit_info.spend_limit),
-                        Some(format_amount(limit_info.spend_limit)),
-                        Some(remaining_amount),
-                        Some(format_amount(remaining_amount)),
-                    )
-                } else {
-                    (None, None, None, None)
-                };
-
-            Ok(ResponseJson(OrganizationBalanceResponse {
-                organization_id: balance.organization_id.to_string(),
-                total_spent: balance.total_spent,
-                total_spent_display: format_amount(balance.total_spent),
-                spend_limit,
-                spend_limit_display,
-                remaining,
-                remaining_display,
-                last_usage_at: balance.last_usage_at.map(|dt| dt.to_rfc3339()),
-                total_requests: balance.total_requests,
-                total_tokens: balance.total_tokens,
-                updated_at: balance.updated_at.to_rfc3339(),
-            }))
-        }
-        None => {
-            // No balance yet, but may have a limit
-            if let Some(limit_info) = limit {
-                // Organization has a limit but no usage yet - return with zero balance
-                Ok(ResponseJson(OrganizationBalanceResponse {
-                    organization_id: org_id,
-                    total_spent: 0,
-                    total_spent_display: format_amount(0),
-                    spend_limit: Some(limit_info.spend_limit),
-                    spend_limit_display: Some(format_amount(limit_info.spend_limit)),
-                    remaining: Some(limit_info.spend_limit),
-                    remaining_display: Some(format_amount(limit_info.spend_limit)),
-                    last_usage_at: None,
-                    total_requests: 0,
-                    total_tokens: 0,
-                    updated_at: chrono::Utc::now().to_rfc3339(),
-                }))
-            } else {
-                Err((
-                    StatusCode::NOT_FOUND,
-                    ResponseJson(ErrorResponse::new(
-                        "No usage data or limit found for organization".to_string(),
-                        "not_found".to_string(),
-                    )),
-                ))
-            }
-        }
-    }
+        .map(ResponseJson)
 }
 
 /// Get organization usage history

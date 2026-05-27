@@ -1765,6 +1765,11 @@ fn model_with_pricing_to_info(model: services::models::ModelWithPricing) -> Mode
         supported_sampling_parameters: model.supported_sampling_parameters,
         supported_features: model.supported_features,
         description,
+        top_provider: Some(TopProvider {
+            context_length: Some(model.context_length),
+            max_completion_tokens: model.max_output_length,
+            is_moderated: false,
+        }),
     }
 }
 

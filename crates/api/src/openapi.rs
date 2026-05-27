@@ -137,6 +137,7 @@ use utoipa::{Modify, OpenApi};
         crate::routes::admin::delete_model,
         crate::routes::admin::deprecate_model,
         crate::routes::admin::get_model_history,
+        crate::routes::admin::get_admin_organization_balance,
         crate::routes::admin::update_organization_limits,
         crate::routes::admin::get_organization_limits_history,
         crate::routes::admin::update_organization_concurrent_limit,
@@ -165,7 +166,7 @@ use utoipa::{Modify, OpenApi};
             // Core API models
             ChatCompletionRequest, ChatCompletionResponse, Message, CompletionUsage,
             CompletionRequest, CompletionPrompt, StopSequences, CompletionResponse,
-            CompletionChoice, ModelsResponse, ModelInfo, ModelPricing, ErrorResponse,
+            CompletionChoice, ModelsResponse, ModelInfo, ModelPricing, TopProvider, ErrorResponse,
             // Image generation models
             ImageGenerationRequest, ImageGenerationResponse, ImageData,
             // Audio transcription models

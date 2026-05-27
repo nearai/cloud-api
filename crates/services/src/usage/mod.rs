@@ -627,6 +627,17 @@ impl UsageServiceTrait for UsageServiceImpl {
 
         Ok(results)
     }
+
+    async fn get_usage_by_model(
+        &self,
+        organization_id: Uuid,
+        start_date: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Vec<UsageByModelEntry>, UsageError> {
+        self.usage_repository
+            .get_usage_by_model(organization_id, start_date)
+            .await
+            .map_err(|e| UsageError::InternalError(format!("Failed to get usage by model: {e}")))
+    }
 }
 
 #[cfg(test)]

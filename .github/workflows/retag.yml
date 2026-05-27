@@ -37,9 +37,15 @@ jobs:
           TARGET: ${{ inputs.target }}
         run: |
           set -euo pipefail
-          # :prod is owned by promote.yml / rollback.yml (serialized + audited).
-          if [ "$TARGET" = "prod" ]; then
-            echo "::error::Refusing to target :prod. Use promote.yml or rollback.yml, which serialize and audit prod mutations."
+          # The entire prod-* tag namespace is owned by promote.yml / rollback.yml:
+          # :prod itself, the immutable prod-YYYYMMDD-<shortsha> rollback history,
+          # and prod-rollback-* audit tags. rollback.yml auto-selects the newest
+          # prod-* tag as a rollback candidate, so writing any prod-* tag here —
+          # without the production environment, the prod-image-mutation concurrency
+          # group, or a GitHub release — could pollute that history and later point
+          # a rollback at an unaudited image. Refuse the whole namespace.
+          if echo "$TARGET" | grep -Eq '^prod($|-)'; then
+            echo "::error::Refusing to target the prod-* tag namespace ('${TARGET}'). Use promote.yml or rollback.yml, which serialize and audit prod mutations."
             exit 1
           fi
           # Reject obviously malformed refs so we fail before touching the registry.
@@ -51,6 +57,17 @@ jobs:
             echo "::error::source must not be empty"
             exit 1
           fi
+          # Validate the tag form of source (digests are checked structurally in the
+          # resolve step) so an obvious typo fails fast with a clear message.
+          case "$SOURCE" in
+            sha256:*) ;;
+            *)
+              if ! echo "$SOURCE" | grep -Eq '^[A-Za-z0-9_][A-Za-z0-9_.-]*$'; then
+                echo "::error::source '${SOURCE}' is neither a sha256: digest nor a valid Docker tag"
+                exit 1
+              fi
+              ;;
+          esac
           if [ "$SOURCE" = "$TARGET" ]; then
             echo "::error::source and target are identical ('${SOURCE}'); nothing to do"
             exit 1
@@ -85,9 +102,16 @@ jobs:
               SOURCE_REF="${{ env.IMAGE }}:${SOURCE}"
               ;;
           esac
-          DIGEST=$(skopeo inspect "docker://${SOURCE_REF}" 2>/dev/null | jq -r '.Digest' || true)
+          # Don't mask skopeo failures: surface stderr so auth / rate-limit /
+          # network errors are distinguishable from a genuinely missing tag.
+          if ! RAW=$(skopeo inspect "docker://${SOURCE_REF}" 2>&1); then
+            echo "::error::skopeo inspect failed for ${SOURCE_REF}:"
+            echo "$RAW"
+            exit 1
+          fi
+          DIGEST=$(echo "$RAW" | jq -r '.Digest')
           if [ -z "$DIGEST" ] || [ "$DIGEST" = "null" ]; then
-            echo "::error::Failed to resolve source ${SOURCE_REF} (tag or digest may not exist)"
+            echo "::error::Could not read a digest from ${SOURCE_REF} (unexpected skopeo output)"
             exit 1
           fi
           echo "source_ref=${SOURCE_REF}" >> "$GITHUB_OUTPUT"

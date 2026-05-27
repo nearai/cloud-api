@@ -226,6 +226,19 @@ Client → CompletionService → Provider Pool (round-robin)
 - **Migrations**: SQL-based using Refinery, run on startup
 - Located at: `crates/database/src/migrations/sql/`
 
+### External Billing / Credits Service
+
+Cloud API itself has no direct Stripe integration. The billing/credits service is the
+Next.js server in `../nearai-cloud-ui`, deployed on Vercel:
+
+- `../nearai-cloud-ui/app/api/stripe/webhook/route.ts` handles Stripe checkout webhooks.
+- `../nearai-cloud-ui/app/api/credit/sync/route.ts` recalculates payment credits from Stripe + Hot Labs.
+- `../nearai-cloud-ui/lib/webhook-utils.ts` calls `PATCH /v1/admin/organizations/{org_id}/limits`.
+
+That service uses `NEAR_AI_CLOUD_ADMIN_ACCESS_TOKEN` and optional `BILLING_SERVICE_USER_AGENT`
+to update organization spend limits in Cloud API after purchases/refunds or manual syncs.
+In Cloud API, the target endpoint is `crates/api/src/routes/admin.rs` (`update_organization_limits`).
+
 ## Critical Files & Locations
 
 ### Adding a New API Endpoint

@@ -773,6 +773,23 @@ pub struct ModelInfo {
     /// Human-readable description (OpenRouter `description`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    /// OpenRouter `top_provider`: per-provider context/output limits.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub top_provider: Option<TopProvider>,
+}
+
+/// OpenRouter `top_provider` block: context length and max output tokens
+/// in the field names OpenRouter's `/api/v1/models` schema uses.
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct TopProvider {
+    /// Context length in tokens (mirrors top-level `context_length`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_length: Option<i32>,
+    /// Maximum output tokens per response (mirrors top-level `max_output_length`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_completion_tokens: Option<i32>,
+    /// Whether the provider moderates content. We do not, so this is always false.
+    pub is_moderated: bool,
 }
 
 #[derive(Debug, Serialize)]

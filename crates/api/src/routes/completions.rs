@@ -1253,13 +1253,14 @@ async fn chat_completions_inner(
     )
 )]
 pub async fn completions(
-    #[allow(unused)] State(app_state): State<AppState>,
+    State(app_state): State<AppState>,
     Extension(api_key): Extension<AuthenticatedApiKey>,
-    #[allow(unused)] Extension(body_hash): Extension<RequestBodyHash>,
+    Extension(body_hash): Extension<RequestBodyHash>,
+    headers: header::HeaderMap,
     Json(request): Json<CompletionRequest>,
 ) -> axum::response::Response {
     debug!(
-        "Text completions request from key: {:?}",
+        "Text completions request from api key: {:?}",
         api_key.api_key.id
     );
     debug!(
@@ -1267,18 +1268,6 @@ pub async fn completions(
         request.model, request.stream, api_key.organization.id, api_key.workspace.id.0
     );
 
-    // This endpoint is not yet implemented — it returns immediately without
-    // any async work, so no tracing span is needed here.
-    return (
-        StatusCode::NOT_IMPLEMENTED,
-        ResponseJson(ErrorResponse::new(
-            "This endpoint is not implemented".to_string(),
-            "not_implemented".to_string(),
-        )),
-    )
-        .into_response();
-
-    #[allow(unreachable_code)]
     // Validate the request
     if let Err(error) = request.validate() {
         return (
@@ -1291,11 +1280,46 @@ pub async fn completions(
             .into_response();
     }
 
-    // Generate correlation ID
-    let request_id = Uuid::new_v4();
+    // Per-request correlation ID: reuse the client's X-Request-Id if present and
+    // parseable as a UUID, otherwise generate one. Matches chat_completions.
+    let request_id = headers
+        .get("x-request-id")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| Uuid::parse_str(s).ok())
+        .unwrap_or_else(Uuid::new_v4);
 
-    // Convert HTTP request to service parameters
-    // Note: Names are not passed - high-cardinality data is tracked via database, not metrics
+    // See chat_completions: do NOT span.enter() in async code; .instrument() the
+    // inner future so the span wraps every await without leaking across tasks.
+    let span = tracing::info_span!(
+        "completions",
+        request_id = %request_id,
+        org_id = %api_key.organization.id.0,
+        workspace_id = %api_key.workspace.id.0,
+        model = %request.model,
+    );
+
+    completions_inner(app_state, api_key, body_hash, request, request_id)
+        .instrument(span)
+        .await
+}
+
+// The legacy text-completions endpoint is implemented by translating the
+// `prompt` into a single user chat message (see convert_text_request_to_service)
+// and reshaping the chat response back into the `object: "text_completion"`
+// format. Consequences worth knowing:
+//   - the backend applies its chat template to the prompt, so output is not
+//     identical to a raw completion against the base model;
+//   - the response is synthesized, so unlike /v1/chat/completions it is not
+//     byte-verifiable against attestation (the Inference-Id header still maps
+//     to the provider response id).
+// Usage tracking/billing is handled inside the completion service, same as chat.
+async fn completions_inner(
+    app_state: AppState,
+    api_key: AuthenticatedApiKey,
+    body_hash: RequestBodyHash,
+    request: CompletionRequest,
+    request_id: Uuid,
+) -> axum::response::Response {
     let service_request = convert_text_request_to_service(
         &request,
         api_key.api_key.created_by_user_id.0,
@@ -1306,23 +1330,185 @@ pub async fn completions(
         request_id,
     );
 
-    // Call the completion service - it handles usage tracking internally
-    match app_state
-        .completion_service
-        .create_chat_completion_stream(service_request)
-        .await
-    {
-        Ok(_stream) => {
-            unimplemented!();
+    if request.stream == Some(true) {
+        match app_state
+            .completion_service
+            .create_chat_completion_stream(service_request)
+            .await
+        {
+            Ok(stream) => {
+                // Peek the first chunk to surface the Inference-Id header.
+                let mut peekable_stream = Box::pin(stream.peekable());
+                let inference_id = peekable_stream
+                    .as_mut()
+                    .peek()
+                    .await
+                    .and_then(|result| result.as_ref().ok())
+                    .map(|event| extract_inference_id_from_chunk(&event.chunk));
+
+                let organization_id = api_key.organization.id.0;
+                let model_for_err = request.model.clone();
+
+                let byte_stream = peekable_stream
+                    .map(move |result| match result {
+                        Ok(event) => {
+                            let text_chunk = chat_chunk_to_text_chunk(event.chunk);
+                            let json_data =
+                                serde_json::to_string(&text_chunk).unwrap_or_else(|e| {
+                                    tracing::error!(
+                                        %organization_id,
+                                        "Failed to serialize text completion chunk: {e}"
+                                    );
+                                    "{}".to_string()
+                                });
+                            Ok::<Bytes, Infallible>(Bytes::from(format!("data: {json_data}\n\n")))
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                %organization_id,
+                                model = %model_for_err,
+                                error_type = %completion_stream_error_category(&e),
+                                "Text completion stream error"
+                            );
+                            Ok::<Bytes, Infallible>(sse_error_frame(&e))
+                        }
+                    })
+                    .chain(futures::stream::once(async move {
+                        Ok::<Bytes, Infallible>(Bytes::from_static(b"data: [DONE]\n\n"))
+                    }));
+
+                let mut response_builder = Response::builder()
+                    .status(StatusCode::OK)
+                    .header(header::CONTENT_TYPE, "text/event-stream")
+                    .header(header::CACHE_CONTROL, "no-cache")
+                    .header(header::CONNECTION, "keep-alive");
+
+                if let Some(uuid) = inference_id {
+                    response_builder = response_builder
+                        .header(HEADER_INFERENCE_ID, uuid.to_string())
+                        .header("Access-Control-Expose-Headers", HEADER_INFERENCE_ID);
+                }
+
+                response_builder
+                    .body(Body::from_stream(byte_stream))
+                    .unwrap()
+            }
+            Err(domain_error) => {
+                let status_code = map_domain_error_to_status(&domain_error);
+                (
+                    status_code,
+                    ResponseJson::<ErrorResponse>(domain_error.into()),
+                )
+                    .into_response()
+            }
         }
-        Err(domain_error) => {
-            let status_code = map_domain_error_to_status(&domain_error);
-            (
-                status_code,
-                ResponseJson::<ErrorResponse>(domain_error.into()),
-            )
-                .into_response()
+    } else {
+        match app_state
+            .completion_service
+            .create_chat_completion(service_request)
+            .await
+        {
+            Ok(response_with_bytes) => {
+                let inference_id = hash_inference_id_to_uuid(&response_with_bytes.response.id);
+                let completion = chat_response_to_text_response(response_with_bytes.response);
+
+                let body_bytes = match serde_json::to_vec(&completion) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        tracing::error!(error = %e, "failed to serialize text completion response");
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            ResponseJson(ErrorResponse::new(
+                                "Failed to assemble response".to_string(),
+                                "internal_server_error".to_string(),
+                            )),
+                        )
+                            .into_response();
+                    }
+                };
+
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(HEADER_INFERENCE_ID, inference_id.to_string())
+                    .header("Access-Control-Expose-Headers", HEADER_INFERENCE_ID)
+                    .body(Body::from(body_bytes))
+                    .unwrap()
+            }
+            Err(domain_error) => {
+                let status_code = map_domain_error_to_status(&domain_error);
+                (
+                    status_code,
+                    ResponseJson::<ErrorResponse>(domain_error.into()),
+                )
+                    .into_response()
+            }
         }
+    }
+}
+
+/// Reshape a non-streaming chat completion response into the legacy
+/// `object: "text_completion"` format: each choice's assistant message content
+/// becomes the choice `text`.
+fn chat_response_to_text_response(
+    response: inference_providers::ChatCompletionResponse,
+) -> CompletionResponse {
+    let cached = response.usage.cached_tokens();
+    CompletionResponse {
+        id: response.id,
+        object: "text_completion".to_string(),
+        created: response.created,
+        model: response.model,
+        choices: response
+            .choices
+            .into_iter()
+            .map(|c| CompletionChoice {
+                index: c.index,
+                text: c.message.content.unwrap_or_default(),
+                logprobs: None,
+                finish_reason: c.finish_reason,
+            })
+            .collect(),
+        usage: CompletionUsage {
+            prompt_tokens: response.usage.prompt_tokens,
+            prompt_tokens_details: (cached != 0).then_some(InputTokensDetails {
+                cached_tokens: cached as i64,
+            }),
+            completion_tokens: response.usage.completion_tokens,
+            completion_tokens_details: None,
+            total_tokens: response.usage.total_tokens,
+        },
+    }
+}
+
+/// Reshape a streaming chat chunk into the legacy text-completion chunk format:
+/// the assistant `delta.content` becomes the choice `text`.
+fn chat_chunk_to_text_chunk(
+    chunk: inference_providers::StreamChunk,
+) -> inference_providers::models::CompletionChunk {
+    let chat = match chunk {
+        inference_providers::StreamChunk::Chat(c) => c,
+        // The service emits chat chunks for this request shape; pass any
+        // already-text chunk through unchanged.
+        inference_providers::StreamChunk::Text(c) => return c,
+    };
+    inference_providers::models::CompletionChunk {
+        id: chat.id,
+        object: "text_completion".to_string(),
+        created: chat.created,
+        model: chat.model,
+        system_fingerprint: chat.system_fingerprint,
+        choices: chat
+            .choices
+            .into_iter()
+            .map(|c| inference_providers::models::TextChoice {
+                index: c.index,
+                text: c.delta.and_then(|d| d.content).unwrap_or_default(),
+                logprobs: None,
+                finish_reason: c.finish_reason,
+            })
+            .collect(),
+        usage: chat.usage,
     }
 }
 
@@ -1932,6 +2118,99 @@ mod tests {
             completion_stream_error_openai_type(&parse_err),
             "server_error"
         );
+    }
+
+    #[test]
+    fn chat_response_to_text_response_maps_content_and_usage() {
+        let response: inference_providers::ChatCompletionResponse = serde_json::from_value(
+            serde_json::json!({
+                "id": "cmpl-abc",
+                "object": "chat.completion",
+                "created": 42,
+                "model": "test-model",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "The capital is Paris."},
+                    "finish_reason": "stop"
+                }],
+                "usage": {
+                    "prompt_tokens": 11,
+                    "completion_tokens": 5,
+                    "total_tokens": 16,
+                    "prompt_tokens_details": {"cached_tokens": 4}
+                }
+            }),
+        )
+        .unwrap();
+
+        let text = chat_response_to_text_response(response);
+
+        assert_eq!(text.object, "text_completion");
+        assert_eq!(text.id, "cmpl-abc");
+        assert_eq!(text.created, 42);
+        assert_eq!(text.choices.len(), 1);
+        assert_eq!(text.choices[0].index, 0);
+        assert_eq!(text.choices[0].text, "The capital is Paris.");
+        assert_eq!(text.choices[0].finish_reason.as_deref(), Some("stop"));
+        assert_eq!(text.usage.prompt_tokens, 11);
+        assert_eq!(text.usage.completion_tokens, 5);
+        assert_eq!(text.usage.total_tokens, 16);
+        assert_eq!(
+            text.usage.prompt_tokens_details.map(|d| d.cached_tokens),
+            Some(4)
+        );
+    }
+
+    #[test]
+    fn chat_response_to_text_response_handles_missing_content_and_no_cache() {
+        let response: inference_providers::ChatCompletionResponse = serde_json::from_value(
+            serde_json::json!({
+                "id": "cmpl-empty",
+                "object": "chat.completion",
+                "created": 0,
+                "model": "m",
+                "choices": [{"index": 0, "message": {"role": "assistant"}}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 0, "total_tokens": 1}
+            }),
+        )
+        .unwrap();
+
+        let text = chat_response_to_text_response(response);
+
+        assert_eq!(text.choices[0].text, "");
+        assert!(text.choices[0].finish_reason.is_none());
+        // No cached tokens reported -> details omitted.
+        assert!(text.usage.prompt_tokens_details.is_none());
+    }
+
+    #[test]
+    fn chat_chunk_to_text_chunk_maps_delta_content() {
+        let chunk = make_chat_chunk_with_choice(
+            Some(inference_providers::models::ChatDelta {
+                content: Some("Hello".to_string()),
+                ..empty_delta()
+            }),
+            Some(inference_providers::models::FinishReason::Stop),
+        );
+
+        let text = chat_chunk_to_text_chunk(chunk);
+
+        assert_eq!(text.object, "text_completion");
+        assert_eq!(text.choices.len(), 1);
+        assert_eq!(text.choices[0].index, 0);
+        assert_eq!(text.choices[0].text, "Hello");
+        assert!(matches!(
+            text.choices[0].finish_reason,
+            Some(inference_providers::models::FinishReason::Stop)
+        ));
+    }
+
+    #[test]
+    fn chat_chunk_to_text_chunk_empty_delta_yields_empty_text() {
+        let chunk = make_chat_chunk_with_choice(Some(empty_delta()), None);
+        let text = chat_chunk_to_text_chunk(chunk);
+        assert_eq!(text.choices[0].text, "");
+        assert!(text.choices[0].finish_reason.is_none());
     }
 }
 

@@ -1312,15 +1312,17 @@ pub struct UsageByModelResponse {
 
 /// Get organization usage broken down by model.
 ///
-/// Returns one row per model, summed over the selected time window (`day`, `week`, or `month`).
-/// Used by the dashboard pie chart to show which models drive spend.
+/// Returns one row per model, summed over a rolling window ending now:
+/// `day` = last 24h, `week` = last 7 days, `month` = last 30 days (NOT calendar
+/// day/week/month-to-date). Used by the dashboard pie chart to show which models
+/// drive spend.
 #[utoipa::path(
     get,
     path = "/v1/organizations/{org_id}/usage/by-model",
     tag = "Usage",
     params(
         ("org_id" = String, Path, description = "Organization ID"),
-        ("period" = Option<String>, Query, description = "`day`, `week`, or `month` (default: `month`)")
+        ("period" = Option<String>, Query, description = "Rolling window: `day` (last 24h), `week` (last 7d), or `month` (last 30d). Default: `month`")
     ),
     responses(
         (status = 200, description = "Per-model usage breakdown", body = UsageByModelResponse),
@@ -1345,8 +1347,8 @@ pub async fn get_organization_usage_by_model(
         .usage_service
         .get_usage_by_model(organization_id, start_date)
         .await
-        .map_err(|_| {
-            tracing::error!("Failed to get usage by model");
+        .map_err(|e| {
+            tracing::error!(error = ?e, "Failed to get usage by model");
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 ResponseJson(ErrorResponse::new(

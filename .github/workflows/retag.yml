@@ -1,0 +1,137 @@
+name: Re-tag Image
+
+# Point one tag at the image currently published under another tag (or at an
+# explicit digest). Example: set :staging to whatever :latest currently is.
+#
+# This is a general-purpose mover for non-prod tags. The :prod tag is owned by
+# promote.yml / rollback.yml, which serialize and audit every prod mutation —
+# this workflow refuses target=prod so that flow is never bypassed.
+
+permissions:
+  contents: read
+
+on:
+  workflow_dispatch:
+    inputs:
+      source:
+        description: "Source to copy from: a tag (e.g. latest, staging) or a digest (sha256:...)"
+        required: true
+        type: string
+      target:
+        description: "Target tag to (re)point at the source (e.g. staging)"
+        required: true
+        type: string
+
+env:
+  REGISTRY: docker.io
+  IMAGE: docker.io/${{ vars.DOCKER_REGISTRY_USER }}/cloud-api
+
+jobs:
+  retag:
+    name: Re-tag ${{ inputs.target }} → ${{ inputs.source }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate inputs
+        env:
+          SOURCE: ${{ inputs.source }}
+          TARGET: ${{ inputs.target }}
+        run: |
+          set -euo pipefail
+          # The entire prod-* tag namespace is owned by promote.yml / rollback.yml:
+          # :prod itself, the immutable prod-YYYYMMDD-<shortsha> rollback history,
+          # and prod-rollback-* audit tags. rollback.yml auto-selects the newest
+          # prod-* tag as a rollback candidate, so writing any prod-* tag here —
+          # without the production environment, the prod-image-mutation concurrency
+          # group, or a GitHub release — could pollute that history and later point
+          # a rollback at an unaudited image. Refuse the whole namespace.
+          if echo "$TARGET" | grep -Eq '^prod($|-)'; then
+            echo "::error::Refusing to target the prod-* tag namespace ('${TARGET}'). Use promote.yml or rollback.yml, which serialize and audit prod mutations."
+            exit 1
+          fi
+          # Reject obviously malformed refs so we fail before touching the registry.
+          if ! echo "$TARGET" | grep -Eq '^[A-Za-z0-9_][A-Za-z0-9_.-]*$'; then
+            echo "::error::target '${TARGET}' is not a valid Docker tag"
+            exit 1
+          fi
+          if [ -z "$SOURCE" ]; then
+            echo "::error::source must not be empty"
+            exit 1
+          fi
+          # Validate the tag form of source (digests are checked structurally in the
+          # resolve step) so an obvious typo fails fast with a clear message.
+          case "$SOURCE" in
+            sha256:*) ;;
+            *)
+              if ! echo "$SOURCE" | grep -Eq '^[A-Za-z0-9_][A-Za-z0-9_.-]*$'; then
+                echo "::error::source '${SOURCE}' is neither a sha256: digest nor a valid Docker tag"
+                exit 1
+              fi
+              ;;
+          esac
+          if [ "$SOURCE" = "$TARGET" ]; then
+            echo "::error::source and target are identical ('${SOURCE}'); nothing to do"
+            exit 1
+          fi
+
+      - name: Log in to Docker registry
+        uses: docker/login-action@9f4a8ea54ed9055d5f86c993e1f2ffa674f98344
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ vars.DOCKER_REGISTRY_USER }}
+          password: ${{ secrets.DOCKER_REGISTRY_TOKEN }}
+
+      - name: Install skopeo and jq
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y skopeo jq
+
+      # Resolve the source to a digest first. Copying from the digest (not the
+      # tag) makes the bytes written to the target provably identical to what we
+      # inspected, immune to a concurrent push racing the source tag mid-run.
+      - name: Resolve source digest
+        id: resolve
+        env:
+          SOURCE: ${{ inputs.source }}
+        run: |
+          set -euo pipefail
+          case "$SOURCE" in
+            sha256:*)
+              SOURCE_REF="${{ env.IMAGE }}@${SOURCE}"
+              ;;
+            *)
+              SOURCE_REF="${{ env.IMAGE }}:${SOURCE}"
+              ;;
+          esac
+          # Don't mask skopeo failures: surface stderr so auth / rate-limit /
+          # network errors are distinguishable from a genuinely missing tag.
+          if ! RAW=$(skopeo inspect "docker://${SOURCE_REF}" 2>&1); then
+            echo "::error::skopeo inspect failed for ${SOURCE_REF}:"
+            echo "$RAW"
+            exit 1
+          fi
+          DIGEST=$(echo "$RAW" | jq -r '.Digest')
+          if [ -z "$DIGEST" ] || [ "$DIGEST" = "null" ]; then
+            echo "::error::Could not read a digest from ${SOURCE_REF} (unexpected skopeo output)"
+            exit 1
+          fi
+          echo "source_ref=${SOURCE_REF}" >> "$GITHUB_OUTPUT"
+          echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
+          echo "Source ${SOURCE_REF} → ${DIGEST}"
+
+      - name: Copy source digest → target tag
+        run: |
+          set -euo pipefail
+          skopeo copy \
+            "docker://${{ env.IMAGE }}@${{ steps.resolve.outputs.digest }}" \
+            "docker://${{ env.IMAGE }}:${{ inputs.target }}"
+
+      - name: Summary
+        run: |
+          {
+            echo "## Re-tag: :${{ inputs.target }} → ${{ steps.resolve.outputs.source_ref }}"
+            echo ""
+            echo "- source: \`${{ steps.resolve.outputs.source_ref }}\`"
+            echo "- target: \`${{ env.IMAGE }}:${{ inputs.target }}\`"
+            echo "- digest: \`${{ steps.resolve.outputs.digest }}\`"
+            echo "- sigstore: https://search.sigstore.dev/?hash=${{ steps.resolve.outputs.digest }}"
+          } >> "$GITHUB_STEP_SUMMARY"

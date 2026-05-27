@@ -1242,7 +1242,7 @@ async fn chat_completions_inner(
     tag = "Chat",
     request_body = CompletionRequest,
     responses(
-        (status = 200, description = "Completion generated successfully", body = ChatCompletionResponse),
+        (status = 200, description = "Completion generated successfully", body = CompletionResponse),
         (status = 400, description = "Invalid request parameters", body = ErrorResponse),
         (status = 401, description = "Invalid or missing API key", body = ErrorResponse),
         (status = 500, description = "Server error", body = ErrorResponse),
@@ -1298,7 +1298,7 @@ pub async fn completions(
         model = %request.model,
     );
 
-    completions_inner(app_state, api_key, body_hash, request, request_id)
+    completions_inner(app_state, api_key, body_hash, headers, request, request_id)
         .instrument(span)
         .await
 }
@@ -1313,13 +1313,65 @@ pub async fn completions(
 //     byte-verifiable against attestation (the Inference-Id header still maps
 //     to the provider response id).
 // Usage tracking/billing is handled inside the completion service, same as chat.
+//
+// E2E encryption and auto-redact are NOT supported here: both rely on the chat
+// path forwarding the provider's bytes (encrypted / un-redacted) straight to the
+// client, which is incompatible with reshaping the response into text_completion
+// format. Rather than silently bypass these privacy features (sending plaintext /
+// un-redacted prompts), we reject such requests with a 400.
+#[allow(clippy::too_many_arguments)]
 async fn completions_inner(
     app_state: AppState,
     api_key: AuthenticatedApiKey,
     body_hash: RequestBodyHash,
+    headers: header::HeaderMap,
     request: CompletionRequest,
     request_id: Uuid,
 ) -> axum::response::Response {
+    // Reject E2E encryption: validate for parity (an invalid version still 400s
+    // the same way chat does), then refuse if any encryption header is present.
+    let encryption_headers = match crate::routes::common::validate_encryption_headers(&headers) {
+        Ok(h) => h,
+        Err(err) => return err.into_response(),
+    };
+    if encryption_headers.signing_algo.is_some()
+        || encryption_headers.client_pub_key.is_some()
+        || encryption_headers.model_pub_key.is_some()
+        || encryption_headers.encryption_version.is_some()
+        || encryption_headers.encrypt_all_fields.is_some()
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            ResponseJson(ErrorResponse::new(
+                "End-to-end encryption is not supported on /v1/completions; use /v1/chat/completions".to_string(),
+                "unsupported_parameter".to_string(),
+            )),
+        )
+            .into_response();
+    }
+
+    // Reject auto-redact opt-in (header or body field) rather than sending the
+    // raw prompt to the provider with redaction silently disabled.
+    let auto_redact_headers: Vec<&str> = headers
+        .get_all(auto_redact::AUTO_REDACT_HEADER)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .collect();
+    if auto_redact::is_enabled(
+        auto_redact_headers.iter().copied(),
+        request.extra.get(auto_redact::AUTO_REDACT_BODY_FIELD),
+    ) {
+        return (
+            StatusCode::BAD_REQUEST,
+            ResponseJson(ErrorResponse::new(
+                "Auto-redact is not supported on /v1/completions; use /v1/chat/completions"
+                    .to_string(),
+                "unsupported_parameter".to_string(),
+            )),
+        )
+            .into_response();
+    }
+
     let service_request = convert_text_request_to_service(
         &request,
         api_key.api_key.created_by_user_id.0,
@@ -1345,6 +1397,14 @@ async fn completions_inner(
                     .await
                     .and_then(|result| result.as_ref().ok())
                     .map(|event| extract_inference_id_from_chunk(&event.chunk));
+
+                if inference_id.is_none() {
+                    tracing::warn!(
+                        organization_id = %api_key.organization.id.0,
+                        model = %request.model,
+                        "Could not extract inference ID from first chunk for text completion (streaming)"
+                    );
+                }
 
                 let organization_id = api_key.organization.id.0;
                 let model_for_err = request.model.clone();
@@ -2122,8 +2182,8 @@ mod tests {
 
     #[test]
     fn chat_response_to_text_response_maps_content_and_usage() {
-        let response: inference_providers::ChatCompletionResponse = serde_json::from_value(
-            serde_json::json!({
+        let response: inference_providers::ChatCompletionResponse =
+            serde_json::from_value(serde_json::json!({
                 "id": "cmpl-abc",
                 "object": "chat.completion",
                 "created": 42,
@@ -2139,9 +2199,8 @@ mod tests {
                     "total_tokens": 16,
                     "prompt_tokens_details": {"cached_tokens": 4}
                 }
-            }),
-        )
-        .unwrap();
+            }))
+            .unwrap();
 
         let text = chat_response_to_text_response(response);
 
@@ -2163,17 +2222,16 @@ mod tests {
 
     #[test]
     fn chat_response_to_text_response_handles_missing_content_and_no_cache() {
-        let response: inference_providers::ChatCompletionResponse = serde_json::from_value(
-            serde_json::json!({
+        let response: inference_providers::ChatCompletionResponse =
+            serde_json::from_value(serde_json::json!({
                 "id": "cmpl-empty",
                 "object": "chat.completion",
                 "created": 0,
                 "model": "m",
                 "choices": [{"index": 0, "message": {"role": "assistant"}}],
                 "usage": {"prompt_tokens": 1, "completion_tokens": 0, "total_tokens": 1}
-            }),
-        )
-        .unwrap();
+            }))
+            .unwrap();
 
         let text = chat_response_to_text_response(response);
 
@@ -2211,6 +2269,27 @@ mod tests {
         let text = chat_chunk_to_text_chunk(chunk);
         assert_eq!(text.choices[0].text, "");
         assert!(text.choices[0].finish_reason.is_none());
+    }
+
+    #[test]
+    fn completion_request_deserializes_minimal_body() {
+        // `extra` is #[serde(flatten)]: a request with only model+prompt must
+        // parse (no required "extra" object) and leave `extra` empty.
+        let req: CompletionRequest =
+            serde_json::from_str(r#"{"model":"m","prompt":"hello"}"#).unwrap();
+        assert_eq!(req.model, "m");
+        assert_eq!(req.prompt, "hello");
+        assert!(req.extra.is_empty());
+    }
+
+    #[test]
+    fn completion_request_flattens_unknown_fields_into_extra() {
+        let req: CompletionRequest =
+            serde_json::from_str(r#"{"model":"m","prompt":"hi","auto_redact":true}"#).unwrap();
+        assert_eq!(
+            req.extra.get("auto_redact"),
+            Some(&serde_json::Value::Bool(true))
+        );
     }
 }
 

@@ -192,10 +192,11 @@ pub struct CompletionRequest {
     pub frequency_penalty: Option<f32>,
     pub best_of: Option<i64>,
 
+    #[serde(flatten)]
     pub extra: std::collections::HashMap<String, serde_json::Value>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct CompletionResponse {
     pub id: String,
     pub object: String, // "text_completion"
@@ -775,7 +776,7 @@ pub struct ModelInfo {
     pub description: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct CompletionChoice {
     pub index: i64,
     pub text: String,

@@ -790,8 +790,10 @@ fn build_flush_chunks(states: &mut StreamUnredactStates, template: &ChunkTemplat
 }
 
 // Convert HTTP CompletionRequest to service CompletionRequest
+#[allow(clippy::too_many_arguments)]
 fn convert_text_request_to_service(
     request: &CompletionRequest,
+    prompt: String,
     user_id: Uuid,
     api_key_id: String,
     organization_id: Uuid,
@@ -823,14 +825,14 @@ fn convert_text_request_to_service(
         model: request.model.clone(),
         messages: vec![CompletionMessage {
             role: "user".to_string(),
-            content: serde_json::Value::String(request.prompt.clone()),
+            content: serde_json::Value::String(prompt),
             tool_call_id: None,
             tool_calls: None,
         }],
         max_tokens: request.max_tokens,
         temperature: request.temperature,
         top_p: request.top_p,
-        stop: request.stop.clone(),
+        stop: request.stop.clone().map(|s| s.into_vec()),
         stream: request.stream,
         user_id: user_id.into(),
         n: request.n,
@@ -1429,8 +1431,26 @@ async fn completions_inner(
             .into_response();
     }
 
+    // Resolve the prompt to the single string this endpoint supports. Batch
+    // (array) and token-id prompts deserialize fine but have no mapping under
+    // the translate-to-chat path, so reject them with a clean 400.
+    let prompt = match request.prompt.single_text() {
+        Ok(p) => p.to_string(),
+        Err(msg) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                ResponseJson(ErrorResponse::new(
+                    msg.to_string(),
+                    "unsupported_parameter".to_string(),
+                )),
+            )
+                .into_response();
+        }
+    };
+
     let service_request = convert_text_request_to_service(
         &request,
+        prompt,
         api_key.api_key.created_by_user_id.0,
         api_key.api_key.id.0.clone(),
         api_key.organization.id.0,
@@ -2335,7 +2355,7 @@ mod tests {
         let req: CompletionRequest =
             serde_json::from_str(r#"{"model":"m","prompt":"hello"}"#).unwrap();
         assert_eq!(req.model, "m");
-        assert_eq!(req.prompt, "hello");
+        assert_eq!(req.prompt.single_text().unwrap(), "hello");
         assert!(req.extra.is_empty());
     }
 
@@ -2403,6 +2423,7 @@ mod tests {
         };
         let svc = convert_text_request_to_service(
             &req,
+            "p".to_string(),
             Uuid::nil(),
             "key".to_string(),
             Uuid::nil(),
@@ -2424,6 +2445,36 @@ mod tests {
             .unwrap();
         assert!((presence - 0.5).abs() < 1e-6);
         assert!((frequency + 0.2).abs() < 1e-6);
+    }
+
+    #[test]
+    fn stop_accepts_string_or_array() {
+        // Single string form (e.g. {"stop":"\n"}) must deserialize, not 422.
+        let single = parse_completion_request(r#"{"model":"m","prompt":"p","stop":"\n"}"#);
+        assert_eq!(single.stop.unwrap().into_vec(), vec!["\n".to_string()]);
+
+        let many = parse_completion_request(r#"{"model":"m","prompt":"p","stop":["a","b"]}"#);
+        assert_eq!(
+            many.stop.unwrap().into_vec(),
+            vec!["a".to_string(), "b".to_string()]
+        );
+    }
+
+    #[test]
+    fn prompt_array_shapes_deserialize_without_422() {
+        // The point: these all parse (so the handler can return a clean 400),
+        // rather than failing JSON extraction at the framework layer.
+        let single_elem = parse_completion_request(r#"{"model":"m","prompt":["solo"]}"#);
+        assert_eq!(single_elem.prompt.single_text().unwrap(), "solo");
+
+        let batch = parse_completion_request(r#"{"model":"m","prompt":["a","b"]}"#);
+        assert!(batch.prompt.single_text().is_err());
+
+        let tokens = parse_completion_request(r#"{"model":"m","prompt":[1,2,3]}"#);
+        assert!(tokens.prompt.single_text().is_err());
+
+        let token_batches = parse_completion_request(r#"{"model":"m","prompt":[[1,2],[3,4]]}"#);
+        assert!(token_batches.prompt.single_text().is_err());
     }
 }
 

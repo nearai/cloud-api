@@ -1383,14 +1383,29 @@ impl InferenceProviderPool {
     /// the same failure. Treat these as non-retryable so one broken URL
     /// from a client doesn't get amplified into 4x backend work.
     fn is_client_media_fetch_error(message: &str) -> bool {
-        let lower = message.to_lowercase();
-        lower.contains("loading image data")
+        // ASCII-only lowercase: the markers are all ASCII and this path can
+        // run at high volume during a malformed-media incident.
+        let lower = message.to_ascii_lowercase();
+        if lower.contains("loading image data")
             || lower.contains("loading video data")
             || lower.contains("cannot identify image file")
             || lower.contains("failed to open input buffer")
-            // aiohttp wrapper format: "HTTP error 500: 4xx, message='...', url='http..."
-            // — the inference engine collapsed a client-fetch 4xx into a 500.
-            || (lower.contains(", url='http") && lower.contains(", message='"))
+        {
+            return true;
+        }
+        // aiohttp wrapper format observed when the inference engine collapses
+        // a client-fetch 4xx into a 500: `HTTP error 500: 4xx, message='...',
+        // url='http...'`. Constrain to a wrapped 4xx (\\d{2} after the leading
+        // "4") so genuinely retryable wrapped 5xx (e.g. "HTTP error 500: 503,
+        // message='Service Unavailable', url='...'") still retry as before.
+        static AIOHTTP_WRAPPED_4XX: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+        let re = AIOHTTP_WRAPPED_4XX.get_or_init(|| {
+            // (?i) is on the original message; lower is already ASCII-lowered,
+            // so an anchored lower-case literal is sufficient and faster.
+            Regex::new(r"http error 500:\s*4\d{2},\s*message='[^']*',\s*url='https?://")
+                .expect("static regex compiles")
+        });
+        re.is_match(&lower)
     }
 
     /// Single source of truth for the retry decision: the inner retry loop
@@ -3569,20 +3584,24 @@ mod tests {
 
         // Upstream 5xx caused by a broken client media URL — must NOT retry
         // (would otherwise amplify load 4x on every broken URL the client sends).
-        // SGLang gemma4 image-load failure (verbatim from prod logs):
+        // Test fixtures use dummy URLs; the matcher only depends on the marker
+        // substrings (`loading IMAGE/VIDEO data`, `cannot identify image file`,
+        // `Failed to open input buffer`, aiohttp wrapper shape).
+
+        // SGLang gemma4 image-load failure shape:
         assert_eq!(
             InferenceProviderPool::classify_retry_decision(&CompletionError::HttpError {
                 status_code: 500,
-                message: "Internal server error: An exception occurred while loading IMAGE data at index 0: Error while loading data ImageData(url='https://external.fsyd15-2.fna.fbcdn.net/...'): 403 Client Error: Forbidden for url: ...".to_string(),
+                message: "Internal server error: An exception occurred while loading IMAGE data at index 0: Error while loading data ImageData(url='https://example.test/img.jpg'): 403 Client Error: Forbidden for url: ...".to_string(),
                 is_external: false,
             }),
             "non_retryable_client_media_error",
         );
-        // vLLM Qwen3.5-122B torchcodec video-load failure (verbatim from prod logs):
+        // vLLM Qwen3.5-122B torchcodec video-load failure shape:
         assert_eq!(
             InferenceProviderPool::classify_retry_decision(&CompletionError::HttpError {
                 status_code: 500,
-                message: "Internal server error: An exception occurred while loading VIDEO data at index 0: Error while loading data https://www.youtube.com/watch?v=2w_pbUrVZHY: SingleStreamDecoder, Failed to open input buffer: Invalid data found when processing input".to_string(),
+                message: "Internal server error: An exception occurred while loading VIDEO data at index 0: Error while loading data https://example.test/vid: SingleStreamDecoder, Failed to open input buffer: Invalid data found when processing input".to_string(),
                 is_external: false,
             }),
             "non_retryable_client_media_error",
@@ -3596,20 +3615,41 @@ mod tests {
             }),
             "non_retryable_client_media_error",
         );
-        // aiohttp wrapper format: 500 wrapping a 4xx from a Facebook Graph URL fetch:
+        // aiohttp wrapper format: 500 wrapping a 4xx (client fetch failed):
         assert_eq!(
             InferenceProviderPool::classify_retry_decision(&CompletionError::HttpError {
                 status_code: 500,
-                message: "HTTP error 500: 404, message='Not Found', url='https://www.facebook.com/v24.0/122181986942783109_1506385084189441'".to_string(),
+                message: "HTTP error 500: 404, message='Not Found', url='https://example.test/img'".to_string(),
                 is_external: false,
             }),
             "non_retryable_client_media_error",
+        );
+        // aiohttp wrapper format: 500 wrapping a 5xx (transient backend) — MUST
+        // remain retryable. The new check requires the wrapped status to be a
+        // 4xx; this guards against the regression PierreLeGuen flagged.
+        assert_eq!(
+            InferenceProviderPool::classify_retry_decision(&CompletionError::HttpError {
+                status_code: 500,
+                message: "HTTP error 500: 503, message='Service Unavailable', url='https://example.test/backend'".to_string(),
+                is_external: false,
+            }),
+            "retryable_http_5xx",
         );
         // 5xx WITHOUT the media-fetch markers — still retryable (real backend hiccup).
         assert_eq!(
             InferenceProviderPool::classify_retry_decision(&CompletionError::HttpError {
                 status_code: 500,
                 message: "engine: KV cache full, retract".to_string(),
+                is_external: false,
+            }),
+            "retryable_http_5xx",
+        );
+        // Generic 5xx message that happens to contain a url=... but no
+        // wrapper-shape and no media markers — still retryable.
+        assert_eq!(
+            InferenceProviderPool::classify_retry_decision(&CompletionError::HttpError {
+                status_code: 500,
+                message: "internal: failed to dial postgres url='postgres://...' message='conn refused'".to_string(),
                 is_external: false,
             }),
             "retryable_http_5xx",

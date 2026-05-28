@@ -18,8 +18,8 @@ use crate::{
         },
         billing::{get_billing_costs, BillingRouteState},
         completions::{
-            audio_transcriptions, chat_completions, embeddings, image_edits, image_generations,
-            models, privacy_classify, privacy_redact, rerank, score,
+            audio_transcriptions, chat_completions, completions, embeddings, image_edits,
+            image_generations, models, privacy_classify, privacy_redact, rerank, score,
         },
         conversations,
         feature_requests::{
@@ -1057,6 +1057,7 @@ pub fn build_completion_routes(
     // Use default body limit (~2 MB) since they only accept JSON
     let text_inference_routes = Router::new()
         .route("/chat/completions", post(chat_completions))
+        .route("/completions", post(completions))
         .route("/images/generations", post(image_generations))
         .route("/audio/transcriptions", post(audio_transcriptions))
         .route("/rerank", post(rerank))

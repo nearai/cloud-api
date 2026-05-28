@@ -1,6 +1,6 @@
 use crate::{middleware::AuthenticatedUser, models::*};
 use inference_providers::{
-    ChatCompletionParams, ChatMessage, CompletionParams, FinishReason, MessageRole, TokenUsage,
+    ChatCompletionParams, ChatMessage, FinishReason, MessageRole, TokenUsage,
 };
 use services::completions::CompletionError;
 
@@ -115,31 +115,6 @@ impl From<ChatCompletionRequest> for ChatCompletionParams {
             stream_options: None,
             modalities,
             extra,
-        }
-    }
-}
-
-impl From<CompletionRequest> for CompletionParams {
-    fn from(req: CompletionRequest) -> Self {
-        Self {
-            model: req.model,
-            prompt: req.prompt,
-            max_tokens: req.max_tokens,
-            temperature: req.temperature,
-            top_p: req.top_p,
-            n: req.n,
-            stream: req.stream,
-            stop: req.stop,
-            frequency_penalty: req.frequency_penalty,
-            presence_penalty: req.presence_penalty,
-            logit_bias: None,
-            logprobs: req.logprobs,
-            echo: req.echo,
-            best_of: req.best_of,
-            seed: None,
-            user: None,
-            suffix: None,
-            stream_options: None,
         }
     }
 }

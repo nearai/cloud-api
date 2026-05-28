@@ -51,7 +51,7 @@ use utoipa::{Modify, OpenApi};
         crate::routes::completions::score,
         crate::routes::completions::privacy_classify,
         crate::routes::completions::privacy_redact,
-        // crate::routes::completions::completions,
+        crate::routes::completions::completions,
         crate::routes::completions::models,
         // Model endpoints (public model catalog)
         crate::routes::models::list_models,
@@ -165,7 +165,8 @@ use utoipa::{Modify, OpenApi};
             crate::routes::health::HealthResponse,
             // Core API models
             ChatCompletionRequest, ChatCompletionResponse, Message, CompletionUsage,
-            CompletionRequest, ModelsResponse, ModelInfo, ModelPricing, TopProvider, ErrorResponse,
+            CompletionRequest, CompletionPrompt, StopSequences, CompletionResponse,
+            CompletionChoice, ModelsResponse, ModelInfo, ModelPricing, TopProvider, ErrorResponse,
             // Image generation models
             ImageGenerationRequest, ImageGenerationResponse, ImageData,
             // Audio transcription models

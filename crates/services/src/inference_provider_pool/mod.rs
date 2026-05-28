@@ -1376,6 +1376,23 @@ impl InferenceProviderPool {
         }
     }
 
+    /// Inference engines (vLLM, SGLang) return HTTP 500 when they fail to
+    /// fetch or decode a multimodal media URL supplied by the client. The
+    /// upstream status is 5xx but the *cause* is a permanent client-input
+    /// error — retrying the same payload re-runs the same fetch and produces
+    /// the same failure. Treat these as non-retryable so one broken URL
+    /// from a client doesn't get amplified into 4x backend work.
+    fn is_client_media_fetch_error(message: &str) -> bool {
+        let lower = message.to_lowercase();
+        lower.contains("loading image data")
+            || lower.contains("loading video data")
+            || lower.contains("cannot identify image file")
+            || lower.contains("failed to open input buffer")
+            // aiohttp wrapper format: "HTTP error 500: 4xx, message='...', url='http..."
+            // — the inference engine collapsed a client-fetch 4xx into a 500.
+            || (lower.contains(", url='http") && lower.contains(", message='"))
+    }
+
     /// Single source of truth for the retry decision: the inner retry loop
     /// gates on `starts_with("retryable_")`, and the terminal error log emits
     /// the label directly so the rationale is visible in production logs.
@@ -1400,9 +1417,21 @@ impl InferenceProviderPool {
                     "non_retryable_no_keyword_match"
                 }
             }
-            CompletionError::HttpError { status_code, .. } => {
+            CompletionError::HttpError {
+                status_code,
+                message,
+                ..
+            } => {
                 if *status_code >= 500 {
-                    "retryable_http_5xx"
+                    // Engines (vLLM, SGLang) return 500 when they fail to fetch
+                    // or decode a client-supplied multimodal media URL. These
+                    // are permanent client-input errors — the same payload
+                    // can't succeed on retry. Don't amplify load by 4x.
+                    if Self::is_client_media_fetch_error(message) {
+                        "non_retryable_client_media_error"
+                    } else {
+                        "retryable_http_5xx"
+                    }
                 } else if *status_code == 429 {
                     "retryable_http_429"
                 } else if *status_code == 408 {
@@ -3536,6 +3565,54 @@ mod tests {
                 &CompletionError::Unknown(String::new())
             ),
             "non_retryable_unknown",
+        );
+
+        // Upstream 5xx caused by a broken client media URL — must NOT retry
+        // (would otherwise amplify load 4x on every broken URL the client sends).
+        // SGLang gemma4 image-load failure (verbatim from prod logs):
+        assert_eq!(
+            InferenceProviderPool::classify_retry_decision(&CompletionError::HttpError {
+                status_code: 500,
+                message: "Internal server error: An exception occurred while loading IMAGE data at index 0: Error while loading data ImageData(url='https://external.fsyd15-2.fna.fbcdn.net/...'): 403 Client Error: Forbidden for url: ...".to_string(),
+                is_external: false,
+            }),
+            "non_retryable_client_media_error",
+        );
+        // vLLM Qwen3.5-122B torchcodec video-load failure (verbatim from prod logs):
+        assert_eq!(
+            InferenceProviderPool::classify_retry_decision(&CompletionError::HttpError {
+                status_code: 500,
+                message: "Internal server error: An exception occurred while loading VIDEO data at index 0: Error while loading data https://www.youtube.com/watch?v=2w_pbUrVZHY: SingleStreamDecoder, Failed to open input buffer: Invalid data found when processing input".to_string(),
+                is_external: false,
+            }),
+            "non_retryable_client_media_error",
+        );
+        // PIL UnidentifiedImageError (client sent base64 mp4 as image_url):
+        assert_eq!(
+            InferenceProviderPool::classify_retry_decision(&CompletionError::HttpError {
+                status_code: 500,
+                message: "Internal server error: An exception occurred while loading IMAGE data at index 0: Error while loading data ...: cannot identify image file <_io.BytesIO object at 0x7f151d152b10>".to_string(),
+                is_external: false,
+            }),
+            "non_retryable_client_media_error",
+        );
+        // aiohttp wrapper format: 500 wrapping a 4xx from a Facebook Graph URL fetch:
+        assert_eq!(
+            InferenceProviderPool::classify_retry_decision(&CompletionError::HttpError {
+                status_code: 500,
+                message: "HTTP error 500: 404, message='Not Found', url='https://www.facebook.com/v24.0/122181986942783109_1506385084189441'".to_string(),
+                is_external: false,
+            }),
+            "non_retryable_client_media_error",
+        );
+        // 5xx WITHOUT the media-fetch markers — still retryable (real backend hiccup).
+        assert_eq!(
+            InferenceProviderPool::classify_retry_decision(&CompletionError::HttpError {
+                status_code: 500,
+                message: "engine: KV cache full, retract".to_string(),
+                is_external: false,
+            }),
+            "retryable_http_5xx",
         );
     }
 

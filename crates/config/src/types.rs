@@ -19,6 +19,7 @@ pub struct ApiConfig {
     pub otlp: OtlpConfig,
     pub cors: CorsConfig,
     pub external_providers: ExternalProvidersConfig,
+    pub github_dispatch: GitHubDispatchConfig,
 }
 
 impl ApiConfig {
@@ -45,6 +46,58 @@ impl ApiConfig {
             otlp: OtlpConfig::from_env()?,
             cors: CorsConfig::default(),
             external_providers: ExternalProvidersConfig::from_env(),
+            github_dispatch: GitHubDispatchConfig::from_env()?,
+        })
+    }
+}
+
+/// Configuration for triggering GitHub Actions workflows after admin PATCH on
+/// models. When `enabled`, a successful `PATCH /v1/admin/models` fires a
+/// `repository_dispatch` event so downstream automation (validate / promote
+/// pipelines) can react. Intended to be enabled only on staging cloud-api.
+#[derive(Debug, Clone, Default)]
+pub struct GitHubDispatchConfig {
+    pub enabled: bool,
+    /// Target repo in `owner/name` form.
+    pub repo: Option<String>,
+    /// `event_type` field in the dispatch payload. Workflows listen on
+    /// `on: repository_dispatch: types: [<event_type>]`.
+    pub event_type: String,
+    /// Fine-grained PAT with `actions: write` scoped to `repo` only.
+    pub pat: Option<String>,
+}
+
+impl GitHubDispatchConfig {
+    pub fn from_env() -> Result<Self, String> {
+        let enabled = env::var("ENABLE_GITHUB_DISPATCH")
+            .ok()
+            .and_then(|v| v.parse::<bool>().ok())
+            .unwrap_or(false);
+
+        let repo = non_empty_env("GITHUB_DISPATCH_REPO");
+        let event_type = non_empty_env("GITHUB_DISPATCH_EVENT_TYPE")
+            .unwrap_or_else(|| "stg_model_loaded".to_string());
+        let pat = read_optional_secret_env("GITHUB_DISPATCH_PAT_FILE", "GITHUB_DISPATCH_PAT")?;
+
+        if enabled {
+            if repo.is_none() {
+                return Err(
+                    "GITHUB_DISPATCH_REPO must be set when ENABLE_GITHUB_DISPATCH=true".to_string(),
+                );
+            }
+            if pat.is_none() {
+                return Err(
+                    "GITHUB_DISPATCH_PAT or GITHUB_DISPATCH_PAT_FILE must be set when ENABLE_GITHUB_DISPATCH=true"
+                        .to_string(),
+                );
+            }
+        }
+
+        Ok(Self {
+            enabled,
+            repo,
+            event_type,
+            pat,
         })
     }
 }

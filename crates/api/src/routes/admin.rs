@@ -25,6 +25,7 @@ use chrono::{Duration, Utc};
 use config::ApiConfig;
 use services::admin::{AdminService, AnalyticsService, UpdateModelAdminRequest};
 use services::auth::AuthServiceTrait;
+use services::github_dispatch::GitHubDispatcher;
 use services::usage::UsageServiceTrait;
 use std::sync::Arc;
 use tracing::{debug, error};
@@ -38,6 +39,7 @@ pub struct AdminAppState {
     pub config: Arc<ApiConfig>,
     pub admin_access_token_repository: Arc<database::repositories::AdminAccessTokenRepository>,
     pub inference_provider_pool: Arc<services::inference_provider_pool::InferenceProviderPool>,
+    pub github_dispatcher: Arc<dyn GitHubDispatcher>,
 }
 
 /// Batch upsert models metadata (Admin only)
@@ -340,6 +342,26 @@ pub async fn batch_upsert_models(
         {
             tracing::warn!(error = %e, "Failed to register some external providers at runtime");
         }
+    }
+
+    // Fire GitHub repository_dispatch for each upserted model. Downstream
+    // automation (validate / promote workflows in cvm-ansible-playbooks)
+    // listens for the configured event_type and reacts. Fire-and-forget:
+    // a GitHub outage does not block the PATCH. Only enabled on staging
+    // cloud-api via ENABLE_GITHUB_DISPATCH; production keeps it off so
+    // promote-driven prod PATCHes do not recursively re-fire the chain.
+    for model_id in batch_request.keys() {
+        let dispatcher = app_state.github_dispatcher.clone();
+        let model_id = model_id.clone();
+        tokio::spawn(async move {
+            if let Err(e) = dispatcher.dispatch_model_loaded(&model_id).await {
+                tracing::warn!(
+                    error = %e,
+                    model_id = %model_id,
+                    "GitHub dispatch failed; manual workflow trigger may be required"
+                );
+            }
+        });
     }
 
     // Convert to API response - map from HashMap to Vec

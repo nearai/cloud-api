@@ -7,7 +7,7 @@
 //! the configured `event_type` and react to the loaded model.
 //!
 //! Failures are intentionally non-fatal: GitHub being unreachable must not
-//! block model registration. Errors are logged and surfaced via metrics so
+//! block model registration. Errors are logged at WARN by the caller so
 //! operators can fall back to a manual `gh workflow run` trigger.
 
 use async_trait::async_trait;
@@ -91,38 +91,44 @@ impl DispatchTransport for ReqwestDispatchTransport {
         pat: &str,
         request: DispatchRequest,
     ) -> Result<(), GitHubDispatchError> {
-        let response = tokio::time::timeout(
-            DISPATCH_TIMEOUT,
-            self.client
+        // Wrap the whole exchange — send AND error-body read — in one timeout.
+        // reqwest has no client-level timeout configured, so reading the body
+        // of a stalled error response would otherwise hang the spawned task.
+        let exchange = async {
+            let response = self
+                .client
                 .post(endpoint)
                 .bearer_auth(pat)
                 .header("Accept", "application/vnd.github+json")
                 .header("X-GitHub-Api-Version", "2022-11-28")
                 .header("User-Agent", USER_AGENT)
                 .json(&request)
-                .send(),
-        )
-        .await
-        .map_err(|_| {
-            GitHubDispatchError::new(format!(
-                "GitHub dispatch timed out after {}s",
-                DISPATCH_TIMEOUT.as_secs()
-            ))
-        })?
-        .map_err(|err| {
-            GitHubDispatchError::new(format!("GitHub dispatch request failed: {err}"))
-        })?;
+                .send()
+                .await
+                .map_err(|err| {
+                    GitHubDispatchError::new(format!("GitHub dispatch request failed: {err}"))
+                })?;
 
-        let status = response.status();
-        if status.is_success() {
-            return Ok(());
-        }
+            let status = response.status();
+            if status.is_success() {
+                return Ok(());
+            }
 
-        let body = response.text().await.unwrap_or_default();
-        Err(GitHubDispatchError::new(format!(
-            "GitHub dispatch returned HTTP {status}: {}",
-            truncate(&body, 200)
-        )))
+            let body = response.text().await.unwrap_or_default();
+            Err(GitHubDispatchError::new(format!(
+                "GitHub dispatch returned HTTP {status}: {}",
+                crate::email::sanitize_error(&body)
+            )))
+        };
+
+        tokio::time::timeout(DISPATCH_TIMEOUT, exchange)
+            .await
+            .map_err(|_| {
+                GitHubDispatchError::new(format!(
+                    "GitHub dispatch timed out after {}s",
+                    DISPATCH_TIMEOUT.as_secs()
+                ))
+            })?
     }
 }
 
@@ -183,16 +189,6 @@ pub fn dispatcher_from_config(config: &GitHubDispatchConfig) -> Arc<dyn GitHubDi
         GITHUB_API_BASE.to_string(),
         Arc::new(ReqwestDispatchTransport::default()),
     ))
-}
-
-fn truncate(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        s.to_string()
-    } else {
-        let mut truncated = s.chars().take(max).collect::<String>();
-        truncated.push('…');
-        truncated
-    }
 }
 
 #[cfg(test)]

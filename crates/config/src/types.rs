@@ -51,11 +51,16 @@ impl ApiConfig {
     }
 }
 
+/// Default `event_type` when `GITHUB_DISPATCH_EVENT_TYPE` is unset. Shared
+/// between `from_env` and the `Default` impl so a `Default`-constructed config
+/// never dispatches with an empty type (which no workflow listens on).
+pub const DEFAULT_GITHUB_DISPATCH_EVENT_TYPE: &str = "stg_model_loaded";
+
 /// Configuration for triggering GitHub Actions workflows after admin PATCH on
 /// models. When `enabled`, a successful `PATCH /v1/admin/models` fires a
 /// `repository_dispatch` event so downstream automation (validate / promote
 /// pipelines) can react. Intended to be enabled only on staging cloud-api.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct GitHubDispatchConfig {
     pub enabled: bool,
     /// Target repo in `owner/name` form.
@@ -67,6 +72,17 @@ pub struct GitHubDispatchConfig {
     pub pat: Option<String>,
 }
 
+impl Default for GitHubDispatchConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            repo: None,
+            event_type: DEFAULT_GITHUB_DISPATCH_EVENT_TYPE.to_string(),
+            pat: None,
+        }
+    }
+}
+
 impl GitHubDispatchConfig {
     pub fn from_env() -> Result<Self, String> {
         let enabled = env::var("ENABLE_GITHUB_DISPATCH")
@@ -76,14 +92,30 @@ impl GitHubDispatchConfig {
 
         let repo = non_empty_env("GITHUB_DISPATCH_REPO");
         let event_type = non_empty_env("GITHUB_DISPATCH_EVENT_TYPE")
-            .unwrap_or_else(|| "stg_model_loaded".to_string());
-        let pat = read_optional_secret_env("GITHUB_DISPATCH_PAT_FILE", "GITHUB_DISPATCH_PAT")?;
+            .unwrap_or_else(|| DEFAULT_GITHUB_DISPATCH_EVENT_TYPE.to_string());
+        // Only read the PAT (which may touch the filesystem) when enabled. A
+        // disabled instance must not fail to boot just because GITHUB_DISPATCH_PAT_FILE
+        // is set in a shared env template but the secret is not mounted.
+        let pat = if enabled {
+            read_optional_secret_env("GITHUB_DISPATCH_PAT_FILE", "GITHUB_DISPATCH_PAT")?
+        } else {
+            None
+        };
 
         if enabled {
-            if repo.is_none() {
-                return Err(
-                    "GITHUB_DISPATCH_REPO must be set when ENABLE_GITHUB_DISPATCH=true".to_string(),
-                );
+            match repo.as_deref() {
+                None => {
+                    return Err(
+                        "GITHUB_DISPATCH_REPO must be set when ENABLE_GITHUB_DISPATCH=true"
+                            .to_string(),
+                    );
+                }
+                Some(r) if !is_owner_name(r) => {
+                    return Err(format!(
+                        "GITHUB_DISPATCH_REPO must be in 'owner/name' form, got '{r}'"
+                    ));
+                }
+                _ => {}
             }
             if pat.is_none() {
                 return Err(
@@ -100,6 +132,15 @@ impl GitHubDispatchConfig {
             pat,
         })
     }
+}
+
+/// `true` when `s` is `owner/name`: exactly one `/` with both sides non-empty.
+fn is_owner_name(s: &str) -> bool {
+    let mut parts = s.split('/');
+    matches!(
+        (parts.next(), parts.next(), parts.next()),
+        (Some(owner), Some(name), None) if !owner.is_empty() && !name.is_empty()
+    )
 }
 
 /// Database configuration
@@ -599,6 +640,106 @@ mod tests {
 
         // Should return false when no admin domains configured
         assert!(!config.is_admin_email("admin@near.ai"));
+    }
+
+    fn clear_github_dispatch_env() {
+        for key in [
+            "ENABLE_GITHUB_DISPATCH",
+            "GITHUB_DISPATCH_REPO",
+            "GITHUB_DISPATCH_EVENT_TYPE",
+            "GITHUB_DISPATCH_PAT",
+            "GITHUB_DISPATCH_PAT_FILE",
+        ] {
+            std::env::remove_var(key);
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn github_dispatch_disabled_by_default() {
+        clear_github_dispatch_env();
+        let config = GitHubDispatchConfig::from_env().unwrap();
+        assert!(!config.enabled);
+        assert!(config.repo.is_none());
+        assert!(config.pat.is_none());
+        assert_eq!(config.event_type, DEFAULT_GITHUB_DISPATCH_EVENT_TYPE);
+    }
+
+    #[test]
+    #[serial]
+    fn github_dispatch_default_matches_from_env_event_type() {
+        // The Default impl must agree with from_env's fallback so a
+        // Default-constructed config never carries an empty event_type.
+        assert_eq!(
+            GitHubDispatchConfig::default().event_type,
+            DEFAULT_GITHUB_DISPATCH_EVENT_TYPE
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn github_dispatch_disabled_ignores_unreadable_pat_file() {
+        // Regression: a disabled instance must boot even when PAT_FILE points
+        // at a missing secret (e.g. left in a shared env template).
+        clear_github_dispatch_env();
+        std::env::set_var("ENABLE_GITHUB_DISPATCH", "false");
+        std::env::set_var(
+            "GITHUB_DISPATCH_PAT_FILE",
+            "/nonexistent/github_dispatch_pat",
+        );
+        let config = GitHubDispatchConfig::from_env().unwrap();
+        assert!(!config.enabled);
+        assert!(config.pat.is_none());
+        clear_github_dispatch_env();
+    }
+
+    #[test]
+    #[serial]
+    fn github_dispatch_enabled_requires_repo() {
+        clear_github_dispatch_env();
+        std::env::set_var("ENABLE_GITHUB_DISPATCH", "true");
+        std::env::set_var("GITHUB_DISPATCH_PAT", "ghp_test");
+        let err = GitHubDispatchConfig::from_env().unwrap_err();
+        assert!(err.contains("GITHUB_DISPATCH_REPO"));
+        clear_github_dispatch_env();
+    }
+
+    #[test]
+    #[serial]
+    fn github_dispatch_enabled_requires_pat() {
+        clear_github_dispatch_env();
+        std::env::set_var("ENABLE_GITHUB_DISPATCH", "true");
+        std::env::set_var("GITHUB_DISPATCH_REPO", "nearai/cvm-ansible-playbooks");
+        let err = GitHubDispatchConfig::from_env().unwrap_err();
+        assert!(err.contains("PAT"));
+        clear_github_dispatch_env();
+    }
+
+    #[test]
+    #[serial]
+    fn github_dispatch_enabled_rejects_malformed_repo() {
+        clear_github_dispatch_env();
+        std::env::set_var("ENABLE_GITHUB_DISPATCH", "true");
+        std::env::set_var("GITHUB_DISPATCH_REPO", "noslash");
+        std::env::set_var("GITHUB_DISPATCH_PAT", "ghp_test");
+        let err = GitHubDispatchConfig::from_env().unwrap_err();
+        assert!(err.contains("owner/name"));
+        clear_github_dispatch_env();
+    }
+
+    #[test]
+    #[serial]
+    fn github_dispatch_enabled_ok_with_inline_pat() {
+        clear_github_dispatch_env();
+        std::env::set_var("ENABLE_GITHUB_DISPATCH", "true");
+        std::env::set_var("GITHUB_DISPATCH_REPO", "nearai/cvm-ansible-playbooks");
+        std::env::set_var("GITHUB_DISPATCH_PAT", "ghp_test");
+        let config = GitHubDispatchConfig::from_env().unwrap();
+        assert!(config.enabled);
+        assert_eq!(config.repo.as_deref(), Some("nearai/cvm-ansible-playbooks"));
+        assert_eq!(config.pat.as_deref(), Some("ghp_test"));
+        assert_eq!(config.event_type, DEFAULT_GITHUB_DISPATCH_EVENT_TYPE);
+        clear_github_dispatch_env();
     }
 
     #[test]

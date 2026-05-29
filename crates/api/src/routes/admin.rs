@@ -344,22 +344,34 @@ pub async fn batch_upsert_models(
         }
     }
 
-    // Fire GitHub repository_dispatch for each upserted model. Downstream
-    // automation (validate / promote workflows in cvm-ansible-playbooks)
-    // listens for the configured event_type and reacts. Fire-and-forget:
-    // a GitHub outage does not block the PATCH. Only enabled on staging
-    // cloud-api via ENABLE_GITHUB_DISPATCH; production keeps it off so
-    // promote-driven prod PATCHes do not recursively re-fire the chain.
-    for model_id in batch_request.keys() {
+    // Fire GitHub repository_dispatch for each model this PATCH (re)loaded.
+    // Downstream automation (validate / promote workflows in
+    // cvm-ansible-playbooks) listens for the configured event_type and reacts.
+    // Fire-and-forget: a GitHub outage does not block the PATCH. Only enabled
+    // on staging cloud-api via ENABLE_GITHUB_DISPATCH; production keeps it off
+    // so promote-driven prod PATCHes do not recursively re-fire the chain.
+    //
+    // Skip deactivations: a PATCH that sets is_active=false is an unload, not a
+    // load, and must not trigger validate/promote of a model being taken
+    // offline. Dispatch the whole set from a single background task so a large
+    // batch does not burst N concurrent requests at GitHub's dispatch API
+    // (which would trip secondary rate limits and silently drop events).
+    let dispatch_model_ids: Vec<String> = batch_request
+        .iter()
+        .filter(|(_, request)| request.is_active != Some(false))
+        .map(|(model_id, _)| model_id.clone())
+        .collect();
+    if !dispatch_model_ids.is_empty() {
         let dispatcher = app_state.github_dispatcher.clone();
-        let model_id = model_id.clone();
         tokio::spawn(async move {
-            if let Err(e) = dispatcher.dispatch_model_loaded(&model_id).await {
-                tracing::warn!(
-                    error = %e,
-                    model_id = %model_id,
-                    "GitHub dispatch failed; manual workflow trigger may be required"
-                );
+            for model_id in dispatch_model_ids {
+                if let Err(e) = dispatcher.dispatch_model_loaded(&model_id).await {
+                    tracing::warn!(
+                        error = %e,
+                        model_id = %model_id,
+                        "GitHub dispatch failed; manual workflow trigger may be required"
+                    );
+                }
             }
         });
     }

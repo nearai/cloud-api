@@ -180,6 +180,10 @@ pub fn dispatcher_from_config(config: &GitHubDispatchConfig) -> Arc<dyn GitHubDi
         return Arc::new(NoopGitHubDispatcher);
     }
     let (Some(repo), Some(pat)) = (config.repo.clone(), config.pat.clone()) else {
+        tracing::error!(
+            "GitHub dispatch enabled but repo/PAT missing; falling back to noop. \
+             Config validation should reject this — the chain is now silently disabled."
+        );
         return Arc::new(NoopGitHubDispatcher);
     };
     Arc::new(HttpGitHubDispatcher::new(

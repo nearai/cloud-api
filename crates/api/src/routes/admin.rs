@@ -28,7 +28,7 @@ use services::auth::AuthServiceTrait;
 use services::github_dispatch::GitHubDispatcher;
 use services::usage::UsageServiceTrait;
 use std::sync::Arc;
-use tracing::{debug, error};
+use tracing::{debug, error, Instrument};
 
 #[derive(Clone)]
 pub struct AdminAppState {
@@ -363,17 +363,23 @@ pub async fn batch_upsert_models(
         .collect();
     if !dispatch_model_ids.is_empty() {
         let dispatcher = app_state.github_dispatcher.clone();
-        tokio::spawn(async move {
-            for model_id in dispatch_model_ids {
-                if let Err(e) = dispatcher.dispatch_model_loaded(&model_id).await {
-                    tracing::warn!(
-                        error = %e,
-                        model_id = %model_id,
-                        "GitHub dispatch failed; manual workflow trigger may be required"
-                    );
+        // Carry the current tracing span into the fire-and-forget task;
+        // tokio::spawn does not inherit it, so dispatch-failure warnings would
+        // otherwise lose the request's log context.
+        tokio::spawn(
+            async move {
+                for model_id in dispatch_model_ids {
+                    if let Err(e) = dispatcher.dispatch_model_loaded(&model_id).await {
+                        tracing::warn!(
+                            error = %e,
+                            model_id = %model_id,
+                            "GitHub dispatch failed; manual workflow trigger may be required"
+                        );
+                    }
                 }
             }
-        });
+            .instrument(tracing::Span::current()),
+        );
     }
 
     // Convert to API response - map from HashMap to Vec

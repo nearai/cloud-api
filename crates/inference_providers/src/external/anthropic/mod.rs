@@ -23,6 +23,25 @@ use reqwest::{header::HeaderValue, Client};
 
 const DEFAULT_ANTHROPIC_VERSION: &str = "2023-06-01";
 
+/// Caller-supplied `extra` keys we forward to Anthropic's Messages API.
+///
+/// This is an allowlist on purpose: `ChatCompletionParams.extra` is an
+/// unbounded catch-all that also holds internal E2EE keys and OpenAI-only
+/// fields, so we only pass through the reasoning controls Anthropic actually
+/// understands (`thinking`) plus `reasoning_effort` (which Anthropic does not
+/// accept and will reject with its own 400, instead of us silently dropping it).
+const ANTHROPIC_PASSTHROUGH_KEYS: &[&str] = &["thinking", "reasoning_effort"];
+
+/// Pick the allowlisted reasoning-control fields out of `extra`.
+fn extract_passthrough(
+    extra: &std::collections::HashMap<String, serde_json::Value>,
+) -> std::collections::HashMap<String, serde_json::Value> {
+    ANTHROPIC_PASSTHROUGH_KEYS
+        .iter()
+        .filter_map(|&key| extra.get(key).map(|value| (key.to_string(), value.clone())))
+        .collect()
+}
+
 /// Anthropic backend - handles HTTP communication with Anthropic's API
 pub struct AnthropicBackend {
     client: Client,
@@ -94,10 +113,14 @@ impl AnthropicBackend {
             tools,
             tool_choice,
             stream,
-            // Passthrough of caller-supplied extra fields (e.g. `thinking`,
-            // `reasoning_effort`). Internal/tracing keys are already stripped
-            // upstream in ExternalProvider before the backend runs.
-            extra: params.extra.clone(),
+            // Forward only the reasoning-control fields from `extra`, not the
+            // whole map. A full passthrough is unsafe here: `extra` also carries
+            // internal E2EE keys (`x_signing_algo`, `x_client_pub_key`, …) that
+            // must never reach Anthropic, OpenAI-only fields that Anthropic
+            // rejects (`max_completion_tokens`, `presence_penalty`,
+            // `frequency_penalty`, …), and could collide with named fields
+            // (`system`, `stop_sequences`) producing duplicate JSON keys.
+            extra: extract_passthrough(&params.extra),
         }
     }
 }
@@ -463,6 +486,57 @@ mod tests {
 
         assert!(body.get("frequency_penalty").is_none());
         assert!(body.get("presence_penalty").is_none());
+    }
+
+    #[test]
+    fn test_build_request_drops_non_allowlisted_extra_keys() {
+        let backend = AnthropicBackend::new();
+        let mut params = make_params(Some(1.0), None);
+        params.stop = Some(vec!["STOP".to_string()]);
+        // `extra` is an unbounded catch-all. None of these may reach Anthropic:
+        // internal E2EE keys, OpenAI-only fields, or keys that collide with the
+        // named request fields (`system`, `stop_sequences`).
+        for key in [
+            "x_signing_algo",
+            "x_client_pub_key",
+            "x_encryption_version",
+            "x_encrypt_all_fields",
+            "max_completion_tokens",
+            "frequency_penalty",
+            "presence_penalty",
+            "response_format",
+            "system",
+            "stop_sequences",
+        ] {
+            params
+                .extra
+                .insert(key.to_string(), serde_json::json!("leak"));
+        }
+
+        let request = backend.build_request("claude-opus-4-7", &params, false);
+        let obj = serde_json::to_value(&request).unwrap();
+        let obj = obj.as_object().unwrap();
+
+        // No internal/OpenAI-only key leaked through.
+        for key in [
+            "x_signing_algo",
+            "x_client_pub_key",
+            "x_encryption_version",
+            "x_encrypt_all_fields",
+            "max_completion_tokens",
+            "frequency_penalty",
+            "presence_penalty",
+            "response_format",
+        ] {
+            assert!(obj.get(key).is_none(), "{key} must not be forwarded");
+        }
+        // Named fields keep their derived values, not the `extra` collision.
+        assert!(obj.get("system").is_none()); // no system message -> field absent
+        assert_eq!(
+            obj.get("stop_sequences"),
+            Some(&serde_json::json!(["STOP"])),
+            "stop_sequences must come from params.stop, not extra"
+        );
     }
 
     #[test]

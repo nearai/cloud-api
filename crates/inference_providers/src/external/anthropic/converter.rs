@@ -88,11 +88,12 @@ pub struct AnthropicRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_choice: Option<AnthropicToolChoice>,
     pub stream: bool,
-    /// Passthrough for caller-supplied fields we don't model explicitly
-    /// (e.g. Anthropic's `thinking` reasoning config, or any other extra
-    /// param). Mirrors the OpenAI-compatible backend, which forwards `extra`
-    /// to the upstream provider. Anthropic validates these and returns its own
-    /// error on unsupported values, so we don't silently drop reasoning controls.
+    /// Allowlisted reasoning-control fields forwarded from the caller's request
+    /// (`thinking`, `reasoning_effort` — see `ANTHROPIC_PASSTHROUGH_KEYS`).
+    /// Flattened to top-level JSON. Populated by `build_request`, which filters
+    /// the request's `extra` map so internal E2EE keys and OpenAI-only fields
+    /// never reach Anthropic. The allowlist guarantees no collision with the
+    /// named fields above, so `flatten` cannot emit duplicate keys.
     #[serde(flatten)]
     pub extra: HashMap<String, serde_json::Value>,
 }

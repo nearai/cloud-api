@@ -88,6 +88,13 @@ pub struct AnthropicRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_choice: Option<AnthropicToolChoice>,
     pub stream: bool,
+    /// Passthrough for caller-supplied fields we don't model explicitly
+    /// (e.g. Anthropic's `thinking` reasoning config, or any other extra
+    /// param). Mirrors the OpenAI-compatible backend, which forwards `extra`
+    /// to the upstream provider. Anthropic validates these and returns its own
+    /// error on unsupported values, so we don't silently drop reasoning controls.
+    #[serde(flatten)]
+    pub extra: HashMap<String, serde_json::Value>,
 }
 
 // =============================================================================

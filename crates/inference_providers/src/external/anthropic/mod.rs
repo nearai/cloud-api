@@ -94,6 +94,10 @@ impl AnthropicBackend {
             tools,
             tool_choice,
             stream,
+            // Passthrough of caller-supplied extra fields (e.g. `thinking`,
+            // `reasoning_effort`). Internal/tracing keys are already stripped
+            // upstream in ExternalProvider before the backend runs.
+            extra: params.extra.clone(),
         }
     }
 }
@@ -406,6 +410,81 @@ mod tests {
         let request = backend.build_request("claude-sonnet-4-5-20250514", &params, false);
 
         assert_eq!(request.max_tokens, 4096);
+    }
+
+    #[test]
+    fn test_build_request_forwards_thinking_config() {
+        let backend = AnthropicBackend::new();
+        let mut params = make_params(None, None);
+        let thinking = serde_json::json!({"type": "enabled", "budget_tokens": 4096});
+        params
+            .extra
+            .insert("thinking".to_string(), thinking.clone());
+
+        let request = backend.build_request("claude-opus-4-7", &params, false);
+        let body = serde_json::to_value(&request).unwrap();
+
+        // The native Anthropic `thinking` object is forwarded verbatim as a
+        // top-level request field so Anthropic applies extended thinking.
+        assert_eq!(body.get("thinking"), Some(&thinking));
+    }
+
+    #[test]
+    fn test_build_request_forwards_reasoning_effort() {
+        let backend = AnthropicBackend::new();
+        let mut params = make_params(None, None);
+        params.extra.insert(
+            "reasoning_effort".to_string(),
+            serde_json::Value::String("high".to_string()),
+        );
+
+        let request = backend.build_request("claude-opus-4-7", &params, false);
+        let body = serde_json::to_value(&request).unwrap();
+
+        // We forward `reasoning_effort` rather than silently dropping it.
+        // Anthropic validates the field and returns its own error if unsupported.
+        assert_eq!(
+            body.get("reasoning_effort"),
+            Some(&serde_json::Value::String("high".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_build_request_does_not_leak_openai_only_params() {
+        let backend = AnthropicBackend::new();
+        let mut params = make_params(None, None);
+        // Typed OpenAI-only sampling params live in named struct fields, never
+        // in `extra`, so they must not appear in the Anthropic request body.
+        params.frequency_penalty = Some(0.5);
+        params.presence_penalty = Some(0.5);
+
+        let request = backend.build_request("claude-opus-4-7", &params, false);
+        let body = serde_json::to_value(&request).unwrap();
+
+        assert!(body.get("frequency_penalty").is_none());
+        assert!(body.get("presence_penalty").is_none());
+    }
+
+    #[test]
+    fn test_build_request_empty_extra_adds_no_fields() {
+        let backend = AnthropicBackend::new();
+        let params = make_params(Some(1.0), None);
+        let request = backend.build_request("claude-opus-4-7", &params, false);
+        let body = serde_json::to_value(&request).unwrap();
+
+        // With no extra fields, the flattened `extra` map contributes nothing:
+        // the serialized request carries only the known Anthropic fields.
+        let keys: std::collections::HashSet<&str> = body
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(|k| k.as_str())
+            .collect();
+        let expected: std::collections::HashSet<&str> =
+            ["model", "messages", "max_tokens", "temperature", "stream"]
+                .into_iter()
+                .collect();
+        assert_eq!(keys, expected);
     }
 
     #[tokio::test]

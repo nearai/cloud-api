@@ -1174,7 +1174,9 @@ pub async fn deprecate_model(
         ("limit" = Option<i64>, Query, description = "Maximum number of users to return (default: 100)"),
         ("offset" = Option<i64>, Query, description = "Number of users to skip (default: 0)"),
         ("include_organizations" = Option<bool>, Query, description = "Whether to include organization information and spend limits for the first organization owned by each user (default: false)"),
-        ("search_by_name" = Option<String>, Query, description = "Filter users by organization name (case-insensitive match). Only effective when include_organizations=true; ignored otherwise.")
+        ("search" = Option<String>, Query, description = "Filter users by email, username, display name, user id, auth provider, or provider user id (case-insensitive partial match)."),
+        ("is_active" = Option<bool>, Query, description = "Filter users by active status. Omit to include active and inactive users."),
+        ("search_by_name" = Option<String>, Query, description = "Filter users by organization name (case-insensitive match). Only effective when include_organizations=true; separate from user search.")
     ),
     responses(
         (status = 200, description = "Users retrieved successfully", body = ListUsersResponse),
@@ -1193,15 +1195,26 @@ pub async fn list_users(
     crate::routes::common::validate_limit_offset(params.limit, params.offset)?;
 
     debug!(
-        "List users request with limit={}, offset={}, include_organizations={}, search_by_name={:?}",
-        params.limit, params.offset, params.include_organizations, params.search_by_name
+        "List users request with limit={}, offset={}, include_organizations={}, search={:?}, is_active={:?}, search_by_name={:?}",
+        params.limit,
+        params.offset,
+        params.include_organizations,
+        params.search,
+        params.is_active,
+        params.search_by_name
     );
 
     let (user_responses, total) = if params.include_organizations {
         // Fetch users with their default organization and spend limit
         let (users_with_orgs, total) = app_state
             .admin_service
-            .list_users_with_organizations(params.limit, params.offset, params.search_by_name)
+            .list_users_with_organizations(
+                params.limit,
+                params.offset,
+                params.search.clone(),
+                params.is_active,
+                params.search_by_name.clone(),
+            )
             .await
             .map_err(|e| {
                 error!("Failed to list users with organizations");
@@ -1253,6 +1266,8 @@ pub async fn list_users(
                     created_at: u.created_at,
                     last_login_at: u.last_login_at,
                     is_active: u.is_active,
+                    auth_provider: u.auth_provider,
+                    provider_user_id: u.provider_user_id,
                     organizations,
                 }
             })
@@ -1263,7 +1278,12 @@ pub async fn list_users(
         // Return users data only
         let (users, total) = app_state
             .admin_service
-            .list_users(params.limit, params.offset)
+            .list_users(
+                params.limit,
+                params.offset,
+                params.search.clone(),
+                params.is_active,
+            )
             .await
             .map_err(|e| {
                 error!("Failed to list users");
@@ -1293,6 +1313,8 @@ pub async fn list_users(
                 created_at: u.created_at,
                 last_login_at: u.last_login_at,
                 is_active: u.is_active,
+                auth_provider: u.auth_provider,
+                provider_user_id: u.provider_user_id,
                 organizations: None,
             })
             .collect();
@@ -1763,6 +1785,8 @@ pub struct ListUsersQueryParams {
     pub offset: i64,
     #[serde(default)]
     pub include_organizations: bool,
+    pub search: Option<String>,
+    pub is_active: Option<bool>,
     pub search_by_name: Option<String>,
 }
 

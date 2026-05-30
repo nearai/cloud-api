@@ -2828,6 +2828,100 @@ async fn test_admin_list_users_with_orgs() {
 }
 
 #[tokio::test]
+async fn test_admin_list_users_finds_inactive_and_oauth_identity_fields() {
+    let (server, database) = setup_test_server_with_database().await;
+    let access_token = get_access_token_from_refresh_token(&server, get_session_id()).await;
+
+    let user_id = uuid::Uuid::new_v4();
+    let suffix = user_id.simple();
+    let email = format!("inactive-admin-search-{suffix}@example.com");
+    let username = format!("inactive-search-{suffix}");
+    let display_name = format!("Inactive Search {suffix}");
+    let provider_user_id = format!("google-sub-{suffix}");
+
+    let client = database
+        .pool()
+        .get()
+        .await
+        .expect("Failed to get database connection");
+    client
+        .execute(
+            r#"
+            INSERT INTO users (
+                id, email, username, display_name, avatar_url,
+                created_at, updated_at, is_active,
+                auth_provider, provider_user_id
+            )
+            VALUES ($1, $2, $3, $4, NULL, NOW(), NOW(), false, 'google', $5)
+            "#,
+            &[
+                &user_id,
+                &email,
+                &username,
+                &display_name,
+                &provider_user_id,
+            ],
+        )
+        .await
+        .expect("Failed to insert inactive user");
+
+    let response = server
+        .get(&format!("/v1/admin/users?limit=10&offset=0&search={email}"))
+        .add_header("Authorization", format!("Bearer {access_token}"))
+        .await;
+
+    assert_eq!(response.status_code(), 200);
+    let users_response = response.json::<api::models::ListUsersResponse>();
+    assert_eq!(users_response.total, 1);
+    assert_eq!(users_response.users.len(), 1);
+    let user = users_response.users.first().unwrap();
+    assert_eq!(user.id, user_id.to_string());
+    assert_eq!(user.email, email);
+    assert!(!user.is_active);
+    assert_eq!(user.auth_provider, "google");
+    assert_eq!(user.provider_user_id, provider_user_id);
+
+    let active_only_response = server
+        .get(&format!(
+            "/v1/admin/users?limit=10&offset=0&search={email}&is_active=true"
+        ))
+        .add_header("Authorization", format!("Bearer {access_token}"))
+        .await;
+
+    assert_eq!(active_only_response.status_code(), 200);
+    let active_only = active_only_response.json::<api::models::ListUsersResponse>();
+    assert_eq!(active_only.total, 0);
+    assert!(active_only.users.is_empty());
+
+    let provider_response = server
+        .get(&format!(
+            "/v1/admin/users?limit=10&offset=0&search={provider_user_id}&is_active=false"
+        ))
+        .add_header("Authorization", format!("Bearer {access_token}"))
+        .await;
+
+    assert_eq!(provider_response.status_code(), 200);
+    let provider_search = provider_response.json::<api::models::ListUsersResponse>();
+    assert_eq!(provider_search.total, 1);
+    assert_eq!(provider_search.users[0].email, email);
+
+    let with_orgs_response = server
+        .get(&format!(
+            "/v1/admin/users?limit=10&offset=0&include_organizations=true&search={email}"
+        ))
+        .add_header("Authorization", format!("Bearer {access_token}"))
+        .await;
+
+    assert_eq!(with_orgs_response.status_code(), 200);
+    let with_orgs = with_orgs_response.json::<api::models::ListUsersResponse>();
+    assert_eq!(with_orgs.total, 1);
+    assert_eq!(with_orgs.users[0].email, email);
+    assert!(!with_orgs.users[0].is_active);
+    assert_eq!(with_orgs.users[0].auth_provider, "google");
+    assert_eq!(with_orgs.users[0].provider_user_id, provider_user_id);
+}
+
+#[tokio::test]
 #[ignore = "skip the test as the user has created orgs in other tests"]
 async fn test_admin_list_users_with_organizations() {
     let server = setup_test_server().await;

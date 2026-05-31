@@ -1195,13 +1195,21 @@ pub async fn list_users(
     crate::routes::common::validate_limit_offset(params.limit, params.offset)?;
 
     debug!(
-        "List users request with limit={}, offset={}, include_organizations={}, search={:?}, is_active={:?}, search_by_name={:?}",
+        "List users request with limit={}, offset={}, include_organizations={}, has_search={}, is_active={:?}, has_search_by_name={}",
         params.limit,
         params.offset,
         params.include_organizations,
-        params.search,
+        params
+            .search
+            .as_ref()
+            .map(|search| !search.is_empty())
+            .unwrap_or(false),
         params.is_active,
-        params.search_by_name
+        params
+            .search_by_name
+            .as_ref()
+            .map(|search| !search.is_empty())
+            .unwrap_or(false)
     );
 
     let (user_responses, total) = if params.include_organizations {

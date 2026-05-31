@@ -2919,6 +2919,19 @@ async fn test_admin_list_users_finds_inactive_and_oauth_identity_fields() {
     assert!(!with_orgs.users[0].is_active);
     assert_eq!(with_orgs.users[0].auth_provider, "google");
     assert_eq!(with_orgs.users[0].provider_user_id, provider_user_id);
+
+    let unrelated_org_name = format!("missing-org-{suffix}");
+    let org_name_response = server
+        .get(&format!(
+            "/v1/admin/users?limit=10&offset=0&include_organizations=true&search_by_name={unrelated_org_name}"
+        ))
+        .add_header("Authorization", format!("Bearer {access_token}"))
+        .await;
+
+    assert_eq!(org_name_response.status_code(), 200);
+    let org_name_search = org_name_response.json::<api::models::ListUsersResponse>();
+    assert_eq!(org_name_search.total, 0);
+    assert!(org_name_search.users.is_empty());
 }
 
 #[tokio::test]

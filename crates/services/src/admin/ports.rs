@@ -171,6 +171,8 @@ pub struct UserInfo {
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub last_login_at: Option<chrono::DateTime<chrono::Utc>>,
     pub is_active: bool,
+    pub auth_provider: String,
+    pub provider_user_id: String,
 }
 
 /// Organization information for user listing (earliest organization with spend limit and usage)
@@ -355,7 +357,13 @@ pub trait AdminRepository: Send + Sync {
     ) -> Result<Vec<OrganizationLimitsHistoryEntry>, anyhow::Error>;
 
     /// List all users with pagination (admin only)
-    async fn list_users(&self, limit: i64, offset: i64) -> Result<Vec<UserInfo>, anyhow::Error>;
+    async fn list_users(
+        &self,
+        limit: i64,
+        offset: i64,
+        search: Option<String>,
+        is_active: Option<bool>,
+    ) -> Result<(Vec<UserInfo>, i64), anyhow::Error>;
 
     /// List all users with their earliest organization and spend limit (admin only)
     /// If search_by_name is provided, filters users by organization name (case-insensitive partial match)
@@ -364,11 +372,10 @@ pub trait AdminRepository: Send + Sync {
         &self,
         limit: i64,
         offset: i64,
+        search: Option<String>,
+        is_active: Option<bool>,
         search_by_name: Option<String>,
     ) -> Result<(Vec<(UserInfo, Option<UserOrganizationInfo>)>, i64), anyhow::Error>;
-
-    /// Get the count of active users (admin only)
-    async fn get_active_user_count(&self) -> Result<i64, anyhow::Error>;
 
     /// List all models with pagination (admin only)
     /// If include_inactive is true, includes disabled models
@@ -510,8 +517,13 @@ pub trait AdminService: Send + Sync {
     ) -> Result<(Vec<OrganizationLimitsHistoryEntry>, i64), AdminError>;
 
     /// List all users with pagination (admin only)
-    async fn list_users(&self, limit: i64, offset: i64)
-        -> Result<(Vec<UserInfo>, i64), AdminError>;
+    async fn list_users(
+        &self,
+        limit: i64,
+        offset: i64,
+        search: Option<String>,
+        is_active: Option<bool>,
+    ) -> Result<(Vec<UserInfo>, i64), AdminError>;
 
     /// List all users with their earliest organization and spend limit (admin only)
     /// If search_by_name is provided, filters users by organization name (case-insensitive partial match)
@@ -519,6 +531,8 @@ pub trait AdminService: Send + Sync {
         &self,
         limit: i64,
         offset: i64,
+        search: Option<String>,
+        is_active: Option<bool>,
         search_by_name: Option<String>,
     ) -> Result<(Vec<(UserInfo, Option<UserOrganizationInfo>)>, i64), AdminError>;
 

@@ -1697,6 +1697,24 @@ impl InferenceProviderPool {
                         let retry_decision = Self::classify_retry_decision(&e);
                         let is_retryable_error = retry_decision.starts_with("retryable_");
 
+                        // Short-circuit on client-media-fetch failures the same
+                        // way as the 4xx fast-return above: the bad client URL
+                        // cannot succeed on any provider, so don't try the rest
+                        // — and don't let a later provider's retryable 5xx flip
+                        // the outer gate back to "retry the whole round," which
+                        // would re-hit this same payload on this same provider.
+                        if retry_decision == "non_retryable_client_media_error" {
+                            tracing::warn!(
+                                model_id = %model_id,
+                                attempt = attempt + 1,
+                                retry_decision,
+                                error_detail = %e,
+                                operation = operation_name,
+                                "Client media-fetch failure, not retrying or trying other providers"
+                            );
+                            return Err(Self::sanitize_completion_error(e, model_id));
+                        }
+
                         // Increment failure counter only for retryable errors —
                         // backend-health signals (5xx, timeouts, network errors).
                         // Non-retryable client-input causes (e.g. a 5xx whose body
@@ -4297,6 +4315,72 @@ mod tests {
                 assert_eq!(status_code, 400);
             }
             other => panic!("Expected HttpError, got: {:?}", other),
+        }
+    }
+
+    /// Multi-provider, alternating-error test pinning Pierre's blocker: provider
+    /// A returns a non-retryable client-media 5xx, provider B (if reached)
+    /// would return a retryable 5xx. Without the short-circuit, the for-loop
+    /// would walk through both providers; B's `retryable_*` decision would
+    /// then flip the outer gate to retry, and the round would loop hitting
+    /// provider A with the same bad payload again (~8 attempts across 4
+    /// rounds × 2 providers). With the short-circuit, provider A's media
+    /// failure returns immediately and B is never tried.
+    #[tokio::test(start_paused = true)]
+    async fn test_client_media_error_short_circuits_across_providers() {
+        let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
+        let model_id = "Qwen/Qwen3-30B-A3B-Instruct-2507".to_string();
+        // Register two providers — Pierre's exact scenario shape.
+        for _ in 0..2 {
+            pool.register_provider(
+                model_id.clone(),
+                Arc::new(inference_providers::mock::MockProvider::new()),
+            )
+            .await;
+        }
+
+        let attempt_count = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let count_clone = attempt_count.clone();
+
+        let result: Result<((), _), _> = pool
+            .retry_with_fallback(&model_id, "test_op", None, move |_provider| {
+                let count = count_clone.clone();
+                async move {
+                    let n = count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if n == 0 {
+                        // Provider A: non-retryable client-media 5xx.
+                        Err(CompletionError::HttpError {
+                            status_code: 500,
+                            message: "Internal server error: An exception occurred \
+                                      while loading IMAGE data at index 0: cannot \
+                                      identify image file <_io.BytesIO ...>"
+                                .to_string(),
+                            is_external: false,
+                        })
+                    } else {
+                        // Provider B (and any further round) would be a transient 502.
+                        Err(CompletionError::HttpError {
+                            status_code: 502,
+                            message: "Bad gateway".to_string(),
+                            is_external: false,
+                        })
+                    }
+                }
+            })
+            .await;
+
+        assert!(result.is_err());
+        assert_eq!(
+            attempt_count.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "client-media 5xx from the first provider must short-circuit immediately; \
+             the second provider must not be tried and the round must not retry"
+        );
+        // And the returned error must preserve the original 500 status (post-sanitize),
+        // not a 502 from a later provider.
+        match result.err().expect("err") {
+            CompletionError::HttpError { status_code, .. } => assert_eq!(status_code, 500),
+            other => panic!("Expected HttpError(500), got: {:?}", other),
         }
     }
 

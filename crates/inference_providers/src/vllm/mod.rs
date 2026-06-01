@@ -1215,8 +1215,9 @@ impl InferenceProvider for VLlmProvider {
         // the hot path the instant the stream ends, so a 404 on every reachable
         // backend is usually a signing race (the signature lands a few ms
         // later), not a permanent miss. Retry the whole fetch with a short,
-        // bounded backoff. A non-404 status is definitive and is never retried;
-        // a transport error is fatal once it reaches the last client.
+        // bounded backoff. Only a 404 is retried: a non-404 status is
+        // definitive, and a transport error is definitive on the rotation
+        // backend or once it reaches the last bucket/general client.
         //
         // Latency bound: the backoffs add at most their sum (~350ms), but each
         // request also keeps its own `control_timeout`, so a slow (not fast-404)
@@ -1225,7 +1226,14 @@ impl InferenceProvider for VLlmProvider {
         // cancels the whole store if it runs long.
         let mut last_error = None;
         for attempt in 0..=SIGNATURE_FETCH_BACKOFFS_MS.len() {
-            // Rotation-SNI first.
+            // Rotation-SNI first. When a rotation pin exists the signature was
+            // produced on that *specific* backend, so its response is the only
+            // authoritative one — the bucket/general clients can't have the
+            // signature and would just 404. A 404 here is the signing-race
+            // signal (retry); any non-404 status or transport error (e.g. a TLS
+            // SPKI/attestation mismatch) is definitive, so fail fast and surface
+            // that error instead of masking it with a bucket/general 404.
+            let mut rotation_failed_definitively = false;
             if let Some((index, rotation_url, client)) = &rotation_target {
                 let index = *index;
                 match client
@@ -1242,20 +1250,37 @@ impl InferenceProvider for VLlmProvider {
                             .map_err(|e| CompletionError::CompletionError(format_error_chain(&e)));
                     }
                     Ok(response) => {
+                        let status = response.status().as_u16();
+                        let error_text = response
+                            .text()
+                            .await
+                            .unwrap_or_else(|e| format!("Failed to read error response body: {e}"));
+                        last_error = Some(format!(
+                            "Rotation-SNI signature fetch failed (HTTP {status}): {error_text}"
+                        ));
+                        rotation_failed_definitively = status != 404;
                         tracing::debug!(
                             index,
-                            status = response.status().as_u16(),
-                            "Rotation-SNI signature fetch did not return 2xx, falling back to bucket/general"
+                            status,
+                            "Rotation-SNI signature fetch did not return 2xx"
                         );
                     }
                     Err(e) => {
-                        tracing::debug!(
-                            index,
-                            error = %format_error_chain(&e),
-                            "Rotation-SNI signature fetch errored, falling back to bucket/general"
-                        );
+                        let message = format_error_chain(&e);
+                        last_error = Some(format!(
+                            "Rotation-SNI signature fetch transport error: {message}"
+                        ));
+                        rotation_failed_definitively = true;
+                        tracing::debug!(index, error = %message, "Rotation-SNI signature fetch errored");
                     }
                 }
+            }
+
+            // A definitive failure on the rotation backend can't be recovered
+            // by the bucket/general clients (the signature isn't there), so stop
+            // now and return the rotation error.
+            if rotation_failed_definitively {
+                break;
             }
 
             // Bucket client, then general LB client.

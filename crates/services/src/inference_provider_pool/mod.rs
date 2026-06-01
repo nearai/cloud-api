@@ -1341,6 +1341,9 @@ impl InferenceProviderPool {
                 CompletionError::InvalidResponse(sanitize_and_format(&msg))
             }
             CompletionError::Unknown(msg) => CompletionError::Unknown(sanitize_and_format(&msg)),
+            CompletionError::ClientMediaError(msg) => {
+                CompletionError::ClientMediaError(sanitize_and_format(&msg))
+            }
             CompletionError::NoPubKeyProvider(msg) => {
                 CompletionError::NoPubKeyProvider(sanitize_and_format(&msg))
             }
@@ -1371,6 +1374,7 @@ impl InferenceProviderPool {
             },
             CompletionError::InvalidResponse(_) => "invalid_response",
             CompletionError::Unknown(_) => "unknown",
+            CompletionError::ClientMediaError(_) => "client_media_error",
             CompletionError::NoPubKeyProvider(_) => "no_pubkey_provider",
             CompletionError::Timeout { .. } => "timeout",
         }
@@ -1382,7 +1386,7 @@ impl InferenceProviderPool {
     /// error — retrying the same payload re-runs the same fetch and produces
     /// the same failure. Treat these as non-retryable so one broken URL
     /// from a client doesn't get amplified into 4x backend work.
-    pub(crate) fn is_client_media_fetch_error(message: &str) -> bool {
+    fn is_client_media_fetch_error(message: &str) -> bool {
         // ASCII-only lowercase: the markers are all ASCII and this path can
         // run at high volume during a malformed-media incident.
         let lower = message.to_ascii_lowercase();
@@ -1460,6 +1464,7 @@ impl InferenceProviderPool {
                 }
             }
             CompletionError::Timeout { .. } => "non_retryable_explicit_timeout",
+            CompletionError::ClientMediaError(_) => "non_retryable_client_media_error",
             CompletionError::NoPubKeyProvider(_) => "non_retryable_no_pubkey_provider",
             CompletionError::InvalidResponse(_) => "non_retryable_invalid_response",
             CompletionError::Unknown(_) => "non_retryable_unknown",
@@ -1712,7 +1717,16 @@ impl InferenceProviderPool {
                                 operation = operation_name,
                                 "Client media-fetch failure, not retrying or trying other providers"
                             );
-                            return Err(Self::sanitize_completion_error(e, model_id));
+                            // Carry the decision as a typed variant (classified
+                            // here on the RAW body) so the status mapping maps it
+                            // to 400 directly, instead of re-deriving it from the
+                            // sanitized, URL-redacted message (which would miss
+                            // the URL-bearing forms). sanitize redacts the carried
+                            // diagnostic text for safe logging.
+                            return Err(Self::sanitize_completion_error(
+                                CompletionError::ClientMediaError(e.to_string()),
+                                model_id,
+                            ));
                         }
 
                         // Increment failure counter only for retryable errors —
@@ -3728,6 +3742,46 @@ mod tests {
     }
 
     #[test]
+    fn test_client_media_error_verdict_survives_sanitize() {
+        // The media short-circuit classifies on the RAW body, then carries the
+        // verdict as a typed ClientMediaError so the status mapping doesn't have
+        // to re-derive it from the sanitized message. Using the URL-bearing
+        // aiohttp form (which the regex can't match once the URL is redacted)
+        // proves the verdict no longer depends on markers surviving redaction.
+        let raw = CompletionError::HttpError {
+            status_code: 500,
+            message: "HTTP error 500: 404, message='Not Found', url='https://example.test/img.jpg'"
+                .to_string(),
+            is_external: false,
+        };
+        // Detected as a client-media error on the raw body.
+        assert_eq!(
+            InferenceProviderPool::classify_retry_decision(&raw),
+            "non_retryable_client_media_error",
+        );
+        // What the short-circuit returns: ClientMediaError(raw), sanitized.
+        let carried = InferenceProviderPool::sanitize_completion_error(
+            CompletionError::ClientMediaError(raw.to_string()),
+            "test-model",
+        );
+        match carried {
+            // Verdict preserved → map_provider_error maps it to 400 directly.
+            CompletionError::ClientMediaError(msg) => {
+                assert!(msg.contains("[URL_REDACTED]"), "URL must be redacted: {msg}");
+                assert!(!msg.contains("https://"), "raw URL must not survive: {msg}");
+            }
+            other => panic!("expected ClientMediaError to survive sanitize, got {other:?}"),
+        }
+        // And it still classifies non-retryable as a typed variant.
+        assert_eq!(
+            InferenceProviderPool::classify_retry_decision(&CompletionError::ClientMediaError(
+                "x".to_string()
+            )),
+            "non_retryable_client_media_error",
+        );
+    }
+
+    #[test]
     fn test_sanitize_error_message() {
         // Test URL sanitization
         let error = "Failed to perform completion: error sending request for url (http://192.168.0.1:8000/v1/chat/completions)";
@@ -4376,11 +4430,12 @@ mod tests {
             "client-media 5xx from the first provider must short-circuit immediately; \
              the second provider must not be tried and the round must not retry"
         );
-        // And the returned error must preserve the original 500 status (post-sanitize),
-        // not a 502 from a later provider.
+        // And the returned error must be the typed client-media verdict from the
+        // first provider (classified on its raw 500 body, carried so the status
+        // layer maps it to 400) — not a 502 from a later provider.
         match result.err().expect("err") {
-            CompletionError::HttpError { status_code, .. } => assert_eq!(status_code, 500),
-            other => panic!("Expected HttpError(500), got: {:?}", other),
+            CompletionError::ClientMediaError(_) => {}
+            other => panic!("Expected ClientMediaError, got: {:?}", other),
         }
     }
 

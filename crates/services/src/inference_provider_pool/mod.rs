@@ -3767,7 +3767,10 @@ mod tests {
         match carried {
             // Verdict preserved → map_provider_error maps it to 400 directly.
             CompletionError::ClientMediaError(msg) => {
-                assert!(msg.contains("[URL_REDACTED]"), "URL must be redacted: {msg}");
+                assert!(
+                    msg.contains("[URL_REDACTED]"),
+                    "URL must be redacted: {msg}"
+                );
                 assert!(!msg.contains("https://"), "raw URL must not survive: {msg}");
             }
             other => panic!("expected ClientMediaError to survive sanitize, got {other:?}"),

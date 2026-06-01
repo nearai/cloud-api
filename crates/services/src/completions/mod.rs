@@ -2684,7 +2684,10 @@ mod tests {
                     out
                 );
             }
-            other => panic!("ClientMediaError should map to InvalidParams, got {:?}", other),
+            other => panic!(
+                "ClientMediaError should map to InvalidParams, got {:?}",
+                other
+            ),
         }
     }
 

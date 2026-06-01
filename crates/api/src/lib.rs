@@ -1586,6 +1586,9 @@ pub fn build_admin_routes(
             as Arc<dyn services::completions::CompletionServiceTrait>,
     )) as Arc<dyn services::admin::AdminService + Send + Sync>;
 
+    let github_dispatcher =
+        services::github_dispatch::dispatcher_from_config(&config.github_dispatch);
+
     let admin_app_state = AdminAppState {
         admin_service,
         analytics_service: services.analytics_service,
@@ -1595,6 +1598,7 @@ pub fn build_admin_routes(
         config,
         admin_access_token_repository,
         inference_provider_pool: services.inference_provider_pool,
+        github_dispatcher,
     };
 
     Router::new()
@@ -1841,6 +1845,7 @@ mod tests {
             },
             cors: config::CorsConfig::default(),
             external_providers: config::ExternalProvidersConfig::default(),
+            github_dispatch: config::GitHubDispatchConfig::default(),
         };
 
         // Initialize services
@@ -1941,6 +1946,7 @@ mod tests {
             },
             cors: config::CorsConfig::default(),
             external_providers: config::ExternalProvidersConfig::default(),
+            github_dispatch: config::GitHubDispatchConfig::default(),
         };
 
         let auth_components = init_auth_services(database.clone(), &config);

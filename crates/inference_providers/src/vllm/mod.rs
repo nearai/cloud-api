@@ -1215,8 +1215,14 @@ impl InferenceProvider for VLlmProvider {
         // the hot path the instant the stream ends, so a 404 on every reachable
         // backend is usually a signing race (the signature lands a few ms
         // later), not a permanent miss. Retry the whole fetch with a short,
-        // bounded backoff. A non-404 status or a transport error (e.g. a TLS
-        // SPKI/attestation mismatch) is definitive and is never retried.
+        // bounded backoff. A non-404 status is definitive and is never retried;
+        // a transport error is fatal once it reaches the last client.
+        //
+        // Latency bound: the backoffs add at most their sum (~350ms), but each
+        // request also keeps its own `control_timeout`, so a slow (not fast-404)
+        // backend can still take longer per attempt. The overall fetch is
+        // ultimately bounded by the caller's hot-path FINALIZE_TIMEOUT, which
+        // cancels the whole store if it runs long.
         let mut last_error = None;
         for attempt in 0..=SIGNATURE_FETCH_BACKOFFS_MS.len() {
             // Rotation-SNI first.
@@ -1253,15 +1259,37 @@ impl InferenceProvider for VLlmProvider {
             }
 
             // Bucket client, then general LB client.
+            let client_count = clients_to_try.len();
             let mut all_not_found = false;
-            for &client in &clients_to_try {
-                let response = client
+            for (idx, &client) in clients_to_try.iter().enumerate() {
+                let response = match client
                     .get(&canonical_url)
                     .headers(headers.clone())
                     .timeout(timeout)
                     .send()
                     .await
-                    .map_err(|e| CompletionError::CompletionError(format_error_chain(&e)))?;
+                {
+                    Ok(response) => response,
+                    // A transport error on a non-final client (e.g. a stale
+                    // bucket connection to a dead backend) shouldn't abort the
+                    // whole fetch — fall through to the next client, which is
+                    // exactly what it's there for. Only the last client's
+                    // transport error is fatal. Transport errors never arm the
+                    // 404 retry, so a definitive TLS/attestation mismatch still
+                    // fails without retrying.
+                    Err(e) => {
+                        let message = format_error_chain(&e);
+                        if idx + 1 < client_count {
+                            tracing::debug!(
+                                error = %message,
+                                "Signature fetch transport error; trying next client"
+                            );
+                            last_error = Some(message);
+                            continue;
+                        }
+                        return Err(CompletionError::CompletionError(message));
+                    }
+                };
 
                 if response.status().is_success() {
                     let signature = response
@@ -1293,17 +1321,18 @@ impl InferenceProvider for VLlmProvider {
             // Only a clean sweep of 404s is a (likely transient) signing-race
             // miss worth retrying. Back off and re-fetch — unless retries are
             // exhausted or the failure was definitive.
-            match (all_not_found, signature_fetch_backoff(attempt)) {
-                (true, Some(backoff)) => {
+            if all_not_found {
+                if let Some(backoff) = signature_fetch_backoff(attempt) {
                     tracing::debug!(
                         %chat_id,
                         attempt = attempt + 1,
                         "Signature not yet present on backend (404); retrying after backoff"
                     );
                     tokio::time::sleep(backoff).await;
+                    continue;
                 }
-                _ => break,
             }
+            break;
         }
 
         Err(CompletionError::CompletionError(

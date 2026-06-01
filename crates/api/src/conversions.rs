@@ -667,6 +667,8 @@ pub fn db_user_to_admin_user(user: &database::User) -> AdminUserResponse {
         created_at: user.created_at,
         last_login_at: user.last_login_at,
         is_active: user.is_active,
+        auth_provider: user.auth_provider.clone(),
+        provider_user_id: user.provider_user_id.clone(),
         organizations: None,
     }
 }

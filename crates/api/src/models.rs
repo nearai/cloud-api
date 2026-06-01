@@ -48,7 +48,8 @@ pub struct ChatCompletionRequest {
     #[serde(default = "default_n")]
     pub n: Option<i64>,
     pub stream: Option<bool>,
-    pub stop: Option<Vec<String>>,
+    /// OpenAI `stop` accepts either a single string or an array of strings.
+    pub stop: Option<StopSequences>,
     pub presence_penalty: Option<f32>,
     pub frequency_penalty: Option<f32>,
 
@@ -204,7 +205,7 @@ impl CompletionPrompt {
 }
 
 /// OpenAI `stop`: either a single string or an array of strings.
-#[derive(Debug, Clone, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(untagged)]
 pub enum StopSequences {
     Single(String),
@@ -2370,6 +2371,8 @@ pub struct AdminUserResponse {
     pub created_at: DateTime<Utc>,
     pub last_login_at: Option<DateTime<Utc>>,
     pub is_active: bool,
+    pub auth_provider: String,
+    pub provider_user_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub organizations: Option<Vec<AdminUserOrganizationDetails>>,
 }
@@ -2628,6 +2631,50 @@ pub struct OrganizationInvitationWithOrgResponse {
     pub invitation: OrganizationInvitationResponse,
     pub organization_name: String,
     pub invited_by_display_name: Option<String>,
+}
+
+/// Admin view of invitation email delivery metadata.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct AdminInvitationEmailDeliveryResponse {
+    pub organization_id: String,
+    pub organization_name: String,
+    pub invitation_id: String,
+    pub recipient_email: String,
+    pub role: MemberRole,
+    pub invitation_status: InvitationStatus,
+    pub email_status: InvitationEmailStatus,
+    pub email_sent_at: Option<DateTime<Utc>>,
+    pub email_last_error: Option<String>,
+    pub email_message_id: Option<String>,
+    pub invited_by_user_id: String,
+    pub invited_by_email: Option<String>,
+    pub invited_by_display_name: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
+    pub responded_at: Option<DateTime<Utc>>,
+}
+
+/// Paginated admin invitation email delivery response.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ListAdminInvitationEmailDeliveriesResponse {
+    pub deliveries: Vec<AdminInvitationEmailDeliveryResponse>,
+    pub total: i64,
+    pub limit: i64,
+    pub offset: i64,
+}
+
+/// Admin invitation email resend result.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct AdminInvitationEmailResendResultResponse {
+    pub invitation_id: String,
+    pub recipient_email: String,
+    pub success: bool,
+    pub email_sent: bool,
+    pub email_status: InvitationEmailStatus,
+    pub email_sent_at: Option<DateTime<Utc>>,
+    pub email_message_id: Option<String>,
+    pub email_last_error: Option<String>,
+    pub error: Option<String>,
 }
 
 /// Accept invitation response

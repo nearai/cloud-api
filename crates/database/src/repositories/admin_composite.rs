@@ -555,10 +555,19 @@ impl AdminRepository for AdminCompositeRepository {
             .collect())
     }
 
-    async fn list_users(&self, limit: i64, offset: i64) -> Result<Vec<UserInfo>> {
-        let users = self.user_repo.list(limit, offset).await?;
+    async fn list_users(
+        &self,
+        limit: i64,
+        offset: i64,
+        search: Option<String>,
+        is_active: Option<bool>,
+    ) -> Result<(Vec<UserInfo>, i64)> {
+        let (users, total) = self
+            .user_repo
+            .list_admin(limit, offset, search, is_active)
+            .await?;
 
-        Ok(users
+        let users = users
             .into_iter()
             .map(|u| UserInfo {
                 id: u.id,
@@ -569,19 +578,25 @@ impl AdminRepository for AdminCompositeRepository {
                 created_at: u.created_at,
                 last_login_at: u.last_login_at,
                 is_active: u.is_active,
+                auth_provider: u.auth_provider,
+                provider_user_id: u.provider_user_id,
             })
-            .collect())
+            .collect();
+
+        Ok((users, total))
     }
 
     async fn list_users_with_organizations(
         &self,
         limit: i64,
         offset: i64,
+        search: Option<String>,
+        is_active: Option<bool>,
         search_by_name: Option<String>,
     ) -> Result<(Vec<(UserInfo, Option<UserOrganizationInfo>)>, i64)> {
         let (users_with_orgs, total_count) = self
             .user_repo
-            .list_with_organizations(limit, offset, search_by_name)
+            .list_with_organizations(limit, offset, search, is_active, search_by_name)
             .await?;
 
         let result = users_with_orgs
@@ -596,16 +611,14 @@ impl AdminRepository for AdminCompositeRepository {
                     created_at: u.created_at,
                     last_login_at: u.last_login_at,
                     is_active: u.is_active,
+                    auth_provider: u.auth_provider,
+                    provider_user_id: u.provider_user_id,
                 };
                 (user_info, org_data)
             })
             .collect();
 
         Ok((result, total_count))
-    }
-
-    async fn get_active_user_count(&self) -> Result<i64> {
-        self.user_repo.get_active_user_count().await
     }
 
     async fn list_models(

@@ -23,6 +23,25 @@ use reqwest::{header::HeaderValue, Client};
 
 const DEFAULT_ANTHROPIC_VERSION: &str = "2023-06-01";
 
+/// Caller-supplied `extra` keys we forward to Anthropic's Messages API.
+///
+/// This is an allowlist on purpose: `ChatCompletionParams.extra` is an
+/// unbounded catch-all that also holds internal E2EE keys and OpenAI-only
+/// fields, so we only pass through the reasoning controls Anthropic actually
+/// understands (`thinking`) plus `reasoning_effort` (which Anthropic does not
+/// accept and will reject with its own 400, instead of us silently dropping it).
+const ANTHROPIC_PASSTHROUGH_KEYS: &[&str] = &["thinking", "reasoning_effort"];
+
+/// Pick the allowlisted reasoning-control fields out of `extra`.
+fn extract_passthrough(
+    extra: &std::collections::HashMap<String, serde_json::Value>,
+) -> std::collections::HashMap<String, serde_json::Value> {
+    ANTHROPIC_PASSTHROUGH_KEYS
+        .iter()
+        .filter_map(|&key| extra.get(key).map(|value| (key.to_string(), value.clone())))
+        .collect()
+}
+
 /// Anthropic backend - handles HTTP communication with Anthropic's API
 pub struct AnthropicBackend {
     client: Client,
@@ -94,6 +113,14 @@ impl AnthropicBackend {
             tools,
             tool_choice,
             stream,
+            // Forward only the reasoning-control fields from `extra`, not the
+            // whole map. A full passthrough is unsafe here: `extra` also carries
+            // internal E2EE keys (`x_signing_algo`, `x_client_pub_key`, …) that
+            // must never reach Anthropic, OpenAI-only fields that Anthropic
+            // rejects (`max_completion_tokens`, `presence_penalty`,
+            // `frequency_penalty`, …), and could collide with named fields
+            // (`system`, `stop_sequences`) producing duplicate JSON keys.
+            extra: extract_passthrough(&params.extra),
         }
     }
 }
@@ -406,6 +433,132 @@ mod tests {
         let request = backend.build_request("claude-sonnet-4-5-20250514", &params, false);
 
         assert_eq!(request.max_tokens, 4096);
+    }
+
+    #[test]
+    fn test_build_request_forwards_thinking_config() {
+        let backend = AnthropicBackend::new();
+        let mut params = make_params(None, None);
+        let thinking = serde_json::json!({"type": "enabled", "budget_tokens": 4096});
+        params
+            .extra
+            .insert("thinking".to_string(), thinking.clone());
+
+        let request = backend.build_request("claude-opus-4-7", &params, false);
+        let body = serde_json::to_value(&request).unwrap();
+
+        // The native Anthropic `thinking` object is forwarded verbatim as a
+        // top-level request field so Anthropic applies extended thinking.
+        assert_eq!(body.get("thinking"), Some(&thinking));
+    }
+
+    #[test]
+    fn test_build_request_forwards_reasoning_effort() {
+        let backend = AnthropicBackend::new();
+        let mut params = make_params(None, None);
+        params.extra.insert(
+            "reasoning_effort".to_string(),
+            serde_json::Value::String("high".to_string()),
+        );
+
+        let request = backend.build_request("claude-opus-4-7", &params, false);
+        let body = serde_json::to_value(&request).unwrap();
+
+        // We forward `reasoning_effort` rather than silently dropping it.
+        // Anthropic validates the field and returns its own error if unsupported.
+        assert_eq!(
+            body.get("reasoning_effort"),
+            Some(&serde_json::Value::String("high".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_build_request_does_not_leak_openai_only_params() {
+        let backend = AnthropicBackend::new();
+        let mut params = make_params(None, None);
+        // Typed OpenAI-only sampling params live in named struct fields, never
+        // in `extra`, so they must not appear in the Anthropic request body.
+        params.frequency_penalty = Some(0.5);
+        params.presence_penalty = Some(0.5);
+
+        let request = backend.build_request("claude-opus-4-7", &params, false);
+        let body = serde_json::to_value(&request).unwrap();
+
+        assert!(body.get("frequency_penalty").is_none());
+        assert!(body.get("presence_penalty").is_none());
+    }
+
+    #[test]
+    fn test_build_request_drops_non_allowlisted_extra_keys() {
+        let backend = AnthropicBackend::new();
+        let mut params = make_params(Some(1.0), None);
+        params.stop = Some(vec!["STOP".to_string()]);
+        // `extra` is an unbounded catch-all. None of these may reach Anthropic:
+        // internal E2EE keys, OpenAI-only fields, or keys that collide with the
+        // named request fields (`system`, `stop_sequences`).
+        for key in [
+            "x_signing_algo",
+            "x_client_pub_key",
+            "x_encryption_version",
+            "x_encrypt_all_fields",
+            "max_completion_tokens",
+            "frequency_penalty",
+            "presence_penalty",
+            "response_format",
+            "system",
+            "stop_sequences",
+        ] {
+            params
+                .extra
+                .insert(key.to_string(), serde_json::json!("leak"));
+        }
+
+        let request = backend.build_request("claude-opus-4-7", &params, false);
+        let obj = serde_json::to_value(&request).unwrap();
+        let obj = obj.as_object().unwrap();
+
+        // No internal/OpenAI-only key leaked through.
+        for key in [
+            "x_signing_algo",
+            "x_client_pub_key",
+            "x_encryption_version",
+            "x_encrypt_all_fields",
+            "max_completion_tokens",
+            "frequency_penalty",
+            "presence_penalty",
+            "response_format",
+        ] {
+            assert!(obj.get(key).is_none(), "{key} must not be forwarded");
+        }
+        // Named fields keep their derived values, not the `extra` collision.
+        assert!(obj.get("system").is_none()); // no system message -> field absent
+        assert_eq!(
+            obj.get("stop_sequences"),
+            Some(&serde_json::json!(["STOP"])),
+            "stop_sequences must come from params.stop, not extra"
+        );
+    }
+
+    #[test]
+    fn test_build_request_empty_extra_adds_no_fields() {
+        let backend = AnthropicBackend::new();
+        let params = make_params(Some(1.0), None);
+        let request = backend.build_request("claude-opus-4-7", &params, false);
+        let body = serde_json::to_value(&request).unwrap();
+
+        // With no extra fields, the flattened `extra` map contributes nothing:
+        // the serialized request carries only the known Anthropic fields.
+        let keys: std::collections::HashSet<&str> = body
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(|k| k.as_str())
+            .collect();
+        let expected: std::collections::HashSet<&str> =
+            ["model", "messages", "max_tokens", "temperature", "stream"]
+                .into_iter()
+                .collect();
+        assert_eq!(keys, expected);
     }
 
     #[tokio::test]

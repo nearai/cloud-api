@@ -202,27 +202,11 @@ impl UserRepository {
         self.row_to_user(row)
     }
 
-    /// Get the number of active users
-    pub async fn get_active_user_count(&self) -> Result<i64> {
-        let row = retry_db!("get_number_of_active_users", {
-            let client = self
-                .pool
-                .get()
-                .await
-                .context("Failed to get database connection")
-                .map_err(RepositoryError::PoolError)?;
-
-            client
-                .query_one(
-                    r#"
-                SELECT COUNT(*) as count FROM users WHERE is_active = true
-                "#,
-                    &[],
-                )
-                .await
-                .map_err(map_db_error)
-        })?;
-        Ok(row.get::<_, i64>("count"))
+    fn escape_like_query(query: &str) -> String {
+        query
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_")
     }
 
     /// List all users (with pagination)
@@ -244,6 +228,85 @@ impl UserRepository {
         rows.into_iter().map(|row| self.row_to_user(row)).collect()
     }
 
+    /// List all users for admin views, including inactive users by default.
+    pub async fn list_admin(
+        &self,
+        limit: i64,
+        offset: i64,
+        search: Option<String>,
+        is_active: Option<bool>,
+    ) -> Result<(Vec<User>, i64)> {
+        let escaped_search = search.as_ref().map(|s| Self::escape_like_query(s));
+
+        let total_count = retry_db!("count_admin_users", {
+            let client = self
+                .pool
+                .get()
+                .await
+                .context("Failed to get database connection")
+                .map_err(RepositoryError::PoolError)?;
+
+            let count_row = client
+                .query_one(
+                    r#"
+            SELECT COUNT(*) as total_count
+            FROM users
+            WHERE ($1::BOOLEAN IS NULL OR is_active = $1)
+              AND ($2::TEXT IS NULL
+                   OR email ILIKE ('%' || $2 || '%') ESCAPE '\'
+                   OR username ILIKE ('%' || $2 || '%') ESCAPE '\'
+                   OR display_name ILIKE ('%' || $2 || '%') ESCAPE '\'
+                   OR id::TEXT ILIKE ('%' || $2 || '%') ESCAPE '\'
+                   OR auth_provider ILIKE ('%' || $2 || '%') ESCAPE '\'
+                   OR provider_user_id ILIKE ('%' || $2 || '%') ESCAPE '\')
+            "#,
+                    &[&is_active, &escaped_search],
+                )
+                .await
+                .map_err(map_db_error)?;
+
+            Ok(count_row.get::<_, i64>("total_count"))
+        })?;
+
+        let rows = retry_db!("list_admin_users_with_pagination", {
+            let client = self
+                .pool
+                .get()
+                .await
+                .context("Failed to get database connection")
+                .map_err(RepositoryError::PoolError)?;
+
+            client
+                .query(
+                    r#"
+            SELECT *
+            FROM users
+            WHERE ($3::BOOLEAN IS NULL OR is_active = $3)
+              AND ($4::TEXT IS NULL
+                   OR email ILIKE ('%' || $4 || '%') ESCAPE '\'
+                   OR username ILIKE ('%' || $4 || '%') ESCAPE '\'
+                   OR display_name ILIKE ('%' || $4 || '%') ESCAPE '\'
+                   OR id::TEXT ILIKE ('%' || $4 || '%') ESCAPE '\'
+                   OR auth_provider ILIKE ('%' || $4 || '%') ESCAPE '\'
+                   OR provider_user_id ILIKE ('%' || $4 || '%') ESCAPE '\')
+            ORDER BY created_at DESC
+            LIMIT $1
+            OFFSET $2
+            "#,
+                    &[&limit, &offset, &is_active, &escaped_search],
+                )
+                .await
+                .map_err(map_db_error)
+        })?;
+
+        let users = rows
+            .into_iter()
+            .map(|row| self.row_to_user(row))
+            .collect::<Result<Vec<_>>>()?;
+
+        Ok((users, total_count))
+    }
+
     /// List all users with organizations (with pagination)
     /// Returns the earliest organization created by each user (owner role) with spend limit and usage
     /// Returns a tuple of (User, Option<UserOrganizationInfo>)
@@ -251,17 +314,16 @@ impl UserRepository {
         &self,
         limit: i64,
         offset: i64,
+        search: Option<String>,
+        is_active: Option<bool>,
         search_by_name: Option<String>,
     ) -> Result<(
         Vec<(User, Option<services::admin::UserOrganizationInfo>)>,
         i64,
     )> {
         // Escape LIKE wildcard characters in user input to prevent injection
-        let escaped_search = search_by_name.as_ref().map(|s| {
-            s.replace('\\', "\\\\")
-                .replace('%', "\\%")
-                .replace('_', "\\_")
-        });
+        let escaped_search = search.as_ref().map(|s| Self::escape_like_query(s));
+        let escaped_org_search = search_by_name.as_ref().map(|s| Self::escape_like_query(s));
 
         // Get total count of matching users (independent of pagination)
         let total_count = retry_db!("count_users_with_organizations", {
@@ -279,12 +341,18 @@ impl UserRepository {
             FROM users u
             LEFT JOIN organization_members om ON u.id = om.user_id AND om.role = 'owner'
             LEFT JOIN organizations o ON om.organization_id = o.id AND o.is_active = true
-            WHERE u.is_active = true
-              AND ($1::TEXT IS NULL
-                   OR o.name ILIKE ('%' || $1 || '%') ESCAPE '\'
-                   OR o.id IS NULL)
+            WHERE ($1::BOOLEAN IS NULL OR u.is_active = $1)
+              AND ($2::TEXT IS NULL
+                   OR u.email ILIKE ('%' || $2 || '%') ESCAPE '\'
+                   OR u.username ILIKE ('%' || $2 || '%') ESCAPE '\'
+                   OR u.display_name ILIKE ('%' || $2 || '%') ESCAPE '\'
+                   OR u.id::TEXT ILIKE ('%' || $2 || '%') ESCAPE '\'
+                   OR u.auth_provider ILIKE ('%' || $2 || '%') ESCAPE '\'
+                   OR u.provider_user_id ILIKE ('%' || $2 || '%') ESCAPE '\')
+              AND ($3::TEXT IS NULL
+                   OR o.name ILIKE ('%' || $3 || '%') ESCAPE '\')
             "#,
-                    &[&escaped_search],
+                    &[&is_active, &escaped_search, &escaped_org_search],
                 )
                 .await
                 .map_err(map_db_error)?;
@@ -304,34 +372,51 @@ impl UserRepository {
             client
                 .query(
                     r#"
-            SELECT DISTINCT ON (u.id)
-                u.*,
-                o.id as organization_id,
-                o.name as organization_name,
-                o.description as organization_description,
-                olh.spend_limit as organization_spend_limit,
-                ob.total_spent as organization_total_spent,
-                ob.total_requests as organization_total_requests,
-                ob.total_tokens as organization_total_tokens
-            FROM users u
-            LEFT JOIN organization_members om ON u.id = om.user_id AND om.role = 'owner'
-            LEFT JOIN organizations o ON om.organization_id = o.id AND o.is_active = true
-            LEFT JOIN LATERAL (
-                SELECT SUM(spend_limit)::BIGINT AS spend_limit
-                FROM organization_limits_history
-                WHERE organization_id = o.id
-                  AND effective_until IS NULL
-            ) olh ON true
-            LEFT JOIN organization_balance ob ON o.id = ob.organization_id
-            WHERE u.is_active = true
-              AND ($3::TEXT IS NULL 
-                   OR o.name ILIKE ('%' || $3 || '%') ESCAPE '\'
-                   OR o.id IS NULL)
-            ORDER BY u.id, o.created_at ASC NULLS LAST
+            WITH first_org_per_user AS (
+                SELECT DISTINCT ON (u.id)
+                    u.*,
+                    o.id as organization_id,
+                    o.name as organization_name,
+                    o.description as organization_description,
+                    olh.spend_limit as organization_spend_limit,
+                    ob.total_spent as organization_total_spent,
+                    ob.total_requests as organization_total_requests,
+                    ob.total_tokens as organization_total_tokens
+                FROM users u
+                LEFT JOIN organization_members om ON u.id = om.user_id AND om.role = 'owner'
+                LEFT JOIN organizations o ON om.organization_id = o.id AND o.is_active = true
+                LEFT JOIN LATERAL (
+                    SELECT SUM(spend_limit)::BIGINT AS spend_limit
+                    FROM organization_limits_history
+                    WHERE organization_id = o.id
+                      AND effective_until IS NULL
+                ) olh ON true
+                LEFT JOIN organization_balance ob ON o.id = ob.organization_id
+                WHERE ($3::BOOLEAN IS NULL OR u.is_active = $3)
+                  AND ($4::TEXT IS NULL
+                       OR u.email ILIKE ('%' || $4 || '%') ESCAPE '\'
+                       OR u.username ILIKE ('%' || $4 || '%') ESCAPE '\'
+                       OR u.display_name ILIKE ('%' || $4 || '%') ESCAPE '\'
+                       OR u.id::TEXT ILIKE ('%' || $4 || '%') ESCAPE '\'
+                       OR u.auth_provider ILIKE ('%' || $4 || '%') ESCAPE '\'
+                       OR u.provider_user_id ILIKE ('%' || $4 || '%') ESCAPE '\')
+                  AND ($5::TEXT IS NULL
+                       OR o.name ILIKE ('%' || $5 || '%') ESCAPE '\')
+                ORDER BY u.id, o.created_at ASC NULLS LAST
+            )
+            SELECT *
+            FROM first_org_per_user
+            ORDER BY created_at DESC
             LIMIT $1
             OFFSET $2
             "#,
-                    &[&limit, &offset, &escaped_search],
+                    &[
+                        &limit,
+                        &offset,
+                        &is_active,
+                        &escaped_search,
+                        &escaped_org_search,
+                    ],
                 )
                 .await
                 .map_err(map_db_error)

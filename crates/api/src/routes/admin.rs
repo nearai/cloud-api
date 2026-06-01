@@ -17,6 +17,7 @@ use crate::models::{
     UpdateOrganizationLimitsRequest, UpdateOrganizationLimitsResponse, UpdateServiceRequest,
 };
 use crate::routes::common::format_amount;
+use crate::routes::usage::{compute_organization_balance_response, OrganizationBalanceResponse};
 use axum::{
     extract::{Json, Path, Query, State},
     http::HeaderMap,
@@ -28,6 +29,7 @@ use chrono::{DateTime, Duration, Utc};
 use config::ApiConfig;
 use services::admin::{AdminService, AnalyticsService, UpdateModelAdminRequest};
 use services::auth::AuthServiceTrait;
+use services::usage::UsageServiceTrait;
 use std::sync::Arc;
 use tracing::{debug, error};
 use uuid::Uuid;
@@ -39,6 +41,7 @@ pub struct AdminAppState {
     pub organization_service:
         Arc<dyn services::organization::OrganizationServiceTrait + Send + Sync>,
     pub auth_service: Arc<dyn AuthServiceTrait>,
+    pub usage_service: Arc<dyn UsageServiceTrait + Send + Sync>,
     pub config: Arc<ApiConfig>,
     pub admin_access_token_repository: Arc<database::repositories::AdminAccessTokenRepository>,
     pub inference_provider_pool: Arc<services::inference_provider_pool::InferenceProviderPool>,
@@ -882,6 +885,54 @@ pub async fn get_organization_limits_history(
     Ok(ResponseJson(response))
 }
 
+/// Get organization balance (Admin only)
+///
+/// Returns the current spending balance for an organization without requiring
+/// the caller to be a member of that organization. Intended for trusted
+/// automated billing services.
+#[utoipa::path(
+    get,
+    path = "/v1/admin/organizations/{org_id}/usage/balance",
+    tag = "Admin",
+    params(
+        ("org_id" = String, Path, description = "Organization ID")
+    ),
+    responses(
+        (status = 200, description = "Organization balance", body = OrganizationBalanceResponse),
+        (status = 400, description = "Invalid request", body = ErrorResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 404, description = "Not found", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    ),
+    security(
+        ("session_token" = [])
+    )
+)]
+pub async fn get_admin_organization_balance(
+    State(app_state): State<AdminAppState>,
+    Path(org_id): Path<String>,
+    Extension(_admin_user): Extension<AdminUser>,
+) -> Result<ResponseJson<OrganizationBalanceResponse>, (StatusCode, ResponseJson<ErrorResponse>)> {
+    debug!(
+        "Admin get organization balance request for org_id: {}",
+        org_id
+    );
+
+    let organization_id = uuid::Uuid::parse_str(&org_id).map_err(|_| {
+        (
+            StatusCode::BAD_REQUEST,
+            ResponseJson(ErrorResponse::new(
+                "Invalid organization ID format".to_string(),
+                "invalid_id".to_string(),
+            )),
+        )
+    })?;
+
+    compute_organization_balance_response(&*app_state.usage_service, organization_id)
+        .await
+        .map(ResponseJson)
+}
+
 /// Delete a model (Admin only)
 ///
 /// Soft deletes a model by setting is_active to false. This preserves historical usage records
@@ -1130,7 +1181,9 @@ pub async fn deprecate_model(
         ("limit" = Option<i64>, Query, description = "Maximum number of users to return (default: 100)"),
         ("offset" = Option<i64>, Query, description = "Number of users to skip (default: 0)"),
         ("include_organizations" = Option<bool>, Query, description = "Whether to include organization information and spend limits for the first organization owned by each user (default: false)"),
-        ("search_by_name" = Option<String>, Query, description = "Filter users by organization name (case-insensitive match). Only effective when include_organizations=true; ignored otherwise.")
+        ("search" = Option<String>, Query, description = "Filter users by email, username, display name, user id, auth provider, or provider user id (case-insensitive partial match)."),
+        ("is_active" = Option<bool>, Query, description = "Filter users by active status. Omit to include active and inactive users."),
+        ("search_by_name" = Option<String>, Query, description = "Filter users by organization name (case-insensitive match). Only effective when include_organizations=true; separate from user search.")
     ),
     responses(
         (status = 200, description = "Users retrieved successfully", body = ListUsersResponse),
@@ -1149,15 +1202,34 @@ pub async fn list_users(
     crate::routes::common::validate_limit_offset(params.limit, params.offset)?;
 
     debug!(
-        "List users request with limit={}, offset={}, include_organizations={}, search_by_name={:?}",
-        params.limit, params.offset, params.include_organizations, params.search_by_name
+        "List users request with limit={}, offset={}, include_organizations={}, has_search={}, is_active={:?}, has_search_by_name={}",
+        params.limit,
+        params.offset,
+        params.include_organizations,
+        params
+            .search
+            .as_ref()
+            .map(|search| !search.is_empty())
+            .unwrap_or(false),
+        params.is_active,
+        params
+            .search_by_name
+            .as_ref()
+            .map(|search| !search.is_empty())
+            .unwrap_or(false)
     );
 
     let (user_responses, total) = if params.include_organizations {
         // Fetch users with their default organization and spend limit
         let (users_with_orgs, total) = app_state
             .admin_service
-            .list_users_with_organizations(params.limit, params.offset, params.search_by_name)
+            .list_users_with_organizations(
+                params.limit,
+                params.offset,
+                params.search.clone(),
+                params.is_active,
+                params.search_by_name.clone(),
+            )
             .await
             .map_err(|e| {
                 error!("Failed to list users with organizations");
@@ -1209,6 +1281,8 @@ pub async fn list_users(
                     created_at: u.created_at,
                     last_login_at: u.last_login_at,
                     is_active: u.is_active,
+                    auth_provider: u.auth_provider,
+                    provider_user_id: u.provider_user_id,
                     organizations,
                 }
             })
@@ -1219,7 +1293,12 @@ pub async fn list_users(
         // Return users data only
         let (users, total) = app_state
             .admin_service
-            .list_users(params.limit, params.offset)
+            .list_users(
+                params.limit,
+                params.offset,
+                params.search.clone(),
+                params.is_active,
+            )
             .await
             .map_err(|e| {
                 error!("Failed to list users");
@@ -1249,6 +1328,8 @@ pub async fn list_users(
                 created_at: u.created_at,
                 last_login_at: u.last_login_at,
                 is_active: u.is_active,
+                auth_provider: u.auth_provider,
+                provider_user_id: u.provider_user_id,
                 organizations: None,
             })
             .collect();
@@ -1870,6 +1951,8 @@ pub struct ListUsersQueryParams {
     pub offset: i64,
     #[serde(default)]
     pub include_organizations: bool,
+    pub search: Option<String>,
+    pub is_active: Option<bool>,
     pub search_by_name: Option<String>,
 }
 

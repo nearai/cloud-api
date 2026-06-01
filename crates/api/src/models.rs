@@ -139,6 +139,11 @@ pub struct ToolCall {
     #[serde(rename = "type")]
     pub type_: String,
     pub function: FunctionCall,
+    /// Gemini-3 thought_signature. The client must echo this verbatim on
+    /// the next turn or Gemini rejects the request with
+    /// "Function call is missing a thought_signature".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thought_signature: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -168,10 +173,57 @@ pub struct ChatChoice {
     pub finish_reason: Option<String>, // "stop", "length", "content_filter"
 }
 
+/// OpenAI `/v1/completions` `prompt`: a single string, a batch of strings, or
+/// token-ID array(s). This endpoint serves only the single-string form; the
+/// other shapes still deserialize (so the handler can return a clean 400 rather
+/// than a framework deserialization error) and are rejected there.
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+#[serde(untagged)]
+pub enum CompletionPrompt {
+    Text(String),
+    Strings(Vec<String>),
+    Tokens(Vec<i64>),
+    TokenBatches(Vec<Vec<i64>>),
+}
+
+impl CompletionPrompt {
+    /// Resolve to the single text prompt this endpoint supports, or an error
+    /// message explaining why the shape is unsupported.
+    pub fn single_text(&self) -> Result<&str, &'static str> {
+        match self {
+            CompletionPrompt::Text(s) => Ok(s),
+            CompletionPrompt::Strings(v) if v.len() == 1 => Ok(&v[0]),
+            CompletionPrompt::Strings(_) => Err(
+                "array (batch) prompts are not supported on /v1/completions; send a single string prompt",
+            ),
+            CompletionPrompt::Tokens(_) | CompletionPrompt::TokenBatches(_) => Err(
+                "token-id prompts are not supported on /v1/completions; send a string prompt",
+            ),
+        }
+    }
+}
+
+/// OpenAI `stop`: either a single string or an array of strings.
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+#[serde(untagged)]
+pub enum StopSequences {
+    Single(String),
+    Many(Vec<String>),
+}
+
+impl StopSequences {
+    pub fn into_vec(self) -> Vec<String> {
+        match self {
+            StopSequences::Single(s) => vec![s],
+            StopSequences::Many(v) => v,
+        }
+    }
+}
+
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct CompletionRequest {
     pub model: String,
-    pub prompt: String,
+    pub prompt: CompletionPrompt,
     pub max_tokens: Option<i64>,
     #[serde(default = "default_temperature")]
     pub temperature: Option<f32>,
@@ -182,15 +234,16 @@ pub struct CompletionRequest {
     pub stream: Option<bool>,
     pub logprobs: Option<i64>,
     pub echo: Option<bool>,
-    pub stop: Option<Vec<String>>,
+    pub stop: Option<StopSequences>,
     pub presence_penalty: Option<f32>,
     pub frequency_penalty: Option<f32>,
     pub best_of: Option<i64>,
 
+    #[serde(flatten)]
     pub extra: std::collections::HashMap<String, serde_json::Value>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct CompletionResponse {
     pub id: String,
     pub object: String, // "text_completion"
@@ -768,9 +821,26 @@ pub struct ModelInfo {
     /// Human-readable description (OpenRouter `description`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    /// OpenRouter `top_provider`: per-provider context/output limits.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub top_provider: Option<TopProvider>,
 }
 
-#[derive(Debug, Serialize)]
+/// OpenRouter `top_provider` block: context length and max output tokens
+/// in the field names OpenRouter's `/api/v1/models` schema uses.
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct TopProvider {
+    /// Context length in tokens (mirrors top-level `context_length`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_length: Option<i32>,
+    /// Maximum output tokens per response (mirrors top-level `max_output_length`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_completion_tokens: Option<i32>,
+    /// Whether the provider moderates content. We do not, so this is always false.
+    pub is_moderated: bool,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
 pub struct CompletionChoice {
     pub index: i64,
     pub text: String,
@@ -994,9 +1064,8 @@ impl CompletionRequest {
             return Err("model is required".to_string());
         }
 
-        if self.prompt.is_empty() {
-            return Err("prompt is required".to_string());
-        }
+        // `prompt` shape is resolved in the handler (single_text) so unsupported
+        // shapes get a 400 unsupported_parameter rather than a generic error.
 
         if let Some(temp) = self.temperature {
             if !(0.0..=2.0).contains(&temp) {
@@ -2301,6 +2370,8 @@ pub struct AdminUserResponse {
     pub created_at: DateTime<Utc>,
     pub last_login_at: Option<DateTime<Utc>>,
     pub is_active: bool,
+    pub auth_provider: String,
+    pub provider_user_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub organizations: Option<Vec<AdminUserOrganizationDetails>>,
 }

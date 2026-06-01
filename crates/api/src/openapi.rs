@@ -51,7 +51,7 @@ use utoipa::{Modify, OpenApi};
         crate::routes::completions::score,
         crate::routes::completions::privacy_classify,
         crate::routes::completions::privacy_redact,
-        // crate::routes::completions::completions,
+        crate::routes::completions::completions,
         crate::routes::completions::models,
         // Model endpoints (public model catalog)
         crate::routes::models::list_models,
@@ -119,6 +119,7 @@ use utoipa::{Modify, OpenApi};
         // Usage endpoints
         crate::routes::usage::get_organization_balance,
         crate::routes::usage::get_organization_usage_history,
+        crate::routes::usage::get_organization_usage_by_model,
         crate::routes::usage::get_api_key_usage_history,
         crate::routes::usage::record_usage,
         crate::routes::usage::get_user_organization_metrics,
@@ -136,6 +137,7 @@ use utoipa::{Modify, OpenApi};
         crate::routes::admin::delete_model,
         crate::routes::admin::deprecate_model,
         crate::routes::admin::get_model_history,
+        crate::routes::admin::get_admin_organization_balance,
         crate::routes::admin::update_organization_limits,
         crate::routes::admin::get_organization_limits_history,
         crate::routes::admin::update_organization_concurrent_limit,
@@ -165,7 +167,8 @@ use utoipa::{Modify, OpenApi};
             crate::routes::health::HealthResponse,
             // Core API models
             ChatCompletionRequest, ChatCompletionResponse, Message, CompletionUsage,
-            CompletionRequest, ModelsResponse, ModelInfo, ModelPricing, ErrorResponse,
+            CompletionRequest, CompletionPrompt, StopSequences, CompletionResponse,
+            CompletionChoice, ModelsResponse, ModelInfo, ModelPricing, TopProvider, ErrorResponse,
             // Image generation models
             ImageGenerationRequest, ImageGenerationResponse, ImageData,
             // Audio transcription models
@@ -245,6 +248,8 @@ use utoipa::{Modify, OpenApi};
             crate::routes::usage::OrganizationBalanceResponse,
             crate::routes::usage::UsageHistoryResponse,
             crate::routes::usage::UsageHistoryEntryResponse,
+            crate::routes::usage::UsageByModelResponse,
+            crate::routes::usage::UsageByModelEntryResponse,
             crate::routes::usage::ServiceUsageHistoryResponse,
             crate::routes::usage::ServiceUsageEntryResponse,
             crate::routes::usage::RecordUsageResponse,

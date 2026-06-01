@@ -11,12 +11,12 @@ use axum::{
 };
 use chrono::{Duration, Utc};
 use serde::{Deserialize, Serialize};
-use services::organization::OrganizationError;
+use services::{organization::OrganizationError, usage::UsageServiceTrait};
 use subtle::ConstantTimeEq;
 use utoipa::ToSchema;
 use uuid::Uuid;
 
-type UsageError = (StatusCode, ResponseJson<ErrorResponse>);
+pub(crate) type UsageError = (StatusCode, ResponseJson<ErrorResponse>);
 
 async fn check_org_membership(
     app_state: &AppState,
@@ -93,6 +93,82 @@ pub struct OrganizationBalanceResponse {
     pub total_requests: i64,
     pub total_tokens: i64,
     pub updated_at: String,
+}
+
+pub async fn compute_organization_balance_response(
+    usage_service: &(dyn UsageServiceTrait + Send + Sync),
+    organization_id: Uuid,
+) -> Result<OrganizationBalanceResponse, UsageError> {
+    let (balance, limit) = tokio::try_join!(
+        usage_service.get_balance(organization_id),
+        usage_service.get_limit(organization_id)
+    )
+    .map_err(|e| {
+        tracing::error!("Failed to get organization balance or limit: {:?}", e);
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            ResponseJson(ErrorResponse::new(
+                "Failed to retrieve balance or limit".to_string(),
+                "internal_server_error".to_string(),
+            )),
+        )
+    })?;
+
+    match balance {
+        Some(balance) => {
+            let (spend_limit, spend_limit_display, remaining, remaining_display) =
+                if let Some(limit_info) = limit {
+                    let remaining_amount = limit_info.spend_limit - balance.total_spent;
+                    (
+                        Some(limit_info.spend_limit),
+                        Some(format_amount(limit_info.spend_limit)),
+                        Some(remaining_amount),
+                        Some(format_amount(remaining_amount)),
+                    )
+                } else {
+                    (None, None, None, None)
+                };
+
+            Ok(OrganizationBalanceResponse {
+                organization_id: balance.organization_id.to_string(),
+                total_spent: balance.total_spent,
+                total_spent_display: format_amount(balance.total_spent),
+                spend_limit,
+                spend_limit_display,
+                remaining,
+                remaining_display,
+                last_usage_at: balance.last_usage_at.map(|dt| dt.to_rfc3339()),
+                total_requests: balance.total_requests,
+                total_tokens: balance.total_tokens,
+                updated_at: balance.updated_at.to_rfc3339(),
+            })
+        }
+        None => {
+            if let Some(limit_info) = limit {
+                Ok(OrganizationBalanceResponse {
+                    organization_id: organization_id.to_string(),
+                    total_spent: 0,
+                    total_spent_display: format_amount(0),
+                    spend_limit: Some(limit_info.spend_limit),
+                    spend_limit_display: Some(format_amount(limit_info.spend_limit)),
+                    remaining: Some(limit_info.spend_limit),
+                    remaining_display: Some(format_amount(limit_info.spend_limit)),
+                    last_usage_at: None,
+                    total_requests: 0,
+                    total_tokens: 0,
+                    updated_at: Utc::now().to_rfc3339(),
+                })
+            } else {
+                Err((
+                    StatusCode::NOT_FOUND,
+                    ResponseJson(ErrorResponse::new(
+                        "No usage data or limit found for organization".to_string(),
+                        "not_found".to_string(),
+                    )),
+                ))
+            }
+        }
+    }
 }
 
 /// Usage history entry
@@ -222,94 +298,9 @@ pub async fn get_organization_balance(
 
     let organization_id = check_org_membership(&app_state, user, &org_id).await?;
 
-    let balance = app_state
-        .usage_service
-        .get_balance(organization_id)
+    compute_organization_balance_response(&*app_state.usage_service, organization_id)
         .await
-        .map_err(|_| {
-            tracing::error!("Failed to get balance");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                ResponseJson(ErrorResponse::new(
-                    "Failed to retrieve balance".to_string(),
-                    "internal_server_error".to_string(),
-                )),
-            )
-        })?;
-
-    // Get spending limit
-    let limit = app_state
-        .usage_service
-        .get_limit(organization_id)
-        .await
-        .map_err(|_| {
-            tracing::error!("Failed to get limit");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                ResponseJson(ErrorResponse::new(
-                    "Failed to retrieve limit".to_string(),
-                    "internal_server_error".to_string(),
-                )),
-            )
-        })?;
-
-    match balance {
-        Some(balance) => {
-            let (spend_limit, spend_limit_display, remaining, remaining_display) =
-                if let Some(limit_info) = limit {
-                    let remaining_amount = limit_info.spend_limit - balance.total_spent;
-                    (
-                        Some(limit_info.spend_limit),
-                        Some(format_amount(limit_info.spend_limit)),
-                        Some(remaining_amount),
-                        Some(format_amount(remaining_amount)),
-                    )
-                } else {
-                    (None, None, None, None)
-                };
-
-            Ok(ResponseJson(OrganizationBalanceResponse {
-                organization_id: balance.organization_id.to_string(),
-                total_spent: balance.total_spent,
-                total_spent_display: format_amount(balance.total_spent),
-                spend_limit,
-                spend_limit_display,
-                remaining,
-                remaining_display,
-                last_usage_at: balance.last_usage_at.map(|dt| dt.to_rfc3339()),
-                total_requests: balance.total_requests,
-                total_tokens: balance.total_tokens,
-                updated_at: balance.updated_at.to_rfc3339(),
-            }))
-        }
-        None => {
-            // No balance yet, but may have a limit
-            if let Some(limit_info) = limit {
-                // Organization has a limit but no usage yet - return with zero balance
-                Ok(ResponseJson(OrganizationBalanceResponse {
-                    organization_id: org_id,
-                    total_spent: 0,
-                    total_spent_display: format_amount(0),
-                    spend_limit: Some(limit_info.spend_limit),
-                    spend_limit_display: Some(format_amount(limit_info.spend_limit)),
-                    remaining: Some(limit_info.spend_limit),
-                    remaining_display: Some(format_amount(limit_info.spend_limit)),
-                    last_usage_at: None,
-                    total_requests: 0,
-                    total_tokens: 0,
-                    updated_at: chrono::Utc::now().to_rfc3339(),
-                }))
-            } else {
-                Err((
-                    StatusCode::NOT_FOUND,
-                    ResponseJson(ErrorResponse::new(
-                        "No usage data or limit found for organization".to_string(),
-                        "not_found".to_string(),
-                    )),
-                ))
-            }
-        }
-    }
+        .map(ResponseJson)
 }
 
 /// Get organization usage history
@@ -1248,6 +1239,133 @@ pub async fn get_user_organization_timeseries(
                 cost_usd: p.cost_usd,
             })
             .collect(),
+    }))
+}
+
+/// Period selector for the by-model usage breakdown.
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum UsageByModelPeriod {
+    Day,
+    Week,
+    Month,
+}
+
+impl UsageByModelPeriod {
+    fn since(self) -> chrono::DateTime<Utc> {
+        let now = Utc::now();
+        match self {
+            UsageByModelPeriod::Day => now - Duration::days(1),
+            UsageByModelPeriod::Week => now - Duration::days(7),
+            UsageByModelPeriod::Month => now - Duration::days(30),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            UsageByModelPeriod::Day => "day",
+            UsageByModelPeriod::Week => "week",
+            UsageByModelPeriod::Month => "month",
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct UsageByModelQuery {
+    /// `day` (last 24h), `week` (last 7d), or `month` (last 30d). Defaults to `month`.
+    #[serde(default = "default_period")]
+    pub period: UsageByModelPeriod,
+}
+
+fn default_period() -> UsageByModelPeriod {
+    UsageByModelPeriod::Month
+}
+
+/// Per-model usage aggregation entry
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct UsageByModelEntryResponse {
+    pub model: String,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub total_tokens: i64,
+    pub total_cost: i64,            // In nano-dollars (scale 9)
+    pub total_cost_display: String, // Human readable, e.g., "$0.00123"
+    pub request_count: i64,
+}
+
+/// Per-model usage breakdown response
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct UsageByModelResponse {
+    pub period: String,
+    pub start_date: String,
+    pub data: Vec<UsageByModelEntryResponse>,
+}
+
+/// Get organization usage broken down by model.
+///
+/// Returns one row per model, summed over a rolling window ending now:
+/// `day` = last 24h, `week` = last 7 days, `month` = last 30 days (NOT calendar
+/// day/week/month-to-date). Used by the dashboard pie chart to show which models
+/// drive spend.
+#[utoipa::path(
+    get,
+    path = "/v1/organizations/{org_id}/usage/by-model",
+    tag = "Usage",
+    params(
+        ("org_id" = String, Path, description = "Organization ID"),
+        ("period" = Option<String>, Query, description = "Rolling window: `day` (last 24h), `week` (last 7d), or `month` (last 30d). Default: `month`")
+    ),
+    responses(
+        (status = 200, description = "Per-model usage breakdown", body = UsageByModelResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 403, description = "Forbidden", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    ),
+    security(
+        ("session_token" = [])
+    )
+)]
+pub async fn get_organization_usage_by_model(
+    State(app_state): State<AppState>,
+    Extension(user): Extension<AuthenticatedUser>,
+    Path(org_id): Path<String>,
+    Query(query): Query<UsageByModelQuery>,
+) -> Result<ResponseJson<UsageByModelResponse>, (StatusCode, ResponseJson<ErrorResponse>)> {
+    let organization_id = check_org_membership(&app_state, user, &org_id).await?;
+    let start_date = query.period.since();
+
+    let entries = app_state
+        .usage_service
+        .get_usage_by_model(organization_id, start_date)
+        .await
+        .map_err(|e| {
+            tracing::error!(error = ?e, "Failed to get usage by model");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ResponseJson(ErrorResponse::new(
+                    "Failed to retrieve usage breakdown".to_string(),
+                    "internal_server_error".to_string(),
+                )),
+            )
+        })?;
+
+    let data = entries
+        .into_iter()
+        .map(|e| UsageByModelEntryResponse {
+            model: e.model,
+            input_tokens: e.input_tokens,
+            output_tokens: e.output_tokens,
+            total_tokens: e.total_tokens,
+            total_cost: e.total_cost,
+            total_cost_display: format_amount(e.total_cost),
+            request_count: e.request_count,
+        })
+        .collect();
+
+    Ok(ResponseJson(UsageByModelResponse {
+        period: query.period.as_str().to_string(),
+        start_date: start_date.to_rfc3339(),
+        data,
     }))
 }
 

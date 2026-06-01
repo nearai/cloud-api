@@ -64,6 +64,14 @@ impl MemberRole {
         matches!(self, MemberRole::Owner | MemberRole::Admin)
     }
 
+    pub fn can_invite_as(&self, role: &MemberRole) -> bool {
+        match self {
+            MemberRole::Owner => true,
+            MemberRole::Admin => matches!(role, MemberRole::Admin | MemberRole::Member),
+            MemberRole::Member => false,
+        }
+    }
+
     pub fn can_manage_api_keys(&self) -> bool {
         // All members can create and manage their own API keys
         true

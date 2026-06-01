@@ -1609,6 +1609,12 @@ impl InferenceProviderPool {
 
         // Track the last error (preserving its structure for proper status code mapping)
         let mut last_error: Option<CompletionError> = None;
+        // Retry decision computed from the RAW error before sanitization redacts
+        // URLs to `[URL_REDACTED]`. Sharing one decision across the retry gate,
+        // the failure-counter gate, and the terminal log keeps them consistent
+        // and prevents the regex matchers in classify_retry_decision from
+        // being defeated by sanitization.
+        let mut last_retry_decision: Option<&'static str> = None;
         let mut total_attempts: usize = 0;
         let mut retry_count: usize = 0;
         let started_at = std::time::Instant::now();
@@ -1684,9 +1690,20 @@ impl InferenceProviderPool {
                             }
                         }
 
-                        // Increment failure counter only for retryable errors
-                        // (5xx, timeouts, network errors — indicators of backend health issues)
-                        {
+                        // Classify the retry decision on the RAW error (before
+                        // sanitize_completion_error redacts URLs). Used for the
+                        // failure-counter gate below, the retry gate after this
+                        // loop, and the terminal "All providers failed" log.
+                        let retry_decision = Self::classify_retry_decision(&e);
+                        let is_retryable_error = retry_decision.starts_with("retryable_");
+
+                        // Increment failure counter only for retryable errors —
+                        // backend-health signals (5xx, timeouts, network errors).
+                        // Non-retryable client-input causes (e.g. a 5xx whose body
+                        // says "loading IMAGE data … cannot identify image file")
+                        // would otherwise demote a healthy backend on every broken
+                        // client URL.
+                        if is_retryable_error {
                             let mut counts = self
                                 .provider_failure_counts
                                 .write()
@@ -1703,13 +1720,17 @@ impl InferenceProviderPool {
                             attempt = attempt + 1,
                             retry = retry_count,
                             error_kind,
+                            retry_decision,
                             error_detail = %e,
                             operation = operation_name,
                             "Provider failed, will try next provider if available"
                         );
 
-                        // Sanitize and preserve the last error with its structure intact
+                        // Sanitize and preserve the last error with its structure intact.
+                        // Carry the raw-error retry decision so downstream gates and the
+                        // terminal log don't re-classify the sanitized form.
                         last_error = Some(Self::sanitize_completion_error(e, model_id));
+                        last_retry_decision = Some(retry_decision);
                     }
                 }
             }
@@ -1732,9 +1753,12 @@ impl InferenceProviderPool {
             //
             // The actual classification lives in `classify_retry_decision` (used
             // for both the retry gate and log labels) so the two can't drift.
-            let is_retryable = last_error
-                .as_ref()
-                .map(|e| Self::classify_retry_decision(e).starts_with("retryable_"))
+            // Use the decision computed from the *raw* error in the loop body —
+            // sanitize_completion_error has since redacted URLs to
+            // [URL_REDACTED], which would defeat the matcher's url='https?://
+            // anchor.
+            let is_retryable = last_retry_decision
+                .map(|d| d.starts_with("retryable_"))
                 .unwrap_or(false);
 
             if !is_retryable || retry_count >= MAX_RETRIES {
@@ -1776,10 +1800,10 @@ impl InferenceProviderPool {
             .as_ref()
             .map(Self::classify_error_kind)
             .unwrap_or("none");
-        let retry_decision = last_error
-            .as_ref()
-            .map(Self::classify_retry_decision)
-            .unwrap_or("none");
+        // Use the decision computed from the raw error in the loop body, not a
+        // re-classification of the sanitized last_error (URLs there are
+        // [URL_REDACTED] which would defeat the matcher's url-anchored regex).
+        let retry_decision = last_retry_decision.unwrap_or("none");
         let elapsed_ms = started_at.elapsed().as_millis();
         if let Some(pub_key) = model_pub_key {
             tracing::error!(
@@ -3619,7 +3643,8 @@ mod tests {
         assert_eq!(
             InferenceProviderPool::classify_retry_decision(&CompletionError::HttpError {
                 status_code: 500,
-                message: "HTTP error 500: 404, message='Not Found', url='https://example.test/img'".to_string(),
+                message: "HTTP error 500: 404, message='Not Found', url='https://example.test/img'"
+                    .to_string(),
                 is_external: false,
             }),
             "non_retryable_client_media_error",
@@ -3649,10 +3674,38 @@ mod tests {
         assert_eq!(
             InferenceProviderPool::classify_retry_decision(&CompletionError::HttpError {
                 status_code: 500,
-                message: "internal: failed to dial postgres url='postgres://...' message='conn refused'".to_string(),
+                message:
+                    "internal: failed to dial postgres url='postgres://...' message='conn refused'"
+                        .to_string(),
                 is_external: false,
             }),
             "retryable_http_5xx",
+        );
+
+        // Pin the sanitize-vs-classify ordering invariant:
+        // sanitize_error_message redacts URLs to `[URL_REDACTED]`, which defeats
+        // the aiohttp-wrapper regex (it anchors on `url='https?://`). The
+        // production retry loop therefore classifies BEFORE sanitization and
+        // stores the decision. If anyone later moves the classification to
+        // run on the sanitized error, this test combined with the assertions
+        // above will catch the regression: same payload, raw form classifies
+        // as non-retryable, sanitized form does not.
+        let raw_wrapped_4xx =
+            "HTTP error 500: 404, message='Not Found', url='https://example.test/img'".to_string();
+        let sanitized = InferenceProviderPool::sanitize_error_message(&raw_wrapped_4xx);
+        assert!(
+            sanitized.contains("[URL_REDACTED]"),
+            "sanitize_error_message should redact URLs (got: {sanitized})"
+        );
+        assert_eq!(
+            InferenceProviderPool::classify_retry_decision(&CompletionError::HttpError {
+                status_code: 500,
+                message: sanitized,
+                is_external: false,
+            }),
+            "retryable_http_5xx",
+            "sanitized aiohttp-wrapper must NOT match the regex — the production \
+             flow avoids this by classifying before sanitize_completion_error",
         );
     }
 

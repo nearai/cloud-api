@@ -48,7 +48,8 @@ pub struct ChatCompletionRequest {
     #[serde(default = "default_n")]
     pub n: Option<i64>,
     pub stream: Option<bool>,
-    pub stop: Option<Vec<String>>,
+    /// OpenAI `stop` accepts either a single string or an array of strings.
+    pub stop: Option<StopSequences>,
     pub presence_penalty: Option<f32>,
     pub frequency_penalty: Option<f32>,
 
@@ -204,7 +205,7 @@ impl CompletionPrompt {
 }
 
 /// OpenAI `stop`: either a single string or an array of strings.
-#[derive(Debug, Clone, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(untagged)]
 pub enum StopSequences {
     Single(String),

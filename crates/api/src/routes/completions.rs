@@ -309,7 +309,7 @@ fn convert_chat_request_to_service(
         max_tokens: request.max_tokens,
         temperature: request.temperature,
         top_p: request.top_p,
-        stop: request.stop.clone(),
+        stop: request.stop.clone().map(|s| s.into_vec()),
         stream: request.stream,
         user_id: user_id.into(),
         n: request.n,

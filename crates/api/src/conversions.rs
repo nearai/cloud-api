@@ -96,7 +96,7 @@ impl From<ChatCompletionRequest> for ChatCompletionParams {
             max_tokens: req.max_tokens,
             temperature: req.temperature,
             top_p: req.top_p,
-            stop: req.stop,
+            stop: req.stop.map(|s| s.into_vec()),
             stream: req.stream,
             tools,
             max_completion_tokens: req.max_tokens,
@@ -828,7 +828,7 @@ mod tests {
             top_p: Some(1.0),
             n: Some(1),
             stream: None,
-            stop: Some(vec!["\\n".to_string()]),
+            stop: Some(crate::models::StopSequences::Many(vec!["\\n".to_string()])),
             presence_penalty: None,
             frequency_penalty: None,
             extra: HashMap::new(),
@@ -840,5 +840,20 @@ mod tests {
         assert_eq!(domain_params.max_tokens, Some(100));
         assert_eq!(domain_params.temperature, Some(0.7));
         assert_eq!(domain_params.stop, Some(vec!["\\n".to_string()]));
+    }
+
+    #[test]
+    fn test_chat_completion_stop_accepts_string_or_array() {
+        // OpenAI `stop` may be a bare string; it must convert to a single-element Vec.
+        let single: ChatCompletionRequest =
+            serde_json::from_str(r#"{"model":"m","messages":[],"stop":"STOP"}"#).unwrap();
+        let domain: ChatCompletionParams = single.into();
+        assert_eq!(domain.stop, Some(vec!["STOP".to_string()]));
+
+        // Array form keeps working.
+        let many: ChatCompletionRequest =
+            serde_json::from_str(r#"{"model":"m","messages":[],"stop":["a","b"]}"#).unwrap();
+        let domain: ChatCompletionParams = many.into();
+        assert_eq!(domain.stop, Some(vec!["a".to_string(), "b".to_string()]));
     }
 }

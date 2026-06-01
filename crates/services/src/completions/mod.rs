@@ -782,6 +782,33 @@ impl CompletionServiceImpl {
                         message: "The request timed out waiting for the model to respond. Please try again.".to_string(),
                     }
                 }
+                // 5xx whose body shows the engine failed to FETCH or DECODE a
+                // client-supplied image/video (e.g. unreachable URL, non-image
+                // bytes, "cannot identify image file"). These are permanent
+                // bad-input errors — the same payload can't succeed on retry —
+                // so surface a 400 instead of a 502. This gives the client a
+                // correct, non-retryable signal and mirrors the pool's
+                // `non_retryable_client_media_error` retry decision (#688).
+                // Use a generic message: the provider body carries the user's
+                // URL and internal paths, which must not be echoed/logged.
+                (500..=599, _)
+                    if crate::inference_provider_pool::InferenceProviderPool::is_client_media_fetch_error(
+                        message,
+                    ) =>
+                {
+                    tracing::warn!(
+                        %organization_id,
+                        model,
+                        status_code,
+                        "Client media fetch/decode error during {}",
+                        operation
+                    );
+                    ports::CompletionError::InvalidParams(
+                        "One or more image or video inputs could not be fetched or decoded. \
+                         Ensure each URL is reachable and points to a valid image."
+                            .to_string(),
+                    )
+                }
                 // 5xx = provider error, use generic message
                 (500..=599, _) => {
                     tracing::error!(
@@ -2639,6 +2666,41 @@ mod tests {
                 assert_eq!(status_code, 502, "External 500 should map to 502");
             }
             other => panic!("Expected ProviderError, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_map_provider_error_500_client_media_becomes_invalid_params() {
+        // Engines return 500 when they can't fetch/decode a client-supplied
+        // image. That's a permanent bad-input error and must surface as a
+        // non-retryable 400, not a 502, and must not echo the provider body
+        // (which carries the user's URL / internal paths).
+        for msg in [
+            "Internal server error: An exception occurred while loading IMAGE data at index 0: \
+             Error while loading data ImageData(url='https://x/y.jpg'): cannot identify image file <_io.BytesIO>",
+            "Error while loading data: failed to open input buffer",
+        ] {
+            let error = inference_providers::CompletionError::HttpError {
+                status_code: 500,
+                message: msg.to_string(),
+                is_external: false,
+            };
+            let result = CompletionServiceImpl::map_provider_error(
+                "test-model",
+                &error,
+                "test",
+                Uuid::nil(),
+            );
+            match result {
+                ports::CompletionError::InvalidParams(out) => {
+                    assert!(
+                        !out.contains("BytesIO") && !out.contains("http"),
+                        "must not echo provider body, got: {}",
+                        out
+                    );
+                }
+                other => panic!("client media 500 should map to InvalidParams, got {:?}", other),
+            }
         }
     }
 

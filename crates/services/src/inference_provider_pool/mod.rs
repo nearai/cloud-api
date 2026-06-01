@@ -1382,7 +1382,7 @@ impl InferenceProviderPool {
     /// error — retrying the same payload re-runs the same fetch and produces
     /// the same failure. Treat these as non-retryable so one broken URL
     /// from a client doesn't get amplified into 4x backend work.
-    fn is_client_media_fetch_error(message: &str) -> bool {
+    pub(crate) fn is_client_media_fetch_error(message: &str) -> bool {
         // ASCII-only lowercase: the markers are all ASCII and this path can
         // run at high volume during a malformed-media incident.
         let lower = message.to_ascii_lowercase();

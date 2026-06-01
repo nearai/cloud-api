@@ -879,6 +879,7 @@ pub fn build_app_with_config(
             analytics_service,
             models_service: domain_services.models_service.clone(),
             completion_service: domain_services.completion_service.clone(),
+            organization_service: domain_services.organization_service.clone(),
             usage_service: domain_services.usage_service.clone(),
         },
     );
@@ -1538,6 +1539,8 @@ pub struct AdminRouteServices {
     pub analytics_service: Arc<services::admin::AnalyticsService>,
     pub models_service: Arc<services::models::ModelsServiceImpl>,
     pub completion_service: Arc<services::CompletionServiceImpl>,
+    pub organization_service:
+        Arc<dyn services::organization::OrganizationServiceTrait + Send + Sync>,
     pub usage_service: Arc<dyn services::usage::UsageServiceTrait + Send + Sync>,
 }
 
@@ -1553,7 +1556,8 @@ pub fn build_admin_routes(
         delete_model, deprecate_model, get_admin_organization_balance, get_model_history,
         get_organization_concurrent_limit, get_organization_limits_history,
         get_organization_metrics, get_organization_timeseries, get_platform_metrics,
-        list_admin_access_tokens, list_models as admin_list_models, list_organizations, list_users,
+        list_admin_access_tokens, list_invitation_email_deliveries,
+        list_models as admin_list_models, list_organizations, list_users, resend_invitation_email,
         update_organization_concurrent_limit, update_organization_limits, update_service,
         AdminAppState,
     };
@@ -1585,6 +1589,7 @@ pub fn build_admin_routes(
     let admin_app_state = AdminAppState {
         admin_service,
         analytics_service: services.analytics_service,
+        organization_service: services.organization_service,
         auth_service: auth_state_middleware.auth_service.clone(),
         usage_service: services.usage_service,
         config,
@@ -1639,6 +1644,14 @@ pub fn build_admin_routes(
         .route(
             "/admin/platform/metrics",
             axum::routing::get(get_platform_metrics),
+        )
+        .route(
+            "/admin/invitation-email-deliveries",
+            axum::routing::get(list_invitation_email_deliveries),
+        )
+        .route(
+            "/admin/invitation-email-deliveries/{invitation_id}/resend",
+            axum::routing::post(resend_invitation_email),
         )
         .route("/admin/users", axum::routing::get(list_users))
         .route(

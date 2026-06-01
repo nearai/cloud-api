@@ -1,14 +1,18 @@
+use crate::conversions::{
+    api_invitation_email_status_to_services, api_invitation_status_to_services,
+    services_invitation_email_delivery_to_api, services_invitation_resend_result_to_api,
+};
 use crate::middleware::AdminUser;
 use crate::models::{
-    AdminAccessTokenResponse, AdminModelListResponse, AdminModelWithPricing,
-    AdminOrganizationResponse, AdminServiceResponse, AdminUserOrganizationDetails,
-    AdminUserResponse, BatchUpdateModelApiRequest, CreateAdminAccessTokenRequest,
-    CreateServiceRequest, CreditType, DecimalPrice, DecimalPriceRequest,
-    DeleteAdminAccessTokenRequest, DeleteModelRequest, DeprecateModelRequest,
+    AdminAccessTokenResponse, AdminInvitationEmailResendResultResponse, AdminModelListResponse,
+    AdminModelWithPricing, AdminOrganizationResponse, AdminServiceResponse,
+    AdminUserOrganizationDetails, AdminUserResponse, BatchUpdateModelApiRequest,
+    CreateAdminAccessTokenRequest, CreateServiceRequest, CreditType, DecimalPrice,
+    DecimalPriceRequest, DeleteAdminAccessTokenRequest, DeleteModelRequest, DeprecateModelRequest,
     DeprecateModelResponse, ErrorResponse, GetOrganizationConcurrentLimitResponse,
-    ListOrganizationsAdminResponse, ListUsersResponse, ModelArchitecture, ModelHistoryEntry,
-    ModelHistoryResponse, ModelMetadata, ModelWithPricing, OrgLimitsHistoryEntry,
-    OrgLimitsHistoryResponse, OrganizationUsage, SpendLimit,
+    ListAdminInvitationEmailDeliveriesResponse, ListOrganizationsAdminResponse, ListUsersResponse,
+    ModelArchitecture, ModelHistoryEntry, ModelHistoryResponse, ModelMetadata, ModelWithPricing,
+    OrgLimitsHistoryEntry, OrgLimitsHistoryResponse, OrganizationUsage, SpendLimit,
     UpdateOrganizationConcurrentLimitRequest, UpdateOrganizationConcurrentLimitResponse,
     UpdateOrganizationLimitsRequest, UpdateOrganizationLimitsResponse, UpdateServiceRequest,
 };
@@ -21,18 +25,21 @@ use axum::{
     response::Json as ResponseJson,
     Extension,
 };
-use chrono::{Duration, Utc};
+use chrono::{DateTime, Duration, Utc};
 use config::ApiConfig;
 use services::admin::{AdminService, AnalyticsService, UpdateModelAdminRequest};
 use services::auth::AuthServiceTrait;
 use services::usage::UsageServiceTrait;
 use std::sync::Arc;
 use tracing::{debug, error};
+use uuid::Uuid;
 
 #[derive(Clone)]
 pub struct AdminAppState {
     pub admin_service: Arc<dyn AdminService + Send + Sync>,
     pub analytics_service: Arc<AnalyticsService>,
+    pub organization_service:
+        Arc<dyn services::organization::OrganizationServiceTrait + Send + Sync>,
     pub auth_service: Arc<dyn AuthServiceTrait>,
     pub usage_service: Arc<dyn UsageServiceTrait + Send + Sync>,
     pub config: Arc<ApiConfig>,
@@ -1430,6 +1437,157 @@ pub async fn list_organizations(
     Ok(ResponseJson(response))
 }
 
+/// List organization invitation email deliveries (Admin only)
+///
+/// Returns delivery metadata for organization invitation emails without exposing invitation tokens.
+#[utoipa::path(
+    get,
+    path = "/v1/admin/invitation-email-deliveries",
+    tag = "Admin",
+    params(
+        ("limit" = Option<i64>, Query, description = "Maximum number of deliveries to return (default: 100)"),
+        ("offset" = Option<i64>, Query, description = "Number of deliveries to skip (default: 0)"),
+        ("organization_id" = Option<Uuid>, Query, description = "Filter by organization ID"),
+        ("recipient_email" = Option<String>, Query, description = "Case-insensitive recipient email substring filter"),
+        ("email_status" = Option<crate::models::InvitationEmailStatus>, Query, description = "Filter by email delivery status"),
+        ("invitation_status" = Option<crate::models::InvitationStatus>, Query, description = "Filter by invitation status"),
+        ("created_after" = Option<DateTime<Utc>>, Query, description = "Only invitations created at or after this timestamp"),
+        ("created_before" = Option<DateTime<Utc>>, Query, description = "Only invitations created at or before this timestamp")
+    ),
+    responses(
+        (status = 200, description = "Invitation email deliveries retrieved successfully", body = ListAdminInvitationEmailDeliveriesResponse),
+        (status = 400, description = "Invalid request", body = ErrorResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    ),
+    security(
+        ("session_token" = [])
+    )
+)]
+pub async fn list_invitation_email_deliveries(
+    State(app_state): State<AdminAppState>,
+    Extension(_admin_user): Extension<AdminUser>,
+    axum::extract::Query(params): axum::extract::Query<ListInvitationEmailDeliveriesQueryParams>,
+) -> Result<
+    ResponseJson<ListAdminInvitationEmailDeliveriesResponse>,
+    (StatusCode, ResponseJson<ErrorResponse>),
+> {
+    crate::routes::common::validate_limit_offset(params.limit, params.offset)?;
+
+    debug!(
+        "List invitation email deliveries request with limit={}, offset={}",
+        params.limit, params.offset
+    );
+
+    let filters = services::organization::InvitationEmailDeliveryFilters {
+        organization_id: params
+            .organization_id
+            .map(services::organization::OrganizationId),
+        recipient_email: params.recipient_email,
+        email_status: params
+            .email_status
+            .map(api_invitation_email_status_to_services),
+        invitation_status: params
+            .invitation_status
+            .map(api_invitation_status_to_services),
+        created_after: params.created_after,
+        created_before: params.created_before,
+    };
+
+    let (deliveries, total) = app_state
+        .organization_service
+        .list_invitation_email_deliveries(filters, params.limit, params.offset)
+        .await
+        .map_err(|e| match e {
+            services::organization::OrganizationError::InvalidParams(msg) => (
+                StatusCode::BAD_REQUEST,
+                ResponseJson(ErrorResponse::new(msg, "invalid_request".to_string())),
+            ),
+            _ => {
+                error!("Failed to list invitation email deliveries: {:?}", e);
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    ResponseJson(ErrorResponse::new(
+                        "Failed to retrieve invitation email deliveries".to_string(),
+                        "internal_server_error".to_string(),
+                    )),
+                )
+            }
+        })?;
+
+    let response = ListAdminInvitationEmailDeliveriesResponse {
+        deliveries: deliveries
+            .into_iter()
+            .map(services_invitation_email_delivery_to_api)
+            .collect(),
+        total,
+        limit: params.limit,
+        offset: params.offset,
+    };
+
+    Ok(ResponseJson(response))
+}
+
+/// Resend a single organization invitation email (Admin only)
+#[utoipa::path(
+    post,
+    path = "/v1/admin/invitation-email-deliveries/{invitation_id}/resend",
+    tag = "Admin",
+    params(
+        ("invitation_id" = Uuid, Path, description = "Invitation ID")
+    ),
+    responses(
+        (status = 200, description = "Invitation email resend attempted", body = AdminInvitationEmailResendResultResponse),
+        (status = 400, description = "Invitation is not pending or has expired", body = ErrorResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 404, description = "Invitation not found", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    ),
+    security(
+        ("session_token" = [])
+    )
+)]
+pub async fn resend_invitation_email(
+    State(app_state): State<AdminAppState>,
+    Extension(_admin_user): Extension<AdminUser>,
+    Path(invitation_id): Path<Uuid>,
+) -> Result<
+    ResponseJson<AdminInvitationEmailResendResultResponse>,
+    (StatusCode, ResponseJson<ErrorResponse>),
+> {
+    debug!("Resend invitation email request for {}", invitation_id);
+
+    app_state
+        .organization_service
+        .resend_invitation_email(invitation_id)
+        .await
+        .map(services_invitation_resend_result_to_api)
+        .map(ResponseJson)
+        .map_err(|e| match e {
+            services::organization::OrganizationError::NotFound => (
+                StatusCode::NOT_FOUND,
+                ResponseJson(ErrorResponse::new(
+                    "Invitation not found".to_string(),
+                    "not_found".to_string(),
+                )),
+            ),
+            services::organization::OrganizationError::InvalidParams(msg) => (
+                StatusCode::BAD_REQUEST,
+                ResponseJson(ErrorResponse::new(msg, "invalid_request".to_string())),
+            ),
+            _ => {
+                error!("Failed to resend invitation email: {:?}", e);
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    ResponseJson(ErrorResponse::new(
+                        "Failed to resend invitation email".to_string(),
+                        "internal_server_error".to_string(),
+                    )),
+                )
+            }
+        })
+}
+
 /// Create platform service (Admin only)
 #[utoipa::path(
     post,
@@ -1804,6 +1962,20 @@ pub struct ListOrganizationsQueryParams {
     pub limit: i64,
     #[serde(default)]
     pub offset: i64,
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct ListInvitationEmailDeliveriesQueryParams {
+    #[serde(default = "crate::routes::common::default_limit")]
+    pub limit: i64,
+    #[serde(default)]
+    pub offset: i64,
+    pub organization_id: Option<Uuid>,
+    pub recipient_email: Option<String>,
+    pub email_status: Option<crate::models::InvitationEmailStatus>,
+    pub invitation_status: Option<crate::models::InvitationStatus>,
+    pub created_after: Option<DateTime<Utc>>,
+    pub created_before: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, serde::Deserialize)]

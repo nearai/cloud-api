@@ -624,6 +624,44 @@ pub fn services_invitation_email_status_to_api(
     }
 }
 
+pub fn api_invitation_status_to_services(
+    status: crate::models::InvitationStatus,
+) -> services::organization::InvitationStatus {
+    match status {
+        crate::models::InvitationStatus::Pending => {
+            services::organization::InvitationStatus::Pending
+        }
+        crate::models::InvitationStatus::Accepted => {
+            services::organization::InvitationStatus::Accepted
+        }
+        crate::models::InvitationStatus::Declined => {
+            services::organization::InvitationStatus::Declined
+        }
+        crate::models::InvitationStatus::Expired => {
+            services::organization::InvitationStatus::Expired
+        }
+    }
+}
+
+pub fn api_invitation_email_status_to_services(
+    status: crate::models::InvitationEmailStatus,
+) -> services::organization::InvitationEmailStatus {
+    match status {
+        crate::models::InvitationEmailStatus::NotAttempted => {
+            services::organization::InvitationEmailStatus::NotAttempted
+        }
+        crate::models::InvitationEmailStatus::Sent => {
+            services::organization::InvitationEmailStatus::Sent
+        }
+        crate::models::InvitationEmailStatus::Failed => {
+            services::organization::InvitationEmailStatus::Failed
+        }
+        crate::models::InvitationEmailStatus::Skipped => {
+            services::organization::InvitationEmailStatus::Skipped
+        }
+    }
+}
+
 /// Convert services OrganizationInvitation to API OrganizationInvitationResponse
 pub fn services_invitation_to_api(
     invitation: services::organization::OrganizationInvitation,
@@ -656,6 +694,47 @@ pub fn services_invitation_to_api_with_org(
     }
 }
 
+pub fn services_invitation_email_delivery_to_api(
+    delivery: services::organization::OrganizationInvitationEmailDelivery,
+) -> crate::models::AdminInvitationEmailDeliveryResponse {
+    let invitation = delivery.invitation;
+
+    crate::models::AdminInvitationEmailDeliveryResponse {
+        organization_id: invitation.organization_id.0.to_string(),
+        organization_name: delivery.organization_name,
+        invitation_id: invitation.id.to_string(),
+        recipient_email: invitation.email,
+        role: services_role_to_api_role(invitation.role),
+        invitation_status: services_invitation_status_to_api(invitation.status),
+        email_status: services_invitation_email_status_to_api(invitation.email_status),
+        email_sent_at: invitation.email_sent_at,
+        email_last_error: invitation.email_last_error,
+        email_message_id: invitation.email_message_id,
+        invited_by_user_id: invitation.invited_by_user_id.0.to_string(),
+        invited_by_email: delivery.invited_by_email,
+        invited_by_display_name: delivery.invited_by_display_name,
+        created_at: invitation.created_at,
+        expires_at: invitation.expires_at,
+        responded_at: invitation.responded_at,
+    }
+}
+
+pub fn services_invitation_resend_result_to_api(
+    result: services::organization::InvitationEmailResendResult,
+) -> crate::models::AdminInvitationEmailResendResultResponse {
+    crate::models::AdminInvitationEmailResendResultResponse {
+        invitation_id: result.invitation_id.to_string(),
+        recipient_email: result.recipient_email,
+        success: result.success,
+        email_sent: result.email_sent,
+        email_status: services_invitation_email_status_to_api(result.email_status),
+        email_sent_at: result.email_sent_at,
+        email_message_id: result.email_message_id,
+        email_last_error: result.email_last_error,
+        error: result.error,
+    }
+}
+
 /// Convert database::User to AdminUserResponse (for owners/admins only)  
 pub fn db_user_to_admin_user(user: &database::User) -> AdminUserResponse {
     AdminUserResponse {
@@ -667,6 +746,8 @@ pub fn db_user_to_admin_user(user: &database::User) -> AdminUserResponse {
         created_at: user.created_at,
         last_login_at: user.last_login_at,
         is_active: user.is_active,
+        auth_provider: user.auth_provider.clone(),
+        provider_user_id: user.provider_user_id.clone(),
         organizations: None,
     }
 }

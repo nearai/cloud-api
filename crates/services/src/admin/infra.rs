@@ -98,13 +98,23 @@ impl InfraService {
             }
             Err(e) => {
                 tracing::warn!("infra inventory fetch failed: {e}");
-                // Serve last-known data marked stale, else a zero fallback.
-                if let Some(cached) = self.cache.read().await.as_ref() {
-                    let mut summary = cached.summary.clone();
-                    summary.stale = true;
-                    return summary;
-                }
-                self.summarize(Vec::new(), true)
+                // Serve last-known data marked stale, else a zero fallback — and
+                // re-cache it with a fresh timestamp so a down endpoint isn't retried
+                // (a 5s fetch) on every request; it degrades for the TTL window.
+                let mut guard = self.cache.write().await;
+                let fallback = match guard.as_ref() {
+                    Some(cached) => {
+                        let mut summary = cached.summary.clone();
+                        summary.stale = true;
+                        summary
+                    }
+                    None => self.summarize(Vec::new(), true),
+                };
+                *guard = Some(Cached {
+                    summary: fallback.clone(),
+                    at: Instant::now(),
+                });
+                fallback
             }
         }
     }

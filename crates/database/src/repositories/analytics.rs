@@ -233,8 +233,10 @@ impl AnalyticsRepository for PgAnalyticsRepository {
                         WHERE created_at >= $1 AND created_at < $2)::bigint as new_users,
                     (SELECT COUNT(*) FROM organizations
                         WHERE created_at >= $1 AND created_at < $2)::bigint as new_organizations,
-                    (SELECT COUNT(DISTINCT organization_id) FROM organization_limits_history
-                        WHERE credit_type = 'payment' AND effective_until IS NULL)::bigint as paying_organizations
+                    (SELECT COUNT(DISTINCT olh.organization_id)
+                        FROM organization_limits_history olh
+                        JOIN organizations o ON o.id = olh.organization_id AND o.is_active = true
+                        WHERE olh.credit_type = 'payment' AND olh.effective_until IS NULL)::bigint as paying_organizations
                 "#,
                 &[&start, &end],
             )
@@ -256,7 +258,7 @@ impl AnalyticsRepository for PgAnalyticsRepository {
                 SELECT
                     COUNT(*)::bigint as requests,
                     COALESCE(SUM(ul.total_cost), 0)::bigint as revenue_nano,
-                    COALESCE(SUM(ul.input_tokens + ul.output_tokens), 0)::bigint as total_tokens,
+                    (COALESCE(SUM(ul.input_tokens), 0) + COALESCE(SUM(ul.output_tokens), 0))::bigint as total_tokens,
                     COALESCE(SUM(ul.cache_read_tokens), 0)::bigint as cache_read_tokens,
                     COUNT(DISTINCT ul.organization_id)::bigint as active_organizations,
                     COALESCE(SUM(ul.total_cost) FILTER (WHERE COALESCE(m.verifiable, false)), 0)::bigint as verifiable_nano,
@@ -474,7 +476,7 @@ impl AnalyticsRepository for PgAnalyticsRepository {
             SELECT
                 DATE_TRUNC('{date_trunc}', ul.created_at)::text as bucket,
                 COUNT(*)::bigint as requests,
-                COALESCE(SUM(ul.input_tokens + ul.output_tokens), 0)::bigint as tokens,
+                (COALESCE(SUM(ul.input_tokens), 0) + COALESCE(SUM(ul.output_tokens), 0))::bigint as tokens,
                 COALESCE(SUM(ul.total_cost), 0)::bigint as cost_nano,
                 COALESCE(SUM(ul.total_cost) FILTER (WHERE COALESCE(m.verifiable, false)), 0)::bigint as verifiable_nano,
                 COALESCE(SUM(ul.total_cost) FILTER (WHERE NOT COALESCE(m.verifiable, false)), 0)::bigint as external_nano,
@@ -579,17 +581,19 @@ impl AnalyticsRepository for PgAnalyticsRepository {
             .map_err(|e| RepositoryError::PoolError(e.into()))?;
 
         // Active credit LIMITS (caps) by type + paying/granted org counts. These are
-        // ceilings from organization_limits_history, NOT payments/cash received.
+        // ceilings from organization_limits_history, NOT payments/cash received. Joined to
+        // organizations with is_active = true so soft-deleted orgs aren't counted.
         let limits_row = client
             .query_one(
                 r#"
                 SELECT
-                    COALESCE(SUM(spend_limit) FILTER (WHERE credit_type = 'payment'), 0)::bigint as paid_limit,
-                    COALESCE(SUM(spend_limit) FILTER (WHERE credit_type = 'grant'), 0)::bigint as grant_limit,
-                    COUNT(DISTINCT organization_id) FILTER (WHERE credit_type = 'payment')::bigint as paying_orgs,
-                    COUNT(DISTINCT organization_id) FILTER (WHERE credit_type = 'grant')::bigint as granted_orgs
-                FROM organization_limits_history
-                WHERE effective_until IS NULL
+                    COALESCE(SUM(olh.spend_limit) FILTER (WHERE olh.credit_type = 'payment'), 0)::bigint as paid_limit,
+                    COALESCE(SUM(olh.spend_limit) FILTER (WHERE olh.credit_type = 'grant'), 0)::bigint as grant_limit,
+                    COUNT(DISTINCT olh.organization_id) FILTER (WHERE olh.credit_type = 'payment')::bigint as paying_orgs,
+                    COUNT(DISTINCT olh.organization_id) FILTER (WHERE olh.credit_type = 'grant')::bigint as granted_orgs
+                FROM organization_limits_history olh
+                JOIN organizations o ON o.id = olh.organization_id AND o.is_active = true
+                WHERE olh.effective_until IS NULL
                 "#,
                 &[],
             )
@@ -620,17 +624,18 @@ impl AnalyticsRepository for PgAnalyticsRepository {
         let inference_consumed_usd = nano_to_usd(consumed_row.get::<_, i64>(1));
         let service_consumed_usd = nano_to_usd(consumed_row.get::<_, i64>(2));
 
-        // Active paid credit limit broken down by funding source.
+        // Active paid credit limit broken down by funding source (active orgs only).
         let source_rows = client
             .query(
                 r#"
                 SELECT
-                    COALESCE(source, 'unknown') as source,
-                    COALESCE(SUM(spend_limit) FILTER (WHERE credit_type = 'payment'), 0)::bigint as paid_limit,
-                    COUNT(DISTINCT organization_id)::bigint as org_count
-                FROM organization_limits_history
-                WHERE effective_until IS NULL
-                GROUP BY source
+                    COALESCE(olh.source, 'unknown') as source,
+                    COALESCE(SUM(olh.spend_limit) FILTER (WHERE olh.credit_type = 'payment'), 0)::bigint as paid_limit,
+                    COUNT(DISTINCT olh.organization_id)::bigint as org_count
+                FROM organization_limits_history olh
+                JOIN organizations o ON o.id = olh.organization_id AND o.is_active = true
+                WHERE olh.effective_until IS NULL
+                GROUP BY olh.source
                 ORDER BY paid_limit DESC
                 "#,
                 &[],
@@ -712,7 +717,7 @@ impl AnalyticsRepository for PgAnalyticsRepository {
                 ul.model_name,
                 COALESCE(SUM(ul.total_cost), 0)::bigint as revenue_nano,
                 COUNT(*)::bigint as requests,
-                COALESCE(SUM(ul.input_tokens + ul.output_tokens), 0)::bigint as tokens,
+                (COALESCE(SUM(ul.input_tokens), 0) + COALESCE(SUM(ul.output_tokens), 0))::bigint as tokens,
                 COUNT(DISTINCT ul.organization_id)::bigint as unique_orgs,
                 BOOL_OR(COALESCE(m.verifiable, false)) as verifiable,
                 MAX(m.provider_type) as provider_type,
@@ -799,7 +804,7 @@ impl AnalyticsRepository for PgAnalyticsRepository {
                 COALESCE(SUM(ul.total_cost) FILTER (WHERE COALESCE(m.verifiable, false)), 0)::bigint as verifiable_nano,
                 COALESCE(SUM(ul.total_cost) FILTER (WHERE NOT COALESCE(m.verifiable, false)), 0)::bigint as external_nano,
                 COUNT(ul.id)::bigint as requests,
-                COALESCE(SUM(ul.input_tokens + ul.output_tokens), 0)::bigint as tokens,
+                (COALESCE(SUM(ul.input_tokens), 0) + COALESCE(SUM(ul.output_tokens), 0))::bigint as tokens,
                 COUNT(DISTINCT ul.model_name)::bigint as models_used,
                 BOOL_OR(p.organization_id IS NOT NULL) as is_paying,
                 MAX(ul.created_at) as last_usage_at

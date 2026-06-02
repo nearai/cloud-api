@@ -1226,14 +1226,17 @@ impl InferenceProvider for VLlmProvider {
         // cancels the whole store if it runs long.
         let mut last_error = None;
         for attempt in 0..=SIGNATURE_FETCH_BACKOFFS_MS.len() {
-            // Rotation-SNI first. When a rotation pin exists the signature was
-            // produced on that *specific* backend, so its response is the only
-            // authoritative one — the bucket/general clients can't have the
-            // signature and would just 404. A 404 here is the signing-race
-            // signal (retry); any non-404 status or transport error (e.g. a TLS
-            // SPKI/attestation mismatch) is definitive, so fail fast and surface
-            // that error instead of masking it with a bucket/general 404.
-            let mut rotation_failed_definitively = false;
+            // For a rotation-pinned chat the signature was produced on that
+            // *specific* backend, so its response is the ONLY authoritative one:
+            // the bucket/general clients can't have the signature, and probing
+            // them risks a non-authoritative 5xx/transport error suppressing a
+            // retryable rotation 404 (the signature would then be lost). So when
+            // a rotation pin exists we talk only to it — a 404 is the
+            // signing-race signal (retry), and any non-404 status or transport
+            // error (e.g. a TLS SPKI/attestation mismatch) is definitive and
+            // fails fast. Without a pin we walk bucket → general and treat an
+            // all-404 sweep as the race signal.
+            let retryable;
             if let Some((index, rotation_url, client)) = &rotation_target {
                 let index = *index;
                 match client
@@ -1258,7 +1261,8 @@ impl InferenceProvider for VLlmProvider {
                         last_error = Some(format!(
                             "Rotation-SNI signature fetch failed (HTTP {status}): {error_text}"
                         ));
-                        rotation_failed_definitively = status != 404;
+                        // 404 == signing race on the authoritative backend.
+                        retryable = status == 404;
                         tracing::debug!(
                             index,
                             status,
@@ -1270,83 +1274,74 @@ impl InferenceProvider for VLlmProvider {
                         last_error = Some(format!(
                             "Rotation-SNI signature fetch transport error: {message}"
                         ));
-                        rotation_failed_definitively = true;
+                        retryable = false;
                         tracing::debug!(index, error = %message, "Rotation-SNI signature fetch errored");
                     }
                 }
-            }
-
-            // A definitive failure on the rotation backend can't be recovered
-            // by the bucket/general clients (the signature isn't there), so stop
-            // now and return the rotation error.
-            if rotation_failed_definitively {
-                break;
-            }
-
-            // Bucket client, then general LB client.
-            let client_count = clients_to_try.len();
-            let mut all_not_found = false;
-            for (idx, &client) in clients_to_try.iter().enumerate() {
-                let response = match client
-                    .get(&canonical_url)
-                    .headers(headers.clone())
-                    .timeout(timeout)
-                    .send()
-                    .await
-                {
-                    Ok(response) => response,
-                    // A transport error on a non-final client (e.g. a stale
-                    // bucket connection to a dead backend) shouldn't abort the
-                    // whole fetch — fall through to the next client, which is
-                    // exactly what it's there for. Only the last client's
-                    // transport error is fatal. Transport errors never arm the
-                    // 404 retry, so a definitive TLS/attestation mismatch still
-                    // fails without retrying.
-                    Err(e) => {
-                        let message = format_error_chain(&e);
-                        if idx + 1 < client_count {
-                            tracing::debug!(
-                                error = %message,
-                                "Signature fetch transport error; trying next client"
-                            );
-                            last_error = Some(message);
-                            continue;
-                        }
-                        return Err(CompletionError::CompletionError(message));
-                    }
-                };
-
-                if response.status().is_success() {
-                    let signature = response
-                        .json()
+            } else {
+                // Bucket client, then general LB client.
+                let client_count = clients_to_try.len();
+                let mut all_clients_404 = false;
+                for (idx, &client) in clients_to_try.iter().enumerate() {
+                    let response = match client
+                        .get(&canonical_url)
+                        .headers(headers.clone())
+                        .timeout(timeout)
+                        .send()
                         .await
-                        .map_err(|e| CompletionError::CompletionError(format_error_chain(&e)))?;
-                    return Ok(signature);
-                }
+                    {
+                        Ok(response) => response,
+                        // A transport error on a non-final client (e.g. a stale
+                        // bucket connection to a dead backend) shouldn't abort
+                        // the whole fetch — fall through to the next client.
+                        // Only the last client's transport error is fatal, and
+                        // transport errors never arm the 404 retry.
+                        Err(e) => {
+                            let message = format_error_chain(&e);
+                            if idx + 1 < client_count {
+                                tracing::debug!(
+                                    error = %message,
+                                    "Signature fetch transport error; trying next client"
+                                );
+                                last_error = Some(message);
+                                continue;
+                            }
+                            return Err(CompletionError::CompletionError(message));
+                        }
+                    };
 
-                let status = response.status().as_u16();
-                let error_text = response
-                    .text()
-                    .await
-                    .unwrap_or_else(|e| format!("Failed to read error response body: {e}"));
-                last_error = Some(format!(
-                    "Signature fetch failed (HTTP {status}): {error_text}"
-                ));
+                    if response.status().is_success() {
+                        let signature = response.json().await.map_err(|e| {
+                            CompletionError::CompletionError(format_error_chain(&e))
+                        })?;
+                        return Ok(signature);
+                    }
 
-                // 404 == signature not present on this backend; try the next
-                // client. Any other status is definitive.
-                if status == 404 {
-                    all_not_found = true;
-                } else {
-                    all_not_found = false;
-                    break;
+                    let status = response.status().as_u16();
+                    let error_text = response
+                        .text()
+                        .await
+                        .unwrap_or_else(|e| format!("Failed to read error response body: {e}"));
+                    last_error = Some(format!(
+                        "Signature fetch failed (HTTP {status}): {error_text}"
+                    ));
+
+                    // 404 == signature not present on this backend; try the next
+                    // client. Any other status is definitive.
+                    if status == 404 {
+                        all_clients_404 = true;
+                    } else {
+                        all_clients_404 = false;
+                        break;
+                    }
                 }
+                retryable = all_clients_404;
             }
 
-            // Only a clean sweep of 404s is a (likely transient) signing-race
-            // miss worth retrying. Back off and re-fetch — unless retries are
-            // exhausted or the failure was definitive.
-            if all_not_found {
+            // A 404 (signing race) is the only retryable outcome. Back off and
+            // re-fetch — unless retries are exhausted or the failure was
+            // definitive.
+            if retryable {
                 if let Some(backoff) = signature_fetch_backoff(attempt) {
                     tracing::debug!(
                         %chat_id,

@@ -732,6 +732,14 @@ pub enum CompletionError {
     InvalidResponse(String),
     #[error("Unknown error")]
     Unknown(String),
+    /// The engine could not fetch or decode a client-supplied image/video
+    /// (unreachable URL, non-image bytes, "cannot identify image file"). This is
+    /// a permanent client-input error: it is classified here on the RAW upstream
+    /// body (before URL redaction) and carried as a typed variant so the status
+    /// mapping doesn't have to re-derive it from the sanitized message.
+    /// Non-retryable; surfaced to the client as a 400.
+    #[error("Client media fetch/decode error: {0}")]
+    ClientMediaError(String),
     /// No provider found matching the requested E2EE public key.
     /// Client should refresh their attestation report and retry.
     #[error("No provider found for encryption key: {0}")]

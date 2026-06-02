@@ -1,6 +1,6 @@
 //! E2E tests: call /v1/responses (Responses API) and verify usage is recorded,
 //! including cache_read_tokens derived from provider-side cached_tokens.
-//! Does not use the manual POST /v1/usage endpoint.
+//! Does not use the manual usage-recording endpoint (`/v1/internal/usage`).
 
 use crate::common::*;
 use serde_json::json;

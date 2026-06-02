@@ -6,9 +6,11 @@ pub struct ApiConfig {
     /// API key for authenticating with inference backends (vLLM/SGLang via inference_url)
     pub inference_api_key: Option<String>,
     /// Shared secret accepted by `POST /v1/internal/usage` from trusted
-    /// reporters (e.g. inference-proxy). When `None`, the endpoint is
-    /// disabled and returns 503. Reporters can still authenticate to the
-    /// legacy `POST /v1/usage` with an `sk-…` key while this is unset.
+    /// reporters (e.g. inference-proxy). This is the only *API endpoint* for
+    /// reporter-submitted usage (the internal inference pipeline records its
+    /// own usage directly, unaffected by this). When `None`, the
+    /// `/v1/internal/usage` endpoint is disabled and returns 503, so reporters
+    /// cannot submit usage until an operator sets the secret.
     pub internal_usage_token: Option<String>,
     pub logging: LoggingConfig,
     pub dstack_client: DstackClientConfig,
@@ -20,6 +22,7 @@ pub struct ApiConfig {
     pub cors: CorsConfig,
     pub external_providers: ExternalProvidersConfig,
     pub github_dispatch: GitHubDispatchConfig,
+    pub infra: InfraConfig,
 }
 
 impl ApiConfig {
@@ -47,7 +50,35 @@ impl ApiConfig {
             cors: CorsConfig::default(),
             external_providers: ExternalProvidersConfig::from_env(),
             github_dispatch: GitHubDispatchConfig::from_env()?,
+            infra: InfraConfig::from_env(),
         })
+    }
+}
+
+/// Configuration for the executive "Stats" dashboard's infra burn metric.
+///
+/// Both values are environment-specific and intentionally have NO hardcoded
+/// defaults — they are provided via deployment secrets/env only. When unset,
+/// the infra-summary endpoint reports no fleet data (stale).
+#[derive(Debug, Clone, Default)]
+pub struct InfraConfig {
+    /// Internal host-inventory endpoint. `None` when unset.
+    pub machines_url: Option<String>,
+    /// Flat planning cost per GPU host per month (USD). `0.0` when unset.
+    pub cost_per_host_usd_month: f64,
+}
+
+impl InfraConfig {
+    pub fn from_env() -> Self {
+        Self {
+            machines_url: env::var("INFRA_MACHINES_URL")
+                .ok()
+                .filter(|s| !s.is_empty()),
+            cost_per_host_usd_month: env::var("INFRA_COST_PER_HOST_USD_MONTH")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0.0),
+        }
     }
 }
 

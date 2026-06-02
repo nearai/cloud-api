@@ -1,30 +1,102 @@
 use crate::common::*;
 
-/// Happy-path test for POST /v1/usage with type=chat_completion.
+/// Shared service token used by every test in this module to authenticate
+/// against `POST /v1/internal/usage`.
+const INTERNAL_USAGE_TOKEN: &str = "test-internal-secret";
+
+/// Identity triple (plus the raw `sk-…` secret) for a provisioned org +
+/// workspace + API key. The internal usage endpoint trusts these as-is in
+/// the request body; `api_key` is only needed by tests that also drive the
+/// inference pipeline directly.
+struct UsageIdentity {
+    org_id: String,
+    workspace_id: String,
+    api_key_id: String,
+    api_key: String,
+}
+
+/// Spin up a test server with the internal usage endpoint enabled. The
+/// legacy `sk-…`-authenticated `POST /v1/usage` has been removed; usage is
+/// recorded exclusively through the service-token `/v1/internal/usage`
+/// path, which shares the same `record_usage_from_api` service logic.
+async fn enable_internal_usage_server() -> axum_test::TestServer {
+    setup_test_server_with_config(|c| {
+        c.internal_usage_token = Some(INTERNAL_USAGE_TOKEN.to_string());
+    })
+    .await
+}
+
+/// Provision an org with $10 credits, grab its default workspace, and mint
+/// an API key — returning the identity the internal usage body requires.
+async fn provision_identity(server: &axum_test::TestServer) -> UsageIdentity {
+    let org = setup_org_with_credits(server, 10_000_000_000i64).await;
+    let workspaces = list_workspaces(server, org.id.clone()).await;
+    let workspace_id = workspaces
+        .first()
+        .expect("org should have a default workspace")
+        .id
+        .clone();
+    let key =
+        create_api_key_in_workspace(server, workspace_id.clone(), "internal-usage".to_string())
+            .await;
+    UsageIdentity {
+        org_id: org.id,
+        workspace_id,
+        api_key_id: key.id,
+        api_key: key.key.expect("freshly created API key returns its secret"),
+    }
+}
+
+/// Merge the identity triple into a usage payload to form the
+/// `/v1/internal/usage` request body.
+fn internal_usage_body(id: &UsageIdentity, mut usage: serde_json::Value) -> serde_json::Value {
+    let obj = usage
+        .as_object_mut()
+        .expect("usage payload must be a JSON object");
+    obj.insert("organization_id".into(), serde_json::json!(id.org_id));
+    obj.insert("workspace_id".into(), serde_json::json!(id.workspace_id));
+    obj.insert("api_key_id".into(), serde_json::json!(id.api_key_id));
+    usage
+}
+
+/// POST a usage payload to `/v1/internal/usage` with the shared service token.
+async fn post_internal_usage(
+    server: &axum_test::TestServer,
+    id: &UsageIdentity,
+    usage: serde_json::Value,
+) -> axum_test::TestResponse {
+    server
+        .post("/v1/internal/usage")
+        .add_header("Authorization", format!("Bearer {INTERNAL_USAGE_TOKEN}"))
+        .json(&internal_usage_body(id, usage))
+        .await
+}
+
+/// Happy-path test for `POST /v1/internal/usage` with type=chat_completion.
 /// Sets up a model with pricing, creates an org with credits, and records usage.
 #[tokio::test]
 async fn test_record_chat_completion_usage() {
-    let server = setup_test_server().await;
+    let server = enable_internal_usage_server().await;
 
     // Setup model with known pricing (input: 1_000_000, output: 2_000_000 nano-dollars per token)
     setup_qwen_model(&server).await;
 
-    // Setup org with $10 credits and get an API key
-    let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
-    let api_key = get_api_key_for_org(&server, org.id.clone()).await;
+    // Setup org with $10 credits and an API key identity
+    let id = provision_identity(&server).await;
 
     // Record chat completion usage
-    let response = server
-        .post("/v1/usage")
-        .add_header("Authorization", format!("Bearer {api_key}"))
-        .json(&serde_json::json!({
+    let response = post_internal_usage(
+        &server,
+        &id,
+        serde_json::json!({
             "type": "chat_completion",
             "model": "Qwen/Qwen3-30B-A3B-Instruct-2507",
             "input_tokens": 100,
             "output_tokens": 50,
             "id": "test-chat-completion-001"
-        }))
-        .await;
+        }),
+    )
+    .await;
 
     assert_eq!(
         response.status_code(),
@@ -70,29 +142,29 @@ async fn test_record_chat_completion_usage() {
     );
 }
 
-/// Happy-path test for POST /v1/usage with type=image_generation.
+/// Happy-path test for `POST /v1/internal/usage` with type=image_generation.
 #[tokio::test]
 async fn test_record_image_generation_usage() {
-    let server = setup_test_server().await;
+    let server = enable_internal_usage_server().await;
 
     // Setup image model with cost_per_image pricing (40_000_000 nano-dollars per image)
     setup_qwen_image_model(&server).await;
 
-    // Setup org with $10 credits and get an API key
-    let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
-    let api_key = get_api_key_for_org(&server, org.id.clone()).await;
+    // Setup org with $10 credits and an API key identity
+    let id = provision_identity(&server).await;
 
     // Record image generation usage
-    let response = server
-        .post("/v1/usage")
-        .add_header("Authorization", format!("Bearer {api_key}"))
-        .json(&serde_json::json!({
+    let response = post_internal_usage(
+        &server,
+        &id,
+        serde_json::json!({
             "type": "image_generation",
             "model": "Qwen/Qwen-Image-2512",
             "image_count": 3,
             "id": "test-image-gen-001"
-        }))
-        .await;
+        }),
+    )
+    .await;
 
     assert_eq!(
         response.status_code(),
@@ -136,23 +208,23 @@ async fn test_record_image_generation_usage() {
 /// Test that the required `id` field is stored and does not affect the response shape.
 #[tokio::test]
 async fn test_record_usage_with_external_id() {
-    let server = setup_test_server().await;
+    let server = enable_internal_usage_server().await;
 
     setup_qwen_model(&server).await;
-    let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
-    let api_key = get_api_key_for_org(&server, org.id.clone()).await;
+    let id = provision_identity(&server).await;
 
-    let response = server
-        .post("/v1/usage")
-        .add_header("Authorization", format!("Bearer {api_key}"))
-        .json(&serde_json::json!({
+    let response = post_internal_usage(
+        &server,
+        &id,
+        serde_json::json!({
             "type": "chat_completion",
             "model": "Qwen/Qwen3-30B-A3B-Instruct-2507",
             "input_tokens": 10,
             "output_tokens": 20,
             "id": "chatcmpl-ext-12345"
-        }))
-        .await;
+        }),
+    )
+    .await;
 
     assert_eq!(
         response.status_code(),
@@ -174,22 +246,22 @@ async fn test_record_usage_with_external_id() {
 /// Test validation: model not found returns 404.
 #[tokio::test]
 async fn test_record_usage_model_not_found() {
-    let server = setup_test_server().await;
+    let server = enable_internal_usage_server().await;
 
-    let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
-    let api_key = get_api_key_for_org(&server, org.id.clone()).await;
+    let id = provision_identity(&server).await;
 
-    let response = server
-        .post("/v1/usage")
-        .add_header("Authorization", format!("Bearer {api_key}"))
-        .json(&serde_json::json!({
+    let response = post_internal_usage(
+        &server,
+        &id,
+        serde_json::json!({
             "type": "chat_completion",
             "model": "nonexistent/model",
             "input_tokens": 100,
             "output_tokens": 50,
             "id": "test-not-found-001"
-        }))
-        .await;
+        }),
+    )
+    .await;
 
     assert_eq!(response.status_code(), 404);
 }
@@ -197,52 +269,56 @@ async fn test_record_usage_model_not_found() {
 /// Test validation: zero tokens returns 400.
 #[tokio::test]
 async fn test_record_usage_zero_tokens() {
-    let server = setup_test_server().await;
+    let server = enable_internal_usage_server().await;
 
     setup_qwen_model(&server).await;
-    let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
-    let api_key = get_api_key_for_org(&server, org.id.clone()).await;
+    let id = provision_identity(&server).await;
 
-    let response = server
-        .post("/v1/usage")
-        .add_header("Authorization", format!("Bearer {api_key}"))
-        .json(&serde_json::json!({
+    let response = post_internal_usage(
+        &server,
+        &id,
+        serde_json::json!({
             "type": "chat_completion",
             "model": "Qwen/Qwen3-30B-A3B-Instruct-2507",
             "input_tokens": 0,
             "output_tokens": 0,
             "id": "test-zero-tokens-001"
-        }))
-        .await;
+        }),
+    )
+    .await;
 
     assert_eq!(response.status_code(), 400);
 }
 
-/// Test validation: missing `id` field returns 422 (deserialization error).
+/// Test validation: missing `id` field returns 400 (deserialization error).
+///
+/// Unlike the removed `POST /v1/usage` (which used the `Json` extractor and
+/// returned 422 on a bad body), `/v1/internal/usage` deserializes raw bytes
+/// itself and maps any parse failure to 400/`validation_error`.
 #[tokio::test]
 async fn test_record_usage_missing_id_field() {
-    let server = setup_test_server().await;
+    let server = enable_internal_usage_server().await;
 
     setup_qwen_model(&server).await;
-    let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
-    let api_key = get_api_key_for_org(&server, org.id.clone()).await;
+    let id = provision_identity(&server).await;
 
-    let response = server
-        .post("/v1/usage")
-        .add_header("Authorization", format!("Bearer {api_key}"))
-        .json(&serde_json::json!({
+    let response = post_internal_usage(
+        &server,
+        &id,
+        serde_json::json!({
             "type": "chat_completion",
             "model": "Qwen/Qwen3-30B-A3B-Instruct-2507",
             "input_tokens": 100,
             "output_tokens": 50
-        }))
-        .await;
+        }),
+    )
+    .await;
 
     // Missing required `id` field should fail deserialization
     assert_eq!(
         response.status_code(),
-        422,
-        "Missing id should return 422: {}",
+        400,
+        "Missing id should return 400: {}",
         response.text()
     );
 }
@@ -250,23 +326,23 @@ async fn test_record_usage_missing_id_field() {
 /// Test validation: empty `id` field returns 400.
 #[tokio::test]
 async fn test_record_usage_empty_id() {
-    let server = setup_test_server().await;
+    let server = enable_internal_usage_server().await;
 
     setup_qwen_model(&server).await;
-    let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
-    let api_key = get_api_key_for_org(&server, org.id.clone()).await;
+    let id = provision_identity(&server).await;
 
-    let response = server
-        .post("/v1/usage")
-        .add_header("Authorization", format!("Bearer {api_key}"))
-        .json(&serde_json::json!({
+    let response = post_internal_usage(
+        &server,
+        &id,
+        serde_json::json!({
             "type": "chat_completion",
             "model": "Qwen/Qwen3-30B-A3B-Instruct-2507",
             "input_tokens": 100,
             "output_tokens": 50,
             "id": ""
-        }))
-        .await;
+        }),
+    )
+    .await;
 
     assert_eq!(
         response.status_code(),
@@ -276,15 +352,15 @@ async fn test_record_usage_empty_id() {
     );
 }
 
-/// Idempotency test: calling POST /v1/usage twice with the same `id` returns
-/// the same record both times and only charges the organization once.
+/// Idempotency test: calling `POST /v1/internal/usage` twice with the same
+/// `id` returns the same record both times and only charges the organization
+/// once.
 #[tokio::test]
 async fn test_record_usage_idempotent_duplicate() {
-    let server = setup_test_server().await;
+    let server = enable_internal_usage_server().await;
 
     setup_qwen_model(&server).await;
-    let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
-    let api_key = get_api_key_for_org(&server, org.id.clone()).await;
+    let id = provision_identity(&server).await;
 
     let payload = serde_json::json!({
         "type": "chat_completion",
@@ -295,11 +371,7 @@ async fn test_record_usage_idempotent_duplicate() {
     });
 
     // First call — creates the record
-    let response1 = server
-        .post("/v1/usage")
-        .add_header("Authorization", format!("Bearer {api_key}"))
-        .json(&payload)
-        .await;
+    let response1 = post_internal_usage(&server, &id, payload.clone()).await;
 
     assert_eq!(
         response1.status_code(),
@@ -310,11 +382,7 @@ async fn test_record_usage_idempotent_duplicate() {
     let body1: serde_json::Value = response1.json();
 
     // Second call — should return existing record (no double-charge)
-    let response2 = server
-        .post("/v1/usage")
-        .add_header("Authorization", format!("Bearer {api_key}"))
-        .json(&payload)
-        .await;
+    let response2 = post_internal_usage(&server, &id, payload).await;
 
     assert_eq!(
         response2.status_code(),
@@ -334,17 +402,18 @@ async fn test_record_usage_idempotent_duplicate() {
 
     // Verify the balance was only charged once (total_cost = 200_000_000)
     // by recording a second distinct usage and checking the combined balance
-    let response3 = server
-        .post("/v1/usage")
-        .add_header("Authorization", format!("Bearer {api_key}"))
-        .json(&serde_json::json!({
+    let response3 = post_internal_usage(
+        &server,
+        &id,
+        serde_json::json!({
             "type": "chat_completion",
             "model": "Qwen/Qwen3-30B-A3B-Instruct-2507",
             "input_tokens": 10,
             "output_tokens": 5,
             "id": "idempotency-test-different-id"
-        }))
-        .await;
+        }),
+    )
+    .await;
 
     assert_eq!(response3.status_code(), 200);
 }
@@ -353,31 +422,29 @@ async fn test_record_usage_idempotent_duplicate() {
 /// without conflicting — the idempotency scope is per-organization.
 #[tokio::test]
 async fn test_record_usage_same_id_different_orgs() {
-    let server = setup_test_server().await;
+    let server = enable_internal_usage_server().await;
 
     setup_qwen_model(&server).await;
 
-    // Setup two separate orgs
-    let org1 = setup_org_with_credits(&server, 10_000_000_000i64).await;
-    let api_key1 = get_api_key_for_org(&server, org1.id.clone()).await;
-
-    let org2 = setup_org_with_credits(&server, 10_000_000_000i64).await;
-    let api_key2 = get_api_key_for_org(&server, org2.id.clone()).await;
+    // Setup two separate org identities on the same server
+    let id1 = provision_identity(&server).await;
+    let id2 = provision_identity(&server).await;
 
     let shared_id = "shared-external-id-across-orgs";
 
     // Org1 records usage with the shared id
-    let response1 = server
-        .post("/v1/usage")
-        .add_header("Authorization", format!("Bearer {api_key1}"))
-        .json(&serde_json::json!({
+    let response1 = post_internal_usage(
+        &server,
+        &id1,
+        serde_json::json!({
             "type": "chat_completion",
             "model": "Qwen/Qwen3-30B-A3B-Instruct-2507",
             "input_tokens": 100,
             "output_tokens": 50,
             "id": shared_id
-        }))
-        .await;
+        }),
+    )
+    .await;
 
     assert_eq!(
         response1.status_code(),
@@ -387,17 +454,18 @@ async fn test_record_usage_same_id_different_orgs() {
     );
 
     // Org2 records usage with the same id — should NOT conflict
-    let response2 = server
-        .post("/v1/usage")
-        .add_header("Authorization", format!("Bearer {api_key2}"))
-        .json(&serde_json::json!({
+    let response2 = post_internal_usage(
+        &server,
+        &id2,
+        serde_json::json!({
             "type": "chat_completion",
             "model": "Qwen/Qwen3-30B-A3B-Instruct-2507",
             "input_tokens": 200,
             "output_tokens": 100,
             "id": shared_id
-        }))
-        .await;
+        }),
+    )
+    .await;
 
     assert_eq!(
         response2.status_code(),
@@ -424,29 +492,29 @@ async fn test_record_usage_same_id_different_orgs() {
 /// Verifies that cache hits reduce input cost according to cache_read_cost_per_token.
 #[tokio::test]
 async fn test_record_chat_completion_usage_with_cached_tokens() {
-    let server = setup_test_server().await;
+    let server = enable_internal_usage_server().await;
 
     // Setup model with cache-read pricing:
     // input: 1_000_000, output: 2_000_000, cache_read: 500_000 nano-dollars per token
     setup_qwen_model_with_cache_pricing(&server).await;
 
-    // Setup org with $10 credits and get an API key
-    let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
-    let api_key = get_api_key_for_org(&server, org.id.clone()).await;
+    // Setup org with $10 credits and an API key identity
+    let id = provision_identity(&server).await;
 
     // Record chat completion usage with 40 cached prompt tokens out of 100
-    let response = server
-        .post("/v1/usage")
-        .add_header("Authorization", format!("Bearer {api_key}"))
-        .json(&serde_json::json!({
+    let response = post_internal_usage(
+        &server,
+        &id,
+        serde_json::json!({
             "type": "chat_completion",
             "model": "Qwen/Qwen3-30B-A3B-Instruct-2507",
             "input_tokens": 100,
             "output_tokens": 50,
             "cache_read_tokens": 40,
             "id": "test-chat-completion-with-cache"
-        }))
-        .await;
+        }),
+    )
+    .await;
 
     assert_eq!(
         response.status_code(),
@@ -477,26 +545,26 @@ async fn test_record_chat_completion_usage_with_cached_tokens() {
     assert_eq!(body["total_cost"], 180_000_000i64);
 }
 
-/// Pins the invariant that a `POST /v1/usage` submission keyed by a
-/// provider-style id (`chatcmpl-…`) does not share an `inference_id` with
-/// the internal chat-completion pipeline's record for the same provider id.
-/// Both writes must land independently in usage history; the per-org
-/// idempotency constraint on `inference_id` applies only within each source.
+/// Pins the invariant that an external usage submission (`/v1/internal/usage`)
+/// keyed by a provider-style id (`chatcmpl-…`) does not share an
+/// `inference_id` with the internal chat-completion pipeline's record for the
+/// same provider id. Both writes must land independently in usage history;
+/// the per-org idempotency constraint on `inference_id` applies only within
+/// each source.
 #[tokio::test]
 async fn test_external_usage_record_does_not_collide_with_internal_pipeline() {
     use inference_providers::StreamChunk;
 
-    let server = setup_test_server().await;
+    let server = enable_internal_usage_server().await;
     setup_qwen_model(&server).await;
-    let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
-    let api_key = get_api_key_for_org(&server, org.id.clone()).await;
+    let id = provision_identity(&server).await;
 
     // Drive a streaming completion so we can capture the provider-assigned
     // chat id from the SSE chunks (same id the internal pipeline will key
     // its billing record under after stream finalize).
     let stream_resp = server
         .post("/v1/chat/completions")
-        .add_header("Authorization", format!("Bearer {api_key}"))
+        .add_header("Authorization", format!("Bearer {}", id.api_key))
         .json(&serde_json::json!({
             "model": "Qwen/Qwen3-30B-A3B-Instruct-2507",
             "messages": [{ "role": "user", "content": "hello" }],
@@ -520,20 +588,21 @@ async fn test_external_usage_record_does_not_collide_with_internal_pipeline() {
         "mock provider should emit chatcmpl-style ids, got {provider_id:?}",
     );
 
-    // Submit POST /v1/usage carrying the same provider id. The namespace
+    // Submit external usage carrying the same provider id. The namespace
     // prefix on external ids must keep this from sharing an inference_id
     // slot with the internal pipeline's record.
-    let external_resp = server
-        .post("/v1/usage")
-        .add_header("Authorization", format!("Bearer {api_key}"))
-        .json(&serde_json::json!({
+    let external_resp = post_internal_usage(
+        &server,
+        &id,
+        serde_json::json!({
             "type": "chat_completion",
             "model": "Qwen/Qwen3-30B-A3B-Instruct-2507",
             "input_tokens": 1,
             "output_tokens": 1,
             "id": provider_id,
-        }))
-        .await;
+        }),
+    )
+    .await;
     assert_eq!(
         external_resp.status_code(),
         200,
@@ -550,7 +619,7 @@ async fn test_external_usage_record_does_not_collide_with_internal_pipeline() {
         let resp = server
             .get(&format!(
                 "/v1/organizations/{}/usage/history?limit=10&offset=0",
-                org.id
+                id.org_id
             ))
             .add_header("Authorization", format!("Bearer {}", get_session_id()))
             .add_header("User-Agent", MOCK_USER_AGENT)
@@ -614,27 +683,27 @@ async fn test_external_usage_record_does_not_collide_with_internal_pipeline() {
 /// Test that cache_read_tokens greater than input_tokens are rejected by validation.
 #[tokio::test]
 async fn test_record_chat_completion_usage_cache_read_capped_to_input() {
-    let server = setup_test_server().await;
+    let server = enable_internal_usage_server().await;
 
     // Setup model with cache-read pricing enabled
     setup_qwen_model_with_cache_pricing(&server).await;
 
-    let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
-    let api_key = get_api_key_for_org(&server, org.id.clone()).await;
+    let id = provision_identity(&server).await;
 
     // cache_read_tokens (100) > input_tokens (30) should be rejected by the API
-    let response = server
-        .post("/v1/usage")
-        .add_header("Authorization", format!("Bearer {api_key}"))
-        .json(&serde_json::json!({
+    let response = post_internal_usage(
+        &server,
+        &id,
+        serde_json::json!({
             "type": "chat_completion",
             "model": "Qwen/Qwen3-30B-A3B-Instruct-2507",
             "input_tokens": 30,
             "output_tokens": 0,
             "cache_read_tokens": 100,
             "id": "test-chat-completion-cache-capped"
-        }))
-        .await;
+        }),
+    )
+    .await;
 
     assert_eq!(
         response.status_code(),
@@ -645,10 +714,8 @@ async fn test_record_chat_completion_usage_cache_read_capped_to_input() {
 }
 
 /// `POST /v1/internal/usage` returns 503 when the deployment has not
-/// configured `CLOUD_API_USAGE_TOKEN`. This is the default test posture
-/// — the feature is fail-closed until an operator sets the secret, so
-/// reporters using the new path can fall back to the legacy `/v1/usage`
-/// without ambiguity.
+/// configured `CLOUD_API_USAGE_TOKEN`. This is the fail-closed posture —
+/// the endpoint is disabled until an operator sets the secret.
 #[tokio::test]
 async fn test_internal_usage_returns_503_when_disabled() {
     let server = setup_test_server().await;
@@ -728,11 +795,10 @@ async fn test_internal_usage_503_takes_precedence_over_bad_body() {
 }
 
 /// Happy path with `internal_usage_token` configured: a valid request
-/// produces a row identical to what the legacy `/v1/usage` endpoint
-/// would write. Exercises the actual `serde(flatten)` of
-/// `RecordUsageApiRequest` under the wrapper — guards against
-/// "wire-format works in production for the first time after a config
-/// flip on staging."
+/// records usage and returns the standard tagged-union response. Exercises
+/// the actual `serde(flatten)` of `RecordUsageApiRequest` under the wrapper
+/// — guards against "wire-format works in production for the first time
+/// after a config flip on staging."
 ///
 /// `api_key_id` comes from the workspace's `create_api_key` response so
 /// the FK to `api_keys` resolves. This avoids depending on whatever
@@ -741,37 +807,23 @@ async fn test_internal_usage_503_takes_precedence_over_bad_body() {
 /// just absent).
 #[tokio::test]
 async fn test_internal_usage_records_with_valid_token() {
-    const TOKEN: &str = "test-internal-secret";
-    let server = setup_test_server_with_config(|c| {
-        c.internal_usage_token = Some(TOKEN.to_string());
-    })
-    .await;
+    let server = enable_internal_usage_server().await;
 
     setup_qwen_model(&server).await;
-    let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
-    let workspaces = list_workspaces(&server, org.id.clone()).await;
-    let workspace_id = workspaces.first().unwrap().id.clone();
-    let api_key_resp = create_api_key_in_workspace(
-        &server,
-        workspace_id.clone(),
-        "internal-usage-happy-path".to_string(),
-    )
-    .await;
+    let id = provision_identity(&server).await;
 
-    let response = server
-        .post("/v1/internal/usage")
-        .add_header("Authorization", format!("Bearer {TOKEN}"))
-        .json(&serde_json::json!({
-            "organization_id": org.id,
-            "workspace_id": workspace_id,
-            "api_key_id": api_key_resp.id,
+    let response = post_internal_usage(
+        &server,
+        &id,
+        serde_json::json!({
             "type": "chat_completion",
             "model": "Qwen/Qwen3-30B-A3B-Instruct-2507",
             "input_tokens": 100,
             "output_tokens": 50,
             "id": "test-internal-happy-path"
-        }))
-        .await;
+        }),
+    )
+    .await;
 
     assert_eq!(
         response.status_code(),
@@ -784,7 +836,7 @@ async fn test_internal_usage_records_with_valid_token() {
     assert_eq!(body["type"], "chat_completion");
     assert_eq!(body["input_tokens"], 100);
     assert_eq!(body["output_tokens"], 50);
-    // Cost shape matches the legacy endpoint (uses same service-layer call).
+    // input: 100 * 1_000_000 + output: 50 * 2_000_000 = 200_000_000
     assert_eq!(body["total_cost"], 200_000_000i64);
 }
 

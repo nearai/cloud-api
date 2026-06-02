@@ -31,7 +31,11 @@ async fn enable_internal_usage_server() -> axum_test::TestServer {
 async fn provision_identity(server: &axum_test::TestServer) -> UsageIdentity {
     let org = setup_org_with_credits(server, 10_000_000_000i64).await;
     let workspaces = list_workspaces(server, org.id.clone()).await;
-    let workspace_id = workspaces.first().unwrap().id.clone();
+    let workspace_id = workspaces
+        .first()
+        .expect("org should have a default workspace")
+        .id
+        .clone();
     let key =
         create_api_key_in_workspace(server, workspace_id.clone(), "internal-usage".to_string())
             .await;

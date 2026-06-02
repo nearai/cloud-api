@@ -6,11 +6,14 @@ use crate::pool::DbPool;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use services::admin::{
-    AnalyticsRepository, ApiKeyMetrics, MetricsSummary, ModelMetrics, OrganizationMetrics,
-    PlatformMetrics, TimeSeriesMetrics, TimeSeriesPoint, TopModelMetrics, TopOrganizationMetrics,
-    WorkspaceMetrics,
+    AnalyticsRepository, ApiKeyMetrics, BillingSourceBreakdown, BillingSummary, MetricsSummary,
+    ModelMetrics, ModelRevenueEntry, ModelRevenueQuery, ModelRevenueReport, OrgRevenueEntry,
+    OrgRevenueQuery, OrgRevenueReport, OrganizationMetrics, PlatformMetrics,
+    PlatformTimeSeriesMetrics, PlatformTimeSeriesPoint, RevenueSort, TimeSeriesMetrics,
+    TimeSeriesPoint, TopModelMetrics, TopOrganizationMetrics, WorkspaceMetrics,
 };
 use services::common::RepositoryError;
+use std::collections::BTreeMap;
 use uuid::Uuid;
 
 /// PostgreSQL implementation of the analytics repository
@@ -218,31 +221,55 @@ impl AnalyticsRepository for PgAnalyticsRepository {
             .await
             .map_err(|e| RepositoryError::PoolError(e.into()))?;
 
-        // Get total users and organizations
+        // Counts: total active users/orgs (snapshot) + new signups (within the period) +
+        // paying-org count (orgs with an active payment-type credit).
         let counts_row = client
             .query_one(
                 r#"
-                SELECT 
+                SELECT
                     (SELECT COUNT(*) FROM users WHERE is_active = true)::bigint as total_users,
-                    (SELECT COUNT(*) FROM organizations WHERE is_active = true)::bigint as total_organizations
+                    (SELECT COUNT(*) FROM organizations WHERE is_active = true)::bigint as total_organizations,
+                    (SELECT COUNT(*) FROM users
+                        WHERE created_at >= $1 AND created_at < $2)::bigint as new_users,
+                    (SELECT COUNT(*) FROM organizations
+                        WHERE created_at >= $1 AND created_at < $2)::bigint as new_organizations,
+                    (SELECT COUNT(DISTINCT olh.organization_id)
+                        FROM organization_limits_history olh
+                        JOIN organizations o ON o.id = olh.organization_id AND o.is_active = true
+                        WHERE olh.credit_type = 'payment' AND olh.effective_until IS NULL)::bigint as paying_organizations
                 "#,
-                &[],
+                &[&start, &end],
             )
             .await
             .map_err(|e| RepositoryError::DatabaseError(e.into()))?;
 
         let total_users: i64 = counts_row.get(0);
         let total_organizations: i64 = counts_row.get(1);
+        let new_users: i64 = counts_row.get(2);
+        let new_organizations: i64 = counts_row.get(3);
+        let paying_organizations: i64 = counts_row.get(4);
 
-        // Get usage summary across all organizations
+        // Single-scan usage summary over the period: totals, the paid-vs-granted split
+        // (attributed by org class), the verifiable-vs-external split (join models), the
+        // error rate, and p95 TTFT. Verifiable split joins models on verifiability.
         let summary_row = client
             .query_one(
                 r#"
-                SELECT 
+                SELECT
                     COUNT(*)::bigint as requests,
-                    COALESCE(SUM(total_cost), 0)::bigint as revenue_nano
-                FROM organization_usage_log
-                WHERE created_at >= $1 AND created_at < $2
+                    COALESCE(SUM(ul.total_cost), 0)::bigint as revenue_nano,
+                    (COALESCE(SUM(ul.input_tokens), 0) + COALESCE(SUM(ul.output_tokens), 0))::bigint as total_tokens,
+                    COALESCE(SUM(ul.cache_read_tokens), 0)::bigint as cache_read_tokens,
+                    COUNT(DISTINCT ul.organization_id)::bigint as active_organizations,
+                    COALESCE(SUM(ul.total_cost) FILTER (WHERE COALESCE(m.verifiable, false)), 0)::bigint as verifiable_nano,
+                    COUNT(*) FILTER (WHERE COALESCE(m.verifiable, false))::bigint as verifiable_requests,
+                    COALESCE(SUM(ul.total_cost) FILTER (WHERE NOT COALESCE(m.verifiable, false)), 0)::bigint as external_nano,
+                    COUNT(*) FILTER (WHERE NOT COALESCE(m.verifiable, false))::bigint as external_requests,
+                    COUNT(*) FILTER (WHERE ul.stop_reason IN ('provider_error', 'timeout'))::bigint as error_count,
+                    PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY ul.ttft_ms)::double precision as p95_ttft_ms
+                FROM organization_usage_log ul
+                LEFT JOIN models m ON m.id = ul.model_id
+                WHERE ul.created_at >= $1 AND ul.created_at < $2
                 "#,
                 &[&start, &end],
             )
@@ -250,7 +277,21 @@ impl AnalyticsRepository for PgAnalyticsRepository {
             .map_err(|e| RepositoryError::DatabaseError(e.into()))?;
 
         let total_requests: i64 = summary_row.get(0);
-        let total_revenue_usd = nano_to_usd(summary_row.get::<_, i64>(1));
+        let total_consumed_usd = nano_to_usd(summary_row.get::<_, i64>(1));
+        let total_tokens: i64 = summary_row.get(2);
+        let total_cache_read_tokens: i64 = summary_row.get(3);
+        let active_organizations: i64 = summary_row.get(4);
+        let verifiable_consumed_usd = nano_to_usd(summary_row.get::<_, i64>(5));
+        let verifiable_requests: i64 = summary_row.get(6);
+        let non_verifiable_consumed_usd = nano_to_usd(summary_row.get::<_, i64>(7));
+        let non_verifiable_requests: i64 = summary_row.get(8);
+        let error_count: i64 = summary_row.get(9);
+        let p95_ttft_ms: Option<f64> = summary_row.get(10);
+        let provider_error_or_timeout_rate = if total_requests > 0 {
+            error_count as f64 / total_requests as f64
+        } else {
+            0.0
+        };
 
         // Get top 10 models by request count
         let top_models_rows = client
@@ -314,10 +355,23 @@ impl AnalyticsRepository for PgAnalyticsRepository {
         Ok(PlatformMetrics {
             period_start: start,
             period_end: end,
+            generated_at: Utc::now(),
             total_users,
             total_organizations,
             total_requests,
-            total_revenue_usd,
+            total_consumed_usd,
+            total_tokens,
+            total_cache_read_tokens,
+            new_users,
+            new_organizations,
+            active_organizations,
+            paying_organizations,
+            verifiable_consumed_usd,
+            verifiable_requests,
+            non_verifiable_consumed_usd,
+            non_verifiable_requests,
+            provider_error_or_timeout_rate,
+            p95_ttft_ms,
             top_models,
             top_organizations,
         })
@@ -393,6 +447,427 @@ impl AnalyticsRepository for PgAnalyticsRepository {
             period_end: end,
             granularity: granularity.to_string(),
             data,
+        })
+    }
+
+    async fn get_platform_timeseries(
+        &self,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+        granularity: &str,
+    ) -> Result<PlatformTimeSeriesMetrics, RepositoryError> {
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| RepositoryError::PoolError(e.into()))?;
+
+        let date_trunc = match granularity {
+            "hour" => "hour",
+            "week" => "week",
+            "month" => "month",
+            _ => "day",
+        };
+
+        // Usage-derived buckets: requests, tokens, cost + verifiable/external split +
+        // active orgs. One scan over usage_log joined to models.
+        let usage_query = format!(
+            r#"
+            SELECT
+                DATE_TRUNC('{date_trunc}', ul.created_at)::text as bucket,
+                COUNT(*)::bigint as requests,
+                (COALESCE(SUM(ul.input_tokens), 0) + COALESCE(SUM(ul.output_tokens), 0))::bigint as tokens,
+                COALESCE(SUM(ul.total_cost), 0)::bigint as cost_nano,
+                COALESCE(SUM(ul.total_cost) FILTER (WHERE COALESCE(m.verifiable, false)), 0)::bigint as verifiable_nano,
+                COALESCE(SUM(ul.total_cost) FILTER (WHERE NOT COALESCE(m.verifiable, false)), 0)::bigint as external_nano,
+                COUNT(DISTINCT ul.organization_id)::bigint as active_orgs
+            FROM organization_usage_log ul
+            LEFT JOIN models m ON m.id = ul.model_id
+            WHERE ul.created_at >= $1 AND ul.created_at < $2
+            GROUP BY DATE_TRUNC('{date_trunc}', ul.created_at)
+            ORDER BY bucket ASC
+            "#
+        );
+
+        let new_orgs_query = format!(
+            r#"
+            SELECT DATE_TRUNC('{date_trunc}', created_at)::text as bucket, COUNT(*)::bigint
+            FROM organizations
+            WHERE created_at >= $1 AND created_at < $2
+            GROUP BY DATE_TRUNC('{date_trunc}', created_at)
+            "#
+        );
+
+        let new_users_query = format!(
+            r#"
+            SELECT DATE_TRUNC('{date_trunc}', created_at)::text as bucket, COUNT(*)::bigint
+            FROM users
+            WHERE created_at >= $1 AND created_at < $2
+            GROUP BY DATE_TRUNC('{date_trunc}', created_at)
+            "#
+        );
+
+        let usage_rows = client
+            .query(&usage_query, &[&start, &end])
+            .await
+            .map_err(|e| RepositoryError::DatabaseError(e.into()))?;
+        let new_orgs_rows = client
+            .query(&new_orgs_query, &[&start, &end])
+            .await
+            .map_err(|e| RepositoryError::DatabaseError(e.into()))?;
+        let new_users_rows = client
+            .query(&new_users_query, &[&start, &end])
+            .await
+            .map_err(|e| RepositoryError::DatabaseError(e.into()))?;
+
+        // Merge the three result sets by bucket key. BTreeMap keeps ISO date keys sorted.
+        let mut points: BTreeMap<String, PlatformTimeSeriesPoint> = BTreeMap::new();
+        for row in &usage_rows {
+            let date: String = row.get(0);
+            points.insert(
+                date.clone(),
+                PlatformTimeSeriesPoint {
+                    date,
+                    requests: row.get(1),
+                    tokens: row.get(2),
+                    cost_usd: nano_to_usd(row.get::<_, i64>(3)),
+                    verifiable_cost_usd: nano_to_usd(row.get::<_, i64>(4)),
+                    non_verifiable_cost_usd: nano_to_usd(row.get::<_, i64>(5)),
+                    active_organizations: row.get(6),
+                    new_organizations: 0,
+                    new_users: 0,
+                },
+            );
+        }
+        let empty_point = |date: String| PlatformTimeSeriesPoint {
+            date,
+            requests: 0,
+            tokens: 0,
+            cost_usd: 0.0,
+            verifiable_cost_usd: 0.0,
+            non_verifiable_cost_usd: 0.0,
+            active_organizations: 0,
+            new_organizations: 0,
+            new_users: 0,
+        };
+        for row in &new_orgs_rows {
+            let date: String = row.get(0);
+            points
+                .entry(date.clone())
+                .or_insert_with(|| empty_point(date))
+                .new_organizations = row.get(1);
+        }
+        for row in &new_users_rows {
+            let date: String = row.get(0);
+            points
+                .entry(date.clone())
+                .or_insert_with(|| empty_point(date))
+                .new_users = row.get(1);
+        }
+
+        Ok(PlatformTimeSeriesMetrics {
+            period_start: start,
+            period_end: end,
+            granularity: granularity.to_string(),
+            data: points.into_values().collect(),
+        })
+    }
+
+    async fn get_billing_summary(&self) -> Result<BillingSummary, RepositoryError> {
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| RepositoryError::PoolError(e.into()))?;
+
+        // Active credit LIMITS (caps) by type + paying/granted org counts. These are
+        // ceilings from organization_limits_history, NOT payments/cash received. Joined to
+        // organizations with is_active = true so soft-deleted orgs aren't counted.
+        let limits_row = client
+            .query_one(
+                r#"
+                SELECT
+                    COALESCE(SUM(olh.spend_limit) FILTER (WHERE olh.credit_type = 'payment'), 0)::bigint as paid_limit,
+                    COALESCE(SUM(olh.spend_limit) FILTER (WHERE olh.credit_type = 'grant'), 0)::bigint as grant_limit,
+                    COUNT(DISTINCT olh.organization_id) FILTER (WHERE olh.credit_type = 'payment')::bigint as paying_orgs,
+                    COUNT(DISTINCT olh.organization_id) FILTER (WHERE olh.credit_type = 'grant')::bigint as granted_orgs
+                FROM organization_limits_history olh
+                JOIN organizations o ON o.id = olh.organization_id AND o.is_active = true
+                WHERE olh.effective_until IS NULL
+                "#,
+                &[],
+            )
+            .await
+            .map_err(|e| RepositoryError::DatabaseError(e.into()))?;
+
+        let active_paid_credit_limit_usd = nano_to_usd(limits_row.get::<_, i64>(0));
+        let active_grant_credit_limit_usd = nano_to_usd(limits_row.get::<_, i64>(1));
+        let paying_org_count: i64 = limits_row.get(2);
+        let granted_org_count: i64 = limits_row.get(3);
+
+        // All-time consumed cost. `total` (from the cached balance) is ALL usage
+        // (inference + services); the inference/service splits come from their logs
+        // and reconcile to the total.
+        let consumed_row = client
+            .query_one(
+                r#"
+                SELECT
+                    (SELECT COALESCE(SUM(total_spent), 0) FROM organization_balance)::bigint as total_nano,
+                    (SELECT COALESCE(SUM(total_cost), 0) FROM organization_usage_log)::bigint as inference_nano,
+                    (SELECT COALESCE(SUM(total_cost), 0) FROM organization_service_usage_log)::bigint as service_nano
+                "#,
+                &[],
+            )
+            .await
+            .map_err(|e| RepositoryError::DatabaseError(e.into()))?;
+        let total_consumed_usd = nano_to_usd(consumed_row.get::<_, i64>(0));
+        let inference_consumed_usd = nano_to_usd(consumed_row.get::<_, i64>(1));
+        let service_consumed_usd = nano_to_usd(consumed_row.get::<_, i64>(2));
+
+        // Active paid credit limit broken down by funding source (active orgs only).
+        let source_rows = client
+            .query(
+                r#"
+                SELECT
+                    COALESCE(olh.source, 'unknown') as source,
+                    COALESCE(SUM(olh.spend_limit) FILTER (WHERE olh.credit_type = 'payment'), 0)::bigint as paid_limit,
+                    COUNT(DISTINCT olh.organization_id)::bigint as org_count
+                FROM organization_limits_history olh
+                JOIN organizations o ON o.id = olh.organization_id AND o.is_active = true
+                WHERE olh.effective_until IS NULL
+                GROUP BY olh.source
+                ORDER BY paid_limit DESC
+                "#,
+                &[],
+            )
+            .await
+            .map_err(|e| RepositoryError::DatabaseError(e.into()))?;
+
+        let by_source: Vec<BillingSourceBreakdown> = source_rows
+            .iter()
+            .map(|row| BillingSourceBreakdown {
+                source: row.get(0),
+                paid_credit_limit_usd: nano_to_usd(row.get::<_, i64>(1)),
+                org_count: row.get(2),
+            })
+            .collect();
+
+        Ok(BillingSummary {
+            generated_at: Utc::now(),
+            active_paid_credit_limit_usd,
+            active_grant_credit_limit_usd,
+            total_consumed_usd,
+            inference_consumed_usd,
+            service_consumed_usd,
+            paying_org_count,
+            granted_org_count,
+            by_source,
+        })
+    }
+
+    async fn get_model_revenue(
+        &self,
+        query: ModelRevenueQuery,
+    ) -> Result<ModelRevenueReport, RepositoryError> {
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| RepositoryError::PoolError(e.into()))?;
+
+        // Sort column from a fixed allowlist (never interpolate user input).
+        let sort_col = match query.sort {
+            RevenueSort::Revenue => "revenue_nano",
+            RevenueSort::Requests => "requests",
+            RevenueSort::Tokens => "tokens",
+        };
+        // Shared WHERE; optional filters via `$n::type IS NULL OR …`. `model_search`
+        // is a case-insensitive substring (the `%…%` wrapping is the bind value).
+        let where_clause = r#"
+            WHERE ul.created_at >= $1 AND ul.created_at < $2
+              AND ($3::bool IS NULL OR COALESCE(m.verifiable, false) = $3)
+              AND ($4::text IS NULL OR m.provider_type = $4)
+              AND ($5::text IS NULL OR ul.model_name ILIKE $5)
+        "#;
+        let model_like = query.model_search.as_ref().map(|s| format!("%{s}%"));
+
+        // Total = number of matching model groups (correct even when offset >= total).
+        let count_sql = format!(
+            "SELECT COUNT(*)::bigint FROM (SELECT 1 FROM organization_usage_log ul \
+             LEFT JOIN models m ON m.id = ul.model_id {where_clause} GROUP BY ul.model_name) t"
+        );
+        let total: i64 = client
+            .query_one(
+                &count_sql,
+                &[
+                    &query.start,
+                    &query.end,
+                    &query.verifiable,
+                    &query.provider_type,
+                    &model_like,
+                ],
+            )
+            .await
+            .map_err(|e| RepositoryError::DatabaseError(e.into()))?
+            .get(0);
+
+        let data_sql = format!(
+            r#"
+            SELECT
+                ul.model_name,
+                COALESCE(SUM(ul.total_cost), 0)::bigint as revenue_nano,
+                COUNT(*)::bigint as requests,
+                (COALESCE(SUM(ul.input_tokens), 0) + COALESCE(SUM(ul.output_tokens), 0))::bigint as tokens,
+                COUNT(DISTINCT ul.organization_id)::bigint as unique_orgs,
+                BOOL_OR(COALESCE(m.verifiable, false)) as verifiable,
+                MAX(m.provider_type) as provider_type,
+                AVG(ul.ttft_ms)::double precision as avg_ttft_ms,
+                PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY ul.ttft_ms)::double precision as p95_ttft_ms
+            FROM organization_usage_log ul
+            LEFT JOIN models m ON m.id = ul.model_id
+            {where_clause}
+            GROUP BY ul.model_name
+            ORDER BY {sort_col} DESC
+            LIMIT $6 OFFSET $7
+            "#
+        );
+        let rows = client
+            .query(
+                &data_sql,
+                &[
+                    &query.start,
+                    &query.end,
+                    &query.verifiable,
+                    &query.provider_type,
+                    &model_like,
+                    &query.limit,
+                    &query.offset,
+                ],
+            )
+            .await
+            .map_err(|e| RepositoryError::DatabaseError(e.into()))?;
+
+        let data: Vec<ModelRevenueEntry> = rows
+            .iter()
+            .map(|row| ModelRevenueEntry {
+                model_name: row.get(0),
+                consumed_cost_usd: nano_to_usd(row.get::<_, i64>(1)),
+                requests: row.get(2),
+                tokens: row.get(3),
+                unique_orgs: row.get(4),
+                verifiable: row.get::<_, Option<bool>>(5).unwrap_or(false),
+                provider_type: row.get(6),
+                avg_ttft_ms: row.get(7),
+                p95_ttft_ms: row.get(8),
+            })
+            .collect();
+
+        Ok(ModelRevenueReport {
+            period_start: query.start,
+            period_end: query.end,
+            data,
+            total,
+            limit: query.limit,
+            offset: query.offset,
+        })
+    }
+
+    async fn get_org_revenue(
+        &self,
+        query: OrgRevenueQuery,
+    ) -> Result<OrgRevenueReport, RepositoryError> {
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| RepositoryError::PoolError(e.into()))?;
+
+        let sort_col = match query.sort {
+            RevenueSort::Revenue => "revenue_nano",
+            RevenueSort::Requests => "requests",
+            RevenueSort::Tokens => "tokens",
+        };
+        // `is_paying` is a current-state flag (org has an active payment credit), used
+        // both as an output column and as the optional `paying` filter (via HAVING).
+        // `search` is a case-insensitive substring on org name (the `%…%` is the bind).
+        let org_like = query.search.as_ref().map(|s| format!("%{s}%"));
+        let cte_and_from = r#"
+            WITH paying AS (
+                SELECT DISTINCT organization_id
+                FROM organization_limits_history
+                WHERE credit_type = 'payment' AND effective_until IS NULL
+            )
+            SELECT
+                o.id as organization_id,
+                o.name as organization_name,
+                COALESCE(SUM(ul.total_cost), 0)::bigint as revenue_nano,
+                COALESCE(SUM(ul.total_cost) FILTER (WHERE COALESCE(m.verifiable, false)), 0)::bigint as verifiable_nano,
+                COALESCE(SUM(ul.total_cost) FILTER (WHERE NOT COALESCE(m.verifiable, false)), 0)::bigint as external_nano,
+                COUNT(ul.id)::bigint as requests,
+                (COALESCE(SUM(ul.input_tokens), 0) + COALESCE(SUM(ul.output_tokens), 0))::bigint as tokens,
+                COUNT(DISTINCT ul.model_name)::bigint as models_used,
+                BOOL_OR(p.organization_id IS NOT NULL) as is_paying,
+                MAX(ul.created_at) as last_usage_at
+            FROM organizations o
+            INNER JOIN organization_usage_log ul ON ul.organization_id = o.id
+                AND ul.created_at >= $1 AND ul.created_at < $2
+            LEFT JOIN models m ON m.id = ul.model_id
+            LEFT JOIN paying p ON p.organization_id = o.id
+            WHERE ($4::text IS NULL OR o.name ILIKE $4)
+            GROUP BY o.id, o.name
+            HAVING ($3::bool IS NULL OR BOOL_OR(p.organization_id IS NOT NULL) = $3)
+        "#;
+
+        // Total = matching org groups after HAVING (correct when offset >= total).
+        let count_sql = format!("SELECT COUNT(*)::bigint FROM ({cte_and_from}) t");
+        let total: i64 = client
+            .query_one(
+                &count_sql,
+                &[&query.start, &query.end, &query.paying, &org_like],
+            )
+            .await
+            .map_err(|e| RepositoryError::DatabaseError(e.into()))?
+            .get(0);
+
+        let data_sql = format!("{cte_and_from} ORDER BY {sort_col} DESC LIMIT $5 OFFSET $6");
+        let rows = client
+            .query(
+                &data_sql,
+                &[
+                    &query.start,
+                    &query.end,
+                    &query.paying,
+                    &org_like,
+                    &query.limit,
+                    &query.offset,
+                ],
+            )
+            .await
+            .map_err(|e| RepositoryError::DatabaseError(e.into()))?;
+
+        let data: Vec<OrgRevenueEntry> = rows
+            .iter()
+            .map(|row| OrgRevenueEntry {
+                organization_id: row.get(0),
+                organization_name: row.get(1),
+                consumed_cost_usd: nano_to_usd(row.get::<_, i64>(2)),
+                verifiable_consumed_usd: nano_to_usd(row.get::<_, i64>(3)),
+                non_verifiable_consumed_usd: nano_to_usd(row.get::<_, i64>(4)),
+                requests: row.get(5),
+                tokens: row.get(6),
+                models_used: row.get(7),
+                is_paying: row.get::<_, Option<bool>>(8).unwrap_or(false),
+                last_usage_at: row.get(9),
+            })
+            .collect();
+
+        Ok(OrgRevenueReport {
+            period_start: query.start,
+            period_end: query.end,
+            data,
+            total,
+            limit: query.limit,
+            offset: query.offset,
         })
     }
 }

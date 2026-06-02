@@ -25,7 +25,7 @@ thiserror = "2.0"
 config = { path = "../config" }
 rand = "0.10"
 rand_core = { version = "0.6", features = ["getrandom"] }
-utoipa = "5.3"
+utoipa = { version = "5.3", features = ["chrono", "uuid"] }
 # OAuth2 authentication
 oauth2 = { version = "5", features = ["reqwest"] }
 reqwest = { version = "0.12", features = ["json", "stream"] }

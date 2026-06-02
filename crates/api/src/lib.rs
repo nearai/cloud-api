@@ -818,13 +818,6 @@ pub fn build_app_with_config(
         rate_limit_state.clone(),
     );
 
-    let usage_recording_routes = build_usage_recording_routes(
-        app_state.clone(),
-        &auth_components.auth_state_middleware,
-        usage_state.clone(),
-        rate_limit_state.clone(),
-    );
-
     let gateway_routes = build_gateway_routes(
         app_state.clone(),
         &auth_components.auth_state_middleware,
@@ -952,7 +945,6 @@ pub fn build_app_with_config(
                 .merge(files_routes)
                 .merge(feature_request_routes)
                 .merge(billing_routes)
-                .merge(usage_recording_routes)
                 .merge(gateway_routes)
                 .merge(internal_routes)
                 .merge(health_routes),
@@ -1385,31 +1377,6 @@ pub fn build_billing_routes(
         ))
 }
 
-/// Build usage recording routes with auth, rate limiting, and usage check.
-/// No body_hash_middleware — attestation/signing is not applicable to usage records.
-pub fn build_usage_recording_routes(
-    app_state: AppState,
-    auth_state_middleware: &AuthState,
-    usage_state: middleware::UsageState,
-    rate_limit_state: middleware::RateLimitState,
-) -> Router {
-    Router::new()
-        .route("/usage", post(crate::routes::usage::record_usage))
-        .with_state(app_state)
-        .layer(from_fn_with_state(
-            usage_state,
-            middleware::usage_check_middleware,
-        ))
-        .layer(from_fn_with_state(
-            rate_limit_state,
-            middleware::api_key_rate_limit_middleware,
-        ))
-        .layer(from_fn_with_state(
-            auth_state_middleware.clone(),
-            middleware::auth::auth_middleware_with_workspace_context,
-        ))
-}
-
 /// Build gateway routes for external model gateways to validate API keys.
 /// Reuses the same auth, rate limiting, and usage check middleware as completions.
 pub fn build_gateway_routes(
@@ -1586,6 +1553,9 @@ pub fn build_admin_routes(
             as Arc<dyn services::completions::CompletionServiceTrait>,
     )) as Arc<dyn services::admin::AdminService + Send + Sync>;
 
+    let github_dispatcher =
+        services::github_dispatch::dispatcher_from_config(&config.github_dispatch);
+
     let admin_app_state = AdminAppState {
         admin_service,
         analytics_service: services.analytics_service,
@@ -1595,6 +1565,7 @@ pub fn build_admin_routes(
         config,
         admin_access_token_repository,
         inference_provider_pool: services.inference_provider_pool,
+        github_dispatcher,
     };
 
     Router::new()
@@ -1841,6 +1812,7 @@ mod tests {
             },
             cors: config::CorsConfig::default(),
             external_providers: config::ExternalProvidersConfig::default(),
+            github_dispatch: config::GitHubDispatchConfig::default(),
         };
 
         // Initialize services
@@ -1941,6 +1913,7 @@ mod tests {
             },
             cors: config::CorsConfig::default(),
             external_providers: config::ExternalProvidersConfig::default(),
+            github_dispatch: config::GitHubDispatchConfig::default(),
         };
 
         let auth_components = init_auth_services(database.clone(), &config);

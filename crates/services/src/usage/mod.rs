@@ -9,7 +9,7 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 /// Dedicated UUID v5 namespace for `inference_id`s derived from external `id`s
-/// submitted via `POST /v1/usage`. The internal inference pipeline hashes
+/// submitted via `POST /v1/internal/usage`. The internal inference pipeline hashes
 /// provider request ids under `Uuid::NAMESPACE_DNS`; using a different
 /// namespace UUID here makes the two `inference_id` spaces mathematically
 /// disjoint regardless of input — no shape of provider id (even one that
@@ -805,7 +805,7 @@ mod tests {
         assert!(result.is_none(), "1T tokens * 10B cost should overflow");
     }
 
-    /// `POST /v1/usage` and the internal inference pipeline both derive
+    /// `POST /v1/internal/usage` and the internal inference pipeline both derive
     /// `inference_id` (the DB's per-org idempotency key) by feeding
     /// caller-visible ids into UUID v5. To keep the two sources from
     /// sharing a slot, externally-submitted ids are hashed under a
@@ -840,7 +840,7 @@ mod tests {
                 Uuid::new_v5(&super::EXTERNAL_USAGE_ID_NAMESPACE, raw_id.as_bytes());
             assert_ne!(
                 internal_uuid, external_uuid,
-                "external POST /v1/usage with id={raw_id:?} must hash to a different \
+                "external POST /v1/internal/usage with id={raw_id:?} must hash to a different \
                  inference_id than the internal pipeline writes for the same provider id"
             );
         }

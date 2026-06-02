@@ -1,5 +1,5 @@
 use crate::{
-    middleware::{auth::AuthenticatedApiKey, AuthenticatedUser},
+    middleware::AuthenticatedUser,
     models::ErrorResponse,
     routes::{api::AppState, common::format_amount},
 };
@@ -7,7 +7,7 @@ use axum::{
     extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
     response::Json as ResponseJson,
-    Extension, Json,
+    Extension,
 };
 use chrono::{Duration, Utc};
 use serde::{Deserialize, Serialize};
@@ -606,11 +606,12 @@ pub async fn get_api_key_usage_history(
 }
 
 // ============================================
-// POST /v1/usage — Record usage
+// Usage recording response
 // ============================================
 
-/// POST /v1/usage response body — tagged union matching the request type.
-/// All costs use fixed scale of 9 (nano-dollars) and USD currency.
+/// Usage-recording response body — tagged union matching the request type.
+/// Returned by `POST /v1/internal/usage`. All costs use fixed scale of 9
+/// (nano-dollars) and USD currency.
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum RecordUsageResponse {
@@ -656,93 +657,6 @@ pub enum RecordUsageResponse {
     },
 }
 
-/// Record usage
-///
-/// Record a usage event. The server calculates costs based on the model's pricing.
-/// Uses a tagged union on the `type` field to distinguish usage kinds.
-///
-/// A required `id` field serves as an **idempotency key**. It is stored as
-/// `provider_request_id` and hashed to a deterministic UUID v5 for `inference_id`.
-/// If a record with the same `id` already exists within the same organization,
-/// the existing record is returned without double-charging.
-///
-/// ## Chat completion example
-/// ```json
-/// { "type": "chat_completion", "model": "Qwen/Qwen3-30B-A3B-Instruct-2507", "input_tokens": 100, "output_tokens": 50, "id": "req-abc-123" }
-/// ```
-///
-/// ## Image generation example
-/// ```json
-/// { "type": "image_generation", "model": "black-forest-labs/FLUX.1", "image_count": 2, "id": "req-img-456" }
-/// ```
-#[utoipa::path(
-    post,
-    path = "/v1/usage",
-    tag = "Usage",
-    request_body = serde_json::Value,
-    responses(
-        (status = 200, description = "Usage recorded successfully", body = RecordUsageResponse),
-        (status = 400, description = "Invalid request", body = ErrorResponse),
-        (status = 401, description = "Unauthorized", body = ErrorResponse),
-        (status = 402, description = "Insufficient credits", body = ErrorResponse),
-        (status = 404, description = "Model not found", body = ErrorResponse),
-        (status = 500, description = "Internal server error", body = ErrorResponse)
-    ),
-    security(
-        ("api_key" = [])
-    )
-)]
-pub async fn record_usage(
-    State(app_state): State<AppState>,
-    Extension(api_key): Extension<AuthenticatedApiKey>,
-    Json(request): Json<services::usage::RecordUsageApiRequest>,
-) -> Result<ResponseJson<RecordUsageResponse>, (StatusCode, ResponseJson<ErrorResponse>)> {
-    let api_key_id = Uuid::parse_str(&api_key.api_key.id.0).map_err(|_| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            ResponseJson(ErrorResponse::new(
-                "Invalid API key ID".to_string(),
-                "internal_server_error".to_string(),
-            )),
-        )
-    })?;
-
-    let entry = app_state
-        .usage_service
-        .record_usage_from_api(
-            api_key.organization.id.0,
-            api_key.workspace.id.0,
-            api_key_id,
-            request,
-        )
-        .await
-        .map_err(|e| match &e {
-            services::usage::UsageError::ModelNotFound(_) => (
-                StatusCode::NOT_FOUND,
-                ResponseJson(ErrorResponse::new(e.to_string(), "not_found".to_string())),
-            ),
-            services::usage::UsageError::ValidationError(_) => (
-                StatusCode::BAD_REQUEST,
-                ResponseJson(ErrorResponse::new(
-                    e.to_string(),
-                    "validation_error".to_string(),
-                )),
-            ),
-            _ => {
-                tracing::error!("Failed to record usage");
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    ResponseJson(ErrorResponse::new(
-                        "Failed to record usage".to_string(),
-                        "internal_server_error".to_string(),
-                    )),
-                )
-            }
-        })?;
-
-    Ok(ResponseJson(build_record_usage_response(entry)))
-}
-
 /// Build the public `RecordUsageResponse` from a service-layer `UsageLogEntry`.
 ///
 /// The variant is chosen by the *returned entry's* `inference_type` rather
@@ -786,34 +700,31 @@ fn build_record_usage_response(entry: services::usage::UsageLogEntry) -> RecordU
 // POST /v1/internal/usage — Service-token-authenticated usage recording
 // =====================================================================
 //
-// This endpoint is the locked-down replacement for `POST /v1/usage` aimed
-// at trusted infrastructure reporters (today: inference-proxy). Instead of
-// accepting an `sk-…` API key — which lets any holder of that key submit
-// arbitrary usage rows on the org's behalf — it requires a shared
-// `CLOUD_API_USAGE_TOKEN` service secret and carries the subject identity
-// (`organization_id`, `workspace_id`, `api_key_id`) in the body.
+// This endpoint is the sole usage-recording entry point for trusted
+// infrastructure reporters (today: inference-proxy). It replaced the
+// removed `sk-…`-authenticated `POST /v1/usage` — which let any holder of
+// that key submit arbitrary usage rows on the org's behalf — and instead
+// requires a shared `CLOUD_API_USAGE_TOKEN` service secret and carries the
+// subject identity (`organization_id`, `workspace_id`, `api_key_id`) in
+// the body.
 //
 // Threat model:
 // - Anyone holding `CLOUD_API_USAGE_TOKEN` can submit usage rows for any
 //   org. The token therefore lives only on trusted infrastructure
 //   (inference-proxy CVMs) and is rotated alongside other service secrets.
-// - The legacy `POST /v1/usage` endpoint stays available so the rollout
-//   can be staged. Once all reporters have switched, that endpoint can be
-//   restricted or removed (separate PR).
 //
 // The body shape is the existing `RecordUsageApiRequest` flattened under a
-// wrapper that adds the three identity fields. The actual usage payload
-// is identical to the legacy endpoint so reporters keep one builder.
+// wrapper that adds the three identity fields, so reporters keep one builder.
 
 /// Request body for `POST /v1/internal/usage`. The `usage` field is
-/// flattened, so the on-the-wire shape is the legacy `RecordUsageApiRequest`
-/// JSON with three extra top-level keys.
+/// flattened, so the on-the-wire shape is `RecordUsageApiRequest` JSON with
+/// three extra top-level keys.
 ///
 /// `ToSchema` is intentionally not derived: `RecordUsageApiRequest`
-/// doesn't implement `PartialSchema` (its OpenAPI doc is hand-rolled on
-/// the legacy handler via `request_body = serde_json::Value`), and
-/// `#[serde(flatten)]` requires the inner type to be a known schema.
-/// Internal endpoints aren't surfaced in the public OpenAPI doc anyway.
+/// doesn't implement `PartialSchema` (its OpenAPI doc was hand-rolled via
+/// `request_body = serde_json::Value`), and `#[serde(flatten)]` requires
+/// the inner type to be a known schema. Internal endpoints aren't surfaced
+/// in the public OpenAPI doc anyway.
 #[derive(Debug, Deserialize)]
 pub struct RecordUsageInternalRequest {
     /// UUID of the organization to bill. **Trusted as provided** —
@@ -830,7 +741,7 @@ pub struct RecordUsageInternalRequest {
     /// UUID of the API key the usage should be attributed to (for
     /// per-key analytics). Trusted as provided.
     pub api_key_id: String,
-    /// The standard usage payload, identical to `POST /v1/usage`.
+    /// The standard usage payload.
     #[serde(flatten)]
     pub usage: services::usage::RecordUsageApiRequest,
 }
@@ -1385,9 +1296,9 @@ mod internal_usage_tests {
 
     #[test]
     fn verify_returns_503_when_endpoint_unconfigured() {
-        // Default deployment posture: feature disabled until the operator
-        // sets CLOUD_API_USAGE_TOKEN. Reporters fall back to the legacy
-        // /v1/usage path when they observe this.
+        // Default deployment posture: usage recording is disabled until the
+        // operator sets CLOUD_API_USAGE_TOKEN. There is no longer a legacy
+        // fallback, so reporters simply cannot submit usage until then.
         let h = headers_with_bearer("anything");
         let err = verify_internal_usage_token(&h, None).unwrap_err();
         assert_eq!(err.0, StatusCode::SERVICE_UNAVAILABLE);

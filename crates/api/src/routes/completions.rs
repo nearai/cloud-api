@@ -1744,11 +1744,9 @@ fn model_with_pricing_to_info(model: services::models::ModelWithPricing) -> Mode
     // fields are never absent. Real per-model values are set via the admin API.
     let input_modalities = model
         .input_modalities
-        .clone()
         .unwrap_or_else(|| vec!["text".to_string()]);
     let output_modalities = model
         .output_modalities
-        .clone()
         .unwrap_or_else(|| vec!["text".to_string()]);
     let architecture = Some(ModelArchitecture {
         input_modalities: input_modalities.clone(),

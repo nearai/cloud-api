@@ -659,3 +659,89 @@ async fn test_model_history_tracks_modalities() {
         "Previous history should have original output modalities"
     );
 }
+
+/// The OpenRouter `datacenters` field should be captured in model history,
+/// mirroring how the other OpenRouter metadata fields are audited.
+#[tokio::test]
+async fn test_model_history_records_datacenters() {
+    let server = setup_test_server().await;
+    let model_name = format!("test-model-datacenters-history-{}", uuid::Uuid::new_v4());
+
+    let mut batch = HashMap::new();
+    batch.insert(
+        model_name.clone(),
+        serde_json::from_value(serde_json::json!({
+            "inputCostPerToken": { "amount": 1000, "currency": "USD" },
+            "outputCostPerToken": { "amount": 2000, "currency": "USD" },
+            "modelDisplayName": "Datacenters History Model",
+            "modelDescription": "Testing datacenters history recording",
+            "contextLength": 4096,
+            "verifiable": true,
+            "isActive": true,
+            "datacenters": [{ "country_code": "US" }],
+            "changeReason": "Initial creation with US datacenter"
+        }))
+        .unwrap(),
+    );
+    admin_batch_upsert_models(&server, batch, get_session_id()).await;
+
+    let response = server
+        .get(format!("/v1/admin/models/{model_name}/history").as_str())
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .await;
+    assert_eq!(response.status_code(), 200, "Failed to get model history");
+    let history_response = response.json::<api::models::ModelHistoryResponse>();
+
+    assert_eq!(
+        history_response.history.len(),
+        1,
+        "Should have 1 history record"
+    );
+    let entry = &history_response.history[0];
+    let datacenters = entry
+        .datacenters
+        .as_ref()
+        .expect("history should record datacenters");
+    let codes: Vec<&str> = datacenters
+        .iter()
+        .map(|dc| dc.country_code.as_str())
+        .collect();
+    assert_eq!(codes, vec!["US"], "History should capture datacenters");
+
+    // Update datacenters; history should reflect the new snapshot.
+    let mut batch2 = HashMap::new();
+    batch2.insert(
+        model_name.clone(),
+        serde_json::from_value(serde_json::json!({
+            "datacenters": [{ "country_code": "US" }, { "country_code": "DE" }],
+            "changeReason": "Expanded to DE datacenter"
+        }))
+        .unwrap(),
+    );
+    admin_batch_upsert_models(&server, batch2, get_session_id()).await;
+
+    let response = server
+        .get(format!("/v1/admin/models/{model_name}/history").as_str())
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .await;
+    assert_eq!(response.status_code(), 200);
+    let history_response = response.json::<api::models::ModelHistoryResponse>();
+    assert_eq!(
+        history_response.history.len(),
+        2,
+        "Should have 2 history records"
+    );
+    let latest = &history_response.history[0];
+    let latest_codes: Vec<&str> = latest
+        .datacenters
+        .as_ref()
+        .expect("latest history should record datacenters")
+        .iter()
+        .map(|dc| dc.country_code.as_str())
+        .collect();
+    assert_eq!(
+        latest_codes,
+        vec!["US", "DE"],
+        "Latest history should have updated datacenters"
+    );
+}

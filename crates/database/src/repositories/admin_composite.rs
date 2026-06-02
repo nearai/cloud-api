@@ -87,6 +87,7 @@ impl AdminRepository for AdminCompositeRepository {
             max_output_length: request.max_output_length,
             supported_sampling_parameters: request.supported_sampling_parameters,
             supported_features: request.supported_features,
+            datacenters: request.datacenters,
             change_reason: request.change_reason,
             changed_by_user_id: request.changed_by_user_id,
             changed_by_user_email: request.changed_by_user_email,
@@ -128,6 +129,7 @@ impl AdminRepository for AdminCompositeRepository {
             max_output_length: model.max_output_length,
             supported_sampling_parameters: model.supported_sampling_parameters,
             supported_features: model.supported_features,
+            datacenters: model.datacenters,
         })
     }
 
@@ -172,6 +174,7 @@ impl AdminRepository for AdminCompositeRepository {
                 max_output_length: h.max_output_length,
                 supported_sampling_parameters: h.supported_sampling_parameters,
                 supported_features: h.supported_features,
+                datacenters: h.datacenters,
                 effective_from: h.effective_from,
                 effective_until: h.effective_until,
                 changed_by_user_id: h.changed_by_user_id,
@@ -421,6 +424,7 @@ impl AdminRepository for AdminCompositeRepository {
                 .try_get("supported_sampling_parameters")
                 .unwrap_or_default(),
             supported_features: row.try_get("supported_features").unwrap_or_default(),
+            datacenters: row.try_get("datacenters").ok().flatten(),
         };
 
         let select_with_aliases_sql = r#"
@@ -432,7 +436,7 @@ impl AdminRepository for AdminCompositeRepository {
                 m.attestation_supported, m.input_modalities, m.output_modalities,
                 m.inference_url,
                 m.hugging_face_id, m.quantization, m.max_output_length,
-                m.supported_sampling_parameters, m.supported_features,
+                m.supported_sampling_parameters, m.supported_features, m.datacenters,
                 COALESCE(
                     array_agg(ma.alias_name) FILTER (WHERE ma.alias_name IS NOT NULL),
                     '{}'
@@ -667,6 +671,7 @@ impl AdminRepository for AdminCompositeRepository {
                 max_output_length: m.max_output_length,
                 supported_sampling_parameters: m.supported_sampling_parameters,
                 supported_features: m.supported_features,
+                datacenters: m.datacenters,
             })
             .collect();
 

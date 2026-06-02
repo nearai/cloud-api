@@ -154,6 +154,7 @@ pub async fn list_models(
                 max_output_length: model.max_output_length,
                 supported_sampling_parameters: model.supported_sampling_parameters,
                 supported_features: model.supported_features,
+                datacenters: crate::models::Datacenter::from_codes(model.datacenters),
             },
         })
         .collect();
@@ -262,6 +263,7 @@ pub async fn get_model_by_name(
             max_output_length: model.max_output_length,
             supported_sampling_parameters: model.supported_sampling_parameters,
             supported_features: model.supported_features,
+            datacenters: crate::models::Datacenter::from_codes(model.datacenters),
         },
     };
 

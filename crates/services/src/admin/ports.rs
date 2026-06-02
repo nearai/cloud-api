@@ -32,6 +32,8 @@ pub struct UpdateModelAdminRequest {
     pub max_output_length: Option<i32>,
     pub supported_sampling_parameters: Option<Vec<String>>,
     pub supported_features: Option<Vec<String>>,
+    /// Datacenter country codes (ISO 3166 Alpha-2) the model runs in.
+    pub datacenters: Option<Vec<String>>,
     // User audit tracking for history
     pub change_reason: Option<String>,
     pub changed_by_user_id: Option<uuid::Uuid>,
@@ -78,6 +80,8 @@ pub struct ModelPricing {
     pub max_output_length: Option<i32>,
     pub supported_sampling_parameters: Vec<String>,
     pub supported_features: Vec<String>,
+    /// Datacenter country codes (ISO 3166 Alpha-2) the model runs in.
+    pub datacenters: Option<Vec<String>>,
 }
 
 /// Model history entry - includes pricing, context length, and other model attributes
@@ -107,6 +111,8 @@ pub struct ModelHistoryEntry {
     pub max_output_length: Option<i32>,
     pub supported_sampling_parameters: Vec<String>,
     pub supported_features: Vec<String>,
+    /// Datacenter country codes (ISO 3166 Alpha-2) the model ran in.
+    pub datacenters: Option<Vec<String>>,
     pub effective_from: chrono::DateTime<chrono::Utc>,
     pub effective_until: Option<chrono::DateTime<chrono::Utc>>,
     pub changed_by_user_id: Option<uuid::Uuid>,
@@ -225,6 +231,8 @@ pub struct AdminModelInfo {
     pub max_output_length: Option<i32>,
     pub supported_sampling_parameters: Vec<String>,
     pub supported_features: Vec<String>,
+    /// Datacenter country codes (ISO 3166 Alpha-2) the model runs in.
+    pub datacenters: Option<Vec<String>>,
 }
 
 /// Organization information for admin listing (includes spend limit and usage)

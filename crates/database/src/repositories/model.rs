@@ -82,7 +82,7 @@ impl ModelRepository {
                         m.provider_type, m.provider_config, m.attestation_supported,
                         m.input_modalities, m.output_modalities, m.inference_url,
                         m.hugging_face_id, m.quantization, m.max_output_length,
-                        m.supported_sampling_parameters, m.supported_features,
+                        m.supported_sampling_parameters, m.supported_features, m.datacenters,
                         COALESCE(array_agg(a.alias_name) FILTER (WHERE a.alias_name IS NOT NULL), '{}') AS aliases
                     FROM models m
                     LEFT JOIN model_aliases a ON a.canonical_model_id = m.id AND a.is_active = true
@@ -164,7 +164,7 @@ impl ModelRepository {
                             m.provider_type, m.provider_config, m.attestation_supported,
                             m.input_modalities, m.output_modalities, m.inference_url,
                             m.hugging_face_id, m.quantization, m.max_output_length,
-                            m.supported_sampling_parameters, m.supported_features,
+                            m.supported_sampling_parameters, m.supported_features, m.datacenters,
                             COALESCE(array_agg(a.alias_name) FILTER (WHERE a.alias_name IS NOT NULL), '{}') AS aliases
                         FROM models m
                         LEFT JOIN model_aliases a ON a.canonical_model_id = m.id AND a.is_active = true
@@ -187,7 +187,7 @@ impl ModelRepository {
                             m.provider_type, m.provider_config, m.attestation_supported,
                             m.input_modalities, m.output_modalities, m.inference_url,
                             m.hugging_face_id, m.quantization, m.max_output_length,
-                            m.supported_sampling_parameters, m.supported_features,
+                            m.supported_sampling_parameters, m.supported_features, m.datacenters,
                             COALESCE(array_agg(a.alias_name) FILTER (WHERE a.alias_name IS NOT NULL), '{}') AS aliases
                         FROM models m
                         LEFT JOIN model_aliases a ON a.canonical_model_id = m.id AND a.is_active = true
@@ -229,7 +229,7 @@ impl ModelRepository {
                         input_cost_per_token, output_cost_per_token, cost_per_image, cache_read_cost_per_token,
                         context_length, verifiable, is_active, owned_by, created_at, updated_at,
                         provider_type, provider_config, attestation_supported,
-                        input_modalities, output_modalities, inference_url, hugging_face_id, quantization, max_output_length, supported_sampling_parameters, supported_features
+                        input_modalities, output_modalities, inference_url, hugging_face_id, quantization, max_output_length, supported_sampling_parameters, supported_features, datacenters
                     FROM models
                     WHERE model_name = $1
                     "#,
@@ -264,7 +264,7 @@ impl ModelRepository {
                         input_cost_per_token, output_cost_per_token, cost_per_image, cache_read_cost_per_token,
                         context_length, verifiable, is_active, owned_by, created_at, updated_at,
                         provider_type, provider_config, attestation_supported,
-                        input_modalities, output_modalities, inference_url, hugging_face_id, quantization, max_output_length, supported_sampling_parameters, supported_features
+                        input_modalities, output_modalities, inference_url, hugging_face_id, quantization, max_output_length, supported_sampling_parameters, supported_features, datacenters
                     FROM models
                     WHERE id = $1
                     "#,
@@ -322,6 +322,7 @@ impl ModelRepository {
                         m.max_output_length,
                         m.supported_sampling_parameters,
                         m.supported_features,
+                        m.datacenters,
                         COALESCE(
                             array_agg(ma.alias_name)
                             FILTER (WHERE ma.alias_name IS NOT NULL),
@@ -427,13 +428,14 @@ impl ModelRepository {
                             max_output_length = COALESCE($21, max_output_length),
                             supported_sampling_parameters = COALESCE($22, supported_sampling_parameters),
                             supported_features = COALESCE($23, supported_features),
+                            datacenters = COALESCE($24, datacenters),
                             updated_at = NOW()
                         WHERE model_name = $1
                         RETURNING id, model_name, model_display_name, model_description, model_icon,
                                   input_cost_per_token, output_cost_per_token, cost_per_image, cache_read_cost_per_token,
                                   context_length, verifiable, is_active, owned_by, created_at, updated_at,
                                   provider_type, provider_config, attestation_supported,
-                                  input_modalities, output_modalities, inference_url, hugging_face_id, quantization, max_output_length, supported_sampling_parameters, supported_features
+                                  input_modalities, output_modalities, inference_url, hugging_face_id, quantization, max_output_length, supported_sampling_parameters, supported_features, datacenters
                         "#,
                         &[
                             &model_name,
@@ -459,6 +461,7 @@ impl ModelRepository {
                             &update_request.max_output_length,
                             &update_request.supported_sampling_parameters,
                             &update_request.supported_features,
+                            &update_request.datacenters,
                         ],
                     )
                     .await
@@ -491,7 +494,7 @@ impl ModelRepository {
                             model_display_name, model_description, model_icon,
                             context_length, verifiable, is_active, owned_by,
                             provider_type, provider_config, attestation_supported,
-                            input_modalities, output_modalities, inference_url, hugging_face_id, quantization, max_output_length, supported_sampling_parameters, supported_features
+                            input_modalities, output_modalities, inference_url, hugging_face_id, quantization, max_output_length, supported_sampling_parameters, supported_features, datacenters
                         ) VALUES (
                             $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11,
                             COALESCE($12, $13),
@@ -504,7 +507,8 @@ impl ModelRepository {
                             $17, $18, $19,
                             $20, $21, $22,
                             COALESCE($23, ARRAY[]::TEXT[]),
-                            COALESCE($24, ARRAY[]::TEXT[])
+                            COALESCE($24, ARRAY[]::TEXT[]),
+                            $25
                         )
                         ON CONFLICT (model_name) DO UPDATE SET
                             input_cost_per_token = EXCLUDED.input_cost_per_token,
@@ -532,12 +536,13 @@ impl ModelRepository {
                             -- param directly preserves existing values on partial updates.
                             supported_sampling_parameters = COALESCE($23, models.supported_sampling_parameters),
                             supported_features = COALESCE($24, models.supported_features),
+                            datacenters = COALESCE($25, models.datacenters),
                             updated_at = NOW()
                         RETURNING id, model_name, model_display_name, model_description, model_icon,
                                   input_cost_per_token, output_cost_per_token, cost_per_image, cache_read_cost_per_token,
                                   context_length, verifiable, is_active, owned_by, created_at, updated_at,
                                   provider_type, provider_config, attestation_supported,
-                                  input_modalities, output_modalities, inference_url, hugging_face_id, quantization, max_output_length, supported_sampling_parameters, supported_features
+                                  input_modalities, output_modalities, inference_url, hugging_face_id, quantization, max_output_length, supported_sampling_parameters, supported_features, datacenters
                         "#,
                         &[
                             &model_name,
@@ -564,6 +569,7 @@ impl ModelRepository {
                             &update_request.max_output_length,
                             &update_request.supported_sampling_parameters,
                             &update_request.supported_features,
+                            &update_request.datacenters,
                         ],
                     )
                     .await
@@ -615,17 +621,17 @@ impl ModelRepository {
                         input_cost_per_token, output_cost_per_token, cost_per_image, cache_read_cost_per_token,
                         context_length, verifiable, is_active, owned_by,
                         provider_type, provider_config, attestation_supported,
-                        input_modalities, output_modalities, inference_url, hugging_face_id, quantization, max_output_length, supported_sampling_parameters, supported_features
+                        input_modalities, output_modalities, inference_url, hugging_face_id, quantization, max_output_length, supported_sampling_parameters, supported_features, datacenters
                     ) VALUES (
                         $1, $2, $3, $4, $5, $6, $7, $8,
                         $9, $10, $11, $12, $13, $14, $15, $16, $17, $18,
-                        $19, $20, $21, $22, $23
+                        $19, $20, $21, $22, $23, $24
                     )
                     RETURNING id, model_name, model_display_name, model_description, model_icon,
                               input_cost_per_token, output_cost_per_token, cost_per_image, cache_read_cost_per_token,
                               context_length, verifiable, is_active, owned_by, created_at, updated_at,
                               provider_type, provider_config, attestation_supported,
-                              input_modalities, output_modalities, inference_url, hugging_face_id, quantization, max_output_length, supported_sampling_parameters, supported_features
+                              input_modalities, output_modalities, inference_url, hugging_face_id, quantization, max_output_length, supported_sampling_parameters, supported_features, datacenters
                     "#,
                     &[
                         &model.model_name,
@@ -651,6 +657,7 @@ impl ModelRepository {
                         &model.max_output_length,
                         &model.supported_sampling_parameters,
                         &model.supported_features,
+                        &model.datacenters,
                     ],
                 )
                 .await
@@ -678,7 +685,7 @@ impl ModelRepository {
                         context_length, model_name, model_display_name, model_description,
                         model_icon, verifiable, is_active, owned_by,
                         provider_type, provider_config, attestation_supported,
-                        input_modalities, output_modalities, inference_url, hugging_face_id, quantization, max_output_length, supported_sampling_parameters, supported_features,
+                        input_modalities, output_modalities, inference_url, hugging_face_id, quantization, max_output_length, supported_sampling_parameters, supported_features, datacenters,
                         effective_from, effective_until, changed_by_user_id, changed_by_user_email,
                         change_reason, created_at
                     FROM model_history
@@ -720,7 +727,7 @@ impl ModelRepository {
                         context_length, model_name, model_display_name, model_description,
                         model_icon, verifiable, is_active, owned_by,
                         provider_type, provider_config, attestation_supported,
-                        input_modalities, output_modalities, inference_url, hugging_face_id, quantization, max_output_length, supported_sampling_parameters, supported_features,
+                        input_modalities, output_modalities, inference_url, hugging_face_id, quantization, max_output_length, supported_sampling_parameters, supported_features, datacenters,
                         effective_from, effective_until, changed_by_user_id, changed_by_user_email,
                         change_reason, created_at
                     FROM model_history
@@ -794,7 +801,7 @@ impl ModelRepository {
                         h.provider_type, h.provider_config, h.attestation_supported,
                         h.input_modalities, h.output_modalities, h.inference_url,
                         h.hugging_face_id, h.quantization, h.max_output_length,
-                        h.supported_sampling_parameters, h.supported_features,
+                        h.supported_sampling_parameters, h.supported_features, h.datacenters,
                         h.effective_from, h.effective_until, h.changed_by_user_id, h.changed_by_user_email,
                         h.change_reason, h.created_at
                     FROM model_history h
@@ -928,6 +935,7 @@ impl ModelRepository {
                     max_output_length,
                     supported_sampling_parameters,
                     supported_features,
+                    datacenters,
                     effective_from,
                     effective_until,
                     changed_by_user_id,
@@ -939,7 +947,8 @@ impl ModelRepository {
                     $20, $21, $22,
                     COALESCE($23, ARRAY[]::TEXT[]),
                     COALESCE($24, ARRAY[]::TEXT[]),
-                    NOW(), NULL, $25, $26, $27, NOW()
+                    $25,
+                    NOW(), NULL, $26, $27, $28, NOW()
                 )
                 "#,
                 &[
@@ -991,6 +1000,10 @@ impl ModelRepository {
                         .flatten(),
                     &model_row
                         .try_get::<_, Option<Vec<String>>>("supported_features")
+                        .ok()
+                        .flatten(),
+                    &model_row
+                        .try_get::<_, Option<Vec<String>>>("datacenters")
                         .ok()
                         .flatten(),
                     &changed_by_user_id,
@@ -1078,6 +1091,7 @@ impl ModelRepository {
                         m.max_output_length,
                         m.supported_sampling_parameters,
                         m.supported_features,
+                        m.datacenters,
                         COALESCE(
                             array_agg(ma_all.alias_name)
                             FILTER (WHERE ma_all.alias_name IS NOT NULL),
@@ -1157,6 +1171,7 @@ impl ModelRepository {
                 .try_get("supported_sampling_parameters")
                 .unwrap_or_default(),
             supported_features: row.try_get("supported_features").unwrap_or_default(),
+            datacenters: row.try_get("datacenters").ok().flatten(),
         }
     }
 
@@ -1203,6 +1218,7 @@ impl ModelRepository {
                 .try_get("supported_sampling_parameters")
                 .unwrap_or_default(),
             supported_features: row.try_get("supported_features").unwrap_or_default(),
+            datacenters: row.try_get("datacenters").ok().flatten(),
             effective_from: row.get("effective_from"),
             effective_until: row.get("effective_until"),
             changed_by_user_id: row.get("changed_by_user_id"),
@@ -1269,7 +1285,7 @@ impl ModelRepository {
                         m.provider_type, m.provider_config, m.attestation_supported,
                         m.input_modalities, m.output_modalities, m.inference_url,
                         m.hugging_face_id, m.quantization, m.max_output_length,
-                        m.supported_sampling_parameters, m.supported_features,
+                        m.supported_sampling_parameters, m.supported_features, m.datacenters,
                         COALESCE(array_agg(a.alias_name) FILTER (WHERE a.alias_name IS NOT NULL), '{}') AS aliases
                     FROM models m
                     LEFT JOIN model_aliases a ON a.canonical_model_id = m.id AND a.is_active = true
@@ -1349,6 +1365,7 @@ impl services::models::ModelsRepository for ModelRepository {
                 max_output_length: m.max_output_length,
                 supported_sampling_parameters: m.supported_sampling_parameters,
                 supported_features: m.supported_features,
+                datacenters: m.datacenters,
                 created_at: m.created_at,
             })
             .collect())
@@ -1384,6 +1401,7 @@ impl services::models::ModelsRepository for ModelRepository {
             max_output_length: m.max_output_length,
             supported_sampling_parameters: m.supported_sampling_parameters,
             supported_features: m.supported_features,
+            datacenters: m.datacenters,
             created_at: m.created_at,
         }))
     }
@@ -1418,6 +1436,7 @@ impl services::models::ModelsRepository for ModelRepository {
             max_output_length: m.max_output_length,
             supported_sampling_parameters: m.supported_sampling_parameters,
             supported_features: m.supported_features,
+            datacenters: m.datacenters,
             created_at: m.created_at,
         }))
     }

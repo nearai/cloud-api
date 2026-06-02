@@ -504,3 +504,123 @@ async fn test_admin_list_models_after_soft_delete() {
 
     println!("✅ Admin list models handles soft delete correctly");
 }
+
+// ============================================
+// OpenRouter `datacenters` field
+// ============================================
+
+/// Setting `datacenters` via the admin upsert should persist and surface as
+/// `[{ "country_code": "US" }, ...]` on the admin list endpoint.
+#[tokio::test]
+async fn test_admin_list_models_datacenters_round_trip() {
+    let server = setup_test_server().await;
+
+    let model_name = format!("datacenters-model-{}", uuid::Uuid::new_v4());
+    let mut batch = BatchUpdateModelApiRequest::new();
+    batch.insert(
+        model_name.clone(),
+        serde_json::from_value(serde_json::json!({
+            "inputCostPerToken": { "amount": 1000000, "currency": "USD" },
+            "outputCostPerToken": { "amount": 2000000, "currency": "USD" },
+            "modelDisplayName": "Datacenters Model",
+            "modelDescription": "A model with datacenters set",
+            "contextLength": 4096,
+            "verifiable": false,
+            "isActive": true,
+            "datacenters": [{ "country_code": "US" }, { "country_code": "FR" }]
+        }))
+        .unwrap(),
+    );
+    admin_batch_upsert_models(&server, batch, get_session_id()).await;
+
+    let response = server
+        .get("/v1/admin/models?limit=500")
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .add_header("User-Agent", MOCK_USER_AGENT)
+        .await;
+    assert_eq!(response.status_code(), 200);
+
+    let list_response: AdminModelListResponse =
+        serde_json::from_str(&response.text()).expect("Failed to parse response");
+
+    let model = list_response
+        .models
+        .iter()
+        .find(|m| m.model_id == model_name)
+        .expect("Should find the datacenters test model");
+
+    let datacenters = model
+        .metadata
+        .datacenters
+        .as_ref()
+        .expect("metadata should carry datacenters");
+    let codes: Vec<&str> = datacenters
+        .iter()
+        .map(|dc| dc.country_code.as_str())
+        .collect();
+    assert_eq!(codes, vec!["US", "FR"], "Datacenters should round-trip");
+
+    println!("✅ Admin datacenters round-trip works correctly");
+}
+
+/// `datacenters` country codes must be 2-letter uppercase ISO 3166 Alpha-2.
+/// Garbage codes are rejected at the admin write path with a 400.
+#[tokio::test]
+async fn test_admin_upsert_rejects_invalid_datacenters() {
+    let server = setup_test_server().await;
+
+    let model_name = format!("bad-datacenters-{}", uuid::Uuid::new_v4());
+    let body = serde_json::json!({
+        model_name: {
+            "inputCostPerToken": { "amount": 1000000, "currency": "USD" },
+            "outputCostPerToken": { "amount": 2000000, "currency": "USD" },
+            "modelDisplayName": "Bad Datacenters Model",
+            "modelDescription": "Has an invalid country code",
+            "contextLength": 4096,
+            "verifiable": false,
+            "isActive": true,
+            "datacenters": [{ "country_code": "usa" }]
+        }
+    });
+
+    let response = server
+        .patch("/v1/admin/models")
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .add_header("User-Agent", MOCK_USER_AGENT)
+        .json(&body)
+        .await;
+
+    assert_eq!(
+        response.status_code(),
+        400,
+        "Invalid ISO 3166 Alpha-2 country code should be rejected"
+    );
+
+    // Lowercase two-letter codes must also be rejected (must be uppercase).
+    let model_name = format!("bad-datacenters-lc-{}", uuid::Uuid::new_v4());
+    let body = serde_json::json!({
+        model_name: {
+            "inputCostPerToken": { "amount": 1000000, "currency": "USD" },
+            "outputCostPerToken": { "amount": 2000000, "currency": "USD" },
+            "modelDisplayName": "Bad Datacenters Model",
+            "modelDescription": "Has a lowercase country code",
+            "contextLength": 4096,
+            "verifiable": false,
+            "isActive": true,
+            "datacenters": [{ "country_code": "us" }]
+        }
+    });
+    let response = server
+        .patch("/v1/admin/models")
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .add_header("User-Agent", MOCK_USER_AGENT)
+        .json(&body)
+        .await;
+    assert_eq!(
+        response.status_code(),
+        400,
+        "Lowercase country code should be rejected"
+    );
+
+    println!("✅ Admin upsert rejects invalid datacenters");
+}

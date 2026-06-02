@@ -468,6 +468,10 @@ pub struct Model {
     pub supported_sampling_parameters: Vec<String>,
     /// Feature capabilities (OpenRouter vocabulary: tools, json_mode, ...).
     pub supported_features: Vec<String>,
+    /// Datacenter country codes (ISO 3166 Alpha-2) the model runs in.
+    /// NULL when unset; serialized on the public API as
+    /// `datacenters: [{ "country_code": "US" }, ...]`.
+    pub datacenters: Option<Vec<String>>,
 
     // Tracking fields
     pub is_active: bool,
@@ -507,6 +511,8 @@ pub struct UpdateModelPricingRequest {
     pub max_output_length: Option<i32>,
     pub supported_sampling_parameters: Option<Vec<String>>,
     pub supported_features: Option<Vec<String>>,
+    /// Datacenter country codes (ISO 3166 Alpha-2) the model runs in.
+    pub datacenters: Option<Vec<String>>,
     // User audit tracking for history
     pub change_reason: Option<String>,
     pub changed_by_user_id: Option<Uuid>,
@@ -554,6 +560,8 @@ pub struct ModelHistory {
     pub max_output_length: Option<i32>,
     pub supported_sampling_parameters: Vec<String>,
     pub supported_features: Vec<String>,
+    /// Datacenter country codes (ISO 3166 Alpha-2) the model ran in.
+    pub datacenters: Option<Vec<String>>,
 
     // Temporal fields
     pub effective_from: DateTime<Utc>,

@@ -173,6 +173,10 @@ impl StopReason {
             inference_providers::CompletionError::InvalidResponse(_) => StopReason::ProviderError,
             inference_providers::CompletionError::NoPubKeyProvider(_) => StopReason::ProviderError,
             inference_providers::CompletionError::Unknown(_) => StopReason::ProviderError,
+            // Internal stop-reason label only (not the client-facing status,
+            // which is a 400). Grouped with the other non-timeout/non-ratelimit
+            // error variants, matching the siblings above.
+            inference_providers::CompletionError::ClientMediaError(_) => StopReason::ProviderError,
             inference_providers::CompletionError::Timeout { .. } => StopReason::Timeout,
         }
     }

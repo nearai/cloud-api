@@ -205,6 +205,7 @@ fn completion_stream_error_category(e: &inference_providers::CompletionError) ->
         inference_providers::CompletionError::InvalidResponse(_) => "invalid_response",
         inference_providers::CompletionError::NoPubKeyProvider(_) => "stale_pubkey",
         inference_providers::CompletionError::Unknown(_) => "unknown",
+        inference_providers::CompletionError::ClientMediaError(_) => "client_media_error",
         inference_providers::CompletionError::Timeout { .. } => "timeout",
     }
 }
@@ -222,6 +223,10 @@ fn completion_stream_error_openai_type(e: &inference_providers::CompletionError)
             400..=499 => "invalid_request_error",
             _ => "server_error",
         },
+        // Client supplied an unfetchable/undecodable image or video: a 400-class
+        // bad-input error, surfaced to the client as invalid_request_error to
+        // match the non-stream path (map_provider_error -> InvalidParams -> 400).
+        inference_providers::CompletionError::ClientMediaError(_) => "invalid_request_error",
         inference_providers::CompletionError::CompletionError(_)
         | inference_providers::CompletionError::InvalidResponse(_)
         | inference_providers::CompletionError::Unknown(_)

@@ -35,6 +35,28 @@ fn to_embedding_error<E: std::fmt::Display>(e: E) -> EmbeddingError {
     EmbeddingError::RequestFailed(e.to_string())
 }
 
+/// Backoff schedule for retrying a signature fetch that returned 404 on every
+/// reachable backend. The backend signs in a background task that finalizes
+/// *after* the final stream chunk, then caches the signature; cloud-api fetches
+/// in the hot path the instant the stream ends, so an initial 404 ("Chat id not
+/// found or expired") is usually a race — the signature lands a few ms later —
+/// not a permanent miss.
+///
+/// Index = number of attempts already completed (0 = wait before the 2nd
+/// attempt). The array length bounds retries to `len + 1` total attempts, and
+/// the sum (350ms) caps the extra hot-path latency well under the caller's 5s
+/// FINALIZE_TIMEOUT. Non-404 statuses and transport errors are definitive and
+/// never reach this path.
+const SIGNATURE_FETCH_BACKOFFS_MS: [u64; 2] = [100, 250];
+
+/// Backoff to wait before the next signature-fetch retry, or `None` once
+/// retries are exhausted. See [`SIGNATURE_FETCH_BACKOFFS_MS`].
+fn signature_fetch_backoff(completed_attempts: usize) -> Option<Duration> {
+    SIGNATURE_FETCH_BACKOFFS_MS
+        .get(completed_attempts)
+        .map(|ms| Duration::from_millis(*ms))
+}
+
 /// Convert any displayable error to PrivacyClassifyError::RequestFailed
 fn to_privacy_classify_error<E: std::fmt::Display>(e: E) -> PrivacyClassifyError {
     PrivacyClassifyError::RequestFailed(e.to_string())
@@ -1147,60 +1169,29 @@ impl InferenceProvider for VLlmProvider {
             .map_err(CompletionError::CompletionError)?;
         let timeout = self.config.control_timeout();
 
+        // Resolve the rotation-SNI target once; it's stable across retries.
         // If this chat_id was served by a rotation-SNI fallback (sticky bucket
         // returned 5xx, so we walked backends by index until one took the
         // request), the signature lives on that *specific* backend — neither
-        // the bucket-pinned client nor the general LB client can find it. We
-        // build a one-shot rotation client targeting the same index and use
-        // it FIRST; the existing bucket/general fallback runs only if that
-        // attempt also misses.
+        // the bucket-pinned client nor the general LB client can find it — so
+        // we try this client FIRST on every attempt.
         let rotation_index = self
             .signature_rotation
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .get(chat_id)
             .copied();
-        if let Some(index) = rotation_index {
-            if let Some(rotation_url) = self.rotation_url(index, "") {
-                let rotation_url =
-                    format!("{}{}", rotation_url.trim_end_matches('/'), path_and_query);
-                if let Ok(client) = self.build_rotation_client() {
-                    match client
-                        .get(&rotation_url)
-                        .headers(headers.clone())
-                        .timeout(timeout)
-                        .send()
-                        .await
-                    {
-                        Ok(response) if response.status().is_success() => {
-                            return response.json().await.map_err(|e| {
-                                CompletionError::CompletionError(format_error_chain(&e))
-                            });
-                        }
-                        Ok(response) => {
-                            tracing::debug!(
-                                index,
-                                status = response.status().as_u16(),
-                                "Rotation-SNI signature fetch did not return 2xx, falling back to bucket/general"
-                            );
-                        }
-                        Err(e) => {
-                            tracing::debug!(
-                                index,
-                                error = %format_error_chain(&e),
-                                "Rotation-SNI signature fetch errored, falling back to bucket/general"
-                            );
-                        }
-                    }
-                }
-            }
-        }
+        let rotation_target = rotation_index.and_then(|index| {
+            let base = self.rotation_url(index, "")?;
+            let url = format!("{}{}", base.trim_end_matches('/'), path_and_query);
+            let client = self.build_rotation_client().ok()?;
+            Some((index, url, client))
+        });
 
-        // Use the bucket client for this chat_id to hit the same backend.
-        // With HTTP/2 (ALPN-negotiated), all requests multiplex on one connection.
-        // Under HTTP/1.1 fallback with concurrency, the bucket client may have
-        // opened a second connection to a different backend — if we get 404,
-        // retry once on the general-purpose client as a fallback.
+        // Bucket client hits the same backend under HTTP/2 (ALPN-negotiated)
+        // multiplexing. Under HTTP/1.1 fallback with concurrency it may have
+        // opened a second connection to a different backend, so on 404 we fall
+        // back to the general-purpose LB client.
         let bucket_id = self
             .signature_buckets
             .lock()
@@ -1213,44 +1204,155 @@ impl InferenceProvider for VLlmProvider {
                 .unwrap_or_else(|e| e.into_inner())
                 .clone()
         });
-
         let mut clients_to_try: Vec<&Client> = Vec::new();
         if let Some(ref bc) = bucket_client {
             clients_to_try.push(bc);
         }
         clients_to_try.push(&self.client);
 
+        // The backend signs in a background task that finalizes *after* the
+        // final stream chunk, then caches the signature. cloud-api fetches in
+        // the hot path the instant the stream ends, so a 404 on every reachable
+        // backend is usually a signing race (the signature lands a few ms
+        // later), not a permanent miss. Retry the whole fetch with a short,
+        // bounded backoff. Only a 404 is retried: a non-404 status is
+        // definitive, and a transport error is definitive on the rotation
+        // backend or once it reaches the last bucket/general client.
+        //
+        // Latency bound: the backoffs add at most their sum (~350ms), but each
+        // request also keeps its own `control_timeout`, so a slow (not fast-404)
+        // backend can still take longer per attempt. The overall fetch is
+        // ultimately bounded by the caller's hot-path FINALIZE_TIMEOUT, which
+        // cancels the whole store if it runs long.
         let mut last_error = None;
-        for client in clients_to_try {
-            let response = client
-                .get(&canonical_url)
-                .headers(headers.clone())
-                .timeout(timeout)
-                .send()
-                .await
-                .map_err(|e| CompletionError::CompletionError(format_error_chain(&e)))?;
-
-            if response.status().is_success() {
-                let signature = response
-                    .json()
+        for attempt in 0..=SIGNATURE_FETCH_BACKOFFS_MS.len() {
+            // For a rotation-pinned chat the signature was produced on that
+            // *specific* backend, so its response is the ONLY authoritative one:
+            // the bucket/general clients can't have the signature, and probing
+            // them risks a non-authoritative 5xx/transport error suppressing a
+            // retryable rotation 404 (the signature would then be lost). So when
+            // a rotation pin exists we talk only to it — a 404 is the
+            // signing-race signal (retry), and any non-404 status or transport
+            // error (e.g. a TLS SPKI/attestation mismatch) is definitive and
+            // fails fast. Without a pin we walk bucket → general and treat an
+            // all-404 sweep as the race signal.
+            let retryable;
+            if let Some((index, rotation_url, client)) = &rotation_target {
+                let index = *index;
+                match client
+                    .get(rotation_url.as_str())
+                    .headers(headers.clone())
+                    .timeout(timeout)
+                    .send()
                     .await
-                    .map_err(|e| CompletionError::CompletionError(format_error_chain(&e)))?;
-                return Ok(signature);
+                {
+                    Ok(response) if response.status().is_success() => {
+                        return response
+                            .json()
+                            .await
+                            .map_err(|e| CompletionError::CompletionError(format_error_chain(&e)));
+                    }
+                    Ok(response) => {
+                        let status = response.status().as_u16();
+                        let error_text = response
+                            .text()
+                            .await
+                            .unwrap_or_else(|e| format!("Failed to read error response body: {e}"));
+                        last_error = Some(format!(
+                            "Rotation-SNI signature fetch failed (HTTP {status}): {error_text}"
+                        ));
+                        // 404 == signing race on the authoritative backend.
+                        retryable = status == 404;
+                        tracing::debug!(
+                            index,
+                            status,
+                            "Rotation-SNI signature fetch did not return 2xx"
+                        );
+                    }
+                    Err(e) => {
+                        let message = format_error_chain(&e);
+                        last_error = Some(format!(
+                            "Rotation-SNI signature fetch transport error: {message}"
+                        ));
+                        retryable = false;
+                        tracing::debug!(index, error = %message, "Rotation-SNI signature fetch errored");
+                    }
+                }
+            } else {
+                // Bucket client, then general LB client.
+                let client_count = clients_to_try.len();
+                let mut all_clients_404 = false;
+                for (idx, &client) in clients_to_try.iter().enumerate() {
+                    let response = match client
+                        .get(&canonical_url)
+                        .headers(headers.clone())
+                        .timeout(timeout)
+                        .send()
+                        .await
+                    {
+                        Ok(response) => response,
+                        // A transport error on a non-final client (e.g. a stale
+                        // bucket connection to a dead backend) shouldn't abort
+                        // the whole fetch — fall through to the next client.
+                        // Only the last client's transport error is fatal, and
+                        // transport errors never arm the 404 retry.
+                        Err(e) => {
+                            let message = format_error_chain(&e);
+                            if idx + 1 < client_count {
+                                tracing::debug!(
+                                    error = %message,
+                                    "Signature fetch transport error; trying next client"
+                                );
+                                last_error = Some(message);
+                                continue;
+                            }
+                            return Err(CompletionError::CompletionError(message));
+                        }
+                    };
+
+                    if response.status().is_success() {
+                        let signature = response.json().await.map_err(|e| {
+                            CompletionError::CompletionError(format_error_chain(&e))
+                        })?;
+                        return Ok(signature);
+                    }
+
+                    let status = response.status().as_u16();
+                    let error_text = response
+                        .text()
+                        .await
+                        .unwrap_or_else(|e| format!("Failed to read error response body: {e}"));
+                    last_error = Some(format!(
+                        "Signature fetch failed (HTTP {status}): {error_text}"
+                    ));
+
+                    // 404 == signature not present on this backend; try the next
+                    // client. Any other status is definitive.
+                    if status == 404 {
+                        all_clients_404 = true;
+                    } else {
+                        all_clients_404 = false;
+                        break;
+                    }
+                }
+                retryable = all_clients_404;
             }
 
-            let status = response.status().as_u16();
-            let error_text = response
-                .text()
-                .await
-                .unwrap_or_else(|e| format!("Failed to read error response body: {e}"));
-            last_error = Some(format!(
-                "Signature fetch failed (HTTP {status}): {error_text}"
-            ));
-
-            // Only retry on 404 (wrong backend) — other errors are definitive
-            if status != 404 {
-                break;
+            // A 404 (signing race) is the only retryable outcome. Back off and
+            // re-fetch — unless retries are exhausted or the failure was
+            // definitive.
+            if retryable {
+                if let Some(backoff) = signature_fetch_backoff(attempt) {
+                    tracing::debug!(
+                        %chat_id,
+                        attempt = attempt + 1,
+                        "Signature not yet present on backend (404); retrying after backoff"
+                    );
+                    tokio::time::sleep(backoff).await;
+                    continue;
+                }
             }
+            break;
         }
 
         Err(CompletionError::CompletionError(
@@ -3375,5 +3477,34 @@ mod tests {
             .insert("chat-1".to_string(), 4);
         provider.unpin_chat_connection("chat-1");
         assert!(provider.signature_rotation.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn signature_fetch_backoff_is_bounded_and_terminates() {
+        // The signature-fetch retry runs in the hot path before `[DONE]`, so
+        // it must add only a small, bounded delay and always terminate.
+        // Index 0 is the wait before the 2nd attempt; the schedule yields
+        // `len + 1` total attempts and then `None`.
+        let n = super::SIGNATURE_FETCH_BACKOFFS_MS.len();
+        assert!(n >= 1, "must retry at least once");
+
+        // Retries terminate: no backoff at or beyond the final attempt index.
+        assert!(super::signature_fetch_backoff(n).is_none());
+        assert!(super::signature_fetch_backoff(n + 5).is_none());
+
+        // Each scheduled retry yields a positive, sane delay.
+        for i in 0..n {
+            let d = super::signature_fetch_backoff(i).expect("backoff present");
+            assert!(d > std::time::Duration::ZERO);
+            assert!(d <= std::time::Duration::from_secs(1));
+        }
+
+        // Total added latency stays comfortably under the caller's 5s
+        // FINALIZE_TIMEOUT budget.
+        let total_ms: u64 = super::SIGNATURE_FETCH_BACKOFFS_MS.iter().sum();
+        assert!(
+            total_ms < 2_000,
+            "total backoff {total_ms}ms must stay well under FINALIZE_TIMEOUT"
+        );
     }
 }

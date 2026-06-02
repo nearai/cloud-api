@@ -326,7 +326,7 @@ async fn test_admin_get_platform_metrics() {
         "Requests should be non-negative"
     );
     assert!(
-        metrics.total_revenue_usd >= 0.0,
+        metrics.total_consumed_usd >= 0.0,
         "Revenue should be non-negative"
     );
 
@@ -386,7 +386,7 @@ async fn test_admin_get_platform_metrics_with_usage() {
         "Should have at least 1 request"
     );
     assert!(
-        metrics.total_revenue_usd >= 0.0,
+        metrics.total_consumed_usd >= 0.0,
         "Revenue should be non-negative"
     );
 
@@ -402,7 +402,8 @@ async fn test_admin_get_platform_metrics_with_usage() {
 async fn test_admin_get_platform_metrics_with_time_range() {
     let server = setup_test_server().await;
 
-    // Get metrics with custom time range
+    // Get metrics with custom time range. URL-encode the `+` in the `+00:00`
+    // offset (otherwise it decodes to a space and is rejected as a bad timestamp).
     let now = chrono::Utc::now();
     let week_ago = now - chrono::Duration::days(7);
 
@@ -410,8 +411,8 @@ async fn test_admin_get_platform_metrics_with_time_range() {
         .get(
             format!(
                 "/v1/admin/platform/metrics?start={}&end={}",
-                week_ago.to_rfc3339(),
-                now.to_rfc3339()
+                week_ago.to_rfc3339().replace('+', "%2B"),
+                now.to_rfc3339().replace('+', "%2B")
             )
             .as_str(),
         )
@@ -877,16 +878,20 @@ async fn test_admin_platform_metrics_splits_reconcile() {
     // The verifiable split must reconcile to the total (within fp tolerance).
     let eps = 1e-6;
     assert!(
-        (m.verifiable_revenue_usd + m.external_revenue_usd - m.total_revenue_usd).abs() < eps,
+        (m.verifiable_consumed_usd + m.non_verifiable_consumed_usd - m.total_consumed_usd).abs()
+            < eps,
         "verifiable + external must equal total consumed"
     );
     assert_eq!(
-        m.verifiable_requests + m.external_requests,
+        m.verifiable_requests + m.non_verifiable_requests,
         m.total_requests,
         "verifiable + external requests must equal total requests"
     );
     assert!(m.active_organizations >= 1, "should have an active org");
-    assert!((0.0..=1.0).contains(&m.error_rate), "error_rate in [0,1]");
+    assert!(
+        (0.0..=1.0).contains(&m.provider_error_or_timeout_rate),
+        "provider_error_or_timeout_rate in [0,1]"
+    );
 
     println!("✅ Platform metrics verifiable split reconciles to total");
 }
@@ -969,8 +974,11 @@ async fn test_admin_platform_model_revenue() {
     let eps = 1e-6;
     let mut prev = f64::INFINITY;
     for m in &report.data {
-        assert!(m.revenue_usd <= prev + eps, "models sorted by revenue desc");
-        prev = m.revenue_usd;
+        assert!(
+            m.consumed_cost_usd <= prev + eps,
+            "models sorted by revenue desc"
+        );
+        prev = m.consumed_cost_usd;
     }
     assert!(report.total >= report.data.len() as i64);
     assert!(report.total >= 1, "the used model should appear");
@@ -1033,12 +1041,16 @@ async fn test_admin_platform_org_revenue() {
     let mut prev = f64::INFINITY;
     for o in &report.data {
         assert!(
-            (o.verifiable_revenue_usd + o.external_revenue_usd - o.revenue_usd).abs() < eps,
+            (o.verifiable_consumed_usd + o.non_verifiable_consumed_usd - o.consumed_cost_usd).abs()
+                < eps,
             "org {} verifiable+external must equal revenue",
             o.organization_name
         );
-        assert!(o.revenue_usd <= prev + eps, "orgs sorted by revenue desc");
-        prev = o.revenue_usd;
+        assert!(
+            o.consumed_cost_usd <= prev + eps,
+            "orgs sorted by revenue desc"
+        );
+        prev = o.consumed_cost_usd;
     }
     assert!(report.total >= report.data.len() as i64);
 
@@ -1066,4 +1078,96 @@ async fn test_admin_platform_infra_summary_graceful() {
     );
 
     println!("✅ Platform infra summary degrades gracefully");
+}
+
+#[tokio::test]
+async fn test_admin_platform_analytics_input_validation() {
+    let server = setup_test_server().await;
+    let sid = get_session_id();
+
+    // Invalid start date -> 400 (not a silent default).
+    let r = server
+        .get("/v1/admin/platform/metrics?start=not-a-date")
+        .add_header("Authorization", format!("Bearer {sid}"))
+        .add_header("User-Agent", MOCK_USER_AGENT)
+        .await;
+    assert_eq!(r.status_code(), 400, "invalid start should 400");
+
+    // start >= end -> 400.
+    let r = server
+        .get("/v1/admin/platform/metrics?start=2026-02-01T00:00:00Z&end=2026-01-01T00:00:00Z")
+        .add_header("Authorization", format!("Bearer {sid}"))
+        .add_header("User-Agent", MOCK_USER_AGENT)
+        .await;
+    assert_eq!(r.status_code(), 400, "start>=end should 400");
+
+    // Invalid sort -> 400.
+    let r = server
+        .get("/v1/admin/platform/model-revenue?sort=toknes")
+        .add_header("Authorization", format!("Bearer {sid}"))
+        .add_header("User-Agent", MOCK_USER_AGENT)
+        .await;
+    assert_eq!(r.status_code(), 400, "invalid sort should 400");
+
+    // Invalid provider_type -> 400.
+    let r = server
+        .get("/v1/admin/platform/model-revenue?provider_type=banana")
+        .add_header("Authorization", format!("Bearer {sid}"))
+        .add_header("User-Agent", MOCK_USER_AGENT)
+        .await;
+    assert_eq!(r.status_code(), 400, "invalid provider_type should 400");
+
+    // hour granularity over a huge range -> 400.
+    let r = server
+        .get("/v1/admin/platform/metrics/timeseries?granularity=hour&start=2020-01-01T00:00:00Z&end=2026-01-01T00:00:00Z")
+        .add_header("Authorization", format!("Bearer {sid}"))
+        .add_header("User-Agent", MOCK_USER_AGENT)
+        .await;
+    assert_eq!(
+        r.status_code(),
+        400,
+        "hour granularity over huge range should 400"
+    );
+
+    println!("✅ Platform analytics input validation returns 400s");
+}
+
+#[tokio::test]
+async fn test_admin_platform_model_revenue_offset_beyond_total() {
+    let server = setup_test_server().await;
+    let org = setup_org_with_credits(&server, 10000000000i64).await;
+    let api_key = get_api_key_for_org(&server, org.id.clone()).await;
+    let model_name = setup_qwen_model(&server).await;
+
+    let resp = server
+        .post("/v1/chat/completions")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .add_header("User-Agent", MOCK_USER_AGENT)
+        .json(&serde_json::json!({
+            "model": model_name,
+            "messages": [{"role": "user", "content": "offset test"}],
+            "stream": false,
+            "max_tokens": 20
+        }))
+        .await;
+    assert_eq!(resp.status_code(), 200);
+    tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
+
+    // A page past the end must still report the true total with empty data
+    // (regression: COUNT(*) OVER read from the first row returned 0 here).
+    let resp = server
+        .get("/v1/admin/platform/model-revenue?limit=10&offset=10000")
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .add_header("User-Agent", MOCK_USER_AGENT)
+        .await;
+    assert_eq!(resp.status_code(), 200);
+    let report: ModelRevenueReport =
+        serde_json::from_str(&resp.text()).expect("parse ModelRevenueReport");
+    assert!(report.data.is_empty(), "page beyond end should be empty");
+    assert!(
+        report.total >= 1,
+        "total must reflect matches, not the empty page"
+    );
+
+    println!("✅ model-revenue reports correct total on an out-of-range page");
 }

@@ -275,17 +275,17 @@ impl AnalyticsRepository for PgAnalyticsRepository {
             .map_err(|e| RepositoryError::DatabaseError(e.into()))?;
 
         let total_requests: i64 = summary_row.get(0);
-        let total_revenue_usd = nano_to_usd(summary_row.get::<_, i64>(1));
+        let total_consumed_usd = nano_to_usd(summary_row.get::<_, i64>(1));
         let total_tokens: i64 = summary_row.get(2);
         let total_cache_read_tokens: i64 = summary_row.get(3);
         let active_organizations: i64 = summary_row.get(4);
-        let verifiable_revenue_usd = nano_to_usd(summary_row.get::<_, i64>(5));
+        let verifiable_consumed_usd = nano_to_usd(summary_row.get::<_, i64>(5));
         let verifiable_requests: i64 = summary_row.get(6);
-        let external_revenue_usd = nano_to_usd(summary_row.get::<_, i64>(7));
-        let external_requests: i64 = summary_row.get(8);
+        let non_verifiable_consumed_usd = nano_to_usd(summary_row.get::<_, i64>(7));
+        let non_verifiable_requests: i64 = summary_row.get(8);
         let error_count: i64 = summary_row.get(9);
         let p95_ttft_ms: Option<f64> = summary_row.get(10);
-        let error_rate = if total_requests > 0 {
+        let provider_error_or_timeout_rate = if total_requests > 0 {
             error_count as f64 / total_requests as f64
         } else {
             0.0
@@ -353,21 +353,22 @@ impl AnalyticsRepository for PgAnalyticsRepository {
         Ok(PlatformMetrics {
             period_start: start,
             period_end: end,
+            generated_at: Utc::now(),
             total_users,
             total_organizations,
             total_requests,
-            total_revenue_usd,
+            total_consumed_usd,
             total_tokens,
             total_cache_read_tokens,
             new_users,
             new_organizations,
             active_organizations,
             paying_organizations,
-            verifiable_revenue_usd,
+            verifiable_consumed_usd,
             verifiable_requests,
-            external_revenue_usd,
-            external_requests,
-            error_rate,
+            non_verifiable_consumed_usd,
+            non_verifiable_requests,
+            provider_error_or_timeout_rate,
             p95_ttft_ms,
             top_models,
             top_organizations,
@@ -529,7 +530,7 @@ impl AnalyticsRepository for PgAnalyticsRepository {
                     tokens: row.get(2),
                     cost_usd: nano_to_usd(row.get::<_, i64>(3)),
                     verifiable_cost_usd: nano_to_usd(row.get::<_, i64>(4)),
-                    external_cost_usd: nano_to_usd(row.get::<_, i64>(5)),
+                    non_verifiable_cost_usd: nano_to_usd(row.get::<_, i64>(5)),
                     active_organizations: row.get(6),
                     new_organizations: 0,
                     new_users: 0,
@@ -542,7 +543,7 @@ impl AnalyticsRepository for PgAnalyticsRepository {
             tokens: 0,
             cost_usd: 0.0,
             verifiable_cost_usd: 0.0,
-            external_cost_usd: 0.0,
+            non_verifiable_cost_usd: 0.0,
             active_organizations: 0,
             new_organizations: 0,
             new_users: 0,
@@ -600,15 +601,24 @@ impl AnalyticsRepository for PgAnalyticsRepository {
         let paying_org_count: i64 = limits_row.get(2);
         let granted_org_count: i64 = limits_row.get(3);
 
-        // All-time consumed cost across all orgs (real, from the cached balance table).
+        // All-time consumed cost. `total` (from the cached balance) is ALL usage
+        // (inference + services); the inference/service splits come from their logs
+        // and reconcile to the total.
         let consumed_row = client
             .query_one(
-                "SELECT COALESCE(SUM(total_spent), 0)::bigint FROM organization_balance",
+                r#"
+                SELECT
+                    (SELECT COALESCE(SUM(total_spent), 0) FROM organization_balance)::bigint as total_nano,
+                    (SELECT COALESCE(SUM(total_cost), 0) FROM organization_usage_log)::bigint as inference_nano,
+                    (SELECT COALESCE(SUM(total_cost), 0) FROM organization_service_usage_log)::bigint as service_nano
+                "#,
                 &[],
             )
             .await
             .map_err(|e| RepositoryError::DatabaseError(e.into()))?;
         let total_consumed_usd = nano_to_usd(consumed_row.get::<_, i64>(0));
+        let inference_consumed_usd = nano_to_usd(consumed_row.get::<_, i64>(1));
+        let service_consumed_usd = nano_to_usd(consumed_row.get::<_, i64>(2));
 
         // Active paid credit limit broken down by funding source.
         let source_rows = client
@@ -638,9 +648,12 @@ impl AnalyticsRepository for PgAnalyticsRepository {
             .collect();
 
         Ok(BillingSummary {
+            generated_at: Utc::now(),
             active_paid_credit_limit_usd,
             active_grant_credit_limit_usd,
             total_consumed_usd,
+            inference_consumed_usd,
+            service_consumed_usd,
             paying_org_count,
             granted_org_count,
             by_source,
@@ -663,8 +676,37 @@ impl AnalyticsRepository for PgAnalyticsRepository {
             RevenueSort::Requests => "requests",
             RevenueSort::Tokens => "tokens",
         };
-        // Optional filters via `$n::type IS NULL OR …`; total via window count.
-        let sql = format!(
+        // Shared WHERE; optional filters via `$n::type IS NULL OR …`. `model_search`
+        // is a case-insensitive substring (the `%…%` wrapping is the bind value).
+        let where_clause = r#"
+            WHERE ul.created_at >= $1 AND ul.created_at < $2
+              AND ($3::bool IS NULL OR COALESCE(m.verifiable, false) = $3)
+              AND ($4::text IS NULL OR m.provider_type = $4)
+              AND ($5::text IS NULL OR ul.model_name ILIKE $5)
+        "#;
+        let model_like = query.model_search.as_ref().map(|s| format!("%{s}%"));
+
+        // Total = number of matching model groups (correct even when offset >= total).
+        let count_sql = format!(
+            "SELECT COUNT(*)::bigint FROM (SELECT 1 FROM organization_usage_log ul \
+             LEFT JOIN models m ON m.id = ul.model_id {where_clause} GROUP BY ul.model_name) t"
+        );
+        let total: i64 = client
+            .query_one(
+                &count_sql,
+                &[
+                    &query.start,
+                    &query.end,
+                    &query.verifiable,
+                    &query.provider_type,
+                    &model_like,
+                ],
+            )
+            .await
+            .map_err(|e| RepositoryError::DatabaseError(e.into()))?
+            .get(0);
+
+        let data_sql = format!(
             r#"
             SELECT
                 ul.model_name,
@@ -675,27 +717,24 @@ impl AnalyticsRepository for PgAnalyticsRepository {
                 BOOL_OR(COALESCE(m.verifiable, false)) as verifiable,
                 MAX(m.provider_type) as provider_type,
                 AVG(ul.ttft_ms)::double precision as avg_ttft_ms,
-                PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY ul.ttft_ms)::double precision as p95_ttft_ms,
-                COUNT(*) OVER()::bigint as total_count
+                PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY ul.ttft_ms)::double precision as p95_ttft_ms
             FROM organization_usage_log ul
             LEFT JOIN models m ON m.id = ul.model_id
-            WHERE ul.created_at >= $1 AND ul.created_at < $2
-              AND ($3::bool IS NULL OR COALESCE(m.verifiable, false) = $3)
-              AND ($4::text IS NULL OR m.provider_type = $4)
+            {where_clause}
             GROUP BY ul.model_name
             ORDER BY {sort_col} DESC
-            LIMIT $5 OFFSET $6
+            LIMIT $6 OFFSET $7
             "#
         );
-
         let rows = client
             .query(
-                &sql,
+                &data_sql,
                 &[
                     &query.start,
                     &query.end,
                     &query.verifiable,
                     &query.provider_type,
+                    &model_like,
                     &query.limit,
                     &query.offset,
                 ],
@@ -703,12 +742,11 @@ impl AnalyticsRepository for PgAnalyticsRepository {
             .await
             .map_err(|e| RepositoryError::DatabaseError(e.into()))?;
 
-        let total = rows.first().map(|r| r.get::<_, i64>(9)).unwrap_or(0);
         let data: Vec<ModelRevenueEntry> = rows
             .iter()
             .map(|row| ModelRevenueEntry {
                 model_name: row.get(0),
-                revenue_usd: nano_to_usd(row.get::<_, i64>(1)),
+                consumed_cost_usd: nano_to_usd(row.get::<_, i64>(1)),
                 requests: row.get(2),
                 tokens: row.get(3),
                 unique_orgs: row.get(4),
@@ -744,11 +782,11 @@ impl AnalyticsRepository for PgAnalyticsRepository {
             RevenueSort::Requests => "requests",
             RevenueSort::Tokens => "tokens",
         };
-        // `is_paying` is a current-state flag (org has an active payment credit), used both
-        // as an output column and as the optional `paying` filter (via HAVING). Window count
-        // runs after HAVING, so `total_count` reflects the filtered total.
-        let sql = format!(
-            r#"
+        // `is_paying` is a current-state flag (org has an active payment credit), used
+        // both as an output column and as the optional `paying` filter (via HAVING).
+        // `search` is a case-insensitive substring on org name (the `%…%` is the bind).
+        let org_like = query.search.as_ref().map(|s| format!("%{s}%"));
+        let cte_and_from = r#"
             WITH paying AS (
                 SELECT DISTINCT organization_id
                 FROM organization_limits_history
@@ -764,27 +802,37 @@ impl AnalyticsRepository for PgAnalyticsRepository {
                 COALESCE(SUM(ul.input_tokens + ul.output_tokens), 0)::bigint as tokens,
                 COUNT(DISTINCT ul.model_name)::bigint as models_used,
                 BOOL_OR(p.organization_id IS NOT NULL) as is_paying,
-                MAX(ul.created_at) as last_usage_at,
-                COUNT(*) OVER()::bigint as total_count
+                MAX(ul.created_at) as last_usage_at
             FROM organizations o
             INNER JOIN organization_usage_log ul ON ul.organization_id = o.id
                 AND ul.created_at >= $1 AND ul.created_at < $2
             LEFT JOIN models m ON m.id = ul.model_id
             LEFT JOIN paying p ON p.organization_id = o.id
+            WHERE ($4::text IS NULL OR o.name ILIKE $4)
             GROUP BY o.id, o.name
             HAVING ($3::bool IS NULL OR BOOL_OR(p.organization_id IS NOT NULL) = $3)
-            ORDER BY {sort_col} DESC
-            LIMIT $4 OFFSET $5
-            "#
-        );
+        "#;
 
+        // Total = matching org groups after HAVING (correct when offset >= total).
+        let count_sql = format!("SELECT COUNT(*)::bigint FROM ({cte_and_from}) t");
+        let total: i64 = client
+            .query_one(
+                &count_sql,
+                &[&query.start, &query.end, &query.paying, &org_like],
+            )
+            .await
+            .map_err(|e| RepositoryError::DatabaseError(e.into()))?
+            .get(0);
+
+        let data_sql = format!("{cte_and_from} ORDER BY {sort_col} DESC LIMIT $5 OFFSET $6");
         let rows = client
             .query(
-                &sql,
+                &data_sql,
                 &[
                     &query.start,
                     &query.end,
                     &query.paying,
+                    &org_like,
                     &query.limit,
                     &query.offset,
                 ],
@@ -792,15 +840,14 @@ impl AnalyticsRepository for PgAnalyticsRepository {
             .await
             .map_err(|e| RepositoryError::DatabaseError(e.into()))?;
 
-        let total = rows.first().map(|r| r.get::<_, i64>(10)).unwrap_or(0);
         let data: Vec<OrgRevenueEntry> = rows
             .iter()
             .map(|row| OrgRevenueEntry {
                 organization_id: row.get(0),
                 organization_name: row.get(1),
-                revenue_usd: nano_to_usd(row.get::<_, i64>(2)),
-                verifiable_revenue_usd: nano_to_usd(row.get::<_, i64>(3)),
-                external_revenue_usd: nano_to_usd(row.get::<_, i64>(4)),
+                consumed_cost_usd: nano_to_usd(row.get::<_, i64>(2)),
+                verifiable_consumed_usd: nano_to_usd(row.get::<_, i64>(3)),
+                non_verifiable_consumed_usd: nano_to_usd(row.get::<_, i64>(4)),
                 requests: row.get(5),
                 tokens: row.get(6),
                 models_used: row.get(7),

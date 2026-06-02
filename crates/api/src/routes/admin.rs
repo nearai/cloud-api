@@ -50,6 +50,17 @@ pub struct AdminAppState {
     pub infra_service: Arc<services::admin::InfraService>,
 }
 
+/// Small helper for 400 responses from analytics query-param validation.
+fn bad_request(
+    message: impl Into<String>,
+    code: &str,
+) -> (StatusCode, ResponseJson<ErrorResponse>) {
+    (
+        StatusCode::BAD_REQUEST,
+        ResponseJson(ErrorResponse::new(message.into(), code.to_string())),
+    )
+}
+
 /// Batch upsert models metadata (Admin only)
 ///
 /// Upserts (inserts or updates) pricing and metadata for one or more models. Only authenticated admins can perform this operation.
@@ -2178,18 +2189,12 @@ pub async fn get_platform_metrics(
         params.start, params.end
     );
 
-    // Parse time range with defaults
-    let end = params
-        .end
-        .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
-        .map(|dt| dt.with_timezone(&Utc))
-        .unwrap_or_else(Utc::now);
-
-    let start = params
-        .start
-        .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
-        .map(|dt| dt.with_timezone(&Utc))
-        .unwrap_or_else(|| end - Duration::days(30));
+    let (start, end) = crate::routes::common::parse_metrics_range(
+        params.start.as_deref(),
+        params.end.as_deref(),
+        None,
+        0,
+    )?;
 
     // Get platform metrics from analytics service
     let metrics = app_state
@@ -2260,16 +2265,13 @@ pub async fn get_platform_timeseries(
         }
     };
 
-    let end = params
-        .end
-        .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
-        .map(|dt| dt.with_timezone(&Utc))
-        .unwrap_or_else(Utc::now);
-    let start = params
-        .start
-        .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
-        .map(|dt| dt.with_timezone(&Utc))
-        .unwrap_or_else(|| end - Duration::days(30));
+    // Cap `hour` granularity to 31 days to avoid unbounded bucket counts.
+    let (start, end) = crate::routes::common::parse_metrics_range(
+        params.start.as_deref(),
+        params.end.as_deref(),
+        Some(granularity),
+        31,
+    )?;
 
     let metrics = app_state
         .analytics_service
@@ -2344,8 +2346,10 @@ pub struct ModelRevenueQueryParams {
     pub offset: i64,
     /// Filter by verifiable (TEE) models only / non-verifiable only.
     pub verifiable: Option<bool>,
-    /// Filter by provider type (e.g. "vllm" or "external").
+    /// Filter by provider type ("vllm" or "external").
     pub provider_type: Option<String>,
+    /// Case-insensitive substring match on model name.
+    pub model_search: Option<String>,
     /// Sort key: "revenue" (default), "requests", or "tokens".
     pub sort: Option<String>,
 }
@@ -2390,17 +2394,22 @@ pub async fn get_model_revenue(
         params.start, params.end, params.limit, params.offset
     );
     crate::routes::common::validate_limit_offset(params.limit, params.offset)?;
-
-    let end = params
-        .end
-        .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
-        .map(|dt| dt.with_timezone(&Utc))
-        .unwrap_or_else(Utc::now);
-    let start = params
-        .start
-        .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
-        .map(|dt| dt.with_timezone(&Utc))
-        .unwrap_or_else(|| end - Duration::days(30));
+    let (start, end) = crate::routes::common::parse_metrics_range(
+        params.start.as_deref(),
+        params.end.as_deref(),
+        None,
+        0,
+    )?;
+    let sort = services::admin::RevenueSort::from_query(params.sort.as_deref())
+        .map_err(|m| bad_request(m, "invalid_parameter"))?;
+    if let Some(pt) = params.provider_type.as_deref() {
+        if pt != "vllm" && pt != "external" {
+            return Err(bad_request(
+                format!("invalid provider_type '{pt}'; expected 'vllm' or 'external'"),
+                "invalid_parameter",
+            ));
+        }
+    }
 
     let report = app_state
         .analytics_service
@@ -2409,7 +2418,8 @@ pub async fn get_model_revenue(
             end,
             verifiable: params.verifiable,
             provider_type: params.provider_type,
-            sort: services::admin::RevenueSort::from_query(params.sort.as_deref()),
+            model_search: params.model_search,
+            sort,
             limit: params.limit,
             offset: params.offset,
         })
@@ -2440,6 +2450,8 @@ pub struct OrgRevenueQueryParams {
     pub offset: i64,
     /// Filter to current paying (true) / non-paying (false) orgs.
     pub paying: Option<bool>,
+    /// Case-insensitive substring match on organization name.
+    pub search: Option<String>,
     /// Sort key: "revenue" (default), "requests", or "tokens".
     pub sort: Option<String>,
 }
@@ -2484,17 +2496,14 @@ pub async fn get_org_revenue(
         params.start, params.end, params.limit, params.offset
     );
     crate::routes::common::validate_limit_offset(params.limit, params.offset)?;
-
-    let end = params
-        .end
-        .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
-        .map(|dt| dt.with_timezone(&Utc))
-        .unwrap_or_else(Utc::now);
-    let start = params
-        .start
-        .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
-        .map(|dt| dt.with_timezone(&Utc))
-        .unwrap_or_else(|| end - Duration::days(30));
+    let (start, end) = crate::routes::common::parse_metrics_range(
+        params.start.as_deref(),
+        params.end.as_deref(),
+        None,
+        0,
+    )?;
+    let sort = services::admin::RevenueSort::from_query(params.sort.as_deref())
+        .map_err(|m| bad_request(m, "invalid_parameter"))?;
 
     let report = app_state
         .analytics_service
@@ -2502,7 +2511,8 @@ pub async fn get_org_revenue(
             start,
             end,
             paying: params.paying,
-            sort: services::admin::RevenueSort::from_query(params.sort.as_deref()),
+            search: params.search,
+            sort,
             limit: params.limit,
             offset: params.offset,
         })

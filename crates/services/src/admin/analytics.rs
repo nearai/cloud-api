@@ -86,12 +86,19 @@ pub struct OrganizationMetrics {
 pub struct PlatformMetrics {
     pub period_start: DateTime<Utc>,
     pub period_end: DateTime<Utc>,
+    /// When this response was computed. The `total_users`/`total_organizations`/
+    /// `paying_organizations` fields are **current snapshots as of this time**, not
+    /// period-bound like the rest.
+    pub generated_at: DateTime<Utc>,
+    /// Snapshot (as of `generated_at`).
     pub total_users: i64,
+    /// Snapshot (as of `generated_at`).
     pub total_organizations: i64,
     pub total_requests: i64,
-    /// Total **consumed usage cost** in USD. NOT recognized revenue: grant- and
-    /// payment-funded usage are not separable without per-request attribution.
-    pub total_revenue_usd: f64,
+    /// Total **consumed usage cost** in USD over the period (inference only).
+    /// NOT recognized revenue: grant/payment funding is not separable without
+    /// per-request attribution (tracked in #704).
+    pub total_consumed_usd: f64,
     // --- Token volume (within the period) ---
     pub total_tokens: i64,
     pub total_cache_read_tokens: i64,
@@ -102,19 +109,21 @@ pub struct PlatformMetrics {
     pub new_organizations: i64,
     /// Organizations that issued ≥1 request in the period
     pub active_organizations: i64,
-    /// Current snapshot: organizations that have an active payment-type credit
-    /// (a current count, not a historical attribution).
+    /// Snapshot (as of `generated_at`): orgs with an active payment-type credit.
+    /// NOTE: does not yet count postpaid/invoiced customers (see #704).
     pub paying_organizations: i64,
-    // --- Verifiable / TEE differentiator split ---
+    // --- Verifiable / TEE split. NOTE: computed by joining usage to *current*
+    //     model metadata, so historical periods can shift if a model's verifiable
+    //     flag changes. A usage-time snapshot is tracked in #704. ---
     /// Consumed cost on verifiable (TEE-attested) models, USD
-    pub verifiable_revenue_usd: f64,
+    pub verifiable_consumed_usd: f64,
     pub verifiable_requests: i64,
-    /// Consumed cost on non-verifiable models, USD
-    pub external_revenue_usd: f64,
-    pub external_requests: i64,
+    /// Consumed cost on non-verifiable models, USD (NOT necessarily third-party)
+    pub non_verifiable_consumed_usd: f64,
+    pub non_verifiable_requests: i64,
     // --- Reliability ---
     /// Share of requests whose stop_reason ∈ {provider_error, timeout}, 0.0–1.0
-    pub error_rate: f64,
+    pub provider_error_or_timeout_rate: f64,
     /// 95th percentile time-to-first-token across the platform (ms)
     pub p95_ttft_ms: Option<f64>,
     pub top_models: Vec<TopModelMetrics>,
@@ -130,7 +139,8 @@ pub struct PlatformTimeSeriesPoint {
     /// Consumed usage cost for the bucket, USD
     pub cost_usd: f64,
     pub verifiable_cost_usd: f64,
-    pub external_cost_usd: f64,
+    /// Non-verifiable consumed cost (NOT necessarily third-party), USD
+    pub non_verifiable_cost_usd: f64,
     pub active_organizations: i64,
     pub new_organizations: i64,
     pub new_users: i64,
@@ -161,12 +171,19 @@ pub struct BillingSourceBreakdown {
 /// (nearai-cloud-ui), not in cloud-api.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct BillingSummary {
+    pub generated_at: DateTime<Utc>,
     /// Sum of active payment-type spend limits (caps), USD
     pub active_paid_credit_limit_usd: f64,
     /// Sum of active grant-type spend limits (caps), USD
     pub active_grant_credit_limit_usd: f64,
-    /// All-time consumed cost across all orgs, USD (from organization_balance)
+    /// All-time consumed cost across all orgs, USD — **all usage** (from
+    /// organization_balance: inference + services). `inference_consumed_usd +
+    /// service_consumed_usd` reconcile to this.
     pub total_consumed_usd: f64,
+    /// All-time inference consumed cost, USD (organization_usage_log)
+    pub inference_consumed_usd: f64,
+    /// All-time service consumed cost, USD (organization_service_usage_log, e.g. web_search)
+    pub service_consumed_usd: f64,
     pub paying_org_count: i64,
     pub granted_org_count: i64,
     pub by_source: Vec<BillingSourceBreakdown>,
@@ -177,10 +194,11 @@ pub struct BillingSummary {
 pub struct ModelRevenueEntry {
     pub model_name: String,
     /// Consumed usage cost, USD
-    pub revenue_usd: f64,
+    pub consumed_cost_usd: f64,
     pub requests: i64,
     pub tokens: i64,
     pub unique_orgs: i64,
+    /// Current model metadata (may differ from when the usage occurred).
     pub verifiable: bool,
     pub provider_type: Option<String>,
     pub avg_ttft_ms: Option<f64>,
@@ -205,13 +223,14 @@ pub struct OrgRevenueEntry {
     pub organization_id: Uuid,
     pub organization_name: String,
     /// Consumed usage cost, USD
-    pub revenue_usd: f64,
-    pub verifiable_revenue_usd: f64,
-    pub external_revenue_usd: f64,
+    pub consumed_cost_usd: f64,
+    pub verifiable_consumed_usd: f64,
+    pub non_verifiable_consumed_usd: f64,
     pub requests: i64,
     pub tokens: i64,
     pub models_used: i64,
-    /// Current snapshot: org has an active payment-type credit (not historical).
+    /// Current snapshot: org has an active payment-type credit (not historical;
+    /// does not yet count postpaid — see #704).
     pub is_paying: bool,
     pub last_usage_at: Option<DateTime<Utc>>,
 }
@@ -238,12 +257,16 @@ pub enum RevenueSort {
 }
 
 impl RevenueSort {
-    /// Parse from the API `sort` query param; unknown/None → `Revenue`.
-    pub fn from_query(s: Option<&str>) -> Self {
+    /// Parse from the API `sort` query param. `None` → `Revenue` (default);
+    /// an unknown value is an error (handlers return 400).
+    pub fn from_query(s: Option<&str>) -> Result<Self, String> {
         match s {
-            Some("requests") => RevenueSort::Requests,
-            Some("tokens") => RevenueSort::Tokens,
-            _ => RevenueSort::Revenue,
+            None | Some("revenue") => Ok(RevenueSort::Revenue),
+            Some("requests") => Ok(RevenueSort::Requests),
+            Some("tokens") => Ok(RevenueSort::Tokens),
+            Some(other) => Err(format!(
+                "invalid sort '{other}'; expected one of: revenue, requests, tokens"
+            )),
         }
     }
 }
@@ -254,7 +277,10 @@ pub struct ModelRevenueQuery {
     pub start: DateTime<Utc>,
     pub end: DateTime<Utc>,
     pub verifiable: Option<bool>,
+    /// Allowlisted provider type ("vllm" | "external"); validated in the handler.
     pub provider_type: Option<String>,
+    /// Case-insensitive substring match on model name.
+    pub model_search: Option<String>,
     pub sort: RevenueSort,
     pub limit: i64,
     pub offset: i64,
@@ -267,6 +293,8 @@ pub struct OrgRevenueQuery {
     pub end: DateTime<Utc>,
     /// Filter to current paying / non-paying orgs (by active payment credit).
     pub paying: Option<bool>,
+    /// Case-insensitive substring match on organization name.
+    pub search: Option<String>,
     pub sort: RevenueSort,
     pub limit: i64,
     pub offset: i64,

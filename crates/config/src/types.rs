@@ -6,9 +6,11 @@ pub struct ApiConfig {
     /// API key for authenticating with inference backends (vLLM/SGLang via inference_url)
     pub inference_api_key: Option<String>,
     /// Shared secret accepted by `POST /v1/internal/usage` from trusted
-    /// reporters (e.g. inference-proxy). When `None`, the endpoint is
-    /// disabled and returns 503. Reporters can still authenticate to the
-    /// legacy `POST /v1/usage` with an `sk-…` key while this is unset.
+    /// reporters (e.g. inference-proxy). This is the only *API endpoint* for
+    /// reporter-submitted usage (the internal inference pipeline records its
+    /// own usage directly, unaffected by this). When `None`, the
+    /// `/v1/internal/usage` endpoint is disabled and returns 503, so reporters
+    /// cannot submit usage until an operator sets the secret.
     pub internal_usage_token: Option<String>,
     pub logging: LoggingConfig,
     pub dstack_client: DstackClientConfig,

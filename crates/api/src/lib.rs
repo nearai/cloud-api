@@ -1553,10 +1553,11 @@ pub fn build_admin_routes(
     use crate::middleware::admin_middleware;
     use crate::routes::admin::{
         batch_upsert_models, create_admin_access_token, create_service, delete_admin_access_token,
-        delete_model, deprecate_model, get_admin_organization_balance, get_model_history,
+        delete_model, deprecate_model, get_admin_organization_balance, get_billing_summary,
+        get_infra_summary, get_model_history, get_model_revenue, get_org_revenue,
         get_organization_concurrent_limit, get_organization_limits_history,
         get_organization_metrics, get_organization_timeseries, get_platform_metrics,
-        list_admin_access_tokens, list_invitation_email_deliveries,
+        get_platform_timeseries, list_admin_access_tokens, list_invitation_email_deliveries,
         list_models as admin_list_models, list_organizations, list_users, resend_invitation_email,
         update_organization_concurrent_limit, update_organization_limits, update_service,
         AdminAppState,
@@ -1589,6 +1590,11 @@ pub fn build_admin_routes(
     let github_dispatcher =
         services::github_dispatch::dispatcher_from_config(&config.github_dispatch);
 
+    let infra_service = Arc::new(services::admin::InfraService::new(
+        config.infra.machines_url.clone(),
+        config.infra.cost_per_host_usd_month,
+    ));
+
     let admin_app_state = AdminAppState {
         admin_service,
         analytics_service: services.analytics_service,
@@ -1599,6 +1605,7 @@ pub fn build_admin_routes(
         admin_access_token_repository,
         inference_provider_pool: services.inference_provider_pool,
         github_dispatcher,
+        infra_service,
     };
 
     Router::new()
@@ -1648,6 +1655,26 @@ pub fn build_admin_routes(
         .route(
             "/admin/platform/metrics",
             axum::routing::get(get_platform_metrics),
+        )
+        .route(
+            "/admin/platform/metrics/timeseries",
+            axum::routing::get(get_platform_timeseries),
+        )
+        .route(
+            "/admin/platform/billing-summary",
+            axum::routing::get(get_billing_summary),
+        )
+        .route(
+            "/admin/platform/model-revenue",
+            axum::routing::get(get_model_revenue),
+        )
+        .route(
+            "/admin/platform/org-revenue",
+            axum::routing::get(get_org_revenue),
+        )
+        .route(
+            "/admin/platform/infra-summary",
+            axum::routing::get(get_infra_summary),
         )
         .route(
             "/admin/invitation-email-deliveries",
@@ -1846,6 +1873,7 @@ mod tests {
             cors: config::CorsConfig::default(),
             external_providers: config::ExternalProvidersConfig::default(),
             github_dispatch: config::GitHubDispatchConfig::default(),
+            infra: config::InfraConfig::default(),
         };
 
         // Initialize services
@@ -1947,6 +1975,7 @@ mod tests {
             cors: config::CorsConfig::default(),
             external_providers: config::ExternalProvidersConfig::default(),
             github_dispatch: config::GitHubDispatchConfig::default(),
+            infra: config::InfraConfig::default(),
         };
 
         let auth_components = init_auth_services(database.clone(), &config);

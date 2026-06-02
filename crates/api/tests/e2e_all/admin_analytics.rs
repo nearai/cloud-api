@@ -1,7 +1,10 @@
 // E2E tests for admin analytics endpoints
 
 use crate::common::*;
-use services::admin::{OrganizationMetrics, PlatformMetrics, TimeSeriesMetrics};
+use services::admin::{
+    BillingSummary, InfraSummary, ModelRevenueReport, OrgRevenueReport, OrganizationMetrics,
+    PlatformMetrics, PlatformTimeSeriesMetrics, TimeSeriesMetrics,
+};
 
 // ============================================
 // Organization Metrics Tests
@@ -834,4 +837,231 @@ async fn test_admin_metrics_unique_api_keys_tracking() {
     );
 
     println!("✅ Admin metrics correctly track unique API keys");
+}
+
+// ============================================
+// Platform Stats Dashboard Tests (new endpoints)
+// ============================================
+
+#[tokio::test]
+async fn test_admin_platform_metrics_splits_reconcile() {
+    let server = setup_test_server().await;
+
+    let org = setup_org_with_credits(&server, 10000000000i64).await; // $10.00
+    let api_key = get_api_key_for_org(&server, org.id.clone()).await;
+    let model_name = setup_qwen_model(&server).await;
+
+    let response = server
+        .post("/v1/chat/completions")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .add_header("User-Agent", MOCK_USER_AGENT)
+        .json(&serde_json::json!({
+            "model": model_name,
+            "messages": [{"role": "user", "content": "Hello splits!"}],
+            "stream": false,
+            "max_tokens": 20
+        }))
+        .await;
+    assert_eq!(response.status_code(), 200);
+    tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
+
+    let response = server
+        .get("/v1/admin/platform/metrics")
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .add_header("User-Agent", MOCK_USER_AGENT)
+        .await;
+    assert_eq!(response.status_code(), 200);
+
+    let m: PlatformMetrics = serde_json::from_str(&response.text()).expect("parse PlatformMetrics");
+
+    // Splits must reconcile to the total (within fp tolerance).
+    let eps = 1e-6;
+    assert!(
+        (m.paid_revenue_usd + m.granted_revenue_usd - m.total_revenue_usd).abs() < eps,
+        "paid + granted must equal total revenue"
+    );
+    assert!(
+        (m.verifiable_revenue_usd + m.external_revenue_usd - m.total_revenue_usd).abs() < eps,
+        "verifiable + external must equal total revenue"
+    );
+    assert_eq!(
+        m.verifiable_requests + m.external_requests,
+        m.total_requests,
+        "verifiable + external requests must equal total requests"
+    );
+    assert!(m.active_organizations >= 1, "should have an active org");
+    assert!((0.0..=1.0).contains(&m.error_rate), "error_rate in [0,1]");
+
+    println!("✅ Platform metrics splits reconcile to totals");
+}
+
+#[tokio::test]
+async fn test_admin_platform_timeseries() {
+    let server = setup_test_server().await;
+
+    let response = server
+        .get("/v1/admin/platform/metrics/timeseries?granularity=month")
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .add_header("User-Agent", MOCK_USER_AGENT)
+        .await;
+    assert_eq!(response.status_code(), 200);
+    let ts: PlatformTimeSeriesMetrics =
+        serde_json::from_str(&response.text()).expect("parse PlatformTimeSeriesMetrics");
+    assert_eq!(ts.granularity, "month");
+
+    // Invalid granularity should 400.
+    let bad = server
+        .get("/v1/admin/platform/metrics/timeseries?granularity=decade")
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .add_header("User-Agent", MOCK_USER_AGENT)
+        .await;
+    assert_eq!(bad.status_code(), 400);
+
+    println!("✅ Platform timeseries works and validates granularity");
+}
+
+#[tokio::test]
+async fn test_admin_platform_billing_summary() {
+    let server = setup_test_server().await;
+    let _org = setup_org_with_credits(&server, 5000000000i64).await; // $5.00
+
+    let response = server
+        .get("/v1/admin/platform/billing-summary")
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .add_header("User-Agent", MOCK_USER_AGENT)
+        .await;
+    assert_eq!(response.status_code(), 200);
+    let b: BillingSummary = serde_json::from_str(&response.text()).expect("parse BillingSummary");
+    assert!(b.paid_provisioned_usd >= 0.0);
+    assert!(b.unspent_paid_balance_usd >= 0.0, "deferred clamped >= 0");
+
+    println!("✅ Platform billing summary works");
+}
+
+#[tokio::test]
+async fn test_admin_platform_model_revenue() {
+    let server = setup_test_server().await;
+    let org = setup_org_with_credits(&server, 10000000000i64).await;
+    let api_key = get_api_key_for_org(&server, org.id.clone()).await;
+    let model_name = setup_qwen_model(&server).await;
+
+    let response = server
+        .post("/v1/chat/completions")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .add_header("User-Agent", MOCK_USER_AGENT)
+        .json(&serde_json::json!({
+            "model": model_name,
+            "messages": [{"role": "user", "content": "Hi model revenue!"}],
+            "stream": false,
+            "max_tokens": 20
+        }))
+        .await;
+    assert_eq!(response.status_code(), 200);
+    tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
+
+    let response = server
+        .get("/v1/admin/platform/model-revenue")
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .add_header("User-Agent", MOCK_USER_AGENT)
+        .await;
+    assert_eq!(response.status_code(), 200);
+    let report: ModelRevenueReport =
+        serde_json::from_str(&response.text()).expect("parse ModelRevenueReport");
+
+    // Per-model paid + granted must reconcile to that model's revenue, and the
+    // list must be sorted by revenue desc.
+    let eps = 1e-6;
+    let mut prev = f64::INFINITY;
+    for m in &report.models {
+        assert!(
+            (m.paid_revenue_usd + m.granted_revenue_usd - m.revenue_usd).abs() < eps,
+            "model {} paid+granted must equal revenue",
+            m.model_name
+        );
+        assert!(m.revenue_usd <= prev + eps, "models sorted by revenue desc");
+        prev = m.revenue_usd;
+    }
+
+    println!("✅ Platform model-revenue works and reconciles");
+}
+
+#[tokio::test]
+async fn test_admin_platform_org_revenue() {
+    let server = setup_test_server().await;
+    let org = setup_org_with_credits(&server, 10000000000i64).await;
+    let api_key = get_api_key_for_org(&server, org.id.clone()).await;
+    let model_name = setup_qwen_model(&server).await;
+
+    let response = server
+        .post("/v1/chat/completions")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .add_header("User-Agent", MOCK_USER_AGENT)
+        .json(&serde_json::json!({
+            "model": model_name,
+            "messages": [{"role": "user", "content": "Hi org revenue!"}],
+            "stream": false,
+            "max_tokens": 20
+        }))
+        .await;
+    assert_eq!(response.status_code(), 200);
+    tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
+
+    let response = server
+        .get("/v1/admin/platform/org-revenue")
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .add_header("User-Agent", MOCK_USER_AGENT)
+        .await;
+    assert_eq!(response.status_code(), 200);
+    let report: OrgRevenueReport =
+        serde_json::from_str(&response.text()).expect("parse OrgRevenueReport");
+
+    // The org that made requests must be attributed, splits reconcile, sorted desc.
+    let found = report
+        .organizations
+        .iter()
+        .find(|o| o.organization_id.to_string() == org.id)
+        .expect("org with usage should be attributed");
+    assert!(found.requests >= 1, "attributed org should have requests");
+
+    let eps = 1e-6;
+    let mut prev = f64::INFINITY;
+    for o in &report.organizations {
+        assert!(
+            (o.paid_revenue_usd + o.granted_revenue_usd - o.revenue_usd).abs() < eps,
+            "org {} paid+granted must equal revenue",
+            o.organization_name
+        );
+        assert!(
+            (o.verifiable_revenue_usd + o.external_revenue_usd - o.revenue_usd).abs() < eps,
+            "org {} verifiable+external must equal revenue",
+            o.organization_name
+        );
+        assert!(o.revenue_usd <= prev + eps, "orgs sorted by revenue desc");
+        prev = o.revenue_usd;
+    }
+
+    println!("✅ Platform org-revenue works and reconciles");
+}
+
+#[tokio::test]
+async fn test_admin_platform_infra_summary_graceful() {
+    let server = setup_test_server().await;
+
+    // The machines endpoint is not reachable in tests; the handler must degrade
+    // gracefully (200 + stale flag), never 500.
+    let response = server
+        .get("/v1/admin/platform/infra-summary")
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .add_header("User-Agent", MOCK_USER_AGENT)
+        .await;
+    assert_eq!(response.status_code(), 200);
+    let infra: InfraSummary = serde_json::from_str(&response.text()).expect("parse InfraSummary");
+    assert!(infra.cost_per_host_usd_month >= 0.0);
+    // Unconfigured/unreachable inventory in tests -> zero hosts, marked stale.
+    assert!(
+        infra.stale && infra.total_hosts == 0,
+        "unconfigured fleet should be stale with 0 hosts"
+    );
+
+    println!("✅ Platform infra summary degrades gracefully");
 }

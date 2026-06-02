@@ -47,6 +47,7 @@ pub struct AdminAppState {
     pub admin_access_token_repository: Arc<database::repositories::AdminAccessTokenRepository>,
     pub inference_provider_pool: Arc<services::inference_provider_pool::InferenceProviderPool>,
     pub github_dispatcher: Arc<dyn GitHubDispatcher>,
+    pub infra_service: Arc<services::admin::InfraService>,
 }
 
 /// Batch upsert models metadata (Admin only)
@@ -2207,6 +2208,283 @@ pub async fn get_platform_metrics(
         })?;
 
     Ok(ResponseJson(metrics))
+}
+
+/// Get platform-wide time series for admin dashboards (Admin only)
+///
+/// Returns per-bucket requests, tokens, cost (paid/granted + verifiable/external splits),
+/// active organizations, and new signups for growth/mix trend charts.
+#[utoipa::path(
+    get,
+    path = "/v1/admin/platform/metrics/timeseries",
+    tag = "Admin",
+    params(
+        ("start" = Option<String>, Query, description = "Start of time range (ISO 8601). Defaults to 30 days ago."),
+        ("end" = Option<String>, Query, description = "End of time range (ISO 8601). Defaults to now."),
+        ("granularity" = Option<String>, Query, description = "Time granularity: hour, day (default), week, or month")
+    ),
+    responses(
+        (status = 200, description = "Platform time series retrieved successfully"),
+        (status = 400, description = "Invalid request", body = ErrorResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    ),
+    security(
+        ("session_token" = [])
+    )
+)]
+pub async fn get_platform_timeseries(
+    State(app_state): State<AdminAppState>,
+    Query(params): Query<TimeSeriesQueryParams>,
+    Extension(_admin_user): Extension<AdminUser>,
+) -> Result<
+    ResponseJson<services::admin::PlatformTimeSeriesMetrics>,
+    (StatusCode, ResponseJson<ErrorResponse>),
+> {
+    debug!(
+        "Get platform timeseries request, start: {:?}, end: {:?}, granularity: {}",
+        params.start, params.end, params.granularity
+    );
+
+    // Validate granularity (platform supports month in addition to hour/day/week)
+    let granularity = match params.granularity.as_str() {
+        "hour" | "day" | "week" | "month" => params.granularity.as_str(),
+        _ => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                ResponseJson(ErrorResponse::new(
+                    "Invalid granularity. Must be 'hour', 'day', 'week', or 'month'".to_string(),
+                    "invalid_granularity".to_string(),
+                )),
+            ))
+        }
+    };
+
+    let end = params
+        .end
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
+        .map(|dt| dt.with_timezone(&Utc))
+        .unwrap_or_else(Utc::now);
+    let start = params
+        .start
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
+        .map(|dt| dt.with_timezone(&Utc))
+        .unwrap_or_else(|| end - Duration::days(30));
+
+    let metrics = app_state
+        .analytics_service
+        .get_platform_timeseries(start, end, granularity)
+        .await
+        .map_err(|e| {
+            error!("Failed to get platform timeseries, error: {:?}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ResponseJson(ErrorResponse::new(
+                    format!("Failed to retrieve platform timeseries: {e}"),
+                    "internal_server_error".to_string(),
+                )),
+            )
+        })?;
+
+    Ok(ResponseJson(metrics))
+}
+
+/// Get the platform billing / credits summary (Admin only)
+///
+/// Money-in lens: provisioned paid/granted credits, consumption, deferred revenue
+/// (unspent paid balance), paying/granted org counts, annualized run-rate, and a
+/// breakdown by funding source. Current snapshot (not time-ranged).
+#[utoipa::path(
+    get,
+    path = "/v1/admin/platform/billing-summary",
+    tag = "Admin",
+    responses(
+        (status = 200, description = "Billing summary retrieved successfully"),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    ),
+    security(
+        ("session_token" = [])
+    )
+)]
+pub async fn get_billing_summary(
+    State(app_state): State<AdminAppState>,
+    Extension(_admin_user): Extension<AdminUser>,
+) -> Result<ResponseJson<services::admin::BillingSummary>, (StatusCode, ResponseJson<ErrorResponse>)>
+{
+    debug!("Get platform billing summary request");
+
+    let summary = app_state
+        .analytics_service
+        .get_billing_summary(Utc::now())
+        .await
+        .map_err(|e| {
+            error!("Failed to get billing summary, error: {:?}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ResponseJson(ErrorResponse::new(
+                    format!("Failed to retrieve billing summary: {e}"),
+                    "internal_server_error".to_string(),
+                )),
+            )
+        })?;
+
+    Ok(ResponseJson(summary))
+}
+
+/// Get the full per-model revenue ranking (Admin only)
+///
+/// Every model for the selected period, ranked by revenue, with the paid/granted split,
+/// requests, tokens, unique orgs, verifiable flag, provider type, and latency.
+#[utoipa::path(
+    get,
+    path = "/v1/admin/platform/model-revenue",
+    tag = "Admin",
+    params(
+        ("start" = Option<String>, Query, description = "Start of time range (ISO 8601). Defaults to 30 days ago."),
+        ("end" = Option<String>, Query, description = "End of time range (ISO 8601). Defaults to now.")
+    ),
+    responses(
+        (status = 200, description = "Model revenue retrieved successfully"),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    ),
+    security(
+        ("session_token" = [])
+    )
+)]
+pub async fn get_model_revenue(
+    State(app_state): State<AdminAppState>,
+    Query(params): Query<MetricsQueryParams>,
+    Extension(_admin_user): Extension<AdminUser>,
+) -> Result<
+    ResponseJson<services::admin::ModelRevenueReport>,
+    (StatusCode, ResponseJson<ErrorResponse>),
+> {
+    debug!(
+        "Get platform model revenue request, start: {:?}, end: {:?}",
+        params.start, params.end
+    );
+
+    let end = params
+        .end
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
+        .map(|dt| dt.with_timezone(&Utc))
+        .unwrap_or_else(Utc::now);
+    let start = params
+        .start
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
+        .map(|dt| dt.with_timezone(&Utc))
+        .unwrap_or_else(|| end - Duration::days(30));
+
+    let report = app_state
+        .analytics_service
+        .get_model_revenue(start, end)
+        .await
+        .map_err(|e| {
+            error!("Failed to get model revenue, error: {:?}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ResponseJson(ErrorResponse::new(
+                    format!("Failed to retrieve model revenue: {e}"),
+                    "internal_server_error".to_string(),
+                )),
+            )
+        })?;
+
+    Ok(ResponseJson(report))
+}
+
+/// Get the full per-organization spend/usage ranking (Admin only)
+///
+/// Every organization with usage in the selected period, ranked by spend, with the
+/// paid/granted and verifiable/external splits, requests, tokens, models used, paying
+/// flag, and last-usage timestamp. Full attribution of usage/spend per org.
+#[utoipa::path(
+    get,
+    path = "/v1/admin/platform/org-revenue",
+    tag = "Admin",
+    params(
+        ("start" = Option<String>, Query, description = "Start of time range (ISO 8601). Defaults to 30 days ago."),
+        ("end" = Option<String>, Query, description = "End of time range (ISO 8601). Defaults to now.")
+    ),
+    responses(
+        (status = 200, description = "Org revenue retrieved successfully"),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    ),
+    security(
+        ("session_token" = [])
+    )
+)]
+pub async fn get_org_revenue(
+    State(app_state): State<AdminAppState>,
+    Query(params): Query<MetricsQueryParams>,
+    Extension(_admin_user): Extension<AdminUser>,
+) -> Result<
+    ResponseJson<services::admin::OrgRevenueReport>,
+    (StatusCode, ResponseJson<ErrorResponse>),
+> {
+    debug!(
+        "Get platform org revenue request, start: {:?}, end: {:?}",
+        params.start, params.end
+    );
+
+    let end = params
+        .end
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
+        .map(|dt| dt.with_timezone(&Utc))
+        .unwrap_or_else(Utc::now);
+    let start = params
+        .start
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
+        .map(|dt| dt.with_timezone(&Utc))
+        .unwrap_or_else(|| end - Duration::days(30));
+
+    let report = app_state
+        .analytics_service
+        .get_org_revenue(start, end)
+        .await
+        .map_err(|e| {
+            error!("Failed to get org revenue, error: {:?}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ResponseJson(ErrorResponse::new(
+                    format!("Failed to retrieve org revenue: {e}"),
+                    "internal_server_error".to_string(),
+                )),
+            )
+        })?;
+
+    Ok(ResponseJson(report))
+}
+
+/// Get the platform infrastructure / fleet burn summary (Admin only)
+///
+/// Fetches the live host list, counts active/idle hosts, and computes the monthly/daily
+/// GPU burn rate from the configured cost-per-host. Degrades gracefully (stale=true) if
+/// the host inventory is unreachable.
+#[utoipa::path(
+    get,
+    path = "/v1/admin/platform/infra-summary",
+    tag = "Admin",
+    responses(
+        (status = 200, description = "Infra summary retrieved successfully"),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    ),
+    security(
+        ("session_token" = [])
+    )
+)]
+pub async fn get_infra_summary(
+    State(app_state): State<AdminAppState>,
+    Extension(_admin_user): Extension<AdminUser>,
+) -> Result<ResponseJson<services::admin::InfraSummary>, (StatusCode, ResponseJson<ErrorResponse>)>
+{
+    debug!("Get platform infra summary request");
+    let summary = app_state.infra_service.get_infra_summary().await;
+    Ok(ResponseJson(summary))
 }
 
 #[derive(Debug, serde::Deserialize)]

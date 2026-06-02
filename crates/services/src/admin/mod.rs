@@ -2,10 +2,14 @@ pub mod analytics;
 pub mod ports;
 
 pub use analytics::{
-    AnalyticsRepository, AnalyticsService, ApiKeyMetrics, MetricsSummary, ModelMetrics,
-    OrganizationMetrics, PlatformMetrics, TimeSeriesMetrics, TimeSeriesPoint, TopModelMetrics,
+    AnalyticsRepository, AnalyticsService, ApiKeyMetrics, BillingSourceBreakdown, BillingSummary,
+    MetricsSummary, ModelMetrics, ModelRevenueEntry, ModelRevenueReport, OrgRevenueEntry,
+    OrgRevenueReport, OrganizationMetrics, PlatformMetrics, PlatformTimeSeriesMetrics,
+    PlatformTimeSeriesPoint, TimeSeriesMetrics, TimeSeriesPoint, TopModelMetrics,
     TopOrganizationMetrics, WorkspaceMetrics,
 };
+pub mod infra;
+pub use infra::{InfraService, InfraSummary};
 pub use ports::{PlatformServiceInfo, *};
 use std::sync::Arc;
 

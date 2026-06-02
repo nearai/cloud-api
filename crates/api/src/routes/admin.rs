@@ -37,10 +37,13 @@ use uuid::Uuid;
 
 /// Parse an OpenRouter `deprecation_date` into a `DateTime<Utc>`.
 ///
-/// Accepts either a full RFC 3339 instant (e.g. `2026-01-01T00:00:00Z`) or a
-/// bare ISO 8601 date (e.g. `2026-01-01`), the two shapes the OpenRouter
-/// provider spec allows. A bare date is interpreted as midnight UTC. Returns
-/// `None` for anything that does not parse, so callers can reject it.
+/// Accepts either a bare ISO 8601 date (e.g. `2026-01-01`) or a full RFC 3339
+/// instant (e.g. `2026-01-01T00:00:00Z`). The OpenRouter provider spec writes
+/// its examples at hour precision, but we accept any valid RFC 3339 instant
+/// and normalize it to UTC rather than rejecting finer precision — storing the
+/// caller's exact intent is strictly more faithful than truncating it. A bare
+/// date is interpreted as midnight UTC. Returns `None` for anything that does
+/// not parse, so callers can reject it.
 fn parse_deprecation_date(s: &str) -> Option<DateTime<Utc>> {
     if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
         return Some(dt.with_timezone(&Utc));
@@ -254,7 +257,7 @@ pub async fn batch_upsert_models(
                     StatusCode::BAD_REQUEST,
                     ResponseJson(ErrorResponse::new(
                         format!(
-                            "model '{model_name}': deprecationDate: '{d}' is not a valid ISO 8601 date or datetime"
+                            "model '{model_name}': deprecationDate: '{d}' must be an ISO 8601 date (YYYY-MM-DD) or RFC 3339 datetime (e.g. 2026-01-01T00:00:00Z)"
                         ),
                         "invalid_request".to_string(),
                     )),

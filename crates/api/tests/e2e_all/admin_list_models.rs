@@ -165,8 +165,11 @@ async fn test_admin_upsert_is_ready_and_deprecation_date_round_trip() {
         .deprecation_date
         .as_ref()
         .expect("deprecation_date should be present");
-    assert!(
-        dep.starts_with("2030-01-01T00:00:00"),
+    // A bare date normalizes to midnight UTC and serializes with a +00:00
+    // offset. Asserting the full value (not just a prefix) guards against a
+    // regression that emits a non-UTC offset.
+    assert_eq!(
+        dep, "2030-01-01T00:00:00+00:00",
         "deprecation_date should serialize as ISO 8601 midnight UTC, got {dep}"
     );
 
@@ -186,12 +189,10 @@ async fn test_admin_upsert_is_ready_and_deprecation_date_round_trip() {
         .find(|m| m.model_id == model_name)
         .expect("update should return our model");
     assert_eq!(model2.metadata.is_ready, Some(false));
-    assert!(model2
-        .metadata
-        .deprecation_date
-        .as_ref()
-        .unwrap()
-        .starts_with("2031-06-15T00:00:00"));
+    assert_eq!(
+        model2.metadata.deprecation_date.as_deref(),
+        Some("2031-06-15T00:00:00+00:00")
+    );
 }
 
 #[tokio::test]

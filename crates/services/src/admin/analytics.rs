@@ -9,6 +9,7 @@ use crate::common::RepositoryError;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use utoipa::ToSchema;
 use uuid::Uuid;
 
 /// Summary metrics for an organization over a time period
@@ -81,14 +82,15 @@ pub struct OrganizationMetrics {
 }
 
 /// Platform-wide metrics for admin dashboard
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct PlatformMetrics {
     pub period_start: DateTime<Utc>,
     pub period_end: DateTime<Utc>,
     pub total_users: i64,
     pub total_organizations: i64,
     pub total_requests: i64,
-    /// Total consumed usage cost in USD (paid + granted)
+    /// Total **consumed usage cost** in USD. NOT recognized revenue: grant- and
+    /// payment-funded usage are not separable without per-request attribution.
     pub total_revenue_usd: f64,
     // --- Token volume (within the period) ---
     pub total_tokens: i64,
@@ -100,18 +102,14 @@ pub struct PlatformMetrics {
     pub new_organizations: i64,
     /// Organizations that issued ≥1 request in the period
     pub active_organizations: i64,
-    /// Organizations with an active payment-type credit (paying customers)
+    /// Current snapshot: organizations that have an active payment-type credit
+    /// (a current count, not a historical attribution).
     pub paying_organizations: i64,
-    // --- Monetization split (consumption attributed by org class) ---
-    /// Consumed cost from paying orgs (real revenue), USD
-    pub paid_revenue_usd: f64,
-    /// Consumed cost from grant-only orgs (free-credit burn), USD
-    pub granted_revenue_usd: f64,
     // --- Verifiable / TEE differentiator split ---
     /// Consumed cost on verifiable (TEE-attested) models, USD
     pub verifiable_revenue_usd: f64,
     pub verifiable_requests: i64,
-    /// Consumed cost on non-verifiable (external) models, USD
+    /// Consumed cost on non-verifiable models, USD
     pub external_revenue_usd: f64,
     pub external_requests: i64,
     // --- Reliability ---
@@ -124,14 +122,13 @@ pub struct PlatformMetrics {
 }
 
 /// One bucket of platform-wide time-series data
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct PlatformTimeSeriesPoint {
     pub date: String,
     pub requests: i64,
     pub tokens: i64,
+    /// Consumed usage cost for the bucket, USD
     pub cost_usd: f64,
-    pub paid_cost_usd: f64,
-    pub granted_cost_usd: f64,
     pub verifiable_cost_usd: f64,
     pub external_cost_usd: f64,
     pub active_organizations: i64,
@@ -140,7 +137,7 @@ pub struct PlatformTimeSeriesPoint {
 }
 
 /// Platform-wide time series response
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct PlatformTimeSeriesMetrics {
     pub period_start: DateTime<Utc>,
     pub period_end: DateTime<Utc>,
@@ -148,41 +145,39 @@ pub struct PlatformTimeSeriesMetrics {
     pub data: Vec<PlatformTimeSeriesPoint>,
 }
 
-/// Provisioned-credit / money-in breakdown by funding source
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Active credit limit by funding source (caps, not payments).
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct BillingSourceBreakdown {
     pub source: String,
-    pub paid_provisioned_usd: f64,
+    /// Sum of active payment-type spend limits (caps) for this source, USD
+    pub paid_credit_limit_usd: f64,
     pub org_count: i64,
 }
 
-/// Platform billing / credits summary (money-in lens, current snapshot)
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Platform billing summary — credit LIMITS (caps) and consumption.
+///
+/// These are spend-limit ceilings from `organization_limits_history`, NOT payments
+/// or cash received. Real money-in (Stripe top-ups) lives in the billing service
+/// (nearai-cloud-ui), not in cloud-api.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct BillingSummary {
-    /// Sum of active payment-type spend limits (paid credits provisioned), USD
-    pub paid_provisioned_usd: f64,
-    /// Sum of active grant-type spend limits (free credits provisioned), USD
-    pub granted_provisioned_usd: f64,
-    /// All-time consumed cost across all orgs, USD
+    /// Sum of active payment-type spend limits (caps), USD
+    pub active_paid_credit_limit_usd: f64,
+    /// Sum of active grant-type spend limits (caps), USD
+    pub active_grant_credit_limit_usd: f64,
+    /// All-time consumed cost across all orgs, USD (from organization_balance)
     pub total_consumed_usd: f64,
-    /// All-time consumed cost from paying orgs, USD
-    pub paid_consumed_usd: f64,
-    /// Outstanding prepaid (deferred revenue): paid provisioned − paid consumed, clamped ≥0, USD
-    pub unspent_paid_balance_usd: f64,
     pub paying_org_count: i64,
     pub granted_org_count: i64,
-    /// Annualized run-rate: last-30d paid consumption × 12.17, USD
-    pub run_rate_usd: f64,
     pub by_source: Vec<BillingSourceBreakdown>,
 }
 
-/// Per-model revenue breakdown entry
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Per-model consumption breakdown entry
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ModelRevenueEntry {
     pub model_name: String,
+    /// Consumed usage cost, USD
     pub revenue_usd: f64,
-    pub paid_revenue_usd: f64,
-    pub granted_revenue_usd: f64,
     pub requests: i64,
     pub tokens: i64,
     pub unique_orgs: i64,
@@ -192,42 +187,93 @@ pub struct ModelRevenueEntry {
     pub p95_ttft_ms: Option<f64>,
 }
 
-/// Full per-model revenue ranking for a period
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Paginated per-model consumption ranking for a period
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ModelRevenueReport {
     pub period_start: DateTime<Utc>,
     pub period_end: DateTime<Utc>,
-    pub models: Vec<ModelRevenueEntry>,
+    pub data: Vec<ModelRevenueEntry>,
+    /// Total matching models (before limit/offset)
+    pub total: i64,
+    pub limit: i64,
+    pub offset: i64,
 }
 
-/// Per-organization spend/usage breakdown entry
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Per-organization consumption breakdown entry
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct OrgRevenueEntry {
     pub organization_id: Uuid,
     pub organization_name: String,
+    /// Consumed usage cost, USD
     pub revenue_usd: f64,
-    pub paid_revenue_usd: f64,
-    pub granted_revenue_usd: f64,
     pub verifiable_revenue_usd: f64,
     pub external_revenue_usd: f64,
     pub requests: i64,
     pub tokens: i64,
     pub models_used: i64,
-    /// Whether the org has an active payment-type credit (paying customer)
+    /// Current snapshot: org has an active payment-type credit (not historical).
     pub is_paying: bool,
     pub last_usage_at: Option<DateTime<Utc>>,
 }
 
-/// Full per-organization spend/usage ranking for a period
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Paginated per-organization consumption ranking for a period
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct OrgRevenueReport {
     pub period_start: DateTime<Utc>,
     pub period_end: DateTime<Utc>,
-    pub organizations: Vec<OrgRevenueEntry>,
+    pub data: Vec<OrgRevenueEntry>,
+    /// Total matching organizations (before limit/offset)
+    pub total: i64,
+    pub limit: i64,
+    pub offset: i64,
+}
+
+/// Sort key for paginated revenue rankings. Maps to a column via an allowlist
+/// in the repository (never interpolate user input into SQL).
+#[derive(Debug, Clone, Copy)]
+pub enum RevenueSort {
+    Revenue,
+    Requests,
+    Tokens,
+}
+
+impl RevenueSort {
+    /// Parse from the API `sort` query param; unknown/None → `Revenue`.
+    pub fn from_query(s: Option<&str>) -> Self {
+        match s {
+            Some("requests") => RevenueSort::Requests,
+            Some("tokens") => RevenueSort::Tokens,
+            _ => RevenueSort::Revenue,
+        }
+    }
+}
+
+/// Filters + pagination for the per-model revenue ranking.
+#[derive(Debug, Clone)]
+pub struct ModelRevenueQuery {
+    pub start: DateTime<Utc>,
+    pub end: DateTime<Utc>,
+    pub verifiable: Option<bool>,
+    pub provider_type: Option<String>,
+    pub sort: RevenueSort,
+    pub limit: i64,
+    pub offset: i64,
+}
+
+/// Filters + pagination for the per-organization revenue ranking.
+#[derive(Debug, Clone)]
+pub struct OrgRevenueQuery {
+    pub start: DateTime<Utc>,
+    pub end: DateTime<Utc>,
+    /// Filter to current paying / non-paying orgs (by active payment credit).
+    pub paying: Option<bool>,
+    pub sort: RevenueSort,
+    pub limit: i64,
+    pub offset: i64,
 }
 
 /// Top model by request count
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct TopModelMetrics {
     pub model_name: String,
     pub requests: i64,
@@ -235,7 +281,7 @@ pub struct TopModelMetrics {
 }
 
 /// Top organization by spend
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct TopOrganizationMetrics {
     pub organization_id: Uuid,
     pub organization_name: String,
@@ -300,24 +346,19 @@ pub trait AnalyticsRepository: Send + Sync {
         granularity: &str,
     ) -> Result<PlatformTimeSeriesMetrics, RepositoryError>;
 
-    /// Get the platform billing / credits summary (money-in lens)
-    async fn get_billing_summary(
-        &self,
-        as_of: DateTime<Utc>,
-    ) -> Result<BillingSummary, RepositoryError>;
+    /// Get the platform billing summary (credit limits + consumption)
+    async fn get_billing_summary(&self) -> Result<BillingSummary, RepositoryError>;
 
-    /// Get the full per-model revenue ranking for a period
+    /// Get a paginated/filtered per-model consumption ranking
     async fn get_model_revenue(
         &self,
-        start: DateTime<Utc>,
-        end: DateTime<Utc>,
+        query: ModelRevenueQuery,
     ) -> Result<ModelRevenueReport, RepositoryError>;
 
-    /// Get the full per-organization spend/usage ranking for a period
+    /// Get a paginated/filtered per-organization consumption ranking
     async fn get_org_revenue(
         &self,
-        start: DateTime<Utc>,
-        end: DateTime<Utc>,
+        query: OrgRevenueQuery,
     ) -> Result<OrgRevenueReport, RepositoryError>;
 }
 
@@ -397,37 +438,32 @@ impl AnalyticsService {
             .map_err(|e| super::AdminError::InternalError(e.to_string()))
     }
 
-    /// Get the platform billing / credits summary (money-in lens)
-    pub async fn get_billing_summary(
-        &self,
-        as_of: DateTime<Utc>,
-    ) -> Result<BillingSummary, super::AdminError> {
+    /// Get the platform billing summary (credit limits + consumption)
+    pub async fn get_billing_summary(&self) -> Result<BillingSummary, super::AdminError> {
         self.repository
-            .get_billing_summary(as_of)
+            .get_billing_summary()
             .await
             .map_err(|e| super::AdminError::InternalError(e.to_string()))
     }
 
-    /// Get the full per-model revenue ranking for a period
+    /// Get a paginated/filtered per-model consumption ranking
     pub async fn get_model_revenue(
         &self,
-        start: DateTime<Utc>,
-        end: DateTime<Utc>,
+        query: ModelRevenueQuery,
     ) -> Result<ModelRevenueReport, super::AdminError> {
         self.repository
-            .get_model_revenue(start, end)
+            .get_model_revenue(query)
             .await
             .map_err(|e| super::AdminError::InternalError(e.to_string()))
     }
 
-    /// Get the full per-organization spend/usage ranking for a period
+    /// Get a paginated/filtered per-organization consumption ranking
     pub async fn get_org_revenue(
         &self,
-        start: DateTime<Utc>,
-        end: DateTime<Utc>,
+        query: OrgRevenueQuery,
     ) -> Result<OrgRevenueReport, super::AdminError> {
         self.repository
-            .get_org_revenue(start, end)
+            .get_org_revenue(query)
             .await
             .map_err(|e| super::AdminError::InternalError(e.to_string()))
     }

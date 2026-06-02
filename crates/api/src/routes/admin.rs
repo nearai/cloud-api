@@ -2159,7 +2159,7 @@ pub async fn get_organization_metrics(
         ("end" = Option<String>, Query, description = "End of time range (ISO 8601). Defaults to now.")
     ),
     responses(
-        (status = 200, description = "Platform metrics retrieved successfully"),
+        (status = 200, description = "Platform metrics retrieved successfully", body = services::admin::PlatformMetrics),
         (status = 401, description = "Unauthorized", body = ErrorResponse),
         (status = 500, description = "Internal server error", body = ErrorResponse)
     ),
@@ -2224,7 +2224,7 @@ pub async fn get_platform_metrics(
         ("granularity" = Option<String>, Query, description = "Time granularity: hour, day (default), week, or month")
     ),
     responses(
-        (status = 200, description = "Platform time series retrieved successfully"),
+        (status = 200, description = "Platform time series retrieved successfully", body = services::admin::PlatformTimeSeriesMetrics),
         (status = 400, description = "Invalid request", body = ErrorResponse),
         (status = 401, description = "Unauthorized", body = ErrorResponse),
         (status = 500, description = "Internal server error", body = ErrorResponse)
@@ -2289,17 +2289,17 @@ pub async fn get_platform_timeseries(
     Ok(ResponseJson(metrics))
 }
 
-/// Get the platform billing / credits summary (Admin only)
+/// Get the platform billing summary (Admin only)
 ///
-/// Money-in lens: provisioned paid/granted credits, consumption, deferred revenue
-/// (unspent paid balance), paying/granted org counts, annualized run-rate, and a
-/// breakdown by funding source. Current snapshot (not time-ranged).
+/// Credit LIMITS (caps) and consumption — NOT payments/cash. Returns active paid/grant
+/// credit limits, total consumed, paying/granted org counts, and a breakdown by funding
+/// source. Real money-in lives in the billing service, not cloud-api.
 #[utoipa::path(
     get,
     path = "/v1/admin/platform/billing-summary",
     tag = "Admin",
     responses(
-        (status = 200, description = "Billing summary retrieved successfully"),
+        (status = 200, description = "Billing summary retrieved successfully", body = services::admin::BillingSummary),
         (status = 401, description = "Unauthorized", body = ErrorResponse),
         (status = 500, description = "Internal server error", body = ErrorResponse)
     ),
@@ -2316,7 +2316,7 @@ pub async fn get_billing_summary(
 
     let summary = app_state
         .analytics_service
-        .get_billing_summary(Utc::now())
+        .get_billing_summary()
         .await
         .map_err(|e| {
             error!("Failed to get billing summary, error: {:?}", e);
@@ -2332,20 +2332,44 @@ pub async fn get_billing_summary(
     Ok(ResponseJson(summary))
 }
 
-/// Get the full per-model revenue ranking (Admin only)
+#[derive(Debug, serde::Deserialize)]
+pub struct ModelRevenueQueryParams {
+    /// Start of time range (ISO 8601). Defaults to 30 days ago.
+    pub start: Option<String>,
+    /// End of time range (ISO 8601). Defaults to now.
+    pub end: Option<String>,
+    #[serde(default = "crate::routes::common::default_limit")]
+    pub limit: i64,
+    #[serde(default)]
+    pub offset: i64,
+    /// Filter by verifiable (TEE) models only / non-verifiable only.
+    pub verifiable: Option<bool>,
+    /// Filter by provider type (e.g. "vllm" or "external").
+    pub provider_type: Option<String>,
+    /// Sort key: "revenue" (default), "requests", or "tokens".
+    pub sort: Option<String>,
+}
+
+/// Get the per-model consumption ranking (Admin only)
 ///
-/// Every model for the selected period, ranked by revenue, with the paid/granted split,
-/// requests, tokens, unique orgs, verifiable flag, provider type, and latency.
+/// Models for the selected period ranked by consumed cost, with requests, tokens,
+/// unique orgs, verifiable flag, provider type, and latency. Paginated and filterable.
 #[utoipa::path(
     get,
     path = "/v1/admin/platform/model-revenue",
     tag = "Admin",
     params(
         ("start" = Option<String>, Query, description = "Start of time range (ISO 8601). Defaults to 30 days ago."),
-        ("end" = Option<String>, Query, description = "End of time range (ISO 8601). Defaults to now.")
+        ("end" = Option<String>, Query, description = "End of time range (ISO 8601). Defaults to now."),
+        ("limit" = Option<i64>, Query, description = "Page size (1-1000, default 100)"),
+        ("offset" = Option<i64>, Query, description = "Page offset (default 0)"),
+        ("verifiable" = Option<bool>, Query, description = "Filter to verifiable (true) or non-verifiable (false) models"),
+        ("provider_type" = Option<String>, Query, description = "Filter by provider type (e.g. vllm, external)"),
+        ("sort" = Option<String>, Query, description = "Sort: revenue (default), requests, tokens")
     ),
     responses(
-        (status = 200, description = "Model revenue retrieved successfully"),
+        (status = 200, description = "Model revenue retrieved successfully", body = services::admin::ModelRevenueReport),
+        (status = 400, description = "Invalid request", body = ErrorResponse),
         (status = 401, description = "Unauthorized", body = ErrorResponse),
         (status = 500, description = "Internal server error", body = ErrorResponse)
     ),
@@ -2355,16 +2379,17 @@ pub async fn get_billing_summary(
 )]
 pub async fn get_model_revenue(
     State(app_state): State<AdminAppState>,
-    Query(params): Query<MetricsQueryParams>,
+    Query(params): Query<ModelRevenueQueryParams>,
     Extension(_admin_user): Extension<AdminUser>,
 ) -> Result<
     ResponseJson<services::admin::ModelRevenueReport>,
     (StatusCode, ResponseJson<ErrorResponse>),
 > {
     debug!(
-        "Get platform model revenue request, start: {:?}, end: {:?}",
-        params.start, params.end
+        "Get platform model revenue request, start: {:?}, end: {:?}, limit: {}, offset: {}",
+        params.start, params.end, params.limit, params.offset
     );
+    crate::routes::common::validate_limit_offset(params.limit, params.offset)?;
 
     let end = params
         .end
@@ -2379,7 +2404,15 @@ pub async fn get_model_revenue(
 
     let report = app_state
         .analytics_service
-        .get_model_revenue(start, end)
+        .get_model_revenue(services::admin::ModelRevenueQuery {
+            start,
+            end,
+            verifiable: params.verifiable,
+            provider_type: params.provider_type,
+            sort: services::admin::RevenueSort::from_query(params.sort.as_deref()),
+            limit: params.limit,
+            offset: params.offset,
+        })
         .await
         .map_err(|e| {
             error!("Failed to get model revenue, error: {:?}", e);
@@ -2395,21 +2428,42 @@ pub async fn get_model_revenue(
     Ok(ResponseJson(report))
 }
 
-/// Get the full per-organization spend/usage ranking (Admin only)
+#[derive(Debug, serde::Deserialize)]
+pub struct OrgRevenueQueryParams {
+    /// Start of time range (ISO 8601). Defaults to 30 days ago.
+    pub start: Option<String>,
+    /// End of time range (ISO 8601). Defaults to now.
+    pub end: Option<String>,
+    #[serde(default = "crate::routes::common::default_limit")]
+    pub limit: i64,
+    #[serde(default)]
+    pub offset: i64,
+    /// Filter to current paying (true) / non-paying (false) orgs.
+    pub paying: Option<bool>,
+    /// Sort key: "revenue" (default), "requests", or "tokens".
+    pub sort: Option<String>,
+}
+
+/// Get the per-organization consumption ranking (Admin only)
 ///
-/// Every organization with usage in the selected period, ranked by spend, with the
-/// paid/granted and verifiable/external splits, requests, tokens, models used, paying
-/// flag, and last-usage timestamp. Full attribution of usage/spend per org.
+/// Organizations with usage in the selected period ranked by consumed cost, with the
+/// verifiable/external split, requests, tokens, models used, a current paying flag, and
+/// last-usage timestamp. Paginated and filterable — full attribution of usage/spend per org.
 #[utoipa::path(
     get,
     path = "/v1/admin/platform/org-revenue",
     tag = "Admin",
     params(
         ("start" = Option<String>, Query, description = "Start of time range (ISO 8601). Defaults to 30 days ago."),
-        ("end" = Option<String>, Query, description = "End of time range (ISO 8601). Defaults to now.")
+        ("end" = Option<String>, Query, description = "End of time range (ISO 8601). Defaults to now."),
+        ("limit" = Option<i64>, Query, description = "Page size (1-1000, default 100)"),
+        ("offset" = Option<i64>, Query, description = "Page offset (default 0)"),
+        ("paying" = Option<bool>, Query, description = "Filter to current paying (true) / non-paying (false) orgs"),
+        ("sort" = Option<String>, Query, description = "Sort: revenue (default), requests, tokens")
     ),
     responses(
-        (status = 200, description = "Org revenue retrieved successfully"),
+        (status = 200, description = "Org revenue retrieved successfully", body = services::admin::OrgRevenueReport),
+        (status = 400, description = "Invalid request", body = ErrorResponse),
         (status = 401, description = "Unauthorized", body = ErrorResponse),
         (status = 500, description = "Internal server error", body = ErrorResponse)
     ),
@@ -2419,16 +2473,17 @@ pub async fn get_model_revenue(
 )]
 pub async fn get_org_revenue(
     State(app_state): State<AdminAppState>,
-    Query(params): Query<MetricsQueryParams>,
+    Query(params): Query<OrgRevenueQueryParams>,
     Extension(_admin_user): Extension<AdminUser>,
 ) -> Result<
     ResponseJson<services::admin::OrgRevenueReport>,
     (StatusCode, ResponseJson<ErrorResponse>),
 > {
     debug!(
-        "Get platform org revenue request, start: {:?}, end: {:?}",
-        params.start, params.end
+        "Get platform org revenue request, start: {:?}, end: {:?}, limit: {}, offset: {}",
+        params.start, params.end, params.limit, params.offset
     );
+    crate::routes::common::validate_limit_offset(params.limit, params.offset)?;
 
     let end = params
         .end
@@ -2443,7 +2498,14 @@ pub async fn get_org_revenue(
 
     let report = app_state
         .analytics_service
-        .get_org_revenue(start, end)
+        .get_org_revenue(services::admin::OrgRevenueQuery {
+            start,
+            end,
+            paying: params.paying,
+            sort: services::admin::RevenueSort::from_query(params.sort.as_deref()),
+            limit: params.limit,
+            offset: params.offset,
+        })
         .await
         .map_err(|e| {
             error!("Failed to get org revenue, error: {:?}", e);
@@ -2469,7 +2531,7 @@ pub async fn get_org_revenue(
     path = "/v1/admin/platform/infra-summary",
     tag = "Admin",
     responses(
-        (status = 200, description = "Infra summary retrieved successfully"),
+        (status = 200, description = "Infra summary retrieved successfully", body = services::admin::InfraSummary),
         (status = 401, description = "Unauthorized", body = ErrorResponse),
         (status = 500, description = "Internal server error", body = ErrorResponse)
     ),

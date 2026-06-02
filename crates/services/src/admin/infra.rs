@@ -12,19 +12,24 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
+use utoipa::ToSchema;
 
 /// How long a fetched inventory stays fresh before we refetch.
 const CACHE_TTL: Duration = Duration::from_secs(300);
 
-/// One host and the models it is currently serving.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct HostInfo {
-    pub host: String,
-    pub models: Vec<String>,
+/// One host and the models it is currently serving. Internal only — host
+/// identities (IPs/model lists) are NEVER exposed in the API response.
+#[derive(Debug, Clone)]
+struct HostInfo {
+    #[allow(dead_code)]
+    host: String,
+    models: Vec<String>,
 }
 
 /// Fleet burn summary returned by the admin endpoint.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// Exposes only counts and burn — never host IPs or per-host model lists.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct InfraSummary {
     pub total_hosts: i64,
     /// Hosts serving ≥1 model.
@@ -34,7 +39,6 @@ pub struct InfraSummary {
     pub cost_per_host_usd_month: f64,
     pub monthly_burn_usd: f64,
     pub daily_burn_usd: f64,
-    pub host_models: Vec<HostInfo>,
     pub fetched_at: DateTime<Utc>,
     /// True when this is last-known / fallback data because the live fetch failed.
     pub stale: bool,
@@ -118,7 +122,6 @@ impl InfraService {
             cost_per_host_usd_month: self.cost_per_host_usd_month,
             monthly_burn_usd,
             daily_burn_usd: monthly_burn_usd / 30.4,
-            host_models: hosts,
             fetched_at: Utc::now(),
             stale,
         }

@@ -874,15 +874,11 @@ async fn test_admin_platform_metrics_splits_reconcile() {
 
     let m: PlatformMetrics = serde_json::from_str(&response.text()).expect("parse PlatformMetrics");
 
-    // Splits must reconcile to the total (within fp tolerance).
+    // The verifiable split must reconcile to the total (within fp tolerance).
     let eps = 1e-6;
     assert!(
-        (m.paid_revenue_usd + m.granted_revenue_usd - m.total_revenue_usd).abs() < eps,
-        "paid + granted must equal total revenue"
-    );
-    assert!(
         (m.verifiable_revenue_usd + m.external_revenue_usd - m.total_revenue_usd).abs() < eps,
-        "verifiable + external must equal total revenue"
+        "verifiable + external must equal total consumed"
     );
     assert_eq!(
         m.verifiable_requests + m.external_requests,
@@ -892,7 +888,7 @@ async fn test_admin_platform_metrics_splits_reconcile() {
     assert!(m.active_organizations >= 1, "should have an active org");
     assert!((0.0..=1.0).contains(&m.error_rate), "error_rate in [0,1]");
 
-    println!("✅ Platform metrics splits reconcile to totals");
+    println!("✅ Platform metrics verifiable split reconciles to total");
 }
 
 #[tokio::test]
@@ -932,8 +928,9 @@ async fn test_admin_platform_billing_summary() {
         .await;
     assert_eq!(response.status_code(), 200);
     let b: BillingSummary = serde_json::from_str(&response.text()).expect("parse BillingSummary");
-    assert!(b.paid_provisioned_usd >= 0.0);
-    assert!(b.unspent_paid_balance_usd >= 0.0, "deferred clamped >= 0");
+    assert!(b.active_paid_credit_limit_usd >= 0.0);
+    assert!(b.active_grant_credit_limit_usd >= 0.0);
+    assert!(b.total_consumed_usd >= 0.0);
 
     println!("✅ Platform billing summary works");
 }
@@ -968,21 +965,30 @@ async fn test_admin_platform_model_revenue() {
     let report: ModelRevenueReport =
         serde_json::from_str(&response.text()).expect("parse ModelRevenueReport");
 
-    // Per-model paid + granted must reconcile to that model's revenue, and the
-    // list must be sorted by revenue desc.
+    // Sorted by revenue desc; total >= rows returned.
     let eps = 1e-6;
     let mut prev = f64::INFINITY;
-    for m in &report.models {
-        assert!(
-            (m.paid_revenue_usd + m.granted_revenue_usd - m.revenue_usd).abs() < eps,
-            "model {} paid+granted must equal revenue",
-            m.model_name
-        );
+    for m in &report.data {
         assert!(m.revenue_usd <= prev + eps, "models sorted by revenue desc");
         prev = m.revenue_usd;
     }
+    assert!(report.total >= report.data.len() as i64);
+    assert!(report.total >= 1, "the used model should appear");
 
-    println!("✅ Platform model-revenue works and reconciles");
+    // Pagination: limit=1 returns at most one row but the full total.
+    let paged = server
+        .get("/v1/admin/platform/model-revenue?limit=1&sort=requests")
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .add_header("User-Agent", MOCK_USER_AGENT)
+        .await;
+    assert_eq!(paged.status_code(), 200);
+    let paged: ModelRevenueReport =
+        serde_json::from_str(&paged.text()).expect("parse ModelRevenueReport");
+    assert!(paged.data.len() <= 1);
+    assert_eq!(paged.limit, 1);
+    assert_eq!(paged.total, report.total);
+
+    println!("✅ Platform model-revenue works, sorts, and paginates");
 }
 
 #[tokio::test]
@@ -1015,9 +1021,9 @@ async fn test_admin_platform_org_revenue() {
     let report: OrgRevenueReport =
         serde_json::from_str(&response.text()).expect("parse OrgRevenueReport");
 
-    // The org that made requests must be attributed, splits reconcile, sorted desc.
+    // The org that made requests must be attributed; verifiable split reconciles; sorted desc.
     let found = report
-        .organizations
+        .data
         .iter()
         .find(|o| o.organization_id.to_string() == org.id)
         .expect("org with usage should be attributed");
@@ -1025,12 +1031,7 @@ async fn test_admin_platform_org_revenue() {
 
     let eps = 1e-6;
     let mut prev = f64::INFINITY;
-    for o in &report.organizations {
-        assert!(
-            (o.paid_revenue_usd + o.granted_revenue_usd - o.revenue_usd).abs() < eps,
-            "org {} paid+granted must equal revenue",
-            o.organization_name
-        );
+    for o in &report.data {
         assert!(
             (o.verifiable_revenue_usd + o.external_revenue_usd - o.revenue_usd).abs() < eps,
             "org {} verifiable+external must equal revenue",
@@ -1039,8 +1040,9 @@ async fn test_admin_platform_org_revenue() {
         assert!(o.revenue_usd <= prev + eps, "orgs sorted by revenue desc");
         prev = o.revenue_usd;
     }
+    assert!(report.total >= report.data.len() as i64);
 
-    println!("✅ Platform org-revenue works and reconciles");
+    println!("✅ Platform org-revenue works, reconciles, and paginates");
 }
 
 #[tokio::test]

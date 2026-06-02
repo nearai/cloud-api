@@ -3,10 +3,10 @@ pub mod ports;
 
 pub use analytics::{
     AnalyticsRepository, AnalyticsService, ApiKeyMetrics, BillingSourceBreakdown, BillingSummary,
-    MetricsSummary, ModelMetrics, ModelRevenueEntry, ModelRevenueReport, OrgRevenueEntry,
-    OrgRevenueReport, OrganizationMetrics, PlatformMetrics, PlatformTimeSeriesMetrics,
-    PlatformTimeSeriesPoint, TimeSeriesMetrics, TimeSeriesPoint, TopModelMetrics,
-    TopOrganizationMetrics, WorkspaceMetrics,
+    MetricsSummary, ModelMetrics, ModelRevenueEntry, ModelRevenueQuery, ModelRevenueReport,
+    OrgRevenueEntry, OrgRevenueQuery, OrgRevenueReport, OrganizationMetrics, PlatformMetrics,
+    PlatformTimeSeriesMetrics, PlatformTimeSeriesPoint, RevenueSort, TimeSeriesMetrics,
+    TimeSeriesPoint, TopModelMetrics, TopOrganizationMetrics, WorkspaceMetrics,
 };
 pub mod infra;
 pub use infra::{InfraService, InfraSummary};

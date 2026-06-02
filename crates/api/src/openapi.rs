@@ -280,6 +280,19 @@ use utoipa::{Modify, OpenApi};
             crate::routes::billing::RequestCost,
             // File models
             FileUploadResponse, ExpiresAfter, FileListResponse, FileDeleteResponse,
+            // Platform Stats analytics models
+            services::admin::PlatformMetrics,
+            services::admin::TopModelMetrics,
+            services::admin::TopOrganizationMetrics,
+            services::admin::PlatformTimeSeriesMetrics,
+            services::admin::PlatformTimeSeriesPoint,
+            services::admin::BillingSummary,
+            services::admin::BillingSourceBreakdown,
+            services::admin::ModelRevenueReport,
+            services::admin::ModelRevenueEntry,
+            services::admin::OrgRevenueReport,
+            services::admin::OrgRevenueEntry,
+            services::admin::InfraSummary,
         ),
     ),
     modifiers(&SecurityAddon)

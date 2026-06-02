@@ -297,7 +297,8 @@ impl AdminRepository for AdminCompositeRepository {
                           input_cost_per_token, output_cost_per_token, cost_per_image,
                           cache_read_cost_per_token, context_length, verifiable, is_active,
                           owned_by, created_at, updated_at, provider_type, provider_config,
-                          attestation_supported, input_modalities, output_modalities, inference_url
+                          attestation_supported, input_modalities, output_modalities, inference_url,
+                          datacenters
                 "#,
                 &[&deprecated_id],
             )
@@ -328,11 +329,12 @@ impl AdminRepository for AdminCompositeRepository {
                 cache_read_cost_per_token, context_length, model_name, model_display_name,
                 model_description, model_icon, verifiable, is_active, owned_by, provider_type,
                 provider_config, attestation_supported, input_modalities, output_modalities,
-                inference_url, effective_from, effective_until, changed_by_user_id,
+                inference_url, datacenters, effective_from, effective_until, changed_by_user_id,
                 changed_by_user_email, change_reason, created_at
             ) VALUES (
                 $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19,
-                NOW(), NULL, $20, $21, $22, NOW()
+                $20,
+                NOW(), NULL, $21, $22, $23, NOW()
             )
             "#,
             &[
@@ -366,6 +368,10 @@ impl AdminRepository for AdminCompositeRepository {
                     .flatten(),
                 &deprecated_row_after
                     .try_get::<_, Option<String>>("inference_url")
+                    .ok()
+                    .flatten(),
+                &deprecated_row_after
+                    .try_get::<_, Option<Vec<String>>>("datacenters")
                     .ok()
                     .flatten(),
                 &changed_by_user_id,

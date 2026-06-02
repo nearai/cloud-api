@@ -745,3 +745,64 @@ async fn test_model_history_records_datacenters() {
         "Latest history should have updated datacenters"
     );
 }
+
+/// A soft delete must preserve the model's `datacenters` in the history
+/// snapshot it writes (the `UPDATE ... RETURNING` feeding `record_model_history`
+/// has to include the column, otherwise the audited row loses it).
+#[tokio::test]
+async fn test_soft_delete_preserves_datacenters_in_history() {
+    let server = setup_test_server().await;
+    let model_name = format!("test-model-datacenters-delete-{}", uuid::Uuid::new_v4());
+
+    let mut batch = HashMap::new();
+    batch.insert(
+        model_name.clone(),
+        serde_json::from_value(serde_json::json!({
+            "inputCostPerToken": { "amount": 1000, "currency": "USD" },
+            "outputCostPerToken": { "amount": 2000, "currency": "USD" },
+            "modelDisplayName": "Datacenters Delete Model",
+            "modelDescription": "Testing datacenters survive soft delete",
+            "contextLength": 4096,
+            "verifiable": true,
+            "isActive": true,
+            "datacenters": [{ "country_code": "US" }]
+        }))
+        .unwrap(),
+    );
+    admin_batch_upsert_models(&server, batch, get_session_id()).await;
+
+    let encoded_model_name =
+        url::form_urlencoded::byte_serialize(model_name.as_bytes()).collect::<String>();
+    let delete_response = server
+        .delete(format!("/v1/admin/models/{encoded_model_name}").as_str())
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .add_header("User-Agent", MOCK_USER_AGENT)
+        .await;
+    assert_eq!(delete_response.status_code(), 204, "Delete should succeed");
+
+    let response = server
+        .get(format!("/v1/admin/models/{model_name}/history").as_str())
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .await;
+    assert_eq!(response.status_code(), 200);
+    let history_response = response.json::<api::models::ModelHistoryResponse>();
+
+    // Most recent history entry is the soft-delete snapshot.
+    let latest = &history_response.history[0];
+    assert!(
+        !latest.is_active,
+        "Most recent history entry should be the soft-delete snapshot"
+    );
+    let codes: Vec<&str> = latest
+        .datacenters
+        .as_ref()
+        .expect("soft-delete history should preserve datacenters")
+        .iter()
+        .map(|dc| dc.country_code.as_str())
+        .collect();
+    assert_eq!(
+        codes,
+        vec!["US"],
+        "Soft-delete history snapshot should retain datacenters"
+    );
+}

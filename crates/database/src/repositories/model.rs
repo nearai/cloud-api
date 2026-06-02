@@ -849,7 +849,7 @@ impl ModelRepository {
                               input_cost_per_token, output_cost_per_token, cost_per_image, cache_read_cost_per_token,
                               context_length, verifiable, is_active, owned_by, created_at, updated_at,
                               provider_type, provider_config, attestation_supported,
-                              input_modalities, output_modalities, inference_url, hugging_face_id, quantization, max_output_length, supported_sampling_parameters, supported_features
+                              input_modalities, output_modalities, inference_url, hugging_face_id, quantization, max_output_length, supported_sampling_parameters, supported_features, datacenters
                     "#,
                     &[&model_name],
                 )

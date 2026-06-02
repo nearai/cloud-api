@@ -35,6 +35,24 @@ use std::sync::Arc;
 use tracing::{debug, error, Instrument};
 use uuid::Uuid;
 
+/// Parse an OpenRouter `deprecation_date` into a `DateTime<Utc>`.
+///
+/// Accepts either a full RFC 3339 instant (e.g. `2026-01-01T00:00:00Z`) or a
+/// bare ISO 8601 date (e.g. `2026-01-01`), the two shapes the OpenRouter
+/// provider spec allows. A bare date is interpreted as midnight UTC. Returns
+/// `None` for anything that does not parse, so callers can reject it.
+fn parse_deprecation_date(s: &str) -> Option<DateTime<Utc>> {
+    if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
+        return Some(dt.with_timezone(&Utc));
+    }
+    if let Ok(date) = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d") {
+        return date
+            .and_hms_opt(0, 0, 0)
+            .map(|naive| DateTime::<Utc>::from_naive_utc_and_offset(naive, Utc));
+    }
+    None
+}
+
 #[derive(Clone)]
 pub struct AdminAppState {
     pub admin_service: Arc<dyn AdminService + Send + Sync>,
@@ -226,6 +244,23 @@ pub async fn batch_upsert_models(
                 }
             }
         }
+        // `deprecation_date` must parse as ISO 8601 (a bare date like
+        // "2026-01-01" or a full instant like "2026-01-01T00:00:00Z"). Reject
+        // anything else at the write path so the stored value — and the
+        // `GET /v1/models` we serve from it — stays well-formed.
+        if let Some(d) = &request.deprecation_date {
+            if parse_deprecation_date(d).is_none() {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    ResponseJson(ErrorResponse::new(
+                        format!(
+                            "model '{model_name}': deprecationDate: '{d}' is not a valid ISO 8601 date or datetime"
+                        ),
+                        "invalid_request".to_string(),
+                    )),
+                ));
+            }
+        }
     }
 
     // Extract admin user context for audit tracking
@@ -268,6 +303,13 @@ pub async fn batch_upsert_models(
                     supported_sampling_parameters: request.supported_sampling_parameters.clone(),
                     supported_features: request.supported_features.clone(),
                     datacenters: crate::models::Datacenter::to_codes(request.datacenters.clone()),
+                    is_ready: request.is_ready,
+                    // Already validated above; parse again to store as a
+                    // timestamp. `and_then` keeps None when unset.
+                    deprecation_date: request
+                        .deprecation_date
+                        .as_deref()
+                        .and_then(parse_deprecation_date),
                     change_reason: request.change_reason.clone(),
                     changed_by_user_id: Some(admin_user_id),
                     changed_by_user_email: Some(admin_user_email.clone()),
@@ -472,6 +514,8 @@ pub async fn batch_upsert_models(
                 supported_sampling_parameters: updated_model.supported_sampling_parameters,
                 supported_features: updated_model.supported_features,
                 datacenters: crate::models::Datacenter::from_codes(updated_model.datacenters),
+                is_ready: updated_model.is_ready,
+                deprecation_date: updated_model.deprecation_date.map(|dt| dt.to_rfc3339()),
             },
         })
         .collect();
@@ -576,6 +620,8 @@ pub async fn list_models(
                 supported_sampling_parameters: model.supported_sampling_parameters,
                 supported_features: model.supported_features,
                 datacenters: crate::models::Datacenter::from_codes(model.datacenters),
+                is_ready: model.is_ready,
+                deprecation_date: model.deprecation_date.map(|dt| dt.to_rfc3339()),
             },
             is_active: model.is_active,
             created_at: model.created_at,
@@ -712,6 +758,8 @@ pub async fn get_model_history(
             supported_sampling_parameters: h.supported_sampling_parameters,
             supported_features: h.supported_features,
             datacenters: crate::models::Datacenter::from_codes(h.datacenters),
+            is_ready: h.is_ready,
+            deprecation_date: h.deprecation_date.map(|dt| dt.to_rfc3339()),
         })
         .collect();
 
@@ -1237,6 +1285,8 @@ pub async fn deprecate_model(
             supported_sampling_parameters: m.supported_sampling_parameters,
             supported_features: m.supported_features,
             datacenters: crate::models::Datacenter::from_codes(m.datacenters),
+            is_ready: m.is_ready,
+            deprecation_date: m.deprecation_date.map(|dt| dt.to_rfc3339()),
         },
     };
 

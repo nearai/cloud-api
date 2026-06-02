@@ -819,6 +819,14 @@ pub struct ModelInfo {
     pub supported_sampling_parameters: Vec<String>,
     /// Feature capabilities (OpenRouter `supported_features`).
     pub supported_features: Vec<String>,
+    /// OpenRouter `is_ready`: `false` keeps the model hidden on OpenRouter's
+    /// side, `true` enables auto-staging. Exposed verbatim; omitted when unset.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_ready: Option<bool>,
+    /// OpenRouter `deprecation_date`: planned deprecation date as an ISO 8601
+    /// string. Omitted when there is no planned deprecation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deprecation_date: Option<String>,
     /// Human-readable description (OpenRouter `description`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
@@ -3040,6 +3048,13 @@ pub struct ModelMetadata {
     /// `[{ "country_code": "US" }]`. Omitted when unset.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub datacenters: Option<Vec<Datacenter>>,
+    /// OpenRouter `is_ready`: stored/exposed verbatim. Omitted when unset.
+    #[serde(rename = "isReady", skip_serializing_if = "Option::is_none")]
+    pub is_ready: Option<bool>,
+    /// OpenRouter `deprecation_date`: planned deprecation date as an ISO 8601
+    /// string. Omitted when there is no planned deprecation.
+    #[serde(rename = "deprecationDate", skip_serializing_if = "Option::is_none")]
+    pub deprecation_date: Option<String>,
 }
 
 /// Request to update model pricing (admin endpoint)
@@ -3114,6 +3129,14 @@ pub struct UpdateModelApiRequest {
     /// uppercase ISO 3166 Alpha-2.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub datacenters: Option<Vec<Datacenter>>,
+    /// OpenRouter `is_ready`. Stored and exposed verbatim on `GET /v1/models`.
+    #[serde(rename = "isReady", skip_serializing_if = "Option::is_none")]
+    pub is_ready: Option<bool>,
+    /// OpenRouter `deprecation_date`: ISO 8601 string (`YYYY-MM-DD` or
+    /// `YYYY-MM-DDTHH:00:00Z`). Validated at the write path; rejected if it
+    /// does not parse.
+    #[serde(rename = "deprecationDate", skip_serializing_if = "Option::is_none")]
+    pub deprecation_date: Option<String>,
     #[serde(rename = "changeReason", skip_serializing_if = "Option::is_none")]
     pub change_reason: Option<String>,
 }
@@ -3247,6 +3270,10 @@ pub struct ModelHistoryEntry {
     /// `[{ "country_code": "US" }]`. Omitted when unset.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub datacenters: Option<Vec<Datacenter>>,
+    #[serde(rename = "isReady", skip_serializing_if = "Option::is_none")]
+    pub is_ready: Option<bool>,
+    #[serde(rename = "deprecationDate", skip_serializing_if = "Option::is_none")]
+    pub deprecation_date: Option<String>,
 }
 
 /// Model history response - complete history of model changes

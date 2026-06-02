@@ -83,6 +83,7 @@ impl ModelRepository {
                         m.input_modalities, m.output_modalities, m.inference_url,
                         m.hugging_face_id, m.quantization, m.max_output_length,
                         m.supported_sampling_parameters, m.supported_features, m.datacenters,
+                        m.is_ready, m.deprecation_date,
                         COALESCE(array_agg(a.alias_name) FILTER (WHERE a.alias_name IS NOT NULL), '{}') AS aliases
                     FROM models m
                     LEFT JOIN model_aliases a ON a.canonical_model_id = m.id AND a.is_active = true
@@ -165,6 +166,7 @@ impl ModelRepository {
                             m.input_modalities, m.output_modalities, m.inference_url,
                             m.hugging_face_id, m.quantization, m.max_output_length,
                             m.supported_sampling_parameters, m.supported_features, m.datacenters,
+                            m.is_ready, m.deprecation_date,
                             COALESCE(array_agg(a.alias_name) FILTER (WHERE a.alias_name IS NOT NULL), '{}') AS aliases
                         FROM models m
                         LEFT JOIN model_aliases a ON a.canonical_model_id = m.id AND a.is_active = true
@@ -188,6 +190,7 @@ impl ModelRepository {
                             m.input_modalities, m.output_modalities, m.inference_url,
                             m.hugging_face_id, m.quantization, m.max_output_length,
                             m.supported_sampling_parameters, m.supported_features, m.datacenters,
+                            m.is_ready, m.deprecation_date,
                             COALESCE(array_agg(a.alias_name) FILTER (WHERE a.alias_name IS NOT NULL), '{}') AS aliases
                         FROM models m
                         LEFT JOIN model_aliases a ON a.canonical_model_id = m.id AND a.is_active = true
@@ -229,7 +232,7 @@ impl ModelRepository {
                         input_cost_per_token, output_cost_per_token, cost_per_image, cache_read_cost_per_token,
                         context_length, verifiable, is_active, owned_by, created_at, updated_at,
                         provider_type, provider_config, attestation_supported,
-                        input_modalities, output_modalities, inference_url, hugging_face_id, quantization, max_output_length, supported_sampling_parameters, supported_features, datacenters
+                        input_modalities, output_modalities, inference_url, hugging_face_id, quantization, max_output_length, supported_sampling_parameters, supported_features, datacenters, is_ready, deprecation_date
                     FROM models
                     WHERE model_name = $1
                     "#,
@@ -264,7 +267,7 @@ impl ModelRepository {
                         input_cost_per_token, output_cost_per_token, cost_per_image, cache_read_cost_per_token,
                         context_length, verifiable, is_active, owned_by, created_at, updated_at,
                         provider_type, provider_config, attestation_supported,
-                        input_modalities, output_modalities, inference_url, hugging_face_id, quantization, max_output_length, supported_sampling_parameters, supported_features, datacenters
+                        input_modalities, output_modalities, inference_url, hugging_face_id, quantization, max_output_length, supported_sampling_parameters, supported_features, datacenters, is_ready, deprecation_date
                     FROM models
                     WHERE id = $1
                     "#,
@@ -323,6 +326,8 @@ impl ModelRepository {
                         m.supported_sampling_parameters,
                         m.supported_features,
                         m.datacenters,
+                        m.is_ready,
+                        m.deprecation_date,
                         COALESCE(
                             array_agg(ma.alias_name)
                             FILTER (WHERE ma.alias_name IS NOT NULL),
@@ -429,13 +434,15 @@ impl ModelRepository {
                             supported_sampling_parameters = COALESCE($22, supported_sampling_parameters),
                             supported_features = COALESCE($23, supported_features),
                             datacenters = COALESCE($24, datacenters),
+                            is_ready = COALESCE($25, is_ready),
+                            deprecation_date = COALESCE($26, deprecation_date),
                             updated_at = NOW()
                         WHERE model_name = $1
                         RETURNING id, model_name, model_display_name, model_description, model_icon,
                                   input_cost_per_token, output_cost_per_token, cost_per_image, cache_read_cost_per_token,
                                   context_length, verifiable, is_active, owned_by, created_at, updated_at,
                                   provider_type, provider_config, attestation_supported,
-                                  input_modalities, output_modalities, inference_url, hugging_face_id, quantization, max_output_length, supported_sampling_parameters, supported_features, datacenters
+                                  input_modalities, output_modalities, inference_url, hugging_face_id, quantization, max_output_length, supported_sampling_parameters, supported_features, datacenters, is_ready, deprecation_date
                         "#,
                         &[
                             &model_name,
@@ -462,6 +469,8 @@ impl ModelRepository {
                             &update_request.supported_sampling_parameters,
                             &update_request.supported_features,
                             &update_request.datacenters,
+                            &update_request.is_ready,
+                            &update_request.deprecation_date,
                         ],
                     )
                     .await
@@ -494,7 +503,8 @@ impl ModelRepository {
                             model_display_name, model_description, model_icon,
                             context_length, verifiable, is_active, owned_by,
                             provider_type, provider_config, attestation_supported,
-                            input_modalities, output_modalities, inference_url, hugging_face_id, quantization, max_output_length, supported_sampling_parameters, supported_features, datacenters
+                            input_modalities, output_modalities, inference_url, hugging_face_id, quantization, max_output_length, supported_sampling_parameters, supported_features, datacenters,
+                            is_ready, deprecation_date
                         ) VALUES (
                             $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11,
                             COALESCE($12, $13),
@@ -508,7 +518,7 @@ impl ModelRepository {
                             $20, $21, $22,
                             COALESCE($23, ARRAY[]::TEXT[]),
                             COALESCE($24, ARRAY[]::TEXT[]),
-                            $25
+                            $25, $26, $27
                         )
                         ON CONFLICT (model_name) DO UPDATE SET
                             input_cost_per_token = EXCLUDED.input_cost_per_token,
@@ -537,12 +547,14 @@ impl ModelRepository {
                             supported_sampling_parameters = COALESCE($23, models.supported_sampling_parameters),
                             supported_features = COALESCE($24, models.supported_features),
                             datacenters = COALESCE($25, models.datacenters),
+                            is_ready = COALESCE($26, models.is_ready),
+                            deprecation_date = COALESCE($27, models.deprecation_date),
                             updated_at = NOW()
                         RETURNING id, model_name, model_display_name, model_description, model_icon,
                                   input_cost_per_token, output_cost_per_token, cost_per_image, cache_read_cost_per_token,
                                   context_length, verifiable, is_active, owned_by, created_at, updated_at,
                                   provider_type, provider_config, attestation_supported,
-                                  input_modalities, output_modalities, inference_url, hugging_face_id, quantization, max_output_length, supported_sampling_parameters, supported_features, datacenters
+                                  input_modalities, output_modalities, inference_url, hugging_face_id, quantization, max_output_length, supported_sampling_parameters, supported_features, datacenters, is_ready, deprecation_date
                         "#,
                         &[
                             &model_name,
@@ -570,6 +582,8 @@ impl ModelRepository {
                             &update_request.supported_sampling_parameters,
                             &update_request.supported_features,
                             &update_request.datacenters,
+                            &update_request.is_ready,
+                            &update_request.deprecation_date,
                         ],
                     )
                     .await
@@ -621,17 +635,18 @@ impl ModelRepository {
                         input_cost_per_token, output_cost_per_token, cost_per_image, cache_read_cost_per_token,
                         context_length, verifiable, is_active, owned_by,
                         provider_type, provider_config, attestation_supported,
-                        input_modalities, output_modalities, inference_url, hugging_face_id, quantization, max_output_length, supported_sampling_parameters, supported_features, datacenters
+                        input_modalities, output_modalities, inference_url, hugging_face_id, quantization, max_output_length, supported_sampling_parameters, supported_features, datacenters,
+                        is_ready, deprecation_date
                     ) VALUES (
                         $1, $2, $3, $4, $5, $6, $7, $8,
                         $9, $10, $11, $12, $13, $14, $15, $16, $17, $18,
-                        $19, $20, $21, $22, $23, $24
+                        $19, $20, $21, $22, $23, $24, $25, $26
                     )
                     RETURNING id, model_name, model_display_name, model_description, model_icon,
                               input_cost_per_token, output_cost_per_token, cost_per_image, cache_read_cost_per_token,
                               context_length, verifiable, is_active, owned_by, created_at, updated_at,
                               provider_type, provider_config, attestation_supported,
-                              input_modalities, output_modalities, inference_url, hugging_face_id, quantization, max_output_length, supported_sampling_parameters, supported_features, datacenters
+                              input_modalities, output_modalities, inference_url, hugging_face_id, quantization, max_output_length, supported_sampling_parameters, supported_features, datacenters, is_ready, deprecation_date
                     "#,
                     &[
                         &model.model_name,
@@ -658,6 +673,8 @@ impl ModelRepository {
                         &model.supported_sampling_parameters,
                         &model.supported_features,
                         &model.datacenters,
+                        &model.is_ready,
+                        &model.deprecation_date,
                     ],
                 )
                 .await
@@ -686,6 +703,7 @@ impl ModelRepository {
                         model_icon, verifiable, is_active, owned_by,
                         provider_type, provider_config, attestation_supported,
                         input_modalities, output_modalities, inference_url, hugging_face_id, quantization, max_output_length, supported_sampling_parameters, supported_features, datacenters,
+                        is_ready, deprecation_date,
                         effective_from, effective_until, changed_by_user_id, changed_by_user_email,
                         change_reason, created_at
                     FROM model_history
@@ -728,6 +746,7 @@ impl ModelRepository {
                         model_icon, verifiable, is_active, owned_by,
                         provider_type, provider_config, attestation_supported,
                         input_modalities, output_modalities, inference_url, hugging_face_id, quantization, max_output_length, supported_sampling_parameters, supported_features, datacenters,
+                        is_ready, deprecation_date,
                         effective_from, effective_until, changed_by_user_id, changed_by_user_email,
                         change_reason, created_at
                     FROM model_history
@@ -802,6 +821,7 @@ impl ModelRepository {
                         h.input_modalities, h.output_modalities, h.inference_url,
                         h.hugging_face_id, h.quantization, h.max_output_length,
                         h.supported_sampling_parameters, h.supported_features, h.datacenters,
+                        h.is_ready, h.deprecation_date,
                         h.effective_from, h.effective_until, h.changed_by_user_id, h.changed_by_user_email,
                         h.change_reason, h.created_at
                     FROM model_history h
@@ -849,7 +869,7 @@ impl ModelRepository {
                               input_cost_per_token, output_cost_per_token, cost_per_image, cache_read_cost_per_token,
                               context_length, verifiable, is_active, owned_by, created_at, updated_at,
                               provider_type, provider_config, attestation_supported,
-                              input_modalities, output_modalities, inference_url, hugging_face_id, quantization, max_output_length, supported_sampling_parameters, supported_features, datacenters
+                              input_modalities, output_modalities, inference_url, hugging_face_id, quantization, max_output_length, supported_sampling_parameters, supported_features, datacenters, is_ready, deprecation_date
                     "#,
                     &[&model_name],
                 )
@@ -936,6 +956,8 @@ impl ModelRepository {
                     supported_sampling_parameters,
                     supported_features,
                     datacenters,
+                    is_ready,
+                    deprecation_date,
                     effective_from,
                     effective_until,
                     changed_by_user_id,
@@ -947,8 +969,8 @@ impl ModelRepository {
                     $20, $21, $22,
                     COALESCE($23, ARRAY[]::TEXT[]),
                     COALESCE($24, ARRAY[]::TEXT[]),
-                    $25,
-                    NOW(), NULL, $26, $27, $28, NOW()
+                    $25, $26, $27,
+                    NOW(), NULL, $28, $29, $30, NOW()
                 )
                 "#,
                 &[
@@ -1004,6 +1026,11 @@ impl ModelRepository {
                         .flatten(),
                     &model_row
                         .try_get::<_, Option<Vec<String>>>("datacenters")
+                        .ok()
+                        .flatten(),
+                    &model_row.try_get::<_, Option<bool>>("is_ready").ok().flatten(),
+                    &model_row
+                        .try_get::<_, Option<chrono::DateTime<chrono::Utc>>>("deprecation_date")
                         .ok()
                         .flatten(),
                     &changed_by_user_id,
@@ -1092,6 +1119,8 @@ impl ModelRepository {
                         m.supported_sampling_parameters,
                         m.supported_features,
                         m.datacenters,
+                        m.is_ready,
+                        m.deprecation_date,
                         COALESCE(
                             array_agg(ma_all.alias_name)
                             FILTER (WHERE ma_all.alias_name IS NOT NULL),
@@ -1172,6 +1201,8 @@ impl ModelRepository {
                 .unwrap_or_default(),
             supported_features: row.try_get("supported_features").unwrap_or_default(),
             datacenters: row.try_get("datacenters").ok().flatten(),
+            is_ready: row.try_get("is_ready").ok().flatten(),
+            deprecation_date: row.try_get("deprecation_date").ok().flatten(),
         }
     }
 
@@ -1219,6 +1250,8 @@ impl ModelRepository {
                 .unwrap_or_default(),
             supported_features: row.try_get("supported_features").unwrap_or_default(),
             datacenters: row.try_get("datacenters").ok().flatten(),
+            is_ready: row.try_get("is_ready").ok().flatten(),
+            deprecation_date: row.try_get("deprecation_date").ok().flatten(),
             effective_from: row.get("effective_from"),
             effective_until: row.get("effective_until"),
             changed_by_user_id: row.get("changed_by_user_id"),
@@ -1286,6 +1319,7 @@ impl ModelRepository {
                         m.input_modalities, m.output_modalities, m.inference_url,
                         m.hugging_face_id, m.quantization, m.max_output_length,
                         m.supported_sampling_parameters, m.supported_features, m.datacenters,
+                        m.is_ready, m.deprecation_date,
                         COALESCE(array_agg(a.alias_name) FILTER (WHERE a.alias_name IS NOT NULL), '{}') AS aliases
                     FROM models m
                     LEFT JOIN model_aliases a ON a.canonical_model_id = m.id AND a.is_active = true
@@ -1366,6 +1400,8 @@ impl services::models::ModelsRepository for ModelRepository {
                 supported_sampling_parameters: m.supported_sampling_parameters,
                 supported_features: m.supported_features,
                 datacenters: m.datacenters,
+                is_ready: m.is_ready,
+                deprecation_date: m.deprecation_date,
                 created_at: m.created_at,
             })
             .collect())
@@ -1402,6 +1438,8 @@ impl services::models::ModelsRepository for ModelRepository {
             supported_sampling_parameters: m.supported_sampling_parameters,
             supported_features: m.supported_features,
             datacenters: m.datacenters,
+            is_ready: m.is_ready,
+            deprecation_date: m.deprecation_date,
             created_at: m.created_at,
         }))
     }
@@ -1437,6 +1475,8 @@ impl services::models::ModelsRepository for ModelRepository {
             supported_sampling_parameters: m.supported_sampling_parameters,
             supported_features: m.supported_features,
             datacenters: m.datacenters,
+            is_ready: m.is_ready,
+            deprecation_date: m.deprecation_date,
             created_at: m.created_at,
         }))
     }

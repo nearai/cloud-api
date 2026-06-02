@@ -155,6 +155,8 @@ pub async fn list_models(
                 supported_sampling_parameters: model.supported_sampling_parameters,
                 supported_features: model.supported_features,
                 datacenters: crate::models::Datacenter::from_codes(model.datacenters),
+                is_ready: model.is_ready,
+                deprecation_date: model.deprecation_date.map(|dt| dt.to_rfc3339()),
             },
         })
         .collect();
@@ -264,6 +266,8 @@ pub async fn get_model_by_name(
             supported_sampling_parameters: model.supported_sampling_parameters,
             supported_features: model.supported_features,
             datacenters: crate::models::Datacenter::from_codes(model.datacenters),
+            is_ready: model.is_ready,
+            deprecation_date: model.deprecation_date.map(|dt| dt.to_rfc3339()),
         },
     };
 

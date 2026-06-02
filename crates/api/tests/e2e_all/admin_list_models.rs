@@ -126,6 +126,113 @@ async fn test_admin_list_models_with_models() {
 }
 
 #[tokio::test]
+async fn test_admin_upsert_is_ready_and_deprecation_date_round_trip() {
+    let server = setup_test_server().await;
+
+    // Create a model with the two OpenRouter fields set.
+    let model_name = format!("test-isready-{}", uuid::Uuid::new_v4());
+    let mut batch = BatchUpdateModelApiRequest::new();
+    batch.insert(
+        model_name.clone(),
+        serde_json::from_value(serde_json::json!({
+            "inputCostPerToken": { "amount": 1000, "currency": "USD" },
+            "outputCostPerToken": { "amount": 2000, "currency": "USD" },
+            "modelDisplayName": "Test is_ready Model",
+            "modelDescription": "Round-trips is_ready and deprecation_date",
+            "contextLength": 4096,
+            "isActive": true,
+            "isReady": true,
+            "deprecationDate": "2030-01-01"
+        }))
+        .unwrap(),
+    );
+
+    let updated = admin_batch_upsert_models(&server, batch, get_session_id()).await;
+    let model = updated
+        .iter()
+        .find(|m| m.model_id == model_name)
+        .expect("upsert should return our model");
+
+    assert_eq!(
+        model.metadata.is_ready,
+        Some(true),
+        "is_ready should round-trip verbatim"
+    );
+    // Stored as TIMESTAMPTZ, serialized back as an ISO 8601 string. A bare
+    // date is normalized to midnight UTC.
+    let dep = model
+        .metadata
+        .deprecation_date
+        .as_ref()
+        .expect("deprecation_date should be present");
+    assert!(
+        dep.starts_with("2030-01-01T00:00:00"),
+        "deprecation_date should serialize as ISO 8601 midnight UTC, got {dep}"
+    );
+
+    // Now clear is_ready to false and supply a full datetime; verify update.
+    let mut batch2 = BatchUpdateModelApiRequest::new();
+    batch2.insert(
+        model_name.clone(),
+        serde_json::from_value(serde_json::json!({
+            "isReady": false,
+            "deprecationDate": "2031-06-15T00:00:00Z"
+        }))
+        .unwrap(),
+    );
+    let updated2 = admin_batch_upsert_models(&server, batch2, get_session_id()).await;
+    let model2 = updated2
+        .iter()
+        .find(|m| m.model_id == model_name)
+        .expect("update should return our model");
+    assert_eq!(model2.metadata.is_ready, Some(false));
+    assert!(model2
+        .metadata
+        .deprecation_date
+        .as_ref()
+        .unwrap()
+        .starts_with("2031-06-15T00:00:00"));
+}
+
+#[tokio::test]
+async fn test_admin_upsert_rejects_invalid_deprecation_date() {
+    let server = setup_test_server().await;
+
+    let model_name = format!("test-baddep-{}", uuid::Uuid::new_v4());
+    let mut batch = BatchUpdateModelApiRequest::new();
+    batch.insert(
+        model_name,
+        serde_json::from_value(serde_json::json!({
+            "inputCostPerToken": { "amount": 1000, "currency": "USD" },
+            "outputCostPerToken": { "amount": 2000, "currency": "USD" },
+            "modelDisplayName": "Bad deprecation date",
+            "modelDescription": "Should be rejected",
+            "contextLength": 4096,
+            "deprecationDate": "not-a-date"
+        }))
+        .unwrap(),
+    );
+
+    let response = server
+        .patch("/v1/admin/models")
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .add_header("User-Agent", MOCK_USER_AGENT)
+        .json(&batch)
+        .await;
+
+    assert_eq!(
+        response.status_code(),
+        400,
+        "Invalid deprecationDate should be rejected with 400"
+    );
+    assert!(
+        response.text().contains("deprecationDate"),
+        "error should mention deprecationDate, got: {}",
+        response.text()
+    );
+}
+
+#[tokio::test]
 async fn test_admin_list_models_include_inactive() {
     let server = setup_test_server().await;
 

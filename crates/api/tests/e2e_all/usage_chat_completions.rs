@@ -1,6 +1,6 @@
 //! E2E tests: call /v1/chat/completions and verify usage in the response and that it was
 //! recorded into the usage history table (including cache_read_tokens when present).
-//! Does not use the manual POST /v1/usage endpoint.
+//! Does not use the manual usage-recording endpoint (`/v1/internal/usage`).
 
 use crate::common::*;
 use inference_providers::StreamChunk;

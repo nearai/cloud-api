@@ -121,7 +121,6 @@ use utoipa::{Modify, OpenApi};
         crate::routes::usage::get_organization_usage_history,
         crate::routes::usage::get_organization_usage_by_model,
         crate::routes::usage::get_api_key_usage_history,
-        crate::routes::usage::record_usage,
         crate::routes::usage::get_user_organization_metrics,
         crate::routes::usage::get_user_organization_timeseries,
         // Feature request endpoints

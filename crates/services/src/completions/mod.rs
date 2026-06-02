@@ -823,6 +823,24 @@ impl CompletionServiceImpl {
                     }
                 }
             },
+            // The pool already determined (on the RAW upstream body, before URL
+            // redaction) that the engine couldn't fetch/decode a client-supplied
+            // image/video. Surface a 400 (non-retryable) — not a 502 — and use a
+            // generic message: the carried body holds the user's URL and internal
+            // paths, which must not be echoed to the client or logged here.
+            inference_providers::CompletionError::ClientMediaError(_) => {
+                tracing::warn!(
+                    %organization_id,
+                    model,
+                    "Client media fetch/decode error during {}",
+                    operation
+                );
+                ports::CompletionError::InvalidParams(
+                    "One or more image or video inputs could not be fetched or decoded. \
+                     Ensure each URL is reachable and resolves to a valid image or video."
+                        .to_string(),
+                )
+            }
             inference_providers::CompletionError::NoPubKeyProvider(msg) => {
                 tracing::warn!(
                     model,
@@ -2639,6 +2657,37 @@ mod tests {
                 assert_eq!(status_code, 502, "External 500 should map to 502");
             }
             other => panic!("Expected ProviderError, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_map_provider_error_client_media_becomes_invalid_params() {
+        // The pool classifies media fetch/decode failures on the RAW upstream
+        // body and carries the verdict as ClientMediaError, so the status
+        // mapping is a simple variant match — independent of the (sanitized)
+        // message content. Must be a non-retryable 400 with a GENERIC message
+        // that never echoes the carried body (URL / internal paths). Using a
+        // URL-bearing body here proves the status no longer depends on markers
+        // that URL-redaction would strip.
+        let error = inference_providers::CompletionError::ClientMediaError(
+            "HTTP error 500: 404, message='Not Found', url='https://x/y.jpg': \
+             cannot identify image file <_io.BytesIO>"
+                .to_string(),
+        );
+        let result =
+            CompletionServiceImpl::map_provider_error("test-model", &error, "test", Uuid::nil());
+        match result {
+            ports::CompletionError::InvalidParams(out) => {
+                assert!(
+                    !out.contains("BytesIO") && !out.contains("http") && !out.contains("y.jpg"),
+                    "must not echo carried provider body, got: {}",
+                    out
+                );
+            }
+            other => panic!(
+                "ClientMediaError should map to InvalidParams, got {:?}",
+                other
+            ),
         }
     }
 

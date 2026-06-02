@@ -48,7 +48,8 @@ pub struct ChatCompletionRequest {
     #[serde(default = "default_n")]
     pub n: Option<i64>,
     pub stream: Option<bool>,
-    pub stop: Option<Vec<String>>,
+    /// OpenAI `stop` accepts either a single string or an array of strings.
+    pub stop: Option<StopSequences>,
     pub presence_penalty: Option<f32>,
     pub frequency_penalty: Option<f32>,
 
@@ -173,10 +174,57 @@ pub struct ChatChoice {
     pub finish_reason: Option<String>, // "stop", "length", "content_filter"
 }
 
+/// OpenAI `/v1/completions` `prompt`: a single string, a batch of strings, or
+/// token-ID array(s). This endpoint serves only the single-string form; the
+/// other shapes still deserialize (so the handler can return a clean 400 rather
+/// than a framework deserialization error) and are rejected there.
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+#[serde(untagged)]
+pub enum CompletionPrompt {
+    Text(String),
+    Strings(Vec<String>),
+    Tokens(Vec<i64>),
+    TokenBatches(Vec<Vec<i64>>),
+}
+
+impl CompletionPrompt {
+    /// Resolve to the single text prompt this endpoint supports, or an error
+    /// message explaining why the shape is unsupported.
+    pub fn single_text(&self) -> Result<&str, &'static str> {
+        match self {
+            CompletionPrompt::Text(s) => Ok(s),
+            CompletionPrompt::Strings(v) if v.len() == 1 => Ok(&v[0]),
+            CompletionPrompt::Strings(_) => Err(
+                "array (batch) prompts are not supported on /v1/completions; send a single string prompt",
+            ),
+            CompletionPrompt::Tokens(_) | CompletionPrompt::TokenBatches(_) => Err(
+                "token-id prompts are not supported on /v1/completions; send a string prompt",
+            ),
+        }
+    }
+}
+
+/// OpenAI `stop`: either a single string or an array of strings.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(untagged)]
+pub enum StopSequences {
+    Single(String),
+    Many(Vec<String>),
+}
+
+impl StopSequences {
+    pub fn into_vec(self) -> Vec<String> {
+        match self {
+            StopSequences::Single(s) => vec![s],
+            StopSequences::Many(v) => v,
+        }
+    }
+}
+
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct CompletionRequest {
     pub model: String,
-    pub prompt: String,
+    pub prompt: CompletionPrompt,
     pub max_tokens: Option<i64>,
     #[serde(default = "default_temperature")]
     pub temperature: Option<f32>,
@@ -187,15 +235,16 @@ pub struct CompletionRequest {
     pub stream: Option<bool>,
     pub logprobs: Option<i64>,
     pub echo: Option<bool>,
-    pub stop: Option<Vec<String>>,
+    pub stop: Option<StopSequences>,
     pub presence_penalty: Option<f32>,
     pub frequency_penalty: Option<f32>,
     pub best_of: Option<i64>,
 
+    #[serde(flatten)]
     pub extra: std::collections::HashMap<String, serde_json::Value>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct CompletionResponse {
     pub id: String,
     pub object: String, // "text_completion"
@@ -792,7 +841,7 @@ pub struct TopProvider {
     pub is_moderated: bool,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct CompletionChoice {
     pub index: i64,
     pub text: String,
@@ -1016,9 +1065,8 @@ impl CompletionRequest {
             return Err("model is required".to_string());
         }
 
-        if self.prompt.is_empty() {
-            return Err("prompt is required".to_string());
-        }
+        // `prompt` shape is resolved in the handler (single_text) so unsupported
+        // shapes get a 400 unsupported_parameter rather than a generic error.
 
         if let Some(temp) = self.temperature {
             if !(0.0..=2.0).contains(&temp) {
@@ -2323,6 +2371,8 @@ pub struct AdminUserResponse {
     pub created_at: DateTime<Utc>,
     pub last_login_at: Option<DateTime<Utc>>,
     pub is_active: bool,
+    pub auth_provider: String,
+    pub provider_user_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub organizations: Option<Vec<AdminUserOrganizationDetails>>,
 }
@@ -2581,6 +2631,50 @@ pub struct OrganizationInvitationWithOrgResponse {
     pub invitation: OrganizationInvitationResponse,
     pub organization_name: String,
     pub invited_by_display_name: Option<String>,
+}
+
+/// Admin view of invitation email delivery metadata.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct AdminInvitationEmailDeliveryResponse {
+    pub organization_id: String,
+    pub organization_name: String,
+    pub invitation_id: String,
+    pub recipient_email: String,
+    pub role: MemberRole,
+    pub invitation_status: InvitationStatus,
+    pub email_status: InvitationEmailStatus,
+    pub email_sent_at: Option<DateTime<Utc>>,
+    pub email_last_error: Option<String>,
+    pub email_message_id: Option<String>,
+    pub invited_by_user_id: String,
+    pub invited_by_email: Option<String>,
+    pub invited_by_display_name: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
+    pub responded_at: Option<DateTime<Utc>>,
+}
+
+/// Paginated admin invitation email delivery response.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ListAdminInvitationEmailDeliveriesResponse {
+    pub deliveries: Vec<AdminInvitationEmailDeliveryResponse>,
+    pub total: i64,
+    pub limit: i64,
+    pub offset: i64,
+}
+
+/// Admin invitation email resend result.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct AdminInvitationEmailResendResultResponse {
+    pub invitation_id: String,
+    pub recipient_email: String,
+    pub success: bool,
+    pub email_sent: bool,
+    pub email_status: InvitationEmailStatus,
+    pub email_sent_at: Option<DateTime<Utc>>,
+    pub email_message_id: Option<String>,
+    pub email_last_error: Option<String>,
+    pub error: Option<String>,
 }
 
 /// Accept invitation response

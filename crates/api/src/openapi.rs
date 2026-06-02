@@ -51,7 +51,7 @@ use utoipa::{Modify, OpenApi};
         crate::routes::completions::score,
         crate::routes::completions::privacy_classify,
         crate::routes::completions::privacy_redact,
-        // crate::routes::completions::completions,
+        crate::routes::completions::completions,
         crate::routes::completions::models,
         // Model endpoints (public model catalog)
         crate::routes::models::list_models,
@@ -121,7 +121,6 @@ use utoipa::{Modify, OpenApi};
         crate::routes::usage::get_organization_usage_history,
         crate::routes::usage::get_organization_usage_by_model,
         crate::routes::usage::get_api_key_usage_history,
-        crate::routes::usage::record_usage,
         crate::routes::usage::get_user_organization_metrics,
         crate::routes::usage::get_user_organization_timeseries,
         // Feature request endpoints
@@ -145,6 +144,13 @@ use utoipa::{Modify, OpenApi};
         crate::routes::admin::get_organization_metrics,
         crate::routes::admin::get_platform_metrics,
         crate::routes::admin::get_organization_timeseries,
+        crate::routes::admin::get_platform_timeseries,
+        crate::routes::admin::get_billing_summary,
+        crate::routes::admin::get_model_revenue,
+        crate::routes::admin::get_org_revenue,
+        crate::routes::admin::get_infra_summary,
+        crate::routes::admin::list_invitation_email_deliveries,
+        crate::routes::admin::resend_invitation_email,
         crate::routes::admin::list_users,
         crate::routes::admin::create_admin_access_token,
         crate::routes::admin::list_admin_access_tokens,
@@ -165,7 +171,8 @@ use utoipa::{Modify, OpenApi};
             crate::routes::health::HealthResponse,
             // Core API models
             ChatCompletionRequest, ChatCompletionResponse, Message, CompletionUsage,
-            CompletionRequest, ModelsResponse, ModelInfo, ModelPricing, TopProvider, ErrorResponse,
+            CompletionRequest, CompletionPrompt, StopSequences, CompletionResponse,
+            CompletionChoice, ModelsResponse, ModelInfo, ModelPricing, TopProvider, ErrorResponse,
             // Image generation models
             ImageGenerationRequest, ImageGenerationResponse, ImageData,
             // Audio transcription models
@@ -234,6 +241,9 @@ use utoipa::{Modify, OpenApi};
             // Organization concurrent limit models (Admin)
             UpdateOrganizationConcurrentLimitRequest, UpdateOrganizationConcurrentLimitResponse,
             GetOrganizationConcurrentLimitResponse,
+            // Invitation email delivery models (Admin)
+            AdminInvitationEmailDeliveryResponse, ListAdminInvitationEmailDeliveriesResponse,
+            AdminInvitationEmailResendResultResponse,
             // User models (Admin)
             ListUsersResponse, AdminUserResponse,
             // Admin access token models
@@ -269,6 +279,19 @@ use utoipa::{Modify, OpenApi};
             crate::routes::billing::RequestCost,
             // File models
             FileUploadResponse, ExpiresAfter, FileListResponse, FileDeleteResponse,
+            // Platform Stats analytics models
+            services::admin::PlatformMetrics,
+            services::admin::TopModelMetrics,
+            services::admin::TopOrganizationMetrics,
+            services::admin::PlatformTimeSeriesMetrics,
+            services::admin::PlatformTimeSeriesPoint,
+            services::admin::BillingSummary,
+            services::admin::BillingSourceBreakdown,
+            services::admin::ModelRevenueReport,
+            services::admin::ModelRevenueEntry,
+            services::admin::OrgRevenueReport,
+            services::admin::OrgRevenueEntry,
+            services::admin::InfraSummary,
         ),
     ),
     modifiers(&SecurityAddon)

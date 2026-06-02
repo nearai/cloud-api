@@ -18,8 +18,8 @@ use crate::{
         },
         billing::{get_billing_costs, BillingRouteState},
         completions::{
-            audio_transcriptions, chat_completions, embeddings, image_edits, image_generations,
-            models, privacy_classify, privacy_redact, rerank, score,
+            audio_transcriptions, chat_completions, completions, embeddings, image_edits,
+            image_generations, models, privacy_classify, privacy_redact, rerank, score,
         },
         conversations,
         feature_requests::{
@@ -818,13 +818,6 @@ pub fn build_app_with_config(
         rate_limit_state.clone(),
     );
 
-    let usage_recording_routes = build_usage_recording_routes(
-        app_state.clone(),
-        &auth_components.auth_state_middleware,
-        usage_state.clone(),
-        rate_limit_state.clone(),
-    );
-
     let gateway_routes = build_gateway_routes(
         app_state.clone(),
         &auth_components.auth_state_middleware,
@@ -879,6 +872,7 @@ pub fn build_app_with_config(
             analytics_service,
             models_service: domain_services.models_service.clone(),
             completion_service: domain_services.completion_service.clone(),
+            organization_service: domain_services.organization_service.clone(),
             usage_service: domain_services.usage_service.clone(),
         },
     );
@@ -951,7 +945,6 @@ pub fn build_app_with_config(
                 .merge(files_routes)
                 .merge(feature_request_routes)
                 .merge(billing_routes)
-                .merge(usage_recording_routes)
                 .merge(gateway_routes)
                 .merge(internal_routes)
                 .merge(health_routes),
@@ -1057,6 +1050,7 @@ pub fn build_completion_routes(
     // Use default body limit (~2 MB) since they only accept JSON
     let text_inference_routes = Router::new()
         .route("/chat/completions", post(chat_completions))
+        .route("/completions", post(completions))
         .route("/images/generations", post(image_generations))
         .route("/audio/transcriptions", post(audio_transcriptions))
         .route("/rerank", post(rerank))
@@ -1383,31 +1377,6 @@ pub fn build_billing_routes(
         ))
 }
 
-/// Build usage recording routes with auth, rate limiting, and usage check.
-/// No body_hash_middleware — attestation/signing is not applicable to usage records.
-pub fn build_usage_recording_routes(
-    app_state: AppState,
-    auth_state_middleware: &AuthState,
-    usage_state: middleware::UsageState,
-    rate_limit_state: middleware::RateLimitState,
-) -> Router {
-    Router::new()
-        .route("/usage", post(crate::routes::usage::record_usage))
-        .with_state(app_state)
-        .layer(from_fn_with_state(
-            usage_state,
-            middleware::usage_check_middleware,
-        ))
-        .layer(from_fn_with_state(
-            rate_limit_state,
-            middleware::api_key_rate_limit_middleware,
-        ))
-        .layer(from_fn_with_state(
-            auth_state_middleware.clone(),
-            middleware::auth::auth_middleware_with_workspace_context,
-        ))
-}
-
 /// Build gateway routes for external model gateways to validate API keys.
 /// Reuses the same auth, rate limiting, and usage check middleware as completions.
 pub fn build_gateway_routes(
@@ -1537,6 +1506,8 @@ pub struct AdminRouteServices {
     pub analytics_service: Arc<services::admin::AnalyticsService>,
     pub models_service: Arc<services::models::ModelsServiceImpl>,
     pub completion_service: Arc<services::CompletionServiceImpl>,
+    pub organization_service:
+        Arc<dyn services::organization::OrganizationServiceTrait + Send + Sync>,
     pub usage_service: Arc<dyn services::usage::UsageServiceTrait + Send + Sync>,
 }
 
@@ -1549,10 +1520,12 @@ pub fn build_admin_routes(
     use crate::middleware::admin_middleware;
     use crate::routes::admin::{
         batch_upsert_models, create_admin_access_token, create_service, delete_admin_access_token,
-        delete_model, deprecate_model, get_admin_organization_balance, get_model_history,
+        delete_model, deprecate_model, get_admin_organization_balance, get_billing_summary,
+        get_infra_summary, get_model_history, get_model_revenue, get_org_revenue,
         get_organization_concurrent_limit, get_organization_limits_history,
         get_organization_metrics, get_organization_timeseries, get_platform_metrics,
-        list_admin_access_tokens, list_models as admin_list_models, list_organizations, list_users,
+        get_platform_timeseries, list_admin_access_tokens, list_invitation_email_deliveries,
+        list_models as admin_list_models, list_organizations, list_users, resend_invitation_email,
         update_organization_concurrent_limit, update_organization_limits, update_service,
         AdminAppState,
     };
@@ -1581,14 +1554,25 @@ pub fn build_admin_routes(
             as Arc<dyn services::completions::CompletionServiceTrait>,
     )) as Arc<dyn services::admin::AdminService + Send + Sync>;
 
+    let github_dispatcher =
+        services::github_dispatch::dispatcher_from_config(&config.github_dispatch);
+
+    let infra_service = Arc::new(services::admin::InfraService::new(
+        config.infra.machines_url.clone(),
+        config.infra.cost_per_host_usd_month,
+    ));
+
     let admin_app_state = AdminAppState {
         admin_service,
         analytics_service: services.analytics_service,
+        organization_service: services.organization_service,
         auth_service: auth_state_middleware.auth_service.clone(),
         usage_service: services.usage_service,
         config,
         admin_access_token_repository,
         inference_provider_pool: services.inference_provider_pool,
+        github_dispatcher,
+        infra_service,
     };
 
     Router::new()
@@ -1638,6 +1622,34 @@ pub fn build_admin_routes(
         .route(
             "/admin/platform/metrics",
             axum::routing::get(get_platform_metrics),
+        )
+        .route(
+            "/admin/platform/metrics/timeseries",
+            axum::routing::get(get_platform_timeseries),
+        )
+        .route(
+            "/admin/platform/billing-summary",
+            axum::routing::get(get_billing_summary),
+        )
+        .route(
+            "/admin/platform/model-revenue",
+            axum::routing::get(get_model_revenue),
+        )
+        .route(
+            "/admin/platform/org-revenue",
+            axum::routing::get(get_org_revenue),
+        )
+        .route(
+            "/admin/platform/infra-summary",
+            axum::routing::get(get_infra_summary),
+        )
+        .route(
+            "/admin/invitation-email-deliveries",
+            axum::routing::get(list_invitation_email_deliveries),
+        )
+        .route(
+            "/admin/invitation-email-deliveries/{invitation_id}/resend",
+            axum::routing::post(resend_invitation_email),
         )
         .route("/admin/users", axum::routing::get(list_users))
         .route(
@@ -1827,6 +1839,8 @@ mod tests {
             },
             cors: config::CorsConfig::default(),
             external_providers: config::ExternalProvidersConfig::default(),
+            github_dispatch: config::GitHubDispatchConfig::default(),
+            infra: config::InfraConfig::default(),
         };
 
         // Initialize services
@@ -1927,6 +1941,8 @@ mod tests {
             },
             cors: config::CorsConfig::default(),
             external_providers: config::ExternalProvidersConfig::default(),
+            github_dispatch: config::GitHubDispatchConfig::default(),
+            infra: config::InfraConfig::default(),
         };
 
         let auth_components = init_auth_services(database.clone(), &config);

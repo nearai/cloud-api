@@ -1,14 +1,18 @@
+use crate::conversions::{
+    api_invitation_email_status_to_services, api_invitation_status_to_services,
+    services_invitation_email_delivery_to_api, services_invitation_resend_result_to_api,
+};
 use crate::middleware::AdminUser;
 use crate::models::{
-    AdminAccessTokenResponse, AdminModelListResponse, AdminModelWithPricing,
-    AdminOrganizationResponse, AdminServiceResponse, AdminUserOrganizationDetails,
-    AdminUserResponse, BatchUpdateModelApiRequest, CreateAdminAccessTokenRequest,
-    CreateServiceRequest, CreditType, DecimalPrice, DecimalPriceRequest,
-    DeleteAdminAccessTokenRequest, DeleteModelRequest, DeprecateModelRequest,
+    AdminAccessTokenResponse, AdminInvitationEmailResendResultResponse, AdminModelListResponse,
+    AdminModelWithPricing, AdminOrganizationResponse, AdminServiceResponse,
+    AdminUserOrganizationDetails, AdminUserResponse, BatchUpdateModelApiRequest,
+    CreateAdminAccessTokenRequest, CreateServiceRequest, CreditType, DecimalPrice,
+    DecimalPriceRequest, DeleteAdminAccessTokenRequest, DeleteModelRequest, DeprecateModelRequest,
     DeprecateModelResponse, ErrorResponse, GetOrganizationConcurrentLimitResponse,
-    ListOrganizationsAdminResponse, ListUsersResponse, ModelArchitecture, ModelHistoryEntry,
-    ModelHistoryResponse, ModelMetadata, ModelWithPricing, OrgLimitsHistoryEntry,
-    OrgLimitsHistoryResponse, OrganizationUsage, SpendLimit,
+    ListAdminInvitationEmailDeliveriesResponse, ListOrganizationsAdminResponse, ListUsersResponse,
+    ModelArchitecture, ModelHistoryEntry, ModelHistoryResponse, ModelMetadata, ModelWithPricing,
+    OrgLimitsHistoryEntry, OrgLimitsHistoryResponse, OrganizationUsage, SpendLimit,
     UpdateOrganizationConcurrentLimitRequest, UpdateOrganizationConcurrentLimitResponse,
     UpdateOrganizationLimitsRequest, UpdateOrganizationLimitsResponse, UpdateServiceRequest,
 };
@@ -21,23 +25,40 @@ use axum::{
     response::Json as ResponseJson,
     Extension,
 };
-use chrono::{Duration, Utc};
+use chrono::{DateTime, Duration, Utc};
 use config::ApiConfig;
 use services::admin::{AdminService, AnalyticsService, UpdateModelAdminRequest};
 use services::auth::AuthServiceTrait;
+use services::github_dispatch::GitHubDispatcher;
 use services::usage::UsageServiceTrait;
 use std::sync::Arc;
-use tracing::{debug, error};
+use tracing::{debug, error, Instrument};
+use uuid::Uuid;
 
 #[derive(Clone)]
 pub struct AdminAppState {
     pub admin_service: Arc<dyn AdminService + Send + Sync>,
     pub analytics_service: Arc<AnalyticsService>,
+    pub organization_service:
+        Arc<dyn services::organization::OrganizationServiceTrait + Send + Sync>,
     pub auth_service: Arc<dyn AuthServiceTrait>,
     pub usage_service: Arc<dyn UsageServiceTrait + Send + Sync>,
     pub config: Arc<ApiConfig>,
     pub admin_access_token_repository: Arc<database::repositories::AdminAccessTokenRepository>,
     pub inference_provider_pool: Arc<services::inference_provider_pool::InferenceProviderPool>,
+    pub github_dispatcher: Arc<dyn GitHubDispatcher>,
+    pub infra_service: Arc<services::admin::InfraService>,
+}
+
+/// Small helper for 400 responses from analytics query-param validation.
+fn bad_request(
+    message: impl Into<String>,
+    code: &str,
+) -> (StatusCode, ResponseJson<ErrorResponse>) {
+    (
+        StatusCode::BAD_REQUEST,
+        ResponseJson(ErrorResponse::new(message.into(), code.to_string())),
+    )
 }
 
 /// Batch upsert models metadata (Admin only)
@@ -340,6 +361,44 @@ pub async fn batch_upsert_models(
         {
             tracing::warn!(error = %e, "Failed to register some external providers at runtime");
         }
+    }
+
+    // Fire GitHub repository_dispatch for each model this PATCH (re)loaded.
+    // Downstream automation (validate / promote workflows in
+    // cvm-ansible-playbooks) listens for the configured event_type and reacts.
+    // Fire-and-forget: a GitHub outage does not block the PATCH. Only enabled
+    // on staging cloud-api via ENABLE_GITHUB_DISPATCH; production keeps it off
+    // so promote-driven prod PATCHes do not recursively re-fire the chain.
+    //
+    // Skip deactivations: a PATCH that sets is_active=false is an unload, not a
+    // load, and must not trigger validate/promote of a model being taken
+    // offline. Dispatch the whole set from a single background task so a large
+    // batch does not burst N concurrent requests at GitHub's dispatch API
+    // (which would trip secondary rate limits and silently drop events).
+    let dispatch_model_ids: Vec<String> = batch_request
+        .iter()
+        .filter(|(_, request)| request.is_active != Some(false))
+        .map(|(model_id, _)| model_id.clone())
+        .collect();
+    if !dispatch_model_ids.is_empty() {
+        let dispatcher = app_state.github_dispatcher.clone();
+        // Carry the current tracing span into the fire-and-forget task;
+        // tokio::spawn does not inherit it, so dispatch-failure warnings would
+        // otherwise lose the request's log context.
+        tokio::spawn(
+            async move {
+                for model_id in dispatch_model_ids {
+                    if let Err(e) = dispatcher.dispatch_model_loaded(&model_id).await {
+                        tracing::warn!(
+                            error = %e,
+                            model_id = %model_id,
+                            "GitHub dispatch failed; manual workflow trigger may be required"
+                        );
+                    }
+                }
+            }
+            .instrument(tracing::Span::current()),
+        );
     }
 
     // Convert to API response - map from HashMap to Vec
@@ -1174,7 +1233,9 @@ pub async fn deprecate_model(
         ("limit" = Option<i64>, Query, description = "Maximum number of users to return (default: 100)"),
         ("offset" = Option<i64>, Query, description = "Number of users to skip (default: 0)"),
         ("include_organizations" = Option<bool>, Query, description = "Whether to include organization information and spend limits for the first organization owned by each user (default: false)"),
-        ("search_by_name" = Option<String>, Query, description = "Filter users by organization name (case-insensitive match). Only effective when include_organizations=true; ignored otherwise.")
+        ("search" = Option<String>, Query, description = "Filter users by email, username, display name, user id, auth provider, or provider user id (case-insensitive partial match)."),
+        ("is_active" = Option<bool>, Query, description = "Filter users by active status. Omit to include active and inactive users."),
+        ("search_by_name" = Option<String>, Query, description = "Filter users by organization name (case-insensitive match). Only effective when include_organizations=true; separate from user search.")
     ),
     responses(
         (status = 200, description = "Users retrieved successfully", body = ListUsersResponse),
@@ -1193,15 +1254,34 @@ pub async fn list_users(
     crate::routes::common::validate_limit_offset(params.limit, params.offset)?;
 
     debug!(
-        "List users request with limit={}, offset={}, include_organizations={}, search_by_name={:?}",
-        params.limit, params.offset, params.include_organizations, params.search_by_name
+        "List users request with limit={}, offset={}, include_organizations={}, has_search={}, is_active={:?}, has_search_by_name={}",
+        params.limit,
+        params.offset,
+        params.include_organizations,
+        params
+            .search
+            .as_ref()
+            .map(|search| !search.is_empty())
+            .unwrap_or(false),
+        params.is_active,
+        params
+            .search_by_name
+            .as_ref()
+            .map(|search| !search.is_empty())
+            .unwrap_or(false)
     );
 
     let (user_responses, total) = if params.include_organizations {
         // Fetch users with their default organization and spend limit
         let (users_with_orgs, total) = app_state
             .admin_service
-            .list_users_with_organizations(params.limit, params.offset, params.search_by_name)
+            .list_users_with_organizations(
+                params.limit,
+                params.offset,
+                params.search.clone(),
+                params.is_active,
+                params.search_by_name.clone(),
+            )
             .await
             .map_err(|e| {
                 error!("Failed to list users with organizations");
@@ -1253,6 +1333,8 @@ pub async fn list_users(
                     created_at: u.created_at,
                     last_login_at: u.last_login_at,
                     is_active: u.is_active,
+                    auth_provider: u.auth_provider,
+                    provider_user_id: u.provider_user_id,
                     organizations,
                 }
             })
@@ -1263,7 +1345,12 @@ pub async fn list_users(
         // Return users data only
         let (users, total) = app_state
             .admin_service
-            .list_users(params.limit, params.offset)
+            .list_users(
+                params.limit,
+                params.offset,
+                params.search.clone(),
+                params.is_active,
+            )
             .await
             .map_err(|e| {
                 error!("Failed to list users");
@@ -1293,6 +1380,8 @@ pub async fn list_users(
                 created_at: u.created_at,
                 last_login_at: u.last_login_at,
                 is_active: u.is_active,
+                auth_provider: u.auth_provider,
+                provider_user_id: u.provider_user_id,
                 organizations: None,
             })
             .collect();
@@ -1398,6 +1487,157 @@ pub async fn list_organizations(
     };
 
     Ok(ResponseJson(response))
+}
+
+/// List organization invitation email deliveries (Admin only)
+///
+/// Returns delivery metadata for organization invitation emails without exposing invitation tokens.
+#[utoipa::path(
+    get,
+    path = "/v1/admin/invitation-email-deliveries",
+    tag = "Admin",
+    params(
+        ("limit" = Option<i64>, Query, description = "Maximum number of deliveries to return (default: 100)"),
+        ("offset" = Option<i64>, Query, description = "Number of deliveries to skip (default: 0)"),
+        ("organization_id" = Option<Uuid>, Query, description = "Filter by organization ID"),
+        ("recipient_email" = Option<String>, Query, description = "Case-insensitive recipient email substring filter"),
+        ("email_status" = Option<crate::models::InvitationEmailStatus>, Query, description = "Filter by email delivery status"),
+        ("invitation_status" = Option<crate::models::InvitationStatus>, Query, description = "Filter by invitation status"),
+        ("created_after" = Option<DateTime<Utc>>, Query, description = "Only invitations created at or after this timestamp"),
+        ("created_before" = Option<DateTime<Utc>>, Query, description = "Only invitations created at or before this timestamp")
+    ),
+    responses(
+        (status = 200, description = "Invitation email deliveries retrieved successfully", body = ListAdminInvitationEmailDeliveriesResponse),
+        (status = 400, description = "Invalid request", body = ErrorResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    ),
+    security(
+        ("session_token" = [])
+    )
+)]
+pub async fn list_invitation_email_deliveries(
+    State(app_state): State<AdminAppState>,
+    Extension(_admin_user): Extension<AdminUser>,
+    axum::extract::Query(params): axum::extract::Query<ListInvitationEmailDeliveriesQueryParams>,
+) -> Result<
+    ResponseJson<ListAdminInvitationEmailDeliveriesResponse>,
+    (StatusCode, ResponseJson<ErrorResponse>),
+> {
+    crate::routes::common::validate_limit_offset(params.limit, params.offset)?;
+
+    debug!(
+        "List invitation email deliveries request with limit={}, offset={}",
+        params.limit, params.offset
+    );
+
+    let filters = services::organization::InvitationEmailDeliveryFilters {
+        organization_id: params
+            .organization_id
+            .map(services::organization::OrganizationId),
+        recipient_email: params.recipient_email,
+        email_status: params
+            .email_status
+            .map(api_invitation_email_status_to_services),
+        invitation_status: params
+            .invitation_status
+            .map(api_invitation_status_to_services),
+        created_after: params.created_after,
+        created_before: params.created_before,
+    };
+
+    let (deliveries, total) = app_state
+        .organization_service
+        .list_invitation_email_deliveries(filters, params.limit, params.offset)
+        .await
+        .map_err(|e| match e {
+            services::organization::OrganizationError::InvalidParams(msg) => (
+                StatusCode::BAD_REQUEST,
+                ResponseJson(ErrorResponse::new(msg, "invalid_request".to_string())),
+            ),
+            _ => {
+                error!("Failed to list invitation email deliveries: {:?}", e);
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    ResponseJson(ErrorResponse::new(
+                        "Failed to retrieve invitation email deliveries".to_string(),
+                        "internal_server_error".to_string(),
+                    )),
+                )
+            }
+        })?;
+
+    let response = ListAdminInvitationEmailDeliveriesResponse {
+        deliveries: deliveries
+            .into_iter()
+            .map(services_invitation_email_delivery_to_api)
+            .collect(),
+        total,
+        limit: params.limit,
+        offset: params.offset,
+    };
+
+    Ok(ResponseJson(response))
+}
+
+/// Resend a single organization invitation email (Admin only)
+#[utoipa::path(
+    post,
+    path = "/v1/admin/invitation-email-deliveries/{invitation_id}/resend",
+    tag = "Admin",
+    params(
+        ("invitation_id" = Uuid, Path, description = "Invitation ID")
+    ),
+    responses(
+        (status = 200, description = "Invitation email resend attempted", body = AdminInvitationEmailResendResultResponse),
+        (status = 400, description = "Invitation is not pending or has expired", body = ErrorResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 404, description = "Invitation not found", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    ),
+    security(
+        ("session_token" = [])
+    )
+)]
+pub async fn resend_invitation_email(
+    State(app_state): State<AdminAppState>,
+    Extension(_admin_user): Extension<AdminUser>,
+    Path(invitation_id): Path<Uuid>,
+) -> Result<
+    ResponseJson<AdminInvitationEmailResendResultResponse>,
+    (StatusCode, ResponseJson<ErrorResponse>),
+> {
+    debug!("Resend invitation email request for {}", invitation_id);
+
+    app_state
+        .organization_service
+        .resend_invitation_email(invitation_id)
+        .await
+        .map(services_invitation_resend_result_to_api)
+        .map(ResponseJson)
+        .map_err(|e| match e {
+            services::organization::OrganizationError::NotFound => (
+                StatusCode::NOT_FOUND,
+                ResponseJson(ErrorResponse::new(
+                    "Invitation not found".to_string(),
+                    "not_found".to_string(),
+                )),
+            ),
+            services::organization::OrganizationError::InvalidParams(msg) => (
+                StatusCode::BAD_REQUEST,
+                ResponseJson(ErrorResponse::new(msg, "invalid_request".to_string())),
+            ),
+            _ => {
+                error!("Failed to resend invitation email: {:?}", e);
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    ResponseJson(ErrorResponse::new(
+                        "Failed to resend invitation email".to_string(),
+                        "internal_server_error".to_string(),
+                    )),
+                )
+            }
+        })
 }
 
 /// Create platform service (Admin only)
@@ -1763,6 +2003,8 @@ pub struct ListUsersQueryParams {
     pub offset: i64,
     #[serde(default)]
     pub include_organizations: bool,
+    pub search: Option<String>,
+    pub is_active: Option<bool>,
     pub search_by_name: Option<String>,
 }
 
@@ -1772,6 +2014,20 @@ pub struct ListOrganizationsQueryParams {
     pub limit: i64,
     #[serde(default)]
     pub offset: i64,
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct ListInvitationEmailDeliveriesQueryParams {
+    #[serde(default = "crate::routes::common::default_limit")]
+    pub limit: i64,
+    #[serde(default)]
+    pub offset: i64,
+    pub organization_id: Option<Uuid>,
+    pub recipient_email: Option<String>,
+    pub email_status: Option<crate::models::InvitationEmailStatus>,
+    pub invitation_status: Option<crate::models::InvitationStatus>,
+    pub created_after: Option<DateTime<Utc>>,
+    pub created_before: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -1914,7 +2170,7 @@ pub async fn get_organization_metrics(
         ("end" = Option<String>, Query, description = "End of time range (ISO 8601). Defaults to now.")
     ),
     responses(
-        (status = 200, description = "Platform metrics retrieved successfully"),
+        (status = 200, description = "Platform metrics retrieved successfully", body = services::admin::PlatformMetrics),
         (status = 401, description = "Unauthorized", body = ErrorResponse),
         (status = 500, description = "Internal server error", body = ErrorResponse)
     ),
@@ -1933,18 +2189,12 @@ pub async fn get_platform_metrics(
         params.start, params.end
     );
 
-    // Parse time range with defaults
-    let end = params
-        .end
-        .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
-        .map(|dt| dt.with_timezone(&Utc))
-        .unwrap_or_else(Utc::now);
-
-    let start = params
-        .start
-        .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
-        .map(|dt| dt.with_timezone(&Utc))
-        .unwrap_or_else(|| end - Duration::days(30));
+    let (start, end) = crate::routes::common::parse_metrics_range(
+        params.start.as_deref(),
+        params.end.as_deref(),
+        None,
+        0,
+    )?;
 
     // Get platform metrics from analytics service
     let metrics = app_state
@@ -1963,6 +2213,350 @@ pub async fn get_platform_metrics(
         })?;
 
     Ok(ResponseJson(metrics))
+}
+
+/// Get platform-wide time series for admin dashboards (Admin only)
+///
+/// Returns per-bucket requests, tokens, cost (paid/granted + verifiable/external splits),
+/// active organizations, and new signups for growth/mix trend charts.
+#[utoipa::path(
+    get,
+    path = "/v1/admin/platform/metrics/timeseries",
+    tag = "Admin",
+    params(
+        ("start" = Option<String>, Query, description = "Start of time range (ISO 8601). Defaults to 30 days ago."),
+        ("end" = Option<String>, Query, description = "End of time range (ISO 8601). Defaults to now."),
+        ("granularity" = Option<String>, Query, description = "Time granularity: hour, day (default), week, or month")
+    ),
+    responses(
+        (status = 200, description = "Platform time series retrieved successfully", body = services::admin::PlatformTimeSeriesMetrics),
+        (status = 400, description = "Invalid request", body = ErrorResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    ),
+    security(
+        ("session_token" = [])
+    )
+)]
+pub async fn get_platform_timeseries(
+    State(app_state): State<AdminAppState>,
+    Query(params): Query<TimeSeriesQueryParams>,
+    Extension(_admin_user): Extension<AdminUser>,
+) -> Result<
+    ResponseJson<services::admin::PlatformTimeSeriesMetrics>,
+    (StatusCode, ResponseJson<ErrorResponse>),
+> {
+    debug!(
+        "Get platform timeseries request, start: {:?}, end: {:?}, granularity: {}",
+        params.start, params.end, params.granularity
+    );
+
+    // Validate granularity (platform supports month in addition to hour/day/week)
+    let granularity = match params.granularity.as_str() {
+        "hour" | "day" | "week" | "month" => params.granularity.as_str(),
+        _ => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                ResponseJson(ErrorResponse::new(
+                    "Invalid granularity. Must be 'hour', 'day', 'week', or 'month'".to_string(),
+                    "invalid_granularity".to_string(),
+                )),
+            ))
+        }
+    };
+
+    // Cap `hour` granularity to 31 days to avoid unbounded bucket counts.
+    let (start, end) = crate::routes::common::parse_metrics_range(
+        params.start.as_deref(),
+        params.end.as_deref(),
+        Some(granularity),
+        31,
+    )?;
+
+    let metrics = app_state
+        .analytics_service
+        .get_platform_timeseries(start, end, granularity)
+        .await
+        .map_err(|e| {
+            error!("Failed to get platform timeseries, error: {:?}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ResponseJson(ErrorResponse::new(
+                    format!("Failed to retrieve platform timeseries: {e}"),
+                    "internal_server_error".to_string(),
+                )),
+            )
+        })?;
+
+    Ok(ResponseJson(metrics))
+}
+
+/// Get the platform billing summary (Admin only)
+///
+/// Credit LIMITS (caps) and consumption — NOT payments/cash. Returns active paid/grant
+/// credit limits, total consumed, paying/granted org counts, and a breakdown by funding
+/// source. Real money-in lives in the billing service, not cloud-api.
+#[utoipa::path(
+    get,
+    path = "/v1/admin/platform/billing-summary",
+    tag = "Admin",
+    responses(
+        (status = 200, description = "Billing summary retrieved successfully", body = services::admin::BillingSummary),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    ),
+    security(
+        ("session_token" = [])
+    )
+)]
+pub async fn get_billing_summary(
+    State(app_state): State<AdminAppState>,
+    Extension(_admin_user): Extension<AdminUser>,
+) -> Result<ResponseJson<services::admin::BillingSummary>, (StatusCode, ResponseJson<ErrorResponse>)>
+{
+    debug!("Get platform billing summary request");
+
+    let summary = app_state
+        .analytics_service
+        .get_billing_summary()
+        .await
+        .map_err(|e| {
+            error!("Failed to get billing summary, error: {:?}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ResponseJson(ErrorResponse::new(
+                    format!("Failed to retrieve billing summary: {e}"),
+                    "internal_server_error".to_string(),
+                )),
+            )
+        })?;
+
+    Ok(ResponseJson(summary))
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct ModelRevenueQueryParams {
+    /// Start of time range (ISO 8601). Defaults to 30 days ago.
+    pub start: Option<String>,
+    /// End of time range (ISO 8601). Defaults to now.
+    pub end: Option<String>,
+    #[serde(default = "crate::routes::common::default_limit")]
+    pub limit: i64,
+    #[serde(default)]
+    pub offset: i64,
+    /// Filter by verifiable (TEE) models only / non-verifiable only.
+    pub verifiable: Option<bool>,
+    /// Filter by provider type ("vllm" or "external").
+    pub provider_type: Option<String>,
+    /// Case-insensitive substring match on model name.
+    pub model_search: Option<String>,
+    /// Sort key: "revenue" (default), "requests", or "tokens".
+    pub sort: Option<String>,
+}
+
+/// Get the per-model consumption ranking (Admin only)
+///
+/// Models for the selected period ranked by consumed cost, with requests, tokens,
+/// unique orgs, verifiable flag, provider type, and latency. Paginated and filterable.
+#[utoipa::path(
+    get,
+    path = "/v1/admin/platform/model-revenue",
+    tag = "Admin",
+    params(
+        ("start" = Option<String>, Query, description = "Start of time range (ISO 8601). Defaults to 30 days ago."),
+        ("end" = Option<String>, Query, description = "End of time range (ISO 8601). Defaults to now."),
+        ("limit" = Option<i64>, Query, description = "Page size (1-1000, default 100)"),
+        ("offset" = Option<i64>, Query, description = "Page offset (default 0)"),
+        ("verifiable" = Option<bool>, Query, description = "Filter to verifiable (true) or non-verifiable (false) models"),
+        ("provider_type" = Option<String>, Query, description = "Filter by provider type (e.g. vllm, external)"),
+        ("sort" = Option<String>, Query, description = "Sort: revenue (default), requests, tokens")
+    ),
+    responses(
+        (status = 200, description = "Model revenue retrieved successfully", body = services::admin::ModelRevenueReport),
+        (status = 400, description = "Invalid request", body = ErrorResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    ),
+    security(
+        ("session_token" = [])
+    )
+)]
+pub async fn get_model_revenue(
+    State(app_state): State<AdminAppState>,
+    Query(params): Query<ModelRevenueQueryParams>,
+    Extension(_admin_user): Extension<AdminUser>,
+) -> Result<
+    ResponseJson<services::admin::ModelRevenueReport>,
+    (StatusCode, ResponseJson<ErrorResponse>),
+> {
+    debug!(
+        "Get platform model revenue request, start: {:?}, end: {:?}, limit: {}, offset: {}",
+        params.start, params.end, params.limit, params.offset
+    );
+    crate::routes::common::validate_limit_offset(params.limit, params.offset)?;
+    let (start, end) = crate::routes::common::parse_metrics_range(
+        params.start.as_deref(),
+        params.end.as_deref(),
+        None,
+        0,
+    )?;
+    let sort = services::admin::RevenueSort::from_query(params.sort.as_deref())
+        .map_err(|m| bad_request(m, "invalid_parameter"))?;
+    if let Some(pt) = params.provider_type.as_deref() {
+        if pt != "vllm" && pt != "external" {
+            return Err(bad_request(
+                format!("invalid provider_type '{pt}'; expected 'vllm' or 'external'"),
+                "invalid_parameter",
+            ));
+        }
+    }
+
+    let report = app_state
+        .analytics_service
+        .get_model_revenue(services::admin::ModelRevenueQuery {
+            start,
+            end,
+            verifiable: params.verifiable,
+            provider_type: params.provider_type,
+            model_search: params.model_search,
+            sort,
+            limit: params.limit,
+            offset: params.offset,
+        })
+        .await
+        .map_err(|e| {
+            error!("Failed to get model revenue, error: {:?}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ResponseJson(ErrorResponse::new(
+                    format!("Failed to retrieve model revenue: {e}"),
+                    "internal_server_error".to_string(),
+                )),
+            )
+        })?;
+
+    Ok(ResponseJson(report))
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct OrgRevenueQueryParams {
+    /// Start of time range (ISO 8601). Defaults to 30 days ago.
+    pub start: Option<String>,
+    /// End of time range (ISO 8601). Defaults to now.
+    pub end: Option<String>,
+    #[serde(default = "crate::routes::common::default_limit")]
+    pub limit: i64,
+    #[serde(default)]
+    pub offset: i64,
+    /// Filter to current paying (true) / non-paying (false) orgs.
+    pub paying: Option<bool>,
+    /// Case-insensitive substring match on organization name.
+    pub search: Option<String>,
+    /// Sort key: "revenue" (default), "requests", or "tokens".
+    pub sort: Option<String>,
+}
+
+/// Get the per-organization consumption ranking (Admin only)
+///
+/// Organizations with usage in the selected period ranked by consumed cost, with the
+/// verifiable/external split, requests, tokens, models used, a current paying flag, and
+/// last-usage timestamp. Paginated and filterable — full attribution of usage/spend per org.
+#[utoipa::path(
+    get,
+    path = "/v1/admin/platform/org-revenue",
+    tag = "Admin",
+    params(
+        ("start" = Option<String>, Query, description = "Start of time range (ISO 8601). Defaults to 30 days ago."),
+        ("end" = Option<String>, Query, description = "End of time range (ISO 8601). Defaults to now."),
+        ("limit" = Option<i64>, Query, description = "Page size (1-1000, default 100)"),
+        ("offset" = Option<i64>, Query, description = "Page offset (default 0)"),
+        ("paying" = Option<bool>, Query, description = "Filter to current paying (true) / non-paying (false) orgs"),
+        ("sort" = Option<String>, Query, description = "Sort: revenue (default), requests, tokens")
+    ),
+    responses(
+        (status = 200, description = "Org revenue retrieved successfully", body = services::admin::OrgRevenueReport),
+        (status = 400, description = "Invalid request", body = ErrorResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    ),
+    security(
+        ("session_token" = [])
+    )
+)]
+pub async fn get_org_revenue(
+    State(app_state): State<AdminAppState>,
+    Query(params): Query<OrgRevenueQueryParams>,
+    Extension(_admin_user): Extension<AdminUser>,
+) -> Result<
+    ResponseJson<services::admin::OrgRevenueReport>,
+    (StatusCode, ResponseJson<ErrorResponse>),
+> {
+    debug!(
+        "Get platform org revenue request, start: {:?}, end: {:?}, limit: {}, offset: {}",
+        params.start, params.end, params.limit, params.offset
+    );
+    crate::routes::common::validate_limit_offset(params.limit, params.offset)?;
+    let (start, end) = crate::routes::common::parse_metrics_range(
+        params.start.as_deref(),
+        params.end.as_deref(),
+        None,
+        0,
+    )?;
+    let sort = services::admin::RevenueSort::from_query(params.sort.as_deref())
+        .map_err(|m| bad_request(m, "invalid_parameter"))?;
+
+    let report = app_state
+        .analytics_service
+        .get_org_revenue(services::admin::OrgRevenueQuery {
+            start,
+            end,
+            paying: params.paying,
+            search: params.search,
+            sort,
+            limit: params.limit,
+            offset: params.offset,
+        })
+        .await
+        .map_err(|e| {
+            error!("Failed to get org revenue, error: {:?}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ResponseJson(ErrorResponse::new(
+                    format!("Failed to retrieve org revenue: {e}"),
+                    "internal_server_error".to_string(),
+                )),
+            )
+        })?;
+
+    Ok(ResponseJson(report))
+}
+
+/// Get the platform infrastructure / fleet burn summary (Admin only)
+///
+/// Fetches the live host list, counts active/idle hosts, and computes the monthly/daily
+/// GPU burn rate from the configured cost-per-host. Degrades gracefully (stale=true) if
+/// the host inventory is unreachable.
+#[utoipa::path(
+    get,
+    path = "/v1/admin/platform/infra-summary",
+    tag = "Admin",
+    responses(
+        (status = 200, description = "Infra summary retrieved successfully", body = services::admin::InfraSummary),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    ),
+    security(
+        ("session_token" = [])
+    )
+)]
+pub async fn get_infra_summary(
+    State(app_state): State<AdminAppState>,
+    Extension(_admin_user): Extension<AdminUser>,
+) -> Result<ResponseJson<services::admin::InfraSummary>, (StatusCode, ResponseJson<ErrorResponse>)>
+{
+    debug!("Get platform infra summary request");
+    let summary = app_state.infra_service.get_infra_summary().await;
+    Ok(ResponseJson(summary))
 }
 
 #[derive(Debug, serde::Deserialize)]

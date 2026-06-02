@@ -2,10 +2,14 @@ pub mod analytics;
 pub mod ports;
 
 pub use analytics::{
-    AnalyticsRepository, AnalyticsService, ApiKeyMetrics, MetricsSummary, ModelMetrics,
-    OrganizationMetrics, PlatformMetrics, TimeSeriesMetrics, TimeSeriesPoint, TopModelMetrics,
-    TopOrganizationMetrics, WorkspaceMetrics,
+    AnalyticsRepository, AnalyticsService, ApiKeyMetrics, BillingSourceBreakdown, BillingSummary,
+    MetricsSummary, ModelMetrics, ModelRevenueEntry, ModelRevenueQuery, ModelRevenueReport,
+    OrgRevenueEntry, OrgRevenueQuery, OrgRevenueReport, OrganizationMetrics, PlatformMetrics,
+    PlatformTimeSeriesMetrics, PlatformTimeSeriesPoint, RevenueSort, TimeSeriesMetrics,
+    TimeSeriesPoint, TopModelMetrics, TopOrganizationMetrics, WorkspaceMetrics,
 };
+pub mod infra;
+pub use infra::{InfraService, InfraSummary};
 pub use ports::{PlatformServiceInfo, *};
 use std::sync::Arc;
 
@@ -243,16 +247,12 @@ impl AdminService for AdminServiceImpl {
         &self,
         limit: i64,
         offset: i64,
+        search: Option<String>,
+        is_active: Option<bool>,
     ) -> Result<(Vec<UserInfo>, i64), AdminError> {
-        let users = self
+        let (users, total) = self
             .repository
-            .list_users(limit, offset)
-            .await
-            .map_err(|e| AdminError::InternalError(e.to_string()))?;
-
-        let total = self
-            .repository
-            .get_active_user_count()
+            .list_users(limit, offset, search, is_active)
             .await
             .map_err(|e| AdminError::InternalError(e.to_string()))?;
 
@@ -263,11 +263,13 @@ impl AdminService for AdminServiceImpl {
         &self,
         limit: i64,
         offset: i64,
+        search: Option<String>,
+        is_active: Option<bool>,
         search_by_name: Option<String>,
     ) -> Result<(Vec<(UserInfo, Option<UserOrganizationInfo>)>, i64), AdminError> {
         let (users_with_orgs, total) = self
             .repository
-            .list_users_with_organizations(limit, offset, search_by_name)
+            .list_users_with_organizations(limit, offset, search, is_active, search_by_name)
             .await
             .map_err(|e| AdminError::InternalError(e.to_string()))?;
 

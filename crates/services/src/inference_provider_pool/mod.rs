@@ -1341,6 +1341,9 @@ impl InferenceProviderPool {
                 CompletionError::InvalidResponse(sanitize_and_format(&msg))
             }
             CompletionError::Unknown(msg) => CompletionError::Unknown(sanitize_and_format(&msg)),
+            CompletionError::ClientMediaError(msg) => {
+                CompletionError::ClientMediaError(sanitize_and_format(&msg))
+            }
             CompletionError::NoPubKeyProvider(msg) => {
                 CompletionError::NoPubKeyProvider(sanitize_and_format(&msg))
             }
@@ -1371,9 +1374,42 @@ impl InferenceProviderPool {
             },
             CompletionError::InvalidResponse(_) => "invalid_response",
             CompletionError::Unknown(_) => "unknown",
+            CompletionError::ClientMediaError(_) => "client_media_error",
             CompletionError::NoPubKeyProvider(_) => "no_pubkey_provider",
             CompletionError::Timeout { .. } => "timeout",
         }
+    }
+
+    /// Inference engines (vLLM, SGLang) return HTTP 500 when they fail to
+    /// fetch or decode a multimodal media URL supplied by the client. The
+    /// upstream status is 5xx but the *cause* is a permanent client-input
+    /// error — retrying the same payload re-runs the same fetch and produces
+    /// the same failure. Treat these as non-retryable so one broken URL
+    /// from a client doesn't get amplified into 4x backend work.
+    fn is_client_media_fetch_error(message: &str) -> bool {
+        // ASCII-only lowercase: the markers are all ASCII and this path can
+        // run at high volume during a malformed-media incident.
+        let lower = message.to_ascii_lowercase();
+        if lower.contains("loading image data")
+            || lower.contains("loading video data")
+            || lower.contains("cannot identify image file")
+            || lower.contains("failed to open input buffer")
+        {
+            return true;
+        }
+        // aiohttp wrapper format observed when the inference engine collapses
+        // a client-fetch 4xx into a 500: `HTTP error 500: 4xx, message='...',
+        // url='http...'`. Constrain to a wrapped 4xx (\\d{2} after the leading
+        // "4") so genuinely retryable wrapped 5xx (e.g. "HTTP error 500: 503,
+        // message='Service Unavailable', url='...'") still retry as before.
+        static AIOHTTP_WRAPPED_4XX: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+        let re = AIOHTTP_WRAPPED_4XX.get_or_init(|| {
+            // (?i) is on the original message; lower is already ASCII-lowered,
+            // so an anchored lower-case literal is sufficient and faster.
+            Regex::new(r"http error 500:\s*4\d{2},\s*message='[^']*',\s*url='https?://")
+                .expect("static regex compiles")
+        });
+        re.is_match(&lower)
     }
 
     /// Single source of truth for the retry decision: the inner retry loop
@@ -1400,9 +1436,21 @@ impl InferenceProviderPool {
                     "non_retryable_no_keyword_match"
                 }
             }
-            CompletionError::HttpError { status_code, .. } => {
+            CompletionError::HttpError {
+                status_code,
+                message,
+                ..
+            } => {
                 if *status_code >= 500 {
-                    "retryable_http_5xx"
+                    // Engines (vLLM, SGLang) return 500 when they fail to fetch
+                    // or decode a client-supplied multimodal media URL. These
+                    // are permanent client-input errors — the same payload
+                    // can't succeed on retry. Don't amplify load by 4x.
+                    if Self::is_client_media_fetch_error(message) {
+                        "non_retryable_client_media_error"
+                    } else {
+                        "retryable_http_5xx"
+                    }
                 } else if *status_code == 429 {
                     "retryable_http_429"
                 } else if *status_code == 408 {
@@ -1416,6 +1464,7 @@ impl InferenceProviderPool {
                 }
             }
             CompletionError::Timeout { .. } => "non_retryable_explicit_timeout",
+            CompletionError::ClientMediaError(_) => "non_retryable_client_media_error",
             CompletionError::NoPubKeyProvider(_) => "non_retryable_no_pubkey_provider",
             CompletionError::InvalidResponse(_) => "non_retryable_invalid_response",
             CompletionError::Unknown(_) => "non_retryable_unknown",
@@ -1565,6 +1614,12 @@ impl InferenceProviderPool {
 
         // Track the last error (preserving its structure for proper status code mapping)
         let mut last_error: Option<CompletionError> = None;
+        // Retry decision computed from the RAW error before sanitization redacts
+        // URLs to `[URL_REDACTED]`. Sharing one decision across the retry gate,
+        // the failure-counter gate, and the terminal log keeps them consistent
+        // and prevents the regex matchers in classify_retry_decision from
+        // being defeated by sanitization.
+        let mut last_retry_decision: Option<&'static str> = None;
         let mut total_attempts: usize = 0;
         let mut retry_count: usize = 0;
         let started_at = std::time::Instant::now();
@@ -1640,9 +1695,47 @@ impl InferenceProviderPool {
                             }
                         }
 
-                        // Increment failure counter only for retryable errors
-                        // (5xx, timeouts, network errors — indicators of backend health issues)
-                        {
+                        // Classify the retry decision on the RAW error (before
+                        // sanitize_completion_error redacts URLs). Used for the
+                        // failure-counter gate below, the retry gate after this
+                        // loop, and the terminal "All providers failed" log.
+                        let retry_decision = Self::classify_retry_decision(&e);
+                        let is_retryable_error = retry_decision.starts_with("retryable_");
+
+                        // Short-circuit on client-media-fetch failures the same
+                        // way as the 4xx fast-return above: the bad client URL
+                        // cannot succeed on any provider, so don't try the rest
+                        // — and don't let a later provider's retryable 5xx flip
+                        // the outer gate back to "retry the whole round," which
+                        // would re-hit this same payload on this same provider.
+                        if retry_decision == "non_retryable_client_media_error" {
+                            tracing::warn!(
+                                model_id = %model_id,
+                                attempt = attempt + 1,
+                                retry_decision,
+                                error_detail = %e,
+                                operation = operation_name,
+                                "Client media-fetch failure, not retrying or trying other providers"
+                            );
+                            // Carry the decision as a typed variant (classified
+                            // here on the RAW body) so the status mapping maps it
+                            // to 400 directly, instead of re-deriving it from the
+                            // sanitized, URL-redacted message (which would miss
+                            // the URL-bearing forms). sanitize redacts the carried
+                            // diagnostic text for safe logging.
+                            return Err(Self::sanitize_completion_error(
+                                CompletionError::ClientMediaError(e.to_string()),
+                                model_id,
+                            ));
+                        }
+
+                        // Increment failure counter only for retryable errors —
+                        // backend-health signals (5xx, timeouts, network errors).
+                        // Non-retryable client-input causes (e.g. a 5xx whose body
+                        // says "loading IMAGE data … cannot identify image file")
+                        // would otherwise demote a healthy backend on every broken
+                        // client URL.
+                        if is_retryable_error {
                             let mut counts = self
                                 .provider_failure_counts
                                 .write()
@@ -1659,13 +1752,17 @@ impl InferenceProviderPool {
                             attempt = attempt + 1,
                             retry = retry_count,
                             error_kind,
+                            retry_decision,
                             error_detail = %e,
                             operation = operation_name,
                             "Provider failed, will try next provider if available"
                         );
 
-                        // Sanitize and preserve the last error with its structure intact
+                        // Sanitize and preserve the last error with its structure intact.
+                        // Carry the raw-error retry decision so downstream gates and the
+                        // terminal log don't re-classify the sanitized form.
                         last_error = Some(Self::sanitize_completion_error(e, model_id));
+                        last_retry_decision = Some(retry_decision);
                     }
                 }
             }
@@ -1688,9 +1785,12 @@ impl InferenceProviderPool {
             //
             // The actual classification lives in `classify_retry_decision` (used
             // for both the retry gate and log labels) so the two can't drift.
-            let is_retryable = last_error
-                .as_ref()
-                .map(|e| Self::classify_retry_decision(e).starts_with("retryable_"))
+            // Use the decision computed from the *raw* error in the loop body —
+            // sanitize_completion_error has since redacted URLs to
+            // [URL_REDACTED], which would defeat the matcher's url='https?://
+            // anchor.
+            let is_retryable = last_retry_decision
+                .map(|d| d.starts_with("retryable_"))
                 .unwrap_or(false);
 
             if !is_retryable || retry_count >= MAX_RETRIES {
@@ -1732,10 +1832,10 @@ impl InferenceProviderPool {
             .as_ref()
             .map(Self::classify_error_kind)
             .unwrap_or("none");
-        let retry_decision = last_error
-            .as_ref()
-            .map(Self::classify_retry_decision)
-            .unwrap_or("none");
+        // Use the decision computed from the raw error in the loop body, not a
+        // re-classification of the sanitized last_error (URLs there are
+        // [URL_REDACTED] which would defeat the matcher's url-anchored regex).
+        let retry_decision = last_retry_decision.unwrap_or("none");
         let elapsed_ms = started_at.elapsed().as_millis();
         if let Some(pub_key) = model_pub_key {
             tracing::error!(
@@ -3537,6 +3637,151 @@ mod tests {
             ),
             "non_retryable_unknown",
         );
+
+        // Upstream 5xx caused by a broken client media URL — must NOT retry
+        // (would otherwise amplify load 4x on every broken URL the client sends).
+        // Test fixtures use dummy URLs; the matcher only depends on the marker
+        // substrings (`loading IMAGE/VIDEO data`, `cannot identify image file`,
+        // `Failed to open input buffer`, aiohttp wrapper shape).
+
+        // SGLang gemma4 image-load failure shape:
+        assert_eq!(
+            InferenceProviderPool::classify_retry_decision(&CompletionError::HttpError {
+                status_code: 500,
+                message: "Internal server error: An exception occurred while loading IMAGE data at index 0: Error while loading data ImageData(url='https://example.test/img.jpg'): 403 Client Error: Forbidden for url: ...".to_string(),
+                is_external: false,
+            }),
+            "non_retryable_client_media_error",
+        );
+        // vLLM Qwen3.5-122B torchcodec video-load failure shape:
+        assert_eq!(
+            InferenceProviderPool::classify_retry_decision(&CompletionError::HttpError {
+                status_code: 500,
+                message: "Internal server error: An exception occurred while loading VIDEO data at index 0: Error while loading data https://example.test/vid: SingleStreamDecoder, Failed to open input buffer: Invalid data found when processing input".to_string(),
+                is_external: false,
+            }),
+            "non_retryable_client_media_error",
+        );
+        // PIL UnidentifiedImageError (client sent base64 mp4 as image_url):
+        assert_eq!(
+            InferenceProviderPool::classify_retry_decision(&CompletionError::HttpError {
+                status_code: 500,
+                message: "Internal server error: An exception occurred while loading IMAGE data at index 0: Error while loading data ...: cannot identify image file <_io.BytesIO object at 0x7f151d152b10>".to_string(),
+                is_external: false,
+            }),
+            "non_retryable_client_media_error",
+        );
+        // aiohttp wrapper format: 500 wrapping a 4xx (client fetch failed):
+        assert_eq!(
+            InferenceProviderPool::classify_retry_decision(&CompletionError::HttpError {
+                status_code: 500,
+                message: "HTTP error 500: 404, message='Not Found', url='https://example.test/img'"
+                    .to_string(),
+                is_external: false,
+            }),
+            "non_retryable_client_media_error",
+        );
+        // aiohttp wrapper format: 500 wrapping a 5xx (transient backend) — MUST
+        // remain retryable. The new check requires the wrapped status to be a
+        // 4xx; this guards against the regression PierreLeGuen flagged.
+        assert_eq!(
+            InferenceProviderPool::classify_retry_decision(&CompletionError::HttpError {
+                status_code: 500,
+                message: "HTTP error 500: 503, message='Service Unavailable', url='https://example.test/backend'".to_string(),
+                is_external: false,
+            }),
+            "retryable_http_5xx",
+        );
+        // 5xx WITHOUT the media-fetch markers — still retryable (real backend hiccup).
+        assert_eq!(
+            InferenceProviderPool::classify_retry_decision(&CompletionError::HttpError {
+                status_code: 500,
+                message: "engine: KV cache full, retract".to_string(),
+                is_external: false,
+            }),
+            "retryable_http_5xx",
+        );
+        // Generic 5xx message that happens to contain a url=... but no
+        // wrapper-shape and no media markers — still retryable.
+        assert_eq!(
+            InferenceProviderPool::classify_retry_decision(&CompletionError::HttpError {
+                status_code: 500,
+                message:
+                    "internal: failed to dial postgres url='postgres://...' message='conn refused'"
+                        .to_string(),
+                is_external: false,
+            }),
+            "retryable_http_5xx",
+        );
+
+        // Pin the sanitize-vs-classify ordering invariant:
+        // sanitize_error_message redacts URLs to `[URL_REDACTED]`, which defeats
+        // the aiohttp-wrapper regex (it anchors on `url='https?://`). The
+        // production retry loop therefore classifies BEFORE sanitization and
+        // stores the decision. If anyone later moves the classification to
+        // run on the sanitized error, this test combined with the assertions
+        // above will catch the regression: same payload, raw form classifies
+        // as non-retryable, sanitized form does not.
+        let raw_wrapped_4xx =
+            "HTTP error 500: 404, message='Not Found', url='https://example.test/img'".to_string();
+        let sanitized = InferenceProviderPool::sanitize_error_message(&raw_wrapped_4xx);
+        assert!(
+            sanitized.contains("[URL_REDACTED]"),
+            "sanitize_error_message should redact URLs (got: {sanitized})"
+        );
+        assert_eq!(
+            InferenceProviderPool::classify_retry_decision(&CompletionError::HttpError {
+                status_code: 500,
+                message: sanitized,
+                is_external: false,
+            }),
+            "retryable_http_5xx",
+            "sanitized aiohttp-wrapper must NOT match the regex — the production \
+             flow avoids this by classifying before sanitize_completion_error",
+        );
+    }
+
+    #[test]
+    fn test_client_media_error_verdict_survives_sanitize() {
+        // The media short-circuit classifies on the RAW body, then carries the
+        // verdict as a typed ClientMediaError so the status mapping doesn't have
+        // to re-derive it from the sanitized message. Using the URL-bearing
+        // aiohttp form (which the regex can't match once the URL is redacted)
+        // proves the verdict no longer depends on markers surviving redaction.
+        let raw = CompletionError::HttpError {
+            status_code: 500,
+            message: "HTTP error 500: 404, message='Not Found', url='https://example.test/img.jpg'"
+                .to_string(),
+            is_external: false,
+        };
+        // Detected as a client-media error on the raw body.
+        assert_eq!(
+            InferenceProviderPool::classify_retry_decision(&raw),
+            "non_retryable_client_media_error",
+        );
+        // What the short-circuit returns: ClientMediaError(raw), sanitized.
+        let carried = InferenceProviderPool::sanitize_completion_error(
+            CompletionError::ClientMediaError(raw.to_string()),
+            "test-model",
+        );
+        match carried {
+            // Verdict preserved → map_provider_error maps it to 400 directly.
+            CompletionError::ClientMediaError(msg) => {
+                assert!(
+                    msg.contains("[URL_REDACTED]"),
+                    "URL must be redacted: {msg}"
+                );
+                assert!(!msg.contains("https://"), "raw URL must not survive: {msg}");
+            }
+            other => panic!("expected ClientMediaError to survive sanitize, got {other:?}"),
+        }
+        // And it still classifies non-retryable as a typed variant.
+        assert_eq!(
+            InferenceProviderPool::classify_retry_decision(&CompletionError::ClientMediaError(
+                "x".to_string()
+            )),
+            "non_retryable_client_media_error",
+        );
     }
 
     #[test]
@@ -4127,6 +4372,73 @@ mod tests {
                 assert_eq!(status_code, 400);
             }
             other => panic!("Expected HttpError, got: {:?}", other),
+        }
+    }
+
+    /// Multi-provider, alternating-error test pinning Pierre's blocker: provider
+    /// A returns a non-retryable client-media 5xx, provider B (if reached)
+    /// would return a retryable 5xx. Without the short-circuit, the for-loop
+    /// would walk through both providers; B's `retryable_*` decision would
+    /// then flip the outer gate to retry, and the round would loop hitting
+    /// provider A with the same bad payload again (~8 attempts across 4
+    /// rounds × 2 providers). With the short-circuit, provider A's media
+    /// failure returns immediately and B is never tried.
+    #[tokio::test(start_paused = true)]
+    async fn test_client_media_error_short_circuits_across_providers() {
+        let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
+        let model_id = "Qwen/Qwen3-30B-A3B-Instruct-2507".to_string();
+        // Register two providers — Pierre's exact scenario shape.
+        for _ in 0..2 {
+            pool.register_provider(
+                model_id.clone(),
+                Arc::new(inference_providers::mock::MockProvider::new()),
+            )
+            .await;
+        }
+
+        let attempt_count = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let count_clone = attempt_count.clone();
+
+        let result: Result<((), _), _> = pool
+            .retry_with_fallback(&model_id, "test_op", None, move |_provider| {
+                let count = count_clone.clone();
+                async move {
+                    let n = count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if n == 0 {
+                        // Provider A: non-retryable client-media 5xx.
+                        Err(CompletionError::HttpError {
+                            status_code: 500,
+                            message: "Internal server error: An exception occurred \
+                                      while loading IMAGE data at index 0: cannot \
+                                      identify image file <_io.BytesIO ...>"
+                                .to_string(),
+                            is_external: false,
+                        })
+                    } else {
+                        // Provider B (and any further round) would be a transient 502.
+                        Err(CompletionError::HttpError {
+                            status_code: 502,
+                            message: "Bad gateway".to_string(),
+                            is_external: false,
+                        })
+                    }
+                }
+            })
+            .await;
+
+        assert!(result.is_err());
+        assert_eq!(
+            attempt_count.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "client-media 5xx from the first provider must short-circuit immediately; \
+             the second provider must not be tried and the round must not retry"
+        );
+        // And the returned error must be the typed client-media verdict from the
+        // first provider (classified on its raw 500 body, carried so the status
+        // layer maps it to 400) — not a 502 from a later provider.
+        match result.err().expect("err") {
+            CompletionError::ClientMediaError(_) => {}
+            other => panic!("Expected ClientMediaError, got: {:?}", other),
         }
     }
 

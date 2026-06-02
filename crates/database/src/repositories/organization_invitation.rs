@@ -9,9 +9,10 @@ use async_trait::async_trait;
 use chrono::{Duration, Utc};
 use services::common::RepositoryError;
 use services::organization::ports::{
-    CreateInvitationRequest, InvitationEmailStatus as ServicesInvitationEmailStatus,
+    CreateInvitationRequest, InvitationEmailDeliveryFilters,
+    InvitationEmailStatus as ServicesInvitationEmailStatus,
     InvitationStatus as ServicesInvitationStatus, OrganizationInvitation as ServicesInvitation,
-    OrganizationInvitationRepository,
+    OrganizationInvitationEmailDelivery, OrganizationInvitationRepository,
     OrganizationInvitationWithDetails as ServicesInvitationWithDetails,
 };
 use tracing::debug;
@@ -89,6 +90,20 @@ impl PgOrganizationInvitationRepository {
         })
     }
 
+    fn row_to_domain_email_delivery(
+        &self,
+        row: &tokio_postgres::Row,
+    ) -> Result<OrganizationInvitationEmailDelivery> {
+        let db_inv = self.row_to_db_invitation(row)?;
+
+        Ok(OrganizationInvitationEmailDelivery {
+            invitation: self.db_to_domain(db_inv)?,
+            organization_name: row.get("organization_name"),
+            invited_by_email: row.get("invited_by_email"),
+            invited_by_display_name: row.get("invited_by_display_name"),
+        })
+    }
+
     fn db_to_domain_status(&self, status: InvitationStatus) -> ServicesInvitationStatus {
         match status {
             InvitationStatus::Pending => ServicesInvitationStatus::Pending,
@@ -107,6 +122,18 @@ impl PgOrganizationInvitationRepository {
             InvitationEmailStatus::Sent => ServicesInvitationEmailStatus::Sent,
             InvitationEmailStatus::Failed => ServicesInvitationEmailStatus::Failed,
             InvitationEmailStatus::Skipped => ServicesInvitationEmailStatus::Skipped,
+        }
+    }
+
+    fn domain_to_db_email_status(
+        &self,
+        status: ServicesInvitationEmailStatus,
+    ) -> InvitationEmailStatus {
+        match status {
+            ServicesInvitationEmailStatus::NotAttempted => InvitationEmailStatus::NotAttempted,
+            ServicesInvitationEmailStatus::Sent => InvitationEmailStatus::Sent,
+            ServicesInvitationEmailStatus::Failed => InvitationEmailStatus::Failed,
+            ServicesInvitationEmailStatus::Skipped => InvitationEmailStatus::Skipped,
         }
     }
 
@@ -433,6 +460,104 @@ impl OrganizationInvitationRepository for PgOrganizationInvitationRepository {
         }
 
         Ok(invitations)
+    }
+
+    async fn list_email_deliveries(
+        &self,
+        filters: InvitationEmailDeliveryFilters,
+        limit: i64,
+        offset: i64,
+    ) -> Result<(Vec<OrganizationInvitationEmailDelivery>, i64)> {
+        let organization_id = filters.organization_id.map(|id| id.0);
+        let recipient_email = filters.recipient_email;
+        let email_status = filters
+            .email_status
+            .map(|status| self.domain_to_db_email_status(status).to_string());
+        let invitation_status = filters
+            .invitation_status
+            .map(|status| self.domain_to_db_status(status).to_string());
+        let created_after = filters.created_after;
+        let created_before = filters.created_before;
+
+        let rows = retry_db!("list_organization_invitation_email_deliveries", {
+            let client = self
+                .pool
+                .get()
+                .await
+                .context("Failed to get database connection")
+                .map_err(RepositoryError::PoolError)?;
+
+            client
+                .query(
+                    "SELECT i.id, i.organization_id, i.email, i.role, i.invited_by_user_id,
+                            i.status, i.token, i.created_at, i.expires_at, i.responded_at,
+                            i.email_status, i.email_sent_at, i.email_last_error,
+                            i.email_message_id, o.name AS organization_name,
+                            u.email AS invited_by_email,
+                            u.display_name AS invited_by_display_name
+                     FROM organization_invitations i
+                     JOIN organizations o ON o.id = i.organization_id
+                     LEFT JOIN users u ON u.id = i.invited_by_user_id
+                     WHERE ($1::uuid IS NULL OR i.organization_id = $1)
+                       AND ($2::text IS NULL OR i.email ILIKE '%' || $2 || '%')
+                       AND ($3::text IS NULL OR i.email_status::text = $3)
+                       AND ($4::text IS NULL OR i.status::text = $4)
+                       AND ($5::timestamptz IS NULL OR i.created_at >= $5)
+                       AND ($6::timestamptz IS NULL OR i.created_at <= $6)
+                     ORDER BY i.created_at DESC, i.id DESC
+                     LIMIT $7 OFFSET $8",
+                    &[
+                        &organization_id,
+                        &recipient_email,
+                        &email_status,
+                        &invitation_status,
+                        &created_after,
+                        &created_before,
+                        &limit,
+                        &offset,
+                    ],
+                )
+                .await
+                .map_err(map_db_error)
+        })?;
+
+        let count_row = retry_db!("count_organization_invitation_email_deliveries", {
+            let client = self
+                .pool
+                .get()
+                .await
+                .context("Failed to get database connection")
+                .map_err(RepositoryError::PoolError)?;
+
+            client
+                .query_one(
+                    "SELECT COUNT(*) AS total
+                     FROM organization_invitations i
+                     WHERE ($1::uuid IS NULL OR i.organization_id = $1)
+                       AND ($2::text IS NULL OR i.email ILIKE '%' || $2 || '%')
+                       AND ($3::text IS NULL OR i.email_status::text = $3)
+                       AND ($4::text IS NULL OR i.status::text = $4)
+                       AND ($5::timestamptz IS NULL OR i.created_at >= $5)
+                       AND ($6::timestamptz IS NULL OR i.created_at <= $6)",
+                    &[
+                        &organization_id,
+                        &recipient_email,
+                        &email_status,
+                        &invitation_status,
+                        &created_after,
+                        &created_before,
+                    ],
+                )
+                .await
+                .map_err(map_db_error)
+        })?;
+
+        let mut deliveries = Vec::new();
+        for row in rows {
+            deliveries.push(self.row_to_domain_email_delivery(&row)?);
+        }
+
+        Ok((deliveries, count_row.get("total")))
     }
 
     async fn update_status(

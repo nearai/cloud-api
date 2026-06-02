@@ -21,23 +21,6 @@ ignore = [
     # https://rustsec.org/advisories/RUSTSEC-2024-0388
     "RUSTSEC-2024-0388",
 
-    # rustls-webpki 0.101.7 — all four advisories below share the same root cause:
-    # transitive dep from aws-smithy-http-client -> hyper-rustls 0.24 -> rustls 0.21.x.
-    # Cannot update: locked by AWS SDK's legacy rustls 0.21 dependency.
-    # Our direct rustls-webpki 0.103.x is patched (0.103.13).
-    #
-    # CRL distribution point matching — requires compromised issuing authority.
-    # https://rustsec.org/advisories/RUSTSEC-2026-0049
-    "RUSTSEC-2026-0049",
-    # Name constraint bugs — require cert misissuance to exploit, very low risk.
-    # https://rustsec.org/advisories/RUSTSEC-2026-0098
-    "RUSTSEC-2026-0098",
-    # https://rustsec.org/advisories/RUSTSEC-2026-0099
-    "RUSTSEC-2026-0099",
-    # CRL parsing panic — we don't use CRLs.
-    # https://rustsec.org/advisories/RUSTSEC-2026-0104
-    "RUSTSEC-2026-0104",
-
 ]
 
 # Treat unmaintained crates as warnings (not errors)

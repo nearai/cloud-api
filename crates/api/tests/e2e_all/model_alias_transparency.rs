@@ -406,6 +406,96 @@ async fn test_alias_equal_to_upstream_override_still_warns() {
     assert_eq!(strict.status_code(), 400, "{}", strict.text());
 }
 
+/// Legacy /v1/completions dispatches through the same alias-resolving
+/// service and must carry the same contract: warning + header on aliased
+/// responses, x-no-aliasing rejection.
+#[tokio::test]
+async fn test_legacy_completions_alias_contract() {
+    let server = setup_test_server().await;
+    let alias = setup_deprecated_alias(&server).await;
+    let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
+    let api_key = get_api_key_for_org(&server, org.id).await;
+
+    let body = |stream: bool| {
+        serde_json::json!({
+            "model": alias,
+            "prompt": "Say hello",
+            "stream": stream,
+            "max_tokens": 16
+        })
+    };
+
+    // Non-streaming: warning + header
+    let response = server
+        .post("/v1/completions")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .json(&body(false))
+        .await;
+    assert_eq!(response.status_code(), 200, "{}", response.text());
+    let header = response
+        .headers()
+        .get("x-model-alias-resolved")
+        .expect("aliased legacy completion must carry x-model-alias-resolved")
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(header, format!("{alias} -> {E2E_QWEN_MODEL_NAME}"));
+    let json: serde_json::Value = response.json();
+    let warning = json["warning"]
+        .as_str()
+        .expect("aliased legacy completion must carry a warning");
+    assert!(warning.contains(&alias) && warning.contains(E2E_QWEN_MODEL_NAME));
+
+    // Streaming: header + warning on first chunk only
+    let response = server
+        .post("/v1/completions")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .json(&body(true))
+        .await;
+    assert_eq!(response.status_code(), 200, "{}", response.text());
+    assert!(response.headers().get("x-model-alias-resolved").is_some());
+    let text = response.text();
+    let mut data_chunks = text
+        .lines()
+        .filter_map(|l| l.strip_prefix("data: "))
+        .filter(|d| d.trim() != "[DONE]")
+        .map(|d| serde_json::from_str::<serde_json::Value>(d).expect("chunk should parse"));
+    let first = data_chunks.next().expect("stream should have chunks");
+    assert!(
+        first["warning"].as_str().is_some(),
+        "first legacy chunk must carry the warning: {first}"
+    );
+    for chunk in data_chunks {
+        assert!(chunk.get("warning").is_none());
+    }
+
+    // Strict mode rejects
+    let strict = server
+        .post("/v1/completions")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .add_header("x-no-aliasing", "true")
+        .json(&body(false))
+        .await;
+    assert_eq!(strict.status_code(), 400, "{}", strict.text());
+    assert!(strict.text().contains("model_alias_rejected"));
+
+    // Canonical request stays unannotated
+    let canonical = server
+        .post("/v1/completions")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .json(&serde_json::json!({
+            "model": E2E_QWEN_MODEL_NAME,
+            "prompt": "Say hello",
+            "stream": false,
+            "max_tokens": 16
+        }))
+        .await;
+    assert_eq!(canonical.status_code(), 200, "{}", canonical.text());
+    assert!(canonical.headers().get("x-model-alias-resolved").is_none());
+    let json: serde_json::Value = canonical.json();
+    assert!(json.get("warning").is_none());
+}
+
 #[tokio::test]
 async fn test_attestation_report_announces_alias() {
     let server = setup_test_server().await;

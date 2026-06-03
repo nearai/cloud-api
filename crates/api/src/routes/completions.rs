@@ -1633,6 +1633,19 @@ async fn completions_inner(
         }
     };
 
+    // Strict alias mode + pre-dispatch alias detection (issue #573) — the
+    // service resolves aliases for this endpoint exactly like chat, so it
+    // gets the same contract: x-no-aliasing rejects, and aliased responses
+    // carry the warning + x-model-alias-resolved header.
+    if let Err(resp) = reject_if_aliased(&app_state.models_service, &headers, &request.model).await
+    {
+        return resp;
+    }
+    let alias_canonical = app_state
+        .models_service
+        .resolve_alias_cached(&request.model)
+        .await;
+
     let service_request = convert_text_request_to_service(
         &request,
         prompt,
@@ -1671,18 +1684,39 @@ async fn completions_inner(
                 let organization_id = api_key.organization.id.0;
                 let model_for_err = request.model.clone();
 
+                // Warning to inject into the first streamed chunk of an
+                // alias-served response (issue #573).
+                let alias_warning_pending: Arc<std::sync::Mutex<Option<String>>> =
+                    Arc::new(std::sync::Mutex::new(alias_canonical.as_ref().map(
+                        |canonical| alias_warning_message(&request.model, canonical),
+                    )));
+                let pending_warning = alias_warning_pending.clone();
+
                 let byte_stream = peekable_stream
                     .map(move |result| match result {
                         Ok(event) => {
                             let text_chunk = chat_chunk_to_text_chunk(event.chunk);
-                            let json_data =
-                                serde_json::to_string(&text_chunk).unwrap_or_else(|e| {
-                                    tracing::error!(
-                                        %organization_id,
-                                        "Failed to serialize text completion chunk: {e}"
-                                    );
-                                    "{}".to_string()
-                                });
+                            let alias_warning =
+                                pending_warning.lock().ok().and_then(|mut g| g.take());
+                            let json_data = match alias_warning {
+                                Some(warning) => serde_json::to_value(&text_chunk).map(|mut v| {
+                                    if let Some(obj) = v.as_object_mut() {
+                                        obj.insert(
+                                            "warning".to_string(),
+                                            serde_json::Value::String(warning),
+                                        );
+                                    }
+                                    v.to_string()
+                                }),
+                                None => serde_json::to_string(&text_chunk),
+                            }
+                            .unwrap_or_else(|e| {
+                                tracing::error!(
+                                    %organization_id,
+                                    "Failed to serialize text completion chunk: {e}"
+                                );
+                                "{}".to_string()
+                            });
                             Ok::<Bytes, Infallible>(Bytes::from(format!("data: {json_data}\n\n")))
                         }
                         Err(e) => {
@@ -1705,10 +1739,26 @@ async fn completions_inner(
                     .header(header::CACHE_CONTROL, "no-cache")
                     .header(header::CONNECTION, "keep-alive");
 
+                let mut exposed_headers: Vec<&str> = Vec::new();
                 if let Some(uuid) = inference_id {
+                    response_builder =
+                        response_builder.header(HEADER_INFERENCE_ID, uuid.to_string());
+                    exposed_headers.push(HEADER_INFERENCE_ID);
+                }
+                // Announce alias substitution so it is never silent (issue #573)
+                if let Some(canonical) = &alias_canonical {
+                    if let Ok(value) = header::HeaderValue::from_str(&format!(
+                        "{} -> {}",
+                        request.model, canonical
+                    )) {
+                        response_builder =
+                            response_builder.header(HEADER_MODEL_ALIAS_RESOLVED, value);
+                        exposed_headers.push(HEADER_MODEL_ALIAS_RESOLVED);
+                    }
+                }
+                if !exposed_headers.is_empty() {
                     response_builder = response_builder
-                        .header(HEADER_INFERENCE_ID, uuid.to_string())
-                        .header("Access-Control-Expose-Headers", HEADER_INFERENCE_ID);
+                        .header("Access-Control-Expose-Headers", exposed_headers.join(", "));
                 }
 
                 response_builder
@@ -1749,13 +1799,39 @@ async fn completions_inner(
                     }
                 };
 
-                Response::builder()
+                // Annotate alias-served responses (issue #573). This
+                // endpoint already re-serializes (no raw-bytes contract),
+                // so the warning injection costs nothing extra.
+                let body_bytes = match &alias_canonical {
+                    Some(canonical) => inject_warning_field(
+                        &body_bytes,
+                        &alias_warning_message(&request.model, canonical),
+                    )
+                    .unwrap_or(body_bytes),
+                    None => body_bytes,
+                };
+
+                let mut response_builder = Response::builder()
                     .status(StatusCode::OK)
                     .header(header::CONTENT_TYPE, "application/json")
-                    .header(HEADER_INFERENCE_ID, inference_id.to_string())
-                    .header("Access-Control-Expose-Headers", HEADER_INFERENCE_ID)
-                    .body(Body::from(body_bytes))
-                    .unwrap()
+                    .header(HEADER_INFERENCE_ID, inference_id.to_string());
+
+                let mut exposed_headers: Vec<&str> = vec![HEADER_INFERENCE_ID];
+                // Announce alias substitution so it is never silent (issue #573)
+                if let Some(canonical) = &alias_canonical {
+                    if let Ok(value) = header::HeaderValue::from_str(&format!(
+                        "{} -> {}",
+                        request.model, canonical
+                    )) {
+                        response_builder =
+                            response_builder.header(HEADER_MODEL_ALIAS_RESOLVED, value);
+                        exposed_headers.push(HEADER_MODEL_ALIAS_RESOLVED);
+                    }
+                }
+                response_builder = response_builder
+                    .header("Access-Control-Expose-Headers", exposed_headers.join(", "));
+
+                response_builder.body(Body::from(body_bytes)).unwrap()
             }
             Err(domain_error) => {
                 let status_code = map_domain_error_to_status(&domain_error);

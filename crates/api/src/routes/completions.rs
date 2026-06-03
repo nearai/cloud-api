@@ -84,29 +84,39 @@ fn e2ee_requested(encryption_headers: &crate::routes::common::EncryptionHeaders)
         || encryption_headers.encrypt_all_fields.is_some()
 }
 
-/// When the served model differs from the requested one, confirm via the
-/// catalog that `requested` is a registered alias of `served`. Returns the
-/// canonical name only when the response was genuinely produced through
-/// alias resolution — provider-side echo differences (e.g. an external
-/// provider answering `gpt-4o` with a dated snapshot id) resolve to `None`.
+/// When the served model differs from the requested one, determine via the
+/// catalog whether `requested` is a registered alias — mirroring the exact
+/// resolution the completion service applied — and return the canonical
+/// name it resolved to.
+///
+/// Alias-ness is derived from catalog resolution of the *requested* name,
+/// NOT from comparing the response's `model` echo against the canonical
+/// name: external providers may rewrite the upstream model name
+/// (`provider_config.model_name`), so the echo can legitimately differ from
+/// the canonical name (e.g. catalog `openai/gpt-5.2` answered as
+/// `gpt-5.2`). Echo differences on non-alias requests still resolve to
+/// `None` because the requested name is not a registered alias of anything.
 ///
 /// Uses the cache-backed active-models list rather than a per-request DB
 /// resolve: requested != served is the *common* case for external providers
-/// (snapshot-id echoes), and on the streaming path this sits ahead of TTFT.
-/// Worst case the warning lags a just-registered alias by one cache TTL;
-/// strict mode (`reject_if_aliased`) keeps the authoritative DB lookup.
+/// (upstream-name echoes), and on the streaming path this sits ahead of
+/// TTFT. Worst case the warning lags a just-registered alias by one cache
+/// TTL; strict mode (`reject_if_aliased`) keeps the authoritative DB lookup.
 async fn check_alias_resolution(
     models_service: &Arc<dyn services::models::ModelsServiceTrait>,
     requested: &str,
     served: &str,
 ) -> Option<String> {
+    // The backend echoes the post-resolution name (canonical or its
+    // upstream override), never the alias itself — so requested == served
+    // means no alias resolution happened.
     if requested == served {
         return None;
     }
     let models = models_service.get_models_with_pricing().await.ok()?;
     models
         .iter()
-        .find(|m| m.model_name == served && m.aliases.iter().any(|a| a == requested))
+        .find(|m| m.aliases.iter().any(|a| a == requested))
         .map(|m| m.model_name.clone())
 }
 

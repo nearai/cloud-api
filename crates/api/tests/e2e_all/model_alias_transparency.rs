@@ -200,6 +200,117 @@ async fn test_no_aliasing_header_allows_canonical_request() {
     assert!(body.get("warning").is_none());
 }
 
+/// Alias of an *external* model whose backend answers with its upstream
+/// model name (`provider_config.model_name` override): the response `model`
+/// echo differs from the catalog canonical name, but the warning and header
+/// must still fire because alias-ness is derived from catalog resolution of
+/// the requested name, not from the echo.
+#[tokio::test]
+async fn test_alias_to_external_model_with_upstream_name_override_warns() {
+    let (server, inference_pool, mock_provider, _) = setup_test_server_with_pool().await;
+
+    let canonical = format!("openai/test-gpt-5-{}", uuid::Uuid::new_v4());
+    let upstream = "gpt-5-upstream-snapshot";
+
+    // Canonical external model with an upstream model-name override, plus a
+    // synthetic old model deprecated onto it (registers the alias).
+    let old = format!("test-alias-ext-old/Old-{}", uuid::Uuid::new_v4());
+    let mut batch = BatchUpdateModelApiRequest::new();
+    batch.insert(
+        canonical.clone(),
+        serde_json::from_value(serde_json::json!({
+            "inputCostPerToken":  { "amount": 2_500_000, "currency": "USD" },
+            "outputCostPerToken": { "amount": 10_000_000, "currency": "USD" },
+            "modelDisplayName":   "External Override Test Model",
+            "modelDescription":   "External model with upstream name override",
+            "contextLength":      128000,
+            "verifiable":         false,
+            "isActive":           true,
+            "providerType":       "external",
+            "providerConfig": {
+                "backend": "openai_compatible",
+                "base_url": "https://api.openai.com/v1",
+                "model_name": upstream,
+            },
+            "attestationSupported": false
+        }))
+        .unwrap(),
+    );
+    batch.insert(
+        old.clone(),
+        serde_json::from_value(serde_json::json!({
+            "inputCostPerToken":  { "amount": 1_000_000, "currency": "USD" },
+            "outputCostPerToken": { "amount": 2_000_000, "currency": "USD" },
+            "modelDisplayName":   "External Override Old Model",
+            "modelDescription":   "Synthetic model deprecated onto the external model",
+            "contextLength":      4096,
+            "verifiable":         false,
+            "isActive":           true,
+        }))
+        .unwrap(),
+    );
+    admin_batch_upsert_models(&server, batch, get_session_id()).await;
+
+    let resp = server
+        .post("/v1/admin/models/deprecate")
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .add_header("User-Agent", MOCK_USER_AGENT)
+        .json(&serde_json::json!({
+            "modelId": old,
+            "successorModelId": canonical,
+            "changeReason": "alias transparency e2e (external override)"
+        }))
+        .await;
+    assert_eq!(resp.status_code(), 200, "{}", resp.text());
+
+    // Mock backend echoes the UPSTREAM name, like a real external provider
+    // applying provider_config.model_name.
+    mock_provider
+        .when(inference_providers::mock::RequestMatcher::Any)
+        .respond_with(
+            inference_providers::mock::ResponseTemplate::new("Hello from upstream")
+                .with_model(upstream),
+        )
+        .await;
+    let mock_provider_trait: std::sync::Arc<
+        dyn inference_providers::InferenceProvider + Send + Sync,
+    > = mock_provider.clone();
+    inference_pool
+        .register_provider(canonical.clone(), mock_provider_trait)
+        .await;
+
+    let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
+    let api_key = get_api_key_for_org(&server, org.id).await;
+
+    let response = server
+        .post("/v1/chat/completions")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .json(&chat_body(&old, false))
+        .await;
+    assert_eq!(response.status_code(), 200, "{}", response.text());
+
+    let body: serde_json::Value = response.json();
+    assert_eq!(
+        body["model"], upstream,
+        "external backend echoes its upstream name"
+    );
+    let warning = body["warning"].as_str().expect(
+        "alias of an external model with upstream-name override must still carry a warning",
+    );
+    assert!(
+        warning.contains(&old) && warning.contains(&canonical),
+        "warning should name alias and canonical: {warning}"
+    );
+    let header = response
+        .headers()
+        .get("x-model-alias-resolved")
+        .expect("alias header must be present despite the upstream echo")
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(header, format!("{old} -> {canonical}"));
+}
+
 #[tokio::test]
 async fn test_attestation_report_announces_alias() {
     let server = setup_test_server().await;

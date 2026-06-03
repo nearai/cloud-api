@@ -216,6 +216,10 @@ pub struct ResponseTemplate {
     tool_calls: Option<Vec<ToolCall>>,
     /// If set, usage will include prompt_tokens_details.cached_tokens (for cache-hit tests)
     cache_tokens: Option<i32>,
+    /// If set, the response `model` field echoes this value instead of the
+    /// request's model param — simulates external backends that answer with
+    /// their upstream model name (`provider_config.model_name` overrides).
+    model_override: Option<String>,
 }
 
 impl ResponseTemplate {
@@ -227,7 +231,15 @@ impl ResponseTemplate {
             disconnect_after_chunks: None,
             tool_calls: None,
             cache_tokens: None,
+            model_override: None,
         }
+    }
+
+    /// Echo `model` in responses instead of the request's model param
+    /// (simulates upstream model-name overrides on external providers).
+    pub fn with_model(mut self, model: impl Into<String>) -> Self {
+        self.model_override = Some(model.into());
+        self
     }
 
     /// Set cache_read_tokens for usage (prompt_tokens_details.cached_tokens) in non-stream and stream final chunk.
@@ -270,6 +282,7 @@ impl ResponseTemplate {
         model: String,
         input_tokens: i32,
     ) -> ChatCompletionResponse {
+        let model = self.model_override.clone().unwrap_or(model);
         // Calculate output tokens as word count of content
         let output_tokens = self.content.split_whitespace().count() as i32;
 
@@ -342,6 +355,7 @@ impl ResponseTemplate {
         model: String,
         input_tokens: i32,
     ) -> Vec<ChatCompletionChunk> {
+        let model = self.model_override.clone().unwrap_or(model);
         let mut chunks = Vec::new();
         let mut output_token_count = 0;
 

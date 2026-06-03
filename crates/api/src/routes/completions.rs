@@ -1872,6 +1872,7 @@ mod tests {
             max_output_length: None,
             supported_sampling_parameters: vec![],
             supported_features: vec![],
+            datacenters: None,
             created_at: chrono::Utc::now(),
         }
     }

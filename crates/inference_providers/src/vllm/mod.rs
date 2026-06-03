@@ -1113,19 +1113,7 @@ impl VLlmProvider {
             };
             let parser = new_sse_parser(response.bytes_stream(), true);
             let stream: StreamingResult = Box::pin(parser);
-            let mut peekable = StreamingResultExt::peekable(stream);
-            let first_chunk_status =
-                if let Some(Err(CompletionError::HttpError { status_code, .. })) =
-                    peekable.peek().await
-                {
-                    if Self::is_rotation_retryable_status(*status_code) {
-                        Some(*status_code)
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                };
+            let (first_chunk_status, stream) = Self::peek_first_payload_status(stream).await;
             if let Some(status_code) = first_chunk_status {
                 tracing::debug!(
                     index,
@@ -1137,7 +1125,7 @@ impl VLlmProvider {
                     message: "Upstream stream emitted an error event".to_string(),
                     is_external: false,
                 };
-                drop(peekable);
+                drop(stream);
                 continue;
             }
             self.pending_rotation
@@ -1148,9 +1136,50 @@ impl VLlmProvider {
                 index,
                 "Rotation-SNI chat_completion_stream served by alternative backend"
             );
-            return Ok(Box::pin(peekable));
+            return Ok(stream);
         }
         Err(last_error)
+    }
+
+    /// Peek past any leading control events (chunk-less `SSEEvent`s — e.g. a
+    /// keepalive comment or blank line surfaced by the lossless passthrough
+    /// parser, issue #701) to classify the first real SSE payload. Returns
+    /// the upstream status code when that first payload is an in-stream
+    /// `HttpError` eligible for rotation fallback, together with the stream
+    /// with all consumed control events re-attached in order (they are part
+    /// of the signed byte stream and must still reach the client). Without
+    /// the skip, a leading control event would mask a first-chunk error frame
+    /// (e.g. SGLang queue-full) and bypass rotation.
+    async fn peek_first_payload_status(stream: StreamingResult) -> (Option<u16>, StreamingResult) {
+        let mut peekable = StreamingResultExt::peekable(stream);
+        let mut leading_control: Vec<Result<SSEEvent, CompletionError>> = Vec::new();
+        while matches!(peekable.peek().await, Some(Ok(event)) if event.chunk.is_none()) {
+            if let Some(ev) = tokio_stream::StreamExt::next(&mut peekable).await {
+                leading_control.push(ev);
+            }
+        }
+
+        let status = if let Some(Err(CompletionError::HttpError { status_code, .. })) =
+            peekable.peek().await
+        {
+            if Self::is_rotation_retryable_status(*status_code) {
+                Some(*status_code)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        let stream: StreamingResult = if leading_control.is_empty() {
+            Box::pin(peekable)
+        } else {
+            Box::pin(futures_util::StreamExt::chain(
+                futures_util::stream::iter(leading_control),
+                peekable,
+            ))
+        };
+        (status, stream)
     }
 }
 
@@ -1594,32 +1623,20 @@ impl InferenceProvider for VLlmProvider {
             Ok(response) => {
                 let parser = new_sse_parser(response.bytes_stream(), true);
                 let stream: StreamingResult = Box::pin(parser);
-                let mut peekable = StreamingResultExt::peekable(stream);
-                let first_chunk_status =
-                    if let Some(Err(CompletionError::HttpError { status_code, .. })) =
-                        peekable.peek().await
-                    {
-                        if Self::is_rotation_retryable_status(*status_code) {
-                            Some(*status_code)
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    };
+                let (first_chunk_status, stream) = Self::peek_first_payload_status(stream).await;
                 match first_chunk_status {
                     None => {
                         self.pending_buckets
                             .lock()
                             .unwrap_or_else(|e| e.into_inner())
                             .insert(request_hash, bucket_id);
-                        Ok(Box::pin(peekable))
+                        Ok(stream)
                     }
                     Some(status_code) => {
                         // rotation_count() > 0 is guaranteed by the arm
                         // guard above, so the fallback will actually iterate
                         // at least one alternative backend.
-                        drop(peekable);
+                        drop(stream);
                         self.try_chat_completion_stream_rotation(
                             &streaming_params,
                             &headers,
@@ -2216,6 +2233,104 @@ impl InferenceProvider for VLlmProvider {
 mod tests {
     use super::*;
     use serial_test::serial;
+
+    fn control_event(raw: &'static str) -> SSEEvent {
+        SSEEvent {
+            raw_bytes: bytes::Bytes::from_static(raw.as_bytes()),
+            chunk: None,
+            raw_passthrough: true,
+        }
+    }
+
+    fn data_event() -> SSEEvent {
+        SSEEvent {
+            raw_bytes: bytes::Bytes::from_static(b"data: {}\n"),
+            chunk: Some(StreamChunk::Chat(ChatCompletionChunk {
+                id: "chat-1".to_string(),
+                object: "chat.completion.chunk".to_string(),
+                created: 0,
+                model: "test".to_string(),
+                choices: vec![],
+                usage: None,
+                prompt_token_ids: None,
+                system_fingerprint: None,
+                modality: None,
+            })),
+            raw_passthrough: true,
+        }
+    }
+
+    /// A leading control event (keepalive comment) must not mask a
+    /// first-payload in-stream error frame: rotation classification has to
+    /// skip past chunk-less events, and the skipped events must be
+    /// re-attached so the byte stream stays exact (issue #701).
+    #[tokio::test]
+    async fn peek_first_payload_status_skips_leading_control_events() {
+        let items: Vec<Result<SSEEvent, CompletionError>> = vec![
+            Ok(control_event(": keepalive\n")),
+            Ok(control_event("\n")),
+            Err(CompletionError::HttpError {
+                status_code: 503,
+                message: "queue full".to_string(),
+                is_external: false,
+            }),
+        ];
+        let stream: StreamingResult = Box::pin(futures_util::stream::iter(items));
+        let (status, stream) = VLlmProvider::peek_first_payload_status(stream).await;
+        assert_eq!(
+            status,
+            Some(503),
+            "Control events must not mask a retryable first-payload error"
+        );
+
+        // The consumed control events must still come out of the returned
+        // stream, in order, before the error.
+        let replayed: Vec<Result<SSEEvent, CompletionError>> =
+            futures_util::StreamExt::collect(stream).await;
+        assert_eq!(replayed.len(), 3);
+        assert_eq!(
+            replayed[0].as_ref().unwrap().raw_bytes.as_ref(),
+            b": keepalive\n"
+        );
+        assert_eq!(replayed[1].as_ref().unwrap().raw_bytes.as_ref(), b"\n");
+        assert!(matches!(
+            replayed[2],
+            Err(CompletionError::HttpError {
+                status_code: 503,
+                ..
+            })
+        ));
+    }
+
+    /// Happy path: first payload is a parsed data chunk — no rotation, and
+    /// the stream is returned intact.
+    #[tokio::test]
+    async fn peek_first_payload_status_data_first_returns_none() {
+        let items: Vec<Result<SSEEvent, CompletionError>> =
+            vec![Ok(control_event(": ping\n")), Ok(data_event())];
+        let stream: StreamingResult = Box::pin(futures_util::stream::iter(items));
+        let (status, stream) = VLlmProvider::peek_first_payload_status(stream).await;
+        assert_eq!(status, None);
+        let replayed: Vec<Result<SSEEvent, CompletionError>> =
+            futures_util::StreamExt::collect(stream).await;
+        assert_eq!(replayed.len(), 2);
+        assert!(replayed[0].as_ref().unwrap().chunk.is_none());
+        assert!(replayed[1].as_ref().unwrap().chunk.is_some());
+    }
+
+    /// A non-retryable first-payload error (e.g. 400) must not trigger
+    /// rotation.
+    #[tokio::test]
+    async fn peek_first_payload_status_non_retryable_error_returns_none() {
+        let items: Vec<Result<SSEEvent, CompletionError>> = vec![Err(CompletionError::HttpError {
+            status_code: 400,
+            message: "bad request".to_string(),
+            is_external: false,
+        })];
+        let stream: StreamingResult = Box::pin(futures_util::stream::iter(items));
+        let (status, _stream) = VLlmProvider::peek_first_payload_status(stream).await;
+        assert_eq!(status, None);
+    }
 
     #[derive(Debug)]
     struct ChainedErr {

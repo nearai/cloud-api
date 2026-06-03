@@ -35,10 +35,16 @@ pub struct UpdateModelAdminRequest {
     /// Datacenter country codes (ISO 3166 Alpha-2) the model runs in.
     pub datacenters: Option<Vec<String>>,
     /// Whether the model is "ready" (OpenRouter `is_ready`).
-    pub is_ready: Option<bool>,
-    /// Planned deprecation date (OpenRouter `deprecation_date`), parsed from an
-    /// ISO 8601 string at the route layer.
-    pub deprecation_date: Option<chrono::DateTime<chrono::Utc>>,
+    ///
+    /// Tri-state: `None` = leave unchanged, `Some(None)` = clear to NULL,
+    /// `Some(Some(v))` = set to `v`.
+    pub is_ready: Option<Option<bool>>,
+    /// Planned deprecation date (OpenRouter `deprecation_date`), parsed and
+    /// normalized from an ISO 8601 string at the route layer.
+    ///
+    /// Tri-state: `None` = leave unchanged, `Some(None)` = clear to NULL,
+    /// `Some(Some(dt))` = set to `dt`.
+    pub deprecation_date: Option<Option<chrono::DateTime<chrono::Utc>>>,
     // User audit tracking for history
     pub change_reason: Option<String>,
     pub changed_by_user_id: Option<uuid::Uuid>,

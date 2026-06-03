@@ -25,7 +25,7 @@ use axum::{
     response::Json as ResponseJson,
     Extension,
 };
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Duration, DurationRound, Utc};
 use config::ApiConfig;
 use services::admin::{AdminService, AnalyticsService, UpdateModelAdminRequest};
 use services::auth::AuthServiceTrait;
@@ -35,25 +35,43 @@ use std::sync::Arc;
 use tracing::{debug, error, Instrument};
 use uuid::Uuid;
 
-/// Parse an OpenRouter `deprecation_date` into a `DateTime<Utc>`.
+/// Parse an OpenRouter `deprecation_date` into a normalized `DateTime<Utc>`.
 ///
-/// Accepts either a bare ISO 8601 date (e.g. `2026-01-01`) or a full RFC 3339
-/// instant (e.g. `2026-01-01T00:00:00Z`). The OpenRouter provider spec writes
-/// its examples at hour precision, but we accept any valid RFC 3339 instant
-/// and normalize it to UTC rather than rejecting finer precision — storing the
-/// caller's exact intent is strictly more faithful than truncating it. A bare
-/// date is interpreted as midnight UTC. Returns `None` for anything that does
-/// not parse, so callers can reject it.
+/// Follows the OpenRouter provider spec
+/// (<https://openrouter.ai/docs/guides/community/for-providers>) exactly. The
+/// spec models deprecation at *hour* precision and defines two input shapes:
+///
+/// - A bare ISO 8601 date (e.g. `2030-01-01`). Per the spec: *"Date-only
+///   values default to 13:00 UTC on that date."* So we store 13:00 UTC.
+/// - An explicit RFC 3339 instant in UTC-hour form (e.g. `2025-06-01T15:00:00Z`).
+///   The spec only expresses whole UTC hours, so we normalize to the top of the
+///   hour (minutes/seconds/sub-second truncated) in UTC. Emitting and storing at
+///   finer precision would diverge from the spec, so we deliberately truncate.
+///
+/// Returns `None` for anything that does not parse as a date or RFC 3339
+/// instant, so callers can reject it with a 400.
 fn parse_deprecation_date(s: &str) -> Option<DateTime<Utc>> {
     if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
-        return Some(dt.with_timezone(&Utc));
+        // Normalize to the top of the UTC hour — the spec only models hour
+        // precision (`YYYY-MM-DDTHH:00:00Z`).
+        let utc = dt.with_timezone(&Utc);
+        return utc.duration_trunc(Duration::hours(1)).ok();
     }
     if let Ok(date) = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d") {
+        // Date-only values default to 13:00 UTC on that date (OpenRouter spec).
         return date
-            .and_hms_opt(0, 0, 0)
+            .and_hms_opt(13, 0, 0)
             .map(|naive| DateTime::<Utc>::from_naive_utc_and_offset(naive, Utc));
     }
     None
+}
+
+/// Serialize a stored `deprecation_date` into the OpenRouter-compatible
+/// UTC-hour form `YYYY-MM-DDTHH:00:00Z` (matching the spec's examples, e.g.
+/// `2025-06-01T15:00:00Z`). The stored value is always normalized to a whole
+/// UTC hour by [`parse_deprecation_date`], so this is a faithful round-trip.
+pub(crate) fn format_deprecation_date(dt: &DateTime<Utc>) -> String {
+    dt.format("%Y-%m-%dT%H:00:00Z").to_string()
 }
 
 #[derive(Clone)]
@@ -250,8 +268,9 @@ pub async fn batch_upsert_models(
         // `deprecation_date` must parse as ISO 8601 (a bare date like
         // "2026-01-01" or a full instant like "2026-01-01T00:00:00Z"). Reject
         // anything else at the write path so the stored value — and the
-        // `GET /v1/models` we serve from it — stays well-formed.
-        if let Some(d) = &request.deprecation_date {
+        // `GET /v1/models` we serve from it — stays well-formed. An explicit
+        // `null` (clear) and an omitted field both skip this check.
+        if let Some(Some(d)) = &request.deprecation_date {
             if parse_deprecation_date(d).is_none() {
                 return Err((
                     StatusCode::BAD_REQUEST,
@@ -306,13 +325,16 @@ pub async fn batch_upsert_models(
                     supported_sampling_parameters: request.supported_sampling_parameters.clone(),
                     supported_features: request.supported_features.clone(),
                     datacenters: crate::models::Datacenter::to_codes(request.datacenters.clone()),
+                    // Tri-state passes straight through: outer None = leave
+                    // unchanged, Some(None) = clear, Some(Some(v)) = set.
                     is_ready: request.is_ready,
-                    // Already validated above; parse again to store as a
-                    // timestamp. `and_then` keeps None when unset.
+                    // Tri-state. Outer None = leave unchanged, Some(None) =
+                    // clear. For Some(Some(s)) the string was already validated
+                    // above, so parse+normalize it to a stored timestamp.
                     deprecation_date: request
                         .deprecation_date
-                        .as_deref()
-                        .and_then(parse_deprecation_date),
+                        .as_ref()
+                        .map(|inner| inner.as_deref().and_then(parse_deprecation_date)),
                     change_reason: request.change_reason.clone(),
                     changed_by_user_id: Some(admin_user_id),
                     changed_by_user_email: Some(admin_user_email.clone()),
@@ -518,7 +540,10 @@ pub async fn batch_upsert_models(
                 supported_features: updated_model.supported_features,
                 datacenters: crate::models::Datacenter::from_codes(updated_model.datacenters),
                 is_ready: updated_model.is_ready,
-                deprecation_date: updated_model.deprecation_date.map(|dt| dt.to_rfc3339()),
+                deprecation_date: updated_model
+                    .deprecation_date
+                    .as_ref()
+                    .map(format_deprecation_date),
             },
         })
         .collect();
@@ -624,7 +649,7 @@ pub async fn list_models(
                 supported_features: model.supported_features,
                 datacenters: crate::models::Datacenter::from_codes(model.datacenters),
                 is_ready: model.is_ready,
-                deprecation_date: model.deprecation_date.map(|dt| dt.to_rfc3339()),
+                deprecation_date: model.deprecation_date.as_ref().map(format_deprecation_date),
             },
             is_active: model.is_active,
             created_at: model.created_at,
@@ -762,7 +787,7 @@ pub async fn get_model_history(
             supported_features: h.supported_features,
             datacenters: crate::models::Datacenter::from_codes(h.datacenters),
             is_ready: h.is_ready,
-            deprecation_date: h.deprecation_date.map(|dt| dt.to_rfc3339()),
+            deprecation_date: h.deprecation_date.as_ref().map(format_deprecation_date),
         })
         .collect();
 
@@ -1289,7 +1314,7 @@ pub async fn deprecate_model(
             supported_features: m.supported_features,
             datacenters: crate::models::Datacenter::from_codes(m.datacenters),
             is_ready: m.is_ready,
-            deprecation_date: m.deprecation_date.map(|dt| dt.to_rfc3339()),
+            deprecation_date: m.deprecation_date.as_ref().map(format_deprecation_date),
         },
     };
 
@@ -2926,4 +2951,43 @@ pub async fn get_organization_concurrent_limit(
     };
 
     Ok(ResponseJson(response))
+}
+
+#[cfg(test)]
+mod deprecation_date_tests {
+    use super::{format_deprecation_date, parse_deprecation_date};
+
+    #[test]
+    fn date_only_defaults_to_13_00_utc() {
+        // OpenRouter spec: "Date-only values default to 13:00 UTC on that date."
+        let dt = parse_deprecation_date("2030-01-01").expect("date-only must parse");
+        assert_eq!(format_deprecation_date(&dt), "2030-01-01T13:00:00Z");
+    }
+
+    #[test]
+    fn explicit_utc_hour_round_trips() {
+        // Spec example: 2025-06-01T15:00:00Z.
+        let dt = parse_deprecation_date("2025-06-01T15:00:00Z").expect("must parse");
+        assert_eq!(format_deprecation_date(&dt), "2025-06-01T15:00:00Z");
+    }
+
+    #[test]
+    fn sub_hour_precision_truncates_to_hour() {
+        // The spec only models hour precision; finer input is truncated down.
+        let dt = parse_deprecation_date("2025-06-01T15:47:33Z").expect("must parse");
+        assert_eq!(format_deprecation_date(&dt), "2025-06-01T15:00:00Z");
+    }
+
+    #[test]
+    fn non_utc_offset_is_normalized_to_utc_hour() {
+        // 15:30+02:00 == 13:30 UTC, truncated to 13:00 UTC.
+        let dt = parse_deprecation_date("2025-06-01T15:30:00+02:00").expect("must parse");
+        assert_eq!(format_deprecation_date(&dt), "2025-06-01T13:00:00Z");
+    }
+
+    #[test]
+    fn invalid_input_returns_none() {
+        assert!(parse_deprecation_date("not-a-date").is_none());
+        assert!(parse_deprecation_date("2025-13-01").is_none());
+    }
 }

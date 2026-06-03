@@ -156,7 +156,10 @@ pub async fn list_models(
                 supported_features: model.supported_features,
                 datacenters: crate::models::Datacenter::from_codes(model.datacenters),
                 is_ready: model.is_ready,
-                deprecation_date: model.deprecation_date.map(|dt| dt.to_rfc3339()),
+                deprecation_date: model
+                    .deprecation_date
+                    .as_ref()
+                    .map(crate::routes::admin::format_deprecation_date),
             },
         })
         .collect();
@@ -267,7 +270,10 @@ pub async fn get_model_by_name(
             supported_features: model.supported_features,
             datacenters: crate::models::Datacenter::from_codes(model.datacenters),
             is_ready: model.is_ready,
-            deprecation_date: model.deprecation_date.map(|dt| dt.to_rfc3339()),
+            deprecation_date: model
+                .deprecation_date
+                .as_ref()
+                .map(crate::routes::admin::format_deprecation_date),
         },
     };
 

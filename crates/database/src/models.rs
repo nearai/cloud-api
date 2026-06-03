@@ -519,8 +519,12 @@ pub struct UpdateModelPricingRequest {
     pub supported_features: Option<Vec<String>>,
     /// Datacenter country codes (ISO 3166 Alpha-2) the model runs in.
     pub datacenters: Option<Vec<String>>,
-    pub is_ready: Option<bool>,
-    pub deprecation_date: Option<DateTime<Utc>>,
+    /// Tri-state: `None` = leave unchanged, `Some(None)` = clear to NULL,
+    /// `Some(Some(v))` = set to `v`.
+    pub is_ready: Option<Option<bool>>,
+    /// Tri-state: `None` = leave unchanged, `Some(None)` = clear to NULL,
+    /// `Some(Some(dt))` = set to `dt`.
+    pub deprecation_date: Option<Option<DateTime<Utc>>>,
     // User audit tracking for history
     pub change_reason: Option<String>,
     pub changed_by_user_id: Option<Uuid>,

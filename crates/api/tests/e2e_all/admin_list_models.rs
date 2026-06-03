@@ -158,28 +158,43 @@ async fn test_admin_upsert_is_ready_and_deprecation_date_round_trip() {
         Some(true),
         "is_ready should round-trip verbatim"
     );
-    // Stored as TIMESTAMPTZ, serialized back as an ISO 8601 string. A bare
-    // date is normalized to midnight UTC.
+    // Per the OpenRouter provider spec, "Date-only values default to 13:00 UTC
+    // on that date" and explicit times use the UTC-hour form
+    // (`YYYY-MM-DDTHH:00:00Z`). A bare date therefore normalizes to 13:00 UTC
+    // and serializes as `2030-01-01T13:00:00Z`.
     let dep = model
         .metadata
         .deprecation_date
         .as_ref()
         .expect("deprecation_date should be present");
-    // A bare date normalizes to midnight UTC and serializes with a +00:00
-    // offset. Asserting the full value (not just a prefix) guards against a
-    // regression that emits a non-UTC offset.
     assert_eq!(
-        dep, "2030-01-01T00:00:00+00:00",
-        "deprecation_date should serialize as ISO 8601 midnight UTC, got {dep}"
+        dep, "2030-01-01T13:00:00Z",
+        "date-only deprecation_date should default to 13:00 UTC (OpenRouter spec), got {dep}"
     );
 
-    // Now clear is_ready to false and supply a full datetime; verify update.
+    // Verify the same value round-trips through the public GET /v1/models.
+    let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
+    let api_key = get_api_key_for_org(&server, org.id).await;
+    let listed = list_models(&server, api_key.clone()).await;
+    let public = listed
+        .data
+        .iter()
+        .find(|m| m.id == model_name)
+        .expect("model should appear in GET /v1/models");
+    assert_eq!(public.is_ready, Some(true));
+    assert_eq!(
+        public.deprecation_date.as_deref(),
+        Some("2030-01-01T13:00:00Z"),
+        "GET /v1/models must emit the OpenRouter-compatible 13:00 UTC value"
+    );
+
+    // Now set is_ready to false and supply an explicit UTC-hour datetime.
     let mut batch2 = BatchUpdateModelApiRequest::new();
     batch2.insert(
         model_name.clone(),
         serde_json::from_value(serde_json::json!({
             "isReady": false,
-            "deprecationDate": "2031-06-15T00:00:00Z"
+            "deprecationDate": "2031-06-15T15:00:00Z"
         }))
         .unwrap(),
     );
@@ -191,7 +206,135 @@ async fn test_admin_upsert_is_ready_and_deprecation_date_round_trip() {
     assert_eq!(model2.metadata.is_ready, Some(false));
     assert_eq!(
         model2.metadata.deprecation_date.as_deref(),
-        Some("2031-06-15T00:00:00+00:00")
+        Some("2031-06-15T15:00:00Z"),
+        "explicit datetime should serialize in UTC-hour form (OpenRouter spec)"
+    );
+
+    // A finer-than-hour explicit time is normalized down to the whole UTC hour
+    // (the spec only models hour precision).
+    let mut batch3 = BatchUpdateModelApiRequest::new();
+    batch3.insert(
+        model_name.clone(),
+        serde_json::from_value(serde_json::json!({
+            "deprecationDate": "2031-06-15T15:47:33Z"
+        }))
+        .unwrap(),
+    );
+    let updated3 = admin_batch_upsert_models(&server, batch3, get_session_id()).await;
+    let model3 = updated3
+        .iter()
+        .find(|m| m.model_id == model_name)
+        .expect("update should return our model");
+    assert_eq!(
+        model3.metadata.deprecation_date.as_deref(),
+        Some("2031-06-15T15:00:00Z"),
+        "sub-hour precision should truncate to the top of the UTC hour"
+    );
+}
+
+#[tokio::test]
+async fn test_admin_clear_deprecation_date_and_is_ready() {
+    let server = setup_test_server().await;
+
+    // Create a model with both fields set.
+    let model_name = format!("test-clear-{}", uuid::Uuid::new_v4());
+    let mut batch = BatchUpdateModelApiRequest::new();
+    batch.insert(
+        model_name.clone(),
+        serde_json::from_value(serde_json::json!({
+            "inputCostPerToken": { "amount": 1000, "currency": "USD" },
+            "outputCostPerToken": { "amount": 2000, "currency": "USD" },
+            "modelDisplayName": "Clearable Model",
+            "modelDescription": "Tri-state clear semantics",
+            "contextLength": 4096,
+            "isActive": true,
+            "isReady": false,
+            "deprecationDate": "2030-01-01"
+        }))
+        .unwrap(),
+    );
+    let created = admin_batch_upsert_models(&server, batch, get_session_id()).await;
+    let created_model = created
+        .iter()
+        .find(|m| m.model_id == model_name)
+        .expect("upsert should return our model");
+    assert_eq!(created_model.metadata.is_ready, Some(false));
+    assert_eq!(
+        created_model.metadata.deprecation_date.as_deref(),
+        Some("2030-01-01T13:00:00Z")
+    );
+
+    // Explicit JSON null clears both fields back to "unset".
+    let mut clear_batch = BatchUpdateModelApiRequest::new();
+    clear_batch.insert(
+        model_name.clone(),
+        serde_json::from_value(serde_json::json!({
+            "isReady": null,
+            "deprecationDate": null
+        }))
+        .unwrap(),
+    );
+    let cleared = admin_batch_upsert_models(&server, clear_batch, get_session_id()).await;
+    let cleared_model = cleared
+        .iter()
+        .find(|m| m.model_id == model_name)
+        .expect("update should return our model");
+    assert_eq!(
+        cleared_model.metadata.is_ready, None,
+        "explicit null should clear is_ready"
+    );
+    assert_eq!(
+        cleared_model.metadata.deprecation_date, None,
+        "explicit null should clear deprecation_date"
+    );
+
+    // The fields must also be absent from the public GET /v1/models response.
+    let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
+    let api_key = get_api_key_for_org(&server, org.id).await;
+    let listed = list_models(&server, api_key).await;
+    let public = listed
+        .data
+        .iter()
+        .find(|m| m.id == model_name)
+        .expect("model should appear in GET /v1/models");
+    assert_eq!(
+        public.deprecation_date, None,
+        "cleared deprecation_date must disappear from GET /v1/models"
+    );
+    assert_eq!(
+        public.is_ready, None,
+        "cleared is_ready must disappear from GET /v1/models"
+    );
+
+    // An omitted field after a set must NOT clear it (regression guard for the
+    // tri-state: absent != null).
+    let mut set_batch = BatchUpdateModelApiRequest::new();
+    set_batch.insert(
+        model_name.clone(),
+        serde_json::from_value(serde_json::json!({
+            "deprecationDate": "2032-03-03"
+        }))
+        .unwrap(),
+    );
+    admin_batch_upsert_models(&server, set_batch, get_session_id()).await;
+
+    let mut noop_batch = BatchUpdateModelApiRequest::new();
+    noop_batch.insert(
+        model_name.clone(),
+        serde_json::from_value(serde_json::json!({
+            "isActive": true
+        }))
+        .unwrap(),
+    );
+    let after_noop = admin_batch_upsert_models(&server, noop_batch, get_session_id()).await;
+    let after_noop_model = after_noop
+        .iter()
+        .find(|m| m.model_id == model_name)
+        .expect("update should return our model");
+    assert_eq!(
+        after_noop_model.metadata.deprecation_date.as_deref(),
+        Some("2032-03-03T13:00:00Z"),
+        "omitting deprecationDate must preserve the existing value"
     );
 }
 

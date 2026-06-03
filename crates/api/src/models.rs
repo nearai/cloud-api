@@ -3130,13 +3130,35 @@ pub struct UpdateModelApiRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub datacenters: Option<Vec<Datacenter>>,
     /// OpenRouter `is_ready`. Stored and exposed verbatim on `GET /v1/models`.
-    #[serde(rename = "isReady", skip_serializing_if = "Option::is_none")]
-    pub is_ready: Option<bool>,
+    ///
+    /// Tri-state PATCH semantics:
+    /// - omitted → leave unchanged
+    /// - `null` → clear back to "unset" (column set to NULL)
+    /// - `true`/`false` → set verbatim
+    #[serde(
+        rename = "isReady",
+        default,
+        deserialize_with = "deserialize_nullable",
+        skip_serializing_if = "Option::is_none"
+    )]
+    #[schema(value_type = Option<bool>)]
+    pub is_ready: Nullable<bool>,
     /// OpenRouter `deprecation_date`: ISO 8601 string (`YYYY-MM-DD` or
     /// `YYYY-MM-DDTHH:00:00Z`). Validated at the write path; rejected if it
     /// does not parse.
-    #[serde(rename = "deprecationDate", skip_serializing_if = "Option::is_none")]
-    pub deprecation_date: Option<String>,
+    ///
+    /// Tri-state PATCH semantics:
+    /// - omitted → leave unchanged
+    /// - `null` → clear back to "no planned deprecation" (column set to NULL)
+    /// - a string → set to the normalized deprecation timestamp
+    #[serde(
+        rename = "deprecationDate",
+        default,
+        deserialize_with = "deserialize_nullable",
+        skip_serializing_if = "Option::is_none"
+    )]
+    #[schema(value_type = Option<String>)]
+    pub deprecation_date: Nullable<String>,
     #[serde(rename = "changeReason", skip_serializing_if = "Option::is_none")]
     pub change_reason: Option<String>,
 }

@@ -397,6 +397,19 @@ impl ModelRepository {
         let output_modalities_json =
             serialize_modalities(&update_request.output_modalities, "output_modalities")?;
 
+        // Tri-state fields (`is_ready`, `deprecation_date`): split each into a
+        // value param (used by COALESCE for the "set" case) and a `clear` flag
+        // (set true only for an explicit `null`). The SQL applies
+        // `CASE WHEN $clear THEN NULL ELSE COALESCE($value, col) END` so that:
+        //   - outer None        -> clear=false, value=None  -> preserve column
+        //   - Some(None) (null) -> clear=true               -> set column NULL
+        //   - Some(Some(v))     -> clear=false, value=Some(v) -> set to v
+        let is_ready_value: Option<bool> = update_request.is_ready.flatten();
+        let is_ready_clear: bool = matches!(update_request.is_ready, Some(None));
+        let deprecation_date_value: Option<DateTime<Utc>> =
+            update_request.deprecation_date.flatten();
+        let deprecation_date_clear: bool = matches!(update_request.deprecation_date, Some(None));
+
         let row = retry_db!("upsert_model_pricing", {
             let client = self
                 .pool
@@ -434,8 +447,8 @@ impl ModelRepository {
                             supported_sampling_parameters = COALESCE($22, supported_sampling_parameters),
                             supported_features = COALESCE($23, supported_features),
                             datacenters = COALESCE($24, datacenters),
-                            is_ready = COALESCE($25, is_ready),
-                            deprecation_date = COALESCE($26, deprecation_date),
+                            is_ready = CASE WHEN $27 THEN NULL ELSE COALESCE($25, is_ready) END,
+                            deprecation_date = CASE WHEN $28 THEN NULL ELSE COALESCE($26, deprecation_date) END,
                             updated_at = NOW()
                         WHERE model_name = $1
                         RETURNING id, model_name, model_display_name, model_description, model_icon,
@@ -469,8 +482,10 @@ impl ModelRepository {
                             &update_request.supported_sampling_parameters,
                             &update_request.supported_features,
                             &update_request.datacenters,
-                            &update_request.is_ready,
-                            &update_request.deprecation_date,
+                            &is_ready_value,
+                            &deprecation_date_value,
+                            &is_ready_clear,
+                            &deprecation_date_clear,
                         ],
                     )
                     .await
@@ -547,8 +562,8 @@ impl ModelRepository {
                             supported_sampling_parameters = COALESCE($23, models.supported_sampling_parameters),
                             supported_features = COALESCE($24, models.supported_features),
                             datacenters = COALESCE($25, models.datacenters),
-                            is_ready = COALESCE($26, models.is_ready),
-                            deprecation_date = COALESCE($27, models.deprecation_date),
+                            is_ready = CASE WHEN $28 THEN NULL ELSE COALESCE($26, models.is_ready) END,
+                            deprecation_date = CASE WHEN $29 THEN NULL ELSE COALESCE($27, models.deprecation_date) END,
                             updated_at = NOW()
                         RETURNING id, model_name, model_display_name, model_description, model_icon,
                                   input_cost_per_token, output_cost_per_token, cost_per_image, cache_read_cost_per_token,
@@ -582,8 +597,10 @@ impl ModelRepository {
                             &update_request.supported_sampling_parameters,
                             &update_request.supported_features,
                             &update_request.datacenters,
-                            &update_request.is_ready,
-                            &update_request.deprecation_date,
+                            &is_ready_value,
+                            &deprecation_date_value,
+                            &is_ready_clear,
+                            &deprecation_date_clear,
                         ],
                     )
                     .await

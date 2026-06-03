@@ -311,6 +311,101 @@ async fn test_alias_to_external_model_with_upstream_name_override_warns() {
     assert_eq!(header, format!("{old} -> {canonical}"));
 }
 
+/// Regression for the case where the upstream override string EQUALS the
+/// alias: alias `gpt-5.2` -> canonical `openai/gpt-5.2` with
+/// `provider_config.model_name = "gpt-5.2"`. The response echo then equals
+/// the requested string, so any echo-based detection would stay silent —
+/// alias-ness must come from pre-dispatch catalog resolution alone.
+#[tokio::test]
+async fn test_alias_equal_to_upstream_override_still_warns() {
+    let (server, inference_pool, mock_provider, _) = setup_test_server_with_pool().await;
+
+    let suffix = uuid::Uuid::new_v4();
+    let bare = format!("test-gpt-bare-{suffix}");
+    let canonical = format!("openai/{bare}");
+
+    // Canonical external model whose upstream override AND registered alias
+    // are both the bare name.
+    let mut batch = BatchUpdateModelApiRequest::new();
+    batch.insert(
+        canonical.clone(),
+        serde_json::from_value(serde_json::json!({
+            "inputCostPerToken":  { "amount": 2_500_000, "currency": "USD" },
+            "outputCostPerToken": { "amount": 10_000_000, "currency": "USD" },
+            "modelDisplayName":   "Bare-Alias Override Test Model",
+            "modelDescription":   "External model whose alias equals its upstream name",
+            "contextLength":      128000,
+            "verifiable":         false,
+            "isActive":           true,
+            "providerType":       "external",
+            "providerConfig": {
+                "backend": "openai_compatible",
+                "base_url": "https://api.openai.com/v1",
+                "model_name": bare,
+            },
+            "aliases": [bare],
+            "attestationSupported": false
+        }))
+        .unwrap(),
+    );
+    admin_batch_upsert_models(&server, batch, get_session_id()).await;
+
+    // Mock echoes the upstream (== alias) name.
+    mock_provider
+        .when(inference_providers::mock::RequestMatcher::Any)
+        .respond_with(
+            inference_providers::mock::ResponseTemplate::new("Hello from bare upstream")
+                .with_model(bare.clone()),
+        )
+        .await;
+    let mock_provider_trait: std::sync::Arc<
+        dyn inference_providers::InferenceProvider + Send + Sync,
+    > = mock_provider.clone();
+    inference_pool
+        .register_provider(canonical.clone(), mock_provider_trait)
+        .await;
+
+    let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
+    let api_key = get_api_key_for_org(&server, org.id).await;
+
+    let response = server
+        .post("/v1/chat/completions")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .json(&chat_body(&bare, false))
+        .await;
+    assert_eq!(response.status_code(), 200, "{}", response.text());
+
+    let body: serde_json::Value = response.json();
+    assert_eq!(
+        body["model"], bare,
+        "echo equals the requested alias string"
+    );
+    let warning = body["warning"]
+        .as_str()
+        .expect("alias must warn even when the echo equals the requested string");
+    assert!(
+        warning.contains(&bare) && warning.contains(&canonical),
+        "warning should name alias and canonical: {warning}"
+    );
+    let header = response
+        .headers()
+        .get("x-model-alias-resolved")
+        .expect("alias header must be present despite echo == requested")
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(header, format!("{bare} -> {canonical}"));
+
+    // Strict mode must also reject it.
+    let strict = server
+        .post("/v1/chat/completions")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .add_header("x-no-aliasing", "true")
+        .json(&chat_body(&bare, false))
+        .await;
+    assert_eq!(strict.status_code(), 400, "{}", strict.text());
+}
+
 #[tokio::test]
 async fn test_attestation_report_announces_alias() {
     let server = setup_test_server().await;

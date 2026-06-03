@@ -2015,8 +2015,24 @@ impl InferenceProviderPool {
         // Must be synchronous to ensure attestation service can find the provider
         let mut peekable = StreamingResultExt::peekable(stream);
         let mut pinned = false;
+
+        // Control events (blank lines, comments — no parsed chunk) may
+        // precede the first data chunk. Consume and stash them so the peek
+        // below sees the first parsed chunk; they are re-attached in order
+        // since their raw bytes are part of the signed stream (issue #701).
+        let mut leading_control: Vec<Result<inference_providers::SSEEvent, CompletionError>> =
+            Vec::new();
+        {
+            use futures::StreamExt as _;
+            while matches!(peekable.peek().await, Some(Ok(event)) if event.chunk.is_none()) {
+                if let Some(ev) = peekable.next().await {
+                    leading_control.push(ev);
+                }
+            }
+        }
+
         if let Some(Ok(event)) = peekable.peek().await {
-            if let inference_providers::StreamChunk::Chat(chat_chunk) = &event.chunk {
+            if let Some(inference_providers::StreamChunk::Chat(chat_chunk)) = &event.chunk {
                 let chat_id = chat_chunk.id.clone();
                 tracing::info!(
                     chat_id = %chat_id,
@@ -2034,7 +2050,14 @@ impl InferenceProviderPool {
             provider.pin_chat_connection(&request_hash, "");
             provider.unpin_chat_connection("");
         }
-        Ok(Box::pin(peekable))
+        if leading_control.is_empty() {
+            Ok(Box::pin(peekable))
+        } else {
+            use futures::StreamExt as _;
+            Ok(Box::pin(
+                futures::stream::iter(leading_control).chain(peekable),
+            ))
+        }
     }
 
     pub async fn chat_completion(
@@ -3998,7 +4021,7 @@ mod tests {
 
         let first_event = stream.next().await.unwrap().unwrap();
         let chat_id = match first_event.chunk {
-            inference_providers::StreamChunk::Chat(chunk) => chunk.id,
+            Some(inference_providers::StreamChunk::Chat(chunk)) => chunk.id,
             _ => panic!("Expected chat chunk"),
         };
 

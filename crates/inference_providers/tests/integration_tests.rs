@@ -144,7 +144,7 @@ async fn test_chat_completion_streaming() {
             {
                 match chunk_result {
                     Ok(sse_event) => match sse_event.chunk {
-                        StreamChunk::Chat(chat_chunk) => {
+                        Some(StreamChunk::Chat(chat_chunk)) => {
                             chunks_received += 1;
                             println!("Received chat chunk #{chunks_received}: {chat_chunk:?}");
 
@@ -175,9 +175,11 @@ async fn test_chat_completion_streaming() {
                                 }
                             }
                         }
-                        StreamChunk::Text(text_chunk) => {
+                        Some(StreamChunk::Text(text_chunk)) => {
                             panic!("CRITICAL ERROR: Received text chunk in chat completion stream! This indicates stream isolation failure. Chunk: {text_chunk:?}");
                         }
+                        // Control events (comments, blank lines, [DONE]) carry no chunk
+                        None => {}
                     },
                     Err(e) => {
                         // Stream errors should be treated as test failures
@@ -260,7 +262,7 @@ async fn test_text_completion_streaming() {
             {
                 match chunk_result {
                     Ok(sse_event) => match sse_event.chunk {
-                        StreamChunk::Text(text_chunk) => {
+                        Some(StreamChunk::Text(text_chunk)) => {
                             chunks_received += 1;
                             println!("Received text chunk #{chunks_received}: {text_chunk:?}");
 
@@ -287,9 +289,11 @@ async fn test_text_completion_streaming() {
                                 content_received.push_str(&choice.text);
                             }
                         }
-                        StreamChunk::Chat(chat_chunk) => {
+                        Some(StreamChunk::Chat(chat_chunk)) => {
                             panic!("CRITICAL ERROR: Received chat chunk in text completion stream! This indicates stream isolation failure. Chunk: {chat_chunk:?}");
                         }
+                        // Control events (comments, blank lines, [DONE]) carry no chunk
+                        None => {}
                     },
                     Err(e) => {
                         panic!("Stream error in text completion: {e}. This could indicate SSE parsing issues or stream corruption.");
@@ -468,7 +472,7 @@ async fn test_chat_completion_streaming_with_tool_calls() {
             {
                 match chunk_result {
                     Ok(sse_event) => match sse_event.chunk {
-                        StreamChunk::Chat(chat_chunk) => {
+                        Some(StreamChunk::Chat(chat_chunk)) => {
                             chunks_received += 1;
 
                             // Check for tool calls in delta
@@ -529,9 +533,11 @@ async fn test_chat_completion_streaming_with_tool_calls() {
                                 println!("Processed {chunks_received} chunks so far...");
                             }
                         }
-                        StreamChunk::Text(text_chunk) => {
+                        Some(StreamChunk::Text(text_chunk)) => {
                             panic!("CRITICAL ERROR: Received text chunk in chat completion stream with tool calls! Chunk: {text_chunk:?}");
                         }
+                        // Control events (comments, blank lines, [DONE]) carry no chunk
+                        None => {}
                     },
                     Err(e) => {
                         // Stream errors should be treated as test failures
@@ -651,7 +657,7 @@ async fn test_reasoning_content() {
     while let Some(chunk_result) = stream.next().await {
         let event = chunk_result.expect("Stream error");
         match event.chunk {
-            StreamChunk::Chat(chunk) => {
+            Some(StreamChunk::Chat(chunk)) => {
                 if let Some(choice) = chunk.choices.first() {
                     if let Some(delta) = &choice.delta {
                         if let Some(reasoning) = &delta.reasoning_content {

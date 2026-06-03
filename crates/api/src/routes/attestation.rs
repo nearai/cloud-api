@@ -248,12 +248,12 @@ pub async fn get_attestation_report(
     // binds) belongs to a different canonical model.
     let mut alias_resolved: Option<(String, String)> = None;
     if let Some(requested) = &params.model {
-        if let Ok(m) = app_state
+        match app_state
             .models_service
             .resolve_and_get_model(requested)
             .await
         {
-            if &m.model_name != requested {
+            Ok(m) if &m.model_name != requested => {
                 if crate::routes::common::no_aliasing_requested(&headers) {
                     return Err((
                         StatusCode::BAD_REQUEST,
@@ -270,10 +270,26 @@ pub async fn get_attestation_report(
                 }
                 alias_resolved = Some((requested.clone(), m.model_name));
             }
+            Ok(_) => {}
+            // Unknown model: fall through — the attestation service
+            // produces its own error for unknown models, and strict mode
+            // only guards the alias-substitution case.
+            Err(services::models::ModelsError::NotFound(_)) => {}
+            Err(_) => {
+                // Strict mode must fail closed: if the catalog can't be
+                // consulted we can't guarantee no alias was applied —
+                // and an E2EE client could bind a payload to the wrong
+                // model TD's signing key.
+                if crate::routes::common::no_aliasing_requested(&headers) {
+                    return Err((
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        ResponseJson(ErrorResponse {
+                            error: "Failed to resolve model for x-no-aliasing check".to_string(),
+                        }),
+                    ));
+                }
+            }
         }
-        // Unknown model or resolver error: fall through — the attestation
-        // service produces its own error for unknown models, and strict
-        // mode only guards the alias-substitution case.
     }
 
     let report = app_state
@@ -306,12 +322,22 @@ pub async fn get_attestation_report(
                 ),
                 value,
             );
-            http_response.headers_mut().insert(
-                axum::http::HeaderName::from_static("access-control-expose-headers"),
-                axum::http::HeaderValue::from_static(
-                    crate::routes::common::HEADER_MODEL_ALIAS_RESOLVED,
+            // Append to (rather than replace) any expose list set upstream.
+            let expose_name = axum::http::HeaderName::from_static("access-control-expose-headers");
+            let exposed = match http_response
+                .headers()
+                .get(&expose_name)
+                .and_then(|v| v.to_str().ok())
+            {
+                Some(existing) => format!(
+                    "{existing}, {}",
+                    crate::routes::common::HEADER_MODEL_ALIAS_RESOLVED
                 ),
-            );
+                None => crate::routes::common::HEADER_MODEL_ALIAS_RESOLVED.to_string(),
+            };
+            if let Ok(exposed) = axum::http::HeaderValue::from_str(&exposed) {
+                http_response.headers_mut().insert(expose_name, exposed);
+            }
         }
     }
     Ok(http_response)

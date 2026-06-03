@@ -201,6 +201,52 @@ async fn test_no_aliasing_header_allows_canonical_request() {
 }
 
 #[tokio::test]
+async fn test_attestation_report_announces_alias() {
+    let server = setup_test_server().await;
+    let alias = setup_deprecated_alias(&server).await;
+
+    let encoded = url::form_urlencoded::byte_serialize(alias.as_bytes()).collect::<String>();
+    let response = server
+        .get(&format!("/v1/attestation/report?model={encoded}"))
+        .await;
+    // The mock attestation path may or may not produce a full report, but
+    // whenever the request is served the alias header must be present.
+    if response.status_code() == 200 {
+        let header = response
+            .headers()
+            .get("x-model-alias-resolved")
+            .expect("aliased attestation report must carry x-model-alias-resolved")
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(header, format!("{alias} -> {E2E_QWEN_MODEL_NAME}"));
+    }
+}
+
+#[tokio::test]
+async fn test_attestation_report_no_aliasing_rejects() {
+    let server = setup_test_server().await;
+    let alias = setup_deprecated_alias(&server).await;
+
+    let encoded = url::form_urlencoded::byte_serialize(alias.as_bytes()).collect::<String>();
+    let response = server
+        .get(&format!("/v1/attestation/report?model={encoded}"))
+        .add_header("x-no-aliasing", "true")
+        .await;
+    assert_eq!(
+        response.status_code(),
+        400,
+        "x-no-aliasing on an aliased attestation request must 400, got: {}",
+        response.text()
+    );
+    assert!(
+        response.text().contains(E2E_QWEN_MODEL_NAME),
+        "rejection should name the canonical model: {}",
+        response.text()
+    );
+}
+
+#[tokio::test]
 async fn test_non_aliased_request_unannotated() {
     let server = setup_test_server().await;
     setup_qwen_model(&server).await;

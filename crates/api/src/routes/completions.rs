@@ -89,7 +89,12 @@ fn e2ee_requested(encryption_headers: &crate::routes::common::EncryptionHeaders)
 /// canonical name only when the response was genuinely produced through
 /// alias resolution — provider-side echo differences (e.g. an external
 /// provider answering `gpt-4o` with a dated snapshot id) resolve to `None`.
-/// Costs one DB lookup, paid only on the rare requested != served path.
+///
+/// Uses the cache-backed active-models list rather than a per-request DB
+/// resolve: requested != served is the *common* case for external providers
+/// (snapshot-id echoes), and on the streaming path this sits ahead of TTFT.
+/// Worst case the warning lags a just-registered alias by one cache TTL;
+/// strict mode (`reject_if_aliased`) keeps the authoritative DB lookup.
 async fn check_alias_resolution(
     models_service: &Arc<dyn services::models::ModelsServiceTrait>,
     requested: &str,
@@ -98,10 +103,11 @@ async fn check_alias_resolution(
     if requested == served {
         return None;
     }
-    match models_service.resolve_and_get_model(requested).await {
-        Ok(m) if m.model_name == served => Some(m.model_name),
-        _ => None,
-    }
+    let models = models_service.get_models_with_pricing().await.ok()?;
+    models
+        .iter()
+        .find(|m| m.model_name == served && m.aliases.iter().any(|a| a == requested))
+        .map(|m| m.model_name.clone())
 }
 
 /// Enforce the `x-no-aliasing` strict mode (issue #573): if the client set
@@ -1336,21 +1342,36 @@ async fn chat_completions_inner(
                     .header(header::CACHE_CONTROL, "no-cache")
                     .header(header::CONNECTION, "keep-alive");
 
+                // Collect CORS-exposed header names so the
+                // Access-Control-Expose-Headers value is a single
+                // comma-joined list (repeated header lines are not
+                // consistently merged by browsers).
+                let mut exposed_headers: Vec<&str> = Vec::new();
+
                 // Add Inference-Id header if available
                 if let Some(uuid) = inference_id {
-                    response_builder = response_builder
-                        .header(HEADER_INFERENCE_ID, uuid.to_string())
-                        .header("Access-Control-Expose-Headers", HEADER_INFERENCE_ID);
+                    response_builder =
+                        response_builder.header(HEADER_INFERENCE_ID, uuid.to_string());
+                    exposed_headers.push(HEADER_INFERENCE_ID);
                 }
 
-                // Announce alias substitution so it is never silent (issue #573)
+                // Announce alias substitution so it is never silent (issue #573).
+                // Guarded HeaderValue construction: a header-invalid byte in a
+                // model name must not panic the `.body().unwrap()` below.
                 if let Some(canonical) = &alias_canonical {
+                    if let Ok(value) = header::HeaderValue::from_str(&format!(
+                        "{} -> {}",
+                        request.model, canonical
+                    )) {
+                        response_builder =
+                            response_builder.header(HEADER_MODEL_ALIAS_RESOLVED, value);
+                        exposed_headers.push(HEADER_MODEL_ALIAS_RESOLVED);
+                    }
+                }
+
+                if !exposed_headers.is_empty() {
                     response_builder = response_builder
-                        .header(
-                            HEADER_MODEL_ALIAS_RESOLVED,
-                            format!("{} -> {}", request.model, canonical),
-                        )
-                        .header("Access-Control-Expose-Headers", HEADER_MODEL_ALIAS_RESOLVED);
+                        .header("Access-Control-Expose-Headers", exposed_headers.join(", "));
                 }
 
                 response_builder
@@ -1438,21 +1459,36 @@ async fn chat_completions_inner(
                     .status(StatusCode::OK)
                     .header(header::CONTENT_TYPE, "application/json");
 
+                // Collect CORS-exposed header names so the
+                // Access-Control-Expose-Headers value is a single
+                // comma-joined list (repeated header lines are not
+                // consistently merged by browsers).
+                let mut exposed_headers: Vec<&str> = Vec::new();
+
                 // Add Inference-Id header if available
                 if let Some(uuid) = inference_id {
-                    response_builder = response_builder
-                        .header(HEADER_INFERENCE_ID, uuid.to_string())
-                        .header("Access-Control-Expose-Headers", HEADER_INFERENCE_ID);
+                    response_builder =
+                        response_builder.header(HEADER_INFERENCE_ID, uuid.to_string());
+                    exposed_headers.push(HEADER_INFERENCE_ID);
                 }
 
-                // Announce alias substitution so it is never silent (issue #573)
+                // Announce alias substitution so it is never silent (issue #573).
+                // Guarded HeaderValue construction: a header-invalid byte in a
+                // model name must not panic the `.body().unwrap()` below.
                 if let Some(canonical) = &alias_canonical {
+                    if let Ok(value) = header::HeaderValue::from_str(&format!(
+                        "{} -> {}",
+                        request.model, canonical
+                    )) {
+                        response_builder =
+                            response_builder.header(HEADER_MODEL_ALIAS_RESOLVED, value);
+                        exposed_headers.push(HEADER_MODEL_ALIAS_RESOLVED);
+                    }
+                }
+
+                if !exposed_headers.is_empty() {
                     response_builder = response_builder
-                        .header(
-                            HEADER_MODEL_ALIAS_RESOLVED,
-                            format!("{} -> {}", request.model, canonical),
-                        )
-                        .header("Access-Control-Expose-Headers", HEADER_MODEL_ALIAS_RESOLVED);
+                        .header("Access-Control-Expose-Headers", exposed_headers.join(", "));
                 }
 
                 response_builder.body(Body::from(body_bytes)).unwrap()

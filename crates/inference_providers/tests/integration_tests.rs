@@ -669,6 +669,8 @@ async fn test_reasoning_content() {
                     }
                 }
             }
+            // Control events (blank lines, comments, [DONE]) carry no chunk
+            None => {}
             _ => panic!("Unexpected chunk type"),
         }
     }

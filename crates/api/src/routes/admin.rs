@@ -25,7 +25,7 @@ use axum::{
     response::Json as ResponseJson,
     Extension,
 };
-use chrono::{DateTime, Duration, DurationRound, Utc};
+use chrono::{DateTime, Duration, Timelike, Utc};
 use config::ApiConfig;
 use services::admin::{AdminService, AnalyticsService, UpdateModelAdminRequest};
 use services::auth::AuthServiceTrait;
@@ -43,19 +43,33 @@ use uuid::Uuid;
 ///
 /// - A bare ISO 8601 date (e.g. `2030-01-01`). Per the spec: *"Date-only
 ///   values default to 13:00 UTC on that date."* So we store 13:00 UTC.
-/// - An explicit RFC 3339 instant in UTC-hour form (e.g. `2025-06-01T15:00:00Z`).
-///   The spec only expresses whole UTC hours, so we normalize to the top of the
-///   hour (minutes/seconds/sub-second truncated) in UTC. Emitting and storing at
-///   finer precision would diverge from the spec, so we deliberately truncate.
+/// - An explicit RFC 3339 instant in whole-hour UTC form
+///   (e.g. `2025-06-01T15:00:00Z`). The spec only expresses whole UTC hours, so
+///   we accept the datetime form **only** when it is already an exact whole-hour
+///   UTC instant: minutes, seconds, and sub-second components must all be zero
+///   and the offset must be UTC. We do **not** truncate finer-grained values —
+///   that would silently move a model's deprecation earlier than requested and
+///   accept inputs outside the advertised contract. Anything off the hour, or in
+///   a non-UTC offset, returns `None` so the caller rejects it with a 400.
 ///
-/// Returns `None` for anything that does not parse as a date or RFC 3339
-/// instant, so callers can reject it with a 400.
+/// Note: a zero offset spelled `+00:00` is treated as equivalent to `Z` (both
+/// denote the same UTC instant), provided minutes/seconds/sub-second are zero.
+///
+/// Returns `None` for anything that does not parse as a date or as a whole-hour
+/// UTC RFC 3339 instant, so callers can reject it with a 400.
 fn parse_deprecation_date(s: &str) -> Option<DateTime<Utc>> {
     if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
-        // Normalize to the top of the UTC hour — the spec only models hour
-        // precision (`YYYY-MM-DDTHH:00:00Z`).
+        // Reject non-UTC offsets — the contract is whole-hour UTC only.
+        if dt.offset().local_minus_utc() != 0 {
+            return None;
+        }
         let utc = dt.with_timezone(&Utc);
-        return utc.duration_trunc(Duration::hours(1)).ok();
+        // Reject anything not already on the top of the hour. We do not truncate;
+        // off-hour datetimes are invalid input.
+        if utc.minute() != 0 || utc.second() != 0 || utc.nanosecond() != 0 {
+            return None;
+        }
+        return Some(utc);
     }
     if let Ok(date) = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d") {
         // Date-only values default to 13:00 UTC on that date (OpenRouter spec).
@@ -265,18 +279,20 @@ pub async fn batch_upsert_models(
                 }
             }
         }
-        // `deprecation_date` must parse as ISO 8601 (a bare date like
-        // "2026-01-01" or a full instant like "2026-01-01T00:00:00Z"). Reject
-        // anything else at the write path so the stored value — and the
-        // `GET /v1/models` we serve from it — stays well-formed. An explicit
-        // `null` (clear) and an omitted field both skip this check.
+        // `deprecation_date` must be either a bare date (`YYYY-MM-DD`, which
+        // defaults to 13:00 UTC) or a whole-hour UTC instant
+        // (`YYYY-MM-DDTHH:00:00Z`). We reject off-hour or non-UTC datetimes
+        // rather than silently truncating them, so the stored value — and the
+        // `GET /v1/models` we serve from it — never deprecates a model earlier
+        // than requested. An explicit `null` (clear) and an omitted field both
+        // skip this check.
         if let Some(Some(d)) = &request.deprecation_date {
             if parse_deprecation_date(d).is_none() {
                 return Err((
                     StatusCode::BAD_REQUEST,
                     ResponseJson(ErrorResponse::new(
                         format!(
-                            "model '{model_name}': deprecationDate: '{d}' must be an ISO 8601 date (YYYY-MM-DD) or RFC 3339 datetime (e.g. 2026-01-01T00:00:00Z)"
+                            "model '{model_name}': deprecationDate: '{d}' must be a date 'YYYY-MM-DD' (defaults to 13:00 UTC) or a whole-hour UTC instant 'YYYY-MM-DDTHH:00:00Z' (e.g. 2026-01-01T00:00:00Z); off-hour or non-UTC datetimes are not accepted"
                         ),
                         "invalid_request".to_string(),
                     )),
@@ -2966,23 +2982,35 @@ mod deprecation_date_tests {
 
     #[test]
     fn explicit_utc_hour_round_trips() {
-        // Spec example: 2025-06-01T15:00:00Z.
+        // Spec example: 2025-06-01T15:00:00Z is accepted as-is.
         let dt = parse_deprecation_date("2025-06-01T15:00:00Z").expect("must parse");
         assert_eq!(format_deprecation_date(&dt), "2025-06-01T15:00:00Z");
     }
 
     #[test]
-    fn sub_hour_precision_truncates_to_hour() {
-        // The spec only models hour precision; finer input is truncated down.
-        let dt = parse_deprecation_date("2025-06-01T15:47:33Z").expect("must parse");
+    fn zero_offset_plus_00_00_is_accepted_as_utc() {
+        // `+00:00` denotes the same instant as `Z`; with whole-hour
+        // minutes/seconds it is accepted and round-trips to the `Z` form.
+        let dt = parse_deprecation_date("2025-06-01T15:00:00+00:00").expect("must parse");
         assert_eq!(format_deprecation_date(&dt), "2025-06-01T15:00:00Z");
     }
 
     #[test]
-    fn non_utc_offset_is_normalized_to_utc_hour() {
-        // 15:30+02:00 == 13:30 UTC, truncated to 13:00 UTC.
-        let dt = parse_deprecation_date("2025-06-01T15:30:00+02:00").expect("must parse");
-        assert_eq!(format_deprecation_date(&dt), "2025-06-01T13:00:00Z");
+    fn sub_hour_precision_is_rejected() {
+        // Off-hour datetimes must be rejected (not truncated): truncation would
+        // deprecate the model earlier than the requested instant.
+        assert!(parse_deprecation_date("2025-06-01T15:47:33Z").is_none());
+        // Non-zero minutes alone are also rejected.
+        assert!(parse_deprecation_date("2025-06-01T15:30:00Z").is_none());
+    }
+
+    #[test]
+    fn non_utc_offset_is_rejected() {
+        // 15:30+02:00 is not a whole-hour UTC instant; reject it.
+        assert!(parse_deprecation_date("2025-06-01T15:30:00+02:00").is_none());
+        // Even a whole-hour wall-clock time in a non-UTC offset is rejected:
+        // 15:00+02:00 == 13:00 UTC, which the caller did not write.
+        assert!(parse_deprecation_date("2025-06-01T15:00:00+02:00").is_none());
     }
 
     #[test]

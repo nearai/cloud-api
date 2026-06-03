@@ -210,8 +210,9 @@ async fn test_admin_upsert_is_ready_and_deprecation_date_round_trip() {
         "explicit datetime should serialize in UTC-hour form (OpenRouter spec)"
     );
 
-    // A finer-than-hour explicit time is normalized down to the whole UTC hour
-    // (the spec only models hour precision).
+    // A finer-than-hour explicit time is rejected with 400 — we do NOT truncate
+    // it, since that would deprecate the model earlier than requested and accept
+    // a value outside the advertised YYYY-MM-DDTHH:00:00Z contract.
     let mut batch3 = BatchUpdateModelApiRequest::new();
     batch3.insert(
         model_name.clone(),
@@ -220,15 +221,58 @@ async fn test_admin_upsert_is_ready_and_deprecation_date_round_trip() {
         }))
         .unwrap(),
     );
-    let updated3 = admin_batch_upsert_models(&server, batch3, get_session_id()).await;
-    let model3 = updated3
-        .iter()
-        .find(|m| m.model_id == model_name)
-        .expect("update should return our model");
+    let response3 = server
+        .patch("/v1/admin/models")
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .add_header("User-Agent", MOCK_USER_AGENT)
+        .json(&batch3)
+        .await;
     assert_eq!(
-        model3.metadata.deprecation_date.as_deref(),
+        response3.status_code(),
+        400,
+        "off-hour datetime must be rejected (not truncated), got: {}",
+        response3.text()
+    );
+    assert!(
+        response3.text().contains("deprecationDate"),
+        "error should mention deprecationDate, got: {}",
+        response3.text()
+    );
+
+    // The rejected write must not have mutated the previously stored whole-hour
+    // value: it still round-trips through the public GET /v1/models.
+    let listed_after = list_models(&server, api_key).await;
+    let public_after = listed_after
+        .data
+        .iter()
+        .find(|m| m.id == model_name)
+        .expect("model should still appear in GET /v1/models");
+    assert_eq!(
+        public_after.deprecation_date.as_deref(),
         Some("2031-06-15T15:00:00Z"),
-        "sub-hour precision should truncate to the top of the UTC hour"
+        "rejected off-hour write must leave the prior whole-hour value intact"
+    );
+
+    // A non-UTC offset (even on a whole hour) is likewise rejected.
+    let mut batch4 = BatchUpdateModelApiRequest::new();
+    batch4.insert(
+        model_name.clone(),
+        serde_json::from_value(serde_json::json!({
+            "deprecationDate": "2031-06-15T15:00:00+02:00"
+        }))
+        .unwrap(),
+    );
+    let response4 = server
+        .patch("/v1/admin/models")
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .add_header("User-Agent", MOCK_USER_AGENT)
+        .json(&batch4)
+        .await;
+    assert_eq!(
+        response4.status_code(),
+        400,
+        "non-UTC offset must be rejected, got: {}",
+        response4.text()
     );
 }
 

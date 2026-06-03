@@ -240,7 +240,42 @@ impl From<services::attestation::models::AttestationReport> for AttestationRespo
 pub async fn get_attestation_report(
     Query(params): Query<AttestationQuery>,
     State(app_state): State<AppState>,
-) -> Result<ResponseJson<AttestationResponse>, (StatusCode, ResponseJson<ErrorResponse>)> {
+    headers: axum::http::HeaderMap,
+) -> Result<axum::response::Response, (StatusCode, ResponseJson<ErrorResponse>)> {
+    // Surface alias resolution before fetching the report (issue #573):
+    // a client asking for model X must learn — or, with x-no-aliasing,
+    // refuse to learn — that the attestation (and the TD signing key it
+    // binds) belongs to a different canonical model.
+    let mut alias_resolved: Option<(String, String)> = None;
+    if let Some(requested) = &params.model {
+        if let Ok(m) = app_state
+            .models_service
+            .resolve_and_get_model(requested)
+            .await
+        {
+            if &m.model_name != requested {
+                if crate::routes::common::no_aliasing_requested(&headers) {
+                    return Err((
+                        StatusCode::BAD_REQUEST,
+                        ResponseJson(ErrorResponse {
+                            error: format!(
+                                "Model '{requested}' is an alias of '{}' and the request set \
+                                 {}. Use the canonical model name '{}'.",
+                                m.model_name,
+                                crate::routes::common::HEADER_NO_ALIASING,
+                                m.model_name
+                            ),
+                        }),
+                    ));
+                }
+                alias_resolved = Some((requested.clone(), m.model_name));
+            }
+        }
+        // Unknown model or resolver error: fall through — the attestation
+        // service produces its own error for unknown models, and strict
+        // mode only guards the alias-substitution case.
+    }
+
     let report = app_state
         .attestation_service
         .get_attestation_report(
@@ -260,8 +295,26 @@ pub async fn get_attestation_report(
             )
         })?;
 
-    let response = report.into();
-    Ok(ResponseJson(response))
+    let response: AttestationResponse = report.into();
+    let mut http_response = axum::response::IntoResponse::into_response(ResponseJson(response));
+    if let Some((requested, canonical)) = alias_resolved {
+        if let Ok(value) = axum::http::HeaderValue::from_str(&format!("{requested} -> {canonical}"))
+        {
+            http_response.headers_mut().insert(
+                axum::http::HeaderName::from_static(
+                    crate::routes::common::HEADER_MODEL_ALIAS_RESOLVED,
+                ),
+                value,
+            );
+            http_response.headers_mut().insert(
+                axum::http::HeaderName::from_static("access-control-expose-headers"),
+                axum::http::HeaderValue::from_static(
+                    crate::routes::common::HEADER_MODEL_ALIAS_RESOLVED,
+                ),
+            );
+        }
+    }
+    Ok(http_response)
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]

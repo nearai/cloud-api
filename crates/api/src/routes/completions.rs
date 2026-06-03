@@ -1,7 +1,14 @@
 use crate::{
     middleware::{auth::AuthenticatedApiKey, RequestBodyHash},
     models::*,
-    routes::{api::AppState, common::map_domain_error_to_status, files::MAX_FILE_SIZE},
+    routes::{
+        api::AppState,
+        common::{
+            alias_warning_message, inject_warning_field, map_domain_error_to_status,
+            no_aliasing_requested, HEADER_MODEL_ALIAS_RESOLVED, HEADER_NO_ALIASING,
+        },
+        files::MAX_FILE_SIZE,
+    },
 };
 use axum::{
     body::{Body, Bytes},
@@ -65,6 +72,82 @@ fn insert_encryption_headers(
 
 // Custom header for exposing the inference ID as a UUID
 const HEADER_INFERENCE_ID: &str = "Inference-Id";
+
+/// True when any E2EE encryption header was supplied. E2EE bodies are opaque
+/// to the gateway, so alias warnings can't be injected into them — the
+/// `x-model-alias-resolved` response header is the only signal in that mode.
+fn e2ee_requested(encryption_headers: &crate::routes::common::EncryptionHeaders) -> bool {
+    encryption_headers.signing_algo.is_some()
+        || encryption_headers.client_pub_key.is_some()
+        || encryption_headers.model_pub_key.is_some()
+        || encryption_headers.encryption_version.is_some()
+        || encryption_headers.encrypt_all_fields.is_some()
+}
+
+/// When the served model differs from the requested one, confirm via the
+/// catalog that `requested` is a registered alias of `served`. Returns the
+/// canonical name only when the response was genuinely produced through
+/// alias resolution — provider-side echo differences (e.g. an external
+/// provider answering `gpt-4o` with a dated snapshot id) resolve to `None`.
+/// Costs one DB lookup, paid only on the rare requested != served path.
+async fn check_alias_resolution(
+    models_service: &Arc<dyn services::models::ModelsServiceTrait>,
+    requested: &str,
+    served: &str,
+) -> Option<String> {
+    if requested == served {
+        return None;
+    }
+    match models_service.resolve_and_get_model(requested).await {
+        Ok(m) if m.model_name == served => Some(m.model_name),
+        _ => None,
+    }
+}
+
+/// Enforce the `x-no-aliasing` strict mode (issue #573): if the client set
+/// the header and the requested model is an alias, refuse with 400 before
+/// any inference happens — i.e. before tokens are billed and, for E2EE
+/// clients, before a payload is bound to a different model TD's signing key.
+///
+/// Unknown models fall through (`Ok`) so the completion service returns its
+/// canonical "not a valid model name or alias" error.
+async fn reject_if_aliased(
+    models_service: &Arc<dyn services::models::ModelsServiceTrait>,
+    headers: &header::HeaderMap,
+    requested_model: &str,
+) -> Result<(), Response> {
+    if !no_aliasing_requested(headers) {
+        return Ok(());
+    }
+    match models_service.resolve_and_get_model(requested_model).await {
+        Ok(m) if m.model_name != requested_model => Err((
+            StatusCode::BAD_REQUEST,
+            ResponseJson(ErrorResponse::new(
+                format!(
+                    "Model '{requested_model}' is an alias of '{}' and the request set \
+                     {HEADER_NO_ALIASING}. Use the canonical model name '{}'.",
+                    m.model_name, m.model_name
+                ),
+                "model_alias_rejected".to_string(),
+            )),
+        )
+            .into_response()),
+        Ok(_) => Ok(()),
+        Err(services::models::ModelsError::NotFound(_)) => Ok(()),
+        Err(_) => {
+            // Strict mode must fail closed: if the catalog can't be
+            // consulted, we can't guarantee no alias was applied.
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ResponseJson(ErrorResponse::new(
+                    "Failed to resolve model for x-no-aliasing check".to_string(),
+                    "internal_server_error".to_string(),
+                )),
+            )
+                .into_response())
+        }
+    }
+}
 
 /// Build a `RecordUsageServiceRequest` for image operations (generation or editing).
 fn build_image_usage_request(
@@ -986,6 +1069,14 @@ async fn chat_completions_inner(
 
     // Add validated headers to service_request.extra
     insert_encryption_headers(&encryption_headers, &mut service_request.extra);
+    let e2ee_active = e2ee_requested(&encryption_headers);
+
+    // Strict alias mode: refuse to serve through an alias before any
+    // inference happens (issue #573).
+    if let Err(resp) = reject_if_aliased(&app_state.models_service, &headers, &request.model).await
+    {
+        return resp;
+    }
 
     // Auto-redact (opt-in via x-auto-redact header or auto_redact body field).
     // On success this may rewrite service_request.messages to substitute
@@ -1020,13 +1111,45 @@ async fn chat_completions_inner(
                 // Make stream peekable to extract chat_id for Inference-Id header
                 let mut peekable_stream = Box::pin(stream.peekable());
 
-                // Peek at first chunk to extract chat_id and generate Inference-Id UUID
-                let inference_id = peekable_stream
+                // Peek at first chunk to extract chat_id and generate Inference-Id UUID.
+                // Also capture the served model name so alias substitution
+                // can be surfaced (issue #573).
+                let (inference_id, first_chunk_model) = match peekable_stream
                     .as_mut()
                     .peek()
                     .await
                     .and_then(|result| result.as_ref().ok())
-                    .map(|event| extract_inference_id_from_chunk(&event.chunk));
+                {
+                    Some(event) => (
+                        Some(extract_inference_id_from_chunk(&event.chunk)),
+                        match &event.chunk {
+                            inference_providers::StreamChunk::Chat(c) => Some(c.model.clone()),
+                            _ => None,
+                        },
+                    ),
+                    None => (None, None),
+                };
+
+                // Canonical name when the request was served through a
+                // catalog alias (e.g. a deprecated model rewritten to its
+                // successor); None on the common non-aliased path.
+                let alias_canonical = match &first_chunk_model {
+                    Some(served) => {
+                        check_alias_resolution(&app_state.models_service, &request.model, served)
+                            .await
+                    }
+                    None => None,
+                };
+                // Warning to inject into the first streamed chunk. Skipped
+                // for E2EE (the chunks are opaque; the response header is
+                // the only signal there).
+                let alias_warning_pending: Arc<std::sync::Mutex<Option<String>>> =
+                    Arc::new(std::sync::Mutex::new(
+                        alias_canonical
+                            .as_ref()
+                            .filter(|_| !e2ee_active)
+                            .map(|canonical| alias_warning_message(&request.model, canonical)),
+                    ));
 
                 if inference_id.is_none() {
                     tracing::warn!(
@@ -1073,6 +1196,7 @@ async fn chat_completions_inner(
                         let states = unredact_states.clone();
                         let template = chunk_template.clone();
                         let map = redaction_map_for_chunks.clone();
+                        let pending_warning = alias_warning_pending.clone();
                         async move {
                             match result {
                                 Ok(mut event) => {
@@ -1112,14 +1236,31 @@ async fn chat_completions_inner(
                                     // Serialize the parsed chunk (normalized to OpenAI format)
                                     // instead of forwarding raw provider bytes, which may be
                                     // in a provider-specific format (e.g. Gemini native).
-                                    let json_data = serde_json::to_string(&event.chunk)
-                                        .unwrap_or_else(|e| {
-                                            tracing::error!(
-                                                %organization_id,
-                                                "Failed to serialize stream chunk: {e}"
-                                            );
-                                            "{}".to_string()
-                                        });
+                                    // The first chunk of an alias-served response gets a
+                                    // top-level "warning" so the substitution isn't silent.
+                                    let alias_warning =
+                                        pending_warning.lock().ok().and_then(|mut g| g.take());
+                                    let json_data = match alias_warning {
+                                        Some(warning) => {
+                                            serde_json::to_value(&event.chunk).map(|mut v| {
+                                                if let Some(obj) = v.as_object_mut() {
+                                                    obj.insert(
+                                                        "warning".to_string(),
+                                                        serde_json::Value::String(warning),
+                                                    );
+                                                }
+                                                v.to_string()
+                                            })
+                                        }
+                                        None => serde_json::to_string(&event.chunk),
+                                    }
+                                    .unwrap_or_else(|e| {
+                                        tracing::error!(
+                                            %organization_id,
+                                            "Failed to serialize stream chunk: {e}"
+                                        );
+                                        "{}".to_string()
+                                    });
                                     // Suppress per-chunk debug logging when
                                     // auto_redact is enabled: the chunk now
                                     // holds the user's original PII (we just
@@ -1202,6 +1343,16 @@ async fn chat_completions_inner(
                         .header("Access-Control-Expose-Headers", HEADER_INFERENCE_ID);
                 }
 
+                // Announce alias substitution so it is never silent (issue #573)
+                if let Some(canonical) = &alias_canonical {
+                    response_builder = response_builder
+                        .header(
+                            HEADER_MODEL_ALIAS_RESOLVED,
+                            format!("{} -> {}", request.model, canonical),
+                        )
+                        .header("Access-Control-Expose-Headers", HEADER_MODEL_ALIAS_RESOLVED);
+                }
+
                 response_builder
                     .body(Body::from_stream(byte_stream))
                     .unwrap()
@@ -1226,6 +1377,15 @@ async fn chat_completions_inner(
                 // Extract inference ID from response ID (reuse same hashing as usage tracking)
                 let inference_id =
                     Some(hash_inference_id_to_uuid(&response_with_bytes.response.id));
+
+                // Canonical name when the request was served through a
+                // catalog alias (issue #573); None on the common path.
+                let alias_canonical = check_alias_resolution(
+                    &app_state.models_service,
+                    &request.model,
+                    &response_with_bytes.response.model,
+                )
+                .await;
 
                 // When auto-redact is enabled, we substitute placeholders back to
                 // originals and re-serialize. The provider's raw_bytes are over the
@@ -1257,6 +1417,23 @@ async fn chat_completions_inner(
                     response_with_bytes.raw_bytes
                 };
 
+                // Annotate alias-served responses with a top-level "warning"
+                // (issue #573). This re-serializes the body, so — like
+                // auto-redact — it deliberately gives up raw-bytes hash
+                // verification for these responses; clients that need the
+                // raw-bytes guarantee should send the canonical model name
+                // (or x-no-aliasing). E2EE bodies are opaque and are left
+                // untouched (inject_warning_field returns None for them, and
+                // we don't attempt it) — the header below is the signal.
+                let body_bytes = match &alias_canonical {
+                    Some(canonical) if !e2ee_active => inject_warning_field(
+                        &body_bytes,
+                        &alias_warning_message(&request.model, canonical),
+                    )
+                    .unwrap_or(body_bytes),
+                    _ => body_bytes,
+                };
+
                 let mut response_builder = Response::builder()
                     .status(StatusCode::OK)
                     .header(header::CONTENT_TYPE, "application/json");
@@ -1266,6 +1443,16 @@ async fn chat_completions_inner(
                     response_builder = response_builder
                         .header(HEADER_INFERENCE_ID, uuid.to_string())
                         .header("Access-Control-Expose-Headers", HEADER_INFERENCE_ID);
+                }
+
+                // Announce alias substitution so it is never silent (issue #573)
+                if let Some(canonical) = &alias_canonical {
+                    response_builder = response_builder
+                        .header(
+                            HEADER_MODEL_ALIAS_RESOLVED,
+                            format!("{} -> {}", request.model, canonical),
+                        )
+                        .header("Access-Control-Expose-Headers", HEADER_MODEL_ALIAS_RESOLVED);
                 }
 
                 response_builder.body(Body::from(body_bytes)).unwrap()

@@ -1786,6 +1786,7 @@ fn model_with_pricing_to_info(model: services::models::ModelWithPricing) -> Mode
             max_completion_tokens: model.max_output_length,
             is_moderated: false,
         }),
+        datacenters: crate::models::Datacenter::from_codes(model.datacenters),
     }
 }
 
@@ -1871,6 +1872,7 @@ mod tests {
             max_output_length: None,
             supported_sampling_parameters: vec![],
             supported_features: vec![],
+            datacenters: None,
             created_at: chrono::Utc::now(),
         }
     }

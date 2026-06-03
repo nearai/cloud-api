@@ -825,6 +825,44 @@ pub struct ModelInfo {
     /// OpenRouter `top_provider`: per-provider context/output limits.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub top_provider: Option<TopProvider>,
+    /// Datacenters the model runs in (OpenRouter `datacenters`), e.g.
+    /// `[{ "country_code": "US" }]`. Omitted when unset.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub datacenters: Option<Vec<Datacenter>>,
+}
+
+/// OpenRouter `datacenters` entry: a single datacenter the model runs in.
+///
+/// The provider spec
+/// (https://openrouter.ai/docs/guides/community/for-providers) models
+/// `datacenters` as an array of objects, each with an ISO 3166 Alpha-2
+/// `country_code`. We store only the country codes (a `TEXT[]`) and
+/// reconstruct this object wrapper at serialization time.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct Datacenter {
+    /// ISO 3166 Alpha-2 country code (e.g. "US"), uppercase.
+    pub country_code: String,
+}
+
+impl Datacenter {
+    /// Wrap stored country codes into OpenRouter `datacenters` objects.
+    /// Returns `None` for `None`/empty so the field is omitted from output.
+    pub fn from_codes(codes: Option<Vec<String>>) -> Option<Vec<Datacenter>> {
+        match codes {
+            Some(codes) if !codes.is_empty() => Some(
+                codes
+                    .into_iter()
+                    .map(|country_code| Datacenter { country_code })
+                    .collect(),
+            ),
+            _ => None,
+        }
+    }
+
+    /// Flatten OpenRouter `datacenters` objects back into stored country codes.
+    pub fn to_codes(datacenters: Option<Vec<Datacenter>>) -> Option<Vec<String>> {
+        datacenters.map(|dcs| dcs.into_iter().map(|dc| dc.country_code).collect())
+    }
 }
 
 /// OpenRouter `top_provider` block: context length and max output tokens
@@ -2998,6 +3036,10 @@ pub struct ModelMetadata {
         default
     )]
     pub supported_features: Vec<String>,
+    /// Datacenters the model runs in (OpenRouter `datacenters`), e.g.
+    /// `[{ "country_code": "US" }]`. Omitted when unset.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub datacenters: Option<Vec<Datacenter>>,
 }
 
 /// Request to update model pricing (admin endpoint)
@@ -3067,6 +3109,11 @@ pub struct UpdateModelApiRequest {
     /// Feature capabilities (OpenRouter vocabulary).
     #[serde(rename = "supportedFeatures", skip_serializing_if = "Option::is_none")]
     pub supported_features: Option<Vec<String>>,
+    /// Datacenters the model runs in (OpenRouter `datacenters`), as
+    /// `[{ "country_code": "US" }]`. Country codes must be 2-letter
+    /// uppercase ISO 3166 Alpha-2.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub datacenters: Option<Vec<Datacenter>>,
     #[serde(rename = "changeReason", skip_serializing_if = "Option::is_none")]
     pub change_reason: Option<String>,
 }
@@ -3196,6 +3243,10 @@ pub struct ModelHistoryEntry {
         default
     )]
     pub supported_features: Vec<String>,
+    /// Datacenters the model ran in (OpenRouter `datacenters`), e.g.
+    /// `[{ "country_code": "US" }]`. Omitted when unset.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub datacenters: Option<Vec<Datacenter>>,
 }
 
 /// Model history response - complete history of model changes

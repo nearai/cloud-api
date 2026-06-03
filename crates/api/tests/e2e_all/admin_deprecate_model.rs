@@ -365,3 +365,58 @@ async fn test_deprecate_inactive_successor_returns_404() {
         resp.text()
     );
 }
+
+/// Deprecation writes its own `model_history` snapshot in-transaction; that
+/// snapshot must preserve the deprecated model's `datacenters`.
+#[tokio::test]
+async fn test_deprecate_preserves_datacenters_in_history() {
+    let server = setup_test_server().await;
+    let old = format!("test-deprecate-dc-old-{}", uuid::Uuid::new_v4());
+    let new = format!("test-deprecate-dc-new-{}", uuid::Uuid::new_v4());
+
+    // Create the to-be-deprecated model with datacenters set.
+    let mut batch = BatchUpdateModelApiRequest::new();
+    let mut payload = minimal_model_upsert(&[]);
+    payload["datacenters"] = serde_json::json!([{ "country_code": "US" }]);
+    batch.insert(old.clone(), serde_json::from_value(payload).unwrap());
+    admin_batch_upsert_models(&server, batch, get_session_id()).await;
+    create_model(&server, &new, &[]).await;
+
+    let resp = deprecate(
+        &server,
+        serde_json::json!({ "modelId": old, "successorModelId": new }),
+    )
+    .await;
+    assert_eq!(
+        resp.status_code(),
+        200,
+        "Deprecation should succeed: {}",
+        resp.text()
+    );
+
+    let response = server
+        .get(format!("/v1/admin/models/{old}/history").as_str())
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .await;
+    assert_eq!(response.status_code(), 200);
+    let history_response = response.json::<api::models::ModelHistoryResponse>();
+
+    // The most recent entry is the deprecation (is_active=false) snapshot.
+    let latest = &history_response.history[0];
+    assert!(
+        !latest.is_active,
+        "Most recent history entry should be the deprecation snapshot"
+    );
+    let codes: Vec<&str> = latest
+        .datacenters
+        .as_ref()
+        .expect("deprecation history should preserve datacenters")
+        .iter()
+        .map(|dc| dc.country_code.as_str())
+        .collect();
+    assert_eq!(
+        codes,
+        vec!["US"],
+        "Deprecation history snapshot should retain datacenters"
+    );
+}

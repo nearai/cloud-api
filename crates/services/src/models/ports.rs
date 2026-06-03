@@ -67,6 +67,10 @@ pub struct ModelWithPricing {
     pub supported_sampling_parameters: Vec<String>,
     /// Feature capabilities (OpenRouter vocabulary: tools, json_mode, ...).
     pub supported_features: Vec<String>,
+    /// Datacenter country codes (ISO 3166 Alpha-2) the model runs in.
+    /// NULL when unset; serialized on the public API as
+    /// `datacenters: [{ "country_code": "US" }, ...]`.
+    pub datacenters: Option<Vec<String>>,
     /// When the model row was created — used as OpenRouter's `created` unix timestamp.
     pub created_at: chrono::DateTime<chrono::Utc>,
 }

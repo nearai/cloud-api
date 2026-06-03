@@ -206,6 +206,26 @@ pub async fn batch_upsert_models(
                 }
             }
         }
+        if let Some(datacenters) = &request.datacenters {
+            // OpenRouter's `datacenters` country_code is an ISO 3166 Alpha-2
+            // code: exactly two ASCII uppercase letters. Reject anything else
+            // so the catalog can't emit malformed codes.
+            for dc in datacenters {
+                let code = &dc.country_code;
+                let valid = code.len() == 2 && code.bytes().all(|b| b.is_ascii_uppercase());
+                if !valid {
+                    return Err((
+                        StatusCode::BAD_REQUEST,
+                        ResponseJson(ErrorResponse::new(
+                            format!(
+                                "model '{model_name}': datacenters: '{code}' is not a 2-letter uppercase ISO 3166 Alpha-2 country code"
+                            ),
+                            "invalid_request".to_string(),
+                        )),
+                    ));
+                }
+            }
+        }
     }
 
     // Extract admin user context for audit tracking
@@ -247,6 +267,7 @@ pub async fn batch_upsert_models(
                     max_output_length: request.max_output_length,
                     supported_sampling_parameters: request.supported_sampling_parameters.clone(),
                     supported_features: request.supported_features.clone(),
+                    datacenters: crate::models::Datacenter::to_codes(request.datacenters.clone()),
                     change_reason: request.change_reason.clone(),
                     changed_by_user_id: Some(admin_user_id),
                     changed_by_user_email: Some(admin_user_email.clone()),
@@ -450,6 +471,7 @@ pub async fn batch_upsert_models(
                 max_output_length: updated_model.max_output_length,
                 supported_sampling_parameters: updated_model.supported_sampling_parameters,
                 supported_features: updated_model.supported_features,
+                datacenters: crate::models::Datacenter::from_codes(updated_model.datacenters),
             },
         })
         .collect();
@@ -553,6 +575,7 @@ pub async fn list_models(
                 max_output_length: model.max_output_length,
                 supported_sampling_parameters: model.supported_sampling_parameters,
                 supported_features: model.supported_features,
+                datacenters: crate::models::Datacenter::from_codes(model.datacenters),
             },
             is_active: model.is_active,
             created_at: model.created_at,
@@ -688,6 +711,7 @@ pub async fn get_model_history(
             max_output_length: h.max_output_length,
             supported_sampling_parameters: h.supported_sampling_parameters,
             supported_features: h.supported_features,
+            datacenters: crate::models::Datacenter::from_codes(h.datacenters),
         })
         .collect();
 
@@ -1212,6 +1236,7 @@ pub async fn deprecate_model(
             max_output_length: m.max_output_length,
             supported_sampling_parameters: m.supported_sampling_parameters,
             supported_features: m.supported_features,
+            datacenters: crate::models::Datacenter::from_codes(m.datacenters),
         },
     };
 

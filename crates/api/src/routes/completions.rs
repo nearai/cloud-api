@@ -1737,10 +1737,21 @@ fn model_with_pricing_to_info(model: services::models::ModelWithPricing) -> Mode
         input_cache_read: nano_dollars_to_per_token_string(model.cache_read_cost_per_token),
     };
 
-    let architecture = ModelArchitecture::from_options(
-        model.input_modalities.clone(),
-        model.output_modalities.clone(),
-    );
+    // OpenRouter's provider spec marks `input_modalities` / `output_modalities`
+    // as REQUIRED fields. They are derived from the nullable `architecture`
+    // column, so models whose architecture was never backfilled would otherwise
+    // emit no modality fields at all. Default to text/text so the required
+    // fields are never absent. Real per-model values are set via the admin API.
+    let input_modalities = model
+        .input_modalities
+        .unwrap_or_else(|| vec!["text".to_string()]);
+    let output_modalities = model
+        .output_modalities
+        .unwrap_or_else(|| vec!["text".to_string()]);
+    let architecture = Some(ModelArchitecture {
+        input_modalities: input_modalities.clone(),
+        output_modalities: output_modalities.clone(),
+    });
 
     let name = if model.model_display_name.is_empty() {
         None
@@ -1765,8 +1776,8 @@ fn model_with_pricing_to_info(model: services::models::ModelWithPricing) -> Mode
         context_length: Some(model.context_length),
         max_output_length: model.max_output_length,
         architecture,
-        input_modalities: model.input_modalities,
-        output_modalities: model.output_modalities,
+        input_modalities: Some(input_modalities),
+        output_modalities: Some(output_modalities),
         supported_sampling_parameters: model.supported_sampling_parameters,
         supported_features: model.supported_features,
         description,
@@ -1829,6 +1840,79 @@ mod tests {
             nano_dollars_to_per_token_string(i64::MAX),
             "9223372036.854775807"
         );
+    }
+
+    fn make_model_with_pricing(
+        input_modalities: Option<Vec<String>>,
+        output_modalities: Option<Vec<String>>,
+    ) -> services::models::ModelWithPricing {
+        services::models::ModelWithPricing {
+            id: uuid::Uuid::new_v4(),
+            model_name: "test/model".to_string(),
+            model_display_name: "Test Model".to_string(),
+            model_description: "A test model".to_string(),
+            model_icon: None,
+            input_cost_per_token: 0,
+            output_cost_per_token: 0,
+            cost_per_image: 0,
+            cache_read_cost_per_token: 0,
+            context_length: 4096,
+            verifiable: false,
+            aliases: vec![],
+            owned_by: "test".to_string(),
+            provider_type: "vllm".to_string(),
+            provider_config: None,
+            attestation_supported: false,
+            input_modalities,
+            output_modalities,
+            inference_url: None,
+            hugging_face_id: None,
+            quantization: None,
+            max_output_length: None,
+            supported_sampling_parameters: vec![],
+            supported_features: vec![],
+            created_at: chrono::Utc::now(),
+        }
+    }
+
+    #[test]
+    fn model_without_architecture_defaults_to_text_modalities() {
+        // OpenRouter requires input_modalities / output_modalities. Models whose
+        // architecture column was never backfilled (NULL modalities) must still
+        // emit the text/text defaults so the required fields are never absent.
+        let info = model_with_pricing_to_info(make_model_with_pricing(None, None));
+
+        assert_eq!(info.input_modalities, Some(vec!["text".to_string()]));
+        assert_eq!(info.output_modalities, Some(vec!["text".to_string()]));
+
+        let architecture = info
+            .architecture
+            .expect("architecture must be populated even without DB modalities");
+        assert_eq!(architecture.input_modalities, vec!["text".to_string()]);
+        assert_eq!(architecture.output_modalities, vec!["text".to_string()]);
+    }
+
+    #[test]
+    fn model_with_architecture_preserves_real_modalities() {
+        // When the DB has real modalities they must pass through untouched
+        // (both the flat fields and the nested architecture shape).
+        let info = model_with_pricing_to_info(make_model_with_pricing(
+            Some(vec!["text".to_string(), "image".to_string()]),
+            Some(vec!["text".to_string()]),
+        ));
+
+        assert_eq!(
+            info.input_modalities,
+            Some(vec!["text".to_string(), "image".to_string()])
+        );
+        assert_eq!(info.output_modalities, Some(vec!["text".to_string()]));
+
+        let architecture = info.architecture.expect("architecture must be populated");
+        assert_eq!(
+            architecture.input_modalities,
+            vec!["text".to_string(), "image".to_string()]
+        );
+        assert_eq!(architecture.output_modalities, vec!["text".to_string()]);
     }
 
     fn make_chat_chunk(id: &str) -> inference_providers::StreamChunk {

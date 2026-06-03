@@ -34,6 +34,17 @@ pub struct UpdateModelAdminRequest {
     pub supported_features: Option<Vec<String>>,
     /// Datacenter country codes (ISO 3166 Alpha-2) the model runs in.
     pub datacenters: Option<Vec<String>>,
+    /// Whether the model is "ready" (OpenRouter `is_ready`).
+    ///
+    /// Tri-state: `None` = leave unchanged, `Some(None)` = clear to NULL,
+    /// `Some(Some(v))` = set to `v`.
+    pub is_ready: Option<Option<bool>>,
+    /// Planned deprecation date (OpenRouter `deprecation_date`), parsed and
+    /// normalized from an ISO 8601 string at the route layer.
+    ///
+    /// Tri-state: `None` = leave unchanged, `Some(None)` = clear to NULL,
+    /// `Some(Some(dt))` = set to `dt`.
+    pub deprecation_date: Option<Option<chrono::DateTime<chrono::Utc>>>,
     // User audit tracking for history
     pub change_reason: Option<String>,
     pub changed_by_user_id: Option<uuid::Uuid>,
@@ -82,6 +93,8 @@ pub struct ModelPricing {
     pub supported_features: Vec<String>,
     /// Datacenter country codes (ISO 3166 Alpha-2) the model runs in.
     pub datacenters: Option<Vec<String>>,
+    pub is_ready: Option<bool>,
+    pub deprecation_date: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// Model history entry - includes pricing, context length, and other model attributes
@@ -113,6 +126,8 @@ pub struct ModelHistoryEntry {
     pub supported_features: Vec<String>,
     /// Datacenter country codes (ISO 3166 Alpha-2) the model ran in.
     pub datacenters: Option<Vec<String>>,
+    pub is_ready: Option<bool>,
+    pub deprecation_date: Option<chrono::DateTime<chrono::Utc>>,
     pub effective_from: chrono::DateTime<chrono::Utc>,
     pub effective_until: Option<chrono::DateTime<chrono::Utc>>,
     pub changed_by_user_id: Option<uuid::Uuid>,
@@ -233,6 +248,8 @@ pub struct AdminModelInfo {
     pub supported_features: Vec<String>,
     /// Datacenter country codes (ISO 3166 Alpha-2) the model runs in.
     pub datacenters: Option<Vec<String>>,
+    pub is_ready: Option<bool>,
+    pub deprecation_date: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// Organization information for admin listing (includes spend limit and usage)

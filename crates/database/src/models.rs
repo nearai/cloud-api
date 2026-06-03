@@ -468,6 +468,16 @@ pub struct Model {
     pub supported_sampling_parameters: Vec<String>,
     /// Feature capabilities (OpenRouter vocabulary: tools, json_mode, ...).
     pub supported_features: Vec<String>,
+    /// Datacenter country codes (ISO 3166 Alpha-2) the model runs in.
+    /// NULL when unset; serialized on the public API as
+    /// `datacenters: [{ "country_code": "US" }, ...]`.
+    pub datacenters: Option<Vec<String>>,
+    /// Whether the model is "ready". Per OpenRouter, `false` keeps the model
+    /// hidden on their side and `true` enables auto-staging. Stored and exposed
+    /// verbatim; does not affect Cloud API's own listing/filtering. NULL = unset.
+    pub is_ready: Option<bool>,
+    /// Planned deprecation date (ISO 8601). NULL = no planned deprecation.
+    pub deprecation_date: Option<DateTime<Utc>>,
 
     // Tracking fields
     pub is_active: bool,
@@ -507,6 +517,14 @@ pub struct UpdateModelPricingRequest {
     pub max_output_length: Option<i32>,
     pub supported_sampling_parameters: Option<Vec<String>>,
     pub supported_features: Option<Vec<String>>,
+    /// Datacenter country codes (ISO 3166 Alpha-2) the model runs in.
+    pub datacenters: Option<Vec<String>>,
+    /// Tri-state: `None` = leave unchanged, `Some(None)` = clear to NULL,
+    /// `Some(Some(v))` = set to `v`.
+    pub is_ready: Option<Option<bool>>,
+    /// Tri-state: `None` = leave unchanged, `Some(None)` = clear to NULL,
+    /// `Some(Some(dt))` = set to `dt`.
+    pub deprecation_date: Option<Option<DateTime<Utc>>>,
     // User audit tracking for history
     pub change_reason: Option<String>,
     pub changed_by_user_id: Option<Uuid>,
@@ -554,6 +572,10 @@ pub struct ModelHistory {
     pub max_output_length: Option<i32>,
     pub supported_sampling_parameters: Vec<String>,
     pub supported_features: Vec<String>,
+    /// Datacenter country codes (ISO 3166 Alpha-2) the model ran in.
+    pub datacenters: Option<Vec<String>>,
+    pub is_ready: Option<bool>,
+    pub deprecation_date: Option<DateTime<Utc>>,
 
     // Temporal fields
     pub effective_from: DateTime<Utc>,

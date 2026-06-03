@@ -25,7 +25,7 @@ use axum::{
     response::Json as ResponseJson,
     Extension,
 };
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Duration, Timelike, Utc};
 use config::ApiConfig;
 use services::admin::{AdminService, AnalyticsService, UpdateModelAdminRequest};
 use services::auth::AuthServiceTrait;
@@ -34,6 +34,59 @@ use services::usage::UsageServiceTrait;
 use std::sync::Arc;
 use tracing::{debug, error, Instrument};
 use uuid::Uuid;
+
+/// Parse an OpenRouter `deprecation_date` into a normalized `DateTime<Utc>`.
+///
+/// Follows the OpenRouter provider spec
+/// (<https://openrouter.ai/docs/guides/community/for-providers>) exactly. The
+/// spec models deprecation at *hour* precision and defines two input shapes:
+///
+/// - A bare ISO 8601 date (e.g. `2030-01-01`). Per the spec: *"Date-only
+///   values default to 13:00 UTC on that date."* So we store 13:00 UTC.
+/// - An explicit RFC 3339 instant in whole-hour UTC form
+///   (e.g. `2025-06-01T15:00:00Z`). The spec only expresses whole UTC hours, so
+///   we accept the datetime form **only** when it is already an exact whole-hour
+///   UTC instant: minutes, seconds, and sub-second components must all be zero
+///   and the offset must be UTC. We do **not** truncate finer-grained values —
+///   that would silently move a model's deprecation earlier than requested and
+///   accept inputs outside the advertised contract. Anything off the hour, or in
+///   a non-UTC offset, returns `None` so the caller rejects it with a 400.
+///
+/// Note: a zero offset spelled `+00:00` is treated as equivalent to `Z` (both
+/// denote the same UTC instant), provided minutes/seconds/sub-second are zero.
+///
+/// Returns `None` for anything that does not parse as a date or as a whole-hour
+/// UTC RFC 3339 instant, so callers can reject it with a 400.
+fn parse_deprecation_date(s: &str) -> Option<DateTime<Utc>> {
+    if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
+        // Reject non-UTC offsets — the contract is whole-hour UTC only.
+        if dt.offset().local_minus_utc() != 0 {
+            return None;
+        }
+        let utc = dt.with_timezone(&Utc);
+        // Reject anything not already on the top of the hour. We do not truncate;
+        // off-hour datetimes are invalid input.
+        if utc.minute() != 0 || utc.second() != 0 || utc.nanosecond() != 0 {
+            return None;
+        }
+        return Some(utc);
+    }
+    if let Ok(date) = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d") {
+        // Date-only values default to 13:00 UTC on that date (OpenRouter spec).
+        return date
+            .and_hms_opt(13, 0, 0)
+            .map(|naive| DateTime::<Utc>::from_naive_utc_and_offset(naive, Utc));
+    }
+    None
+}
+
+/// Serialize a stored `deprecation_date` into the OpenRouter-compatible
+/// UTC-hour form `YYYY-MM-DDTHH:00:00Z` (matching the spec's examples, e.g.
+/// `2025-06-01T15:00:00Z`). The stored value is always normalized to a whole
+/// UTC hour by [`parse_deprecation_date`], so this is a faithful round-trip.
+pub(crate) fn format_deprecation_date(dt: &DateTime<Utc>) -> String {
+    dt.format("%Y-%m-%dT%H:00:00Z").to_string()
+}
 
 #[derive(Clone)]
 pub struct AdminAppState {
@@ -206,6 +259,46 @@ pub async fn batch_upsert_models(
                 }
             }
         }
+        if let Some(datacenters) = &request.datacenters {
+            // OpenRouter's `datacenters` country_code is an ISO 3166 Alpha-2
+            // code: exactly two ASCII uppercase letters. Reject anything else
+            // so the catalog can't emit malformed codes.
+            for dc in datacenters {
+                let code = &dc.country_code;
+                let valid = code.len() == 2 && code.bytes().all(|b| b.is_ascii_uppercase());
+                if !valid {
+                    return Err((
+                        StatusCode::BAD_REQUEST,
+                        ResponseJson(ErrorResponse::new(
+                            format!(
+                                "model '{model_name}': datacenters: '{code}' is not a 2-letter uppercase ISO 3166 Alpha-2 country code"
+                            ),
+                            "invalid_request".to_string(),
+                        )),
+                    ));
+                }
+            }
+        }
+        // `deprecation_date` must be either a bare date (`YYYY-MM-DD`, which
+        // defaults to 13:00 UTC) or a whole-hour UTC instant
+        // (`YYYY-MM-DDTHH:00:00Z`). We reject off-hour or non-UTC datetimes
+        // rather than silently truncating them, so the stored value — and the
+        // `GET /v1/models` we serve from it — never deprecates a model earlier
+        // than requested. An explicit `null` (clear) and an omitted field both
+        // skip this check.
+        if let Some(Some(d)) = &request.deprecation_date {
+            if parse_deprecation_date(d).is_none() {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    ResponseJson(ErrorResponse::new(
+                        format!(
+                            "model '{model_name}': deprecationDate: '{d}' must be a date 'YYYY-MM-DD' (defaults to 13:00 UTC) or a whole-hour UTC instant 'YYYY-MM-DDTHH:00:00Z' (e.g. 2026-01-01T00:00:00Z); off-hour or non-UTC datetimes are not accepted"
+                        ),
+                        "invalid_request".to_string(),
+                    )),
+                ));
+            }
+        }
     }
 
     // Extract admin user context for audit tracking
@@ -247,6 +340,17 @@ pub async fn batch_upsert_models(
                     max_output_length: request.max_output_length,
                     supported_sampling_parameters: request.supported_sampling_parameters.clone(),
                     supported_features: request.supported_features.clone(),
+                    datacenters: crate::models::Datacenter::to_codes(request.datacenters.clone()),
+                    // Tri-state passes straight through: outer None = leave
+                    // unchanged, Some(None) = clear, Some(Some(v)) = set.
+                    is_ready: request.is_ready,
+                    // Tri-state. Outer None = leave unchanged, Some(None) =
+                    // clear. For Some(Some(s)) the string was already validated
+                    // above, so parse+normalize it to a stored timestamp.
+                    deprecation_date: request
+                        .deprecation_date
+                        .as_ref()
+                        .map(|inner| inner.as_deref().and_then(parse_deprecation_date)),
                     change_reason: request.change_reason.clone(),
                     changed_by_user_id: Some(admin_user_id),
                     changed_by_user_email: Some(admin_user_email.clone()),
@@ -450,6 +554,12 @@ pub async fn batch_upsert_models(
                 max_output_length: updated_model.max_output_length,
                 supported_sampling_parameters: updated_model.supported_sampling_parameters,
                 supported_features: updated_model.supported_features,
+                datacenters: crate::models::Datacenter::from_codes(updated_model.datacenters),
+                is_ready: updated_model.is_ready,
+                deprecation_date: updated_model
+                    .deprecation_date
+                    .as_ref()
+                    .map(format_deprecation_date),
             },
         })
         .collect();
@@ -553,6 +663,9 @@ pub async fn list_models(
                 max_output_length: model.max_output_length,
                 supported_sampling_parameters: model.supported_sampling_parameters,
                 supported_features: model.supported_features,
+                datacenters: crate::models::Datacenter::from_codes(model.datacenters),
+                is_ready: model.is_ready,
+                deprecation_date: model.deprecation_date.as_ref().map(format_deprecation_date),
             },
             is_active: model.is_active,
             created_at: model.created_at,
@@ -688,6 +801,9 @@ pub async fn get_model_history(
             max_output_length: h.max_output_length,
             supported_sampling_parameters: h.supported_sampling_parameters,
             supported_features: h.supported_features,
+            datacenters: crate::models::Datacenter::from_codes(h.datacenters),
+            is_ready: h.is_ready,
+            deprecation_date: h.deprecation_date.as_ref().map(format_deprecation_date),
         })
         .collect();
 
@@ -1212,6 +1328,9 @@ pub async fn deprecate_model(
             max_output_length: m.max_output_length,
             supported_sampling_parameters: m.supported_sampling_parameters,
             supported_features: m.supported_features,
+            datacenters: crate::models::Datacenter::from_codes(m.datacenters),
+            is_ready: m.is_ready,
+            deprecation_date: m.deprecation_date.as_ref().map(format_deprecation_date),
         },
     };
 
@@ -2848,4 +2967,55 @@ pub async fn get_organization_concurrent_limit(
     };
 
     Ok(ResponseJson(response))
+}
+
+#[cfg(test)]
+mod deprecation_date_tests {
+    use super::{format_deprecation_date, parse_deprecation_date};
+
+    #[test]
+    fn date_only_defaults_to_13_00_utc() {
+        // OpenRouter spec: "Date-only values default to 13:00 UTC on that date."
+        let dt = parse_deprecation_date("2030-01-01").expect("date-only must parse");
+        assert_eq!(format_deprecation_date(&dt), "2030-01-01T13:00:00Z");
+    }
+
+    #[test]
+    fn explicit_utc_hour_round_trips() {
+        // Spec example: 2025-06-01T15:00:00Z is accepted as-is.
+        let dt = parse_deprecation_date("2025-06-01T15:00:00Z").expect("must parse");
+        assert_eq!(format_deprecation_date(&dt), "2025-06-01T15:00:00Z");
+    }
+
+    #[test]
+    fn zero_offset_plus_00_00_is_accepted_as_utc() {
+        // `+00:00` denotes the same instant as `Z`; with whole-hour
+        // minutes/seconds it is accepted and round-trips to the `Z` form.
+        let dt = parse_deprecation_date("2025-06-01T15:00:00+00:00").expect("must parse");
+        assert_eq!(format_deprecation_date(&dt), "2025-06-01T15:00:00Z");
+    }
+
+    #[test]
+    fn sub_hour_precision_is_rejected() {
+        // Off-hour datetimes must be rejected (not truncated): truncation would
+        // deprecate the model earlier than the requested instant.
+        assert!(parse_deprecation_date("2025-06-01T15:47:33Z").is_none());
+        // Non-zero minutes alone are also rejected.
+        assert!(parse_deprecation_date("2025-06-01T15:30:00Z").is_none());
+    }
+
+    #[test]
+    fn non_utc_offset_is_rejected() {
+        // 15:30+02:00 is not a whole-hour UTC instant; reject it.
+        assert!(parse_deprecation_date("2025-06-01T15:30:00+02:00").is_none());
+        // Even a whole-hour wall-clock time in a non-UTC offset is rejected:
+        // 15:00+02:00 == 13:00 UTC, which the caller did not write.
+        assert!(parse_deprecation_date("2025-06-01T15:00:00+02:00").is_none());
+    }
+
+    #[test]
+    fn invalid_input_returns_none() {
+        assert!(parse_deprecation_date("not-a-date").is_none());
+        assert!(parse_deprecation_date("2025-13-01").is_none());
+    }
 }

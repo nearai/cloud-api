@@ -73,6 +73,70 @@ pub fn default_limit() -> i64 {
     100
 }
 
+/// Parse + validate an analytics `start`/`end` window.
+///
+/// Unlike the old "parse-or-default" behavior, a malformed `start`/`end` is a
+/// hard error (a typo must not silently return a polished but wrong chart):
+/// - missing `end` defaults to now; missing `start` defaults to `end - 30d`
+/// - a present-but-unparseable value → 400
+/// - `start >= end` → 400
+/// - for `hour` granularity, a window longer than `max_hour_days` → 400
+#[allow(clippy::type_complexity)]
+pub fn parse_metrics_range(
+    start: Option<&str>,
+    end: Option<&str>,
+    granularity: Option<&str>,
+    max_hour_days: i64,
+) -> Result<
+    (chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>),
+    (StatusCode, ResponseJson<ErrorResponse>),
+> {
+    let bad = |field: &str| {
+        (
+            StatusCode::BAD_REQUEST,
+            ResponseJson(ErrorResponse::new(
+                format!("Invalid '{field}': expected an ISO 8601 / RFC 3339 timestamp"),
+                "invalid_parameter".to_string(),
+            )),
+        )
+    };
+
+    let end = match end {
+        Some(s) => chrono::DateTime::parse_from_rfc3339(s)
+            .map(|dt| dt.with_timezone(&chrono::Utc))
+            .map_err(|_| bad("end"))?,
+        None => chrono::Utc::now(),
+    };
+    let start = match start {
+        Some(s) => chrono::DateTime::parse_from_rfc3339(s)
+            .map(|dt| dt.with_timezone(&chrono::Utc))
+            .map_err(|_| bad("start"))?,
+        None => end - chrono::Duration::days(30),
+    };
+
+    if start >= end {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            ResponseJson(ErrorResponse::new(
+                "'start' must be before 'end'".to_string(),
+                "invalid_parameter".to_string(),
+            )),
+        ));
+    }
+
+    if granularity == Some("hour") && (end - start) > chrono::Duration::days(max_hour_days) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            ResponseJson(ErrorResponse::new(
+                format!("'hour' granularity is limited to {max_hour_days} days; use a coarser granularity or a shorter range"),
+                "invalid_parameter".to_string(),
+            )),
+        ));
+    }
+
+    Ok((start, end))
+}
+
 /// Basic non-empty string validation helper
 pub fn validate_non_empty_field(value: &str, field: &str) -> Result<(), String> {
     if value.is_empty() {

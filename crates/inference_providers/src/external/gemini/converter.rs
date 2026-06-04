@@ -242,6 +242,32 @@ pub struct GeminiResponse {
 // Conversion Functions
 // =============================================================================
 
+/// Infer an image MIME type from a remote URL's path extension.
+///
+/// Gemini's `fileData` requires a `mimeType` for media references; a bare URL
+/// carries none, so we derive it from the file extension. Returns `None` when
+/// the extension is missing or unrecognised, so the caller can skip the part
+/// instead of emitting a `fileData` that Gemini would reject.
+///
+/// Query strings and fragments are stripped before inspecting the extension
+/// (e.g. `https://host/cat.jpg?sig=abc#frag` → `jpg`). Matching is
+/// case-insensitive.
+fn mime_type_from_url(url: &str) -> Option<String> {
+    // Trim query (`?`) and fragment (`#`) so they don't pollute the extension.
+    let path = url.split(['?', '#']).next().unwrap_or(url);
+    let ext = path.rsplit('.').next()?.to_ascii_lowercase();
+    let mime = match ext.as_str() {
+        "jpg" | "jpeg" => "image/jpeg",
+        "png" => "image/png",
+        "webp" => "image/webp",
+        "gif" => "image/gif",
+        "heic" => "image/heic",
+        "heif" => "image/heif",
+        _ => return None,
+    };
+    Some(mime.to_string())
+}
+
 /// Convert OpenAI messages to Gemini format
 pub fn convert_messages(
     messages: &[ChatMessage],
@@ -280,9 +306,31 @@ pub fn convert_messages(
                             parts.push(GeminiPart::inline_image(media_type, data));
                         }
                         ContentPart::ImageUrl { url } => {
-                            // Gemini's fileData accepts a remote URI and fetches
-                            // it itself. MIME type is unknown for a bare URL.
-                            parts.push(GeminiPart::file_image(None, url));
+                            // Gemini's `fileData` accepts a public HTTPS URI and
+                            // fetches the bytes itself, but it *requires* a
+                            // `mimeType` — an empty/omitted `fileData.mimeType`
+                            // is rejected upstream with 400 "empty mimeType
+                            // parameter in fileData". cloud-api does not pre-fetch
+                            // remote images (Gemini is an external passthrough to
+                            // Google's API with no engine in the loop, see #606),
+                            // so we infer the MIME type from the URL path
+                            // extension. If we cannot determine a supported image
+                            // type, we skip the part rather than emit a broken
+                            // `fileData` that would fail the whole request.
+                            // Remote-URL image support is provider-dependent and
+                            // not guaranteed; base64 data URIs (the common,
+                            // advertised case) go through `inlineData` above.
+                            match mime_type_from_url(&url) {
+                                Some(mime_type) => {
+                                    parts.push(GeminiPart::file_image(Some(mime_type), url));
+                                }
+                                None => {
+                                    tracing::warn!(
+                                        "skipping Gemini image: cannot infer mimeType from \
+                                         remote URL extension (fileData requires a mimeType)"
+                                    );
+                                }
+                            }
                         }
                     }
                 }
@@ -791,7 +839,11 @@ mod tests {
     }
 
     #[test]
-    fn test_convert_messages_image_url_uses_file_data() {
+    fn test_convert_messages_image_url_uses_file_data_with_mime_type() {
+        // Remote image URL with a recognisable extension: must emit `fileData`
+        // WITH an inferred `mimeType`. Gemini rejects a `fileData` whose
+        // `mimeType` is empty/omitted with 400 "empty mimeType parameter in
+        // fileData", so the serialized request must always carry it (#719).
         let messages = vec![ChatMessage {
             role: MessageRole::User,
             content: Some(serde_json::json!([
@@ -808,6 +860,94 @@ mod tests {
             .as_ref()
             .expect("expected fileData for remote URL");
         assert_eq!(file.file_uri, "https://example.com/cat.jpg");
+        assert_eq!(
+            file.mime_type.as_deref(),
+            Some("image/jpeg"),
+            "fileData must carry an inferred mimeType"
+        );
+
+        // Serialization guard: the camelCase `mimeType` must be present in the
+        // wire body. A regression to `file_image(None, ..)` would drop it.
+        let json = serde_json::to_string(&contents[0]).unwrap();
+        assert!(
+            json.contains("\"fileData\""),
+            "expected fileData on the wire"
+        );
+        assert!(
+            json.contains("\"mimeType\":\"image/jpeg\""),
+            "serialized fileData is missing the required mimeType; got: {json}"
+        );
+    }
+
+    #[test]
+    fn test_convert_messages_image_url_infers_mime_from_various_extensions() {
+        // Extension → mimeType inference, including query-string stripping and
+        // case-insensitivity.
+        let cases = [
+            ("https://example.com/a.png", "image/png"),
+            ("https://example.com/a.JPEG", "image/jpeg"),
+            ("https://example.com/a.webp", "image/webp"),
+            ("https://example.com/a.gif", "image/gif"),
+            (
+                "https://cdn.example.com/img/cat.jpg?sig=abc&x=1#frag",
+                "image/jpeg",
+            ),
+        ];
+        for (url, expected) in cases {
+            let messages = vec![ChatMessage {
+                role: MessageRole::User,
+                content: Some(serde_json::json!([
+                    {"type": "image_url", "image_url": {"url": url}}
+                ])),
+                name: None,
+                tool_call_id: None,
+                tool_calls: None,
+            }];
+            let (_system, contents) = convert_messages(&messages);
+            let file = contents[0].parts[0]
+                .file_data
+                .as_ref()
+                .unwrap_or_else(|| panic!("expected fileData for {url}"));
+            assert_eq!(
+                file.mime_type.as_deref(),
+                Some(expected),
+                "wrong mimeType inferred for {url}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_convert_messages_image_url_unknown_extension_is_skipped() {
+        // No / unknown extension → we cannot infer a mimeType, so we skip the
+        // image part rather than emit a `fileData` lacking `mimeType` (which
+        // Gemini rejects, breaking the *entire* request). Text is preserved.
+        let messages = vec![ChatMessage {
+            role: MessageRole::User,
+            content: Some(serde_json::json!([
+                {"type": "text", "text": "look at this"},
+                {"type": "image_url", "image_url": {"url": "https://example.com/image"}},
+                {"type": "image_url", "image_url": {"url": "https://example.com/file.bin"}}
+            ])),
+            name: None,
+            tool_call_id: None,
+            tool_calls: None,
+        }];
+
+        let (_system, contents) = convert_messages(&messages);
+        assert_eq!(contents.len(), 1);
+        let parts = &contents[0].parts;
+        // Only the text part survives; both unknown-extension images dropped.
+        assert_eq!(parts.len(), 1, "unknown-extension images must be skipped");
+        assert_eq!(parts[0].text.as_deref(), Some("look at this"));
+        assert!(parts.iter().all(|p| p.file_data.is_none()));
+
+        // And crucially: the serialized request never contains a `fileData`
+        // without a `mimeType`.
+        let json = serde_json::to_string(&contents[0]).unwrap();
+        assert!(
+            !json.contains("\"fileData\""),
+            "must not emit fileData when mimeType is unknown; got: {json}"
+        );
     }
 
     #[test]

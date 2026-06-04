@@ -108,7 +108,17 @@ fn strip_reasoning_effort_if_unsupported(
 /// because they tend to accept (or apply) the extra sampling knobs below, and
 /// stripping them there would silently change behaviour.
 fn is_openai_source(base_url: &str) -> bool {
-    base_url.contains("api.openai.com") || base_url.contains(".openai.azure.com")
+    // Match on the parsed URL *host* (lower-cased), not a substring of the whole
+    // URL. A substring check would both miss mixed-case hosts (`API.OPENAI.COM`)
+    // and misclassify look-alikes such as `api.openai.com.evil.example` as
+    // OpenAI-source, silently mutating requests bound for the wrong upstream.
+    match url::Url::parse(base_url)
+        .ok()
+        .and_then(|u| u.host_str().map(str::to_ascii_lowercase))
+    {
+        Some(host) => host == "api.openai.com" || host.ends_with(".openai.azure.com"),
+        None => false,
+    }
 }
 
 /// Sampling knobs that OpenAI's `/v1/chat/completions` does **not** recognise
@@ -137,15 +147,22 @@ fn strip_unsupported_sampling_params(
     if !is_openai_source(base_url) {
         return;
     }
-    for key in OPENAI_UNSUPPORTED_SAMPLING_PARAMS {
-        if params.extra.remove(*key).is_some() {
-            tracing::warn!(
-                model = %model,
-                base_url = %base_url,
-                param = %key,
-                "Stripped unsupported sampling param from OpenAI request: rejected by /v1/chat/completions (graceful-ignore, nearai/cloud-api#697)"
-            );
-        }
+    // Collect into a single log line rather than one per stripped key: OpenRouter
+    // clients send these params broadly, so per-key logging would multiply log
+    // volume by up to 4x per request. debug! (not warn!) since this is expected,
+    // graceful behaviour and prod runs at info level.
+    let stripped: Vec<&str> = OPENAI_UNSUPPORTED_SAMPLING_PARAMS
+        .iter()
+        .copied()
+        .filter(|key| params.extra.remove(*key).is_some())
+        .collect();
+    if !stripped.is_empty() {
+        tracing::debug!(
+            model = %model,
+            base_url = %base_url,
+            stripped = ?stripped,
+            "Stripped unsupported sampling params from OpenAI request (graceful-ignore, nearai/cloud-api#697)"
+        );
     }
 }
 
@@ -901,5 +918,44 @@ mod tests {
             .insert("seed".to_string(), serde_json::json!(7));
         strip_unsupported_sampling_params(&mut params, "https://api.openai.com/v1", "gpt-4.1");
         assert_eq!(params.extra.get("seed"), Some(&serde_json::json!(7)));
+    }
+
+    /// `is_openai_source` matches on the parsed host, so it is case-insensitive
+    /// and must not be fooled by look-alike hosts that merely *contain* the
+    /// OpenAI domain as a substring (e.g. `api.openai.com.evil.example`).
+    #[test]
+    fn test_is_openai_source_host_matching() {
+        // genuine OpenAI / Azure OpenAI hosts (incl. mixed case)
+        assert!(is_openai_source("https://api.openai.com/v1"));
+        assert!(is_openai_source("https://API.OpenAI.com/v1"));
+        assert!(is_openai_source(
+            "https://my-resource.openai.azure.com/openai"
+        ));
+        // look-alikes and unrelated hosts must NOT match
+        assert!(!is_openai_source("https://api.openai.com.evil.example/v1"));
+        assert!(!is_openai_source("https://api.together.xyz/v1"));
+        assert!(!is_openai_source(
+            "https://notapi.openai.com.attacker.test/v1"
+        ));
+        // malformed URL → not OpenAI-source (and never panics)
+        assert!(!is_openai_source("not a url"));
+    }
+
+    /// A look-alike host must keep the sampling knobs (we only strip for the
+    /// genuine OpenAI upstream that rejects them).
+    #[test]
+    fn test_strip_sampling_params_lookalike_host_keeps_all() {
+        let mut params = with_sampling_extras();
+        strip_unsupported_sampling_params(
+            &mut params,
+            "https://api.openai.com.evil.example/v1",
+            "some-model",
+        );
+        for key in OPENAI_UNSUPPORTED_SAMPLING_PARAMS {
+            assert!(
+                params.extra.contains_key(*key),
+                "{key} must be preserved for look-alike host"
+            );
+        }
     }
 }

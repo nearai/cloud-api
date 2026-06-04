@@ -11,10 +11,12 @@ use crate::models::{
     DecimalPriceRequest, DeleteAdminAccessTokenRequest, DeleteModelRequest, DeprecateModelRequest,
     DeprecateModelResponse, ErrorResponse, GetOrganizationConcurrentLimitResponse,
     ListAdminInvitationEmailDeliveriesResponse, ListOrganizationsAdminResponse, ListUsersResponse,
-    ModelArchitecture, ModelHistoryEntry, ModelHistoryResponse, ModelMetadata, ModelWithPricing,
-    OrgLimitsHistoryEntry, OrgLimitsHistoryResponse, OrganizationUsage, SpendLimit,
-    UpdateOrganizationConcurrentLimitRequest, UpdateOrganizationConcurrentLimitResponse,
-    UpdateOrganizationLimitsRequest, UpdateOrganizationLimitsResponse, UpdateServiceRequest,
+    ModelArchitecture, ModelDeprecationConfirmResponse, ModelDeprecationPreviewResponse,
+    ModelDeprecationRequest, ModelHistoryEntry, ModelHistoryResponse, ModelMetadata,
+    ModelWithPricing, OrgLimitsHistoryEntry, OrgLimitsHistoryResponse, OrganizationUsage,
+    SpendLimit, UpdateOrganizationConcurrentLimitRequest,
+    UpdateOrganizationConcurrentLimitResponse, UpdateOrganizationLimitsRequest,
+    UpdateOrganizationLimitsResponse, UpdateServiceRequest,
 };
 use crate::routes::common::format_amount;
 use crate::routes::usage::{compute_organization_balance_response, OrganizationBalanceResponse};
@@ -1339,6 +1341,145 @@ pub async fn deprecate_model(
         successor: to_api(successor_model_id, outcome.successor),
         aliases_carried: outcome.aliases_carried,
     }))
+}
+
+/// Preview affected admins for a planned model deprecation (Admin only).
+#[utoipa::path(
+    post,
+    path = "/v1/admin/models/{model_name}/deprecation/preview",
+    tag = "Admin",
+    request_body = ModelDeprecationRequest,
+    responses(
+        (status = 200, description = "Deprecation notification preview", body = ModelDeprecationPreviewResponse),
+        (status = 400, description = "Invalid request", body = ErrorResponse),
+        (status = 404, description = "Model or successor not found", body = ErrorResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    ),
+    security(
+        ("session_token" = [])
+    )
+)]
+pub async fn preview_model_deprecation(
+    State(app_state): State<AdminAppState>,
+    Path(model_name): Path<String>,
+    Extension(_admin_user): Extension<AdminUser>,
+    ResponseJson(req): ResponseJson<ModelDeprecationRequest>,
+) -> Result<ResponseJson<ModelDeprecationPreviewResponse>, (StatusCode, ResponseJson<ErrorResponse>)>
+{
+    let deprecation_date = parse_deprecation_date(&req.deprecation_date).ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            ResponseJson(ErrorResponse::new(
+                format!(
+                    "deprecationDate: '{}' must be a date 'YYYY-MM-DD' (defaults to 13:00 UTC) or a whole-hour UTC instant 'YYYY-MM-DDTHH:00:00Z'",
+                    req.deprecation_date
+                ),
+                "invalid_request".to_string(),
+            )),
+        )
+    })?;
+
+    let preview = app_state
+        .admin_service
+        .preview_model_deprecation(&model_name, &req.successor_model_id, deprecation_date)
+        .await
+        .map_err(admin_error_to_response)?;
+
+    Ok(ResponseJson(ModelDeprecationPreviewResponse {
+        recipient_count: preview.recipient_count,
+        organization_count: preview.organization_count,
+        usage_window_days: preview.usage_window_days,
+    }))
+}
+
+/// Confirm a planned model deprecation, update the catalog, and notify affected admins.
+#[utoipa::path(
+    post,
+    path = "/v1/admin/models/{model_name}/deprecation/confirm",
+    tag = "Admin",
+    request_body = ModelDeprecationRequest,
+    responses(
+        (status = 200, description = "Deprecation confirmed and notifications attempted", body = ModelDeprecationConfirmResponse),
+        (status = 400, description = "Invalid request", body = ErrorResponse),
+        (status = 404, description = "Model or successor not found", body = ErrorResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    ),
+    security(
+        ("session_token" = [])
+    )
+)]
+pub async fn confirm_model_deprecation(
+    State(app_state): State<AdminAppState>,
+    Path(model_name): Path<String>,
+    Extension(admin_user): Extension<AdminUser>,
+    ResponseJson(req): ResponseJson<ModelDeprecationRequest>,
+) -> Result<ResponseJson<ModelDeprecationConfirmResponse>, (StatusCode, ResponseJson<ErrorResponse>)>
+{
+    let deprecation_date = parse_deprecation_date(&req.deprecation_date).ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            ResponseJson(ErrorResponse::new(
+                format!(
+                    "deprecationDate: '{}' must be a date 'YYYY-MM-DD' (defaults to 13:00 UTC) or a whole-hour UTC instant 'YYYY-MM-DDTHH:00:00Z'",
+                    req.deprecation_date
+                ),
+                "invalid_request".to_string(),
+            )),
+        )
+    })?;
+
+    let result = app_state
+        .admin_service
+        .confirm_model_deprecation(
+            &model_name,
+            &req.successor_model_id,
+            deprecation_date,
+            req.change_reason,
+            Some(admin_user.0.id),
+            Some(admin_user.0.email),
+        )
+        .await
+        .map_err(admin_error_to_response)?;
+
+    Ok(ResponseJson(ModelDeprecationConfirmResponse {
+        model_id: result.model_id,
+        successor_model_id: result.successor_model_id,
+        deprecation_date: format_deprecation_date(&result.deprecation_date),
+        recipient_count: result.recipient_count,
+        organization_count: result.organization_count,
+        sent_count: result.sent_count,
+        failed_count: result.failed_count,
+        skipped_count: result.skipped_count,
+    }))
+}
+
+fn admin_error_to_response(
+    e: services::admin::AdminError,
+) -> (StatusCode, ResponseJson<ErrorResponse>) {
+    match e {
+        services::admin::AdminError::InvalidDeprecation(msg)
+        | services::admin::AdminError::InvalidPricing(msg) => (
+            StatusCode::BAD_REQUEST,
+            ResponseJson(ErrorResponse::new(msg, "invalid_request".to_string())),
+        ),
+        services::admin::AdminError::ModelNotFound(msg) => (
+            StatusCode::NOT_FOUND,
+            ResponseJson(ErrorResponse::new(msg, "model_not_found".to_string())),
+        ),
+        services::admin::AdminError::Unauthorized(msg) => (
+            StatusCode::UNAUTHORIZED,
+            ResponseJson(ErrorResponse::new(msg, "unauthorized".to_string())),
+        ),
+        other => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            ResponseJson(ErrorResponse::new(
+                format!("Admin operation failed: {other}"),
+                "internal_server_error".to_string(),
+            )),
+        ),
+    }
 }
 
 /// List all registered users with pagination (Admin only)

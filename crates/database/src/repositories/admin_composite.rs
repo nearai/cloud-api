@@ -8,9 +8,10 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use services::admin::{
     AdminModelInfo, AdminOrganizationInfo, AdminRepository, DeprecateModelOutcome,
-    ModelHistoryEntry, ModelPricing, OrganizationLimits, OrganizationLimitsHistoryEntry,
-    OrganizationLimitsUpdate, PlatformServiceInfo, UpdateModelAdminRequest, UserInfo,
-    UserOrganizationInfo,
+    ModelDeprecationDeliveryRecord, ModelDeprecationEmailStatus, ModelDeprecationModel,
+    ModelDeprecationRecipient, ModelHistoryEntry, ModelPricing, OrganizationLimits,
+    OrganizationLimitsHistoryEntry, OrganizationLimitsUpdate, PlatformServiceInfo,
+    UpdateModelAdminRequest, UserInfo, UserOrganizationInfo,
 };
 use services::service_usage::ports::ServiceUnit;
 use std::sync::Arc;
@@ -728,6 +729,160 @@ impl AdminRepository for AdminCompositeRepository {
             .collect();
 
         Ok((admin_models, total))
+    }
+
+    async fn get_active_model_for_deprecation(
+        &self,
+        model_name: &str,
+    ) -> Result<Option<ModelDeprecationModel>> {
+        let client = self.pool.get().await?;
+        let row = client
+            .query_opt(
+                r#"
+                SELECT id, model_name, model_display_name
+                FROM models
+                WHERE model_name = $1 AND is_active = true
+                "#,
+                &[&model_name],
+            )
+            .await?;
+
+        Ok(row.map(|row| ModelDeprecationModel {
+            id: row.get("id"),
+            model_name: row.get("model_name"),
+            model_display_name: row.get("model_display_name"),
+        }))
+    }
+
+    async fn list_model_deprecation_recipients(
+        &self,
+        model_name: &str,
+        since: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Vec<ModelDeprecationRecipient>> {
+        let client = self.pool.get().await?;
+        let rows = client
+            .query(
+                r#"
+                SELECT DISTINCT
+                    u.id AS user_id,
+                    u.email AS email,
+                    o.id AS organization_id,
+                    o.name AS organization_name
+                FROM organization_usage_log ul
+                JOIN organizations o ON o.id = ul.organization_id
+                JOIN organization_members om ON om.organization_id = o.id
+                JOIN users u ON u.id = om.user_id
+                WHERE ul.model_name = $1
+                  AND ul.created_at >= $2
+                  AND o.is_active = true
+                  AND u.is_active = true
+                  AND om.role IN ('owner', 'admin')
+                ORDER BY lower(u.email), o.name
+                "#,
+                &[&model_name, &since],
+            )
+            .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(|row| ModelDeprecationRecipient {
+                user_id: row.get("user_id"),
+                email: row.get("email"),
+                organization_id: row.get("organization_id"),
+                organization_name: row.get("organization_name"),
+            })
+            .collect())
+    }
+
+    async fn list_sent_model_deprecation_delivery_keys(
+        &self,
+        model_id: Uuid,
+        successor_model_name: &str,
+        deprecation_date: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Vec<(Uuid, Uuid)>> {
+        let client = self.pool.get().await?;
+        let rows = client
+            .query(
+                r#"
+                SELECT recipient_user_id, organization_id
+                FROM model_deprecation_email_deliveries
+                WHERE model_id = $1
+                  AND successor_model_name = $2
+                  AND deprecation_date = $3
+                  AND status = 'sent'
+                "#,
+                &[&model_id, &successor_model_name, &deprecation_date],
+            )
+            .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(|row| (row.get("recipient_user_id"), row.get("organization_id")))
+            .collect())
+    }
+
+    async fn record_model_deprecation_delivery(
+        &self,
+        record: ModelDeprecationDeliveryRecord,
+    ) -> Result<()> {
+        let client = self.pool.get().await?;
+        let status = record.status.as_str();
+        let email_sent_at = if record.status == ModelDeprecationEmailStatus::Sent {
+            Some(chrono::Utc::now())
+        } else {
+            None
+        };
+
+        client
+            .execute(
+                r#"
+                INSERT INTO model_deprecation_email_deliveries (
+                    model_id, model_name, model_display_name, successor_model_name,
+                    deprecation_date, recipient_user_id, recipient_email,
+                    organization_id, organization_name, status, email_sent_at,
+                    email_message_id, email_last_error, initiated_by_user_id,
+                    initiated_by_user_email
+                ) VALUES (
+                    $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
+                    $14, $15
+                )
+                ON CONFLICT (
+                    model_id, successor_model_name, deprecation_date,
+                    recipient_user_id, organization_id
+                ) DO UPDATE SET
+                    model_name = EXCLUDED.model_name,
+                    model_display_name = EXCLUDED.model_display_name,
+                    recipient_email = EXCLUDED.recipient_email,
+                    organization_name = EXCLUDED.organization_name,
+                    status = EXCLUDED.status,
+                    email_sent_at = EXCLUDED.email_sent_at,
+                    email_message_id = EXCLUDED.email_message_id,
+                    email_last_error = EXCLUDED.email_last_error,
+                    initiated_by_user_id = EXCLUDED.initiated_by_user_id,
+                    initiated_by_user_email = EXCLUDED.initiated_by_user_email,
+                    updated_at = NOW()
+                "#,
+                &[
+                    &record.model_id,
+                    &record.model_name,
+                    &record.model_display_name,
+                    &record.successor_model_name,
+                    &record.deprecation_date,
+                    &record.recipient_user_id,
+                    &record.recipient_email,
+                    &record.organization_id,
+                    &record.organization_name,
+                    &status,
+                    &email_sent_at,
+                    &record.email_message_id,
+                    &record.email_last_error,
+                    &record.initiated_by_user_id,
+                    &record.initiated_by_user_email,
+                ],
+            )
+            .await?;
+
+        Ok(())
     }
 
     async fn update_organization_concurrent_limit(

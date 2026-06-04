@@ -252,6 +252,78 @@ pub struct AdminModelInfo {
     pub deprecation_date: Option<chrono::DateTime<chrono::Utc>>,
 }
 
+/// Active model summary used by the planned-deprecation notification workflow.
+#[derive(Debug, Clone)]
+pub struct ModelDeprecationModel {
+    pub id: uuid::Uuid,
+    pub model_name: String,
+    pub model_display_name: String,
+}
+
+/// One affected admin membership row. The service deduplicates sends by
+/// recipient email, but records delivery status for every affected org row.
+#[derive(Debug, Clone)]
+pub struct ModelDeprecationRecipient {
+    pub user_id: uuid::Uuid,
+    pub email: String,
+    pub organization_id: uuid::Uuid,
+    pub organization_name: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelDeprecationEmailStatus {
+    Sent,
+    Failed,
+    Skipped,
+}
+
+impl ModelDeprecationEmailStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Sent => "sent",
+            Self::Failed => "failed",
+            Self::Skipped => "skipped",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ModelDeprecationDeliveryRecord {
+    pub model_id: uuid::Uuid,
+    pub model_name: String,
+    pub model_display_name: String,
+    pub successor_model_name: String,
+    pub deprecation_date: chrono::DateTime<chrono::Utc>,
+    pub recipient_user_id: uuid::Uuid,
+    pub recipient_email: String,
+    pub organization_id: uuid::Uuid,
+    pub organization_name: String,
+    pub status: ModelDeprecationEmailStatus,
+    pub email_message_id: Option<String>,
+    pub email_last_error: Option<String>,
+    pub initiated_by_user_id: Option<uuid::Uuid>,
+    pub initiated_by_user_email: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ModelDeprecationPreview {
+    pub recipient_count: i64,
+    pub organization_count: i64,
+    pub usage_window_days: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct ModelDeprecationConfirmResult {
+    pub model_id: String,
+    pub successor_model_id: String,
+    pub deprecation_date: chrono::DateTime<chrono::Utc>,
+    pub recipient_count: i64,
+    pub organization_count: i64,
+    pub sent_count: i64,
+    pub failed_count: i64,
+    pub skipped_count: i64,
+}
+
 /// Organization information for admin listing (includes spend limit and usage)
 #[derive(Debug, Clone)]
 pub struct AdminOrganizationInfo {
@@ -411,6 +483,33 @@ pub trait AdminRepository: Send + Sync {
         offset: i64,
     ) -> Result<(Vec<AdminModelInfo>, i64), anyhow::Error>;
 
+    /// Fetch an active model by canonical model name for planned-deprecation workflows.
+    async fn get_active_model_for_deprecation(
+        &self,
+        model_name: &str,
+    ) -> Result<Option<ModelDeprecationModel>, anyhow::Error>;
+
+    /// List active owner/admin recipients for orgs that used the model since `since`.
+    async fn list_model_deprecation_recipients(
+        &self,
+        model_name: &str,
+        since: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Vec<ModelDeprecationRecipient>, anyhow::Error>;
+
+    /// Return delivery keys already successfully sent for idempotent confirms.
+    async fn list_sent_model_deprecation_delivery_keys(
+        &self,
+        model_id: uuid::Uuid,
+        successor_model_name: &str,
+        deprecation_date: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Vec<(uuid::Uuid, uuid::Uuid)>, anyhow::Error>;
+
+    /// Persist one deprecation email delivery outcome.
+    async fn record_model_deprecation_delivery(
+        &self,
+        record: ModelDeprecationDeliveryRecord,
+    ) -> Result<(), anyhow::Error>;
+
     /// Update organization concurrent request limit
     /// Set to None to use the default limit
     async fn update_organization_concurrent_limit(
@@ -569,6 +668,25 @@ pub trait AdminService: Send + Sync {
         limit: i64,
         offset: i64,
     ) -> Result<(Vec<AdminModelInfo>, i64), AdminError>;
+
+    /// Preview recipients for a planned deprecation without mutating state.
+    async fn preview_model_deprecation(
+        &self,
+        model_name: &str,
+        successor_model_name: &str,
+        deprecation_date: chrono::DateTime<chrono::Utc>,
+    ) -> Result<ModelDeprecationPreview, AdminError>;
+
+    /// Set `deprecationDate`, send deprecation emails, and persist delivery audit rows.
+    async fn confirm_model_deprecation(
+        &self,
+        model_name: &str,
+        successor_model_name: &str,
+        deprecation_date: chrono::DateTime<chrono::Utc>,
+        change_reason: Option<String>,
+        changed_by_user_id: Option<uuid::Uuid>,
+        changed_by_user_email: Option<String>,
+    ) -> Result<ModelDeprecationConfirmResult, AdminError>;
 
     /// Update organization concurrent request limit (admin only)
     /// Set to None to use the default limit

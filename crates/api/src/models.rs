@@ -3220,6 +3220,50 @@ pub struct DeprecateModelResponse {
     pub aliases_carried: u32,
 }
 
+/// Request to mark an active model with a planned deprecation date and notify affected admins.
+#[derive(Debug, Deserialize, Serialize, ToSchema)]
+pub struct ModelDeprecationRequest {
+    /// Active replacement model to recommend in the email. Does not affect routing.
+    #[serde(rename = "successorModelId")]
+    pub successor_model_id: String,
+    /// Planned deprecation date (`YYYY-MM-DD` or `YYYY-MM-DDTHH:00:00Z`).
+    #[serde(rename = "deprecationDate")]
+    pub deprecation_date: String,
+    /// Optional reason recorded in model history.
+    #[serde(rename = "changeReason", skip_serializing_if = "Option::is_none")]
+    pub change_reason: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct ModelDeprecationPreviewResponse {
+    #[serde(rename = "recipientCount")]
+    pub recipient_count: i64,
+    #[serde(rename = "organizationCount")]
+    pub organization_count: i64,
+    #[serde(rename = "usageWindowDays")]
+    pub usage_window_days: i64,
+}
+
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct ModelDeprecationConfirmResponse {
+    #[serde(rename = "modelId")]
+    pub model_id: String,
+    #[serde(rename = "successorModelId")]
+    pub successor_model_id: String,
+    #[serde(rename = "deprecationDate")]
+    pub deprecation_date: String,
+    #[serde(rename = "recipientCount")]
+    pub recipient_count: i64,
+    #[serde(rename = "organizationCount")]
+    pub organization_count: i64,
+    #[serde(rename = "sentCount")]
+    pub sent_count: i64,
+    #[serde(rename = "failedCount")]
+    pub failed_count: i64,
+    #[serde(rename = "skippedCount")]
+    pub skipped_count: i64,
+}
+
 /// Model history entry - includes pricing, context length, and other model attributes
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct ModelHistoryEntry {

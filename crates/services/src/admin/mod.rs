@@ -14,7 +14,10 @@ pub use ports::{PlatformServiceInfo, *};
 use std::sync::Arc;
 
 use crate::completions::CompletionServiceTrait;
+use crate::email::{EmailDeliveryOutcome, EmailSender, ModelDeprecationEmail};
 use crate::models::ModelsServiceTrait;
+
+const MODEL_DEPRECATION_USAGE_WINDOW_DAYS: i64 = 30;
 
 pub struct AdminServiceImpl {
     repository: Arc<dyn AdminRepository>,
@@ -25,6 +28,7 @@ pub struct AdminServiceImpl {
     /// to `/v1/admin/organizations/{org_id}/concurrent-limit`, so admin
     /// changes take effect immediately instead of waiting for the 5-minute TTL.
     completion_service: Arc<dyn CompletionServiceTrait>,
+    email_sender: Arc<dyn EmailSender>,
 }
 
 impl AdminServiceImpl {
@@ -32,11 +36,90 @@ impl AdminServiceImpl {
         repository: Arc<dyn AdminRepository>,
         models_service: Arc<dyn ModelsServiceTrait>,
         completion_service: Arc<dyn CompletionServiceTrait>,
+        email_sender: Arc<dyn EmailSender>,
     ) -> Self {
         Self {
             repository,
             models_service,
             completion_service,
+            email_sender,
+        }
+    }
+
+    async fn validate_and_load_model_deprecation(
+        &self,
+        model_name: &str,
+        successor_model_name: &str,
+        _deprecation_date: chrono::DateTime<chrono::Utc>,
+    ) -> Result<
+        (
+            ModelDeprecationModel,
+            ModelDeprecationModel,
+            Vec<ModelDeprecationRecipient>,
+        ),
+        AdminError,
+    > {
+        let model = model_name.trim();
+        let successor = successor_model_name.trim();
+        if model.is_empty() || successor.is_empty() {
+            return Err(AdminError::InvalidDeprecation(
+                "modelId and successorModelId are required".to_string(),
+            ));
+        }
+        if model == successor {
+            return Err(AdminError::InvalidDeprecation(
+                "modelId and successorModelId must differ".to_string(),
+            ));
+        }
+
+        let model = self
+            .repository
+            .get_active_model_for_deprecation(model)
+            .await
+            .map_err(|e| AdminError::InternalError(e.to_string()))?
+            .ok_or_else(|| {
+                AdminError::ModelNotFound(format!("Model '{model_name}' not found or inactive"))
+            })?;
+        let successor = self
+            .repository
+            .get_active_model_for_deprecation(successor)
+            .await
+            .map_err(|e| AdminError::InternalError(e.to_string()))?
+            .ok_or_else(|| {
+                AdminError::ModelNotFound(format!(
+                    "Successor model '{successor_model_name}' not found or inactive"
+                ))
+            })?;
+
+        let since =
+            chrono::Utc::now() - chrono::Duration::days(MODEL_DEPRECATION_USAGE_WINDOW_DAYS);
+        let recipients = self
+            .repository
+            .list_model_deprecation_recipients(&model.model_name, since)
+            .await
+            .map_err(|e| AdminError::InternalError(e.to_string()))?;
+
+        Ok((model, successor, recipients))
+    }
+
+    fn deprecation_preview_from_recipients(
+        recipients: &[ModelDeprecationRecipient],
+    ) -> ModelDeprecationPreview {
+        let recipient_count = recipients
+            .iter()
+            .map(|r| r.email.to_lowercase())
+            .collect::<std::collections::HashSet<_>>()
+            .len() as i64;
+        let organization_count = recipients
+            .iter()
+            .map(|r| r.organization_id)
+            .collect::<std::collections::HashSet<_>>()
+            .len() as i64;
+
+        ModelDeprecationPreview {
+            recipient_count,
+            organization_count,
+            usage_window_days: MODEL_DEPRECATION_USAGE_WINDOW_DAYS,
         }
     }
 }
@@ -289,6 +372,188 @@ impl AdminService for AdminServiceImpl {
             .map_err(|e| AdminError::InternalError(e.to_string()))?;
 
         Ok((models, total))
+    }
+
+    async fn preview_model_deprecation(
+        &self,
+        model_name: &str,
+        successor_model_name: &str,
+        deprecation_date: chrono::DateTime<chrono::Utc>,
+    ) -> Result<ModelDeprecationPreview, AdminError> {
+        let (model, successor, recipients) = self
+            .validate_and_load_model_deprecation(model_name, successor_model_name, deprecation_date)
+            .await?;
+        drop(model);
+        drop(successor);
+
+        Ok(Self::deprecation_preview_from_recipients(&recipients))
+    }
+
+    async fn confirm_model_deprecation(
+        &self,
+        model_name: &str,
+        successor_model_name: &str,
+        deprecation_date: chrono::DateTime<chrono::Utc>,
+        change_reason: Option<String>,
+        changed_by_user_id: Option<uuid::Uuid>,
+        changed_by_user_email: Option<String>,
+    ) -> Result<ModelDeprecationConfirmResult, AdminError> {
+        let (model, successor, recipients) = self
+            .validate_and_load_model_deprecation(model_name, successor_model_name, deprecation_date)
+            .await?;
+
+        let update = UpdateModelAdminRequest {
+            input_cost_per_token: None,
+            output_cost_per_token: None,
+            cost_per_image: None,
+            cache_read_cost_per_token: None,
+            model_display_name: None,
+            model_description: None,
+            model_icon: None,
+            context_length: None,
+            verifiable: None,
+            is_active: None,
+            aliases: None,
+            owned_by: None,
+            provider_type: None,
+            provider_config: None,
+            attestation_supported: None,
+            input_modalities: None,
+            output_modalities: None,
+            inference_url: None,
+            hugging_face_id: None,
+            quantization: None,
+            max_output_length: None,
+            supported_sampling_parameters: None,
+            supported_features: None,
+            datacenters: None,
+            is_ready: None,
+            deprecation_date: Some(Some(deprecation_date)),
+            change_reason: change_reason.or_else(|| {
+                Some(format!(
+                    "Planned deprecation; recommended successor: {}",
+                    successor.model_name
+                ))
+            }),
+            changed_by_user_id,
+            changed_by_user_email: changed_by_user_email.clone(),
+        };
+
+        self.repository
+            .upsert_model_pricing(&model.model_name, update)
+            .await
+            .map_err(|e| AdminError::InternalError(e.to_string()))?;
+        self.models_service.invalidate_models_cache().await;
+
+        let already_sent = self
+            .repository
+            .list_sent_model_deprecation_delivery_keys(
+                model.id,
+                &successor.model_name,
+                deprecation_date,
+            )
+            .await
+            .map_err(|e| AdminError::InternalError(e.to_string()))?;
+        let already_sent: std::collections::HashSet<(uuid::Uuid, uuid::Uuid)> =
+            already_sent.into_iter().collect();
+        let already_sent_emails = recipients
+            .iter()
+            .filter(|recipient| {
+                already_sent.contains(&(recipient.user_id, recipient.organization_id))
+            })
+            .map(|recipient| recipient.email.to_lowercase())
+            .collect::<std::collections::HashSet<_>>();
+
+        let mut sent_count = 0_i64;
+        let mut failed_count = 0_i64;
+        let mut skipped_count = 0_i64;
+        let mut counted_emails = std::collections::HashSet::<String>::new();
+        let mut email_results = std::collections::HashMap::<
+            String,
+            (ModelDeprecationEmailStatus, Option<String>, Option<String>),
+        >::new();
+
+        for recipient in &recipients {
+            let email_key = recipient.email.to_lowercase();
+            let already_sent_for_row =
+                already_sent.contains(&(recipient.user_id, recipient.organization_id));
+            let result = if already_sent_for_row || already_sent_emails.contains(&email_key) {
+                (
+                    ModelDeprecationEmailStatus::Skipped,
+                    None,
+                    Some("Already sent for this deprecation".to_string()),
+                )
+            } else if let Some(existing) = email_results.get(&email_key) {
+                existing.clone()
+            } else {
+                let email = ModelDeprecationEmail {
+                    recipient_email: recipient.email.clone(),
+                    model_id: model.model_name.clone(),
+                    model_display_name: model.model_display_name.clone(),
+                    deprecation_date,
+                    successor_model_id: successor.model_name.clone(),
+                };
+                let outcome = match self.email_sender.send_model_deprecation(&email).await {
+                    Ok(EmailDeliveryOutcome::Sent { message_id }) => {
+                        (ModelDeprecationEmailStatus::Sent, message_id, None)
+                    }
+                    Ok(EmailDeliveryOutcome::Skipped) => {
+                        (ModelDeprecationEmailStatus::Skipped, None, None)
+                    }
+                    Err(e) => (
+                        ModelDeprecationEmailStatus::Failed,
+                        None,
+                        Some(e.sanitized_message()),
+                    ),
+                };
+                email_results.insert(email_key.clone(), outcome.clone());
+                outcome
+            };
+
+            if counted_emails.insert(email_key) {
+                match result.0 {
+                    ModelDeprecationEmailStatus::Sent => sent_count += 1,
+                    ModelDeprecationEmailStatus::Failed => failed_count += 1,
+                    ModelDeprecationEmailStatus::Skipped => skipped_count += 1,
+                }
+            }
+
+            if already_sent_for_row {
+                continue;
+            }
+
+            self.repository
+                .record_model_deprecation_delivery(ModelDeprecationDeliveryRecord {
+                    model_id: model.id,
+                    model_name: model.model_name.clone(),
+                    model_display_name: model.model_display_name.clone(),
+                    successor_model_name: successor.model_name.clone(),
+                    deprecation_date,
+                    recipient_user_id: recipient.user_id,
+                    recipient_email: recipient.email.clone(),
+                    organization_id: recipient.organization_id,
+                    organization_name: recipient.organization_name.clone(),
+                    status: result.0,
+                    email_message_id: result.1,
+                    email_last_error: result.2,
+                    initiated_by_user_id: changed_by_user_id,
+                    initiated_by_user_email: changed_by_user_email.clone(),
+                })
+                .await
+                .map_err(|e| AdminError::InternalError(e.to_string()))?;
+        }
+
+        let preview = Self::deprecation_preview_from_recipients(&recipients);
+        Ok(ModelDeprecationConfirmResult {
+            model_id: model.model_name,
+            successor_model_id: successor.model_name,
+            deprecation_date,
+            recipient_count: preview.recipient_count,
+            organization_count: preview.organization_count,
+            sent_count,
+            failed_count,
+            skipped_count,
+        })
     }
 
     async fn update_organization_concurrent_limit(

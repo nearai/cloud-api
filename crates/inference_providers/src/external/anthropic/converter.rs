@@ -49,6 +49,23 @@ pub enum AnthropicContentPart {
         tool_use_id: String,
         content: String,
     },
+    #[serde(rename = "image")]
+    Image { source: AnthropicImageSource },
+}
+
+/// Anthropic image source. Anthropic accepts either inline base64 bytes
+/// (`type: "base64"`) or a remote URL (`type: "url"`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum AnthropicImageSource {
+    #[serde(rename = "base64")]
+    Base64 {
+        media_type: String,
+        /// Exact base64 payload, forwarded verbatim (no re-encoding).
+        data: String,
+    },
+    #[serde(rename = "url")]
+    Url { url: String },
 }
 
 /// Anthropic tool definition
@@ -221,15 +238,12 @@ pub struct AnthropicResponse {
 
 /// Convert OpenAI messages to Anthropic format
 pub fn convert_messages(messages: &[ChatMessage]) -> (Option<String>, Vec<AnthropicMessage>) {
+    use crate::external::content::{
+        parse_content, text_from_content as extract_content, ContentPart,
+    };
+
     let mut system_message = None;
     let mut anthropic_messages = Vec::new();
-
-    let extract_content = |value: &serde_json::Value| -> String {
-        match value {
-            serde_json::Value::String(s) => s.clone(),
-            _ => value.to_string(),
-        }
-    };
 
     for msg in messages {
         match msg.role {
@@ -239,15 +253,49 @@ pub fn convert_messages(messages: &[ChatMessage]) -> (Option<String>, Vec<Anthro
                 }
             }
             MessageRole::User => {
-                let content = msg
-                    .content
-                    .as_ref()
-                    .map(&extract_content)
-                    .unwrap_or_default();
-                anthropic_messages.push(AnthropicMessage {
-                    role: "user".to_string(),
-                    content: AnthropicMessageContent::Text(content),
-                });
+                // User messages may be multimodal (text + image parts). Build
+                // native Anthropic content blocks so images are transmitted as
+                // images, not flattened into a JSON text blob (issue #640).
+                let parts = msg.content.as_ref().map(parse_content).unwrap_or_default();
+
+                let has_image = parts.iter().any(|p| !matches!(p, ContentPart::Text(_)));
+
+                if has_image {
+                    let mut blocks = Vec::with_capacity(parts.len());
+                    for part in parts {
+                        match part {
+                            ContentPart::Text(text) => {
+                                if !text.is_empty() {
+                                    blocks.push(AnthropicContentPart::Text { text });
+                                }
+                            }
+                            ContentPart::ImageBase64 { media_type, data } => {
+                                blocks.push(AnthropicContentPart::Image {
+                                    source: AnthropicImageSource::Base64 { media_type, data },
+                                });
+                            }
+                            ContentPart::ImageUrl { url } => {
+                                blocks.push(AnthropicContentPart::Image {
+                                    source: AnthropicImageSource::Url { url },
+                                });
+                            }
+                        }
+                    }
+                    anthropic_messages.push(AnthropicMessage {
+                        role: "user".to_string(),
+                        content: AnthropicMessageContent::Blocks(blocks),
+                    });
+                } else {
+                    let content = msg
+                        .content
+                        .as_ref()
+                        .map(&extract_content)
+                        .unwrap_or_default();
+                    anthropic_messages.push(AnthropicMessage {
+                        role: "user".to_string(),
+                        content: AnthropicMessageContent::Text(content),
+                    });
+                }
             }
             MessageRole::Assistant => {
                 // Check if the assistant message contains tool calls
@@ -585,6 +633,90 @@ mod tests {
 
         assert_eq!(system, Some("You are helpful.".to_string()));
         assert_eq!(anthropic_messages.len(), 1);
+    }
+
+    /// A real, minimal 1x1 solid-red PNG (constructed by hand, base64-encoded).
+    /// Used to prove the converter forwards the EXACT bytes (issue #640).
+    const RED_PNG_B64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAD\
+        UlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+
+    #[test]
+    fn test_convert_messages_image_preserves_base64_and_media_type() {
+        // Strip the line-continuation whitespace so the constant is a clean
+        // base64 string, exactly as a client would send it.
+        let payload: String = RED_PNG_B64.split_whitespace().collect();
+        let data_uri = format!("data:image/png;base64,{payload}");
+
+        let messages = vec![ChatMessage {
+            role: MessageRole::User,
+            content: Some(serde_json::json!([
+                {"type": "text", "text": "Describe this image."},
+                {"type": "image_url", "image_url": {"url": data_uri}}
+            ])),
+            name: None,
+            tool_call_id: None,
+            tool_calls: None,
+        }];
+
+        let (_system, anthropic_messages) = convert_messages(&messages);
+        assert_eq!(anthropic_messages.len(), 1);
+
+        let blocks = match &anthropic_messages[0].content {
+            AnthropicMessageContent::Blocks(b) => b,
+            AnthropicMessageContent::Text(t) => {
+                panic!("image was flattened to text instead of an image block: {t}")
+            }
+        };
+        assert_eq!(blocks.len(), 2, "expected text + image blocks");
+
+        match &blocks[0] {
+            AnthropicContentPart::Text { text } => assert_eq!(text, "Describe this image."),
+            other => panic!("expected text block first, got {other:?}"),
+        }
+        match &blocks[1] {
+            AnthropicContentPart::Image {
+                source: AnthropicImageSource::Base64 { media_type, data },
+            } => {
+                assert_eq!(media_type, "image/png");
+                assert_eq!(data, &payload, "base64 payload must be byte-identical");
+            }
+            other => panic!("expected base64 image block, got {other:?}"),
+        }
+
+        // Serialize the whole request shape Anthropic receives and assert the
+        // exact bytes survive (no double-encoding, no JSON-blob flattening).
+        let json = serde_json::to_string(&anthropic_messages[0]).unwrap();
+        assert!(
+            json.contains(&payload),
+            "serialized request lost the base64 payload"
+        );
+        assert!(json.contains("\"type\":\"image\""));
+        assert!(json.contains("\"media_type\":\"image/png\""));
+    }
+
+    #[test]
+    fn test_convert_messages_image_url_uses_url_source() {
+        let messages = vec![ChatMessage {
+            role: MessageRole::User,
+            content: Some(serde_json::json!([
+                {"type": "image_url", "image_url": {"url": "https://example.com/cat.jpg"}}
+            ])),
+            name: None,
+            tool_call_id: None,
+            tool_calls: None,
+        }];
+
+        let (_system, anthropic_messages) = convert_messages(&messages);
+        let blocks = match &anthropic_messages[0].content {
+            AnthropicMessageContent::Blocks(b) => b,
+            _ => panic!("expected blocks"),
+        };
+        match &blocks[0] {
+            AnthropicContentPart::Image {
+                source: AnthropicImageSource::Url { url },
+            } => assert_eq!(url, "https://example.com/cat.jpg"),
+            other => panic!("expected url image source, got {other:?}"),
+        }
     }
 
     #[test]

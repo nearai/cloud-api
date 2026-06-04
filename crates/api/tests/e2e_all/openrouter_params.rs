@@ -434,3 +434,55 @@ async fn test_json_schema_response_format_accepted_and_forwarded() {
         "response_format.type not preserved on passthrough"
     );
 }
+
+// ── frequency_penalty / presence_penalty (nearai/cloud-api #622) ─────────────
+
+/// `frequency_penalty` and `presence_penalty` are typed fields on
+/// `ChatCompletionRequest`, so they don't fall through `#[serde(flatten)] extra`
+/// on their own. They must still reach the self-hosted backend — the service
+/// layer hardcodes the typed `ChatCompletionParams` penalty slots to `None`, so
+/// the route forwards them via the `extra` passthrough map. Regression guard for
+/// #622, where both penalties were silently dropped (output byte-identical at
+/// penalty 0 vs 2.0).
+#[tokio::test]
+async fn test_penalties_accepted_and_forwarded() {
+    let (server, mock, model, api_key) = setup().await;
+
+    let response = server
+        .post("/v1/chat/completions")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .json(&serde_json::json!({
+            "model": model,
+            "messages": [{"role": "user", "content": "Repeat banana ten times."}],
+            "frequency_penalty": 1.5,
+            "presence_penalty": 0.75,
+            "max_tokens": 20,
+            "temperature": 0,
+            "stream": false,
+        }))
+        .await;
+
+    assert_eq!(
+        response.status_code(),
+        200,
+        "penalties should be accepted, got: {}",
+        response.text()
+    );
+    let params = mock.last_chat_params().await.expect("provider was called");
+    assert_eq!(
+        params
+            .extra
+            .get("frequency_penalty")
+            .and_then(|v| v.as_f64()),
+        Some(1.5),
+        "frequency_penalty not forwarded in `extra` (#622)"
+    );
+    assert_eq!(
+        params
+            .extra
+            .get("presence_penalty")
+            .and_then(|v| v.as_f64()),
+        Some(0.75),
+        "presence_penalty not forwarded in `extra` (#622)"
+    );
+}

@@ -27,9 +27,33 @@ pub struct GeminiPart {
     pub function_call: Option<GeminiFunctionCall>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub function_response: Option<GeminiFunctionResponse>,
+    /// Inline image (or other binary) data, base64-encoded.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inline_data: Option<GeminiInlineData>,
+    /// Reference to remote media by URI (Gemini fetches it itself).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file_data: Option<GeminiFileData>,
     /// Thought signature for Gemini 3 models - required for tool calls to work correctly
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thought_signature: Option<String>,
+}
+
+/// Inline base64 media payload for a Gemini part (`inlineData`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GeminiInlineData {
+    pub mime_type: String,
+    /// Exact base64 payload, forwarded verbatim (no re-encoding).
+    pub data: String,
+}
+
+/// Remote media reference for a Gemini part (`fileData`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GeminiFileData {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mime_type: Option<String>,
+    pub file_uri: String,
 }
 
 impl GeminiPart {
@@ -38,6 +62,33 @@ impl GeminiPart {
             text: Some(s),
             function_call: None,
             function_response: None,
+            inline_data: None,
+            file_data: None,
+            thought_signature: None,
+        }
+    }
+
+    pub fn inline_image(mime_type: String, data: String) -> Self {
+        Self {
+            text: None,
+            function_call: None,
+            function_response: None,
+            inline_data: Some(GeminiInlineData { mime_type, data }),
+            file_data: None,
+            thought_signature: None,
+        }
+    }
+
+    pub fn file_image(mime_type: Option<String>, file_uri: String) -> Self {
+        Self {
+            text: None,
+            function_call: None,
+            function_response: None,
+            inline_data: None,
+            file_data: Some(GeminiFileData {
+                mime_type,
+                file_uri,
+            }),
             thought_signature: None,
         }
     }
@@ -47,6 +98,8 @@ impl GeminiPart {
             text: None,
             function_call: None,
             function_response: Some(GeminiFunctionResponse { name, response }),
+            inline_data: None,
+            file_data: None,
             thought_signature: None,
         }
     }
@@ -60,6 +113,8 @@ impl GeminiPart {
             text: None,
             function_call: Some(GeminiFunctionCall { name, args }),
             function_response: None,
+            inline_data: None,
+            file_data: None,
             thought_signature,
         }
     }
@@ -191,11 +246,8 @@ pub struct GeminiResponse {
 pub fn convert_messages(
     messages: &[ChatMessage],
 ) -> (Option<GeminiSystemInstruction>, Vec<GeminiContent>) {
-    let extract_content = |value: &serde_json::Value| -> String {
-        match value {
-            serde_json::Value::String(s) => s.clone(),
-            _ => value.to_string(),
-        }
+    use crate::external::content::{
+        parse_content, text_from_content as extract_content, ContentPart,
     };
 
     let mut system_instruction = None;
@@ -211,14 +263,38 @@ pub fn convert_messages(
                 }
             }
             MessageRole::User => {
+                // User messages may be multimodal (text + image parts). Emit
+                // native Gemini parts so images are sent as `inlineData`/
+                // `fileData`, not flattened into a JSON text blob (issue #640).
+                let content_parts = msg.content.as_ref().map(parse_content).unwrap_or_default();
+
+                let mut parts = Vec::with_capacity(content_parts.len());
+                for part in content_parts {
+                    match part {
+                        ContentPart::Text(text) => {
+                            if !text.is_empty() {
+                                parts.push(GeminiPart::text(text));
+                            }
+                        }
+                        ContentPart::ImageBase64 { media_type, data } => {
+                            parts.push(GeminiPart::inline_image(media_type, data));
+                        }
+                        ContentPart::ImageUrl { url } => {
+                            // Gemini's fileData accepts a remote URI and fetches
+                            // it itself. MIME type is unknown for a bare URL.
+                            parts.push(GeminiPart::file_image(None, url));
+                        }
+                    }
+                }
+                // Preserve prior behaviour for empty/text-only content: at least
+                // one (possibly empty) text part.
+                if parts.is_empty() {
+                    parts.push(GeminiPart::text(String::new()));
+                }
+
                 contents.push(GeminiContent {
                     role: "user".to_string(),
-                    parts: vec![GeminiPart::text(
-                        msg.content
-                            .as_ref()
-                            .map(&extract_content)
-                            .unwrap_or_default(),
-                    )],
+                    parts,
                 });
             }
             MessageRole::Assistant => {
@@ -666,6 +742,72 @@ mod tests {
         assert!(system.is_some());
         assert_eq!(contents.len(), 1);
         assert_eq!(contents[0].role, "user");
+    }
+
+    /// Real minimal 1x1 solid-red PNG, base64-encoded (issue #640 guard).
+    const RED_PNG_B64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAD\
+        UlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+
+    #[test]
+    fn test_convert_messages_image_preserves_base64_and_mime() {
+        let payload: String = RED_PNG_B64.split_whitespace().collect();
+        let data_uri = format!("data:image/png;base64,{payload}");
+
+        let messages = vec![ChatMessage {
+            role: MessageRole::User,
+            content: Some(serde_json::json!([
+                {"type": "text", "text": "Describe this image."},
+                {"type": "image_url", "image_url": {"url": data_uri}}
+            ])),
+            name: None,
+            tool_call_id: None,
+            tool_calls: None,
+        }];
+
+        let (_system, contents) = convert_messages(&messages);
+        assert_eq!(contents.len(), 1);
+        let parts = &contents[0].parts;
+        assert_eq!(parts.len(), 2, "expected text + inlineData parts");
+
+        assert_eq!(parts[0].text.as_deref(), Some("Describe this image."));
+        let inline = parts[1]
+            .inline_data
+            .as_ref()
+            .expect("expected inlineData image part, not a flattened text blob");
+        assert_eq!(inline.mime_type, "image/png");
+        assert_eq!(
+            inline.data, payload,
+            "base64 payload must be byte-identical"
+        );
+
+        // Serialize and check Gemini camelCase wire shape + exact bytes survive.
+        let json = serde_json::to_string(&contents[0]).unwrap();
+        assert!(
+            json.contains(&payload),
+            "serialized request lost the base64 payload"
+        );
+        assert!(json.contains("\"inlineData\""));
+        assert!(json.contains("\"mimeType\":\"image/png\""));
+    }
+
+    #[test]
+    fn test_convert_messages_image_url_uses_file_data() {
+        let messages = vec![ChatMessage {
+            role: MessageRole::User,
+            content: Some(serde_json::json!([
+                {"type": "image_url", "image_url": {"url": "https://example.com/cat.jpg"}}
+            ])),
+            name: None,
+            tool_call_id: None,
+            tool_calls: None,
+        }];
+
+        let (_system, contents) = convert_messages(&messages);
+        let file = contents[0].parts[0]
+            .file_data
+            .as_ref()
+            .expect("expected fileData for remote URL");
+        assert_eq!(file.file_uri, "https://example.com/cat.jpg");
     }
 
     #[test]

@@ -42,8 +42,9 @@ const ANTHROPIC_PASSTHROUGH_KEYS: &[&str] = &["thinking", "reasoning_effort"];
 /// not over-strip.
 const ANTHROPIC_MODELS_REJECTING_TEMPERATURE: &[&str] = &["claude-opus-4-7"];
 
-/// Whether `model` rejects a non-default `temperature` and we must drop it
-/// (forwarding `top_p` instead) rather than 400 the caller (#696).
+/// Whether `model` rejects a non-default `temperature` (and also `top_p`), so we
+/// must drop BOTH sampling knobs rather than 400 the caller (#696). opus-4-7
+/// returns `temperature is deprecated` / `top_p is deprecated` for either.
 fn rejects_non_default_temperature(model: &str) -> bool {
     ANTHROPIC_MODELS_REJECTING_TEMPERATURE
         .iter()
@@ -150,11 +151,16 @@ impl AnthropicBackend {
         // Also clamp temperature to Anthropic's valid range [0.0, 1.0] (OpenAI allows up to 2.0).
         //
         // #696: some newer models (e.g. claude-opus-4-7) 400 on ANY non-default
-        // `temperature`. For those we drop `temperature` entirely and forward
-        // `top_p` instead, so OpenAI/OpenRouter clients that routinely send
-        // `temperature: 0`/`0.7` get a 200 (param ignored) instead of a 400.
+        // `temperature` — AND on any `top_p` ("`top_p` is deprecated for this
+        // model"). So we drop BOTH and forward neither, letting the model use
+        // its own defaults; OpenAI/OpenRouter clients that routinely send
+        // `temperature: 0`/`0.7` (and our own `top_p` default of 1.0) then get a
+        // 200 with the params ignored instead of a 400. NOTE: `top_p` defaults to
+        // `Some(1.0)` at deserialization, so forwarding `params.top_p` here would
+        // send `top_p: 1.0` unconditionally and 400 every request — we must send
+        // `None` for both.
         let (temperature, top_p) = if rejects_non_default_temperature(model) {
-            (None, params.top_p)
+            (None, None)
         } else if let Some(temp) = params.temperature {
             (Some(temp.clamp(0.0, 1.0)), None)
         } else {
@@ -642,26 +648,32 @@ mod tests {
     // ── #696: temperature dropped for models that reject non-default values ──
 
     #[test]
-    fn test_opus_4_7_drops_non_default_temperature_forwards_top_p() {
+    fn test_opus_4_7_drops_both_temperature_and_top_p() {
         let backend = AnthropicBackend::new();
-        // opus-4-7 400s on any non-default temperature; we must drop it.
-        let mut params = make_params(Some(0.0), Some(0.5));
+        // opus-4-7 400s on any non-default `temperature` AND on any `top_p`
+        // ("`top_p` is deprecated for this model"). Crucially `top_p` defaults to
+        // Some(1.0) at deserialization, so forwarding it would 400 every request
+        // — we must drop BOTH and let the model use its own defaults (#696).
+        let params = make_params(Some(0.0), Some(0.5));
         let request = backend.build_request("claude-opus-4-7", &params, false);
         assert_eq!(
             request.temperature, None,
             "temperature must be dropped for opus-4-7"
         );
         assert_eq!(
-            request.top_p,
-            Some(0.5),
-            "top_p must still be forwarded for opus-4-7"
+            request.top_p, None,
+            "top_p must also be dropped for opus-4-7 (it rejects top_p too)"
         );
 
-        // Same when only temperature is set (no top_p): just drop it.
-        params = make_params(Some(0.7), None);
+        // Dated form + the defaulted top_p=1.0 (the real-world no-params case
+        // that regressed): still send neither.
+        let params = make_params(None, Some(1.0));
         let request = backend.build_request("claude-opus-4-7-20991231", &params, false);
         assert_eq!(request.temperature, None);
-        assert_eq!(request.top_p, None);
+        assert_eq!(
+            request.top_p, None,
+            "the default top_p=1.0 must not be forwarded to opus-4-7"
+        );
     }
 
     #[test]

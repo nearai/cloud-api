@@ -598,6 +598,25 @@ impl CompletionServiceImpl {
             None => None,
         };
 
+        // Honor `tool_choice: "none"` universally (nearai/cloud-api #619).
+        //
+        // OpenAI semantics: "none" forbids the model from calling any tool on
+        // this turn. Some backends (notably vLLM-served Qwen / gpt-oss) ignore
+        // `tool_choice` and emit tool_calls anyway. The robust, backend-agnostic
+        // enforcement is to strip the tool definitions entirely so there is
+        // nothing the model *can* call. We drop both the typed `tools` and any
+        // `tools` left in `extra` (e.g. non-standard tool shapes that didn't
+        // parse above). The `tool_choice: "none"` itself is harmless to forward.
+        let tools = if matches!(
+            tool_choice,
+            Some(inference_providers::ToolChoice::String(ref s)) if s == "none"
+        ) {
+            extra.remove("tools");
+            None
+        } else {
+            tools
+        };
+
         (tools, tool_choice)
     }
 
@@ -2894,6 +2913,57 @@ mod tests {
 
         assert!(tools.is_none());
         assert!(extra.contains_key("tools"));
+    }
+
+    #[test]
+    fn extract_tools_strips_function_tools_when_choice_none() {
+        // nearai/cloud-api #619: tool_choice="none" must remove the tools so a
+        // backend that ignores tool_choice (vLLM) cannot emit a tool call.
+        let mut extra = std::collections::HashMap::new();
+        extra.insert(
+            "tools".to_string(),
+            serde_json::json!([{
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "description": "Get weather.",
+                    "parameters": {"type": "object", "properties": {}}
+                }
+            }]),
+        );
+        extra.insert("tool_choice".to_string(), serde_json::json!("none"));
+
+        let (tools, tool_choice) = CompletionServiceImpl::extract_tools_from_extra(&mut extra);
+
+        assert!(
+            tools.is_none(),
+            "tools must be stripped when choice is none"
+        );
+        assert!(
+            matches!(tool_choice, Some(inference_providers::ToolChoice::String(ref s)) if s == "none"),
+            "tool_choice=none should still be returned"
+        );
+        assert!(!extra.contains_key("tools"));
+    }
+
+    #[test]
+    fn extract_tools_strips_unparsed_extra_tools_when_choice_none() {
+        // Even tools that didn't parse into the typed field (and would normally
+        // flow through via `extra`) must be removed when choice is "none".
+        let mut extra = std::collections::HashMap::new();
+        extra.insert(
+            "tools".to_string(),
+            serde_json::json!([{"type": "web_context_search"}]),
+        );
+        extra.insert("tool_choice".to_string(), serde_json::json!("none"));
+
+        let (tools, _) = CompletionServiceImpl::extract_tools_from_extra(&mut extra);
+
+        assert!(tools.is_none());
+        assert!(
+            !extra.contains_key("tools"),
+            "tool_choice=none must also strip unparsed `tools` from extra"
+        );
     }
 
     #[test]

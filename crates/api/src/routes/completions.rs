@@ -437,6 +437,34 @@ fn unredact_chat_response_in_place(
     }
 }
 
+/// Correct `finish_reason` to `"tool_calls"` on any choice that carries a
+/// non-empty `tool_calls` array but reports a different reason (nearai/cloud-api
+/// #619). When `tool_choice` forces a specific function, some backends (vLLM)
+/// return `finish_reason: "stop"` even though a tool *was* called; per the
+/// OpenAI spec, clients keying off `finish_reason` to detect tool calls must
+/// see `"tool_calls"`.
+///
+/// Returns `true` if any choice was modified, so the caller can decide whether
+/// it must re-serialize (which forgoes returning the provider's exact attested
+/// bytes) or can keep the verbatim body for hash/attestation verification.
+fn fix_tool_call_finish_reason_in_place(
+    response: &mut inference_providers::ChatCompletionResponse,
+) -> bool {
+    let mut changed = false;
+    for choice in &mut response.choices {
+        let has_tool_calls = choice
+            .message
+            .tool_calls
+            .as_ref()
+            .is_some_and(|tc| !tc.is_empty());
+        if has_tool_calls && choice.finish_reason.as_deref() != Some("tool_calls") {
+            choice.finish_reason = Some("tool_calls".to_string());
+            changed = true;
+        }
+    }
+    changed
+}
+
 /// Per-choice, per-field streaming un-redact state. For `n > 1`
 /// completions the provider may interleave chunks for different choice
 /// indices; each choice needs its own sliding tail buffer or split
@@ -1236,10 +1264,34 @@ async fn chat_completions_inner(
                         &mut response_with_bytes.response,
                         &redaction_map,
                     );
+                    // Correct finish_reason for forced-tool calls (#619). The
+                    // body is already being re-serialized for un-redaction, so
+                    // this is free here.
+                    fix_tool_call_finish_reason_in_place(&mut response_with_bytes.response);
                     match serde_json::to_vec(&response_with_bytes.response) {
                         Ok(b) => b,
                         Err(e) => {
                             tracing::error!(error = %e, "failed to re-serialize unredacted chat response");
+                            return (
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                ResponseJson(ErrorResponse::new(
+                                    "Failed to assemble response".to_string(),
+                                    "internal_server_error".to_string(),
+                                )),
+                            )
+                                .into_response();
+                        }
+                    }
+                } else if fix_tool_call_finish_reason_in_place(&mut response_with_bytes.response) {
+                    // A choice carried tool_calls but the backend mislabeled
+                    // finish_reason (e.g. vLLM returns "stop" on forced-tool
+                    // calls, #619). We must correct the body, which means
+                    // re-serializing and forgoing the provider's verbatim
+                    // attested bytes for this (narrow) case.
+                    match serde_json::to_vec(&response_with_bytes.response) {
+                        Ok(b) => b,
+                        Err(e) => {
+                            tracing::error!(error = %e, "failed to re-serialize chat response after finish_reason fix");
                             return (
                                 StatusCode::INTERNAL_SERVER_ERROR,
                                 ResponseJson(ErrorResponse::new(

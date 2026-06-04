@@ -102,6 +102,53 @@ fn strip_reasoning_effort_if_unsupported(
     }
 }
 
+/// Returns true for OpenAI proper (`api.openai.com`) and Azure OpenAI
+/// (`*.openai.azure.com`) base URLs. Other OpenAI-*compatible* providers
+/// (Together, Groq, Fireworks, OpenRouter, …) are intentionally excluded
+/// because they tend to accept (or apply) the extra sampling knobs below, and
+/// stripping them there would silently change behaviour.
+fn is_openai_source(base_url: &str) -> bool {
+    base_url.contains("api.openai.com") || base_url.contains(".openai.azure.com")
+}
+
+/// Sampling knobs that OpenAI's `/v1/chat/completions` does **not** recognise
+/// and hard-rejects with HTTP 400 ("Unrecognized request argument supplied:
+/// …"). OpenRouter clients send these broadly, so any request carrying one and
+/// routed to an OpenAI-backed model would 400 (nearai/cloud-api#697).
+///
+/// These are passthrough-only fields that land in `ChatCompletionParams.extra`
+/// (they have no typed slot on the struct). We strip them before forwarding to
+/// OpenAI-source upstreams so the request succeeds with the unsupported param
+/// silently ignored — the same graceful-ignore semantics the Anthropic path
+/// already has. Self-hosted (vLLM/SGLang) and Anthropic paths use different
+/// backends and are unaffected; other openai-compatible providers are excluded
+/// via `is_openai_source`.
+const OPENAI_UNSUPPORTED_SAMPLING_PARAMS: &[&str] =
+    &["top_k", "repetition_penalty", "min_p", "top_a"];
+
+/// Strip sampling parameters that OpenAI's chat/completions API rejects, but
+/// only when the upstream is OpenAI-source. See
+/// `OPENAI_UNSUPPORTED_SAMPLING_PARAMS` for the rationale.
+fn strip_unsupported_sampling_params(
+    params: &mut ChatCompletionParams,
+    base_url: &str,
+    model: &str,
+) {
+    if !is_openai_source(base_url) {
+        return;
+    }
+    for key in OPENAI_UNSUPPORTED_SAMPLING_PARAMS {
+        if params.extra.remove(*key).is_some() {
+            tracing::warn!(
+                model = %model,
+                base_url = %base_url,
+                param = %key,
+                "Stripped unsupported sampling param from OpenAI request: rejected by /v1/chat/completions (graceful-ignore, nearai/cloud-api#697)"
+            );
+        }
+    }
+}
+
 #[async_trait]
 impl ExternalBackend for OpenAiCompatibleBackend {
     fn backend_type(&self) -> &'static str {
@@ -136,6 +183,7 @@ impl ExternalBackend for OpenAiCompatibleBackend {
         streaming_params.max_tokens = None;
 
         strip_reasoning_effort_if_unsupported(&mut streaming_params, &config.base_url, model);
+        strip_unsupported_sampling_params(&mut streaming_params, &config.base_url, model);
 
         let headers = self
             .build_headers(config)
@@ -200,6 +248,7 @@ impl ExternalBackend for OpenAiCompatibleBackend {
         non_streaming_params.max_tokens = None;
 
         strip_reasoning_effort_if_unsupported(&mut non_streaming_params, &config.base_url, model);
+        strip_unsupported_sampling_params(&mut non_streaming_params, &config.base_url, model);
 
         let headers = self
             .build_headers(config)
@@ -740,5 +789,117 @@ mod tests {
             params.extra.get("verbosity"),
             Some(&serde_json::Value::String("high".to_string()))
         );
+    }
+
+    // ===== unsupported sampling-param stripping (nearai/cloud-api#697) =====
+
+    /// Insert every non-OpenAI sampling knob from the issue into `extra`.
+    fn with_sampling_extras() -> ChatCompletionParams {
+        let mut params = make_chat_params(None, None);
+        params
+            .extra
+            .insert("top_k".to_string(), serde_json::json!(5));
+        params
+            .extra
+            .insert("repetition_penalty".to_string(), serde_json::json!(1.3));
+        params
+            .extra
+            .insert("min_p".to_string(), serde_json::json!(0.5));
+        params
+            .extra
+            .insert("top_a".to_string(), serde_json::json!(0.5));
+        params
+    }
+
+    /// The exact repro from #697: OpenAI proper rejects `top_k`/`min_p`/
+    /// `top_a`/`repetition_penalty`. All four must be stripped before
+    /// forwarding so the request is a 200 with the knobs ignored, not a 400.
+    #[test]
+    fn test_strip_sampling_params_openai_strips_all() {
+        let mut params = with_sampling_extras();
+        strip_unsupported_sampling_params(&mut params, "https://api.openai.com/v1", "gpt-4.1");
+        for key in OPENAI_UNSUPPORTED_SAMPLING_PARAMS {
+            assert!(
+                !params.extra.contains_key(*key),
+                "{key} should be stripped for OpenAI upstream"
+            );
+        }
+    }
+
+    /// Azure OpenAI hosts the same models with the same rejection behaviour.
+    #[test]
+    fn test_strip_sampling_params_azure_strips_all() {
+        let mut params = with_sampling_extras();
+        strip_unsupported_sampling_params(
+            &mut params,
+            "https://my-resource.openai.azure.com",
+            "gpt-4.1",
+        );
+        for key in OPENAI_UNSUPPORTED_SAMPLING_PARAMS {
+            assert!(
+                !params.extra.contains_key(*key),
+                "{key} should be stripped for Azure OpenAI upstream"
+            );
+        }
+    }
+
+    /// Other openai-compatible providers (Together, Groq, Fireworks, OpenRouter)
+    /// often accept/apply these knobs — never strip there.
+    #[test]
+    fn test_strip_sampling_params_non_openai_keeps_all() {
+        for base_url in &[
+            "https://api.together.xyz/v1",
+            "https://api.groq.com/openai/v1",
+            "https://api.fireworks.ai/inference/v1",
+            "https://openrouter.ai/api/v1",
+        ] {
+            let mut params = with_sampling_extras();
+            strip_unsupported_sampling_params(&mut params, base_url, "some-model");
+            for key in OPENAI_UNSUPPORTED_SAMPLING_PARAMS {
+                assert!(
+                    params.extra.contains_key(*key),
+                    "{key} must be preserved for non-OpenAI provider {base_url}"
+                );
+            }
+        }
+    }
+
+    /// Stripping the unsupported knobs must not disturb legitimate OpenAI
+    /// passthrough extras that also ride in `extra` (seed, logprobs,
+    /// response_format, reasoning_effort, …).
+    #[test]
+    fn test_strip_sampling_params_preserves_supported_extras() {
+        let mut params = with_sampling_extras();
+        params
+            .extra
+            .insert("seed".to_string(), serde_json::json!(12345));
+        params
+            .extra
+            .insert("logprobs".to_string(), serde_json::json!(true));
+        params.extra.insert(
+            "response_format".to_string(),
+            serde_json::json!({"type": "json_object"}),
+        );
+        strip_unsupported_sampling_params(&mut params, "https://api.openai.com/v1", "gpt-4.1");
+        assert_eq!(params.extra.get("seed"), Some(&serde_json::json!(12345)));
+        assert_eq!(params.extra.get("logprobs"), Some(&serde_json::json!(true)));
+        assert_eq!(
+            params.extra.get("response_format"),
+            Some(&serde_json::json!({"type": "json_object"}))
+        );
+        for key in OPENAI_UNSUPPORTED_SAMPLING_PARAMS {
+            assert!(!params.extra.contains_key(*key));
+        }
+    }
+
+    /// No-op when none of the unsupported knobs are present (no log noise).
+    #[test]
+    fn test_strip_sampling_params_no_unsupported_present() {
+        let mut params = make_chat_params(None, None);
+        params
+            .extra
+            .insert("seed".to_string(), serde_json::json!(7));
+        strip_unsupported_sampling_params(&mut params, "https://api.openai.com/v1", "gpt-4.1");
+        assert_eq!(params.extra.get("seed"), Some(&serde_json::json!(7)));
     }
 }

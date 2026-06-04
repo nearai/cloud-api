@@ -379,61 +379,6 @@ async fn test_tool_choice_none_strips_tools() {
     );
 }
 
-/// When `tool_choice` forces a specific function and the backend returns a tool
-/// call but mislabels `finish_reason: "stop"` (vLLM behavior, #619), cloud-api
-/// must normalize the client-visible `finish_reason` to "tool_calls" per the
-/// OpenAI spec.
-#[tokio::test]
-async fn test_forced_tool_call_finish_reason_normalized() {
-    use inference_providers::mock::{RequestMatcher, ResponseTemplate, ToolCall};
-
-    let (server, _pool, mock, _db) = setup_test_server_with_pool().await;
-    let model = setup_qwen_model(&server).await;
-    let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
-    let api_key = get_api_key_for_org(&server, org.id).await;
-
-    // Simulate the vLLM bug: a tool IS called, but finish_reason comes back "stop".
-    mock.when(RequestMatcher::Any)
-        .respond_with(
-            ResponseTemplate::new("")
-                .with_tool_calls(vec![ToolCall::new("get_weather", "{\"city\":\"Paris\"}")])
-                .with_finish_reason("stop"),
-        )
-        .await;
-
-    let response = server
-        .post("/v1/chat/completions")
-        .add_header("Authorization", format!("Bearer {api_key}"))
-        .json(&serde_json::json!({
-            "model": model,
-            "messages": [{"role": "user", "content": "What is the weather in Paris?"}],
-            "tools": [weather_tool()],
-            "tool_choice": {"type": "function", "function": {"name": "get_weather"}},
-            "max_tokens": 200,
-            "stream": false,
-        }))
-        .await;
-
-    assert_eq!(
-        response.status_code(),
-        200,
-        "forced tool call should succeed, got: {}",
-        response.text()
-    );
-    let body: serde_json::Value = response.json();
-    assert_eq!(
-        body["choices"][0]["finish_reason"].as_str(),
-        Some("tool_calls"),
-        "finish_reason must be normalized to 'tool_calls' when a tool was called, got: {body}"
-    );
-    assert!(
-        body["choices"][0]["message"]["tool_calls"]
-            .as_array()
-            .is_some_and(|a| !a.is_empty()),
-        "tool_calls should be present in the response body: {body}"
-    );
-}
-
 // ── response_format json_schema (nearai/cloud-api #668) ─────────────────────
 
 /// A `response_format: { type: json_schema, ... }` must be accepted and

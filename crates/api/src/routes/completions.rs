@@ -437,44 +437,6 @@ fn unredact_chat_response_in_place(
     }
 }
 
-/// Correct `finish_reason` to `"tool_calls"` on any choice that carries a
-/// non-empty `tool_calls` array but reports a different reason (nearai/cloud-api
-/// #619). When `tool_choice` forces a specific function, some backends (vLLM)
-/// return `finish_reason: "stop"` even though a tool *was* called; per the
-/// OpenAI spec, clients keying off `finish_reason` to detect tool calls must
-/// see `"tool_calls"`.
-///
-/// Returns `true` if any choice was modified, so the caller can decide whether
-/// it must re-serialize (which forgoes returning the provider's exact attested
-/// bytes) or can keep the verbatim body for hash/attestation verification.
-fn fix_tool_call_finish_reason_in_place(
-    response: &mut inference_providers::ChatCompletionResponse,
-) -> bool {
-    let mut changed = false;
-    for choice in &mut response.choices {
-        let has_tool_calls = choice
-            .message
-            .tool_calls
-            .as_ref()
-            .is_some_and(|tc| !tc.is_empty());
-        // Only normalize the known mis-labels: a backend that ran to a natural
-        // stop (`"stop"`), reported nothing (`None`), or used the legacy
-        // `"function_call"` reason while a tool *was* called. Reasons that carry
-        // independent meaning — `"length"` (truncated, e.g. tool args cut off by
-        // max_tokens) and `"content_filter"` — MUST be preserved, or clients
-        // would mistake a truncated/filtered response for a clean tool call.
-        let is_mislabel = matches!(
-            choice.finish_reason.as_deref(),
-            None | Some("stop") | Some("function_call")
-        );
-        if has_tool_calls && is_mislabel {
-            choice.finish_reason = Some("tool_calls".to_string());
-            changed = true;
-        }
-    }
-    changed
-}
-
 /// Per-choice, per-field streaming un-redact state. For `n > 1`
 /// completions the provider may interleave chunks for different choice
 /// indices; each choice needs its own sliding tail buffer or split
@@ -1274,34 +1236,10 @@ async fn chat_completions_inner(
                         &mut response_with_bytes.response,
                         &redaction_map,
                     );
-                    // Correct finish_reason for forced-tool calls (#619). The
-                    // body is already being re-serialized for un-redaction, so
-                    // this is free here.
-                    fix_tool_call_finish_reason_in_place(&mut response_with_bytes.response);
                     match serde_json::to_vec(&response_with_bytes.response) {
                         Ok(b) => b,
                         Err(e) => {
                             tracing::error!(error = %e, "failed to re-serialize unredacted chat response");
-                            return (
-                                StatusCode::INTERNAL_SERVER_ERROR,
-                                ResponseJson(ErrorResponse::new(
-                                    "Failed to assemble response".to_string(),
-                                    "internal_server_error".to_string(),
-                                )),
-                            )
-                                .into_response();
-                        }
-                    }
-                } else if fix_tool_call_finish_reason_in_place(&mut response_with_bytes.response) {
-                    // A choice carried tool_calls but the backend mislabeled
-                    // finish_reason (e.g. vLLM returns "stop" on forced-tool
-                    // calls, #619). We must correct the body, which means
-                    // re-serializing and forgoing the provider's verbatim
-                    // attested bytes for this (narrow) case.
-                    match serde_json::to_vec(&response_with_bytes.response) {
-                        Ok(b) => b,
-                        Err(e) => {
-                            tracing::error!(error = %e, "failed to re-serialize chat response after finish_reason fix");
                             return (
                                 StatusCode::INTERNAL_SERVER_ERROR,
                                 ResponseJson(ErrorResponse::new(
@@ -1908,76 +1846,6 @@ mod tests {
             nano_dollars_to_per_token_string(i64::MAX),
             "9223372036.854775807"
         );
-    }
-
-    /// Build a minimal non-streaming chat response with one choice whose
-    /// `finish_reason` and tool-call presence are set as given. Constructed via
-    /// deserialization to avoid hand-spelling every field of the response types.
-    fn response_with(
-        finish_reason: Option<&str>,
-        with_tool_call: bool,
-    ) -> inference_providers::ChatCompletionResponse {
-        let tool_calls = if with_tool_call {
-            serde_json::json!([{
-                "id": "call_1",
-                "type": "function",
-                "function": {"name": "get_weather", "arguments": "{\"city\":\"Paris\"}"}
-            }])
-        } else {
-            serde_json::Value::Null
-        };
-        serde_json::from_value(serde_json::json!({
-            "id": "chatcmpl-test",
-            "object": "chat.completion",
-            "created": 0,
-            "model": "test/model",
-            "choices": [{
-                "index": 0,
-                "message": {"role": "assistant", "content": "", "tool_calls": tool_calls},
-                "finish_reason": finish_reason,
-            }],
-            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
-        }))
-        .expect("valid ChatCompletionResponse fixture")
-    }
-
-    #[test]
-    fn finish_reason_mislabeled_stop_with_tool_call_is_corrected() {
-        let mut r = response_with(Some("stop"), true);
-        assert!(fix_tool_call_finish_reason_in_place(&mut r));
-        assert_eq!(r.choices[0].finish_reason.as_deref(), Some("tool_calls"));
-    }
-
-    #[test]
-    fn finish_reason_missing_with_tool_call_is_corrected() {
-        let mut r = response_with(None, true);
-        assert!(fix_tool_call_finish_reason_in_place(&mut r));
-        assert_eq!(r.choices[0].finish_reason.as_deref(), Some("tool_calls"));
-    }
-
-    #[test]
-    fn finish_reason_length_with_tool_call_is_preserved() {
-        // Tool args truncated by max_tokens: clients must still see "length".
-        let mut r = response_with(Some("length"), true);
-        assert!(!fix_tool_call_finish_reason_in_place(&mut r));
-        assert_eq!(r.choices[0].finish_reason.as_deref(), Some("length"));
-    }
-
-    #[test]
-    fn finish_reason_content_filter_with_tool_call_is_preserved() {
-        let mut r = response_with(Some("content_filter"), true);
-        assert!(!fix_tool_call_finish_reason_in_place(&mut r));
-        assert_eq!(
-            r.choices[0].finish_reason.as_deref(),
-            Some("content_filter")
-        );
-    }
-
-    #[test]
-    fn finish_reason_untouched_when_no_tool_calls() {
-        let mut r = response_with(Some("stop"), false);
-        assert!(!fix_tool_call_finish_reason_in_place(&mut r));
-        assert_eq!(r.choices[0].finish_reason.as_deref(), Some("stop"));
     }
 
     fn make_model_with_pricing(

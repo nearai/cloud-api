@@ -216,10 +216,6 @@ pub struct ResponseTemplate {
     tool_calls: Option<Vec<ToolCall>>,
     /// If set, usage will include prompt_tokens_details.cached_tokens (for cache-hit tests)
     cache_tokens: Option<i32>,
-    /// Override the non-streaming `finish_reason` (defaults to "tool_calls" when
-    /// tool_calls are present, else "stop"). Used to simulate backends that
-    /// mislabel forced-tool calls as "stop" (nearai/cloud-api #619).
-    finish_reason_override: Option<String>,
 }
 
 impl ResponseTemplate {
@@ -231,7 +227,6 @@ impl ResponseTemplate {
             disconnect_after_chunks: None,
             tool_calls: None,
             cache_tokens: None,
-            finish_reason_override: None,
         }
     }
 
@@ -267,14 +262,6 @@ impl ResponseTemplate {
         self
     }
 
-    /// Force a specific non-streaming `finish_reason`, overriding the default
-    /// derived from `tool_calls`. Lets tests reproduce backends that return
-    /// `finish_reason: "stop"` even when a tool was called (#619).
-    pub fn with_finish_reason(mut self, finish_reason: impl Into<String>) -> Self {
-        self.finish_reason_override = Some(finish_reason.into());
-        self
-    }
-
     /// Generate a ChatCompletionResponse from this template
     fn generate_response(
         &self,
@@ -304,14 +291,10 @@ impl ResponseTemplate {
                 .collect()
         });
 
-        let finish_reason = match &self.finish_reason_override {
-            Some(fr) => fr.clone(),
-            None => if tool_calls.is_some() {
-                "tool_calls"
-            } else {
-                "stop"
-            }
-            .to_string(),
+        let finish_reason = if tool_calls.is_some() {
+            "tool_calls"
+        } else {
+            "stop"
         };
 
         ChatCompletionResponse {
@@ -337,7 +320,7 @@ impl ResponseTemplate {
                     reasoning: self.reasoning_content.clone(),
                 },
                 logprobs: None,
-                finish_reason: Some(finish_reason),
+                finish_reason: Some(finish_reason.to_string()),
                 token_ids: None,
             }],
             service_tier: None,

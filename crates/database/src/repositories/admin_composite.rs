@@ -87,6 +87,9 @@ impl AdminRepository for AdminCompositeRepository {
             max_output_length: request.max_output_length,
             supported_sampling_parameters: request.supported_sampling_parameters,
             supported_features: request.supported_features,
+            datacenters: request.datacenters,
+            is_ready: request.is_ready,
+            deprecation_date: request.deprecation_date,
             change_reason: request.change_reason,
             changed_by_user_id: request.changed_by_user_id,
             changed_by_user_email: request.changed_by_user_email,
@@ -128,6 +131,9 @@ impl AdminRepository for AdminCompositeRepository {
             max_output_length: model.max_output_length,
             supported_sampling_parameters: model.supported_sampling_parameters,
             supported_features: model.supported_features,
+            datacenters: model.datacenters,
+            is_ready: model.is_ready,
+            deprecation_date: model.deprecation_date,
         })
     }
 
@@ -172,6 +178,9 @@ impl AdminRepository for AdminCompositeRepository {
                 max_output_length: h.max_output_length,
                 supported_sampling_parameters: h.supported_sampling_parameters,
                 supported_features: h.supported_features,
+                datacenters: h.datacenters,
+                is_ready: h.is_ready,
+                deprecation_date: h.deprecation_date,
                 effective_from: h.effective_from,
                 effective_until: h.effective_until,
                 changed_by_user_id: h.changed_by_user_id,
@@ -294,7 +303,10 @@ impl AdminRepository for AdminCompositeRepository {
                           input_cost_per_token, output_cost_per_token, cost_per_image,
                           cache_read_cost_per_token, context_length, verifiable, is_active,
                           owned_by, created_at, updated_at, provider_type, provider_config,
-                          attestation_supported, input_modalities, output_modalities, inference_url
+                          attestation_supported, input_modalities, output_modalities, inference_url,
+                          datacenters, hugging_face_id, quantization, max_output_length,
+                          supported_sampling_parameters, supported_features,
+                          is_ready, deprecation_date
                 "#,
                 &[&deprecated_id],
             )
@@ -325,11 +337,17 @@ impl AdminRepository for AdminCompositeRepository {
                 cache_read_cost_per_token, context_length, model_name, model_display_name,
                 model_description, model_icon, verifiable, is_active, owned_by, provider_type,
                 provider_config, attestation_supported, input_modalities, output_modalities,
-                inference_url, effective_from, effective_until, changed_by_user_id,
+                inference_url, datacenters, hugging_face_id, quantization, max_output_length,
+                supported_sampling_parameters, supported_features, is_ready, deprecation_date,
+                effective_from, effective_until, changed_by_user_id,
                 changed_by_user_email, change_reason, created_at
             ) VALUES (
                 $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19,
-                NOW(), NULL, $20, $21, $22, NOW()
+                $20, $21, $22, $23,
+                COALESCE($24, ARRAY[]::TEXT[]),
+                COALESCE($25, ARRAY[]::TEXT[]),
+                $26, $27,
+                NOW(), NULL, $28, $29, $30, NOW()
             )
             "#,
             &[
@@ -363,6 +381,38 @@ impl AdminRepository for AdminCompositeRepository {
                     .flatten(),
                 &deprecated_row_after
                     .try_get::<_, Option<String>>("inference_url")
+                    .ok()
+                    .flatten(),
+                &deprecated_row_after
+                    .try_get::<_, Option<Vec<String>>>("datacenters")
+                    .ok()
+                    .flatten(),
+                &deprecated_row_after
+                    .try_get::<_, Option<String>>("hugging_face_id")
+                    .ok()
+                    .flatten(),
+                &deprecated_row_after
+                    .try_get::<_, Option<String>>("quantization")
+                    .ok()
+                    .flatten(),
+                &deprecated_row_after
+                    .try_get::<_, Option<i32>>("max_output_length")
+                    .ok()
+                    .flatten(),
+                &deprecated_row_after
+                    .try_get::<_, Option<Vec<String>>>("supported_sampling_parameters")
+                    .ok()
+                    .flatten(),
+                &deprecated_row_after
+                    .try_get::<_, Option<Vec<String>>>("supported_features")
+                    .ok()
+                    .flatten(),
+                &deprecated_row_after
+                    .try_get::<_, Option<bool>>("is_ready")
+                    .ok()
+                    .flatten(),
+                &deprecated_row_after
+                    .try_get::<_, Option<chrono::DateTime<chrono::Utc>>>("deprecation_date")
                     .ok()
                     .flatten(),
                 &changed_by_user_id,
@@ -421,6 +471,9 @@ impl AdminRepository for AdminCompositeRepository {
                 .try_get("supported_sampling_parameters")
                 .unwrap_or_default(),
             supported_features: row.try_get("supported_features").unwrap_or_default(),
+            datacenters: row.try_get("datacenters").ok().flatten(),
+            is_ready: row.try_get("is_ready").ok().flatten(),
+            deprecation_date: row.try_get("deprecation_date").ok().flatten(),
         };
 
         let select_with_aliases_sql = r#"
@@ -432,7 +485,8 @@ impl AdminRepository for AdminCompositeRepository {
                 m.attestation_supported, m.input_modalities, m.output_modalities,
                 m.inference_url,
                 m.hugging_face_id, m.quantization, m.max_output_length,
-                m.supported_sampling_parameters, m.supported_features,
+                m.supported_sampling_parameters, m.supported_features, m.datacenters,
+                m.is_ready, m.deprecation_date,
                 COALESCE(
                     array_agg(ma.alias_name) FILTER (WHERE ma.alias_name IS NOT NULL),
                     '{}'
@@ -667,6 +721,9 @@ impl AdminRepository for AdminCompositeRepository {
                 max_output_length: m.max_output_length,
                 supported_sampling_parameters: m.supported_sampling_parameters,
                 supported_features: m.supported_features,
+                datacenters: m.datacenters,
+                is_ready: m.is_ready,
+                deprecation_date: m.deprecation_date,
             })
             .collect();
 

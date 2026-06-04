@@ -1422,10 +1422,29 @@ impl InferenceProviderPool {
         // ASCII-only lowercase: the markers are all ASCII and this path can
         // run at high volume during a malformed-media incident.
         let lower = message.to_ascii_lowercase();
+        // Decode-side failures (engine fetched bytes but couldn't parse them as
+        // a valid image/video) and the vLLM/SGLang multimodal-connector phrasings
+        // for fetch failures. These all describe a permanent fault in the
+        // client-supplied media, not a transient backend problem.
         if lower.contains("loading image data")
             || lower.contains("loading video data")
             || lower.contains("cannot identify image file")
             || lower.contains("failed to open input buffer")
+            // vLLM MediaConnector / SGLang fetch-side phrasings. The host
+            // returns a 4xx (e.g. Wikimedia's 400 for a disallowed User-Agent,
+            // a 403, or a 404 for a stale URL) and the engine surfaces it via
+            // aiohttp's ClientResponseError. Retrying the identical URL only
+            // re-triggers the same upstream rejection. See cloud-api#606.
+            || lower.contains("failed to fetch image")
+            || lower.contains("failed to fetch video")
+            || lower.contains("error fetching image")
+            || lower.contains("error fetching video")
+            || lower.contains("failed to load image")
+            || lower.contains("failed to load video")
+            || lower.contains("clientresponseerror")
+            || lower.contains("client error: bad request for url")
+            || lower.contains("client error: forbidden for url")
+            || lower.contains("client error: not found for url")
         {
             return true;
         }
@@ -3808,6 +3827,47 @@ mod tests {
             }),
             "retryable_http_5xx",
         );
+
+        // cloud-api#606: Wikimedia (and other hosts with a User-Agent policy)
+        // return 400 to the inference engine's default UA. The engine collapses
+        // that client-fetch 400 into a 500. This is a permanent client-input
+        // fault — the same URL re-fetched with the same UA fails identically —
+        // so it must be non-retryable and surface as a 4xx, not a 502.
+        // aiohttp-wrapper shape wrapping a 400:
+        assert_eq!(
+            InferenceProviderPool::classify_retry_decision(&CompletionError::HttpError {
+                status_code: 500,
+                message: "HTTP error 500: 400, message='Bad Request', url='https://upload.wikimedia.org/wikipedia/commons/x.jpg'".to_string(),
+                is_external: false,
+            }),
+            "non_retryable_client_media_error",
+        );
+        // SGLang "loading IMAGE data ... 400 Client Error: Bad Request" shape:
+        assert_eq!(
+            InferenceProviderPool::classify_retry_decision(&CompletionError::HttpError {
+                status_code: 500,
+                message: "Internal server error: An exception occurred while loading IMAGE data at index 0: 400 Client Error: Bad Request for url: https://upload.wikimedia.org/wikipedia/commons/x.jpg".to_string(),
+                is_external: false,
+            }),
+            "non_retryable_client_media_error",
+        );
+        // vLLM MediaConnector fetch-side phrasings (no aiohttp wrapper, no
+        // "loading IMAGE data" prefix) — the broadened markers must catch them.
+        for msg in [
+            "Internal Server Error: Failed to fetch image from https://upload.wikimedia.org/x.jpg",
+            "Error fetching image: ClientResponseError, status=400, message='Bad Request'",
+            "Failed to load image from url: 403 Client Error: Forbidden for url: https://host/x.png",
+        ] {
+            assert_eq!(
+                InferenceProviderPool::classify_retry_decision(&CompletionError::HttpError {
+                    status_code: 500,
+                    message: msg.to_string(),
+                    is_external: false,
+                }),
+                "non_retryable_client_media_error",
+                "expected non-retryable client-media error for: {msg}",
+            );
+        }
 
         // Pin the sanitize-vs-classify ordering invariant:
         // sanitize_error_message redacts URLs to `[URL_REDACTED]`, which defeats

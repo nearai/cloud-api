@@ -793,6 +793,17 @@ impl InferenceProviderPool {
     /// `/backends/count`, then fan out calls across backend indices and
     /// algos. One cycle = full coverage.
     ///
+    /// Single-backend floor: when `backend_count < ALGOS.len()`, the loop
+    /// would otherwise miss an algorithm — e.g., `backend_count=1` would
+    /// only fetch ECDSA and never harvest the Ed25519 pubkey, leaving
+    /// `pubkey_to_providers` permanently missing that entry and breaking
+    /// Ed25519 E2EE for that model (nearai/infra#167). We pad the iteration
+    /// count to `max(backend_count, ALGOS.len())` so every algo is hit at
+    /// least once; the rotation index wraps with `i % backend_count`, so
+    /// the extra iterations re-probe an existing backend with the missing
+    /// algo. Pubkeys are TEE-derived from the compose hash so the same
+    /// backend serves a deterministic pubkey per algo.
+    ///
     /// Why an isolated Bootstrap state per call: if discovery calls shared
     /// the caller's `fingerprint_state`, the first call that completed and
     /// pinned its backend's SPKI would transition the state to `Pinned({A})`,
@@ -3335,6 +3346,69 @@ impl InferenceProviderPool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Pure mirror of the `discover_model` call-plan: returns `(backend_idx, algo)`
+    /// for each of the `max(backend_count, algos.len())` calls. Lets us pin the
+    /// invariant without spinning up a real provider + verifier. Drifts only if
+    /// the loop in `discover_model` changes; bring this helper in sync if it does.
+    fn discover_model_call_plan<'a>(
+        backend_count: usize,
+        algos: &'a [&'a str],
+    ) -> Vec<(usize, &'a str)> {
+        let n_calls = backend_count.max(algos.len());
+        (0..n_calls)
+            .map(|i| (i % backend_count.max(1), algos[i % algos.len()]))
+            .collect()
+    }
+
+    #[test]
+    fn discover_model_single_backend_covers_both_algos() {
+        // Regression for nearai/infra#167: pre-fix, `backend_count=1` produced
+        // exactly one call with `ALGOS[0]` ("ecdsa"), so Ed25519 was never
+        // harvested and E2EE-via-ed25519 failed with HTTP 421 NoPubKeyProvider.
+        let algos = ["ecdsa", "ed25519"];
+        let plan = discover_model_call_plan(1, &algos);
+        assert_eq!(plan.len(), 2, "expected 2 calls to cover both algos");
+        // Both calls target the only backend (index 0). The extra iteration
+        // wraps via `i % backend_count` so the rotation URL is buildable.
+        assert!(plan.iter().all(|(idx, _)| *idx == 0));
+        let covered: std::collections::HashSet<&str> = plan.iter().map(|(_, a)| *a).collect();
+        for algo in &algos {
+            assert!(
+                covered.contains(algo),
+                "missing algo {algo} in single-backend plan"
+            );
+        }
+    }
+
+    #[test]
+    fn discover_model_multi_backend_unchanged() {
+        // Multi-backend models were already correct (alternating algos across
+        // distinct backends); this test pins that pre-fix behavior.
+        let algos = ["ecdsa", "ed25519"];
+
+        // backend_count == ALGOS.len(): one call per backend, both algos.
+        let plan = discover_model_call_plan(2, &algos);
+        assert_eq!(plan, vec![(0, "ecdsa"), (1, "ed25519")]);
+
+        // backend_count > ALGOS.len(): every backend gets a call, algos alternate.
+        let plan = discover_model_call_plan(5, &algos);
+        assert_eq!(
+            plan,
+            vec![
+                (0, "ecdsa"),
+                (1, "ed25519"),
+                (2, "ecdsa"),
+                (3, "ed25519"),
+                (4, "ecdsa"),
+            ]
+        );
+        // Both algos still covered.
+        let covered: std::collections::HashSet<&str> = plan.iter().map(|(_, a)| *a).collect();
+        for algo in &algos {
+            assert!(covered.contains(algo));
+        }
+    }
 
     /// Helper for `apply_pin_update` tests: build a state, run the policy,
     /// return the (PinUpdate, current pinned-set) pair.

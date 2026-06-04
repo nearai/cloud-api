@@ -422,3 +422,43 @@ async fn test_json_schema_response_format_accepted_and_forwarded() {
         "response_format.type not preserved on passthrough"
     );
 }
+
+// ── response_format json_object (nearai/cloud-api #668) ─────────────────────
+
+/// `response_format: { type: json_object }` must be accepted and forwarded in
+/// `extra` so the provider adapters (Gemini → responseMimeType, Anthropic →
+/// fence-strip) can act on it. #668 tracks the markdown-fence breakage on
+/// passthroughs; cloud-api must not reject or drop the param.
+#[tokio::test]
+async fn test_json_object_response_format_accepted_and_forwarded() {
+    let (server, mock, model, api_key) = setup().await;
+
+    let response = server
+        .post("/v1/chat/completions")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .json(&serde_json::json!({
+            "model": model,
+            "messages": [{"role": "user", "content": "Give me a JSON object."}],
+            "response_format": {"type": "json_object"},
+            "max_tokens": 200,
+            "stream": false,
+        }))
+        .await;
+
+    assert_eq!(
+        response.status_code(),
+        200,
+        "json_object response_format should be accepted, got: {}",
+        response.text()
+    );
+    let params = mock.last_chat_params().await.expect("provider was called");
+    let forwarded = params
+        .extra
+        .get("response_format")
+        .expect("response_format forwarded in `extra`");
+    assert_eq!(
+        forwarded.get("type").and_then(|v| v.as_str()),
+        Some("json_object"),
+        "response_format.type not preserved on passthrough"
+    );
+}

@@ -102,7 +102,7 @@ pub struct GeminiSystemInstruction {
 }
 
 /// Gemini generation config
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct GeminiGenerationConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -113,6 +113,20 @@ pub struct GeminiGenerationConfig {
     pub max_output_tokens: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stop_sequences: Option<Vec<String>>,
+    /// Deterministic-sampling seed. Gemini's native API supports this via
+    /// `generationConfig.seed`; OpenAI clients send the OpenAI-standard `seed`
+    /// (nearai/cloud-api #669).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub seed: Option<i64>,
+    /// Structured-output MIME type. `"application/json"` enables Gemini's JSON
+    /// mode (raw JSON, no markdown fences) for `response_format: json_object`
+    /// and `json_schema` (nearai/cloud-api #668).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response_mime_type: Option<String>,
+    /// Structured-output schema, translated from OpenAI `json_schema` and
+    /// sanitized to Gemini's OpenAPI subset (nearai/cloud-api #668).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response_schema: Option<serde_json::Value>,
 }
 
 /// Gemini function declaration (tool definition)
@@ -418,6 +432,44 @@ fn sanitize_schema_for_gemini(value: &mut serde_json::Value) {
             }
         }
         _ => {}
+    }
+}
+
+/// Translate an OpenAI `response_format` value into Gemini's structured-output
+/// `generationConfig` fields (nearai/cloud-api #668).
+///
+/// Returns `(response_mime_type, response_schema)`:
+/// - `{"type": "json_object"}` → `("application/json", None)` so Gemini emits
+///   raw JSON instead of markdown-fenced text.
+/// - `{"type": "json_schema", "json_schema": {"schema": {...}}}` →
+///   `("application/json", Some(sanitized schema))` so Gemini enforces the
+///   schema natively (it was previously ignored entirely).
+/// - anything else (including `{"type": "text"}`) → `(None, None)`.
+///
+/// The schema is sanitized through `sanitize_schema_for_gemini` so JSON-Schema
+/// keywords Gemini's OpenAPI subset rejects (e.g. `additionalProperties`,
+/// `$schema`) do not 400 the request.
+pub fn response_format_to_gemini(
+    response_format: &serde_json::Value,
+) -> (Option<String>, Option<serde_json::Value>) {
+    let Some(type_) = response_format.get("type").and_then(|v| v.as_str()) else {
+        return (None, None);
+    };
+
+    match type_ {
+        "json_object" => (Some("application/json".to_string()), None),
+        "json_schema" => {
+            let schema = response_format
+                .get("json_schema")
+                .and_then(|js| js.get("schema"))
+                .cloned()
+                .map(|mut s| {
+                    sanitize_schema_for_gemini(&mut s);
+                    s
+                });
+            (Some("application/json".to_string()), schema)
+        }
+        _ => (None, None),
     }
 }
 
@@ -950,6 +1002,56 @@ mod tests {
             "serialized parameters must not contain `additionalProperties`; got: {}",
             serialized
         );
+    }
+
+    // ── #668: response_format → Gemini structured output ────────────────────
+
+    #[test]
+    fn test_response_format_json_object_sets_mime_type_only() {
+        let rf = serde_json::json!({"type": "json_object"});
+        let (mime, schema) = response_format_to_gemini(&rf);
+        assert_eq!(mime.as_deref(), Some("application/json"));
+        assert!(schema.is_none());
+    }
+
+    #[test]
+    fn test_response_format_json_schema_sets_mime_and_sanitized_schema() {
+        let rf = serde_json::json!({
+            "type": "json_schema",
+            "json_schema": {
+                "name": "weather",
+                "strict": true,
+                "schema": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["city", "temp_c"],
+                    "properties": {
+                        "city": {"type": "string"},
+                        "temp_c": {"type": "number"}
+                    }
+                }
+            }
+        });
+        let (mime, schema) = response_format_to_gemini(&rf);
+        assert_eq!(mime.as_deref(), Some("application/json"));
+        let schema = schema.expect("schema translated");
+        // `additionalProperties` (rejected by Gemini) must be stripped.
+        assert!(schema
+            .as_object()
+            .unwrap()
+            .get("additionalProperties")
+            .is_none());
+        // Structural keys survive.
+        assert_eq!(schema["type"], "object");
+        assert!(schema["properties"]["city"].is_object());
+        assert_eq!(schema["required"], serde_json::json!(["city", "temp_c"]));
+    }
+
+    #[test]
+    fn test_response_format_text_is_noop() {
+        let (mime, schema) = response_format_to_gemini(&serde_json::json!({"type": "text"}));
+        assert!(mime.is_none());
+        assert!(schema.is_none());
     }
 
     #[test]

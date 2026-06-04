@@ -16,8 +16,8 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use converter::{
     convert_messages, convert_tools, extract_response_content, map_finish_reason_string,
-    GeminiEventParser, GeminiGenerationConfig, GeminiParserState, GeminiPart, GeminiRequest,
-    GeminiResponse,
+    response_format_to_gemini, GeminiEventParser, GeminiGenerationConfig, GeminiParserState,
+    GeminiPart, GeminiRequest, GeminiResponse,
 };
 use futures_util::Stream;
 use reqwest::Client;
@@ -143,16 +143,39 @@ impl GeminiBackend {
         let (system_instruction, contents) = convert_messages(&params.messages);
         let max_tokens = params.max_completion_tokens.or(params.max_tokens);
 
+        // `seed` (nearai/cloud-api #669): Gemini supports deterministic sampling
+        // via `generationConfig.seed`. The service layer hardcodes the typed
+        // `seed` field to None and forwards the original in `extra`, so read
+        // both (typed first, then the passthrough map).
+        let seed = params
+            .seed
+            .or_else(|| params.extra.get("seed").and_then(serde_json::Value::as_i64));
+
+        // `response_format` (nearai/cloud-api #668): rides in `extra`. Translate
+        // json_object/json_schema into Gemini's native structured-output fields
+        // so it returns raw JSON (no markdown fences) and enforces the schema.
+        let (response_mime_type, response_schema) = params
+            .extra
+            .get("response_format")
+            .map(response_format_to_gemini)
+            .unwrap_or((None, None));
+
         let generation_config = if params.temperature.is_some()
             || params.top_p.is_some()
             || max_tokens.is_some()
             || params.stop.is_some()
+            || seed.is_some()
+            || response_mime_type.is_some()
+            || response_schema.is_some()
         {
             Some(GeminiGenerationConfig {
                 temperature: params.temperature,
                 top_p: params.top_p,
                 max_output_tokens: max_tokens,
                 stop_sequences: params.stop.clone(),
+                seed,
+                response_mime_type,
+                response_schema,
             })
         } else {
             None
@@ -461,6 +484,131 @@ impl ExternalBackend for GeminiBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn base_params() -> ChatCompletionParams {
+        ChatCompletionParams {
+            model: "gemini-2.5-flash".to_string(),
+            messages: vec![crate::ChatMessage {
+                role: MessageRole::User,
+                content: Some(serde_json::Value::String("Hello".to_string())),
+                name: None,
+                tool_call_id: None,
+                tool_calls: None,
+            }],
+            max_completion_tokens: None,
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            n: None,
+            stream: None,
+            stop: None,
+            frequency_penalty: None,
+            presence_penalty: None,
+            logit_bias: None,
+            logprobs: None,
+            top_logprobs: None,
+            user: None,
+            seed: None,
+            tools: None,
+            tool_choice: None,
+            parallel_tool_calls: None,
+            metadata: None,
+            store: None,
+            stream_options: None,
+            modalities: None,
+            extra: std::collections::HashMap::new(),
+        }
+    }
+
+    // ── #669: seed forwarded to generationConfig.seed ───────────────────────
+
+    #[test]
+    fn test_build_request_forwards_seed_from_extra() {
+        let backend = GeminiBackend::new();
+        let mut params = base_params();
+        // The service layer hardcodes the typed `seed` to None and forwards the
+        // original in `extra`; we must still pick it up.
+        params
+            .extra
+            .insert("seed".to_string(), serde_json::json!(42));
+        let request = backend.build_request(&params);
+        let body = serde_json::to_value(&request).unwrap();
+        assert_eq!(body["generationConfig"]["seed"], 42);
+    }
+
+    #[test]
+    fn test_build_request_forwards_typed_seed() {
+        let backend = GeminiBackend::new();
+        let mut params = base_params();
+        params.seed = Some(7);
+        let request = backend.build_request(&params);
+        let body = serde_json::to_value(&request).unwrap();
+        assert_eq!(body["generationConfig"]["seed"], 7);
+    }
+
+    #[test]
+    fn test_build_request_no_seed_omits_field() {
+        let backend = GeminiBackend::new();
+        let params = base_params();
+        let request = backend.build_request(&params);
+        let body = serde_json::to_value(&request).unwrap();
+        // No generationConfig at all when nothing is set.
+        assert!(body.get("generationConfig").is_none());
+    }
+
+    // ── #668: response_format → generationConfig structured output ──────────
+
+    #[test]
+    fn test_build_request_json_object_sets_mime_type() {
+        let backend = GeminiBackend::new();
+        let mut params = base_params();
+        params.extra.insert(
+            "response_format".to_string(),
+            serde_json::json!({"type": "json_object"}),
+        );
+        let request = backend.build_request(&params);
+        let body = serde_json::to_value(&request).unwrap();
+        assert_eq!(
+            body["generationConfig"]["responseMimeType"],
+            "application/json"
+        );
+        assert!(body["generationConfig"].get("responseSchema").is_none());
+    }
+
+    #[test]
+    fn test_build_request_json_schema_sets_mime_and_schema() {
+        let backend = GeminiBackend::new();
+        let mut params = base_params();
+        params.extra.insert(
+            "response_format".to_string(),
+            serde_json::json!({
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "weather",
+                    "schema": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "properties": {"city": {"type": "string"}}
+                    }
+                }
+            }),
+        );
+        let request = backend.build_request(&params);
+        let body = serde_json::to_value(&request).unwrap();
+        assert_eq!(
+            body["generationConfig"]["responseMimeType"],
+            "application/json"
+        );
+        let schema = &body["generationConfig"]["responseSchema"];
+        assert_eq!(schema["type"], "object");
+        assert!(schema["properties"]["city"].is_object());
+        // sanitized: Gemini-unsupported keyword removed
+        assert!(schema
+            .as_object()
+            .unwrap()
+            .get("additionalProperties")
+            .is_none());
+    }
 
     #[test]
     fn test_strip_vendor_prefix_google() {

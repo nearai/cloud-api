@@ -25,6 +25,7 @@
 
 pub mod anthropic;
 pub mod backend;
+pub mod content;
 pub mod gemini;
 pub mod openai_compatible;
 

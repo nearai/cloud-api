@@ -32,6 +32,58 @@ const DEFAULT_ANTHROPIC_VERSION: &str = "2023-06-01";
 /// accept and will reject with its own 400, instead of us silently dropping it).
 const ANTHROPIC_PASSTHROUGH_KEYS: &[&str] = &["thinking", "reasoning_effort"];
 
+/// Anthropic model-name fragments that **reject any non-default `temperature`**
+/// with a 400 (`temperature is deprecated for this model`), even though they
+/// still advertise `temperature` (nearai/cloud-api #696).
+///
+/// These are matched as substrings so both the bare alias (`claude-opus-4-7`)
+/// and the dated form (`claude-opus-4-7-20XXYYZZ`) are covered. opus-4-6 and
+/// earlier still accept `temperature`, so they are intentionally absent — do
+/// not over-strip.
+const ANTHROPIC_MODELS_REJECTING_TEMPERATURE: &[&str] = &["claude-opus-4-7"];
+
+/// Whether `model` rejects a non-default `temperature` and we must drop it
+/// (forwarding `top_p` instead) rather than 400 the caller (#696).
+fn rejects_non_default_temperature(model: &str) -> bool {
+    ANTHROPIC_MODELS_REJECTING_TEMPERATURE
+        .iter()
+        .any(|fragment| model.contains(fragment))
+}
+
+/// Whether a requested `response_format` asks for JSON output, which Anthropic
+/// has no native mode for and tends to return markdown-fenced (#668). When
+/// true, we strip code fences from the response so `JSON.parse` works.
+fn wants_json_output(extra: &std::collections::HashMap<String, serde_json::Value>) -> bool {
+    extra
+        .get("response_format")
+        .and_then(|rf| rf.get("type"))
+        .and_then(|t| t.as_str())
+        .map(|t| t == "json_object" || t == "json_schema")
+        .unwrap_or(false)
+}
+
+/// Strip a single leading/trailing markdown code fence from `content`.
+///
+/// Anthropic has no native JSON-output mode, so when a caller requests
+/// `response_format: json_object`/`json_schema` the model frequently wraps the
+/// JSON in a ` ```json … ``` ` block. This unwraps that fence so the content is
+/// raw parseable JSON (#668). Content without a fence is returned unchanged.
+fn strip_json_code_fence(content: &str) -> String {
+    let trimmed = content.trim();
+    let Some(rest) = trimmed.strip_prefix("```") else {
+        return content.to_string();
+    };
+    // Drop the optional language tag on the opening fence line (e.g. `json`).
+    let after_lang = match rest.find('\n') {
+        Some(idx) => &rest[idx + 1..],
+        None => return content.to_string(),
+    };
+    let Some(inner) = after_lang.trim_end().strip_suffix("```") else {
+        return content.to_string();
+    };
+    inner.trim().to_string()
+}
+
 /// Pick the allowlisted reasoning-control fields out of `extra`.
 fn extract_passthrough(
     extra: &std::collections::HashMap<String, serde_json::Value>,
@@ -96,7 +148,14 @@ impl AnthropicBackend {
 
         // Anthropic doesn't allow both temperature and top_p - prefer temperature if both are set.
         // Also clamp temperature to Anthropic's valid range [0.0, 1.0] (OpenAI allows up to 2.0).
-        let (temperature, top_p) = if let Some(temp) = params.temperature {
+        //
+        // #696: some newer models (e.g. claude-opus-4-7) 400 on ANY non-default
+        // `temperature`. For those we drop `temperature` entirely and forward
+        // `top_p` instead, so OpenAI/OpenRouter clients that routinely send
+        // `temperature: 0`/`0.7` get a 200 (param ignored) instead of a 400.
+        let (temperature, top_p) = if rejects_non_default_temperature(model) {
+            (None, params.top_p)
+        } else if let Some(temp) = params.temperature {
             (Some(temp.clamp(0.0, 1.0)), None)
         } else {
             (None, params.top_p)
@@ -154,6 +213,13 @@ impl ExternalBackend for AnthropicBackend {
         model: &str,
         params: ChatCompletionParams,
     ) -> Result<StreamingResult, CompletionError> {
+        // NOTE (#668): markdown-fence stripping for `response_format` JSON modes
+        // is applied on the non-streaming path only. A fence marker (```) can
+        // split across SSE deltas, so reliably stripping it mid-stream would
+        // require buffering the whole response and defeats streaming. The
+        // model's own behaviour with the json hint is usually fence-free when
+        // streaming; callers needing guaranteed raw JSON should use the
+        // non-streaming endpoint.
         let url = format!("{}/messages", config.base_url);
         let request = self.build_request(model, &params, true);
 
@@ -239,6 +305,16 @@ impl ExternalBackend for AnthropicBackend {
 
         // Convert to OpenAI format using the converter
         let (content, tool_calls) = extract_response_content(&anthropic_response.content);
+
+        // #668: Anthropic has no native JSON-output mode, so when the caller
+        // requested `response_format: json_object`/`json_schema` it tends to
+        // wrap the JSON in a markdown ```json … ``` fence, breaking
+        // `JSON.parse`. Strip that fence so the content is raw parseable JSON.
+        let content = if wants_json_output(&params.extra) {
+            content.map(|c| strip_json_code_fence(&c))
+        } else {
+            content
+        };
 
         let openai_response = ChatCompletionResponse {
             id: anthropic_response.id,
@@ -543,7 +619,9 @@ mod tests {
     fn test_build_request_empty_extra_adds_no_fields() {
         let backend = AnthropicBackend::new();
         let params = make_params(Some(1.0), None);
-        let request = backend.build_request("claude-opus-4-7", &params, false);
+        // Use a model that accepts temperature so this test isolates the
+        // "extra adds nothing" property (opus-4-7 drops temperature, see #696).
+        let request = backend.build_request("claude-sonnet-4-5-20250514", &params, false);
         let body = serde_json::to_value(&request).unwrap();
 
         // With no extra fields, the flattened `extra` map contributes nothing:
@@ -559,6 +637,85 @@ mod tests {
                 .into_iter()
                 .collect();
         assert_eq!(keys, expected);
+    }
+
+    // ── #696: temperature dropped for models that reject non-default values ──
+
+    #[test]
+    fn test_opus_4_7_drops_non_default_temperature_forwards_top_p() {
+        let backend = AnthropicBackend::new();
+        // opus-4-7 400s on any non-default temperature; we must drop it.
+        let mut params = make_params(Some(0.0), Some(0.5));
+        let request = backend.build_request("claude-opus-4-7", &params, false);
+        assert_eq!(
+            request.temperature, None,
+            "temperature must be dropped for opus-4-7"
+        );
+        assert_eq!(
+            request.top_p,
+            Some(0.5),
+            "top_p must still be forwarded for opus-4-7"
+        );
+
+        // Same when only temperature is set (no top_p): just drop it.
+        params = make_params(Some(0.7), None);
+        let request = backend.build_request("claude-opus-4-7-20991231", &params, false);
+        assert_eq!(request.temperature, None);
+        assert_eq!(request.top_p, None);
+    }
+
+    #[test]
+    fn test_opus_4_6_still_accepts_temperature() {
+        let backend = AnthropicBackend::new();
+        // Regression guard against over-stripping: opus-4-6 still accepts it.
+        let params = make_params(Some(0.5), None);
+        let request = backend.build_request("claude-opus-4-6", &params, false);
+        assert_eq!(
+            request.temperature,
+            Some(0.5),
+            "opus-4-6 must still forward temperature"
+        );
+    }
+
+    // ── #668: strip markdown code fences when json output was requested ──────
+
+    fn json_format_extra(type_: &str) -> std::collections::HashMap<String, serde_json::Value> {
+        let mut extra = std::collections::HashMap::new();
+        extra.insert(
+            "response_format".to_string(),
+            serde_json::json!({"type": type_}),
+        );
+        extra
+    }
+
+    #[test]
+    fn test_wants_json_output() {
+        assert!(wants_json_output(&json_format_extra("json_object")));
+        assert!(wants_json_output(&json_format_extra("json_schema")));
+        assert!(!wants_json_output(&json_format_extra("text")));
+        assert!(!wants_json_output(&std::collections::HashMap::new()));
+    }
+
+    #[test]
+    fn test_strip_json_code_fence_unwraps_fenced_json() {
+        let fenced = "```json\n{\n  \"city\": \"Paris\"\n}\n```";
+        let stripped = strip_json_code_fence(fenced);
+        assert_eq!(stripped, "{\n  \"city\": \"Paris\"\n}");
+        // Result is valid parseable JSON.
+        let v: serde_json::Value = serde_json::from_str(&stripped).unwrap();
+        assert_eq!(v["city"], "Paris");
+    }
+
+    #[test]
+    fn test_strip_json_code_fence_handles_no_language_tag() {
+        let fenced = "```\n{\"a\":1}\n```";
+        assert_eq!(strip_json_code_fence(fenced), "{\"a\":1}");
+    }
+
+    #[test]
+    fn test_strip_json_code_fence_passes_through_raw_json() {
+        let raw = "{\"city\":\"Paris\"}";
+        assert_eq!(strip_json_code_fence(raw), raw);
     }
 
     #[tokio::test]

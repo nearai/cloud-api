@@ -151,22 +151,26 @@ impl GeminiBackend {
             .seed
             .or_else(|| params.extra.get("seed").and_then(serde_json::Value::as_i64));
 
-        // `response_format` (nearai/cloud-api #668): rides in `extra`. Translate
-        // json_object/json_schema into Gemini's native structured-output fields
-        // so it returns raw JSON (no markdown fences) and enforces the schema.
-        let (response_mime_type, response_schema) = params
+        // `response_format` (nearai/cloud-api #668, #720): rides in `extra`.
+        // Translate json_object/json_schema into Gemini's native structured-output
+        // fields so it returns raw JSON (no markdown fences) and enforces the
+        // schema. Strict json_schema goes through `responseJsonSchema` so
+        // constraints (`additionalProperties:false`, `$ref`, `$defs`, `oneOf`)
+        // are preserved; non-strict uses the lossy OpenAPI-subset `responseSchema`.
+        let response_format = params
             .extra
             .get("response_format")
             .map(response_format_to_gemini)
-            .unwrap_or((None, None));
+            .unwrap_or_default();
 
         let generation_config = if params.temperature.is_some()
             || params.top_p.is_some()
             || max_tokens.is_some()
             || params.stop.is_some()
             || seed.is_some()
-            || response_mime_type.is_some()
-            || response_schema.is_some()
+            || response_format.mime_type.is_some()
+            || response_format.schema.is_some()
+            || response_format.json_schema.is_some()
         {
             Some(GeminiGenerationConfig {
                 temperature: params.temperature,
@@ -174,8 +178,9 @@ impl GeminiBackend {
                 max_output_tokens: max_tokens,
                 stop_sequences: params.stop.clone(),
                 seed,
-                response_mime_type,
-                response_schema,
+                response_mime_type: response_format.mime_type,
+                response_schema: response_format.schema,
+                response_json_schema: response_format.json_schema,
             })
         } else {
             None
@@ -575,8 +580,47 @@ mod tests {
         assert!(body["generationConfig"].get("responseSchema").is_none());
     }
 
+    /// #720: a strict `json_schema` request must be wired to
+    /// `generationConfig.responseJsonSchema` with the ORIGINAL schema preserved
+    /// (`additionalProperties:false` and friends intact), and must NOT populate
+    /// the lossy `responseSchema` field (they are mutually exclusive in Gemini).
     #[test]
-    fn test_build_request_json_schema_sets_mime_and_schema() {
+    fn test_build_request_strict_json_schema_uses_response_json_schema() {
+        let backend = GeminiBackend::new();
+        let mut params = base_params();
+        params.extra.insert(
+            "response_format".to_string(),
+            serde_json::json!({
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "weather",
+                    "strict": true,
+                    "schema": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "properties": {"city": {"type": "string"}}
+                    }
+                }
+            }),
+        );
+        let request = backend.build_request(&params);
+        let body = serde_json::to_value(&request).unwrap();
+        assert_eq!(
+            body["generationConfig"]["responseMimeType"],
+            "application/json"
+        );
+        // Lossy field must be absent for strict schemas.
+        assert!(body["generationConfig"].get("responseSchema").is_none());
+        let schema = &body["generationConfig"]["responseJsonSchema"];
+        assert_eq!(schema["type"], "object");
+        assert!(schema["properties"]["city"].is_object());
+        // Strict constraint preserved (would have been stripped before #720).
+        assert_eq!(schema["additionalProperties"], serde_json::json!(false));
+    }
+
+    /// Non-strict `json_schema` uses the lossy `responseSchema` (best-effort).
+    #[test]
+    fn test_build_request_non_strict_json_schema_uses_response_schema() {
         let backend = GeminiBackend::new();
         let mut params = base_params();
         params.extra.insert(
@@ -599,6 +643,8 @@ mod tests {
             body["generationConfig"]["responseMimeType"],
             "application/json"
         );
+        // Strict JSON-Schema field must be absent for non-strict schemas.
+        assert!(body["generationConfig"].get("responseJsonSchema").is_none());
         let schema = &body["generationConfig"]["responseSchema"];
         assert_eq!(schema["type"], "object");
         assert!(schema["properties"]["city"].is_object());

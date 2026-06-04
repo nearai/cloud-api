@@ -123,10 +123,26 @@ pub struct GeminiGenerationConfig {
     /// and `json_schema` (nearai/cloud-api #668).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub response_mime_type: Option<String>,
-    /// Structured-output schema, translated from OpenAI `json_schema` and
-    /// sanitized to Gemini's OpenAPI subset (nearai/cloud-api #668).
+    /// Structured-output schema, translated from a non-strict OpenAI
+    /// `json_schema` and sanitized to Gemini's OpenAPI 3.0 subset
+    /// (nearai/cloud-api #668). Lossy: keywords Gemini's OpenAPI subset rejects
+    /// (`additionalProperties`, `$ref`, `$defs`, `oneOf`, ...) are dropped.
+    ///
+    /// Mutually exclusive with `response_json_schema`: Gemini rejects a request
+    /// that sets both. We only ever populate one of the two.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub response_schema: Option<serde_json::Value>,
+    /// Structured-output schema sent as **standard JSON Schema**, used for
+    /// strict requests (`response_format.json_schema.strict == true`). Unlike
+    /// `response_schema`, this preserves constraints the client asked for —
+    /// `additionalProperties: false`, `$ref`, `$defs`, `oneOf` — so we don't
+    /// silently weaken a strict schema (nearai/cloud-api #720 review).
+    ///
+    /// Gemini's REST API expects `responseJsonSchema` and treats it as mutually
+    /// exclusive with `responseSchema`; it must be paired with
+    /// `responseMimeType: application/json`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response_json_schema: Option<serde_json::Value>,
 }
 
 /// Gemini function declaration (tool definition)
@@ -435,41 +451,89 @@ fn sanitize_schema_for_gemini(value: &mut serde_json::Value) {
     }
 }
 
+/// Outcome of translating an OpenAI `response_format` into Gemini's
+/// structured-output `generationConfig` fields.
+///
+/// `response_schema` and `response_json_schema` are mutually exclusive — at most
+/// one is ever `Some`, because Gemini rejects a request that sets both.
+#[derive(Debug, Default, PartialEq)]
+pub struct GeminiResponseFormat {
+    /// `generationConfig.responseMimeType`.
+    pub mime_type: Option<String>,
+    /// `generationConfig.responseSchema` (lossy OpenAPI-subset schema; used for
+    /// non-strict `json_schema`).
+    pub schema: Option<serde_json::Value>,
+    /// `generationConfig.responseJsonSchema` (lossless standard JSON Schema;
+    /// used for strict `json_schema`).
+    pub json_schema: Option<serde_json::Value>,
+}
+
 /// Translate an OpenAI `response_format` value into Gemini's structured-output
-/// `generationConfig` fields (nearai/cloud-api #668).
+/// `generationConfig` fields (nearai/cloud-api #668, #720).
 ///
-/// Returns `(response_mime_type, response_schema)`:
-/// - `{"type": "json_object"}` → `("application/json", None)` so Gemini emits
-///   raw JSON instead of markdown-fenced text.
-/// - `{"type": "json_schema", "json_schema": {"schema": {...}}}` →
-///   `("application/json", Some(sanitized schema))` so Gemini enforces the
-///   schema natively (it was previously ignored entirely).
-/// - anything else (including `{"type": "text"}`) → `(None, None)`.
+/// - `{"type": "json_object"}` → `responseMimeType = application/json` only, so
+///   Gemini emits raw JSON instead of markdown-fenced text.
+/// - `{"type": "json_schema", "json_schema": {"strict": true, "schema": {...}}}`
+///   → `responseMimeType = application/json` + `responseJsonSchema = <original
+///   schema, unmodified>`. We use Gemini's standard-JSON-Schema field so strict
+///   constraints the client asked for — `additionalProperties: false`, `$ref`,
+///   `$defs`, `oneOf` — are preserved and actually enforced, rather than being
+///   silently dropped (the concern Pierre raised on PR #720).
+/// - `{"type": "json_schema", ...}` without `strict: true` → `responseMimeType =
+///   application/json` + `responseSchema = <sanitized schema>`. This is the
+///   best-effort, OpenAPI-3.0-subset path: keywords Gemini's `responseSchema`
+///   rejects are stripped via `sanitize_schema_for_gemini`. Acceptable here
+///   because the caller did not request strict enforcement.
+/// - anything else (including `{"type": "text"}`) → all `None`.
 ///
-/// The schema is sanitized through `sanitize_schema_for_gemini` so JSON-Schema
-/// keywords Gemini's OpenAPI subset rejects (e.g. `additionalProperties`,
-/// `$schema`) do not 400 the request.
-pub fn response_format_to_gemini(
-    response_format: &serde_json::Value,
-) -> (Option<String>, Option<serde_json::Value>) {
+/// `responseSchema` and `responseJsonSchema` are mutually exclusive in Gemini's
+/// API, so this never returns both.
+pub fn response_format_to_gemini(response_format: &serde_json::Value) -> GeminiResponseFormat {
     let Some(type_) = response_format.get("type").and_then(|v| v.as_str()) else {
-        return (None, None);
+        return GeminiResponseFormat::default();
     };
 
     match type_ {
-        "json_object" => (Some("application/json".to_string()), None),
+        "json_object" => GeminiResponseFormat {
+            mime_type: Some("application/json".to_string()),
+            ..Default::default()
+        },
         "json_schema" => {
-            let schema = response_format
-                .get("json_schema")
-                .and_then(|js| js.get("schema"))
-                .cloned()
-                .map(|mut s| {
-                    sanitize_schema_for_gemini(&mut s);
-                    s
-                });
-            (Some("application/json".to_string()), schema)
+            let json_schema = response_format.get("json_schema");
+            let Some(schema) = json_schema.and_then(|js| js.get("schema")).cloned() else {
+                // `json_schema` requested but no schema body: fall back to plain
+                // JSON mode rather than emitting an empty/invalid schema.
+                return GeminiResponseFormat {
+                    mime_type: Some("application/json".to_string()),
+                    ..Default::default()
+                };
+            };
+
+            let strict = json_schema
+                .and_then(|js| js.get("strict"))
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+
+            if strict {
+                // Strict: preserve the ORIGINAL schema verbatim via Gemini's
+                // standard-JSON-Schema field so constraints are enforced.
+                GeminiResponseFormat {
+                    mime_type: Some("application/json".to_string()),
+                    json_schema: Some(schema),
+                    ..Default::default()
+                }
+            } else {
+                // Non-strict: best-effort via the OpenAPI-subset field.
+                let mut sanitized = schema;
+                sanitize_schema_for_gemini(&mut sanitized);
+                GeminiResponseFormat {
+                    mime_type: Some("application/json".to_string()),
+                    schema: Some(sanitized),
+                    ..Default::default()
+                }
+            }
         }
-        _ => (None, None),
+        _ => GeminiResponseFormat::default(),
     }
 }
 
@@ -1009,33 +1073,79 @@ mod tests {
     #[test]
     fn test_response_format_json_object_sets_mime_type_only() {
         let rf = serde_json::json!({"type": "json_object"});
-        let (mime, schema) = response_format_to_gemini(&rf);
-        assert_eq!(mime.as_deref(), Some("application/json"));
-        assert!(schema.is_none());
+        let rf = response_format_to_gemini(&rf);
+        assert_eq!(rf.mime_type.as_deref(), Some("application/json"));
+        assert!(rf.schema.is_none());
+        assert!(rf.json_schema.is_none());
     }
 
+    /// #720: a strict `json_schema` must be forwarded VERBATIM through Gemini's
+    /// standard-JSON-Schema field (`responseJsonSchema`) so constraints the
+    /// client asked for are preserved and enforced — NOT stripped.
     #[test]
-    fn test_response_format_json_schema_sets_mime_and_sanitized_schema() {
-        let rf = serde_json::json!({
+    fn test_response_format_strict_json_schema_preserves_original_via_json_schema_field() {
+        let original = serde_json::json!({
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["city", "temp_c"],
+            "$defs": {
+                "City": {"type": "string"}
+            },
+            "properties": {
+                "city": {"$ref": "#/$defs/City"},
+                "temp_c": {"type": "number"},
+                "kind": {"oneOf": [{"type": "string"}, {"type": "null"}]}
+            }
+        });
+        let rf = response_format_to_gemini(&serde_json::json!({
             "type": "json_schema",
             "json_schema": {
                 "name": "weather",
                 "strict": true,
+                "schema": original.clone()
+            }
+        }));
+        assert_eq!(rf.mime_type.as_deref(), Some("application/json"));
+        // Mutually exclusive: the lossy `responseSchema` field must be unset.
+        assert!(
+            rf.schema.is_none(),
+            "strict schemas must NOT use the lossy responseSchema field"
+        );
+        let json_schema = rf.json_schema.expect("responseJsonSchema populated");
+        // The original strict schema is preserved byte-for-byte: constraints
+        // Gemini's OpenAPI subset would have dropped are all still present.
+        assert_eq!(json_schema, original);
+        assert_eq!(
+            json_schema["additionalProperties"],
+            serde_json::json!(false)
+        );
+        assert!(json_schema["$defs"]["City"].is_object());
+        assert_eq!(json_schema["properties"]["city"]["$ref"], "#/$defs/City");
+        assert!(json_schema["properties"]["kind"]["oneOf"].is_array());
+    }
+
+    /// Non-strict `json_schema` is best-effort: it goes through the lossy
+    /// OpenAPI-subset `responseSchema` field (constraints stripped) so Gemini
+    /// does not 400 on unsupported keywords.
+    #[test]
+    fn test_response_format_non_strict_json_schema_uses_sanitized_response_schema() {
+        let rf = response_format_to_gemini(&serde_json::json!({
+            "type": "json_schema",
+            "json_schema": {
+                "name": "weather",
                 "schema": {
                     "type": "object",
                     "additionalProperties": false,
-                    "required": ["city", "temp_c"],
-                    "properties": {
-                        "city": {"type": "string"},
-                        "temp_c": {"type": "number"}
-                    }
+                    "required": ["city"],
+                    "properties": {"city": {"type": "string"}}
                 }
             }
-        });
-        let (mime, schema) = response_format_to_gemini(&rf);
-        assert_eq!(mime.as_deref(), Some("application/json"));
-        let schema = schema.expect("schema translated");
-        // `additionalProperties` (rejected by Gemini) must be stripped.
+        }));
+        assert_eq!(rf.mime_type.as_deref(), Some("application/json"));
+        // Mutually exclusive: the strict JSON-Schema field must be unset.
+        assert!(rf.json_schema.is_none());
+        let schema = rf.schema.expect("responseSchema populated");
+        // Lossy path: `additionalProperties` (rejected by Gemini) is stripped.
         assert!(schema
             .as_object()
             .unwrap()
@@ -1044,14 +1154,15 @@ mod tests {
         // Structural keys survive.
         assert_eq!(schema["type"], "object");
         assert!(schema["properties"]["city"].is_object());
-        assert_eq!(schema["required"], serde_json::json!(["city", "temp_c"]));
+        assert_eq!(schema["required"], serde_json::json!(["city"]));
     }
 
     #[test]
     fn test_response_format_text_is_noop() {
-        let (mime, schema) = response_format_to_gemini(&serde_json::json!({"type": "text"}));
-        assert!(mime.is_none());
-        assert!(schema.is_none());
+        let rf = response_format_to_gemini(&serde_json::json!({"type": "text"}));
+        assert!(rf.mime_type.is_none());
+        assert!(rf.schema.is_none());
+        assert!(rf.json_schema.is_none());
     }
 
     #[test]

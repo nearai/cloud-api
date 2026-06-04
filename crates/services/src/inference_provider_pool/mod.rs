@@ -61,10 +61,12 @@ struct DiscoveryOutcome {
     /// they're identical across backends of the same model.
     pubkeys_by_algo: HashMap<String, String>,
     /// Per-call verified TLS fingerprints observed in this pass, in launch
-    /// order (by index — `futures::future::join_all` preserves the input
-    /// order, not completion order). With rotation, each index lands on a
-    /// distinct backend, so under complete coverage every entry is unique
-    /// and `observed_fingerprints.len() == backend_count`.
+    /// order (`futures::future::join_all` preserves input order, not
+    /// completion order). One entry per call, not per backend, so under
+    /// complete coverage `observed_fingerprints.len() == max(backend_count,
+    /// ALGOS.len())`. When `backend_count == 1`, the two algo calls hit
+    /// the same backend and entries repeat — the set of *distinct*
+    /// fingerprints is `verified_this_round` (used for pin updates).
     observed_fingerprints: Vec<String>,
     /// Per-call failure reasons that prevented a fingerprint observation, in
     /// launch order. Each entry is `"{category}: {detail}"` where category
@@ -766,10 +768,18 @@ impl InferenceProviderPool {
         None
     }
 
-    /// Run N attestation-discovery calls against a model URL, each on its own
+    /// Run attestation-discovery calls against a model URL, each on its own
     /// minimal `reqwest::Client` (fresh TCP connection, isolated `FingerprintState`),
-    /// alternating signing algorithms to harvest both ECDSA and Ed25519 signing
-    /// pubkeys in the same pass.
+    /// covering every (backend_index, signing_algo) pair needed to harvest
+    /// both ECDSA and Ed25519 signing pubkeys in the same pass.
+    ///
+    /// The number of calls is `max(backend_count, ALGOS.len())`: one per
+    /// backend (for TLS-cert fingerprint coverage across all serving CVMs)
+    /// and at least one per algo (so both ECDSA and Ed25519 pubkeys are
+    /// fetched even when a model has only a single backend). For
+    /// `backend_count >= ALGOS.len()`, this degenerates to one call per
+    /// backend; for `backend_count == 1` it issues two calls to the same
+    /// backend, one per algo.
     ///
     /// Why a fresh client per call: reqwest with HTTP/2 multiplexes many
     /// concurrent requests onto a single TCP connection, which hashes to a
@@ -780,8 +790,8 @@ impl InferenceProviderPool {
     /// (see model-proxy PR #27). A fresh-TCP probe to that SNI is routed
     /// deterministically to `backends_sorted_by_address[N % healthy_count]`,
     /// bypassing the least-connections LB. We fetch the healthy count from
-    /// `/backends/count`, then fan out one call per backend index. One cycle
-    /// = full coverage.
+    /// `/backends/count`, then fan out calls across backend indices and
+    /// algos. One cycle = full coverage.
     ///
     /// Why an isolated Bootstrap state per call: if discovery calls shared
     /// the caller's `fingerprint_state`, the first call that completed and
@@ -793,11 +803,12 @@ impl InferenceProviderPool {
     /// accumulator *after* the HTTP calls return.
     ///
     /// Why extract pubkeys here: the attestation report already contains
-    /// `signing_public_key` for the requested `signing_algo`. Alternating
-    /// algos across the N calls yields both keys in one pass. Pubkeys are
-    /// derived from the TEE compose hash so they're identical across
-    /// backends of the same model+algo; the first verified response per
-    /// algo wins.
+    /// `signing_public_key` for the requested `signing_algo`. The
+    /// `max(backend_count, ALGOS.len())` fan-out guarantees both ECDSA and
+    /// Ed25519 are queried at least once per cycle, even when a model has
+    /// only a single backend. Pubkeys are derived from the TEE compose
+    /// hash so they're identical across backends of the same model+algo;
+    /// the first verified response per algo wins.
     ///
     /// Rapid eviction: when every healthy backend produced exactly one
     /// verified fingerprint, the pin set is REPLACED with the observed set
@@ -945,11 +956,20 @@ impl InferenceProviderPool {
             backend_count
         };
 
-        // Step 2: fan out one attestation call per backend index, in
-        // parallel (no stagger — each call lands on a distinct backend, so
-        // per-backend pressure is exactly one attestation per cycle).
-        let futures = (0..backend_count)
+        // Step 2: fan out attestation calls across (backend_index, algo) pairs
+        // in parallel (no stagger). Total calls = max(backend_count,
+        // ALGOS.len()) so every algo is sampled at least once even when a
+        // model has only a single backend (which would otherwise leave one
+        // algo's pubkey out of pubkey_to_providers, breaking E2EE routing
+        // for that algo — see nearai/cloud-api#710).
+        //
+        // backend_index = i % backend_count maps the call sequence back to a
+        // rotation backend; for backend_count >= 2 this equals i and the
+        // loop degenerates to one call per backend (unchanged from before).
+        let call_count = backend_count.max(ALGOS.len());
+        let futures = (0..call_count)
             .map(|i| {
+                let backend_index = i % backend_count;
                 let parts = parts.clone();
                 let api_key = api_key.clone();
                 let model = model_name.to_string();
@@ -970,7 +990,7 @@ impl InferenceProviderPool {
                         Err(e) => {
                             debug!(
                                 model = %model,
-                                index = i,
+                                index = backend_index,
                                 algo = %algo,
                                 error = %e,
                                 "Failed to build discovery client"
@@ -979,10 +999,11 @@ impl InferenceProviderPool {
                         }
                     };
 
-                    let mut request_url = match rotation::rotation_base_url(&parts, i as u64) {
-                        Some(u) => u,
-                        None => return Err("rotation_url_build: failed".to_string()),
-                    };
+                    let mut request_url =
+                        match rotation::rotation_base_url(&parts, backend_index as u64) {
+                            Some(u) => u,
+                            None => return Err("rotation_url_build: failed".to_string()),
+                        };
                     request_url.set_path("/v1/attestation/report");
 
                     let nonce_bytes: [u8; 32] = rand::random();
@@ -1012,7 +1033,7 @@ impl InferenceProviderPool {
                         Ok(Err(e)) => {
                             debug!(
                                 model = %model,
-                                index = i,
+                                index = backend_index,
                                 algo = %algo,
                                 elapsed_ms,
                                 error = %e,
@@ -1037,7 +1058,7 @@ impl InferenceProviderPool {
                         Err(_) => {
                             debug!(
                                 model = %model,
-                                index = i,
+                                index = backend_index,
                                 algo = %algo,
                                 elapsed_ms,
                                 "Discovery call timed out"
@@ -1050,7 +1071,7 @@ impl InferenceProviderPool {
                         let status = resp.status().as_u16();
                         debug!(
                             model = %model,
-                            index = i,
+                            index = backend_index,
                             algo = %algo,
                             status = status,
                             elapsed_ms,
@@ -1064,7 +1085,7 @@ impl InferenceProviderPool {
                         Err(e) => {
                             debug!(
                                 model = %model,
-                                index = i,
+                                index = backend_index,
                                 algo = %algo,
                                 error = %e,
                                 "Discovery call returned malformed JSON"
@@ -1074,7 +1095,7 @@ impl InferenceProviderPool {
                     };
                     debug!(
                         model = %model,
-                        index = i,
+                        index = backend_index,
                         algo = %algo,
                         elapsed_ms,
                         "Discovery call succeeded"

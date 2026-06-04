@@ -90,7 +90,7 @@ fn strip_reasoning_effort_if_unsupported(
     if params.tools.as_ref().is_none_or(|t| t.is_empty()) {
         return;
     }
-    if !base_url.contains("api.openai.com") && !base_url.contains(".openai.azure.com") {
+    if !is_openai_source(base_url) {
         return;
     }
     if params.extra.remove("reasoning_effort").is_some() {

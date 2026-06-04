@@ -772,7 +772,17 @@ impl AdminRepository for AdminCompositeRepository {
                 JOIN organizations o ON o.id = ul.organization_id
                 JOIN organization_members om ON om.organization_id = o.id
                 JOIN users u ON u.id = om.user_id
-                WHERE ul.model_name = $1
+                WHERE ul.model_name IN (
+                    SELECT model_name
+                    FROM models
+                    WHERE model_name = $1
+                    UNION
+                    SELECT ma.alias_name
+                    FROM model_aliases ma
+                    JOIN models m ON m.id = ma.canonical_model_id
+                    WHERE m.model_name = $1
+                      AND ma.is_active = true
+                )
                   AND ul.created_at >= $2
                   AND o.is_active = true
                   AND u.is_active = true

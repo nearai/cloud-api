@@ -1258,27 +1258,7 @@ pub async fn deprecate_model(
                 successor_model_id = %successor_model_id,
                 "Failed to deprecate model"
             );
-            match e {
-                services::admin::AdminError::InvalidDeprecation(msg) => (
-                    StatusCode::BAD_REQUEST,
-                    ResponseJson(ErrorResponse::new(msg, "invalid_request".to_string())),
-                ),
-                services::admin::AdminError::ModelNotFound(msg) => (
-                    StatusCode::NOT_FOUND,
-                    ResponseJson(ErrorResponse::new(msg, "model_not_found".to_string())),
-                ),
-                services::admin::AdminError::Unauthorized(msg) => (
-                    StatusCode::UNAUTHORIZED,
-                    ResponseJson(ErrorResponse::new(msg, "unauthorized".to_string())),
-                ),
-                _ => (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    ResponseJson(ErrorResponse::new(
-                        format!("Failed to deprecate model: {e}"),
-                        "internal_server_error".to_string(),
-                    )),
-                ),
-            }
+            admin_error_to_response(e)
         })?;
 
     // Stop sending live traffic to the deprecated provider. The alias
@@ -1460,22 +1440,25 @@ fn admin_error_to_response(
 ) -> (StatusCode, ResponseJson<ErrorResponse>) {
     match e {
         services::admin::AdminError::InvalidDeprecation(msg)
-        | services::admin::AdminError::InvalidPricing(msg) => (
+        | services::admin::AdminError::InvalidPricing(msg)
+        | services::admin::AdminError::InvalidLimits(msg) => (
             StatusCode::BAD_REQUEST,
             ResponseJson(ErrorResponse::new(msg, "invalid_request".to_string())),
         ),
-        services::admin::AdminError::ModelNotFound(msg) => (
+        services::admin::AdminError::ModelNotFound(msg)
+        | services::admin::AdminError::ServiceNotFound(msg)
+        | services::admin::AdminError::OrganizationNotFound(msg) => (
             StatusCode::NOT_FOUND,
-            ResponseJson(ErrorResponse::new(msg, "model_not_found".to_string())),
+            ResponseJson(ErrorResponse::new(msg, "not_found".to_string())),
         ),
         services::admin::AdminError::Unauthorized(msg) => (
             StatusCode::UNAUTHORIZED,
             ResponseJson(ErrorResponse::new(msg, "unauthorized".to_string())),
         ),
-        other => (
+        services::admin::AdminError::InternalError(msg) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             ResponseJson(ErrorResponse::new(
-                format!("Admin operation failed: {other}"),
+                format!("Admin operation failed: {msg}"),
                 "internal_server_error".to_string(),
             )),
         ),

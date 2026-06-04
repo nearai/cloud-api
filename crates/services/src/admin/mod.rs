@@ -484,7 +484,21 @@ impl AdminService for AdminServiceImpl {
                     Some("Already sent for this deprecation".to_string()),
                 )
             } else if let Some(existing) = email_results.get(&email_key) {
-                existing.clone()
+                match existing.0 {
+                    ModelDeprecationEmailStatus::Failed => (
+                        ModelDeprecationEmailStatus::Failed,
+                        None,
+                        existing.2.clone(),
+                    ),
+                    _ => (
+                        ModelDeprecationEmailStatus::Skipped,
+                        existing.1.clone(),
+                        Some(
+                            "Deduplicated: email already sent to this recipient in this run"
+                                .to_string(),
+                        ),
+                    ),
+                }
             } else {
                 let email = ModelDeprecationEmail {
                     recipient_email: recipient.email.clone(),

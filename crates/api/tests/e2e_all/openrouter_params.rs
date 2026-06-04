@@ -16,6 +16,14 @@
 //! bugs these tests guard (nearai/cloud-api #695/#696/#697/#619/#668) all
 //! manifest as cloud-api *rejecting or dropping* a parameter, which a mocked
 //! backend reproduces faithfully.
+//!
+//! NOTE on where a param lands: `ChatCompletionParams` has typed `seed`,
+//! `logprobs` and `top_logprobs` fields, but the service-layer conversion
+//! (`crates/services/src/completions/mod.rs`, `create_chat_completion[_stream]`)
+//! hardcodes those to `None` and forwards the originals through the `extra`
+//! passthrough map. So the assertions below correctly look for `seed` /
+//! `logprobs` / `top_logprobs` in `params.extra`, *not* in the typed fields —
+//! that is what the live request actually carries to the provider.
 
 use crate::common::*;
 use inference_providers::mock::{RequestMatcher, ResponseTemplate};
@@ -175,16 +183,23 @@ async fn test_sampling_extras_accepted_and_forwarded() {
     ];
 
     for (param, value) in extras {
+        // Build the body with the dynamic key inserted explicitly (rather than
+        // relying on `json!`'s identifier-key handling) so the parametrisation
+        // is unambiguous.
+        let mut body = serde_json::json!({
+            "model": model,
+            "messages": [{"role": "user", "content": "Say hi."}],
+            "max_tokens": 10,
+            "stream": false,
+        });
+        body.as_object_mut()
+            .unwrap()
+            .insert(param.to_string(), value.clone());
+
         let response = server
             .post("/v1/chat/completions")
             .add_header("Authorization", format!("Bearer {api_key}"))
-            .json(&serde_json::json!({
-                "model": model,
-                "messages": [{"role": "user", "content": "Say hi."}],
-                param: value,
-                "max_tokens": 10,
-                "stream": false,
-            }))
+            .json(&body)
             .await;
 
         assert_eq!(

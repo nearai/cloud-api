@@ -13,15 +13,29 @@
 
 use crate::common::*;
 use inference_providers::mock::{RequestMatcher, ResponseTemplate};
+use std::sync::Arc;
+
+/// Provision a server (mocked provider), a registered model, a funded org and
+/// an API key. Each test wires its own `respond_with` afterwards, since the
+/// response template differs per case.
+async fn setup() -> (
+    axum_test::TestServer,
+    Arc<inference_providers::mock::MockProvider>,
+    String,
+    String,
+) {
+    let (server, _pool, mock, _db) = setup_test_server_with_pool().await;
+    let model = setup_qwen_model(&server).await;
+    let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
+    let api_key = get_api_key_for_org(&server, org.id).await;
+    (server, mock, model, api_key)
+}
 
 /// When the backend returns reasoning, cloud-api surfaces it on the
 /// non-streaming chat completion.
 #[tokio::test]
 async fn test_reasoning_content_surfaced_non_streaming() {
-    let (server, _pool, mock, _db) = setup_test_server_with_pool().await;
-    let model = setup_qwen_model(&server).await;
-    let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
-    let api_key = get_api_key_for_org(&server, org.id).await;
+    let (server, mock, model, api_key) = setup().await;
 
     mock.when(RequestMatcher::Any)
         .respond_with(
@@ -59,13 +73,13 @@ async fn test_reasoning_content_surfaced_non_streaming() {
     );
 }
 
-/// Same, but for streaming: reasoning deltas appear in the SSE stream.
+/// Same, but for streaming: reasoning deltas appear in the SSE stream and
+/// reassemble to the value the provider emitted. We parse the `data:` lines
+/// rather than substring-matching the raw body, so the assertion can't pass on
+/// an unrelated field or formatting.
 #[tokio::test]
 async fn test_reasoning_content_surfaced_streaming() {
-    let (server, _pool, mock, _db) = setup_test_server_with_pool().await;
-    let model = setup_qwen_model(&server).await;
-    let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
-    let api_key = get_api_key_for_org(&server, org.id).await;
+    let (server, mock, model, api_key) = setup().await;
 
     mock.when(RequestMatcher::Any)
         .respond_with(
@@ -86,9 +100,30 @@ async fn test_reasoning_content_surfaced_streaming() {
 
     assert_eq!(response.status_code(), 200);
     let body = response.text();
+
+    // Reassemble reasoning from the streamed deltas.
+    let mut reasoning = String::new();
+    for line in body.lines() {
+        let Some(data) = line.strip_prefix("data: ") else {
+            continue;
+        };
+        if data.trim() == "[DONE]" {
+            continue;
+        }
+        let Ok(chunk) = serde_json::from_str::<serde_json::Value>(data) else {
+            continue;
+        };
+        if let Some(delta) = chunk.pointer("/choices/0/delta") {
+            if let Some(rc) = delta.get("reasoning_content").and_then(|v| v.as_str()) {
+                reasoning.push_str(rc);
+            } else if let Some(r) = delta.get("reasoning").and_then(|v| v.as_str()) {
+                reasoning.push_str(r);
+            }
+        }
+    }
     assert!(
-        body.contains("reasoning_content") || body.contains("reasoning"),
-        "reasoning deltas not present in stream: {body}"
+        reasoning.contains("Thinking about it carefully"),
+        "reasoning not reassembled from streamed deltas (got {reasoning:?}): {body}"
     );
 }
 
@@ -96,10 +131,7 @@ async fn test_reasoning_content_surfaced_streaming() {
 /// provider verbatim (it is not a first-class field, so it rides in `extra`).
 #[tokio::test]
 async fn test_chat_template_kwargs_forwarded() {
-    let (server, _pool, mock, _db) = setup_test_server_with_pool().await;
-    let model = setup_qwen_model(&server).await;
-    let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
-    let api_key = get_api_key_for_org(&server, org.id).await;
+    let (server, mock, model, api_key) = setup().await;
 
     mock.when(RequestMatcher::Any)
         .respond_with(ResponseTemplate::new("ok"))

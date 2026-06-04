@@ -288,6 +288,26 @@ fn convert_chat_request_to_service(
     body_hash: RequestBodyHash,
     request_id: Uuid,
 ) -> ServiceCompletionRequest {
+    // `presence_penalty` / `frequency_penalty` are typed fields on
+    // `ChatCompletionRequest`, so `#[serde(flatten)] extra` never captures them.
+    // The service layer hardcodes the typed `ChatCompletionParams` penalty slots
+    // to `None`, so forward them through `extra` (matching seed/logprobs and the
+    // text-completion path) — otherwise they are silently dropped before reaching
+    // the self-hosted backend (nearai/cloud-api #622).
+    let mut extra = request.extra.clone();
+    if let Some(presence_penalty) = request.presence_penalty {
+        extra.insert(
+            "presence_penalty".to_string(),
+            serde_json::json!(presence_penalty),
+        );
+    }
+    if let Some(frequency_penalty) = request.frequency_penalty {
+        extra.insert(
+            "frequency_penalty".to_string(),
+            serde_json::json!(frequency_penalty),
+        );
+    }
+
     ServiceCompletionRequest {
         request_id,
         model: request.model.clone(),
@@ -325,7 +345,7 @@ fn convert_chat_request_to_service(
         store: None,
         body_hash: body_hash.hash.clone(),
         response_id: None, // Direct chat completions API calls don't have a response_id
-        extra: request.extra.clone(),
+        extra,
     }
 }
 

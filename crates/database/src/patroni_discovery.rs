@@ -1,11 +1,35 @@
 use anyhow::{anyhow, Result};
 use reqwest::Client;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{Mutex, RwLock};
 use tokio::time;
 use tracing::{debug, error, info, warn};
+
+/// Patroni reports `lag` as an integer for streaming members, but emits the
+/// string `"unknown"` for members it cannot measure (e.g. `stopped`, `crashed`,
+/// or `start failed` replicas). A bare `Option<i64>` rejects that string and
+/// fails the entire `/cluster` parse, which would freeze topology discovery (or
+/// abort startup) over a single unhealthy member. Coerce any non-integer value
+/// to `None` so the rest of the cluster still parses.
+fn deserialize_lag<'de, D>(deserializer: D) -> Result<Option<i64>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Lag {
+        Int(i64),
+        Other(serde::de::IgnoredAny),
+    }
+
+    Ok(match Option::<Lag>::deserialize(deserializer)? {
+        Some(Lag::Int(n)) => Some(n),
+        // "unknown", null, or any other non-integer value -> unknown lag
+        _ => None,
+    })
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClusterMember {
@@ -14,7 +38,7 @@ pub struct ClusterMember {
     pub port: u16,
     pub role: String,
     pub state: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_lag")]
     pub lag: Option<i64>,
     #[serde(default)]
     pub timeline: Option<i64>,
@@ -325,5 +349,46 @@ mod tests {
         let info: ClusterInfo = serde_json::from_str(json).unwrap();
         assert_eq!(info.members.len(), 2);
         assert_eq!(info.scope.as_deref(), Some("pg-cluster"));
+    }
+
+    #[test]
+    fn test_member_with_string_lag_unknown() {
+        // Patroni reports `lag` as the string "unknown" for stopped/crashed
+        // members. This must not fail parsing of the member.
+        let json = r#"{
+            "name": "b5eecc86101d",
+            "host": "postgres-prod-vzeis375.dstack.internal",
+            "port": 5432,
+            "role": "replica",
+            "state": "stopped",
+            "lag": "unknown"
+        }"#;
+
+        let member: ClusterMember = serde_json::from_str(json).unwrap();
+        assert_eq!(member.state, "stopped");
+        assert!(member.lag.is_none());
+    }
+
+    #[test]
+    fn test_cluster_with_stopped_member_string_lag() {
+        // Regression: a single stopped replica reporting `"lag": "unknown"` must
+        // not poison the whole cluster parse. Exact payload that previously
+        // returned `invalid type: string "unknown", expected i64`.
+        let json = r#"{"members": [{"name": "0513d70cb4dc", "role": "replica", "state": "streaming", "api_url": "http://[postgres-ikupakqr.dstack.internal:8008]:8008/patroni", "host": "postgres-ikupakqr.dstack.internal", "port": 5432, "timeline": 3, "lag": 0}, {"name": "b5eecc86101d", "role": "replica", "state": "stopped", "api_url": "http://[postgres-prod-vzeis375.dstack.internal:8008]:8008/patroni", "host": "postgres-prod-vzeis375.dstack.internal", "port": 5432, "lag": "unknown"}, {"name": "d2fb312c9ab6", "role": "leader", "state": "running", "api_url": "http://[postgres-qr5ygiq4.dstack.internal:8008]:8008/patroni", "host": "postgres-qr5ygiq4.dstack.internal", "port": 5432, "timeline": 3}], "scope": "pg-cluster"}"#;
+
+        let info: ClusterInfo = serde_json::from_str(json).unwrap();
+        assert_eq!(info.members.len(), 3);
+        let stopped = info
+            .members
+            .iter()
+            .find(|m| m.name == "b5eecc86101d")
+            .unwrap();
+        assert!(stopped.lag.is_none());
+        let streaming = info
+            .members
+            .iter()
+            .find(|m| m.name == "0513d70cb4dc")
+            .unwrap();
+        assert_eq!(streaming.lag, Some(0));
     }
 }

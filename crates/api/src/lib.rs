@@ -1519,15 +1519,15 @@ pub fn build_admin_routes(
 ) -> Router {
     use crate::middleware::admin_middleware;
     use crate::routes::admin::{
-        batch_upsert_models, create_admin_access_token, create_service, delete_admin_access_token,
-        delete_model, deprecate_model, get_admin_organization_balance, get_billing_summary,
-        get_infra_summary, get_model_history, get_model_revenue, get_org_revenue,
-        get_organization_concurrent_limit, get_organization_limits_history,
+        batch_upsert_models, confirm_model_deprecation, create_admin_access_token, create_service,
+        delete_admin_access_token, delete_model, deprecate_model, get_admin_organization_balance,
+        get_billing_summary, get_infra_summary, get_model_history, get_model_revenue,
+        get_org_revenue, get_organization_concurrent_limit, get_organization_limits_history,
         get_organization_metrics, get_organization_timeseries, get_platform_metrics,
         get_platform_timeseries, list_admin_access_tokens, list_invitation_email_deliveries,
-        list_models as admin_list_models, list_organizations, list_users, resend_invitation_email,
-        update_organization_concurrent_limit, update_organization_limits, update_service,
-        AdminAppState,
+        list_models as admin_list_models, list_organizations, list_users,
+        preview_model_deprecation, resend_invitation_email, update_organization_concurrent_limit,
+        update_organization_limits, update_service, AdminAppState,
     };
     use database::repositories::{AdminAccessTokenRepository, AdminCompositeRepository};
     use services::admin::AdminServiceImpl;
@@ -1552,6 +1552,8 @@ pub fn build_admin_routes(
         services.models_service as Arc<dyn services::models::ModelsServiceTrait>,
         services.completion_service.clone()
             as Arc<dyn services::completions::CompletionServiceTrait>,
+        services::email::sender_from_config(&config.invitation_email)
+            .expect("Failed to initialize admin email sender"),
     )) as Arc<dyn services::admin::AdminService + Send + Sync>;
 
     let github_dispatcher =
@@ -1591,6 +1593,14 @@ pub fn build_admin_routes(
         .route(
             "/admin/models/{model_name}/history",
             axum::routing::get(get_model_history),
+        )
+        .route(
+            "/admin/models/{model_name}/deprecation/preview",
+            axum::routing::post(preview_model_deprecation),
+        )
+        .route(
+            "/admin/models/{model_name}/deprecation/confirm",
+            axum::routing::post(confirm_model_deprecation),
         )
         .route("/admin/services", axum::routing::post(create_service))
         .route("/admin/services/{id}", axum::routing::patch(update_service))

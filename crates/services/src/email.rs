@@ -18,6 +18,15 @@ pub struct InvitationEmail {
     pub invitations_url: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct ModelDeprecationEmail {
+    pub recipient_email: String,
+    pub model_id: String,
+    pub model_display_name: String,
+    pub deprecation_date: DateTime<Utc>,
+    pub successor_model_id: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EmailDeliveryOutcome {
     Sent { message_id: Option<String> },
@@ -48,6 +57,11 @@ pub trait EmailSender: Send + Sync {
         &self,
         email: &InvitationEmail,
     ) -> Result<EmailDeliveryOutcome, EmailError>;
+
+    async fn send_model_deprecation(
+        &self,
+        email: &ModelDeprecationEmail,
+    ) -> Result<EmailDeliveryOutcome, EmailError>;
 }
 
 pub struct NoopEmailSender;
@@ -57,6 +71,13 @@ impl EmailSender for NoopEmailSender {
     async fn send_invitation(
         &self,
         _email: &InvitationEmail,
+    ) -> Result<EmailDeliveryOutcome, EmailError> {
+        Ok(EmailDeliveryOutcome::Skipped)
+    }
+
+    async fn send_model_deprecation(
+        &self,
+        _email: &ModelDeprecationEmail,
     ) -> Result<EmailDeliveryOutcome, EmailError> {
         Ok(EmailDeliveryOutcome::Skipped)
     }
@@ -200,6 +221,26 @@ impl EmailSender for ResendEmailSender {
             message_id: Some(response.id),
         })
     }
+
+    async fn send_model_deprecation(
+        &self,
+        email: &ModelDeprecationEmail,
+    ) -> Result<EmailDeliveryOutcome, EmailError> {
+        let rendered = render_model_deprecation_email(email);
+        let request = ResendSendEmailRequest {
+            from: self.from_email.clone(),
+            to: vec![email.recipient_email.clone()],
+            subject: rendered.subject,
+            html: rendered.html_body,
+            text: rendered.text_body,
+            reply_to: self.reply_to.clone(),
+        };
+        let response = self.transport.send_email(&self.api_key, request).await?;
+
+        Ok(EmailDeliveryOutcome::Sent {
+            message_id: Some(response.id),
+        })
+    }
 }
 
 pub fn sender_from_config(
@@ -278,6 +319,45 @@ pub fn render_invitation_email(email: &InvitationEmail) -> RenderedEmail {
     let text_body = format!(
         "You’ve been invited to NEAR AI Cloud\n\n{inviter} invited you to join {organization_name} as {role}.\n\nThis invitation expires on {expires_at}.\n\nView invitation: {url}\n",
         url = email.invitations_url,
+    );
+
+    RenderedEmail {
+        subject,
+        html_body,
+        text_body,
+    }
+}
+
+pub fn render_model_deprecation_email(email: &ModelDeprecationEmail) -> RenderedEmail {
+    let model_display_name = email.model_display_name.trim();
+    let model_label = if model_display_name.is_empty() {
+        email.model_id.as_str()
+    } else {
+        model_display_name
+    };
+    let deprecation_date = email.deprecation_date.format("%B %-d, %Y at %H:%M UTC");
+    let subject = format!("NEAR AI Cloud model deprecation: {}", email.model_id);
+
+    let html_body = format!(
+        r#"<!doctype html>
+<html lang="en">
+  <body style="font-family:Arial,sans-serif;line-height:1.5;color:#111827;">
+    <h1 style="font-size:20px;margin-bottom:16px;">Model deprecation notice</h1>
+    <p>The NEAR AI Cloud model <strong>{model_label}</strong> (<code>{model_id}</code>) is scheduled for deprecation on <strong>{deprecation_date}</strong>.</p>
+    <p>We recommend migrating affected workloads to <strong>{successor}</strong> before that date.</p>
+    <p>No traffic has been rerouted automatically. Existing calls continue to use the current model until it is removed in a later step.</p>
+  </body>
+</html>"#,
+        model_label = escape_html(model_label),
+        model_id = escape_html(&email.model_id),
+        deprecation_date = escape_html(&deprecation_date.to_string()),
+        successor = escape_html(&email.successor_model_id),
+    );
+
+    let text_body = format!(
+        "NEAR AI Cloud model deprecation notice\n\nThe model {model_label} ({model_id}) is scheduled for deprecation on {deprecation_date}.\n\nWe recommend migrating affected workloads to {successor} before that date.\n\nNo traffic has been rerouted automatically. Existing calls continue to use the current model until it is removed in a later step.\n",
+        model_id = email.model_id,
+        successor = email.successor_model_id,
     );
 
     RenderedEmail {
@@ -404,6 +484,24 @@ mod tests {
     }
 
     #[test]
+    fn render_model_deprecation_email_includes_expected_content_and_escapes_html() {
+        let email = ModelDeprecationEmail {
+            recipient_email: "admin@example.com".to_string(),
+            model_id: "nearai/old-model".to_string(),
+            model_display_name: "<Old & Model>".to_string(),
+            deprecation_date: Utc.with_ymd_and_hms(2026, 7, 1, 13, 0, 0).unwrap(),
+            successor_model_id: "nearai/new-model".to_string(),
+        };
+
+        let rendered = render_model_deprecation_email(&email);
+
+        assert!(rendered.subject.contains("nearai/old-model"));
+        assert!(rendered.html_body.contains("&lt;Old &amp; Model&gt;"));
+        assert!(rendered.html_body.contains("nearai/new-model"));
+        assert!(rendered.text_body.contains("July 1, 2026"));
+    }
+
+    #[test]
     fn sanitize_error_removes_newlines_and_truncates() {
         let message = format!("line one\n{}", "x".repeat(1100));
 
@@ -451,6 +549,45 @@ mod tests {
         assert!(request
             .text
             .contains("https://cloud.example.com/dashboard/invitations"));
+    }
+
+    #[tokio::test]
+    async fn resend_sender_builds_model_deprecation_payload() {
+        let transport = Arc::new(StubResendTransport {
+            outcome: Ok(ResendSendEmailResponse {
+                id: "deprecation-email-id".to_string(),
+            }),
+            requests: Mutex::new(Vec::new()),
+        });
+        let sender = ResendEmailSender::new_with_transport(
+            "NEAR AI Cloud <no-reply@near.ai>".to_string(),
+            None,
+            "re_test".to_string(),
+            transport.clone(),
+        );
+
+        let result = sender
+            .send_model_deprecation(&ModelDeprecationEmail {
+                recipient_email: "admin@example.com".to_string(),
+                model_id: "nearai/old-model".to_string(),
+                model_display_name: "Old Model".to_string(),
+                deprecation_date: Utc.with_ymd_and_hms(2026, 7, 1, 13, 0, 0).unwrap(),
+                successor_model_id: "nearai/new-model".to_string(),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result,
+            EmailDeliveryOutcome::Sent {
+                message_id: Some("deprecation-email-id".to_string())
+            }
+        );
+        let requests = transport.requests.lock().unwrap();
+        let (_, request) = &requests[0];
+        assert_eq!(request.to, vec!["admin@example.com"]);
+        assert!(request.subject.contains("nearai/old-model"));
+        assert!(request.text.contains("nearai/new-model"));
     }
 
     #[tokio::test]

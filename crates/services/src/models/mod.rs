@@ -49,6 +49,30 @@ impl ModelsServiceImpl {
             models_list_cache,
         }
     }
+
+    /// Fetch the active-models list through the in-process cache, returning
+    /// the shared `Arc` so callers that only need to scan the list (e.g.
+    /// alias resolution) avoid cloning every entry.
+    ///
+    /// Uses `try_get_with` to coalesce concurrent loads: when the cache is
+    /// empty (cold start, after TTL expiry, or after an admin invalidation),
+    /// moka guarantees that only ONE caller runs the async loader and any
+    /// other callers waiting on the same key receive the same result.
+    /// Without this, every cache miss would let N concurrent requests all
+    /// hit the DB with the same JOIN+GROUP BY query — defeating most of
+    /// the cache win and producing periodic spikes every 30 s.
+    async fn cached_models(&self) -> Result<Arc<Vec<ModelWithPricing>>, ModelsError> {
+        let repo = self.models_repository.clone();
+        self.models_list_cache
+            .try_get_with(MODELS_LIST_CACHE_KEY, async move {
+                repo.get_all_active_models()
+                    .await
+                    .map(Arc::new)
+                    .map_err(|e| ModelsError::InternalError(e.to_string()))
+            })
+            .await
+            .map_err(|e: Arc<ModelsError>| ModelsError::InternalError(e.to_string()))
+    }
 }
 
 #[async_trait]
@@ -67,24 +91,7 @@ impl ModelsServiceTrait for ModelsServiceImpl {
     }
 
     async fn get_models_with_pricing(&self) -> Result<Vec<ModelWithPricing>, ModelsError> {
-        // Use `try_get_with` to coalesce concurrent loads: when the cache is
-        // empty (cold start, after TTL expiry, or after an admin invalidation),
-        // moka guarantees that only ONE caller runs the async loader and any
-        // other callers waiting on the same key receive the same result.
-        // Without this, every cache miss would let N concurrent requests all
-        // hit the DB with the same JOIN+GROUP BY query — defeating most of
-        // the cache win and producing periodic spikes every 30 s.
-        let repo = self.models_repository.clone();
-        let arc = self
-            .models_list_cache
-            .try_get_with(MODELS_LIST_CACHE_KEY, async move {
-                repo.get_all_active_models()
-                    .await
-                    .map(Arc::new)
-                    .map_err(|e| ModelsError::InternalError(e.to_string()))
-            })
-            .await
-            .map_err(|e: Arc<ModelsError>| ModelsError::InternalError(e.to_string()))?;
+        let arc = self.cached_models().await?;
         Ok((*arc).clone())
     }
 
@@ -105,6 +112,14 @@ impl ModelsServiceTrait for ModelsServiceImpl {
             .await
             .map_err(|e| ModelsError::InternalError(e.to_string()))?
             .ok_or_else(|| ModelsError::NotFound(format!("Model '{identifier}' not found")))
+    }
+
+    async fn resolve_alias_cached(&self, identifier: &str) -> Option<String> {
+        let models = self.cached_models().await.ok()?;
+        models
+            .iter()
+            .find(|m| m.aliases.iter().any(|a| a == identifier))
+            .map(|m| m.model_name.clone())
     }
 
     async fn get_configured_model_names(&self) -> Result<Vec<String>, ModelsError> {

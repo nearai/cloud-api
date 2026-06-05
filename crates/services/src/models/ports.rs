@@ -136,6 +136,17 @@ pub trait ModelsServiceTrait: Send + Sync {
         identifier: &str,
     ) -> Result<ModelWithPricing, ModelsError>;
 
+    /// Resolve `identifier` against the cached active-models alias map.
+    /// Returns `Some(canonical_name)` when `identifier` is a registered
+    /// alias of an active model, `None` when it is a canonical name,
+    /// unknown, or the lookup fails.
+    ///
+    /// Unlike `resolve_and_get_model`, this never hits the DB on the hot
+    /// path (cache-backed, short TTL) and is intended for advisory
+    /// annotations such as alias-substitution warnings — authoritative
+    /// checks must use `resolve_and_get_model`.
+    async fn resolve_alias_cached(&self, identifier: &str) -> Option<String>;
+
     /// Get list of configured model names (canonical names) from database
     /// Returns only active models that have been configured with pricing
     async fn get_configured_model_names(&self) -> Result<Vec<String>, ModelsError>;

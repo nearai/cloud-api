@@ -22,6 +22,13 @@ use tracing::{debug, info, warn};
 
 type InferenceProviderTrait = dyn InferenceProvider + Send + Sync;
 
+/// Upper bound on leading SSE control events (keepalive comments, blank
+/// lines — chunk-less `SSEEvent`s) consumed while peeking for the first
+/// parsed chunk to establish sticky-routing. Real upstreams emit zero before
+/// the first data chunk; the cap stops a misbehaving upstream from stalling
+/// stream return or growing the stash unbounded (issue #701).
+const MAX_LEADING_CONTROL_EVENTS: usize = 32;
+
 /// Trait for fetching external model configurations from a data source (e.g., database).
 /// This decouples the InferenceProviderPool from the database crate (hexagonal architecture).
 #[async_trait::async_trait]
@@ -2020,11 +2027,16 @@ impl InferenceProviderPool {
         // precede the first data chunk. Consume and stash them so the peek
         // below sees the first parsed chunk; they are re-attached in order
         // since their raw bytes are part of the signed stream (issue #701).
+        // Bounded by MAX_LEADING_CONTROL_EVENTS so a keepalive-only upstream
+        // can't stall stream return or grow the stash unbounded — past the
+        // cap we return the stream without pinning a sticky-routing mapping.
         let mut leading_control: Vec<Result<inference_providers::SSEEvent, CompletionError>> =
             Vec::new();
         {
             use futures::StreamExt as _;
-            while matches!(peekable.peek().await, Some(Ok(event)) if event.chunk.is_none()) {
+            while leading_control.len() < MAX_LEADING_CONTROL_EVENTS
+                && matches!(peekable.peek().await, Some(Ok(event)) if event.chunk.is_none())
+            {
                 if let Some(ev) = peekable.next().await {
                     leading_control.push(ev);
                 }

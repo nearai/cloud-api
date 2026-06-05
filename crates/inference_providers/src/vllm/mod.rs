@@ -1151,9 +1151,15 @@ impl VLlmProvider {
     /// the skip, a leading control event would mask a first-chunk error frame
     /// (e.g. SGLang queue-full) and bypass rotation.
     async fn peek_first_payload_status(stream: StreamingResult) -> (Option<u16>, StreamingResult) {
+        // Cap the control-event skip so a keepalive-only upstream can't stall
+        // first-chunk classification or grow the stash unbounded; past the cap
+        // we stop skipping and classify whatever we've reached.
+        const MAX_LEADING_CONTROL_EVENTS: usize = 32;
         let mut peekable = StreamingResultExt::peekable(stream);
         let mut leading_control: Vec<Result<SSEEvent, CompletionError>> = Vec::new();
-        while matches!(peekable.peek().await, Some(Ok(event)) if event.chunk.is_none()) {
+        while leading_control.len() < MAX_LEADING_CONTROL_EVENTS
+            && matches!(peekable.peek().await, Some(Ok(event)) if event.chunk.is_none())
+        {
             if let Some(ev) = tokio_stream::StreamExt::next(&mut peekable).await {
                 leading_control.push(ev);
             }

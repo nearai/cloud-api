@@ -33,6 +33,14 @@ use uuid::Uuid;
 // Timeout for synchronous usage recording before response is returned
 const USAGE_RECORDING_TIMEOUT_SECS: u64 = 5;
 
+// Upper bound on leading SSE control events (keepalive comments, blank
+// lines) consumed while peeking for the first parsed chunk. Real upstreams
+// emit zero before the first data chunk; the cap stops a misbehaving or
+// malicious upstream from stalling response start or growing the stash
+// unbounded. Past the cap we proceed without an Inference-Id header and let
+// the remaining stream (including the buffered control events) flow through.
+const MAX_LEADING_CONTROL_EVENTS: usize = 32;
+
 /// Insert validated E2EE headers into a provider `extra` HashMap.
 fn insert_encryption_headers(
     encryption_headers: &crate::routes::common::EncryptionHeaders,
@@ -1120,7 +1128,11 @@ async fn chat_completions_inner(
                 // upstream keepalive comment) may precede the first data
                 // chunk; consume and stash them so they are still forwarded
                 // to the client in order (they're part of the signed byte
-                // stream — issue #701).
+                // stream — issue #701). Bounded by MAX_LEADING_CONTROL_EVENTS
+                // so a misbehaving upstream that only emits keepalives can't
+                // stall response start or grow this buffer unbounded — past
+                // the cap we proceed without an Inference-Id and let the rest
+                // flow through the byte stream below.
                 let mut leading_control: Vec<
                     Result<inference_providers::SSEEvent, inference_providers::CompletionError>,
                 > = Vec::new();
@@ -1135,6 +1147,9 @@ async fn chat_completions_inner(
                         _ => break None,
                     };
                     if is_control {
+                        if leading_control.len() >= MAX_LEADING_CONTROL_EVENTS {
+                            break None;
+                        }
                         if let Some(ev) = peekable_stream.next().await {
                             leading_control.push(ev);
                         }
@@ -1218,7 +1233,9 @@ async fn chat_completions_inner(
                                     // and are non-byte-verifiable anyway since the TEE
                                     // signs under the canonical model name, not the alias
                                     // the client requested.
-                                    if event.raw_passthrough && !auto_redact_enabled && !alias_served
+                                    if event.raw_passthrough
+                                        && !auto_redact_enabled
+                                        && !alias_served
                                     {
                                         if event.is_done_marker() {
                                             upstream_done
@@ -1268,15 +1285,17 @@ async fn chat_completions_inner(
                                     let alias_warning =
                                         pending_warning.lock().ok().and_then(|mut g| g.take());
                                     let json_data = match alias_warning {
-                                        Some(warning) => serde_json::to_value(&chunk).map(|mut v| {
-                                            if let Some(obj) = v.as_object_mut() {
-                                                obj.insert(
-                                                    "warning".to_string(),
-                                                    serde_json::Value::String(warning),
-                                                );
-                                            }
-                                            v.to_string()
-                                        }),
+                                        Some(warning) => {
+                                            serde_json::to_value(&chunk).map(|mut v| {
+                                                if let Some(obj) = v.as_object_mut() {
+                                                    obj.insert(
+                                                        "warning".to_string(),
+                                                        serde_json::Value::String(warning),
+                                                    );
+                                                }
+                                                v.to_string()
+                                            })
+                                        }
                                         None => serde_json::to_string(&chunk),
                                     }
                                     .unwrap_or_else(|e| {
@@ -1730,8 +1749,11 @@ async fn completions_inner(
                 // header, consuming any leading control events. This route
                 // reshapes chat chunks into text-completion format, so
                 // control lines are never forwarded (no byte passthrough
-                // here by design) and the stash can be discarded.
+                // here by design) and the consumed events can be discarded.
+                // Bounded so a keepalive-only upstream can't stall the
+                // response: past the cap we proceed without an Inference-Id.
                 let mut peekable_stream = Box::pin(stream.peekable());
+                let mut control_skipped = 0usize;
                 let inference_id = loop {
                     let is_control = match peekable_stream.as_mut().peek().await {
                         Some(Ok(event)) => {
@@ -1743,6 +1765,10 @@ async fn completions_inner(
                         _ => break None,
                     };
                     if is_control {
+                        if control_skipped >= MAX_LEADING_CONTROL_EVENTS {
+                            break None;
+                        }
+                        control_skipped += 1;
                         peekable_stream.next().await;
                     }
                 };

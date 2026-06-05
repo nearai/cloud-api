@@ -216,6 +216,10 @@ pub struct ResponseTemplate {
     tool_calls: Option<Vec<ToolCall>>,
     /// If set, usage will include prompt_tokens_details.cached_tokens (for cache-hit tests)
     cache_tokens: Option<i32>,
+    /// If set, the response `model` field echoes this value instead of the
+    /// request's model param — simulates external backends that answer with
+    /// their upstream model name (`provider_config.model_name` overrides).
+    model_override: Option<String>,
 }
 
 impl ResponseTemplate {
@@ -227,7 +231,15 @@ impl ResponseTemplate {
             disconnect_after_chunks: None,
             tool_calls: None,
             cache_tokens: None,
+            model_override: None,
         }
+    }
+
+    /// Echo `model` in responses instead of the request's model param
+    /// (simulates upstream model-name overrides on external providers).
+    pub fn with_model(mut self, model: impl Into<String>) -> Self {
+        self.model_override = Some(model.into());
+        self
     }
 
     /// Set cache_read_tokens for usage (prompt_tokens_details.cached_tokens) in non-stream and stream final chunk.
@@ -270,6 +282,7 @@ impl ResponseTemplate {
         model: String,
         input_tokens: i32,
     ) -> ChatCompletionResponse {
+        let model = self.model_override.clone().unwrap_or(model);
         // Calculate output tokens as word count of content
         let output_tokens = self.content.split_whitespace().count() as i32;
 
@@ -342,6 +355,7 @@ impl ResponseTemplate {
         model: String,
         input_tokens: i32,
     ) -> Vec<ChatCompletionChunk> {
+        let model = self.model_override.clone().unwrap_or(model);
         let mut chunks = Vec::new();
         let mut output_token_count = 0;
 
@@ -723,6 +737,27 @@ impl MockProvider {
         format!("chatcmpl-{:x}", hasher.finish())
     }
 
+    /// Wire-format encoding for streamed mock chat chunks, as an upstream
+    /// would emit them. Deliberately differs from serde struct serialization
+    /// in two ways real OpenAI-format upstreams do: alphabetically ordered
+    /// keys (`serde_json::to_value` uses a sorted map) and an extra field our
+    /// `ChatCompletionChunk` struct doesn't know (like vLLM's `matched_stop`).
+    /// Decode→re-encode through the typed struct can never reproduce these
+    /// bytes, so a response-hash match in tests proves the gateway forwarded
+    /// the upstream bytes verbatim (issue #701).
+    fn mock_chunk_wire_bytes(chunk: &ChatCompletionChunk) -> Result<Vec<u8>, CompletionError> {
+        let mut value = serde_json::to_value(chunk).map_err(|e| {
+            CompletionError::CompletionError(format!("Failed to serialize mock chunk to JSON: {e}"))
+        })?;
+        if let Some(obj) = value.as_object_mut() {
+            obj.insert(
+                "mock_upstream_only_field".to_string(),
+                serde_json::Value::String("dropped-by-typed-parse".to_string()),
+            );
+        }
+        Ok(format!("data: {value}\n\n").into_bytes())
+    }
+
     /// Get current timestamp
     fn current_timestamp(&self) -> i64 {
         SystemTime::now()
@@ -859,22 +894,21 @@ impl crate::InferenceProvider for MockProvider {
         }
 
         // Register signature hashes for this chat_id.
-        // response_hash is computed over SSE bytes in the same format as returned by the API:
-        // concatenated "data: {json}\n\n" lines plus the final "data: [DONE]\n\n" terminator.
-        // IMPORTANT: Use serde_json::to_string (preserves struct field order) rather than
-        // serde_json::to_value().to_string() (sorts keys alphabetically via BTreeMap).
-        // The server serializes StreamChunk with to_string, so the mock must match.
+        // response_hash is computed over the exact wire bytes this mock emits
+        // (mock_chunk_wire_bytes) plus the final "data: [DONE]\n\n" terminator —
+        // mirroring inference-proxy, which signs the bytes it actually sends.
+        // IMPORTANT: mock_chunk_wire_bytes deliberately uses a DIFFERENT (but
+        // semantically equal) JSON encoding than serde struct serialization
+        // (alphabetically sorted keys via serde_json::to_value). The gateway
+        // can only reproduce this hash by forwarding the upstream bytes
+        // verbatim — re-serializing the parsed chunk yields different bytes.
+        // This makes the e2e signature tests a regression guard for byte-exact
+        // streaming passthrough (issue #701).
         let chat_id_opt = chunks.first().map(|c| c.id.clone());
         if let Some(chat_id) = chat_id_opt {
             let mut accumulated: Vec<u8> = Vec::new();
             for chunk in &chunks {
-                let json_str = serde_json::to_string(chunk).map_err(|e| {
-                    CompletionError::CompletionError(format!(
-                        "Failed to serialize mock chunk to JSON for hashing: {e}"
-                    ))
-                })?;
-                let sse_line = format!("data: {json_str}\n\n");
-                accumulated.extend_from_slice(sse_line.as_bytes());
+                accumulated.extend_from_slice(&Self::mock_chunk_wire_bytes(chunk)?);
             }
             if response_template.disconnect_after_chunks.is_none() {
                 accumulated.extend_from_slice(b"data: [DONE]\n\n");
@@ -884,15 +918,31 @@ impl crate::InferenceProvider for MockProvider {
                 .await;
         }
 
-        // Convert chunks to SSE stream
-        let stream = stream::iter(chunks.into_iter().map(move |chunk| {
-            let json_str = serde_json::to_string(&chunk).unwrap();
-            let raw_bytes = Bytes::from(format!("data: {json_str}\n\n"));
-            Ok(SSEEvent {
-                raw_bytes,
-                chunk: StreamChunk::Chat(chunk),
-            })
-        }));
+        let send_done = response_template.disconnect_after_chunks.is_none();
+
+        // Convert chunks to an SSE event stream carrying the exact wire bytes
+        // alongside the parsed chunk, like the real BufferedSSEParser does.
+        // The trailing [DONE] terminator is emitted as a chunk-less control
+        // event, matching the lossless passthrough parser behavior.
+        let stream = stream::iter(
+            chunks
+                .into_iter()
+                .map(move |chunk| {
+                    let raw_bytes = Bytes::from(Self::mock_chunk_wire_bytes(&chunk)?);
+                    Ok(SSEEvent {
+                        raw_bytes,
+                        chunk: Some(StreamChunk::Chat(chunk)),
+                        raw_passthrough: true,
+                    })
+                })
+                .chain(send_done.then(|| {
+                    Ok(SSEEvent {
+                        raw_bytes: Bytes::from_static(b"data: [DONE]\n\n"),
+                        chunk: None,
+                        raw_passthrough: true,
+                    })
+                })),
+        );
 
         Ok(Box::pin(stream))
     }
@@ -980,7 +1030,8 @@ impl crate::InferenceProvider for MockProvider {
             let raw_bytes = Bytes::from(format!("data: {json_str}\n\n"));
             Ok(SSEEvent {
                 raw_bytes,
-                chunk: StreamChunk::Text(chunk),
+                chunk: Some(StreamChunk::Text(chunk)),
+                raw_passthrough: true,
             })
         }));
 

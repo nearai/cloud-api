@@ -41,9 +41,9 @@ pub struct ChatCompletionRequest {
     pub model: String,
     pub messages: Vec<Message>,
     pub max_tokens: Option<i64>,
-    #[serde(default = "default_temperature")]
+    #[serde(default)]
     pub temperature: Option<f32>,
-    #[serde(default = "default_top_p")]
+    #[serde(default)]
     pub top_p: Option<f32>,
     #[serde(default = "default_n")]
     pub n: Option<i64>,
@@ -226,9 +226,9 @@ pub struct CompletionRequest {
     pub model: String,
     pub prompt: CompletionPrompt,
     pub max_tokens: Option<i64>,
-    #[serde(default = "default_temperature")]
+    #[serde(default)]
     pub temperature: Option<f32>,
-    #[serde(default = "default_top_p")]
+    #[serde(default)]
     pub top_p: Option<f32>,
     #[serde(default = "default_n")]
     pub n: Option<i64>,
@@ -1012,14 +1012,6 @@ pub struct WebSearchQueryParams {
     /// Enable search operators interpretation in query
     #[serde(skip_serializing_if = "Option::is_none")]
     pub operators: Option<bool>,
-}
-
-fn default_temperature() -> Option<f32> {
-    Some(1.0)
-}
-
-fn default_top_p() -> Option<f32> {
-    Some(1.0)
 }
 
 fn default_n() -> Option<i64> {
@@ -3784,6 +3776,24 @@ mod tests {
 
         // Text-only content array should pass validation
         assert!(request.validate().is_ok());
+    }
+
+    #[test]
+    fn test_chat_completion_request_omits_unset_sampling_defaults() {
+        // Regression guard (nearai/cloud-api #696 follow-up): cloud-api must NOT
+        // inject a default `temperature`/`top_p`. A request that omits them must
+        // deserialize to `None` so we forward neither upstream — some models
+        // (e.g. anthropic/claude-opus-4-7) 400 on a `top_p` the caller never set.
+        let req: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "gpt-4",
+            "messages": [{"role": "user", "content": "hi"}],
+        }))
+        .expect("minimal request should deserialize");
+        assert_eq!(
+            req.temperature, None,
+            "temperature must not default to Some(1.0)"
+        );
+        assert_eq!(req.top_p, None, "top_p must not default to Some(1.0)");
     }
 
     #[test]

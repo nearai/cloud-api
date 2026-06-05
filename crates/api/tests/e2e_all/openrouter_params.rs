@@ -333,11 +333,13 @@ async fn test_tool_choice_required_accepted_and_forwarded() {
     );
 }
 
-/// `tool_choice: "none"` must be accepted and forwarded verbatim so the
-/// backend can suppress the call (#619 tracks providers that ignore it; cloud-api's
-/// contract is simply to pass it through, which is what we assert here).
+/// `tool_choice: "none"` must be accepted, and cloud-api must STRIP the tools
+/// from the upstream request so the backend cannot emit a tool call regardless
+/// of whether it honors `tool_choice` (#619: vLLM-served models ignore "none").
+/// We assert the tools array is gone while `tool_choice: "none"` is still
+/// forwarded (harmless, and preserves intent for backends that do honor it).
 #[tokio::test]
-async fn test_tool_choice_none_accepted_and_forwarded() {
+async fn test_tool_choice_none_strips_tools() {
     let (server, mock, model, api_key) = setup().await;
 
     let response = server
@@ -361,8 +363,18 @@ async fn test_tool_choice_none_accepted_and_forwarded() {
     );
     let params = mock.last_chat_params().await.expect("provider was called");
     assert!(
+        params.tools.is_none(),
+        "tool_choice=none must strip the tools array (got {:?})",
+        params.tools
+    );
+    // The tools must not have leaked into the extra passthrough map either.
+    assert!(
+        !params.extra.contains_key("tools"),
+        "tool_choice=none must also strip `tools` from extra"
+    );
+    assert!(
         matches!(params.tool_choice, Some(ToolChoice::String(ref s)) if s == "none"),
-        "tool_choice=none not forwarded (got {:?})",
+        "tool_choice=none itself should still be forwarded (got {:?})",
         params.tool_choice
     );
 }
@@ -419,6 +431,46 @@ async fn test_json_schema_response_format_accepted_and_forwarded() {
     assert_eq!(
         forwarded.get("type").and_then(|v| v.as_str()),
         Some("json_schema"),
+        "response_format.type not preserved on passthrough"
+    );
+}
+
+// ── response_format json_object (nearai/cloud-api #668) ─────────────────────
+
+/// `response_format: { type: json_object }` must be accepted and forwarded in
+/// `extra` so the provider adapters (Gemini → responseMimeType, Anthropic →
+/// fence-strip) can act on it. #668 tracks the markdown-fence breakage on
+/// passthroughs; cloud-api must not reject or drop the param.
+#[tokio::test]
+async fn test_json_object_response_format_accepted_and_forwarded() {
+    let (server, mock, model, api_key) = setup().await;
+
+    let response = server
+        .post("/v1/chat/completions")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .json(&serde_json::json!({
+            "model": model,
+            "messages": [{"role": "user", "content": "Give me a JSON object."}],
+            "response_format": {"type": "json_object"},
+            "max_tokens": 200,
+            "stream": false,
+        }))
+        .await;
+
+    assert_eq!(
+        response.status_code(),
+        200,
+        "json_object response_format should be accepted, got: {}",
+        response.text()
+    );
+    let params = mock.last_chat_params().await.expect("provider was called");
+    let forwarded = params
+        .extra
+        .get("response_format")
+        .expect("response_format forwarded in `extra`");
+    assert_eq!(
+        forwarded.get("type").and_then(|v| v.as_str()),
+        Some("json_object"),
         "response_format.type not preserved on passthrough"
     );
 }

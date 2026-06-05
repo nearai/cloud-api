@@ -468,6 +468,79 @@ pub async fn list_organization_invitations(
     }
 }
 
+/// Cancel an organization invitation
+///
+/// Cancels a pending invitation for the organization. Only owners and admins can cancel invitations.
+#[utoipa::path(
+    delete,
+    path = "/v1/organizations/{org_id}/members/invitations/{invitation_id}",
+    tag = "Organization Members",
+    params(
+        ("org_id" = Uuid, Path, description = "Organization ID"),
+        ("invitation_id" = Uuid, Path, description = "Invitation ID")
+    ),
+    responses(
+        (status = 204, description = "Invitation cancelled successfully"),
+        (status = 400, description = "Bad request - invitation is not pending", body = ErrorResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 403, description = "Forbidden - not an admin or owner", body = ErrorResponse),
+        (status = 404, description = "Organization or invitation not found", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    ),
+    security(
+        ("session_token" = [])
+    )
+)]
+pub async fn cancel_organization_invitation(
+    State(app_state): State<AppState>,
+    Extension(user): Extension<AuthenticatedUser>,
+    Path((org_id, invitation_id)): Path<(Uuid, Uuid)>,
+) -> Result<StatusCode, (StatusCode, Json<ErrorResponse>)> {
+    debug!(
+        "Cancelling invitation {} for organization: {} by user: {}",
+        invitation_id, org_id, user.0.id
+    );
+
+    let organization_id = OrganizationId(org_id);
+    let requester_id = authenticated_user_to_user_id(user);
+
+    match app_state
+        .organization_service
+        .cancel_organization_invitation(organization_id, requester_id, invitation_id)
+        .await
+    {
+        Ok(()) => Ok(StatusCode::NO_CONTENT),
+        Err(OrganizationError::InvalidParams(msg)) => Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse::new(msg, "bad_request".to_string())),
+        )),
+        Err(OrganizationError::Unauthorized(msg)) => Err((
+            StatusCode::FORBIDDEN,
+            Json(ErrorResponse::new(msg, "forbidden".to_string())),
+        )),
+        Err(OrganizationError::NotFound) => Err((
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse::new(
+                "Invitation not found".to_string(),
+                "not_found".to_string(),
+            )),
+        )),
+        Err(OrganizationError::UserNotFound)
+        | Err(OrganizationError::AlreadyExists)
+        | Err(OrganizationError::AlreadyMember)
+        | Err(OrganizationError::InternalError(_)) => {
+            error!("Failed to cancel organization invitation");
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse::new(
+                    "Failed to cancel organization invitation".to_string(),
+                    "internal_server_error".to_string(),
+                )),
+            ))
+        }
+    }
+}
+
 /// List organization members with limited user information
 ///
 /// Returns limited user information for privacy and security:

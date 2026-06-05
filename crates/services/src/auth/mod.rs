@@ -1123,6 +1123,14 @@ mod tests {
         async fn decline_invitation(&self, _: Uuid, _: &str) -> Result<(), OrganizationError> {
             unimplemented!()
         }
+        async fn cancel_organization_invitation(
+            &self,
+            _: OrganizationId,
+            _: UserId,
+            _: Uuid,
+        ) -> Result<(), OrganizationError> {
+            unimplemented!()
+        }
         async fn list_organization_invitations(
             &self,
             _: OrganizationId,

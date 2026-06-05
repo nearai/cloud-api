@@ -706,6 +706,27 @@ impl OrganizationInvitationRepository for PgOrganizationInvitationRepository {
         Ok(rows_affected > 0)
     }
 
+    async fn delete_pending(&self, id: Uuid) -> Result<bool> {
+        let rows_affected = retry_db!("delete_pending_organization_invitation", {
+            let client = self
+                .pool
+                .get()
+                .await
+                .context("Failed to get database connection")
+                .map_err(RepositoryError::PoolError)?;
+
+            client
+                .execute(
+                    "DELETE FROM organization_invitations WHERE id = $1 AND status = 'pending'",
+                    &[&id],
+                )
+                .await
+                .map_err(map_db_error)
+        })?;
+
+        Ok(rows_affected > 0)
+    }
+
     async fn mark_expired(&self) -> Result<usize> {
         let rows_affected = retry_db!("mark_expired_organization_invitations", {
             let client = self

@@ -1201,6 +1201,89 @@ impl OrganizationServiceImpl {
         Ok(())
     }
 
+    async fn ensure_can_manage_organization_invitations(
+        &self,
+        organization_id: &OrganizationId,
+        requester_id: &UserId,
+    ) -> Result<MemberRole, OrganizationError> {
+        let org = self.get_organization_impl(organization_id.clone()).await?;
+        if org.owner_id == *requester_id {
+            return Ok(MemberRole::Owner);
+        }
+
+        let member = self
+            .repository
+            .get_member(organization_id.0, requester_id.0)
+            .await
+            .map_err(Self::map_repository_error)?
+            .ok_or_else(|| {
+                OrganizationError::Unauthorized(
+                    "User is not a member of this organization".to_string(),
+                )
+            })?;
+
+        if !member.role.can_manage_members() {
+            return Err(OrganizationError::Unauthorized(
+                "Only owners and admins can manage invitations".to_string(),
+            ));
+        }
+
+        Ok(member.role)
+    }
+
+    async fn cancel_organization_invitation_impl(
+        &self,
+        organization_id: OrganizationId,
+        requester_id: UserId,
+        invitation_id: uuid::Uuid,
+    ) -> Result<(), OrganizationError> {
+        let requester_role = self
+            .ensure_can_manage_organization_invitations(&organization_id, &requester_id)
+            .await?;
+
+        let invitation = self
+            .invitation_repository
+            .get_by_id(invitation_id)
+            .await
+            .map_err(|e| {
+                OrganizationError::InternalError(format!("Failed to get invitation: {e}"))
+            })?
+            .ok_or(OrganizationError::NotFound)?;
+
+        if invitation.organization_id != organization_id {
+            return Err(OrganizationError::NotFound);
+        }
+
+        if invitation.status != ports::InvitationStatus::Pending {
+            return Err(OrganizationError::InvalidParams(
+                "Invitation is not pending".to_string(),
+            ));
+        }
+
+        if !requester_role.can_invite_as(&invitation.role) {
+            return Err(OrganizationError::Unauthorized(format!(
+                "Insufficient permissions to cancel {role} invitations",
+                role = invitation.role
+            )));
+        }
+
+        let deleted = self
+            .invitation_repository
+            .delete_pending(invitation_id)
+            .await
+            .map_err(|e| {
+                OrganizationError::InternalError(format!("Failed to cancel invitation: {e}"))
+            })?;
+
+        if !deleted {
+            return Err(OrganizationError::InvalidParams(
+                "Invitation is not pending".to_string(),
+            ));
+        }
+
+        Ok(())
+    }
+
     /// List invitations for an organization (admin/owner only, private helper)
     async fn list_organization_invitations_impl(
         &self,
@@ -1602,6 +1685,16 @@ impl OrganizationServiceTrait for OrganizationServiceImpl {
         user_email: &str,
     ) -> Result<(), OrganizationError> {
         self.decline_invitation_impl(invitation_id, user_email)
+            .await
+    }
+
+    async fn cancel_organization_invitation(
+        &self,
+        organization_id: OrganizationId,
+        requester_id: UserId,
+        invitation_id: uuid::Uuid,
+    ) -> Result<(), OrganizationError> {
+        self.cancel_organization_invitation_impl(organization_id, requester_id, invitation_id)
             .await
     }
 
@@ -2041,6 +2134,7 @@ mod tests {
                 .find(|invitation| invitation.id == id)
                 .unwrap();
             invitation.status = status;
+            invitation.responded_at = Some(chrono::Utc::now());
             Ok(invitation.clone())
         }
 
@@ -2066,6 +2160,15 @@ mod tests {
 
         async fn delete(&self, _: Uuid) -> anyhow::Result<bool> {
             unimplemented!()
+        }
+
+        async fn delete_pending(&self, id: Uuid) -> anyhow::Result<bool> {
+            let mut records = self.records.lock().unwrap();
+            let original_len = records.len();
+            records.retain(|invitation| {
+                !(invitation.id == id && invitation.status == InvitationStatus::Pending)
+            });
+            Ok(records.len() != original_len)
         }
 
         async fn mark_expired(&self) -> anyhow::Result<usize> {
@@ -2593,5 +2696,185 @@ mod tests {
         assert!(email_sender.sent_to.lock().unwrap().is_empty());
         let stored = invitation_repo.records.lock().unwrap()[0].clone();
         assert_eq!(stored.status, InvitationStatus::Expired);
+    }
+
+    #[tokio::test]
+    async fn cancel_organization_invitation_allows_org_admin() {
+        let (service, invitation_repo, _, user_repo) = make_service_with_requester_role(
+            Ok(EmailDeliveryOutcome::Skipped),
+            None,
+            MemberRole::Admin,
+        );
+        let org = service
+            .repository
+            .get_by_id(Uuid::nil())
+            .await
+            .unwrap()
+            .unwrap();
+        let requester_id = user_repo.inviter.id.clone();
+
+        let result = service
+            .create_invitations(
+                org.id.clone(),
+                requester_id.clone(),
+                vec![("invitee@example.com".to_string(), MemberRole::Member)],
+                24,
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.successful, 1);
+        let invitation_id = invitation_repo.records.lock().unwrap()[0].id;
+
+        service
+            .cancel_organization_invitation(org.id, requester_id, invitation_id)
+            .await
+            .unwrap();
+
+        assert!(invitation_repo.records.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn cancel_organization_invitation_rejects_member() {
+        let (service, invitation_repo, _, user_repo) = make_service_with_requester_role(
+            Ok(EmailDeliveryOutcome::Skipped),
+            None,
+            MemberRole::Member,
+        );
+        let org = service
+            .repository
+            .get_by_id(Uuid::nil())
+            .await
+            .unwrap()
+            .unwrap();
+        let invitation = invitation_repo
+            .create(
+                org.id.0,
+                CreateInvitationRequest {
+                    email: "invitee@example.com".to_string(),
+                    role: MemberRole::Member,
+                    expires_in_hours: 24,
+                },
+                org.owner_id.0,
+            )
+            .await
+            .unwrap();
+
+        let error = service
+            .cancel_organization_invitation(org.id, user_repo.inviter.id.clone(), invitation.id)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, OrganizationError::Unauthorized(_)));
+        assert_eq!(invitation_repo.records.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn cancel_organization_invitation_hides_cross_org_invitation() {
+        let (service, invitation_repo, _, user_repo) = make_service_with_requester_role(
+            Ok(EmailDeliveryOutcome::Skipped),
+            None,
+            MemberRole::Admin,
+        );
+        let org = service
+            .repository
+            .get_by_id(Uuid::nil())
+            .await
+            .unwrap()
+            .unwrap();
+        let other_org_id = Uuid::new_v4();
+        let invitation = invitation_repo
+            .create(
+                other_org_id,
+                CreateInvitationRequest {
+                    email: "invitee@example.com".to_string(),
+                    role: MemberRole::Member,
+                    expires_in_hours: 24,
+                },
+                org.owner_id.0,
+            )
+            .await
+            .unwrap();
+
+        let error = service
+            .cancel_organization_invitation(org.id, user_repo.inviter.id.clone(), invitation.id)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, OrganizationError::NotFound));
+        assert_eq!(invitation_repo.records.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn cancel_organization_invitation_rejects_non_pending_invitation() {
+        let (service, invitation_repo, _, user_repo) = make_service_with_requester_role(
+            Ok(EmailDeliveryOutcome::Skipped),
+            None,
+            MemberRole::Admin,
+        );
+        let org = service
+            .repository
+            .get_by_id(Uuid::nil())
+            .await
+            .unwrap()
+            .unwrap();
+        let invitation = invitation_repo
+            .create(
+                org.id.0,
+                CreateInvitationRequest {
+                    email: "invitee@example.com".to_string(),
+                    role: MemberRole::Member,
+                    expires_in_hours: 24,
+                },
+                org.owner_id.0,
+            )
+            .await
+            .unwrap();
+        invitation_repo
+            .update_status(invitation.id, InvitationStatus::Declined)
+            .await
+            .unwrap();
+
+        let error = service
+            .cancel_organization_invitation(org.id, user_repo.inviter.id.clone(), invitation.id)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, OrganizationError::InvalidParams(_)));
+        assert_eq!(invitation_repo.records.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn cancel_organization_invitation_rejects_admin_for_owner_invite() {
+        let (service, invitation_repo, _, user_repo) = make_service_with_requester_role(
+            Ok(EmailDeliveryOutcome::Skipped),
+            None,
+            MemberRole::Admin,
+        );
+        let org = service
+            .repository
+            .get_by_id(Uuid::nil())
+            .await
+            .unwrap()
+            .unwrap();
+        let invitation = invitation_repo
+            .create(
+                org.id.0,
+                CreateInvitationRequest {
+                    email: "new-owner@example.com".to_string(),
+                    role: MemberRole::Owner,
+                    expires_in_hours: 24,
+                },
+                org.owner_id.0,
+            )
+            .await
+            .unwrap();
+
+        let error = service
+            .cancel_organization_invitation(org.id, user_repo.inviter.id.clone(), invitation.id)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, OrganizationError::Unauthorized(_)));
+        assert_eq!(invitation_repo.records.lock().unwrap().len(), 1);
     }
 }

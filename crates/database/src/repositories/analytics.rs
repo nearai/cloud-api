@@ -14,6 +14,7 @@ use services::admin::{
 };
 use services::common::RepositoryError;
 use std::collections::BTreeMap;
+use tokio_postgres::Error as PostgresError;
 use uuid::Uuid;
 
 /// PostgreSQL implementation of the analytics repository
@@ -30,6 +31,30 @@ impl PgAnalyticsRepository {
 /// Convert nano-dollars (scale 9) to USD
 fn nano_to_usd(nano: i64) -> f64 {
     nano as f64 / 1_000_000_000.0
+}
+
+fn log_billing_summary_db_error(stage: &'static str, err: PostgresError) -> RepositoryError {
+    if let Some(db_error) = err.as_db_error() {
+        tracing::error!(
+            billing_summary_stage = stage,
+            sqlstate = db_error.code().code(),
+            db_message = db_error.message(),
+            db_table = db_error.table().unwrap_or(""),
+            db_column = db_error.column().unwrap_or(""),
+            "Billing summary database query failed"
+        );
+    } else {
+        tracing::error!(
+            billing_summary_stage = stage,
+            sqlstate = "",
+            db_message = "non-Postgres database error",
+            db_table = "",
+            db_column = "",
+            "Billing summary database query failed"
+        );
+    }
+
+    RepositoryError::DatabaseError(err.into())
 }
 
 #[async_trait]
@@ -598,7 +623,7 @@ impl AnalyticsRepository for PgAnalyticsRepository {
                 &[],
             )
             .await
-            .map_err(|e| RepositoryError::DatabaseError(e.into()))?;
+            .map_err(|e| log_billing_summary_db_error("active_limits", e))?;
 
         let active_paid_credit_limit_usd = nano_to_usd(limits_row.get::<_, i64>(0));
         let active_grant_credit_limit_usd = nano_to_usd(limits_row.get::<_, i64>(1));
@@ -619,7 +644,7 @@ impl AnalyticsRepository for PgAnalyticsRepository {
                 &[],
             )
             .await
-            .map_err(|e| RepositoryError::DatabaseError(e.into()))?;
+            .map_err(|e| log_billing_summary_db_error("consumed_totals", e))?;
         let total_consumed_usd = nano_to_usd(consumed_row.get::<_, i64>(0));
         let inference_consumed_usd = nano_to_usd(consumed_row.get::<_, i64>(1));
         let service_consumed_usd = nano_to_usd(consumed_row.get::<_, i64>(2));
@@ -641,7 +666,7 @@ impl AnalyticsRepository for PgAnalyticsRepository {
                 &[],
             )
             .await
-            .map_err(|e| RepositoryError::DatabaseError(e.into()))?;
+            .map_err(|e| log_billing_summary_db_error("source_breakdown", e))?;
 
         let by_source: Vec<BillingSourceBreakdown> = source_rows
             .iter()

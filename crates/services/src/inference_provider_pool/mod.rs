@@ -1429,26 +1429,94 @@ impl InferenceProviderPool {
         // ASCII-only lowercase: the markers are all ASCII and this path can
         // run at high volume during a malformed-media incident.
         let lower = message.to_ascii_lowercase();
-        if lower.contains("loading image data")
-            || lower.contains("loading video data")
-            || lower.contains("cannot identify image file")
+        // Pure decode-side failures: the engine fetched the bytes but could not
+        // parse them. There is NO fetch HTTP status involved — these are
+        // unconditionally permanent client-input faults (a corrupt/unsupported
+        // payload re-decodes identically). NOTE: `loading image/video data` is
+        // deliberately NOT here. It is the SGLang/vLLM *prefix* for BOTH a decode
+        // failure (`... cannot identify image file`, caught here) AND a fetch
+        // failure (`... NNN Client Error`, status-gated below). Treating it as
+        // decode-only would mis-map a transient `loading IMAGE data ... 503
+        // Client Error` to a client 400 — the exact regression the status gate
+        // exists to prevent (PR #721 review).
+        if lower.contains("cannot identify image file")
             || lower.contains("failed to open input buffer")
         {
             return true;
         }
-        // aiohttp wrapper format observed when the inference engine collapses
-        // a client-fetch 4xx into a 500: `HTTP error 500: 4xx, message='...',
-        // url='http...'`. Constrain to a wrapped 4xx (\\d{2} after the leading
-        // "4") so genuinely retryable wrapped 5xx (e.g. "HTTP error 500: 503,
-        // message='Service Unavailable', url='...'") still retry as before.
-        static AIOHTTP_WRAPPED_4XX: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
-        let re = AIOHTTP_WRAPPED_4XX.get_or_init(|| {
-            // (?i) is on the original message; lower is already ASCII-lowered,
-            // so an anchored lower-case literal is sufficient and faster.
-            Regex::new(r"http error 500:\s*4\d{2},\s*message='[^']*',\s*url='https?://")
-                .expect("static regex compiles")
+        // Fetch-side failures: the engine reached out to the client-supplied URL
+        // and the *remote host* answered. Only an explicit upstream 4xx is a
+        // permanent client-input fault (Wikimedia's 400 for a disallowed
+        // User-Agent, a 403, a 404 for a stale URL — retrying the identical URL
+        // re-triggers the same rejection). A 5xx (or an indeterminate status)
+        // from the remote host is a transient backend problem and MUST remain
+        // retryable, so we gate every fetch-side marker on a determinable 4xx.
+        // See cloud-api#606 (positive 4xx) and PR #721 review (5xx must retry).
+        let has_fetch_marker = lower.contains("failed to fetch image")
+            || lower.contains("failed to fetch video")
+            || lower.contains("error fetching image")
+            || lower.contains("error fetching video")
+            || lower.contains("failed to load image")
+            || lower.contains("failed to load video")
+            || lower.contains("clientresponseerror")
+            || lower.contains("client error:")
+            // aiohttp wrapper format observed when the inference engine collapses
+            // a client-fetch status into a 500: `HTTP error 500: NNN, message=...`.
+            || lower.contains("http error 500:")
+            // SGLang/vLLM media-load prefix that carries a fetch status in its
+            // fetch-failure form (`loading IMAGE data ... NNN Client Error`); the
+            // decode form (`... cannot identify image file`) has no status and is
+            // already caught above, so status-gating these here is safe.
+            || lower.contains("loading image data")
+            || lower.contains("loading video data");
+        has_fetch_marker
+            && Self::extract_fetch_status(&lower).is_some_and(|s| (400..500).contains(&s))
+    }
+
+    /// Extract the *upstream fetch* HTTP status embedded in an inference-engine
+    /// error message, across the phrasings vLLM/SGLang/aiohttp produce:
+    ///
+    /// - aiohttp wrapper: `HTTP error 500: 503, message='...', url='http...'`
+    /// - aiohttp exception: `ClientResponseError, status=503, message='...'`
+    /// - aiohttp `raise_for_status()` str: `400, message='Bad Request', url='...'`
+    /// - requests/urllib: `503 Client Error: ... for url: http...`
+    ///
+    /// Returns `None` when no status is determinable (then the caller keeps the
+    /// error retryable). Input is expected ASCII-lowercased.
+    fn extract_fetch_status(lower: &str) -> Option<u16> {
+        // Each pattern captures the *upstream fetch* status from one specific
+        // phrasing. We deliberately do NOT match a bare 3-digit number: the
+        // aiohttp wrapper's outer envelope is always "http error 500:", and we
+        // must capture the inner status (e.g. the `400` in `HTTP error 500:
+        // 400, ...`), never the outer 500. Pattern 4 (`NNN, message=`) is
+        // anchored to the literal `, message=` that immediately follows the
+        // status in aiohttp's `ClientResponseError.__str__`; the wrapper's outer
+        // `500` is followed by `: `, not `, message=`, so it can never match it.
+        static FETCH_STATUS: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+        let re = FETCH_STATUS.get_or_init(|| {
+            Regex::new(
+                // 1. aiohttp wrapper:            `http error 500: 400, message=`
+                // 2. aiohttp exception:          `clientresponseerror, status=400`
+                // 3. requests/urllib:            `400 client error: ... for url`
+                // 4. aiohttp raise_for_status(): `400, message='bad request', url=`
+                r"http error 500:\s*(\d{3})\b|status=(\d{3})\b|\b(\d{3}) client error:|\b(\d{3}), message=",
+            )
+            .expect("static regex compiles")
         });
-        re.is_match(&lower)
+        for caps in re.captures_iter(lower) {
+            let code = caps
+                .get(1)
+                .or_else(|| caps.get(2))
+                .or_else(|| caps.get(3))
+                .or_else(|| caps.get(4))
+                .and_then(|m| m.as_str().parse::<u16>().ok());
+            if let Some(code) = code {
+                if (400..600).contains(&code) {
+                    return Some(code);
+                }
+            }
+        }
+        None
     }
 
     /// Single source of truth for the retry decision: the inner retry loop
@@ -3844,14 +3912,116 @@ mod tests {
             "retryable_http_5xx",
         );
 
-        // Pin the sanitize-vs-classify ordering invariant:
-        // sanitize_error_message redacts URLs to `[URL_REDACTED]`, which defeats
-        // the aiohttp-wrapper regex (it anchors on `url='https?://`). The
-        // production retry loop therefore classifies BEFORE sanitization and
-        // stores the decision. If anyone later moves the classification to
-        // run on the sanitized error, this test combined with the assertions
-        // above will catch the regression: same payload, raw form classifies
-        // as non-retryable, sanitized form does not.
+        // cloud-api#606: Wikimedia (and other hosts with a User-Agent policy)
+        // return 400 to the inference engine's default UA. The engine collapses
+        // that client-fetch 400 into a 500. This is a permanent client-input
+        // fault — the same URL re-fetched with the same UA fails identically —
+        // so it must be non-retryable and surface as a 4xx, not a 502.
+        // aiohttp-wrapper shape wrapping a 400:
+        assert_eq!(
+            InferenceProviderPool::classify_retry_decision(&CompletionError::HttpError {
+                status_code: 500,
+                message: "HTTP error 500: 400, message='Bad Request', url='https://upload.wikimedia.org/wikipedia/commons/x.jpg'".to_string(),
+                is_external: false,
+            }),
+            "non_retryable_client_media_error",
+        );
+        // SGLang "loading IMAGE data ... 400 Client Error: Bad Request" shape:
+        assert_eq!(
+            InferenceProviderPool::classify_retry_decision(&CompletionError::HttpError {
+                status_code: 500,
+                message: "Internal server error: An exception occurred while loading IMAGE data at index 0: 400 Client Error: Bad Request for url: https://upload.wikimedia.org/wikipedia/commons/x.jpg".to_string(),
+                is_external: false,
+            }),
+            "non_retryable_client_media_error",
+        );
+        // vLLM MediaConnector fetch-side phrasings (no aiohttp wrapper, no
+        // "loading IMAGE data" prefix) — the broadened markers must catch them,
+        // but ONLY when they carry an explicit upstream 4xx (PR #721 review). A
+        // bare "Failed to fetch image from <url>" with no status is covered by
+        // the negative cases below (stays retryable).
+        for msg in [
+            "Error fetching image: ClientResponseError, status=400, message='Bad Request'",
+            "Failed to load image from url: 403 Client Error: Forbidden for url: https://host/x.png",
+            "Internal Server Error: Failed to fetch image: 404 Client Error: Not Found for url: https://upload.wikimedia.org/x.jpg",
+            // aiohttp `ClientResponseError.__str__` from raise_for_status():
+            // `NNN, message='...', url='...'` (no `status=`, no `Client Error:`).
+            // PR #721 review 3 (PierreLeGuen) — the Wikimedia default-UA 400 takes
+            // this exact shape and must be non-retryable, not a 502.
+            "Failed to fetch image: 400, message='Bad Request', url='https://upload.wikimedia.org/wikipedia/commons/x.jpg'",
+            "ClientResponseError: 403, message='Forbidden', url='https://host/x.png'",
+        ] {
+            assert_eq!(
+                InferenceProviderPool::classify_retry_decision(&CompletionError::HttpError {
+                    status_code: 500,
+                    message: msg.to_string(),
+                    is_external: false,
+                }),
+                "non_retryable_client_media_error",
+                "expected non-retryable client-media error for: {msg}",
+            );
+        }
+
+        // PR #721 review (PierreLeGuen): fetch-side markers wrapping a 5xx — or
+        // carrying NO determinable status — describe a transient remote-host
+        // failure, NOT a permanent client-input fault. They MUST stay retryable
+        // so we don't mask a backend hiccup as a 400 client-media error.
+        for msg in [
+            // aiohttp ClientResponseError carrying a 5xx → retry.
+            "Error fetching image: ClientResponseError, status=503, message='Service Unavailable'",
+            "Failed to fetch image: ClientResponseError, status=500, message='Internal Server Error'",
+            // requests/urllib phrasing carrying a 5xx → retry.
+            "Failed to load image from url: 502 Client Error: Bad Gateway for url: https://host/x.png",
+            // Fetch marker with no determinable status → retry (can't prove 4xx).
+            "Error fetching image: ClientResponseError, message='connection closed'",
+            "Failed to fetch image from https://upload.wikimedia.org/x.jpg",
+            // aiohttp raise_for_status() str form carrying a 5xx → retry (the
+            // `NNN, message=` parser must keep these retryable). PR #721 review 3.
+            "Failed to fetch image: 503, message='Service Unavailable', url='https://host/x.jpg'",
+            "ClientResponseError: 502, message='Bad Gateway', url='https://host/x.png'",
+            // aiohttp wrapper around a 5xx → retry (regression guard, kept here too).
+            "Error fetching image: HTTP error 500: 503, message='Service Unavailable', url='https://host/x.jpg'",
+            // SGLang "loading IMAGE/VIDEO data" prefix wrapping a transient 5xx →
+            // retry. This is the case the 2nd #721 review (PierreLeGuen) flagged:
+            // these markers were previously treated as decode-only and would
+            // short-circuit a 503 into a client 400.
+            "Internal server error: An exception occurred while loading IMAGE data at index 0: 503 Client Error: Service Unavailable for url: https://upload.wikimedia.org/x.jpg",
+            "Internal server error: An exception occurred while loading VIDEO data at index 0: 502 Client Error: Bad Gateway for url: https://host/v.mp4",
+        ] {
+            assert_eq!(
+                InferenceProviderPool::classify_retry_decision(&CompletionError::HttpError {
+                    status_code: 500,
+                    message: msg.to_string(),
+                    is_external: false,
+                }),
+                "retryable_http_5xx",
+                "fetch-side error without a 4xx must stay retryable: {msg}",
+            );
+        }
+        // Positive control alongside the negatives: same ClientResponseError
+        // phrasing but with an explicit 4xx → non-retryable client-media.
+        for msg in [
+            "Error fetching image: ClientResponseError, status=403, message='Forbidden'",
+            "Error fetching video: ClientResponseError, status=404, message='Not Found'",
+        ] {
+            assert_eq!(
+                InferenceProviderPool::classify_retry_decision(&CompletionError::HttpError {
+                    status_code: 500,
+                    message: msg.to_string(),
+                    is_external: false,
+                }),
+                "non_retryable_client_media_error",
+                "fetch-side error with an explicit 4xx must be client-media: {msg}",
+            );
+        }
+
+        // Classification is now driven by the embedded upstream status, not by
+        // the URL surviving redaction. sanitize_error_message only redacts the
+        // URL/IP, so the `404` status survives and the sanitized aiohttp wrapper
+        // STILL classifies as a non-retryable client-media error. This is more
+        // robust than the prior URL-anchored regex: the verdict no longer depends
+        // on classifying before sanitization. (The production flow still
+        // classifies on the raw body — see test_client_media_error_verdict_survives_sanitize.)
         let raw_wrapped_4xx =
             "HTTP error 500: 404, message='Not Found', url='https://example.test/img'".to_string();
         let sanitized = InferenceProviderPool::sanitize_error_message(&raw_wrapped_4xx);
@@ -3865,9 +4035,9 @@ mod tests {
                 message: sanitized,
                 is_external: false,
             }),
-            "retryable_http_5xx",
-            "sanitized aiohttp-wrapper must NOT match the regex — the production \
-             flow avoids this by classifying before sanitize_completion_error",
+            "non_retryable_client_media_error",
+            "embedded 404 survives sanitization, so the wrapper still classifies \
+             as a non-retryable client-media error (status-driven, not URL-driven)",
         );
     }
 
@@ -3875,9 +4045,9 @@ mod tests {
     fn test_client_media_error_verdict_survives_sanitize() {
         // The media short-circuit classifies on the RAW body, then carries the
         // verdict as a typed ClientMediaError so the status mapping doesn't have
-        // to re-derive it from the sanitized message. Using the URL-bearing
-        // aiohttp form (which the regex can't match once the URL is redacted)
-        // proves the verdict no longer depends on markers surviving redaction.
+        // to re-derive it from the sanitized message. The embedded 404 here is a
+        // genuine 4xx client-media fault, so it classifies non-retryable on the
+        // raw body and is carried as a typed variant regardless of redaction.
         let raw = CompletionError::HttpError {
             status_code: 500,
             message: "HTTP error 500: 404, message='Not Found', url='https://example.test/img.jpg'"

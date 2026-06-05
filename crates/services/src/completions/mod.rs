@@ -350,6 +350,14 @@ where
                 StreamState::Streaming => {
                     match Pin::new(&mut self.inner).poll_next(cx) {
                         Poll::Ready(Some(Ok(ref event))) => {
+                            // Control events (blank lines, comments, [DONE])
+                            // carry no tokens: pass them through untouched so
+                            // the route can forward their raw bytes, but keep
+                            // them out of TTFT/ITL metrics and chat tracking.
+                            if event.chunk.is_none() {
+                                return Poll::Ready(Some(Ok(event.clone())));
+                            }
+
                             let now = Instant::now();
 
                             if !self.first_token_received {
@@ -379,7 +387,7 @@ where
                                 self.last_token_time = Some(now);
                             }
 
-                            if let StreamChunk::Chat(ref chat_chunk) = event.chunk {
+                            if let Some(StreamChunk::Chat(ref chat_chunk)) = event.chunk {
                                 // Track chat_id for attestation (updated on each chunk)
                                 self.last_chat_id = Some(chat_chunk.id.clone());
 
@@ -596,6 +604,25 @@ impl CompletionServiceImpl {
                 Err(_) => None,
             },
             None => None,
+        };
+
+        // Honor `tool_choice: "none"` universally (nearai/cloud-api #619).
+        //
+        // OpenAI semantics: "none" forbids the model from calling any tool on
+        // this turn. Some backends (notably vLLM-served Qwen / gpt-oss) ignore
+        // `tool_choice` and emit tool_calls anyway. The robust, backend-agnostic
+        // enforcement is to strip the tool definitions entirely so there is
+        // nothing the model *can* call. We drop both the typed `tools` and any
+        // `tools` left in `extra` (e.g. non-standard tool shapes that didn't
+        // parse above). The `tool_choice: "none"` itself is harmless to forward.
+        let tools = if matches!(
+            tool_choice,
+            Some(inference_providers::ToolChoice::String(ref s)) if s == "none"
+        ) {
+            extra.remove("tools");
+            None
+        } else {
+            tools
         };
 
         (tools, tool_choice)
@@ -1816,7 +1843,8 @@ mod tests {
         // Create a stream with a content chunk and a usage chunk
         let content_chunk = SSEEvent {
             raw_bytes: Bytes::from("data: ..."),
-            chunk: StreamChunk::Chat(ChatCompletionChunk {
+            raw_passthrough: true,
+            chunk: Some(StreamChunk::Chat(ChatCompletionChunk {
                 id: "chat-1".to_string(),
                 object: "chat.completion.chunk".to_string(),
                 created: 1234567890,
@@ -1826,12 +1854,13 @@ mod tests {
                 prompt_token_ids: None,
                 system_fingerprint: None,
                 modality: None,
-            }),
+            })),
         };
 
         let usage_chunk = SSEEvent {
             raw_bytes: Bytes::from("data: ..."),
-            chunk: StreamChunk::Chat(ChatCompletionChunk {
+            raw_passthrough: true,
+            chunk: Some(StreamChunk::Chat(ChatCompletionChunk {
                 id: "chat-1".to_string(),
                 object: "chat.completion.chunk".to_string(),
                 created: 1234567890,
@@ -1852,7 +1881,7 @@ mod tests {
                 prompt_token_ids: None,
                 system_fingerprint: None,
                 modality: None,
-            }),
+            })),
         };
 
         let stream = stream::iter(vec![Ok(content_chunk), Ok(usage_chunk)]);
@@ -1954,7 +1983,8 @@ mod tests {
         // Create multiple content chunks to test ITL calculation
         let chunk1 = SSEEvent {
             raw_bytes: Bytes::from("data: chunk1"),
-            chunk: StreamChunk::Chat(ChatCompletionChunk {
+            raw_passthrough: true,
+            chunk: Some(StreamChunk::Chat(ChatCompletionChunk {
                 id: "chat-1".to_string(),
                 object: "chat.completion.chunk".to_string(),
                 created: 1234567890,
@@ -1964,12 +1994,13 @@ mod tests {
                 prompt_token_ids: None,
                 system_fingerprint: None,
                 modality: None,
-            }),
+            })),
         };
 
         let chunk2 = SSEEvent {
             raw_bytes: Bytes::from("data: chunk2"),
-            chunk: StreamChunk::Chat(ChatCompletionChunk {
+            raw_passthrough: true,
+            chunk: Some(StreamChunk::Chat(ChatCompletionChunk {
                 id: "chat-1".to_string(),
                 object: "chat.completion.chunk".to_string(),
                 created: 1234567890,
@@ -1979,12 +2010,13 @@ mod tests {
                 prompt_token_ids: None,
                 system_fingerprint: None,
                 modality: None,
-            }),
+            })),
         };
 
         let usage_chunk = SSEEvent {
             raw_bytes: Bytes::from("data: usage"),
-            chunk: StreamChunk::Chat(ChatCompletionChunk {
+            raw_passthrough: true,
+            chunk: Some(StreamChunk::Chat(ChatCompletionChunk {
                 id: "chat-1".to_string(),
                 object: "chat.completion.chunk".to_string(),
                 created: 1234567890,
@@ -2005,7 +2037,7 @@ mod tests {
                 prompt_token_ids: None,
                 modality: None,
                 system_fingerprint: None,
-            }),
+            })),
         };
 
         // Simulate a stream with delays between chunks
@@ -2107,7 +2139,8 @@ mod tests {
         // Single chunk with usage (no inter-token latency to measure)
         let usage_chunk = SSEEvent {
             raw_bytes: Bytes::from("data: usage"),
-            chunk: StreamChunk::Chat(ChatCompletionChunk {
+            raw_passthrough: true,
+            chunk: Some(StreamChunk::Chat(ChatCompletionChunk {
                 id: "chat-1".to_string(),
                 object: "chat.completion.chunk".to_string(),
                 created: 1234567890,
@@ -2128,7 +2161,7 @@ mod tests {
                 prompt_token_ids: None,
                 modality: None,
                 system_fingerprint: None,
-            }),
+            })),
         };
 
         let stream = stream::iter(vec![Ok(usage_chunk)]);
@@ -2894,6 +2927,57 @@ mod tests {
 
         assert!(tools.is_none());
         assert!(extra.contains_key("tools"));
+    }
+
+    #[test]
+    fn extract_tools_strips_function_tools_when_choice_none() {
+        // nearai/cloud-api #619: tool_choice="none" must remove the tools so a
+        // backend that ignores tool_choice (vLLM) cannot emit a tool call.
+        let mut extra = std::collections::HashMap::new();
+        extra.insert(
+            "tools".to_string(),
+            serde_json::json!([{
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "description": "Get weather.",
+                    "parameters": {"type": "object", "properties": {}}
+                }
+            }]),
+        );
+        extra.insert("tool_choice".to_string(), serde_json::json!("none"));
+
+        let (tools, tool_choice) = CompletionServiceImpl::extract_tools_from_extra(&mut extra);
+
+        assert!(
+            tools.is_none(),
+            "tools must be stripped when choice is none"
+        );
+        assert!(
+            matches!(tool_choice, Some(inference_providers::ToolChoice::String(ref s)) if s == "none"),
+            "tool_choice=none should still be returned"
+        );
+        assert!(!extra.contains_key("tools"));
+    }
+
+    #[test]
+    fn extract_tools_strips_unparsed_extra_tools_when_choice_none() {
+        // Even tools that didn't parse into the typed field (and would normally
+        // flow through via `extra`) must be removed when choice is "none".
+        let mut extra = std::collections::HashMap::new();
+        extra.insert(
+            "tools".to_string(),
+            serde_json::json!([{"type": "web_context_search"}]),
+        );
+        extra.insert("tool_choice".to_string(), serde_json::json!("none"));
+
+        let (tools, _) = CompletionServiceImpl::extract_tools_from_extra(&mut extra);
+
+        assert!(tools.is_none());
+        assert!(
+            !extra.contains_key("tools"),
+            "tool_choice=none must also strip unparsed `tools` from extra"
+        );
     }
 
     #[test]

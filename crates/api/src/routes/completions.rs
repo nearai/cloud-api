@@ -1,7 +1,14 @@
 use crate::{
     middleware::{auth::AuthenticatedApiKey, RequestBodyHash},
     models::*,
-    routes::{api::AppState, common::map_domain_error_to_status, files::MAX_FILE_SIZE},
+    routes::{
+        api::AppState,
+        common::{
+            alias_warning_message, inject_warning_field, map_domain_error_to_status,
+            no_aliasing_requested, HEADER_MODEL_ALIAS_RESOLVED, HEADER_NO_ALIASING,
+        },
+        files::MAX_FILE_SIZE,
+    },
 };
 use axum::{
     body::{Body, Bytes},
@@ -25,6 +32,14 @@ use uuid::Uuid;
 
 // Timeout for synchronous usage recording before response is returned
 const USAGE_RECORDING_TIMEOUT_SECS: u64 = 5;
+
+// Upper bound on leading SSE control events (keepalive comments, blank
+// lines) consumed while peeking for the first parsed chunk. Real upstreams
+// emit zero before the first data chunk; the cap stops a misbehaving or
+// malicious upstream from stalling response start or growing the stash
+// unbounded. Past the cap we proceed without an Inference-Id header and let
+// the remaining stream (including the buffered control events) flow through.
+const MAX_LEADING_CONTROL_EVENTS: usize = 32;
 
 /// Insert validated E2EE headers into a provider `extra` HashMap.
 fn insert_encryption_headers(
@@ -65,6 +80,62 @@ fn insert_encryption_headers(
 
 // Custom header for exposing the inference ID as a UUID
 const HEADER_INFERENCE_ID: &str = "Inference-Id";
+
+/// True when any E2EE encryption header was supplied. E2EE bodies are opaque
+/// to the gateway, so alias warnings can't be injected into them — the
+/// `x-model-alias-resolved` response header is the only signal in that mode.
+fn e2ee_requested(encryption_headers: &crate::routes::common::EncryptionHeaders) -> bool {
+    encryption_headers.signing_algo.is_some()
+        || encryption_headers.client_pub_key.is_some()
+        || encryption_headers.model_pub_key.is_some()
+        || encryption_headers.encryption_version.is_some()
+        || encryption_headers.encrypt_all_fields.is_some()
+}
+
+/// Enforce the `x-no-aliasing` strict mode (issue #573): if the client set
+/// the header and the requested model is an alias, refuse with 400 before
+/// any inference happens — i.e. before tokens are billed and, for E2EE
+/// clients, before a payload is bound to a different model TD's signing key.
+///
+/// Unknown models fall through (`Ok`) so the completion service returns its
+/// canonical "not a valid model name or alias" error.
+async fn reject_if_aliased(
+    models_service: &Arc<dyn services::models::ModelsServiceTrait>,
+    headers: &header::HeaderMap,
+    requested_model: &str,
+) -> Result<(), Response> {
+    if !no_aliasing_requested(headers) {
+        return Ok(());
+    }
+    match models_service.resolve_and_get_model(requested_model).await {
+        Ok(m) if m.model_name != requested_model => Err((
+            StatusCode::BAD_REQUEST,
+            ResponseJson(ErrorResponse::new(
+                format!(
+                    "Model '{requested_model}' is an alias of '{}' and the request set \
+                     {HEADER_NO_ALIASING}. Use the canonical model name '{}'.",
+                    m.model_name, m.model_name
+                ),
+                "model_alias_rejected".to_string(),
+            )),
+        )
+            .into_response()),
+        Ok(_) => Ok(()),
+        Err(services::models::ModelsError::NotFound(_)) => Ok(()),
+        Err(_) => {
+            // Strict mode must fail closed: if the catalog can't be
+            // consulted, we can't guarantee no alias was applied.
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ResponseJson(ErrorResponse::new(
+                    "Failed to resolve model for x-no-aliasing check".to_string(),
+                    "internal_server_error".to_string(),
+                )),
+            )
+                .into_response())
+        }
+    }
+}
 
 /// Build a `RecordUsageServiceRequest` for image operations (generation or editing).
 fn build_image_usage_request(
@@ -257,14 +328,6 @@ fn extract_inference_id_from_chunk(chunk: &inference_providers::StreamChunk) -> 
         inference_providers::StreamChunk::Text(c) => &c.id,
     };
     hash_inference_id_to_uuid(id)
-}
-
-/// Extract the provider-assigned chat ID string from a parsed stream chunk.
-fn extract_chat_id_from_chunk(chunk: &inference_providers::StreamChunk) -> String {
-    match chunk {
-        inference_providers::StreamChunk::Chat(c) => c.id.clone(),
-        inference_providers::StreamChunk::Text(c) => c.id.clone(),
-    }
 }
 
 // Convert MessageContent to serde_json::Value, preserving multimodal parts (images, audio, etc.)
@@ -1006,6 +1069,27 @@ async fn chat_completions_inner(
 
     // Add validated headers to service_request.extra
     insert_encryption_headers(&encryption_headers, &mut service_request.extra);
+    let e2ee_active = e2ee_requested(&encryption_headers);
+
+    // Strict alias mode: refuse to serve through an alias before any
+    // inference happens (issue #573).
+    if let Err(resp) = reject_if_aliased(&app_state.models_service, &headers, &request.model).await
+    {
+        return resp;
+    }
+
+    // Pre-dispatch alias detection (issue #573): the canonical name when
+    // the requested model is a registered alias, mirroring the resolution
+    // the completion service is about to apply. Derived purely from the
+    // catalog — never from the response's `model` echo, which carries no
+    // signal about alias-ness: external providers may rewrite the upstream
+    // model name (`provider_config.model_name`), and that override can
+    // even equal the alias string itself. Cache-backed (no DB on the hot
+    // path); advisory only — strict mode above stays authoritative.
+    let alias_canonical = app_state
+        .models_service
+        .resolve_alias_cached(&request.model)
+        .await;
 
     // Auto-redact (opt-in via x-auto-redact header or auto_redact body field).
     // On success this may rewrite service_request.messages to substitute
@@ -1040,13 +1124,52 @@ async fn chat_completions_inner(
                 // Make stream peekable to extract chat_id for Inference-Id header
                 let mut peekable_stream = Box::pin(stream.peekable());
 
-                // Peek at first chunk to extract chat_id and generate Inference-Id UUID
-                let inference_id = peekable_stream
-                    .as_mut()
-                    .peek()
-                    .await
-                    .and_then(|result| result.as_ref().ok())
-                    .map(|event| extract_inference_id_from_chunk(&event.chunk));
+                // Peek for the Inference-Id header. Control events (e.g. an
+                // upstream keepalive comment) may precede the first data
+                // chunk; consume and stash them so they are still forwarded
+                // to the client in order (they're part of the signed byte
+                // stream — issue #701). Bounded by MAX_LEADING_CONTROL_EVENTS
+                // so a misbehaving upstream that only emits keepalives can't
+                // stall response start or grow this buffer unbounded — past
+                // the cap we proceed without an Inference-Id and let the rest
+                // flow through the byte stream below.
+                let mut leading_control: Vec<
+                    Result<inference_providers::SSEEvent, inference_providers::CompletionError>,
+                > = Vec::new();
+                let inference_id = loop {
+                    let is_control = match peekable_stream.as_mut().peek().await {
+                        Some(Ok(event)) => {
+                            if let Some(chunk) = &event.chunk {
+                                break Some(extract_inference_id_from_chunk(chunk));
+                            }
+                            true
+                        }
+                        _ => break None,
+                    };
+                    if is_control {
+                        if leading_control.len() >= MAX_LEADING_CONTROL_EVENTS {
+                            break None;
+                        }
+                        if let Some(ev) = peekable_stream.next().await {
+                            leading_control.push(ev);
+                        }
+                    }
+                };
+
+                // Warning to inject into the first streamed chunk. Skipped
+                // for E2EE (the chunks are opaque; the response header is
+                // the only signal there).
+                let alias_warning_pending: Arc<std::sync::Mutex<Option<String>>> =
+                    Arc::new(std::sync::Mutex::new(
+                        alias_canonical
+                            .as_ref()
+                            .filter(|_| !e2ee_active)
+                            .map(|canonical| alias_warning_message(&request.model, canonical)),
+                    ));
+                // Alias-served responses can't use byte-exact passthrough: the
+                // first chunk is rewritten to carry the warning, and the TEE
+                // signs under the canonical model name anyway.
+                let alias_served = alias_canonical.is_some();
 
                 if inference_id.is_none() {
                     tracing::warn!(
@@ -1056,16 +1179,17 @@ async fn chat_completions_inner(
                     );
                 }
 
-                // Accumulate all SSE bytes for response hash computation
-                let accumulated_bytes = Arc::new(tokio::sync::Mutex::new(Vec::new()));
-                let chat_id_state = Arc::new(tokio::sync::Mutex::new(None::<String>));
                 let stream_error_count = Arc::new(std::sync::atomic::AtomicU32::new(0));
 
-                let accumulated_clone = accumulated_bytes.clone();
-                let chat_id_clone = chat_id_state.clone();
                 let error_count_clone = stream_error_count.clone();
                 let request_model = request.model.clone();
                 let organization_id = api_key.organization.id.0;
+
+                // Set when the upstream's own `data: [DONE]` terminator was
+                // forwarded verbatim, so the end-of-stream tail doesn't
+                // append a second, gateway-minted one.
+                let upstream_done_forwarded = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let upstream_done_for_chain = upstream_done_forwarded.clone();
 
                 // Per-stream un-redact state, keyed by choice index so n>1
                 // completions don't cross-contaminate sliding tails. When
@@ -1080,29 +1204,53 @@ async fn chat_completions_inner(
                     Arc::new(tokio::sync::Mutex::new(None));
                 let chunk_template_for_chain = chunk_template.clone();
                 let unredact_states_for_chain = unredact_states.clone();
-                let accumulated_for_chain = accumulated_bytes.clone();
                 let redaction_map_for_chunks = redaction_map.clone();
 
-                // Convert to raw bytes stream with proper SSE formatting
-                let byte_stream = peekable_stream
-                    .then(move |result| {
-                        let accumulated_inner = accumulated_clone.clone();
-                        let chat_id_inner = chat_id_clone.clone();
+                // Re-attach any stashed leading control events, then convert
+                // to a raw bytes stream.
+                let event_stream = futures::stream::iter(leading_control).chain(peekable_stream);
+
+                let byte_stream = event_stream
+                    .filter_map(move |result| {
                         let error_count_inner = error_count_clone.clone();
                         let model_for_err = request_model.clone();
                         let states = unredact_states.clone();
                         let template = chunk_template.clone();
                         let map = redaction_map_for_chunks.clone();
+                        let pending_warning = alias_warning_pending.clone();
+                        let upstream_done = upstream_done_forwarded.clone();
                         async move {
                             match result {
-                                Ok(mut event) => {
-                                    // Extract chat_id from the parsed chunk
+                                Ok(event) => {
+                                    // Byte-exact passthrough (issue #701): the upstream
+                                    // emits OpenAI-format SSE and no chunk rewriting is
+                                    // active, so forward the wire bytes untouched. This
+                                    // keeps sha256(received bytes) reproducible against
+                                    // the response hash signed inside the inference TEE.
+                                    //
+                                    // Disabled for alias-served responses: those inject
+                                    // a top-level `warning` into the first chunk (below),
+                                    // and are non-byte-verifiable anyway since the TEE
+                                    // signs under the canonical model name, not the alias
+                                    // the client requested.
+                                    if event.raw_passthrough
+                                        && !auto_redact_enabled
+                                        && !alias_served
                                     {
-                                        let mut cid = chat_id_inner.lock().await;
-                                        if cid.is_none() {
-                                            *cid = Some(extract_chat_id_from_chunk(&event.chunk));
+                                        if event.is_done_marker() {
+                                            upstream_done
+                                                .store(true, std::sync::atomic::Ordering::Relaxed);
                                         }
+                                        return Some(Ok::<Bytes, Infallible>(event.raw_bytes));
                                     }
+
+                                    // Re-serialization path: auto-redact rewrites chunk
+                                    // text, and non-OpenAI upstreams (Gemini native,
+                                    // Anthropic) need normalization to OpenAI format.
+                                    // Control lines carry no parsed payload — drop them
+                                    // here; the end-of-stream tail appends the gateway's
+                                    // own [DONE] terminator.
+                                    let mut chunk = event.chunk?;
 
                                     if auto_redact_enabled {
                                         // Cache a template for the synthetic
@@ -1111,7 +1259,7 @@ async fn chat_completions_inner(
                                             let mut t = template.lock().await;
                                             if t.is_none() {
                                                 if let inference_providers::StreamChunk::Chat(c) =
-                                                    &event.chunk
+                                                    &chunk
                                                 {
                                                     *t = Some((
                                                         c.id.clone(),
@@ -1126,20 +1274,37 @@ async fn chat_completions_inner(
                                         // Swap minted placeholders in this
                                         // chunk's text deltas back to originals.
                                         let mut s = states.lock().await;
-                                        unredact_chunk_in_place(&mut event.chunk, &mut s, &map);
+                                        unredact_chunk_in_place(&mut chunk, &mut s, &map);
                                     }
 
                                     // Serialize the parsed chunk (normalized to OpenAI format)
                                     // instead of forwarding raw provider bytes, which may be
                                     // in a provider-specific format (e.g. Gemini native).
-                                    let json_data = serde_json::to_string(&event.chunk)
-                                        .unwrap_or_else(|e| {
-                                            tracing::error!(
-                                                %organization_id,
-                                                "Failed to serialize stream chunk: {e}"
-                                            );
-                                            "{}".to_string()
-                                        });
+                                    // The first chunk of an alias-served response gets a
+                                    // top-level "warning" so the substitution isn't silent.
+                                    let alias_warning =
+                                        pending_warning.lock().ok().and_then(|mut g| g.take());
+                                    let json_data = match alias_warning {
+                                        Some(warning) => {
+                                            serde_json::to_value(&chunk).map(|mut v| {
+                                                if let Some(obj) = v.as_object_mut() {
+                                                    obj.insert(
+                                                        "warning".to_string(),
+                                                        serde_json::Value::String(warning),
+                                                    );
+                                                }
+                                                v.to_string()
+                                            })
+                                        }
+                                        None => serde_json::to_string(&chunk),
+                                    }
+                                    .unwrap_or_else(|e| {
+                                        tracing::error!(
+                                            %organization_id,
+                                            "Failed to serialize stream chunk: {e}"
+                                        );
+                                        "{}".to_string()
+                                    });
                                     // Suppress per-chunk debug logging when
                                     // auto_redact is enabled: the chunk now
                                     // holds the user's original PII (we just
@@ -1150,8 +1315,7 @@ async fn chat_completions_inner(
                                     }
                                     // Format as SSE event with proper newlines
                                     let sse_bytes = Bytes::from(format!("data: {json_data}\n\n"));
-                                    accumulated_inner.lock().await.extend_from_slice(&sse_bytes);
-                                    Ok::<Bytes, Infallible>(sse_bytes)
+                                    Some(Ok::<Bytes, Infallible>(sse_bytes))
                                 }
                                 Err(e) => {
                                     let count = error_count_inner
@@ -1164,49 +1328,59 @@ async fn chat_completions_inner(
                                             "Completion stream error"
                                         );
                                     }
-                                    Ok::<Bytes, Infallible>(sse_error_frame(&e))
+                                    Some(Ok::<Bytes, Infallible>(sse_error_frame(&e)))
                                 }
                             }
                         }
                     })
-                    .chain(futures::stream::once({
-                        // End-of-stream tail: emit any flush chunks (held
-                        // tail bytes that the sliding window didn't get to
-                        // resolve) inline with [DONE]. They're framed as
-                        // separate SSE events by `\n\n` so the client sees
-                        // them as distinct deltas.
-                        let organization_id = api_key.organization.id.0;
-                        let model_name = request.model.clone();
-                        async move {
-                            let mut combined: Vec<u8> = Vec::new();
-                            if auto_redact_enabled {
-                                let mut states = unredact_states_for_chain.lock().await;
-                                let template = chunk_template_for_chain.lock().await.clone();
-                                for bytes in build_flush_chunks(&mut states, &template) {
-                                    combined.extend_from_slice(&bytes);
+                    .chain(
+                        futures::stream::once({
+                            // End-of-stream tail: emit any flush chunks (held
+                            // tail bytes that the sliding window didn't get to
+                            // resolve) inline with [DONE]. They're framed as
+                            // separate SSE events by `\n\n` so the client sees
+                            // them as distinct deltas. When the upstream's own
+                            // [DONE] was already forwarded verbatim
+                            // (passthrough), nothing is appended — the byte
+                            // stream must end exactly as the upstream's did.
+                            let organization_id = api_key.organization.id.0;
+                            let model_name = request.model.clone();
+                            async move {
+                                let mut combined: Vec<u8> = Vec::new();
+                                if auto_redact_enabled {
+                                    let mut states = unredact_states_for_chain.lock().await;
+                                    let template = chunk_template_for_chain.lock().await.clone();
+                                    for bytes in build_flush_chunks(&mut states, &template) {
+                                        combined.extend_from_slice(&bytes);
+                                    }
+                                }
+
+                                let error_count_final =
+                                    stream_error_count.load(std::sync::atomic::Ordering::Relaxed);
+                                if error_count_final > 1 {
+                                    tracing::error!(
+                                        %organization_id,
+                                        model = %model_name,
+                                        total_stream_errors = error_count_final,
+                                        "Completion stream ended with multiple errors"
+                                    );
+                                }
+
+                                if !upstream_done_for_chain
+                                    .load(std::sync::atomic::Ordering::Relaxed)
+                                {
+                                    combined.extend_from_slice(b"data: [DONE]\n\n");
+                                }
+                                if combined.is_empty() {
+                                    // Avoid emitting an empty body frame.
+                                    None
+                                } else {
+                                    Some(Ok::<Bytes, Infallible>(Bytes::from(combined)))
                                 }
                             }
-
-                            let error_count_final =
-                                stream_error_count.load(std::sync::atomic::Ordering::Relaxed);
-                            if error_count_final > 1 {
-                                tracing::error!(
-                                    %organization_id,
-                                    model = %model_name,
-                                    total_stream_errors = error_count_final,
-                                    "Completion stream ended with multiple errors"
-                                );
-                            }
-
-                            combined.extend_from_slice(b"data: [DONE]\n\n");
-                            let final_bytes = Bytes::from(combined);
-                            accumulated_for_chain
-                                .lock()
-                                .await
-                                .extend_from_slice(&final_bytes);
-                            Ok::<Bytes, Infallible>(final_bytes)
-                        }
-                    }));
+                        })
+                        .filter_map(std::future::ready),
+                    );
 
                 // Return raw streaming response with SSE headers
                 let mut response_builder = Response::builder()
@@ -1215,11 +1389,36 @@ async fn chat_completions_inner(
                     .header(header::CACHE_CONTROL, "no-cache")
                     .header(header::CONNECTION, "keep-alive");
 
+                // Collect CORS-exposed header names so the
+                // Access-Control-Expose-Headers value is a single
+                // comma-joined list (repeated header lines are not
+                // consistently merged by browsers).
+                let mut exposed_headers: Vec<&str> = Vec::new();
+
                 // Add Inference-Id header if available
                 if let Some(uuid) = inference_id {
+                    response_builder =
+                        response_builder.header(HEADER_INFERENCE_ID, uuid.to_string());
+                    exposed_headers.push(HEADER_INFERENCE_ID);
+                }
+
+                // Announce alias substitution so it is never silent (issue #573).
+                // Guarded HeaderValue construction: a header-invalid byte in a
+                // model name must not panic the `.body().unwrap()` below.
+                if let Some(canonical) = &alias_canonical {
+                    if let Ok(value) = header::HeaderValue::from_str(&format!(
+                        "{} -> {}",
+                        request.model, canonical
+                    )) {
+                        response_builder =
+                            response_builder.header(HEADER_MODEL_ALIAS_RESOLVED, value);
+                        exposed_headers.push(HEADER_MODEL_ALIAS_RESOLVED);
+                    }
+                }
+
+                if !exposed_headers.is_empty() {
                     response_builder = response_builder
-                        .header(HEADER_INFERENCE_ID, uuid.to_string())
-                        .header("Access-Control-Expose-Headers", HEADER_INFERENCE_ID);
+                        .header("Access-Control-Expose-Headers", exposed_headers.join(", "));
                 }
 
                 response_builder
@@ -1277,15 +1476,57 @@ async fn chat_completions_inner(
                     response_with_bytes.raw_bytes
                 };
 
+                // Annotate alias-served responses with a top-level "warning"
+                // (issue #573). This re-serializes the body, so — like
+                // auto-redact — it deliberately gives up raw-bytes hash
+                // verification for these responses; clients that need the
+                // raw-bytes guarantee should send the canonical model name
+                // (or x-no-aliasing). E2EE bodies are opaque and are left
+                // untouched (inject_warning_field returns None for them, and
+                // we don't attempt it) — the header below is the signal.
+                let body_bytes = match &alias_canonical {
+                    Some(canonical) if !e2ee_active => inject_warning_field(
+                        &body_bytes,
+                        &alias_warning_message(&request.model, canonical),
+                    )
+                    .unwrap_or(body_bytes),
+                    _ => body_bytes,
+                };
+
                 let mut response_builder = Response::builder()
                     .status(StatusCode::OK)
                     .header(header::CONTENT_TYPE, "application/json");
 
+                // Collect CORS-exposed header names so the
+                // Access-Control-Expose-Headers value is a single
+                // comma-joined list (repeated header lines are not
+                // consistently merged by browsers).
+                let mut exposed_headers: Vec<&str> = Vec::new();
+
                 // Add Inference-Id header if available
                 if let Some(uuid) = inference_id {
+                    response_builder =
+                        response_builder.header(HEADER_INFERENCE_ID, uuid.to_string());
+                    exposed_headers.push(HEADER_INFERENCE_ID);
+                }
+
+                // Announce alias substitution so it is never silent (issue #573).
+                // Guarded HeaderValue construction: a header-invalid byte in a
+                // model name must not panic the `.body().unwrap()` below.
+                if let Some(canonical) = &alias_canonical {
+                    if let Ok(value) = header::HeaderValue::from_str(&format!(
+                        "{} -> {}",
+                        request.model, canonical
+                    )) {
+                        response_builder =
+                            response_builder.header(HEADER_MODEL_ALIAS_RESOLVED, value);
+                        exposed_headers.push(HEADER_MODEL_ALIAS_RESOLVED);
+                    }
+                }
+
+                if !exposed_headers.is_empty() {
                     response_builder = response_builder
-                        .header(HEADER_INFERENCE_ID, uuid.to_string())
-                        .header("Access-Control-Expose-Headers", HEADER_INFERENCE_ID);
+                        .header("Access-Control-Expose-Headers", exposed_headers.join(", "));
                 }
 
                 response_builder.body(Body::from(body_bytes)).unwrap()
@@ -1473,6 +1714,19 @@ async fn completions_inner(
         }
     };
 
+    // Strict alias mode + pre-dispatch alias detection (issue #573) — the
+    // service resolves aliases for this endpoint exactly like chat, so it
+    // gets the same contract: x-no-aliasing rejects, and aliased responses
+    // carry the warning + x-model-alias-resolved header.
+    if let Err(resp) = reject_if_aliased(&app_state.models_service, &headers, &request.model).await
+    {
+        return resp;
+    }
+    let alias_canonical = app_state
+        .models_service
+        .resolve_alias_cached(&request.model)
+        .await;
+
     let service_request = convert_text_request_to_service(
         &request,
         prompt,
@@ -1491,14 +1745,33 @@ async fn completions_inner(
             .await
         {
             Ok(stream) => {
-                // Peek the first chunk to surface the Inference-Id header.
+                // Peek the first data chunk to surface the Inference-Id
+                // header, consuming any leading control events. This route
+                // reshapes chat chunks into text-completion format, so
+                // control lines are never forwarded (no byte passthrough
+                // here by design) and the consumed events can be discarded.
+                // Bounded so a keepalive-only upstream can't stall the
+                // response: past the cap we proceed without an Inference-Id.
                 let mut peekable_stream = Box::pin(stream.peekable());
-                let inference_id = peekable_stream
-                    .as_mut()
-                    .peek()
-                    .await
-                    .and_then(|result| result.as_ref().ok())
-                    .map(|event| extract_inference_id_from_chunk(&event.chunk));
+                let mut control_skipped = 0usize;
+                let inference_id = loop {
+                    let is_control = match peekable_stream.as_mut().peek().await {
+                        Some(Ok(event)) => {
+                            if let Some(chunk) = &event.chunk {
+                                break Some(extract_inference_id_from_chunk(chunk));
+                            }
+                            true
+                        }
+                        _ => break None,
+                    };
+                    if is_control {
+                        if control_skipped >= MAX_LEADING_CONTROL_EVENTS {
+                            break None;
+                        }
+                        control_skipped += 1;
+                        peekable_stream.next().await;
+                    }
+                };
 
                 if inference_id.is_none() {
                     tracing::warn!(
@@ -1511,29 +1784,65 @@ async fn completions_inner(
                 let organization_id = api_key.organization.id.0;
                 let model_for_err = request.model.clone();
 
+                // Warning to inject into the first streamed chunk of an
+                // alias-served response (issue #573).
+                let alias_warning_pending: Arc<std::sync::Mutex<Option<String>>> =
+                    Arc::new(std::sync::Mutex::new(alias_canonical.as_ref().map(
+                        |canonical| alias_warning_message(&request.model, canonical),
+                    )));
+                let pending_warning = alias_warning_pending.clone();
+
                 let byte_stream = peekable_stream
-                    .map(move |result| match result {
-                        Ok(event) => {
-                            let text_chunk = chat_chunk_to_text_chunk(event.chunk);
-                            let json_data =
-                                serde_json::to_string(&text_chunk).unwrap_or_else(|e| {
+                    .filter_map(move |result| {
+                        let model_for_err = model_for_err.clone();
+                        let pending_warning = pending_warning.clone();
+                        std::future::ready(match result {
+                            // Control lines (blank/comment/[DONE]) carry no
+                            // parsed payload — skip; the gateway appends its
+                            // own [DONE] terminator below. This route reshapes
+                            // chat chunks into text-completion format, so it
+                            // always re-serializes (no byte passthrough).
+                            Ok(event) => event.chunk.map(|chunk| {
+                                let text_chunk = chat_chunk_to_text_chunk(chunk);
+                                // The first chunk of an alias-served response
+                                // gets a top-level "warning" (issue #573).
+                                let alias_warning =
+                                    pending_warning.lock().ok().and_then(|mut g| g.take());
+                                let json_data = match alias_warning {
+                                    Some(warning) => {
+                                        serde_json::to_value(&text_chunk).map(|mut v| {
+                                            if let Some(obj) = v.as_object_mut() {
+                                                obj.insert(
+                                                    "warning".to_string(),
+                                                    serde_json::Value::String(warning),
+                                                );
+                                            }
+                                            v.to_string()
+                                        })
+                                    }
+                                    None => serde_json::to_string(&text_chunk),
+                                }
+                                .unwrap_or_else(|e| {
                                     tracing::error!(
                                         %organization_id,
                                         "Failed to serialize text completion chunk: {e}"
                                     );
                                     "{}".to_string()
                                 });
-                            Ok::<Bytes, Infallible>(Bytes::from(format!("data: {json_data}\n\n")))
-                        }
-                        Err(e) => {
-                            tracing::error!(
-                                %organization_id,
-                                model = %model_for_err,
-                                error_type = %completion_stream_error_category(&e),
-                                "Text completion stream error"
-                            );
-                            Ok::<Bytes, Infallible>(sse_error_frame(&e))
-                        }
+                                Ok::<Bytes, Infallible>(Bytes::from(format!(
+                                    "data: {json_data}\n\n"
+                                )))
+                            }),
+                            Err(e) => {
+                                tracing::error!(
+                                    %organization_id,
+                                    model = %model_for_err,
+                                    error_type = %completion_stream_error_category(&e),
+                                    "Text completion stream error"
+                                );
+                                Some(Ok::<Bytes, Infallible>(sse_error_frame(&e)))
+                            }
+                        })
                     })
                     .chain(futures::stream::once(async move {
                         Ok::<Bytes, Infallible>(Bytes::from_static(b"data: [DONE]\n\n"))
@@ -1545,10 +1854,26 @@ async fn completions_inner(
                     .header(header::CACHE_CONTROL, "no-cache")
                     .header(header::CONNECTION, "keep-alive");
 
+                let mut exposed_headers: Vec<&str> = Vec::new();
                 if let Some(uuid) = inference_id {
+                    response_builder =
+                        response_builder.header(HEADER_INFERENCE_ID, uuid.to_string());
+                    exposed_headers.push(HEADER_INFERENCE_ID);
+                }
+                // Announce alias substitution so it is never silent (issue #573)
+                if let Some(canonical) = &alias_canonical {
+                    if let Ok(value) = header::HeaderValue::from_str(&format!(
+                        "{} -> {}",
+                        request.model, canonical
+                    )) {
+                        response_builder =
+                            response_builder.header(HEADER_MODEL_ALIAS_RESOLVED, value);
+                        exposed_headers.push(HEADER_MODEL_ALIAS_RESOLVED);
+                    }
+                }
+                if !exposed_headers.is_empty() {
                     response_builder = response_builder
-                        .header(HEADER_INFERENCE_ID, uuid.to_string())
-                        .header("Access-Control-Expose-Headers", HEADER_INFERENCE_ID);
+                        .header("Access-Control-Expose-Headers", exposed_headers.join(", "));
                 }
 
                 response_builder
@@ -1589,13 +1914,39 @@ async fn completions_inner(
                     }
                 };
 
-                Response::builder()
+                // Annotate alias-served responses (issue #573). This
+                // endpoint already re-serializes (no raw-bytes contract),
+                // so the warning injection costs nothing extra.
+                let body_bytes = match &alias_canonical {
+                    Some(canonical) => inject_warning_field(
+                        &body_bytes,
+                        &alias_warning_message(&request.model, canonical),
+                    )
+                    .unwrap_or(body_bytes),
+                    None => body_bytes,
+                };
+
+                let mut response_builder = Response::builder()
                     .status(StatusCode::OK)
                     .header(header::CONTENT_TYPE, "application/json")
-                    .header(HEADER_INFERENCE_ID, inference_id.to_string())
-                    .header("Access-Control-Expose-Headers", HEADER_INFERENCE_ID)
-                    .body(Body::from(body_bytes))
-                    .unwrap()
+                    .header(HEADER_INFERENCE_ID, inference_id.to_string());
+
+                let mut exposed_headers: Vec<&str> = vec![HEADER_INFERENCE_ID];
+                // Announce alias substitution so it is never silent (issue #573)
+                if let Some(canonical) = &alias_canonical {
+                    if let Ok(value) = header::HeaderValue::from_str(&format!(
+                        "{} -> {}",
+                        request.model, canonical
+                    )) {
+                        response_builder =
+                            response_builder.header(HEADER_MODEL_ALIAS_RESOLVED, value);
+                        exposed_headers.push(HEADER_MODEL_ALIAS_RESOLVED);
+                    }
+                }
+                response_builder = response_builder
+                    .header("Access-Control-Expose-Headers", exposed_headers.join(", "));
+
+                response_builder.body(Body::from(body_bytes)).unwrap()
             }
             Err(domain_error) => {
                 let status_code = map_domain_error_to_status(&domain_error);
@@ -1983,13 +2334,6 @@ mod tests {
         let uuid1 = extract_inference_id_from_chunk(&chunk1);
         let uuid2 = extract_inference_id_from_chunk(&chunk2);
         assert_ne!(uuid1, uuid2);
-    }
-
-    #[test]
-    fn test_extract_chat_id_from_chunk() {
-        let chunk = make_chat_chunk("chatcmpl-abc123");
-        let id = extract_chat_id_from_chunk(&chunk);
-        assert_eq!(id, "chatcmpl-abc123");
     }
 
     #[test]

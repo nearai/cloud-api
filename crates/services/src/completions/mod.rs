@@ -350,6 +350,14 @@ where
                 StreamState::Streaming => {
                     match Pin::new(&mut self.inner).poll_next(cx) {
                         Poll::Ready(Some(Ok(ref event))) => {
+                            // Control events (blank lines, comments, [DONE])
+                            // carry no tokens: pass them through untouched so
+                            // the route can forward their raw bytes, but keep
+                            // them out of TTFT/ITL metrics and chat tracking.
+                            if event.chunk.is_none() {
+                                return Poll::Ready(Some(Ok(event.clone())));
+                            }
+
                             let now = Instant::now();
 
                             if !self.first_token_received {
@@ -379,7 +387,7 @@ where
                                 self.last_token_time = Some(now);
                             }
 
-                            if let StreamChunk::Chat(ref chat_chunk) = event.chunk {
+                            if let Some(StreamChunk::Chat(ref chat_chunk)) = event.chunk {
                                 // Track chat_id for attestation (updated on each chunk)
                                 self.last_chat_id = Some(chat_chunk.id.clone());
 
@@ -1835,7 +1843,8 @@ mod tests {
         // Create a stream with a content chunk and a usage chunk
         let content_chunk = SSEEvent {
             raw_bytes: Bytes::from("data: ..."),
-            chunk: StreamChunk::Chat(ChatCompletionChunk {
+            raw_passthrough: true,
+            chunk: Some(StreamChunk::Chat(ChatCompletionChunk {
                 id: "chat-1".to_string(),
                 object: "chat.completion.chunk".to_string(),
                 created: 1234567890,
@@ -1845,12 +1854,13 @@ mod tests {
                 prompt_token_ids: None,
                 system_fingerprint: None,
                 modality: None,
-            }),
+            })),
         };
 
         let usage_chunk = SSEEvent {
             raw_bytes: Bytes::from("data: ..."),
-            chunk: StreamChunk::Chat(ChatCompletionChunk {
+            raw_passthrough: true,
+            chunk: Some(StreamChunk::Chat(ChatCompletionChunk {
                 id: "chat-1".to_string(),
                 object: "chat.completion.chunk".to_string(),
                 created: 1234567890,
@@ -1871,7 +1881,7 @@ mod tests {
                 prompt_token_ids: None,
                 system_fingerprint: None,
                 modality: None,
-            }),
+            })),
         };
 
         let stream = stream::iter(vec![Ok(content_chunk), Ok(usage_chunk)]);
@@ -1973,7 +1983,8 @@ mod tests {
         // Create multiple content chunks to test ITL calculation
         let chunk1 = SSEEvent {
             raw_bytes: Bytes::from("data: chunk1"),
-            chunk: StreamChunk::Chat(ChatCompletionChunk {
+            raw_passthrough: true,
+            chunk: Some(StreamChunk::Chat(ChatCompletionChunk {
                 id: "chat-1".to_string(),
                 object: "chat.completion.chunk".to_string(),
                 created: 1234567890,
@@ -1983,12 +1994,13 @@ mod tests {
                 prompt_token_ids: None,
                 system_fingerprint: None,
                 modality: None,
-            }),
+            })),
         };
 
         let chunk2 = SSEEvent {
             raw_bytes: Bytes::from("data: chunk2"),
-            chunk: StreamChunk::Chat(ChatCompletionChunk {
+            raw_passthrough: true,
+            chunk: Some(StreamChunk::Chat(ChatCompletionChunk {
                 id: "chat-1".to_string(),
                 object: "chat.completion.chunk".to_string(),
                 created: 1234567890,
@@ -1998,12 +2010,13 @@ mod tests {
                 prompt_token_ids: None,
                 system_fingerprint: None,
                 modality: None,
-            }),
+            })),
         };
 
         let usage_chunk = SSEEvent {
             raw_bytes: Bytes::from("data: usage"),
-            chunk: StreamChunk::Chat(ChatCompletionChunk {
+            raw_passthrough: true,
+            chunk: Some(StreamChunk::Chat(ChatCompletionChunk {
                 id: "chat-1".to_string(),
                 object: "chat.completion.chunk".to_string(),
                 created: 1234567890,
@@ -2024,7 +2037,7 @@ mod tests {
                 prompt_token_ids: None,
                 modality: None,
                 system_fingerprint: None,
-            }),
+            })),
         };
 
         // Simulate a stream with delays between chunks
@@ -2126,7 +2139,8 @@ mod tests {
         // Single chunk with usage (no inter-token latency to measure)
         let usage_chunk = SSEEvent {
             raw_bytes: Bytes::from("data: usage"),
-            chunk: StreamChunk::Chat(ChatCompletionChunk {
+            raw_passthrough: true,
+            chunk: Some(StreamChunk::Chat(ChatCompletionChunk {
                 id: "chat-1".to_string(),
                 object: "chat.completion.chunk".to_string(),
                 created: 1234567890,
@@ -2147,7 +2161,7 @@ mod tests {
                 prompt_token_ids: None,
                 modality: None,
                 system_fingerprint: None,
-            }),
+            })),
         };
 
         let stream = stream::iter(vec![Ok(usage_chunk)]);

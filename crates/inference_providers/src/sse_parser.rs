@@ -13,8 +13,35 @@ pub struct SSEEvent {
     /// The raw bytes of this SSE event (including "data: " prefix and newline)
     #[serde(skip)]
     pub raw_bytes: Bytes,
-    /// The parsed StreamChunk
-    pub chunk: StreamChunk,
+    /// The parsed StreamChunk. `None` for control lines (blank separator
+    /// lines, `: comments`, the `data: [DONE]` terminator, non-data SSE
+    /// fields like `event:`/`id:`, and the end-of-stream tail flush) — these
+    /// carry only `raw_bytes` so the upstream byte stream can be reassembled
+    /// exactly for TEE signature verification (issue #701). Control events
+    /// are only emitted by passthrough-capable parsers (see
+    /// [`SSEEventParser::passthrough_raw`]).
+    pub chunk: Option<StreamChunk>,
+    /// True when `raw_bytes` are the upstream's OpenAI-format SSE wire bytes
+    /// and may be forwarded to clients verbatim. False for providers whose
+    /// raw bytes are in a native non-OpenAI format (Gemini, Anthropic) that
+    /// must be re-serialized before reaching clients.
+    #[serde(skip)]
+    pub raw_passthrough: bool,
+}
+
+impl SSEEvent {
+    /// True if this is the upstream `data: [DONE]` terminator control line.
+    /// Used by the route layer to avoid appending a duplicate gateway-minted
+    /// `[DONE]` after forwarding the upstream one verbatim.
+    pub fn is_done_marker(&self) -> bool {
+        if self.chunk.is_some() {
+            return false;
+        }
+        let line = String::from_utf8_lossy(&self.raw_bytes);
+        line.trim()
+            .strip_prefix("data:")
+            .is_some_and(|d| d.trim() == "[DONE]")
+    }
 }
 
 /// Trait for provider-specific SSE event parsing
@@ -41,6 +68,18 @@ pub trait SSEEventParser: Send + Unpin {
     /// If true, lines without "data: " prefix are also parsed.
     /// Used by Gemini which can return raw JSON lines.
     fn handles_raw_json() -> bool {
+        false
+    }
+
+    /// Whether the upstream wire format is OpenAI-format SSE that clients can
+    /// consume directly. When true, the parser is lossless: control lines
+    /// (blank separators, comments, `[DONE]`, non-data fields) and any
+    /// trailing unterminated bytes are emitted as chunk-less [`SSEEvent`]s so
+    /// concatenating every event's `raw_bytes` reproduces the upstream byte
+    /// stream exactly — required for byte-exact TEE signature verification
+    /// through the gateway (issue #701). When false (Gemini, Anthropic
+    /// native formats), control lines are silently skipped as before.
+    fn passthrough_raw() -> bool {
         false
     }
 }
@@ -102,8 +141,19 @@ where
             let line = String::from_utf8_lossy(&raw_bytes[..newline_pos]);
             let line = line.trim();
 
-            // Skip empty lines and comments
+            let passthrough = P::passthrough_raw();
+
+            // Empty lines and comments carry no parseable payload. For
+            // passthrough parsers, emit them as control events so the raw
+            // byte stream stays reconstructable; otherwise skip as before.
             if line.is_empty() || line.starts_with(':') {
+                if passthrough {
+                    results.push(Ok(SSEEvent {
+                        raw_bytes,
+                        chunk: None,
+                        raw_passthrough: true,
+                    }));
+                }
                 continue;
             }
 
@@ -119,11 +169,33 @@ where
             if let Some(data) = data {
                 match P::parse_event(&mut self.state, data) {
                     Ok(Some(chunk)) => {
-                        results.push(Ok(SSEEvent { raw_bytes, chunk }));
+                        results.push(Ok(SSEEvent {
+                            raw_bytes,
+                            chunk: Some(chunk),
+                            raw_passthrough: passthrough,
+                        }));
                     }
-                    Ok(None) => {} // Skip (e.g., [DONE] marker)
+                    Ok(None) => {
+                        // [DONE] marker: control event in passthrough mode,
+                        // skipped otherwise.
+                        if passthrough {
+                            results.push(Ok(SSEEvent {
+                                raw_bytes,
+                                chunk: None,
+                                raw_passthrough: true,
+                            }));
+                        }
+                    }
                     Err(e) => results.push(Err(e)),
                 }
+            } else if passthrough {
+                // Non-data SSE field line (event:, id:, retry:). We don't
+                // parse these, but they're part of the signed byte stream.
+                results.push(Ok(SSEEvent {
+                    raw_bytes,
+                    chunk: None,
+                    raw_passthrough: true,
+                }));
             }
         }
 
@@ -175,11 +247,23 @@ where
                 }
                 Poll::Ready(None) => {
                     this.finished = true;
-                    // Stream ended - check for any remaining incomplete data
-                    if !this.bytes_buffer.is_empty()
-                        && this.bytes_buffer.iter().any(|&b| !b.is_ascii_whitespace())
-                    {
-                        warn!("Incomplete SSE data in buffer at stream end");
+                    // Stream ended - flush or report any remaining incomplete data
+                    if !this.bytes_buffer.is_empty() {
+                        if P::passthrough_raw() {
+                            // A trailing line without a final newline is part
+                            // of the signed upstream byte stream — emit it as
+                            // a control event so byte-exact reassembly holds
+                            // (mirrors inference-proxy's transformer flush).
+                            let leftover = Bytes::from(std::mem::take(&mut this.bytes_buffer));
+                            return Poll::Ready(Some(Ok(SSEEvent {
+                                raw_bytes: leftover,
+                                chunk: None,
+                                raw_passthrough: true,
+                            })));
+                        }
+                        if this.bytes_buffer.iter().any(|&b| !b.is_ascii_whitespace()) {
+                            warn!("Incomplete SSE data in buffer at stream end");
+                        }
                     }
                     return Poll::Ready(None);
                 }
@@ -229,6 +313,14 @@ pub struct OpenAIEventParser;
 
 impl SSEEventParser for OpenAIEventParser {
     type State = OpenAIParserState;
+
+    /// vLLM/SGLang (and OpenAI-compatible third parties) emit the same SSE
+    /// wire format clients consume, so raw bytes may be forwarded verbatim.
+    /// This is what makes gateway streams byte-exact verifiable against the
+    /// inference TEE's response-hash signature (issue #701).
+    fn passthrough_raw() -> bool {
+        true
+    }
 
     fn parse_event(
         state: &mut Self::State,
@@ -353,20 +445,20 @@ mod tests {
         let parser = new_sse_parser(mock_stream, true);
         let events: Vec<_> = parser.collect().await;
 
-        // Should have received all 3 events
-        assert_eq!(events.len(), 3, "Expected 3 events, got {}", events.len());
+        // 3 data events + 3 blank-line control events (lossless passthrough)
+        assert_eq!(events.len(), 6, "Expected 6 events, got {}", events.len());
 
         // Verify each event is Ok
         for (i, event) in events.iter().enumerate() {
             assert!(event.is_ok(), "Event {} should be Ok", i);
         }
 
-        // Verify the content of each event
+        // Verify the content of each parsed event
         let contents: Vec<String> = events
             .into_iter()
             .filter_map(|e| e.ok())
             .filter_map(|e| {
-                if let StreamChunk::Chat(chunk) = e.chunk {
+                if let Some(StreamChunk::Chat(chunk)) = e.chunk {
                     chunk
                         .choices
                         .first()
@@ -394,7 +486,13 @@ mod tests {
         let parser = new_sse_parser(mock_stream, true);
         let events: Vec<_> = parser.collect().await;
 
-        assert_eq!(events.len(), 2, "Expected 2 events, got {}", events.len());
+        // 2 data events + 2 blank-line control events
+        assert_eq!(events.len(), 4, "Expected 4 events, got {}", events.len());
+        let parsed = events
+            .iter()
+            .filter(|e| e.as_ref().is_ok_and(|ev| ev.chunk.is_some()))
+            .count();
+        assert_eq!(parsed, 2, "Expected 2 parsed events");
 
         for event in &events {
             assert!(event.is_ok());
@@ -414,9 +512,22 @@ mod tests {
         let parser = new_sse_parser(mock_stream, true);
         let events: Vec<_> = parser.collect().await;
 
-        // Should only have 1 event (the [DONE] marker is skipped)
-        assert_eq!(events.len(), 1, "Expected 1 event, got {}", events.len());
-        assert!(events[0].is_ok());
+        // 1 data event + blank control + [DONE] control + blank control
+        assert_eq!(events.len(), 4, "Expected 4 events, got {}", events.len());
+        let events: Vec<SSEEvent> = events.into_iter().map(|e| e.unwrap()).collect();
+        assert!(
+            events[0].chunk.is_some(),
+            "First event should be parsed data"
+        );
+        assert!(
+            events[2].is_done_marker(),
+            "[DONE] should surface as a control event marked as done"
+        );
+        assert_eq!(
+            events.iter().filter(|e| e.is_done_marker()).count(),
+            1,
+            "Exactly one [DONE] marker expected"
+        );
     }
 
     #[tokio::test]
@@ -434,9 +545,14 @@ mod tests {
         let parser = new_sse_parser(mock_stream, true);
         let events: Vec<_> = parser.collect().await;
 
-        // Should only have 1 event (comments and empty lines are skipped)
-        assert_eq!(events.len(), 1, "Expected 1 event, got {}", events.len());
-        assert!(events[0].is_ok());
+        // Comments and blank lines surface as chunk-less control events so
+        // the byte stream stays reconstructable; exactly 1 parsed event.
+        assert_eq!(events.len(), 5, "Expected 5 events, got {}", events.len());
+        let parsed: Vec<_> = events
+            .iter()
+            .filter(|e| e.as_ref().is_ok_and(|ev| ev.chunk.is_some()))
+            .collect();
+        assert_eq!(parsed.len(), 1, "Expected 1 parsed event");
     }
 
     #[tokio::test]
@@ -453,8 +569,10 @@ mod tests {
         let parser = new_sse_parser(mock_stream, true);
         let events: Vec<_> = parser.collect().await;
 
-        assert_eq!(events.len(), 1, "Expected 1 event, got {}", events.len());
+        // 1 data event + 1 blank-line control event
+        assert_eq!(events.len(), 2, "Expected 2 events, got {}", events.len());
         assert!(events[0].is_ok());
+        assert!(events[0].as_ref().unwrap().chunk.is_some());
     }
 
     #[tokio::test]
@@ -509,11 +627,14 @@ mod tests {
             BufferedSSEParser::<_, OpenAIEventParser>::new(stream, OpenAIParserState::new(true));
         let events: Vec<_> = parser.collect().await;
 
-        // Should have exactly 1 event (the good chunk).
-        // The stream ended after that, and the parser must NOT poll again.
-        // If the `finished` flag is broken, the ErrorThenPanicStream will panic.
-        assert_eq!(events.len(), 1, "Expected 1 event, got {}", events.len());
+        // Should have exactly 2 events (the good chunk + its blank-line
+        // control event). The stream ended after that, and the parser must
+        // NOT poll again. If the `finished` flag is broken, the
+        // ErrorThenPanicStream will panic.
+        assert_eq!(events.len(), 2, "Expected 2 events, got {}", events.len());
         assert!(events[0].is_ok(), "Event should be Ok");
+        assert!(events[0].as_ref().unwrap().chunk.is_some());
+        assert!(events[1].as_ref().unwrap().chunk.is_none());
     }
 
     #[tokio::test]
@@ -533,8 +654,10 @@ mod tests {
         let parser = new_sse_parser(mock_stream, true);
         let events: Vec<_> = parser.collect().await;
 
-        assert_eq!(events.len(), 1, "Expected 1 event, got {}", events.len());
+        // 1 data event + 1 blank-line control event
+        assert_eq!(events.len(), 2, "Expected 2 events, got {}", events.len());
         assert!(events[0].is_ok());
+        assert!(events[0].as_ref().unwrap().chunk.is_some());
     }
 
     #[tokio::test]
@@ -567,10 +690,12 @@ mod tests {
         let parser = new_sse_parser(mock_stream, true);
         let events: Vec<_> = parser.collect().await;
 
-        // Should get 1 event without panicking. The content will contain the
-        // correctly reassembled é since bytes are buffered until newline.
-        assert_eq!(events.len(), 1, "Expected 1 event, got {}", events.len());
+        // Should get the data event + blank-line control event without
+        // panicking. The content will contain the correctly reassembled é
+        // since bytes are buffered until newline.
+        assert_eq!(events.len(), 2, "Expected 2 events, got {}", events.len());
         assert!(events[0].is_ok(), "The event should be parsed successfully");
+        assert!(events[0].as_ref().unwrap().chunk.is_some());
     }
 
     #[tokio::test]
@@ -587,11 +712,21 @@ mod tests {
             futures_util::stream::iter(vec![Ok::<_, reqwest::Error>(bytes::Bytes::from(packet))]);
         let parser = new_sse_parser(mock_stream, true);
         let events: Vec<_> = parser.collect().await;
+        // The error event, plus control events for the blank separators and
+        // the [DONE] terminator (lossless passthrough).
         assert_eq!(
             events.len(),
-            1,
-            "Expected exactly one error event before stream termination, got {}",
+            4,
+            "Expected error event + 3 control events, got {}",
             events.len()
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(e, Err(CompletionError::HttpError { .. })))
+                .count(),
+            1,
+            "Exactly one error event expected"
         );
         match &events[0] {
             Err(CompletionError::HttpError {
@@ -673,11 +808,150 @@ mod tests {
             futures_util::stream::iter(vec![Ok::<_, reqwest::Error>(bytes::Bytes::from(packet))]);
         let parser = new_sse_parser(mock_stream, true);
         let events: Vec<_> = parser.collect().await;
-        assert_eq!(events.len(), 1);
+        // 1 data event + 1 blank-line control event
+        assert_eq!(events.len(), 2);
         assert!(
             events[0].is_ok(),
             "null `error` field must not trigger the error path: got {:?}",
             events[0]
         );
+        assert!(events[0].as_ref().unwrap().chunk.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_sse_parser_passthrough_byte_exact_reassembly() {
+        // Core property behind issue #701: for an OpenAI-format upstream,
+        // concatenating raw_bytes of every Ok event must reproduce the
+        // upstream byte stream EXACTLY — including comments, blank lines,
+        // CRLF line endings, non-data SSE fields, the [DONE] terminator and
+        // a trailing unterminated line. This is what makes
+        // sha256(client-received bytes) match the response hash signed by
+        // the inference TEE (which hashes the bytes it sends).
+        let part1: &[u8] = b": keepalive comment\n\ndata: {\"id\":\"1\",\"object\":\"chat.completion.chunk\",\"created\":1234567890,\"model\":\"test\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hel";
+        let part2: &[u8] = b"lo\"},\"finish_reason\":null}]}\r\n\r\nevent: ping\ndata: {\"id\":\"1\",\"object\":\"chat.completion.chunk\",\"created\":1234567890,\"model\":\"test\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"!\"},\"finish_reason\":\"stop\"}]}\n\n";
+        let part3: &[u8] = b"data: [DONE]\n\ntrailing-unterminated";
+
+        let mock_stream = futures_util::stream::iter(vec![
+            Ok::<_, reqwest::Error>(bytes::Bytes::from(part1)),
+            Ok(bytes::Bytes::from(part2)),
+            Ok(bytes::Bytes::from(part3)),
+        ]);
+
+        let parser = new_sse_parser(mock_stream, true);
+        let events: Vec<_> = parser.collect().await;
+
+        let mut reassembled: Vec<u8> = Vec::new();
+        let mut parsed_count = 0;
+        let mut done_count = 0;
+        for event in events {
+            let event = event.expect("No errors expected in this stream");
+            assert!(
+                event.raw_passthrough,
+                "OpenAI-format parser events must be passthrough-capable"
+            );
+            if event.chunk.is_some() {
+                parsed_count += 1;
+            }
+            if event.is_done_marker() {
+                done_count += 1;
+            }
+            reassembled.extend_from_slice(&event.raw_bytes);
+        }
+
+        let mut original: Vec<u8> = Vec::new();
+        original.extend_from_slice(part1);
+        original.extend_from_slice(part2);
+        original.extend_from_slice(part3);
+
+        assert_eq!(parsed_count, 2, "Expected 2 parsed data chunks");
+        assert_eq!(done_count, 1, "Expected exactly one [DONE] control event");
+        assert_eq!(
+            reassembled, original,
+            "Concatenated raw_bytes must reproduce the upstream byte stream exactly"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_sse_parser_non_passthrough_parser_skips_control_lines() {
+        // A parser that does NOT opt into passthrough (Gemini/Anthropic
+        // native formats) must keep the historical behavior: control lines
+        // are silently dropped, no tail flush, and events are not marked
+        // passthrough.
+        struct NonPassthroughParser;
+        impl SSEEventParser for NonPassthroughParser {
+            type State = OpenAIParserState;
+            fn parse_event(
+                state: &mut Self::State,
+                data: &str,
+            ) -> Result<Option<StreamChunk>, CompletionError> {
+                OpenAIEventParser::parse_event(state, data)
+            }
+        }
+
+        let packet = ": comment\n\ndata: {\"id\":\"1\",\"object\":\"chat.completion.chunk\",\"created\":1234567890,\"model\":\"test\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hi\"},\"finish_reason\":null}]}\n\ndata: [DONE]\n\ntrailing";
+        let mock_stream =
+            futures_util::stream::iter(vec![Ok::<_, reqwest::Error>(bytes::Bytes::from(packet))]);
+
+        let parser = BufferedSSEParser::<_, NonPassthroughParser>::new(
+            mock_stream,
+            OpenAIParserState::new(true),
+        );
+        let events: Vec<_> = parser.collect().await;
+
+        assert_eq!(
+            events.len(),
+            1,
+            "Non-passthrough parser must emit only parsed events"
+        );
+        let event = events[0].as_ref().unwrap();
+        assert!(event.chunk.is_some());
+        assert!(
+            !event.raw_passthrough,
+            "Non-passthrough parser events must not be marked passthrough"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_sse_event_is_done_marker() {
+        let done = SSEEvent {
+            raw_bytes: bytes::Bytes::from_static(
+                b"data: [DONE]
+",
+            ),
+            chunk: None,
+            raw_passthrough: true,
+        };
+        assert!(done.is_done_marker());
+
+        // No space after the colon is still a valid SSE data line
+        let done_no_space = SSEEvent {
+            raw_bytes: bytes::Bytes::from_static(
+                b"data:[DONE]
+",
+            ),
+            chunk: None,
+            raw_passthrough: true,
+        };
+        assert!(done_no_space.is_done_marker());
+
+        let comment = SSEEvent {
+            raw_bytes: bytes::Bytes::from_static(
+                b": keepalive
+",
+            ),
+            chunk: None,
+            raw_passthrough: true,
+        };
+        assert!(!comment.is_done_marker());
+
+        let blank = SSEEvent {
+            raw_bytes: bytes::Bytes::from_static(
+                b"
+",
+            ),
+            chunk: None,
+            raw_passthrough: true,
+        };
+        assert!(!blank.is_done_marker());
     }
 }

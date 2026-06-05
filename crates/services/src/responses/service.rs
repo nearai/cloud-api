@@ -2491,7 +2491,7 @@ impl ResponseServiceImpl {
         use inference_providers::StreamChunk;
 
         match &event.chunk {
-            StreamChunk::Chat(chat_chunk) => {
+            Some(StreamChunk::Chat(chat_chunk)) => {
                 // Extract delta content from choices
                 for choice in &chat_chunk.choices {
                     if let Some(delta) = &choice.delta {
@@ -2724,7 +2724,7 @@ impl ResponseServiceImpl {
     ) {
         use inference_providers::StreamChunk;
 
-        if let StreamChunk::Chat(chat_chunk) = &event.chunk {
+        if let Some(StreamChunk::Chat(chat_chunk)) = &event.chunk {
             if let Some(usage) = &chat_chunk.usage {
                 tracing::debug!(
                     "Extracted usage from completion stream: input={}, output={}",
@@ -2747,7 +2747,7 @@ impl ResponseServiceImpl {
     ) {
         use inference_providers::StreamChunk;
 
-        if let StreamChunk::Chat(chat_chunk) = &event.chunk {
+        if let Some(StreamChunk::Chat(chat_chunk)) = &event.chunk {
             for choice in &chat_chunk.choices {
                 if let Some(delta) = &choice.delta {
                     if let Some(tool_calls) = &delta.tool_calls {

@@ -22,6 +22,17 @@ pub const METRIC_REQUEST_ERRORS: &str = "cloud_api.request.errors";
 // Cost metrics
 pub const METRIC_COST_USD: &str = "cloud_api.cost.usd";
 
+// Billed-usage metrics (emitted once per newly-recorded usage row, covering every
+// inference type, dimensioned by model + inference_type). These are the authoritative
+// "what we billed" counters; tokens.input/output above are throughput-oriented and only
+// cover the chat-completions path.
+pub const METRIC_BILLED_REQUESTS: &str = "cloud_api.billed.requests";
+pub const METRIC_BILLED_INPUT_TOKENS: &str = "cloud_api.billed.input_tokens";
+pub const METRIC_BILLED_OUTPUT_TOKENS: &str = "cloud_api.billed.output_tokens";
+pub const METRIC_BILLED_CACHE_READ_TOKENS: &str = "cloud_api.billed.cache_read_tokens";
+pub const METRIC_BILLED_INPUT_COST_USD: &str = "cloud_api.billed.input_cost_usd";
+pub const METRIC_BILLED_OUTPUT_COST_USD: &str = "cloud_api.billed.output_cost_usd";
+
 // Provider data quality metrics
 pub const METRIC_PROVIDER_TOKEN_ANOMALIES: &str = "cloud_api.provider.token_anomalies";
 pub const METRIC_PROVIDER_ZERO_TOKENS: &str = "cloud_api.provider.zero_tokens";
@@ -39,6 +50,7 @@ pub const TAG_ENDPOINT: &str = "endpoint";
 pub const TAG_METHOD: &str = "method";
 pub const TAG_REASON: &str = "reason";
 pub const TAG_INPUT_BUCKET: &str = "input_bucket";
+pub const TAG_INFERENCE_TYPE: &str = "inference_type";
 
 // Error types for TAG_ERROR_TYPE
 pub const ERROR_TYPE_INVALID_MODEL: &str = "invalid_model";

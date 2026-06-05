@@ -2090,6 +2090,13 @@ mod tests {
                 .push(email.recipient_email.clone());
             self.outcome.clone()
         }
+
+        async fn send_model_deprecation(
+            &self,
+            _email: &crate::email::ModelDeprecationEmail,
+        ) -> Result<EmailDeliveryOutcome, EmailError> {
+            self.outcome.clone()
+        }
     }
 
     fn make_service(

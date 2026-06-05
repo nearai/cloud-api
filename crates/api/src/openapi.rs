@@ -135,6 +135,8 @@ use utoipa::{Modify, OpenApi};
         crate::routes::admin::batch_upsert_models,
         crate::routes::admin::delete_model,
         crate::routes::admin::deprecate_model,
+        crate::routes::admin::preview_model_deprecation,
+        crate::routes::admin::confirm_model_deprecation,
         crate::routes::admin::get_model_history,
         crate::routes::admin::get_admin_organization_balance,
         crate::routes::admin::update_organization_limits,
@@ -234,7 +236,8 @@ use utoipa::{Modify, OpenApi};
             ServiceResponse, ServiceListResponse,
             AdminServiceResponse, AdminServiceListResponse, CreateServiceRequest, UpdateServiceRequest,
             UpdateModelApiRequest, ModelHistoryEntry, ModelHistoryResponse,
-            DeprecateModelRequest, DeprecateModelResponse,
+            DeprecateModelRequest, DeprecateModelResponse, ModelDeprecationRequest,
+            ModelDeprecationPreviewResponse, ModelDeprecationConfirmResponse,
             // Organization limits models (Admin)
             UpdateOrganizationLimitsRequest, UpdateOrganizationLimitsResponse, SpendLimit, SpendLimitRequest,
             OrgLimitsHistoryEntry, OrgLimitsHistoryResponse,

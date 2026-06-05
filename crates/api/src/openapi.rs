@@ -86,6 +86,8 @@ use utoipa::{Modify, OpenApi};
         crate::routes::organization_members::update_organization_member,
         crate::routes::organization_members::remove_organization_member,
         crate::routes::organization_members::list_organization_members,
+        crate::routes::organization_members::list_organization_invitations,
+        crate::routes::organization_members::cancel_organization_invitation,
         // Workspace endpoints
         crate::routes::workspaces::create_workspace,
         crate::routes::workspaces::list_organization_workspaces,

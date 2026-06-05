@@ -418,6 +418,9 @@ pub trait OrganizationInvitationRepository: Send + Sync {
     /// Delete invitation
     async fn delete(&self, id: Uuid) -> Result<bool>;
 
+    /// Delete invitation only if it is still pending
+    async fn delete_pending(&self, id: Uuid) -> Result<bool>;
+
     /// Mark expired invitations
     async fn mark_expired(&self) -> Result<usize>;
 }
@@ -616,6 +619,14 @@ pub trait OrganizationServiceTrait: Send + Sync {
         &self,
         invitation_id: uuid::Uuid,
         user_email: &str,
+    ) -> Result<(), OrganizationError>;
+
+    /// Cancel a pending invitation for an organization (admin/owner only)
+    async fn cancel_organization_invitation(
+        &self,
+        organization_id: OrganizationId,
+        requester_id: UserId,
+        invitation_id: uuid::Uuid,
     ) -> Result<(), OrganizationError>;
 
     /// List invitations for an organization (admin/owner only)

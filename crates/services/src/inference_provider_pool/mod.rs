@@ -1422,13 +1422,17 @@ impl InferenceProviderPool {
         // ASCII-only lowercase: the markers are all ASCII and this path can
         // run at high volume during a malformed-media incident.
         let lower = message.to_ascii_lowercase();
-        // Decode-side failures: the engine successfully fetched the bytes but
-        // could not parse them as a valid image/video. There is no fetch HTTP
-        // status involved — these are unconditionally permanent client-input
-        // faults (a corrupt/unsupported payload re-decodes identically).
-        if lower.contains("loading image data")
-            || lower.contains("loading video data")
-            || lower.contains("cannot identify image file")
+        // Pure decode-side failures: the engine fetched the bytes but could not
+        // parse them. There is NO fetch HTTP status involved — these are
+        // unconditionally permanent client-input faults (a corrupt/unsupported
+        // payload re-decodes identically). NOTE: `loading image/video data` is
+        // deliberately NOT here. It is the SGLang/vLLM *prefix* for BOTH a decode
+        // failure (`... cannot identify image file`, caught here) AND a fetch
+        // failure (`... NNN Client Error`, status-gated below). Treating it as
+        // decode-only would mis-map a transient `loading IMAGE data ... 503
+        // Client Error` to a client 400 — the exact regression the status gate
+        // exists to prevent (PR #721 review).
+        if lower.contains("cannot identify image file")
             || lower.contains("failed to open input buffer")
         {
             return true;
@@ -1451,7 +1455,13 @@ impl InferenceProviderPool {
             || lower.contains("client error:")
             // aiohttp wrapper format observed when the inference engine collapses
             // a client-fetch status into a 500: `HTTP error 500: NNN, message=...`.
-            || lower.contains("http error 500:");
+            || lower.contains("http error 500:")
+            // SGLang/vLLM media-load prefix that carries a fetch status in its
+            // fetch-failure form (`loading IMAGE data ... NNN Client Error`); the
+            // decode form (`... cannot identify image file`) has no status and is
+            // already caught above, so status-gating these here is safe.
+            || lower.contains("loading image data")
+            || lower.contains("loading video data");
         has_fetch_marker
             && Self::extract_fetch_status(&lower).is_some_and(|s| (400..500).contains(&s))
     }
@@ -3920,6 +3930,12 @@ mod tests {
             "Failed to fetch image from https://upload.wikimedia.org/x.jpg",
             // aiohttp wrapper around a 5xx → retry (regression guard, kept here too).
             "Error fetching image: HTTP error 500: 503, message='Service Unavailable', url='https://host/x.jpg'",
+            // SGLang "loading IMAGE/VIDEO data" prefix wrapping a transient 5xx →
+            // retry. This is the case the 2nd #721 review (PierreLeGuen) flagged:
+            // these markers were previously treated as decode-only and would
+            // short-circuit a 503 into a client 400.
+            "Internal server error: An exception occurred while loading IMAGE data at index 0: 503 Client Error: Service Unavailable for url: https://upload.wikimedia.org/x.jpg",
+            "Internal server error: An exception occurred while loading VIDEO data at index 0: 502 Client Error: Bad Gateway for url: https://host/v.mp4",
         ] {
             assert_eq!(
                 InferenceProviderPool::classify_retry_decision(&CompletionError::HttpError {

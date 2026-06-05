@@ -1,7 +1,11 @@
 pub mod ports;
 
 use crate::metrics::{
-    consts::{get_environment, METRIC_COST_USD, TAG_ENVIRONMENT, TAG_MODEL},
+    consts::{
+        get_environment, METRIC_BILLED_CACHE_READ_TOKENS, METRIC_BILLED_INPUT_COST_USD,
+        METRIC_BILLED_INPUT_TOKENS, METRIC_BILLED_OUTPUT_COST_USD, METRIC_BILLED_OUTPUT_TOKENS,
+        METRIC_BILLED_REQUESTS, METRIC_COST_USD, TAG_ENVIRONMENT, TAG_INFERENCE_TYPE, TAG_MODEL,
+    },
     MetricsServiceTrait,
 };
 pub use ports::*;
@@ -269,18 +273,46 @@ impl UsageServiceTrait for UsageServiceImpl {
             .await
             .map_err(|e| UsageError::InternalError(format!("Failed to record usage: {e}")))?;
 
-        // Record cost metric ONLY for new inserts (not duplicates)
-        // This prevents metric inflation when idempotent requests are retried
-        if log.was_inserted && total_cost > 0 {
+        // Record billed-usage metrics ONLY for new inserts (not duplicates).
+        // This prevents metric inflation when idempotent requests are retried.
+        // Recorded at this single, authoritative billing point so every inference
+        // type (chat, image, audio, rerank, embedding, ...) is captured uniformly,
+        // dimensioned by model + inference_type.
+        if log.was_inserted {
             let environment = get_environment();
             let tags = [
                 format!("{}:{}", TAG_MODEL, model.model_name),
+                format!("{}:{}", TAG_INFERENCE_TYPE, request.inference_type.as_str()),
                 format!("{TAG_ENVIRONMENT}:{environment}"),
             ];
             let tags_str: Vec<&str> = tags.iter().map(|s| s.as_str()).collect();
-            self.metrics_service
-                .record_count(METRIC_COST_USD, total_cost, &tags_str);
-        } else if !log.was_inserted {
+
+            let metrics = &self.metrics_service;
+            metrics.record_count(METRIC_BILLED_REQUESTS, 1, &tags_str);
+            metrics.record_count(
+                METRIC_BILLED_INPUT_TOKENS,
+                request.input_tokens as i64,
+                &tags_str,
+            );
+            metrics.record_count(
+                METRIC_BILLED_OUTPUT_TOKENS,
+                request.output_tokens as i64,
+                &tags_str,
+            );
+            metrics.record_count(
+                METRIC_BILLED_CACHE_READ_TOKENS,
+                cache_read_tokens as i64,
+                &tags_str,
+            );
+            metrics.record_count(METRIC_BILLED_INPUT_COST_USD, input_cost, &tags_str);
+            metrics.record_count(METRIC_BILLED_OUTPUT_COST_USD, output_cost, &tags_str);
+
+            // Existing total-cost metric, kept for backward compatibility with
+            // dashboards; now also dimensioned by inference_type.
+            if total_cost > 0 {
+                metrics.record_count(METRIC_COST_USD, total_cost, &tags_str);
+            }
+        } else {
             // Log when we skip metrics for a duplicate (aids debugging)
             tracing::debug!(
                 organization_id = %log.organization_id,

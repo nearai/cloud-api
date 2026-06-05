@@ -98,6 +98,24 @@ impl MetricsServiceTrait for OtlpMetricsService {
                 }
                 consts::METRIC_REQUEST_ERRORS => "API request errors by error type",
                 consts::METRIC_COST_USD => "Total cost in nano-dollars (USD) by model",
+                consts::METRIC_BILLED_REQUESTS => {
+                    "Billed requests by model and inference_type (one per recorded usage row)"
+                }
+                consts::METRIC_BILLED_INPUT_TOKENS => {
+                    "Billed input tokens by model and inference_type"
+                }
+                consts::METRIC_BILLED_OUTPUT_TOKENS => {
+                    "Billed output tokens by model and inference_type"
+                }
+                consts::METRIC_BILLED_CACHE_READ_TOKENS => {
+                    "Billed cache-read tokens by model and inference_type"
+                }
+                consts::METRIC_BILLED_INPUT_COST_USD => {
+                    "Billed input cost in nano-dollars (USD) by model and inference_type"
+                }
+                consts::METRIC_BILLED_OUTPUT_COST_USD => {
+                    "Billed output cost in nano-dollars (USD) by model and inference_type"
+                }
                 consts::METRIC_PROVIDER_TOKEN_ANOMALIES => {
                     "Count of provider token count anomalies (capped values)"
                 }

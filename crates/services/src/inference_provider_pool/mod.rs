@@ -1471,6 +1471,7 @@ impl InferenceProviderPool {
     ///
     /// - aiohttp wrapper: `HTTP error 500: 503, message='...', url='http...'`
     /// - aiohttp exception: `ClientResponseError, status=503, message='...'`
+    /// - aiohttp `raise_for_status()` str: `400, message='Bad Request', url='...'`
     /// - requests/urllib: `503 Client Error: ... for url: http...`
     ///
     /// Returns `None` when no status is determinable (then the caller keeps the
@@ -1480,14 +1481,18 @@ impl InferenceProviderPool {
         // phrasing. We deliberately do NOT match a bare 3-digit number: the
         // aiohttp wrapper's outer envelope is always "http error 500:", and we
         // must capture the inner status (e.g. the `400` in `HTTP error 500:
-        // 400, ...`), never the outer 500.
+        // 400, ...`), never the outer 500. Pattern 4 (`NNN, message=`) is
+        // anchored to the literal `, message=` that immediately follows the
+        // status in aiohttp's `ClientResponseError.__str__`; the wrapper's outer
+        // `500` is followed by `: `, not `, message=`, so it can never match it.
         static FETCH_STATUS: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
         let re = FETCH_STATUS.get_or_init(|| {
             Regex::new(
-                // 1. aiohttp wrapper:    `http error 500: 400, message=`
-                // 2. aiohttp exception:  `clientresponseerror, status=400`
-                // 3. requests/urllib:    `400 client error: ... for url`
-                r"http error 500:\s*(\d{3})\b|status=(\d{3})\b|\b(\d{3}) client error:",
+                // 1. aiohttp wrapper:            `http error 500: 400, message=`
+                // 2. aiohttp exception:          `clientresponseerror, status=400`
+                // 3. requests/urllib:            `400 client error: ... for url`
+                // 4. aiohttp raise_for_status(): `400, message='bad request', url=`
+                r"http error 500:\s*(\d{3})\b|status=(\d{3})\b|\b(\d{3}) client error:|\b(\d{3}), message=",
             )
             .expect("static regex compiles")
         });
@@ -1496,6 +1501,7 @@ impl InferenceProviderPool {
                 .get(1)
                 .or_else(|| caps.get(2))
                 .or_else(|| caps.get(3))
+                .or_else(|| caps.get(4))
                 .and_then(|m| m.as_str().parse::<u16>().ok());
             if let Some(code) = code {
                 if (400..600).contains(&code) {
@@ -3903,6 +3909,12 @@ mod tests {
             "Error fetching image: ClientResponseError, status=400, message='Bad Request'",
             "Failed to load image from url: 403 Client Error: Forbidden for url: https://host/x.png",
             "Internal Server Error: Failed to fetch image: 404 Client Error: Not Found for url: https://upload.wikimedia.org/x.jpg",
+            // aiohttp `ClientResponseError.__str__` from raise_for_status():
+            // `NNN, message='...', url='...'` (no `status=`, no `Client Error:`).
+            // PR #721 review 3 (PierreLeGuen) — the Wikimedia default-UA 400 takes
+            // this exact shape and must be non-retryable, not a 502.
+            "Failed to fetch image: 400, message='Bad Request', url='https://upload.wikimedia.org/wikipedia/commons/x.jpg'",
+            "ClientResponseError: 403, message='Forbidden', url='https://host/x.png'",
         ] {
             assert_eq!(
                 InferenceProviderPool::classify_retry_decision(&CompletionError::HttpError {
@@ -3928,6 +3940,10 @@ mod tests {
             // Fetch marker with no determinable status → retry (can't prove 4xx).
             "Error fetching image: ClientResponseError, message='connection closed'",
             "Failed to fetch image from https://upload.wikimedia.org/x.jpg",
+            // aiohttp raise_for_status() str form carrying a 5xx → retry (the
+            // `NNN, message=` parser must keep these retryable). PR #721 review 3.
+            "Failed to fetch image: 503, message='Service Unavailable', url='https://host/x.jpg'",
+            "ClientResponseError: 502, message='Bad Gateway', url='https://host/x.png'",
             // aiohttp wrapper around a 5xx → retry (regression guard, kept here too).
             "Error fetching image: HTTP error 500: 503, message='Service Unavailable', url='https://host/x.jpg'",
             // SGLang "loading IMAGE/VIDEO data" prefix wrapping a transient 5xx →

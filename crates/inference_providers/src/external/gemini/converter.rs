@@ -27,9 +27,33 @@ pub struct GeminiPart {
     pub function_call: Option<GeminiFunctionCall>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub function_response: Option<GeminiFunctionResponse>,
+    /// Inline image (or other binary) data, base64-encoded.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inline_data: Option<GeminiInlineData>,
+    /// Reference to remote media by URI (Gemini fetches it itself).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file_data: Option<GeminiFileData>,
     /// Thought signature for Gemini 3 models - required for tool calls to work correctly
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thought_signature: Option<String>,
+}
+
+/// Inline base64 media payload for a Gemini part (`inlineData`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GeminiInlineData {
+    pub mime_type: String,
+    /// Exact base64 payload, forwarded verbatim (no re-encoding).
+    pub data: String,
+}
+
+/// Remote media reference for a Gemini part (`fileData`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GeminiFileData {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mime_type: Option<String>,
+    pub file_uri: String,
 }
 
 impl GeminiPart {
@@ -38,6 +62,33 @@ impl GeminiPart {
             text: Some(s),
             function_call: None,
             function_response: None,
+            inline_data: None,
+            file_data: None,
+            thought_signature: None,
+        }
+    }
+
+    pub fn inline_image(mime_type: String, data: String) -> Self {
+        Self {
+            text: None,
+            function_call: None,
+            function_response: None,
+            inline_data: Some(GeminiInlineData { mime_type, data }),
+            file_data: None,
+            thought_signature: None,
+        }
+    }
+
+    pub fn file_image(mime_type: Option<String>, file_uri: String) -> Self {
+        Self {
+            text: None,
+            function_call: None,
+            function_response: None,
+            inline_data: None,
+            file_data: Some(GeminiFileData {
+                mime_type,
+                file_uri,
+            }),
             thought_signature: None,
         }
     }
@@ -47,6 +98,8 @@ impl GeminiPart {
             text: None,
             function_call: None,
             function_response: Some(GeminiFunctionResponse { name, response }),
+            inline_data: None,
+            file_data: None,
             thought_signature: None,
         }
     }
@@ -60,6 +113,8 @@ impl GeminiPart {
             text: None,
             function_call: Some(GeminiFunctionCall { name, args }),
             function_response: None,
+            inline_data: None,
+            file_data: None,
             thought_signature,
         }
     }
@@ -102,7 +157,7 @@ pub struct GeminiSystemInstruction {
 }
 
 /// Gemini generation config
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct GeminiGenerationConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -113,6 +168,36 @@ pub struct GeminiGenerationConfig {
     pub max_output_tokens: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stop_sequences: Option<Vec<String>>,
+    /// Deterministic-sampling seed. Gemini's native API supports this via
+    /// `generationConfig.seed`; OpenAI clients send the OpenAI-standard `seed`
+    /// (nearai/cloud-api #669).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub seed: Option<i64>,
+    /// Structured-output MIME type. `"application/json"` enables Gemini's JSON
+    /// mode (raw JSON, no markdown fences) for `response_format: json_object`
+    /// and `json_schema` (nearai/cloud-api #668).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response_mime_type: Option<String>,
+    /// Structured-output schema, translated from a non-strict OpenAI
+    /// `json_schema` and sanitized to Gemini's OpenAPI 3.0 subset
+    /// (nearai/cloud-api #668). Lossy: keywords Gemini's OpenAPI subset rejects
+    /// (`additionalProperties`, `$ref`, `$defs`, `oneOf`, ...) are dropped.
+    ///
+    /// Mutually exclusive with `response_json_schema`: Gemini rejects a request
+    /// that sets both. We only ever populate one of the two.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response_schema: Option<serde_json::Value>,
+    /// Structured-output schema sent as **standard JSON Schema**, used for
+    /// strict requests (`response_format.json_schema.strict == true`). Unlike
+    /// `response_schema`, this preserves constraints the client asked for —
+    /// `additionalProperties: false`, `$ref`, `$defs`, `oneOf` — so we don't
+    /// silently weaken a strict schema (nearai/cloud-api #720 review).
+    ///
+    /// Gemini's REST API expects `responseJsonSchema` and treats it as mutually
+    /// exclusive with `responseSchema`; it must be paired with
+    /// `responseMimeType: application/json`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response_json_schema: Option<serde_json::Value>,
 }
 
 /// Gemini function declaration (tool definition)
@@ -187,15 +272,38 @@ pub struct GeminiResponse {
 // Conversion Functions
 // =============================================================================
 
+/// Infer an image MIME type from a remote URL's path extension.
+///
+/// Gemini's `fileData` requires a `mimeType` for media references; a bare URL
+/// carries none, so we derive it from the file extension. Returns `None` when
+/// the extension is missing or unrecognised, so the caller can skip the part
+/// instead of emitting a `fileData` that Gemini would reject.
+///
+/// Query strings and fragments are stripped before inspecting the extension
+/// (e.g. `https://host/cat.jpg?sig=abc#frag` → `jpg`). Matching is
+/// case-insensitive.
+fn mime_type_from_url(url: &str) -> Option<String> {
+    // Trim query (`?`) and fragment (`#`) so they don't pollute the extension.
+    let path = url.split(['?', '#']).next().unwrap_or(url);
+    let ext = path.rsplit('.').next()?.to_ascii_lowercase();
+    let mime = match ext.as_str() {
+        "jpg" | "jpeg" => "image/jpeg",
+        "png" => "image/png",
+        "webp" => "image/webp",
+        "gif" => "image/gif",
+        "heic" => "image/heic",
+        "heif" => "image/heif",
+        _ => return None,
+    };
+    Some(mime.to_string())
+}
+
 /// Convert OpenAI messages to Gemini format
 pub fn convert_messages(
     messages: &[ChatMessage],
 ) -> (Option<GeminiSystemInstruction>, Vec<GeminiContent>) {
-    let extract_content = |value: &serde_json::Value| -> String {
-        match value {
-            serde_json::Value::String(s) => s.clone(),
-            _ => value.to_string(),
-        }
+    use crate::external::content::{
+        parse_content, text_from_content as extract_content, ContentPart,
     };
 
     let mut system_instruction = None;
@@ -211,14 +319,60 @@ pub fn convert_messages(
                 }
             }
             MessageRole::User => {
+                // User messages may be multimodal (text + image parts). Emit
+                // native Gemini parts so images are sent as `inlineData`/
+                // `fileData`, not flattened into a JSON text blob (issue #640).
+                let content_parts = msg.content.as_ref().map(parse_content).unwrap_or_default();
+
+                let mut parts = Vec::with_capacity(content_parts.len());
+                for part in content_parts {
+                    match part {
+                        ContentPart::Text(text) => {
+                            if !text.is_empty() {
+                                parts.push(GeminiPart::text(text));
+                            }
+                        }
+                        ContentPart::ImageBase64 { media_type, data } => {
+                            parts.push(GeminiPart::inline_image(media_type, data));
+                        }
+                        ContentPart::ImageUrl { url } => {
+                            // Gemini's `fileData` accepts a public HTTPS URI and
+                            // fetches the bytes itself, but it *requires* a
+                            // `mimeType` — an empty/omitted `fileData.mimeType`
+                            // is rejected upstream with 400 "empty mimeType
+                            // parameter in fileData". cloud-api does not pre-fetch
+                            // remote images (Gemini is an external passthrough to
+                            // Google's API with no engine in the loop, see #606),
+                            // so we infer the MIME type from the URL path
+                            // extension. If we cannot determine a supported image
+                            // type, we skip the part rather than emit a broken
+                            // `fileData` that would fail the whole request.
+                            // Remote-URL image support is provider-dependent and
+                            // not guaranteed; base64 data URIs (the common,
+                            // advertised case) go through `inlineData` above.
+                            match mime_type_from_url(&url) {
+                                Some(mime_type) => {
+                                    parts.push(GeminiPart::file_image(Some(mime_type), url));
+                                }
+                                None => {
+                                    tracing::warn!(
+                                        "skipping Gemini image: cannot infer mimeType from \
+                                         remote URL extension (fileData requires a mimeType)"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+                // Preserve prior behaviour for empty/text-only content: at least
+                // one (possibly empty) text part.
+                if parts.is_empty() {
+                    parts.push(GeminiPart::text(String::new()));
+                }
+
                 contents.push(GeminiContent {
                     role: "user".to_string(),
-                    parts: vec![GeminiPart::text(
-                        msg.content
-                            .as_ref()
-                            .map(&extract_content)
-                            .unwrap_or_default(),
-                    )],
+                    parts,
                 });
             }
             MessageRole::Assistant => {
@@ -418,6 +572,92 @@ fn sanitize_schema_for_gemini(value: &mut serde_json::Value) {
             }
         }
         _ => {}
+    }
+}
+
+/// Outcome of translating an OpenAI `response_format` into Gemini's
+/// structured-output `generationConfig` fields.
+///
+/// `response_schema` and `response_json_schema` are mutually exclusive — at most
+/// one is ever `Some`, because Gemini rejects a request that sets both.
+#[derive(Debug, Default, PartialEq)]
+pub struct GeminiResponseFormat {
+    /// `generationConfig.responseMimeType`.
+    pub mime_type: Option<String>,
+    /// `generationConfig.responseSchema` (lossy OpenAPI-subset schema; used for
+    /// non-strict `json_schema`).
+    pub schema: Option<serde_json::Value>,
+    /// `generationConfig.responseJsonSchema` (lossless standard JSON Schema;
+    /// used for strict `json_schema`).
+    pub json_schema: Option<serde_json::Value>,
+}
+
+/// Translate an OpenAI `response_format` value into Gemini's structured-output
+/// `generationConfig` fields (nearai/cloud-api #668, #720).
+///
+/// - `{"type": "json_object"}` → `responseMimeType = application/json` only, so
+///   Gemini emits raw JSON instead of markdown-fenced text.
+/// - `{"type": "json_schema", "json_schema": {"strict": true, "schema": {...}}}`
+///   → `responseMimeType = application/json` + `responseJsonSchema = <original
+///   schema, unmodified>`. We use Gemini's standard-JSON-Schema field so strict
+///   constraints the client asked for — `additionalProperties: false`, `$ref`,
+///   `$defs`, `oneOf` — are preserved and actually enforced, rather than being
+///   silently dropped (the concern Pierre raised on PR #720).
+/// - `{"type": "json_schema", ...}` without `strict: true` → `responseMimeType =
+///   application/json` + `responseSchema = <sanitized schema>`. This is the
+///   best-effort, OpenAPI-3.0-subset path: keywords Gemini's `responseSchema`
+///   rejects are stripped via `sanitize_schema_for_gemini`. Acceptable here
+///   because the caller did not request strict enforcement.
+/// - anything else (including `{"type": "text"}`) → all `None`.
+///
+/// `responseSchema` and `responseJsonSchema` are mutually exclusive in Gemini's
+/// API, so this never returns both.
+pub fn response_format_to_gemini(response_format: &serde_json::Value) -> GeminiResponseFormat {
+    let Some(type_) = response_format.get("type").and_then(|v| v.as_str()) else {
+        return GeminiResponseFormat::default();
+    };
+
+    match type_ {
+        "json_object" => GeminiResponseFormat {
+            mime_type: Some("application/json".to_string()),
+            ..Default::default()
+        },
+        "json_schema" => {
+            let json_schema = response_format.get("json_schema");
+            let Some(schema) = json_schema.and_then(|js| js.get("schema")).cloned() else {
+                // `json_schema` requested but no schema body: fall back to plain
+                // JSON mode rather than emitting an empty/invalid schema.
+                return GeminiResponseFormat {
+                    mime_type: Some("application/json".to_string()),
+                    ..Default::default()
+                };
+            };
+
+            let strict = json_schema
+                .and_then(|js| js.get("strict"))
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+
+            if strict {
+                // Strict: preserve the ORIGINAL schema verbatim via Gemini's
+                // standard-JSON-Schema field so constraints are enforced.
+                GeminiResponseFormat {
+                    mime_type: Some("application/json".to_string()),
+                    json_schema: Some(schema),
+                    ..Default::default()
+                }
+            } else {
+                // Non-strict: best-effort via the OpenAPI-subset field.
+                let mut sanitized = schema;
+                sanitize_schema_for_gemini(&mut sanitized);
+                GeminiResponseFormat {
+                    mime_type: Some("application/json".to_string()),
+                    schema: Some(sanitized),
+                    ..Default::default()
+                }
+            }
+        }
+        _ => GeminiResponseFormat::default(),
     }
 }
 
@@ -666,6 +906,164 @@ mod tests {
         assert!(system.is_some());
         assert_eq!(contents.len(), 1);
         assert_eq!(contents[0].role, "user");
+    }
+
+    /// Real minimal 1x1 solid-red PNG, base64-encoded (issue #640 guard).
+    const RED_PNG_B64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAD\
+        UlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+
+    #[test]
+    fn test_convert_messages_image_preserves_base64_and_mime() {
+        let payload: String = RED_PNG_B64.split_whitespace().collect();
+        let data_uri = format!("data:image/png;base64,{payload}");
+
+        let messages = vec![ChatMessage {
+            role: MessageRole::User,
+            content: Some(serde_json::json!([
+                {"type": "text", "text": "Describe this image."},
+                {"type": "image_url", "image_url": {"url": data_uri}}
+            ])),
+            name: None,
+            tool_call_id: None,
+            tool_calls: None,
+        }];
+
+        let (_system, contents) = convert_messages(&messages);
+        assert_eq!(contents.len(), 1);
+        let parts = &contents[0].parts;
+        assert_eq!(parts.len(), 2, "expected text + inlineData parts");
+
+        assert_eq!(parts[0].text.as_deref(), Some("Describe this image."));
+        let inline = parts[1]
+            .inline_data
+            .as_ref()
+            .expect("expected inlineData image part, not a flattened text blob");
+        assert_eq!(inline.mime_type, "image/png");
+        assert_eq!(
+            inline.data, payload,
+            "base64 payload must be byte-identical"
+        );
+
+        // Serialize and check Gemini camelCase wire shape + exact bytes survive.
+        let json = serde_json::to_string(&contents[0]).unwrap();
+        assert!(
+            json.contains(&payload),
+            "serialized request lost the base64 payload"
+        );
+        assert!(json.contains("\"inlineData\""));
+        assert!(json.contains("\"mimeType\":\"image/png\""));
+    }
+
+    #[test]
+    fn test_convert_messages_image_url_uses_file_data_with_mime_type() {
+        // Remote image URL with a recognisable extension: must emit `fileData`
+        // WITH an inferred `mimeType`. Gemini rejects a `fileData` whose
+        // `mimeType` is empty/omitted with 400 "empty mimeType parameter in
+        // fileData", so the serialized request must always carry it (#719).
+        let messages = vec![ChatMessage {
+            role: MessageRole::User,
+            content: Some(serde_json::json!([
+                {"type": "image_url", "image_url": {"url": "https://example.com/cat.jpg"}}
+            ])),
+            name: None,
+            tool_call_id: None,
+            tool_calls: None,
+        }];
+
+        let (_system, contents) = convert_messages(&messages);
+        let file = contents[0].parts[0]
+            .file_data
+            .as_ref()
+            .expect("expected fileData for remote URL");
+        assert_eq!(file.file_uri, "https://example.com/cat.jpg");
+        assert_eq!(
+            file.mime_type.as_deref(),
+            Some("image/jpeg"),
+            "fileData must carry an inferred mimeType"
+        );
+
+        // Serialization guard: the camelCase `mimeType` must be present in the
+        // wire body. A regression to `file_image(None, ..)` would drop it.
+        let json = serde_json::to_string(&contents[0]).unwrap();
+        assert!(
+            json.contains("\"fileData\""),
+            "expected fileData on the wire"
+        );
+        assert!(
+            json.contains("\"mimeType\":\"image/jpeg\""),
+            "serialized fileData is missing the required mimeType; got: {json}"
+        );
+    }
+
+    #[test]
+    fn test_convert_messages_image_url_infers_mime_from_various_extensions() {
+        // Extension → mimeType inference, including query-string stripping and
+        // case-insensitivity.
+        let cases = [
+            ("https://example.com/a.png", "image/png"),
+            ("https://example.com/a.JPEG", "image/jpeg"),
+            ("https://example.com/a.webp", "image/webp"),
+            ("https://example.com/a.gif", "image/gif"),
+            (
+                "https://cdn.example.com/img/cat.jpg?sig=abc&x=1#frag",
+                "image/jpeg",
+            ),
+        ];
+        for (url, expected) in cases {
+            let messages = vec![ChatMessage {
+                role: MessageRole::User,
+                content: Some(serde_json::json!([
+                    {"type": "image_url", "image_url": {"url": url}}
+                ])),
+                name: None,
+                tool_call_id: None,
+                tool_calls: None,
+            }];
+            let (_system, contents) = convert_messages(&messages);
+            let file = contents[0].parts[0]
+                .file_data
+                .as_ref()
+                .unwrap_or_else(|| panic!("expected fileData for {url}"));
+            assert_eq!(
+                file.mime_type.as_deref(),
+                Some(expected),
+                "wrong mimeType inferred for {url}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_convert_messages_image_url_unknown_extension_is_skipped() {
+        // No / unknown extension → we cannot infer a mimeType, so we skip the
+        // image part rather than emit a `fileData` lacking `mimeType` (which
+        // Gemini rejects, breaking the *entire* request). Text is preserved.
+        let messages = vec![ChatMessage {
+            role: MessageRole::User,
+            content: Some(serde_json::json!([
+                {"type": "text", "text": "look at this"},
+                {"type": "image_url", "image_url": {"url": "https://example.com/image"}},
+                {"type": "image_url", "image_url": {"url": "https://example.com/file.bin"}}
+            ])),
+            name: None,
+            tool_call_id: None,
+            tool_calls: None,
+        }];
+
+        let (_system, contents) = convert_messages(&messages);
+        assert_eq!(contents.len(), 1);
+        let parts = &contents[0].parts;
+        // Only the text part survives; both unknown-extension images dropped.
+        assert_eq!(parts.len(), 1, "unknown-extension images must be skipped");
+        assert_eq!(parts[0].text.as_deref(), Some("look at this"));
+        assert!(parts.iter().all(|p| p.file_data.is_none()));
+
+        // And crucially: the serialized request never contains a `fileData`
+        // without a `mimeType`.
+        let json = serde_json::to_string(&contents[0]).unwrap();
+        assert!(
+            !json.contains("\"fileData\""),
+            "must not emit fileData when mimeType is unknown; got: {json}"
+        );
     }
 
     #[test]
@@ -950,6 +1348,103 @@ mod tests {
             "serialized parameters must not contain `additionalProperties`; got: {}",
             serialized
         );
+    }
+
+    // ── #668: response_format → Gemini structured output ────────────────────
+
+    #[test]
+    fn test_response_format_json_object_sets_mime_type_only() {
+        let rf = serde_json::json!({"type": "json_object"});
+        let rf = response_format_to_gemini(&rf);
+        assert_eq!(rf.mime_type.as_deref(), Some("application/json"));
+        assert!(rf.schema.is_none());
+        assert!(rf.json_schema.is_none());
+    }
+
+    /// #720: a strict `json_schema` must be forwarded VERBATIM through Gemini's
+    /// standard-JSON-Schema field (`responseJsonSchema`) so constraints the
+    /// client asked for are preserved and enforced — NOT stripped.
+    #[test]
+    fn test_response_format_strict_json_schema_preserves_original_via_json_schema_field() {
+        let original = serde_json::json!({
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["city", "temp_c"],
+            "$defs": {
+                "City": {"type": "string"}
+            },
+            "properties": {
+                "city": {"$ref": "#/$defs/City"},
+                "temp_c": {"type": "number"},
+                "kind": {"oneOf": [{"type": "string"}, {"type": "null"}]}
+            }
+        });
+        let rf = response_format_to_gemini(&serde_json::json!({
+            "type": "json_schema",
+            "json_schema": {
+                "name": "weather",
+                "strict": true,
+                "schema": original.clone()
+            }
+        }));
+        assert_eq!(rf.mime_type.as_deref(), Some("application/json"));
+        // Mutually exclusive: the lossy `responseSchema` field must be unset.
+        assert!(
+            rf.schema.is_none(),
+            "strict schemas must NOT use the lossy responseSchema field"
+        );
+        let json_schema = rf.json_schema.expect("responseJsonSchema populated");
+        // The original strict schema is preserved byte-for-byte: constraints
+        // Gemini's OpenAPI subset would have dropped are all still present.
+        assert_eq!(json_schema, original);
+        assert_eq!(
+            json_schema["additionalProperties"],
+            serde_json::json!(false)
+        );
+        assert!(json_schema["$defs"]["City"].is_object());
+        assert_eq!(json_schema["properties"]["city"]["$ref"], "#/$defs/City");
+        assert!(json_schema["properties"]["kind"]["oneOf"].is_array());
+    }
+
+    /// Non-strict `json_schema` is best-effort: it goes through the lossy
+    /// OpenAPI-subset `responseSchema` field (constraints stripped) so Gemini
+    /// does not 400 on unsupported keywords.
+    #[test]
+    fn test_response_format_non_strict_json_schema_uses_sanitized_response_schema() {
+        let rf = response_format_to_gemini(&serde_json::json!({
+            "type": "json_schema",
+            "json_schema": {
+                "name": "weather",
+                "schema": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["city"],
+                    "properties": {"city": {"type": "string"}}
+                }
+            }
+        }));
+        assert_eq!(rf.mime_type.as_deref(), Some("application/json"));
+        // Mutually exclusive: the strict JSON-Schema field must be unset.
+        assert!(rf.json_schema.is_none());
+        let schema = rf.schema.expect("responseSchema populated");
+        // Lossy path: `additionalProperties` (rejected by Gemini) is stripped.
+        assert!(schema
+            .as_object()
+            .unwrap()
+            .get("additionalProperties")
+            .is_none());
+        // Structural keys survive.
+        assert_eq!(schema["type"], "object");
+        assert!(schema["properties"]["city"].is_object());
+        assert_eq!(schema["required"], serde_json::json!(["city"]));
+    }
+
+    #[test]
+    fn test_response_format_text_is_noop() {
+        let rf = response_format_to_gemini(&serde_json::json!({"type": "text"}));
+        assert!(rf.mime_type.is_none());
+        assert!(rf.schema.is_none());
+        assert!(rf.json_schema.is_none());
     }
 
     #[test]

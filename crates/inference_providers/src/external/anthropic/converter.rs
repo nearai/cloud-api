@@ -523,7 +523,21 @@ impl SSEEventParser for AnthropicEventParser {
                 state.message_id = Some(message.id);
                 state.input_tokens = message.usage.input_tokens;
                 let ctx = state.chunk_context();
-                Ok(Some(StreamChunk::Chat(ctx.role_chunk())))
+                // Anthropic reports input tokens up front in `message_start`, but
+                // completion tokens only in the final `message_delta`. Carry the
+                // known input tokens on the first chunk so an interrupted stream is
+                // still billed for the prompt tokens Anthropic charged us for
+                // (completion tokens stay 0 until the final chunk). On a clean
+                // stream the final chunk's full usage overwrites this.
+                let early_usage = TokenUsage {
+                    prompt_tokens: state.input_tokens,
+                    completion_tokens: 0,
+                    total_tokens: state.input_tokens,
+                    prompt_tokens_details: None,
+                };
+                Ok(Some(StreamChunk::Chat(
+                    ctx.role_chunk_with_usage(Some(early_usage)),
+                )))
             }
 
             AnthropicStreamEvent::ContentBlockStart {
@@ -806,5 +820,30 @@ mod tests {
         let calls = tool_calls.unwrap();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].id, Some("toolu_123".to_string()));
+    }
+
+    #[test]
+    fn test_message_start_chunk_carries_input_usage() {
+        // Regression test for nearai/infra#98: an interrupted Anthropic stream
+        // (client disconnect / provider error before the final message_delta)
+        // must still be billable for the prompt tokens Anthropic charged us for.
+        // The billing layer (`InterceptStream`) only sees usage attached to a
+        // chunk, so `message_start` must surface the input tokens immediately.
+        let mut state = AnthropicParserState::new("claude-test".to_string());
+        let data =
+            r#"{"type":"message_start","message":{"id":"msg_123","usage":{"input_tokens":42}}}"#;
+
+        let chunk = AnthropicEventParser::parse_event(&mut state, data)
+            .unwrap()
+            .expect("message_start should produce a chunk");
+
+        let StreamChunk::Chat(chat) = chunk else {
+            panic!("expected a chat chunk");
+        };
+        let usage = chat.usage.expect("role chunk should carry early usage");
+        assert_eq!(usage.prompt_tokens, 42);
+        assert_eq!(usage.completion_tokens, 0);
+        assert_eq!(usage.total_tokens, 42);
+        assert_eq!(state.input_tokens, 42);
     }
 }

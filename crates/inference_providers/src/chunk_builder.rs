@@ -50,6 +50,21 @@ impl ChunkContext {
 
     /// Create a chunk with assistant role (typically first chunk)
     pub fn role_chunk(&self) -> ChatCompletionChunk {
+        self.role_chunk_with_usage(None)
+    }
+
+    /// Create a chunk with assistant role, optionally carrying early usage stats.
+    ///
+    /// Some providers (notably Anthropic) only emit complete token usage in the
+    /// final stream event, but expose the prompt/input token count at the very
+    /// start (Anthropic's `message_start`). Attaching that partial usage to the
+    /// first chunk lets the billing layer (`InterceptStream`) capture it as
+    /// `last_usage_stats`, so an interrupted stream (client disconnect or
+    /// provider error before the final chunk) is still billed for the input
+    /// tokens the provider already charged us for. On a clean stream the final
+    /// chunk's complete usage overwrites this partial value, so billing is
+    /// unaffected.
+    pub fn role_chunk_with_usage(&self, usage: Option<TokenUsage>) -> ChatCompletionChunk {
         self.build(
             ChatDelta {
                 role: Some(MessageRole::Assistant),
@@ -62,7 +77,7 @@ impl ChunkContext {
                 extra: Default::default(),
             },
             None,
-            None,
+            usage,
         )
     }
 

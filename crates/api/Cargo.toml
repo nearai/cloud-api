@@ -44,7 +44,7 @@ bytes = "1.11"
 http-body-util = "0.1"
 # AWS S3 for file storage
 aws-config = { version = "1.8", features = ["behavior-version-latest"] }
-aws-sdk-s3 = { version = "1.134", default-features = false, features = ["sigv4a", "http-1x", "default-https-client", "rt-tokio"] }
+aws-sdk-s3 = { version = "1.135", default-features = false, features = ["sigv4a", "http-1x", "default-https-client", "rt-tokio"] }
 # NEAR wallet authentication
 near-api = "0.8.6"
 base64 = "0.22"

@@ -684,18 +684,27 @@ async fn auto_redact_bills_classify_pass() {
 
     // Exactly one privacy_classify row should be billed for the inline
     // classify pass, carrying the mock's 10 input tokens and no output.
+    // Billing runs on a spawned background task, so poll (bounded) until the
+    // row lands rather than querying once.
     let org_uuid = uuid::Uuid::parse_str(&org.id).expect("org id is a uuid");
     let pool = db.pool();
-    let client = pool.get().await.expect("db connection");
-    let rows = client
-        .query(
-            "SELECT input_tokens, output_tokens, model_name \
-             FROM organization_usage_log \
-             WHERE organization_id = $1 AND inference_type = 'privacy_classify'",
-            &[&org_uuid],
-        )
-        .await
-        .expect("query privacy_classify usage");
+    let mut rows = Vec::new();
+    for _ in 0..40 {
+        let client = pool.get().await.expect("db connection");
+        rows = client
+            .query(
+                "SELECT input_tokens, output_tokens, model_name \
+                 FROM organization_usage_log \
+                 WHERE organization_id = $1 AND inference_type = 'privacy_classify'",
+                &[&org_uuid],
+            )
+            .await
+            .expect("query privacy_classify usage");
+        if !rows.is_empty() {
+            break;
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+    }
 
     assert_eq!(
         rows.len(),

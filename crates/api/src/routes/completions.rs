@@ -483,6 +483,10 @@ fn auto_redact_error_response(err: AutoRedactError) -> Response {
     }
 }
 
+/// Upper bound on the spawned auto-redact billing task so a stuck billing DB
+/// or model lookup can't leak a background task indefinitely.
+const AUTO_REDACT_BILL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Record usage for the privacy-filter classify pass that auto-redact runs
 /// before a completion (nearai/cloud-api#602). The classify is a real
 /// inference call to the PII model, so it is billed like an explicit
@@ -499,11 +503,12 @@ async fn bill_auto_redact_classify(
     api_key: &crate::middleware::auth::AuthenticatedApiKey,
     classify_tokens: i64,
 ) {
-    let input_tokens = match i32::try_from(classify_tokens) {
-        Ok(t) if t > 0 => t,
-        // 0 (or, defensively, negative/overflow) means nothing to bill.
-        _ => return,
-    };
+    // Clamp to the i32 the usage row stores: an implausibly large count is
+    // capped (billed) rather than dropped, and 0/negative is nothing to bill.
+    let input_tokens = classify_tokens.clamp(0, i32::MAX as i64) as i32;
+    if input_tokens == 0 {
+        return;
+    }
 
     let model = match app_state
         .models_service
@@ -1179,10 +1184,24 @@ async fn chat_completions_inner(
     };
     // Bill the privacy-filter classify pass that auto-redact ran (it is a
     // real inference call to the PII model). Charged like an explicit
-    // `/v1/privacy/classify`; best-effort so a billing hiccup never fails
-    // the user's completion. See nearai/cloud-api#602.
+    // `/v1/privacy/classify`. Spawned (not awaited) and time-bounded so a
+    // slow/exhausted billing DB or model lookup can never stall the user's
+    // completion before dispatch — the classify already succeeded, and the
+    // chat bills separately via InterceptStream. See nearai/cloud-api#602.
     if auto_redact_requested {
-        bill_auto_redact_classify(&app_state, &api_key, auto_redact_classify_tokens).await;
+        let app_state = app_state.clone();
+        let api_key = api_key.clone();
+        tokio::spawn(async move {
+            if tokio::time::timeout(
+                AUTO_REDACT_BILL_TIMEOUT,
+                bill_auto_redact_classify(&app_state, &api_key, auto_redact_classify_tokens),
+            )
+            .await
+            .is_err()
+            {
+                tracing::error!("auto_redact: classify billing timed out; usage not recorded");
+            }
+        });
     }
     // Treat auto-redact as effectively *enabled* only when the detector
     // actually minted placeholders. A request that opts in but contains no

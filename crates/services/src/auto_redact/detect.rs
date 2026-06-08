@@ -109,12 +109,13 @@ pub(super) fn parse_response(
     let parsed: DetectResponse = serde_json::from_slice(bytes)
         .map_err(|e| AutoRedactError::Internal(format!("decode detect resp: {e}")))?;
 
+    // Saturating sum: a malicious/buggy detector returning huge or many
+    // per-item counts must not wrap to a negative total and mis-bill.
     let input_tokens: i64 = parsed
         .data
         .iter()
         .filter_map(|item| item.usage.as_ref())
-        .map(|u| u.input_tokens.max(0))
-        .sum();
+        .fold(0i64, |acc, u| acc.saturating_add(u.input_tokens.max(0)));
 
     let mut out: Vec<Vec<Span>> = (0..expected_len).map(|_| Vec::new()).collect();
     for item in parsed.data {

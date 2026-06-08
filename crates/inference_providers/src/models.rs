@@ -436,6 +436,15 @@ pub struct ChatCompletionChunk {
     /// Modality indicator for Qwen3-Omni streaming ("text" or "audio")
     #[serde(skip_serializing_if = "Option::is_none")]
     pub modality: Option<String>,
+
+    /// Preserve any additional top-level fields the upstream emits on a
+    /// streaming chunk that we don't have an explicit slot for, so they
+    /// survive the re-serialized streaming path (auto-redact / alias /
+    /// non-OpenAI upstream normalization) instead of being silently
+    /// dropped. Note: sglang attaches streaming hidden states inside
+    /// `choices[].delta` (see [`ChatDelta::extra`]), not at this level.
+    #[serde(flatten)]
+    pub extra: std::collections::HashMap<String, serde_json::Value>,
 }
 
 /// Text completion streaming chunk (matches OpenAI legacy format)
@@ -606,6 +615,15 @@ pub struct ChatCompletionResponse {
     /// KV cache transfer parameters
     #[serde(skip_serializing_if = "Option::is_none")]
     pub kv_transfer_params: Option<serde_json::Value>,
+
+    /// Preserve any additional top-level fields the upstream emits that we
+    /// don't have an explicit slot for (e.g. sglang's `sglext`/`metadata`),
+    /// so they survive re-serialized response paths instead of being
+    /// silently dropped. Per-choice provider fields (such as sglang's
+    /// `hidden_states`) are captured by the catch-all on
+    /// [`ChatCompletionResponseChoice`] instead.
+    #[serde(flatten)]
+    pub extra: std::collections::HashMap<String, serde_json::Value>,
 }
 
 /// Wrapper for chat completion response that includes raw bytes.
@@ -642,6 +660,22 @@ pub struct ChatCompletionResponseChoice {
     /// Token IDs generated for this choice
     #[serde(skip_serializing_if = "Option::is_none")]
     pub token_ids: Option<Vec<i64>>,
+
+    /// Preserve any additional fields the upstream emits at the choice
+    /// level that we don't have an explicit slot for. Without this, serde
+    /// silently drops unknown per-choice fields on deserialize, so they
+    /// never reach the client on re-serialized response paths (e.g. the
+    /// auto-redact path, which rebuilds the body from this struct instead
+    /// of forwarding the provider's raw bytes).
+    ///
+    /// Specifically: sglang attaches per-layer activations to each choice
+    /// as `choices[].hidden_states` (sibling of `message`) when a request
+    /// sets `return_hidden_states` — see
+    /// sglang `entrypoints/openai/protocol.py::ChatCompletionResponseChoice`.
+    /// Streaming hidden states live in `choices[].delta` and are covered by
+    /// the catch-all on [`ChatDelta`] instead.
+    #[serde(flatten)]
+    pub extra: std::collections::HashMap<String, serde_json::Value>,
 }
 
 /// Message in a complete chat completion response
@@ -1091,7 +1125,7 @@ pub enum AudioTranscriptionError {
 /// # Examples
 ///
 /// ```
-/// # use inference_providers::detect_audio_content_type;
+/// # use inference_providers::models::detect_audio_content_type;
 /// assert_eq!(detect_audio_content_type("speech.mp3"), "audio/mpeg");
 /// assert_eq!(detect_audio_content_type("recording.wav"), "audio/wav");
 /// assert_eq!(detect_audio_content_type("unknown.xyz"), "application/octet-stream");
@@ -1263,6 +1297,100 @@ mod tests {
         assert!(reserialized.contains("\"nearai_tool_result\""));
         assert!(reserialized.contains("\"web_context_search\""));
         assert!(reserialized.contains("\"call_1\""));
+    }
+
+    #[test]
+    fn non_streaming_choice_preserves_hidden_states_round_trip() {
+        // sglang attaches per-layer activations to each choice as
+        // `choices[].hidden_states` (a sibling of `message`) when a
+        // request sets `return_hidden_states`. Without the choice-level
+        // `extra` catch-all, serde drops it on deserialize, so it never
+        // reaches the client on re-serialized response paths (e.g.
+        // auto-redact). See sglang
+        // entrypoints/openai/protocol.py::ChatCompletionResponseChoice.
+        let json_response = r#"{
+            "id": "chatcmpl-hidden",
+            "object": "chat.completion",
+            "created": 1,
+            "model": "sglang-model",
+            "choices": [{
+                "index": 0,
+                "message": { "role": "assistant", "content": "hi" },
+                "finish_reason": "stop",
+                "hidden_states": [[0.1, 0.2], [0.3, 0.4]]
+            }],
+            "usage": { "prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2 }
+        }"#;
+
+        let response: ChatCompletionResponse = serde_json::from_str(json_response).unwrap();
+        let hidden_states = response.choices[0]
+            .extra
+            .get("hidden_states")
+            .expect("per-choice hidden_states must survive deserialization");
+        assert_eq!(hidden_states[1][0], 0.3);
+
+        let reserialized = serde_json::to_string(&response).unwrap();
+        assert!(reserialized.contains("\"hidden_states\""));
+    }
+
+    #[test]
+    fn streaming_delta_preserves_hidden_states_round_trip() {
+        // sglang attaches streaming hidden states inside the delta as
+        // `choices[].delta.hidden_states` (see protocol.py::DeltaMessage).
+        // This is already covered by the `ChatDelta` catch-all; this test
+        // locks that behavior for the hidden-states use case specifically.
+        let json_chunk = r#"{
+            "id": "chatcmpl-hidden",
+            "object": "chat.completion.chunk",
+            "created": 1,
+            "model": "sglang-model",
+            "choices": [{
+                "index": 0,
+                "delta": { "hidden_states": [[0.1, 0.2]] }
+            }]
+        }"#;
+
+        let chunk: ChatCompletionChunk = serde_json::from_str(json_chunk).unwrap();
+        let delta = chunk.choices[0]
+            .delta
+            .as_ref()
+            .expect("delta should deserialize");
+        let hidden_states = delta
+            .extra
+            .get("hidden_states")
+            .expect("delta hidden_states must survive deserialization");
+        assert_eq!(hidden_states[0][1], 0.2);
+
+        let reserialized = serde_json::to_string(&chunk).unwrap();
+        assert!(reserialized.contains("\"hidden_states\""));
+    }
+
+    #[test]
+    fn response_preserves_top_level_unknown_fields_round_trip() {
+        // Top-level provider fields we don't model (e.g. sglang's
+        // `sglext`/`metadata`) must survive re-serialized response paths
+        // via the top-level `extra` catch-all.
+        let json_response = r#"{
+            "id": "chatcmpl-meta",
+            "object": "chat.completion",
+            "created": 1,
+            "model": "sglang-model",
+            "choices": [],
+            "usage": { "prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2 },
+            "sglext": { "spec_verify_ct": 3 }
+        }"#;
+
+        let response: ChatCompletionResponse = serde_json::from_str(json_response).unwrap();
+        assert_eq!(
+            response
+                .extra
+                .get("sglext")
+                .expect("top-level sglext must survive")["spec_verify_ct"],
+            3
+        );
+
+        let reserialized = serde_json::to_string(&response).unwrap();
+        assert!(reserialized.contains("\"sglext\""));
     }
 }
 

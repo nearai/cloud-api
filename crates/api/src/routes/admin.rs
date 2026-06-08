@@ -90,6 +90,37 @@ pub(crate) fn format_deprecation_date(dt: &DateTime<Utc>) -> String {
     dt.format("%Y-%m-%dT%H:00:00Z").to_string()
 }
 
+/// Validate an OpenRouter `openrouter.slug` override.
+///
+/// OpenRouter's `/api/v1/models` ids are lowercase `author/slug` pairs (e.g.
+/// `z-ai/glm-5.1`, `qwen/qwen3.6-27b`). We accept exactly that shape: one `/`
+/// separator, each segment starting and ending with `[a-z0-9]` and containing
+/// only `[a-z0-9._-]` in between. This mirrors the regex
+/// `^[a-z0-9](?:[a-z0-9._-]*[a-z0-9])?/[a-z0-9](?:[a-z0-9._-]*[a-z0-9])?$`
+/// without pulling in a regex dependency.
+pub(crate) fn is_valid_openrouter_slug(slug: &str) -> bool {
+    fn is_valid_segment(seg: &str) -> bool {
+        let bytes = seg.as_bytes();
+        if bytes.is_empty() {
+            return false;
+        }
+        let is_boundary = |b: u8| b.is_ascii_lowercase() || b.is_ascii_digit();
+        let is_interior = |b: u8| is_boundary(b) || matches!(b, b'.' | b'_' | b'-');
+        // First and last must be boundary chars; interior may use . _ -
+        if !is_boundary(bytes[0]) || !is_boundary(bytes[bytes.len() - 1]) {
+            return false;
+        }
+        bytes.iter().all(|&b| is_interior(b))
+    }
+
+    let mut parts = slug.split('/');
+    match (parts.next(), parts.next(), parts.next()) {
+        // Exactly two non-empty, well-formed segments (no second `/`).
+        (Some(author), Some(name), None) => is_valid_segment(author) && is_valid_segment(name),
+        _ => false,
+    }
+}
+
 #[derive(Clone)]
 pub struct AdminAppState {
     pub admin_service: Arc<dyn AdminService + Send + Sync>,
@@ -301,6 +332,24 @@ pub async fn batch_upsert_models(
                 ));
             }
         }
+        // `openrouter.slug` override must be a lowercase `author/slug` (the
+        // canonical shape OpenRouter uses in its `/api/v1/models` ids, e.g.
+        // `z-ai/glm-5.1`). Reject anything else at the write path so the
+        // catalog can't emit a slug OpenRouter would refuse to match. An
+        // explicit `null` (clear) and an omitted field both skip this check.
+        if let Some(Some(slug)) = &request.openrouter_slug {
+            if !is_valid_openrouter_slug(slug) {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    ResponseJson(ErrorResponse::new(
+                        format!(
+                            "model '{model_name}': openrouterSlug: '{slug}' is not a valid OpenRouter slug; expected lowercase 'author/slug' (e.g. 'z-ai/glm-5.1')"
+                        ),
+                        "invalid_request".to_string(),
+                    )),
+                ));
+            }
+        }
     }
 
     // Extract admin user context for audit tracking
@@ -353,6 +402,10 @@ pub async fn batch_upsert_models(
                         .deprecation_date
                         .as_ref()
                         .map(|inner| inner.as_deref().and_then(parse_deprecation_date)),
+                    // Tri-state passes straight through: outer None = leave
+                    // unchanged, Some(None) = clear, Some(Some(v)) = set. The
+                    // value was already shape-validated above.
+                    openrouter_slug: request.openrouter_slug.clone(),
                     change_reason: request.change_reason.clone(),
                     changed_by_user_id: Some(admin_user_id),
                     changed_by_user_email: Some(admin_user_email.clone()),
@@ -562,6 +615,7 @@ pub async fn batch_upsert_models(
                     .deprecation_date
                     .as_ref()
                     .map(format_deprecation_date),
+                openrouter_slug: updated_model.openrouter_slug,
             },
         })
         .collect();
@@ -668,6 +722,7 @@ pub async fn list_models(
                 datacenters: crate::models::Datacenter::from_codes(model.datacenters),
                 is_ready: model.is_ready,
                 deprecation_date: model.deprecation_date.as_ref().map(format_deprecation_date),
+                openrouter_slug: model.openrouter_slug,
             },
             is_active: model.is_active,
             created_at: model.created_at,
@@ -806,6 +861,7 @@ pub async fn get_model_history(
             datacenters: crate::models::Datacenter::from_codes(h.datacenters),
             is_ready: h.is_ready,
             deprecation_date: h.deprecation_date.as_ref().map(format_deprecation_date),
+            openrouter_slug: h.openrouter_slug,
         })
         .collect();
 
@@ -1313,6 +1369,7 @@ pub async fn deprecate_model(
             datacenters: crate::models::Datacenter::from_codes(m.datacenters),
             is_ready: m.is_ready,
             deprecation_date: m.deprecation_date.as_ref().map(format_deprecation_date),
+            openrouter_slug: m.openrouter_slug,
         },
     };
 
@@ -3141,5 +3198,57 @@ mod deprecation_date_tests {
     fn invalid_input_returns_none() {
         assert!(parse_deprecation_date("not-a-date").is_none());
         assert!(parse_deprecation_date("2025-13-01").is_none());
+    }
+}
+
+#[cfg(test)]
+mod openrouter_slug_tests {
+    use super::is_valid_openrouter_slug;
+
+    #[test]
+    fn accepts_canonical_openrouter_slugs() {
+        // The real slugs we need to back-fill (per the OpenRouter for-providers
+        // spec) must all validate.
+        for slug in [
+            "z-ai/glm-5.1",
+            "deepseek/deepseek-v4-flash",
+            "google/gemma-4-31b-it",
+            "qwen/qwen3.5-122b-a10b",
+            "qwen/qwen3.6-27b",
+            "qwen/qwen3.6-35b-a3b",
+            "qwen/qwen3-vl-30b-a3b-instruct",
+            "qwen/qwen3-30b-a3b-instruct-2507",
+            "openai/gpt-oss-120b",
+            "a/b",         // minimal single-char segments
+            "a.b_c-d/e.f", // all interior punctuation classes
+        ] {
+            assert!(
+                is_valid_openrouter_slug(slug),
+                "expected '{slug}' to be a valid OpenRouter slug"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_malformed_slugs() {
+        for slug in [
+            "",              // empty
+            "glm-5.1",       // missing author/ segment
+            "Z-AI/glm-5.1",  // uppercase
+            "z-ai/GLM-5.1",  // uppercase in slug
+            "z-ai/",         // empty slug segment
+            "/glm-5.1",      // empty author segment
+            "z-ai/glm/5.1",  // more than one separator
+            "-z-ai/glm-5.1", // leading punctuation
+            "z-ai-/glm-5.1", // trailing punctuation on author
+            "z-ai/glm-5.1-", // trailing punctuation on slug
+            "z-ai/.glm",     // leading punctuation on slug
+            "z ai/glm-5.1",  // space is not allowed
+        ] {
+            assert!(
+                !is_valid_openrouter_slug(slug),
+                "expected '{slug}' to be rejected"
+            );
+        }
     }
 }

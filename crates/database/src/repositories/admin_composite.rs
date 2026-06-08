@@ -91,6 +91,7 @@ impl AdminRepository for AdminCompositeRepository {
             datacenters: request.datacenters,
             is_ready: request.is_ready,
             deprecation_date: request.deprecation_date,
+            openrouter_slug: request.openrouter_slug,
             change_reason: request.change_reason,
             changed_by_user_id: request.changed_by_user_id,
             changed_by_user_email: request.changed_by_user_email,
@@ -135,6 +136,7 @@ impl AdminRepository for AdminCompositeRepository {
             datacenters: model.datacenters,
             is_ready: model.is_ready,
             deprecation_date: model.deprecation_date,
+            openrouter_slug: model.openrouter_slug,
         })
     }
 
@@ -182,6 +184,7 @@ impl AdminRepository for AdminCompositeRepository {
                 datacenters: h.datacenters,
                 is_ready: h.is_ready,
                 deprecation_date: h.deprecation_date,
+                openrouter_slug: h.openrouter_slug,
                 effective_from: h.effective_from,
                 effective_until: h.effective_until,
                 changed_by_user_id: h.changed_by_user_id,
@@ -307,7 +310,7 @@ impl AdminRepository for AdminCompositeRepository {
                           attestation_supported, input_modalities, output_modalities, inference_url,
                           datacenters, hugging_face_id, quantization, max_output_length,
                           supported_sampling_parameters, supported_features,
-                          is_ready, deprecation_date
+                          is_ready, deprecation_date, openrouter_slug
                 "#,
                 &[&deprecated_id],
             )
@@ -340,6 +343,7 @@ impl AdminRepository for AdminCompositeRepository {
                 provider_config, attestation_supported, input_modalities, output_modalities,
                 inference_url, datacenters, hugging_face_id, quantization, max_output_length,
                 supported_sampling_parameters, supported_features, is_ready, deprecation_date,
+                openrouter_slug,
                 effective_from, effective_until, changed_by_user_id,
                 changed_by_user_email, change_reason, created_at
             ) VALUES (
@@ -347,8 +351,8 @@ impl AdminRepository for AdminCompositeRepository {
                 $20, $21, $22, $23,
                 COALESCE($24, ARRAY[]::TEXT[]),
                 COALESCE($25, ARRAY[]::TEXT[]),
-                $26, $27,
-                NOW(), NULL, $28, $29, $30, NOW()
+                $26, $27, $28,
+                NOW(), NULL, $29, $30, $31, NOW()
             )
             "#,
             &[
@@ -416,6 +420,10 @@ impl AdminRepository for AdminCompositeRepository {
                     .try_get::<_, Option<chrono::DateTime<chrono::Utc>>>("deprecation_date")
                     .ok()
                     .flatten(),
+                &deprecated_row_after
+                    .try_get::<_, Option<String>>("openrouter_slug")
+                    .ok()
+                    .flatten(),
                 &changed_by_user_id,
                 &changed_by_user_email,
                 &reason,
@@ -475,6 +483,7 @@ impl AdminRepository for AdminCompositeRepository {
             datacenters: row.try_get("datacenters").ok().flatten(),
             is_ready: row.try_get("is_ready").ok().flatten(),
             deprecation_date: row.try_get("deprecation_date").ok().flatten(),
+            openrouter_slug: row.try_get("openrouter_slug").ok().flatten(),
         };
 
         let select_with_aliases_sql = r#"
@@ -487,7 +496,7 @@ impl AdminRepository for AdminCompositeRepository {
                 m.inference_url,
                 m.hugging_face_id, m.quantization, m.max_output_length,
                 m.supported_sampling_parameters, m.supported_features, m.datacenters,
-                m.is_ready, m.deprecation_date,
+                m.is_ready, m.deprecation_date, m.openrouter_slug,
                 COALESCE(
                     array_agg(ma.alias_name) FILTER (WHERE ma.alias_name IS NOT NULL),
                     '{}'
@@ -725,6 +734,7 @@ impl AdminRepository for AdminCompositeRepository {
                 datacenters: m.datacenters,
                 is_ready: m.is_ready,
                 deprecation_date: m.deprecation_date,
+                openrouter_slug: m.openrouter_slug,
             })
             .collect();
 

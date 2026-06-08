@@ -45,6 +45,11 @@ pub struct UpdateModelAdminRequest {
     /// Tri-state: `None` = leave unchanged, `Some(None)` = clear to NULL,
     /// `Some(Some(dt))` = set to `dt`.
     pub deprecation_date: Option<Option<chrono::DateTime<chrono::Utc>>>,
+    /// OpenRouter `openrouter.slug` override (validated at the route layer).
+    ///
+    /// Tri-state: `None` = leave unchanged, `Some(None)` = clear to NULL,
+    /// `Some(Some(v))` = set to `v`.
+    pub openrouter_slug: Option<Option<String>>,
     // User audit tracking for history
     pub change_reason: Option<String>,
     pub changed_by_user_id: Option<uuid::Uuid>,
@@ -95,6 +100,8 @@ pub struct ModelPricing {
     pub datacenters: Option<Vec<String>>,
     pub is_ready: Option<bool>,
     pub deprecation_date: Option<chrono::DateTime<chrono::Utc>>,
+    /// OpenRouter `openrouter.slug` override. NULL = unset.
+    pub openrouter_slug: Option<String>,
 }
 
 /// Model history entry - includes pricing, context length, and other model attributes
@@ -128,6 +135,8 @@ pub struct ModelHistoryEntry {
     pub datacenters: Option<Vec<String>>,
     pub is_ready: Option<bool>,
     pub deprecation_date: Option<chrono::DateTime<chrono::Utc>>,
+    /// OpenRouter `openrouter.slug` override the model carried at this point.
+    pub openrouter_slug: Option<String>,
     pub effective_from: chrono::DateTime<chrono::Utc>,
     pub effective_until: Option<chrono::DateTime<chrono::Utc>>,
     pub changed_by_user_id: Option<uuid::Uuid>,
@@ -250,6 +259,8 @@ pub struct AdminModelInfo {
     pub datacenters: Option<Vec<String>>,
     pub is_ready: Option<bool>,
     pub deprecation_date: Option<chrono::DateTime<chrono::Utc>>,
+    /// OpenRouter `openrouter.slug` override. NULL = unset.
+    pub openrouter_slug: Option<String>,
 }
 
 /// Active model summary used by the planned-deprecation notification workflow.

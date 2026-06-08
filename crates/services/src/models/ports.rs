@@ -77,6 +77,9 @@ pub struct ModelWithPricing {
     /// Planned deprecation date (OpenRouter `deprecation_date`, ISO 8601).
     /// NULL = no planned deprecation.
     pub deprecation_date: Option<chrono::DateTime<chrono::Utc>>,
+    /// OpenRouter `openrouter.slug` override. When set, the public API emits a
+    /// nested `openrouter: { slug: <value> }` object; NULL = unset (omitted).
+    pub openrouter_slug: Option<String>,
     /// When the model row was created — used as OpenRouter's `created` unix timestamp.
     pub created_at: chrono::DateTime<chrono::Utc>,
 }

@@ -3666,6 +3666,142 @@ mod tests {
         );
     }
 
+    // --- Characterization tests for get_signature's fetch/retry behavior over
+    // a real (mock) HTTP backend. With an IP-literal base_url the rotation path
+    // is disabled, so these exercise the general-client walk + the 404 (signing
+    // race) retry. They pin the network-facing contract the FleetRouter
+    // extraction must preserve. ---
+
+    /// Spawn a mock HTTP/1.1 backend. Each incoming request is answered with the
+    /// status at `script[request_index]` (saturating at the last entry); a 200
+    /// carries a valid `ChatSignature` JSON body. Returns the address, the
+    /// acceptor handle (abort to stop), and a counter of requests served.
+    async fn spawn_signature_mock(
+        script: Vec<u16>,
+    ) -> (
+        std::net::SocketAddr,
+        tokio::task::JoinHandle<()>,
+        Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let counter = Arc::new(AtomicUsize::new(0));
+        let counter_acc = counter.clone();
+        let handle = tokio::spawn(async move {
+            loop {
+                let (mut sock, _) = match listener.accept().await {
+                    Ok(c) => c,
+                    Err(_) => break,
+                };
+                let script = script.clone();
+                let counter_conn = counter_acc.clone();
+                tokio::spawn(async move {
+                    // Read request headers (until CRLFCRLF); we don't need the body.
+                    let mut buf = Vec::new();
+                    let mut tmp = [0u8; 1024];
+                    loop {
+                        match sock.read(&mut tmp).await {
+                            Ok(0) => return,
+                            Ok(n) => {
+                                buf.extend_from_slice(&tmp[..n]);
+                                if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                                    break;
+                                }
+                            }
+                            Err(_) => return,
+                        }
+                    }
+                    let idx = counter_conn.fetch_add(1, Ordering::SeqCst);
+                    let status = *script.get(idx).or_else(|| script.last()).unwrap_or(&404);
+                    let resp = if status == 200 {
+                        let body = serde_json::json!({
+                            "text": "req:resp",
+                            "signature": "0xsig",
+                            "signing_address": "0xabc",
+                            "signing_algo": "ecdsa",
+                        })
+                        .to_string();
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        )
+                    } else {
+                        format!("HTTP/1.1 {status} ERR\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                    };
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                    let _ = sock.flush().await;
+                });
+            }
+        });
+        (addr, handle, counter)
+    }
+
+    fn mock_provider(addr: std::net::SocketAddr) -> VLlmProvider {
+        VLlmProvider::new(VLlmConfig {
+            base_url: format!("http://{addr}"),
+            api_key: None,
+            completion_timeout_seconds: 5,
+            control_timeout_seconds: 5,
+        })
+    }
+
+    #[tokio::test]
+    async fn get_signature_returns_signature_on_200() {
+        use crate::InferenceProvider;
+        use std::sync::atomic::Ordering;
+        let (addr, handle, counter) = spawn_signature_mock(vec![200]).await;
+        let provider = mock_provider(addr);
+        let sig = provider
+            .get_signature("chat-1", Some("ecdsa".to_string()))
+            .await
+            .expect("200 should yield a signature");
+        assert_eq!(sig.signing_algo, "ecdsa");
+        assert_eq!(sig.signing_address, "0xabc");
+        assert_eq!(counter.load(Ordering::SeqCst), 1, "exactly one fetch");
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn get_signature_retries_on_404_then_succeeds() {
+        use crate::InferenceProvider;
+        use std::sync::atomic::Ordering;
+        // 404 is the signing-race signal: the first fetch misses, the retry hits.
+        let (addr, handle, counter) = spawn_signature_mock(vec![404, 200]).await;
+        let provider = mock_provider(addr);
+        let sig = provider
+            .get_signature("chat-1", Some("ecdsa".to_string()))
+            .await
+            .expect("404 then 200 should succeed on retry");
+        assert_eq!(sig.signing_algo, "ecdsa");
+        assert_eq!(counter.load(Ordering::SeqCst), 2, "one 404, then a retry");
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn get_signature_persistent_404_fails_after_bounded_retries() {
+        use crate::InferenceProvider;
+        use std::sync::atomic::Ordering;
+        // Always 404: the fetch must give up after a bounded number of attempts
+        // (1 initial + one per backoff in the schedule), not loop forever.
+        let (addr, handle, counter) = spawn_signature_mock(vec![404]).await;
+        let provider = mock_provider(addr);
+        let res = provider
+            .get_signature("chat-1", Some("ecdsa".to_string()))
+            .await;
+        assert!(res.is_err(), "persistent 404 is a definitive failure");
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            1 + super::SIGNATURE_FETCH_BACKOFFS_MS.len(),
+            "1 initial fetch + one retry per backoff entry"
+        );
+        handle.abort();
+    }
+
     #[test]
     fn signature_fetch_backoff_is_bounded_and_terminates() {
         // The signature-fetch retry runs in the hot path before `[DONE]`, so

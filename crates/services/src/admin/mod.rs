@@ -429,6 +429,7 @@ impl AdminService for AdminServiceImpl {
             datacenters: None,
             is_ready: None,
             deprecation_date: Some(Some(deprecation_date)),
+            openrouter_slug: None,
             change_reason: change_reason.or_else(|| {
                 Some(format!(
                     "Planned deprecation; recommended successor: {}",

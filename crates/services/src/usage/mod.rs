@@ -102,6 +102,23 @@ pub fn compute_token_cost(
     })
 }
 
+/// Validate the shared fields of the input-token-billed, output-less usage
+/// kinds (`embedding`, `rerank`, `score`, `privacy_classify`): a non-empty
+/// idempotency id and a positive input-token count.
+fn validate_input_only_usage(id: &str, input_tokens: i32) -> Result<(), UsageError> {
+    if id.trim().is_empty() {
+        return Err(UsageError::ValidationError(
+            "id must be a non-empty string".into(),
+        ));
+    }
+    if input_tokens <= 0 {
+        return Err(UsageError::ValidationError(
+            "input_tokens must be positive".into(),
+        ));
+    }
+    Ok(())
+}
+
 pub struct UsageServiceImpl {
     usage_repository: Arc<dyn UsageRepository>,
     model_repository: Arc<dyn ModelRepository>,
@@ -211,8 +228,9 @@ impl UsageServiceTrait for UsageServiceImpl {
             }
             ports::InferenceType::Rerank
             | ports::InferenceType::Embedding
+            | ports::InferenceType::Score
             | ports::InferenceType::PrivacyClassify => {
-                // For rerank/embedding/privacy_classify: use input tokens as the billing unit.
+                // For rerank/embedding/score/privacy_classify: use input tokens as the billing unit.
                 // Cache pricing is intentionally NOT applied, even if
                 // cache_read_cost_per_token is configured on the model.
                 // Use checked arithmetic to prevent integer overflow in billing-critical path
@@ -404,6 +422,70 @@ impl UsageServiceTrait for UsageServiceImpl {
                     0,
                     Some(*image_count),
                     InferenceType::ImageGeneration,
+                    id.clone(),
+                )
+            }
+            RecordUsageApiRequest::Embedding {
+                model,
+                input_tokens,
+                id,
+            } => {
+                validate_input_only_usage(id, *input_tokens)?;
+                (
+                    model.clone(),
+                    *input_tokens,
+                    0,
+                    0,
+                    None,
+                    InferenceType::Embedding,
+                    id.clone(),
+                )
+            }
+            RecordUsageApiRequest::Rerank {
+                model,
+                input_tokens,
+                id,
+            } => {
+                validate_input_only_usage(id, *input_tokens)?;
+                (
+                    model.clone(),
+                    *input_tokens,
+                    0,
+                    0,
+                    None,
+                    InferenceType::Rerank,
+                    id.clone(),
+                )
+            }
+            RecordUsageApiRequest::Score {
+                model,
+                input_tokens,
+                id,
+            } => {
+                validate_input_only_usage(id, *input_tokens)?;
+                (
+                    model.clone(),
+                    *input_tokens,
+                    0,
+                    0,
+                    None,
+                    InferenceType::Score,
+                    id.clone(),
+                )
+            }
+            RecordUsageApiRequest::PrivacyClassify {
+                model,
+                input_tokens,
+                id,
+            } => {
+                validate_input_only_usage(id, *input_tokens)?;
+                (
+                    model.clone(),
+                    *input_tokens,
+                    0,
+                    0,
+                    None,
+                    InferenceType::PrivacyClassify,
                     id.clone(),
                 )
             }

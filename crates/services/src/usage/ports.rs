@@ -414,6 +414,39 @@ pub enum RecordUsageApiRequest {
         /// return the existing record without double-charging.
         id: String,
     },
+    /// Input-token-billed, output-less inference. Bills
+    /// `input_tokens × input_cost_per_token` on the named model (no output
+    /// cost, no cache pricing) and differs from its siblings only in the
+    /// recorded `inference_type` label. inference-proxy reports these for
+    /// direct `sk-` requests to the matching `completions.near.ai`
+    /// endpoints — previously mislabeled as `chat_completion`, or (for
+    /// privacy classify) dropped entirely. See nearai/infra#169.
+    Embedding {
+        /// Model name to look up pricing
+        model: String,
+        /// Number of input tokens (must be positive)
+        input_tokens: i32,
+        /// External idempotency key (see [`Self::ChatCompletion`]'s `id`)
+        id: String,
+    },
+    /// Document reranking (billed like [`Self::Embedding`])
+    Rerank {
+        model: String,
+        input_tokens: i32,
+        id: String,
+    },
+    /// Text similarity scoring (billed like [`Self::Embedding`])
+    Score {
+        model: String,
+        input_tokens: i32,
+        id: String,
+    },
+    /// Privacy/PII classification (billed like [`Self::Embedding`])
+    PrivacyClassify {
+        model: String,
+        input_tokens: i32,
+        id: String,
+    },
 }
 
 /// Request to record usage (service layer)

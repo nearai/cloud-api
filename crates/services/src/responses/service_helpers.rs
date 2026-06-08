@@ -171,6 +171,8 @@ impl EventEmitter {
             part: None,
             delta: None,
             text: None,
+            error: None,
+            status_code: None,
             logprobs: None,
             obfuscation: None,
             annotation_index: None,
@@ -198,6 +200,8 @@ impl EventEmitter {
             part: None,
             delta: None,
             text: None,
+            error: None,
+            status_code: None,
             logprobs: None,
             obfuscation: None,
             annotation_index: None,
@@ -226,6 +230,8 @@ impl EventEmitter {
             part: None,
             delta: None,
             text: None,
+            error: None,
+            status_code: None,
             logprobs: None,
             obfuscation: None,
             annotation_index: None,
@@ -254,6 +260,8 @@ impl EventEmitter {
             part: None,
             delta: None,
             text: None,
+            error: None,
+            status_code: None,
             logprobs: None,
             obfuscation: None,
             annotation_index: None,
@@ -282,6 +290,8 @@ impl EventEmitter {
             part: None,
             delta: None,
             text: None,
+            error: None,
+            status_code: None,
             logprobs: None,
             obfuscation: None,
             annotation_index: None,
@@ -310,6 +320,8 @@ impl EventEmitter {
             part: Some(part),
             delta: None,
             text: None,
+            error: None,
+            status_code: None,
             logprobs: None,
             obfuscation: None,
             annotation_index: None,
@@ -338,6 +350,8 @@ impl EventEmitter {
             part: Some(part),
             delta: None,
             text: None,
+            error: None,
+            status_code: None,
             logprobs: None,
             obfuscation: None,
             annotation_index: None,
@@ -366,6 +380,8 @@ impl EventEmitter {
             part: None,
             delta: Some(delta),
             text: None,
+            error: None,
+            status_code: None,
             logprobs: Some(vec![]),
             obfuscation: None,
             annotation_index: None,
@@ -394,6 +410,8 @@ impl EventEmitter {
             part: None,
             delta: None,
             text: Some(text),
+            error: None,
+            status_code: None,
             logprobs: Some(vec![]),
             obfuscation: None,
             annotation_index: None,
@@ -422,6 +440,8 @@ impl EventEmitter {
             part: None,
             delta: None,
             text: None,
+            error: None,
+            status_code: None,
             logprobs: None,
             obfuscation: None,
             annotation_index: Some(0), // Start with index 0 for first annotation
@@ -471,6 +491,8 @@ impl EventEmitter {
             part: None,
             delta: Some(delta),
             text: None,
+            error: None,
+            status_code: None,
             logprobs: None,
             obfuscation: None,
             annotation_index: None,
@@ -570,6 +592,11 @@ pub struct ProcessStreamResult {
     /// Whether the stream terminated with an error (client disconnect, network error, etc.)
     /// When true, the response may be incomplete and the agent loop should stop.
     pub stream_error: bool,
+    /// Typed error cause when the provider stream failed.
+    ///
+    /// Client disconnects and local event-emitter failures do not carry a cause
+    /// and should continue to surface as `StreamInterrupted`.
+    pub stream_error_cause: Option<errors::ResponseError>,
 }
 
 /// Entry for accumulated tool call data from streaming chunks

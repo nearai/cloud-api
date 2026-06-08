@@ -19,6 +19,16 @@ fn chat_request(model: &str, stream: bool) -> serde_json::Value {
     })
 }
 
+/// Helper to create a standard responses request body
+fn responses_request(model: &str, stream: bool) -> serde_json::Value {
+    serde_json::json!({
+        "model": model,
+        "input": "Hello",
+        "stream": stream,
+        "max_output_tokens": 10
+    })
+}
+
 // ============================================
 // Provider error propagation tests (vLLM-style, is_external: false)
 // ============================================
@@ -96,6 +106,160 @@ async fn test_provider_error_429_propagated() {
 
     let err = response.json::<api::models::ErrorResponse>();
     assert_eq!(err.error.r#type, "rate_limit_exceeded");
+}
+
+/// Test that the non-streaming Responses API propagates provider 429s as HTTP 429
+/// instead of returning HTTP 200 with status=failed.
+#[tokio::test]
+async fn test_responses_provider_error_429_propagated_non_streaming() {
+    let (server, _pool, mock_provider, _db) = setup_test_server_with_pool().await;
+    setup_qwen_model(&server).await;
+    let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
+    let api_key = get_api_key_for_org(&server, org.id).await;
+
+    mock_provider
+        .set_error_override(Some(inference_providers::CompletionError::HttpError {
+            status_code: 429,
+            message: "Too many requests".to_string(),
+            is_external: false,
+        }))
+        .await;
+
+    let response = server
+        .post("/v1/responses")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .json(&responses_request(
+            "Qwen/Qwen3-30B-A3B-Instruct-2507",
+            false,
+        ))
+        .await;
+
+    assert_eq!(
+        response.status_code(),
+        429,
+        "Expected 429 Too Many Requests, got {}",
+        response.status_code()
+    );
+
+    let err = response.json::<api::models::ErrorResponse>();
+    assert_eq!(err.error.r#type, "rate_limit_exceeded");
+}
+
+/// Test that the non-streaming Responses API propagates 429s emitted by an
+/// already-created provider stream instead of treating them as generic stream
+/// interruptions.
+#[tokio::test]
+async fn test_responses_stream_error_429_propagated_non_streaming() {
+    let (server, _pool, mock_provider, _db) = setup_test_server_with_pool().await;
+    setup_qwen_model(&server).await;
+    let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
+    let api_key = get_api_key_for_org(&server, org.id).await;
+
+    mock_provider
+        .set_stream_error_override(Some(inference_providers::CompletionError::HttpError {
+            status_code: 429,
+            message: "Too many requests".to_string(),
+            is_external: false,
+        }))
+        .await;
+
+    let response = server
+        .post("/v1/responses")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .json(&responses_request(
+            "Qwen/Qwen3-30B-A3B-Instruct-2507",
+            false,
+        ))
+        .await;
+
+    assert_eq!(
+        response.status_code(),
+        429,
+        "Expected 429 Too Many Requests, got {}",
+        response.status_code()
+    );
+
+    let err = response.json::<api::models::ErrorResponse>();
+    assert_eq!(err.error.r#type, "rate_limit_exceeded");
+}
+
+/// Test that provider stream errors after partial output are still propagated
+/// instead of being converted to a completed 200 response with partial content.
+#[tokio::test]
+async fn test_responses_partial_output_then_stream_error_429_non_streaming() {
+    let (server, _pool, mock_provider, _db) = setup_test_server_with_pool().await;
+    setup_qwen_model(&server).await;
+    let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
+    let api_key = get_api_key_for_org(&server, org.id).await;
+
+    mock_provider
+        .set_default_response(
+            inference_providers::mock::ResponseTemplate::new("partial output")
+                .with_stream_error_after(
+                    1,
+                    inference_providers::CompletionError::HttpError {
+                        status_code: 429,
+                        message: "Too many requests".to_string(),
+                        is_external: false,
+                    },
+                ),
+        )
+        .await;
+
+    let response = server
+        .post("/v1/responses")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .json(&responses_request(
+            "Qwen/Qwen3-30B-A3B-Instruct-2507",
+            false,
+        ))
+        .await;
+
+    assert_eq!(
+        response.status_code(),
+        429,
+        "Expected 429 Too Many Requests, got {}",
+        response.status_code()
+    );
+
+    let err = response.json::<api::models::ErrorResponse>();
+    assert_eq!(err.error.r#type, "rate_limit_exceeded");
+}
+
+/// Test that initial inference failures in non-streaming Responses API surface
+/// as HTTP errors rather than fallback ResponseObjects with status=failed.
+#[tokio::test]
+async fn test_responses_missing_model_returns_http_error_non_streaming() {
+    let (server, _pool, _mock_provider, _db) = setup_test_server_with_pool().await;
+    let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
+    let api_key = get_api_key_for_org(&server, org.id).await;
+
+    let response = server
+        .post("/v1/responses")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .json(&responses_request(
+            "non-existent-model-for-responses-error-test",
+            false,
+        ))
+        .await;
+
+    assert_eq!(
+        response.status_code(),
+        400,
+        "Expected 400 Bad Request, got {}",
+        response.status_code()
+    );
+
+    let err = response.json::<api::models::ErrorResponse>();
+    assert_eq!(err.error.r#type, "invalid_request_error");
+    assert_eq!(err.error.param.as_deref(), Some("model"));
+    assert!(
+        err.error
+            .message
+            .contains("non-existent-model-for-responses-error-test"),
+        "Error should mention the invalid model. Got: {}",
+        err.error.message
+    );
 }
 
 /// Test that a 500 error from the provider is mapped to 502 Bad Gateway

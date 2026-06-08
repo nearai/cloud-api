@@ -937,4 +937,37 @@ mod tests {
         let domain: ChatCompletionParams = many.into();
         assert_eq!(domain.stop, Some(vec!["a".to_string(), "b".to_string()]));
     }
+
+    /// The mechanistic-interpretability workflow sends `return_hidden_states`
+    /// / `layers` on the chat-completions request. We deliberately do NOT
+    /// model these as typed fields: they ride the flattened `extra` catch-all
+    /// on both `ChatCompletionRequest` and `ChatCompletionParams`, so they
+    /// survive the request -> params conversion and serialize back out to the
+    /// backend verbatim (vLLM/sglang reads them directly). This is the request
+    /// half of hidden-state passthrough; the response half is covered by the
+    /// per-choice / delta catch-alls in `inference_providers::models`.
+    #[test]
+    fn return_hidden_states_request_fields_pass_through_to_backend() {
+        let req: ChatCompletionRequest = serde_json::from_str(
+            r#"{"model":"sglang-model","messages":[],"return_hidden_states":true,"layers":[0,5,11]}"#,
+        )
+        .unwrap();
+
+        let params: ChatCompletionParams = req.into();
+
+        // Land in the catch-all that is serialized straight to the backend.
+        assert_eq!(
+            params.extra.get("return_hidden_states"),
+            Some(&serde_json::json!(true))
+        );
+        assert_eq!(
+            params.extra.get("layers"),
+            Some(&serde_json::json!([0, 5, 11]))
+        );
+
+        // And survive serialization of the outgoing backend request body.
+        let wire = serde_json::to_value(&params).unwrap();
+        assert_eq!(wire["return_hidden_states"], serde_json::json!(true));
+        assert_eq!(wire["layers"], serde_json::json!([0, 5, 11]));
+    }
 }

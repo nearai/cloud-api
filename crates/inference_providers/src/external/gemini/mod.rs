@@ -91,6 +91,7 @@ fn convert_to_openai_response(
             logprobs: None,
             finish_reason,
             token_ids: None,
+            extra: Default::default(),
         }],
         service_tier: None,
         system_fingerprint: None,
@@ -103,6 +104,7 @@ fn convert_to_openai_response(
         prompt_logprobs: None,
         prompt_token_ids: None,
         kv_transfer_params: None,
+        extra: Default::default(),
     })
 }
 

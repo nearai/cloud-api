@@ -148,6 +148,54 @@ impl UsageServiceTrait for MockUsageService {
                     Some(*image_count),
                     InferenceType::ImageGeneration,
                 ),
+                RecordUsageApiRequest::Embedding {
+                    model,
+                    input_tokens,
+                    ..
+                } => (
+                    model.clone(),
+                    *input_tokens,
+                    0,
+                    0,
+                    None,
+                    InferenceType::Embedding,
+                ),
+                RecordUsageApiRequest::Rerank {
+                    model,
+                    input_tokens,
+                    ..
+                } => (
+                    model.clone(),
+                    *input_tokens,
+                    0,
+                    0,
+                    None,
+                    InferenceType::Rerank,
+                ),
+                RecordUsageApiRequest::Score {
+                    model,
+                    input_tokens,
+                    ..
+                } => (
+                    model.clone(),
+                    *input_tokens,
+                    0,
+                    0,
+                    None,
+                    InferenceType::Score,
+                ),
+                RecordUsageApiRequest::PrivacyClassify {
+                    model,
+                    input_tokens,
+                    ..
+                } => (
+                    model.clone(),
+                    *input_tokens,
+                    0,
+                    0,
+                    None,
+                    InferenceType::PrivacyClassify,
+                ),
             };
         Ok(UsageLogEntry {
             id: Uuid::new_v4(),
@@ -338,6 +386,54 @@ impl UsageServiceTrait for CapturingUsageService {
                     0,
                     Some(*image_count),
                     InferenceType::ImageGeneration,
+                ),
+                RecordUsageApiRequest::Embedding {
+                    model,
+                    input_tokens,
+                    ..
+                } => (
+                    model.clone(),
+                    *input_tokens,
+                    0,
+                    0,
+                    None,
+                    InferenceType::Embedding,
+                ),
+                RecordUsageApiRequest::Rerank {
+                    model,
+                    input_tokens,
+                    ..
+                } => (
+                    model.clone(),
+                    *input_tokens,
+                    0,
+                    0,
+                    None,
+                    InferenceType::Rerank,
+                ),
+                RecordUsageApiRequest::Score {
+                    model,
+                    input_tokens,
+                    ..
+                } => (
+                    model.clone(),
+                    *input_tokens,
+                    0,
+                    0,
+                    None,
+                    InferenceType::Score,
+                ),
+                RecordUsageApiRequest::PrivacyClassify {
+                    model,
+                    input_tokens,
+                    ..
+                } => (
+                    model.clone(),
+                    *input_tokens,
+                    0,
+                    0,
+                    None,
+                    InferenceType::PrivacyClassify,
                 ),
             };
         Ok(UsageLogEntry {

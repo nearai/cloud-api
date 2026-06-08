@@ -235,12 +235,6 @@ pub struct VLlmProvider {
     /// the rotation-SNI fallback path so the fingerprint pin set stays
     /// consistent with the bucket clients.
     tls_roots: SharedTlsRoots,
-    /// Pre-parsed rotation parts derived from `config.base_url` at
-    /// construction time, so we don't reparse on every retry. `None` for
-    /// URLs that don't fit the rotation scheme (one-label host, IP literal,
-    /// etc.) — in that case the rotation fallback is a no-op and the
-    /// canonical-SNI error propagates as before.
-    rotation_parts: Option<crate::rotation::UrlParts>,
 }
 
 impl VLlmProvider {
@@ -393,11 +387,10 @@ impl VLlmProvider {
             verification_semaphore,
             bucket_clients,
             prefix_router,
-            fleet: FleetRouter::new(),
+            fleet: FleetRouter::new(rotation_parts),
             fingerprint_state,
             backend_verifier,
             tls_roots,
-            rotation_parts,
         }
     }
 
@@ -842,28 +835,6 @@ impl VLlmProvider {
         status_code == 408 || status_code == 429 || (500..=599).contains(&status_code)
     }
 
-    /// Healthy backend count clamped to the rotation fan-out cap. Returns 0
-    /// when rotation is disabled (URL doesn't fit the rotation scheme, or
-    /// discovery hasn't reported a count yet) — callers use that as the
-    /// signal to skip the rotation fallback and propagate the original error.
-    fn rotation_count(&self) -> usize {
-        if self.rotation_parts.is_none() {
-            return 0;
-        }
-        self.fleet.backend_count().min(crate::rotation::MAX_FANOUT)
-    }
-
-    /// Build the absolute URL `https://<canonical>-i<index>.<base><path>` for
-    /// a rotation attempt at the given backend index. Returns `None` only if
-    /// rotation parts are missing — callers should already have filtered via
-    /// `rotation_count() > 0`.
-    fn rotation_url(&self, index: u64, path: &str) -> Option<String> {
-        let parts = self.rotation_parts.as_ref()?;
-        let mut url = crate::rotation::rotation_base_url(parts, index)?;
-        url.set_path(path);
-        Some(url.to_string())
-    }
-
     /// Build a one-shot reqwest client used for a single rotation-SNI
     /// attempt. We disable connection pooling (`pool_max_idle_per_host(0)`)
     /// so a follow-up attempt at index N+1 can't accidentally reuse the
@@ -898,7 +869,7 @@ impl VLlmProvider {
         timeout: Duration,
         canonical_err: CompletionError,
     ) -> Result<ChatCompletionResponseWithBytes, CompletionError> {
-        let count = self.rotation_count();
+        let count = self.fleet.rotation_count();
         // `last_error` tracks only HttpError-shaped failures so the pool's
         // `classify_retry_decision` sees a typed `retryable_http_5xx` (or
         // 429) at the end. Transport-level failures from the rotation loop
@@ -910,7 +881,7 @@ impl VLlmProvider {
         // `retryable_connection_keyword`.
         let mut last_error = canonical_err;
         for index in 0..count as u64 {
-            let url = match self.rotation_url(index, "/v1/chat/completions") {
+            let url = match self.fleet.rotation_url(index, "/v1/chat/completions") {
                 Some(u) => u,
                 None => continue,
             };
@@ -1023,7 +994,7 @@ impl VLlmProvider {
         request_hash: &str,
         canonical_err: CompletionError,
     ) -> Result<StreamingResult, CompletionError> {
-        let count = self.rotation_count();
+        let count = self.fleet.rotation_count();
         // See the non-streaming sibling for the design: `last_error` only
         // tracks HttpError-shaped failures from rotation indices, so the
         // pool's `classify_retry_decision` sees the right `retryable_http_*`
@@ -1034,7 +1005,7 @@ impl VLlmProvider {
         // construction).
         let mut last_error = canonical_err;
         for index in 0..count as u64 {
-            let url = match self.rotation_url(index, "/v1/chat/completions") {
+            let url = match self.fleet.rotation_url(index, "/v1/chat/completions") {
                 Some(u) => u,
                 None => continue,
             };
@@ -1197,7 +1168,7 @@ impl InferenceProvider for VLlmProvider {
             .get(chat_id)
             .copied();
         let rotation_target = rotation_index.and_then(|index| {
-            let base = self.rotation_url(index, "")?;
+            let base = self.fleet.rotation_url(index, "")?;
             let url = format!("{}{}", base.trim_end_matches('/'), path_and_query);
             let client = self.build_rotation_client().ok()?;
             Some((index, url, client))
@@ -1564,7 +1535,7 @@ impl InferenceProvider for VLlmProvider {
         // through the route layer's `sse_error_frame` path (PR #629) and
         // happy-path streams return HTTP 200 as soon as the headers arrive.
         match canonical_send {
-            Ok(response) if self.rotation_count() == 0 => {
+            Ok(response) if self.fleet.rotation_count() == 0 => {
                 self.fleet
                     .pending_buckets
                     .lock()
@@ -1608,7 +1579,7 @@ impl InferenceProvider for VLlmProvider {
             Err(canonical_err) => match &canonical_err {
                 CompletionError::HttpError { status_code, .. }
                     if Self::is_rotation_retryable_status(*status_code)
-                        && self.rotation_count() > 0 =>
+                        && self.fleet.rotation_count() > 0 =>
                 {
                     self.try_chat_completion_stream_rotation(
                         &streaming_params,
@@ -1718,7 +1689,7 @@ impl InferenceProvider for VLlmProvider {
             // pooling disabled on the rotation client, every attempt lands
             // on a distinct backend. If one is healthy, the request succeeds
             // and we record the index for signature retrieval.
-            if Self::is_rotation_retryable_status(status_code) && self.rotation_count() > 0 {
+            if Self::is_rotation_retryable_status(status_code) && self.fleet.rotation_count() > 0 {
                 return self
                     .try_chat_completion_rotation(
                         &non_streaming_params,
@@ -3431,11 +3402,14 @@ mod tests {
         let provider = create_test_provider();
         provider.set_backend_count(5);
         assert_eq!(
-            provider.rotation_count(),
+            provider.fleet.rotation_count(),
             0,
             "rotation must stay disabled for URLs that don't fit the <canonical>.<multi-label-base> shape"
         );
-        assert!(provider.rotation_url(0, "/v1/chat/completions").is_none());
+        assert!(provider
+            .fleet
+            .rotation_url(0, "/v1/chat/completions")
+            .is_none());
     }
 
     #[test]
@@ -3447,11 +3421,13 @@ mod tests {
             control_timeout_seconds: 30,
         });
         provider.set_backend_count(3);
-        assert_eq!(provider.rotation_count(), 3);
+        assert_eq!(provider.fleet.rotation_count(), 3);
         let url0 = provider
+            .fleet
             .rotation_url(0, "/v1/chat/completions")
             .expect("rotation URL build");
         let url2 = provider
+            .fleet
             .rotation_url(2, "/v1/chat/completions")
             .expect("rotation URL build");
         assert_eq!(
@@ -3476,7 +3452,7 @@ mod tests {
             control_timeout_seconds: 30,
         });
         provider.set_backend_count(10_000);
-        assert_eq!(provider.rotation_count(), crate::rotation::MAX_FANOUT);
+        assert_eq!(provider.fleet.rotation_count(), crate::rotation::MAX_FANOUT);
     }
 
     #[test]
@@ -3490,7 +3466,7 @@ mod tests {
             completion_timeout_seconds: 30,
             control_timeout_seconds: 30,
         });
-        assert_eq!(provider.rotation_count(), 0);
+        assert_eq!(provider.fleet.rotation_count(), 0);
     }
 
     #[test]

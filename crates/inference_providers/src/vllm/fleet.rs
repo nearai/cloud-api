@@ -11,6 +11,7 @@
 //! verbatim logic previously inlined on `VLlmProvider`, guarded by the
 //! characterization tests in the parent module.
 
+use crate::rotation;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard};
@@ -36,11 +37,39 @@ pub(super) struct FleetRouter {
     /// Most recent healthy backend count reported by discovery; bounds the
     /// rotation-SNI fan-out. Read with `Relaxed` (best-effort).
     pub(super) last_backend_count: AtomicUsize,
+    /// Pre-parsed rotation parts from the provider's base_url. `None` for URLs
+    /// that don't fit the rotation scheme (one-label host, IP literal, …) — then
+    /// rotation is a no-op and the canonical-SNI error propagates as before.
+    rotation_parts: Option<rotation::UrlParts>,
 }
 
 impl FleetRouter {
-    pub(super) fn new() -> Self {
-        Self::default()
+    pub(super) fn new(rotation_parts: Option<rotation::UrlParts>) -> Self {
+        Self {
+            rotation_parts,
+            ..Self::default()
+        }
+    }
+
+    /// Number of rotation-SNI indices to fan out across, clamped to the
+    /// fan-out cap. `0` when rotation is disabled (no rotation parts) or
+    /// discovery hasn't reported a backend count yet — the signal to skip the
+    /// rotation path and propagate the canonical error.
+    pub(super) fn rotation_count(&self) -> usize {
+        if self.rotation_parts.is_none() {
+            return 0;
+        }
+        self.backend_count().min(rotation::MAX_FANOUT)
+    }
+
+    /// Build the absolute URL `https://<canonical>-i<index>.<base><path>` for a
+    /// rotation attempt at the given backend index. `None` only when rotation
+    /// parts are missing — callers should have filtered via `rotation_count()`.
+    pub(super) fn rotation_url(&self, index: u64, path: &str) -> Option<String> {
+        let parts = self.rotation_parts.as_ref()?;
+        let mut url = rotation::rotation_base_url(parts, index)?;
+        url.set_path(path);
+        Some(url.to_string())
     }
 
     /// Promote the pre-chat_id mappings (keyed by request_hash) onto the

@@ -417,11 +417,15 @@ fn convert_chat_request_to_service(
 /// detector + rewrite messages in place. Returns the placeholder map for
 /// downstream un-redact; an empty map is also returned when auto-redact is
 /// off.
+/// The tuple is `(requested, map, classify_input_tokens)`. `classify_input_tokens`
+/// is the number of tokens the privacy-filter billed for the classify pass,
+/// for the caller to charge (nearai/cloud-api#602); it is 0 when auto-redact
+/// is off or there was nothing to classify.
 async fn maybe_redact(
     headers: &header::HeaderMap,
     service_request: &mut ServiceCompletionRequest,
     pool: &services::inference_provider_pool::InferenceProviderPool,
-) -> Result<(bool, RedactionMap), AutoRedactError> {
+) -> Result<(bool, RedactionMap, i64), AutoRedactError> {
     let header_values: Vec<&str> = headers
         .get_all(auto_redact::AUTO_REDACT_HEADER)
         .iter()
@@ -437,16 +441,16 @@ async fn maybe_redact(
     auto_redact::strip_body_field(&mut service_request.extra);
 
     if !enabled {
-        return Ok((false, RedactionMap::new()));
+        return Ok((false, RedactionMap::new(), 0));
     }
 
-    let map = auto_redact::redact_messages(
+    let (map, classify_tokens) = auto_redact::redact_messages(
         &mut service_request.messages,
         auto_redact::DEFAULT_PII_MODEL,
         pool,
     )
     .await?;
-    Ok((true, map))
+    Ok((true, map, classify_tokens))
 }
 
 /// Convert an [`AutoRedactError`] into the user-facing error response.
@@ -476,6 +480,104 @@ fn auto_redact_error_response(err: AutoRedactError) -> Response {
             )
                 .into_response()
         }
+    }
+}
+
+/// Upper bound on the spawned auto-redact billing task so a stuck billing DB
+/// or model lookup can't leak a background task indefinitely.
+const AUTO_REDACT_BILL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Record usage for the privacy-filter classify pass that auto-redact runs
+/// before a completion (nearai/cloud-api#602). The classify is a real
+/// inference call to the PII model, so it is billed like an explicit
+/// `/v1/privacy/classify`: `input_tokens × input_rate` on the privacy-filter
+/// model, one record per request (a fresh v4 id, matching the explicit
+/// privacy endpoints).
+///
+/// Best-effort: a model-lookup or record failure is logged and swallowed so
+/// it never fails the user's completion (which bills separately via
+/// `InterceptStream`). The classify already happened and cost GPU time, so
+/// it is billed even if the downstream completion later fails.
+async fn bill_auto_redact_classify(
+    app_state: &AppState,
+    api_key: &crate::middleware::auth::AuthenticatedApiKey,
+    classify_tokens: i64,
+) {
+    if classify_tokens <= 0 {
+        return; // nothing to bill
+    }
+    // Cap an anomalous count at the same `MAX_REASONABLE_TOKENS` the explicit
+    // `/v1/privacy/{classify,redact}` paths use, emitting the same anomaly
+    // metric — so x-auto-redact (which shares the privacy-filter classify
+    // call) can't massively overcharge on a buggy/malicious provider response
+    // instead of just clamping to i32::MAX. See nearai/cloud-api#602 review.
+    const MAX_REASONABLE_TOKENS: i32 = 1_000_000;
+    let input_tokens = if classify_tokens > MAX_REASONABLE_TOKENS as i64 {
+        tracing::error!(
+            token_count = classify_tokens,
+            max_expected = MAX_REASONABLE_TOKENS,
+            model = auto_redact::DEFAULT_PII_MODEL,
+            "auto_redact: provider returned unreasonable classify token count - capping"
+        );
+        let model_tag = format!("model:{}", auto_redact::DEFAULT_PII_MODEL);
+        let reason_tag = format!(
+            "reason:{}",
+            services::metrics::consts::REASON_TOKEN_OVERFLOW
+        );
+        app_state.metrics_service.record_count(
+            services::metrics::consts::METRIC_PROVIDER_TOKEN_ANOMALIES,
+            1,
+            &[model_tag.as_str(), reason_tag.as_str()],
+        );
+        MAX_REASONABLE_TOKENS
+    } else {
+        classify_tokens as i32 // safe: 0 < classify_tokens <= 1_000_000
+    };
+
+    let model = match app_state
+        .models_service
+        .get_model_by_name(auto_redact::DEFAULT_PII_MODEL)
+        .await
+    {
+        Ok(model) => model,
+        Err(e) => {
+            tracing::error!(
+                error = %e,
+                model = auto_redact::DEFAULT_PII_MODEL,
+                "auto_redact: could not resolve PII model; classify usage not recorded"
+            );
+            return;
+        }
+    };
+
+    let api_key_id = match Uuid::parse_str(&api_key.api_key.id.0) {
+        Ok(id) => id,
+        Err(e) => {
+            tracing::error!(error = %e, "auto_redact: invalid API key id; classify usage not recorded");
+            return;
+        }
+    };
+
+    let usage_request = services::usage::RecordUsageServiceRequest {
+        organization_id: api_key.organization.id.0,
+        workspace_id: api_key.workspace.id.0,
+        api_key_id,
+        model_id: model.id,
+        input_tokens,
+        output_tokens: 0,
+        cache_read_tokens: 0,
+        inference_type: services::usage::ports::InferenceType::PrivacyClassify,
+        ttft_ms: None,
+        avg_itl_ms: None,
+        inference_id: Some(Uuid::new_v4()),
+        provider_request_id: None,
+        stop_reason: Some(services::usage::StopReason::Completed),
+        response_id: None,
+        image_count: None,
+    };
+
+    if let Err(e) = app_state.usage_service.record_usage(usage_request).await {
+        tracing::error!(error = %e, "auto_redact: failed to record classify usage");
     }
 }
 
@@ -807,6 +909,7 @@ fn build_flush_chunks(states: &mut StreamUnredactStates, template: &ChunkTemplat
             usage: None,
             prompt_token_ids: None,
             modality: None,
+            extra: Default::default(),
         };
         if let Ok(s) = serde_json::to_string(&chunk) {
             out.push(Bytes::from(format!("data: {s}\n\n")));
@@ -868,6 +971,7 @@ fn build_flush_chunks(states: &mut StreamUnredactStates, template: &ChunkTemplat
             usage: None,
             prompt_token_ids: None,
             modality: None,
+            extra: Default::default(),
         };
         if let Ok(s) = serde_json::to_string(&chunk) {
             out.push(Bytes::from(format!("data: {s}\n\n")));
@@ -1094,7 +1198,7 @@ async fn chat_completions_inner(
     // Auto-redact (opt-in via x-auto-redact header or auto_redact body field).
     // On success this may rewrite service_request.messages to substitute
     // placeholders for PII; the returned map drives the response un-redact.
-    let (auto_redact_requested, redaction_map) = match maybe_redact(
+    let (auto_redact_requested, redaction_map, auto_redact_classify_tokens) = match maybe_redact(
         &headers,
         &mut service_request,
         &app_state.inference_provider_pool,
@@ -1104,6 +1208,27 @@ async fn chat_completions_inner(
         Ok(out) => out,
         Err(e) => return auto_redact_error_response(e),
     };
+    // Bill the privacy-filter classify pass that auto-redact ran (it is a
+    // real inference call to the PII model). Charged like an explicit
+    // `/v1/privacy/classify`. Spawned (not awaited) and time-bounded so a
+    // slow/exhausted billing DB or model lookup can never stall the user's
+    // completion before dispatch — the classify already succeeded, and the
+    // chat bills separately via InterceptStream. See nearai/cloud-api#602.
+    if auto_redact_requested {
+        let app_state = app_state.clone();
+        let api_key = api_key.clone();
+        tokio::spawn(async move {
+            if tokio::time::timeout(
+                AUTO_REDACT_BILL_TIMEOUT,
+                bill_auto_redact_classify(&app_state, &api_key, auto_redact_classify_tokens),
+            )
+            .await
+            .is_err()
+            {
+                tracing::error!("auto_redact: classify billing timed out; usage not recorded");
+            }
+        });
+    }
     // Treat auto-redact as effectively *enabled* only when the detector
     // actually minted placeholders. A request that opts in but contains no
     // PII has nothing to substitute, so we skip the response re-serialize
@@ -2306,6 +2431,7 @@ mod tests {
             usage: None,
             prompt_token_ids: None,
             modality: None,
+            extra: Default::default(),
         })
     }
 
@@ -2380,6 +2506,7 @@ mod tests {
             usage: None,
             prompt_token_ids: None,
             modality: None,
+            extra: Default::default(),
         })
     }
 
@@ -2600,6 +2727,7 @@ mod tests {
             usage: Some(inference_providers::models::TokenUsage::new(10, 5)),
             prompt_token_ids: None,
             modality: None,
+            extra: Default::default(),
         };
 
         let stream_chunk = inference_providers::StreamChunk::Chat(chunk.clone());

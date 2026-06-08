@@ -2261,6 +2261,7 @@ mod tests {
                 prompt_token_ids: None,
                 system_fingerprint: None,
                 modality: None,
+                extra: Default::default(),
             })),
             raw_passthrough: true,
         }

@@ -643,3 +643,81 @@ async fn auto_redact_unredacts_tool_call_arguments() {
         "placeholder should be swapped back; got {args}"
     );
 }
+
+/// x-auto-redact bills the privacy-filter classify pass it runs before the
+/// completion (nearai/cloud-api#602). The mock privacy filter reports 10
+/// input tokens per fragment; one user message => one fragment => one
+/// `privacy_classify` usage row with 10 input tokens (the test model is
+/// priced at 0, so the dollar amount is 0 — we assert the metered row, not
+/// the price).
+#[tokio::test]
+async fn auto_redact_bills_classify_pass() {
+    let (server, _pool, mock_provider, db) = setup_test_server_with_pool().await;
+    setup_qwen_model(&server).await;
+    setup_privacy_filter_model(&server).await;
+    let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
+    let api_key = get_api_key_for_org(&server, org.id.clone()).await;
+
+    mock_provider
+        .set_default_response(inference_providers::mock::ResponseTemplate::new("Done."))
+        .await;
+
+    let resp = server
+        .post("/v1/chat/completions")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .add_header("User-Agent", MOCK_USER_AGENT)
+        .add_header("x-auto-redact", "on")
+        .json(&serde_json::json!({
+            "model": E2E_QWEN_MODEL_NAME,
+            "messages": [{
+                "role": "user",
+                "content": "Please reach out to alice@example.com"
+            }],
+        }))
+        .await;
+    assert_eq!(
+        resp.status_code(),
+        200,
+        "chat should succeed: {}",
+        resp.text()
+    );
+
+    // Exactly one privacy_classify row should be billed for the inline
+    // classify pass, carrying the mock's 10 input tokens and no output.
+    // Billing runs on a spawned background task, so poll (bounded) until the
+    // row lands rather than querying once.
+    let org_uuid = uuid::Uuid::parse_str(&org.id).expect("org id is a uuid");
+    let pool = db.pool();
+    let mut rows = Vec::new();
+    for _ in 0..40 {
+        let client = pool.get().await.expect("db connection");
+        rows = client
+            .query(
+                "SELECT input_tokens, output_tokens, model_name \
+                 FROM organization_usage_log \
+                 WHERE organization_id = $1 AND inference_type = 'privacy_classify'",
+                &[&org_uuid],
+            )
+            .await
+            .expect("query privacy_classify usage");
+        if !rows.is_empty() {
+            break;
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+    }
+
+    assert_eq!(
+        rows.len(),
+        1,
+        "expected exactly one privacy_classify usage row for the auto-redact classify pass"
+    );
+    let input_tokens: i32 = rows[0].get("input_tokens");
+    let output_tokens: i32 = rows[0].get("output_tokens");
+    let model_name: String = rows[0].get("model_name");
+    assert_eq!(
+        input_tokens, 10,
+        "mock privacy filter reports 10 tokens/fragment"
+    );
+    assert_eq!(output_tokens, 0, "classify has no output tokens");
+    assert_eq!(model_name, "openai/privacy-filter");
+}

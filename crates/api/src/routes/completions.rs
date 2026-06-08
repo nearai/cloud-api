@@ -417,11 +417,15 @@ fn convert_chat_request_to_service(
 /// detector + rewrite messages in place. Returns the placeholder map for
 /// downstream un-redact; an empty map is also returned when auto-redact is
 /// off.
+/// The tuple is `(requested, map, classify_input_tokens)`. `classify_input_tokens`
+/// is the number of tokens the privacy-filter billed for the classify pass,
+/// for the caller to charge (nearai/cloud-api#602); it is 0 when auto-redact
+/// is off or there was nothing to classify.
 async fn maybe_redact(
     headers: &header::HeaderMap,
     service_request: &mut ServiceCompletionRequest,
     pool: &services::inference_provider_pool::InferenceProviderPool,
-) -> Result<(bool, RedactionMap), AutoRedactError> {
+) -> Result<(bool, RedactionMap, i64), AutoRedactError> {
     let header_values: Vec<&str> = headers
         .get_all(auto_redact::AUTO_REDACT_HEADER)
         .iter()
@@ -437,16 +441,16 @@ async fn maybe_redact(
     auto_redact::strip_body_field(&mut service_request.extra);
 
     if !enabled {
-        return Ok((false, RedactionMap::new()));
+        return Ok((false, RedactionMap::new(), 0));
     }
 
-    let map = auto_redact::redact_messages(
+    let (map, classify_tokens) = auto_redact::redact_messages(
         &mut service_request.messages,
         auto_redact::DEFAULT_PII_MODEL,
         pool,
     )
     .await?;
-    Ok((true, map))
+    Ok((true, map, classify_tokens))
 }
 
 /// Convert an [`AutoRedactError`] into the user-facing error response.
@@ -476,6 +480,75 @@ fn auto_redact_error_response(err: AutoRedactError) -> Response {
             )
                 .into_response()
         }
+    }
+}
+
+/// Record usage for the privacy-filter classify pass that auto-redact runs
+/// before a completion (nearai/cloud-api#602). The classify is a real
+/// inference call to the PII model, so it is billed like an explicit
+/// `/v1/privacy/classify`: `input_tokens × input_rate` on the privacy-filter
+/// model, one record per request (a fresh v4 id, matching the explicit
+/// privacy endpoints).
+///
+/// Best-effort: a model-lookup or record failure is logged and swallowed so
+/// it never fails the user's completion (which bills separately via
+/// `InterceptStream`). The classify already happened and cost GPU time, so
+/// it is billed even if the downstream completion later fails.
+async fn bill_auto_redact_classify(
+    app_state: &AppState,
+    api_key: &crate::middleware::auth::AuthenticatedApiKey,
+    classify_tokens: i64,
+) {
+    let input_tokens = match i32::try_from(classify_tokens) {
+        Ok(t) if t > 0 => t,
+        // 0 (or, defensively, negative/overflow) means nothing to bill.
+        _ => return,
+    };
+
+    let model = match app_state
+        .models_service
+        .get_model_by_name(auto_redact::DEFAULT_PII_MODEL)
+        .await
+    {
+        Ok(model) => model,
+        Err(e) => {
+            tracing::error!(
+                error = %e,
+                model = auto_redact::DEFAULT_PII_MODEL,
+                "auto_redact: could not resolve PII model; classify usage not recorded"
+            );
+            return;
+        }
+    };
+
+    let api_key_id = match Uuid::parse_str(&api_key.api_key.id.0) {
+        Ok(id) => id,
+        Err(e) => {
+            tracing::error!(error = %e, "auto_redact: invalid API key id; classify usage not recorded");
+            return;
+        }
+    };
+
+    let usage_request = services::usage::RecordUsageServiceRequest {
+        organization_id: api_key.organization.id.0,
+        workspace_id: api_key.workspace.id.0,
+        api_key_id,
+        model_id: model.id,
+        input_tokens,
+        output_tokens: 0,
+        cache_read_tokens: 0,
+        inference_type: services::usage::ports::InferenceType::PrivacyClassify,
+        ttft_ms: None,
+        avg_itl_ms: None,
+        inference_id: Some(Uuid::new_v4()),
+        provider_request_id: None,
+        stop_reason: Some(services::usage::StopReason::Completed),
+        response_id: None,
+        image_count: None,
+    };
+
+    if let Err(e) = app_state.usage_service.record_usage(usage_request).await {
+        tracing::error!(error = %e, "auto_redact: failed to record classify usage");
     }
 }
 
@@ -1094,7 +1167,7 @@ async fn chat_completions_inner(
     // Auto-redact (opt-in via x-auto-redact header or auto_redact body field).
     // On success this may rewrite service_request.messages to substitute
     // placeholders for PII; the returned map drives the response un-redact.
-    let (auto_redact_requested, redaction_map) = match maybe_redact(
+    let (auto_redact_requested, redaction_map, auto_redact_classify_tokens) = match maybe_redact(
         &headers,
         &mut service_request,
         &app_state.inference_provider_pool,
@@ -1104,6 +1177,13 @@ async fn chat_completions_inner(
         Ok(out) => out,
         Err(e) => return auto_redact_error_response(e),
     };
+    // Bill the privacy-filter classify pass that auto-redact ran (it is a
+    // real inference call to the PII model). Charged like an explicit
+    // `/v1/privacy/classify`; best-effort so a billing hiccup never fails
+    // the user's completion. See nearai/cloud-api#602.
+    if auto_redact_requested {
+        bill_auto_redact_classify(&app_state, &api_key, auto_redact_classify_tokens).await;
+    }
     // Treat auto-redact as effectively *enabled* only when the detector
     // actually minted placeholders. A request that opts in but contains no
     // PII has nothing to substitute, so we skip the response re-serialize

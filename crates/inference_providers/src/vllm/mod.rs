@@ -986,7 +986,8 @@ impl VLlmProvider {
                 })?;
 
             let chat_id = chat_completion_response.id.clone();
-            self.fleet.signature_rotation
+            self.fleet
+                .signature_rotation
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .insert(chat_id, index);
@@ -1105,7 +1106,8 @@ impl VLlmProvider {
                 drop(stream);
                 continue;
             }
-            self.fleet.pending_rotation
+            self.fleet
+                .pending_rotation
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .insert(request_hash.to_string(), index);
@@ -1563,7 +1565,8 @@ impl InferenceProvider for VLlmProvider {
         // happy-path streams return HTTP 200 as soon as the headers arrive.
         match canonical_send {
             Ok(response) if self.rotation_count() == 0 => {
-                self.fleet.pending_buckets
+                self.fleet
+                    .pending_buckets
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .insert(request_hash, bucket_id);
@@ -1576,7 +1579,8 @@ impl InferenceProvider for VLlmProvider {
                 let (first_chunk_status, stream) = Self::peek_first_payload_status(stream).await;
                 match first_chunk_status {
                     None => {
-                        self.fleet.pending_buckets
+                        self.fleet
+                            .pending_buckets
                             .lock()
                             .unwrap_or_else(|e| e.into_inner())
                             .insert(request_hash, bucket_id);
@@ -1739,7 +1743,8 @@ impl InferenceProvider for VLlmProvider {
         // Store the effective bucket ID for signature fetching.
         // For non-streaming, we know the chat_id immediately.
         let chat_id = chat_completion_response.id.clone();
-        self.fleet.signature_buckets
+        self.fleet
+            .signature_buckets
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .insert(chat_id, bucket_id);
@@ -3612,7 +3617,13 @@ mod tests {
         provider.pin_chat_connection("req-hash-orphan", "");
         assert!(provider.fleet.pending_buckets.lock().unwrap().is_empty());
         assert_eq!(
-            provider.fleet.signature_buckets.lock().unwrap().get("").copied(),
+            provider
+                .fleet
+                .signature_buckets
+                .lock()
+                .unwrap()
+                .get("")
+                .copied(),
             Some(5),
             "bucket side currently writes signature_buckets[\"\"] even for empty chat_id"
         );

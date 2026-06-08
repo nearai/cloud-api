@@ -3601,6 +3601,71 @@ mod tests {
         assert!(provider.signature_rotation.lock().unwrap().is_empty());
     }
 
+    // --- Characterization tests for the bucket side of pin/unpin (the H2
+    // sticky-prefix routing state). These pin down current behavior so the
+    // FleetRouter extraction can be proven behavior-identical. ---
+
+    #[test]
+    fn pin_chat_connection_promotes_pending_bucket_to_signature_bucket() {
+        // The streaming path stores `request_hash → bucket_id` in
+        // `pending_buckets` before the chat_id is known; `pin_chat_connection`
+        // must promote it into `signature_buckets` so the signature fetch
+        // reuses the same bucket's pinned H2 connection.
+        let provider = create_test_provider();
+        provider
+            .pending_buckets
+            .lock()
+            .unwrap()
+            .insert("req-hash-abc".to_string(), 3);
+        provider.pin_chat_connection("req-hash-abc", "chatcmpl-xyz");
+        assert_eq!(
+            provider
+                .signature_buckets
+                .lock()
+                .unwrap()
+                .get("chatcmpl-xyz")
+                .copied(),
+            Some(3)
+        );
+        // Pending entry drained so a future request_hash reuse can't surface
+        // a stale bucket.
+        assert!(provider.pending_buckets.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn unpin_chat_connection_clears_signature_bucket() {
+        let provider = create_test_provider();
+        provider
+            .signature_buckets
+            .lock()
+            .unwrap()
+            .insert("chat-1".to_string(), 2);
+        provider.unpin_chat_connection("chat-1");
+        assert!(provider.signature_buckets.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn pin_chat_connection_empty_chat_id_still_writes_signature_bucket() {
+        // Asymmetry to preserve: with an empty chat_id, the ROTATION side skips
+        // writing signature_rotation (see the empty-chat_id test above), but the
+        // BUCKET side still drains pending_buckets into signature_buckets[""].
+        // This characterizes existing behavior — the extraction must keep it
+        // (changing it is a separate, deliberate decision, not a refactor).
+        let provider = create_test_provider();
+        provider
+            .pending_buckets
+            .lock()
+            .unwrap()
+            .insert("req-hash-orphan".to_string(), 5);
+        provider.pin_chat_connection("req-hash-orphan", "");
+        assert!(provider.pending_buckets.lock().unwrap().is_empty());
+        assert_eq!(
+            provider.signature_buckets.lock().unwrap().get("").copied(),
+            Some(5),
+            "bucket side currently writes signature_buckets[\"\"] even for empty chat_id"
+        );
+    }
+
     #[test]
     fn signature_fetch_backoff_is_bounded_and_terminates() {
         // The signature-fetch retry runs in the hot path before `[DONE]`, so

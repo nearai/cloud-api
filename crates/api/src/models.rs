@@ -837,6 +837,24 @@ pub struct ModelInfo {
     /// `[{ "country_code": "US" }]`. Omitted when unset.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub datacenters: Option<Vec<Datacenter>>,
+    /// OpenRouter slug override: `{ "slug": "<value>" }`. Present only when an
+    /// override is set (our `id` does not match OpenRouter's canonical slug).
+    /// Omitted entirely when unset.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub openrouter: Option<OpenRouter>,
+}
+
+/// OpenRouter slug-override block.
+///
+/// OpenRouter's provider spec
+/// (https://openrouter.ai/docs/guides/community/for-providers) requires the
+/// model `id` to EXACTLY match OpenRouter's canonical slug, OR for the provider
+/// to supply an explicit override via a nested `openrouter` object carrying the
+/// canonical slug. We emit this object only when an override is configured.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct OpenRouter {
+    /// OpenRouter's canonical slug for this model (lowercase `author/slug`).
+    pub slug: String,
 }
 
 /// OpenRouter `datacenters` entry: a single datacenter the model runs in.
@@ -3047,6 +3065,11 @@ pub struct ModelMetadata {
     /// string. Omitted when there is no planned deprecation.
     #[serde(rename = "deprecationDate", skip_serializing_if = "Option::is_none")]
     pub deprecation_date: Option<String>,
+    /// OpenRouter `openrouter.slug` override (lowercase `author/slug`). Omitted
+    /// when unset. On public `GET /v1/models` this surfaces as the nested
+    /// `openrouter: { slug }` object; the admin view exposes the raw value.
+    #[serde(rename = "openrouterSlug", skip_serializing_if = "Option::is_none")]
+    pub openrouter_slug: Option<String>,
 }
 
 /// Request to update model pricing (admin endpoint)
@@ -3151,6 +3174,24 @@ pub struct UpdateModelApiRequest {
     )]
     #[schema(value_type = Option<String>)]
     pub deprecation_date: Nullable<String>,
+    /// OpenRouter `openrouter.slug` override (lowercase `author/slug`, e.g.
+    /// `z-ai/glm-5.1`). Set when our canonical `model_name` does not match
+    /// OpenRouter's slug; surfaced as the nested `openrouter: { slug }` object
+    /// on `GET /v1/models`. Validated at the write path; rejected if it does
+    /// not match the `author/slug` shape.
+    ///
+    /// Tri-state PATCH semantics:
+    /// - omitted → leave unchanged
+    /// - `null` → clear back to "unset" (column set to NULL)
+    /// - a string → set verbatim
+    #[serde(
+        rename = "openrouterSlug",
+        default,
+        deserialize_with = "deserialize_nullable",
+        skip_serializing_if = "Option::is_none"
+    )]
+    #[schema(value_type = Option<String>)]
+    pub openrouter_slug: Nullable<String>,
     #[serde(rename = "changeReason", skip_serializing_if = "Option::is_none")]
     pub change_reason: Option<String>,
 }
@@ -3332,6 +3373,9 @@ pub struct ModelHistoryEntry {
     pub is_ready: Option<bool>,
     #[serde(rename = "deprecationDate", skip_serializing_if = "Option::is_none")]
     pub deprecation_date: Option<String>,
+    /// OpenRouter `openrouter.slug` override the model carried at this point.
+    #[serde(rename = "openrouterSlug", skip_serializing_if = "Option::is_none")]
+    pub openrouter_slug: Option<String>,
 }
 
 /// Model history response - complete history of model changes

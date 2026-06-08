@@ -2163,6 +2163,13 @@ fn model_with_pricing_to_info(model: services::models::ModelWithPricing) -> Mode
             is_moderated: false,
         }),
         datacenters: crate::models::Datacenter::from_codes(model.datacenters),
+        // OpenRouter requires `id` to match its canonical slug, or an explicit
+        // override via this nested object. Emit it only when an override is set
+        // (NULL/empty → omit the key entirely).
+        openrouter: model
+            .openrouter_slug
+            .filter(|s| !s.is_empty())
+            .map(|slug| crate::models::OpenRouter { slug }),
     }
 }
 
@@ -2251,6 +2258,7 @@ mod tests {
             datacenters: None,
             is_ready: None,
             deprecation_date: None,
+            openrouter_slug: None,
             created_at: chrono::Utc::now(),
         }
     }
@@ -2293,6 +2301,44 @@ mod tests {
             vec!["text".to_string(), "image".to_string()]
         );
         assert_eq!(architecture.output_modalities, vec!["text".to_string()]);
+    }
+
+    #[test]
+    fn model_without_openrouter_slug_omits_nested_object() {
+        // No override set → the public ModelInfo must not carry the nested
+        // `openrouter` object at all (serde skips it when None).
+        let info = model_with_pricing_to_info(make_model_with_pricing(None, None));
+        assert!(
+            info.openrouter.is_none(),
+            "openrouter object must be omitted when no slug override is set"
+        );
+        // And it must not appear in the serialized JSON either.
+        let json = serde_json::to_value(&info).unwrap();
+        assert!(
+            json.get("openrouter").is_none(),
+            "serialized JSON must omit the openrouter key when unset"
+        );
+    }
+
+    #[test]
+    fn model_with_openrouter_slug_emits_nested_object() {
+        // Override set → the public ModelInfo must carry
+        // `openrouter: { slug: <value> }`.
+        let mut model = make_model_with_pricing(None, None);
+        model.openrouter_slug = Some("z-ai/glm-5.1".to_string());
+        let info = model_with_pricing_to_info(model);
+        let openrouter = info
+            .openrouter
+            .as_ref()
+            .expect("openrouter object must be present when slug override is set");
+        assert_eq!(openrouter.slug, "z-ai/glm-5.1");
+
+        let json = serde_json::to_value(&info).unwrap();
+        assert_eq!(
+            json["openrouter"]["slug"],
+            serde_json::json!("z-ai/glm-5.1"),
+            "serialized JSON must nest the slug under openrouter.slug"
+        );
     }
 
     fn make_chat_chunk(id: &str) -> inference_providers::StreamChunk {

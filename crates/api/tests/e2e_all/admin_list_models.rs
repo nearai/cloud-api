@@ -919,3 +919,166 @@ async fn test_admin_upsert_rejects_invalid_datacenters() {
 
     println!("✅ Admin upsert rejects invalid datacenters");
 }
+
+// ============================================
+// OpenRouter `openrouter.slug` override field
+// ============================================
+
+/// Setting `openrouterSlug` via the admin upsert should persist, surface as the
+/// raw value on the admin list endpoint, and surface as the nested
+/// `openrouter: { slug }` object on the public `GET /v1/models`. Clearing it
+/// with an explicit JSON null must remove the nested object entirely.
+#[tokio::test]
+async fn test_admin_openrouter_slug_round_trip_and_clear() {
+    let server = setup_test_server().await;
+
+    let model_name = format!("openrouter-slug-{}", uuid::Uuid::new_v4());
+    let mut batch = BatchUpdateModelApiRequest::new();
+    batch.insert(
+        model_name.clone(),
+        serde_json::from_value(serde_json::json!({
+            "inputCostPerToken": { "amount": 1000, "currency": "USD" },
+            "outputCostPerToken": { "amount": 2000, "currency": "USD" },
+            "modelDisplayName": "OpenRouter Slug Model",
+            "modelDescription": "Round-trips openrouter.slug override",
+            "contextLength": 4096,
+            "isActive": true,
+            "openrouterSlug": "z-ai/glm-5.1"
+        }))
+        .unwrap(),
+    );
+    let updated = admin_batch_upsert_models(&server, batch, get_session_id()).await;
+    let model = updated
+        .iter()
+        .find(|m| m.model_id == model_name)
+        .expect("upsert should return our model");
+    assert_eq!(
+        model.metadata.openrouter_slug.as_deref(),
+        Some("z-ai/glm-5.1"),
+        "openrouterSlug should round-trip verbatim on the admin view"
+    );
+
+    // The public GET /v1/models must surface it as the nested object.
+    let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
+    let api_key = get_api_key_for_org(&server, org.id).await;
+    let listed = list_models(&server, api_key.clone()).await;
+    let public = listed
+        .data
+        .iter()
+        .find(|m| m.id == model_name)
+        .expect("model should appear in GET /v1/models");
+    let openrouter = public
+        .openrouter
+        .as_ref()
+        .expect("public model should carry the nested openrouter object when slug is set");
+    assert_eq!(
+        openrouter.slug, "z-ai/glm-5.1",
+        "GET /v1/models must emit openrouter.slug verbatim"
+    );
+
+    // Explicit JSON null clears it back to "unset".
+    let mut clear_batch = BatchUpdateModelApiRequest::new();
+    clear_batch.insert(
+        model_name.clone(),
+        serde_json::from_value(serde_json::json!({ "openrouterSlug": null })).unwrap(),
+    );
+    let cleared = admin_batch_upsert_models(&server, clear_batch, get_session_id()).await;
+    let cleared_model = cleared
+        .iter()
+        .find(|m| m.model_id == model_name)
+        .expect("update should return our model");
+    assert_eq!(
+        cleared_model.metadata.openrouter_slug, None,
+        "explicit null should clear openrouterSlug"
+    );
+
+    // The nested object must disappear from the public response.
+    let listed_after = list_models(&server, api_key.clone()).await;
+    let public_after = listed_after
+        .data
+        .iter()
+        .find(|m| m.id == model_name)
+        .expect("model should still appear in GET /v1/models");
+    assert!(
+        public_after.openrouter.is_none(),
+        "cleared openrouter.slug must omit the nested object from GET /v1/models"
+    );
+
+    // An omitted field after a set must NOT clear it (tri-state regression guard:
+    // absent != null). Re-set it, then send an unrelated update.
+    let mut reset_batch = BatchUpdateModelApiRequest::new();
+    reset_batch.insert(
+        model_name.clone(),
+        serde_json::from_value(serde_json::json!({ "openrouterSlug": "qwen/qwen3.6-27b" }))
+            .unwrap(),
+    );
+    admin_batch_upsert_models(&server, reset_batch, get_session_id()).await;
+
+    let mut unrelated_batch = BatchUpdateModelApiRequest::new();
+    unrelated_batch.insert(
+        model_name.clone(),
+        serde_json::from_value(serde_json::json!({ "modelDescription": "touch" })).unwrap(),
+    );
+    let touched = admin_batch_upsert_models(&server, unrelated_batch, get_session_id()).await;
+    let touched_model = touched
+        .iter()
+        .find(|m| m.model_id == model_name)
+        .expect("update should return our model");
+    assert_eq!(
+        touched_model.metadata.openrouter_slug.as_deref(),
+        Some("qwen/qwen3.6-27b"),
+        "omitting openrouterSlug must leave the prior value intact"
+    );
+
+    println!("✅ Admin openrouter.slug round-trip + clear works correctly");
+}
+
+/// The `openrouterSlug` override must be a lowercase `author/slug`. Garbage
+/// values are rejected at the admin write path with a 400.
+#[tokio::test]
+async fn test_admin_upsert_rejects_invalid_openrouter_slug() {
+    let server = setup_test_server().await;
+
+    // Each of these must be rejected: uppercase, missing the author/slug
+    // separator, an empty segment, and a stray second slash.
+    for bad in [
+        "Z-AI/GLM-5.1",  // uppercase not allowed
+        "glm-5.1",       // missing the `author/` segment
+        "z-ai/",         // empty slug segment
+        "z-ai/glm/5.1",  // more than one separator
+        "-z-ai/glm-5.1", // segment may not start with a separator char
+        "z-ai/glm-5.1-", // segment may not end with a separator char
+    ] {
+        let model_name = format!("bad-or-slug-{}", uuid::Uuid::new_v4());
+        let body = serde_json::json!({
+            model_name: {
+                "inputCostPerToken": { "amount": 1000, "currency": "USD" },
+                "outputCostPerToken": { "amount": 2000, "currency": "USD" },
+                "modelDisplayName": "Bad OpenRouter Slug Model",
+                "modelDescription": "Has an invalid openrouter slug",
+                "contextLength": 4096,
+                "isActive": true,
+                "openrouterSlug": bad
+            }
+        });
+        let response = server
+            .patch("/v1/admin/models")
+            .add_header("Authorization", format!("Bearer {}", get_session_id()))
+            .add_header("User-Agent", MOCK_USER_AGENT)
+            .json(&body)
+            .await;
+        assert_eq!(
+            response.status_code(),
+            400,
+            "invalid openrouter slug '{bad}' should be rejected, got: {}",
+            response.text()
+        );
+        assert!(
+            response.text().contains("openrouterSlug"),
+            "error should mention openrouterSlug for '{bad}', got: {}",
+            response.text()
+        );
+    }
+
+    println!("✅ Admin upsert rejects invalid openrouter slug");
+}

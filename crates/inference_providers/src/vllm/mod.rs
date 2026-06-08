@@ -202,15 +202,12 @@ pub struct VLlmProvider {
     config: VLlmConfig,
     /// General-purpose client for non-completion requests (attestation, models, etc.)
     client: Client,
-    /// Lazily-filled bucket clients indexed by prefix bucket ID. Each slot starts
-    /// empty and is filled on first use via inline backend verification. Once filled,
-    /// the client maintains a persistent H2 connection to a specific verified backend.
-    bucket_clients: Vec<std::sync::Mutex<Option<Client>>>,
-    /// Prefix router: message-level trie mapping conversation prefixes to bucket IDs.
-    prefix_router: Arc<PrefixRouter>,
     /// Routing state for sending a completion and its signature fetch to the
-    /// same model-proxy backend: prefix-bucket and rotation-SNI mappings + the
-    /// last-known healthy backend count. See [`fleet::FleetRouter`].
+    /// same model-proxy backend: the prefix-bucket clients + prefix router, the
+    /// rotation-SNI addressing, the signature/bucket pin maps, and the
+    /// last-known healthy backend count. See [`fleet::FleetRouter`]. The
+    /// provider still fills/clears bucket clients (inline attestation) and
+    /// builds rotation clients (TLS), reading the slots from here.
     fleet: FleetRouter,
     /// TLS fingerprint verification state (Bootstrap → Pinned or Blocked).
     /// Shared across the main client and all bucket clients.
@@ -385,9 +382,7 @@ impl VLlmProvider {
             client,
             fallback_client,
             verification_semaphore,
-            bucket_clients,
-            prefix_router,
-            fleet: FleetRouter::new(rotation_parts),
+            fleet: FleetRouter::new(rotation_parts, prefix_router, bucket_clients),
             fingerprint_state,
             backend_verifier,
             tls_roots,
@@ -462,7 +457,7 @@ impl VLlmProvider {
             );
             return;
         }
-        let num_buckets = self.bucket_clients.len();
+        let num_buckets = self.fleet.bucket_clients.len();
         tracing::info!(num_buckets = num_buckets, "Pre-warming bucket clients");
         for bucket_id in 0..num_buckets {
             let provider = self.clone();
@@ -504,7 +499,7 @@ impl VLlmProvider {
         // Fast path: bucket already has a verified client.
         // reqwest::Client::clone is an Arc refcount bump — hold the lock briefly.
         {
-            let guard = self.bucket_clients[bucket_id]
+            let guard = self.fleet.bucket_clients[bucket_id]
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
             if let Some(ref client) = *guard {
@@ -547,7 +542,7 @@ impl VLlmProvider {
         // Re-check after acquiring the permit: a concurrent request that held the
         // semaphore before us may have already filled this bucket.
         {
-            let guard = self.bucket_clients[bucket_id]
+            let guard = self.fleet.bucket_clients[bucket_id]
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
             if let Some(ref client) = *guard {
@@ -562,7 +557,7 @@ impl VLlmProvider {
                     // Double-check: another concurrent request may have filled
                     // this bucket while we were verifying. Use its client if so
                     // (avoids wasting the connection it established).
-                    let mut guard = self.bucket_clients[bucket_id]
+                    let mut guard = self.fleet.bucket_clients[bucket_id]
                         .lock()
                         .unwrap_or_else(|e| e.into_inner());
                     if let Some(ref existing) = *guard {
@@ -573,7 +568,7 @@ impl VLlmProvider {
                 }
                 Err(e) => {
                     // Another request may have filled the bucket while we failed.
-                    let guard = self.bucket_clients[bucket_id]
+                    let guard = self.fleet.bucket_clients[bucket_id]
                         .lock()
                         .unwrap_or_else(|e| e.into_inner());
                     if let Some(ref existing) = *guard {
@@ -650,7 +645,7 @@ impl VLlmProvider {
     /// Called on connection errors — prevents a stale client (whose H2
     /// connection dropped) from being reused with an unverified reconnection.
     fn clear_bucket(&self, bucket_id: usize) {
-        *self.bucket_clients[bucket_id]
+        *self.fleet.bucket_clients[bucket_id]
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = None;
     }
@@ -1186,7 +1181,7 @@ impl InferenceProvider for VLlmProvider {
             .get(chat_id)
             .copied();
         let bucket_client = bucket_id.and_then(|id| {
-            self.bucket_clients[id]
+            self.fleet.bucket_clients[id]
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .clone()
@@ -1494,7 +1489,7 @@ impl InferenceProvider for VLlmProvider {
         // via L4 passthrough → prefix cache hits. Buckets are lazily filled: on first
         // use, inline verification connects to a backend, verifies attestation, and
         // pins the client.
-        let bucket_id = self.prefix_router.route(&streaming_params.messages);
+        let bucket_id = self.fleet.route(&streaming_params.messages);
         let bucket_client = self.get_or_verify_bucket_client(bucket_id).await?;
         let canonical_send = match self
             .send_streaming_request(
@@ -1617,7 +1612,7 @@ impl InferenceProvider for VLlmProvider {
         self.prepare_encryption_headers(&mut headers, &mut non_streaming_params.extra);
 
         // Route to a verified bucket client based on prompt prefix.
-        let bucket_id = self.prefix_router.route(&non_streaming_params.messages);
+        let bucket_id = self.fleet.route(&non_streaming_params.messages);
         let bucket_client = self.get_or_verify_bucket_client(bucket_id).await?;
         let timeout_secs = self.config.completion_timeout_seconds.max(0) as u64;
         let timeout = Duration::from_secs(timeout_secs);
@@ -2758,8 +2753,8 @@ mod tests {
     fn test_bucket_count_matches_prefix_router() {
         let provider = create_test_provider();
         assert_eq!(
-            provider.bucket_clients.len(),
-            provider.prefix_router.num_buckets()
+            provider.fleet.bucket_clients.len(),
+            provider.fleet.prefix_router.num_buckets()
         );
     }
 
@@ -2767,7 +2762,7 @@ mod tests {
     fn test_legacy_provider_eagerly_creates_buckets() {
         // Without a verifier, buckets are eagerly pre-created (legacy path)
         let provider = create_test_provider();
-        let guard = provider.bucket_clients[0]
+        let guard = provider.fleet.bucket_clients[0]
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         assert!(guard.is_some(), "Legacy provider should pre-create buckets");
@@ -2799,7 +2794,7 @@ mod tests {
             )),
             Arc::new(NoopVerifier),
         );
-        let guard = provider.bucket_clients[0]
+        let guard = provider.fleet.bucket_clients[0]
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         assert!(
@@ -2836,12 +2831,12 @@ mod tests {
         );
 
         // Bucket starts empty
-        assert!(provider.bucket_clients[0].lock().unwrap().is_none());
+        assert!(provider.fleet.bucket_clients[0].lock().unwrap().is_none());
 
         // get_or_verify fills it
         let result = provider.get_or_verify_bucket_client(0).await;
         assert!(result.is_ok());
-        assert!(provider.bucket_clients[0].lock().unwrap().is_some());
+        assert!(provider.fleet.bucket_clients[0].lock().unwrap().is_some());
 
         // Second call returns cached client (fast path)
         let result2 = provider.get_or_verify_bucket_client(0).await;
@@ -2851,9 +2846,9 @@ mod tests {
     #[test]
     fn test_clear_bucket() {
         let provider = create_test_provider();
-        assert!(provider.bucket_clients[0].lock().unwrap().is_some());
+        assert!(provider.fleet.bucket_clients[0].lock().unwrap().is_some());
         provider.clear_bucket(0);
-        assert!(provider.bucket_clients[0].lock().unwrap().is_none());
+        assert!(provider.fleet.bucket_clients[0].lock().unwrap().is_none());
     }
 
     /// Fix 2 + security guard: when a verifier always fails AND no fingerprints
@@ -2888,7 +2883,7 @@ mod tests {
         );
 
         // Bucket starts empty and no fingerprints are pinned.
-        assert!(provider.bucket_clients[0].lock().unwrap().is_none());
+        assert!(provider.fleet.bucket_clients[0].lock().unwrap().is_none());
         assert_eq!(provider.pinned_fingerprint_count(), 0);
 
         // All attempts fail in Bootstrap state → must return Err (not fallback).
@@ -2899,7 +2894,7 @@ mod tests {
         );
 
         // Bucket remains empty.
-        assert!(provider.bucket_clients[0].lock().unwrap().is_none());
+        assert!(provider.fleet.bucket_clients[0].lock().unwrap().is_none());
     }
 
     /// Fix 2: when a verifier always fails but at least one fingerprint has already
@@ -2938,7 +2933,7 @@ mod tests {
         assert_eq!(provider.pinned_fingerprint_count(), 1);
 
         // Bucket starts empty.
-        assert!(provider.bucket_clients[0].lock().unwrap().is_none());
+        assert!(provider.fleet.bucket_clients[0].lock().unwrap().is_none());
 
         // All attempts fail but fingerprints are pinned → fallback client returned.
         let result = provider.get_or_verify_bucket_client(0).await;
@@ -2946,7 +2941,7 @@ mod tests {
 
         // Bucket remains empty — fallback is not stored as a verified bucket client.
         assert!(
-            provider.bucket_clients[0].lock().unwrap().is_none(),
+            provider.fleet.bucket_clients[0].lock().unwrap().is_none(),
             "fallback should not be stored in bucket"
         );
     }
@@ -2986,7 +2981,7 @@ mod tests {
         assert_eq!(provider.pinned_fingerprint_count(), 0);
 
         // Bucket starts empty.
-        assert!(provider.bucket_clients[0].lock().unwrap().is_none());
+        assert!(provider.fleet.bucket_clients[0].lock().unwrap().is_none());
 
         // Blocked state has pinned_count == 0 → same safe path as Bootstrap → Err.
         let result = provider.get_or_verify_bucket_client(0).await;
@@ -3242,10 +3237,11 @@ mod tests {
             4, // production-default semaphore concurrency — exercises throttling with 64 tasks
         ));
 
-        let num_buckets = provider.bucket_clients.len();
+        let num_buckets = provider.fleet.bucket_clients.len();
 
         // All buckets start empty.
         assert!(provider
+            .fleet
             .bucket_clients
             .iter()
             .all(|b| b.lock().unwrap().is_none()));
@@ -3257,6 +3253,7 @@ mod tests {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
             let filled = provider
+                .fleet
                 .bucket_clients
                 .iter()
                 .filter(|b| b.lock().unwrap().is_some())
@@ -3292,6 +3289,7 @@ mod tests {
 
         // In legacy mode buckets are eagerly pre-filled at construction.
         assert!(provider
+            .fleet
             .bucket_clients
             .iter()
             .all(|b| b.lock().unwrap().is_some()));
@@ -3299,6 +3297,7 @@ mod tests {
         // pre_warm should not panic and should not clear the pre-filled buckets.
         provider.clone().pre_warm();
         assert!(provider
+            .fleet
             .bucket_clients
             .iter()
             .all(|b| b.lock().unwrap().is_some()));
@@ -3363,6 +3362,7 @@ mod tests {
             // All buckets must remain empty (no tasks ran).
             assert!(
                 provider
+                    .fleet
                     .bucket_clients
                     .iter()
                     .all(|b| b.lock().unwrap().is_none()),

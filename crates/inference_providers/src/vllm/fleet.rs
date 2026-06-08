@@ -11,10 +11,12 @@
 //! verbatim logic previously inlined on `VLlmProvider`, guarded by the
 //! characterization tests in the parent module.
 
+use super::prefix_router::PrefixRouter;
 use crate::rotation;
+use reqwest::Client;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 /// Poison-tolerant lock: a panicked holder shouldn't wedge routing — we only
 /// ever mutate small maps under it, so recovering the inner value is safe.
@@ -22,7 +24,6 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-#[derive(Default)]
 pub(super) struct FleetRouter {
     /// request_hash → bucket_id during streaming (before the chat_id is known).
     pub(super) pending_buckets: Mutex<HashMap<String, usize>>,
@@ -41,14 +42,37 @@ pub(super) struct FleetRouter {
     /// that don't fit the rotation scheme (one-label host, IP literal, …) — then
     /// rotation is a no-op and the canonical-SNI error propagates as before.
     rotation_parts: Option<rotation::UrlParts>,
+    /// Message-prefix trie mapping a conversation prefix to a bucket id, so
+    /// requests sharing a prefix stick to the same backend (prefix-cache hit).
+    pub(super) prefix_router: Arc<PrefixRouter>,
+    /// Lazily-filled (or eagerly pre-created in legacy mode) per-bucket clients,
+    /// each pinning a persistent H2 connection to one verified backend. The
+    /// provider fills/clears these slots via inline attestation; FleetRouter
+    /// just owns the storage.
+    pub(super) bucket_clients: Vec<Mutex<Option<Client>>>,
 }
 
 impl FleetRouter {
-    pub(super) fn new(rotation_parts: Option<rotation::UrlParts>) -> Self {
+    pub(super) fn new(
+        rotation_parts: Option<rotation::UrlParts>,
+        prefix_router: Arc<PrefixRouter>,
+        bucket_clients: Vec<Mutex<Option<Client>>>,
+    ) -> Self {
         Self {
+            pending_buckets: Mutex::new(HashMap::new()),
+            signature_buckets: Mutex::new(HashMap::new()),
+            pending_rotation: Mutex::new(HashMap::new()),
+            signature_rotation: Mutex::new(HashMap::new()),
+            last_backend_count: AtomicUsize::new(0),
             rotation_parts,
-            ..Self::default()
+            prefix_router,
+            bucket_clients,
         }
+    }
+
+    /// Route a request's messages to a prefix bucket id.
+    pub(super) fn route(&self, messages: &[crate::ChatMessage]) -> usize {
+        self.prefix_router.route(messages)
     }
 
     /// Number of rotation-SNI indices to fan out across, clamped to the

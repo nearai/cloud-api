@@ -79,14 +79,13 @@ struct DetectItem {
     index: usize,
     #[serde(default)]
     spans: Vec<RawSpan>,
+    /// Billing-only metadata, parsed as a tolerant `Value` (not a typed
+    /// struct) so a malformed `usage` field — wrong type, out-of-range
+    /// number — can never turn a valid span response into a parse error
+    /// and fail the completion. `input_tokens` is extracted leniently in
+    /// `parse_response` (invalid/absent => 0).
     #[serde(default)]
-    usage: Option<DetectUsage>,
-}
-
-#[derive(Deserialize)]
-struct DetectUsage {
-    #[serde(default)]
-    input_tokens: i64,
+    usage: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize)]
@@ -109,13 +108,17 @@ pub(super) fn parse_response(
     let parsed: DetectResponse = serde_json::from_slice(bytes)
         .map_err(|e| AutoRedactError::Internal(format!("decode detect resp: {e}")))?;
 
-    // Saturating sum: a malicious/buggy detector returning huge or many
-    // per-item counts must not wrap to a negative total and mis-bill.
+    // Sum `input_tokens` across entries, leniently: a non-integer or absent
+    // value contributes 0 (billing metadata must never break span parsing).
+    // Saturating so a malicious/buggy detector returning huge or many counts
+    // can't wrap to a negative total and mis-bill.
     let input_tokens: i64 = parsed
         .data
         .iter()
         .filter_map(|item| item.usage.as_ref())
-        .fold(0i64, |acc, u| acc.saturating_add(u.input_tokens.max(0)));
+        .filter_map(|u| u.get("input_tokens"))
+        .filter_map(|v| v.as_i64())
+        .fold(0i64, |acc, t| acc.saturating_add(t.max(0)));
 
     let mut out: Vec<Vec<Span>> = (0..expected_len).map(|_| Vec::new()).collect();
     for item in parsed.data {
@@ -184,6 +187,22 @@ mod tests {
         assert!(spans.iter().all(|v| v.is_empty()));
         // Out-of-range index is dropped for spans, but its tokens still count.
         assert_eq!(input_tokens, 1);
+    }
+
+    #[test]
+    fn parse_tolerates_malformed_usage() {
+        // A malformed/missing billing-only `usage` field must NOT fail span
+        // parsing (which would fail the completion). Spans still apply; the
+        // bad usage contributes 0 tokens. (nearai/cloud-api#602 review.)
+        let body = br#"{"data": [
+            {"index": 0, "spans": [{"category": "private_email", "start": 0, "end": 1, "score": 1.0, "text": "a"}], "usage": {"input_tokens": "oops"}},
+            {"index": 1, "spans": [], "usage": "garbage"},
+            {"index": 1, "spans": []}
+        ]}"#;
+        let (spans, input_tokens) = parse_response(body, 2).unwrap();
+        assert_eq!(spans.len(), 2);
+        assert_eq!(spans[0].len(), 1, "span must still apply despite bad usage");
+        assert_eq!(input_tokens, 0, "invalid/absent usage contributes 0");
     }
 
     #[test]

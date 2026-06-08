@@ -503,12 +503,36 @@ async fn bill_auto_redact_classify(
     api_key: &crate::middleware::auth::AuthenticatedApiKey,
     classify_tokens: i64,
 ) {
-    // Clamp to the i32 the usage row stores: an implausibly large count is
-    // capped (billed) rather than dropped, and 0/negative is nothing to bill.
-    let input_tokens = classify_tokens.clamp(0, i32::MAX as i64) as i32;
-    if input_tokens == 0 {
-        return;
+    if classify_tokens <= 0 {
+        return; // nothing to bill
     }
+    // Cap an anomalous count at the same `MAX_REASONABLE_TOKENS` the explicit
+    // `/v1/privacy/{classify,redact}` paths use, emitting the same anomaly
+    // metric — so x-auto-redact (which shares the privacy-filter classify
+    // call) can't massively overcharge on a buggy/malicious provider response
+    // instead of just clamping to i32::MAX. See nearai/cloud-api#602 review.
+    const MAX_REASONABLE_TOKENS: i32 = 1_000_000;
+    let input_tokens = if classify_tokens > MAX_REASONABLE_TOKENS as i64 {
+        tracing::error!(
+            token_count = classify_tokens,
+            max_expected = MAX_REASONABLE_TOKENS,
+            model = auto_redact::DEFAULT_PII_MODEL,
+            "auto_redact: provider returned unreasonable classify token count - capping"
+        );
+        let model_tag = format!("model:{}", auto_redact::DEFAULT_PII_MODEL);
+        let reason_tag = format!(
+            "reason:{}",
+            services::metrics::consts::REASON_TOKEN_OVERFLOW
+        );
+        app_state.metrics_service.record_count(
+            services::metrics::consts::METRIC_PROVIDER_TOKEN_ANOMALIES,
+            1,
+            &[model_tag.as_str(), reason_tag.as_str()],
+        );
+        MAX_REASONABLE_TOKENS
+    } else {
+        classify_tokens as i32 // safe: 0 < classify_tokens <= 1_000_000
+    };
 
     let model = match app_state
         .models_service

@@ -13,8 +13,9 @@ use std::collections::HashMap;
 /// positive resistance.
 pub const DEFAULT_THRESHOLD: f64 = 0.5;
 
-/// Call the privacy-filter model with the list of input texts. Returns
-/// one Span vec per input, in the same order.
+/// Call the privacy-filter model with the list of input texts. Returns one
+/// Span vec per input (in the same order) plus the total `input_tokens` the
+/// model billed for the classify pass.
 ///
 /// On any transport / parse / status error, returns `AutoRedactError`.
 /// Callers should fail closed (return 503 to the client) when this errors.
@@ -22,9 +23,9 @@ pub async fn detect_pii(
     texts: &[String],
     model: &str,
     pool: &InferenceProviderPool,
-) -> Result<Vec<Vec<Span>>, AutoRedactError> {
+) -> Result<(Vec<Vec<Span>>, i64), AutoRedactError> {
     if texts.is_empty() {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), 0));
     }
 
     let req_body = serde_json::json!({
@@ -78,6 +79,13 @@ struct DetectItem {
     index: usize,
     #[serde(default)]
     spans: Vec<RawSpan>,
+    /// Billing-only metadata, parsed as a tolerant `Value` (not a typed
+    /// struct) so a malformed `usage` field — wrong type, out-of-range
+    /// number — can never turn a valid span response into a parse error
+    /// and fail the completion. `input_tokens` is extracted leniently in
+    /// `parse_response` (invalid/absent => 0).
+    #[serde(default)]
+    usage: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize)]
@@ -87,12 +95,30 @@ struct RawSpan {
     end: usize,
 }
 
+/// Parse a privacy-filter response into per-text spans plus the total
+/// `input_tokens` the model reported across all `data` entries. The token
+/// total is summed independently of the per-index span mapping so it
+/// reflects the full classify cost even if the model returns an unexpected
+/// index (which is otherwise dropped). Used to bill the classify pass
+/// (nearai/cloud-api#602).
 pub(super) fn parse_response(
     bytes: &[u8],
     expected_len: usize,
-) -> Result<Vec<Vec<Span>>, AutoRedactError> {
+) -> Result<(Vec<Vec<Span>>, i64), AutoRedactError> {
     let parsed: DetectResponse = serde_json::from_slice(bytes)
         .map_err(|e| AutoRedactError::Internal(format!("decode detect resp: {e}")))?;
+
+    // Sum `input_tokens` across entries, leniently: a non-integer or absent
+    // value contributes 0 (billing metadata must never break span parsing).
+    // Saturating so a malicious/buggy detector returning huge or many counts
+    // can't wrap to a negative total and mis-bill.
+    let input_tokens: i64 = parsed
+        .data
+        .iter()
+        .filter_map(|item| item.usage.as_ref())
+        .filter_map(|u| u.get("input_tokens"))
+        .filter_map(|v| v.as_i64())
+        .fold(0i64, |acc, t| acc.saturating_add(t.max(0)));
 
     let mut out: Vec<Vec<Span>> = (0..expected_len).map(|_| Vec::new()).collect();
     for item in parsed.data {
@@ -108,7 +134,7 @@ pub(super) fn parse_response(
             end: s.end,
         }));
     }
-    Ok(out)
+    Ok((out, input_tokens))
 }
 
 #[cfg(test)]
@@ -126,13 +152,15 @@ mod tests {
                 {"index": 1, "spans": [], "usage": {"input_tokens": 2}}
             ]
         }"#;
-        let spans = parse_response(body, 2).unwrap();
+        let (spans, input_tokens) = parse_response(body, 2).unwrap();
         assert_eq!(spans.len(), 2);
         assert_eq!(spans[0].len(), 1);
         assert_eq!(spans[0][0].category, "private_email");
         assert_eq!(spans[0][0].start, 6);
         assert_eq!(spans[0][0].end, 23);
         assert_eq!(spans[1].len(), 0);
+        // Tokens summed across all data entries: 5 + 2.
+        assert_eq!(input_tokens, 7);
     }
 
     #[test]
@@ -140,11 +168,12 @@ mod tests {
         // If the detector omits index 1 entirely, we still return an empty
         // span vec for it so apply.write_back stays index-aligned.
         let body = br#"{"data": [{"index": 0, "spans": [], "usage": {"input_tokens": 1}}]}"#;
-        let spans = parse_response(body, 3).unwrap();
+        let (spans, input_tokens) = parse_response(body, 3).unwrap();
         assert_eq!(spans.len(), 3);
         for s in &spans {
             assert!(s.is_empty());
         }
+        assert_eq!(input_tokens, 1);
     }
 
     #[test]
@@ -153,9 +182,27 @@ mod tests {
         let body = br#"{"data": [
             {"index": 5, "spans": [{"category": "x", "start": 0, "end": 1, "score": 1.0, "text": "h"}], "usage": {"input_tokens": 1}}
         ]}"#;
-        let spans = parse_response(body, 2).unwrap();
+        let (spans, input_tokens) = parse_response(body, 2).unwrap();
         assert_eq!(spans.len(), 2);
         assert!(spans.iter().all(|v| v.is_empty()));
+        // Out-of-range index is dropped for spans, but its tokens still count.
+        assert_eq!(input_tokens, 1);
+    }
+
+    #[test]
+    fn parse_tolerates_malformed_usage() {
+        // A malformed/missing billing-only `usage` field must NOT fail span
+        // parsing (which would fail the completion). Spans still apply; the
+        // bad usage contributes 0 tokens. (nearai/cloud-api#602 review.)
+        let body = br#"{"data": [
+            {"index": 0, "spans": [{"category": "private_email", "start": 0, "end": 1, "score": 1.0, "text": "a"}], "usage": {"input_tokens": "oops"}},
+            {"index": 1, "spans": [], "usage": "garbage"},
+            {"index": 1, "spans": []}
+        ]}"#;
+        let (spans, input_tokens) = parse_response(body, 2).unwrap();
+        assert_eq!(spans.len(), 2);
+        assert_eq!(spans[0].len(), 1, "span must still apply despite bad usage");
+        assert_eq!(input_tokens, 0, "invalid/absent usage contributes 0");
     }
 
     #[test]

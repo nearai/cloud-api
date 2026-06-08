@@ -1,3 +1,4 @@
+mod fleet;
 mod prefix_router;
 
 use crate::spki_verifier::{FingerprintState, SharedTlsRoots};
@@ -6,11 +7,10 @@ use crate::{
     PrivacyClassifyError, RerankError, ScoreError, *,
 };
 use async_trait::async_trait;
+use fleet::FleetRouter;
 use prefix_router::PrefixRouter;
 use reqwest::{header::HeaderValue, Client};
 use serde::Serialize;
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Semaphore;
@@ -208,10 +208,10 @@ pub struct VLlmProvider {
     bucket_clients: Vec<std::sync::Mutex<Option<Client>>>,
     /// Prefix router: message-level trie mapping conversation prefixes to bucket IDs.
     prefix_router: Arc<PrefixRouter>,
-    /// Maps request_hash → bucket_id during streaming (before chat_id is known).
-    pending_buckets: Arc<std::sync::Mutex<HashMap<String, usize>>>,
-    /// Maps chat_id → bucket_id for signature fetching on the correct backend.
-    signature_buckets: Arc<std::sync::Mutex<HashMap<String, usize>>>,
+    /// Routing state for sending a completion and its signature fetch to the
+    /// same model-proxy backend: prefix-bucket and rotation-SNI mappings + the
+    /// last-known healthy backend count. See [`fleet::FleetRouter`].
+    fleet: FleetRouter,
     /// TLS fingerprint verification state (Bootstrap → Pinned or Blocked).
     /// Shared across the main client and all bucket clients.
     fingerprint_state: Arc<std::sync::RwLock<FingerprintState>>,
@@ -235,29 +235,12 @@ pub struct VLlmProvider {
     /// the rotation-SNI fallback path so the fingerprint pin set stays
     /// consistent with the bucket clients.
     tls_roots: SharedTlsRoots,
-    /// Most recent healthy backend count reported by discovery. Used by the
-    /// rotation-SNI retry path to bound the number of distinct backends to
-    /// fan out to when the sticky bucket returns 5xx. Discovery writes via
-    /// `set_backend_count`; the chat paths read with `Ordering::Relaxed`
-    /// (best-effort — a stale read just means we try one too few or one too
-    /// many indices, both safe because the proxy wraps `index % healthy`).
-    last_backend_count: AtomicUsize,
     /// Pre-parsed rotation parts derived from `config.base_url` at
     /// construction time, so we don't reparse on every retry. `None` for
     /// URLs that don't fit the rotation scheme (one-label host, IP literal,
     /// etc.) — in that case the rotation fallback is a no-op and the
     /// canonical-SNI error propagates as before.
     rotation_parts: Option<crate::rotation::UrlParts>,
-    /// Maps request_hash → rotation index when the streaming canonical attempt
-    /// fell over and a rotation-SNI attempt served the response instead.
-    /// `pin_chat_connection` promotes this to `signature_rotation` once the
-    /// chat_id is known, so `get_signature` can reuse the same rotation SNI.
-    pending_rotation: Arc<std::sync::Mutex<HashMap<String, u64>>>,
-    /// Maps chat_id → rotation index for the signature fetch path. Populated
-    /// either by the non-streaming chat_completion (chat_id known at send
-    /// time) or by `pin_chat_connection` once the stream's first chunk
-    /// yields a chat_id.
-    signature_rotation: Arc<std::sync::Mutex<HashMap<String, u64>>>,
 }
 
 impl VLlmProvider {
@@ -410,15 +393,11 @@ impl VLlmProvider {
             verification_semaphore,
             bucket_clients,
             prefix_router,
-            pending_buckets: Arc::new(std::sync::Mutex::new(HashMap::new())),
-            signature_buckets: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            fleet: FleetRouter::new(),
             fingerprint_state,
             backend_verifier,
             tls_roots,
-            last_backend_count: AtomicUsize::new(0),
             rotation_parts,
-            pending_rotation: Arc::new(std::sync::Mutex::new(HashMap::new())),
-            signature_rotation: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
     }
 
@@ -871,9 +850,7 @@ impl VLlmProvider {
         if self.rotation_parts.is_none() {
             return 0;
         }
-        self.last_backend_count
-            .load(Ordering::Relaxed)
-            .min(crate::rotation::MAX_FANOUT)
+        self.fleet.backend_count().min(crate::rotation::MAX_FANOUT)
     }
 
     /// Build the absolute URL `https://<canonical>-i<index>.<base><path>` for
@@ -1009,7 +986,7 @@ impl VLlmProvider {
                 })?;
 
             let chat_id = chat_completion_response.id.clone();
-            self.signature_rotation
+            self.fleet.signature_rotation
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .insert(chat_id, index);
@@ -1128,7 +1105,7 @@ impl VLlmProvider {
                 drop(stream);
                 continue;
             }
-            self.pending_rotation
+            self.fleet.pending_rotation
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .insert(request_hash.to_string(), index);
@@ -1211,6 +1188,7 @@ impl InferenceProvider for VLlmProvider {
         // the bucket-pinned client nor the general LB client can find it — so
         // we try this client FIRST on every attempt.
         let rotation_index = self
+            .fleet
             .signature_rotation
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -1228,6 +1206,7 @@ impl InferenceProvider for VLlmProvider {
         // opened a second connection to a different backend, so on 404 we fall
         // back to the general-purpose LB client.
         let bucket_id = self
+            .fleet
             .signature_buckets
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -1396,50 +1375,15 @@ impl InferenceProvider for VLlmProvider {
     }
 
     fn pin_chat_connection(&self, request_hash: &str, chat_id: &str) {
-        if let Some(bucket_id) = self
-            .pending_buckets
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(request_hash)
-        {
-            self.signature_buckets
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .insert(chat_id.to_string(), bucket_id);
-        }
-        // Streaming attempts that fell over to a rotation index left the
-        // index in `pending_rotation` keyed by request_hash; promote it
-        // alongside the bucket-side mapping so `get_signature` knows which
-        // SNI to use. Empty chat_id (orphan-cleanup case) only clears the
-        // pending entry without writing into signature_rotation.
-        if let Some(index) = self
-            .pending_rotation
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(request_hash)
-        {
-            if !chat_id.is_empty() {
-                self.signature_rotation
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .insert(chat_id.to_string(), index);
-            }
-        }
+        self.fleet.pin_chat_connection(request_hash, chat_id);
     }
 
     fn unpin_chat_connection(&self, chat_id: &str) {
-        self.signature_buckets
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(chat_id);
-        self.signature_rotation
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(chat_id);
+        self.fleet.unpin_chat_connection(chat_id);
     }
 
     fn set_backend_count(&self, count: usize) {
-        self.last_backend_count.store(count, Ordering::Relaxed);
+        self.fleet.set_backend_count(count);
     }
 
     async fn get_attestation_report(
@@ -1619,7 +1563,7 @@ impl InferenceProvider for VLlmProvider {
         // happy-path streams return HTTP 200 as soon as the headers arrive.
         match canonical_send {
             Ok(response) if self.rotation_count() == 0 => {
-                self.pending_buckets
+                self.fleet.pending_buckets
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .insert(request_hash, bucket_id);
@@ -1632,7 +1576,7 @@ impl InferenceProvider for VLlmProvider {
                 let (first_chunk_status, stream) = Self::peek_first_payload_status(stream).await;
                 match first_chunk_status {
                     None => {
-                        self.pending_buckets
+                        self.fleet.pending_buckets
                             .lock()
                             .unwrap_or_else(|e| e.into_inner())
                             .insert(request_hash, bucket_id);
@@ -1795,7 +1739,7 @@ impl InferenceProvider for VLlmProvider {
         // Store the effective bucket ID for signature fetching.
         // For non-streaming, we know the chat_id immediately.
         let chat_id = chat_completion_response.id.clone();
-        self.signature_buckets
+        self.fleet.signature_buckets
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .insert(chat_id, bucket_id);
@@ -3555,12 +3499,14 @@ mod tests {
         // backend and 404.
         let provider = create_test_provider();
         provider
+            .fleet
             .pending_rotation
             .lock()
             .unwrap()
             .insert("req-hash-abc".to_string(), 2);
         provider.pin_chat_connection("req-hash-abc", "chatcmpl-xyz");
         let stored = provider
+            .fleet
             .signature_rotation
             .lock()
             .unwrap()
@@ -3569,7 +3515,7 @@ mod tests {
         assert_eq!(stored, Some(2));
         // Pending entry should be drained so a future `request_hash` reuse
         // can't accidentally surface the stale index.
-        assert!(provider.pending_rotation.lock().unwrap().is_empty());
+        assert!(provider.fleet.pending_rotation.lock().unwrap().is_empty());
     }
 
     #[test]
@@ -3580,25 +3526,27 @@ mod tests {
         // collide on the same `""` signature_rotation slot.
         let provider = create_test_provider();
         provider
+            .fleet
             .pending_rotation
             .lock()
             .unwrap()
             .insert("req-hash-orphan".to_string(), 1);
         provider.pin_chat_connection("req-hash-orphan", "");
-        assert!(provider.pending_rotation.lock().unwrap().is_empty());
-        assert!(provider.signature_rotation.lock().unwrap().is_empty());
+        assert!(provider.fleet.pending_rotation.lock().unwrap().is_empty());
+        assert!(provider.fleet.signature_rotation.lock().unwrap().is_empty());
     }
 
     #[test]
     fn unpin_chat_connection_clears_signature_rotation() {
         let provider = create_test_provider();
         provider
+            .fleet
             .signature_rotation
             .lock()
             .unwrap()
             .insert("chat-1".to_string(), 4);
         provider.unpin_chat_connection("chat-1");
-        assert!(provider.signature_rotation.lock().unwrap().is_empty());
+        assert!(provider.fleet.signature_rotation.lock().unwrap().is_empty());
     }
 
     // --- Characterization tests for the bucket side of pin/unpin (the H2
@@ -3613,6 +3561,7 @@ mod tests {
         // reuses the same bucket's pinned H2 connection.
         let provider = create_test_provider();
         provider
+            .fleet
             .pending_buckets
             .lock()
             .unwrap()
@@ -3620,6 +3569,7 @@ mod tests {
         provider.pin_chat_connection("req-hash-abc", "chatcmpl-xyz");
         assert_eq!(
             provider
+                .fleet
                 .signature_buckets
                 .lock()
                 .unwrap()
@@ -3629,19 +3579,20 @@ mod tests {
         );
         // Pending entry drained so a future request_hash reuse can't surface
         // a stale bucket.
-        assert!(provider.pending_buckets.lock().unwrap().is_empty());
+        assert!(provider.fleet.pending_buckets.lock().unwrap().is_empty());
     }
 
     #[test]
     fn unpin_chat_connection_clears_signature_bucket() {
         let provider = create_test_provider();
         provider
+            .fleet
             .signature_buckets
             .lock()
             .unwrap()
             .insert("chat-1".to_string(), 2);
         provider.unpin_chat_connection("chat-1");
-        assert!(provider.signature_buckets.lock().unwrap().is_empty());
+        assert!(provider.fleet.signature_buckets.lock().unwrap().is_empty());
     }
 
     #[test]
@@ -3653,14 +3604,15 @@ mod tests {
         // (changing it is a separate, deliberate decision, not a refactor).
         let provider = create_test_provider();
         provider
+            .fleet
             .pending_buckets
             .lock()
             .unwrap()
             .insert("req-hash-orphan".to_string(), 5);
         provider.pin_chat_connection("req-hash-orphan", "");
-        assert!(provider.pending_buckets.lock().unwrap().is_empty());
+        assert!(provider.fleet.pending_buckets.lock().unwrap().is_empty());
         assert_eq!(
-            provider.signature_buckets.lock().unwrap().get("").copied(),
+            provider.fleet.signature_buckets.lock().unwrap().get("").copied(),
             Some(5),
             "bucket side currently writes signature_buckets[\"\"] even for empty chat_id"
         );

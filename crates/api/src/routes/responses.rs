@@ -56,6 +56,9 @@ fn map_response_error_to_status(error: &ServiceResponseError) -> StatusCode {
     match error {
         ServiceResponseError::InvalidParams(_) => StatusCode::BAD_REQUEST,
         ServiceResponseError::InternalError(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        ServiceResponseError::Completion(error) => {
+            crate::routes::common::map_domain_error_to_status(error)
+        }
         ServiceResponseError::UnknownTool(_) => StatusCode::BAD_REQUEST,
         ServiceResponseError::EmptyToolName => StatusCode::BAD_REQUEST,
         ServiceResponseError::StreamInterrupted => StatusCode::INTERNAL_SERVER_ERROR,
@@ -73,6 +76,21 @@ fn map_response_error_to_status(error: &ServiceResponseError) -> StatusCode {
     }
 }
 
+fn status_code_from_response_event(status_code: Option<u16>) -> StatusCode {
+    status_code
+        .and_then(|code| StatusCode::from_u16(code).ok())
+        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+fn error_response_from_response_event(
+    error: services::responses::models::ResponseError,
+) -> ErrorResponse {
+    let mut response = ErrorResponse::new(error.message, error.type_);
+    response.error.param = error.param;
+    response.error.code = error.code;
+    response
+}
+
 /// Compute SHA256 hash of data
 fn compute_sha256(data: &[u8]) -> String {
     let mut hasher = Sha256::new();
@@ -86,6 +104,7 @@ impl From<ServiceResponseError> for ErrorResponse {
             ServiceResponseError::InvalidParams(msg) => {
                 ErrorResponse::new(msg, "invalid_request_error".to_string())
             }
+            ServiceResponseError::Completion(error) => error.into(),
             ServiceResponseError::InternalError(msg) => ErrorResponse::new(
                 format!("Internal server error: {msg}"),
                 "internal_server_error".to_string(),
@@ -399,6 +418,8 @@ pub async fn create_response(
                 let mut status = ResponseStatus::InProgress;
                 let mut final_response: Option<ResponseObject> = None;
                 let mut tracked_usage: Option<Usage> = None;
+                let mut failed_error: Option<services::responses::models::ResponseError> = None;
+                let mut failed_status_code: Option<u16> = None;
 
                 let mut stream = Box::pin(stream);
                 let mut event_count = 0;
@@ -483,6 +504,8 @@ pub async fn create_response(
                         }
                         "response.failed" => {
                             status = ResponseStatus::Failed;
+                            failed_error = event.error.clone();
+                            failed_status_code = event.status_code;
                             if event.usage.is_some() {
                                 tracked_usage = event.usage.clone();
                             }
@@ -498,6 +521,14 @@ pub async fn create_response(
                     delta_count,
                     content.len()
                 );
+
+                if final_response.is_none() {
+                    if let Some(error) = failed_error {
+                        let status_code = status_code_from_response_event(failed_status_code);
+                        let error_response = error_response_from_response_event(error);
+                        return (status_code, ResponseJson(error_response)).into_response();
+                    }
+                }
 
                 // Use final response from completed event or build fallback response
                 let response = if let Some(final_resp) = final_response {

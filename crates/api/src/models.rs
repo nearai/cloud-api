@@ -1094,6 +1094,17 @@ impl ChatCompletionRequest {
             }
         }
 
+        let logprobs = self
+            .extra
+            .get("logprobs")
+            .filter(|value| !value.is_null())
+            .map(|value| {
+                value
+                    .as_bool()
+                    .ok_or_else(|| "logprobs must be a boolean".to_string())
+            })
+            .transpose()?;
+
         if let Some(top_logprobs_value) = self
             .extra
             .get("top_logprobs")
@@ -1107,7 +1118,7 @@ impl ChatCompletionRequest {
                 return Err("top_logprobs must be in the range 0..=20".to_string());
             }
 
-            if self.extra.get("logprobs").and_then(Value::as_bool) != Some(true) {
+            if logprobs != Some(true) {
                 return Err("top_logprobs requires logprobs to be true".to_string());
             }
         }
@@ -3883,6 +3894,30 @@ mod tests {
                 "top_logprobs requires logprobs to be true"
             );
         }
+    }
+
+    #[test]
+    fn test_chat_completion_logprobs_must_be_boolean() {
+        for logprobs in [serde_json::json!("true"), serde_json::json!(1)] {
+            let req: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+                "model": "gpt-4",
+                "messages": [{"role": "user", "content": "hi"}],
+                "logprobs": logprobs,
+            }))
+            .expect("request should deserialize");
+            assert_eq!(req.validate().unwrap_err(), "logprobs must be a boolean");
+        }
+    }
+
+    #[test]
+    fn test_chat_completion_logprobs_null_is_treated_as_unset() {
+        let req: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "gpt-4",
+            "messages": [{"role": "user", "content": "hi"}],
+            "logprobs": null,
+        }))
+        .expect("request should deserialize");
+        assert!(req.validate().is_ok());
     }
 
     #[test]

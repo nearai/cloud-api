@@ -3116,12 +3116,13 @@ mod tests {
     /// guard. Without the `!is_timeout()` guard, a timeout doubles end-to-end
     /// latency before the pool's no-retry classifier sees `Timeout`.
     ///
-    /// `#[serial]`: this asserts wall-clock elapsed (< 1700ms for a single 1s
-    /// timeout vs ~2s for an erroneous retry), so it must not run under the
-    /// CPU contention of the parallel test pool, which can otherwise push the
-    /// single-timeout path past the bound and flake.
+    /// Asserts on the *connection count* (exactly one TCP accept = no retry; a
+    /// retry would open a second), not on wall-clock elapsed — the behavioral
+    /// check is deterministic, so the test is immune to test-harness CPU load.
+    /// An earlier wall-clock bound flaked under the parallel pool, and
+    /// `#[serial]` does not help: it only serializes against other `#[serial]`
+    /// tests, not the non-serial async load that actually skews the timing.
     #[tokio::test]
-    #[serial]
     async fn test_timeout_does_not_trigger_bucket_clear_retry() {
         use crate::{ChatCompletionParams, ChatMessage, InferenceProvider, MessageRole};
         use std::sync::Arc;
@@ -3205,11 +3206,9 @@ mod tests {
             extra: std::collections::HashMap::new(),
         };
 
-        let start = std::time::Instant::now();
         let result = provider
             .chat_completion(params, "test-hash".to_string())
             .await;
-        let elapsed = start.elapsed();
 
         // Must surface as Timeout, not as a generic CompletionError.
         match result {
@@ -3223,13 +3222,11 @@ mod tests {
             other => panic!("expected CompletionError::Timeout, got: {other:?}"),
         }
 
-        // One timeout cycle is ~1s. A retry would be ~2s. Allow generous
-        // headroom for CI scheduler jitter but fail well before 2× to
-        // catch the regression.
-        assert!(
-            elapsed < Duration::from_millis(1700),
-            "chat_completion took {elapsed:?} — looks like the bucket-clear retry fired on timeout"
-        );
+        // The regression guard, asserted deterministically: without the
+        // `!is_timeout()` check, the timeout would fall into the bucket-clear
+        // retry branch and open a *second* backend connection. Exactly one TCP
+        // accept proves no retry fired — no wall-clock comparison, so this
+        // cannot flake under test-harness CPU load.
         assert_eq!(
             accept_count.load(std::sync::atomic::Ordering::SeqCst),
             1,

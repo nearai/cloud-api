@@ -1,6 +1,8 @@
+pub mod measurement;
 pub mod models;
 pub mod verification;
 use dstack_sdk::dstack_client;
+pub use measurement::MeasurementPolicy;
 pub use models::{AttestationError, ChatSignature, SignatureLookupResult};
 use std::sync::Arc;
 pub use verification::{AttestationVerificationError, AttestationVerifier, VerifiedAttestation};

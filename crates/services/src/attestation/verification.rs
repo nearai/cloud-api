@@ -6,6 +6,8 @@
 use sha2::{Digest as Sha2Digest, Sha256};
 use std::collections::HashSet;
 
+use super::measurement::MeasurementPolicy;
+
 const NVIDIA_NRAS_URL: &str = "https://nras.attestation.nvidia.com/v3/attest/gpu";
 
 /// Result of verifying an attestation report from an inference backend.
@@ -59,59 +61,55 @@ struct EventLogEntry {
 pub struct AttestationVerifier {
     /// HTTP client for NVIDIA NRAS calls.
     http_client: reqwest::Client,
-    /// Set of allowed OS image hashes (from env var). Empty = skip image hash check.
-    allowed_image_hashes: HashSet<String>,
+    /// Per-provider measurement policy (OS-image-hash allowlist, TCB floor).
+    /// Selected by provider tier at construction; NEAR's own fleet reproduces
+    /// the previous env-driven, fail-open-on-empty behavior exactly.
+    policy: MeasurementPolicy,
     /// Optional PCCS URL override for Intel collateral fetching.
     pccs_url: Option<String>,
-    /// If true, reject attestations where TCB status is not "UpToDate".
-    require_tcb_up_to_date: bool,
 }
 
 impl AttestationVerifier {
+    /// Construct a NEAR-fleet verifier from explicit allowlist + TCB flag.
+    ///
+    /// Preserved for existing callers/tests: builds a [`ProviderTier::Near`]
+    /// [`MeasurementPolicy`] with the historical semantics (empty allowlist =
+    /// skip the image-hash check).
     pub fn new(
         allowed_image_hashes: HashSet<String>,
         pccs_url: Option<String>,
         require_tcb_up_to_date: bool,
     ) -> Self {
+        Self::with_policy(
+            MeasurementPolicy::near(allowed_image_hashes, require_tcb_up_to_date),
+            pccs_url,
+        )
+    }
+
+    /// Construct a verifier with an explicit per-provider [`MeasurementPolicy`].
+    /// Used to give an attested third-party provider (e.g. Chutes) its own
+    /// fail-closed policy without affecting NEAR's verifier.
+    pub fn with_policy(policy: MeasurementPolicy, pccs_url: Option<String>) -> Self {
         let http_client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(30))
             .build()
             .expect("failed to create HTTP client for attestation verification");
         Self {
             http_client,
-            allowed_image_hashes,
+            policy,
             pccs_url,
-            require_tcb_up_to_date,
         }
     }
 
-    /// Build an `AttestationVerifier` from environment variables.
+    /// Build an `AttestationVerifier` for NEAR's own fleet from environment variables.
     ///
     /// - `ALLOWED_IMAGE_HASHES`: comma-separated list of allowed OS image hashes (hex).
-    ///   If unset or empty, image hash verification is skipped.
+    ///   If unset or empty, image hash verification is skipped (NEAR fleet only).
     /// - `PCCS_URL`: optional Intel PCCS URL for TDX collateral fetching.
+    /// - `REQUIRE_TCB_UP_TO_DATE`: reject non-`UpToDate` TCB when set.
     pub fn from_env() -> Self {
-        let allowed_image_hashes: HashSet<String> = std::env::var("ALLOWED_IMAGE_HASHES")
-            .unwrap_or_default()
-            .split(',')
-            .map(|s| s.trim().to_lowercase())
-            .filter(|s| !s.is_empty())
-            .collect();
-
-        if !allowed_image_hashes.is_empty() {
-            tracing::info!(
-                count = allowed_image_hashes.len(),
-                "Loaded allowed image hashes for attestation verification"
-            );
-        }
-
         let pccs_url = std::env::var("PCCS_URL").ok().filter(|s| !s.is_empty());
-
-        let require_tcb_up_to_date = std::env::var("REQUIRE_TCB_UP_TO_DATE")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false);
-
-        Self::new(allowed_image_hashes, pccs_url, require_tcb_up_to_date)
+        Self::with_policy(MeasurementPolicy::near_from_env(), pccs_url)
     }
 
     /// Verify an attestation report from an inference backend.
@@ -129,6 +127,11 @@ impl AttestationVerifier {
         attestation_report: &serde_json::Map<String, serde_json::Value>,
         request_nonce: &str,
     ) -> Result<VerifiedAttestation, AttestationVerificationError> {
+        // 0. Fail-closed policy guard: an attested third-party provider must
+        //    carry an enforceable measurement allowlist before we trust any
+        //    measurement. No-op for NEAR's own fleet (empty allowlist = skip).
+        self.policy.assert_enforceable()?;
+
         // 1. Extract and verify TDX quote
         let intel_quote_hex = attestation_report
             .get("intel_quote")
@@ -159,7 +162,7 @@ impl AttestationVerifier {
 
         // Check TCB status
         let tcb_status = &verified_report.status;
-        if self.require_tcb_up_to_date && tcb_status != "UpToDate" {
+        if self.policy.require_tcb_up_to_date() && tcb_status != "UpToDate" {
             return Err(AttestationVerificationError::TdxVerificationFailed(format!(
                 "TCB status is '{tcb_status}' but REQUIRE_TCB_UP_TO_DATE is set (advisory_ids: {:?})",
                 verified_report.advisory_ids
@@ -219,17 +222,18 @@ impl AttestationVerifier {
         let event_log_data =
             self.verify_rtmr3_and_extract(attestation_report, &td_report.rt_mr3)?;
 
-        // 4. Check OS image hash from verified event log against allowlist
+        // 4. Check OS image hash from verified event log against the policy's
+        //    allowlist. For NEAR an empty allowlist skips the check (historical
+        //    behavior); for an attested third party the empty case was already
+        //    rejected by `assert_enforceable()` above, so the check is enforced.
         if let Some(ref hash) = event_log_data.os_image_hash {
-            if !self.allowed_image_hashes.is_empty()
-                && !self.allowed_image_hashes.contains(&hash.to_lowercase())
-            {
+            if self.policy.enforces_image_hash() && !self.policy.allows_image_hash(hash) {
                 return Err(AttestationVerificationError::ImageHashMismatch(format!(
                     "os_image_hash '{}' from RTMR3-verified event log not in allowed list",
                     hash
                 )));
             }
-        } else if !self.allowed_image_hashes.is_empty() {
+        } else if self.policy.enforces_image_hash() {
             return Err(AttestationVerificationError::ImageHashMismatch(
                 "ALLOWED_IMAGE_HASHES configured but no os-image-hash in event log".to_string(),
             ));

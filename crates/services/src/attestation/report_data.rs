@@ -8,14 +8,17 @@
 //!   when a TLS fingerprint is present, binding the signing key **and** the live
 //!   TLS endpoint into the quote.
 //!
-//! NEAR's own fleet has historically also accepted a *fallback* form for the
-//! first 32 bytes when no fingerprint is present: `signing_address` zero-padded
-//! to 32 bytes. That fallback drops the TLS co-binding, so for an **attested
-//! third party** (whose nodes we do not operate) it is unsafe — an attacker who
-//! can set `signing_address` could satisfy the check without binding the
-//! connection. [`StrictBoundReportDataVerifier`] therefore requires the
-//! fingerprint binding and forbids the padded-address fallback, while
-//! [`NearReportDataVerifier`] preserves today's behavior byte-for-byte.
+//! The verifier has historically also accepted a *fallback* for the first 32
+//! bytes when no fingerprint was present: `signing_address` zero-padded to 32
+//! bytes. That fallback drops the TLS co-binding — an attacker who can set the
+//! JSON `signing_address` could satisfy the check against a quote that isn't
+//! bound to the TLS endpoint we're actually talking to. [`StrictBoundReportDataVerifier`]
+//! removes that fallback and requires the fingerprint binding for **every**
+//! attested provider, NEAR's own fleet included: a uniform, no-exceptions bar.
+//! NEAR backends already bind the fingerprint (the fallback was never exercised
+//! in practice), so this is a hardening, but it must be validated across the
+//! whole NEAR fleet in staging before promotion — any model that does not bind
+//! a fingerprint would now be (correctly) rejected.
 
 use sha2::{Digest as Sha2Digest, Sha256};
 
@@ -86,47 +89,20 @@ fn check_fingerprint_binding(
     Ok(())
 }
 
-/// NEAR's own-fleet report-data verifier: preserves today's behavior exactly.
-/// Uses the TLS-fingerprint binding when present, else falls back to the
-/// zero-padded `signing_address` form.
-pub struct NearReportDataVerifier;
-
-impl ReportDataVerifier for NearReportDataVerifier {
-    fn verify(
-        &self,
-        report_data: &[u8; 64],
-        signing_address: &str,
-        tls_cert_fingerprint: Option<&str>,
-        nonce: &str,
-    ) -> Result<(), AttestationVerificationError> {
-        check_nonce(report_data, nonce)?;
-        let addr_bytes = decode_addr(signing_address)?;
-
-        if let Some(fp_hex) = tls_cert_fingerprint {
-            check_fingerprint_binding(report_data, &addr_bytes, fp_hex)
-        } else {
-            // No TLS fingerprint: first 32 bytes = signing_address padded to 32.
-            let mut expected = [0u8; 32];
-            let copy_len = addr_bytes.len().min(32);
-            expected[..copy_len].copy_from_slice(&addr_bytes[..copy_len]);
-            if report_data[..32] != expected[..] {
-                return Err(AttestationVerificationError::ReportDataMismatch(format!(
-                    "report_data[0:32] does not match padded signing_address. \
-                     Expected: {}, got: {}",
-                    hex::encode(expected),
-                    hex::encode(&report_data[..32])
-                )));
-            }
-            Ok(())
-        }
-    }
-}
-
-/// Strict report-data verifier for attested third parties: requires the
-/// TLS-fingerprint binding (the padded-`signing_address` fallback is forbidden),
-/// and re-checks the per-request nonce. A report with no `tls_cert_fingerprint`
-/// is rejected outright, closing the connection-hijack hole the fallback opens
-/// when we do not operate the backend.
+/// The report-data verifier used for **every** attested provider — NEAR's own
+/// fleet included. It requires the full binding and admits no exceptions:
+///
+/// - `report_data[32:64]` == the caller's per-request nonce (freshness), and
+/// - `report_data[0:32]` == `SHA256(signing_address ‖ tls_cert_fingerprint)`,
+///   so a `tls_cert_fingerprint` is **mandatory** — the legacy zero-padded
+///   `signing_address` fallback is gone.
+///
+/// NEAR backends already bind the TLS fingerprint into `report_data` (the
+/// fallback was never exercised in practice), so holding NEAR to this bar is a
+/// hardening with no intended behavior change — and it removes the
+/// connection-hijack surface that the padded-address fallback opened for any
+/// backend we do not operate. Keeping one uniform, no-exceptions rule is the
+/// point: the verifier presents the same high bar to NEAR and to third parties.
 pub struct StrictBoundReportDataVerifier;
 
 impl ReportDataVerifier for StrictBoundReportDataVerifier {
@@ -141,9 +117,8 @@ impl ReportDataVerifier for StrictBoundReportDataVerifier {
         let addr_bytes = decode_addr(signing_address)?;
         let fp_hex = tls_cert_fingerprint.ok_or_else(|| {
             AttestationVerificationError::ReportDataMismatch(
-                "attested third-party report has no tls_cert_fingerprint; the padded \
-                 signing_address fallback is forbidden for this tier (would drop the \
-                 TLS co-binding)"
+                "attestation report has no tls_cert_fingerprint; the padded signing_address \
+                 fallback is not accepted (it would drop the TLS co-binding from report_data)"
                     .to_string(),
             )
         })?;
@@ -179,30 +154,6 @@ mod tests {
         let mut a = [0u8; 32];
         a.copy_from_slice(&v);
         a
-    }
-
-    #[test]
-    fn near_accepts_fingerprint_binding() {
-        let rd = bound_report_data(
-            &hex::decode(ADDR).unwrap(),
-            &hex::decode(FP).unwrap(),
-            &nonce_bytes(),
-        );
-        assert!(NearReportDataVerifier
-            .verify(&rd, ADDR, Some(FP), NONCE)
-            .is_ok());
-    }
-
-    #[test]
-    fn near_accepts_padded_address_fallback() {
-        // No fingerprint: [0:32] = addr padded.
-        let mut rd = [0u8; 64];
-        let addr = hex::decode(ADDR).unwrap();
-        rd[..addr.len()].copy_from_slice(&addr);
-        rd[32..].copy_from_slice(&nonce_bytes());
-        assert!(NearReportDataVerifier
-            .verify(&rd, ADDR, None, NONCE)
-            .is_ok());
     }
 
     #[test]
@@ -246,16 +197,13 @@ mod tests {
     }
 
     #[test]
-    fn both_reject_wrong_fingerprint_binding() {
+    fn rejects_wrong_fingerprint_binding() {
         let rd = bound_report_data(
             &hex::decode(ADDR).unwrap(),
             &hex::decode(FP).unwrap(),
             &nonce_bytes(),
         );
         let wrong_fp = "5555555555555555555555555555555555555555555555555555555555555555";
-        assert!(NearReportDataVerifier
-            .verify(&rd, ADDR, Some(wrong_fp), NONCE)
-            .is_err());
         assert!(StrictBoundReportDataVerifier
             .verify(&rd, ADDR, Some(wrong_fp), NONCE)
             .is_err());

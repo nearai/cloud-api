@@ -5,7 +5,7 @@ pub mod verification;
 use dstack_sdk::dstack_client;
 pub use measurement::MeasurementPolicy;
 pub use models::{AttestationError, ChatSignature, SignatureLookupResult};
-pub use report_data::{NearReportDataVerifier, ReportDataVerifier, StrictBoundReportDataVerifier};
+pub use report_data::{ReportDataVerifier, StrictBoundReportDataVerifier};
 use std::sync::Arc;
 pub use verification::{AttestationVerificationError, AttestationVerifier, VerifiedAttestation};
 

@@ -7,12 +7,8 @@ use sha2::Digest;
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use inference_providers::ProviderTier;
-
 use super::measurement::MeasurementPolicy;
-use super::report_data::{
-    NearReportDataVerifier, ReportDataVerifier, StrictBoundReportDataVerifier,
-};
+use super::report_data::{ReportDataVerifier, StrictBoundReportDataVerifier};
 
 const NVIDIA_NRAS_URL: &str = "https://nras.attestation.nvidia.com/v3/attest/gpu";
 
@@ -83,7 +79,7 @@ pub struct AttestationVerifier {
 impl AttestationVerifier {
     /// Construct a NEAR-fleet verifier from explicit allowlist + TCB flag.
     ///
-    /// Preserved for existing callers/tests: builds a [`ProviderTier::Near`]
+    /// Preserved for existing callers/tests: builds a `Near`-tier
     /// [`MeasurementPolicy`] with the historical semantics (empty allowlist =
     /// skip the image-hash check).
     pub fn new(
@@ -105,13 +101,13 @@ impl AttestationVerifier {
             .timeout(std::time::Duration::from_secs(30))
             .build()
             .expect("failed to create HTTP client for attestation verification");
-        // Select the report_data verifier from the tier (never from a report
-        // field). Attested third parties must bind the TLS fingerprint into the
-        // quote; NEAR keeps its historical behavior including the fallback.
-        let report_data_verifier: Arc<dyn ReportDataVerifier> = match policy.tier() {
-            ProviderTier::Attested3p => Arc::new(StrictBoundReportDataVerifier),
-            ProviderTier::Near | ProviderTier::NonAttested => Arc::new(NearReportDataVerifier),
-        };
+        // Strict report_data binding for EVERY attested provider — NEAR's own
+        // fleet is held to the same bar as third parties (TLS fingerprint
+        // required; no padded-`signing_address` fallback). The `Arc<dyn>` seam
+        // is kept so a provider with a different report_data layout can plug its
+        // own verifier in a later PR.
+        let report_data_verifier: Arc<dyn ReportDataVerifier> =
+            Arc::new(StrictBoundReportDataVerifier);
         Self {
             http_client,
             policy,

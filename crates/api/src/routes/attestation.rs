@@ -408,7 +408,7 @@ fn attestation_report_error_response(
         AttestationError::ProviderError(_) => error_response(
             StatusCode::SERVICE_UNAVAILABLE,
             message,
-            "service_unavailable",
+            "provider_error",
             None,
         ),
         AttestationError::SignatureNotFound(_) => {

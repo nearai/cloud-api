@@ -3,10 +3,12 @@
 //! Verifies TDX quotes, report_data bindings (signing address + TLS fingerprint),
 //! image hashes, and GPU evidence from attestation reports returned by inference-proxy.
 
-use sha2::{Digest as Sha2Digest, Sha256};
+use sha2::Digest;
 use std::collections::HashSet;
+use std::sync::Arc;
 
 use super::measurement::MeasurementPolicy;
+use super::report_data::{ReportDataVerifier, StrictBoundReportDataVerifier};
 
 const NVIDIA_NRAS_URL: &str = "https://nras.attestation.nvidia.com/v3/attest/gpu";
 
@@ -65,6 +67,11 @@ pub struct AttestationVerifier {
     /// Selected by provider tier at construction; NEAR's own fleet reproduces
     /// the previous env-driven, fail-open-on-empty behavior exactly.
     policy: MeasurementPolicy,
+    /// Per-tier `report_data` binding verifier. NEAR keeps the historical
+    /// behavior (TLS-fingerprint binding with a padded-address fallback); an
+    /// attested third party gets the strict verifier (fingerprint binding
+    /// required, no fallback). Selected from `policy.tier()` at construction.
+    report_data_verifier: Arc<dyn ReportDataVerifier>,
     /// Optional PCCS URL override for Intel collateral fetching.
     pccs_url: Option<String>,
 }
@@ -72,7 +79,7 @@ pub struct AttestationVerifier {
 impl AttestationVerifier {
     /// Construct a NEAR-fleet verifier from explicit allowlist + TCB flag.
     ///
-    /// Preserved for existing callers/tests: builds a [`ProviderTier::Near`]
+    /// Preserved for existing callers/tests: builds a `Near`-tier
     /// [`MeasurementPolicy`] with the historical semantics (empty allowlist =
     /// skip the image-hash check).
     pub fn new(
@@ -94,9 +101,17 @@ impl AttestationVerifier {
             .timeout(std::time::Duration::from_secs(30))
             .build()
             .expect("failed to create HTTP client for attestation verification");
+        // Strict report_data binding for EVERY attested provider — NEAR's own
+        // fleet is held to the same bar as third parties (TLS fingerprint
+        // required; no padded-`signing_address` fallback). The `Arc<dyn>` seam
+        // is kept so a provider with a different report_data layout can plug its
+        // own verifier in a later PR.
+        let report_data_verifier: Arc<dyn ReportDataVerifier> =
+            Arc::new(StrictBoundReportDataVerifier);
         Self {
             http_client,
             policy,
+            report_data_verifier,
             pccs_url,
         }
     }
@@ -206,15 +221,11 @@ impl AttestationVerifier {
             .get("tls_cert_fingerprint")
             .and_then(|v| v.as_str());
 
-        self.verify_report_data(
+        self.report_data_verifier.verify(
             report_data,
             signing_address,
             tls_cert_fingerprint,
             request_nonce,
-            attestation_report
-                .get("signing_algo")
-                .and_then(|v| v.as_str())
-                .unwrap_or("ed25519"),
         )?;
 
         // 3. Replay RTMR3 from event log and verify against the TDX quote.
@@ -253,85 +264,6 @@ impl AttestationVerifier {
             compose_hash: event_log_data.compose_hash,
             gpu_verdict,
         })
-    }
-
-    /// Verify that `report_data` correctly binds the signing address, TLS fingerprint, and nonce.
-    ///
-    /// When `tls_cert_fingerprint` is present:
-    ///   `report_data[0:32] = SHA256(signing_address_bytes || fingerprint_bytes)`
-    /// Otherwise:
-    ///   `report_data[0:32] = signing_address_bytes padded to 32`
-    ///
-    /// Always: `report_data[32:64] = nonce_bytes`
-    fn verify_report_data(
-        &self,
-        report_data: &[u8; 64],
-        signing_address: &str,
-        tls_cert_fingerprint: Option<&str>,
-        nonce: &str,
-        _signing_algo: &str,
-    ) -> Result<(), AttestationVerificationError> {
-        // Verify nonce (second 32 bytes)
-        let nonce_bytes = hex::decode(nonce.strip_prefix("0x").unwrap_or(nonce)).map_err(|e| {
-            AttestationVerificationError::InvalidFormat(format!("nonce hex decode: {e}"))
-        })?;
-        if nonce_bytes.len() != 32 {
-            return Err(AttestationVerificationError::ReportDataMismatch(format!(
-                "nonce must be 32 bytes, got {}",
-                nonce_bytes.len()
-            )));
-        }
-        if report_data[32..64] != nonce_bytes[..] {
-            return Err(AttestationVerificationError::ReportDataMismatch(
-                "nonce mismatch in report_data[32:64]".to_string(),
-            ));
-        }
-
-        // Verify first 32 bytes
-        let addr_hex = signing_address
-            .strip_prefix("0x")
-            .unwrap_or(signing_address);
-        let addr_bytes = hex::decode(addr_hex).map_err(|e| {
-            AttestationVerificationError::InvalidFormat(format!("signing_address hex decode: {e}"))
-        })?;
-
-        if let Some(fp_hex) = tls_cert_fingerprint {
-            // TLS fingerprint binding: SHA256(signing_address_bytes || fingerprint_bytes)
-            let fp_bytes =
-                hex::decode(fp_hex.strip_prefix("0x").unwrap_or(fp_hex)).map_err(|e| {
-                    AttestationVerificationError::InvalidFormat(format!(
-                        "tls_cert_fingerprint hex decode: {e}"
-                    ))
-                })?;
-            let mut hasher = Sha256::new();
-            hasher.update(&addr_bytes);
-            hasher.update(&fp_bytes);
-            let expected = hasher.finalize();
-
-            if report_data[..32] != expected[..] {
-                return Err(AttestationVerificationError::ReportDataMismatch(format!(
-                    "report_data[0:32] does not match SHA256(signing_address || tls_fingerprint). \
-                     Expected: {}, got: {}",
-                    hex::encode(expected),
-                    hex::encode(&report_data[..32])
-                )));
-            }
-        } else {
-            // No TLS fingerprint: first 32 bytes = signing_address padded to 32
-            let mut expected = [0u8; 32];
-            let copy_len = addr_bytes.len().min(32);
-            expected[..copy_len].copy_from_slice(&addr_bytes[..copy_len]);
-            if report_data[..32] != expected[..] {
-                return Err(AttestationVerificationError::ReportDataMismatch(format!(
-                    "report_data[0:32] does not match padded signing_address. \
-                     Expected: {}, got: {}",
-                    hex::encode(expected),
-                    hex::encode(&report_data[..32])
-                )));
-            }
-        }
-
-        Ok(())
     }
 
     /// Replay RTMR3 from the event log and verify it matches the TDX quote.

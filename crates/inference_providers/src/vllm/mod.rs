@@ -199,39 +199,12 @@ impl VLlmConfig {
 /// Provides inference through vLLM's OpenAI-compatible API endpoints.
 /// Supports both chat completions and text completions with streaming.
 pub struct VLlmProvider {
-    config: VLlmConfig,
-    /// General-purpose client for non-completion requests (attestation, models, etc.)
-    client: Client,
-    /// Routing state for sending a completion and its signature fetch to the
-    /// same model-proxy backend: the prefix-bucket clients + prefix router, the
-    /// rotation-SNI addressing, the signature/bucket pin maps, and the
-    /// last-known healthy backend count. See [`fleet::FleetRouter`]. The
-    /// provider still fills/clears bucket clients (inline attestation) and
-    /// builds rotation clients (TLS), reading the slots from here.
+    /// All NEAR-AI model-proxy state and behavior: config + clients, the TLS
+    /// fingerprint pin state, the backend verifier, and the routing state
+    /// (prefix buckets, rotation addressing, signature pins). VLlmProvider is
+    /// becoming a thin trait adapter over this; methods currently still on the
+    /// provider read their state via `self.fleet.*` until they move too.
     fleet: FleetRouter,
-    /// TLS fingerprint verification state (Bootstrap → Pinned or Blocked).
-    /// Shared across the main client and all bucket clients.
-    fingerprint_state: Arc<std::sync::RwLock<FingerprintState>>,
-    /// Creates verified clients for lazy bucket initialization.
-    /// When a bucket needs a client, the verifier connects to a backend,
-    /// verifies its attestation, pins the fingerprint, and returns the client.
-    backend_verifier: Option<Arc<dyn crate::BackendVerifier>>,
-    /// Fallback client used when inline bucket verification exhausts all retries.
-    /// Has completion-timeout read settings so long-running inference requests
-    /// don't hit the shorter control_timeout (read budget) used by the general
-    /// client. Does not pin TLS to a specific backend — requests are served
-    /// without prefix-cache routing but are not dropped, ensuring inline
-    /// verification failures degrade gracefully.
-    fallback_client: Client,
-    /// Bounds concurrent inline verifications to prevent thundering-herd pressure
-    /// on inference-proxy GPU evidence collection at startup (when all buckets are
-    /// empty and many requests arrive simultaneously). Configurable via the
-    /// `INLINE_VERIFY_CONCURRENCY` environment variable (default: 4).
-    verification_semaphore: Arc<Semaphore>,
-    /// Cached TLS roots for building per-attempt rotation clients. Reused for
-    /// the rotation-SNI fallback path so the fingerprint pin set stays
-    /// consistent with the bucket clients.
-    tls_roots: SharedTlsRoots,
 }
 
 impl VLlmProvider {
@@ -378,31 +351,36 @@ impl VLlmProvider {
             .and_then(crate::rotation::split_inference_url);
 
         Self {
-            config,
-            client,
-            fallback_client,
-            verification_semaphore,
-            fleet: FleetRouter::new(rotation_parts, prefix_router, bucket_clients),
-            fingerprint_state,
-            backend_verifier,
-            tls_roots,
+            fleet: FleetRouter::new(
+                rotation_parts,
+                prefix_router,
+                bucket_clients,
+                config,
+                client,
+                fallback_client,
+                verification_semaphore,
+                fingerprint_state,
+                backend_verifier,
+                tls_roots,
+            ),
         }
     }
 
     /// Access the provider's configuration.
     pub fn config(&self) -> &VLlmConfig {
-        &self.config
+        &self.fleet.config
     }
 
     /// Get a reference to the shared fingerprint state.
     pub fn fingerprint_state(&self) -> Arc<std::sync::RwLock<FingerprintState>> {
-        self.fingerprint_state.clone()
+        self.fleet.fingerprint_state.clone()
     }
 
     /// Add a verified SPKI fingerprint. Transitions Bootstrap → Pinned,
     /// or adds to existing Pinned set. Unblocks a Blocked provider.
     pub fn add_verified_fingerprint(&self, fingerprint: String) {
-        self.fingerprint_state
+        self.fleet
+            .fingerprint_state
             .write()
             .unwrap_or_else(|e| e.into_inner())
             .add_fingerprint(fingerprint);
@@ -411,7 +389,8 @@ impl VLlmProvider {
     /// Block all TLS connections (attestation verification failed).
     /// Only blocks from Bootstrap state — does not override existing Pinned fingerprints.
     pub fn block_connections(&self) {
-        self.fingerprint_state
+        self.fleet
+            .fingerprint_state
             .write()
             .unwrap_or_else(|e| e.into_inner())
             .block();
@@ -419,7 +398,8 @@ impl VLlmProvider {
 
     /// Returns the number of verified fingerprints currently pinned.
     pub fn pinned_fingerprint_count(&self) -> usize {
-        self.fingerprint_state
+        self.fleet
+            .fingerprint_state
             .read()
             .unwrap_or_else(|e| e.into_inner())
             .pinned_count()
@@ -448,7 +428,7 @@ impl VLlmProvider {
     ///   has been explicitly blocked; attempting verification would only waste
     ///   attestation round-trips and fill logs with noise.
     pub fn pre_warm(self: Arc<Self>) {
-        if self.backend_verifier.is_none() {
+        if self.fleet.backend_verifier.is_none() {
             return;
         }
         if self.pinned_fingerprint_count() == 0 {
@@ -508,7 +488,7 @@ impl VLlmProvider {
         }
 
         // Slow path: inline verification.
-        let verifier = match self.backend_verifier.as_ref() {
+        let verifier = match self.fleet.backend_verifier.as_ref() {
             Some(v) => v,
             None => {
                 // No verifier configured (legacy/test mode) — bucket should have
@@ -534,6 +514,7 @@ impl VLlmProvider {
         // In practice the first successful verification fills the bucket and all
         // subsequent waiters take the fast path (re-check after acquiring permit).
         let _permit = self
+            .fleet
             .verification_semaphore
             .acquire()
             .await
@@ -552,7 +533,10 @@ impl VLlmProvider {
 
         let mut last_err = None;
         for _attempt in 0..=Self::INLINE_VERIFY_RETRIES {
-            match verifier.create_verified_client(&self.config.base_url).await {
+            match verifier
+                .create_verified_client(&self.fleet.config.base_url)
+                .await
+            {
                 Ok(client) => {
                     // Double-check: another concurrent request may have filled
                     // this bucket while we were verifying. Use its client if so
@@ -609,7 +593,7 @@ impl VLlmProvider {
                 error = %err_msg,
                 "Inline backend verification exhausted retries; serving with fallback client"
             );
-            Ok(self.fallback_client.clone())
+            Ok(self.fleet.fallback_client.clone())
         } else {
             // Bootstrap: no fingerprints pinned yet. Fail safely.
             tracing::warn!(
@@ -655,7 +639,7 @@ impl VLlmProvider {
         let mut headers = reqwest::header::HeaderMap::new();
         headers.insert("Content-Type", HeaderValue::from_static("application/json"));
 
-        if let Some(ref api_key) = self.config.api_key {
+        if let Some(ref api_key) = self.fleet.config.api_key {
             let auth_value = format!("Bearer {api_key}");
             let header_value = HeaderValue::from_str(&auth_value)
                 .map_err(|e| format!("Invalid API key format: {e}"))?;
@@ -783,10 +767,10 @@ impl VLlmProvider {
         params: &T,
         client_override: Option<&Client>,
     ) -> Result<reqwest::Response, CompletionError> {
-        let client = client_override.unwrap_or(&self.client);
-        let ttfb_timeout_secs = self.config.control_timeout_seconds.max(0) as u64;
+        let client = client_override.unwrap_or(&self.fleet.client);
+        let ttfb_timeout_secs = self.fleet.config.control_timeout_seconds.max(0) as u64;
         let response = tokio::time::timeout(
-            self.config.control_timeout(),
+            self.fleet.config.control_timeout(),
             client.post(url).headers(headers).json(params).send(),
         )
         .await
@@ -838,11 +822,15 @@ impl VLlmProvider {
     /// same pinned SPKI set is enforced for every backend.
     fn build_rotation_client(&self) -> Result<Client, CompletionError> {
         Client::builder()
-            .use_preconfigured_tls(self.tls_roots.build_config(self.fingerprint_state.clone()))
+            .use_preconfigured_tls(
+                self.fleet
+                    .tls_roots
+                    .build_config(self.fleet.fingerprint_state.clone()),
+            )
             .pool_max_idle_per_host(0)
             .http2_adaptive_window(true)
             .connect_timeout(Duration::from_secs(5))
-            .read_timeout(self.config.completion_timeout())
+            .read_timeout(self.fleet.config.completion_timeout())
             .build()
             .map_err(|e| CompletionError::CompletionError(format!("rotation_client_build: {e}")))
     }
@@ -1143,11 +1131,11 @@ impl InferenceProvider for VLlmProvider {
     ) -> Result<ChatSignature, CompletionError> {
         let signing_algo = signing_algo.unwrap_or_else(|| "ecdsa".to_string());
         let path_and_query = format!("/v1/signature/{chat_id}?signing_algo={signing_algo}");
-        let canonical_url = format!("{}{}", self.config.base_url, path_and_query);
+        let canonical_url = format!("{}{}", self.fleet.config.base_url, path_and_query);
         let headers = self
             .build_headers()
             .map_err(CompletionError::CompletionError)?;
-        let timeout = self.config.control_timeout();
+        let timeout = self.fleet.config.control_timeout();
 
         // Resolve the rotation-SNI target once; it's stable across retries.
         // If this chat_id was served by a rotation-SNI fallback (sticky bucket
@@ -1190,7 +1178,7 @@ impl InferenceProvider for VLlmProvider {
         if let Some(ref bc) = bucket_client {
             clients_to_try.push(bc);
         }
-        clients_to_try.push(&self.client);
+        clients_to_try.push(&self.fleet.client);
 
         // The backend signs in a background task that finalizes *after* the
         // final stream chunk, then caches the signature. cloud-api fetches in
@@ -1383,7 +1371,7 @@ impl InferenceProvider for VLlmProvider {
         // Build URL with optional query parameters
         let url = format!(
             "{}/v1/attestation/report?{}",
-            self.config.base_url,
+            self.fleet.config.base_url,
             serde_urlencoded::to_string(&query).map_err(|_| AttestationError::Unknown(
                 "Failed to serialize query string".to_string()
             ))?
@@ -1392,10 +1380,11 @@ impl InferenceProvider for VLlmProvider {
         let headers = self.build_headers().map_err(AttestationError::FetchError)?;
 
         let response = self
+            .fleet
             .client
             .get(&url)
             .headers(headers)
-            .timeout(self.config.control_timeout())
+            .timeout(self.fleet.config.control_timeout())
             .send()
             .await
             .map_err(|e| AttestationError::FetchError(e.to_string()))?;
@@ -1427,15 +1416,16 @@ impl InferenceProvider for VLlmProvider {
 
     /// Lists all available models from the vLLM server
     async fn models(&self) -> Result<ModelsResponse, ListModelsError> {
-        let url = format!("{}/v1/models", self.config.base_url);
+        let url = format!("{}/v1/models", self.fleet.config.base_url);
         tracing::debug!("Listing models from vLLM server, url: {}", url);
 
         let headers = self.build_headers().map_err(ListModelsError::FetchError)?;
         let response = self
+            .fleet
             .client
             .get(&url)
             .headers(headers)
-            .timeout(self.config.control_timeout())
+            .timeout(self.fleet.config.control_timeout())
             .send()
             .await
             .map_err(|e| ListModelsError::FetchError(format!("{e:?}")))?;
@@ -1462,7 +1452,7 @@ impl InferenceProvider for VLlmProvider {
         params: ChatCompletionParams,
         request_hash: String,
     ) -> Result<StreamingResult, CompletionError> {
-        let url = format!("{}/v1/chat/completions", self.config.base_url);
+        let url = format!("{}/v1/chat/completions", self.fleet.config.base_url);
 
         // Ensure streaming and token usage are enabled
         let mut streaming_params = params;
@@ -1595,7 +1585,7 @@ impl InferenceProvider for VLlmProvider {
         params: ChatCompletionParams,
         request_hash: String,
     ) -> Result<ChatCompletionResponseWithBytes, CompletionError> {
-        let url = format!("{}/v1/chat/completions", self.config.base_url);
+        let url = format!("{}/v1/chat/completions", self.fleet.config.base_url);
 
         let mut non_streaming_params = params;
 
@@ -1614,7 +1604,7 @@ impl InferenceProvider for VLlmProvider {
         // Route to a verified bucket client based on prompt prefix.
         let bucket_id = self.fleet.route(&non_streaming_params.messages);
         let bucket_client = self.get_or_verify_bucket_client(bucket_id).await?;
-        let timeout_secs = self.config.completion_timeout_seconds.max(0) as u64;
+        let timeout_secs = self.fleet.config.completion_timeout_seconds.max(0) as u64;
         let timeout = Duration::from_secs(timeout_secs);
 
         let send = |client: &Client, hdrs: reqwest::header::HeaderMap| {
@@ -1726,7 +1716,7 @@ impl InferenceProvider for VLlmProvider {
         &self,
         params: CompletionParams,
     ) -> Result<StreamingResult, CompletionError> {
-        let url = format!("{}/v1/completions", self.config.base_url);
+        let url = format!("{}/v1/completions", self.fleet.config.base_url);
 
         // Ensure streaming and token usage are enabled
         let mut streaming_params = params;
@@ -1754,7 +1744,7 @@ impl InferenceProvider for VLlmProvider {
         mut params: ImageGenerationParams,
         request_hash: String,
     ) -> Result<ImageGenerationResponseWithBytes, ImageGenerationError> {
-        let url = format!("{}/v1/images/generations", self.config.base_url);
+        let url = format!("{}/v1/images/generations", self.fleet.config.base_url);
 
         let mut headers = self.build_headers().map_err(to_image_gen_error)?;
 
@@ -1768,6 +1758,7 @@ impl InferenceProvider for VLlmProvider {
         self.prepare_encryption_headers(&mut headers, &mut params.extra);
 
         let response = self
+            .fleet
             .client
             .post(&url)
             .headers(headers)
@@ -1807,7 +1798,7 @@ impl InferenceProvider for VLlmProvider {
         mut params: AudioTranscriptionParams,
         request_hash: String,
     ) -> Result<AudioTranscriptionResponse, AudioTranscriptionError> {
-        let url = format!("{}/v1/audio/transcriptions", self.config.base_url);
+        let url = format!("{}/v1/audio/transcriptions", self.fleet.config.base_url);
 
         // Detect content type from filename
         let content_type = crate::models::detect_audio_content_type(&params.filename);
@@ -1856,11 +1847,12 @@ impl InferenceProvider for VLlmProvider {
 
         // Send request with timeout
         let response = self
+            .fleet
             .client
             .post(&url)
             .headers(headers)
             .multipart(form)
-            .timeout(self.config.completion_timeout())
+            .timeout(self.fleet.config.completion_timeout())
             .send()
             .await
             .map_err(|e| {
@@ -1907,12 +1899,12 @@ impl InferenceProvider for VLlmProvider {
         params: Arc<ImageEditParams>,
         request_hash: String,
     ) -> Result<ImageEditResponseWithBytes, ImageEditError> {
-        let url = format!("{}/v1/images/edits", self.config.base_url);
+        let url = format!("{}/v1/images/edits", self.fleet.config.base_url);
 
         // Build headers without Content-Type (let reqwest set multipart boundary)
         let mut headers = reqwest::header::HeaderMap::new();
 
-        if let Some(ref api_key) = self.config.api_key {
+        if let Some(ref api_key) = self.fleet.config.api_key {
             let auth_value = format!("Bearer {api_key}");
             let header_value = HeaderValue::from_str(&auth_value)
                 .map_err(|e| ImageEditError::EditError(format!("Invalid API key format: {e}")))?;
@@ -1960,6 +1952,7 @@ impl InferenceProvider for VLlmProvider {
         }
 
         let response = self
+            .fleet
             .client
             .post(&url)
             .headers(headers)
@@ -2004,7 +1997,7 @@ impl InferenceProvider for VLlmProvider {
         mut params: ScoreParams,
         request_hash: String,
     ) -> Result<ScoreResponse, ScoreError> {
-        let url = format!("{}/v1/score", self.config.base_url);
+        let url = format!("{}/v1/score", self.fleet.config.base_url);
 
         let mut headers = self.build_headers().map_err(to_score_error)?;
         self.prepare_tracing_headers(&mut headers, &mut params.extra);
@@ -2015,11 +2008,12 @@ impl InferenceProvider for VLlmProvider {
         );
 
         let response = self
+            .fleet
             .client
             .post(&url)
             .headers(headers)
             .json(&params)
-            .timeout(self.config.completion_timeout())
+            .timeout(self.fleet.config.completion_timeout())
             .send()
             .await
             .map_err(to_score_error)?;
@@ -2041,18 +2035,19 @@ impl InferenceProvider for VLlmProvider {
     }
 
     async fn rerank(&self, mut params: RerankParams) -> Result<RerankResponse, RerankError> {
-        let url = format!("{}/v1/rerank", self.config.base_url);
+        let url = format!("{}/v1/rerank", self.fleet.config.base_url);
 
         let mut headers = self.build_headers().map_err(to_rerank_error)?;
         self.prepare_tracing_headers(&mut headers, &mut params.extra);
         self.prepare_encryption_headers(&mut headers, &mut params.extra);
 
         let response = self
+            .fleet
             .client
             .post(&url)
             .headers(headers)
             .json(&params)
-            .timeout(self.config.completion_timeout())
+            .timeout(self.fleet.config.completion_timeout())
             .send()
             .await
             .map_err(to_rerank_error)?;
@@ -2078,19 +2073,20 @@ impl InferenceProvider for VLlmProvider {
         body: bytes::Bytes,
         mut extra: std::collections::HashMap<String, serde_json::Value>,
     ) -> Result<bytes::Bytes, EmbeddingError> {
-        let url = format!("{}/v1/embeddings", self.config.base_url);
+        let url = format!("{}/v1/embeddings", self.fleet.config.base_url);
 
         let mut headers = self.build_headers().map_err(to_embedding_error)?;
         self.prepare_tracing_headers(&mut headers, &mut extra);
         self.prepare_encryption_headers(&mut headers, &mut extra);
 
         let response = self
+            .fleet
             .client
             .post(&url)
             .headers(headers)
             .header(reqwest::header::CONTENT_TYPE, "application/json")
             .body(body)
-            .timeout(self.config.completion_timeout())
+            .timeout(self.fleet.config.completion_timeout())
             .send()
             .await
             .map_err(to_embedding_error)?;
@@ -2116,19 +2112,20 @@ impl InferenceProvider for VLlmProvider {
         body: bytes::Bytes,
         mut extra: std::collections::HashMap<String, serde_json::Value>,
     ) -> Result<bytes::Bytes, PrivacyClassifyError> {
-        let url = format!("{}/v1/privacy/classify", self.config.base_url);
+        let url = format!("{}/v1/privacy/classify", self.fleet.config.base_url);
 
         let mut headers = self.build_headers().map_err(to_privacy_classify_error)?;
         self.prepare_tracing_headers(&mut headers, &mut extra);
         self.prepare_encryption_headers(&mut headers, &mut extra);
 
         let response = self
+            .fleet
             .client
             .post(&url)
             .headers(headers)
             .header(reqwest::header::CONTENT_TYPE, "application/json")
             .body(body)
-            .timeout(self.config.completion_timeout())
+            .timeout(self.fleet.config.completion_timeout())
             .send()
             .await
             .map_err(to_privacy_classify_error)?;

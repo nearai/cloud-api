@@ -12,11 +12,15 @@
 //! characterization tests in the parent module.
 
 use super::prefix_router::PrefixRouter;
+use super::VLlmConfig;
 use crate::rotation;
+use crate::spki_verifier::{FingerprintState, SharedTlsRoots};
+use crate::BackendVerifier;
 use reqwest::Client;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, RwLock};
+use tokio::sync::Semaphore;
 
 /// Poison-tolerant lock: a panicked holder shouldn't wedge routing — we only
 /// ever mutate small maps under it, so recovering the inner value is safe.
@@ -50,13 +54,37 @@ pub(super) struct FleetRouter {
     /// provider fills/clears these slots via inline attestation; FleetRouter
     /// just owns the storage.
     pub(super) bucket_clients: Vec<Mutex<Option<Client>>>,
+    /// Provider config (base_url, api_key, timeouts).
+    pub(super) config: VLlmConfig,
+    /// General-purpose client for non-completion requests (attestation, models).
+    pub(super) client: Client,
+    /// Completion-timeout, non-pinned client used when inline bucket
+    /// verification exhausts retries (graceful degradation).
+    pub(super) fallback_client: Client,
+    /// Bounds concurrent inline verifications (thundering-herd guard).
+    pub(super) verification_semaphore: Arc<Semaphore>,
+    /// TLS fingerprint pin state shared by the general client + all bucket and
+    /// rotation clients.
+    pub(super) fingerprint_state: Arc<RwLock<FingerprintState>>,
+    /// Builds verified clients for lazy bucket init (None in legacy/test mode).
+    pub(super) backend_verifier: Option<Arc<dyn BackendVerifier>>,
+    /// Cached TLS roots for building per-attempt rotation/bucket clients.
+    pub(super) tls_roots: SharedTlsRoots,
 }
 
 impl FleetRouter {
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn new(
         rotation_parts: Option<rotation::UrlParts>,
         prefix_router: Arc<PrefixRouter>,
         bucket_clients: Vec<Mutex<Option<Client>>>,
+        config: VLlmConfig,
+        client: Client,
+        fallback_client: Client,
+        verification_semaphore: Arc<Semaphore>,
+        fingerprint_state: Arc<RwLock<FingerprintState>>,
+        backend_verifier: Option<Arc<dyn BackendVerifier>>,
+        tls_roots: SharedTlsRoots,
     ) -> Self {
         Self {
             pending_buckets: Mutex::new(HashMap::new()),
@@ -67,6 +95,13 @@ impl FleetRouter {
             rotation_parts,
             prefix_router,
             bucket_clients,
+            config,
+            client,
+            fallback_client,
+            verification_semaphore,
+            fingerprint_state,
+            backend_verifier,
+            tls_roots,
         }
     }
 

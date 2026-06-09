@@ -343,6 +343,7 @@ impl ExternalBackend for AnthropicBackend {
                 logprobs: None,
                 finish_reason: map_finish_reason_string(anthropic_response.stop_reason),
                 token_ids: None,
+                extra: Default::default(),
             }],
             service_tier: None,
             system_fingerprint: None,
@@ -356,6 +357,7 @@ impl ExternalBackend for AnthropicBackend {
             prompt_logprobs: None,
             prompt_token_ids: None,
             kv_transfer_params: None,
+            extra: Default::default(),
         };
 
         // Serialize our normalized response. We intentionally overwrite fields

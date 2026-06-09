@@ -868,3 +868,74 @@ async fn test_internal_usage_returns_401_on_wrong_token() {
 
     assert_eq!(response.status_code(), 401);
 }
+
+/// `/v1/internal/usage` accepts the input-token-billed kinds (embedding,
+/// rerank, score, privacy_classify) that inference-proxy now reports for
+/// direct `sk-` requests. Each bills `input_tokens × input_rate` with no
+/// output cost. See nearai/infra#169. (The internal ack echoes the
+/// chat-completion shape; the *stored* `inference_type` carries the label.)
+#[tokio::test]
+async fn test_record_input_only_usage_types() {
+    let server = enable_internal_usage_server().await;
+    setup_qwen_model(&server).await;
+    let id = provision_identity(&server).await;
+
+    for (idx, ty) in ["embedding", "rerank", "score", "privacy_classify"]
+        .iter()
+        .enumerate()
+    {
+        let response = post_internal_usage(
+            &server,
+            &id,
+            serde_json::json!({
+                "type": ty,
+                "model": "Qwen/Qwen3-30B-A3B-Instruct-2507",
+                "input_tokens": 100,
+                "id": format!("test-{ty}-{idx}"),
+            }),
+        )
+        .await;
+
+        assert_eq!(
+            response.status_code(),
+            200,
+            "{ty} usage should record: {}",
+            response.text()
+        );
+
+        let body: serde_json::Value = response.json();
+        assert_eq!(body["input_tokens"], 100);
+        assert_eq!(body["output_tokens"], 0);
+        // 100 input tokens * 1_000_000 nano-dollars input rate; no output cost.
+        assert_eq!(body["input_cost"], 100_000_000i64);
+        assert_eq!(body["output_cost"], 0i64);
+        assert_eq!(body["total_cost"], 100_000_000i64);
+    }
+}
+
+/// The input-token-billed kinds reject a non-positive `input_tokens`.
+#[tokio::test]
+async fn test_record_input_only_usage_rejects_zero_tokens() {
+    let server = enable_internal_usage_server().await;
+    setup_qwen_model(&server).await;
+    let id = provision_identity(&server).await;
+
+    let response = post_internal_usage(
+        &server,
+        &id,
+        serde_json::json!({
+            "type": "embedding",
+            "model": "Qwen/Qwen3-30B-A3B-Instruct-2507",
+            "input_tokens": 0,
+            "id": "test-embedding-zero",
+        }),
+    )
+    .await;
+
+    assert_eq!(
+        response.status_code(),
+        400,
+        "zero input_tokens should be rejected: {}",
+        response.text()
+    );
+}

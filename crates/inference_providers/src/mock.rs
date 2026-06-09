@@ -335,6 +335,7 @@ impl ResponseTemplate {
                 logprobs: None,
                 finish_reason: Some(finish_reason.to_string()),
                 token_ids: None,
+                extra: Default::default(),
             }],
             service_tier: None,
             system_fingerprint: None,
@@ -342,6 +343,7 @@ impl ResponseTemplate {
             prompt_logprobs: None,
             prompt_token_ids: None,
             kv_transfer_params: None,
+            extra: Default::default(),
         }
     }
 
@@ -394,6 +396,7 @@ impl ResponseTemplate {
                     usage: Some(self.token_usage(input_tokens, output_token_count)),
                     prompt_token_ids: None,
                     modality: None,
+                    extra: Default::default(),
                 });
             }
         }
@@ -439,6 +442,7 @@ impl ResponseTemplate {
                     usage: Some(self.token_usage(input_tokens, output_token_count)),
                     prompt_token_ids: None,
                     modality: None,
+                    extra: Default::default(),
                 });
             }
         }
@@ -485,6 +489,7 @@ impl ResponseTemplate {
                     usage: Some(self.token_usage(input_tokens, output_token_count)),
                     prompt_token_ids: None,
                     modality: None,
+                    extra: Default::default(),
                 });
 
                 // Stream arguments split by spaces (like content)
@@ -536,6 +541,7 @@ impl ResponseTemplate {
                         usage: Some(self.token_usage(input_tokens, output_token_count)),
                         prompt_token_ids: None,
                         modality: None,
+                        extra: Default::default(),
                     });
                 }
             }
@@ -552,6 +558,7 @@ impl ResponseTemplate {
             usage: Some(self.token_usage(input_tokens, output_token_count)),
             prompt_token_ids: None,
             modality: None,
+            extra: Default::default(),
         });
 
         chunks

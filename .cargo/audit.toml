@@ -21,6 +21,14 @@ ignore = [
     # https://rustsec.org/advisories/RUSTSEC-2024-0388
     "RUSTSEC-2024-0388",
 
+    # proc-macro-error2 is unmaintained - build-time transitive dependency from
+    # dstack-sdk -> alloy -> alloy-sol-types -> alloy-sol-macro (proc-macro).
+    # This is informational only (no security issue) and a build-time-only dep.
+    # We cannot update it directly; the original proc-macro-error is also unmaintained.
+    # Tracking: nearai/cloud-api#732 - waiting for alloy-sol-macro to migrate away.
+    # https://rustsec.org/advisories/RUSTSEC-2026-0173
+    "RUSTSEC-2026-0173",
+
 ]
 
 # Treat unmaintained crates as warnings (not errors)

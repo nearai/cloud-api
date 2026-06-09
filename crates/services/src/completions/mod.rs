@@ -510,7 +510,7 @@ impl CompletionServiceImpl {
     /// headers on the outbound call to the vLLM/SGLang backend.
     ///
     /// The key names must match the constants in
-    /// `inference_providers::vllm::tracing_headers`.
+    /// `inference_providers::attested::nearai::tracing_headers`.
     fn inject_tracing_headers(
         extra: &mut std::collections::HashMap<String, serde_json::Value>,
         request_id: Uuid,
@@ -1854,6 +1854,7 @@ mod tests {
                 prompt_token_ids: None,
                 system_fingerprint: None,
                 modality: None,
+                extra: Default::default(),
             })),
         };
 
@@ -1881,6 +1882,7 @@ mod tests {
                 prompt_token_ids: None,
                 system_fingerprint: None,
                 modality: None,
+                extra: Default::default(),
             })),
         };
 
@@ -1994,6 +1996,7 @@ mod tests {
                 prompt_token_ids: None,
                 system_fingerprint: None,
                 modality: None,
+                extra: Default::default(),
             })),
         };
 
@@ -2010,6 +2013,7 @@ mod tests {
                 prompt_token_ids: None,
                 system_fingerprint: None,
                 modality: None,
+                extra: Default::default(),
             })),
         };
 
@@ -2037,6 +2041,7 @@ mod tests {
                 prompt_token_ids: None,
                 modality: None,
                 system_fingerprint: None,
+                extra: Default::default(),
             })),
         };
 
@@ -2161,6 +2166,7 @@ mod tests {
                 prompt_token_ids: None,
                 modality: None,
                 system_fingerprint: None,
+                extra: Default::default(),
             })),
         };
 

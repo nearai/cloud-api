@@ -1,3 +1,4 @@
+mod fleet;
 mod prefix_router;
 
 use crate::spki_verifier::{FingerprintState, SharedTlsRoots};
@@ -6,11 +7,10 @@ use crate::{
     PrivacyClassifyError, RerankError, ScoreError, *,
 };
 use async_trait::async_trait;
+use fleet::Fleet;
 use prefix_router::PrefixRouter;
 use reqwest::{header::HeaderValue, Client};
 use serde::Serialize;
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Semaphore;
@@ -130,9 +130,9 @@ mod encryption_headers {
 ///   these are metadata or first-byte ops that should return promptly. A long timeout
 ///   here just delays the user's error message when something is actually wrong.
 ///
-/// Both are tunable per-deployment via env vars (see `VLlmConfig::new`).
+/// Both are tunable per-deployment via env vars (see `Config::new`).
 #[derive(Debug, Clone)]
-pub struct VLlmConfig {
+pub struct Config {
     pub base_url: String,
     pub api_key: Option<String>,
     /// Total per-request timeout for completion-style operations.
@@ -141,7 +141,7 @@ pub struct VLlmConfig {
     pub control_timeout_seconds: i64,
 }
 
-impl VLlmConfig {
+impl Config {
     /// Default completion timeout. Reasoning models can spend several minutes
     /// on a single non-streaming request; 600s is a comfortable ceiling that
     /// still surfaces genuinely stuck requests.
@@ -198,73 +198,224 @@ impl VLlmConfig {
 ///
 /// Provides inference through vLLM's OpenAI-compatible API endpoints.
 /// Supports both chat completions and text completions with streaming.
-pub struct VLlmProvider {
-    config: VLlmConfig,
-    /// General-purpose client for non-completion requests (attestation, models, etc.)
-    client: Client,
-    /// Lazily-filled bucket clients indexed by prefix bucket ID. Each slot starts
-    /// empty and is filled on first use via inline backend verification. Once filled,
-    /// the client maintains a persistent H2 connection to a specific verified backend.
-    bucket_clients: Vec<std::sync::Mutex<Option<Client>>>,
-    /// Prefix router: message-level trie mapping conversation prefixes to bucket IDs.
-    prefix_router: Arc<PrefixRouter>,
-    /// Maps request_hash → bucket_id during streaming (before chat_id is known).
-    pending_buckets: Arc<std::sync::Mutex<HashMap<String, usize>>>,
-    /// Maps chat_id → bucket_id for signature fetching on the correct backend.
-    signature_buckets: Arc<std::sync::Mutex<HashMap<String, usize>>>,
-    /// TLS fingerprint verification state (Bootstrap → Pinned or Blocked).
-    /// Shared across the main client and all bucket clients.
-    fingerprint_state: Arc<std::sync::RwLock<FingerprintState>>,
-    /// Creates verified clients for lazy bucket initialization.
-    /// When a bucket needs a client, the verifier connects to a backend,
-    /// verifies its attestation, pins the fingerprint, and returns the client.
-    backend_verifier: Option<Arc<dyn crate::BackendVerifier>>,
-    /// Fallback client used when inline bucket verification exhausts all retries.
-    /// Has completion-timeout read settings so long-running inference requests
-    /// don't hit the shorter control_timeout (read budget) used by the general
-    /// client. Does not pin TLS to a specific backend — requests are served
-    /// without prefix-cache routing but are not dropped, ensuring inline
-    /// verification failures degrade gracefully.
-    fallback_client: Client,
-    /// Bounds concurrent inline verifications to prevent thundering-herd pressure
-    /// on inference-proxy GPU evidence collection at startup (when all buckets are
-    /// empty and many requests arrive simultaneously). Configurable via the
-    /// `INLINE_VERIFY_CONCURRENCY` environment variable (default: 4).
-    verification_semaphore: Arc<Semaphore>,
-    /// Cached TLS roots for building per-attempt rotation clients. Reused for
-    /// the rotation-SNI fallback path so the fingerprint pin set stays
-    /// consistent with the bucket clients.
-    tls_roots: SharedTlsRoots,
-    /// Most recent healthy backend count reported by discovery. Used by the
-    /// rotation-SNI retry path to bound the number of distinct backends to
-    /// fan out to when the sticky bucket returns 5xx. Discovery writes via
-    /// `set_backend_count`; the chat paths read with `Ordering::Relaxed`
-    /// (best-effort — a stale read just means we try one too few or one too
-    /// many indices, both safe because the proxy wraps `index % healthy`).
-    last_backend_count: AtomicUsize,
-    /// Pre-parsed rotation parts derived from `config.base_url` at
-    /// construction time, so we don't reparse on every retry. `None` for
-    /// URLs that don't fit the rotation scheme (one-label host, IP literal,
-    /// etc.) — in that case the rotation fallback is a no-op and the
-    /// canonical-SNI error propagates as before.
-    rotation_parts: Option<crate::rotation::UrlParts>,
-    /// Maps request_hash → rotation index when the streaming canonical attempt
-    /// fell over and a rotation-SNI attempt served the response instead.
-    /// `pin_chat_connection` promotes this to `signature_rotation` once the
-    /// chat_id is known, so `get_signature` can reuse the same rotation SNI.
-    pending_rotation: Arc<std::sync::Mutex<HashMap<String, u64>>>,
-    /// Maps chat_id → rotation index for the signature fetch path. Populated
-    /// either by the non-streaming chat_completion (chat_id known at send
-    /// time) or by `pin_chat_connection` once the stream's first chunk
-    /// yields a chat_id.
-    signature_rotation: Arc<std::sync::Mutex<HashMap<String, u64>>>,
+pub struct Provider {
+    /// All NEAR-AI model-proxy state and behavior: config + clients, the TLS
+    /// fingerprint pin state, the backend verifier, and the routing state
+    /// (prefix buckets, rotation addressing, signature pins). Provider is
+    /// becoming a thin trait adapter over this; methods currently still on the
+    /// provider read their state via `self.fleet.*` until they move too.
+    fleet: Arc<Fleet>,
 }
 
-impl VLlmProvider {
+/// Client-construction + attestation helpers, owned by Fleet (it holds
+/// the config, clients, TLS roots, fingerprint state, and verifier). Moved off
+/// Provider in step 4b; the provider's remaining methods call these via
+/// `self.fleet.*` until they move in 4c.
+impl Fleet {
+    /// Block all TLS connections (attestation failed). Only blocks from
+    /// Bootstrap — doesn't override an existing Pinned set.
+    pub(super) fn block_connections(&self) {
+        self.fingerprint_state
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .block();
+    }
+
+    /// Number of verified fingerprints currently pinned.
+    pub(super) fn pinned_fingerprint_count(&self) -> usize {
+        self.fingerprint_state
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .pinned_count()
+    }
+
+    /// Whether a CompletionError is a connection/transport failure (vs an
+    /// HTTP-level error from the backend).
+    pub(super) fn is_connection_error(err: &CompletionError) -> bool {
+        match err {
+            CompletionError::CompletionError(msg) => {
+                msg.contains("error sending request")
+                    || msg.contains("connection closed")
+                    || msg.contains("connection reset")
+                    || msg.contains("broken pipe")
+                    || msg.contains("does not match any attested fingerprint")
+                    || msg.contains("TLS connections blocked")
+            }
+            _ => false,
+        }
+    }
+
+    /// Clear a bucket's client so it is re-verified on next use (called on a
+    /// connection error — a stale H2 connection must not be reused unverified).
+    pub(super) fn clear_bucket(&self, bucket_id: usize) {
+        *self.bucket_clients[bucket_id]
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
+    /// Build base HTTP request headers (Content-Type + bearer auth).
+    pub(super) fn build_headers(&self) -> Result<reqwest::header::HeaderMap, String> {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("Content-Type", HeaderValue::from_static("application/json"));
+
+        if let Some(ref api_key) = self.config.api_key {
+            let auth_value = format!("Bearer {api_key}");
+            let header_value = HeaderValue::from_str(&auth_value)
+                .map_err(|e| format!("Invalid API key format: {e}"))?;
+            headers.insert("Authorization", header_value);
+        }
+
+        Ok(headers)
+    }
+
+    /// Build a one-shot client for a single rotation-SNI attempt. Pooling is
+    /// disabled so attempt N+1 can't reuse attempt N's connection; shares the
+    /// per-provider fingerprint state so the pinned SPKI set is enforced.
+    pub(super) fn build_rotation_client(&self) -> Result<Client, CompletionError> {
+        Client::builder()
+            .use_preconfigured_tls(self.tls_roots.build_config(self.fingerprint_state.clone()))
+            .pool_max_idle_per_host(0)
+            .http2_adaptive_window(true)
+            .connect_timeout(Duration::from_secs(5))
+            .read_timeout(self.config.completion_timeout())
+            .build()
+            .map_err(|e| CompletionError::CompletionError(format!("rotation_client_build: {e}")))
+    }
+
+    /// Maximum inline-verification retries when creating a verified bucket client.
+    const INLINE_VERIFY_RETRIES: usize = 2;
+
+    /// Spawn background tasks to pre-warm all bucket clients. No-op without a
+    /// verifier or before any fingerprint is pinned (Bootstrap/Blocked) — every
+    /// task would otherwise fail the security guard and log noise.
+    pub(super) fn pre_warm(self: Arc<Self>) {
+        if self.backend_verifier.is_none() {
+            return;
+        }
+        if self.pinned_fingerprint_count() == 0 {
+            tracing::debug!(
+                "Pre-warm skipped: no fingerprints pinned (Bootstrap or Blocked state)"
+            );
+            return;
+        }
+        let num_buckets = self.bucket_clients.len();
+        tracing::info!(num_buckets = num_buckets, "Pre-warming bucket clients");
+        for bucket_id in 0..num_buckets {
+            let fleet = self.clone();
+            tokio::spawn(async move {
+                match fleet.get_or_verify_bucket_client(bucket_id).await {
+                    Ok(_) => tracing::debug!(bucket = bucket_id, "Bucket pre-warm complete"),
+                    Err(e) => tracing::warn!(
+                        bucket = bucket_id,
+                        error = %e,
+                        "Bucket pre-warm failed; will retry inline on first use"
+                    ),
+                }
+            });
+        }
+    }
+
+    /// Get the client for a bucket, creating + verifying it inline if needed.
+    /// Bounded by `verification_semaphore`; on exhausted retries falls back to
+    /// `fallback_client` only once a fingerprint is pinned (else fails closed).
+    pub(super) async fn get_or_verify_bucket_client(
+        &self,
+        bucket_id: usize,
+    ) -> Result<Client, CompletionError> {
+        // Fast path: bucket already has a verified client.
+        {
+            let guard = self.bucket_clients[bucket_id]
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if let Some(ref client) = *guard {
+                return Ok(client.clone());
+            }
+        }
+
+        // Slow path: inline verification.
+        let verifier = match self.backend_verifier.as_ref() {
+            Some(v) => v,
+            None => {
+                return Err(CompletionError::CompletionError(
+                    "No backend verifier configured for lazy bucket creation".to_string(),
+                ));
+            }
+        };
+
+        // Bound concurrent inline verifications (thundering-herd guard). The
+        // permit is held for the whole retry loop; the first success fills the
+        // bucket and subsequent waiters take the fast path after re-checking.
+        let _permit = self
+            .verification_semaphore
+            .acquire()
+            .await
+            .expect("verification semaphore should never be closed");
+
+        // Re-check after acquiring the permit.
+        {
+            let guard = self.bucket_clients[bucket_id]
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if let Some(ref client) = *guard {
+                return Ok(client.clone());
+            }
+        }
+
+        let mut last_err = None;
+        for _attempt in 0..=Self::INLINE_VERIFY_RETRIES {
+            match verifier.create_verified_client(&self.config.base_url).await {
+                Ok(client) => {
+                    let mut guard = self.bucket_clients[bucket_id]
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    if let Some(ref existing) = *guard {
+                        return Ok(existing.clone());
+                    }
+                    *guard = Some(client.clone());
+                    return Ok(client);
+                }
+                Err(e) => {
+                    let guard = self.bucket_clients[bucket_id]
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    if let Some(ref existing) = *guard {
+                        return Ok(existing.clone());
+                    }
+                    drop(guard);
+                    tracing::warn!(bucket = bucket_id, error = %e, "Inline backend verification failed, retrying");
+                    last_err = Some(e);
+                }
+            }
+        }
+
+        // Retries exhausted. Fall back to the non-pinned client ONLY if a
+        // fingerprint is already pinned (its verifier still rejects unknown
+        // SPKIs); in Bootstrap, fail closed to avoid unauthenticated connections.
+        let err_msg = format!(
+            "Inline backend verification failed after {} attempts: {}",
+            Self::INLINE_VERIFY_RETRIES + 1,
+            last_err.unwrap_or_default()
+        );
+        if self.pinned_fingerprint_count() > 0 {
+            tracing::warn!(bucket = bucket_id, error = %err_msg, "Inline backend verification exhausted retries; serving with fallback client");
+            Ok(self.fallback_client.clone())
+        } else {
+            tracing::warn!(
+                bucket = bucket_id,
+                error = %err_msg,
+                "Inline backend verification exhausted retries in Bootstrap state; \
+                 refusing fallback to prevent unauthenticated connections"
+            );
+            Err(CompletionError::CompletionError(err_msg))
+        }
+    }
+}
+
+impl Provider {
     /// Create a new vLLM provider with the given configuration.
     /// Without a `BackendVerifier`, bucket clients are pre-created eagerly
     /// (legacy behavior for tests and non-TEE environments).
-    pub fn new(config: VLlmConfig) -> Self {
+    pub fn new(config: Config) -> Self {
         let fingerprint_state = Arc::new(std::sync::RwLock::new(FingerprintState::Bootstrap));
         Self::new_with_fingerprint_state(config, fingerprint_state)
     }
@@ -272,7 +423,7 @@ impl VLlmProvider {
     /// Create a new vLLM provider sharing an existing fingerprint state.
     /// Without a `BackendVerifier`, bucket clients are pre-created eagerly.
     pub fn new_with_fingerprint_state(
-        config: VLlmConfig,
+        config: Config,
         fingerprint_state: Arc<std::sync::RwLock<FingerprintState>>,
     ) -> Self {
         Self::build(
@@ -288,7 +439,7 @@ impl VLlmProvider {
     /// a backend, verifies attestation, pins the fingerprint, and returns a client
     /// whose H2 connection is pinned to that verified backend.
     pub fn new_with_verifier(
-        config: VLlmConfig,
+        config: Config,
         fingerprint_state: Arc<std::sync::RwLock<FingerprintState>>,
         verifier: Arc<dyn crate::BackendVerifier>,
     ) -> Self {
@@ -304,7 +455,7 @@ impl VLlmProvider {
     /// so tests can exercise the semaphore logic without mutating env vars.
     #[cfg(test)]
     fn new_with_verifier_and_concurrency(
-        config: VLlmConfig,
+        config: Config,
         fingerprint_state: Arc<std::sync::RwLock<FingerprintState>>,
         verifier: Arc<dyn crate::BackendVerifier>,
         inline_verify_concurrency: usize,
@@ -327,7 +478,7 @@ impl VLlmProvider {
     }
 
     fn build(
-        config: VLlmConfig,
+        config: Config,
         fingerprint_state: Arc<std::sync::RwLock<FingerprintState>>,
         backend_verifier: Option<Arc<dyn crate::BackendVerifier>>,
         inline_verify_concurrency: usize,
@@ -404,38 +555,36 @@ impl VLlmProvider {
             .and_then(crate::rotation::split_inference_url);
 
         Self {
-            config,
-            client,
-            fallback_client,
-            verification_semaphore,
-            bucket_clients,
-            prefix_router,
-            pending_buckets: Arc::new(std::sync::Mutex::new(HashMap::new())),
-            signature_buckets: Arc::new(std::sync::Mutex::new(HashMap::new())),
-            fingerprint_state,
-            backend_verifier,
-            tls_roots,
-            last_backend_count: AtomicUsize::new(0),
-            rotation_parts,
-            pending_rotation: Arc::new(std::sync::Mutex::new(HashMap::new())),
-            signature_rotation: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            fleet: Arc::new(Fleet::new(
+                rotation_parts,
+                prefix_router,
+                bucket_clients,
+                config,
+                client,
+                fallback_client,
+                verification_semaphore,
+                fingerprint_state,
+                backend_verifier,
+                tls_roots,
+            )),
         }
     }
 
     /// Access the provider's configuration.
-    pub fn config(&self) -> &VLlmConfig {
-        &self.config
+    pub fn config(&self) -> &Config {
+        &self.fleet.config
     }
 
     /// Get a reference to the shared fingerprint state.
     pub fn fingerprint_state(&self) -> Arc<std::sync::RwLock<FingerprintState>> {
-        self.fingerprint_state.clone()
+        self.fleet.fingerprint_state.clone()
     }
 
     /// Add a verified SPKI fingerprint. Transitions Bootstrap → Pinned,
     /// or adds to existing Pinned set. Unblocks a Blocked provider.
     pub fn add_verified_fingerprint(&self, fingerprint: String) {
-        self.fingerprint_state
+        self.fleet
+            .fingerprint_state
             .write()
             .unwrap_or_else(|e| e.into_inner())
             .add_fingerprint(fingerprint);
@@ -444,260 +593,25 @@ impl VLlmProvider {
     /// Block all TLS connections (attestation verification failed).
     /// Only blocks from Bootstrap state — does not override existing Pinned fingerprints.
     pub fn block_connections(&self) {
-        self.fingerprint_state
-            .write()
-            .unwrap_or_else(|e| e.into_inner())
-            .block();
+        self.fleet.block_connections();
     }
 
     /// Returns the number of verified fingerprints currently pinned.
     pub fn pinned_fingerprint_count(&self) -> usize {
-        self.fingerprint_state
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .pinned_count()
+        self.fleet.pinned_fingerprint_count()
     }
 
-    /// Spawn background tasks to pre-warm all bucket clients.
-    ///
-    /// Each empty bucket gets a background task that calls
-    /// `get_or_verify_bucket_client`: it connects to a backend, verifies its
-    /// attestation, and caches the resulting HTTP client. By the time user
-    /// traffic arrives, most buckets are already filled and the inline
-    /// verification cost has been paid upfront rather than on first use.
-    ///
-    /// Concurrency is bounded by `verification_semaphore` (the same limit
-    /// that guards against thundering-herd pressure at startup), so the
-    /// pre-warm tasks and any concurrent user requests share a single pool
-    /// of attestation permits and don't amplify load on inference-proxy.
-    ///
-    /// No-op in three cases:
-    /// - No `BackendVerifier` (legacy / non-TEE mode — buckets are eagerly
-    ///   pre-filled at construction time).
-    /// - Bootstrap state (`pinned_fingerprint_count() == 0`) — no verified
-    ///   fingerprints yet, so every task would fail the security guard in
-    ///   `get_or_verify_bucket_client` and log a spurious warn.
-    /// - Blocked state (also `pinned_fingerprint_count() == 0`) — provider
-    ///   has been explicitly blocked; attempting verification would only waste
-    ///   attestation round-trips and fill logs with noise.
+    /// Spawn background tasks to pre-warm all bucket clients (delegates to
+    /// [`Fleet::pre_warm`]; no-op without a verifier or before any
+    /// fingerprint is pinned).
     pub fn pre_warm(self: Arc<Self>) {
-        if self.backend_verifier.is_none() {
-            return;
-        }
-        if self.pinned_fingerprint_count() == 0 {
-            tracing::debug!(
-                "Pre-warm skipped: no fingerprints pinned (Bootstrap or Blocked state)"
-            );
-            return;
-        }
-        let num_buckets = self.bucket_clients.len();
-        tracing::info!(num_buckets = num_buckets, "Pre-warming bucket clients");
-        for bucket_id in 0..num_buckets {
-            let provider = self.clone();
-            tokio::spawn(async move {
-                match provider.get_or_verify_bucket_client(bucket_id).await {
-                    Ok(_) => {
-                        tracing::debug!(bucket = bucket_id, "Bucket pre-warm complete");
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            bucket = bucket_id,
-                            error = %e,
-                            "Bucket pre-warm failed; will retry inline on first use"
-                        );
-                    }
-                }
-            });
-        }
+        self.fleet.clone().pre_warm();
     }
+}
 
-    /// Maximum inline-verification retries when creating a verified bucket client.
-    const INLINE_VERIFY_RETRIES: usize = 2;
-
-    /// Get the client for a bucket, creating and verifying it inline if needed.
-    /// On first use, connects to a backend via L4, fetches its attestation report,
-    /// verifies it, pins the fingerprint, and caches the client.
-    ///
-    /// Concurrent inline verifications are bounded by `verification_semaphore`
-    /// (Fix 1: prevents thundering-herd pressure on inference-proxy GPU evidence
-    /// collection when all buckets are empty at startup).
-    ///
-    /// If all verification attempts fail, falls back to `fallback_client` so the
-    /// request is served without prefix-cache routing rather than returning an
-    /// error to the user (Fix 2: graceful degradation on attestation failure).
-    async fn get_or_verify_bucket_client(
-        &self,
-        bucket_id: usize,
-    ) -> Result<Client, CompletionError> {
-        // Fast path: bucket already has a verified client.
-        // reqwest::Client::clone is an Arc refcount bump — hold the lock briefly.
-        {
-            let guard = self.bucket_clients[bucket_id]
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            if let Some(ref client) = *guard {
-                return Ok(client.clone());
-            }
-        }
-
-        // Slow path: inline verification.
-        let verifier = match self.backend_verifier.as_ref() {
-            Some(v) => v,
-            None => {
-                // No verifier configured (legacy/test mode) — bucket should have
-                // been pre-created eagerly; reaching here is a logic error.
-                return Err(CompletionError::CompletionError(
-                    "No backend verifier configured for lazy bucket creation".to_string(),
-                ));
-            }
-        };
-
-        // Acquire a semaphore permit before attempting attestation. This bounds
-        // the number of concurrent inline verifications, preventing thundering-herd
-        // pressure on inference-proxy GPU evidence collection at startup (when all
-        // buckets are empty and many requests arrive simultaneously).
-        //
-        // The semaphore is never closed, so acquire() only returns Err on close —
-        // treat that as a bug.
-        //
-        // Note on worst-case wait time: the permit is held for the entire retry
-        // loop (INLINE_VERIFY_RETRIES + 1 attempts × control_timeout each). With
-        // default values that is 3 × 300s = 900s per slot. Requests queueing behind
-        // a saturated semaphore of size N can wait up to (queue_depth / N) × 900s.
-        // In practice the first successful verification fills the bucket and all
-        // subsequent waiters take the fast path (re-check after acquiring permit).
-        let _permit = self
-            .verification_semaphore
-            .acquire()
-            .await
-            .expect("verification semaphore should never be closed");
-
-        // Re-check after acquiring the permit: a concurrent request that held the
-        // semaphore before us may have already filled this bucket.
-        {
-            let guard = self.bucket_clients[bucket_id]
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            if let Some(ref client) = *guard {
-                return Ok(client.clone());
-            }
-        }
-
-        let mut last_err = None;
-        for _attempt in 0..=Self::INLINE_VERIFY_RETRIES {
-            match verifier.create_verified_client(&self.config.base_url).await {
-                Ok(client) => {
-                    // Double-check: another concurrent request may have filled
-                    // this bucket while we were verifying. Use its client if so
-                    // (avoids wasting the connection it established).
-                    let mut guard = self.bucket_clients[bucket_id]
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner());
-                    if let Some(ref existing) = *guard {
-                        return Ok(existing.clone());
-                    }
-                    *guard = Some(client.clone());
-                    return Ok(client);
-                }
-                Err(e) => {
-                    // Another request may have filled the bucket while we failed.
-                    let guard = self.bucket_clients[bucket_id]
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner());
-                    if let Some(ref existing) = *guard {
-                        return Ok(existing.clone());
-                    }
-                    drop(guard);
-
-                    tracing::warn!(
-                        bucket = bucket_id,
-                        error = %e,
-                        "Inline backend verification failed, retrying"
-                    );
-                    last_err = Some(e);
-                }
-            }
-        }
-
-        // All retry attempts exhausted.
-        //
-        // Only fall back to the general-purpose client when at least one
-        // backend fingerprint has already been pinned (Pinned state). In that
-        // case the fallback_client's TLS verifier will still reject any backend
-        // whose SPKI fingerprint is unknown — so we degrade gracefully (no
-        // prefix-cache routing) without bypassing attestation.
-        //
-        // In Bootstrap state (pinned_count == 0) no fingerprints have been
-        // verified yet. fallback_client in Bootstrap mode would accept *any*
-        // WebPKI-valid cert, silently bypassing SPKI pinning and TEE attestation
-        // guarantees. Return Err instead so the pool can surface the failure.
-        let err_msg = format!(
-            "Inline backend verification failed after {} attempts: {}",
-            Self::INLINE_VERIFY_RETRIES + 1,
-            last_err.unwrap_or_default()
-        );
-        if self.pinned_fingerprint_count() > 0 {
-            tracing::warn!(
-                bucket = bucket_id,
-                error = %err_msg,
-                "Inline backend verification exhausted retries; serving with fallback client"
-            );
-            Ok(self.fallback_client.clone())
-        } else {
-            // Bootstrap: no fingerprints pinned yet. Fail safely.
-            tracing::warn!(
-                bucket = bucket_id,
-                error = %err_msg,
-                "Inline backend verification exhausted retries in Bootstrap state; \
-                 refusing fallback to prevent unauthenticated connections"
-            );
-            Err(CompletionError::CompletionError(err_msg))
-        }
-    }
-
-    /// Check if a CompletionError indicates a connection/transport failure
-    /// (as opposed to an HTTP-level error from the backend).
-    fn is_connection_error(err: &CompletionError) -> bool {
-        match err {
-            CompletionError::CompletionError(msg) => {
-                // reqwest connection errors contain these keywords.
-                // After send_streaming_request converts reqwest::Error to String,
-                // this is the only way to detect transport failures.
-                msg.contains("error sending request")
-                    || msg.contains("connection closed")
-                    || msg.contains("connection reset")
-                    || msg.contains("broken pipe")
-                    || msg.contains("does not match any attested fingerprint")
-                    || msg.contains("TLS connections blocked")
-            }
-            _ => false,
-        }
-    }
-
-    /// Clear a bucket's client so it will be re-verified on next use.
-    /// Called on connection errors — prevents a stale client (whose H2
-    /// connection dropped) from being reused with an unverified reconnection.
-    fn clear_bucket(&self, bucket_id: usize) {
-        *self.bucket_clients[bucket_id]
-            .lock()
-            .unwrap_or_else(|e| e.into_inner()) = None;
-    }
-
-    /// Build HTTP request headers
-    fn build_headers(&self) -> Result<reqwest::header::HeaderMap, String> {
-        let mut headers = reqwest::header::HeaderMap::new();
-        headers.insert("Content-Type", HeaderValue::from_static("application/json"));
-
-        if let Some(ref api_key) = self.config.api_key {
-            let auth_value = format!("Bearer {api_key}");
-            let header_value = HeaderValue::from_str(&auth_value)
-                .map_err(|e| format!("Invalid API key format: {e}"))?;
-            headers.insert("Authorization", header_value);
-        }
-
-        Ok(headers)
-    }
-
+/// Network/IO helpers (rotation-SNI fallback + request header prep), owned by
+/// Fleet. Moved off Provider in step 4c.
+impl Fleet {
     /// Prepare encryption headers by extracting them from `extra` and forwarding as HTTP headers.
     /// Also removes encryption-related keys from `extra` to prevent them from leaking into the JSON body.
     ///
@@ -863,47 +777,6 @@ impl VLlmProvider {
         status_code == 408 || status_code == 429 || (500..=599).contains(&status_code)
     }
 
-    /// Healthy backend count clamped to the rotation fan-out cap. Returns 0
-    /// when rotation is disabled (URL doesn't fit the rotation scheme, or
-    /// discovery hasn't reported a count yet) — callers use that as the
-    /// signal to skip the rotation fallback and propagate the original error.
-    fn rotation_count(&self) -> usize {
-        if self.rotation_parts.is_none() {
-            return 0;
-        }
-        self.last_backend_count
-            .load(Ordering::Relaxed)
-            .min(crate::rotation::MAX_FANOUT)
-    }
-
-    /// Build the absolute URL `https://<canonical>-i<index>.<base><path>` for
-    /// a rotation attempt at the given backend index. Returns `None` only if
-    /// rotation parts are missing — callers should already have filtered via
-    /// `rotation_count() > 0`.
-    fn rotation_url(&self, index: u64, path: &str) -> Option<String> {
-        let parts = self.rotation_parts.as_ref()?;
-        let mut url = crate::rotation::rotation_base_url(parts, index)?;
-        url.set_path(path);
-        Some(url.to_string())
-    }
-
-    /// Build a one-shot reqwest client used for a single rotation-SNI
-    /// attempt. We disable connection pooling (`pool_max_idle_per_host(0)`)
-    /// so a follow-up attempt at index N+1 can't accidentally reuse the
-    /// TLS/H2 connection that landed on index N — defeating the whole point
-    /// of the rotation. Shares the per-provider fingerprint state so the
-    /// same pinned SPKI set is enforced for every backend.
-    fn build_rotation_client(&self) -> Result<Client, CompletionError> {
-        Client::builder()
-            .use_preconfigured_tls(self.tls_roots.build_config(self.fingerprint_state.clone()))
-            .pool_max_idle_per_host(0)
-            .http2_adaptive_window(true)
-            .connect_timeout(Duration::from_secs(5))
-            .read_timeout(self.config.completion_timeout())
-            .build()
-            .map_err(|e| CompletionError::CompletionError(format!("rotation_client_build: {e}")))
-    }
-
     /// Iterate every healthy backend by index until one returns a 2xx (or
     /// every backend has been exhausted). Called by `chat_completion` after
     /// the sticky bucket's canonical-SNI attempt returns 5xx/429: with H2
@@ -983,7 +856,7 @@ impl VLlmProvider {
                     message: crate::extract_error_message(&error_text),
                     is_external: false,
                 };
-                if Self::is_rotation_retryable_status(status_code) {
+                if Fleet::is_rotation_retryable_status(status_code) {
                     tracing::debug!(
                         index,
                         status_code,
@@ -1081,7 +954,7 @@ impl VLlmProvider {
                     // it the same way, so surface immediately rather than
                     // burn the remaining indices on a doomed request.
                     CompletionError::HttpError { status_code, .. }
-                        if !Self::is_rotation_retryable_status(*status_code) =>
+                        if !Fleet::is_rotation_retryable_status(*status_code) =>
                     {
                         return Err(e);
                     }
@@ -1168,7 +1041,7 @@ impl VLlmProvider {
         let status = if let Some(Err(CompletionError::HttpError { status_code, .. })) =
             peekable.peek().await
         {
-            if Self::is_rotation_retryable_status(*status_code) {
+            if Fleet::is_rotation_retryable_status(*status_code) {
                 Some(*status_code)
             } else {
                 None
@@ -1190,7 +1063,7 @@ impl VLlmProvider {
 }
 
 #[async_trait]
-impl InferenceProvider for VLlmProvider {
+impl InferenceProvider for Fleet {
     async fn get_signature(
         &self,
         chat_id: &str,
@@ -1396,50 +1269,15 @@ impl InferenceProvider for VLlmProvider {
     }
 
     fn pin_chat_connection(&self, request_hash: &str, chat_id: &str) {
-        if let Some(bucket_id) = self
-            .pending_buckets
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(request_hash)
-        {
-            self.signature_buckets
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .insert(chat_id.to_string(), bucket_id);
-        }
-        // Streaming attempts that fell over to a rotation index left the
-        // index in `pending_rotation` keyed by request_hash; promote it
-        // alongside the bucket-side mapping so `get_signature` knows which
-        // SNI to use. Empty chat_id (orphan-cleanup case) only clears the
-        // pending entry without writing into signature_rotation.
-        if let Some(index) = self
-            .pending_rotation
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(request_hash)
-        {
-            if !chat_id.is_empty() {
-                self.signature_rotation
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .insert(chat_id.to_string(), index);
-            }
-        }
+        self.pin_chat(request_hash, chat_id);
     }
 
     fn unpin_chat_connection(&self, chat_id: &str) {
-        self.signature_buckets
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(chat_id);
-        self.signature_rotation
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(chat_id);
+        self.unpin_chat(chat_id);
     }
 
     fn set_backend_count(&self, count: usize) {
-        self.last_backend_count.store(count, Ordering::Relaxed);
+        self.store_backend_count(count);
     }
 
     async fn get_attestation_report(
@@ -1577,7 +1415,7 @@ impl InferenceProvider for VLlmProvider {
         // via L4 passthrough → prefix cache hits. Buckets are lazily filled: on first
         // use, inline verification connects to a backend, verifies attestation, and
         // pins the client.
-        let bucket_id = self.prefix_router.route(&streaming_params.messages);
+        let bucket_id = self.route(&streaming_params.messages);
         let bucket_client = self.get_or_verify_bucket_client(bucket_id).await?;
         let canonical_send = match self
             .send_streaming_request(
@@ -1589,7 +1427,7 @@ impl InferenceProvider for VLlmProvider {
             .await
         {
             Ok(r) => Ok(r),
-            Err(ref e) if Self::is_connection_error(e) => {
+            Err(ref e) if Fleet::is_connection_error(e) => {
                 // Connection dropped or fingerprint mismatch on reconnect —
                 // clear bucket and re-verify with a fresh attestation.
                 self.clear_bucket(bucket_id);
@@ -1659,7 +1497,7 @@ impl InferenceProvider for VLlmProvider {
             }
             Err(canonical_err) => match &canonical_err {
                 CompletionError::HttpError { status_code, .. }
-                    if Self::is_rotation_retryable_status(*status_code)
+                    if Fleet::is_rotation_retryable_status(*status_code)
                         && self.rotation_count() > 0 =>
                 {
                     self.try_chat_completion_stream_rotation(
@@ -1698,7 +1536,7 @@ impl InferenceProvider for VLlmProvider {
         self.prepare_encryption_headers(&mut headers, &mut non_streaming_params.extra);
 
         // Route to a verified bucket client based on prompt prefix.
-        let bucket_id = self.prefix_router.route(&non_streaming_params.messages);
+        let bucket_id = self.route(&non_streaming_params.messages);
         let bucket_client = self.get_or_verify_bucket_client(bucket_id).await?;
         let timeout_secs = self.config.completion_timeout_seconds.max(0) as u64;
         let timeout = Duration::from_secs(timeout_secs);
@@ -1770,7 +1608,7 @@ impl InferenceProvider for VLlmProvider {
             // pooling disabled on the rotation client, every attempt lands
             // on a distinct backend. If one is healthy, the request succeeds
             // and we record the index for signature retrieval.
-            if Self::is_rotation_retryable_status(status_code) && self.rotation_count() > 0 {
+            if Fleet::is_rotation_retryable_status(status_code) && self.rotation_count() > 0 {
                 return self
                     .try_chat_completion_rotation(
                         &non_streaming_params,
@@ -2235,6 +2073,116 @@ impl InferenceProvider for VLlmProvider {
     }
 }
 
+/// Provider is a thin trait adapter: every InferenceProvider call delegates
+/// to its Fleet, which holds all NEAR-AI model-proxy state and logic.
+#[async_trait]
+impl InferenceProvider for Provider {
+    async fn models(&self) -> Result<ModelsResponse, ListModelsError> {
+        self.fleet.models().await
+    }
+    async fn chat_completion_stream(
+        &self,
+        params: ChatCompletionParams,
+        request_hash: String,
+    ) -> Result<StreamingResult, CompletionError> {
+        self.fleet
+            .chat_completion_stream(params, request_hash)
+            .await
+    }
+    async fn chat_completion(
+        &self,
+        params: ChatCompletionParams,
+        request_hash: String,
+    ) -> Result<ChatCompletionResponseWithBytes, CompletionError> {
+        self.fleet.chat_completion(params, request_hash).await
+    }
+    async fn text_completion_stream(
+        &self,
+        params: CompletionParams,
+    ) -> Result<StreamingResult, CompletionError> {
+        self.fleet.text_completion_stream(params).await
+    }
+    async fn image_generation(
+        &self,
+        params: ImageGenerationParams,
+        request_hash: String,
+    ) -> Result<ImageGenerationResponseWithBytes, ImageGenerationError> {
+        self.fleet.image_generation(params, request_hash).await
+    }
+    async fn image_edit(
+        &self,
+        params: Arc<ImageEditParams>,
+        request_hash: String,
+    ) -> Result<ImageEditResponseWithBytes, ImageEditError> {
+        self.fleet.image_edit(params, request_hash).await
+    }
+    async fn score(
+        &self,
+        params: ScoreParams,
+        request_hash: String,
+    ) -> Result<ScoreResponse, ScoreError> {
+        self.fleet.score(params, request_hash).await
+    }
+    async fn rerank(&self, params: RerankParams) -> Result<RerankResponse, RerankError> {
+        self.fleet.rerank(params).await
+    }
+    async fn embeddings_raw(
+        &self,
+        body: bytes::Bytes,
+        extra: std::collections::HashMap<String, serde_json::Value>,
+    ) -> Result<bytes::Bytes, EmbeddingError> {
+        self.fleet.embeddings_raw(body, extra).await
+    }
+    async fn privacy_classify_raw(
+        &self,
+        body: bytes::Bytes,
+        extra: std::collections::HashMap<String, serde_json::Value>,
+    ) -> Result<bytes::Bytes, PrivacyClassifyError> {
+        self.fleet.privacy_classify_raw(body, extra).await
+    }
+    async fn get_signature(
+        &self,
+        chat_id: &str,
+        signing_algo: Option<String>,
+    ) -> Result<ChatSignature, CompletionError> {
+        self.fleet.get_signature(chat_id, signing_algo).await
+    }
+    fn pin_chat_connection(&self, request_hash: &str, chat_id: &str) {
+        self.fleet.pin_chat_connection(request_hash, chat_id)
+    }
+    fn unpin_chat_connection(&self, chat_id: &str) {
+        self.fleet.unpin_chat_connection(chat_id)
+    }
+    fn set_backend_count(&self, count: usize) {
+        self.fleet.set_backend_count(count)
+    }
+    async fn get_attestation_report(
+        &self,
+        model: String,
+        signing_algo: Option<String>,
+        nonce: Option<String>,
+        signing_address: Option<String>,
+        include_tls_fingerprint: bool,
+    ) -> Result<serde_json::Map<String, serde_json::Value>, AttestationError> {
+        self.fleet
+            .get_attestation_report(
+                model,
+                signing_algo,
+                nonce,
+                signing_address,
+                include_tls_fingerprint,
+            )
+            .await
+    }
+    async fn audio_transcription(
+        &self,
+        params: AudioTranscriptionParams,
+        request_hash: String,
+    ) -> Result<AudioTranscriptionResponse, AudioTranscriptionError> {
+        self.fleet.audio_transcription(params, request_hash).await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2261,6 +2209,7 @@ mod tests {
                 prompt_token_ids: None,
                 system_fingerprint: None,
                 modality: None,
+                extra: Default::default(),
             })),
             raw_passthrough: true,
         }
@@ -2282,7 +2231,7 @@ mod tests {
             }),
         ];
         let stream: StreamingResult = Box::pin(futures_util::stream::iter(items));
-        let (status, stream) = VLlmProvider::peek_first_payload_status(stream).await;
+        let (status, stream) = Fleet::peek_first_payload_status(stream).await;
         assert_eq!(
             status,
             Some(503),
@@ -2315,7 +2264,7 @@ mod tests {
         let items: Vec<Result<SSEEvent, CompletionError>> =
             vec![Ok(control_event(": ping\n")), Ok(data_event())];
         let stream: StreamingResult = Box::pin(futures_util::stream::iter(items));
-        let (status, stream) = VLlmProvider::peek_first_payload_status(stream).await;
+        let (status, stream) = Fleet::peek_first_payload_status(stream).await;
         assert_eq!(status, None);
         let replayed: Vec<Result<SSEEvent, CompletionError>> =
             futures_util::StreamExt::collect(stream).await;
@@ -2334,7 +2283,7 @@ mod tests {
             is_external: false,
         })];
         let stream: StreamingResult = Box::pin(futures_util::stream::iter(items));
-        let (status, _stream) = VLlmProvider::peek_first_payload_status(stream).await;
+        let (status, _stream) = Fleet::peek_first_payload_status(stream).await;
         assert_eq!(status, None);
     }
 
@@ -2387,8 +2336,8 @@ mod tests {
         );
     }
 
-    fn create_test_provider() -> VLlmProvider {
-        VLlmProvider::new(VLlmConfig {
+    fn create_test_provider() -> Provider {
+        Provider::new(Config {
             base_url: "http://localhost".to_string(),
             api_key: None,
             completion_timeout_seconds: 30,
@@ -2424,22 +2373,22 @@ mod tests {
     #[serial]
     fn vllm_config_uses_default_timeouts_when_env_unset() {
         with_clean_timeout_env(|| {
-            let cfg = VLlmConfig::new("http://x".to_string(), None, None);
+            let cfg = Config::new("http://x".to_string(), None, None);
             assert_eq!(
                 cfg.completion_timeout_seconds,
-                VLlmConfig::DEFAULT_COMPLETION_TIMEOUT_SECS
+                Config::DEFAULT_COMPLETION_TIMEOUT_SECS
             );
             assert_eq!(
                 cfg.control_timeout_seconds,
-                VLlmConfig::DEFAULT_CONTROL_TIMEOUT_SECS
+                Config::DEFAULT_CONTROL_TIMEOUT_SECS
             );
             assert_eq!(
                 cfg.completion_timeout(),
-                Duration::from_secs(VLlmConfig::DEFAULT_COMPLETION_TIMEOUT_SECS as u64)
+                Duration::from_secs(Config::DEFAULT_COMPLETION_TIMEOUT_SECS as u64)
             );
             assert_eq!(
                 cfg.control_timeout(),
-                Duration::from_secs(VLlmConfig::DEFAULT_CONTROL_TIMEOUT_SECS as u64)
+                Duration::from_secs(Config::DEFAULT_CONTROL_TIMEOUT_SECS as u64)
             );
         });
     }
@@ -2450,7 +2399,7 @@ mod tests {
         with_clean_timeout_env(|| {
             std::env::set_var("VLLM_PROVIDER_COMPLETION_TIMEOUT", "1234");
             std::env::set_var("VLLM_PROVIDER_CONTROL_TIMEOUT", "42");
-            let cfg = VLlmConfig::new("http://x".to_string(), None, None);
+            let cfg = Config::new("http://x".to_string(), None, None);
             assert_eq!(cfg.completion_timeout_seconds, 1234);
             assert_eq!(cfg.control_timeout_seconds, 42);
         });
@@ -2464,7 +2413,7 @@ mod tests {
             std::env::set_var("VLLM_PROVIDER_CONTROL_TIMEOUT", "42");
             // Positional `Some(N)` keeps the legacy meaning: it sets completion only,
             // overriding the env. Control still reads from env.
-            let cfg = VLlmConfig::new("http://x".to_string(), None, Some(7));
+            let cfg = Config::new("http://x".to_string(), None, Some(7));
             assert_eq!(cfg.completion_timeout_seconds, 7);
             assert_eq!(cfg.control_timeout_seconds, 42);
         });
@@ -2476,21 +2425,21 @@ mod tests {
         with_clean_timeout_env(|| {
             std::env::set_var("VLLM_PROVIDER_COMPLETION_TIMEOUT", "not-a-number");
             std::env::set_var("VLLM_PROVIDER_CONTROL_TIMEOUT", "");
-            let cfg = VLlmConfig::new("http://x".to_string(), None, None);
+            let cfg = Config::new("http://x".to_string(), None, None);
             assert_eq!(
                 cfg.completion_timeout_seconds,
-                VLlmConfig::DEFAULT_COMPLETION_TIMEOUT_SECS
+                Config::DEFAULT_COMPLETION_TIMEOUT_SECS
             );
             assert_eq!(
                 cfg.control_timeout_seconds,
-                VLlmConfig::DEFAULT_CONTROL_TIMEOUT_SECS
+                Config::DEFAULT_CONTROL_TIMEOUT_SECS
             );
         });
     }
 
     #[test]
     fn vllm_config_negative_timeout_clamped_to_zero_duration() {
-        let cfg = VLlmConfig {
+        let cfg = Config {
             base_url: "http://x".to_string(),
             api_key: None,
             completion_timeout_seconds: -5,
@@ -2534,7 +2483,9 @@ mod tests {
             serde_json::Value::String("keep-me".to_string()),
         );
 
-        provider.prepare_tracing_headers(&mut headers, &mut extra);
+        provider
+            .fleet
+            .prepare_tracing_headers(&mut headers, &mut extra);
 
         assert!(
             !extra.contains_key(tracing_headers::REQUEST_ID),
@@ -2572,7 +2523,9 @@ mod tests {
             serde_json::Value::String("cccc-dddd".to_string()),
         );
 
-        provider.prepare_tracing_headers(&mut headers, &mut extra);
+        provider
+            .fleet
+            .prepare_tracing_headers(&mut headers, &mut extra);
 
         assert_eq!(
             headers.get("X-Request-Id").and_then(|v| v.to_str().ok()),
@@ -2595,7 +2548,9 @@ mod tests {
         let mut extra: std::collections::HashMap<String, serde_json::Value> =
             std::collections::HashMap::new();
 
-        provider.prepare_tracing_headers(&mut headers, &mut extra);
+        provider
+            .fleet
+            .prepare_tracing_headers(&mut headers, &mut extra);
 
         assert!(headers.get("X-Request-Id").is_none());
         assert!(headers.get("X-Org-Id").is_none());
@@ -2625,7 +2580,9 @@ mod tests {
             serde_json::Value::String("2".to_string()),
         );
 
-        provider.prepare_encryption_headers(&mut headers, &mut extra);
+        provider
+            .fleet
+            .prepare_encryption_headers(&mut headers, &mut extra);
 
         // Verify all encryption keys removed from extra
         assert!(
@@ -2669,7 +2626,9 @@ mod tests {
             serde_json::Value::String("2".to_string()),
         );
 
-        provider.prepare_encryption_headers(&mut headers, &mut extra);
+        provider
+            .fleet
+            .prepare_encryption_headers(&mut headers, &mut extra);
 
         // Verify encryption headers forwarded (except model_pub_key)
         assert_eq!(
@@ -2713,7 +2672,9 @@ mod tests {
             serde_json::Value::Number(serde_json::Number::from(42)),
         );
 
-        provider.prepare_encryption_headers(&mut headers, &mut extra);
+        provider
+            .fleet
+            .prepare_encryption_headers(&mut headers, &mut extra);
 
         // Encryption key should be removed
         assert!(!extra.contains_key(encryption_headers::SIGNING_ALGO));
@@ -2793,7 +2754,9 @@ mod tests {
         );
 
         let mut headers = reqwest::header::HeaderMap::new();
-        provider.prepare_encryption_headers(&mut headers, &mut extra);
+        provider
+            .fleet
+            .prepare_encryption_headers(&mut headers, &mut extra);
 
         let params = ImageGenerationParams {
             model: "test-model".to_string(),
@@ -2837,8 +2800,8 @@ mod tests {
     fn test_bucket_count_matches_prefix_router() {
         let provider = create_test_provider();
         assert_eq!(
-            provider.bucket_clients.len(),
-            provider.prefix_router.num_buckets()
+            provider.fleet.bucket_clients.len(),
+            provider.fleet.prefix_router.num_buckets()
         );
     }
 
@@ -2846,7 +2809,7 @@ mod tests {
     fn test_legacy_provider_eagerly_creates_buckets() {
         // Without a verifier, buckets are eagerly pre-created (legacy path)
         let provider = create_test_provider();
-        let guard = provider.bucket_clients[0]
+        let guard = provider.fleet.bucket_clients[0]
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         assert!(guard.is_some(), "Legacy provider should pre-create buckets");
@@ -2866,8 +2829,8 @@ mod tests {
             }
         }
 
-        let provider = VLlmProvider::new_with_verifier(
-            VLlmConfig {
+        let provider = Provider::new_with_verifier(
+            Config {
                 base_url: "http://localhost".to_string(),
                 api_key: None,
                 completion_timeout_seconds: 30,
@@ -2878,7 +2841,7 @@ mod tests {
             )),
             Arc::new(NoopVerifier),
         );
-        let guard = provider.bucket_clients[0]
+        let guard = provider.fleet.bucket_clients[0]
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         assert!(
@@ -2901,8 +2864,8 @@ mod tests {
             }
         }
 
-        let provider = VLlmProvider::new_with_verifier(
-            VLlmConfig {
+        let provider = Provider::new_with_verifier(
+            Config {
                 base_url: "http://localhost".to_string(),
                 api_key: None,
                 completion_timeout_seconds: 30,
@@ -2915,24 +2878,24 @@ mod tests {
         );
 
         // Bucket starts empty
-        assert!(provider.bucket_clients[0].lock().unwrap().is_none());
+        assert!(provider.fleet.bucket_clients[0].lock().unwrap().is_none());
 
         // get_or_verify fills it
-        let result = provider.get_or_verify_bucket_client(0).await;
+        let result = provider.fleet.get_or_verify_bucket_client(0).await;
         assert!(result.is_ok());
-        assert!(provider.bucket_clients[0].lock().unwrap().is_some());
+        assert!(provider.fleet.bucket_clients[0].lock().unwrap().is_some());
 
         // Second call returns cached client (fast path)
-        let result2 = provider.get_or_verify_bucket_client(0).await;
+        let result2 = provider.fleet.get_or_verify_bucket_client(0).await;
         assert!(result2.is_ok());
     }
 
     #[test]
     fn test_clear_bucket() {
         let provider = create_test_provider();
-        assert!(provider.bucket_clients[0].lock().unwrap().is_some());
-        provider.clear_bucket(0);
-        assert!(provider.bucket_clients[0].lock().unwrap().is_none());
+        assert!(provider.fleet.bucket_clients[0].lock().unwrap().is_some());
+        provider.fleet.clear_bucket(0);
+        assert!(provider.fleet.bucket_clients[0].lock().unwrap().is_none());
     }
 
     /// Fix 2 + security guard: when a verifier always fails AND no fingerprints
@@ -2953,8 +2916,8 @@ mod tests {
             }
         }
 
-        let provider = VLlmProvider::new_with_verifier(
-            VLlmConfig {
+        let provider = Provider::new_with_verifier(
+            Config {
                 base_url: "http://localhost".to_string(),
                 api_key: None,
                 completion_timeout_seconds: 30,
@@ -2967,18 +2930,18 @@ mod tests {
         );
 
         // Bucket starts empty and no fingerprints are pinned.
-        assert!(provider.bucket_clients[0].lock().unwrap().is_none());
+        assert!(provider.fleet.bucket_clients[0].lock().unwrap().is_none());
         assert_eq!(provider.pinned_fingerprint_count(), 0);
 
         // All attempts fail in Bootstrap state → must return Err (not fallback).
-        let result = provider.get_or_verify_bucket_client(0).await;
+        let result = provider.fleet.get_or_verify_bucket_client(0).await;
         assert!(
             result.is_err(),
             "expected Err in Bootstrap state, got: {result:?}"
         );
 
         // Bucket remains empty.
-        assert!(provider.bucket_clients[0].lock().unwrap().is_none());
+        assert!(provider.fleet.bucket_clients[0].lock().unwrap().is_none());
     }
 
     /// Fix 2: when a verifier always fails but at least one fingerprint has already
@@ -2999,8 +2962,8 @@ mod tests {
             }
         }
 
-        let provider = VLlmProvider::new_with_verifier(
-            VLlmConfig {
+        let provider = Provider::new_with_verifier(
+            Config {
                 base_url: "http://localhost".to_string(),
                 api_key: None,
                 completion_timeout_seconds: 30,
@@ -3017,15 +2980,15 @@ mod tests {
         assert_eq!(provider.pinned_fingerprint_count(), 1);
 
         // Bucket starts empty.
-        assert!(provider.bucket_clients[0].lock().unwrap().is_none());
+        assert!(provider.fleet.bucket_clients[0].lock().unwrap().is_none());
 
         // All attempts fail but fingerprints are pinned → fallback client returned.
-        let result = provider.get_or_verify_bucket_client(0).await;
+        let result = provider.fleet.get_or_verify_bucket_client(0).await;
         assert!(result.is_ok(), "expected fallback Ok, got: {result:?}");
 
         // Bucket remains empty — fallback is not stored as a verified bucket client.
         assert!(
-            provider.bucket_clients[0].lock().unwrap().is_none(),
+            provider.fleet.bucket_clients[0].lock().unwrap().is_none(),
             "fallback should not be stored in bucket"
         );
     }
@@ -3047,8 +3010,8 @@ mod tests {
             }
         }
 
-        let provider = VLlmProvider::new_with_verifier(
-            VLlmConfig {
+        let provider = Provider::new_with_verifier(
+            Config {
                 base_url: "http://localhost".to_string(),
                 api_key: None,
                 completion_timeout_seconds: 30,
@@ -3065,10 +3028,10 @@ mod tests {
         assert_eq!(provider.pinned_fingerprint_count(), 0);
 
         // Bucket starts empty.
-        assert!(provider.bucket_clients[0].lock().unwrap().is_none());
+        assert!(provider.fleet.bucket_clients[0].lock().unwrap().is_none());
 
         // Blocked state has pinned_count == 0 → same safe path as Bootstrap → Err.
-        let result = provider.get_or_verify_bucket_client(0).await;
+        let result = provider.fleet.get_or_verify_bucket_client(0).await;
         assert!(
             result.is_err(),
             "expected Err in Blocked state, got: {result:?}"
@@ -3108,8 +3071,8 @@ mod tests {
 
         // concurrency=1 means verifications are fully serialised. Pass the value
         // directly rather than via env var to avoid races with parallel tests.
-        let provider = Arc::new(VLlmProvider::new_with_verifier_and_concurrency(
-            VLlmConfig {
+        let provider = Arc::new(Provider::new_with_verifier_and_concurrency(
+            Config {
                 base_url: "http://localhost".to_string(),
                 api_key: None,
                 completion_timeout_seconds: 30,
@@ -3129,7 +3092,7 @@ mod tests {
         for _ in 0..8 {
             let p = provider.clone();
             handles.push(tokio::spawn(async move {
-                p.get_or_verify_bucket_client(0).await
+                p.fleet.get_or_verify_bucket_client(0).await
             }));
         }
         for h in handles {
@@ -3152,6 +3115,13 @@ mod tests {
     /// for url (...): operation timed out" — a substring of the connect-retry
     /// guard. Without the `!is_timeout()` guard, a timeout doubles end-to-end
     /// latency before the pool's no-retry classifier sees `Timeout`.
+    ///
+    /// Asserts on the *connection count* (exactly one TCP accept = no retry; a
+    /// retry would open a second), not on wall-clock elapsed — the behavioral
+    /// check is deterministic, so the test is immune to test-harness CPU load.
+    /// An earlier wall-clock bound flaked under the parallel pool, and
+    /// `#[serial]` does not help: it only serializes against other `#[serial]`
+    /// tests, not the non-serial async load that actually skews the timing.
     #[tokio::test]
     async fn test_timeout_does_not_trigger_bucket_clear_retry() {
         use crate::{ChatCompletionParams, ChatMessage, InferenceProvider, MessageRole};
@@ -3190,8 +3160,8 @@ mod tests {
             }
         }
 
-        let provider = VLlmProvider::new_with_verifier(
-            VLlmConfig {
+        let provider = Provider::new_with_verifier(
+            Config {
                 base_url: format!("http://{addr}"),
                 api_key: None,
                 completion_timeout_seconds: 1,
@@ -3236,11 +3206,9 @@ mod tests {
             extra: std::collections::HashMap::new(),
         };
 
-        let start = std::time::Instant::now();
         let result = provider
             .chat_completion(params, "test-hash".to_string())
             .await;
-        let elapsed = start.elapsed();
 
         // Must surface as Timeout, not as a generic CompletionError.
         match result {
@@ -3254,13 +3222,11 @@ mod tests {
             other => panic!("expected CompletionError::Timeout, got: {other:?}"),
         }
 
-        // One timeout cycle is ~1s. A retry would be ~2s. Allow generous
-        // headroom for CI scheduler jitter but fail well before 2× to
-        // catch the regression.
-        assert!(
-            elapsed < Duration::from_millis(1700),
-            "chat_completion took {elapsed:?} — looks like the bucket-clear retry fired on timeout"
-        );
+        // The regression guard, asserted deterministically: without the
+        // `!is_timeout()` check, the timeout would fall into the bucket-clear
+        // retry branch and open a *second* backend connection. Exactly one TCP
+        // accept proves no retry fired — no wall-clock comparison, so this
+        // cannot flake under test-harness CPU load.
         assert_eq!(
             accept_count.load(std::sync::atomic::Ordering::SeqCst),
             1,
@@ -3301,8 +3267,8 @@ mod tests {
             }
         }
 
-        let provider = Arc::new(VLlmProvider::new_with_verifier_and_concurrency(
-            VLlmConfig {
+        let provider = Arc::new(Provider::new_with_verifier_and_concurrency(
+            Config {
                 base_url: "http://localhost".to_string(),
                 api_key: None,
                 completion_timeout_seconds: 30,
@@ -3321,10 +3287,11 @@ mod tests {
             4, // production-default semaphore concurrency — exercises throttling with 64 tasks
         ));
 
-        let num_buckets = provider.bucket_clients.len();
+        let num_buckets = provider.fleet.bucket_clients.len();
 
         // All buckets start empty.
         assert!(provider
+            .fleet
             .bucket_clients
             .iter()
             .all(|b| b.lock().unwrap().is_none()));
@@ -3336,6 +3303,7 @@ mod tests {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
             let filled = provider
+                .fleet
                 .bucket_clients
                 .iter()
                 .filter(|b| b.lock().unwrap().is_some())
@@ -3362,7 +3330,7 @@ mod tests {
     /// pre_warm is a no-op when no backend verifier is configured (legacy mode).
     #[tokio::test]
     async fn test_pre_warm_noop_without_verifier() {
-        let provider = Arc::new(VLlmProvider::new(VLlmConfig {
+        let provider = Arc::new(Provider::new(Config {
             base_url: "http://localhost".to_string(),
             api_key: None,
             completion_timeout_seconds: 30,
@@ -3371,6 +3339,7 @@ mod tests {
 
         // In legacy mode buckets are eagerly pre-filled at construction.
         assert!(provider
+            .fleet
             .bucket_clients
             .iter()
             .all(|b| b.lock().unwrap().is_some()));
@@ -3378,6 +3347,7 @@ mod tests {
         // pre_warm should not panic and should not clear the pre-filled buckets.
         provider.clone().pre_warm();
         assert!(provider
+            .fleet
             .bucket_clients
             .iter()
             .all(|b| b.lock().unwrap().is_some()));
@@ -3412,8 +3382,8 @@ mod tests {
             crate::spki_verifier::FingerprintState::Blocked,
         ] {
             let call_count = Arc::new(AtomicUsize::new(0));
-            let provider = Arc::new(VLlmProvider::new_with_verifier_and_concurrency(
-                VLlmConfig {
+            let provider = Arc::new(Provider::new_with_verifier_and_concurrency(
+                Config {
                     base_url: "http://localhost".to_string(),
                     api_key: None,
                     completion_timeout_seconds: 30,
@@ -3442,6 +3412,7 @@ mod tests {
             // All buckets must remain empty (no tasks ran).
             assert!(
                 provider
+                    .fleet
                     .bucket_clients
                     .iter()
                     .all(|b| b.lock().unwrap().is_none()),
@@ -3460,16 +3431,16 @@ mod tests {
         // already treats it as next-provider-worthy in the chat_completion
         // closure — and other indices may succeed where the sticky bucket
         // timed out.
-        assert!(VLlmProvider::is_rotation_retryable_status(408));
-        assert!(VLlmProvider::is_rotation_retryable_status(429));
-        assert!(VLlmProvider::is_rotation_retryable_status(500));
-        assert!(VLlmProvider::is_rotation_retryable_status(503));
-        assert!(VLlmProvider::is_rotation_retryable_status(599));
-        assert!(!VLlmProvider::is_rotation_retryable_status(200));
-        assert!(!VLlmProvider::is_rotation_retryable_status(400));
-        assert!(!VLlmProvider::is_rotation_retryable_status(401));
-        assert!(!VLlmProvider::is_rotation_retryable_status(404));
-        assert!(!VLlmProvider::is_rotation_retryable_status(422));
+        assert!(Fleet::is_rotation_retryable_status(408));
+        assert!(Fleet::is_rotation_retryable_status(429));
+        assert!(Fleet::is_rotation_retryable_status(500));
+        assert!(Fleet::is_rotation_retryable_status(503));
+        assert!(Fleet::is_rotation_retryable_status(599));
+        assert!(!Fleet::is_rotation_retryable_status(200));
+        assert!(!Fleet::is_rotation_retryable_status(400));
+        assert!(!Fleet::is_rotation_retryable_status(401));
+        assert!(!Fleet::is_rotation_retryable_status(404));
+        assert!(!Fleet::is_rotation_retryable_status(422));
     }
 
     #[test]
@@ -3481,27 +3452,32 @@ mod tests {
         let provider = create_test_provider();
         provider.set_backend_count(5);
         assert_eq!(
-            provider.rotation_count(),
+            provider.fleet.rotation_count(),
             0,
             "rotation must stay disabled for URLs that don't fit the <canonical>.<multi-label-base> shape"
         );
-        assert!(provider.rotation_url(0, "/v1/chat/completions").is_none());
+        assert!(provider
+            .fleet
+            .rotation_url(0, "/v1/chat/completions")
+            .is_none());
     }
 
     #[test]
     fn rotation_url_uses_canonical_label_and_index() {
-        let provider = VLlmProvider::new(VLlmConfig {
+        let provider = Provider::new(Config {
             base_url: "https://glm-5-1.completions.near.ai".to_string(),
             api_key: None,
             completion_timeout_seconds: 30,
             control_timeout_seconds: 30,
         });
         provider.set_backend_count(3);
-        assert_eq!(provider.rotation_count(), 3);
+        assert_eq!(provider.fleet.rotation_count(), 3);
         let url0 = provider
+            .fleet
             .rotation_url(0, "/v1/chat/completions")
             .expect("rotation URL build");
         let url2 = provider
+            .fleet
             .rotation_url(2, "/v1/chat/completions")
             .expect("rotation URL build");
         assert_eq!(
@@ -3519,14 +3495,14 @@ mod tests {
         // Defensive: a bogus `/backends/count` reading (race during deploy,
         // partial registry split) shouldn't let one 5xx burn unbounded
         // fresh-TCP handshakes. Mirrors the discovery path's cap.
-        let provider = VLlmProvider::new(VLlmConfig {
+        let provider = Provider::new(Config {
             base_url: "https://glm-5-1.completions.near.ai".to_string(),
             api_key: None,
             completion_timeout_seconds: 30,
             control_timeout_seconds: 30,
         });
         provider.set_backend_count(10_000);
-        assert_eq!(provider.rotation_count(), crate::rotation::MAX_FANOUT);
+        assert_eq!(provider.fleet.rotation_count(), crate::rotation::MAX_FANOUT);
     }
 
     #[test]
@@ -3534,13 +3510,13 @@ mod tests {
         // First request after startup, before discovery's first cycle: count
         // is 0, so rotation is skipped and the canonical 5xx propagates
         // as it did pre-this-PR. No false positives.
-        let provider = VLlmProvider::new(VLlmConfig {
+        let provider = Provider::new(Config {
             base_url: "https://glm-5-1.completions.near.ai".to_string(),
             api_key: None,
             completion_timeout_seconds: 30,
             control_timeout_seconds: 30,
         });
-        assert_eq!(provider.rotation_count(), 0);
+        assert_eq!(provider.fleet.rotation_count(), 0);
     }
 
     #[test]
@@ -3554,12 +3530,14 @@ mod tests {
         // backend and 404.
         let provider = create_test_provider();
         provider
+            .fleet
             .pending_rotation
             .lock()
             .unwrap()
             .insert("req-hash-abc".to_string(), 2);
         provider.pin_chat_connection("req-hash-abc", "chatcmpl-xyz");
         let stored = provider
+            .fleet
             .signature_rotation
             .lock()
             .unwrap()
@@ -3568,7 +3546,7 @@ mod tests {
         assert_eq!(stored, Some(2));
         // Pending entry should be drained so a future `request_hash` reuse
         // can't accidentally surface the stale index.
-        assert!(provider.pending_rotation.lock().unwrap().is_empty());
+        assert!(provider.fleet.pending_rotation.lock().unwrap().is_empty());
     }
 
     #[test]
@@ -3579,25 +3557,256 @@ mod tests {
         // collide on the same `""` signature_rotation slot.
         let provider = create_test_provider();
         provider
+            .fleet
             .pending_rotation
             .lock()
             .unwrap()
             .insert("req-hash-orphan".to_string(), 1);
         provider.pin_chat_connection("req-hash-orphan", "");
-        assert!(provider.pending_rotation.lock().unwrap().is_empty());
-        assert!(provider.signature_rotation.lock().unwrap().is_empty());
+        assert!(provider.fleet.pending_rotation.lock().unwrap().is_empty());
+        assert!(provider.fleet.signature_rotation.lock().unwrap().is_empty());
     }
 
     #[test]
     fn unpin_chat_connection_clears_signature_rotation() {
         let provider = create_test_provider();
         provider
+            .fleet
             .signature_rotation
             .lock()
             .unwrap()
             .insert("chat-1".to_string(), 4);
         provider.unpin_chat_connection("chat-1");
-        assert!(provider.signature_rotation.lock().unwrap().is_empty());
+        assert!(provider.fleet.signature_rotation.lock().unwrap().is_empty());
+    }
+
+    // --- Characterization tests for the bucket side of pin/unpin (the H2
+    // sticky-prefix routing state). These pin down current behavior so the
+    // Fleet extraction can be proven behavior-identical. ---
+
+    #[test]
+    fn pin_chat_connection_promotes_pending_bucket_to_signature_bucket() {
+        // The streaming path stores `request_hash → bucket_id` in
+        // `pending_buckets` before the chat_id is known; `pin_chat_connection`
+        // must promote it into `signature_buckets` so the signature fetch
+        // reuses the same bucket's pinned H2 connection.
+        let provider = create_test_provider();
+        provider
+            .fleet
+            .pending_buckets
+            .lock()
+            .unwrap()
+            .insert("req-hash-abc".to_string(), 3);
+        provider.pin_chat_connection("req-hash-abc", "chatcmpl-xyz");
+        assert_eq!(
+            provider
+                .fleet
+                .signature_buckets
+                .lock()
+                .unwrap()
+                .get("chatcmpl-xyz")
+                .copied(),
+            Some(3)
+        );
+        // Pending entry drained so a future request_hash reuse can't surface
+        // a stale bucket.
+        assert!(provider.fleet.pending_buckets.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn unpin_chat_connection_clears_signature_bucket() {
+        let provider = create_test_provider();
+        provider
+            .fleet
+            .signature_buckets
+            .lock()
+            .unwrap()
+            .insert("chat-1".to_string(), 2);
+        provider.unpin_chat_connection("chat-1");
+        assert!(provider.fleet.signature_buckets.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn pin_chat_connection_empty_chat_id_still_writes_signature_bucket() {
+        // Asymmetry to preserve: with an empty chat_id, the ROTATION side skips
+        // writing signature_rotation (see the empty-chat_id test above), but the
+        // BUCKET side still drains pending_buckets into signature_buckets[""].
+        // This characterizes existing behavior — the extraction must keep it
+        // (changing it is a separate, deliberate decision, not a refactor).
+        let provider = create_test_provider();
+        provider
+            .fleet
+            .pending_buckets
+            .lock()
+            .unwrap()
+            .insert("req-hash-orphan".to_string(), 5);
+        provider.pin_chat_connection("req-hash-orphan", "");
+        assert!(provider.fleet.pending_buckets.lock().unwrap().is_empty());
+        assert_eq!(
+            provider
+                .fleet
+                .signature_buckets
+                .lock()
+                .unwrap()
+                .get("")
+                .copied(),
+            Some(5),
+            "bucket side currently writes signature_buckets[\"\"] even for empty chat_id"
+        );
+    }
+
+    // --- Characterization tests for get_signature's fetch/retry behavior over
+    // a real (mock) HTTP backend. With an IP-literal base_url the rotation path
+    // is disabled, so these exercise the general-client walk + the 404 (signing
+    // race) retry. They pin the network-facing contract the Fleet
+    // extraction must preserve. ---
+
+    /// Spawn a mock HTTP/1.1 backend. Each incoming request is answered with the
+    /// status at `script[request_index]` (saturating at the last entry); a 200
+    /// carries a valid `ChatSignature` JSON body. Returns the address, the
+    /// acceptor handle (abort to stop), and a counter of requests served.
+    async fn spawn_signature_mock(
+        script: Vec<u16>,
+    ) -> (
+        std::net::SocketAddr,
+        tokio::task::JoinHandle<()>,
+        Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let counter = Arc::new(AtomicUsize::new(0));
+        let counter_acc = counter.clone();
+        let handle = tokio::spawn(async move {
+            loop {
+                let (mut sock, _) = match listener.accept().await {
+                    Ok(c) => c,
+                    Err(_) => break,
+                };
+                let script = script.clone();
+                let counter_conn = counter_acc.clone();
+                tokio::spawn(async move {
+                    // Read request headers (until CRLFCRLF); we don't need the body.
+                    let mut buf = Vec::new();
+                    let mut tmp = [0u8; 1024];
+                    loop {
+                        match sock.read(&mut tmp).await {
+                            Ok(0) => return,
+                            Ok(n) => {
+                                buf.extend_from_slice(&tmp[..n]);
+                                if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                                    break;
+                                }
+                            }
+                            Err(_) => return,
+                        }
+                    }
+                    let idx = counter_conn.fetch_add(1, Ordering::SeqCst);
+                    let status = *script.get(idx).or_else(|| script.last()).unwrap_or(&404);
+                    let resp = if status == 200 {
+                        let body = serde_json::json!({
+                            "text": "req:resp",
+                            "signature": "0xsig",
+                            "signing_address": "0xabc",
+                            "signing_algo": "ecdsa",
+                        })
+                        .to_string();
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        )
+                    } else {
+                        format!("HTTP/1.1 {status} ERR\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                    };
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                    let _ = sock.flush().await;
+                });
+            }
+        });
+        (addr, handle, counter)
+    }
+
+    fn mock_provider(addr: std::net::SocketAddr) -> Provider {
+        Provider::new(Config {
+            base_url: format!("http://{addr}"),
+            api_key: None,
+            completion_timeout_seconds: 5,
+            control_timeout_seconds: 5,
+        })
+    }
+
+    #[tokio::test]
+    async fn get_signature_returns_signature_on_200() {
+        use crate::InferenceProvider;
+        use std::sync::atomic::Ordering;
+        let (addr, handle, counter) = spawn_signature_mock(vec![200]).await;
+        let provider = mock_provider(addr);
+        let sig = provider
+            .get_signature("chat-1", Some("ecdsa".to_string()))
+            .await
+            .expect("200 should yield a signature");
+        assert_eq!(sig.signing_algo, "ecdsa");
+        assert_eq!(sig.signing_address, "0xabc");
+        assert_eq!(counter.load(Ordering::SeqCst), 1, "exactly one fetch");
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn get_signature_retries_on_404_then_succeeds() {
+        use crate::InferenceProvider;
+        use std::sync::atomic::Ordering;
+        // 404 is the signing-race signal: the first fetch misses, the retry hits.
+        let (addr, handle, counter) = spawn_signature_mock(vec![404, 200]).await;
+        let provider = mock_provider(addr);
+        let sig = provider
+            .get_signature("chat-1", Some("ecdsa".to_string()))
+            .await
+            .expect("404 then 200 should succeed on retry");
+        assert_eq!(sig.signing_algo, "ecdsa");
+        assert_eq!(counter.load(Ordering::SeqCst), 2, "one 404, then a retry");
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn get_signature_persistent_404_fails_after_bounded_retries() {
+        use crate::InferenceProvider;
+        use std::sync::atomic::Ordering;
+        // Always 404: the fetch must give up after a bounded number of attempts
+        // (1 initial + one per backoff in the schedule), not loop forever.
+        let (addr, handle, counter) = spawn_signature_mock(vec![404]).await;
+        let provider = mock_provider(addr);
+        let res = provider
+            .get_signature("chat-1", Some("ecdsa".to_string()))
+            .await;
+        assert!(res.is_err(), "persistent 404 is a definitive failure");
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            1 + super::SIGNATURE_FETCH_BACKOFFS_MS.len(),
+            "1 initial fetch + one retry per backoff entry"
+        );
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn get_attestation_report_delegates_to_fleet_without_recursing() {
+        use crate::InferenceProvider;
+        // Regression guard for the Provider -> Fleet delegation: the
+        // trait method must forward to self.fleet, not self (which would resolve
+        // back to the same trait method and recurse to a stack overflow). The
+        // provider points at http://localhost with no server, so this returns a
+        // transport error quickly — the point is that it RETURNS, not overflows.
+        let provider = create_test_provider();
+        let res = provider
+            .get_attestation_report("test-model".to_string(), None, None, None, false)
+            .await;
+        assert!(
+            res.is_err(),
+            "expected a transport error (no backend), not a value or a stack overflow"
+        );
     }
 
     #[test]

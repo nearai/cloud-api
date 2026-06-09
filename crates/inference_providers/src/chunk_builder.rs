@@ -45,6 +45,7 @@ impl ChunkContext {
             usage,
             prompt_token_ids: None,
             modality: None,
+            extra: Default::default(),
         }
     }
 

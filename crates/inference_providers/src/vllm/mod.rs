@@ -2164,14 +2164,15 @@ impl InferenceProvider for VLlmProvider {
         signing_address: Option<String>,
         include_tls_fingerprint: bool,
     ) -> Result<serde_json::Map<String, serde_json::Value>, AttestationError> {
-        self.get_attestation_report(
-            model,
-            signing_algo,
-            nonce,
-            signing_address,
-            include_tls_fingerprint,
-        )
-        .await
+        self.fleet
+            .get_attestation_report(
+                model,
+                signing_algo,
+                nonce,
+                signing_address,
+                include_tls_fingerprint,
+            )
+            .await
     }
     async fn audio_transcription(
         &self,
@@ -3785,6 +3786,24 @@ mod tests {
             "1 initial fetch + one retry per backoff entry"
         );
         handle.abort();
+    }
+
+    #[tokio::test]
+    async fn get_attestation_report_delegates_to_fleet_without_recursing() {
+        use crate::InferenceProvider;
+        // Regression guard for the VLlmProvider -> FleetRouter delegation: the
+        // trait method must forward to self.fleet, not self (which would resolve
+        // back to the same trait method and recurse to a stack overflow). The
+        // provider points at http://localhost with no server, so this returns a
+        // transport error quickly — the point is that it RETURNS, not overflows.
+        let provider = create_test_provider();
+        let res = provider
+            .get_attestation_report("test-model".to_string(), None, None, None, false)
+            .await;
+        assert!(
+            res.is_err(),
+            "expected a transport error (no backend), not a value or a stack overflow"
+        );
     }
 
     #[test]

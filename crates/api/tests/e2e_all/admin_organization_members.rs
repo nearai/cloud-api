@@ -31,10 +31,7 @@ async fn test_admin_list_organization_members_includes_owner() {
         "Org should have at least its owner as a member, got total={}",
         body.total
     );
-    assert!(
-        !body.members.is_empty(),
-        "Members list should not be empty"
-    );
+    assert!(!body.members.is_empty(), "Members list should not be empty");
 
     let owner = body
         .members

@@ -9,9 +9,11 @@
 //!
 //! [`MeasurementPolicy`] makes the policy explicit and **per-provider**, selected
 //! by [`ProviderTier`] at construction time — never derived from attacker-
-//! influenced report fields. NEAR's behavior is reproduced exactly by
-//! [`MeasurementPolicy::near_from_env`] / [`MeasurementPolicy::near`], so the
-//! existing verification path is byte-for-byte unchanged.
+//! influenced report fields. Its fields are private: a policy can only be built
+//! through the safe constructors below, so it is impossible to construct an
+//! attested-tier policy that silently skips its measurement check. NEAR's
+//! behavior is reproduced exactly by [`MeasurementPolicy::near_from_env`] /
+//! [`MeasurementPolicy::near`].
 
 use std::collections::HashSet;
 
@@ -19,51 +21,58 @@ use inference_providers::ProviderTier;
 
 use super::verification::AttestationVerificationError;
 
+/// Normalize an OS-image-hash for storage/comparison: trim, strip an optional
+/// `0x` prefix, lowercase. Keeps allowlist matching robust to formatting.
+fn normalize_hash(s: &str) -> String {
+    let t = s.trim();
+    t.strip_prefix("0x").unwrap_or(t).to_lowercase()
+}
+
 /// Measurement-verification policy scoped to one provider tier.
 ///
-/// Constructed at pool build time from a known [`ProviderTier`] (PR1), so a
-/// Chutes measurement policy can never be applied to a NEAR backend or vice
-/// versa. PR2 carries the OS-image-hash allowlist + TCB floor; later PRs extend
-/// it with register-pin allowlists for providers (like Chutes) that ship no
-/// replayable event log.
+/// Constructed at pool build time from a known [`ProviderTier`] (PR1) via the
+/// safe constructors only — fields are private — so a Chutes measurement policy
+/// can never be applied to a NEAR backend or vice versa, and an attested-tier
+/// policy can never be assembled in a fail-open state.
 #[derive(Clone, Debug)]
 pub struct MeasurementPolicy {
     /// Trust tier this policy applies to. Selected at construction, never from a report.
-    pub tier: ProviderTier,
-    /// Allowed OS image-hash measurements (lowercase hex), checked against the
+    tier: ProviderTier,
+    /// Allowed OS image-hash measurements (normalized), checked against the
     /// RTMR3-verified event log's `os-image-hash`.
-    pub allowed_os_image_hashes: HashSet<String>,
+    allowed_os_image_hashes: HashSet<String>,
     /// Reject attestations whose TDX TCB status is not `UpToDate`.
-    pub require_tcb_up_to_date: bool,
-    /// Require a replayable dstack-shaped RTMR3 event log to authenticate the
-    /// measurement (NEAR + preferred Chutes). A register-pin fallback for
-    /// providers without an event log is added in a later PR.
-    pub require_dstack_event_log: bool,
+    require_tcb_up_to_date: bool,
 }
 
 impl MeasurementPolicy {
     /// NEAR's own-fleet policy from explicit values, preserving the exact
     /// semantics of the previous `AttestationVerifier::new` fields: an empty
     /// `allowed_os_image_hashes` **skips** the image-hash check (fail-open is
-    /// acceptable for our own fleet).
+    /// acceptable for our own fleet). Allowlist entries are normalized.
     pub fn near(allowed_os_image_hashes: HashSet<String>, require_tcb_up_to_date: bool) -> Self {
         Self {
             tier: ProviderTier::Near,
-            allowed_os_image_hashes,
+            allowed_os_image_hashes: allowed_os_image_hashes
+                .iter()
+                .map(|s| normalize_hash(s))
+                .collect(),
             require_tcb_up_to_date,
-            require_dstack_event_log: true,
         }
     }
 
     /// An attested third-party ([`ProviderTier::Attested3p`]) policy. TCB-up-to-date
     /// is enforced by default (stricter than NEAR's own fleet), and an empty
     /// `allowed_os_image_hashes` is rejected by [`Self::assert_enforceable`].
+    /// Allowlist entries are normalized.
     pub fn attested3p(allowed_os_image_hashes: HashSet<String>) -> Self {
         Self {
             tier: ProviderTier::Attested3p,
-            allowed_os_image_hashes,
+            allowed_os_image_hashes: allowed_os_image_hashes
+                .iter()
+                .map(|s| normalize_hash(s))
+                .collect(),
             require_tcb_up_to_date: true,
-            require_dstack_event_log: true,
         }
     }
 
@@ -74,7 +83,7 @@ impl MeasurementPolicy {
         let allowed_os_image_hashes: HashSet<String> = std::env::var("ALLOWED_IMAGE_HASHES")
             .unwrap_or_default()
             .split(',')
-            .map(|s| s.trim().to_lowercase())
+            .map(normalize_hash)
             .filter(|s| !s.is_empty())
             .collect();
 
@@ -89,22 +98,24 @@ impl MeasurementPolicy {
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
 
-        Self::near(allowed_os_image_hashes, require_tcb_up_to_date)
+        // Build directly (not via `near`) so we don't double-normalize; entries
+        // are already normalized above.
+        Self {
+            tier: ProviderTier::Near,
+            allowed_os_image_hashes,
+            require_tcb_up_to_date,
+        }
     }
 
     /// Fail-closed guard, called before measurement verification.
     ///
-    /// For an attested **third party** ([`ProviderTier::Attested3p`]) using the
-    /// event-log replay path, an empty allowlist is a misconfiguration that would
-    /// otherwise silently accept arbitrary software — so it is rejected here.
-    /// For NEAR's own fleet ([`ProviderTier::Near`]) an empty allowlist keeps the
-    /// historical skip behavior, and [`ProviderTier::NonAttested`] has no
-    /// attestation path, so neither errors.
+    /// An attested **third party** ([`ProviderTier::Attested3p`]) with an empty
+    /// allowlist is **always** rejected — an empty allowlist would otherwise
+    /// silently accept arbitrary software. NEAR's own fleet ([`ProviderTier::Near`])
+    /// keeps the historical skip-on-empty behavior, and [`ProviderTier::NonAttested`]
+    /// has no attestation path, so neither errors.
     pub fn assert_enforceable(&self) -> Result<(), AttestationVerificationError> {
-        if self.tier == ProviderTier::Attested3p
-            && self.require_dstack_event_log
-            && self.allowed_os_image_hashes.is_empty()
-        {
+        if self.tier == ProviderTier::Attested3p && self.allowed_os_image_hashes.is_empty() {
             return Err(AttestationVerificationError::ImageHashMismatch(
                 "attested third-party provider has no os-image-hash allowlist configured \
                  (fail-closed: empty allowlist would accept arbitrary software)"
@@ -112,6 +123,16 @@ impl MeasurementPolicy {
             ));
         }
         Ok(())
+    }
+
+    /// The trust tier this policy applies to.
+    pub fn tier(&self) -> ProviderTier {
+        self.tier
+    }
+
+    /// Whether attestations with a non-`UpToDate` TCB status must be rejected.
+    pub fn require_tcb_up_to_date(&self) -> bool {
+        self.require_tcb_up_to_date
     }
 
     /// Whether the OS-image-hash allowlist is enforced for this policy.
@@ -122,6 +143,11 @@ impl MeasurementPolicy {
     /// non-empty, so the check is always enforced.
     pub fn enforces_image_hash(&self) -> bool {
         !self.allowed_os_image_hashes.is_empty()
+    }
+
+    /// Whether `hash` (in any case / with-or-without `0x`) is in the allowlist.
+    pub fn allows_image_hash(&self, hash: &str) -> bool {
+        self.allowed_os_image_hashes.contains(&normalize_hash(hash))
     }
 }
 
@@ -146,16 +172,13 @@ mod tests {
         let p = MeasurementPolicy::near(hashes(&["abc"]), false);
         assert!(p.assert_enforceable().is_ok());
         assert!(p.enforces_image_hash());
+        assert!(p.allows_image_hash("abc"));
     }
 
     #[test]
     fn attested3p_empty_allowlist_is_rejected_fail_closed() {
-        let p = MeasurementPolicy {
-            tier: ProviderTier::Attested3p,
-            allowed_os_image_hashes: HashSet::new(),
-            require_tcb_up_to_date: true,
-            require_dstack_event_log: true,
-        };
+        // Unconditional: there is no flag a caller can flip to disable this.
+        let p = MeasurementPolicy::attested3p(HashSet::new());
         assert!(
             p.assert_enforceable().is_err(),
             "attested 3p with empty allowlist must fail closed"
@@ -163,14 +186,23 @@ mod tests {
     }
 
     #[test]
-    fn attested3p_nonempty_allowlist_enforced() {
-        let p = MeasurementPolicy {
-            tier: ProviderTier::Attested3p,
-            allowed_os_image_hashes: hashes(&["deadbeef"]),
-            require_tcb_up_to_date: true,
-            require_dstack_event_log: true,
-        };
+    fn attested3p_nonempty_allowlist_enforced_and_tcb_required() {
+        let p = MeasurementPolicy::attested3p(hashes(&["deadbeef"]));
         assert!(p.assert_enforceable().is_ok());
         assert!(p.enforces_image_hash());
+        assert!(
+            p.require_tcb_up_to_date(),
+            "attested 3p enforces TCB by default"
+        );
+    }
+
+    #[test]
+    fn allowlist_entries_are_normalized() {
+        // Uppercase + 0x-prefixed allowlist entry must still match a lowercase
+        // bare hash from the event log (and vice versa).
+        let p = MeasurementPolicy::near(hashes(&["0xDEADBEEF"]), false);
+        assert!(p.allows_image_hash("deadbeef"));
+        assert!(p.allows_image_hash("0xDEADBEEF"));
+        assert!(!p.allows_image_hash("cafe"));
     }
 }

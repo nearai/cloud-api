@@ -162,7 +162,7 @@ impl AttestationVerifier {
 
         // Check TCB status
         let tcb_status = &verified_report.status;
-        if self.policy.require_tcb_up_to_date && tcb_status != "UpToDate" {
+        if self.policy.require_tcb_up_to_date() && tcb_status != "UpToDate" {
             return Err(AttestationVerificationError::TdxVerificationFailed(format!(
                 "TCB status is '{tcb_status}' but REQUIRE_TCB_UP_TO_DATE is set (advisory_ids: {:?})",
                 verified_report.advisory_ids
@@ -227,12 +227,7 @@ impl AttestationVerifier {
         //    behavior); for an attested third party the empty case was already
         //    rejected by `assert_enforceable()` above, so the check is enforced.
         if let Some(ref hash) = event_log_data.os_image_hash {
-            if self.policy.enforces_image_hash()
-                && !self
-                    .policy
-                    .allowed_os_image_hashes
-                    .contains(&hash.to_lowercase())
-            {
+            if self.policy.enforces_image_hash() && !self.policy.allows_image_hash(hash) {
                 return Err(AttestationVerificationError::ImageHashMismatch(format!(
                     "os_image_hash '{}' from RTMR3-verified event log not in allowed list",
                     hash
@@ -240,7 +235,7 @@ impl AttestationVerifier {
             }
         } else if self.policy.enforces_image_hash() {
             return Err(AttestationVerificationError::ImageHashMismatch(
-                "image-hash allowlist configured but no os-image-hash in event log".to_string(),
+                "ALLOWED_IMAGE_HASHES configured but no os-image-hash in event log".to_string(),
             ));
         }
 

@@ -226,3 +226,48 @@ async fn test_spki_fingerprint_verifier() {
     let err = resp2.unwrap_err().to_string();
     println!("Wrong fingerprint rejection: {err}");
 }
+
+/// PR2 fail-closed guard (deterministic, no network): an attested third-party
+/// `MeasurementPolicy` with an empty OS-image-hash allowlist must reject *before*
+/// any quote work — `assert_enforceable()` is the very first step of
+/// `verify_attestation_report`. This is the check that stops a Chutes-tier
+/// misconfiguration from silently accepting arbitrary software.
+#[tokio::test]
+async fn attested3p_empty_allowlist_fails_closed_before_verification() {
+    use services::attestation::{AttestationVerifier, MeasurementPolicy};
+
+    let verifier =
+        AttestationVerifier::with_policy(MeasurementPolicy::attested3p(HashSet::new()), None);
+
+    // Empty report: if the policy guard did NOT fire first we'd get a
+    // MissingField("intel_quote") error instead of the fail-closed policy error.
+    let empty_report = serde_json::Map::new();
+    let err = verifier
+        .verify_attestation_report(&empty_report, "00")
+        .await
+        .expect_err("attested 3p with empty allowlist must fail closed");
+    let msg = err.to_string().to_lowercase();
+    assert!(
+        msg.contains("fail-closed") || msg.contains("allowlist"),
+        "expected fail-closed policy error, got: {err}"
+    );
+}
+
+/// NEAR's own fleet with an empty allowlist must NOT fail closed at the policy
+/// guard — it falls through to real verification (here surfacing the expected
+/// missing-field error on an empty report), proving the historical
+/// fail-open-on-empty behavior is preserved for `ProviderTier::Near`.
+#[tokio::test]
+async fn near_empty_allowlist_does_not_fail_closed() {
+    let verifier = services::attestation::AttestationVerifier::new(HashSet::new(), None, false);
+    let empty_report = serde_json::Map::new();
+    let err = verifier
+        .verify_attestation_report(&empty_report, "00")
+        .await
+        .expect_err("empty report still fails on missing quote");
+    let msg = err.to_string().to_lowercase();
+    assert!(
+        msg.contains("intel_quote") || msg.contains("missing"),
+        "NEAR empty allowlist should reach quote extraction, not a fail-closed policy error; got: {err}"
+    );
+}

@@ -55,15 +55,19 @@
 
 use reqwest::Client;
 
+pub mod attested;
 pub mod bucket_keepalive;
 pub mod chunk_builder;
-pub mod external;
 pub mod mock;
 pub mod models;
+pub mod non_attested;
 pub mod rotation;
 pub mod spki_verifier;
 pub mod sse_parser;
-pub mod vllm;
+
+// Attested NEAR-AI fleet provider. Use the module path (`nearai::Provider`,
+// `nearai::Config`) rather than a bare re-export to keep the names unambiguous.
+pub use attested::nearai;
 
 use std::pin::Pin;
 use std::sync::Arc;
@@ -90,20 +94,18 @@ pub use models::{
 pub use sse_parser::{
     new_external_sse_parser, new_sse_parser, BufferedSSEParser, SSEEvent, SSEEventParser, SSEParser,
 };
-pub use vllm::{VLlmConfig, VLlmProvider};
-
 // Chunk builder for external provider parsers
 pub use chunk_builder::ChunkContext;
 
-// External provider exports
-pub use external::{
+// Non-attested (third-party) provider exports
+pub use non_attested::external::{
     AnthropicBackend, ExternalProvider, ExternalProviderConfig, GeminiBackend,
     OpenAiCompatibleBackend, ProviderConfig,
 };
 
 /// Creates a verified `reqwest::Client` with an H2 connection to a specific backend.
 ///
-/// Used by `VLlmProvider` for inline backend verification: when a bucket needs a new
+/// Used by `nearai::Provider` for inline backend verification: when a bucket needs a new
 /// client, the verifier connects to model-proxy, fetches the backend's attestation
 /// report, verifies it (TDX quote, GPU evidence, image hash), pins the TLS fingerprint,
 /// and returns the client with its established connection.

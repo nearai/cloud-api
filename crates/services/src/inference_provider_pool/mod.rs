@@ -1,6 +1,7 @@
 use crate::attestation::AttestationVerifier;
 use crate::common::encryption_headers;
 use config::ExternalProvidersConfig;
+use inference_providers::nearai;
 use inference_providers::rotation;
 use inference_providers::spki_verifier::{FingerprintState, SharedTlsRoots};
 use inference_providers::{
@@ -9,7 +10,7 @@ use inference_providers::{
     ChatCompletionParams, ExternalProvider, ExternalProviderConfig, ImageEditError,
     ImageEditParams, ImageEditResponseWithBytes, ImageGenerationError, ImageGenerationParams,
     ImageGenerationResponseWithBytes, InferenceProvider, ProviderConfig, RerankError, RerankParams,
-    RerankResponse, StreamingResult, StreamingResultExt, VLlmConfig, VLlmProvider,
+    RerankResponse, StreamingResult, StreamingResultExt,
 };
 use regex::Regex;
 use std::{
@@ -230,7 +231,7 @@ pub struct InferenceProviderPool {
 
 /// Backend verifier that creates verified reqwest clients by connecting to a backend,
 /// fetching its attestation report, and verifying the TDX quote + GPU evidence.
-/// Used by `VLlmProvider` for lazy bucket client creation.
+/// Used by `nearai::Provider` for lazy bucket client creation.
 struct PoolBackendVerifier {
     api_key: Option<String>,
     model_name: String,
@@ -389,7 +390,7 @@ impl PoolBackendVerifier {
         state: Arc<std::sync::RwLock<FingerprintState>>,
     ) -> Result<reqwest::Client, reqwest::Error> {
         let read_timeout =
-            Duration::from_secs(VLlmConfig::completion_timeout_from_env().max(0) as u64);
+            Duration::from_secs(nearai::Config::completion_timeout_from_env().max(0) as u64);
         let builder = reqwest::Client::builder()
             .use_preconfigured_tls(self.tls_roots.build_config(state))
             .pool_max_idle_per_host(1)
@@ -881,8 +882,8 @@ impl InferenceProviderPool {
         const ALGOS: [&str; 2] = ["ecdsa", "ed25519"];
 
         /// Query parameters for `/v1/attestation/report`. Matches
-        /// `VLlmProvider::get_attestation_report`'s Query struct; duplicated
-        /// here so discovery doesn't need a full VLlmProvider (which spins
+        /// `nearai::Provider::get_attestation_report`'s Query struct; duplicated
+        /// here so discovery doesn't need a full nearai::Provider (which spins
         /// up 128 bucket clients per instance — very heavy).
         #[derive(serde::Serialize)]
         struct Query<'a> {
@@ -955,7 +956,7 @@ impl InferenceProviderPool {
         // Defense-in-depth: cap the fan-out. A bogus registry reading (race
         // during a deploy, partial split) could otherwise spawn an unbounded
         // number of fresh-TCP TLS handshakes per cycle per model. Shared
-        // with VLlmProvider's traffic-time rotation gate so the cap is
+        // with nearai::Provider's traffic-time rotation gate so the cap is
         // defined exactly once.
         let backend_count = if backend_count > rotation::MAX_FANOUT {
             warn!(
@@ -2607,7 +2608,7 @@ impl InferenceProviderPool {
         }
     }
 
-    /// Load models with inference_url as VLlmProviders into provider_mappings.
+    /// Load models with inference_url as nearai::Providers into provider_mappings.
     ///
     /// For each model, reuses the existing provider (and its warm TLS connections)
     /// if the inference_url hasn't changed since last load. Only creates new providers
@@ -2685,8 +2686,8 @@ impl InferenceProviderPool {
                         fingerprint_state: state.clone(),
                     });
                     let serving_provider =
-                        Arc::new(VLlmProvider::new_with_verifier(
-                            VLlmConfig::new(url.clone(), api_key.clone(), None),
+                        Arc::new(nearai::Provider::new_with_verifier(
+                            nearai::Config::new(url.clone(), api_key.clone(), None),
                             state.clone(),
                             backend_verifier,
                         ));
@@ -5121,7 +5122,7 @@ mod tests {
 
         // Simulate next refresh cycle — now the URL is not in the cache,
         // so it goes through needs_creation (fresh bootstrap TLS provider).
-        // The VLlmProvider creation will fail (test URL not reachable), but
+        // The nearai::Provider creation will fail (test URL not reachable), but
         // the important thing is it was NOT reused from the blocked cache.
         let cache_before = {
             let cache = pool.inference_url_providers.read().await;

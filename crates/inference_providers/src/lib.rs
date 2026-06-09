@@ -103,6 +103,50 @@ pub use non_attested::external::{
     OpenAiCompatibleBackend, ProviderConfig,
 };
 
+/// Trust tier of an inference provider, along the attestation axis introduced in
+/// the `attested::` / `non_attested::` module split.
+///
+/// This is the taxonomy the inference stack branches on — *can we cryptographically
+/// verify what served the response?* — not the engine or who operates the backend:
+///
+/// - [`ProviderTier::Near`] — NEAR AI's own TEE fleet ([`attested::nearai`]). Full
+///   chain: per-request TDX quote + GPU evidence + TLS-SPKI pin + per-response
+///   signature, all rooted in NEAR's own KMS / compose-manager / gateway.
+/// - [`ProviderTier::Attested3p`] — a third party that produces a *verifiable* TEE
+///   attestation we can bind to the response (e.g. Chutes, future siblings of
+///   `attested::nearai`). Earns the "attested" badge **only** when the per-response
+///   bindings that NEAR's verifier requires (fresh nonce, signing key, TLS
+///   fingerprint, authenticated measurement) are present; otherwise it is
+///   [`ProviderTier::NonAttested`].
+/// - [`ProviderTier::NonAttested`] — plaintext third parties
+///   ([`non_attested::external`]: OpenAI / Anthropic / Gemini / OpenRouter) with no
+///   verifiable attestation. No "verified" badge.
+///
+/// PR1 of the Chutes integration: this enum is the scaffolding that later PRs use to
+/// select a per-provider measurement policy and report-data verifier at pool
+/// construction time. It carries no behavior on its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ProviderTier {
+    /// NEAR AI's own attested TEE fleet (`attested::nearai`).
+    Near,
+    /// A third party with a verifiable, response-bound TEE attestation
+    /// (`attested::<provider>`, e.g. Chutes).
+    Attested3p,
+    /// A plaintext third party with no verifiable attestation
+    /// (`non_attested::external`).
+    NonAttested,
+}
+
+impl ProviderTier {
+    /// Whether this tier carries a verifiable TEE attestation we gate a
+    /// "verified" badge on. True for [`Near`](ProviderTier::Near) and
+    /// [`Attested3p`](ProviderTier::Attested3p); false for
+    /// [`NonAttested`](ProviderTier::NonAttested).
+    pub fn is_attested(self) -> bool {
+        matches!(self, ProviderTier::Near | ProviderTier::Attested3p)
+    }
+}
+
 /// Creates a verified `reqwest::Client` with an H2 connection to a specific backend.
 ///
 /// Used by `nearai::Provider` for inline backend verification: when a bucket needs a new
@@ -300,6 +344,18 @@ pub trait InferenceProvider {
         params: AudioTranscriptionParams,
         request_hash: String,
     ) -> Result<AudioTranscriptionResponse, AudioTranscriptionError>;
+}
+
+#[cfg(test)]
+mod provider_tier_tests {
+    use super::ProviderTier;
+
+    #[test]
+    fn attested_tiers_gate_the_verified_badge() {
+        assert!(ProviderTier::Near.is_attested());
+        assert!(ProviderTier::Attested3p.is_attested());
+        assert!(!ProviderTier::NonAttested.is_attested());
+    }
 }
 
 #[cfg(test)]

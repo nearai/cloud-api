@@ -457,10 +457,11 @@ pub struct ConversationResponseReference {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, ToSchema)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "snake_case")]
 pub enum ResponseStatus {
     Completed,
     Failed,
+    #[serde(alias = "inprogress")]
     InProgress,
     Cancelled,
     Queued,
@@ -758,10 +759,11 @@ pub enum WebSearchAction {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "snake_case")]
 pub enum ResponseItemStatus {
     Completed,
     Failed,
+    #[serde(alias = "inprogress")]
     InProgress,
     Cancelled,
 }
@@ -1260,6 +1262,30 @@ impl Usage {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn test_response_status_serializes_in_progress_with_underscore() {
+        assert_eq!(
+            serde_json::to_value(ResponseStatus::InProgress).unwrap(),
+            json!("in_progress")
+        );
+        assert_eq!(
+            serde_json::to_value(ResponseItemStatus::InProgress).unwrap(),
+            json!("in_progress")
+        );
+    }
+
+    #[test]
+    fn test_response_status_deserializes_legacy_inprogress_without_underscore() {
+        assert_eq!(
+            serde_json::from_value::<ResponseStatus>(json!("inprogress")).unwrap(),
+            ResponseStatus::InProgress
+        );
+        assert!(matches!(
+            serde_json::from_value::<ResponseItemStatus>(json!("inprogress")).unwrap(),
+            ResponseItemStatus::InProgress
+        ));
+    }
 
     #[test]
     fn test_deserialize_old_response_item_message_without_new_fields() {

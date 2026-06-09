@@ -411,12 +411,28 @@ impl AttestationVerifier {
         attestation_report: &serde_json::Map<String, serde_json::Value>,
         request_nonce: &str,
     ) -> Result<Option<String>, AttestationVerificationError> {
-        let nvidia_payload_str = match attestation_report
-            .get("nvidia_payload")
-            .and_then(|v| v.as_str())
-        {
-            Some(s) if !s.is_empty() => s,
-            _ => {
+        // Distinguish three cases explicitly, so a present-but-malformed payload
+        // can never be mistaken for "absent" and silently skip GPU verification
+        // (type-confusion bypass):
+        //   - absent / null / empty string  -> no GPU evidence offered
+        //   - non-empty string              -> the evidence to verify
+        //   - present but not a string      -> MALFORMED, always rejected
+        let nvidia_payload_str = match attestation_report.get("nvidia_payload") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(serde_json::Value::String(s)) if s.is_empty() => None,
+            Some(serde_json::Value::String(s)) => Some(s.as_str()),
+            Some(_) => {
+                return Err(AttestationVerificationError::GpuVerificationFailed(
+                    "nvidia_payload is present but is not a string (malformed report); \
+                     refusing to skip GPU verification"
+                        .to_string(),
+                ));
+            }
+        };
+
+        let nvidia_payload_str = match nvidia_payload_str {
+            Some(s) => s,
+            None => {
                 // No GPU evidence. Acceptable for NEAR's non-GPU CVMs, but an
                 // attested provider that must prove confidential GPU compute
                 // (policy.require_gpu_evidence) is rejected rather than passing
@@ -925,6 +941,18 @@ mod tests {
             .await
             .expect_err("attested 3p requires GPU evidence");
         assert!(format!("{err}").contains("GPU evidence"));
+
+        // Type-confusion guard: a present-but-non-string nvidia_payload is
+        // malformed and MUST error for both tiers — never silently skipped.
+        let mut malformed = serde_json::Map::new();
+        malformed.insert("nvidia_payload".to_string(), json!({"not": "a string"}));
+        for v in [&near, &a3p] {
+            let err = v
+                .verify_gpu_evidence(&malformed, "00")
+                .await
+                .expect_err("malformed nvidia_payload must not be treated as absent");
+            assert!(format!("{err}").contains("not a string"));
+        }
     }
 
     /// Build a fake NRAS response in the wire format observed in production:

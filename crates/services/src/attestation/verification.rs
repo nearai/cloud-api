@@ -416,7 +416,20 @@ impl AttestationVerifier {
             .and_then(|v| v.as_str())
         {
             Some(s) if !s.is_empty() => s,
-            _ => return Ok(None), // No GPU evidence — acceptable for non-GPU CVMs
+            _ => {
+                // No GPU evidence. Acceptable for NEAR's non-GPU CVMs, but an
+                // attested provider that must prove confidential GPU compute
+                // (policy.require_gpu_evidence) is rejected rather than passing
+                // with no GPU verdict.
+                if self.policy.require_gpu_evidence() {
+                    return Err(AttestationVerificationError::GpuVerificationFailed(
+                        "GPU evidence (nvidia_payload) required by policy but absent from the \
+                         attestation report"
+                            .to_string(),
+                    ));
+                }
+                return Ok(None);
+            }
         };
 
         let payload: serde_json::Value = serde_json::from_str(nvidia_payload_str).map_err(|e| {
@@ -885,6 +898,33 @@ mod tests {
         let body = base64::engine::general_purpose::URL_SAFE_NO_PAD
             .encode(serde_json::to_vec(&payload).unwrap());
         format!("{header}.{body}.")
+    }
+
+    /// PR4: absent GPU evidence is best-effort for NEAR (`Ok(None)`) but rejected
+    /// for an attested third party whose policy requires it. Deterministic — the
+    /// absent branch returns before any NRAS call.
+    #[tokio::test]
+    async fn gpu_evidence_absent_ok_for_near_but_rejected_for_attested3p() {
+        use crate::attestation::MeasurementPolicy;
+        use std::collections::HashSet;
+
+        let report = serde_json::Map::new(); // no nvidia_payload
+
+        let near = AttestationVerifier::new(HashSet::new(), None, false);
+        assert!(
+            matches!(near.verify_gpu_evidence(&report, "00").await, Ok(None)),
+            "NEAR best-effort: absent GPU evidence -> Ok(None)"
+        );
+
+        let a3p = AttestationVerifier::with_policy(
+            MeasurementPolicy::attested3p(["abc".to_string()].into_iter().collect::<HashSet<_>>()),
+            None,
+        );
+        let err = a3p
+            .verify_gpu_evidence(&report, "00")
+            .await
+            .expect_err("attested 3p requires GPU evidence");
+        assert!(format!("{err}").contains("GPU evidence"));
     }
 
     /// Build a fake NRAS response in the wire format observed in production:

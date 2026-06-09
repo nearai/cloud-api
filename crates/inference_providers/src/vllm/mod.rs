@@ -607,15 +607,11 @@ impl VLlmProvider {
     pub fn pre_warm(self: Arc<Self>) {
         self.fleet.clone().pre_warm();
     }
+}
 
-    /// Get/verify the client for a bucket (delegates to FleetRouter).
-    async fn get_or_verify_bucket_client(
-        &self,
-        bucket_id: usize,
-    ) -> Result<Client, CompletionError> {
-        self.fleet.get_or_verify_bucket_client(bucket_id).await
-    }
-
+/// Network/IO helpers (rotation-SNI fallback + request header prep), owned by
+/// FleetRouter. Moved off VLlmProvider in step 4c.
+impl FleetRouter {
     /// Prepare encryption headers by extracting them from `extra` and forwarding as HTTP headers.
     /// Also removes encryption-related keys from `extra` to prevent them from leaking into the JSON body.
     ///
@@ -734,10 +730,10 @@ impl VLlmProvider {
         params: &T,
         client_override: Option<&Client>,
     ) -> Result<reqwest::Response, CompletionError> {
-        let client = client_override.unwrap_or(&self.fleet.client);
-        let ttfb_timeout_secs = self.fleet.config.control_timeout_seconds.max(0) as u64;
+        let client = client_override.unwrap_or(&self.client);
+        let ttfb_timeout_secs = self.config.control_timeout_seconds.max(0) as u64;
         let response = tokio::time::timeout(
-            self.fleet.config.control_timeout(),
+            self.config.control_timeout(),
             client.post(url).headers(headers).json(params).send(),
         )
         .await
@@ -798,7 +794,7 @@ impl VLlmProvider {
         timeout: Duration,
         canonical_err: CompletionError,
     ) -> Result<ChatCompletionResponseWithBytes, CompletionError> {
-        let count = self.fleet.rotation_count();
+        let count = self.rotation_count();
         // `last_error` tracks only HttpError-shaped failures so the pool's
         // `classify_retry_decision` sees a typed `retryable_http_5xx` (or
         // 429) at the end. Transport-level failures from the rotation loop
@@ -810,11 +806,11 @@ impl VLlmProvider {
         // `retryable_connection_keyword`.
         let mut last_error = canonical_err;
         for index in 0..count as u64 {
-            let url = match self.fleet.rotation_url(index, "/v1/chat/completions") {
+            let url = match self.rotation_url(index, "/v1/chat/completions") {
                 Some(u) => u,
                 None => continue,
             };
-            let client = match self.fleet.build_rotation_client() {
+            let client = match self.build_rotation_client() {
                 Ok(c) => c,
                 Err(e) => {
                     tracing::debug!(
@@ -860,7 +856,7 @@ impl VLlmProvider {
                     message: crate::extract_error_message(&error_text),
                     is_external: false,
                 };
-                if Self::is_rotation_retryable_status(status_code) {
+                if FleetRouter::is_rotation_retryable_status(status_code) {
                     tracing::debug!(
                         index,
                         status_code,
@@ -886,8 +882,7 @@ impl VLlmProvider {
                 })?;
 
             let chat_id = chat_completion_response.id.clone();
-            self.fleet
-                .signature_rotation
+            self.signature_rotation
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .insert(chat_id, index);
@@ -923,7 +918,7 @@ impl VLlmProvider {
         request_hash: &str,
         canonical_err: CompletionError,
     ) -> Result<StreamingResult, CompletionError> {
-        let count = self.fleet.rotation_count();
+        let count = self.rotation_count();
         // See the non-streaming sibling for the design: `last_error` only
         // tracks HttpError-shaped failures from rotation indices, so the
         // pool's `classify_retry_decision` sees the right `retryable_http_*`
@@ -934,11 +929,11 @@ impl VLlmProvider {
         // construction).
         let mut last_error = canonical_err;
         for index in 0..count as u64 {
-            let url = match self.fleet.rotation_url(index, "/v1/chat/completions") {
+            let url = match self.rotation_url(index, "/v1/chat/completions") {
                 Some(u) => u,
                 None => continue,
             };
-            let client = match self.fleet.build_rotation_client() {
+            let client = match self.build_rotation_client() {
                 Ok(c) => c,
                 Err(e) => {
                     tracing::debug!(
@@ -959,7 +954,7 @@ impl VLlmProvider {
                     // it the same way, so surface immediately rather than
                     // burn the remaining indices on a doomed request.
                     CompletionError::HttpError { status_code, .. }
-                        if !Self::is_rotation_retryable_status(*status_code) =>
+                        if !FleetRouter::is_rotation_retryable_status(*status_code) =>
                     {
                         return Err(e);
                     }
@@ -1006,8 +1001,7 @@ impl VLlmProvider {
                 drop(stream);
                 continue;
             }
-            self.fleet
-                .pending_rotation
+            self.pending_rotation
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .insert(request_hash.to_string(), index);
@@ -1047,7 +1041,7 @@ impl VLlmProvider {
         let status = if let Some(Err(CompletionError::HttpError { status_code, .. })) =
             peekable.peek().await
         {
-            if Self::is_rotation_retryable_status(*status_code) {
+            if FleetRouter::is_rotation_retryable_status(*status_code) {
                 Some(*status_code)
             } else {
                 None
@@ -1069,7 +1063,7 @@ impl VLlmProvider {
 }
 
 #[async_trait]
-impl InferenceProvider for VLlmProvider {
+impl InferenceProvider for FleetRouter {
     async fn get_signature(
         &self,
         chat_id: &str,
@@ -1077,12 +1071,11 @@ impl InferenceProvider for VLlmProvider {
     ) -> Result<ChatSignature, CompletionError> {
         let signing_algo = signing_algo.unwrap_or_else(|| "ecdsa".to_string());
         let path_and_query = format!("/v1/signature/{chat_id}?signing_algo={signing_algo}");
-        let canonical_url = format!("{}{}", self.fleet.config.base_url, path_and_query);
+        let canonical_url = format!("{}{}", self.config.base_url, path_and_query);
         let headers = self
-            .fleet
             .build_headers()
             .map_err(CompletionError::CompletionError)?;
-        let timeout = self.fleet.config.control_timeout();
+        let timeout = self.config.control_timeout();
 
         // Resolve the rotation-SNI target once; it's stable across retries.
         // If this chat_id was served by a rotation-SNI fallback (sticky bucket
@@ -1091,16 +1084,15 @@ impl InferenceProvider for VLlmProvider {
         // the bucket-pinned client nor the general LB client can find it — so
         // we try this client FIRST on every attempt.
         let rotation_index = self
-            .fleet
             .signature_rotation
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .get(chat_id)
             .copied();
         let rotation_target = rotation_index.and_then(|index| {
-            let base = self.fleet.rotation_url(index, "")?;
+            let base = self.rotation_url(index, "")?;
             let url = format!("{}{}", base.trim_end_matches('/'), path_and_query);
-            let client = self.fleet.build_rotation_client().ok()?;
+            let client = self.build_rotation_client().ok()?;
             Some((index, url, client))
         });
 
@@ -1109,14 +1101,13 @@ impl InferenceProvider for VLlmProvider {
         // opened a second connection to a different backend, so on 404 we fall
         // back to the general-purpose LB client.
         let bucket_id = self
-            .fleet
             .signature_buckets
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .get(chat_id)
             .copied();
         let bucket_client = bucket_id.and_then(|id| {
-            self.fleet.bucket_clients[id]
+            self.bucket_clients[id]
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .clone()
@@ -1125,7 +1116,7 @@ impl InferenceProvider for VLlmProvider {
         if let Some(ref bc) = bucket_client {
             clients_to_try.push(bc);
         }
-        clients_to_try.push(&self.fleet.client);
+        clients_to_try.push(&self.client);
 
         // The backend signs in a background task that finalizes *after* the
         // final stream chunk, then caches the signature. cloud-api fetches in
@@ -1278,15 +1269,15 @@ impl InferenceProvider for VLlmProvider {
     }
 
     fn pin_chat_connection(&self, request_hash: &str, chat_id: &str) {
-        self.fleet.pin_chat_connection(request_hash, chat_id);
+        self.pin_chat_connection(request_hash, chat_id);
     }
 
     fn unpin_chat_connection(&self, chat_id: &str) {
-        self.fleet.unpin_chat_connection(chat_id);
+        self.unpin_chat_connection(chat_id);
     }
 
     fn set_backend_count(&self, count: usize) {
-        self.fleet.set_backend_count(count);
+        self.set_backend_count(count);
     }
 
     async fn get_attestation_report(
@@ -1318,23 +1309,19 @@ impl InferenceProvider for VLlmProvider {
         // Build URL with optional query parameters
         let url = format!(
             "{}/v1/attestation/report?{}",
-            self.fleet.config.base_url,
+            self.config.base_url,
             serde_urlencoded::to_string(&query).map_err(|_| AttestationError::Unknown(
                 "Failed to serialize query string".to_string()
             ))?
         );
 
-        let headers = self
-            .fleet
-            .build_headers()
-            .map_err(AttestationError::FetchError)?;
+        let headers = self.build_headers().map_err(AttestationError::FetchError)?;
 
         let response = self
-            .fleet
             .client
             .get(&url)
             .headers(headers)
-            .timeout(self.fleet.config.control_timeout())
+            .timeout(self.config.control_timeout())
             .send()
             .await
             .map_err(|e| AttestationError::FetchError(e.to_string()))?;
@@ -1366,19 +1353,15 @@ impl InferenceProvider for VLlmProvider {
 
     /// Lists all available models from the vLLM server
     async fn models(&self) -> Result<ModelsResponse, ListModelsError> {
-        let url = format!("{}/v1/models", self.fleet.config.base_url);
+        let url = format!("{}/v1/models", self.config.base_url);
         tracing::debug!("Listing models from vLLM server, url: {}", url);
 
-        let headers = self
-            .fleet
-            .build_headers()
-            .map_err(ListModelsError::FetchError)?;
+        let headers = self.build_headers().map_err(ListModelsError::FetchError)?;
         let response = self
-            .fleet
             .client
             .get(&url)
             .headers(headers)
-            .timeout(self.fleet.config.control_timeout())
+            .timeout(self.config.control_timeout())
             .send()
             .await
             .map_err(|e| ListModelsError::FetchError(format!("{e:?}")))?;
@@ -1405,7 +1388,7 @@ impl InferenceProvider for VLlmProvider {
         params: ChatCompletionParams,
         request_hash: String,
     ) -> Result<StreamingResult, CompletionError> {
-        let url = format!("{}/v1/chat/completions", self.fleet.config.base_url);
+        let url = format!("{}/v1/chat/completions", self.config.base_url);
 
         // Ensure streaming and token usage are enabled
         let mut streaming_params = params;
@@ -1416,7 +1399,6 @@ impl InferenceProvider for VLlmProvider {
         });
 
         let mut headers = self
-            .fleet
             .build_headers()
             .map_err(CompletionError::CompletionError)?;
         let request_hash_value = HeaderValue::from_str(&request_hash)
@@ -1433,7 +1415,7 @@ impl InferenceProvider for VLlmProvider {
         // via L4 passthrough → prefix cache hits. Buckets are lazily filled: on first
         // use, inline verification connects to a backend, verifies attestation, and
         // pins the client.
-        let bucket_id = self.fleet.route(&streaming_params.messages);
+        let bucket_id = self.route(&streaming_params.messages);
         let bucket_client = self.get_or_verify_bucket_client(bucket_id).await?;
         let canonical_send = match self
             .send_streaming_request(
@@ -1448,7 +1430,7 @@ impl InferenceProvider for VLlmProvider {
             Err(ref e) if FleetRouter::is_connection_error(e) => {
                 // Connection dropped or fingerprint mismatch on reconnect —
                 // clear bucket and re-verify with a fresh attestation.
-                self.fleet.clear_bucket(bucket_id);
+                self.clear_bucket(bucket_id);
                 let fresh = self.get_or_verify_bucket_client(bucket_id).await?;
                 self.send_streaming_request(&url, headers.clone(), &streaming_params, Some(&fresh))
                     .await
@@ -1474,9 +1456,8 @@ impl InferenceProvider for VLlmProvider {
         // through the route layer's `sse_error_frame` path (PR #629) and
         // happy-path streams return HTTP 200 as soon as the headers arrive.
         match canonical_send {
-            Ok(response) if self.fleet.rotation_count() == 0 => {
-                self.fleet
-                    .pending_buckets
+            Ok(response) if self.rotation_count() == 0 => {
+                self.pending_buckets
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .insert(request_hash, bucket_id);
@@ -1489,8 +1470,7 @@ impl InferenceProvider for VLlmProvider {
                 let (first_chunk_status, stream) = Self::peek_first_payload_status(stream).await;
                 match first_chunk_status {
                     None => {
-                        self.fleet
-                            .pending_buckets
+                        self.pending_buckets
                             .lock()
                             .unwrap_or_else(|e| e.into_inner())
                             .insert(request_hash, bucket_id);
@@ -1517,8 +1497,8 @@ impl InferenceProvider for VLlmProvider {
             }
             Err(canonical_err) => match &canonical_err {
                 CompletionError::HttpError { status_code, .. }
-                    if Self::is_rotation_retryable_status(*status_code)
-                        && self.fleet.rotation_count() > 0 =>
+                    if FleetRouter::is_rotation_retryable_status(*status_code)
+                        && self.rotation_count() > 0 =>
                 {
                     self.try_chat_completion_stream_rotation(
                         &streaming_params,
@@ -1539,12 +1519,11 @@ impl InferenceProvider for VLlmProvider {
         params: ChatCompletionParams,
         request_hash: String,
     ) -> Result<ChatCompletionResponseWithBytes, CompletionError> {
-        let url = format!("{}/v1/chat/completions", self.fleet.config.base_url);
+        let url = format!("{}/v1/chat/completions", self.config.base_url);
 
         let mut non_streaming_params = params;
 
         let mut headers = self
-            .fleet
             .build_headers()
             .map_err(CompletionError::CompletionError)?;
         let request_hash_value = HeaderValue::from_str(&request_hash)
@@ -1557,9 +1536,9 @@ impl InferenceProvider for VLlmProvider {
         self.prepare_encryption_headers(&mut headers, &mut non_streaming_params.extra);
 
         // Route to a verified bucket client based on prompt prefix.
-        let bucket_id = self.fleet.route(&non_streaming_params.messages);
+        let bucket_id = self.route(&non_streaming_params.messages);
         let bucket_client = self.get_or_verify_bucket_client(bucket_id).await?;
-        let timeout_secs = self.fleet.config.completion_timeout_seconds.max(0) as u64;
+        let timeout_secs = self.config.completion_timeout_seconds.max(0) as u64;
         let timeout = Duration::from_secs(timeout_secs);
 
         let send = |client: &Client, hdrs: reqwest::header::HeaderMap| {
@@ -1604,7 +1583,7 @@ impl InferenceProvider for VLlmProvider {
                             .contains("does not match any attested fingerprint")
                         || e.to_string().contains("error sending request")) =>
             {
-                self.fleet.clear_bucket(bucket_id);
+                self.clear_bucket(bucket_id);
                 let fresh = self.get_or_verify_bucket_client(bucket_id).await?;
                 send(&fresh, headers.clone()).await.map_err(map_send_err)?
             }
@@ -1629,7 +1608,7 @@ impl InferenceProvider for VLlmProvider {
             // pooling disabled on the rotation client, every attempt lands
             // on a distinct backend. If one is healthy, the request succeeds
             // and we record the index for signature retrieval.
-            if Self::is_rotation_retryable_status(status_code) && self.fleet.rotation_count() > 0 {
+            if FleetRouter::is_rotation_retryable_status(status_code) && self.rotation_count() > 0 {
                 return self
                     .try_chat_completion_rotation(
                         &non_streaming_params,
@@ -1654,8 +1633,7 @@ impl InferenceProvider for VLlmProvider {
         // Store the effective bucket ID for signature fetching.
         // For non-streaming, we know the chat_id immediately.
         let chat_id = chat_completion_response.id.clone();
-        self.fleet
-            .signature_buckets
+        self.signature_buckets
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .insert(chat_id, bucket_id);
@@ -1671,7 +1649,7 @@ impl InferenceProvider for VLlmProvider {
         &self,
         params: CompletionParams,
     ) -> Result<StreamingResult, CompletionError> {
-        let url = format!("{}/v1/completions", self.fleet.config.base_url);
+        let url = format!("{}/v1/completions", self.config.base_url);
 
         // Ensure streaming and token usage are enabled
         let mut streaming_params = params;
@@ -1682,7 +1660,6 @@ impl InferenceProvider for VLlmProvider {
         });
 
         let headers = self
-            .fleet
             .build_headers()
             .map_err(CompletionError::CompletionError)?;
         let response = self
@@ -1700,9 +1677,9 @@ impl InferenceProvider for VLlmProvider {
         mut params: ImageGenerationParams,
         request_hash: String,
     ) -> Result<ImageGenerationResponseWithBytes, ImageGenerationError> {
-        let url = format!("{}/v1/images/generations", self.fleet.config.base_url);
+        let url = format!("{}/v1/images/generations", self.config.base_url);
 
-        let mut headers = self.fleet.build_headers().map_err(to_image_gen_error)?;
+        let mut headers = self.build_headers().map_err(to_image_gen_error)?;
 
         headers.insert(
             "X-Request-Hash",
@@ -1714,7 +1691,6 @@ impl InferenceProvider for VLlmProvider {
         self.prepare_encryption_headers(&mut headers, &mut params.extra);
 
         let response = self
-            .fleet
             .client
             .post(&url)
             .headers(headers)
@@ -1754,7 +1730,7 @@ impl InferenceProvider for VLlmProvider {
         mut params: AudioTranscriptionParams,
         request_hash: String,
     ) -> Result<AudioTranscriptionResponse, AudioTranscriptionError> {
-        let url = format!("{}/v1/audio/transcriptions", self.fleet.config.base_url);
+        let url = format!("{}/v1/audio/transcriptions", self.config.base_url);
 
         // Detect content type from filename
         let content_type = crate::models::detect_audio_content_type(&params.filename);
@@ -1788,7 +1764,6 @@ impl InferenceProvider for VLlmProvider {
 
         // Build headers (no Content-Type - reqwest sets it automatically for multipart)
         let mut headers = self
-            .fleet
             .build_headers()
             .map_err(|e| AudioTranscriptionError::TranscriptionError(e.to_string()))?;
         // Forward tracing and encryption headers from extra to HTTP headers
@@ -1804,12 +1779,11 @@ impl InferenceProvider for VLlmProvider {
 
         // Send request with timeout
         let response = self
-            .fleet
             .client
             .post(&url)
             .headers(headers)
             .multipart(form)
-            .timeout(self.fleet.config.completion_timeout())
+            .timeout(self.config.completion_timeout())
             .send()
             .await
             .map_err(|e| {
@@ -1856,12 +1830,12 @@ impl InferenceProvider for VLlmProvider {
         params: Arc<ImageEditParams>,
         request_hash: String,
     ) -> Result<ImageEditResponseWithBytes, ImageEditError> {
-        let url = format!("{}/v1/images/edits", self.fleet.config.base_url);
+        let url = format!("{}/v1/images/edits", self.config.base_url);
 
         // Build headers without Content-Type (let reqwest set multipart boundary)
         let mut headers = reqwest::header::HeaderMap::new();
 
-        if let Some(ref api_key) = self.fleet.config.api_key {
+        if let Some(ref api_key) = self.config.api_key {
             let auth_value = format!("Bearer {api_key}");
             let header_value = HeaderValue::from_str(&auth_value)
                 .map_err(|e| ImageEditError::EditError(format!("Invalid API key format: {e}")))?;
@@ -1909,7 +1883,6 @@ impl InferenceProvider for VLlmProvider {
         }
 
         let response = self
-            .fleet
             .client
             .post(&url)
             .headers(headers)
@@ -1954,9 +1927,9 @@ impl InferenceProvider for VLlmProvider {
         mut params: ScoreParams,
         request_hash: String,
     ) -> Result<ScoreResponse, ScoreError> {
-        let url = format!("{}/v1/score", self.fleet.config.base_url);
+        let url = format!("{}/v1/score", self.config.base_url);
 
-        let mut headers = self.fleet.build_headers().map_err(to_score_error)?;
+        let mut headers = self.build_headers().map_err(to_score_error)?;
         self.prepare_tracing_headers(&mut headers, &mut params.extra);
         self.prepare_encryption_headers(&mut headers, &mut params.extra);
         headers.insert(
@@ -1965,12 +1938,11 @@ impl InferenceProvider for VLlmProvider {
         );
 
         let response = self
-            .fleet
             .client
             .post(&url)
             .headers(headers)
             .json(&params)
-            .timeout(self.fleet.config.completion_timeout())
+            .timeout(self.config.completion_timeout())
             .send()
             .await
             .map_err(to_score_error)?;
@@ -1992,19 +1964,18 @@ impl InferenceProvider for VLlmProvider {
     }
 
     async fn rerank(&self, mut params: RerankParams) -> Result<RerankResponse, RerankError> {
-        let url = format!("{}/v1/rerank", self.fleet.config.base_url);
+        let url = format!("{}/v1/rerank", self.config.base_url);
 
-        let mut headers = self.fleet.build_headers().map_err(to_rerank_error)?;
+        let mut headers = self.build_headers().map_err(to_rerank_error)?;
         self.prepare_tracing_headers(&mut headers, &mut params.extra);
         self.prepare_encryption_headers(&mut headers, &mut params.extra);
 
         let response = self
-            .fleet
             .client
             .post(&url)
             .headers(headers)
             .json(&params)
-            .timeout(self.fleet.config.completion_timeout())
+            .timeout(self.config.completion_timeout())
             .send()
             .await
             .map_err(to_rerank_error)?;
@@ -2030,20 +2001,19 @@ impl InferenceProvider for VLlmProvider {
         body: bytes::Bytes,
         mut extra: std::collections::HashMap<String, serde_json::Value>,
     ) -> Result<bytes::Bytes, EmbeddingError> {
-        let url = format!("{}/v1/embeddings", self.fleet.config.base_url);
+        let url = format!("{}/v1/embeddings", self.config.base_url);
 
-        let mut headers = self.fleet.build_headers().map_err(to_embedding_error)?;
+        let mut headers = self.build_headers().map_err(to_embedding_error)?;
         self.prepare_tracing_headers(&mut headers, &mut extra);
         self.prepare_encryption_headers(&mut headers, &mut extra);
 
         let response = self
-            .fleet
             .client
             .post(&url)
             .headers(headers)
             .header(reqwest::header::CONTENT_TYPE, "application/json")
             .body(body)
-            .timeout(self.fleet.config.completion_timeout())
+            .timeout(self.config.completion_timeout())
             .send()
             .await
             .map_err(to_embedding_error)?;
@@ -2069,23 +2039,19 @@ impl InferenceProvider for VLlmProvider {
         body: bytes::Bytes,
         mut extra: std::collections::HashMap<String, serde_json::Value>,
     ) -> Result<bytes::Bytes, PrivacyClassifyError> {
-        let url = format!("{}/v1/privacy/classify", self.fleet.config.base_url);
+        let url = format!("{}/v1/privacy/classify", self.config.base_url);
 
-        let mut headers = self
-            .fleet
-            .build_headers()
-            .map_err(to_privacy_classify_error)?;
+        let mut headers = self.build_headers().map_err(to_privacy_classify_error)?;
         self.prepare_tracing_headers(&mut headers, &mut extra);
         self.prepare_encryption_headers(&mut headers, &mut extra);
 
         let response = self
-            .fleet
             .client
             .post(&url)
             .headers(headers)
             .header(reqwest::header::CONTENT_TYPE, "application/json")
             .body(body)
-            .timeout(self.fleet.config.completion_timeout())
+            .timeout(self.config.completion_timeout())
             .send()
             .await
             .map_err(to_privacy_classify_error)?;
@@ -2104,6 +2070,115 @@ impl InferenceProvider for VLlmProvider {
 
         let raw_bytes = response.bytes().await.map_err(to_privacy_classify_error)?;
         Ok(raw_bytes)
+    }
+}
+
+/// VLlmProvider is a thin trait adapter: every InferenceProvider call delegates
+/// to its FleetRouter, which holds all NEAR-AI model-proxy state and logic.
+#[async_trait]
+impl InferenceProvider for VLlmProvider {
+    async fn models(&self) -> Result<ModelsResponse, ListModelsError> {
+        self.fleet.models().await
+    }
+    async fn chat_completion_stream(
+        &self,
+        params: ChatCompletionParams,
+        request_hash: String,
+    ) -> Result<StreamingResult, CompletionError> {
+        self.fleet
+            .chat_completion_stream(params, request_hash)
+            .await
+    }
+    async fn chat_completion(
+        &self,
+        params: ChatCompletionParams,
+        request_hash: String,
+    ) -> Result<ChatCompletionResponseWithBytes, CompletionError> {
+        self.fleet.chat_completion(params, request_hash).await
+    }
+    async fn text_completion_stream(
+        &self,
+        params: CompletionParams,
+    ) -> Result<StreamingResult, CompletionError> {
+        self.fleet.text_completion_stream(params).await
+    }
+    async fn image_generation(
+        &self,
+        params: ImageGenerationParams,
+        request_hash: String,
+    ) -> Result<ImageGenerationResponseWithBytes, ImageGenerationError> {
+        self.fleet.image_generation(params, request_hash).await
+    }
+    async fn image_edit(
+        &self,
+        params: Arc<ImageEditParams>,
+        request_hash: String,
+    ) -> Result<ImageEditResponseWithBytes, ImageEditError> {
+        self.fleet.image_edit(params, request_hash).await
+    }
+    async fn score(
+        &self,
+        params: ScoreParams,
+        request_hash: String,
+    ) -> Result<ScoreResponse, ScoreError> {
+        self.fleet.score(params, request_hash).await
+    }
+    async fn rerank(&self, params: RerankParams) -> Result<RerankResponse, RerankError> {
+        self.fleet.rerank(params).await
+    }
+    async fn embeddings_raw(
+        &self,
+        body: bytes::Bytes,
+        extra: std::collections::HashMap<String, serde_json::Value>,
+    ) -> Result<bytes::Bytes, EmbeddingError> {
+        self.fleet.embeddings_raw(body, extra).await
+    }
+    async fn privacy_classify_raw(
+        &self,
+        body: bytes::Bytes,
+        extra: std::collections::HashMap<String, serde_json::Value>,
+    ) -> Result<bytes::Bytes, PrivacyClassifyError> {
+        self.fleet.privacy_classify_raw(body, extra).await
+    }
+    async fn get_signature(
+        &self,
+        chat_id: &str,
+        signing_algo: Option<String>,
+    ) -> Result<ChatSignature, CompletionError> {
+        self.fleet.get_signature(chat_id, signing_algo).await
+    }
+    fn pin_chat_connection(&self, request_hash: &str, chat_id: &str) {
+        self.fleet.pin_chat_connection(request_hash, chat_id)
+    }
+    fn unpin_chat_connection(&self, chat_id: &str) {
+        self.fleet.unpin_chat_connection(chat_id)
+    }
+    fn set_backend_count(&self, count: usize) {
+        self.fleet.set_backend_count(count)
+    }
+    async fn get_attestation_report(
+        &self,
+        model: String,
+        signing_algo: Option<String>,
+        nonce: Option<String>,
+        signing_address: Option<String>,
+        include_tls_fingerprint: bool,
+    ) -> Result<serde_json::Map<String, serde_json::Value>, AttestationError> {
+        self.get_attestation_report(
+            model,
+            signing_algo,
+            nonce,
+            signing_address,
+            include_tls_fingerprint,
+        )
+        .await
+    }
+    async fn audio_transcription(
+        &self,
+        params: AudioTranscriptionParams,
+        request_hash: String,
+    ) -> Result<AudioTranscriptionResponse, AudioTranscriptionError> {
+        self.fleet.audio_transcription(params, request_hash).await
     }
 }
 
@@ -2155,7 +2230,7 @@ mod tests {
             }),
         ];
         let stream: StreamingResult = Box::pin(futures_util::stream::iter(items));
-        let (status, stream) = VLlmProvider::peek_first_payload_status(stream).await;
+        let (status, stream) = FleetRouter::peek_first_payload_status(stream).await;
         assert_eq!(
             status,
             Some(503),
@@ -2188,7 +2263,7 @@ mod tests {
         let items: Vec<Result<SSEEvent, CompletionError>> =
             vec![Ok(control_event(": ping\n")), Ok(data_event())];
         let stream: StreamingResult = Box::pin(futures_util::stream::iter(items));
-        let (status, stream) = VLlmProvider::peek_first_payload_status(stream).await;
+        let (status, stream) = FleetRouter::peek_first_payload_status(stream).await;
         assert_eq!(status, None);
         let replayed: Vec<Result<SSEEvent, CompletionError>> =
             futures_util::StreamExt::collect(stream).await;
@@ -2207,7 +2282,7 @@ mod tests {
             is_external: false,
         })];
         let stream: StreamingResult = Box::pin(futures_util::stream::iter(items));
-        let (status, _stream) = VLlmProvider::peek_first_payload_status(stream).await;
+        let (status, _stream) = FleetRouter::peek_first_payload_status(stream).await;
         assert_eq!(status, None);
     }
 
@@ -2407,7 +2482,9 @@ mod tests {
             serde_json::Value::String("keep-me".to_string()),
         );
 
-        provider.prepare_tracing_headers(&mut headers, &mut extra);
+        provider
+            .fleet
+            .prepare_tracing_headers(&mut headers, &mut extra);
 
         assert!(
             !extra.contains_key(tracing_headers::REQUEST_ID),
@@ -2445,7 +2522,9 @@ mod tests {
             serde_json::Value::String("cccc-dddd".to_string()),
         );
 
-        provider.prepare_tracing_headers(&mut headers, &mut extra);
+        provider
+            .fleet
+            .prepare_tracing_headers(&mut headers, &mut extra);
 
         assert_eq!(
             headers.get("X-Request-Id").and_then(|v| v.to_str().ok()),
@@ -2468,7 +2547,9 @@ mod tests {
         let mut extra: std::collections::HashMap<String, serde_json::Value> =
             std::collections::HashMap::new();
 
-        provider.prepare_tracing_headers(&mut headers, &mut extra);
+        provider
+            .fleet
+            .prepare_tracing_headers(&mut headers, &mut extra);
 
         assert!(headers.get("X-Request-Id").is_none());
         assert!(headers.get("X-Org-Id").is_none());
@@ -2498,7 +2579,9 @@ mod tests {
             serde_json::Value::String("2".to_string()),
         );
 
-        provider.prepare_encryption_headers(&mut headers, &mut extra);
+        provider
+            .fleet
+            .prepare_encryption_headers(&mut headers, &mut extra);
 
         // Verify all encryption keys removed from extra
         assert!(
@@ -2542,7 +2625,9 @@ mod tests {
             serde_json::Value::String("2".to_string()),
         );
 
-        provider.prepare_encryption_headers(&mut headers, &mut extra);
+        provider
+            .fleet
+            .prepare_encryption_headers(&mut headers, &mut extra);
 
         // Verify encryption headers forwarded (except model_pub_key)
         assert_eq!(
@@ -2586,7 +2671,9 @@ mod tests {
             serde_json::Value::Number(serde_json::Number::from(42)),
         );
 
-        provider.prepare_encryption_headers(&mut headers, &mut extra);
+        provider
+            .fleet
+            .prepare_encryption_headers(&mut headers, &mut extra);
 
         // Encryption key should be removed
         assert!(!extra.contains_key(encryption_headers::SIGNING_ALGO));
@@ -2666,7 +2753,9 @@ mod tests {
         );
 
         let mut headers = reqwest::header::HeaderMap::new();
-        provider.prepare_encryption_headers(&mut headers, &mut extra);
+        provider
+            .fleet
+            .prepare_encryption_headers(&mut headers, &mut extra);
 
         let params = ImageGenerationParams {
             model: "test-model".to_string(),
@@ -2791,12 +2880,12 @@ mod tests {
         assert!(provider.fleet.bucket_clients[0].lock().unwrap().is_none());
 
         // get_or_verify fills it
-        let result = provider.get_or_verify_bucket_client(0).await;
+        let result = provider.fleet.get_or_verify_bucket_client(0).await;
         assert!(result.is_ok());
         assert!(provider.fleet.bucket_clients[0].lock().unwrap().is_some());
 
         // Second call returns cached client (fast path)
-        let result2 = provider.get_or_verify_bucket_client(0).await;
+        let result2 = provider.fleet.get_or_verify_bucket_client(0).await;
         assert!(result2.is_ok());
     }
 
@@ -2844,7 +2933,7 @@ mod tests {
         assert_eq!(provider.pinned_fingerprint_count(), 0);
 
         // All attempts fail in Bootstrap state → must return Err (not fallback).
-        let result = provider.get_or_verify_bucket_client(0).await;
+        let result = provider.fleet.get_or_verify_bucket_client(0).await;
         assert!(
             result.is_err(),
             "expected Err in Bootstrap state, got: {result:?}"
@@ -2893,7 +2982,7 @@ mod tests {
         assert!(provider.fleet.bucket_clients[0].lock().unwrap().is_none());
 
         // All attempts fail but fingerprints are pinned → fallback client returned.
-        let result = provider.get_or_verify_bucket_client(0).await;
+        let result = provider.fleet.get_or_verify_bucket_client(0).await;
         assert!(result.is_ok(), "expected fallback Ok, got: {result:?}");
 
         // Bucket remains empty — fallback is not stored as a verified bucket client.
@@ -2941,7 +3030,7 @@ mod tests {
         assert!(provider.fleet.bucket_clients[0].lock().unwrap().is_none());
 
         // Blocked state has pinned_count == 0 → same safe path as Bootstrap → Err.
-        let result = provider.get_or_verify_bucket_client(0).await;
+        let result = provider.fleet.get_or_verify_bucket_client(0).await;
         assert!(
             result.is_err(),
             "expected Err in Blocked state, got: {result:?}"
@@ -3002,7 +3091,7 @@ mod tests {
         for _ in 0..8 {
             let p = provider.clone();
             handles.push(tokio::spawn(async move {
-                p.get_or_verify_bucket_client(0).await
+                p.fleet.get_or_verify_bucket_client(0).await
             }));
         }
         for h in handles {
@@ -3338,16 +3427,16 @@ mod tests {
         // already treats it as next-provider-worthy in the chat_completion
         // closure — and other indices may succeed where the sticky bucket
         // timed out.
-        assert!(VLlmProvider::is_rotation_retryable_status(408));
-        assert!(VLlmProvider::is_rotation_retryable_status(429));
-        assert!(VLlmProvider::is_rotation_retryable_status(500));
-        assert!(VLlmProvider::is_rotation_retryable_status(503));
-        assert!(VLlmProvider::is_rotation_retryable_status(599));
-        assert!(!VLlmProvider::is_rotation_retryable_status(200));
-        assert!(!VLlmProvider::is_rotation_retryable_status(400));
-        assert!(!VLlmProvider::is_rotation_retryable_status(401));
-        assert!(!VLlmProvider::is_rotation_retryable_status(404));
-        assert!(!VLlmProvider::is_rotation_retryable_status(422));
+        assert!(FleetRouter::is_rotation_retryable_status(408));
+        assert!(FleetRouter::is_rotation_retryable_status(429));
+        assert!(FleetRouter::is_rotation_retryable_status(500));
+        assert!(FleetRouter::is_rotation_retryable_status(503));
+        assert!(FleetRouter::is_rotation_retryable_status(599));
+        assert!(!FleetRouter::is_rotation_retryable_status(200));
+        assert!(!FleetRouter::is_rotation_retryable_status(400));
+        assert!(!FleetRouter::is_rotation_retryable_status(401));
+        assert!(!FleetRouter::is_rotation_retryable_status(404));
+        assert!(!FleetRouter::is_rotation_retryable_status(422));
     }
 
     #[test]

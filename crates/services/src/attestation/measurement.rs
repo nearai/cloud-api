@@ -43,6 +43,11 @@ pub struct MeasurementPolicy {
     allowed_os_image_hashes: HashSet<String>,
     /// Reject attestations whose TDX TCB status is not `UpToDate`.
     require_tcb_up_to_date: bool,
+    /// Require GPU (NVIDIA NRAS) evidence to be present. When false, a report
+    /// with no `nvidia_payload` verifies with `gpu_verdict = None` (best-effort,
+    /// for NEAR's non-GPU CVMs). When true, absent GPU evidence is rejected — an
+    /// attested third party that claims confidential GPU compute must prove it.
+    require_gpu_evidence: bool,
 }
 
 impl MeasurementPolicy {
@@ -58,6 +63,9 @@ impl MeasurementPolicy {
                 .map(|s| normalize_hash(s))
                 .collect(),
             require_tcb_up_to_date,
+            // NEAR's own fleet keeps the historical best-effort GPU behavior
+            // (non-GPU CVMs verify with gpu_verdict = None).
+            require_gpu_evidence: false,
         }
     }
 
@@ -73,6 +81,9 @@ impl MeasurementPolicy {
                 .map(|s| normalize_hash(s))
                 .collect(),
             require_tcb_up_to_date: true,
+            // A third party advertising confidential GPU compute must present
+            // verifiable, nonce-bound GPU evidence — absent is rejected.
+            require_gpu_evidence: true,
         }
     }
 
@@ -104,6 +115,7 @@ impl MeasurementPolicy {
             tier: ProviderTier::Near,
             allowed_os_image_hashes,
             require_tcb_up_to_date,
+            require_gpu_evidence: false,
         }
     }
 
@@ -133,6 +145,12 @@ impl MeasurementPolicy {
     /// Whether attestations with a non-`UpToDate` TCB status must be rejected.
     pub fn require_tcb_up_to_date(&self) -> bool {
         self.require_tcb_up_to_date
+    }
+
+    /// Whether GPU evidence must be present (absent GPU evidence is rejected
+    /// rather than verifying with `gpu_verdict = None`).
+    pub fn require_gpu_evidence(&self) -> bool {
+        self.require_gpu_evidence
     }
 
     /// Whether the OS-image-hash allowlist is enforced for this policy.
@@ -182,6 +200,22 @@ mod tests {
         assert!(
             p.assert_enforceable().is_err(),
             "attested 3p with empty allowlist must fail closed"
+        );
+    }
+
+    #[test]
+    fn gpu_evidence_required_only_for_attested3p() {
+        assert!(
+            !MeasurementPolicy::near(HashSet::new(), false).require_gpu_evidence(),
+            "NEAR keeps best-effort GPU (absent allowed)"
+        );
+        assert!(
+            !MeasurementPolicy::near_from_env().require_gpu_evidence(),
+            "NEAR-from-env keeps best-effort GPU"
+        );
+        assert!(
+            MeasurementPolicy::attested3p(hashes(&["abc"])).require_gpu_evidence(),
+            "attested 3p must present GPU evidence"
         );
     }
 

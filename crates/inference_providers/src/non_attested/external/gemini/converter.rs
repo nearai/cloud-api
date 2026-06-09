@@ -302,7 +302,7 @@ fn mime_type_from_url(url: &str) -> Option<String> {
 pub fn convert_messages(
     messages: &[ChatMessage],
 ) -> (Option<GeminiSystemInstruction>, Vec<GeminiContent>) {
-    use crate::external::content::{
+    use crate::non_attested::external::content::{
         parse_content, text_from_content as extract_content, ContentPart,
     };
 

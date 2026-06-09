@@ -1,18 +1,18 @@
-//! `FleetRouter` — the per-provider routing state for NEAR-AI model-proxy
+//! `Fleet` — the per-provider routing state for NEAR-AI model-proxy
 //! backends: the prefix-bucket and rotation-SNI mappings used to send a
 //! completion and its later signature fetch to the *same* backend through
 //! model-proxy's per-TCP L4 load balancer.
 //!
-//! Extracted from `VLlmProvider` so this routing state lives in one place.
+//! Extracted from `Provider` so this routing state lives in one place.
 //! Today it keys on the model-proxy rotation *index* (`u64`); P3 swaps that for
 //! a stable `BackendHandle` here, without touching the completion path.
 //!
 //! This is a mechanical move of existing behavior — the methods below are the
-//! verbatim logic previously inlined on `VLlmProvider`, guarded by the
+//! verbatim logic previously inlined on `Provider`, guarded by the
 //! characterization tests in the parent module.
 
 use super::prefix_router::PrefixRouter;
-use super::VLlmConfig;
+use super::Config;
 use crate::rotation;
 use crate::spki_verifier::{FingerprintState, SharedTlsRoots};
 use crate::BackendVerifier;
@@ -28,7 +28,7 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-pub(super) struct FleetRouter {
+pub(super) struct Fleet {
     /// request_hash → bucket_id during streaming (before the chat_id is known).
     pub(super) pending_buckets: Mutex<HashMap<String, usize>>,
     /// chat_id → bucket_id, so the signature fetch reuses the bucket's pinned
@@ -51,11 +51,11 @@ pub(super) struct FleetRouter {
     pub(super) prefix_router: Arc<PrefixRouter>,
     /// Lazily-filled (or eagerly pre-created in legacy mode) per-bucket clients,
     /// each pinning a persistent H2 connection to one verified backend. The
-    /// provider fills/clears these slots via inline attestation; FleetRouter
+    /// provider fills/clears these slots via inline attestation; Fleet
     /// just owns the storage.
     pub(super) bucket_clients: Vec<Mutex<Option<Client>>>,
     /// Provider config (base_url, api_key, timeouts).
-    pub(super) config: VLlmConfig,
+    pub(super) config: Config,
     /// General-purpose client for non-completion requests (attestation, models).
     pub(super) client: Client,
     /// Completion-timeout, non-pinned client used when inline bucket
@@ -72,13 +72,13 @@ pub(super) struct FleetRouter {
     pub(super) tls_roots: SharedTlsRoots,
 }
 
-impl FleetRouter {
+impl Fleet {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn new(
         rotation_parts: Option<rotation::UrlParts>,
         prefix_router: Arc<PrefixRouter>,
         bucket_clients: Vec<Mutex<Option<Client>>>,
-        config: VLlmConfig,
+        config: Config,
         client: Client,
         fallback_client: Client,
         verification_semaphore: Arc<Semaphore>,

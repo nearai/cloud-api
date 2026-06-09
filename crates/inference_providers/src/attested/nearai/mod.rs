@@ -7,7 +7,7 @@ use crate::{
     PrivacyClassifyError, RerankError, ScoreError, *,
 };
 use async_trait::async_trait;
-use fleet::FleetRouter;
+use fleet::Fleet;
 use prefix_router::PrefixRouter;
 use reqwest::{header::HeaderValue, Client};
 use serde::Serialize;
@@ -130,9 +130,9 @@ mod encryption_headers {
 ///   these are metadata or first-byte ops that should return promptly. A long timeout
 ///   here just delays the user's error message when something is actually wrong.
 ///
-/// Both are tunable per-deployment via env vars (see `VLlmConfig::new`).
+/// Both are tunable per-deployment via env vars (see `Config::new`).
 #[derive(Debug, Clone)]
-pub struct VLlmConfig {
+pub struct Config {
     pub base_url: String,
     pub api_key: Option<String>,
     /// Total per-request timeout for completion-style operations.
@@ -141,7 +141,7 @@ pub struct VLlmConfig {
     pub control_timeout_seconds: i64,
 }
 
-impl VLlmConfig {
+impl Config {
     /// Default completion timeout. Reasoning models can spend several minutes
     /// on a single non-streaming request; 600s is a comfortable ceiling that
     /// still surfaces genuinely stuck requests.
@@ -198,20 +198,20 @@ impl VLlmConfig {
 ///
 /// Provides inference through vLLM's OpenAI-compatible API endpoints.
 /// Supports both chat completions and text completions with streaming.
-pub struct VLlmProvider {
+pub struct Provider {
     /// All NEAR-AI model-proxy state and behavior: config + clients, the TLS
     /// fingerprint pin state, the backend verifier, and the routing state
-    /// (prefix buckets, rotation addressing, signature pins). VLlmProvider is
+    /// (prefix buckets, rotation addressing, signature pins). Provider is
     /// becoming a thin trait adapter over this; methods currently still on the
     /// provider read their state via `self.fleet.*` until they move too.
-    fleet: Arc<FleetRouter>,
+    fleet: Arc<Fleet>,
 }
 
-/// Client-construction + attestation helpers, owned by FleetRouter (it holds
+/// Client-construction + attestation helpers, owned by Fleet (it holds
 /// the config, clients, TLS roots, fingerprint state, and verifier). Moved off
-/// VLlmProvider in step 4b; the provider's remaining methods call these via
+/// Provider in step 4b; the provider's remaining methods call these via
 /// `self.fleet.*` until they move in 4c.
-impl FleetRouter {
+impl Fleet {
     /// Block all TLS connections (attestation failed). Only blocks from
     /// Bootstrap — doesn't override an existing Pinned set.
     pub(super) fn block_connections(&self) {
@@ -411,11 +411,11 @@ impl FleetRouter {
     }
 }
 
-impl VLlmProvider {
+impl Provider {
     /// Create a new vLLM provider with the given configuration.
     /// Without a `BackendVerifier`, bucket clients are pre-created eagerly
     /// (legacy behavior for tests and non-TEE environments).
-    pub fn new(config: VLlmConfig) -> Self {
+    pub fn new(config: Config) -> Self {
         let fingerprint_state = Arc::new(std::sync::RwLock::new(FingerprintState::Bootstrap));
         Self::new_with_fingerprint_state(config, fingerprint_state)
     }
@@ -423,7 +423,7 @@ impl VLlmProvider {
     /// Create a new vLLM provider sharing an existing fingerprint state.
     /// Without a `BackendVerifier`, bucket clients are pre-created eagerly.
     pub fn new_with_fingerprint_state(
-        config: VLlmConfig,
+        config: Config,
         fingerprint_state: Arc<std::sync::RwLock<FingerprintState>>,
     ) -> Self {
         Self::build(
@@ -439,7 +439,7 @@ impl VLlmProvider {
     /// a backend, verifies attestation, pins the fingerprint, and returns a client
     /// whose H2 connection is pinned to that verified backend.
     pub fn new_with_verifier(
-        config: VLlmConfig,
+        config: Config,
         fingerprint_state: Arc<std::sync::RwLock<FingerprintState>>,
         verifier: Arc<dyn crate::BackendVerifier>,
     ) -> Self {
@@ -455,7 +455,7 @@ impl VLlmProvider {
     /// so tests can exercise the semaphore logic without mutating env vars.
     #[cfg(test)]
     fn new_with_verifier_and_concurrency(
-        config: VLlmConfig,
+        config: Config,
         fingerprint_state: Arc<std::sync::RwLock<FingerprintState>>,
         verifier: Arc<dyn crate::BackendVerifier>,
         inline_verify_concurrency: usize,
@@ -478,7 +478,7 @@ impl VLlmProvider {
     }
 
     fn build(
-        config: VLlmConfig,
+        config: Config,
         fingerprint_state: Arc<std::sync::RwLock<FingerprintState>>,
         backend_verifier: Option<Arc<dyn crate::BackendVerifier>>,
         inline_verify_concurrency: usize,
@@ -555,7 +555,7 @@ impl VLlmProvider {
             .and_then(crate::rotation::split_inference_url);
 
         Self {
-            fleet: Arc::new(FleetRouter::new(
+            fleet: Arc::new(Fleet::new(
                 rotation_parts,
                 prefix_router,
                 bucket_clients,
@@ -571,7 +571,7 @@ impl VLlmProvider {
     }
 
     /// Access the provider's configuration.
-    pub fn config(&self) -> &VLlmConfig {
+    pub fn config(&self) -> &Config {
         &self.fleet.config
     }
 
@@ -602,7 +602,7 @@ impl VLlmProvider {
     }
 
     /// Spawn background tasks to pre-warm all bucket clients (delegates to
-    /// [`FleetRouter::pre_warm`]; no-op without a verifier or before any
+    /// [`Fleet::pre_warm`]; no-op without a verifier or before any
     /// fingerprint is pinned).
     pub fn pre_warm(self: Arc<Self>) {
         self.fleet.clone().pre_warm();
@@ -610,8 +610,8 @@ impl VLlmProvider {
 }
 
 /// Network/IO helpers (rotation-SNI fallback + request header prep), owned by
-/// FleetRouter. Moved off VLlmProvider in step 4c.
-impl FleetRouter {
+/// Fleet. Moved off Provider in step 4c.
+impl Fleet {
     /// Prepare encryption headers by extracting them from `extra` and forwarding as HTTP headers.
     /// Also removes encryption-related keys from `extra` to prevent them from leaking into the JSON body.
     ///
@@ -856,7 +856,7 @@ impl FleetRouter {
                     message: crate::extract_error_message(&error_text),
                     is_external: false,
                 };
-                if FleetRouter::is_rotation_retryable_status(status_code) {
+                if Fleet::is_rotation_retryable_status(status_code) {
                     tracing::debug!(
                         index,
                         status_code,
@@ -954,7 +954,7 @@ impl FleetRouter {
                     // it the same way, so surface immediately rather than
                     // burn the remaining indices on a doomed request.
                     CompletionError::HttpError { status_code, .. }
-                        if !FleetRouter::is_rotation_retryable_status(*status_code) =>
+                        if !Fleet::is_rotation_retryable_status(*status_code) =>
                     {
                         return Err(e);
                     }
@@ -1041,7 +1041,7 @@ impl FleetRouter {
         let status = if let Some(Err(CompletionError::HttpError { status_code, .. })) =
             peekable.peek().await
         {
-            if FleetRouter::is_rotation_retryable_status(*status_code) {
+            if Fleet::is_rotation_retryable_status(*status_code) {
                 Some(*status_code)
             } else {
                 None
@@ -1063,7 +1063,7 @@ impl FleetRouter {
 }
 
 #[async_trait]
-impl InferenceProvider for FleetRouter {
+impl InferenceProvider for Fleet {
     async fn get_signature(
         &self,
         chat_id: &str,
@@ -1427,7 +1427,7 @@ impl InferenceProvider for FleetRouter {
             .await
         {
             Ok(r) => Ok(r),
-            Err(ref e) if FleetRouter::is_connection_error(e) => {
+            Err(ref e) if Fleet::is_connection_error(e) => {
                 // Connection dropped or fingerprint mismatch on reconnect —
                 // clear bucket and re-verify with a fresh attestation.
                 self.clear_bucket(bucket_id);
@@ -1497,7 +1497,7 @@ impl InferenceProvider for FleetRouter {
             }
             Err(canonical_err) => match &canonical_err {
                 CompletionError::HttpError { status_code, .. }
-                    if FleetRouter::is_rotation_retryable_status(*status_code)
+                    if Fleet::is_rotation_retryable_status(*status_code)
                         && self.rotation_count() > 0 =>
                 {
                     self.try_chat_completion_stream_rotation(
@@ -1608,7 +1608,7 @@ impl InferenceProvider for FleetRouter {
             // pooling disabled on the rotation client, every attempt lands
             // on a distinct backend. If one is healthy, the request succeeds
             // and we record the index for signature retrieval.
-            if FleetRouter::is_rotation_retryable_status(status_code) && self.rotation_count() > 0 {
+            if Fleet::is_rotation_retryable_status(status_code) && self.rotation_count() > 0 {
                 return self
                     .try_chat_completion_rotation(
                         &non_streaming_params,
@@ -2073,10 +2073,10 @@ impl InferenceProvider for FleetRouter {
     }
 }
 
-/// VLlmProvider is a thin trait adapter: every InferenceProvider call delegates
-/// to its FleetRouter, which holds all NEAR-AI model-proxy state and logic.
+/// Provider is a thin trait adapter: every InferenceProvider call delegates
+/// to its Fleet, which holds all NEAR-AI model-proxy state and logic.
 #[async_trait]
-impl InferenceProvider for VLlmProvider {
+impl InferenceProvider for Provider {
     async fn models(&self) -> Result<ModelsResponse, ListModelsError> {
         self.fleet.models().await
     }
@@ -2231,7 +2231,7 @@ mod tests {
             }),
         ];
         let stream: StreamingResult = Box::pin(futures_util::stream::iter(items));
-        let (status, stream) = FleetRouter::peek_first_payload_status(stream).await;
+        let (status, stream) = Fleet::peek_first_payload_status(stream).await;
         assert_eq!(
             status,
             Some(503),
@@ -2264,7 +2264,7 @@ mod tests {
         let items: Vec<Result<SSEEvent, CompletionError>> =
             vec![Ok(control_event(": ping\n")), Ok(data_event())];
         let stream: StreamingResult = Box::pin(futures_util::stream::iter(items));
-        let (status, stream) = FleetRouter::peek_first_payload_status(stream).await;
+        let (status, stream) = Fleet::peek_first_payload_status(stream).await;
         assert_eq!(status, None);
         let replayed: Vec<Result<SSEEvent, CompletionError>> =
             futures_util::StreamExt::collect(stream).await;
@@ -2283,7 +2283,7 @@ mod tests {
             is_external: false,
         })];
         let stream: StreamingResult = Box::pin(futures_util::stream::iter(items));
-        let (status, _stream) = FleetRouter::peek_first_payload_status(stream).await;
+        let (status, _stream) = Fleet::peek_first_payload_status(stream).await;
         assert_eq!(status, None);
     }
 
@@ -2336,8 +2336,8 @@ mod tests {
         );
     }
 
-    fn create_test_provider() -> VLlmProvider {
-        VLlmProvider::new(VLlmConfig {
+    fn create_test_provider() -> Provider {
+        Provider::new(Config {
             base_url: "http://localhost".to_string(),
             api_key: None,
             completion_timeout_seconds: 30,
@@ -2373,22 +2373,22 @@ mod tests {
     #[serial]
     fn vllm_config_uses_default_timeouts_when_env_unset() {
         with_clean_timeout_env(|| {
-            let cfg = VLlmConfig::new("http://x".to_string(), None, None);
+            let cfg = Config::new("http://x".to_string(), None, None);
             assert_eq!(
                 cfg.completion_timeout_seconds,
-                VLlmConfig::DEFAULT_COMPLETION_TIMEOUT_SECS
+                Config::DEFAULT_COMPLETION_TIMEOUT_SECS
             );
             assert_eq!(
                 cfg.control_timeout_seconds,
-                VLlmConfig::DEFAULT_CONTROL_TIMEOUT_SECS
+                Config::DEFAULT_CONTROL_TIMEOUT_SECS
             );
             assert_eq!(
                 cfg.completion_timeout(),
-                Duration::from_secs(VLlmConfig::DEFAULT_COMPLETION_TIMEOUT_SECS as u64)
+                Duration::from_secs(Config::DEFAULT_COMPLETION_TIMEOUT_SECS as u64)
             );
             assert_eq!(
                 cfg.control_timeout(),
-                Duration::from_secs(VLlmConfig::DEFAULT_CONTROL_TIMEOUT_SECS as u64)
+                Duration::from_secs(Config::DEFAULT_CONTROL_TIMEOUT_SECS as u64)
             );
         });
     }
@@ -2399,7 +2399,7 @@ mod tests {
         with_clean_timeout_env(|| {
             std::env::set_var("VLLM_PROVIDER_COMPLETION_TIMEOUT", "1234");
             std::env::set_var("VLLM_PROVIDER_CONTROL_TIMEOUT", "42");
-            let cfg = VLlmConfig::new("http://x".to_string(), None, None);
+            let cfg = Config::new("http://x".to_string(), None, None);
             assert_eq!(cfg.completion_timeout_seconds, 1234);
             assert_eq!(cfg.control_timeout_seconds, 42);
         });
@@ -2413,7 +2413,7 @@ mod tests {
             std::env::set_var("VLLM_PROVIDER_CONTROL_TIMEOUT", "42");
             // Positional `Some(N)` keeps the legacy meaning: it sets completion only,
             // overriding the env. Control still reads from env.
-            let cfg = VLlmConfig::new("http://x".to_string(), None, Some(7));
+            let cfg = Config::new("http://x".to_string(), None, Some(7));
             assert_eq!(cfg.completion_timeout_seconds, 7);
             assert_eq!(cfg.control_timeout_seconds, 42);
         });
@@ -2425,21 +2425,21 @@ mod tests {
         with_clean_timeout_env(|| {
             std::env::set_var("VLLM_PROVIDER_COMPLETION_TIMEOUT", "not-a-number");
             std::env::set_var("VLLM_PROVIDER_CONTROL_TIMEOUT", "");
-            let cfg = VLlmConfig::new("http://x".to_string(), None, None);
+            let cfg = Config::new("http://x".to_string(), None, None);
             assert_eq!(
                 cfg.completion_timeout_seconds,
-                VLlmConfig::DEFAULT_COMPLETION_TIMEOUT_SECS
+                Config::DEFAULT_COMPLETION_TIMEOUT_SECS
             );
             assert_eq!(
                 cfg.control_timeout_seconds,
-                VLlmConfig::DEFAULT_CONTROL_TIMEOUT_SECS
+                Config::DEFAULT_CONTROL_TIMEOUT_SECS
             );
         });
     }
 
     #[test]
     fn vllm_config_negative_timeout_clamped_to_zero_duration() {
-        let cfg = VLlmConfig {
+        let cfg = Config {
             base_url: "http://x".to_string(),
             api_key: None,
             completion_timeout_seconds: -5,
@@ -2829,8 +2829,8 @@ mod tests {
             }
         }
 
-        let provider = VLlmProvider::new_with_verifier(
-            VLlmConfig {
+        let provider = Provider::new_with_verifier(
+            Config {
                 base_url: "http://localhost".to_string(),
                 api_key: None,
                 completion_timeout_seconds: 30,
@@ -2864,8 +2864,8 @@ mod tests {
             }
         }
 
-        let provider = VLlmProvider::new_with_verifier(
-            VLlmConfig {
+        let provider = Provider::new_with_verifier(
+            Config {
                 base_url: "http://localhost".to_string(),
                 api_key: None,
                 completion_timeout_seconds: 30,
@@ -2916,8 +2916,8 @@ mod tests {
             }
         }
 
-        let provider = VLlmProvider::new_with_verifier(
-            VLlmConfig {
+        let provider = Provider::new_with_verifier(
+            Config {
                 base_url: "http://localhost".to_string(),
                 api_key: None,
                 completion_timeout_seconds: 30,
@@ -2962,8 +2962,8 @@ mod tests {
             }
         }
 
-        let provider = VLlmProvider::new_with_verifier(
-            VLlmConfig {
+        let provider = Provider::new_with_verifier(
+            Config {
                 base_url: "http://localhost".to_string(),
                 api_key: None,
                 completion_timeout_seconds: 30,
@@ -3010,8 +3010,8 @@ mod tests {
             }
         }
 
-        let provider = VLlmProvider::new_with_verifier(
-            VLlmConfig {
+        let provider = Provider::new_with_verifier(
+            Config {
                 base_url: "http://localhost".to_string(),
                 api_key: None,
                 completion_timeout_seconds: 30,
@@ -3071,8 +3071,8 @@ mod tests {
 
         // concurrency=1 means verifications are fully serialised. Pass the value
         // directly rather than via env var to avoid races with parallel tests.
-        let provider = Arc::new(VLlmProvider::new_with_verifier_and_concurrency(
-            VLlmConfig {
+        let provider = Arc::new(Provider::new_with_verifier_and_concurrency(
+            Config {
                 base_url: "http://localhost".to_string(),
                 api_key: None,
                 completion_timeout_seconds: 30,
@@ -3153,8 +3153,8 @@ mod tests {
             }
         }
 
-        let provider = VLlmProvider::new_with_verifier(
-            VLlmConfig {
+        let provider = Provider::new_with_verifier(
+            Config {
                 base_url: format!("http://{addr}"),
                 api_key: None,
                 completion_timeout_seconds: 1,
@@ -3264,8 +3264,8 @@ mod tests {
             }
         }
 
-        let provider = Arc::new(VLlmProvider::new_with_verifier_and_concurrency(
-            VLlmConfig {
+        let provider = Arc::new(Provider::new_with_verifier_and_concurrency(
+            Config {
                 base_url: "http://localhost".to_string(),
                 api_key: None,
                 completion_timeout_seconds: 30,
@@ -3327,7 +3327,7 @@ mod tests {
     /// pre_warm is a no-op when no backend verifier is configured (legacy mode).
     #[tokio::test]
     async fn test_pre_warm_noop_without_verifier() {
-        let provider = Arc::new(VLlmProvider::new(VLlmConfig {
+        let provider = Arc::new(Provider::new(Config {
             base_url: "http://localhost".to_string(),
             api_key: None,
             completion_timeout_seconds: 30,
@@ -3379,8 +3379,8 @@ mod tests {
             crate::spki_verifier::FingerprintState::Blocked,
         ] {
             let call_count = Arc::new(AtomicUsize::new(0));
-            let provider = Arc::new(VLlmProvider::new_with_verifier_and_concurrency(
-                VLlmConfig {
+            let provider = Arc::new(Provider::new_with_verifier_and_concurrency(
+                Config {
                     base_url: "http://localhost".to_string(),
                     api_key: None,
                     completion_timeout_seconds: 30,
@@ -3428,16 +3428,16 @@ mod tests {
         // already treats it as next-provider-worthy in the chat_completion
         // closure — and other indices may succeed where the sticky bucket
         // timed out.
-        assert!(FleetRouter::is_rotation_retryable_status(408));
-        assert!(FleetRouter::is_rotation_retryable_status(429));
-        assert!(FleetRouter::is_rotation_retryable_status(500));
-        assert!(FleetRouter::is_rotation_retryable_status(503));
-        assert!(FleetRouter::is_rotation_retryable_status(599));
-        assert!(!FleetRouter::is_rotation_retryable_status(200));
-        assert!(!FleetRouter::is_rotation_retryable_status(400));
-        assert!(!FleetRouter::is_rotation_retryable_status(401));
-        assert!(!FleetRouter::is_rotation_retryable_status(404));
-        assert!(!FleetRouter::is_rotation_retryable_status(422));
+        assert!(Fleet::is_rotation_retryable_status(408));
+        assert!(Fleet::is_rotation_retryable_status(429));
+        assert!(Fleet::is_rotation_retryable_status(500));
+        assert!(Fleet::is_rotation_retryable_status(503));
+        assert!(Fleet::is_rotation_retryable_status(599));
+        assert!(!Fleet::is_rotation_retryable_status(200));
+        assert!(!Fleet::is_rotation_retryable_status(400));
+        assert!(!Fleet::is_rotation_retryable_status(401));
+        assert!(!Fleet::is_rotation_retryable_status(404));
+        assert!(!Fleet::is_rotation_retryable_status(422));
     }
 
     #[test]
@@ -3461,7 +3461,7 @@ mod tests {
 
     #[test]
     fn rotation_url_uses_canonical_label_and_index() {
-        let provider = VLlmProvider::new(VLlmConfig {
+        let provider = Provider::new(Config {
             base_url: "https://glm-5-1.completions.near.ai".to_string(),
             api_key: None,
             completion_timeout_seconds: 30,
@@ -3492,7 +3492,7 @@ mod tests {
         // Defensive: a bogus `/backends/count` reading (race during deploy,
         // partial registry split) shouldn't let one 5xx burn unbounded
         // fresh-TCP handshakes. Mirrors the discovery path's cap.
-        let provider = VLlmProvider::new(VLlmConfig {
+        let provider = Provider::new(Config {
             base_url: "https://glm-5-1.completions.near.ai".to_string(),
             api_key: None,
             completion_timeout_seconds: 30,
@@ -3507,7 +3507,7 @@ mod tests {
         // First request after startup, before discovery's first cycle: count
         // is 0, so rotation is skipped and the canonical 5xx propagates
         // as it did pre-this-PR. No false positives.
-        let provider = VLlmProvider::new(VLlmConfig {
+        let provider = Provider::new(Config {
             base_url: "https://glm-5-1.completions.near.ai".to_string(),
             api_key: None,
             completion_timeout_seconds: 30,
@@ -3579,7 +3579,7 @@ mod tests {
 
     // --- Characterization tests for the bucket side of pin/unpin (the H2
     // sticky-prefix routing state). These pin down current behavior so the
-    // FleetRouter extraction can be proven behavior-identical. ---
+    // Fleet extraction can be proven behavior-identical. ---
 
     #[test]
     fn pin_chat_connection_promotes_pending_bucket_to_signature_bucket() {
@@ -3655,7 +3655,7 @@ mod tests {
     // --- Characterization tests for get_signature's fetch/retry behavior over
     // a real (mock) HTTP backend. With an IP-literal base_url the rotation path
     // is disabled, so these exercise the general-client walk + the 404 (signing
-    // race) retry. They pin the network-facing contract the FleetRouter
+    // race) retry. They pin the network-facing contract the Fleet
     // extraction must preserve. ---
 
     /// Spawn a mock HTTP/1.1 backend. Each incoming request is answered with the
@@ -3727,8 +3727,8 @@ mod tests {
         (addr, handle, counter)
     }
 
-    fn mock_provider(addr: std::net::SocketAddr) -> VLlmProvider {
-        VLlmProvider::new(VLlmConfig {
+    fn mock_provider(addr: std::net::SocketAddr) -> Provider {
+        Provider::new(Config {
             base_url: format!("http://{addr}"),
             api_key: None,
             completion_timeout_seconds: 5,
@@ -3791,7 +3791,7 @@ mod tests {
     #[tokio::test]
     async fn get_attestation_report_delegates_to_fleet_without_recursing() {
         use crate::InferenceProvider;
-        // Regression guard for the VLlmProvider -> FleetRouter delegation: the
+        // Regression guard for the Provider -> Fleet delegation: the
         // trait method must forward to self.fleet, not self (which would resolve
         // back to the same trait method and recurse to a stack overflow). The
         // provider points at http://localhost with no server, so this returns a

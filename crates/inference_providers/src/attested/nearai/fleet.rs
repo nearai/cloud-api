@@ -135,7 +135,12 @@ impl Fleet {
     /// chat_id, so `get_signature` reuses the same bucket/rotation backend.
     /// Empty chat_id (orphan-cleanup) drains the pending rotation entry without
     /// writing `signature_rotation`.
-    pub(super) fn pin_chat_connection(&self, request_hash: &str, chat_id: &str) {
+    // NB: these inherent helpers are deliberately named differently from the
+    // `InferenceProvider` trait methods (pin_chat_connection / ...). The trait
+    // impl forwards to these; distinct names make that delegation unambiguous
+    // and rule out the accidental-self-recursion footgun that a same-named
+    // inherent/trait pair invites (cf. the get_attestation_report fix).
+    pub(super) fn pin_chat(&self, request_hash: &str, chat_id: &str) {
         if let Some(bucket_id) = lock(&self.pending_buckets).remove(request_hash) {
             lock(&self.signature_buckets).insert(chat_id.to_string(), bucket_id);
         }
@@ -146,12 +151,12 @@ impl Fleet {
         }
     }
 
-    pub(super) fn unpin_chat_connection(&self, chat_id: &str) {
+    pub(super) fn unpin_chat(&self, chat_id: &str) {
         lock(&self.signature_buckets).remove(chat_id);
         lock(&self.signature_rotation).remove(chat_id);
     }
 
-    pub(super) fn set_backend_count(&self, count: usize) {
+    pub(super) fn store_backend_count(&self, count: usize) {
         self.last_backend_count.store(count, Ordering::Relaxed);
     }
 

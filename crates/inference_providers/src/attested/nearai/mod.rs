@@ -1269,15 +1269,15 @@ impl InferenceProvider for Fleet {
     }
 
     fn pin_chat_connection(&self, request_hash: &str, chat_id: &str) {
-        self.pin_chat_connection(request_hash, chat_id);
+        self.pin_chat(request_hash, chat_id);
     }
 
     fn unpin_chat_connection(&self, chat_id: &str) {
-        self.unpin_chat_connection(chat_id);
+        self.unpin_chat(chat_id);
     }
 
     fn set_backend_count(&self, count: usize) {
-        self.set_backend_count(count);
+        self.store_backend_count(count);
     }
 
     async fn get_attestation_report(
@@ -3115,7 +3115,13 @@ mod tests {
     /// for url (...): operation timed out" — a substring of the connect-retry
     /// guard. Without the `!is_timeout()` guard, a timeout doubles end-to-end
     /// latency before the pool's no-retry classifier sees `Timeout`.
+    ///
+    /// `#[serial]`: this asserts wall-clock elapsed (< 1700ms for a single 1s
+    /// timeout vs ~2s for an erroneous retry), so it must not run under the
+    /// CPU contention of the parallel test pool, which can otherwise push the
+    /// single-timeout path past the bound and flake.
     #[tokio::test]
+    #[serial]
     async fn test_timeout_does_not_trigger_bucket_clear_retry() {
         use crate::{ChatCompletionParams, ChatMessage, InferenceProvider, MessageRole};
         use std::sync::Arc;

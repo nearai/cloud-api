@@ -528,6 +528,22 @@ pub struct AdminOrganizationInfo {
     pub created_at: chrono::DateTime<chrono::Utc>,
 }
 
+/// A single organization member with full user details (admin view).
+///
+/// Unlike the member-facing `/v1/organizations/{id}/members` endpoint (which
+/// hides email/last-login from non-privileged members), the admin view exposes
+/// the full user record, consistent with `/v1/admin/users`.
+#[derive(Debug, Clone)]
+pub struct AdminOrganizationMemberInfo {
+    pub member_id: uuid::Uuid,
+    pub organization_id: uuid::Uuid,
+    /// Raw role string from the database: "owner", "admin", or "member".
+    pub role: String,
+    pub joined_at: chrono::DateTime<chrono::Utc>,
+    pub invited_by: Option<uuid::Uuid>,
+    pub user: UserInfo,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum AdminError {
     #[error("Model not found: {0}")]
@@ -828,6 +844,26 @@ pub trait AdminRepository: Send + Sync {
     /// Count all active organizations (admin only)
     async fn count_all_organizations(&self) -> Result<i64, anyhow::Error>;
 
+    /// List members of a specific organization with full user details (admin only).
+    /// Does NOT enforce membership of the caller — authorization is handled by
+    /// the admin middleware at the route layer.
+    async fn list_organization_members(
+        &self,
+        organization_id: uuid::Uuid,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<AdminOrganizationMemberInfo>, anyhow::Error>;
+
+    /// Count members of a specific organization (admin only).
+    async fn count_organization_members(
+        &self,
+        organization_id: uuid::Uuid,
+    ) -> Result<i64, anyhow::Error>;
+
+    /// Whether an active organization with this id exists (admin only).
+    async fn organization_exists(&self, organization_id: uuid::Uuid)
+        -> Result<bool, anyhow::Error>;
+
     /// List platform services with pagination (admin only)
     async fn list_services(
         &self,
@@ -1037,6 +1073,15 @@ pub trait AdminService: Send + Sync {
         limit: i64,
         offset: i64,
     ) -> Result<(Vec<AdminOrganizationInfo>, i64), AdminError>;
+
+    /// List members of a specific organization with full user details (admin only).
+    /// Returns `OrganizationNotFound` if the organization does not exist.
+    async fn list_organization_members(
+        &self,
+        organization_id: uuid::Uuid,
+        limit: i64,
+        offset: i64,
+    ) -> Result<(Vec<AdminOrganizationMemberInfo>, i64), AdminError>;
 
     /// List platform services with pagination (admin only)
     async fn list_services(

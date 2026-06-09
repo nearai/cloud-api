@@ -7,13 +7,14 @@ use crate::repositories::{
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use services::admin::{
-    AdminModelInfo, AdminOrganizationInfo, AdminRepository, DeprecateModelOutcome,
-    ModelDeprecationDeliveryRecord, ModelDeprecationEmailStatus, ModelDeprecationModel,
-    ModelDeprecationRecipient, ModelHistoryEntry, ModelPricing, ModelPricingSnapshot,
-    OrganizationLimits, OrganizationLimitsHistoryEntry, OrganizationLimitsUpdate,
-    PlatformServiceInfo, PricingChangeDeliveryRecord, PricingChangeOpenConflictError,
-    PricingChangeRecipientRow, ScheduledPricingChange, ScheduledPricingChangeInsert,
-    ScheduledPricingChangeStatus, UpdateModelAdminRequest, UserInfo, UserOrganizationInfo,
+    AdminModelInfo, AdminOrganizationInfo, AdminOrganizationMemberInfo, AdminRepository,
+    DeprecateModelOutcome, ModelDeprecationDeliveryRecord, ModelDeprecationEmailStatus,
+    ModelDeprecationModel, ModelDeprecationRecipient, ModelHistoryEntry, ModelPricing,
+    ModelPricingSnapshot, OrganizationLimits, OrganizationLimitsHistoryEntry,
+    OrganizationLimitsUpdate, PlatformServiceInfo, PricingChangeDeliveryRecord,
+    PricingChangeOpenConflictError, PricingChangeRecipientRow, ScheduledPricingChange,
+    ScheduledPricingChangeInsert, ScheduledPricingChangeStatus, UpdateModelAdminRequest, UserInfo,
+    UserOrganizationInfo,
 };
 use services::service_usage::ports::ServiceUnit;
 use std::sync::Arc;
@@ -1489,6 +1490,109 @@ impl AdminRepository for AdminCompositeRepository {
             .await?;
 
         Ok(row.get::<_, i64>("count"))
+    }
+
+    async fn list_organization_members(
+        &self,
+        organization_id: Uuid,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<AdminOrganizationMemberInfo>> {
+        let client = self.pool.get().await?;
+
+        // Join members to their user records. Only active users are surfaced,
+        // mirroring the user repository's "is_active = true" convention.
+        let rows = client
+            .query(
+                r#"
+                SELECT
+                    m.id            AS member_id,
+                    m.organization_id,
+                    m.role,
+                    m.joined_at,
+                    m.invited_by,
+                    u.id            AS user_id,
+                    u.email,
+                    u.username,
+                    u.display_name,
+                    u.avatar_url,
+                    u.created_at    AS user_created_at,
+                    u.last_login_at,
+                    u.is_active,
+                    u.auth_provider,
+                    u.provider_user_id
+                FROM organization_members m
+                JOIN users u ON u.id = m.user_id
+                WHERE m.organization_id = $1
+                  AND u.is_active = true
+                ORDER BY m.joined_at DESC
+                LIMIT $2 OFFSET $3
+                "#,
+                &[&organization_id, &limit, &offset],
+            )
+            .await?;
+
+        let members = rows
+            .into_iter()
+            .map(|row| AdminOrganizationMemberInfo {
+                member_id: row.get("member_id"),
+                organization_id: row.get("organization_id"),
+                role: row.get("role"),
+                joined_at: row.get("joined_at"),
+                invited_by: row.get("invited_by"),
+                user: UserInfo {
+                    id: row.get("user_id"),
+                    email: row.get("email"),
+                    username: row.get("username"),
+                    display_name: row.get("display_name"),
+                    avatar_url: row.get("avatar_url"),
+                    created_at: row.get("user_created_at"),
+                    last_login_at: row.get("last_login_at"),
+                    is_active: row.get("is_active"),
+                    auth_provider: row.get("auth_provider"),
+                    provider_user_id: row.get("provider_user_id"),
+                },
+            })
+            .collect();
+
+        Ok(members)
+    }
+
+    async fn count_organization_members(&self, organization_id: Uuid) -> Result<i64> {
+        let client = self.pool.get().await?;
+
+        let row = client
+            .query_one(
+                r#"
+                SELECT COUNT(*) as count
+                FROM organization_members m
+                JOIN users u ON u.id = m.user_id
+                WHERE m.organization_id = $1
+                  AND u.is_active = true
+                "#,
+                &[&organization_id],
+            )
+            .await?;
+
+        Ok(row.get::<_, i64>("count"))
+    }
+
+    async fn organization_exists(&self, organization_id: Uuid) -> Result<bool> {
+        let client = self.pool.get().await?;
+
+        let row = client
+            .query_one(
+                r#"
+                SELECT EXISTS (
+                    SELECT 1 FROM organizations
+                    WHERE id = $1 AND is_active = true
+                ) AS exists
+                "#,
+                &[&organization_id],
+            )
+            .await?;
+
+        Ok(row.get::<_, bool>("exists"))
     }
 
     async fn list_services(

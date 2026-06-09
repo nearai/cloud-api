@@ -5,16 +5,17 @@ use crate::conversions::{
 use crate::middleware::AdminUser;
 use crate::models::{
     AdminAccessTokenResponse, AdminInvitationEmailResendResultResponse, AdminModelListResponse,
-    AdminModelWithPricing, AdminOrganizationResponse, AdminServiceResponse,
-    AdminUserOrganizationDetails, AdminUserResponse, BatchUpdateModelApiRequest,
-    CreateAdminAccessTokenRequest, CreateServiceRequest, CreditType, DecimalPrice,
-    DecimalPriceRequest, DeleteAdminAccessTokenRequest, DeleteModelRequest, DeprecateModelRequest,
-    DeprecateModelResponse, ErrorResponse, GetOrganizationConcurrentLimitResponse,
-    ListAdminInvitationEmailDeliveriesResponse, ListOrganizationsAdminResponse,
-    ListPricingChangesResponse, ListUsersResponse, ModelArchitecture,
+    AdminModelWithPricing, AdminOrganizationMemberResponse, AdminOrganizationResponse,
+    AdminServiceResponse, AdminUserOrganizationDetails, AdminUserResponse,
+    BatchUpdateModelApiRequest, CreateAdminAccessTokenRequest, CreateServiceRequest, CreditType,
+    DecimalPrice, DecimalPriceRequest, DeleteAdminAccessTokenRequest, DeleteModelRequest,
+    DeprecateModelRequest, DeprecateModelResponse, ErrorResponse,
+    GetOrganizationConcurrentLimitResponse, ListAdminInvitationEmailDeliveriesResponse,
+    ListAdminOrganizationMembersResponse, ListOrganizationsAdminResponse,
+    ListPricingChangesResponse, ListUsersResponse, MemberRole, ModelArchitecture,
     ModelDeprecationConfirmResponse, ModelDeprecationPreviewResponse, ModelDeprecationRequest,
-    ModelHistoryEntry, ModelHistoryResponse, ModelMetadata, ModelWithPricing,
-    OrgLimitsHistoryEntry, OrgLimitsHistoryResponse, OrganizationUsage, PricingChangeBatchRequest,
+    ModelHistoryEntry, ModelHistoryResponse, ModelMetadata, ModelWithPricing, OrgLimitsHistoryEntry,
+    OrgLimitsHistoryResponse, OrganizationUsage, PricingChangeBatchRequest,
     PricingChangeConfirmResponse, PricingChangeModelPreviewDto, PricingChangePreviewResponse,
     PricingFieldUpdates, PricingFields, ScheduledPricingChangeDto, SpendLimit,
     UpdateOrganizationConcurrentLimitRequest, UpdateOrganizationConcurrentLimitResponse,
@@ -2121,6 +2122,117 @@ pub async fn list_organizations(
     };
 
     Ok(ResponseJson(response))
+}
+
+/// Map a raw database role string to the API `MemberRole`. Unknown values fall
+/// back to `Member` (the least-privileged role) so a malformed row can never
+/// be misrepresented as an owner/admin.
+fn member_role_from_db_str(role: &str) -> MemberRole {
+    match role {
+        "owner" => MemberRole::Owner,
+        "admin" => MemberRole::Admin,
+        _ => MemberRole::Member,
+    }
+}
+
+/// List members of a specific organization (Admin only)
+///
+/// Returns the members of the given organization with full user details
+/// (email, last login, active status), consistent with `/v1/admin/users`.
+/// Only authenticated admins can perform this operation.
+#[utoipa::path(
+    get,
+    path = "/v1/admin/organizations/{org_id}/members",
+    tag = "Admin",
+    params(
+        ("org_id" = Uuid, Path, description = "Organization ID"),
+        ("limit" = Option<i64>, Query, description = "Maximum number of members to return (default: 100)"),
+        ("offset" = Option<i64>, Query, description = "Number of members to skip (default: 0)")
+    ),
+    responses(
+        (status = 200, description = "Organization members retrieved successfully", body = ListAdminOrganizationMembersResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 404, description = "Organization not found", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    ),
+    security(
+        ("session_token" = [])
+    )
+)]
+pub async fn list_organization_members(
+    State(app_state): State<AdminAppState>,
+    Extension(_admin_user): Extension<AdminUser>, // Require admin auth
+    Path(org_id): Path<Uuid>,
+    Query(params): Query<ListOrganizationsQueryParams>,
+) -> Result<
+    ResponseJson<ListAdminOrganizationMembersResponse>,
+    (StatusCode, ResponseJson<ErrorResponse>),
+> {
+    crate::routes::common::validate_limit_offset(params.limit, params.offset)?;
+
+    debug!(
+        "List organization members request: org_id={}, limit={}, offset={}",
+        org_id, params.limit, params.offset
+    );
+
+    let (members, total) = app_state
+        .admin_service
+        .list_organization_members(org_id, params.limit, params.offset)
+        .await
+        .map_err(|e| {
+            error!("Failed to list organization members: {:?}", e);
+            match e {
+                services::admin::AdminError::OrganizationNotFound(_) => (
+                    StatusCode::NOT_FOUND,
+                    ResponseJson(ErrorResponse::new(
+                        "Organization not found".to_string(),
+                        "not_found".to_string(),
+                    )),
+                ),
+                services::admin::AdminError::Unauthorized(msg) => (
+                    StatusCode::UNAUTHORIZED,
+                    ResponseJson(ErrorResponse::new(msg, "unauthorized".to_string())),
+                ),
+                _ => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    ResponseJson(ErrorResponse::new(
+                        "Failed to retrieve organization members".to_string(),
+                        "internal_server_error".to_string(),
+                    )),
+                ),
+            }
+        })?;
+
+    let member_responses: Vec<AdminOrganizationMemberResponse> = members
+        .into_iter()
+        .map(|m| AdminOrganizationMemberResponse {
+            id: m.member_id.to_string(),
+            organization_id: m.organization_id.to_string(),
+            role: member_role_from_db_str(&m.role),
+            joined_at: m.joined_at,
+            invited_by: m.invited_by.map(|id| id.to_string()),
+            user: AdminUserResponse {
+                id: m.user.id.to_string(),
+                email: m.user.email,
+                username: Some(m.user.username),
+                display_name: m.user.display_name,
+                avatar_url: m.user.avatar_url,
+                created_at: m.user.created_at,
+                last_login_at: m.user.last_login_at,
+                is_active: m.user.is_active,
+                auth_provider: m.user.auth_provider,
+                provider_user_id: m.user.provider_user_id,
+                organizations: None,
+            },
+        })
+        .collect();
+
+    Ok(ResponseJson(ListAdminOrganizationMembersResponse {
+        members: member_responses,
+        total,
+        limit: params.limit,
+        offset: params.offset,
+    }))
 }
 
 /// List organization invitation email deliveries (Admin only)

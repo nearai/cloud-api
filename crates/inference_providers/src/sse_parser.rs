@@ -338,7 +338,7 @@ impl SSEEventParser for OpenAIEventParser {
                 // fires AFTER the HTTP 200 headers were sent (queue-full,
                 // priority-disabled, waiting timeout, etc.):
                 //   data: {"error":{"message":"...","type":"...","code":503}}
-                // Surface it as a typed `HttpError` so VLlmProvider's
+                // Surface it as a typed `HttpError` so nearai::Provider's
                 // rotation-SNI fallback can classify by upstream status
                 // (5xx → try a different backend) instead of treating it as
                 // a generic `InvalidResponse`, which would terminate the
@@ -703,7 +703,7 @@ mod tests {
         // SGLang `--max-queued-requests` abort emits an in-stream error frame
         // *after* HTTP 200 headers. Previously the parser couldn't classify
         // this and surfaced `InvalidResponse("Failed to parse event")`, which
-        // hid the upstream status from VLlmProvider's rotation fallback.
+        // hid the upstream status from nearai::Provider's rotation fallback.
         // The fix promotes any `{"error":{"code":N,...}}` chunk to a typed
         // `HttpError { status_code: N }` so the rotation path can recognize
         // it as 5xx and walk to a different backend.

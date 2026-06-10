@@ -227,6 +227,11 @@ pub struct InferenceProviderPool {
     tls_roots: SharedTlsRoots,
     /// Attestation verifier for TDX quote, GPU evidence, and image hash verification.
     attestation_verifier: Arc<AttestationVerifier>,
+    /// Models registered out-of-band (not from the DB-backed discovery sources),
+    /// e.g. the config-pinned Chutes provider. These are excluded from
+    /// `remove_stale_providers` so a refresh tick — whose `valid_model_names` is
+    /// built solely from the DB sources — does not wipe them.
+    pinned_models: Arc<std::sync::RwLock<std::collections::HashSet<String>>>,
 }
 
 /// Backend verifier that creates verified reqwest clients by connecting to a backend,
@@ -490,6 +495,7 @@ impl InferenceProviderPool {
             inference_url_fingerprint_states: Arc::new(RwLock::new(HashMap::new())),
             tls_roots: SharedTlsRoots::load(),
             attestation_verifier: Arc::new(AttestationVerifier::from_env()),
+            pinned_models: Arc::new(std::sync::RwLock::new(std::collections::HashSet::new())),
         }
     }
 
@@ -593,6 +599,29 @@ impl InferenceProviderPool {
                 .or_default()
                 .push(provider);
         }
+    }
+
+    /// Register a provider that is **not** sourced from DB discovery (e.g. the
+    /// config-pinned Chutes provider) and mark its model **pinned** so the
+    /// periodic refresh — whose `valid_model_names` comes only from the DB
+    /// sources — does not remove it.
+    ///
+    /// Unlike [`Self::register_provider`], this does **not** run signing-key
+    /// attestation discovery: it would be a wasted discover→evidence→DCAP→NRAS
+    /// round trip for a provider (like Chutes) that has no signing-address
+    /// pubkey, and would add network/latency at startup. Such a provider verifies
+    /// its backend per request instead, so no `pubkey_to_providers` entry is needed.
+    pub async fn register_pinned_provider(
+        &self,
+        model_id: String,
+        provider: Arc<InferenceProviderTrait>,
+    ) {
+        self.pinned_models
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(model_id.clone());
+        let mut mappings = self.provider_mappings.write().await;
+        mappings.model_to_providers.insert(model_id, vec![provider]);
     }
 
     /// Register multiple providers for multiple models (useful for testing)
@@ -3278,12 +3307,19 @@ impl InferenceProviderPool {
     /// Remove models from provider_mappings that are not in `valid_model_names`.
     /// Also cleans up load_balancer_index and provider_failure_counts for removed providers.
     async fn remove_stale_providers(&self, valid_model_names: &std::collections::HashSet<String>) {
+        // Pinned models (e.g. the config-registered Chutes provider) are not in
+        // the DB-backed `valid_model_names`; never treat them as stale.
+        let pinned = self
+            .pinned_models
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         let mut mappings = self.provider_mappings.write().await;
 
         let stale_models: Vec<String> = mappings
             .model_to_providers
             .keys()
-            .filter(|k| !valid_model_names.contains(k.as_str()))
+            .filter(|k| !valid_model_names.contains(k.as_str()) && !pinned.contains(k.as_str()))
             .cloned()
             .collect();
 
@@ -4409,6 +4445,40 @@ mod tests {
     async fn test_unregister_nonexistent_provider() {
         let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
         assert!(!pool.unregister_provider("nonexistent-model").await);
+    }
+
+    #[tokio::test]
+    async fn pinned_provider_survives_refresh() {
+        use inference_providers::mock::MockProvider;
+        let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
+
+        // A DB-discovered provider + a config-pinned (e.g. Chutes) provider.
+        pool.register_provider("db-model".to_string(), Arc::new(MockProvider::new()))
+            .await;
+        pool.register_pinned_provider("chutes-model".to_string(), Arc::new(MockProvider::new()))
+            .await;
+
+        // A refresh tick's `valid_model_names` comes only from the DB sources, so
+        // it knows "db-model" but not the config-pinned "chutes-model".
+        let mut valid = std::collections::HashSet::new();
+        valid.insert("db-model".to_string());
+        pool.remove_stale_providers(&valid).await;
+
+        assert!(
+            pool.has_provider("chutes-model").await,
+            "pinned provider must survive a refresh that doesn't list it"
+        );
+        assert!(pool.has_provider("db-model").await);
+
+        // Sanity: a non-pinned model absent from the valid set IS removed.
+        pool.register_provider("ephemeral".to_string(), Arc::new(MockProvider::new()))
+            .await;
+        pool.remove_stale_providers(&valid).await;
+        assert!(
+            !pool.has_provider("ephemeral").await,
+            "non-pinned stale model must be removed"
+        );
+        assert!(pool.has_provider("chutes-model").await);
     }
 
     /// Verify that reused providers (URL unchanged) keep their pubkey mappings

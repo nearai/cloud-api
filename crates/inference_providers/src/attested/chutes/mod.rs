@@ -135,6 +135,9 @@ pub struct Provider {
     client: ChutesClient,
     verifier: Arc<dyn ChutesInstanceVerifier>,
     model_name: String,
+    /// Memoized model→`chute_id` (the mapping is static), so we don't re-fetch
+    /// `/v1/models` on every request.
+    chute_id_cache: tokio::sync::OnceCell<String>,
 }
 
 /// Everything needed to invoke a verified instance: the targeting headers, the
@@ -166,6 +169,7 @@ impl Provider {
             client,
             verifier,
             model_name: config.model_name,
+            chute_id_cache: tokio::sync::OnceCell::new(),
         })
     }
 
@@ -183,11 +187,13 @@ impl Provider {
     /// E2EE request blob for `request_json`. Returns an error (never an
     /// unverified channel) if any stage fails.
     async fn verify_and_prepare(&self, request_json: &Value) -> Result<PreparedInvoke, String> {
+        // Cached: the model→chute_id mapping is static, so resolve once.
         let chute_id = self
-            .client
-            .resolve_chute_id(&self.model_name)
+            .chute_id_cache
+            .get_or_try_init(|| self.client.resolve_chute_id(&self.model_name))
             .await
-            .map_err(|e| format!("resolve chute_id: {e}"))?;
+            .map_err(|e| format!("resolve chute_id: {e}"))?
+            .clone();
 
         let instances = self
             .client
@@ -246,6 +252,16 @@ fn request_body(model: &str, params: &ChatCompletionParams, stream: bool) -> Res
     if let Some(obj) = v.as_object_mut() {
         obj.insert("model".to_string(), json!(model));
         obj.insert("stream".to_string(), json!(stream));
+        if stream {
+            // Force usage onto the final stream chunk so streamed tokens are
+            // billed and counted against org limits (the OpenAI-compatible
+            // default omits it, and our SSE adapter drops Chutes' outer
+            // usage-only events). Matches every other provider.
+            obj.insert(
+                "stream_options".to_string(),
+                json!({ "include_usage": true }),
+            );
+        }
     } else {
         return Err("chat params did not serialize to a JSON object".to_string());
     }
@@ -570,6 +586,13 @@ mod tests {
         let body = request_body("zai-org/GLM-5.1-TEE", &params, true).unwrap();
         assert_eq!(body["model"], "zai-org/GLM-5.1-TEE");
         assert_eq!(body["stream"], true);
+        // Streaming must request usage so tokens are billed/counted.
+        assert_eq!(body["stream_options"]["include_usage"], true);
+
+        // Non-streaming must NOT set stream_options.
+        let body = request_body("m", &params, false).unwrap();
+        assert_eq!(body["stream"], false);
+        assert!(body.get("stream_options").is_none());
     }
 
     #[tokio::test]

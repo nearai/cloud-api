@@ -1048,12 +1048,20 @@ impl ExternalProvidersConfig {
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
         let chutes_api_key = if let Ok(path) = env::var("CHUTES_API_KEY_FILE") {
-            std::fs::read_to_string(path)
-                .ok()
-                .map(|s| s.trim().to_string())
+            match std::fs::read_to_string(&path) {
+                Ok(s) => Some(s.trim().to_string()),
+                Err(e) => {
+                    // Path only — never the key contents.
+                    eprintln!("WARN: failed to read CHUTES_API_KEY_FILE ({path}): {e}");
+                    None
+                }
+            }
         } else {
             env::var("CHUTES_API_KEY").ok()
-        };
+        }
+        // An empty key is not a key — treat "" as absent so a misconfigured
+        // secret can't pass as Some("") and silently fail at request time.
+        .filter(|s| !s.is_empty());
         let chutes_models = env::var("CHUTES_MODELS")
             .unwrap_or_default()
             .split(',')

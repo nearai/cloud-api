@@ -696,7 +696,10 @@ pub async fn init_inference_providers(
                         verifier.clone(),
                     ) {
                         Ok(provider) => {
-                            pool.register_provider(model.clone(), Arc::new(provider))
+                            // Pinned: registered out-of-band (not DB discovery), so
+                            // excluded from the refresh's stale-removal; also skips the
+                            // signing-key discovery Chutes never satisfies.
+                            pool.register_pinned_provider(model.clone(), Arc::new(provider))
                                 .await;
                             tracing::info!(model = %model, "Registered Chutes attested provider");
                         }

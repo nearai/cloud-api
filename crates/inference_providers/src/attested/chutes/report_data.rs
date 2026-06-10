@@ -93,10 +93,13 @@ impl ChutesReportDataVerifier {
         e2e_pubkey: &str,
         cert_der: &[u8],
     ) -> Result<(), ReportDataError> {
-        // 1. The nonce is *our* freshness anchor — require a full 32-byte hex
-        //    value. (Hashed verbatim below; this only validates entropy/format.)
-        let nonce_bytes = hex::decode(nonce.strip_prefix("0x").unwrap_or(nonce))
-            .map_err(|e| ReportDataError::NonceFormat(format!("hex decode: {e}")))?;
+        // 1. The nonce is *our* freshness anchor — require a **bare** 32-byte hex
+        //    value (no `0x` prefix). It is hashed verbatim into the binding below,
+        //    so accepting a prefixed form would let it validate yet bind
+        //    differently from its bare form — reject the prefix outright.
+        let nonce_bytes = hex::decode(nonce).map_err(|e| {
+            ReportDataError::NonceFormat(format!("expected bare 32-byte hex (no 0x): {e}"))
+        })?;
         if nonce_bytes.len() != 32 {
             return Err(ReportDataError::NonceFormat(format!(
                 "got {} bytes, want 32",
@@ -242,6 +245,13 @@ mod tests {
         assert!(matches!(
             ChutesReportDataVerifier
                 .verify(&rd, &"z".repeat(64), &pk, &der)
+                .unwrap_err(),
+            ReportDataError::NonceFormat(_)
+        ));
+        // 0x-prefixed is rejected (would bind differently from its bare form).
+        assert!(matches!(
+            ChutesReportDataVerifier
+                .verify(&rd, &format!("0x{NONCE}"), &pk, &der)
                 .unwrap_err(),
             ReportDataError::NonceFormat(_)
         ));

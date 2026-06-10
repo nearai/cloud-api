@@ -53,6 +53,78 @@ async fn test_admin_list_organization_members_includes_owner() {
 }
 
 #[tokio::test]
+async fn test_admin_list_organization_members_includes_inactive() {
+    // Inactive (soft-deleted) users are deactivated in place (users.is_active =
+    // false). The admin member list must still surface them — matching
+    // /v1/admin/users — so totals don't silently disagree with the row set.
+    let (server, database) = setup_test_server_with_database().await;
+
+    // The mock admin user is the org owner (an active member).
+    let org = create_org(&server).await;
+    let org_uuid = uuid::Uuid::parse_str(&org.id).expect("org id should be a uuid");
+
+    // Insert a second user that is INACTIVE and add them as a member directly.
+    let inactive_user_id = uuid::Uuid::new_v4();
+    {
+        let pool = database.pool();
+        let client = pool.get().await.expect("Failed to get database connection");
+        client
+            .execute(
+                "INSERT INTO users (id, email, username, display_name, avatar_url, auth_provider, provider_user_id, is_active, created_at, updated_at)
+                 VALUES ($1, $2, $3, NULL, NULL, 'mock', $4, false, NOW(), NOW())",
+                &[
+                    &inactive_user_id,
+                    &format!("inactive-{inactive_user_id}@test.com"),
+                    &format!("inactive-{inactive_user_id}"),
+                    &format!("mock_inactive-{inactive_user_id}"),
+                ],
+            )
+            .await
+            .expect("Failed to insert inactive user");
+        client
+            .execute(
+                "INSERT INTO organization_members (organization_id, user_id, role) VALUES ($1, $2, 'member')",
+                &[&org_uuid, &inactive_user_id],
+            )
+            .await
+            .expect("Failed to insert inactive member");
+    }
+
+    let response = server
+        .get(format!("/v1/admin/organizations/{}/members", org.id).as_str())
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .add_header("User-Agent", MOCK_USER_AGENT)
+        .await;
+
+    assert_eq!(
+        response.status_code(),
+        200,
+        "Should list members, body: {}",
+        response.text()
+    );
+
+    let body = response.json::<ListAdminOrganizationMembersResponse>();
+
+    // Both the active owner and the inactive member must be counted and listed.
+    assert_eq!(
+        body.total, 2,
+        "Owner + inactive member should both be counted, got total={}",
+        body.total
+    );
+    let inactive = body
+        .members
+        .iter()
+        .find(|m| m.user.id == inactive_user_id.to_string())
+        .expect("Inactive member should be present in the admin list");
+    assert!(
+        !inactive.user.is_active,
+        "Inactive member should report is_active=false"
+    );
+
+    println!("✅ Admin list organization members includes inactive (soft-deleted) members");
+}
+
+#[tokio::test]
 async fn test_admin_list_organization_members_org_not_found() {
     let server = setup_test_server().await;
 

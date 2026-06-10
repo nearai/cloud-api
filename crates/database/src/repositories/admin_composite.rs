@@ -1500,8 +1500,12 @@ impl AdminRepository for AdminCompositeRepository {
     ) -> Result<Vec<AdminOrganizationMemberInfo>> {
         let client = self.pool.get().await?;
 
-        // Join members to their user records. Only active users are surfaced,
-        // mirroring the user repository's "is_active = true" convention.
+        // Join members to their user records. Inactive (soft-deleted) users are
+        // INCLUDED — users are soft-deleted in place (`users.is_active = false`),
+        // the response exposes `user.is_active`, and `/v1/admin/users` likewise
+        // returns inactive users by default. Filtering them here would make
+        // `total` and the row set silently disagree with the rest of the admin
+        // surface.
         let rows = client
             .query(
                 r#"
@@ -1524,7 +1528,6 @@ impl AdminRepository for AdminCompositeRepository {
                 FROM organization_members m
                 JOIN users u ON u.id = m.user_id
                 WHERE m.organization_id = $1
-                  AND u.is_active = true
                 ORDER BY m.joined_at DESC
                 LIMIT $2 OFFSET $3
                 "#,
@@ -1568,7 +1571,6 @@ impl AdminRepository for AdminCompositeRepository {
                 FROM organization_members m
                 JOIN users u ON u.id = m.user_id
                 WHERE m.organization_id = $1
-                  AND u.is_active = true
                 "#,
                 &[&organization_id],
             )

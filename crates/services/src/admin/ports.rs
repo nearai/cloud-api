@@ -532,7 +532,8 @@ pub struct AdminOrganizationInfo {
 ///
 /// Unlike the member-facing `/v1/organizations/{id}/members` endpoint (which
 /// hides email/last-login from non-privileged members), the admin view exposes
-/// the full user record, consistent with `/v1/admin/users`.
+/// the full user record — including inactive (soft-deleted) members — consistent
+/// with `/v1/admin/users`.
 #[derive(Debug, Clone)]
 pub struct AdminOrganizationMemberInfo {
     pub member_id: uuid::Uuid,
@@ -844,9 +845,10 @@ pub trait AdminRepository: Send + Sync {
     /// Count all active organizations (admin only)
     async fn count_all_organizations(&self) -> Result<i64, anyhow::Error>;
 
-    /// List members of a specific organization with full user details (admin only).
-    /// Does NOT enforce membership of the caller — authorization is handled by
-    /// the admin middleware at the route layer.
+    /// List members of a specific organization with full user details, including
+    /// inactive (soft-deleted) members (admin only). Does NOT enforce membership
+    /// of the caller — authorization is handled by the admin middleware at the
+    /// route layer.
     async fn list_organization_members(
         &self,
         organization_id: uuid::Uuid,
@@ -854,7 +856,9 @@ pub trait AdminRepository: Send + Sync {
         offset: i64,
     ) -> Result<Vec<AdminOrganizationMemberInfo>, anyhow::Error>;
 
-    /// Count members of a specific organization (admin only).
+    /// Count members of a specific organization, including inactive members
+    /// (admin only). Must apply the same filters as `list_organization_members`
+    /// so paginated totals stay consistent with the rows.
     async fn count_organization_members(
         &self,
         organization_id: uuid::Uuid,

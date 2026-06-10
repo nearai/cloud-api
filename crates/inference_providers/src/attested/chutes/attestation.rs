@@ -51,10 +51,16 @@ pub enum TransformError {
     InvalidCertificate(String),
     #[error("instance has no GPU evidence (a confidential-GPU provider must present it)")]
     NoGpuEvidence,
+    #[error("GPU evidence has an empty 'arch'")]
+    EmptyGpuArch,
+    #[error("GPU evidence mixes architectures ('{first}' vs '{other}')")]
+    InconsistentGpuArch { first: String, other: String },
 }
 
 fn decode_b64(field: &'static str, s: &str) -> Result<Vec<u8>, TransformError> {
     use base64::Engine;
+    // Trim surrounding whitespace/newlines — common in API/PEM-adjacent strings.
+    let s = s.trim();
     if s.is_empty() {
         return Err(TransformError::Empty(field));
     }
@@ -85,6 +91,19 @@ pub fn nvidia_payload(instance: &InstanceEvidence) -> Result<Value, TransformErr
     if instance.gpu_evidence.is_empty() {
         return Err(TransformError::NoGpuEvidence);
     }
+    // The single `arch` describes the whole evidence list, so all GPUs must
+    // agree and it must be non-empty — fail closed otherwise rather than
+    // silently labelling the payload with the first GPU's arch.
+    let arch = instance.gpu_evidence[0].arch.trim();
+    if arch.is_empty() {
+        return Err(TransformError::EmptyGpuArch);
+    }
+    if let Some(g) = instance.gpu_evidence.iter().find(|g| g.arch.trim() != arch) {
+        return Err(TransformError::InconsistentGpuArch {
+            first: arch.to_string(),
+            other: g.arch.trim().to_string(),
+        });
+    }
     // Validate each entry decodes (fail-closed) before assembling.
     let mut evidence_list = Vec::with_capacity(instance.gpu_evidence.len());
     for g in &instance.gpu_evidence {
@@ -92,15 +111,22 @@ pub fn nvidia_payload(instance: &InstanceEvidence) -> Result<Value, TransformErr
         decode_b64("gpu_evidence.evidence", &g.evidence)?;
         evidence_list.push(json!({ "certificate": g.certificate, "evidence": g.evidence }));
     }
-    let arch = instance.gpu_evidence[0].arch.clone();
     Ok(json!({ "arch": arch, "evidence_list": evidence_list }))
 }
 
-/// Transform one Chutes instance's evidence into a NEAR-shaped attestation map
-/// for the *format-identical* fields. Fail-closed: any malformed/absent required
-/// field errors. The Chutes-specific bindings (`report_data` freshness via the
-/// ML-KEM `e2e_pubkey`, GPU nonce, register-pin measurement) are verified by the
-/// Chutes verifier in the next PR.
+/// Normalize one Chutes instance's evidence into the **subset** of NEAR
+/// attestation-report fields that are format-identical (`intel_quote`,
+/// `tls_cert_fingerprint`, `nvidia_payload`, `request_nonce`, `instance_id`).
+///
+/// This is intentionally **not** a complete NEAR attestation report: NEAR's
+/// `signing_address` and `event_log` are N/A for Chutes (no separate signing
+/// address; register-pin instead of an event log), and `report_data` is not a
+/// map field at all — it lives inside the decoded `intel_quote`. The Chutes
+/// verifier (next PR) consumes this partial map and additionally checks the
+/// Chutes-shaped bindings (`report_data[0:32] = SHA256(nonce ‖ e2e_pubkey)`,
+/// `[32:64] = tls_cert_fingerprint`, GPU nonce, register-pin measurement).
+///
+/// Fail-closed: any malformed/absent required field errors.
 pub fn to_near_report(
     instance: &InstanceEvidence,
     request_nonce: &str,
@@ -174,6 +200,49 @@ mod tests {
         assert_eq!(p["evidence_list"].as_array().unwrap().len(), 2);
         // Chutes-derived GPU nonce is NOT set here (verifier supplies it).
         assert!(p.get("nonce").is_none());
+    }
+
+    #[test]
+    fn fail_closed_on_inconsistent_gpu_arch() {
+        let mut g2 = gpu();
+        g2.arch = "BLACKWELL".into();
+        let inst = InstanceEvidence {
+            quote: "BAACAIE=".into(),
+            gpu_evidence: vec![gpu(), g2],
+            instance_id: "i1".into(),
+            certificate: REAL_CERT_B64.trim().into(),
+        };
+        assert!(matches!(
+            nvidia_payload(&inst),
+            Err(TransformError::InconsistentGpuArch { .. })
+        ));
+    }
+
+    #[test]
+    fn fail_closed_on_empty_gpu_arch() {
+        let mut g = gpu();
+        g.arch = "  ".into();
+        let inst = InstanceEvidence {
+            quote: "BAACAIE=".into(),
+            gpu_evidence: vec![g],
+            instance_id: "i1".into(),
+            certificate: REAL_CERT_B64.trim().into(),
+        };
+        assert!(matches!(
+            nvidia_payload(&inst),
+            Err(TransformError::EmptyGpuArch)
+        ));
+    }
+
+    #[test]
+    fn base64_decoding_tolerates_surrounding_whitespace() {
+        let inst = InstanceEvidence {
+            quote: "  BAACAIE=\n".into(),
+            gpu_evidence: vec![gpu()],
+            instance_id: "i1".into(),
+            certificate: REAL_CERT_B64.trim().into(),
+        };
+        assert_eq!(intel_quote_hex(&inst).unwrap(), "0400020081");
     }
 
     #[test]

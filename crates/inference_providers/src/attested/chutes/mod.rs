@@ -7,9 +7,12 @@
 //!
 //! Its **attestation path** is what makes it `Attested3p` rather than
 //! `NonAttested`: a later PR wires a `ChutesBackendVerifier` that fetches Chutes'
-//! `/evidence`, transforms the TDX quote + GPU evidence into NEAR's attestation
-//! format, and runs the shared verifier under the strict `Attested3p` policy
-//! (`MeasurementPolicy::attested3p` + `StrictBoundReportDataVerifier`).
+//! `/evidence` (+ the ML-KEM `e2e_pubkey` from `/e2e/instances`), transforms the
+//! TDX quote + GPU evidence into NEAR's attestation shape (see [`attestation`]),
+//! and runs the shared verifier under the `Attested3p` `MeasurementPolicy`. Note
+//! Chutes' `report_data` layout differs from NEAR's, so it needs a **Chutes-
+//! specific** report-data verifier (checking `SHA256(nonce ‖ e2e_pubkey)`), not
+//! NEAR's `StrictBoundReportDataVerifier`.
 //!
 //! # Status — skeleton, behind a hard-off gate
 //!

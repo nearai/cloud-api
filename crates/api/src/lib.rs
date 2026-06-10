@@ -1793,6 +1793,31 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_openapi_conversation_action_paths_use_v1_prefix() {
+        let spec = serde_json::to_value(ApiDoc::openapi()).unwrap();
+        let paths = spec["paths"].as_object().unwrap();
+
+        for path in [
+            "/v1/conversations/{conversation_id}/archive",
+            "/v1/conversations/{conversation_id}/clone",
+            "/v1/conversations/{conversation_id}/pin",
+        ] {
+            assert!(paths.contains_key(path), "missing OpenAPI path: {path}");
+        }
+
+        for path in [
+            "/conversations/{conversation_id}/archive",
+            "/conversations/{conversation_id}/clone",
+            "/conversations/{conversation_id}/pin",
+        ] {
+            assert!(
+                !paths.contains_key(path),
+                "OpenAPI path is missing /v1 prefix: {path}"
+            );
+        }
+    }
+
     /// Example of how to set up the application for E2E testing
     #[tokio::test]
     #[ignore] // Remove ignore to run with a real database and Patroni cluster

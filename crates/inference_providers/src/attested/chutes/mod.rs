@@ -542,13 +542,21 @@ impl InferenceProvider for Provider {
         Ok(m)
     }
 
+    /// Chutes' response integrity is the ML-KEM E2EE channel's AEAD tag, not a
+    /// per-response signature — so the attestation flow skips the signature
+    /// fetch/store step entirely (rather than calling `get_signature` and
+    /// erroring on every completion).
+    fn supports_chat_signatures(&self) -> bool {
+        false
+    }
+
     async fn get_signature(
         &self,
         _chat_id: &str,
         _signing_algo: Option<String>,
     ) -> Result<ChatSignature, CompletionError> {
-        // Chutes' response integrity is the ML-KEM E2EE channel's AEAD tag, not a
-        // separate per-response signature, so there is no signature to retrieve.
+        // Not reached via the normal flow (see supports_chat_signatures = false);
+        // kept explicit so a direct caller gets a clear, non-panicking answer.
         Err(CompletionError::CompletionError(
             "Chutes provides E2EE-channel (AEAD) integrity, not a separate response signature"
                 .to_string(),

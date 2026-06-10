@@ -489,6 +489,15 @@ impl ports::AttestationServiceTrait for AttestationService {
                 AttestationError::ProviderError(format!("No provider found for chat_id: {chat_id}"))
             })?;
 
+        // Some attested providers don't expose per-response signatures — e.g.
+        // Chutes, whose integrity is the ML-KEM E2EE channel's AEAD tag, not a
+        // signed response. For those, there's nothing to fetch/store, so skip the
+        // signature path entirely (calling get_signature would just error and add
+        // failure-metric noise on every attested completion).
+        if !provider.supports_chat_signatures() {
+            return Ok(());
+        }
+
         let environment = get_environment();
         let env_tag = format!("{TAG_ENVIRONMENT}:{environment}");
 

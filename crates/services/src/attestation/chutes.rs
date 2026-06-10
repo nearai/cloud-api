@@ -9,9 +9,11 @@
 //! 2. **`report_data` bindings** — Chutes-specific: `report_data[0:32] =
 //!    SHA256(nonce ‖ e2e_pubkey)` (freshness + E2EE-key binding) and
 //!    `report_data[32:64] = SHA256(SPKI(cert))`.
-//! 3. **Measurement** — register-pin MRTD + RTMR0-2 against a vetted snapshot of
-//!    Chutes' published golden values (Chutes ships no RTMR3 event log, so this
-//!    replaces NEAR's event-log replay + image-hash path).
+//! 3. **Measurement** — register-pin MRTD + RTMR0-2 (boot chain) **and the
+//!    runtime RTMR3** (running app/IMA layer) against a vetted snapshot of
+//!    Chutes' published golden values (`runtime_rtmrs.RTMR3`). This replaces
+//!    NEAR's event-log replay + image-hash path and authenticates the full
+//!    software identity, not just the boot chain.
 //! 4. **GPU** — NVIDIA NRAS, with the *Chutes-derived* nonce
 //!    (`SHA256(nonce ‖ e2e_pubkey)`, the same value sealed in `report_data[0:32]`
 //!    and bound into the GPU SPDM evidence), not the raw caller nonce.
@@ -27,7 +29,7 @@ use std::collections::HashSet;
 use inference_providers::attested::chutes::attestation as transform;
 use inference_providers::attested::chutes::evidence::InstanceEvidence;
 use inference_providers::attested::chutes::measurements::{
-    BootMeasurement, ChutesMeasurementPolicy, MeasurementError,
+    ChutesMeasurementPolicy, ExpectedMeasurement, MeasurementError,
 };
 use inference_providers::attested::chutes::report_data::{
     freshness_digest, ChutesReportDataVerifier, ReportDataError,
@@ -134,10 +136,12 @@ impl ChutesBackendVerifier {
         let cert_der = transform::certificate_der(evidence)?;
         ChutesReportDataVerifier.verify(&td.report_data, boot_nonce, e2e_pubkey, &cert_der)?;
 
-        // 3. Register-pin the boot chain (MRTD + RTMR0-2) to a vetted config.
+        // 3. Register-pin the full chain — MRTD + RTMR0-2 (boot: firmware/kernel/
+        //    cmdline) AND the runtime RTMR3 (running app/IMA layer) — to a vetted
+        //    config (Chutes publishes the runtime RTMR3 in `runtime_rtmrs`).
         let matched = self
             .measurement_policy
-            .verify(&td.mr_td, &td.rt_mr0, &td.rt_mr1, &td.rt_mr2)?;
+            .verify(&td.mr_td, &td.rt_mr0, &td.rt_mr1, &td.rt_mr2, &td.rt_mr3)?;
         let measurement_config = format!("{} v{}", matched.name, matched.version);
 
         // 4. GPU: the SPDM evidence is bound to the Chutes-derived nonce — the
@@ -203,18 +207,22 @@ impl ChutesInstanceVerifier for ChutesBackendVerifier {
 
 /// A vetted snapshot of Chutes' published golden measurements (from the public
 /// `GET https://api.chutes.ai/servers/tee/measurements`), confirmed 2026-06-10 to
-/// match the live GLM-5.1-TEE fleet byte-for-byte on MRTD + RTMR0-2. RTMR3 is a
-/// runtime register and intentionally not pinned. This is the software-identity
-/// anchor for the staging rollout; expand (or make config-driven) as more configs
-/// are independently vetted. Fail-closed: anything not listed here is rejected.
+/// match the live GLM-5.1-TEE fleet byte-for-byte on MRTD + RTMR0-2 (boot chain)
+/// **and the runtime RTMR3** (`runtime_rtmrs.RTMR3`, 6/6 live quotes) — i.e. the
+/// full software identity, boot + running app/IMA layer. This is the
+/// software-identity anchor for the staging rollout; expand (or make
+/// config-driven) as more configs are independently vetted. Fail-closed: anything
+/// not listed here is rejected.
 pub fn vetted_golden_measurements() -> ChutesMeasurementPolicy {
-    ChutesMeasurementPolicy::new(vec![BootMeasurement::new(
+    ChutesMeasurementPolicy::new(vec![ExpectedMeasurement::new(
         "8xh200",
         "1.3.0",
         "ddc6efcdd2309e10837f8a7f64b71272b7ef003b129460410fe715bdfffec38c7c0c1686dddb2a23d4fd623d145e8455",
         "2864b11878e8129095d62a5dd7c3e3aae178d3a077606a825617324768f189ad05aed08376947df92d6c75865d915cbf",
         "f858ed2aecba4ecd29084352c6b5c6e403c0bec89b8c852f90fa5a8cee796ffa095518c5cd8b92c25c1856e932a95877",
         "7719f4fde518994a5dd6767a8b8b87a38168cc0f3480e7498d4ace99e49319be6a7fed26c21ad43310d2d488fc68ab1c",
+        // runtime RTMR3 (runtime_rtmrs.RTMR3) — the running app/IMA layer.
+        "bfac8bbe97148d00c0bc5dea273ccd926e2415511f08f5dedaa96d3c19e824d2bf01fae86e8987ff509fd3ad31374a60",
     )])
 }
 
@@ -235,8 +243,8 @@ mod tests {
         // Valid 48-byte (96 hex char) registers so assert_enforceable passes and
         // the flow can reach the transform stage.
         let reg = "dd".repeat(48);
-        ChutesMeasurementPolicy::new(vec![BootMeasurement::new(
-            "8xh200", "1.3.0", &reg, &reg, &reg, &reg,
+        ChutesMeasurementPolicy::new(vec![ExpectedMeasurement::new(
+            "8xh200", "1.3.0", &reg, &reg, &reg, &reg, &reg,
         )])
     }
 

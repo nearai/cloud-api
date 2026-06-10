@@ -84,9 +84,22 @@ impl Config {
         }
     }
 
+    /// Override the inference base URL (defaults to [`DEFAULT_BASE_URL`]). Used
+    /// by integration tests / mock servers and by the verifier-wiring PR, which
+    /// sources the URL from config rather than hardcoding it.
+    pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
+        self.base_url = base_url.into();
+        self
+    }
+
     /// The OpenAI-compatible inference base URL.
     pub fn base_url(&self) -> &str {
         &self.base_url
+    }
+
+    /// The per-request timeout in seconds (always > 0).
+    pub fn timeout_seconds(&self) -> i64 {
+        self.timeout_seconds
     }
 }
 
@@ -286,12 +299,41 @@ mod tests {
 
     #[test]
     fn config_non_positive_timeout_falls_back_to_default() {
-        // Guards the `timeout_seconds as u64` cast in the HTTP backend.
-        let redacted = format!("{:?}", Config::new("k".into(), "m".into(), -5));
-        assert!(redacted.contains("timeout_seconds: 300"));
-        // And the api_key must not leak through Debug.
-        assert!(redacted.contains("[redacted]"));
-        assert!(!redacted.contains("\"k\""));
+        // Guards the `timeout_seconds as u64` cast in the HTTP backend. Assert on
+        // the accessor, not Debug output, so formatting changes don't break it.
+        assert_eq!(
+            Config::new("k".into(), "m".into(), -5).timeout_seconds(),
+            DEFAULT_TIMEOUT_SECONDS
+        );
+        assert_eq!(
+            Config::new("k".into(), "m".into(), 0).timeout_seconds(),
+            DEFAULT_TIMEOUT_SECONDS
+        );
+        assert_eq!(
+            Config::new("k".into(), "m".into(), 42).timeout_seconds(),
+            42
+        );
+    }
+
+    #[test]
+    fn config_debug_redacts_api_key() {
+        // Use a realistic-length, distinctive secret so the leak check is meaningful.
+        let secret = "cpk_super_secret_value_0123456789abcdef";
+        let redacted = format!("{:?}", Config::new(secret.into(), "m".into(), 60));
+        assert!(redacted.contains("[redacted]"), "key must be redacted");
+        assert!(
+            !redacted.contains(secret),
+            "api_key must never appear in Debug output, got: {redacted}"
+        );
+    }
+
+    #[test]
+    fn with_base_url_overrides_default() {
+        let c = Config::new("k".into(), "m".into(), 60).with_base_url("http://127.0.0.1:9999/v1");
+        assert_eq!(c.base_url(), "http://127.0.0.1:9999/v1");
+        // And the override survives into the provider.
+        let p = Provider::new(c);
+        assert_eq!(p.model_name(), "m");
     }
 
     #[tokio::test]

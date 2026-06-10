@@ -494,6 +494,10 @@ pub struct AudioTranscriptionRequestSchema {
     /// Response format (optional) - one of: "json", "text", "srt", "verbose_json", "vtt"
     #[serde(skip_serializing_if = "Option::is_none")]
     pub response_format: Option<String>,
+
+    /// Timestamp granularities (optional) - currently supports "segment" with verbose_json
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timestamp_granularities: Option<Vec<String>>,
 }
 
 /// Audio transcription request (internal runtime struct)
@@ -596,19 +600,92 @@ impl AudioTranscriptionRequest {
             }
         }
 
+        if let Some(language) = &self.language {
+            if !is_supported_audio_transcription_language(language) {
+                return Err(
+                    "language must be a supported audio transcription language code (e.g. en, fr, yue)".to_string(),
+                );
+            }
+        }
+
         // Validate response_format if provided
         if let Some(format) = &self.response_format {
-            let valid_formats = ["json", "text", "srt", "verbose_json", "vtt"];
-            if !valid_formats.contains(&format.as_str()) {
+            if matches!(format.as_str(), "srt" | "vtt") {
                 return Err(format!(
-                    "Invalid response_format. Must be one of: {}",
-                    valid_formats.join(", ")
+                    "response_format '{}' is not currently supported. Supported response_format values are: json, text, verbose_json",
+                    format
                 ));
+            }
+
+            let supported_formats = ["json", "text", "verbose_json"];
+            if !supported_formats.contains(&format.as_str()) {
+                return Err(format!(
+                    "Invalid response_format. Supported response_format values are: {}",
+                    supported_formats.join(", ")
+                ));
+            }
+        }
+
+        if let Some(granularities) = &self.timestamp_granularities {
+            if self.response_format.as_deref() != Some("verbose_json") {
+                return Err(
+                    "timestamp_granularities requires response_format=verbose_json".to_string(),
+                );
+            }
+
+            if granularities.is_empty() {
+                return Err("timestamp_granularities must not be empty".to_string());
+            }
+
+            for granularity in granularities {
+                match granularity.as_str() {
+                    "segment" => {}
+                    "word" => {
+                        return Err(
+                            "timestamp_granularities[]=word is not currently supported".to_string()
+                        );
+                    }
+                    _ => {
+                        return Err(
+                            "Invalid timestamp_granularities. Must be one of: segment".to_string()
+                        );
+                    }
+                }
             }
         }
 
         Ok(())
     }
+}
+
+const AUDIO_TRANSCRIPTION_LANGUAGE_CODES: &[&str] = &[
+    "aa", "ab", "ae", "af", "ak", "am", "an", "ar", "as", "av", "ay", "az", "ba", "be", "bg", "bh",
+    "bi", "bm", "bn", "bo", "br", "bs", "ca", "ce", "ch", "co", "cr", "cs", "cu", "cv", "cy", "da",
+    "de", "dv", "dz", "ee", "el", "en", "eo", "es", "et", "eu", "fa", "ff", "fi", "fj", "fo", "fr",
+    "fy", "ga", "gd", "gl", "gn", "gu", "gv", "ha", "haw", "he", "hi", "ho", "hr", "ht", "hu",
+    "hy", "hz", "ia", "id", "ie", "ig", "ii", "ik", "io", "is", "it", "iu", "ja", "jv", "jw", "ka",
+    "kg", "ki", "kj", "kk", "kl", "km", "kn", "ko", "kr", "ks", "ku", "kv", "kw", "ky", "la", "lb",
+    "lg", "li", "ln", "lo", "lt", "lu", "lv", "mg", "mh", "mi", "mk", "ml", "mn", "mr", "ms", "mt",
+    "my", "na", "nb", "nd", "ne", "ng", "nl", "nn", "no", "nr", "nv", "ny", "oc", "oj", "om", "or",
+    "os", "pa", "pi", "pl", "ps", "pt", "qu", "rm", "rn", "ro", "ru", "rw", "sa", "sc", "sd", "se",
+    "sg", "si", "sk", "sl", "sm", "sn", "so", "sq", "sr", "ss", "st", "su", "sv", "sw", "ta", "te",
+    "tg", "th", "ti", "tk", "tl", "tn", "to", "tr", "ts", "tt", "tw", "ty", "ug", "uk", "ur", "uz",
+    "ve", "vi", "vo", "wa", "wo", "xh", "yi", "yo", "yue", "za", "zh", "zu",
+];
+
+pub fn normalize_audio_transcription_language(language: &str) -> String {
+    language
+        .split(['-', '_'])
+        .next()
+        .unwrap_or(language)
+        .to_ascii_lowercase()
+}
+
+fn is_supported_audio_transcription_language(language: &str) -> bool {
+    let normalized_language = normalize_audio_transcription_language(language);
+    AUDIO_TRANSCRIPTION_LANGUAGE_CODES
+        .binary_search(&normalized_language.as_str())
+        .is_ok()
 }
 
 // ========== Rerank Models ==========
@@ -682,6 +759,52 @@ pub struct AudioTranscriptionResponse {
     /// Word-level timing information
     #[serde(skip_serializing_if = "Option::is_none")]
     pub words: Option<Vec<TranscriptionWord>>,
+}
+
+impl From<inference_providers::AudioTranscriptionResponse> for AudioTranscriptionResponse {
+    fn from(response: inference_providers::AudioTranscriptionResponse) -> Self {
+        Self {
+            text: response.text,
+            duration: response.duration,
+            language: response.language,
+            segments: response.segments.map(|segments| {
+                segments
+                    .into_iter()
+                    .map(TranscriptionSegment::from)
+                    .collect()
+            }),
+            words: response
+                .words
+                .map(|words| words.into_iter().map(TranscriptionWord::from).collect()),
+        }
+    }
+}
+
+impl From<inference_providers::TranscriptionSegment> for TranscriptionSegment {
+    fn from(segment: inference_providers::TranscriptionSegment) -> Self {
+        Self {
+            id: segment.id,
+            seek: segment.seek,
+            start: segment.start,
+            end: segment.end,
+            text: segment.text,
+            tokens: segment.tokens,
+            temperature: segment.temperature,
+            avg_logprob: segment.avg_logprob,
+            compression_ratio: segment.compression_ratio,
+            no_speech_prob: segment.no_speech_prob,
+        }
+    }
+}
+
+impl From<inference_providers::TranscriptionWord> for TranscriptionWord {
+    fn from(word: inference_providers::TranscriptionWord) -> Self {
+        Self {
+            word: word.word,
+            start: word.start,
+            end: word.end,
+        }
+    }
 }
 
 /// Transcription segment with optional metadata fields
@@ -4016,6 +4139,108 @@ mod tests {
     #[test]
     fn test_is_basic_valid_email_rejects_multiple_ats() {
         assert!(!is_basic_valid_email("user@domain@example.com"));
+    }
+
+    fn audio_transcription_req() -> AudioTranscriptionRequest {
+        AudioTranscriptionRequest {
+            model: "openai/whisper-large-v3".to_string(),
+            file_bytes: vec![1, 2, 3],
+            filename: "audio.mp3".to_string(),
+            language: None,
+            response_format: None,
+            temperature: None,
+            timestamp_granularities: None,
+        }
+    }
+
+    #[test]
+    fn test_audio_transcription_text_response_format_validates() {
+        let mut request = audio_transcription_req();
+        request.response_format = Some("text".to_string());
+
+        assert!(request.validate().is_ok());
+    }
+
+    #[test]
+    fn test_audio_transcription_rejects_unsupported_subtitle_formats() {
+        for format in ["srt", "vtt"] {
+            let mut request = audio_transcription_req();
+            request.response_format = Some(format.to_string());
+
+            let err = request.validate().unwrap_err();
+            assert!(err.contains("not currently supported"), "got: {err}");
+        }
+    }
+
+    #[test]
+    fn test_audio_transcription_rejects_word_timestamp_granularity() {
+        let mut request = audio_transcription_req();
+        request.response_format = Some("verbose_json".to_string());
+        request.timestamp_granularities = Some(vec!["word".to_string()]);
+
+        let err = request.validate().unwrap_err();
+        assert!(err.contains("word"), "got: {err}");
+        assert!(err.contains("not currently supported"), "got: {err}");
+    }
+
+    #[test]
+    fn test_audio_transcription_requires_verbose_json_for_timestamp_granularity() {
+        let mut request = audio_transcription_req();
+        request.timestamp_granularities = Some(vec!["segment".to_string()]);
+
+        let err = request.validate().unwrap_err();
+        assert!(err.contains("response_format=verbose_json"), "got: {err}");
+    }
+
+    #[test]
+    fn test_audio_transcription_rejects_invalid_language() {
+        let mut request = audio_transcription_req();
+        request.language = Some("xx".to_string());
+
+        let err = request.validate().unwrap_err();
+        assert!(
+            err.contains("supported audio transcription language code"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_audio_transcription_accepts_normalized_language_forms() {
+        for language in ["EN", "En", "en-US", "fr_CA", "yue", "haw", "jw"] {
+            let mut request = audio_transcription_req();
+            request.language = Some(language.to_string());
+
+            assert!(
+                request.validate().is_ok(),
+                "expected language {language} to pass validation"
+            );
+        }
+    }
+
+    #[test]
+    fn test_normalize_audio_transcription_language() {
+        assert_eq!(normalize_audio_transcription_language("EN"), "en");
+        assert_eq!(normalize_audio_transcription_language("en-US"), "en");
+        assert_eq!(normalize_audio_transcription_language("fr_CA"), "fr");
+        assert_eq!(normalize_audio_transcription_language("yue"), "yue");
+    }
+
+    #[test]
+    fn test_audio_transcription_response_conversion_omits_provider_id() {
+        let provider_response = inference_providers::AudioTranscriptionResponse {
+            text: "hello".to_string(),
+            duration: Some(1.0),
+            language: Some("en".to_string()),
+            segments: None,
+            words: None,
+            id: Some("trans-internal".to_string()),
+        };
+
+        let response = AudioTranscriptionResponse::from(provider_response);
+        let value = serde_json::to_value(response).unwrap();
+
+        assert!(value.get("id").is_none());
+        assert_eq!(value["text"], "hello");
     }
 
     // ── ImageGenerationRequest size validation ──

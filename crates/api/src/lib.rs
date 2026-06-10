@@ -834,6 +834,10 @@ pub fn build_app_with_config(
         usage_state.clone(),
         rate_limit_state.clone(),
     );
+    let unsupported_openai_routes = build_unsupported_openai_routes(
+        &auth_components.auth_state_middleware,
+        rate_limit_state.clone(),
+    );
 
     let mcp_routes = build_mcp_routes(
         domain_services.web_search_provider.clone(),
@@ -933,6 +937,7 @@ pub fn build_app_with_config(
                 .nest("/auth", auth_routes)
                 .merge(completion_routes)
                 .merge(response_routes)
+                .merge(unsupported_openai_routes)
                 .merge(conversation_routes)
                 .merge(management_routes)
                 .merge(workspace_routes)
@@ -1176,6 +1181,23 @@ pub fn build_response_routes(
         ));
 
     Router::new().merge(inference_routes).merge(other_routes)
+}
+
+/// Build explicit not-implemented handlers for recognized OpenAI-compatible
+/// endpoints that cloud-api does not support yet.
+pub fn build_unsupported_openai_routes(
+    auth_state_middleware: &AuthState,
+    rate_limit_state: middleware::RateLimitState,
+) -> Router {
+    routes::unsupported::openai_compat_routes()
+        .layer(from_fn_with_state(
+            rate_limit_state,
+            middleware::api_key_rate_limit_middleware,
+        ))
+        .layer(from_fn_with_state(
+            auth_state_middleware.clone(),
+            middleware::auth::auth_middleware_with_workspace_context,
+        ))
 }
 
 pub fn build_mcp_routes(

@@ -33,6 +33,10 @@ use inference_providers::attested::chutes::report_data::{
     freshness_digest, ChutesReportDataVerifier, ReportDataError,
 };
 
+use inference_providers::attested::chutes::verifier_port::{
+    ChutesInstanceVerifier, VerifiedInstanceInfo,
+};
+
 use super::measurement::MeasurementPolicy;
 use super::verification::{AttestationVerificationError, AttestationVerifier};
 
@@ -166,6 +170,32 @@ impl ChutesBackendVerifier {
     }
 }
 
+/// Dependency-inversion seam: let the `inference_providers` Chutes `Provider`
+/// (which can't depend on `services`) drive this verifier through a narrow port.
+/// Maps the rich [`ChutesVerifiedInstance`] to the port's [`VerifiedInstanceInfo`]
+/// and flattens the typed error to a safe string (no secrets/plaintext).
+#[async_trait::async_trait]
+impl ChutesInstanceVerifier for ChutesBackendVerifier {
+    async fn attest_instance(
+        &self,
+        evidence: &InstanceEvidence,
+        boot_nonce: &str,
+        e2e_pubkey: &str,
+    ) -> Result<VerifiedInstanceInfo, String> {
+        // Inherent `verify_instance` (not the trait method) does the work.
+        self.verify_instance(evidence, boot_nonce, e2e_pubkey)
+            .await
+            .map(|v| VerifiedInstanceInfo {
+                instance_id: v.instance_id,
+                e2e_pubkey: v.e2e_pubkey,
+                measurement_config: v.measurement_config,
+                tcb_status: v.tcb_status,
+                gpu_verdict: v.gpu_verdict,
+            })
+            .map_err(|e| e.to_string())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -202,6 +232,22 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, ChutesVerifyError::Measurement(_)));
+    }
+
+    #[tokio::test]
+    async fn port_attest_instance_maps_error_to_string() {
+        // Through the dependency-inversion port, a fail-closed rejection surfaces
+        // as an Err(String) (no panic, no secrets) — the provider treats it fatal.
+        let v = ChutesBackendVerifier::new(ChutesMeasurementPolicy::new(vec![]), None);
+        let err = ChutesInstanceVerifier::attest_instance(
+            &v,
+            &dummy_evidence("BAACAIE="),
+            &"a".repeat(64),
+            "pk",
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("measurement") || err.contains("attest"));
     }
 
     #[tokio::test]

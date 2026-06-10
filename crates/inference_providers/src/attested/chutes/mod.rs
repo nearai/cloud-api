@@ -31,6 +31,7 @@ pub mod e2ee;
 pub mod evidence;
 pub mod measurements;
 pub mod report_data;
+pub mod verifier_port;
 
 use async_trait::async_trait;
 use std::sync::Arc;

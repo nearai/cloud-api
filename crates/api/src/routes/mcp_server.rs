@@ -5,7 +5,7 @@ use crate::models::ErrorResponse;
 use axum::{
     extract::{Extension, Json, State},
     http::StatusCode,
-    response::Json as ResponseJson,
+    response::{IntoResponse, Json as ResponseJson, Response},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -20,6 +20,7 @@ const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
 const MCP_SERVER_VERSION: &str = "1.0.0";
 const WEB_SEARCH_TOOL_NAME: &str = "web_search";
 const WEB_SEARCH_TOOL_DESCRIPTION: &str = "Search the web and return structured search results.";
+const MCP_INITIALIZED_NOTIFICATION: &str = "notifications/initialized";
 // JSON-RPC reserves -32000..-32099 for server-defined errors. We use a small
 // stable subset here to translate HTTP-layer auth/usage/rate-limit failures
 // into MCP-framed responses without changing the underlying REST middleware.
@@ -136,20 +137,17 @@ struct McpWebSearchArgs {
     operators: Option<bool>,
 }
 
-fn ok_response(id: Option<Value>, result: Value) -> ResponseJson<McpResponse> {
+fn ok_response(id: Option<Value>, result: Value) -> Response {
     ResponseJson(McpResponse {
         jsonrpc: "2.0",
         id: response_id(id),
         result: Some(result),
         error: None,
     })
+    .into_response()
 }
 
-fn error_response(
-    id: Option<Value>,
-    code: i64,
-    message: impl Into<String>,
-) -> ResponseJson<McpResponse> {
+fn error_response(id: Option<Value>, code: i64, message: impl Into<String>) -> Response {
     ResponseJson(McpResponse {
         jsonrpc: "2.0",
         id: response_id(id),
@@ -159,13 +157,18 @@ fn error_response(
             message: message.into(),
         }),
     })
+    .into_response()
+}
+
+fn notification_accepted_response() -> Response {
+    StatusCode::ACCEPTED.into_response()
 }
 
 fn map_http_error_to_mcp_error(
     id: Option<Value>,
     status: StatusCode,
     error: ErrorResponse,
-) -> ResponseJson<McpResponse> {
+) -> Response {
     // This helper only translates HTTP-style errors from MCP-local checks
     // (`check_usage_for_api_key` and `check_rate_limit_for_api_key`).
     // JSON parsing/protocol errors and tool execution errors are mapped in the
@@ -180,10 +183,7 @@ fn map_http_error_to_mcp_error(
     error_response(id, code, error.error.message)
 }
 
-fn map_mcp_service_error(
-    id: Option<Value>,
-    error: WebSearchServiceError,
-) -> ResponseJson<McpResponse> {
+fn map_mcp_service_error(id: Option<Value>, error: WebSearchServiceError) -> Response {
     match error {
         WebSearchServiceError::EmptyQuery => error_response(
             id,
@@ -240,10 +240,16 @@ pub async fn handle_mcp_request(
     State(state): State<McpRouteState>,
     Extension(api_key): Extension<AuthenticatedApiKey>,
     Json(request): Json<McpRequest>,
-) -> Result<ResponseJson<McpResponse>, (StatusCode, ResponseJson<ErrorResponse>)> {
+) -> Result<Response, (StatusCode, ResponseJson<ErrorResponse>)> {
     let request_id = request.id.clone();
 
     if request_id.is_none() {
+        if request.jsonrpc.as_deref() == Some("2.0")
+            && request.method == MCP_INITIALIZED_NOTIFICATION
+        {
+            return Ok(notification_accepted_response());
+        }
+
         return Ok(error_response(
             request_id,
             JSONRPC_INVALID_REQUEST,

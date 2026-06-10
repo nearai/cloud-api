@@ -212,6 +212,8 @@ pub struct ResponseTemplate {
     reasoning_content: Option<String>,
     /// Simulate client disconnect after N chunks (stream ends without final usage chunk)
     disconnect_after_chunks: Option<usize>,
+    /// Simulate an upstream stream error after N chunks.
+    stream_error_after_chunks: Option<(usize, CompletionError)>,
     /// Tool calls to include in the response
     tool_calls: Option<Vec<ToolCall>>,
     /// If set, usage will include prompt_tokens_details.cached_tokens (for cache-hit tests)
@@ -229,6 +231,7 @@ impl ResponseTemplate {
             content: content.into(),
             reasoning_content: None,
             disconnect_after_chunks: None,
+            stream_error_after_chunks: None,
             tool_calls: None,
             cache_tokens: None,
             model_override: None,
@@ -265,6 +268,12 @@ impl ResponseTemplate {
     /// The stream will be truncated and end without the final usage chunk
     pub fn with_disconnect_after(mut self, chunks: usize) -> Self {
         self.disconnect_after_chunks = Some(chunks);
+        self
+    }
+
+    /// Simulate an upstream stream error after N chunks
+    pub fn with_stream_error_after(mut self, chunks: usize, error: CompletionError) -> Self {
+        self.stream_error_after_chunks = Some((chunks, error));
         self
     }
 
@@ -577,6 +586,8 @@ struct MockConfig {
     default_response: ResponseTemplate,
     /// When set, all chat completion calls return this error instead of generating a response
     error_override: Option<CompletionError>,
+    /// When set, all chat completion streams are created successfully and then yield this error.
+    stream_error_override: Option<CompletionError>,
     /// When set, all embeddings calls return this error instead of generating a response
     embedding_error_override: Option<EmbeddingError>,
 }
@@ -628,6 +639,7 @@ impl MockProvider {
                 expectations: Vec::new(),
                 default_response: ResponseTemplate::new("1. 2. 3."),
                 error_override: None,
+                stream_error_override: None,
                 embedding_error_override: None,
             })),
             last_chat_params: Arc::new(Mutex::new(None)),
@@ -646,6 +658,7 @@ impl MockProvider {
                 expectations: Vec::new(),
                 default_response: ResponseTemplate::new("1. 2. 3."),
                 error_override: None,
+                stream_error_override: None,
                 embedding_error_override: None,
             })),
             last_chat_params: Arc::new(Mutex::new(None)),
@@ -662,6 +675,7 @@ impl MockProvider {
                 expectations: Vec::new(),
                 default_response: ResponseTemplate::new("1. 2. 3."),
                 error_override: None,
+                stream_error_override: None,
                 embedding_error_override: None,
             })),
             last_chat_params: Arc::new(Mutex::new(None)),
@@ -717,6 +731,14 @@ impl MockProvider {
     pub async fn set_error_override(&self, error: Option<CompletionError>) {
         let mut config = self.config.lock().await;
         config.error_override = error;
+    }
+
+    /// Set a stream error override — when set, chat completion stream creation succeeds
+    /// and the returned stream yields this error.
+    /// Pass `None` to clear the override.
+    pub async fn set_stream_error_override(&self, error: Option<CompletionError>) {
+        let mut config = self.config.lock().await;
+        config.stream_error_override = error;
     }
 
     /// Override the embeddings response with an error (useful for testing error paths).
@@ -869,6 +891,10 @@ impl crate::InferenceProvider for MockProvider {
             if let Some(ref error) = config.error_override {
                 return Err(error.clone());
             }
+            if let Some(ref error) = config.stream_error_override {
+                let stream = stream::iter(vec![Err(error.clone())]);
+                return Ok(Box::pin(stream));
+            }
             config
                 .expectations
                 .iter()
@@ -899,6 +925,13 @@ impl crate::InferenceProvider for MockProvider {
         if let Some(disconnect_at) = response_template.disconnect_after_chunks {
             chunks.truncate(disconnect_at);
         }
+        let stream_error =
+            if let Some((error_at, error)) = &response_template.stream_error_after_chunks {
+                chunks.truncate(*error_at);
+                Some(error.clone())
+            } else {
+                None
+            };
 
         // Register signature hashes for this chat_id.
         // response_hash is computed over the exact wire bytes this mock emits
@@ -917,7 +950,7 @@ impl crate::InferenceProvider for MockProvider {
             for chunk in &chunks {
                 accumulated.extend_from_slice(&Self::mock_chunk_wire_bytes(chunk)?);
             }
-            if response_template.disconnect_after_chunks.is_none() {
+            if response_template.disconnect_after_chunks.is_none() && stream_error.is_none() {
                 accumulated.extend_from_slice(b"data: [DONE]\n\n");
             }
             let response_hash = compute_sha256_hex(&accumulated);
@@ -925,7 +958,8 @@ impl crate::InferenceProvider for MockProvider {
                 .await;
         }
 
-        let send_done = response_template.disconnect_after_chunks.is_none();
+        let send_done =
+            response_template.disconnect_after_chunks.is_none() && stream_error.is_none();
 
         // Convert chunks to an SSE event stream carrying the exact wire bytes
         // alongside the parsed chunk, like the real BufferedSSEParser does.
@@ -948,7 +982,8 @@ impl crate::InferenceProvider for MockProvider {
                         chunk: None,
                         raw_passthrough: true,
                     })
-                })),
+                }))
+                .chain(stream_error.into_iter().map(Err)),
         );
 
         Ok(Box::pin(stream))

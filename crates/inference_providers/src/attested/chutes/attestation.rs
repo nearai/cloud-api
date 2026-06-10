@@ -182,16 +182,22 @@ mod tests {
     }
 
     #[test]
-    fn tls_fingerprint_from_real_cert_is_64_hex() {
+    fn tls_fingerprint_from_synthetic_cert_matches_expected() {
         let inst = InstanceEvidence {
             quote: "BAACAIE=".into(),
             gpu_evidence: vec![gpu()],
             instance_id: "i1".into(),
             certificate: TEST_CERT_B64.trim().into(),
         };
-        let fp = tls_cert_fingerprint(&inst).expect("real cert SPKI fingerprint");
-        assert_eq!(fp.len(), 64, "sha256 hex");
-        assert!(fp.chars().all(|c| c.is_ascii_hexdigit()));
+        let fp = tls_cert_fingerprint(&inst).expect("synthetic cert SPKI fingerprint");
+        // Pin the exact value: a length-only check would miss a regression in
+        // compute_spki_fingerprint_from_der (e.g. hashing the whole cert DER
+        // instead of the SPKI), which would only surface later as a runtime
+        // report_data[32:64] mismatch.
+        assert_eq!(
+            fp,
+            "e7c25815d0d940fea893d56984e131788afa6e931920093c9c2896fb04dea0da"
+        );
     }
 
     #[test]

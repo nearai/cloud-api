@@ -27,15 +27,28 @@
 //! the job of the Chutes-specific verifier (a later PR); this module only models
 //! the wire shape and extracts the fields.
 
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
+
+/// Deserialize a value that may be absent **or explicitly `null`** into its
+/// `Default`. `#[serde(default)]` alone only covers an absent key; Python-backed
+/// APIs (like Chutes') commonly emit `null` for empty lists, which would
+/// otherwise fail deserialization of the whole response.
+fn null_default<'de, D, T>(d: D) -> Result<T, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de> + Default,
+{
+    Ok(Option::<T>::deserialize(d)?.unwrap_or_default())
+}
 
 /// Top-level response of `GET /chutes/{chute_id}/evidence?nonce=...`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct EvidenceResponse {
     /// One entry per live instance of the chute.
     pub evidence: Vec<InstanceEvidence>,
-    /// Instances whose evidence collection failed (best-effort; informational).
-    #[serde(default)]
+    /// Instances whose evidence collection failed (best-effort; informational —
+    /// tolerant of an absent key or an explicit `null`).
+    #[serde(default, deserialize_with = "null_default")]
     pub failed_instance_ids: Vec<String>,
 }
 
@@ -44,8 +57,8 @@ pub struct EvidenceResponse {
 pub struct InstanceEvidence {
     /// Base64-encoded raw Intel TDX quote.
     pub quote: String,
-    /// Per-GPU NVIDIA confidential-compute evidence.
-    #[serde(default)]
+    /// Per-GPU NVIDIA confidential-compute evidence (tolerant of absent/`null`).
+    #[serde(default, deserialize_with = "null_default")]
     pub gpu_evidence: Vec<GpuEvidence>,
     /// Instance identifier (UUID).
     pub instance_id: String,
@@ -114,5 +127,17 @@ mod tests {
         let r: EvidenceResponse =
             serde_json::from_str(r#"{"evidence":[]}"#).expect("failed_instance_ids is optional");
         assert!(r.failed_instance_ids.is_empty());
+    }
+
+    #[test]
+    fn explicit_null_lists_tolerated() {
+        // Python-backed APIs often emit null for empty lists; must not fail the
+        // whole parse (gpu_evidence + failed_instance_ids are null-tolerant).
+        let r: EvidenceResponse = serde_json::from_str(
+            r#"{"evidence":[{"quote":"q","gpu_evidence":null,"instance_id":"i","certificate":"c"}],"failed_instance_ids":null}"#,
+        )
+        .expect("explicit null lists should deserialize to empty");
+        assert!(r.failed_instance_ids.is_empty());
+        assert!(r.evidence[0].gpu_evidence.is_empty());
     }
 }

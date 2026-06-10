@@ -1798,6 +1798,7 @@ mod tests {
         let spec = serde_json::to_value(ApiDoc::openapi()).unwrap();
         let paths = spec["paths"].as_object().unwrap();
 
+        // Pin/unpin and archive/unarchive share path keys with different methods.
         for path in [
             "/v1/conversations/{conversation_id}/archive",
             "/v1/conversations/{conversation_id}/clone",

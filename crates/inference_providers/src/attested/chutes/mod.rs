@@ -41,31 +41,65 @@ pub const DEFAULT_BASE_URL: &str = "https://llm.chutes.ai/v1";
 
 /// Configuration for a Chutes attested provider.
 ///
+/// Fields are **private** and the only constructor is [`Config::new`], so the
+/// `api_key` secret cannot be exposed by a derived `Debug` (see the custom,
+/// redacting `Debug` impl below) and `timeout_seconds` cannot be set to a
+/// negative value that would underflow the `as u64` cast in the HTTP layer.
+///
 /// The attestation-specific fields (chute id, `/evidence` endpoint, golden
 /// measurements) are added by the PR that wires the verifier; this skeleton only
 /// needs what the OpenAI-compatible data path uses.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Config {
     /// OpenAI-compatible inference base URL (e.g. `https://llm.chutes.ai/v1`).
-    pub base_url: String,
+    base_url: String,
     /// Chutes API key (`cpk_...`). A secret — sourced from env/secret store,
-    /// never hard-coded or logged.
-    pub api_key: String,
+    /// never hard-coded or logged (redacted in `Debug`).
+    api_key: String,
     /// The model id as served by Chutes (e.g. `zai-org/GLM-5.1-TEE`).
-    pub model_name: String,
-    /// Per-request timeout, seconds.
-    pub timeout_seconds: i64,
+    model_name: String,
+    /// Per-request timeout, seconds. Always > 0 (see `new`).
+    timeout_seconds: i64,
 }
 
+/// Sane fallback when a non-positive timeout is supplied (matches the external
+/// provider default); a non-positive value would otherwise underflow the
+/// `timeout_seconds as u64` cast in the HTTP backend into an effectively
+/// infinite timeout.
+const DEFAULT_TIMEOUT_SECONDS: i64 = 300;
+
 impl Config {
-    /// Build a config pointing at Chutes' default inference URL.
+    /// Build a config pointing at Chutes' default inference URL. A non-positive
+    /// `timeout_seconds` is replaced with [`DEFAULT_TIMEOUT_SECONDS`].
     pub fn new(api_key: String, model_name: String, timeout_seconds: i64) -> Self {
         Self {
             base_url: DEFAULT_BASE_URL.to_string(),
             api_key,
             model_name,
-            timeout_seconds,
+            timeout_seconds: if timeout_seconds > 0 {
+                timeout_seconds
+            } else {
+                DEFAULT_TIMEOUT_SECONDS
+            },
         }
+    }
+
+    /// The OpenAI-compatible inference base URL.
+    pub fn base_url(&self) -> &str {
+        &self.base_url
+    }
+}
+
+// Manual `Debug` that redacts the API key. Never derive `Debug` on a struct
+// holding a secret — an accidental `{:?}` (init/error log) would leak it.
+impl std::fmt::Debug for Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Config")
+            .field("base_url", &self.base_url)
+            .field("api_key", &"[redacted]")
+            .field("model_name", &self.model_name)
+            .field("timeout_seconds", &self.timeout_seconds)
+            .finish()
     }
 }
 
@@ -247,21 +281,35 @@ mod tests {
     #[test]
     fn config_default_base_url() {
         let c = Config::new("k".to_string(), "m".to_string(), 60);
-        assert_eq!(c.base_url, "https://llm.chutes.ai/v1");
+        assert_eq!(c.base_url(), "https://llm.chutes.ai/v1");
+    }
+
+    #[test]
+    fn config_non_positive_timeout_falls_back_to_default() {
+        // Guards the `timeout_seconds as u64` cast in the HTTP backend.
+        let redacted = format!("{:?}", Config::new("k".into(), "m".into(), -5));
+        assert!(redacted.contains("timeout_seconds: 300"));
+        // And the api_key must not leak through Debug.
+        assert!(redacted.contains("[redacted]"));
+        assert!(!redacted.contains("\"k\""));
     }
 
     #[tokio::test]
     async fn attestation_methods_error_until_wired() {
         let p = Provider::new(Config::new("k".to_string(), "m".to_string(), 60));
 
-        let att = p
+        // Match the concrete error variant + message (not the Debug string).
+        match p
             .get_attestation_report("m".to_string(), None, None, None, true)
-            .await;
-        assert!(att.is_err(), "attestation must not appear available yet");
-        assert!(format!("{:?}", att.unwrap_err()).contains("not yet wired"));
+            .await
+        {
+            Err(AttestationError::FetchError(msg)) => assert!(msg.contains("not yet wired")),
+            other => panic!("expected AttestationError::FetchError, got {other:?}"),
+        }
 
-        let sig = p.get_signature("chat-1", None).await;
-        assert!(sig.is_err(), "signature must not appear available yet");
-        assert!(format!("{:?}", sig.unwrap_err()).contains("not yet wired"));
+        match p.get_signature("chat-1", None).await {
+            Err(CompletionError::CompletionError(msg)) => assert!(msg.contains("not yet wired")),
+            other => panic!("expected CompletionError::CompletionError, got {other:?}"),
+        }
     }
 }

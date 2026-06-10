@@ -4088,11 +4088,9 @@ fn apply_rerank_response_options(
     request: &crate::models::RerankRequest,
     response: &mut inference_providers::RerankResponse,
 ) {
-    response.results.sort_by(|a, b| {
-        b.relevance_score
-            .partial_cmp(&a.relevance_score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
+    response
+        .results
+        .sort_by(|a, b| b.relevance_score.total_cmp(&a.relevance_score));
 
     if let Some(top_n) = request.top_n {
         response.results.truncate(top_n);

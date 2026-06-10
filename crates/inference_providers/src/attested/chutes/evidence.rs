@@ -44,7 +44,11 @@ where
 /// Top-level response of `GET /chutes/{chute_id}/evidence?nonce=...`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct EvidenceResponse {
-    /// One entry per live instance of the chute.
+    /// One entry per live instance of the chute. Null-tolerant for symmetry with
+    /// the sibling list fields: a chute with zero live instances can come back as
+    /// `"evidence": null`, which must reach the clean "instance not found" path
+    /// rather than fail the whole parse with an opaque serde error.
+    #[serde(default, deserialize_with = "null_default")]
     pub evidence: Vec<InstanceEvidence>,
     /// Instances whose evidence collection failed (best-effort; informational —
     /// tolerant of an absent key or an explicit `null`).
@@ -127,6 +131,18 @@ mod tests {
         let r: EvidenceResponse =
             serde_json::from_str(r#"{"evidence":[]}"#).expect("failed_instance_ids is optional");
         assert!(r.failed_instance_ids.is_empty());
+    }
+
+    #[test]
+    fn explicit_null_evidence_tolerated() {
+        // A chute with zero live instances may come back as `"evidence": null`.
+        // It must parse to an empty list and reach the clean "instance not found"
+        // path, not fail the whole response with an opaque serde error.
+        let r: EvidenceResponse =
+            serde_json::from_str(r#"{"evidence":null,"failed_instance_ids":[]}"#)
+                .expect("explicit null evidence should deserialize to empty");
+        assert!(r.evidence.is_empty());
+        assert!(r.instance("anything").is_none());
     }
 
     #[test]

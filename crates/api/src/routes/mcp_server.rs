@@ -20,7 +20,6 @@ const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
 const MCP_SERVER_VERSION: &str = "1.0.0";
 const WEB_SEARCH_TOOL_NAME: &str = "web_search";
 const WEB_SEARCH_TOOL_DESCRIPTION: &str = "Search the web and return structured search results.";
-const MCP_INITIALIZED_NOTIFICATION: &str = "notifications/initialized";
 // JSON-RPC reserves -32000..-32099 for server-defined errors. We use a small
 // stable subset here to translate HTTP-layer auth/usage/rate-limit failures
 // into MCP-framed responses without changing the underlying REST middleware.
@@ -164,6 +163,10 @@ fn notification_accepted_response() -> Response {
     StatusCode::ACCEPTED.into_response()
 }
 
+fn is_mcp_notification(request: &McpRequest) -> bool {
+    request.jsonrpc.as_deref() == Some("2.0") && request.method.starts_with("notifications/")
+}
+
 fn map_http_error_to_mcp_error(
     id: Option<Value>,
     status: StatusCode,
@@ -244,9 +247,7 @@ pub async fn handle_mcp_request(
     let request_id = request.id.clone();
 
     if request_id.is_none() {
-        if request.jsonrpc.as_deref() == Some("2.0")
-            && request.method == MCP_INITIALIZED_NOTIFICATION
-        {
+        if is_mcp_notification(&request) {
             return Ok(notification_accepted_response());
         }
 

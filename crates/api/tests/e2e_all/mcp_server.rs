@@ -39,7 +39,7 @@ async fn test_mcp_requires_api_key_auth() {
 }
 
 #[tokio::test]
-async fn test_mcp_missing_id_returns_jsonrpc_error() {
+async fn test_mcp_non_notification_missing_id_returns_jsonrpc_error() {
     let (server, _database) = setup_test_server_with_mock_web_search().await;
     let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
     let api_key = get_api_key_for_org(&server, org.id.clone()).await;
@@ -62,22 +62,32 @@ async fn test_mcp_missing_id_returns_jsonrpc_error() {
 }
 
 #[tokio::test]
-async fn test_mcp_initialized_notification_is_accepted_without_id() {
+async fn test_mcp_notifications_are_accepted_without_id() {
     let (server, _database) = setup_test_server_with_mock_web_search().await;
     let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
     let api_key = get_api_key_for_org(&server, org.id.clone()).await;
 
-    let response = server
-        .post("/mcp")
-        .add_header("Authorization", format!("Bearer {api_key}"))
-        .json(&json!({
-            "jsonrpc": "2.0",
-            "method": "notifications/initialized"
-        }))
-        .await;
+    for method in [
+        "notifications/initialized",
+        "notifications/cancelled",
+        "notifications/progress",
+        "notifications/roots/list_changed",
+    ] {
+        let response = server
+            .post("/mcp")
+            .add_header("Authorization", format!("Bearer {api_key}"))
+            .json(&json!({
+                "jsonrpc": "2.0",
+                "method": method
+            }))
+            .await;
 
-    assert_eq!(response.status_code(), 202, "{}", response.text());
-    assert!(response.text().is_empty());
+        assert_eq!(response.status_code(), 202, "{method}: {}", response.text());
+        assert!(
+            response.text().is_empty(),
+            "{method}: notification response body should be empty"
+        );
+    }
 }
 
 #[tokio::test]

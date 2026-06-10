@@ -1185,6 +1185,9 @@ pub fn build_response_routes(
 
 /// Build explicit not-implemented handlers for recognized OpenAI-compatible
 /// endpoints that cloud-api does not support yet.
+///
+/// These routes intentionally sit behind the normal API-key middleware, so
+/// unauthenticated callers receive the standard 401 before the 501 placeholder.
 pub fn build_unsupported_openai_routes(
     auth_state_middleware: &AuthState,
     rate_limit_state: middleware::RateLimitState,

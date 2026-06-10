@@ -1,7 +1,7 @@
 use crate::models::ErrorResponse;
-use axum::extract::Request;
-use axum::http::StatusCode;
-use axum::routing::{get, post};
+use axum::extract::OriginalUri;
+use axum::http::{Method, StatusCode};
+use axum::routing::{any, get, post};
 use axum::{Json, Router};
 
 /// Known OpenAI-compatible endpoints that are not implemented yet.
@@ -14,30 +14,25 @@ pub fn openai_compat_routes() -> Router {
         .route("/images/variations", post(openai_endpoint_not_implemented))
         .route("/audio/translations", post(openai_endpoint_not_implemented))
         .route("/moderations", post(openai_endpoint_not_implemented))
-        .route(
-            "/batches",
-            get(openai_endpoint_not_implemented).post(openai_endpoint_not_implemented),
-        )
-        .route(
-            "/threads",
-            get(openai_endpoint_not_implemented).post(openai_endpoint_not_implemented),
-        )
-        .route("/assistants", get(openai_endpoint_not_implemented))
+        .route("/batches", any(openai_endpoint_not_implemented))
+        .route("/batches/{*path}", any(openai_endpoint_not_implemented))
+        .route("/threads", any(openai_endpoint_not_implemented))
+        .route("/threads/{*path}", any(openai_endpoint_not_implemented))
+        .route("/assistants", any(openai_endpoint_not_implemented))
+        .route("/assistants/{*path}", any(openai_endpoint_not_implemented))
         .route("/responses", get(openai_endpoint_not_implemented))
         .route("/models", post(openai_endpoint_not_implemented))
-        .route(
-            "/models/{*model_id}",
-            get(openai_endpoint_not_implemented).delete(openai_endpoint_not_implemented),
-        )
+        .route("/models/{*model_id}", any(openai_endpoint_not_implemented))
 }
 
 pub async fn openai_endpoint_not_implemented(
-    request: Request,
+    method: Method,
+    OriginalUri(uri): OriginalUri,
 ) -> (StatusCode, Json<ErrorResponse>) {
     let message = format!(
         "{} {} is not implemented by NEAR AI Cloud yet",
-        request.method(),
-        request.uri().path()
+        method,
+        uri.path()
     );
 
     (
@@ -56,22 +51,28 @@ mod tests {
     #[tokio::test]
     async fn unsupported_openai_routes_return_json_envelope() {
         let cases = [
-            (Method::POST, "/images/variations"),
-            (Method::POST, "/audio/translations"),
-            (Method::POST, "/moderations"),
-            (Method::GET, "/batches"),
-            (Method::POST, "/batches"),
-            (Method::GET, "/threads"),
-            (Method::POST, "/threads"),
-            (Method::GET, "/assistants"),
-            (Method::GET, "/responses"),
-            (Method::POST, "/models"),
-            (Method::GET, "/models/openai/gpt-oss-120b"),
-            (Method::DELETE, "/models/openai/gpt-oss-120b"),
+            (Method::POST, "/v1/images/variations"),
+            (Method::POST, "/v1/audio/translations"),
+            (Method::POST, "/v1/moderations"),
+            (Method::GET, "/v1/batches"),
+            (Method::POST, "/v1/batches"),
+            (Method::GET, "/v1/batches/batch_123"),
+            (Method::POST, "/v1/batches/batch_123/cancel"),
+            (Method::GET, "/v1/threads"),
+            (Method::POST, "/v1/threads"),
+            (Method::GET, "/v1/threads/thread_123"),
+            (Method::DELETE, "/v1/threads/thread_123"),
+            (Method::GET, "/v1/assistants"),
+            (Method::POST, "/v1/assistants"),
+            (Method::GET, "/v1/assistants/asst_123"),
+            (Method::GET, "/v1/responses"),
+            (Method::POST, "/v1/models"),
+            (Method::GET, "/v1/models/openai/gpt-oss-120b"),
+            (Method::DELETE, "/v1/models/openai/gpt-oss-120b"),
         ];
 
         for (method, path) in cases {
-            let app = openai_compat_routes();
+            let app = Router::new().nest("/v1", openai_compat_routes());
             let response = app
                 .oneshot(
                     HttpRequest::builder()

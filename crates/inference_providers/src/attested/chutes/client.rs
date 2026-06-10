@@ -131,6 +131,9 @@ const READ_TIMEOUT_SECS: u64 = 90;
 /// Upper bound on a non-streaming response body (the E2EE response blob is small;
 /// this caps a misbehaving/hostile gateway, consistent with the gunzip guard).
 const MAX_RESPONSE_BYTES: u64 = 64 * 1024 * 1024;
+/// Upper bound on an error-response body we read for diagnostics (kept small —
+/// only a short prefix is surfaced in the error message anyway).
+const MAX_ERROR_BODY_BYTES: u64 = 16 * 1024;
 
 impl ChutesClient {
     /// Build a client with the default hosts and a per-request timeout (seconds)
@@ -235,25 +238,9 @@ impl ChutesClient {
             .send()
             .await?;
         let resp = error_for_status(resp).await?;
-        // Reject an over-large body — early if declared, and after read as a
-        // backstop (the response blob is small; this bounds a hostile gateway).
-        if resp
-            .content_length()
-            .is_some_and(|n| n > MAX_RESPONSE_BYTES)
-        {
-            return Err(ChutesClientError::Status {
-                status: 0,
-                body: format!("response Content-Length exceeds {MAX_RESPONSE_BYTES} bytes"),
-            });
-        }
-        let bytes = resp.bytes().await?;
-        if bytes.len() as u64 > MAX_RESPONSE_BYTES {
-            return Err(ChutesClientError::Status {
-                status: 0,
-                body: format!("response body exceeds {MAX_RESPONSE_BYTES} bytes"),
-            });
-        }
-        Ok(bytes.to_vec())
+        // Read the body *incrementally* with a cap so a chunked response without
+        // Content-Length can't exhaust memory before the limit is hit.
+        read_body_capped(resp, MAX_RESPONSE_BYTES).await
     }
 
     /// Send an E2EE streaming request and return the (status-checked) response
@@ -291,11 +278,42 @@ async fn error_for_status(resp: reqwest::Response) -> Result<reqwest::Response, 
     if status.is_success() {
         return Ok(resp);
     }
-    let body = resp.text().await.unwrap_or_default();
+    // Bound the error-body read — a hostile/misbehaving gateway could otherwise
+    // stream an unbounded error body. We only keep a short diagnostic prefix.
+    let body = read_body_capped(resp, MAX_ERROR_BODY_BYTES)
+        .await
+        .map(|b| String::from_utf8_lossy(&b).into_owned())
+        .unwrap_or_default();
     Err(ChutesClientError::Status {
         status: status.as_u16(),
         body,
     })
+}
+
+/// Read a response body incrementally, failing once the cumulative size would
+/// exceed `max` — so a chunked body without `Content-Length` can't exhaust
+/// memory before the cap is enforced.
+async fn read_body_capped(resp: reqwest::Response, max: u64) -> Result<Vec<u8>, ChutesClientError> {
+    use futures_util::StreamExt;
+    if resp.content_length().is_some_and(|n| n > max) {
+        return Err(ChutesClientError::Status {
+            status: 0,
+            body: format!("response Content-Length exceeds {max} bytes"),
+        });
+    }
+    let mut stream = resp.bytes_stream();
+    let mut out: Vec<u8> = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        if out.len() as u64 + chunk.len() as u64 > max {
+            return Err(ChutesClientError::Status {
+                status: 0,
+                body: format!("response body exceeds {max} bytes"),
+            });
+        }
+        out.extend_from_slice(&chunk);
+    }
+    Ok(out)
 }
 
 /// Find a model's `chute_id` in a `/v1/models` listing (pure; unit-tested).

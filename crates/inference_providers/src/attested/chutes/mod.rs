@@ -163,9 +163,6 @@ struct PreparedInvoke {
     nonce_token: String,
     blob: Vec<u8>,
     session: e2ee::ResponseSession,
-    /// Matched golden config (for logging/annotation).
-    #[allow(dead_code)]
-    measurement_config: String,
 }
 
 impl Provider {
@@ -280,6 +277,14 @@ impl Provider {
                 }
             };
             let e2ee::PreparedRequest { blob, session } = prepared;
+            // IDs only (privacy-safe): which attested instance + vetted config
+            // served the request, so an operator can trace it during an incident.
+            tracing::info!(
+                instance_id = %inst.instance_id,
+                measurement_config = %info.measurement_config,
+                gpu_verdict = %info.gpu_verdict,
+                "Chutes instance verified; routing request"
+            );
             return Ok(PreparedInvoke {
                 chute_id,
                 instance_id: inst.instance_id.clone(),
@@ -288,7 +293,6 @@ impl Provider {
                 nonce_token: pick_nonce(&inst.nonces).to_string(),
                 blob,
                 session,
-                measurement_config: info.measurement_config,
             });
         }
         Err(format!(

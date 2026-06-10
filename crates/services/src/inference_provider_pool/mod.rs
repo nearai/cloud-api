@@ -560,6 +560,12 @@ impl InferenceProviderPool {
     /// Remove a provider by model name. Used when admin deactivates a model.
     /// Also cleans up pubkey_to_providers, load_balancer_index, and provider_failure_counts.
     pub async fn unregister_provider(&self, model_name: &str) -> bool {
+        // If it was pinned, also clear the pin — otherwise DB discovery could
+        // never re-register a model with this name (the insert guards skip pinned).
+        self.pinned_models
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(model_name);
         let mut mappings = self.provider_mappings.write().await;
         let removed_providers = mappings.model_to_providers.remove(model_name);
         if let Some(removed) = &removed_providers {

@@ -201,49 +201,94 @@ impl Provider {
             .await
             .map_err(|e| format!("discover instances: {e}"))?;
 
-        // Pick a live, E2E-capable instance that still has an unused nonce token.
-        let inst = instances
+        // Candidate instances: live + E2E-capable + with at least one nonce token.
+        let candidates: Vec<&client::E2eInstance> = instances
             .instances
             .iter()
-            .find(|i| !i.e2e_pubkey.is_empty() && !i.nonces.is_empty())
-            .ok_or_else(|| {
-                "no E2E-capable Chutes instance with an available nonce token".to_string()
-            })?;
+            .filter(|i| !i.e2e_pubkey.is_empty() && !i.nonces.is_empty())
+            .collect();
+        if candidates.is_empty() {
+            return Err("no E2E-capable Chutes instance with an available nonce token".to_string());
+        }
 
+        // One chute-wide /evidence fetch bound to a fresh boot nonce; every
+        // instance's report_data binds this same nonce + its own e2e_pubkey.
         let boot_nonce = Self::random_boot_nonce()?;
-
         let evidence_resp = self
             .client
             .fetch_evidence(&chute_id, &boot_nonce)
             .await
             .map_err(|e| format!("fetch evidence: {e}"))?;
-        let evidence = evidence_resp.instance(&inst.instance_id).ok_or_else(|| {
-            "chosen instance is not present in the /evidence response".to_string()
-        })?;
 
-        // FATAL on failure — this is the trust chain; never fall back.
-        let info = self
-            .verifier
-            .attest_instance(evidence, &boot_nonce, &inst.e2e_pubkey)
-            .await
-            .map_err(|e| format!("attestation failed (refusing to send inference): {e}"))?;
-
-        let e2e_pk = base64::engine::general_purpose::STANDARD
-            .decode(inst.e2e_pubkey.trim())
-            .map_err(|e| format!("e2e_pubkey base64: {e}"))?;
-        let prepared = e2ee::build_request(&e2e_pk, request_json)
-            .map_err(|e| format!("E2EE request build: {e}"))?;
-        let e2ee::PreparedRequest { blob, session } = prepared;
-
-        Ok(PreparedInvoke {
-            chute_id,
-            instance_id: inst.instance_id.clone(),
-            nonce_token: inst.nonces[0].clone(),
-            blob,
-            session,
-            measurement_config: info.measurement_config,
-        })
+        // Try each candidate until one verifies, so a single bad/unverifiable
+        // instance doesn't take down all requests. Verification failure is never
+        // a fallback to an unverified channel — we just move to the next attested
+        // candidate, and fail if none verify.
+        let mut last_err = String::from("no candidate instances");
+        for inst in candidates {
+            let evidence = match evidence_resp.instance(&inst.instance_id) {
+                Some(e) => e,
+                None => {
+                    last_err = format!("instance {} not present in /evidence", inst.instance_id);
+                    continue;
+                }
+            };
+            let info = match self
+                .verifier
+                .attest_instance(evidence, &boot_nonce, &inst.e2e_pubkey)
+                .await
+            {
+                Ok(info) => info,
+                Err(e) => {
+                    last_err = format!("instance {} attestation failed: {e}", inst.instance_id);
+                    continue;
+                }
+            };
+            let e2e_pk =
+                match base64::engine::general_purpose::STANDARD.decode(inst.e2e_pubkey.trim()) {
+                    Ok(pk) => pk,
+                    Err(e) => {
+                        last_err = format!("instance {} e2e_pubkey base64: {e}", inst.instance_id);
+                        continue;
+                    }
+                };
+            let prepared = match e2ee::build_request(&e2e_pk, request_json) {
+                Ok(p) => p,
+                Err(e) => {
+                    last_err = format!("instance {} E2EE build: {e}", inst.instance_id);
+                    continue;
+                }
+            };
+            let e2ee::PreparedRequest { blob, session } = prepared;
+            return Ok(PreparedInvoke {
+                chute_id,
+                instance_id: inst.instance_id.clone(),
+                // Random token (not always [0]) to reduce single-use-token
+                // collisions between concurrent requests to the same instance.
+                nonce_token: pick_nonce(&inst.nonces).to_string(),
+                blob,
+                session,
+                measurement_config: info.measurement_config,
+            });
+        }
+        Err(format!(
+            "all candidate Chutes instances failed (refusing to send inference); last: {last_err}"
+        ))
     }
+}
+
+/// Pick a pseudo-random nonce token from a non-empty list, to reduce single-use
+/// token collisions between concurrent requests. Falls back to the first token
+/// if the OS RNG is briefly unavailable (still correct, just less collision-shy).
+fn pick_nonce(nonces: &[String]) -> &str {
+    debug_assert!(!nonces.is_empty());
+    let mut b = [0u8; 1];
+    let idx = if getrandom::fill(&mut b).is_ok() {
+        (b[0] as usize) % nonces.len()
+    } else {
+        0
+    };
+    &nonces[idx]
 }
 
 /// An OpenAI request body (as JSON) with `model` pinned and `stream` set.
@@ -451,11 +496,11 @@ impl InferenceProvider for Provider {
                 AttestationError::FetchError("no E2E-capable Chutes instance".to_string())
             })?;
 
-        // Use the caller's nonce if it normalizes to a 32-byte hex value (accept
-        // an optional `0x` prefix), else mint a fresh one. We send the normalized
-        // bare-hex form to Chutes and bind against the same string, so a
-        // `0x`-prefixed input is honored rather than silently dropped.
-        let boot_nonce = match nonce.as_deref().map(|n| n.strip_prefix("0x").unwrap_or(n)) {
+        // Honor the caller's nonce only if it's a **bare** 32-byte hex value (no
+        // `0x`) — one consistent policy with `ChutesReportDataVerifier`, which
+        // rejects a `0x` prefix (the nonce is hashed verbatim into the binding).
+        // Anything else (prefixed, wrong length, non-hex) → mint a fresh one.
+        let boot_nonce = match nonce.as_deref() {
             Some(n) if hex::decode(n).map(|b| b.len() == 32).unwrap_or(false) => {
                 n.to_ascii_lowercase()
             }

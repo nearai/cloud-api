@@ -10,7 +10,17 @@
 //!
 //! Decryption errors / a chunk before `e2e_init` are fatal (the trust chain is
 //! the AEAD channel) — they end the stream with an error rather than forwarding
-//! anything unauthenticated.
+//! anything unauthenticated. EOF without a terminal `data: [DONE]` is also fatal
+//! (a truncated stream must not look like a successful completion).
+//!
+//! **Security note (inherent to Chutes' published protocol):** content frames are
+//! each AEAD-sealed under one stream key with random per-frame nonces and **no
+//! sequence numbers**, so an on-path gateway can drop, reorder, or replay
+//! individual frames without breaking any single frame's AEAD tag. Each frame's
+//! contents are confidential + integrity-protected, but frame *ordering* and
+//! *completeness* are not cryptographically guaranteed (the `[DONE]` check above
+//! only catches outright truncation). This is the same class of caveat as the
+//! unsigned golden-measurements endpoint — track with Chutes.
 
 use async_stream::try_stream;
 use base64::Engine;
@@ -137,14 +147,23 @@ where
                 };
                 let payload = payload.trim();
                 if let Some(event) = handle_outer_payload(payload, &session, &mut stream_key)? {
-                    let is_done = event.is_done_marker();
-                    yield event;
-                    if is_done {
-                        return;
+                    if event.is_done_marker() {
+                        yield event;
+                        return; // clean terminus
                     }
+                    yield event;
                 }
             }
         }
+
+        // Reached only on EOF *without* a terminal `[DONE]` (or with a dangling
+        // partial line) — a truncated/interrupted encrypted stream. Fail closed,
+        // so the route layer does not mint its own `[DONE]` and present a
+        // truncated completion as successful.
+        Err(CompletionError::CompletionError(
+            "Chutes E2EE stream ended without a terminal [DONE] (truncated or interrupted)"
+                .to_string(),
+        ))?;
     };
     Box::pin(s)
 }
@@ -222,6 +241,16 @@ mod tests {
         // First emitted event is the [DONE] marker; the usage event was dropped.
         let first = out.next().await.unwrap().unwrap();
         assert!(first.is_done_marker());
+    }
+
+    #[tokio::test]
+    async fn stream_without_done_is_error() {
+        // A stream that ends without a terminal [DONE] is a truncation — must
+        // surface an error, not end cleanly (which would look like success).
+        let st = synthetic(&["data: {\"usage\":{\"prompt_tokens\":1}}\n\n"]);
+        let mut out = decrypt_e2ee_sse(st, fresh_session());
+        let err = out.next().await.unwrap().unwrap_err();
+        assert!(format!("{err}").contains("without a terminal [DONE]"));
     }
 
     #[tokio::test]

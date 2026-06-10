@@ -507,8 +507,19 @@ impl InferenceProviderPool {
         let mut success_count = 0;
         let mut error_count = 0;
 
+        let pinned = self
+            .pinned_models
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         let mut mappings = self.provider_mappings.write().await;
         for (model_name, provider_config) in models {
+            // Never overwrite a pinned (out-of-band, attested) provider with a
+            // DB-discovered external one (the external refresh routes here).
+            if pinned.contains(&model_name) {
+                warn!(model = %model_name, "Skipping external provider for a pinned (attested) model");
+                continue;
+            }
             match self.create_external_provider(&model_name, provider_config) {
                 Ok((provider, backend_type)) => {
                     mappings
@@ -646,8 +657,18 @@ impl InferenceProviderPool {
         // Phase 2: Atomic bulk update of both mappings under a single lock
         // This ensures consistency - both mappings are updated together
         {
+            let pinned = self
+                .pinned_models
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
             let mut mappings = self.provider_mappings.write().await;
             for (model_id, providers) in model_providers {
+                // Don't clobber a pinned (attested) provider (see register_pinned_provider).
+                if pinned.contains(&model_id) {
+                    warn!(model = %model_id, "Skipping register_providers for a pinned model");
+                    continue;
+                }
                 mappings.model_to_providers.insert(model_id, providers);
             }
             for (key, provider) in pub_key_updates {
@@ -3228,7 +3249,23 @@ impl InferenceProviderPool {
                 }
             }
 
+            // Never let DB discovery overwrite a pinned (out-of-band, attested)
+            // provider — that would silently substitute the per-request-verified
+            // E2EE provider with an unverified one, the exact attack the pinning
+            // is meant to prevent.
+            let pinned = self
+                .pinned_models
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
             for (model_name, providers) in model_providers {
+                if pinned.contains(&model_name) {
+                    warn!(
+                        model = %model_name,
+                        "DB discovery attempted to overwrite a pinned (attested) provider; ignoring"
+                    );
+                    continue;
+                }
                 mappings.model_to_providers.insert(model_name, providers);
             }
 
@@ -4479,6 +4516,39 @@ mod tests {
             "non-pinned stale model must be removed"
         );
         assert!(pool.has_provider("chutes-model").await);
+    }
+
+    #[tokio::test]
+    async fn pinned_provider_not_overwritten_by_discovery() {
+        use inference_providers::mock::MockProvider;
+        let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
+
+        let pinned: Arc<InferenceProviderTrait> = Arc::new(MockProvider::new());
+        pool.register_pinned_provider("chutes-model".to_string(), pinned.clone())
+            .await;
+
+        // A DB-discovered external model with the SAME id must NOT replace the
+        // attested, per-request-verified pinned provider.
+        let _ = pool
+            .load_external_providers(vec![(
+                "chutes-model".to_string(),
+                serde_json::json!({
+                    "backend": "openai_compatible",
+                    "base_url": "https://example.com/v1",
+                    "api_key": "sk-x"
+                }),
+            )])
+            .await;
+
+        let got = pool
+            .get_providers_for_model("chutes-model")
+            .await
+            .expect("model still registered");
+        assert_eq!(got.len(), 1);
+        assert!(
+            Arc::ptr_eq(&got[0], &pinned),
+            "DB discovery must not overwrite a pinned (attested) provider"
+        );
     }
 
     /// Verify that reused providers (URL unchanged) keep their pubkey mappings

@@ -54,6 +54,8 @@ pub enum ChutesVerifyError {
     Measurement(#[from] MeasurementError),
     #[error("verified quote is not a TDX TD1.0 report")]
     NotTd10,
+    #[error("GPU evidence payload is not a JSON object (cannot bind the GPU nonce)")]
+    MalformedGpuPayload,
     #[error("GPU evidence required but the verifier returned no verdict")]
     MissingGpuVerdict,
 }
@@ -143,12 +145,15 @@ impl ChutesBackendVerifier {
         //    — not the raw caller nonce. Inject it and verify via NRAS.
         let gpu_nonce = hex::encode(freshness_digest(boot_nonce, e2e_pubkey));
         let mut nvidia_payload = transform::nvidia_payload(evidence)?;
-        if let Some(obj) = nvidia_payload.as_object_mut() {
-            obj.insert(
+        // Fatal if the payload isn't an object: proceeding without injecting the
+        // nonce would submit GPU evidence unbound to our freshness anchor.
+        nvidia_payload
+            .as_object_mut()
+            .ok_or(ChutesVerifyError::MalformedGpuPayload)?
+            .insert(
                 "nonce".to_string(),
                 serde_json::Value::String(gpu_nonce.clone()),
             );
-        }
         let mut report = serde_json::Map::new();
         report.insert(
             "nvidia_payload".to_string(),

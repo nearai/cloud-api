@@ -1461,6 +1461,8 @@ pub struct ResponseError {
     #[serde(rename = "type")]
     pub type_: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub param: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub code: Option<String>,
 }
 
@@ -1660,6 +1662,10 @@ pub struct ResponseStreamEvent {
     pub delta: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<ResponseError>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status_code: Option<u16>,
 }
 
 /// Input item list for responses

@@ -27,6 +27,7 @@
 
 pub mod attestation;
 pub mod evidence;
+pub mod report_data;
 
 use async_trait::async_trait;
 use std::sync::Arc;

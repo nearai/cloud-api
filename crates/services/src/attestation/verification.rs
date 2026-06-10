@@ -147,66 +147,19 @@ impl AttestationVerifier {
         //    measurement. No-op for NEAR's own fleet (empty allowlist = skip).
         self.policy.assert_enforceable()?;
 
-        // 1. Extract and verify TDX quote
+        // 1. Verify the TDX quote: DCAP signature chain, TCB floor, debug bit.
         let intel_quote_hex = attestation_report
             .get("intel_quote")
             .and_then(|v| v.as_str())
             .ok_or_else(|| AttestationVerificationError::MissingField("intel_quote".to_string()))?;
-
-        let quote_hex = intel_quote_hex
-            .strip_prefix("0x")
-            .unwrap_or(intel_quote_hex);
-        let quote_bytes = hex::decode(quote_hex).map_err(|e| {
-            AttestationVerificationError::InvalidFormat(format!("intel_quote hex decode: {e}"))
-        })?;
-
-        let pccs_url = self
-            .pccs_url
-            .clone()
-            .unwrap_or_else(|| dcap_qvl::collateral::PHALA_PCCS_URL.to_string());
-        let collateral_client = dcap_qvl::collateral::CollateralClient::with_default_http(pccs_url)
-            .map_err(|e| {
-                AttestationVerificationError::TdxVerificationFailed(format!(
-                    "failed to build collateral client: {e:#}"
-                ))
-            })?;
-        let verified_report = collateral_client
-            .fetch_and_verify(&quote_bytes)
-            .await
-            .map_err(|e| AttestationVerificationError::TdxVerificationFailed(format!("{e:#}")))?;
-
-        // Check TCB status
-        let tcb_status = &verified_report.status;
-        if self.policy.require_tcb_up_to_date() && tcb_status != "UpToDate" {
-            return Err(AttestationVerificationError::TdxVerificationFailed(format!(
-                "TCB status is '{tcb_status}' but REQUIRE_TCB_UP_TO_DATE is set (advisory_ids: {:?})",
-                verified_report.advisory_ids
-            )));
-        }
-        if tcb_status != "UpToDate" {
-            tracing::warn!(
-                tcb_status = %tcb_status,
-                advisory_ids = ?verified_report.advisory_ids,
-                "TDX TCB status is not UpToDate — microcode may need updating"
-            );
-        }
-
-        // Check debug mode is disabled
+        let verified_report = self.verify_tdx_quote(intel_quote_hex).await?;
+        let tcb_status = verified_report.status.clone();
+        let advisory_ids = verified_report.advisory_ids.clone();
         let td_report = verified_report.report.as_td10().ok_or_else(|| {
             AttestationVerificationError::TdxVerificationFailed(
                 "no TD10 report in verified quote".to_string(),
             )
         })?;
-
-        let is_debug = td_report.td_attributes[0] & 0x01 != 0;
-        if is_debug {
-            return Err(AttestationVerificationError::TdxVerificationFailed(
-                "TDX debug mode is enabled — rejecting".to_string(),
-            ));
-        }
-
-        let tcb_status = verified_report.status.clone();
-        let advisory_ids = verified_report.advisory_ids.clone();
 
         // 2. Verify report_data binding
         let report_data = &td_report.report_data;
@@ -264,6 +217,73 @@ impl AttestationVerifier {
             compose_hash: event_log_data.compose_hash,
             gpu_verdict,
         })
+    }
+
+    /// Verify a raw TDX quote's Intel DCAP signature chain and its baseline,
+    /// provider-agnostic invariants: the policy's TCB floor and that the debug
+    /// bit is clear. Returns the verified report — call `.report.as_td10()` for
+    /// the measurements (`report_data`, `mr_td`, `rt_mr0..3`).
+    ///
+    /// This is pure quote validation: no `report_data` binding and no
+    /// measurement/image checks, so it is shared **unchanged** between NEAR's
+    /// `verify_attestation_report` and the Chutes verifier (whose bindings and
+    /// register-pin measurement differ). Extracting it changes no NEAR behavior.
+    pub(crate) async fn verify_tdx_quote(
+        &self,
+        intel_quote_hex: &str,
+    ) -> Result<dcap_qvl::verify::VerifiedReport, AttestationVerificationError> {
+        let quote_hex = intel_quote_hex
+            .strip_prefix("0x")
+            .unwrap_or(intel_quote_hex);
+        let quote_bytes = hex::decode(quote_hex).map_err(|e| {
+            AttestationVerificationError::InvalidFormat(format!("intel_quote hex decode: {e}"))
+        })?;
+
+        let pccs_url = self
+            .pccs_url
+            .clone()
+            .unwrap_or_else(|| dcap_qvl::collateral::PHALA_PCCS_URL.to_string());
+        let collateral_client = dcap_qvl::collateral::CollateralClient::with_default_http(pccs_url)
+            .map_err(|e| {
+                AttestationVerificationError::TdxVerificationFailed(format!(
+                    "failed to build collateral client: {e:#}"
+                ))
+            })?;
+        let verified_report = collateral_client
+            .fetch_and_verify(&quote_bytes)
+            .await
+            .map_err(|e| AttestationVerificationError::TdxVerificationFailed(format!("{e:#}")))?;
+
+        // TCB floor: reject when the policy requires UpToDate; otherwise warn
+        // only (NEAR's historical behavior).
+        let tcb_status = &verified_report.status;
+        if self.policy.require_tcb_up_to_date() && tcb_status != "UpToDate" {
+            return Err(AttestationVerificationError::TdxVerificationFailed(format!(
+                "TCB status is '{tcb_status}' but REQUIRE_TCB_UP_TO_DATE is set (advisory_ids: {:?})",
+                verified_report.advisory_ids
+            )));
+        }
+        if tcb_status != "UpToDate" {
+            tracing::warn!(
+                tcb_status = %tcb_status,
+                advisory_ids = ?verified_report.advisory_ids,
+                "TDX TCB status is not UpToDate — microcode may need updating"
+            );
+        }
+
+        // Debug bit must be clear.
+        let td_report = verified_report.report.as_td10().ok_or_else(|| {
+            AttestationVerificationError::TdxVerificationFailed(
+                "no TD10 report in verified quote".to_string(),
+            )
+        })?;
+        if td_report.td_attributes[0] & 0x01 != 0 {
+            return Err(AttestationVerificationError::TdxVerificationFailed(
+                "TDX debug mode is enabled — rejecting".to_string(),
+            ));
+        }
+
+        Ok(verified_report)
     }
 
     /// Replay RTMR3 from the event log and verify it matches the TDX quote.
@@ -406,7 +426,7 @@ impl AttestationVerifier {
     ///
     /// Returns `Some(verdict)` if GPU evidence was present and verified,
     /// `None` if no GPU evidence was included (e.g., gateway without GPU).
-    async fn verify_gpu_evidence(
+    pub(crate) async fn verify_gpu_evidence(
         &self,
         attestation_report: &serde_json::Map<String, serde_json::Value>,
         request_nonce: &str,

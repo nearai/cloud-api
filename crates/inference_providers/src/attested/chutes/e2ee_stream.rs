@@ -16,11 +16,16 @@
 //! **Security note (inherent to Chutes' published protocol):** content frames are
 //! each AEAD-sealed under one stream key with random per-frame nonces and **no
 //! sequence numbers**, so an on-path gateway can drop, reorder, or replay
-//! individual frames without breaking any single frame's AEAD tag. Each frame's
-//! contents are confidential + integrity-protected, but frame *ordering* and
-//! *completeness* are not cryptographically guaranteed (the `[DONE]` check above
-//! only catches outright truncation). This is the same class of caveat as the
-//! unsigned golden-measurements endpoint — track with Chutes.
+//! individual frames without breaking any single frame's AEAD tag. We therefore
+//! only accept an **authenticated inner** `[DONE]` (decrypted from an `e2e` frame)
+//! as a clean terminus; a *plaintext outer* `[DONE]` is forgeable (the gateway
+//! could inject it after dropping frames) and is ignored, so a truncated stream
+//! surfaces an error instead of a fake success. Frame *ordering* is still not
+//! cryptographically guaranteed. **Open (verify on staging):** confirm Chutes
+//! emits the terminator *inside* the encrypted channel; if it only sends the
+//! outer plaintext `[DONE]`, the terminator is forgeable — add it to the tracked
+//! Chutes asks (alongside missing frame sequence numbers + unsigned measurements)
+//! and reconsider exposing streaming as attested.
 
 use async_stream::try_stream;
 use base64::Engine;
@@ -78,7 +83,14 @@ fn handle_outer_payload(
     stream_key: &mut Option<StreamKey>,
 ) -> Result<Option<SSEEvent>, CompletionError> {
     if payload == "[DONE]" {
-        return Ok(Some(done_event()));
+        // A *plaintext* outer `[DONE]` comes from the untrusted gateway and is
+        // forgeable — it could be injected after dropping the remaining encrypted
+        // frames to fake a successful-but-truncated stream. Ignore it: only the
+        // **authenticated inner** `[DONE]` (decrypted from an `e2e` frame, handled
+        // in `inner_event`) is a valid terminus. If no inner `[DONE]` arrives, the
+        // stream ends as truncation. (If staging shows Chutes terminates only with
+        // the outer `[DONE]`, that's a forgeable terminator — see the module note.)
+        return Ok(None);
     }
     let v: serde_json::Value = match serde_json::from_str(payload) {
         Ok(v) => v,
@@ -215,12 +227,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stream_terminates_on_done() {
+    async fn outer_plaintext_done_is_truncation_not_success() {
+        // A bare plaintext outer [DONE] from the (untrusted) gateway must NOT be
+        // accepted as a clean terminus — only an authenticated inner [DONE] is.
+        // With no inner [DONE], this is a truncated stream → error.
         let st = synthetic(&["data: [DONE]\n\n"]);
         let mut out = decrypt_e2ee_sse(st, fresh_session());
-        let first = out.next().await.unwrap().unwrap();
-        assert!(first.is_done_marker());
-        assert!(out.next().await.is_none(), "stream must end after [DONE]");
+        let err = out.next().await.unwrap().unwrap_err();
+        assert!(format!("{err}").contains("without a terminal [DONE]"));
     }
 
     #[tokio::test]
@@ -233,14 +247,16 @@ mod tests {
 
     #[tokio::test]
     async fn stream_skips_usage_only_events() {
+        // usage-only events are dropped (not yielded as content); with no inner
+        // [DONE] the stream then ends as truncation — so the first (and only)
+        // item is the truncation error, never a content event.
         let st = synthetic(&[
             "data: {\"usage\":{\"prompt_tokens\":1}}\n\n",
             "data: [DONE]\n\n",
         ]);
         let mut out = decrypt_e2ee_sse(st, fresh_session());
-        // First emitted event is the [DONE] marker; the usage event was dropped.
-        let first = out.next().await.unwrap().unwrap();
-        assert!(first.is_done_marker());
+        let err = out.next().await.unwrap().unwrap_err();
+        assert!(format!("{err}").contains("without a terminal [DONE]"));
     }
 
     #[tokio::test]

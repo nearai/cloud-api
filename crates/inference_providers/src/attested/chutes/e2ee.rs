@@ -84,11 +84,20 @@ fn gzip(plain: &[u8]) -> Result<Vec<u8>, E2eeError> {
     enc.finish().map_err(|e| E2eeError::Gzip(e.to_string()))
 }
 
+/// Upper bound on a decompressed response/frame. Inference JSON is far smaller;
+/// this just caps a malicious-but-attested instance's gzip bomb (defense in depth).
+const MAX_DECOMPRESSED: u64 = 64 * 1024 * 1024;
+
 fn gunzip(comp: &[u8]) -> Result<Vec<u8>, E2eeError> {
-    let mut dec = flate2::read::GzDecoder::new(comp);
+    let mut dec = flate2::read::GzDecoder::new(comp).take(MAX_DECOMPRESSED + 1);
     let mut out = Vec::new();
     dec.read_to_end(&mut out)
         .map_err(|e| E2eeError::Gzip(e.to_string()))?;
+    if out.len() as u64 > MAX_DECOMPRESSED {
+        return Err(E2eeError::Gzip(format!(
+            "decompressed payload exceeds {MAX_DECOMPRESSED} bytes (possible gzip bomb)"
+        )));
+    }
     Ok(out)
 }
 

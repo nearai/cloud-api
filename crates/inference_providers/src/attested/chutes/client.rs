@@ -109,23 +109,34 @@ pub struct ChutesClient {
     api_base: String,
     models_base: String,
     api_key: String,
+    /// Total-request timeout (seconds) applied per-request to the *non-streaming*
+    /// calls (discovery, evidence, non-stream invoke). It is deliberately NOT a
+    /// client-wide timeout: that would also cap streamed body reads and cut off
+    /// long generations on `invoke_stream` (which relies on `connect_timeout`).
+    request_timeout_secs: u64,
 }
 
 /// Default hosts (see [`super`]).
 pub const DEFAULT_API_BASE: &str = "https://api.chutes.ai";
 pub const DEFAULT_MODELS_BASE: &str = "https://llm.chutes.ai";
 
+/// Connection-establishment timeout (bounds connect for every request, including
+/// streaming, without capping the streamed body).
+const CONNECT_TIMEOUT_SECS: u64 = 15;
+
 impl ChutesClient {
-    /// Build a client with the default hosts and a per-request timeout (seconds).
+    /// Build a client with the default hosts and a per-request timeout (seconds)
+    /// for the non-streaming calls.
     pub fn new(api_key: String, timeout_seconds: u64) -> Result<Self, ChutesClientError> {
         let http = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(timeout_seconds))
+            .connect_timeout(std::time::Duration::from_secs(CONNECT_TIMEOUT_SECS))
             .build()?;
         Ok(Self {
             http,
             api_base: DEFAULT_API_BASE.to_string(),
             models_base: DEFAULT_MODELS_BASE.to_string(),
             api_key,
+            request_timeout_secs: timeout_seconds.max(1),
         })
     }
 
@@ -147,6 +158,7 @@ impl ChutesClient {
             .http
             .get(&url)
             .bearer_auth(&self.api_key)
+            .timeout(std::time::Duration::from_secs(self.request_timeout_secs))
             .send()
             .await?;
         let resp = error_for_status(resp).await?;
@@ -168,6 +180,7 @@ impl ChutesClient {
             .http
             .get(&url)
             .bearer_auth(&self.api_key)
+            .timeout(std::time::Duration::from_secs(self.request_timeout_secs))
             .send()
             .await?;
         let resp = error_for_status(resp).await?;
@@ -190,6 +203,7 @@ impl ChutesClient {
             .get(&url)
             .query(&[("nonce", boot_nonce)])
             .bearer_auth(&self.api_key)
+            .timeout(std::time::Duration::from_secs(self.request_timeout_secs))
             .send()
             .await?;
         let resp = error_for_status(resp).await?;
@@ -206,7 +220,11 @@ impl ChutesClient {
         &self,
         req: &InvokeRequest<'_>,
     ) -> Result<Vec<u8>, ChutesClientError> {
-        let resp = self.invoke_request(req).send().await?;
+        let resp = self
+            .invoke_request(req)
+            .timeout(std::time::Duration::from_secs(self.request_timeout_secs))
+            .send()
+            .await?;
         let resp = error_for_status(resp).await?;
         Ok(resp.bytes().await?.to_vec())
     }

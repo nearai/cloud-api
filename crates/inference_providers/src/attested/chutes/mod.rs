@@ -26,6 +26,7 @@
 //! verified one.
 
 pub mod attestation;
+pub mod e2ee;
 pub mod evidence;
 pub mod measurements;
 pub mod report_data;

@@ -4084,6 +4084,131 @@ pub async fn image_edits(
     }
 }
 
+fn apply_rerank_response_options(
+    request: &crate::models::RerankRequest,
+    response: &mut inference_providers::RerankResponse,
+) {
+    response.results.sort_by(|a, b| {
+        b.relevance_score
+            .partial_cmp(&a.relevance_score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    if let Some(top_n) = request.top_n {
+        response.results.truncate(top_n);
+    }
+
+    for result in &mut response.results {
+        if request.return_documents == Some(false) {
+            result.document = None;
+            continue;
+        }
+
+        if let Some(serde_json::Value::Object(document)) = result.document.as_mut() {
+            if document
+                .get("multi_modal")
+                .is_some_and(serde_json::Value::is_null)
+            {
+                document.remove("multi_modal");
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod rerank_response_options_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn request(
+        top_n: Option<usize>,
+        return_documents: Option<bool>,
+    ) -> crate::models::RerankRequest {
+        crate::models::RerankRequest {
+            model: "Qwen/Qwen3-Reranker-0.6B".to_string(),
+            query: "capital of France".to_string(),
+            documents: vec![
+                "Paris".to_string(),
+                "Berlin".to_string(),
+                "Tokyo".to_string(),
+            ],
+            top_n,
+            return_documents,
+        }
+    }
+
+    fn response() -> inference_providers::RerankResponse {
+        inference_providers::RerankResponse {
+            id: "rerank-test".to_string(),
+            model: "Qwen/Qwen3-Reranker-0.6B".to_string(),
+            results: vec![
+                inference_providers::RerankResult {
+                    index: 2,
+                    relevance_score: 0.4,
+                    document: Some(json!({"text": "Tokyo", "multi_modal": null})),
+                },
+                inference_providers::RerankResult {
+                    index: 0,
+                    relevance_score: 0.9,
+                    document: Some(json!({"text": "Paris", "multi_modal": null})),
+                },
+                inference_providers::RerankResult {
+                    index: 1,
+                    relevance_score: 0.1,
+                    document: Some(json!({"text": "Berlin", "multi_modal": null})),
+                },
+            ],
+            usage: Some(inference_providers::RerankUsage {
+                prompt_tokens: Some(10),
+                total_tokens: Some(15),
+            }),
+        }
+    }
+
+    #[test]
+    fn top_n_sorts_by_relevance_and_truncates_results() {
+        let mut response = response();
+
+        apply_rerank_response_options(&request(Some(2), None), &mut response);
+
+        let indices: Vec<i32> = response.results.iter().map(|result| result.index).collect();
+        assert_eq!(indices, vec![0, 2]);
+    }
+
+    #[test]
+    fn return_documents_false_omits_documents() {
+        let mut response = response();
+
+        apply_rerank_response_options(&request(None, Some(false)), &mut response);
+
+        assert!(response
+            .results
+            .iter()
+            .all(|result| result.document.is_none()));
+    }
+
+    #[test]
+    fn null_multi_modal_is_stripped_from_document_objects() {
+        let mut response = response();
+
+        apply_rerank_response_options(&request(None, None), &mut response);
+
+        for result in response.results {
+            let document = result.document.expect("document should be returned");
+            assert!(document.get("text").is_some());
+            assert!(document.get("multi_modal").is_none());
+        }
+    }
+
+    #[test]
+    fn top_n_zero_is_invalid() {
+        assert_eq!(
+            request(Some(0), None).validate().unwrap_err(),
+            "top_n must be at least 1"
+        );
+    }
+}
+
 /// Document reranking endpoint
 ///
 /// Ranks documents by relevance to a query using a reranker model.
@@ -4188,7 +4313,9 @@ pub async fn rerank(
         .try_rerank(organization_id, model_id, &request.model, params)
         .await
     {
-        Ok(response) => {
+        Ok(mut response) => {
+            apply_rerank_response_options(&request, &mut response);
+
             // Record usage for rerank SYNCHRONOUSLY to ensure billing accuracy
             // This is critical for revenue tracking and must complete before returning response
             let organization_id = api_key.organization.id.0;

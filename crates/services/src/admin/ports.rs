@@ -845,10 +845,19 @@ pub trait AdminRepository: Send + Sync {
     /// Count all active organizations (admin only)
     async fn count_all_organizations(&self) -> Result<i64, anyhow::Error>;
 
+    /// Fetch a single active organization by id with spend limit and usage
+    /// (admin only). Returns `None` if not found or inactive.
+    async fn get_organization(
+        &self,
+        organization_id: uuid::Uuid,
+    ) -> Result<Option<AdminOrganizationInfo>, anyhow::Error>;
+
     /// List members of a specific organization with full user details, including
-    /// inactive (soft-deleted) members (admin only). Does NOT enforce membership
-    /// of the caller — authorization is handled by the admin middleware at the
-    /// route layer.
+    /// inactive (soft-deleted) *users* (admin only). Inactive (soft-deleted)
+    /// *organizations* are excluded (their member rows are not returned),
+    /// matching `/v1/admin/organizations`. Does NOT enforce membership of the
+    /// caller — authorization is handled by the admin middleware at the route
+    /// layer.
     async fn list_organization_members(
         &self,
         organization_id: uuid::Uuid,
@@ -1077,6 +1086,13 @@ pub trait AdminService: Send + Sync {
         limit: i64,
         offset: i64,
     ) -> Result<(Vec<AdminOrganizationInfo>, i64), AdminError>;
+
+    /// Get a single organization by id (admin only). Returns
+    /// `OrganizationNotFound` if it does not exist or is inactive.
+    async fn get_organization(
+        &self,
+        organization_id: uuid::Uuid,
+    ) -> Result<AdminOrganizationInfo, AdminError>;
 
     /// List members of a specific organization with full user details (admin only).
     /// Returns `OrganizationNotFound` if the organization does not exist.

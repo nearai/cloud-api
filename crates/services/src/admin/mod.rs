@@ -1112,6 +1112,17 @@ impl AdminService for AdminServiceImpl {
         Ok((organizations, total))
     }
 
+    async fn get_organization(
+        &self,
+        organization_id: uuid::Uuid,
+    ) -> Result<AdminOrganizationInfo, AdminError> {
+        self.repository
+            .get_organization(organization_id)
+            .await
+            .map_err(|e| AdminError::InternalError(e.to_string()))?
+            .ok_or_else(|| AdminError::OrganizationNotFound(organization_id.to_string()))
+    }
+
     async fn list_organization_members(
         &self,
         organization_id: uuid::Uuid,

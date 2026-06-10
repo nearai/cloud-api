@@ -2124,6 +2124,85 @@ pub async fn list_organizations(
     Ok(ResponseJson(response))
 }
 
+/// Get a single organization by id (Admin only)
+///
+/// Returns one organization with its spend limit and usage. Only authenticated
+/// admins can perform this operation. Returns 404 if the organization does not
+/// exist or is inactive (consistent with the admin organizations list, which
+/// hides inactive orgs).
+#[utoipa::path(
+    get,
+    path = "/v1/admin/organizations/{org_id}",
+    tag = "Admin",
+    params(
+        ("org_id" = Uuid, Path, description = "Organization ID")
+    ),
+    responses(
+        (status = 200, description = "Organization retrieved successfully", body = AdminOrganizationResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 404, description = "Organization not found", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    ),
+    security(
+        ("session_token" = [])
+    )
+)]
+pub async fn get_organization(
+    State(app_state): State<AdminAppState>,
+    Extension(_admin_user): Extension<AdminUser>, // Require admin auth
+    Path(org_id): Path<Uuid>,
+) -> Result<ResponseJson<AdminOrganizationResponse>, (StatusCode, ResponseJson<ErrorResponse>)> {
+    debug!("Get organization request: org_id={}", org_id);
+
+    let org = app_state
+        .admin_service
+        .get_organization(org_id)
+        .await
+        .map_err(|e| {
+            error!("Failed to get organization: {:?}", e);
+            match e {
+                services::admin::AdminError::OrganizationNotFound(_) => (
+                    StatusCode::NOT_FOUND,
+                    ResponseJson(ErrorResponse::new(
+                        "Organization not found".to_string(),
+                        "not_found".to_string(),
+                    )),
+                ),
+                services::admin::AdminError::Unauthorized(msg) => (
+                    StatusCode::UNAUTHORIZED,
+                    ResponseJson(ErrorResponse::new(msg, "unauthorized".to_string())),
+                ),
+                _ => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    ResponseJson(ErrorResponse::new(
+                        "Failed to retrieve organization".to_string(),
+                        "internal_server_error".to_string(),
+                    )),
+                ),
+            }
+        })?;
+
+    let current_usage = org.total_spent.map(|total_spent| OrganizationUsage {
+        total_spent,
+        total_spent_display: format_amount(total_spent),
+        total_requests: org.total_requests.unwrap_or(0),
+        total_tokens: org.total_tokens.unwrap_or(0),
+    });
+
+    Ok(ResponseJson(AdminOrganizationResponse {
+        id: org.id.to_string(),
+        name: org.name,
+        description: org.description,
+        spend_limit: org.spend_limit.map(|amount| SpendLimit {
+            amount,
+            scale: 9,
+            currency: "USD".to_string(),
+        }),
+        current_usage,
+        created_at: org.created_at,
+    }))
+}
+
 /// Map a raw database role string to the API `MemberRole`. Unknown values fall
 /// back to `Member` (the least-privileged role) so a malformed row can never
 /// be misrepresented as an owner/admin.

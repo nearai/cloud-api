@@ -37,7 +37,7 @@ use services::auth::AuthServiceTrait;
 use services::github_dispatch::GitHubDispatcher;
 use services::usage::UsageServiceTrait;
 use std::sync::Arc;
-use tracing::{debug, error, Instrument};
+use tracing::{debug, error, warn, Instrument};
 use uuid::Uuid;
 
 /// Parse an OpenRouter `deprecation_date` into a normalized `DateTime<Utc>`.
@@ -2158,27 +2158,33 @@ pub async fn get_organization(
         .admin_service
         .get_organization(org_id)
         .await
-        .map_err(|e| {
-            error!("Failed to get organization: {:?}", e);
-            match e {
-                services::admin::AdminError::OrganizationNotFound(_) => (
+        .map_err(|e| match e {
+            services::admin::AdminError::OrganizationNotFound(_) => {
+                debug!("Organization not found: org_id={}", org_id);
+                (
                     StatusCode::NOT_FOUND,
                     ResponseJson(ErrorResponse::new(
                         "Organization not found".to_string(),
                         "not_found".to_string(),
                     )),
-                ),
-                services::admin::AdminError::Unauthorized(msg) => (
+                )
+            }
+            services::admin::AdminError::Unauthorized(msg) => {
+                warn!("Unauthorized get organization: org_id={}", org_id);
+                (
                     StatusCode::UNAUTHORIZED,
                     ResponseJson(ErrorResponse::new(msg, "unauthorized".to_string())),
-                ),
-                _ => (
+                )
+            }
+            other => {
+                error!("Failed to get organization: {:?}", other);
+                (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     ResponseJson(ErrorResponse::new(
                         "Failed to retrieve organization".to_string(),
                         "internal_server_error".to_string(),
                     )),
-                ),
+                )
             }
         })?;
 
@@ -2206,11 +2212,22 @@ pub async fn get_organization(
 /// Map a raw database role string to the API `MemberRole`. Unknown values fall
 /// back to `Member` (the least-privileged role) so a malformed row can never
 /// be misrepresented as an owner/admin.
-fn member_role_from_db_str(role: &str) -> MemberRole {
+fn member_role_from_db_str(role: &str, member_id: Uuid) -> MemberRole {
     match role {
         "owner" => MemberRole::Owner,
         "admin" => MemberRole::Admin,
-        _ => MemberRole::Member,
+        "member" => MemberRole::Member,
+        other => {
+            // Unreachable while the `organization_members.role` CHECK constraint
+            // holds, but if it is ever relaxed we must not silently present a
+            // bogus role as a real one. Fall back to the least-privileged role
+            // and surface the anomaly (ids only — no user data).
+            warn!(
+                "Unknown organization member role '{}' for member_id={}; defaulting to 'member'",
+                other, member_id
+            );
+            MemberRole::Member
+        }
     }
 }
 
@@ -2230,6 +2247,7 @@ fn member_role_from_db_str(role: &str) -> MemberRole {
     ),
     responses(
         (status = 200, description = "Organization members retrieved successfully", body = ListAdminOrganizationMembersResponse),
+        (status = 400, description = "Invalid request", body = ErrorResponse),
         (status = 401, description = "Unauthorized", body = ErrorResponse),
         (status = 404, description = "Organization not found", body = ErrorResponse),
         (status = 500, description = "Internal server error", body = ErrorResponse)
@@ -2258,27 +2276,35 @@ pub async fn list_organization_members(
         .admin_service
         .list_organization_members(org_id, params.limit, params.offset)
         .await
-        .map_err(|e| {
-            error!("Failed to list organization members: {:?}", e);
-            match e {
-                services::admin::AdminError::OrganizationNotFound(_) => (
+        .map_err(|e| match e {
+            services::admin::AdminError::OrganizationNotFound(_) => {
+                // Expected for probes of unknown/deactivated org ids — keep it
+                // out of error-level logs so it can't be used to flood them.
+                debug!("Organization not found for member list: org_id={}", org_id);
+                (
                     StatusCode::NOT_FOUND,
                     ResponseJson(ErrorResponse::new(
                         "Organization not found".to_string(),
                         "not_found".to_string(),
                     )),
-                ),
-                services::admin::AdminError::Unauthorized(msg) => (
+                )
+            }
+            services::admin::AdminError::Unauthorized(msg) => {
+                warn!("Unauthorized organization member list: org_id={}", org_id);
+                (
                     StatusCode::UNAUTHORIZED,
                     ResponseJson(ErrorResponse::new(msg, "unauthorized".to_string())),
-                ),
-                _ => (
+                )
+            }
+            other => {
+                error!("Failed to list organization members: {:?}", other);
+                (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     ResponseJson(ErrorResponse::new(
                         "Failed to retrieve organization members".to_string(),
                         "internal_server_error".to_string(),
                     )),
-                ),
+                )
             }
         })?;
 
@@ -2287,7 +2313,7 @@ pub async fn list_organization_members(
         .map(|m| AdminOrganizationMemberResponse {
             id: m.member_id.to_string(),
             organization_id: m.organization_id.to_string(),
-            role: member_role_from_db_str(&m.role),
+            role: member_role_from_db_str(&m.role, m.member_id),
             joined_at: m.joined_at,
             invited_by: m.invited_by.map(|id| id.to_string()),
             user: AdminUserResponse {

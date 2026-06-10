@@ -123,6 +123,14 @@ pub const DEFAULT_MODELS_BASE: &str = "https://llm.chutes.ai";
 /// Connection-establishment timeout (bounds connect for every request, including
 /// streaming, without capping the streamed body).
 const CONNECT_TIMEOUT_SECS: u64 = 15;
+/// No-progress (inactivity) timeout between successive body reads. Bounds a
+/// stalled stream/response — a gateway that goes quiet after headers won't hold
+/// a request (and its concurrency slot) forever — **without** capping an actively
+/// streaming long generation (the clock resets on each chunk).
+const READ_TIMEOUT_SECS: u64 = 90;
+/// Upper bound on a non-streaming response body (the E2EE response blob is small;
+/// this caps a misbehaving/hostile gateway, consistent with the gunzip guard).
+const MAX_RESPONSE_BYTES: u64 = 64 * 1024 * 1024;
 
 impl ChutesClient {
     /// Build a client with the default hosts and a per-request timeout (seconds)
@@ -130,6 +138,7 @@ impl ChutesClient {
     pub fn new(api_key: String, timeout_seconds: u64) -> Result<Self, ChutesClientError> {
         let http = reqwest::Client::builder()
             .connect_timeout(std::time::Duration::from_secs(CONNECT_TIMEOUT_SECS))
+            .read_timeout(std::time::Duration::from_secs(READ_TIMEOUT_SECS))
             .build()?;
         Ok(Self {
             http,
@@ -226,7 +235,25 @@ impl ChutesClient {
             .send()
             .await?;
         let resp = error_for_status(resp).await?;
-        Ok(resp.bytes().await?.to_vec())
+        // Reject an over-large body — early if declared, and after read as a
+        // backstop (the response blob is small; this bounds a hostile gateway).
+        if resp
+            .content_length()
+            .is_some_and(|n| n > MAX_RESPONSE_BYTES)
+        {
+            return Err(ChutesClientError::Status {
+                status: 0,
+                body: format!("response Content-Length exceeds {MAX_RESPONSE_BYTES} bytes"),
+            });
+        }
+        let bytes = resp.bytes().await?;
+        if bytes.len() as u64 > MAX_RESPONSE_BYTES {
+            return Err(ChutesClientError::Status {
+                status: 0,
+                body: format!("response body exceeds {MAX_RESPONSE_BYTES} bytes"),
+            });
+        }
+        Ok(bytes.to_vec())
     }
 
     /// Send an E2EE streaming request and return the (status-checked) response

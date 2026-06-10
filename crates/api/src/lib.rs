@@ -678,7 +678,8 @@ pub async fn init_inference_providers(
     if config.external_providers.enable_chutes {
         match &config.external_providers.chutes_api_key {
             Some(api_key) if !config.external_providers.chutes_models.is_empty() => {
-                let pccs_url = std::env::var("PCCS_URL").ok().filter(|s| !s.is_empty());
+                let pccs_url = config.external_providers.pccs_url.clone();
+                let allow_streaming = config.external_providers.chutes_enable_streaming;
                 let verifier: Arc<
                     dyn inference_providers::attested::chutes::verifier_port::ChutesInstanceVerifier,
                 > = Arc::new(services::attestation::chutes::ChutesBackendVerifier::new(
@@ -690,7 +691,8 @@ pub async fn init_inference_providers(
                         api_key.clone(),
                         model.clone(),
                         config.external_providers.timeout_seconds,
-                    );
+                    )
+                    .with_streaming(allow_streaming);
                     match inference_providers::attested::chutes::Provider::new(
                         cfg,
                         verifier.clone(),

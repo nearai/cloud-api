@@ -35,6 +35,10 @@ use futures_util::{Stream, StreamExt};
 use super::e2ee::{ResponseSession, StreamKey};
 use crate::{CompletionError, SSEEvent, StreamChunk, StreamingResult};
 
+/// Upper bound on a single SSE line (one `data:` event) before a newline — caps
+/// unbounded buffer growth from a stalled/hostile gateway.
+const MAX_SSE_LINE_BYTES: usize = 16 * 1024 * 1024;
+
 fn b64(field: &str, s: &str) -> Result<Vec<u8>, CompletionError> {
     base64::engine::general_purpose::STANDARD
         .decode(s.trim())
@@ -142,6 +146,15 @@ where
         while let Some(next) = byte_stream.next().await {
             let chunk = next?;
             buf.extend_from_slice(&chunk);
+
+            // Bound the line buffer: a hostile/buggy gateway streaming bytes with
+            // no newline must not grow it without limit. One SSE event here is a
+            // single `data:` line; cap generously.
+            if buf.len() > MAX_SSE_LINE_BYTES {
+                Err(CompletionError::CompletionError(format!(
+                    "Chutes SSE line exceeds {MAX_SSE_LINE_BYTES} bytes without a newline"
+                )))?;
+            }
 
             // Process complete '\n'-terminated lines (the gateway reframes SSE
             // line-by-line; each event is a single `data:` line here).

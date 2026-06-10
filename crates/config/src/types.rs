@@ -997,6 +997,15 @@ pub struct ExternalProvidersConfig {
     /// Comma-separated Chutes model ids to register (e.g. `zai-org/GLM-5.1-TEE`),
     /// from `CHUTES_MODELS`.
     pub chutes_models: Vec<String>,
+    /// Expose Chutes **streaming** as an attested path (`CHUTES_ENABLE_STREAMING`,
+    /// default off). Off because Chutes' stream protocol has no authenticated
+    /// frame sequence numbers, so an on-path gateway could drop/reorder frames
+    /// undetectably — non-streaming is the honest attested default until Chutes
+    /// adds sequencing (and the inner-terminator behavior is verified on staging).
+    pub chutes_enable_streaming: bool,
+    /// Intel PCCS URL for DCAP collateral (shared with the NEAR attestation
+    /// verifier), from `PCCS_URL`. One source of truth instead of ad-hoc env reads.
+    pub pccs_url: Option<String>,
 }
 
 impl ExternalProvidersConfig {
@@ -1068,6 +1077,11 @@ impl ExternalProvidersConfig {
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
             .collect();
+        let chutes_enable_streaming = env::var("CHUTES_ENABLE_STREAMING")
+            .ok()
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        let pccs_url = env::var("PCCS_URL").ok().filter(|s| !s.is_empty());
 
         Self {
             openai_api_key,
@@ -1078,6 +1092,8 @@ impl ExternalProvidersConfig {
             enable_chutes,
             chutes_api_key,
             chutes_models,
+            chutes_enable_streaming,
+            pccs_url,
         }
     }
 

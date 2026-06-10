@@ -77,6 +77,10 @@ pub struct Config {
     /// Optional host overrides (tests/staging). Both or neither.
     api_base: Option<String>,
     models_base: Option<String>,
+    /// Expose the streaming chat path as attested. Default `false` — streaming
+    /// has no authenticated frame ordering (see [`e2ee_stream`]); the honest
+    /// attested default is non-streaming. Opt in via `Config::with_streaming`.
+    allow_streaming: bool,
 }
 
 impl Config {
@@ -93,6 +97,7 @@ impl Config {
             },
             api_base: None,
             models_base: None,
+            allow_streaming: false,
         }
     }
 
@@ -105,6 +110,13 @@ impl Config {
     ) -> Self {
         self.api_base = Some(api_base.into());
         self.models_base = Some(models_base.into());
+        self
+    }
+
+    /// Opt into exposing the streaming chat path as attested (default off — see
+    /// [`Config::allow_streaming`]).
+    pub fn with_streaming(mut self, allow: bool) -> Self {
+        self.allow_streaming = allow;
         self
     }
 
@@ -135,6 +147,9 @@ pub struct Provider {
     client: ChutesClient,
     verifier: Arc<dyn ChutesInstanceVerifier>,
     model_name: String,
+    /// Whether the streaming chat path is exposed as attested (see
+    /// [`Config::allow_streaming`]).
+    allow_streaming: bool,
     /// Memoized model→`chute_id` (the mapping is static), so we don't re-fetch
     /// `/v1/models` on every request.
     chute_id_cache: tokio::sync::OnceCell<String>,
@@ -161,6 +176,7 @@ impl Provider {
         verifier: Arc<dyn ChutesInstanceVerifier>,
     ) -> Result<Self, ChutesClientError> {
         let timeout = config.timeout_seconds.max(1) as u64;
+        let allow_streaming = config.allow_streaming;
         let mut client = ChutesClient::new(config.api_key, timeout)?;
         if let (Some(api), Some(models)) = (config.api_base, config.models_base) {
             client = client.with_hosts(api, models);
@@ -169,6 +185,7 @@ impl Provider {
             client,
             verifier,
             model_name: config.model_name,
+            allow_streaming,
             chute_id_cache: tokio::sync::OnceCell::new(),
         })
     }
@@ -233,9 +250,13 @@ impl Provider {
                     continue;
                 }
             };
+            // Canonicalize the e2e_pubkey once (trim), and use the SAME string for
+            // both the attestation binding (hashed) and the E2EE encapsulation
+            // (base64-decoded), so the two can't diverge.
+            let e2e_pubkey = inst.e2e_pubkey.trim();
             let info = match self
                 .verifier
-                .attest_instance(evidence, &boot_nonce, &inst.e2e_pubkey)
+                .attest_instance(evidence, &boot_nonce, e2e_pubkey)
                 .await
             {
                 Ok(info) => info,
@@ -244,14 +265,13 @@ impl Provider {
                     continue;
                 }
             };
-            let e2e_pk =
-                match base64::engine::general_purpose::STANDARD.decode(inst.e2e_pubkey.trim()) {
-                    Ok(pk) => pk,
-                    Err(e) => {
-                        last_err = format!("instance {} e2e_pubkey base64: {e}", inst.instance_id);
-                        continue;
-                    }
-                };
+            let e2e_pk = match base64::engine::general_purpose::STANDARD.decode(e2e_pubkey) {
+                Ok(pk) => pk,
+                Err(e) => {
+                    last_err = format!("instance {} e2e_pubkey base64: {e}", inst.instance_id);
+                    continue;
+                }
+            };
             let prepared = match e2ee::build_request(&e2e_pk, request_json) {
                 Ok(p) => p,
                 Err(e) => {
@@ -375,6 +395,19 @@ impl InferenceProvider for Provider {
         params: ChatCompletionParams,
         _request_hash: String,
     ) -> Result<StreamingResult, CompletionError> {
+        // Streaming is off by default: Chutes' stream protocol has no
+        // authenticated frame ordering (a gateway could drop/reorder AEAD-valid
+        // frames undetectably), so it isn't honestly attested until Chutes adds
+        // sequence numbers and the inner-terminator behavior is confirmed on
+        // staging. Opt in with CHUTES_ENABLE_STREAMING. Non-streaming is attested.
+        if !self.allow_streaming {
+            return Err(CompletionError::CompletionError(
+                "Chutes streaming is not enabled as an attested path (frame ordering is not \
+                 cryptographically authenticated); use non-streaming, or set \
+                 CHUTES_ENABLE_STREAMING to opt in"
+                    .to_string(),
+            ));
+        }
         let body = request_body(&self.model_name, &params, true)
             .map_err(CompletionError::CompletionError)?;
         let prep = self
@@ -654,6 +687,26 @@ mod tests {
         let m = p.models().await.unwrap();
         assert_eq!(m.data.len(), 1);
         assert_eq!(m.data[0].id, "zai-org/GLM-5.1-TEE");
+    }
+
+    #[tokio::test]
+    async fn streaming_gated_off_by_default() {
+        // Default provider has allow_streaming=false; chat_completion_stream must
+        // refuse before any network (the gate is the first check).
+        let p = provider();
+        // StreamingResult isn't Debug, so match rather than unwrap_err.
+        match p
+            .chat_completion_stream(
+                serde_json::from_value(json!({"model": "m", "messages": []})).unwrap(),
+                "h".into(),
+            )
+            .await
+        {
+            Err(CompletionError::CompletionError(msg)) => {
+                assert!(msg.contains("streaming is not enabled"), "got: {msg}")
+            }
+            _ => panic!("expected streaming-disabled error"),
+        }
     }
 
     #[tokio::test]

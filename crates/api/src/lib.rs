@@ -669,6 +669,52 @@ pub async fn init_inference_providers(
         .start_refresh_task(models_source, refresh_interval)
         .await;
 
+    // Chutes attested provider — hard-off by default (`ENABLE_CHUTES`). Each model
+    // is served over a verified ML-KEM E2EE channel: every request attests the
+    // chosen instance (TDX quote + report_data bindings + register-pinned
+    // measurement + GPU) before encapsulating, so an unverified backend can never
+    // serve a Chutes response. Registration is gated on the flag + an API key +
+    // at least one model id.
+    if config.external_providers.enable_chutes {
+        match &config.external_providers.chutes_api_key {
+            Some(api_key) if !config.external_providers.chutes_models.is_empty() => {
+                let pccs_url = std::env::var("PCCS_URL").ok().filter(|s| !s.is_empty());
+                let verifier: Arc<
+                    dyn inference_providers::attested::chutes::verifier_port::ChutesInstanceVerifier,
+                > = Arc::new(services::attestation::chutes::ChutesBackendVerifier::new(
+                    services::attestation::chutes::vetted_golden_measurements(),
+                    pccs_url,
+                ));
+                for model in &config.external_providers.chutes_models {
+                    let cfg = inference_providers::attested::chutes::Config::new(
+                        api_key.clone(),
+                        model.clone(),
+                        config.external_providers.timeout_seconds,
+                    );
+                    match inference_providers::attested::chutes::Provider::new(
+                        cfg,
+                        verifier.clone(),
+                    ) {
+                        Ok(provider) => {
+                            pool.register_provider(model.clone(), Arc::new(provider))
+                                .await;
+                            tracing::info!(model = %model, "Registered Chutes attested provider");
+                        }
+                        Err(e) => {
+                            tracing::warn!(model = %model, error = %e, "Failed to build Chutes provider");
+                        }
+                    }
+                }
+            }
+            _ => {
+                tracing::warn!(
+                    "ENABLE_CHUTES is set but CHUTES_API_KEY or CHUTES_MODELS is missing; \
+                     not registering any Chutes provider"
+                );
+            }
+        }
+    }
+
     pool
 }
 

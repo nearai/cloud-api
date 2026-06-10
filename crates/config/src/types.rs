@@ -990,6 +990,13 @@ pub struct ExternalProvidersConfig {
     /// Interval in seconds for refreshing external providers from the database.
     /// Set to 0 to disable periodic refresh. Default: 900 (15 minutes) in production.
     pub refresh_interval_secs: u64,
+    /// Chutes attested provider — hard-off by default (`ENABLE_CHUTES`).
+    pub enable_chutes: bool,
+    /// Chutes API key (`cpk_...`), from `CHUTES_API_KEY[_FILE]`. A secret.
+    pub chutes_api_key: Option<String>,
+    /// Comma-separated Chutes model ids to register (e.g. `zai-org/GLM-5.1-TEE`),
+    /// from `CHUTES_MODELS`.
+    pub chutes_models: Vec<String>,
 }
 
 impl ExternalProvidersConfig {
@@ -1035,12 +1042,34 @@ impl ExternalProvidersConfig {
             .and_then(|s| s.parse().ok())
             .unwrap_or(300);
 
+        // Chutes attested provider — hard-off by default.
+        let enable_chutes = env::var("ENABLE_CHUTES")
+            .ok()
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        let chutes_api_key = if let Ok(path) = env::var("CHUTES_API_KEY_FILE") {
+            std::fs::read_to_string(path)
+                .ok()
+                .map(|s| s.trim().to_string())
+        } else {
+            env::var("CHUTES_API_KEY").ok()
+        };
+        let chutes_models = env::var("CHUTES_MODELS")
+            .unwrap_or_default()
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+
         Self {
             openai_api_key,
             anthropic_api_key,
             gemini_api_key,
             timeout_seconds,
             refresh_interval_secs,
+            enable_chutes,
+            chutes_api_key,
+            chutes_models,
         }
     }
 

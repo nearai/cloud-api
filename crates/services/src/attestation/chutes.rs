@@ -27,7 +27,7 @@ use std::collections::HashSet;
 use inference_providers::attested::chutes::attestation as transform;
 use inference_providers::attested::chutes::evidence::InstanceEvidence;
 use inference_providers::attested::chutes::measurements::{
-    ChutesMeasurementPolicy, MeasurementError,
+    BootMeasurement, ChutesMeasurementPolicy, MeasurementError,
 };
 use inference_providers::attested::chutes::report_data::{
     freshness_digest, ChutesReportDataVerifier, ReportDataError,
@@ -196,10 +196,26 @@ impl ChutesInstanceVerifier for ChutesBackendVerifier {
     }
 }
 
+/// A vetted snapshot of Chutes' published golden measurements (from the public
+/// `GET https://api.chutes.ai/servers/tee/measurements`), confirmed 2026-06-10 to
+/// match the live GLM-5.1-TEE fleet byte-for-byte on MRTD + RTMR0-2. RTMR3 is a
+/// runtime register and intentionally not pinned. This is the software-identity
+/// anchor for the staging rollout; expand (or make config-driven) as more configs
+/// are independently vetted. Fail-closed: anything not listed here is rejected.
+pub fn vetted_golden_measurements() -> ChutesMeasurementPolicy {
+    ChutesMeasurementPolicy::new(vec![BootMeasurement::new(
+        "8xh200",
+        "1.3.0",
+        "ddc6efcdd2309e10837f8a7f64b71272b7ef003b129460410fe715bdfffec38c7c0c1686dddb2a23d4fd623d145e8455",
+        "2864b11878e8129095d62a5dd7c3e3aae178d3a077606a825617324768f189ad05aed08376947df92d6c75865d915cbf",
+        "f858ed2aecba4ecd29084352c6b5c6e403c0bec89b8c852f90fa5a8cee796ffa095518c5cd8b92c25c1856e932a95877",
+        "7719f4fde518994a5dd6767a8b8b87a38168cc0f3480e7498d4ace99e49319be6a7fed26c21ad43310d2d488fc68ab1c",
+    )])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use inference_providers::attested::chutes::measurements::BootMeasurement;
 
     fn dummy_evidence(quote: &str) -> InstanceEvidence {
         InstanceEvidence {

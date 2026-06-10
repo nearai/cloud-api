@@ -4227,6 +4227,7 @@ mod tests {
                 gemini_api_key: None,
                 timeout_seconds: 60,
                 refresh_interval_secs: 0,
+                ..Default::default()
             },
         );
 
@@ -4248,6 +4249,7 @@ mod tests {
                 gemini_api_key: None,
                 timeout_seconds: 60,
                 refresh_interval_secs: 0,
+                ..Default::default()
             },
         );
 
@@ -4281,6 +4283,7 @@ mod tests {
                 gemini_api_key: None,
                 timeout_seconds: 60,
                 refresh_interval_secs: 0,
+                ..Default::default()
             },
         );
 
@@ -4315,6 +4318,7 @@ mod tests {
                 gemini_api_key: Some("AIza-test".to_string()),
                 timeout_seconds: 60,
                 refresh_interval_secs: 0,
+                ..Default::default()
             },
         );
 
@@ -4340,6 +4344,7 @@ mod tests {
                 gemini_api_key: None,
                 timeout_seconds: 60,
                 refresh_interval_secs: 0,
+                ..Default::default()
             },
         );
 
@@ -4363,6 +4368,7 @@ mod tests {
                 gemini_api_key: None,
                 timeout_seconds: 60,
                 refresh_interval_secs: 0,
+                ..Default::default()
             },
         );
 
@@ -4385,6 +4391,7 @@ mod tests {
                 gemini_api_key: None,
                 timeout_seconds: 60,
                 refresh_interval_secs: 0,
+                ..Default::default()
             },
         );
 
@@ -4621,6 +4628,7 @@ mod tests {
                 gemini_api_key: None,
                 timeout_seconds: 60,
                 refresh_interval_secs: 0,
+                ..Default::default()
             },
         );
 

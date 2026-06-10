@@ -26,6 +26,7 @@
 //! verified one.
 
 pub mod attestation;
+pub mod client;
 pub mod e2ee;
 pub mod evidence;
 pub mod measurements;

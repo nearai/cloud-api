@@ -1,3 +1,4 @@
+pub mod chutes;
 pub mod measurement;
 pub mod models;
 pub mod report_data;

@@ -81,6 +81,12 @@ pub fn tls_cert_fingerprint(instance: &InstanceEvidence) -> Result<String, Trans
     compute_spki_fingerprint_from_der(&der).map_err(TransformError::InvalidCertificate)
 }
 
+/// The instance certificate as raw DER (base64-decoded). The Chutes verifier
+/// needs the DER to check `report_data[32:64] == SHA256(SPKI(cert))`.
+pub fn certificate_der(instance: &InstanceEvidence) -> Result<Vec<u8>, TransformError> {
+    decode_b64("certificate", &instance.certificate)
+}
+
 /// Assemble the NVIDIA NRAS-submittable payload from the per-GPU evidence.
 ///
 /// The nonce the NVIDIA evidence is bound to is Chutes-derived (not the raw

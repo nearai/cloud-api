@@ -27,6 +27,7 @@
 pub mod attestation;
 pub mod client;
 pub mod e2ee;
+pub mod e2ee_stream;
 pub mod evidence;
 pub mod measurements;
 pub mod report_data;
@@ -37,6 +38,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use base64::Engine;
+use futures_util::StreamExt;
 use serde_json::{json, Value};
 
 use self::client::{ChutesClient, ChutesClientError, InvokeMode, InvokeRequest};
@@ -309,14 +311,38 @@ impl InferenceProvider for Provider {
 
     async fn chat_completion_stream(
         &self,
-        _params: ChatCompletionParams,
+        params: ChatCompletionParams,
         _request_hash: String,
     ) -> Result<StreamingResult, CompletionError> {
-        // The E2EE SSE decrypt adapter (e2e_init -> stream key, per-chunk decrypt)
-        // lands in the next slice; non-streaming is verified end-to-end now.
-        Err(CompletionError::CompletionError(
-            "Chutes streaming E2EE is wired in a follow-up slice; use non-streaming for now"
-                .to_string(),
+        let body = request_body(&self.model_name, &params, true)
+            .map_err(CompletionError::CompletionError)?;
+        let prep = self
+            .verify_and_prepare(&body)
+            .await
+            .map_err(CompletionError::CompletionError)?;
+
+        let resp = self
+            .client
+            .invoke_stream(&InvokeRequest {
+                chute_id: &prep.chute_id,
+                instance_id: &prep.instance_id,
+                nonce_token: &prep.nonce_token,
+                path: CHAT_PATH,
+                mode: InvokeMode::Stream,
+                blob: prep.blob,
+            })
+            .await
+            .map_err(|e| {
+                CompletionError::CompletionError(format!("Chutes /e2e/invoke (stream): {e}"))
+            })?;
+
+        // Decrypt the E2EE SSE into OpenAI SSEEvents (transport errors → CompletionError).
+        let byte_stream = resp.bytes_stream().map(|r| {
+            r.map_err(|e| CompletionError::CompletionError(format!("Chutes stream transport: {e}")))
+        });
+        Ok(e2ee_stream::decrypt_e2ee_sse(
+            Box::pin(byte_stream),
+            prep.session,
         ))
     }
 
@@ -550,12 +576,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn streaming_is_unsupported_for_now() {
+    async fn non_chat_modalities_unsupported() {
+        // text_completion_stream returns the unsupported error with no network.
         let p = provider();
         assert!(p
-            .chat_completion_stream(
-                serde_json::from_value(json!({"model":"m","messages":[]})).unwrap(),
-                "h".into()
+            .text_completion_stream(
+                serde_json::from_value(json!({"model":"m","prompt":"hi"})).unwrap()
             )
             .await
             .is_err());

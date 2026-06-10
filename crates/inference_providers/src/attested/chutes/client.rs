@@ -211,6 +211,16 @@ impl ChutesClient {
         Ok(resp.bytes().await?.to_vec())
     }
 
+    /// Send an E2EE streaming request and return the (status-checked) response
+    /// for the caller to drive (`bytes_stream()` → the E2EE SSE adapter).
+    pub async fn invoke_stream(
+        &self,
+        req: &InvokeRequest<'_>,
+    ) -> Result<reqwest::Response, ChutesClientError> {
+        let resp = self.invoke_request(req).send().await?;
+        error_for_status(resp).await
+    }
+
     /// Build the `/e2e/invoke` request with all required headers. Exposed so the
     /// streaming caller can drive the response itself.
     pub fn invoke_request(&self, req: &InvokeRequest<'_>) -> reqwest::RequestBuilder {

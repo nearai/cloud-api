@@ -22,6 +22,9 @@
 //! explicit "not yet wired" error so this provider can never be mistaken for a
 //! verified one.
 
+pub mod attestation;
+pub mod evidence;
+
 use async_trait::async_trait;
 use std::sync::Arc;
 

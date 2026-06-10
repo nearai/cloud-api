@@ -27,6 +27,7 @@
 
 pub mod attestation;
 pub mod evidence;
+pub mod measurements;
 pub mod report_data;
 
 use async_trait::async_trait;

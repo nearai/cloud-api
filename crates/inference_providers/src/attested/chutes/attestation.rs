@@ -104,12 +104,17 @@ pub fn nvidia_payload(instance: &InstanceEvidence) -> Result<Value, TransformErr
             other: g.arch.trim().to_string(),
         });
     }
-    // Validate each entry decodes (fail-closed) before assembling.
+    // Validate each entry decodes (fail-closed) and emit the SAME (trimmed)
+    // bytes we validated — otherwise whitespace-padded base64 would pass local
+    // validation but NRAS would receive different bytes, failing far from the
+    // root cause.
     let mut evidence_list = Vec::with_capacity(instance.gpu_evidence.len());
     for g in &instance.gpu_evidence {
-        decode_b64("gpu_evidence.certificate", &g.certificate)?;
-        decode_b64("gpu_evidence.evidence", &g.evidence)?;
-        evidence_list.push(json!({ "certificate": g.certificate, "evidence": g.evidence }));
+        let certificate = g.certificate.trim();
+        let evidence = g.evidence.trim();
+        decode_b64("gpu_evidence.certificate", certificate)?;
+        decode_b64("gpu_evidence.evidence", evidence)?;
+        evidence_list.push(json!({ "certificate": certificate, "evidence": evidence }));
     }
     Ok(json!({ "arch": arch, "evidence_list": evidence_list }))
 }
@@ -159,9 +164,11 @@ mod tests {
         }
     }
 
-    // A real Chutes instance attestation certificate (DER, base64), captured from
-    // the live /evidence endpoint — used to exercise the real SPKI path.
-    const REAL_CERT_B64: &str = include_str!("testdata/instance_cert.b64");
+    // A SYNTHETIC self-signed X.509 cert (DER, base64) — exercises the SPKI
+    // fingerprint path without committing a real node's certificate (which
+    // embeds hostnames/IPs into repo history). The real Chutes cert is exercised
+    // by the live integration test in the verifier PR.
+    const TEST_CERT_B64: &str = include_str!("testdata/synthetic_cert.b64");
 
     #[test]
     fn intel_quote_base64_to_hex() {
@@ -169,7 +176,7 @@ mod tests {
             quote: "BAACAIE=".into(), // bytes 04 00 02 00 81
             gpu_evidence: vec![gpu()],
             instance_id: "i1".into(),
-            certificate: REAL_CERT_B64.trim().into(),
+            certificate: TEST_CERT_B64.trim().into(),
         };
         assert_eq!(intel_quote_hex(&inst).unwrap(), "0400020081");
     }
@@ -180,7 +187,7 @@ mod tests {
             quote: "BAACAIE=".into(),
             gpu_evidence: vec![gpu()],
             instance_id: "i1".into(),
-            certificate: REAL_CERT_B64.trim().into(),
+            certificate: TEST_CERT_B64.trim().into(),
         };
         let fp = tls_cert_fingerprint(&inst).expect("real cert SPKI fingerprint");
         assert_eq!(fp.len(), 64, "sha256 hex");
@@ -193,7 +200,7 @@ mod tests {
             quote: "BAACAIE=".into(),
             gpu_evidence: vec![gpu(), gpu()],
             instance_id: "i1".into(),
-            certificate: REAL_CERT_B64.trim().into(),
+            certificate: TEST_CERT_B64.trim().into(),
         };
         let p = nvidia_payload(&inst).unwrap();
         assert_eq!(p["arch"], "HOPPER");
@@ -210,7 +217,7 @@ mod tests {
             quote: "BAACAIE=".into(),
             gpu_evidence: vec![gpu(), g2],
             instance_id: "i1".into(),
-            certificate: REAL_CERT_B64.trim().into(),
+            certificate: TEST_CERT_B64.trim().into(),
         };
         assert!(matches!(
             nvidia_payload(&inst),
@@ -226,7 +233,7 @@ mod tests {
             quote: "BAACAIE=".into(),
             gpu_evidence: vec![g],
             instance_id: "i1".into(),
-            certificate: REAL_CERT_B64.trim().into(),
+            certificate: TEST_CERT_B64.trim().into(),
         };
         assert!(matches!(
             nvidia_payload(&inst),
@@ -240,7 +247,7 @@ mod tests {
             quote: "  BAACAIE=\n".into(),
             gpu_evidence: vec![gpu()],
             instance_id: "i1".into(),
-            certificate: REAL_CERT_B64.trim().into(),
+            certificate: TEST_CERT_B64.trim().into(),
         };
         assert_eq!(intel_quote_hex(&inst).unwrap(), "0400020081");
     }
@@ -251,7 +258,7 @@ mod tests {
             quote: "BAACAIE=".into(),
             gpu_evidence: vec![gpu()],
             instance_id: "inst-7f3a".into(),
-            certificate: REAL_CERT_B64.trim().into(),
+            certificate: TEST_CERT_B64.trim().into(),
         };
         let m = to_near_report(&inst, "deadbeef").unwrap();
         assert_eq!(m["intel_quote"], "0400020081");
@@ -270,7 +277,7 @@ mod tests {
             quote: "!!!not base64!!!".into(),
             gpu_evidence: vec![gpu()],
             instance_id: "i1".into(),
-            certificate: REAL_CERT_B64.trim().into(),
+            certificate: TEST_CERT_B64.trim().into(),
         };
         assert!(matches!(
             intel_quote_hex(&inst),
@@ -284,7 +291,7 @@ mod tests {
             quote: "BAACAIE=".into(),
             gpu_evidence: vec![],
             instance_id: "i1".into(),
-            certificate: REAL_CERT_B64.trim().into(),
+            certificate: TEST_CERT_B64.trim().into(),
         };
         assert!(matches!(
             nvidia_payload(&inst),
@@ -298,7 +305,7 @@ mod tests {
             quote: "".into(),
             gpu_evidence: vec![gpu()],
             instance_id: "i1".into(),
-            certificate: REAL_CERT_B64.trim().into(),
+            certificate: TEST_CERT_B64.trim().into(),
         };
         assert!(matches!(
             intel_quote_hex(&inst),

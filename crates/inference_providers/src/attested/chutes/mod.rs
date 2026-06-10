@@ -302,16 +302,34 @@ impl Provider {
 /// if the OS RNG is briefly unavailable (still correct, just less collision-shy).
 fn pick_nonce(nonces: &[String]) -> &str {
     debug_assert!(!nonces.is_empty());
-    let mut b = [0u8; 1];
-    let idx = if getrandom::fill(&mut b).is_ok() {
-        (b[0] as usize) % nonces.len()
-    } else {
-        0
-    };
+    // Wrapping global counter — infallible and contention-correct: concurrent
+    // requests to the same instance get distinct indices (unlike an RNG with a
+    // fixed `[0]` fallback, which would collide exactly when it matters).
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static COUNTER: AtomicUsize = AtomicUsize::new(0);
+    let idx = COUNTER.fetch_add(1, Ordering::Relaxed) % nonces.len();
     &nonces[idx]
 }
 
-/// An OpenAI request body (as JSON) with `model` pinned and `stream` set.
+/// Internal `extra` keys that must never reach Chutes (a third party): the
+/// tracing identifiers and the client-facing-E2EE markers. `ChatCompletionParams`
+/// flattens `extra` into the top-level body, so these would otherwise leak.
+const INTERNAL_KEYS: &[&str] = {
+    use crate::attested::nearai::{encryption_headers as eh, tracing_headers as th};
+    &[
+        th::REQUEST_ID,
+        th::ORG_ID,
+        th::WORKSPACE_ID,
+        eh::SIGNING_ALGO,
+        eh::CLIENT_PUB_KEY,
+        eh::MODEL_PUB_KEY,
+        eh::ENCRYPTION_VERSION,
+        eh::ENCRYPT_ALL_FIELDS,
+    ]
+};
+
+/// An OpenAI request body (as JSON) with `model` pinned, `stream` set, and all
+/// internal/tracing/E2EE-marker keys stripped (never sent to the third party).
 fn request_body(model: &str, params: &ChatCompletionParams, stream: bool) -> Result<Value, String> {
     let mut v = serde_json::to_value(params).map_err(|e| format!("serialize params: {e}"))?;
     if let Some(obj) = v.as_object_mut() {
@@ -327,10 +345,31 @@ fn request_body(model: &str, params: &ChatCompletionParams, stream: bool) -> Res
                 json!({ "include_usage": true }),
             );
         }
+        // Strip internal identifiers + client-E2EE markers so they never reach
+        // Chutes inside the (encrypted) request body.
+        for k in INTERNAL_KEYS {
+            obj.remove(*k);
+        }
     } else {
         return Err("chat params did not serialize to a JSON object".to_string());
     }
     Ok(v)
+}
+
+/// Reject a request that carries client-facing E2EE intent (the client asked
+/// cloud-api to encrypt the response to its key). The attested Chutes path does
+/// not implement that response encryption, so we **reject** rather than silently
+/// downgrade to a response the client would believe is E2EE but isn't.
+fn reject_client_e2ee(params: &ChatCompletionParams) -> Result<(), CompletionError> {
+    use crate::attested::nearai::encryption_headers as eh;
+    if params.extra.contains_key(eh::CLIENT_PUB_KEY) {
+        return Err(CompletionError::CompletionError(
+            "client-facing E2EE is not supported on the attested Chutes path (responses arrive \
+             over Chutes' own ML-KEM channel); omit the client encryption headers"
+                .to_string(),
+        ));
+    }
+    Ok(())
 }
 
 const UNSUPPORTED: &str =
@@ -356,6 +395,7 @@ impl InferenceProvider for Provider {
         params: ChatCompletionParams,
         _request_hash: String,
     ) -> Result<ChatCompletionResponseWithBytes, CompletionError> {
+        reject_client_e2ee(&params)?;
         let body = request_body(&self.model_name, &params, false)
             .map_err(CompletionError::CompletionError)?;
         let prep = self
@@ -408,6 +448,7 @@ impl InferenceProvider for Provider {
                     .to_string(),
             ));
         }
+        reject_client_e2ee(&params)?;
         let body = request_body(&self.model_name, &params, true)
             .map_err(CompletionError::CompletionError)?;
         let prep = self
@@ -549,9 +590,11 @@ impl InferenceProvider for Provider {
             AttestationError::FetchError("chosen instance not present in /evidence".to_string())
         })?;
 
+        // Trim to match the data path's canonicalization (verify_and_prepare).
+        let e2e_pubkey = inst.e2e_pubkey.trim();
         let info = self
             .verifier
-            .attest_instance(evidence, &boot_nonce, &inst.e2e_pubkey)
+            .attest_instance(evidence, &boot_nonce, e2e_pubkey)
             .await
             .map_err(|e| AttestationError::FetchError(format!("attestation failed: {e}")))?;
 
@@ -679,6 +722,52 @@ mod tests {
         let body = request_body("m", &params, false).unwrap();
         assert_eq!(body["stream"], false);
         assert!(body.get("stream_options").is_none());
+    }
+
+    #[test]
+    fn request_body_strips_internal_and_e2ee_keys() {
+        use crate::attested::nearai::{encryption_headers as eh, tracing_headers as th};
+        let mut params: ChatCompletionParams =
+            serde_json::from_value(json!({"model": "m", "messages": []})).unwrap();
+        // Internal identifiers + client-E2EE markers must never reach Chutes.
+        for k in [
+            th::REQUEST_ID,
+            th::ORG_ID,
+            th::WORKSPACE_ID,
+            eh::SIGNING_ALGO,
+            eh::CLIENT_PUB_KEY,
+            eh::MODEL_PUB_KEY,
+            eh::ENCRYPTION_VERSION,
+            eh::ENCRYPT_ALL_FIELDS,
+        ] {
+            params.extra.insert(k.to_string(), json!("leak"));
+        }
+        let body = request_body("m", &params, false).unwrap();
+        let obj = body.as_object().unwrap();
+        for k in INTERNAL_KEYS {
+            assert!(
+                !obj.contains_key(*k),
+                "internal key {k} must not reach Chutes in the request body"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn rejects_client_facing_e2ee() {
+        use crate::attested::nearai::encryption_headers as eh;
+        let p = provider();
+        let mut params: ChatCompletionParams =
+            serde_json::from_value(json!({"model": "m", "messages": []})).unwrap();
+        params
+            .extra
+            .insert(eh::CLIENT_PUB_KEY.to_string(), json!("clientkey"));
+        // Rejected before any network (the check is first).
+        match p.chat_completion(params, "h".into()).await {
+            Err(CompletionError::CompletionError(msg)) => {
+                assert!(msg.contains("client-facing E2EE"), "got: {msg}")
+            }
+            _ => panic!("expected client-E2EE rejection"),
+        }
     }
 
     #[tokio::test]

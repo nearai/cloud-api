@@ -3158,8 +3158,22 @@ impl InferenceProviderPool {
                 reused.retain(|(_, url, _)| !evict_set.contains(url.as_str()));
 
                 {
+                    // Never evict a pinned (out-of-band, attested) model — a DB
+                    // inference-url model sharing its name (e.g. a Blocked
+                    // fingerprint) must not remove the pinned provider, which the
+                    // insert guards would then refuse to restore. Mirrors the
+                    // guards on the insert paths and remove_stale_providers.
+                    let pinned = self
+                        .pinned_models
+                        .read()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .clone();
                     let mut mappings = self.provider_mappings.write().await;
                     for model in &evicted_models {
+                        if pinned.contains(model) {
+                            warn!(model = %model, "Skipping eviction of a pinned (attested) provider");
+                            continue;
+                        }
                         mappings.model_to_providers.remove(model);
                     }
                     // Prune pubkey_to_providers of entries pointing at the

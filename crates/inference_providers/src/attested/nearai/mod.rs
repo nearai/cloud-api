@@ -103,8 +103,10 @@ pub(crate) mod tracing_headers {
     pub const WORKSPACE_ID: &str = "x_workspace_id";
 }
 
-/// Encryption header keys used in params.extra for passing encryption information
-mod encryption_headers {
+/// Encryption header keys used in params.extra for passing encryption information.
+/// `pub(crate)` so other providers (e.g. the Chutes path) can strip/reject these
+/// internal client-E2EE markers instead of hardcoding the strings.
+pub(crate) mod encryption_headers {
     /// Key for signing algorithm (x-signing-algo header)
     pub const SIGNING_ALGO: &str = "x_signing_algo";
     /// Key for client public key (x-client-pub-key header)

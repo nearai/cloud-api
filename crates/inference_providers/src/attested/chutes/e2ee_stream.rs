@@ -106,6 +106,16 @@ fn handle_outer_payload(
     };
 
     if let Some(init) = obj.get("e2e_init").and_then(|x| x.as_str()) {
+        // Reject a second e2e_init: ML-KEM decapsulation never fails (implicit
+        // rejection), so silently re-keying would let an on-path gateway inject a
+        // bogus e2e_init that makes all subsequent genuine frames fail to decrypt.
+        // One key per stream — fail clearly instead.
+        if stream_key.is_some() {
+            return Err(CompletionError::CompletionError(
+                "Chutes stream: unexpected second e2e_init (possible on-path tampering)"
+                    .to_string(),
+            ));
+        }
         let ct = b64("e2e_init", init)?;
         *stream_key =
             Some(session.stream_key(&ct).map_err(|e| {
@@ -181,10 +191,12 @@ where
             }
         }
 
-        // Reached only on EOF *without* a terminal `[DONE]` (or with a dangling
-        // partial line) — a truncated/interrupted encrypted stream. Fail closed,
-        // so the route layer does not mint its own `[DONE]` and present a
-        // truncated completion as successful.
+        // Reached only on EOF *without* an authenticated inner `[DONE]` (or with a
+        // dangling partial line) — a truncated/interrupted encrypted stream. We
+        // yield an error here; the route layer does append its own gateway-minted
+        // `[DONE]` after the stream (completions.rs), but that's emitted *after*
+        // this error frame, so the client still sees the failure first and the
+        // truncated content is not presented as a clean success.
         Err(CompletionError::CompletionError(
             "Chutes E2EE stream ended without a terminal [DONE] (truncated or interrupted)"
                 .to_string(),

@@ -124,8 +124,10 @@ where
             // Process complete '\n'-terminated lines (the gateway reframes SSE
             // line-by-line; each event is a single `data:` line here).
             while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
-                let line: Vec<u8> = buf.drain(..=pos).collect();
-                let line = String::from_utf8_lossy(&line);
+                // Take the line out (owned) before draining, so we don't hold a
+                // borrow across the buffer mutation; one allocation per line.
+                let line = String::from_utf8_lossy(&buf[..pos]).into_owned();
+                buf.drain(..=pos);
                 let line = line.trim();
                 if line.is_empty() || line.starts_with(':') {
                     continue;

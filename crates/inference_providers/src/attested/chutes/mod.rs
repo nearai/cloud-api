@@ -435,9 +435,14 @@ impl InferenceProvider for Provider {
                 AttestationError::FetchError("no E2E-capable Chutes instance".to_string())
             })?;
 
-        // Use the caller's nonce if it's a usable 32-byte hex value, else fresh.
-        let boot_nonce = match nonce {
-            Some(n) if hex::decode(&n).map(|b| b.len() == 32).unwrap_or(false) => n,
+        // Use the caller's nonce if it normalizes to a 32-byte hex value (accept
+        // an optional `0x` prefix), else mint a fresh one. We send the normalized
+        // bare-hex form to Chutes and bind against the same string, so a
+        // `0x`-prefixed input is honored rather than silently dropped.
+        let boot_nonce = match nonce.as_deref().map(|n| n.strip_prefix("0x").unwrap_or(n)) {
+            Some(n) if hex::decode(n).map(|b| b.len() == 32).unwrap_or(false) => {
+                n.to_ascii_lowercase()
+            }
             _ => Self::random_boot_nonce().map_err(AttestationError::FetchError)?,
         };
 

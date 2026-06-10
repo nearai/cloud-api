@@ -74,10 +74,8 @@ impl BootMeasurement {
 }
 
 fn norm(s: &str) -> String {
-    s.trim()
-        .strip_prefix("0x")
-        .unwrap_or_else(|| s.trim())
-        .to_ascii_lowercase()
+    let t = s.trim();
+    t.strip_prefix("0x").unwrap_or(t).to_ascii_lowercase()
 }
 
 /// Errors from register-pinning Chutes boot measurements. Every variant is fatal.

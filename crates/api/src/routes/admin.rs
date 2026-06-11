@@ -5,13 +5,14 @@ use crate::conversions::{
 use crate::middleware::AdminUser;
 use crate::models::{
     AdminAccessTokenResponse, AdminInvitationEmailResendResultResponse, AdminModelListResponse,
-    AdminModelWithPricing, AdminOrganizationResponse, AdminServiceResponse,
-    AdminUserOrganizationDetails, AdminUserResponse, BatchUpdateModelApiRequest,
-    CreateAdminAccessTokenRequest, CreateServiceRequest, CreditType, DecimalPrice,
-    DecimalPriceRequest, DeleteAdminAccessTokenRequest, DeleteModelRequest, DeprecateModelRequest,
-    DeprecateModelResponse, ErrorResponse, GetOrganizationConcurrentLimitResponse,
-    ListAdminInvitationEmailDeliveriesResponse, ListOrganizationsAdminResponse,
-    ListPricingChangesResponse, ListUsersResponse, ModelArchitecture,
+    AdminModelWithPricing, AdminOrganizationMemberResponse, AdminOrganizationResponse,
+    AdminServiceResponse, AdminUserOrganizationDetails, AdminUserResponse,
+    BatchUpdateModelApiRequest, CreateAdminAccessTokenRequest, CreateServiceRequest, CreditType,
+    DecimalPrice, DecimalPriceRequest, DeleteAdminAccessTokenRequest, DeleteModelRequest,
+    DeprecateModelRequest, DeprecateModelResponse, ErrorResponse,
+    GetOrganizationConcurrentLimitResponse, ListAdminInvitationEmailDeliveriesResponse,
+    ListAdminOrganizationMembersResponse, ListOrganizationsAdminResponse,
+    ListPricingChangesResponse, ListUsersResponse, MemberRole, ModelArchitecture,
     ModelDeprecationConfirmResponse, ModelDeprecationPreviewResponse, ModelDeprecationRequest,
     ModelHistoryEntry, ModelHistoryResponse, ModelMetadata, ModelWithPricing,
     OrgLimitsHistoryEntry, OrgLimitsHistoryResponse, OrganizationUsage, PricingChangeBatchRequest,
@@ -36,7 +37,7 @@ use services::auth::AuthServiceTrait;
 use services::github_dispatch::GitHubDispatcher;
 use services::usage::UsageServiceTrait;
 use std::sync::Arc;
-use tracing::{debug, error, Instrument};
+use tracing::{debug, error, warn, Instrument};
 use uuid::Uuid;
 
 /// Parse an OpenRouter `deprecation_date` into a normalized `DateTime<Utc>`.
@@ -2123,27 +2124,7 @@ pub async fn list_organizations(
 
     let org_responses: Vec<AdminOrganizationResponse> = organizations
         .into_iter()
-        .map(|org| {
-            let current_usage = org.total_spent.map(|total_spent| OrganizationUsage {
-                total_spent,
-                total_spent_display: format_amount(total_spent),
-                total_requests: org.total_requests.unwrap_or(0),
-                total_tokens: org.total_tokens.unwrap_or(0),
-            });
-
-            AdminOrganizationResponse {
-                id: org.id.to_string(),
-                name: org.name,
-                description: org.description,
-                spend_limit: org.spend_limit.map(|amount| SpendLimit {
-                    amount,
-                    scale: 9,
-                    currency: "USD".to_string(),
-                }),
-                current_usage,
-                created_at: org.created_at,
-            }
-        })
+        .map(admin_org_info_to_response)
         .collect();
 
     let response = ListOrganizationsAdminResponse {
@@ -2154,6 +2135,233 @@ pub async fn list_organizations(
     };
 
     Ok(ResponseJson(response))
+}
+
+/// Get a single organization by id (Admin only)
+///
+/// Returns one organization with its spend limit and usage. Only authenticated
+/// admins can perform this operation. Returns 404 if the organization does not
+/// exist or is inactive (consistent with the admin organizations list, which
+/// hides inactive orgs).
+#[utoipa::path(
+    get,
+    path = "/v1/admin/organizations/{org_id}",
+    tag = "Admin",
+    params(
+        ("org_id" = Uuid, Path, description = "Organization ID")
+    ),
+    responses(
+        (status = 200, description = "Organization retrieved successfully", body = AdminOrganizationResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 404, description = "Organization not found", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    ),
+    security(
+        ("session_token" = [])
+    )
+)]
+pub async fn get_organization(
+    State(app_state): State<AdminAppState>,
+    Extension(_admin_user): Extension<AdminUser>, // Require admin auth
+    Path(org_id): Path<Uuid>,
+) -> Result<ResponseJson<AdminOrganizationResponse>, (StatusCode, ResponseJson<ErrorResponse>)> {
+    debug!("Get organization request: org_id={}", org_id);
+
+    let org = app_state
+        .admin_service
+        .get_organization(org_id)
+        .await
+        .map_err(|e| match e {
+            services::admin::AdminError::OrganizationNotFound(_) => {
+                debug!("Organization not found: org_id={}", org_id);
+                (
+                    StatusCode::NOT_FOUND,
+                    ResponseJson(ErrorResponse::new(
+                        "Organization not found".to_string(),
+                        "not_found".to_string(),
+                    )),
+                )
+            }
+            services::admin::AdminError::Unauthorized(msg) => {
+                warn!("Unauthorized get organization: org_id={}", org_id);
+                (
+                    StatusCode::UNAUTHORIZED,
+                    ResponseJson(ErrorResponse::new(msg, "unauthorized".to_string())),
+                )
+            }
+            other => {
+                error!("Failed to get organization: {:?}", other);
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    ResponseJson(ErrorResponse::new(
+                        "Failed to retrieve organization".to_string(),
+                        "internal_server_error".to_string(),
+                    )),
+                )
+            }
+        })?;
+
+    Ok(ResponseJson(admin_org_info_to_response(org)))
+}
+
+/// Map a service-layer `AdminOrganizationInfo` to the API
+/// `AdminOrganizationResponse`. Shared by `list_organizations` and
+/// `get_organization` so the spend-limit scale and usage block can't drift
+/// between the two.
+fn admin_org_info_to_response(
+    org: services::admin::AdminOrganizationInfo,
+) -> AdminOrganizationResponse {
+    let current_usage = org.total_spent.map(|total_spent| OrganizationUsage {
+        total_spent,
+        total_spent_display: format_amount(total_spent),
+        total_requests: org.total_requests.unwrap_or(0),
+        total_tokens: org.total_tokens.unwrap_or(0),
+    });
+
+    AdminOrganizationResponse {
+        id: org.id.to_string(),
+        name: org.name,
+        description: org.description,
+        spend_limit: org.spend_limit.map(|amount| SpendLimit {
+            amount,
+            scale: 9,
+            currency: "USD".to_string(),
+        }),
+        current_usage,
+        created_at: org.created_at,
+    }
+}
+
+/// Map a raw database role string to the API `MemberRole`. Unknown values fall
+/// back to `Member` (the least-privileged role) so a malformed row can never
+/// be misrepresented as an owner/admin.
+fn member_role_from_db_str(role: &str, member_id: Uuid) -> MemberRole {
+    match role {
+        "owner" => MemberRole::Owner,
+        "admin" => MemberRole::Admin,
+        "member" => MemberRole::Member,
+        _ => {
+            // Unreachable while the `organization_members.role` CHECK constraint
+            // holds, but if it is ever relaxed we must not silently present a
+            // bogus role as a real one. Fall back to the least-privileged role
+            // and surface the anomaly by id only (no raw DB value, per the
+            // project's logging rules).
+            warn!(
+                "Unexpected organization member role for member_id={}; defaulting to 'member'",
+                member_id
+            );
+            MemberRole::Member
+        }
+    }
+}
+
+/// List members of a specific organization (Admin only)
+///
+/// Returns the members of the given organization with full user details
+/// (email, last login, active status), consistent with `/v1/admin/users`.
+/// Only authenticated admins can perform this operation.
+#[utoipa::path(
+    get,
+    path = "/v1/admin/organizations/{org_id}/members",
+    tag = "Admin",
+    params(
+        ("org_id" = Uuid, Path, description = "Organization ID"),
+        ("limit" = Option<i64>, Query, description = "Maximum number of members to return (default: 100)"),
+        ("offset" = Option<i64>, Query, description = "Number of members to skip (default: 0)")
+    ),
+    responses(
+        (status = 200, description = "Organization members retrieved successfully", body = ListAdminOrganizationMembersResponse),
+        (status = 400, description = "Invalid request", body = ErrorResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 404, description = "Organization not found", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    ),
+    security(
+        ("session_token" = [])
+    )
+)]
+pub async fn list_organization_members(
+    State(app_state): State<AdminAppState>,
+    Extension(_admin_user): Extension<AdminUser>, // Require admin auth
+    Path(org_id): Path<Uuid>,
+    Query(params): Query<ListOrganizationsQueryParams>,
+) -> Result<
+    ResponseJson<ListAdminOrganizationMembersResponse>,
+    (StatusCode, ResponseJson<ErrorResponse>),
+> {
+    crate::routes::common::validate_limit_offset(params.limit, params.offset)?;
+
+    debug!(
+        "List organization members request: org_id={}, limit={}, offset={}",
+        org_id, params.limit, params.offset
+    );
+
+    let (members, total) = app_state
+        .admin_service
+        .list_organization_members(org_id, params.limit, params.offset)
+        .await
+        .map_err(|e| match e {
+            services::admin::AdminError::OrganizationNotFound(_) => {
+                // Expected for probes of unknown/deactivated org ids — keep it
+                // out of error-level logs so it can't be used to flood them.
+                debug!("Organization not found for member list: org_id={}", org_id);
+                (
+                    StatusCode::NOT_FOUND,
+                    ResponseJson(ErrorResponse::new(
+                        "Organization not found".to_string(),
+                        "not_found".to_string(),
+                    )),
+                )
+            }
+            services::admin::AdminError::Unauthorized(msg) => {
+                warn!("Unauthorized organization member list: org_id={}", org_id);
+                (
+                    StatusCode::UNAUTHORIZED,
+                    ResponseJson(ErrorResponse::new(msg, "unauthorized".to_string())),
+                )
+            }
+            other => {
+                error!("Failed to list organization members: {:?}", other);
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    ResponseJson(ErrorResponse::new(
+                        "Failed to retrieve organization members".to_string(),
+                        "internal_server_error".to_string(),
+                    )),
+                )
+            }
+        })?;
+
+    let member_responses: Vec<AdminOrganizationMemberResponse> = members
+        .into_iter()
+        .map(|m| AdminOrganizationMemberResponse {
+            id: m.member_id.to_string(),
+            organization_id: m.organization_id.to_string(),
+            role: member_role_from_db_str(&m.role, m.member_id),
+            joined_at: m.joined_at,
+            invited_by: m.invited_by.map(|id| id.to_string()),
+            user: AdminUserResponse {
+                id: m.user.id.to_string(),
+                email: m.user.email,
+                username: Some(m.user.username),
+                display_name: m.user.display_name,
+                avatar_url: m.user.avatar_url,
+                created_at: m.user.created_at,
+                last_login_at: m.user.last_login_at,
+                is_active: m.user.is_active,
+                auth_provider: m.user.auth_provider,
+                provider_user_id: m.user.provider_user_id,
+                organizations: None,
+            },
+        })
+        .collect();
+
+    Ok(ResponseJson(ListAdminOrganizationMembersResponse {
+        members: member_responses,
+        total,
+        limit: params.limit,
+        offset: params.offset,
+    }))
 }
 
 /// List organization invitation email deliveries (Admin only)

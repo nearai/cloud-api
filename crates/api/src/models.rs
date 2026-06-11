@@ -2542,6 +2542,16 @@ pub struct ListOrganizationsAdminResponse {
     pub offset: i64,
 }
 
+/// List organization members response model (admin only).
+/// Exposes full user details (email, last login, active status) for each member.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ListAdminOrganizationMembersResponse {
+    pub members: Vec<AdminOrganizationMemberResponse>,
+    pub total: i64,
+    pub limit: i64,
+    pub offset: i64,
+}
+
 /// Admin access token request model
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct CreateAdminAccessTokenRequest {

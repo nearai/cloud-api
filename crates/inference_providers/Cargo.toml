@@ -8,6 +8,7 @@ description.workspace = true
 
 [dependencies]
 async-trait = "0.1"
+base64 = "0.22"
 bytes = "1.11"
 chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1", features = ["v4"] }
@@ -30,6 +31,16 @@ serde_urlencoded = "0.7.1"
 regex = "1"
 sha2 = "0.11"
 url = "2.5"
+# Chutes E2EE transport: ML-KEM-768 (FIPS 203) + HKDF-SHA256 + ChaCha20-Poly1305.
+# Exact-pinned (`=`) to match Chutes' own RustCrypto reference client
+# (github.com/chutesai/e2ee-test), which interoperates with their server — a
+# floated minor could change the KEM wire encoding and silently break interop.
+ml-kem = { version = "=0.3.2", features = ["getrandom"] }
+hkdf = "0.13"
+chacha20poly1305 = "0.10"
+flate2 = "1"
+getrandom = "0.3"
+async-stream = "0.3"
 
 # Dev dependencies for testing and examples
 [dev-dependencies]

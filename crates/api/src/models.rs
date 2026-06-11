@@ -1479,10 +1479,11 @@ pub struct ResponseObject {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, ToSchema)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "snake_case")]
 pub enum ResponseStatus {
     Completed,
     Failed,
+    #[serde(alias = "inprogress")]
     InProgress,
     Cancelled,
     Queued,
@@ -1494,6 +1495,8 @@ pub struct ResponseError {
     pub message: String,
     #[serde(rename = "type")]
     pub type_: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub param: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub code: Option<String>,
 }
@@ -1600,10 +1603,11 @@ pub enum ResponseOutputItem {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "snake_case")]
 pub enum ResponseItemStatus {
     Completed,
     Failed,
+    #[serde(alias = "inprogress")]
     InProgress,
     Cancelled,
 }
@@ -1693,6 +1697,10 @@ pub struct ResponseStreamEvent {
     pub delta: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<ResponseError>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status_code: Option<u16>,
 }
 
 /// Input item list for responses
@@ -2569,6 +2577,16 @@ pub struct ListOrganizationsAdminResponse {
     pub offset: i64,
 }
 
+/// List organization members response model (admin only).
+/// Exposes full user details (email, last login, active status) for each member.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ListAdminOrganizationMembersResponse {
+    pub members: Vec<AdminOrganizationMemberResponse>,
+    pub total: i64,
+    pub limit: i64,
+    pub offset: i64,
+}
+
 /// Admin access token request model
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct CreateAdminAccessTokenRequest {
@@ -3332,6 +3350,155 @@ pub struct ModelDeprecationConfirmResponse {
     pub skipped_count: i64,
 }
 
+/// One model's entry in a scheduled pricing change batch.
+/// Omitted pricing fields are left unchanged; at least one is required.
+#[derive(Debug, Deserialize, Serialize, ToSchema)]
+pub struct PricingChangeItemRequest {
+    #[serde(rename = "modelId")]
+    pub model_id: String,
+    /// When the new pricing takes effect (`YYYY-MM-DD`, defaults to 13:00
+    /// UTC, or a whole-hour UTC instant `YYYY-MM-DDTHH:00:00Z`). Must be at
+    /// least one hour in the future.
+    #[serde(rename = "effectiveAt")]
+    pub effective_at: String,
+    #[serde(rename = "inputCostPerToken", skip_serializing_if = "Option::is_none")]
+    pub input_cost_per_token: Option<DecimalPriceRequest>,
+    #[serde(rename = "outputCostPerToken", skip_serializing_if = "Option::is_none")]
+    pub output_cost_per_token: Option<DecimalPriceRequest>,
+    #[serde(
+        rename = "cacheReadCostPerToken",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub cache_read_cost_per_token: Option<DecimalPriceRequest>,
+    #[serde(rename = "costPerImage", skip_serializing_if = "Option::is_none")]
+    pub cost_per_image: Option<DecimalPriceRequest>,
+}
+
+/// Request to preview or confirm a batch of scheduled pricing changes.
+#[derive(Debug, Deserialize, Serialize, ToSchema)]
+pub struct PricingChangeBatchRequest {
+    /// Idempotency key for the batch. Generate once client-side and reuse on
+    /// retries so a re-confirm never sends duplicate emails. Confirm
+    /// generates one when omitted.
+    #[serde(rename = "batchId", skip_serializing_if = "Option::is_none")]
+    pub batch_id: Option<uuid::Uuid>,
+    pub changes: Vec<PricingChangeItemRequest>,
+    /// Optional reason recorded in model history when the change is applied.
+    #[serde(rename = "changeReason", skip_serializing_if = "Option::is_none")]
+    pub change_reason: Option<String>,
+}
+
+/// Full pricing snapshot (all four fields).
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct PricingFields {
+    #[serde(rename = "inputCostPerToken")]
+    pub input_cost_per_token: DecimalPrice,
+    #[serde(rename = "outputCostPerToken")]
+    pub output_cost_per_token: DecimalPrice,
+    #[serde(rename = "cacheReadCostPerToken")]
+    pub cache_read_cost_per_token: DecimalPrice,
+    #[serde(rename = "costPerImage")]
+    pub cost_per_image: DecimalPrice,
+}
+
+/// Partial pricing update; omitted fields are unchanged.
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct PricingFieldUpdates {
+    #[serde(rename = "inputCostPerToken", skip_serializing_if = "Option::is_none")]
+    pub input_cost_per_token: Option<DecimalPrice>,
+    #[serde(rename = "outputCostPerToken", skip_serializing_if = "Option::is_none")]
+    pub output_cost_per_token: Option<DecimalPrice>,
+    #[serde(
+        rename = "cacheReadCostPerToken",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub cache_read_cost_per_token: Option<DecimalPrice>,
+    #[serde(rename = "costPerImage", skip_serializing_if = "Option::is_none")]
+    pub cost_per_image: Option<DecimalPrice>,
+}
+
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct PricingChangeModelPreviewDto {
+    #[serde(rename = "modelId")]
+    pub model_id: String,
+    #[serde(rename = "modelDisplayName")]
+    pub model_display_name: String,
+    #[serde(rename = "effectiveAt")]
+    pub effective_at: String,
+    #[serde(rename = "recipientCount")]
+    pub recipient_count: i64,
+    #[serde(rename = "organizationCount")]
+    pub organization_count: i64,
+    #[serde(rename = "oldPricing")]
+    pub old_pricing: PricingFields,
+    #[serde(rename = "newPricing")]
+    pub new_pricing: PricingFieldUpdates,
+}
+
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct PricingChangePreviewResponse {
+    /// Distinct recipient emails across the whole batch.
+    #[serde(rename = "recipientCount")]
+    pub recipient_count: i64,
+    #[serde(rename = "organizationCount")]
+    pub organization_count: i64,
+    #[serde(rename = "usageWindowDays")]
+    pub usage_window_days: i64,
+    pub models: Vec<PricingChangeModelPreviewDto>,
+}
+
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct ScheduledPricingChangeDto {
+    pub id: String,
+    #[serde(rename = "batchId")]
+    pub batch_id: String,
+    #[serde(rename = "modelId")]
+    pub model_id: String,
+    #[serde(rename = "modelDisplayName")]
+    pub model_display_name: String,
+    /// One of: pending, applying, applied, cancelled, failed.
+    pub status: String,
+    #[serde(rename = "effectiveAt")]
+    pub effective_at: String,
+    #[serde(rename = "oldPricing")]
+    pub old_pricing: PricingFields,
+    #[serde(rename = "newPricing")]
+    pub new_pricing: PricingFieldUpdates,
+    #[serde(rename = "appliedAt", skip_serializing_if = "Option::is_none")]
+    pub applied_at: Option<String>,
+    #[serde(rename = "lastError", skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+    #[serde(rename = "createdByUserEmail", skip_serializing_if = "Option::is_none")]
+    pub created_by_user_email: Option<String>,
+    #[serde(rename = "changeReason", skip_serializing_if = "Option::is_none")]
+    pub change_reason: Option<String>,
+    #[serde(rename = "createdAt")]
+    pub created_at: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct PricingChangeConfirmResponse {
+    #[serde(rename = "batchId")]
+    pub batch_id: String,
+    #[serde(rename = "recipientCount")]
+    pub recipient_count: i64,
+    #[serde(rename = "organizationCount")]
+    pub organization_count: i64,
+    #[serde(rename = "sentCount")]
+    pub sent_count: i64,
+    #[serde(rename = "failedCount")]
+    pub failed_count: i64,
+    #[serde(rename = "skippedCount")]
+    pub skipped_count: i64,
+    pub changes: Vec<ScheduledPricingChangeDto>,
+}
+
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct ListPricingChangesResponse {
+    pub changes: Vec<ScheduledPricingChangeDto>,
+    pub total: i64,
+}
+
 /// Model history entry - includes pricing, context length, and other model attributes
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct ModelHistoryEntry {
@@ -3642,6 +3809,31 @@ pub struct FileDeleteResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn test_response_status_serializes_in_progress_with_underscore() {
+        assert_eq!(
+            serde_json::to_value(ResponseStatus::InProgress).unwrap(),
+            json!("in_progress")
+        );
+        assert_eq!(
+            serde_json::to_value(ResponseItemStatus::InProgress).unwrap(),
+            json!("in_progress")
+        );
+    }
+
+    #[test]
+    fn test_response_status_deserializes_legacy_inprogress_without_underscore() {
+        assert_eq!(
+            serde_json::from_value::<ResponseStatus>(json!("inprogress")).unwrap(),
+            ResponseStatus::InProgress
+        );
+        assert_eq!(
+            serde_json::from_value::<ResponseItemStatus>(json!("inprogress")).unwrap(),
+            ResponseItemStatus::InProgress
+        );
+    }
 
     #[test]
     fn test_create_response_request_simple_text_input() {

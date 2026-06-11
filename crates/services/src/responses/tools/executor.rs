@@ -34,6 +34,8 @@ impl<'a> ToolEventContext<'a> {
             part: None,
             delta: None,
             text: None,
+            error: None,
+            status_code: None,
             logprobs: None,
             obfuscation: None,
             annotation_index: None,

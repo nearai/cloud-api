@@ -255,6 +255,8 @@ impl ports::ResponseServiceTrait for ResponseServiceImpl {
                     part: None,
                     delta: None,
                     text: Some(e.to_string()),
+                    error: Some(e.response_error()),
+                    status_code: Some(e.http_status_code()),
                     logprobs: None,
                     obfuscation: None,
                     annotation_index: None,
@@ -508,6 +510,7 @@ impl ResponseServiceImpl {
 
         // Stream error tracking - when stream errors (client disconnect, network error, etc.), we save partial response and stop
         let mut stream_error = false;
+        let mut stream_error_cause = None;
 
         while let Some(event) = completion_stream.next().await {
             match event {
@@ -724,6 +727,14 @@ impl ResponseServiceImpl {
                         e
                     );
                     stream_error = true;
+                    stream_error_cause = Some(errors::ResponseError::from(
+                        crate::completions::CompletionServiceImpl::map_provider_error(
+                            &process_context.request.model,
+                            &e,
+                            "responses stream",
+                            process_context.organization_id,
+                        ),
+                    ));
                     // Don't return early - save partial response below
                     break;
                 }
@@ -758,6 +769,7 @@ impl ResponseServiceImpl {
             text: current_text,
             tool_calls: tool_calls_detected,
             stream_error,
+            stream_error_cause,
         })
     }
 
@@ -1145,6 +1157,7 @@ impl ResponseServiceImpl {
                     reason: "function_call_required".to_string(),
                 }),
             ),
+            Err(errors::ResponseError::Completion(_)) => (models::ResponseStatus::Failed, None),
             Err(ref e) => {
                 // Log error but continue - we want to save partial response even on disconnect
                 tracing::warn!("Agent loop error (may be client disconnect): {:?}", e);
@@ -1254,6 +1267,25 @@ impl ResponseServiceImpl {
                     .await
                 {
                     tracing::warn!("Failed to update response status to failed: {}", update_err);
+                }
+                return Err(e);
+            }
+            Err(e @ errors::ResponseError::Completion(_)) => {
+                if let Err(update_err) = context
+                    .response_repository
+                    .update(
+                        ctx.response_id.clone(),
+                        workspace_id_domain.clone(),
+                        Some(final_response_text.clone()),
+                        models::ResponseStatus::Failed,
+                        Some(usage_json),
+                    )
+                    .await
+                {
+                    tracing::warn!(
+                        "Failed to update partial response status to failed: {}",
+                        update_err
+                    );
                 }
                 return Err(e);
             }
@@ -1389,9 +1421,7 @@ impl ResponseServiceImpl {
                 .completion_service
                 .create_chat_completion_stream(completion_request)
                 .await
-                .map_err(|e| {
-                    errors::ResponseError::InternalError(format!("Completion error: {e}"))
-                })?;
+                .map_err(errors::ResponseError::from)?;
 
             let mut completion_stream = completion_result;
 
@@ -1405,15 +1435,18 @@ impl ResponseServiceImpl {
             )
             .await?;
 
+            // Update response state before handling stream errors so partial upstream output
+            // is persisted even when the provider later returns a typed error.
+            if !stream_result.text.is_empty() {
+                final_response_text.push_str(&stream_result.text);
+            }
+
             // If stream errored (client disconnect, network error, etc.), stop the agent loop
             if stream_result.stream_error {
                 tracing::info!("Stream error detected, stopping agent loop");
-                return Err(errors::ResponseError::StreamInterrupted);
-            }
-
-            // Update response state
-            if !stream_result.text.is_empty() {
-                final_response_text.push_str(&stream_result.text);
+                return Err(stream_result
+                    .stream_error_cause
+                    .unwrap_or(errors::ResponseError::StreamInterrupted));
             }
 
             // Check if we're done (no tool calls)
@@ -3033,6 +3066,8 @@ impl ResponseServiceImpl {
             part: None,
             delta: None,
             text: None,
+            error: None,
+            status_code: None,
             logprobs: None,
             obfuscation: None,
             annotation_index: None,
@@ -3191,6 +3226,8 @@ impl ResponseServiceImpl {
             part: None,
             delta: None,
             text: None,
+            error: None,
+            status_code: None,
             logprobs: None,
             obfuscation: None,
             annotation_index: None,
@@ -3221,6 +3258,8 @@ impl ResponseServiceImpl {
             part: None,
             delta: None,
             text: None,
+            error: None,
+            status_code: None,
             logprobs: None,
             obfuscation: None,
             annotation_index: None,

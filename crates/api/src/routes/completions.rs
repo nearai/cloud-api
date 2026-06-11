@@ -3380,7 +3380,10 @@ pub async fn image_generations(
     tag = "Audio",
     request_body(content = AudioTranscriptionRequestSchema, content_type = "multipart/form-data"),
     responses(
-        (status = 200, description = "Successful transcription", body = AudioTranscriptionResponse),
+        (status = 200, description = "Successful transcription", content(
+            (AudioTranscriptionResponse = "application/json"),
+            (String = "text/plain")
+        )),
         (status = 400, description = "Invalid request (empty file, unsupported format, file too large)", body = ErrorResponse),
         (status = 401, description = "Unauthorized (missing or invalid API key)", body = ErrorResponse),
         (status = 404, description = "Model not found", body = ErrorResponse),

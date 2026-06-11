@@ -655,18 +655,13 @@ impl AudioTranscriptionRequest {
 }
 
 const AUDIO_TRANSCRIPTION_LANGUAGE_CODES: &[&str] = &[
-    "aa", "ab", "ae", "af", "ak", "am", "an", "ar", "as", "av", "ay", "az", "ba", "be", "bg", "bh",
-    "bi", "bm", "bn", "bo", "br", "bs", "ca", "ce", "ch", "co", "cr", "cs", "cu", "cv", "cy", "da",
-    "de", "dv", "dz", "ee", "el", "en", "eo", "es", "et", "eu", "fa", "ff", "fi", "fj", "fo", "fr",
-    "fy", "ga", "gd", "gl", "gn", "gu", "gv", "ha", "haw", "he", "hi", "ho", "hr", "ht", "hu",
-    "hy", "hz", "ia", "id", "ie", "ig", "ii", "ik", "io", "is", "it", "iu", "ja", "jv", "jw", "ka",
-    "kg", "ki", "kj", "kk", "kl", "km", "kn", "ko", "kr", "ks", "ku", "kv", "kw", "ky", "la", "lb",
-    "lg", "li", "ln", "lo", "lt", "lu", "lv", "mg", "mh", "mi", "mk", "ml", "mn", "mr", "ms", "mt",
-    "my", "na", "nb", "nd", "ne", "ng", "nl", "nn", "no", "nr", "nv", "ny", "oc", "oj", "om", "or",
-    "os", "pa", "pi", "pl", "ps", "pt", "qu", "rm", "rn", "ro", "ru", "rw", "sa", "sc", "sd", "se",
-    "sg", "si", "sk", "sl", "sm", "sn", "so", "sq", "sr", "ss", "st", "su", "sv", "sw", "ta", "te",
-    "tg", "th", "ti", "tk", "tl", "tn", "to", "tr", "ts", "tt", "tw", "ty", "ug", "uk", "ur", "uz",
-    "ve", "vi", "vo", "wa", "wo", "xh", "yi", "yo", "yue", "za", "zh", "zu",
+    "af", "am", "ar", "as", "az", "ba", "be", "bg", "bn", "bo", "br", "bs", "ca", "cs", "cy", "da",
+    "de", "el", "en", "es", "et", "eu", "fa", "fi", "fo", "fr", "gl", "gu", "ha", "haw", "he",
+    "hi", "hr", "ht", "hu", "hy", "id", "is", "it", "ja", "jw", "ka", "kk", "km", "kn", "ko", "la",
+    "lb", "ln", "lo", "lt", "lv", "mg", "mi", "mk", "ml", "mn", "mr", "ms", "mt", "my", "ne", "nl",
+    "nn", "no", "oc", "pa", "pl", "ps", "pt", "ro", "ru", "sa", "sd", "si", "sk", "sl", "sn", "so",
+    "sq", "sr", "su", "sv", "sw", "ta", "te", "tg", "th", "tk", "tl", "tr", "tt", "uk", "ur", "uz",
+    "vi", "yi", "yo", "yue", "zh",
 ];
 
 pub fn normalize_audio_transcription_language(language: &str) -> String {
@@ -4188,14 +4183,16 @@ mod tests {
 
     #[test]
     fn test_audio_transcription_rejects_invalid_language() {
-        let mut request = audio_transcription_req();
-        request.language = Some("xx".to_string());
+        for language in ["xx", "aa", "kj", "nv"] {
+            let mut request = audio_transcription_req();
+            request.language = Some(language.to_string());
 
-        let err = request.validate().unwrap_err();
-        assert!(
-            err.contains("supported audio transcription language code"),
-            "got: {err}"
-        );
+            let err = request.validate().unwrap_err();
+            assert!(
+                err.contains("supported audio transcription language code"),
+                "got for {language}: {err}"
+            );
+        }
     }
 
     #[test]

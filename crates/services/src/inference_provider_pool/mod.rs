@@ -1835,11 +1835,20 @@ impl InferenceProviderPool {
     /// So when the operation streams and ANY provider can stream, drop the ones that
     /// can't. If NONE can stream (e.g. a Chutes-only model with streaming off), keep
     /// the list as-is so the provider's own clear error still surfaces.
+    /// Operation names (as passed to [`Self::retry_with_fallback`]) that produce a
+    /// streamed response and therefore need a streaming-capable provider. Kept as an
+    /// EXPLICIT list rather than a `_stream` name-suffix convention so a new
+    /// streaming op must be added here deliberately (a silently-misnamed op no longer
+    /// skips the filter); `streaming_operations_list_is_explicit` locks it in.
+    const STREAMING_OPERATIONS: &'static [&'static str] = &["chat_completion_stream"];
+
     fn filter_streaming_capable(
         providers: Vec<Arc<InferenceProviderTrait>>,
         operation_name: &str,
     ) -> Vec<Arc<InferenceProviderTrait>> {
-        if operation_name.ends_with("_stream") && providers.iter().any(|p| p.supports_streaming()) {
+        if Self::STREAMING_OPERATIONS.contains(&operation_name)
+            && providers.iter().any(|p| p.supports_streaming())
+        {
             providers
                 .into_iter()
                 .filter(|p| p.supports_streaming())
@@ -1849,29 +1858,24 @@ impl InferenceProviderPool {
         }
     }
 
-    /// Combine a discovery cycle's per-model provider lists with the out-of-band
-    /// pinned providers, upholding the invariant that DB discovery can never DROP
-    /// or overwrite a pinned (attested, e.g. Chutes) provider:
-    ///   - each discovered model keeps its providers PLUS any pinned providers for
-    ///     it, re-appended and deduped by Arc pointer (`[fresh NEAR..] + [Chutes]`);
-    ///   - each pinned model ABSENT from this discovery cycle is rebuilt from its
-    ///     pinned providers alone, dropping a now-stale discovered backend (NEAR
-    ///     stopped serving it) so the attested fallback serves immediately rather
-    ///     than after ~10 failure-demotions. A Chutes-only id is absent every cycle,
-    ///     so this just re-asserts its pinned-only list.
+    /// Combine the discovered (e.g. NEAR) providers for the models in THIS cycle
+    /// with the out-of-band pinned providers (e.g. Chutes), upholding the invariant
+    /// that DB discovery can never DROP or overwrite a pinned (attested) provider:
+    /// each discovered model keeps its providers PLUS any pinned providers for it,
+    /// re-appended and deduped by Arc pointer (`[fresh NEAR..] + [Chutes]`).
     ///
-    /// Pure (no I/O / no locks) so the riskiest refresh logic is unit-testable.
-    /// Callers must only invoke this with a COMPLETE discovery set (the pool does:
-    /// `load_inference_url_models` early-returns on an empty list and
-    /// `fetch_inference_url_models` is an all-or-error DB SELECT), so an absent
-    /// pinned id genuinely is no longer discovery-served.
+    /// This is **re-append only** and touches ONLY the models present in
+    /// `discovered`, so it is safe for a PARTIAL batch (e.g. the admin
+    /// `PATCH /v1/admin/models` runtime registration): models not in the batch are
+    /// untouched. The stale-prune of pinned ids that have *left* discovery lives in
+    /// [`Self::prune_stale_pinned`], which is complete-set-only.
+    ///
+    /// Pure (no I/O / no locks) so the merge logic is unit-testable.
     fn merge_discovered_and_pinned(
         discovered: HashMap<String, Vec<Arc<InferenceProviderTrait>>>,
         pinned: &HashMap<String, Vec<Arc<InferenceProviderTrait>>>,
     ) -> Vec<(String, Vec<Arc<InferenceProviderTrait>>)> {
         let ptr = |p: &Arc<InferenceProviderTrait>| Arc::as_ptr(p) as *const () as usize;
-        let discovered_names: std::collections::HashSet<String> =
-            discovered.keys().cloned().collect();
         let mut out: Vec<(String, Vec<Arc<InferenceProviderTrait>>)> = Vec::new();
         for (name, mut providers) in discovered {
             if let Some(extra) = pinned.get(&name) {
@@ -1885,12 +1889,73 @@ impl InferenceProviderPool {
             }
             out.push((name, providers));
         }
-        for (name, pin) in pinned {
-            if !discovered_names.contains(name) {
-                out.push((name.clone(), pin.clone()));
+        out
+    }
+
+    /// Complete-set-only counterpart to [`Self::merge_discovered_and_pinned`]: given
+    /// the COMPLETE set of model names served by this discovery cycle, rebuild any
+    /// pinned id ABSENT from it as pinned-only — dropping a now-stale discovered
+    /// (e.g. NEAR) backend that has left discovery, so the attested fallback serves
+    /// immediately instead of being tried tier-first until ~10 failure-demotions.
+    /// Dropped provider Arcs are pruned from `pubkey_to_providers` and the failure
+    /// counters so they don't linger as orphaned / `NoPubKeyProvider`-routable entries.
+    ///
+    /// MUST be called ONLY on the complete-discovery path (the periodic refresh via
+    /// [`Self::sync_inference_url_models`]), NEVER on a partial batch like the admin
+    /// `PATCH /v1/admin/models` runtime registration — otherwise it would reset
+    /// models merely absent from the batch to pinned-only.
+    async fn prune_stale_pinned(&self, complete_names: &std::collections::HashSet<String>) {
+        let pinned_providers = self
+            .pinned_providers
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        if pinned_providers.is_empty() {
+            return;
+        }
+        let ptr = |p: &Arc<InferenceProviderTrait>| Arc::as_ptr(p) as *const () as usize;
+        let mut dropped: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        {
+            let mut mappings = self.provider_mappings.write().await;
+            for (name, pinned) in &pinned_providers {
+                if complete_names.contains(name) {
+                    continue; // still discovery-served; the merge handled it this cycle
+                }
+                let pinned_ptrs: std::collections::HashSet<usize> =
+                    pinned.iter().map(&ptr).collect();
+                if let Some(old) = mappings.model_to_providers.get(name) {
+                    for p in old {
+                        if !pinned_ptrs.contains(&ptr(p)) {
+                            dropped.insert(ptr(p));
+                        }
+                    }
+                }
+                // Only rewrite when something actually changes (avoid churn for
+                // already-pinned-only ids like Chutes-only models).
+                let needs_rewrite = mappings
+                    .model_to_providers
+                    .get(name)
+                    .map(|cur| cur.len() != pinned.len())
+                    .unwrap_or(true);
+                if needs_rewrite {
+                    mappings
+                        .model_to_providers
+                        .insert(name.clone(), pinned.clone());
+                }
+            }
+            if !dropped.is_empty() {
+                mappings.pubkey_to_providers.retain(|_, ps| {
+                    ps.retain(|p| !dropped.contains(&ptr(p)));
+                    !ps.is_empty()
+                });
             }
         }
-        out
+        if !dropped.is_empty() {
+            self.provider_failure_counts
+                .write()
+                .unwrap_or_else(|e| e.into_inner())
+                .retain(|k, _| !dropped.contains(k));
+        }
     }
 
     /// Generic retry helper that tries each provider in order with automatic fallback.
@@ -3561,7 +3626,18 @@ impl InferenceProviderPool {
     /// Refresh inference_url models from the database.
     /// Existing entries in provider_mappings are overwritten with new providers.
     async fn sync_inference_url_models(&self, models: Vec<(String, String)>) {
+        // Complete-set discovery path (periodic refresh): re-append pinned providers
+        // for the discovered models (inside load_inference_url_models's merge), then
+        // prune any pinned id that has LEFT discovery to pinned-only. The complete
+        // name set is captured here so it works even when `models` is empty (the
+        // last NEAR backend disappeared and every pinned id must drop its stale NEAR)
+        // — load_inference_url_models early-returns on empty, so the prune is what
+        // rebuilds those. Only the refresh calls this; the admin PATCH path calls
+        // load_inference_url_models directly (partial batch, no prune).
+        let complete_names: std::collections::HashSet<String> =
+            models.iter().map(|(name, _)| name.clone()).collect();
         self.load_inference_url_models(models).await;
+        self.prune_stale_pinned(&complete_names).await;
     }
 
     /// Remove models from provider_mappings that are not in `valid_model_names`.
@@ -4974,11 +5050,13 @@ mod tests {
         assert_eq!(out.len(), 1);
     }
 
-    /// Refresh merge (review #3 + the highest-risk path): discovery can never DROP
-    /// or overwrite a pinned provider, and a pinned id that falls out of discovery
-    /// is rebuilt pinned-only (stale NEAR dropped).
+    /// The shared merge is re-append-only and PARTIAL-BATCH SAFE (review round 2,
+    /// Pierre's blocking): it re-attaches pinned providers for the DISCOVERED models
+    /// and never emits/rebuilds a pinned id absent from this batch — so an admin
+    /// `PATCH /v1/admin/models` carrying a partial inference_url batch can't reset
+    /// unrelated NEAR+Chutes models to Chutes-only.
     #[test]
-    fn merge_discovered_and_pinned_never_drops_pinned_and_prunes_stale() {
+    fn merge_discovered_and_pinned_reappends_and_leaves_absent_pinned_untouched() {
         use inference_providers::mock::MockProvider;
         use inference_providers::ProviderTier;
         use std::collections::HashMap;
@@ -4990,10 +5068,9 @@ mod tests {
 
         let mut pinned: HashMap<String, Vec<Arc<InferenceProviderTrait>>> = HashMap::new();
         pinned.insert("near+chutes".to_string(), vec![chutes.clone()]);
-        pinned.insert("chutes-only".to_string(), vec![chutes.clone()]);
+        pinned.insert("other-pinned".to_string(), vec![chutes.clone()]);
 
-        // This discovery cycle finds NEAR for "near+chutes" only; "chutes-only" and
-        // the previously-NEAR-served "dropped" id are absent.
+        // A PARTIAL batch: only "near+chutes" is discovered this call.
         let mut discovered: HashMap<String, Vec<Arc<InferenceProviderTrait>>> = HashMap::new();
         discovered.insert("near+chutes".to_string(), vec![near.clone()]);
 
@@ -5003,16 +5080,70 @@ mod tests {
                 .map(|(k, v)| (k, v.iter().map(|p| p.tier()).collect()))
                 .collect();
 
-        // NEAR-served pinned id: NEAR refreshed + Chutes re-attached (never dropped).
+        // Discovered model: NEAR refreshed + Chutes re-attached (never dropped).
         assert_eq!(
             merged.get("near+chutes"),
             Some(&vec![ProviderTier::Near, ProviderTier::Attested3p])
         );
-        // Chutes-only id absent from discovery: rebuilt pinned-only.
-        assert_eq!(
-            merged.get("chutes-only"),
-            Some(&vec![ProviderTier::Attested3p])
-        );
+        // A pinned model NOT in this batch must NOT be emitted (left untouched) —
+        // the partial-batch safety the admin PATCH path depends on.
+        assert!(!merged.contains_key("other-pinned"));
+        assert_eq!(merged.len(), 1);
+    }
+
+    /// Complete-set stale-prune (review round 2): on the refresh path, a pinned id
+    /// absent from the COMPLETE discovery set is rebuilt pinned-only (dropping a
+    /// stale NEAR backend), while one still present is left coexisting.
+    #[tokio::test]
+    async fn prune_stale_pinned_rebuilds_absent_pinned_only() {
+        use inference_providers::mock::MockProvider;
+        use inference_providers::ProviderTier;
+        use std::collections::HashSet;
+
+        let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
+        let model = "zai-org/GLM-5.1-FP8".to_string();
+        pool.register_provider(
+            model.clone(),
+            Arc::new(MockProvider::new().with_tier(ProviderTier::Near)),
+        )
+        .await;
+        pool.register_pinned_secondary_provider(
+            model.clone(),
+            Arc::new(MockProvider::new().with_tier(ProviderTier::Attested3p)),
+        )
+        .await;
+
+        // Still discovery-served → coexistence preserved.
+        let mut complete = HashSet::new();
+        complete.insert(model.clone());
+        pool.prune_stale_pinned(&complete).await;
+        let tiers: Vec<ProviderTier> = pool
+            .get_providers_with_fallback(&model, None)
+            .await
+            .expect("providers")
+            .iter()
+            .map(|p| p.tier())
+            .collect();
+        assert_eq!(tiers, vec![ProviderTier::Near, ProviderTier::Attested3p]);
+
+        // NEAR dropped it (absent from the complete set) → rebuilt pinned-only.
+        pool.prune_stale_pinned(&HashSet::new()).await;
+        let tiers: Vec<ProviderTier> = pool
+            .get_providers_with_fallback(&model, None)
+            .await
+            .expect("providers")
+            .iter()
+            .map(|p| p.tier())
+            .collect();
+        assert_eq!(tiers, vec![ProviderTier::Attested3p]);
+    }
+
+    /// The streaming-operations list is explicit (review round 2 minor): the known
+    /// streaming op routed through `retry_with_fallback` must be registered, so a
+    /// rename/new op can't silently bypass the streaming-capability filter.
+    #[test]
+    fn streaming_operations_list_is_explicit() {
+        assert!(InferenceProviderPool::STREAMING_OPERATIONS.contains(&"chat_completion_stream"));
     }
 
     /// Fail-closed reservation (review #1): a configured Chutes canonical id is

@@ -1066,6 +1066,13 @@ impl Fleet {
 
 #[async_trait]
 impl InferenceProvider for Fleet {
+    /// NEAR's own attested fleet. `Provider` (which wraps `Fleet`) is what the pool
+    /// actually registers, but mirror the tier here too so the verifiable filter can
+    /// never misclassify a `Fleet` as plaintext if one is ever pooled directly.
+    fn tier(&self) -> crate::ProviderTier {
+        crate::ProviderTier::Near
+    }
+
     async fn get_signature(
         &self,
         chat_id: &str,

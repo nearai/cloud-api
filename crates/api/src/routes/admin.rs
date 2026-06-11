@@ -463,12 +463,13 @@ pub async fn batch_upsert_models(
         //
         // NOTE: with tiered fallback this now also covers a NEAR-served canonical id
         // that has a Chutes fallback (it's `is_pinned`). So a PATCH that changes its
-        // `inference_url` or deactivates it skips the eager `unregister_provider`
-        // cleanup here: the NEW url is still re-registered below (the merge keeps
-        // Chutes), but the stale OLD-url NEAR provider + its pubkey/failure-counter
-        // entries linger until the next periodic refresh prunes them. Behavior stays
-        // safe (pubkey intersection + catalog `is_active` gating); it just isn't
-        // instantaneously clean for a runtime url change on a Chutes-fallback model.
+        // `inference_url` skips the eager `unregister_provider` here, but the NEW url
+        // is still re-registered below and `load_inference_url_models`' atomic update
+        // already drops the replaced provider from `model_to_providers` and prunes
+        // its `pubkey_to_providers` entries — only the per-provider failure-counter
+        // entry lingers until the next periodic refresh. Behavior stays safe (pubkey
+        // intersection + catalog `is_active` gating); the residual is just that one
+        // stale counter, not the provider or its routing.
         if app_state.inference_provider_pool.is_pinned(model_name) {
             continue;
         }

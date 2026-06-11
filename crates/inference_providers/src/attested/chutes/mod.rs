@@ -376,13 +376,14 @@ const INTERNAL_KEYS: &[&str] = {
 /// alias-served paths — so leaving the slug there would still leak it). Only
 /// touches chunk-bearing data lines; control events ([DONE], blanks, the keyed
 /// init) have no chunk and pass through unchanged. On any parse failure the event
-/// is returned as-is (never drop a chunk over a rewrite).
+/// is returned as-is (never drop a chunk over a rewrite). The rewrite is ATOMIC:
+/// we compute the rewritten `raw_bytes` first and bail (returning the event
+/// unchanged) on any failure, mutating the parsed `chunk` only once that succeeds —
+/// so the event can never end up with `chunk` carrying the canonical id while
+/// `raw_bytes` still leaks the slug.
 fn rewrite_sse_event_model(mut ev: SSEEvent, canonical: &str) -> SSEEvent {
     if ev.chunk.is_none() {
         return ev;
-    }
-    if let Some(StreamChunk::Chat(c)) = &mut ev.chunk {
-        c.model = canonical.to_string();
     }
     let Ok(s) = std::str::from_utf8(&ev.raw_bytes) else {
         return ev;
@@ -394,6 +395,10 @@ fn rewrite_sse_event_model(mut ev: SSEEvent, canonical: &str) -> SSEEvent {
     let Ok(json) = String::from_utf8(rewritten) else {
         return ev;
     };
+    // raw_bytes rewrite succeeded — now mutate the parsed chunk to match.
+    if let Some(StreamChunk::Chat(c)) = &mut ev.chunk {
+        c.model = canonical.to_string();
+    }
     SSEEvent {
         raw_bytes: bytes::Bytes::from(format!("data: {json}\n\n")),
         chunk: ev.chunk,

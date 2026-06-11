@@ -19,7 +19,7 @@ async fn admin_patch_with_provider_type_keeps_pinned_provider() {
     let model = format!("zai-org/GLM-5.1-TEE-pin-{}", uuid::Uuid::new_v4());
 
     // Register a pinned provider exactly as init_inference_providers does for Chutes.
-    pool.register_pinned_provider(
+    pool.register_pinned_secondary_provider(
         model.clone(),
         Arc::new(inference_providers::mock::MockProvider::new()),
     )

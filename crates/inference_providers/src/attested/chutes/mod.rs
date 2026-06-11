@@ -50,7 +50,7 @@ use crate::{
     EmbeddingError, ImageEditError, ImageEditParams, ImageEditResponseWithBytes,
     ImageGenerationError, ImageGenerationParams, ImageGenerationResponseWithBytes,
     InferenceProvider, ListModelsError, ModelInfo, ModelsResponse, PrivacyClassifyError,
-    RerankError, RerankParams, RerankResponse, ScoreError, ScoreParams, ScoreResponse,
+    RerankError, RerankParams, RerankResponse, SSEEvent, ScoreError, ScoreParams, ScoreResponse,
     StreamingResult,
 };
 
@@ -70,8 +70,14 @@ const CHAT_PATH: &str = "/v1/chat/completions";
 pub struct Config {
     /// Chutes API key (`cpk_...`) — a secret; sourced from env/secret store.
     api_key: String,
-    /// The model id as served by Chutes (e.g. `zai-org/GLM-5.1-TEE`).
+    /// The model id as served by Chutes — the chute SLUG (e.g. `zai-org/GLM-5.1-TEE`).
+    /// Sent upstream and resolved to a `chute_id`; NEVER surfaced to clients.
     model_name: String,
+    /// The CANONICAL id we expose to clients and rewrite `response.model` to (e.g.
+    /// `zai-org/GLM-5.1-FP8`, or the OpenRouter id). Defaults to `model_name` (the
+    /// slug) when not set via [`Config::with_canonical_id`]; when it differs, the
+    /// decrypted response's `model` is rewritten so it never leaks the slug.
+    canonical_id: String,
     /// Per-request timeout, seconds. Always > 0 (see `new`).
     timeout_seconds: i64,
     /// Optional host overrides (tests/staging). Both or neither.
@@ -89,6 +95,7 @@ impl Config {
     pub fn new(api_key: String, model_name: String, timeout_seconds: i64) -> Self {
         Self {
             api_key,
+            canonical_id: model_name.clone(),
             model_name,
             timeout_seconds: if timeout_seconds > 0 {
                 timeout_seconds
@@ -99,6 +106,14 @@ impl Config {
             models_base: None,
             allow_streaming: false,
         }
+    }
+
+    /// Set the canonical id surfaced to clients (the NEAR-served id, or the
+    /// OpenRouter id) when it differs from the chute slug. `response.model` is
+    /// rewritten to this so the raw `-TEE` slug never reaches a client.
+    pub fn with_canonical_id(mut self, canonical_id: impl Into<String>) -> Self {
+        self.canonical_id = canonical_id.into();
+        self
     }
 
     /// Override the Chutes hosts (`api.chutes.ai` / `llm.chutes.ai`) for tests or
@@ -147,6 +162,9 @@ pub struct Provider {
     client: ChutesClient,
     verifier: Arc<dyn ChutesInstanceVerifier>,
     model_name: String,
+    /// Canonical id surfaced to clients; `response.model` is rewritten to this
+    /// when it differs from `model_name` (the chute slug). See [`Config::canonical_id`].
+    canonical_id: String,
     /// Whether the streaming chat path is exposed as attested (see
     /// [`Config::allow_streaming`]).
     allow_streaming: bool,
@@ -182,6 +200,7 @@ impl Provider {
             client,
             verifier,
             model_name: config.model_name,
+            canonical_id: config.canonical_id,
             allow_streaming,
             chute_id_cache: tokio::sync::OnceCell::new(),
         })
@@ -351,6 +370,44 @@ const INTERNAL_KEYS: &[&str] = {
     ]
 };
 
+/// Rewrite the `model` field of a decrypted OpenAI SSE event's `data:` JSON to the
+/// canonical id, so a streamed `model` never leaks the chute slug. Only touches
+/// chunk-bearing data lines; control events ([DONE], blanks, the keyed init) have
+/// no chunk and pass through unchanged. On any parse failure the event is returned
+/// as-is (never drop a chunk over a rewrite). `chunk` is left as parsed — it's
+/// internal-only (clients receive `raw_bytes`; usage/billing keys on the resolved
+/// canonical model, not the chunk).
+fn rewrite_sse_event_model(ev: SSEEvent, canonical: &str) -> SSEEvent {
+    if ev.chunk.is_none() {
+        return ev;
+    }
+    let Ok(s) = std::str::from_utf8(&ev.raw_bytes) else {
+        return ev;
+    };
+    let content = s.strip_prefix("data:").map(str::trim).unwrap_or(s.trim());
+    let Some(rewritten) = set_model_in_json(content.as_bytes(), canonical) else {
+        return ev;
+    };
+    let Ok(json) = String::from_utf8(rewritten) else {
+        return ev;
+    };
+    SSEEvent {
+        raw_bytes: bytes::Bytes::from(format!("data: {json}\n\n")),
+        chunk: ev.chunk,
+        raw_passthrough: ev.raw_passthrough,
+    }
+}
+
+/// Set `model` to `canonical` in an OpenAI JSON body, preserving every other field
+/// (so unmodeled provider fields survive). Returns the re-serialized bytes, or
+/// `None` if the body isn't a JSON object or (de)serialization fails.
+fn set_model_in_json(bytes: &[u8], canonical: &str) -> Option<Vec<u8>> {
+    let mut v: Value = serde_json::from_slice(bytes).ok()?;
+    v.as_object_mut()?
+        .insert("model".to_string(), Value::String(canonical.to_string()));
+    serde_json::to_vec(&v).ok()
+}
+
 /// An OpenAI request body (as JSON) with `model` pinned, `stream` set, and all
 /// internal/tracing/E2EE-marker keys stripped (never sent to the third party).
 fn request_body(model: &str, params: &ChatCompletionParams, stream: bool) -> Result<Value, String> {
@@ -454,14 +511,31 @@ impl InferenceProvider for Provider {
             .session
             .decrypt_response(&resp_blob)
             .map_err(|e| CompletionError::CompletionError(format!("E2EE decrypt: {e}")))?;
+
+        // The upstream body carries the chute SLUG in `model`. When the canonical id
+        // differs (NEAR-served / OpenRouter-id case), rewrite `model` to the
+        // canonical id so the slug never leaks to clients and `response.model`
+        // matches an id listable in /v1/models. We rewrite the JSON *value* (not the
+        // typed struct) so any unmodeled provider fields survive. When canonical ==
+        // slug, keep the plaintext verbatim (byte-exact, preserves unmodeled fields
+        // like `hidden_states`). No signature is sacrificed — Chutes responses aren't
+        // separately signed (`supports_chat_signatures == false`).
+        if self.canonical_id != self.model_name {
+            let raw_bytes = set_model_in_json(&plaintext, &self.canonical_id).ok_or_else(|| {
+                CompletionError::CompletionError(
+                    "failed to rewrite Chutes response model to the canonical id".to_string(),
+                )
+            })?;
+            let response: ChatCompletionResponse = serde_json::from_slice(&raw_bytes)
+                .map_err(|e| CompletionError::CompletionError(format!("parse response: {e}")))?;
+            return Ok(ChatCompletionResponseWithBytes {
+                response,
+                raw_bytes,
+            });
+        }
+
         let response: ChatCompletionResponse = serde_json::from_slice(&plaintext)
             .map_err(|e| CompletionError::CompletionError(format!("parse response: {e}")))?;
-        // The decrypted plaintext IS the backend's exact JSON body, so use it
-        // verbatim as `raw_bytes` rather than re-serializing the parsed struct.
-        // Re-serialization would change the byte representation (key order /
-        // whitespace) and silently drop any provider fields our typed struct
-        // doesn't model (e.g. `hidden_states`); `raw_bytes` is documented as the
-        // exact provider bytes and is what we hand back to the client.
         Ok(ChatCompletionResponseWithBytes {
             response,
             raw_bytes: plaintext,
@@ -513,10 +587,18 @@ impl InferenceProvider for Provider {
         let byte_stream = resp.bytes_stream().map(|r| {
             r.map_err(|e| CompletionError::CompletionError(format!("Chutes stream transport: {e}")))
         });
-        Ok(e2ee_stream::decrypt_e2ee_sse(
-            Box::pin(byte_stream),
-            prep.session,
-        ))
+        let decoded = e2ee_stream::decrypt_e2ee_sse(Box::pin(byte_stream), prep.session);
+        // Same canonical-id rewrite as the non-stream path: when the canonical id
+        // differs from the chute slug, rewrite `model` in each decrypted `data:`
+        // line so streamed chunks never leak the slug to clients. No-op (and no
+        // per-chunk re-serialization) when canonical == slug.
+        if self.canonical_id == self.model_name {
+            return Ok(decoded);
+        }
+        let canonical = self.canonical_id.clone();
+        Ok(Box::pin(decoded.map(move |item| {
+            item.map(|ev| rewrite_sse_event_model(ev, &canonical))
+        })))
     }
 
     async fn text_completion_stream(
@@ -794,6 +876,55 @@ mod tests {
             Config::new("k".into(), "m".into(), 42).timeout_seconds(),
             42
         );
+    }
+
+    #[test]
+    fn set_model_in_json_rewrites_model_and_preserves_other_fields() {
+        // The canonical-id rewrite that keeps the chute slug out of `response.model`
+        // while preserving every other (incl. unmodeled) field.
+        let body =
+            br#"{"id":"x","model":"zai-org/GLM-5.1-TEE","choices":[],"hidden_states":[1,2]}"#;
+        let out = set_model_in_json(body, "zai-org/GLM-5.1-FP8").expect("rewrite");
+        let v: Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["model"], "zai-org/GLM-5.1-FP8");
+        assert_eq!(v["id"], "x");
+        // Unmodeled provider field survives the rewrite.
+        assert_eq!(v["hidden_states"], json!([1, 2]));
+        // Non-object body → None (left untouched by callers).
+        assert!(set_model_in_json(b"[1,2,3]", "x").is_none());
+    }
+
+    #[test]
+    fn rewrite_sse_event_model_rewrites_data_chunk_but_passes_control_through() {
+        use crate::{ChatCompletionChunk, StreamChunk};
+        let chunk: ChatCompletionChunk = serde_json::from_value(json!({
+            "id":"c","object":"chat.completion.chunk","created":0,
+            "model":"zai-org/GLM-5.1-TEE","choices":[]
+        }))
+        .unwrap();
+        let ev = SSEEvent {
+            raw_bytes: bytes::Bytes::from_static(
+                b"data: {\"model\":\"zai-org/GLM-5.1-TEE\",\"id\":\"c\"}\n\n",
+            ),
+            chunk: Some(StreamChunk::Chat(chunk)),
+            raw_passthrough: true,
+        };
+        let out = rewrite_sse_event_model(ev, "zai-org/GLM-5.1-FP8");
+        let s = std::str::from_utf8(&out.raw_bytes).unwrap();
+        assert!(
+            s.contains("zai-org/GLM-5.1-FP8"),
+            "data chunk model rewritten"
+        );
+        assert!(!s.contains("GLM-5.1-TEE"), "slug must not leak");
+
+        // A control event (no chunk: [DONE]/blank) passes through unchanged.
+        let ctrl = SSEEvent {
+            raw_bytes: bytes::Bytes::from_static(b"data: [DONE]\n\n"),
+            chunk: None,
+            raw_passthrough: true,
+        };
+        let out = rewrite_sse_event_model(ctrl, "zai-org/GLM-5.1-FP8");
+        assert_eq!(&out.raw_bytes[..], b"data: [DONE]\n\n");
     }
 
     #[test]

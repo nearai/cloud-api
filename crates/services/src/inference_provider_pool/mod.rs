@@ -638,38 +638,6 @@ impl InferenceProviderPool {
         }
     }
 
-    /// Register a provider that is **not** sourced from DB discovery (e.g. the
-    /// config-pinned Chutes provider) and mark its model **pinned** so the
-    /// periodic refresh — whose `valid_model_names` comes only from the DB
-    /// sources — does not remove it.
-    ///
-    /// Unlike [`Self::register_provider`], this does **not** run signing-key
-    /// attestation discovery: it would be a wasted discover→evidence→DCAP→NRAS
-    /// round trip for a provider (like Chutes) that has no signing-address
-    /// pubkey, and would add network/latency at startup. Such a provider verifies
-    /// its backend per request instead, so no `pubkey_to_providers` entry is needed.
-    pub async fn register_pinned_provider(
-        &self,
-        model_id: String,
-        provider: Arc<InferenceProviderTrait>,
-    ) {
-        self.pinned_models
-            .write()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(model_id.clone());
-        // Record in pinned_providers too so the discovery-refresh merge re-attaches
-        // it: a same-name DB inference_url row can never overwrite this pinned
-        // provider (the security invariant the old skip-if-pinned guard enforced).
-        // Sole-provider semantics: this is THE provider for the id, so replace any
-        // prior pinned entry.
-        self.pinned_providers
-            .write()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(model_id.clone(), vec![provider.clone()]);
-        let mut mappings = self.provider_mappings.write().await;
-        mappings.model_to_providers.insert(model_id, vec![provider]);
-    }
-
     /// Reserve `model_ids` as pinned (verifiable) **before** any external/discovery
     /// load, WITHOUT attaching a provider. Fail-closed guard for configured Chutes
     /// canonical ids: marking them pinned makes [`Self::load_external_providers`]
@@ -688,25 +656,26 @@ impl InferenceProviderPool {
         }
     }
 
-    /// Register a pinned (out-of-band) provider as a **secondary** under a model
-    /// name that may also be served by DB-discovered (e.g. NEAR) providers —
-    /// **pushing** onto the existing list rather than replacing it (unlike
-    /// [`Self::register_pinned_provider`], which is the sole provider for its name).
+    /// Register a pinned (out-of-band, e.g. config-Chutes) provider as a **secondary**
+    /// under a model name that may also be served by DB-discovered (e.g. NEAR)
+    /// providers — **pushing** onto the existing list rather than replacing it (a
+    /// Chutes-only id ends up with just this provider, so it serves as primary). This
+    /// is the sole pinned-registration path used in production.
     ///
     /// Used for the Chutes fallback tier: a NEAR-served canonical id keeps its own
-    /// attested fleet as primary and gains Chutes as fallback; a Chutes-only id has
-    /// just this provider, so it serves as primary. The provider is recorded in
-    /// [`Self::pinned_providers`] so each discovery refresh re-attaches it after
-    /// rebuilding the NEAR backends (never dropped), and its name is added to
-    /// [`Self::pinned_models`] so the discovery guards never overwrite/evict it.
-    /// Tier ordering (NEAR before Attested3p) is applied at selection time, so the
-    /// push order here does not matter.
+    /// attested fleet as primary and gains Chutes as fallback. The provider is
+    /// recorded in [`Self::pinned_providers`] so each discovery refresh re-attaches it
+    /// after rebuilding the NEAR backends (never dropped/overwritten), and its name is
+    /// added to [`Self::pinned_models`] so the discovery guards never evict it. Tier
+    /// ordering (NEAR before Attested3p) is applied at selection time, so the push
+    /// order here does not matter.
     ///
-    /// Like [`Self::register_pinned_provider`], this does NOT populate
-    /// `pubkey_to_providers` (no signing-key discovery). So a pubkey-routed (E2EE)
-    /// request — which selects via `model_pub_key` — gets NO Chutes fallback by
-    /// design: Chutes has no per-response signing key, its integrity is the ML-KEM
-    /// AEAD channel itself. Chutes fallback applies to the non-pubkey selection path.
+    /// Unlike [`Self::register_provider`], this does NOT run signing-key attestation
+    /// discovery (a wasted round trip for Chutes, which has no signing-address pubkey
+    /// and verifies its backend per request) and so does NOT populate
+    /// `pubkey_to_providers`. A pubkey-routed (E2EE) request — selected via
+    /// `model_pub_key` — therefore gets NO Chutes fallback by design: Chutes has no
+    /// per-response signing key, its integrity is the ML-KEM AEAD channel itself.
     pub async fn register_pinned_secondary_provider(
         &self,
         model_id: String,
@@ -786,7 +755,7 @@ impl InferenceProviderPool {
                 .clone();
             let mut mappings = self.provider_mappings.write().await;
             for (model_id, providers) in model_providers {
-                // Don't clobber a pinned (attested) provider (see register_pinned_provider).
+                // Don't clobber a pinned (attested) provider (see register_pinned_secondary_provider).
                 if pinned.contains(&model_id) {
                     warn!(model = %model_id, "Skipping register_providers for a pinned model");
                     continue;
@@ -1943,25 +1912,34 @@ impl InferenceProviderPool {
                 }
                 let pinned_ptrs: std::collections::HashSet<usize> =
                     pinned.iter().map(&ptr).collect();
-                if let Some(old) = mappings.model_to_providers.get(name) {
-                    for p in old {
-                        if !pinned_ptrs.contains(&ptr(p)) {
-                            dropped.insert(ptr(p));
-                        }
-                    }
-                }
-                // Only rewrite when something actually changes (avoid churn for
-                // already-pinned-only ids like Chutes-only models).
-                let needs_rewrite = mappings
+                let cur_ptrs: std::collections::HashSet<usize> = mappings
                     .model_to_providers
                     .get(name)
-                    .map(|cur| cur.len() != pinned.len())
-                    .unwrap_or(true);
-                if needs_rewrite {
+                    .map(|cur| cur.iter().map(&ptr).collect())
+                    .unwrap_or_default();
+                for &p in cur_ptrs.difference(&pinned_ptrs) {
+                    dropped.insert(p);
+                }
+                // Rewrite only when the current list isn't already exactly the pinned
+                // set (compare pointer SETS, not lengths — a future partial overwrite
+                // could match on length but differ in membership).
+                if cur_ptrs != pinned_ptrs {
                     mappings
                         .model_to_providers
                         .insert(name.clone(), pinned.clone());
                 }
+            }
+            // Shared-Arc guard: providers are cached per-URL, so two model names can
+            // share one Arc. Don't prune a dropped pointer's pubkey/counter entries
+            // if that exact Arc still backs another (still-served) model — that would
+            // transiently break the sibling's pubkey-routed selection.
+            if !dropped.is_empty() {
+                let still_referenced: std::collections::HashSet<usize> = mappings
+                    .model_to_providers
+                    .values()
+                    .flat_map(|ps| ps.iter().map(&ptr))
+                    .collect();
+                dropped.retain(|p| !still_referenced.contains(p));
             }
             if !dropped.is_empty() {
                 mappings.pubkey_to_providers.retain(|_, ps| {
@@ -4861,8 +4839,11 @@ mod tests {
         // A DB-discovered provider + a config-pinned (e.g. Chutes) provider.
         pool.register_provider("db-model".to_string(), Arc::new(MockProvider::new()))
             .await;
-        pool.register_pinned_provider("chutes-model".to_string(), Arc::new(MockProvider::new()))
-            .await;
+        pool.register_pinned_secondary_provider(
+            "chutes-model".to_string(),
+            Arc::new(MockProvider::new()),
+        )
+        .await;
 
         // A refresh tick's `valid_model_names` comes only from the DB sources, so
         // it knows "db-model" but not the config-pinned "chutes-model".
@@ -4893,7 +4874,7 @@ mod tests {
         let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
 
         let pinned: Arc<InferenceProviderTrait> = Arc::new(MockProvider::new());
-        pool.register_pinned_provider("chutes-model".to_string(), pinned.clone())
+        pool.register_pinned_secondary_provider("chutes-model".to_string(), pinned.clone())
             .await;
 
         // A DB-discovered external model with the SAME id must NOT replace the
@@ -4925,8 +4906,11 @@ mod tests {
         use inference_providers::mock::MockProvider;
         let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
 
-        pool.register_pinned_provider("chutes-model".to_string(), Arc::new(MockProvider::new()))
-            .await;
+        pool.register_pinned_secondary_provider(
+            "chutes-model".to_string(),
+            Arc::new(MockProvider::new()),
+        )
+        .await;
         pool.register_provider("db-model".to_string(), Arc::new(MockProvider::new()))
             .await;
 

@@ -830,6 +830,7 @@ pub async fn init_inference_providers(
                         entry.chute_slug.clone(),
                         config.external_providers.timeout_seconds,
                     )
+                    .with_canonical_id(entry.canonical_id.clone())
                     .with_streaming(allow_streaming);
                     match inference_providers::attested::chutes::Provider::new(
                         cfg,

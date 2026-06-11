@@ -3560,9 +3560,10 @@ pub async fn audio_transcriptions(
 
     let requested_response_format = request.response_format.clone();
     let provider_response_format = match requested_response_format.as_deref() {
-        // Keep provider parsing stable by requesting JSON and converting to
-        // plain text at the API boundary after usage is recorded.
-        Some("text") => Some("json".to_string()),
+        // Keep provider parsing stable and preserve duration-based billing by
+        // requesting verbose JSON, then returning plain text at the API boundary
+        // after usage is recorded.
+        Some("text") => Some("verbose_json".to_string()),
         _ => request.response_format.clone(),
     };
 

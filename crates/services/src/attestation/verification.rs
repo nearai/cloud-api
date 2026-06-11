@@ -3,8 +3,12 @@
 //! Verifies TDX quotes, report_data bindings (signing address + TLS fingerprint),
 //! image hashes, and GPU evidence from attestation reports returned by inference-proxy.
 
-use sha2::{Digest as Sha2Digest, Sha256};
+use sha2::Digest;
 use std::collections::HashSet;
+use std::sync::Arc;
+
+use super::measurement::MeasurementPolicy;
+use super::report_data::{ReportDataVerifier, StrictBoundReportDataVerifier};
 
 const NVIDIA_NRAS_URL: &str = "https://nras.attestation.nvidia.com/v3/attest/gpu";
 
@@ -59,59 +63,68 @@ struct EventLogEntry {
 pub struct AttestationVerifier {
     /// HTTP client for NVIDIA NRAS calls.
     http_client: reqwest::Client,
-    /// Set of allowed OS image hashes (from env var). Empty = skip image hash check.
-    allowed_image_hashes: HashSet<String>,
+    /// Per-provider measurement policy (OS-image-hash allowlist, TCB floor).
+    /// Selected by provider tier at construction; NEAR's own fleet reproduces
+    /// the previous env-driven, fail-open-on-empty behavior exactly.
+    policy: MeasurementPolicy,
+    /// Per-tier `report_data` binding verifier. NEAR keeps the historical
+    /// behavior (TLS-fingerprint binding with a padded-address fallback); an
+    /// attested third party gets the strict verifier (fingerprint binding
+    /// required, no fallback). Selected from `policy.tier()` at construction.
+    report_data_verifier: Arc<dyn ReportDataVerifier>,
     /// Optional PCCS URL override for Intel collateral fetching.
     pccs_url: Option<String>,
-    /// If true, reject attestations where TCB status is not "UpToDate".
-    require_tcb_up_to_date: bool,
 }
 
 impl AttestationVerifier {
+    /// Construct a NEAR-fleet verifier from explicit allowlist + TCB flag.
+    ///
+    /// Preserved for existing callers/tests: builds a `Near`-tier
+    /// [`MeasurementPolicy`] with the historical semantics (empty allowlist =
+    /// skip the image-hash check).
     pub fn new(
         allowed_image_hashes: HashSet<String>,
         pccs_url: Option<String>,
         require_tcb_up_to_date: bool,
     ) -> Self {
+        Self::with_policy(
+            MeasurementPolicy::near(allowed_image_hashes, require_tcb_up_to_date),
+            pccs_url,
+        )
+    }
+
+    /// Construct a verifier with an explicit per-provider [`MeasurementPolicy`].
+    /// Used to give an attested third-party provider (e.g. Chutes) its own
+    /// fail-closed policy without affecting NEAR's verifier.
+    pub fn with_policy(policy: MeasurementPolicy, pccs_url: Option<String>) -> Self {
         let http_client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(30))
             .build()
             .expect("failed to create HTTP client for attestation verification");
+        // Strict report_data binding for EVERY attested provider — NEAR's own
+        // fleet is held to the same bar as third parties (TLS fingerprint
+        // required; no padded-`signing_address` fallback). The `Arc<dyn>` seam
+        // is kept so a provider with a different report_data layout can plug its
+        // own verifier in a later PR.
+        let report_data_verifier: Arc<dyn ReportDataVerifier> =
+            Arc::new(StrictBoundReportDataVerifier);
         Self {
             http_client,
-            allowed_image_hashes,
+            policy,
+            report_data_verifier,
             pccs_url,
-            require_tcb_up_to_date,
         }
     }
 
-    /// Build an `AttestationVerifier` from environment variables.
+    /// Build an `AttestationVerifier` for NEAR's own fleet from environment variables.
     ///
     /// - `ALLOWED_IMAGE_HASHES`: comma-separated list of allowed OS image hashes (hex).
-    ///   If unset or empty, image hash verification is skipped.
+    ///   If unset or empty, image hash verification is skipped (NEAR fleet only).
     /// - `PCCS_URL`: optional Intel PCCS URL for TDX collateral fetching.
+    /// - `REQUIRE_TCB_UP_TO_DATE`: reject non-`UpToDate` TCB when set.
     pub fn from_env() -> Self {
-        let allowed_image_hashes: HashSet<String> = std::env::var("ALLOWED_IMAGE_HASHES")
-            .unwrap_or_default()
-            .split(',')
-            .map(|s| s.trim().to_lowercase())
-            .filter(|s| !s.is_empty())
-            .collect();
-
-        if !allowed_image_hashes.is_empty() {
-            tracing::info!(
-                count = allowed_image_hashes.len(),
-                "Loaded allowed image hashes for attestation verification"
-            );
-        }
-
         let pccs_url = std::env::var("PCCS_URL").ok().filter(|s| !s.is_empty());
-
-        let require_tcb_up_to_date = std::env::var("REQUIRE_TCB_UP_TO_DATE")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false);
-
-        Self::new(allowed_image_hashes, pccs_url, require_tcb_up_to_date)
+        Self::with_policy(MeasurementPolicy::near_from_env(), pccs_url)
     }
 
     /// Verify an attestation report from an inference backend.
@@ -129,6 +142,11 @@ impl AttestationVerifier {
         attestation_report: &serde_json::Map<String, serde_json::Value>,
         request_nonce: &str,
     ) -> Result<VerifiedAttestation, AttestationVerificationError> {
+        // 0. Fail-closed policy guard: an attested third-party provider must
+        //    carry an enforceable measurement allowlist before we trust any
+        //    measurement. No-op for NEAR's own fleet (empty allowlist = skip).
+        self.policy.assert_enforceable()?;
+
         // 1. Extract and verify TDX quote
         let intel_quote_hex = attestation_report
             .get("intel_quote")
@@ -159,7 +177,7 @@ impl AttestationVerifier {
 
         // Check TCB status
         let tcb_status = &verified_report.status;
-        if self.require_tcb_up_to_date && tcb_status != "UpToDate" {
+        if self.policy.require_tcb_up_to_date() && tcb_status != "UpToDate" {
             return Err(AttestationVerificationError::TdxVerificationFailed(format!(
                 "TCB status is '{tcb_status}' but REQUIRE_TCB_UP_TO_DATE is set (advisory_ids: {:?})",
                 verified_report.advisory_ids
@@ -203,15 +221,11 @@ impl AttestationVerifier {
             .get("tls_cert_fingerprint")
             .and_then(|v| v.as_str());
 
-        self.verify_report_data(
+        self.report_data_verifier.verify(
             report_data,
             signing_address,
             tls_cert_fingerprint,
             request_nonce,
-            attestation_report
-                .get("signing_algo")
-                .and_then(|v| v.as_str())
-                .unwrap_or("ed25519"),
         )?;
 
         // 3. Replay RTMR3 from event log and verify against the TDX quote.
@@ -219,17 +233,18 @@ impl AttestationVerifier {
         let event_log_data =
             self.verify_rtmr3_and_extract(attestation_report, &td_report.rt_mr3)?;
 
-        // 4. Check OS image hash from verified event log against allowlist
+        // 4. Check OS image hash from verified event log against the policy's
+        //    allowlist. For NEAR an empty allowlist skips the check (historical
+        //    behavior); for an attested third party the empty case was already
+        //    rejected by `assert_enforceable()` above, so the check is enforced.
         if let Some(ref hash) = event_log_data.os_image_hash {
-            if !self.allowed_image_hashes.is_empty()
-                && !self.allowed_image_hashes.contains(&hash.to_lowercase())
-            {
+            if self.policy.enforces_image_hash() && !self.policy.allows_image_hash(hash) {
                 return Err(AttestationVerificationError::ImageHashMismatch(format!(
                     "os_image_hash '{}' from RTMR3-verified event log not in allowed list",
                     hash
                 )));
             }
-        } else if !self.allowed_image_hashes.is_empty() {
+        } else if self.policy.enforces_image_hash() {
             return Err(AttestationVerificationError::ImageHashMismatch(
                 "ALLOWED_IMAGE_HASHES configured but no os-image-hash in event log".to_string(),
             ));
@@ -249,85 +264,6 @@ impl AttestationVerifier {
             compose_hash: event_log_data.compose_hash,
             gpu_verdict,
         })
-    }
-
-    /// Verify that `report_data` correctly binds the signing address, TLS fingerprint, and nonce.
-    ///
-    /// When `tls_cert_fingerprint` is present:
-    ///   `report_data[0:32] = SHA256(signing_address_bytes || fingerprint_bytes)`
-    /// Otherwise:
-    ///   `report_data[0:32] = signing_address_bytes padded to 32`
-    ///
-    /// Always: `report_data[32:64] = nonce_bytes`
-    fn verify_report_data(
-        &self,
-        report_data: &[u8; 64],
-        signing_address: &str,
-        tls_cert_fingerprint: Option<&str>,
-        nonce: &str,
-        _signing_algo: &str,
-    ) -> Result<(), AttestationVerificationError> {
-        // Verify nonce (second 32 bytes)
-        let nonce_bytes = hex::decode(nonce.strip_prefix("0x").unwrap_or(nonce)).map_err(|e| {
-            AttestationVerificationError::InvalidFormat(format!("nonce hex decode: {e}"))
-        })?;
-        if nonce_bytes.len() != 32 {
-            return Err(AttestationVerificationError::ReportDataMismatch(format!(
-                "nonce must be 32 bytes, got {}",
-                nonce_bytes.len()
-            )));
-        }
-        if report_data[32..64] != nonce_bytes[..] {
-            return Err(AttestationVerificationError::ReportDataMismatch(
-                "nonce mismatch in report_data[32:64]".to_string(),
-            ));
-        }
-
-        // Verify first 32 bytes
-        let addr_hex = signing_address
-            .strip_prefix("0x")
-            .unwrap_or(signing_address);
-        let addr_bytes = hex::decode(addr_hex).map_err(|e| {
-            AttestationVerificationError::InvalidFormat(format!("signing_address hex decode: {e}"))
-        })?;
-
-        if let Some(fp_hex) = tls_cert_fingerprint {
-            // TLS fingerprint binding: SHA256(signing_address_bytes || fingerprint_bytes)
-            let fp_bytes =
-                hex::decode(fp_hex.strip_prefix("0x").unwrap_or(fp_hex)).map_err(|e| {
-                    AttestationVerificationError::InvalidFormat(format!(
-                        "tls_cert_fingerprint hex decode: {e}"
-                    ))
-                })?;
-            let mut hasher = Sha256::new();
-            hasher.update(&addr_bytes);
-            hasher.update(&fp_bytes);
-            let expected = hasher.finalize();
-
-            if report_data[..32] != expected[..] {
-                return Err(AttestationVerificationError::ReportDataMismatch(format!(
-                    "report_data[0:32] does not match SHA256(signing_address || tls_fingerprint). \
-                     Expected: {}, got: {}",
-                    hex::encode(expected),
-                    hex::encode(&report_data[..32])
-                )));
-            }
-        } else {
-            // No TLS fingerprint: first 32 bytes = signing_address padded to 32
-            let mut expected = [0u8; 32];
-            let copy_len = addr_bytes.len().min(32);
-            expected[..copy_len].copy_from_slice(&addr_bytes[..copy_len]);
-            if report_data[..32] != expected[..] {
-                return Err(AttestationVerificationError::ReportDataMismatch(format!(
-                    "report_data[0:32] does not match padded signing_address. \
-                     Expected: {}, got: {}",
-                    hex::encode(expected),
-                    hex::encode(&report_data[..32])
-                )));
-            }
-        }
-
-        Ok(())
     }
 
     /// Replay RTMR3 from the event log and verify it matches the TDX quote.
@@ -475,12 +411,41 @@ impl AttestationVerifier {
         attestation_report: &serde_json::Map<String, serde_json::Value>,
         request_nonce: &str,
     ) -> Result<Option<String>, AttestationVerificationError> {
-        let nvidia_payload_str = match attestation_report
-            .get("nvidia_payload")
-            .and_then(|v| v.as_str())
-        {
-            Some(s) if !s.is_empty() => s,
-            _ => return Ok(None), // No GPU evidence — acceptable for non-GPU CVMs
+        // Distinguish three cases explicitly, so a present-but-malformed payload
+        // can never be mistaken for "absent" and silently skip GPU verification
+        // (type-confusion bypass):
+        //   - absent / null / empty string  -> no GPU evidence offered
+        //   - non-empty string              -> the evidence to verify
+        //   - present but not a string      -> MALFORMED, always rejected
+        let nvidia_payload_str = match attestation_report.get("nvidia_payload") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(serde_json::Value::String(s)) if s.is_empty() => None,
+            Some(serde_json::Value::String(s)) => Some(s.as_str()),
+            Some(_) => {
+                return Err(AttestationVerificationError::GpuVerificationFailed(
+                    "nvidia_payload is present but is not a string (malformed report); \
+                     refusing to skip GPU verification"
+                        .to_string(),
+                ));
+            }
+        };
+
+        let nvidia_payload_str = match nvidia_payload_str {
+            Some(s) => s,
+            None => {
+                // No GPU evidence. Acceptable for NEAR's non-GPU CVMs, but an
+                // attested provider that must prove confidential GPU compute
+                // (policy.require_gpu_evidence) is rejected rather than passing
+                // with no GPU verdict.
+                if self.policy.require_gpu_evidence() {
+                    return Err(AttestationVerificationError::GpuVerificationFailed(
+                        "GPU evidence (nvidia_payload) required by policy but absent from the \
+                         attestation report"
+                            .to_string(),
+                    ));
+                }
+                return Ok(None);
+            }
         };
 
         let payload: serde_json::Value = serde_json::from_str(nvidia_payload_str).map_err(|e| {
@@ -949,6 +914,45 @@ mod tests {
         let body = base64::engine::general_purpose::URL_SAFE_NO_PAD
             .encode(serde_json::to_vec(&payload).unwrap());
         format!("{header}.{body}.")
+    }
+
+    /// PR4: absent GPU evidence is best-effort for NEAR (`Ok(None)`) but rejected
+    /// for an attested third party whose policy requires it. Deterministic — the
+    /// absent branch returns before any NRAS call.
+    #[tokio::test]
+    async fn gpu_evidence_absent_ok_for_near_but_rejected_for_attested3p() {
+        use crate::attestation::MeasurementPolicy;
+        use std::collections::HashSet;
+
+        let report = serde_json::Map::new(); // no nvidia_payload
+
+        let near = AttestationVerifier::new(HashSet::new(), None, false);
+        assert!(
+            matches!(near.verify_gpu_evidence(&report, "00").await, Ok(None)),
+            "NEAR best-effort: absent GPU evidence -> Ok(None)"
+        );
+
+        let a3p = AttestationVerifier::with_policy(
+            MeasurementPolicy::attested3p(["abc".to_string()].into_iter().collect::<HashSet<_>>()),
+            None,
+        );
+        let err = a3p
+            .verify_gpu_evidence(&report, "00")
+            .await
+            .expect_err("attested 3p requires GPU evidence");
+        assert!(format!("{err}").contains("GPU evidence"));
+
+        // Type-confusion guard: a present-but-non-string nvidia_payload is
+        // malformed and MUST error for both tiers — never silently skipped.
+        let mut malformed = serde_json::Map::new();
+        malformed.insert("nvidia_payload".to_string(), json!({"not": "a string"}));
+        for v in [&near, &a3p] {
+            let err = v
+                .verify_gpu_evidence(&malformed, "00")
+                .await
+                .expect_err("malformed nvidia_payload must not be treated as absent");
+            assert!(format!("{err}").contains("not a string"));
+        }
     }
 
     /// Build a fake NRAS response in the wire format observed in production:

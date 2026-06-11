@@ -238,7 +238,7 @@ pub struct AnthropicResponse {
 
 /// Convert OpenAI messages to Anthropic format
 pub fn convert_messages(messages: &[ChatMessage]) -> (Option<String>, Vec<AnthropicMessage>) {
-    use crate::external::content::{
+    use crate::non_attested::external::content::{
         parse_content, text_from_content as extract_content, ContentPart,
     };
 

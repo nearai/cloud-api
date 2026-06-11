@@ -1444,10 +1444,11 @@ pub struct ResponseObject {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, ToSchema)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "snake_case")]
 pub enum ResponseStatus {
     Completed,
     Failed,
+    #[serde(alias = "inprogress")]
     InProgress,
     Cancelled,
     Queued,
@@ -1459,6 +1460,8 @@ pub struct ResponseError {
     pub message: String,
     #[serde(rename = "type")]
     pub type_: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub param: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub code: Option<String>,
 }
@@ -1565,10 +1568,11 @@ pub enum ResponseOutputItem {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "snake_case")]
 pub enum ResponseItemStatus {
     Completed,
     Failed,
+    #[serde(alias = "inprogress")]
     InProgress,
     Cancelled,
 }
@@ -1658,6 +1662,10 @@ pub struct ResponseStreamEvent {
     pub delta: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<ResponseError>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status_code: Option<u16>,
 }
 
 /// Input item list for responses
@@ -3756,6 +3764,31 @@ pub struct FileDeleteResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn test_response_status_serializes_in_progress_with_underscore() {
+        assert_eq!(
+            serde_json::to_value(ResponseStatus::InProgress).unwrap(),
+            json!("in_progress")
+        );
+        assert_eq!(
+            serde_json::to_value(ResponseItemStatus::InProgress).unwrap(),
+            json!("in_progress")
+        );
+    }
+
+    #[test]
+    fn test_response_status_deserializes_legacy_inprogress_without_underscore() {
+        assert_eq!(
+            serde_json::from_value::<ResponseStatus>(json!("inprogress")).unwrap(),
+            ResponseStatus::InProgress
+        );
+        assert_eq!(
+            serde_json::from_value::<ResponseItemStatus>(json!("inprogress")).unwrap(),
+            ResponseItemStatus::InProgress
+        );
+    }
 
     #[test]
     fn test_create_response_request_simple_text_input() {

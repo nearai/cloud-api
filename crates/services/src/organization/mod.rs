@@ -2200,6 +2200,13 @@ mod tests {
         ) -> Result<EmailDeliveryOutcome, EmailError> {
             self.outcome.clone()
         }
+
+        async fn send_pricing_change(
+            &self,
+            _email: &crate::email::PricingChangeEmail,
+        ) -> Result<EmailDeliveryOutcome, EmailError> {
+            self.outcome.clone()
+        }
     }
 
     fn make_service(

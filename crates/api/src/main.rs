@@ -1,9 +1,11 @@
 use api::{build_app_with_config, init_auth_services, init_database, init_domain_services};
 use config::{ApiConfig, LoggingConfig};
+use database::repositories::AdminCompositeRepository;
 use database::{Database, ShutdownCoordinator, ShutdownStage};
 use opentelemetry::{global, KeyValue};
 use opentelemetry_otlp::{MetricExporter, WithExportConfig};
 use opentelemetry_sdk::{metrics::SdkMeterProvider, Resource};
+use services::admin::ModelPricingScheduler;
 use services::inference_provider_pool::InferenceProviderPool;
 use services::metrics::{MetricsServiceTrait, OtlpMetricsService};
 use std::sync::Arc;
@@ -71,12 +73,24 @@ async fn main() {
         config.clone(),
     );
 
+    // Start the scheduled-pricing-change apply task. Safe to run on every
+    // instance: due rows are claimed atomically (FOR UPDATE SKIP LOCKED).
+    let pricing_scheduler = Arc::new(ModelPricingScheduler::new(
+        Arc::new(AdminCompositeRepository::new(database.pool().clone())),
+        domain_services.models_service.clone(),
+    ));
+    pricing_scheduler
+        .clone()
+        .start(config.server.pricing_change_apply_interval_secs)
+        .await;
+
     // Start server with graceful shutdown handling
     start_server(
         app,
         config,
         database,
         domain_services.inference_provider_pool,
+        pricing_scheduler,
     )
     .await;
 }
@@ -98,6 +112,7 @@ async fn start_server(
     config: Arc<ApiConfig>,
     database: Arc<Database>,
     inference_provider_pool: Arc<InferenceProviderPool>,
+    pricing_scheduler: Arc<ModelPricingScheduler>,
 ) {
     let bind_address = format!("{}:{}", config.server.host, config.server.port);
     let listener = tokio::net::TcpListener::bind(&bind_address)
@@ -119,11 +134,13 @@ async fn start_server(
     match server.await {
         Ok(_) => {
             tracing::info!("Server shutdown successfully, initiating coordinated cleanup");
-            perform_coordinated_shutdown(database, inference_provider_pool).await;
+            perform_coordinated_shutdown(database, inference_provider_pool, pricing_scheduler)
+                .await;
         }
         Err(e) => {
             tracing::error!("Server error: {}", e);
-            perform_coordinated_shutdown(database, inference_provider_pool).await;
+            perform_coordinated_shutdown(database, inference_provider_pool, pricing_scheduler)
+                .await;
             std::process::exit(1);
         }
     }
@@ -133,6 +150,7 @@ async fn start_server(
 async fn perform_coordinated_shutdown(
     database: Arc<Database>,
     inference_provider_pool: Arc<InferenceProviderPool>,
+    pricing_scheduler: Arc<ModelPricingScheduler>,
 ) {
     let mut coordinator = ShutdownCoordinator::new(Duration::from_secs(30));
     coordinator.start();
@@ -150,6 +168,8 @@ async fn perform_coordinated_shutdown(
             || async {
                 tracing::info!("Step 1.1: Cancelling model discovery refresh task");
                 inference_provider_pool.shutdown().await;
+                tracing::info!("Step 1.2: Cancelling pricing change scheduler task");
+                pricing_scheduler.shutdown().await;
                 tracing::debug!("All background tasks cancelled");
             },
         )

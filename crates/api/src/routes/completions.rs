@@ -363,7 +363,12 @@ fn prepare_chat_stream_chunk_for_client(
         return false;
     }
 
-    if !include_usage || !is_usage_only_chunk {
+    let is_terminal_choice_chunk = chunk
+        .choices
+        .iter()
+        .any(|choice| choice.finish_reason.is_some());
+    let is_final_chunk = is_usage_only_chunk || is_terminal_choice_chunk;
+    if !include_usage || !is_final_chunk {
         chunk.usage = None;
     }
     true
@@ -1257,16 +1262,8 @@ async fn chat_completions_inner(
         .models_service
         .resolve_alias_cached(&request.model)
         .await;
-    let resolved_model_name = alias_canonical.as_deref().unwrap_or(&request.model);
-    let model_attestation_supported = app_state
-        .models_service
-        .get_model_by_name(resolved_model_name)
-        .await
-        .map(|model| model.attestation_supported)
-        .unwrap_or(false);
-    let rewrite_public_stream_usage = !e2ee_active
-        && !model_attestation_supported
-        && !chat_stream_has_non_text_modalities(&request);
+    let rewrite_public_stream_usage =
+        !e2ee_active && !chat_stream_has_non_text_modalities(&request);
 
     // Auto-redact (opt-in via x-auto-redact header or auto_redact body field).
     // On success this may rewrite service_request.messages to substitute
@@ -2781,8 +2778,8 @@ mod tests {
             true
         ));
         assert!(
-            final_choice_chunk.usage.is_none(),
-            "choice-bearing chunks should carry usage:null; final usage is emitted by the usage-only chunk"
+            final_choice_chunk.usage.is_some(),
+            "converter-backed providers can attach final usage to a terminal choice chunk"
         );
     }
 

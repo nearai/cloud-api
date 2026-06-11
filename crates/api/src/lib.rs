@@ -612,6 +612,116 @@ pub async fn init_domain_services_with_pool_and_search_providers(
     domain_services
 }
 
+/// Ensure a Chutes (attested) model has a catalog row in the `models` table.
+///
+/// The data plane rejects any model without an active `models` row *before*
+/// reaching the provider pool (`resolve_and_get_model` in completions), so a
+/// pinned Chutes provider registered purely in-memory would 404 every request
+/// even with `ENABLE_CHUTES=true` and a valid key. Worse, usage rows carry a
+/// `FOREIGN KEY (model_id) REFERENCES models(id)` — a synthesized id can't be
+/// billed — so the row must genuinely exist. Seed it here at startup.
+///
+/// Idempotent and non-clobbering: if an active row already exists (operator
+/// pre-seeded it with real pricing/metadata via the admin API) we leave it
+/// untouched. We only INSERT when missing, with attestation flags set and
+/// **zero pricing** — the operator must set real per-token rates via
+/// `PATCH /v1/admin/models` before serving paid traffic, which we warn about.
+async fn ensure_chutes_catalog_row(
+    models_repo: &database::repositories::ModelRepository,
+    model_name: &str,
+) {
+    // Use the *unfiltered* lookup (not get_active_model_by_name): a deliberately
+    // disabled row (is_active=false) must be respected, not silently re-activated
+    // and clobbered by the seed path below.
+    match models_repo.get_by_internal_name(model_name).await {
+        Ok(Some(existing)) => {
+            // Already in the catalog — respect operator configuration verbatim.
+            // Surface a warning if the metadata contradicts attested serving so
+            // a misconfigured row (e.g. attestation_supported=false) is visible.
+            if !existing.is_active {
+                tracing::warn!(
+                    model = %model_name,
+                    "Chutes model has a DISABLED catalog row (is_active=false); requests will \
+                     404 by design — re-enable via PATCH /v1/admin/models if that's unintended"
+                );
+            } else if !existing.attestation_supported {
+                tracing::warn!(
+                    model = %model_name,
+                    "Chutes model has an existing catalog row with attestation_supported=false; \
+                     E2EE/signature handling may misbehave — fix via PATCH /v1/admin/models"
+                );
+            } else {
+                tracing::info!(model = %model_name, "Chutes model already in catalog");
+            }
+        }
+        Ok(None) => {
+            // Friendly display name = last path segment; owner = leading segment.
+            let display_name = model_name.rsplit('/').next().unwrap_or(model_name);
+            let owned_by = model_name.split('/').next().unwrap_or("chutes");
+            let req = database::models::UpdateModelPricingRequest {
+                model_display_name: Some(display_name.to_string()),
+                model_description: Some(
+                    "Attested model served via Chutes TEE (verified end-to-end by NEAR AI)."
+                        .to_string(),
+                ),
+                // Generous default; operator should set the model's real context
+                // window via the admin API. Not enforced as a hard reject here.
+                context_length: Some(128_000),
+                verifiable: Some(true),
+                attestation_supported: Some(true),
+                // Seed INACTIVE. `is_active=false` is the only field that actually
+                // gates serving (`resolve_and_get_model` filters `WHERE is_active`;
+                // `is_ready` is pure display metadata and does NOT gate). Seeding
+                // inactive makes it *impossible* to serve — and therefore bill at
+                // the zero default pricing — until an operator explicitly sets real
+                // per-token rates AND flips is_active=true (one admin PATCH). This
+                // closes the unpriced-serving window rather than merely warning.
+                is_active: Some(false),
+                is_ready: Some(Some(false)),
+                provider_type: Some("chutes".to_string()),
+                owned_by: Some(owned_by.to_string()),
+                input_modalities: Some(vec!["text".to_string()]),
+                output_modalities: Some(vec!["text".to_string()]),
+                // Pricing left None -> defaults to 0 on INSERT. The inactive seed
+                // above prevents this zero price from ever being charged.
+                ..Default::default()
+            };
+            // INSERT ... ON CONFLICT DO NOTHING: if an operator created/activated
+            // the row concurrently with startup, their row wins and is left
+            // untouched (no clobbering is_active/pricing back to the seed defaults).
+            match models_repo.seed_model_if_absent(model_name, &req).await {
+                Ok(Some(_)) => {
+                    tracing::warn!(
+                        model = %model_name,
+                        "Seeded Chutes catalog row as INACTIVE with zero pricing — set real \
+                         per-token rates AND is_active=true via PATCH /v1/admin/models to serve \
+                         (kept inactive so paid traffic can't be billed at $0)"
+                    );
+                }
+                Ok(None) => {
+                    tracing::info!(
+                        model = %model_name,
+                        "Chutes catalog row already present (created concurrently); left untouched"
+                    );
+                }
+                Err(e) => {
+                    tracing::error!(
+                        model = %model_name, error = %e,
+                        "Failed to seed Chutes catalog row; requests for this model will 404 \
+                         until a row exists (create it via PATCH /v1/admin/models)"
+                    );
+                }
+            }
+        }
+        Err(e) => {
+            tracing::warn!(
+                model = %model_name, error = %e,
+                "Could not check catalog for Chutes model; skipping auto-seed"
+            );
+        }
+    }
+}
+
 /// Initialize inference provider pool
 ///
 /// Loads inference_url models and external providers from the database,
@@ -668,6 +778,71 @@ pub async fn init_inference_providers(
     pool.clone()
         .start_refresh_task(models_source, refresh_interval)
         .await;
+
+    // Chutes attested provider — hard-off by default (`ENABLE_CHUTES`). Each model
+    // is served over a verified ML-KEM E2EE channel: every request attests the
+    // chosen instance (TDX quote + report_data bindings + register-pinned
+    // measurement + GPU) before encapsulating, so an unverified backend can never
+    // serve a Chutes response. Registration is gated on the flag + an API key +
+    // at least one model id.
+    if config.external_providers.enable_chutes {
+        match &config.external_providers.chutes_api_key {
+            Some(api_key) if !config.external_providers.chutes_models.is_empty() => {
+                let pccs_url = config.external_providers.pccs_url.clone();
+                let allow_streaming = config.external_providers.chutes_enable_streaming;
+                let verifier: Arc<
+                    dyn inference_providers::attested::chutes::verifier_port::ChutesInstanceVerifier,
+                > = Arc::new(services::attestation::chutes::ChutesBackendVerifier::new(
+                    services::attestation::chutes::vetted_golden_measurements(),
+                    pccs_url,
+                ));
+                for model in &config.external_providers.chutes_models {
+                    let cfg = inference_providers::attested::chutes::Config::new(
+                        api_key.clone(),
+                        model.clone(),
+                        config.external_providers.timeout_seconds,
+                    )
+                    .with_streaming(allow_streaming);
+                    match inference_providers::attested::chutes::Provider::new(
+                        cfg,
+                        verifier.clone(),
+                    ) {
+                        Ok(provider) => {
+                            // Ensure a catalog row exists so the data plane resolves
+                            // the model (and usage can be billed against a real id).
+                            ensure_chutes_catalog_row(&models_repo, model).await;
+                            // Pinned: registered out-of-band (not DB discovery), so
+                            // excluded from the refresh's stale-removal; also skips the
+                            // signing-key discovery Chutes never satisfies.
+                            pool.register_pinned_provider(model.clone(), Arc::new(provider))
+                                .await;
+                            tracing::info!(model = %model, "Registered Chutes attested provider");
+                        }
+                        Err(e) => {
+                            tracing::warn!(model = %model, error = %e, "Failed to build Chutes provider");
+                        }
+                    }
+                }
+            }
+            _ => {
+                tracing::warn!(
+                    "ENABLE_CHUTES is set but CHUTES_API_KEY or CHUTES_MODELS is missing; \
+                     not registering any Chutes provider"
+                );
+            }
+        }
+    } else if !config.external_providers.chutes_models.is_empty() {
+        // Flag off but models still listed: any *active* catalog row left over
+        // from a previous run would resolve to a model with no registered provider
+        // (per-request provider errors, not a clean 404). Warn so an operator
+        // notices and deactivates those rows (PATCH is_active=false).
+        tracing::warn!(
+            models = ?config.external_providers.chutes_models,
+            "ENABLE_CHUTES is off but CHUTES_MODELS is set; if any of these have an active \
+             catalog row, requests will surface provider errors — deactivate them via \
+             PATCH /v1/admin/models or re-enable ENABLE_CHUTES"
+        );
+    }
 
     pool
 }

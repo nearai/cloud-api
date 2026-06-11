@@ -227,6 +227,11 @@ pub struct InferenceProviderPool {
     tls_roots: SharedTlsRoots,
     /// Attestation verifier for TDX quote, GPU evidence, and image hash verification.
     attestation_verifier: Arc<AttestationVerifier>,
+    /// Models registered out-of-band (not from the DB-backed discovery sources),
+    /// e.g. the config-pinned Chutes provider. These are excluded from
+    /// `remove_stale_providers` so a refresh tick — whose `valid_model_names` is
+    /// built solely from the DB sources — does not wipe them.
+    pinned_models: Arc<std::sync::RwLock<std::collections::HashSet<String>>>,
 }
 
 /// Backend verifier that creates verified reqwest clients by connecting to a backend,
@@ -478,6 +483,11 @@ impl PoolBackendVerifier {
 impl InferenceProviderPool {
     /// Create a new pool with optional API key for backend authentication
     pub fn new(api_key: Option<String>, external_configs: ExternalProvidersConfig) -> Self {
+        // Single source of truth for the PCCS endpoint: build the NEAR verifier
+        // from the parsed config's `pccs_url` rather than re-reading `PCCS_URL`
+        // from the environment, so it can't diverge from the Chutes verifier
+        // (which is constructed from the same config field).
+        let pccs_url = external_configs.pccs_url.clone();
         Self {
             api_key,
             provider_mappings: Arc::new(RwLock::new(ProviderMappings::new())),
@@ -489,7 +499,8 @@ impl InferenceProviderPool {
             inference_url_providers: Arc::new(RwLock::new(HashMap::new())),
             inference_url_fingerprint_states: Arc::new(RwLock::new(HashMap::new())),
             tls_roots: SharedTlsRoots::load(),
-            attestation_verifier: Arc::new(AttestationVerifier::from_env()),
+            attestation_verifier: Arc::new(AttestationVerifier::near_with_pccs(pccs_url)),
+            pinned_models: Arc::new(std::sync::RwLock::new(std::collections::HashSet::new())),
         }
     }
 
@@ -501,8 +512,19 @@ impl InferenceProviderPool {
         let mut success_count = 0;
         let mut error_count = 0;
 
+        let pinned = self
+            .pinned_models
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         let mut mappings = self.provider_mappings.write().await;
         for (model_name, provider_config) in models {
+            // Never overwrite a pinned (out-of-band, attested) provider with a
+            // DB-discovered external one (the external refresh routes here).
+            if pinned.contains(&model_name) {
+                warn!(model = %model_name, "Skipping external provider for a pinned (attested) model");
+                continue;
+            }
             match self.create_external_provider(&model_name, provider_config) {
                 Ok((provider, backend_type)) => {
                     mappings
@@ -543,6 +565,12 @@ impl InferenceProviderPool {
     /// Remove a provider by model name. Used when admin deactivates a model.
     /// Also cleans up pubkey_to_providers, load_balancer_index, and provider_failure_counts.
     pub async fn unregister_provider(&self, model_name: &str) -> bool {
+        // If it was pinned, also clear the pin — otherwise DB discovery could
+        // never re-register a model with this name (the insert guards skip pinned).
+        self.pinned_models
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(model_name);
         let mut mappings = self.provider_mappings.write().await;
         let removed_providers = mappings.model_to_providers.remove(model_name);
         if let Some(removed) = &removed_providers {
@@ -595,6 +623,42 @@ impl InferenceProviderPool {
         }
     }
 
+    /// Register a provider that is **not** sourced from DB discovery (e.g. the
+    /// config-pinned Chutes provider) and mark its model **pinned** so the
+    /// periodic refresh — whose `valid_model_names` comes only from the DB
+    /// sources — does not remove it.
+    ///
+    /// Unlike [`Self::register_provider`], this does **not** run signing-key
+    /// attestation discovery: it would be a wasted discover→evidence→DCAP→NRAS
+    /// round trip for a provider (like Chutes) that has no signing-address
+    /// pubkey, and would add network/latency at startup. Such a provider verifies
+    /// its backend per request instead, so no `pubkey_to_providers` entry is needed.
+    pub async fn register_pinned_provider(
+        &self,
+        model_id: String,
+        provider: Arc<InferenceProviderTrait>,
+    ) {
+        self.pinned_models
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(model_id.clone());
+        let mut mappings = self.provider_mappings.write().await;
+        mappings.model_to_providers.insert(model_id, vec![provider]);
+    }
+
+    /// Whether `model_name` is currently registered as a **pinned** (out-of-band)
+    /// provider. The admin PATCH path uses this to avoid tearing down a pinned
+    /// provider (e.g. Chutes): pinned providers are registered from config at
+    /// startup and are not re-registered by the DB-discovery (inference-url /
+    /// external) paths, so unregistering one on a metadata/activation update would
+    /// leave an active catalog row with no serving provider until restart.
+    pub fn is_pinned(&self, model_name: &str) -> bool {
+        self.pinned_models
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(model_name)
+    }
+
     /// Register multiple providers for multiple models (useful for testing)
     /// Also populates model_pub_key_mapping by fetching attestation reports
     /// Fetches attestation reports for both ECDSA and Ed25519 to support both signing algorithms
@@ -617,8 +681,18 @@ impl InferenceProviderPool {
         // Phase 2: Atomic bulk update of both mappings under a single lock
         // This ensures consistency - both mappings are updated together
         {
+            let pinned = self
+                .pinned_models
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
             let mut mappings = self.provider_mappings.write().await;
             for (model_id, providers) in model_providers {
+                // Don't clobber a pinned (attested) provider (see register_pinned_provider).
+                if pinned.contains(&model_id) {
+                    warn!(model = %model_id, "Skipping register_providers for a pinned model");
+                    continue;
+                }
                 mappings.model_to_providers.insert(model_id, providers);
             }
             for (key, provider) in pub_key_updates {
@@ -3108,8 +3182,22 @@ impl InferenceProviderPool {
                 reused.retain(|(_, url, _)| !evict_set.contains(url.as_str()));
 
                 {
+                    // Never evict a pinned (out-of-band, attested) model — a DB
+                    // inference-url model sharing its name (e.g. a Blocked
+                    // fingerprint) must not remove the pinned provider, which the
+                    // insert guards would then refuse to restore. Mirrors the
+                    // guards on the insert paths and remove_stale_providers.
+                    let pinned = self
+                        .pinned_models
+                        .read()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .clone();
                     let mut mappings = self.provider_mappings.write().await;
                     for model in &evicted_models {
+                        if pinned.contains(model) {
+                            warn!(model = %model, "Skipping eviction of a pinned (attested) provider");
+                            continue;
+                        }
                         mappings.model_to_providers.remove(model);
                     }
                     // Prune pubkey_to_providers of entries pointing at the
@@ -3199,7 +3287,23 @@ impl InferenceProviderPool {
                 }
             }
 
+            // Never let DB discovery overwrite a pinned (out-of-band, attested)
+            // provider — that would silently substitute the per-request-verified
+            // E2EE provider with an unverified one, the exact attack the pinning
+            // is meant to prevent.
+            let pinned = self
+                .pinned_models
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
             for (model_name, providers) in model_providers {
+                if pinned.contains(&model_name) {
+                    warn!(
+                        model = %model_name,
+                        "DB discovery attempted to overwrite a pinned (attested) provider; ignoring"
+                    );
+                    continue;
+                }
                 mappings.model_to_providers.insert(model_name, providers);
             }
 
@@ -3278,12 +3382,19 @@ impl InferenceProviderPool {
     /// Remove models from provider_mappings that are not in `valid_model_names`.
     /// Also cleans up load_balancer_index and provider_failure_counts for removed providers.
     async fn remove_stale_providers(&self, valid_model_names: &std::collections::HashSet<String>) {
+        // Pinned models (e.g. the config-registered Chutes provider) are not in
+        // the DB-backed `valid_model_names`; never treat them as stale.
+        let pinned = self
+            .pinned_models
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         let mut mappings = self.provider_mappings.write().await;
 
         let stale_models: Vec<String> = mappings
             .model_to_providers
             .keys()
-            .filter(|k| !valid_model_names.contains(k.as_str()))
+            .filter(|k| !valid_model_names.contains(k.as_str()) && !pinned.contains(k.as_str()))
             .cloned()
             .collect();
 
@@ -4227,6 +4338,7 @@ mod tests {
                 gemini_api_key: None,
                 timeout_seconds: 60,
                 refresh_interval_secs: 0,
+                ..Default::default()
             },
         );
 
@@ -4248,6 +4360,7 @@ mod tests {
                 gemini_api_key: None,
                 timeout_seconds: 60,
                 refresh_interval_secs: 0,
+                ..Default::default()
             },
         );
 
@@ -4281,6 +4394,7 @@ mod tests {
                 gemini_api_key: None,
                 timeout_seconds: 60,
                 refresh_interval_secs: 0,
+                ..Default::default()
             },
         );
 
@@ -4315,6 +4429,7 @@ mod tests {
                 gemini_api_key: Some("AIza-test".to_string()),
                 timeout_seconds: 60,
                 refresh_interval_secs: 0,
+                ..Default::default()
             },
         );
 
@@ -4340,6 +4455,7 @@ mod tests {
                 gemini_api_key: None,
                 timeout_seconds: 60,
                 refresh_interval_secs: 0,
+                ..Default::default()
             },
         );
 
@@ -4363,6 +4479,7 @@ mod tests {
                 gemini_api_key: None,
                 timeout_seconds: 60,
                 refresh_interval_secs: 0,
+                ..Default::default()
             },
         );
 
@@ -4385,6 +4502,7 @@ mod tests {
                 gemini_api_key: None,
                 timeout_seconds: 60,
                 refresh_interval_secs: 0,
+                ..Default::default()
             },
         );
 
@@ -4402,6 +4520,108 @@ mod tests {
     async fn test_unregister_nonexistent_provider() {
         let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
         assert!(!pool.unregister_provider("nonexistent-model").await);
+    }
+
+    #[tokio::test]
+    async fn pinned_provider_survives_refresh() {
+        use inference_providers::mock::MockProvider;
+        let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
+
+        // A DB-discovered provider + a config-pinned (e.g. Chutes) provider.
+        pool.register_provider("db-model".to_string(), Arc::new(MockProvider::new()))
+            .await;
+        pool.register_pinned_provider("chutes-model".to_string(), Arc::new(MockProvider::new()))
+            .await;
+
+        // A refresh tick's `valid_model_names` comes only from the DB sources, so
+        // it knows "db-model" but not the config-pinned "chutes-model".
+        let mut valid = std::collections::HashSet::new();
+        valid.insert("db-model".to_string());
+        pool.remove_stale_providers(&valid).await;
+
+        assert!(
+            pool.has_provider("chutes-model").await,
+            "pinned provider must survive a refresh that doesn't list it"
+        );
+        assert!(pool.has_provider("db-model").await);
+
+        // Sanity: a non-pinned model absent from the valid set IS removed.
+        pool.register_provider("ephemeral".to_string(), Arc::new(MockProvider::new()))
+            .await;
+        pool.remove_stale_providers(&valid).await;
+        assert!(
+            !pool.has_provider("ephemeral").await,
+            "non-pinned stale model must be removed"
+        );
+        assert!(pool.has_provider("chutes-model").await);
+    }
+
+    #[tokio::test]
+    async fn pinned_provider_not_overwritten_by_discovery() {
+        use inference_providers::mock::MockProvider;
+        let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
+
+        let pinned: Arc<InferenceProviderTrait> = Arc::new(MockProvider::new());
+        pool.register_pinned_provider("chutes-model".to_string(), pinned.clone())
+            .await;
+
+        // A DB-discovered external model with the SAME id must NOT replace the
+        // attested, per-request-verified pinned provider.
+        let _ = pool
+            .load_external_providers(vec![(
+                "chutes-model".to_string(),
+                serde_json::json!({
+                    "backend": "openai_compatible",
+                    "base_url": "https://example.com/v1",
+                    "api_key": "sk-x"
+                }),
+            )])
+            .await;
+
+        let got = pool
+            .get_providers_for_model("chutes-model")
+            .await
+            .expect("model still registered");
+        assert_eq!(got.len(), 1);
+        assert!(
+            Arc::ptr_eq(&got[0], &pinned),
+            "DB discovery must not overwrite a pinned (attested) provider"
+        );
+    }
+
+    #[tokio::test]
+    async fn is_pinned_reports_pinned_models_and_guards_admin_unregister() {
+        use inference_providers::mock::MockProvider;
+        let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
+
+        pool.register_pinned_provider("chutes-model".to_string(), Arc::new(MockProvider::new()))
+            .await;
+        pool.register_provider("db-model".to_string(), Arc::new(MockProvider::new()))
+            .await;
+
+        assert!(pool.is_pinned("chutes-model"));
+        assert!(!pool.is_pinned("db-model"));
+        assert!(!pool.is_pinned("absent-model"));
+
+        // Regression for the admin PATCH unregister guard (admin.rs): a PATCH
+        // carrying `provider_type` (e.g. "chutes") would otherwise unregister the
+        // provider, and the inference-url/external re-registration below would NOT
+        // restore a pinned one — leaving an active catalog row with no provider.
+        // The guard skips pinned models, so the pinned provider must survive.
+        for model in ["chutes-model", "db-model"] {
+            let provider_type_present = true; // PATCH includes provider_type
+            if !pool.is_pinned(model) && provider_type_present {
+                pool.unregister_provider(model).await;
+            }
+        }
+        assert!(
+            pool.has_provider("chutes-model").await,
+            "pinned provider must survive an admin PATCH carrying provider_type"
+        );
+        assert!(
+            !pool.has_provider("db-model").await,
+            "a non-pinned provider is still unregistered on a provider_type change"
+        );
     }
 
     /// Verify that reused providers (URL unchanged) keep their pubkey mappings
@@ -4621,6 +4841,7 @@ mod tests {
                 gemini_api_key: None,
                 timeout_seconds: 60,
                 refresh_interval_secs: 0,
+                ..Default::default()
             },
         );
 

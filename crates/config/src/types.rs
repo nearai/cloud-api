@@ -997,6 +997,22 @@ pub struct ExternalProvidersConfig {
     /// Interval in seconds for refreshing external providers from the database.
     /// Set to 0 to disable periodic refresh. Default: 900 (15 minutes) in production.
     pub refresh_interval_secs: u64,
+    /// Chutes attested provider — hard-off by default (`ENABLE_CHUTES`).
+    pub enable_chutes: bool,
+    /// Chutes API key (`cpk_...`), from `CHUTES_API_KEY[_FILE]`. A secret.
+    pub chutes_api_key: Option<String>,
+    /// Comma-separated Chutes model ids to register (e.g. `zai-org/GLM-5.1-TEE`),
+    /// from `CHUTES_MODELS`.
+    pub chutes_models: Vec<String>,
+    /// Expose Chutes **streaming** as an attested path (`CHUTES_ENABLE_STREAMING`,
+    /// default off). Off because Chutes' stream protocol has no authenticated
+    /// frame sequence numbers, so an on-path gateway could drop/reorder frames
+    /// undetectably — non-streaming is the honest attested default until Chutes
+    /// adds sequencing (and the inner-terminator behavior is verified on staging).
+    pub chutes_enable_streaming: bool,
+    /// Intel PCCS URL for DCAP collateral (shared with the NEAR attestation
+    /// verifier), from `PCCS_URL`. One source of truth instead of ad-hoc env reads.
+    pub pccs_url: Option<String>,
 }
 
 impl ExternalProvidersConfig {
@@ -1042,12 +1058,49 @@ impl ExternalProvidersConfig {
             .and_then(|s| s.parse().ok())
             .unwrap_or(300);
 
+        // Chutes attested provider — hard-off by default.
+        let enable_chutes = env::var("ENABLE_CHUTES")
+            .ok()
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        let chutes_api_key = if let Ok(path) = env::var("CHUTES_API_KEY_FILE") {
+            match std::fs::read_to_string(&path) {
+                Ok(s) => Some(s.trim().to_string()),
+                Err(e) => {
+                    // Path only — never the key contents.
+                    eprintln!("WARN: failed to read CHUTES_API_KEY_FILE ({path}): {e}");
+                    None
+                }
+            }
+        } else {
+            env::var("CHUTES_API_KEY").ok()
+        }
+        // An empty key is not a key — treat "" as absent so a misconfigured
+        // secret can't pass as Some("") and silently fail at request time.
+        .filter(|s| !s.is_empty());
+        let chutes_models = env::var("CHUTES_MODELS")
+            .unwrap_or_default()
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        let chutes_enable_streaming = env::var("CHUTES_ENABLE_STREAMING")
+            .ok()
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        let pccs_url = env::var("PCCS_URL").ok().filter(|s| !s.is_empty());
+
         Self {
             openai_api_key,
             anthropic_api_key,
             gemini_api_key,
             timeout_seconds,
             refresh_interval_secs,
+            enable_chutes,
+            chutes_api_key,
+            chutes_models,
+            chutes_enable_streaming,
+            pccs_url,
         }
     }
 

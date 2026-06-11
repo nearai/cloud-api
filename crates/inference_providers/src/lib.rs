@@ -316,6 +316,16 @@ pub trait InferenceProvider {
     /// goes over the same TLS connection that served the completion.
     fn pin_chat_connection(&self, _request_hash: &str, _chat_id: &str) {}
 
+    /// Whether this provider exposes per-response chat signatures via
+    /// [`Self::get_signature`]. Default `true` (the historical behavior). A
+    /// provider whose response integrity is the transport itself — e.g. Chutes,
+    /// where it's the ML-KEM E2EE channel's AEAD tag rather than a signed
+    /// response — returns `false`, so the attestation flow skips the
+    /// signature-fetch/store step instead of erroring on every completion.
+    fn supports_chat_signatures(&self) -> bool {
+        true
+    }
+
     /// Clean up the dedicated client for a chat_id after signature fetching.
     fn unpin_chat_connection(&self, _chat_id: &str) {}
 

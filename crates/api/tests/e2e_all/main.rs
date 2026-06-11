@@ -20,6 +20,7 @@ mod auto_redact_adversarial;
 mod billing_and_models;
 mod chat_encryption;
 mod check_api_key;
+mod chutes_catalog;
 mod client_disconnect;
 mod concurrent_limit;
 mod conversations;

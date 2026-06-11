@@ -453,6 +453,16 @@ pub async fn batch_upsert_models(
     // This covers: is_active=false, provider_type changed, inference_url cleared.
     // Re-registration below will add back the ones that should still be active.
     for (model_name, request) in &batch_request {
+        // Never tear down a pinned (out-of-band, config-managed) provider such as
+        // Chutes. The re-registration below only covers DB-discovered providers
+        // (inference-url / external), so unregistering a pinned provider here —
+        // e.g. on a PATCH carrying `provider_type: "chutes"` or activating the
+        // model — would leave an active catalog row with no serving provider until
+        // restart. Pricing/metadata still applied via batch_upsert_models above;
+        // serving is gated by the catalog `is_active`, not by this in-memory entry.
+        if app_state.inference_provider_pool.is_pinned(model_name) {
+            continue;
+        }
         let is_inactive = request.is_active == Some(false);
         let has_type_change = request.provider_type.is_some() || request.inference_url.is_some();
         if is_inactive || has_type_change {

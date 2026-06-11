@@ -461,6 +461,15 @@ pub async fn batch_upsert_models(
         // model — would leave an active catalog row with no serving provider until
         // restart. Pricing/metadata still applied via batch_upsert_models above;
         // serving is gated by the catalog `is_active`, not by this in-memory entry.
+        //
+        // NOTE: with tiered fallback this now also covers a NEAR-served canonical id
+        // that has a Chutes fallback (it's `is_pinned`). So a PATCH that changes its
+        // `inference_url` or deactivates it skips the eager `unregister_provider`
+        // cleanup here: the NEW url is still re-registered below (the merge keeps
+        // Chutes), but the stale OLD-url NEAR provider + its pubkey/failure-counter
+        // entries linger until the next periodic refresh prunes them. Behavior stays
+        // safe (pubkey intersection + catalog `is_active` gating); it just isn't
+        // instantaneously clean for a runtime url change on a Chutes-fallback model.
         if app_state.inference_provider_pool.is_pinned(model_name) {
             continue;
         }
@@ -1247,12 +1256,24 @@ pub async fn delete_model(
             }
         })?;
 
-    // Unregister external provider if it was registered
-    // This is a no-op for vLLM models (they are discovered, not registered)
-    app_state
-        .inference_provider_pool
-        .unregister_provider(&model_name)
-        .await;
+    // Unregister external provider if it was registered.
+    // No-op for vLLM models (discovered, not registered). Skip pinned models
+    // (e.g. a NEAR-served canonical id with a Chutes fallback): unregistering would
+    // tear down the config-pinned provider too, recoverable only by restart. The
+    // catalog delete already 404s the model via resolve_and_get_model's is_active
+    // gate; config remains the source of truth for the pinned provider.
+    if app_state.inference_provider_pool.is_pinned(&model_name) {
+        tracing::warn!(
+            model = %model_name,
+            "delete_model: skipping unregister of a pinned (config-managed) provider; \
+             the catalog row is removed (model 404s), pinned provider left intact"
+        );
+    } else {
+        app_state
+            .inference_provider_pool
+            .unregister_provider(&model_name)
+            .await;
+    }
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -1334,10 +1355,22 @@ pub async fn deprecate_model(
     // resolver will route requests with the deprecated model_id to the
     // successor on subsequent calls — so this prevents in-flight resolution
     // from picking up a stale provider reference for the now-inactive model.
-    app_state
-        .inference_provider_pool
-        .unregister_provider(&model_id)
-        .await;
+    // Skip pinned models (e.g. a NEAR-served canonical id with a Chutes fallback):
+    // unregistering would tear down the config-pinned provider too (recoverable
+    // only by restart), and the alias already routes the deprecated id to the
+    // successor, so the pinned provider isn't reached.
+    if app_state.inference_provider_pool.is_pinned(&model_id) {
+        tracing::warn!(
+            model = %model_id,
+            "deprecate_model: skipping unregister of a pinned (config-managed) provider; \
+             the alias routes the deprecated id to its successor, pinned provider left intact"
+        );
+    } else {
+        app_state
+            .inference_provider_pool
+            .unregister_provider(&model_id)
+            .await;
+    }
 
     let to_api = |model_name: String, m: services::admin::ModelPricing| ModelWithPricing {
         model_id: model_name,

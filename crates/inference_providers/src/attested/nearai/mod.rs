@@ -1066,6 +1066,13 @@ impl Fleet {
 
 #[async_trait]
 impl InferenceProvider for Fleet {
+    /// NEAR's own attested fleet. `Provider` (which wraps `Fleet`) is what the pool
+    /// actually registers, but mirror the tier here too so the verifiable filter can
+    /// never misclassify a `Fleet` as plaintext if one is ever pooled directly.
+    fn tier(&self) -> crate::ProviderTier {
+        crate::ProviderTier::Near
+    }
+
     async fn get_signature(
         &self,
         chat_id: &str,
@@ -2079,6 +2086,12 @@ impl InferenceProvider for Fleet {
 /// to its Fleet, which holds all NEAR-AI model-proxy state and logic.
 #[async_trait]
 impl InferenceProvider for Provider {
+    /// NEAR AI's own attested TEE fleet — the primary tier for any model NEAR
+    /// serves; an attested third party (Chutes) sits behind it as fallback.
+    fn tier(&self) -> crate::ProviderTier {
+        crate::ProviderTier::Near
+    }
+
     async fn models(&self) -> Result<ModelsResponse, ListModelsError> {
         self.fleet.models().await
     }

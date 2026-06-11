@@ -639,15 +639,11 @@ impl AudioTranscriptionRequest {
 
             for granularity in granularities {
                 match granularity.as_str() {
-                    "segment" => {}
-                    "word" => {
-                        return Err(
-                            "timestamp_granularities[]=word is not currently supported".to_string()
-                        );
-                    }
+                    "segment" | "word" => {}
                     _ => {
                         return Err(
-                            "Invalid timestamp_granularities. Must be one of: segment".to_string()
+                            "Invalid timestamp_granularities. Must be one of: segment, word"
+                                .to_string(),
                         );
                     }
                 }
@@ -4173,14 +4169,12 @@ mod tests {
     }
 
     #[test]
-    fn test_audio_transcription_rejects_word_timestamp_granularity() {
+    fn test_audio_transcription_accepts_word_timestamp_granularity() {
         let mut request = audio_transcription_req();
         request.response_format = Some("verbose_json".to_string());
         request.timestamp_granularities = Some(vec!["word".to_string()]);
 
-        let err = request.validate().unwrap_err();
-        assert!(err.contains("word"), "got: {err}");
-        assert!(err.contains("not currently supported"), "got: {err}");
+        assert!(request.validate().is_ok());
     }
 
     #[test]

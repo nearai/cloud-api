@@ -511,9 +511,9 @@ async fn test_audio_transcription_unsupported_response_formats() {
     }
 }
 
-/// Test that word-level timestamps are rejected instead of silently ignored
+/// Test that word-level timestamps are accepted and returned when available
 #[tokio::test]
-async fn test_audio_transcription_word_timestamps_unsupported() {
+async fn test_audio_transcription_word_timestamps_supported() {
     let server = setup_test_server().await;
 
     let model_name = "Qwen/Qwen-Image-2512";
@@ -541,10 +541,10 @@ async fn test_audio_transcription_word_timestamps_unsupported() {
         )
         .await;
 
-    assert_eq!(response.status_code(), 400);
-    let error: api::models::ErrorResponse = response.json();
-    assert!(error.error.message.contains("word"));
-    assert!(error.error.message.contains("not currently supported"));
+    assert_eq!(response.status_code(), 200);
+    let body: api::models::AudioTranscriptionResponse = response.json();
+    let words = body.words.expect("expected word timestamps");
+    assert!(!words.is_empty());
 }
 
 /// Test that timestamp granularities require verbose_json

@@ -622,6 +622,12 @@ pub struct RerankRequest {
     pub query: String,
     /// Documents to rerank
     pub documents: Vec<String>,
+    /// Maximum number of ranked results to return
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub top_n: Option<usize>,
+    /// Whether to include document text in each result. Defaults to true.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub return_documents: Option<bool>,
 }
 
 impl RerankRequest {
@@ -645,6 +651,10 @@ impl RerankRequest {
         // Documents must not exceed 1000 items
         if self.documents.len() > 1000 {
             return Err("documents must contain at most 1000 items".to_string());
+        }
+
+        if self.top_n == Some(0) {
+            return Err("top_n must be at least 1".to_string());
         }
 
         // Each document must not be empty or whitespace-only

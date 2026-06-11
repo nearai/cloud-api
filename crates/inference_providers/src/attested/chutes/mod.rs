@@ -1075,7 +1075,9 @@ mod tests {
     ///
     /// Uses the real E2EE path with a stub verifier (we're testing the stream
     /// protocol, not re-verifying attestation — the encaps pubkey still comes from
-    /// the live discovered instance). Run:
+    /// the live discovered instance). The model defaults to `zai-org/GLM-5.1-TEE`
+    /// but can be overridden via `CHUTES_PROBE_MODEL` so re-running the probe after
+    /// that model is decommissioned needs no code edit. Run:
     ///   CHUTES_API_KEY=cpk_... cargo test -p inference_providers --lib \
     ///     attested::chutes::tests::live_chutes_streaming_done_probe -- --ignored --nocapture
     #[tokio::test]
@@ -1083,13 +1085,15 @@ mod tests {
     async fn live_chutes_streaming_done_probe() {
         use futures_util::StreamExt;
         let key = std::env::var("CHUTES_API_KEY").expect("set CHUTES_API_KEY for the live probe");
+        let model =
+            std::env::var("CHUTES_PROBE_MODEL").unwrap_or_else(|_| "zai-org/GLM-5.1-TEE".into());
         let provider = Provider::new(
-            Config::new(key, "zai-org/GLM-5.1-TEE".to_string(), 120).with_streaming(true),
+            Config::new(key, model.clone(), 120).with_streaming(true),
             Arc::new(StubVerifier { ok: true }),
         )
         .unwrap();
         let params: ChatCompletionParams = serde_json::from_value(json!({
-            "model": "zai-org/GLM-5.1-TEE",
+            "model": model,
             "messages": [{"role": "user", "content": "Count: 1 2 3, then stop."}],
             "max_tokens": 64,
             "temperature": 0,

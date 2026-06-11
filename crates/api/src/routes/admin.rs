@@ -14,8 +14,8 @@ use crate::models::{
     ListAdminOrganizationMembersResponse, ListOrganizationsAdminResponse,
     ListPricingChangesResponse, ListUsersResponse, MemberRole, ModelArchitecture,
     ModelDeprecationConfirmResponse, ModelDeprecationPreviewResponse, ModelDeprecationRequest,
-    ModelHistoryEntry, ModelHistoryResponse, ModelMetadata, ModelWithPricing, OrgLimitsHistoryEntry,
-    OrgLimitsHistoryResponse, OrganizationUsage, PricingChangeBatchRequest,
+    ModelHistoryEntry, ModelHistoryResponse, ModelMetadata, ModelWithPricing,
+    OrgLimitsHistoryEntry, OrgLimitsHistoryResponse, OrganizationUsage, PricingChangeBatchRequest,
     PricingChangeConfirmResponse, PricingChangeModelPreviewDto, PricingChangePreviewResponse,
     PricingFieldUpdates, PricingFields, ScheduledPricingChangeDto, SpendLimit,
     UpdateOrganizationConcurrentLimitRequest, UpdateOrganizationConcurrentLimitResponse,
@@ -2091,27 +2091,7 @@ pub async fn list_organizations(
 
     let org_responses: Vec<AdminOrganizationResponse> = organizations
         .into_iter()
-        .map(|org| {
-            let current_usage = org.total_spent.map(|total_spent| OrganizationUsage {
-                total_spent,
-                total_spent_display: format_amount(total_spent),
-                total_requests: org.total_requests.unwrap_or(0),
-                total_tokens: org.total_tokens.unwrap_or(0),
-            });
-
-            AdminOrganizationResponse {
-                id: org.id.to_string(),
-                name: org.name,
-                description: org.description,
-                spend_limit: org.spend_limit.map(|amount| SpendLimit {
-                    amount,
-                    scale: 9,
-                    currency: "USD".to_string(),
-                }),
-                current_usage,
-                created_at: org.created_at,
-            }
-        })
+        .map(admin_org_info_to_response)
         .collect();
 
     let response = ListOrganizationsAdminResponse {
@@ -2188,6 +2168,16 @@ pub async fn get_organization(
             }
         })?;
 
+    Ok(ResponseJson(admin_org_info_to_response(org)))
+}
+
+/// Map a service-layer `AdminOrganizationInfo` to the API
+/// `AdminOrganizationResponse`. Shared by `list_organizations` and
+/// `get_organization` so the spend-limit scale and usage block can't drift
+/// between the two.
+fn admin_org_info_to_response(
+    org: services::admin::AdminOrganizationInfo,
+) -> AdminOrganizationResponse {
     let current_usage = org.total_spent.map(|total_spent| OrganizationUsage {
         total_spent,
         total_spent_display: format_amount(total_spent),
@@ -2195,7 +2185,7 @@ pub async fn get_organization(
         total_tokens: org.total_tokens.unwrap_or(0),
     });
 
-    Ok(ResponseJson(AdminOrganizationResponse {
+    AdminOrganizationResponse {
         id: org.id.to_string(),
         name: org.name,
         description: org.description,
@@ -2206,7 +2196,7 @@ pub async fn get_organization(
         }),
         current_usage,
         created_at: org.created_at,
-    }))
+    }
 }
 
 /// Map a raw database role string to the API `MemberRole`. Unknown values fall
@@ -2217,14 +2207,15 @@ fn member_role_from_db_str(role: &str, member_id: Uuid) -> MemberRole {
         "owner" => MemberRole::Owner,
         "admin" => MemberRole::Admin,
         "member" => MemberRole::Member,
-        other => {
+        _ => {
             // Unreachable while the `organization_members.role` CHECK constraint
             // holds, but if it is ever relaxed we must not silently present a
             // bogus role as a real one. Fall back to the least-privileged role
-            // and surface the anomaly (ids only — no user data).
+            // and surface the anomaly by id only (no raw DB value, per the
+            // project's logging rules).
             warn!(
-                "Unknown organization member role '{}' for member_id={}; defaulting to 'member'",
-                other, member_id
+                "Unexpected organization member role for member_id={}; defaulting to 'member'",
+                member_id
             );
             MemberRole::Member
         }

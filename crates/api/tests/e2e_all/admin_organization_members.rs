@@ -205,6 +205,85 @@ async fn test_admin_list_organization_members_deactivated_org() {
 }
 
 #[tokio::test]
+async fn test_admin_list_organization_members_pagination() {
+    // A two-member org paged with limit=1 must return each member exactly once
+    // across the two pages — locking in the `joined_at DESC, m.id` tiebreaker.
+    let (server, database) = setup_test_server_with_database().await;
+
+    let org = create_org(&server).await; // owner = member #1
+    let org_uuid = uuid::Uuid::parse_str(&org.id).expect("org id should be a uuid");
+
+    // Add a second active member directly.
+    let second_user_id = uuid::Uuid::new_v4();
+    {
+        let pool = database.pool();
+        let client = pool.get().await.expect("Failed to get database connection");
+        client
+            .execute(
+                "INSERT INTO users (id, email, username, display_name, avatar_url, auth_provider, provider_user_id, is_active, created_at, updated_at)
+                 VALUES ($1, $2, $3, NULL, NULL, 'mock', $4, true, NOW(), NOW())",
+                &[
+                    &second_user_id,
+                    &format!("second-{second_user_id}@test.com"),
+                    &format!("second-{second_user_id}"),
+                    &format!("mock_second-{second_user_id}"),
+                ],
+            )
+            .await
+            .expect("Failed to insert second user");
+        client
+            .execute(
+                "INSERT INTO organization_members (organization_id, user_id, role) VALUES ($1, $2, 'member')",
+                &[&org_uuid, &second_user_id],
+            )
+            .await
+            .expect("Failed to insert second member");
+    }
+
+    let page0 = server
+        .get(
+            format!(
+                "/v1/admin/organizations/{}/members?limit=1&offset=0",
+                org.id
+            )
+            .as_str(),
+        )
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .add_header("User-Agent", MOCK_USER_AGENT)
+        .await
+        .json::<ListAdminOrganizationMembersResponse>();
+    let page1 = server
+        .get(
+            format!(
+                "/v1/admin/organizations/{}/members?limit=1&offset=1",
+                org.id
+            )
+            .as_str(),
+        )
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .add_header("User-Agent", MOCK_USER_AGENT)
+        .await
+        .json::<ListAdminOrganizationMembersResponse>();
+
+    assert_eq!(
+        page0.total, 2,
+        "total should reflect the full count on page 0"
+    );
+    assert_eq!(
+        page1.total, 2,
+        "total should reflect the full count on page 1"
+    );
+    assert_eq!(page0.members.len(), 1, "limit=1 should return one row");
+    assert_eq!(page1.members.len(), 1, "limit=1 should return one row");
+    assert_ne!(
+        page0.members[0].id, page1.members[0].id,
+        "the two pages must not repeat the same member (stable sort tiebreaker)"
+    );
+
+    println!("✅ Admin list organization members paginates without repeats/skips");
+}
+
+#[tokio::test]
 async fn test_admin_list_organization_members_org_not_found() {
     let server = setup_test_server().await;
 

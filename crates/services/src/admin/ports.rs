@@ -335,6 +335,186 @@ pub struct ModelDeprecationConfirmResult {
     pub skipped_count: i64,
 }
 
+/// Lifecycle status of a scheduled model pricing change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScheduledPricingChangeStatus {
+    Pending,
+    Applying,
+    Applied,
+    Cancelled,
+    Failed,
+}
+
+impl ScheduledPricingChangeStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Applying => "applying",
+            Self::Applied => "applied",
+            Self::Cancelled => "cancelled",
+            Self::Failed => "failed",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "pending" => Some(Self::Pending),
+            "applying" => Some(Self::Applying),
+            "applied" => Some(Self::Applied),
+            "cancelled" => Some(Self::Cancelled),
+            "failed" => Some(Self::Failed),
+            _ => None,
+        }
+    }
+}
+
+/// Validated per-model input for scheduling a pricing change.
+/// New amounts are nano-dollars (scale 9); `None` = field unchanged.
+#[derive(Debug, Clone)]
+pub struct PricingChangeInput {
+    pub model_name: String,
+    pub effective_at: chrono::DateTime<chrono::Utc>,
+    pub new_input_cost_per_token: Option<i64>,
+    pub new_output_cost_per_token: Option<i64>,
+    pub new_cache_read_cost_per_token: Option<i64>,
+    pub new_cost_per_image: Option<i64>,
+}
+
+/// Current pricing + identity snapshot of an active model, captured at
+/// confirm time as the "old" side of a scheduled pricing change.
+#[derive(Debug, Clone)]
+pub struct ModelPricingSnapshot {
+    pub id: uuid::Uuid,
+    pub model_name: String,
+    pub model_display_name: String,
+    pub input_cost_per_token: i64,
+    pub output_cost_per_token: i64,
+    pub cache_read_cost_per_token: i64,
+    pub cost_per_image: i64,
+}
+
+/// One row to insert into `scheduled_model_pricing_changes`.
+#[derive(Debug, Clone)]
+pub struct ScheduledPricingChangeInsert {
+    pub model_id: uuid::Uuid,
+    pub model_name: String,
+    pub model_display_name: String,
+    pub new_input_cost_per_token: Option<i64>,
+    pub new_output_cost_per_token: Option<i64>,
+    pub new_cache_read_cost_per_token: Option<i64>,
+    pub new_cost_per_image: Option<i64>,
+    pub old_input_cost_per_token: i64,
+    pub old_output_cost_per_token: i64,
+    pub old_cache_read_cost_per_token: i64,
+    pub old_cost_per_image: i64,
+    pub effective_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// Full `scheduled_model_pricing_changes` row.
+#[derive(Debug, Clone)]
+pub struct ScheduledPricingChange {
+    pub id: uuid::Uuid,
+    pub batch_id: uuid::Uuid,
+    pub model_id: uuid::Uuid,
+    pub model_name: String,
+    pub model_display_name: String,
+    pub new_input_cost_per_token: Option<i64>,
+    pub new_output_cost_per_token: Option<i64>,
+    pub new_cache_read_cost_per_token: Option<i64>,
+    pub new_cost_per_image: Option<i64>,
+    pub old_input_cost_per_token: i64,
+    pub old_output_cost_per_token: i64,
+    pub old_cache_read_cost_per_token: i64,
+    pub old_cost_per_image: i64,
+    pub effective_at: chrono::DateTime<chrono::Utc>,
+    pub status: ScheduledPricingChangeStatus,
+    pub apply_attempts: i32,
+    pub applied_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub last_error: Option<String>,
+    pub created_by_user_id: Option<uuid::Uuid>,
+    pub created_by_user_email: Option<String>,
+    pub change_reason: Option<String>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// One affected (user, org, model) row. The service consolidates sends into
+/// one email per distinct recipient address covering all their models, but
+/// records delivery status for every affected org membership.
+#[derive(Debug, Clone)]
+pub struct PricingChangeRecipientRow {
+    pub user_id: uuid::Uuid,
+    pub email: String,
+    pub organization_id: uuid::Uuid,
+    pub organization_name: String,
+    /// Canonical model name (alias usage is resolved to the canonical name).
+    pub model_name: String,
+}
+
+/// Per-model breakdown inside a pricing change preview.
+#[derive(Debug, Clone)]
+pub struct PricingChangeModelPreview {
+    pub model_name: String,
+    pub model_display_name: String,
+    pub effective_at: chrono::DateTime<chrono::Utc>,
+    pub recipient_count: i64,
+    pub organization_count: i64,
+    pub old_input_cost_per_token: i64,
+    pub old_output_cost_per_token: i64,
+    pub old_cache_read_cost_per_token: i64,
+    pub old_cost_per_image: i64,
+    pub new_input_cost_per_token: Option<i64>,
+    pub new_output_cost_per_token: Option<i64>,
+    pub new_cache_read_cost_per_token: Option<i64>,
+    pub new_cost_per_image: Option<i64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PricingChangePreview {
+    /// Distinct recipient emails across the whole batch.
+    pub recipient_count: i64,
+    /// Distinct organizations across the whole batch.
+    pub organization_count: i64,
+    pub usage_window_days: i64,
+    pub models: Vec<PricingChangeModelPreview>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PricingChangeConfirmResult {
+    pub batch_id: uuid::Uuid,
+    pub recipient_count: i64,
+    pub organization_count: i64,
+    pub sent_count: i64,
+    pub failed_count: i64,
+    pub skipped_count: i64,
+    pub changes: Vec<ScheduledPricingChange>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PricingChangeDeliveryRecord {
+    pub batch_id: uuid::Uuid,
+    pub recipient_user_id: uuid::Uuid,
+    pub recipient_email: String,
+    pub organization_id: uuid::Uuid,
+    pub organization_name: String,
+    /// Canonical model names included in the email this recipient received.
+    pub model_names: Vec<String>,
+    pub status: ModelDeprecationEmailStatus,
+    pub email_message_id: Option<String>,
+    pub email_last_error: Option<String>,
+    pub initiated_by_user_id: Option<uuid::Uuid>,
+    pub initiated_by_user_email: Option<String>,
+}
+
+/// Marker error returned (wrapped in `anyhow::Error`) by
+/// [`AdminRepository::insert_scheduled_pricing_changes`] when another open
+/// (pending/applying) change already exists for a model. The service
+/// downcasts it to surface a 409 instead of a 500.
+#[derive(Debug, thiserror::Error)]
+#[error("an open scheduled pricing change already exists for model '{model_name}'")]
+pub struct PricingChangeOpenConflictError {
+    pub model_name: String,
+}
+
 /// Organization information for admin listing (includes spend limit and usage)
 #[derive(Debug, Clone)]
 pub struct AdminOrganizationInfo {
@@ -362,6 +542,10 @@ pub enum AdminError {
     InvalidLimits(String),
     #[error("Invalid deprecation request: {0}")]
     InvalidDeprecation(String),
+    #[error("Pricing change conflict: {0}")]
+    PricingChangeConflict(String),
+    #[error("Pricing change not found: {0}")]
+    PricingChangeNotFound(String),
     #[error("Unauthorized: {0}")]
     Unauthorized(String),
     #[error("Internal error: {0}")]
@@ -519,6 +703,98 @@ pub trait AdminRepository: Send + Sync {
     async fn record_model_deprecation_delivery(
         &self,
         record: ModelDeprecationDeliveryRecord,
+    ) -> Result<(), anyhow::Error>;
+
+    /// Fetch an active model's pricing snapshot by canonical model name.
+    async fn get_model_pricing_snapshot(
+        &self,
+        model_name: &str,
+    ) -> Result<Option<ModelPricingSnapshot>, anyhow::Error>;
+
+    /// List active owner/admin recipients for orgs that used any of the
+    /// models (including via aliases) since `since`. Returns one row per
+    /// (user, org, canonical model name).
+    async fn list_pricing_change_recipients(
+        &self,
+        model_names: &[String],
+        since: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Vec<PricingChangeRecipientRow>, anyhow::Error>;
+
+    /// Insert all rows of a batch in one transaction.
+    ///
+    /// Idempotent per batch: if rows for `batch_id` already exist, returns
+    /// them without inserting. If another open (pending/applying) change
+    /// exists for any model, fails the transaction with
+    /// [`AdminError::PricingChangeConflict`] semantics (unique violation on
+    /// the partial index); callers map that to a 409.
+    async fn insert_scheduled_pricing_changes(
+        &self,
+        batch_id: uuid::Uuid,
+        changes: Vec<ScheduledPricingChangeInsert>,
+        created_by_user_id: Option<uuid::Uuid>,
+        created_by_user_email: Option<String>,
+        change_reason: Option<String>,
+    ) -> Result<Vec<ScheduledPricingChange>, anyhow::Error>;
+
+    /// List scheduled pricing changes, optionally filtered by status,
+    /// newest effective date first. Returns (rows, total).
+    async fn list_scheduled_pricing_changes(
+        &self,
+        status: Option<ScheduledPricingChangeStatus>,
+        limit: i64,
+        offset: i64,
+    ) -> Result<(Vec<ScheduledPricingChange>, i64), anyhow::Error>;
+
+    /// Cancel a pending change. Returns `None` if the row is missing or no
+    /// longer pending (already applying/applied/cancelled) — race-safe
+    /// against the scheduler claim.
+    async fn cancel_scheduled_pricing_change(
+        &self,
+        id: uuid::Uuid,
+        cancelled_by_user_id: Option<uuid::Uuid>,
+        cancelled_by_user_email: Option<String>,
+    ) -> Result<Option<ScheduledPricingChange>, anyhow::Error>;
+
+    /// Atomically claim due pending changes (pending -> applying,
+    /// apply_attempts + 1) using `FOR UPDATE SKIP LOCKED` so concurrent
+    /// instances partition the due set.
+    async fn claim_due_pricing_changes(
+        &self,
+        limit: i64,
+    ) -> Result<Vec<ScheduledPricingChange>, anyhow::Error>;
+
+    /// Mark a claimed change as applied.
+    async fn mark_pricing_change_applied(&self, id: uuid::Uuid) -> Result<(), anyhow::Error>;
+
+    /// Mark a claimed change as failed. `retryable = true` returns it to
+    /// `pending` for a later attempt; `false` parks it in `failed`.
+    async fn mark_pricing_change_failed(
+        &self,
+        id: uuid::Uuid,
+        error: &str,
+        retryable: bool,
+    ) -> Result<(), anyhow::Error>;
+
+    /// Recover rows stuck in `applying` (e.g. instance crashed mid-apply)
+    /// older than `stale_after`: back to `pending` while under
+    /// `max_attempts`, otherwise `failed`. Returns the number of rows moved.
+    async fn recover_stale_applying_pricing_changes(
+        &self,
+        stale_after: chrono::Duration,
+        max_attempts: i32,
+    ) -> Result<u64, anyhow::Error>;
+
+    /// Return (user_id, organization_id) delivery keys already successfully
+    /// sent for this batch, for idempotent confirms.
+    async fn list_sent_pricing_change_delivery_keys(
+        &self,
+        batch_id: uuid::Uuid,
+    ) -> Result<Vec<(uuid::Uuid, uuid::Uuid)>, anyhow::Error>;
+
+    /// Persist one pricing change email delivery outcome.
+    async fn record_pricing_change_delivery(
+        &self,
+        record: PricingChangeDeliveryRecord,
     ) -> Result<(), anyhow::Error>;
 
     /// Update organization concurrent request limit
@@ -698,6 +974,41 @@ pub trait AdminService: Send + Sync {
         changed_by_user_id: Option<uuid::Uuid>,
         changed_by_user_email: Option<String>,
     ) -> Result<ModelDeprecationConfirmResult, AdminError>;
+
+    /// Preview recipients and per-model impact of a batch of scheduled
+    /// pricing changes without mutating state.
+    async fn preview_pricing_changes(
+        &self,
+        changes: Vec<PricingChangeInput>,
+    ) -> Result<PricingChangePreview, AdminError>;
+
+    /// Persist a batch of scheduled pricing changes and send one
+    /// consolidated notification email per distinct recipient, covering all
+    /// batch models the recipient's org(s) used. Idempotent per `batch_id`.
+    async fn confirm_pricing_changes(
+        &self,
+        batch_id: uuid::Uuid,
+        changes: Vec<PricingChangeInput>,
+        change_reason: Option<String>,
+        changed_by_user_id: Option<uuid::Uuid>,
+        changed_by_user_email: Option<String>,
+    ) -> Result<PricingChangeConfirmResult, AdminError>;
+
+    /// List scheduled pricing changes, optionally filtered by status.
+    async fn list_pricing_changes(
+        &self,
+        status: Option<ScheduledPricingChangeStatus>,
+        limit: i64,
+        offset: i64,
+    ) -> Result<(Vec<ScheduledPricingChange>, i64), AdminError>;
+
+    /// Cancel a pending scheduled pricing change.
+    async fn cancel_pricing_change(
+        &self,
+        id: uuid::Uuid,
+        cancelled_by_user_id: Option<uuid::Uuid>,
+        cancelled_by_user_email: Option<String>,
+    ) -> Result<ScheduledPricingChange, AdminError>;
 
     /// Update organization concurrent request limit (admin only)
     /// Set to None to use the default limit

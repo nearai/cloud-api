@@ -248,6 +248,9 @@ impl DatabaseConfig {
 pub struct ServerConfig {
     pub host: String,
     pub port: u16,
+    /// Interval in seconds between scheduled-pricing-change apply passes.
+    /// Set to 0 to disable the background scheduler. Default: 60.
+    pub pricing_change_apply_interval_secs: u64,
 }
 
 impl ServerConfig {
@@ -259,6 +262,10 @@ impl ServerConfig {
                 .unwrap_or_else(|_| "3000".to_string())
                 .parse()
                 .map_err(|_| "SERVER_PORT must be a valid port number")?,
+            pricing_change_apply_interval_secs: env::var("PRICING_CHANGE_APPLY_INTERVAL_SECS")
+                .unwrap_or_else(|_| "60".to_string())
+                .parse()
+                .map_err(|_| "PRICING_CHANGE_APPLY_INTERVAL_SECS must be a non-negative integer")?,
         })
     }
 }

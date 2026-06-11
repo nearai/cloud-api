@@ -10,13 +10,15 @@ use crate::models::{
     CreateAdminAccessTokenRequest, CreateServiceRequest, CreditType, DecimalPrice,
     DecimalPriceRequest, DeleteAdminAccessTokenRequest, DeleteModelRequest, DeprecateModelRequest,
     DeprecateModelResponse, ErrorResponse, GetOrganizationConcurrentLimitResponse,
-    ListAdminInvitationEmailDeliveriesResponse, ListOrganizationsAdminResponse, ListUsersResponse,
-    ModelArchitecture, ModelDeprecationConfirmResponse, ModelDeprecationPreviewResponse,
-    ModelDeprecationRequest, ModelHistoryEntry, ModelHistoryResponse, ModelMetadata,
-    ModelWithPricing, OrgLimitsHistoryEntry, OrgLimitsHistoryResponse, OrganizationUsage,
-    SpendLimit, UpdateOrganizationConcurrentLimitRequest,
-    UpdateOrganizationConcurrentLimitResponse, UpdateOrganizationLimitsRequest,
-    UpdateOrganizationLimitsResponse, UpdateServiceRequest,
+    ListAdminInvitationEmailDeliveriesResponse, ListOrganizationsAdminResponse,
+    ListPricingChangesResponse, ListUsersResponse, ModelArchitecture,
+    ModelDeprecationConfirmResponse, ModelDeprecationPreviewResponse, ModelDeprecationRequest,
+    ModelHistoryEntry, ModelHistoryResponse, ModelMetadata, ModelWithPricing,
+    OrgLimitsHistoryEntry, OrgLimitsHistoryResponse, OrganizationUsage, PricingChangeBatchRequest,
+    PricingChangeConfirmResponse, PricingChangeModelPreviewDto, PricingChangePreviewResponse,
+    PricingFieldUpdates, PricingFields, ScheduledPricingChangeDto, SpendLimit,
+    UpdateOrganizationConcurrentLimitRequest, UpdateOrganizationConcurrentLimitResponse,
+    UpdateOrganizationLimitsRequest, UpdateOrganizationLimitsResponse, UpdateServiceRequest,
 };
 use crate::routes::common::format_amount;
 use crate::routes::usage::{compute_organization_balance_response, OrganizationBalanceResponse};
@@ -1492,6 +1494,314 @@ pub async fn confirm_model_deprecation(
     }))
 }
 
+fn usd_price(amount: i64) -> DecimalPrice {
+    DecimalPrice {
+        amount,
+        scale: 9,
+        currency: "USD".to_string(),
+    }
+}
+
+/// Validate the request-level shape of a pricing change batch and convert it
+/// to service inputs. Pricing/lead-time/model validation happens in the
+/// service layer.
+fn pricing_change_inputs_from_request(
+    req: &PricingChangeBatchRequest,
+) -> Result<Vec<services::admin::PricingChangeInput>, (StatusCode, ResponseJson<ErrorResponse>)> {
+    let invalid = |msg: String| {
+        (
+            StatusCode::BAD_REQUEST,
+            ResponseJson(ErrorResponse::new(msg, "invalid_request".to_string())),
+        )
+    };
+
+    req.changes
+        .iter()
+        .map(|item| {
+            let effective_at = parse_deprecation_date(&item.effective_at).ok_or_else(|| {
+                invalid(format!(
+                    "model '{}': effectiveAt: '{}' must be a date 'YYYY-MM-DD' (defaults to 13:00 UTC) or a whole-hour UTC instant 'YYYY-MM-DDTHH:00:00Z'",
+                    item.model_id, item.effective_at
+                ))
+            })?;
+            for price in [
+                &item.input_cost_per_token,
+                &item.output_cost_per_token,
+                &item.cache_read_cost_per_token,
+                &item.cost_per_image,
+            ]
+            .into_iter()
+            .flatten()
+            {
+                price
+                    .validate()
+                    .map_err(|e| invalid(format!("model '{}': {e}", item.model_id)))?;
+            }
+            Ok(services::admin::PricingChangeInput {
+                model_name: item.model_id.clone(),
+                effective_at,
+                new_input_cost_per_token: item.input_cost_per_token.as_ref().map(|p| p.amount),
+                new_output_cost_per_token: item.output_cost_per_token.as_ref().map(|p| p.amount),
+                new_cache_read_cost_per_token: item
+                    .cache_read_cost_per_token
+                    .as_ref()
+                    .map(|p| p.amount),
+                new_cost_per_image: item.cost_per_image.as_ref().map(|p| p.amount),
+            })
+        })
+        .collect()
+}
+
+fn scheduled_pricing_change_to_dto(
+    change: services::admin::ScheduledPricingChange,
+) -> ScheduledPricingChangeDto {
+    ScheduledPricingChangeDto {
+        id: change.id.to_string(),
+        batch_id: change.batch_id.to_string(),
+        model_id: change.model_name,
+        model_display_name: change.model_display_name,
+        status: change.status.as_str().to_string(),
+        effective_at: format_deprecation_date(&change.effective_at),
+        old_pricing: PricingFields {
+            input_cost_per_token: usd_price(change.old_input_cost_per_token),
+            output_cost_per_token: usd_price(change.old_output_cost_per_token),
+            cache_read_cost_per_token: usd_price(change.old_cache_read_cost_per_token),
+            cost_per_image: usd_price(change.old_cost_per_image),
+        },
+        new_pricing: PricingFieldUpdates {
+            input_cost_per_token: change.new_input_cost_per_token.map(usd_price),
+            output_cost_per_token: change.new_output_cost_per_token.map(usd_price),
+            cache_read_cost_per_token: change.new_cache_read_cost_per_token.map(usd_price),
+            cost_per_image: change.new_cost_per_image.map(usd_price),
+        },
+        applied_at: change.applied_at.map(|dt| dt.to_rfc3339()),
+        last_error: change.last_error,
+        created_by_user_email: change.created_by_user_email,
+        change_reason: change.change_reason,
+        created_at: change.created_at.to_rfc3339(),
+    }
+}
+
+/// Preview a batch of scheduled pricing changes without mutating state (Admin only).
+#[utoipa::path(
+    post,
+    path = "/v1/admin/models/pricing-changes/preview",
+    tag = "Admin",
+    request_body = PricingChangeBatchRequest,
+    responses(
+        (status = 200, description = "Pricing change notification preview", body = PricingChangePreviewResponse),
+        (status = 400, description = "Invalid request", body = ErrorResponse),
+        (status = 404, description = "Model not found or inactive", body = ErrorResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    ),
+    security(
+        ("session_token" = [])
+    )
+)]
+pub async fn preview_model_pricing_changes(
+    State(app_state): State<AdminAppState>,
+    Extension(_admin_user): Extension<AdminUser>,
+    ResponseJson(req): ResponseJson<PricingChangeBatchRequest>,
+) -> Result<ResponseJson<PricingChangePreviewResponse>, (StatusCode, ResponseJson<ErrorResponse>)> {
+    let changes = pricing_change_inputs_from_request(&req)?;
+
+    let preview = app_state
+        .admin_service
+        .preview_pricing_changes(changes)
+        .await
+        .map_err(admin_error_to_response)?;
+
+    Ok(ResponseJson(PricingChangePreviewResponse {
+        recipient_count: preview.recipient_count,
+        organization_count: preview.organization_count,
+        usage_window_days: preview.usage_window_days,
+        models: preview
+            .models
+            .into_iter()
+            .map(|m| PricingChangeModelPreviewDto {
+                model_id: m.model_name,
+                model_display_name: m.model_display_name,
+                effective_at: format_deprecation_date(&m.effective_at),
+                recipient_count: m.recipient_count,
+                organization_count: m.organization_count,
+                old_pricing: PricingFields {
+                    input_cost_per_token: usd_price(m.old_input_cost_per_token),
+                    output_cost_per_token: usd_price(m.old_output_cost_per_token),
+                    cache_read_cost_per_token: usd_price(m.old_cache_read_cost_per_token),
+                    cost_per_image: usd_price(m.old_cost_per_image),
+                },
+                new_pricing: PricingFieldUpdates {
+                    input_cost_per_token: m.new_input_cost_per_token.map(usd_price),
+                    output_cost_per_token: m.new_output_cost_per_token.map(usd_price),
+                    cache_read_cost_per_token: m.new_cache_read_cost_per_token.map(usd_price),
+                    cost_per_image: m.new_cost_per_image.map(usd_price),
+                },
+            })
+            .collect(),
+    }))
+}
+
+/// Confirm a batch of scheduled pricing changes and notify affected admins (Admin only).
+///
+/// Persists the schedule (the background scheduler applies each change at its
+/// effective date) and sends one consolidated email per affected recipient.
+#[utoipa::path(
+    post,
+    path = "/v1/admin/models/pricing-changes/confirm",
+    tag = "Admin",
+    request_body = PricingChangeBatchRequest,
+    responses(
+        (status = 200, description = "Pricing changes scheduled and notifications attempted", body = PricingChangeConfirmResponse),
+        (status = 400, description = "Invalid request", body = ErrorResponse),
+        (status = 404, description = "Model not found or inactive", body = ErrorResponse),
+        (status = 409, description = "A pending pricing change already exists for a model", body = ErrorResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    ),
+    security(
+        ("session_token" = [])
+    )
+)]
+pub async fn confirm_model_pricing_changes(
+    State(app_state): State<AdminAppState>,
+    Extension(admin_user): Extension<AdminUser>,
+    ResponseJson(req): ResponseJson<PricingChangeBatchRequest>,
+) -> Result<ResponseJson<PricingChangeConfirmResponse>, (StatusCode, ResponseJson<ErrorResponse>)> {
+    let changes = pricing_change_inputs_from_request(&req)?;
+    let batch_id = req.batch_id.unwrap_or_else(Uuid::new_v4);
+
+    let result = app_state
+        .admin_service
+        .confirm_pricing_changes(
+            batch_id,
+            changes,
+            req.change_reason,
+            Some(admin_user.0.id),
+            Some(admin_user.0.email),
+        )
+        .await
+        .map_err(admin_error_to_response)?;
+
+    Ok(ResponseJson(PricingChangeConfirmResponse {
+        batch_id: result.batch_id.to_string(),
+        recipient_count: result.recipient_count,
+        organization_count: result.organization_count,
+        sent_count: result.sent_count,
+        failed_count: result.failed_count,
+        skipped_count: result.skipped_count,
+        changes: result
+            .changes
+            .into_iter()
+            .map(scheduled_pricing_change_to_dto)
+            .collect(),
+    }))
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct ListPricingChangesQueryParams {
+    /// Filter by status (pending, applying, applied, cancelled, failed).
+    pub status: Option<String>,
+    #[serde(default = "default_pricing_changes_limit")]
+    pub limit: i64,
+    #[serde(default)]
+    pub offset: i64,
+}
+
+fn default_pricing_changes_limit() -> i64 {
+    100
+}
+
+/// List scheduled pricing changes (Admin only).
+#[utoipa::path(
+    get,
+    path = "/v1/admin/models/pricing-changes",
+    tag = "Admin",
+    params(
+        ("status" = Option<String>, Query, description = "Filter by status: pending, applying, applied, cancelled, failed. Omit for all."),
+        ("limit" = Option<i64>, Query, description = "Maximum number of changes to return (default: 100)"),
+        ("offset" = Option<i64>, Query, description = "Number of changes to skip (default: 0)")
+    ),
+    responses(
+        (status = 200, description = "Scheduled pricing changes", body = ListPricingChangesResponse),
+        (status = 400, description = "Invalid request", body = ErrorResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    ),
+    security(
+        ("session_token" = [])
+    )
+)]
+pub async fn list_model_pricing_changes(
+    State(app_state): State<AdminAppState>,
+    Extension(_admin_user): Extension<AdminUser>,
+    Query(params): Query<ListPricingChangesQueryParams>,
+) -> Result<ResponseJson<ListPricingChangesResponse>, (StatusCode, ResponseJson<ErrorResponse>)> {
+    let status = params
+        .status
+        .as_deref()
+        .map(|s| {
+            services::admin::ScheduledPricingChangeStatus::parse(s).ok_or_else(|| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    ResponseJson(ErrorResponse::new(
+                        format!(
+                            "status: '{s}' must be one of pending, applying, applied, cancelled, failed"
+                        ),
+                        "invalid_request".to_string(),
+                    )),
+                )
+            })
+        })
+        .transpose()?;
+
+    let (changes, total) = app_state
+        .admin_service
+        .list_pricing_changes(status, params.limit, params.offset)
+        .await
+        .map_err(admin_error_to_response)?;
+
+    Ok(ResponseJson(ListPricingChangesResponse {
+        changes: changes
+            .into_iter()
+            .map(scheduled_pricing_change_to_dto)
+            .collect(),
+        total,
+    }))
+}
+
+/// Cancel a pending scheduled pricing change (Admin only).
+#[utoipa::path(
+    delete,
+    path = "/v1/admin/models/pricing-changes/{id}",
+    tag = "Admin",
+    params(
+        ("id" = uuid::Uuid, Path, description = "Scheduled pricing change ID")
+    ),
+    responses(
+        (status = 200, description = "Pricing change cancelled", body = ScheduledPricingChangeDto),
+        (status = 404, description = "Pricing change not found or no longer pending", body = ErrorResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    ),
+    security(
+        ("session_token" = [])
+    )
+)]
+pub async fn cancel_model_pricing_change(
+    State(app_state): State<AdminAppState>,
+    Path(id): Path<Uuid>,
+    Extension(admin_user): Extension<AdminUser>,
+) -> Result<ResponseJson<ScheduledPricingChangeDto>, (StatusCode, ResponseJson<ErrorResponse>)> {
+    let cancelled = app_state
+        .admin_service
+        .cancel_pricing_change(id, Some(admin_user.0.id), Some(admin_user.0.email))
+        .await
+        .map_err(admin_error_to_response)?;
+
+    Ok(ResponseJson(scheduled_pricing_change_to_dto(cancelled)))
+}
+
 fn admin_error_to_response(
     e: services::admin::AdminError,
 ) -> (StatusCode, ResponseJson<ErrorResponse>) {
@@ -1504,9 +1814,14 @@ fn admin_error_to_response(
         ),
         services::admin::AdminError::ModelNotFound(msg)
         | services::admin::AdminError::ServiceNotFound(msg)
-        | services::admin::AdminError::OrganizationNotFound(msg) => (
+        | services::admin::AdminError::OrganizationNotFound(msg)
+        | services::admin::AdminError::PricingChangeNotFound(msg) => (
             StatusCode::NOT_FOUND,
             ResponseJson(ErrorResponse::new(msg, "not_found".to_string())),
+        ),
+        services::admin::AdminError::PricingChangeConflict(msg) => (
+            StatusCode::CONFLICT,
+            ResponseJson(ErrorResponse::new(msg, "conflict".to_string())),
         ),
         services::admin::AdminError::Unauthorized(msg) => (
             StatusCode::UNAUTHORIZED,

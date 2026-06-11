@@ -9,9 +9,11 @@ use async_trait::async_trait;
 use services::admin::{
     AdminModelInfo, AdminOrganizationInfo, AdminRepository, DeprecateModelOutcome,
     ModelDeprecationDeliveryRecord, ModelDeprecationEmailStatus, ModelDeprecationModel,
-    ModelDeprecationRecipient, ModelHistoryEntry, ModelPricing, OrganizationLimits,
-    OrganizationLimitsHistoryEntry, OrganizationLimitsUpdate, PlatformServiceInfo,
-    UpdateModelAdminRequest, UserInfo, UserOrganizationInfo,
+    ModelDeprecationRecipient, ModelHistoryEntry, ModelPricing, ModelPricingSnapshot,
+    OrganizationLimits, OrganizationLimitsHistoryEntry, OrganizationLimitsUpdate,
+    PlatformServiceInfo, PricingChangeDeliveryRecord, PricingChangeOpenConflictError,
+    PricingChangeRecipientRow, ScheduledPricingChange, ScheduledPricingChangeInsert,
+    ScheduledPricingChangeStatus, UpdateModelAdminRequest, UserInfo, UserOrganizationInfo,
 };
 use services::service_usage::ports::ServiceUnit;
 use std::sync::Arc;
@@ -39,6 +41,38 @@ impl AdminCompositeRepository {
             service_repo: Arc::new(ServiceRepository::new(pool)),
         }
     }
+}
+
+fn row_to_scheduled_pricing_change(
+    row: &tokio_postgres::Row,
+) -> Result<ScheduledPricingChange, anyhow::Error> {
+    let status_str: String = row.get("status");
+    let status = ScheduledPricingChangeStatus::parse(&status_str)
+        .ok_or_else(|| anyhow::anyhow!("unknown scheduled pricing change status '{status_str}'"))?;
+    Ok(ScheduledPricingChange {
+        id: row.get("id"),
+        batch_id: row.get("batch_id"),
+        model_id: row.get("model_id"),
+        model_name: row.get("model_name"),
+        model_display_name: row.get("model_display_name"),
+        new_input_cost_per_token: row.get("new_input_cost_per_token"),
+        new_output_cost_per_token: row.get("new_output_cost_per_token"),
+        new_cache_read_cost_per_token: row.get("new_cache_read_cost_per_token"),
+        new_cost_per_image: row.get("new_cost_per_image"),
+        old_input_cost_per_token: row.get("old_input_cost_per_token"),
+        old_output_cost_per_token: row.get("old_output_cost_per_token"),
+        old_cache_read_cost_per_token: row.get("old_cache_read_cost_per_token"),
+        old_cost_per_image: row.get("old_cost_per_image"),
+        effective_at: row.get("effective_at"),
+        status,
+        apply_attempts: row.get("apply_attempts"),
+        applied_at: row.get("applied_at"),
+        last_error: row.get("last_error"),
+        created_by_user_id: row.get("created_by_user_id"),
+        created_by_user_email: row.get("created_by_user_email"),
+        change_reason: row.get("change_reason"),
+        created_at: row.get("created_at"),
+    })
 }
 
 fn service_to_info(s: &crate::models::Service) -> Result<PlatformServiceInfo, anyhow::Error> {
@@ -892,6 +926,414 @@ impl AdminRepository for AdminCompositeRepository {
                     &record.recipient_email,
                     &record.organization_id,
                     &record.organization_name,
+                    &status,
+                    &email_sent_at,
+                    &record.email_message_id,
+                    &record.email_last_error,
+                    &record.initiated_by_user_id,
+                    &record.initiated_by_user_email,
+                ],
+            )
+            .await?;
+
+        Ok(())
+    }
+
+    async fn get_model_pricing_snapshot(
+        &self,
+        model_name: &str,
+    ) -> Result<Option<ModelPricingSnapshot>> {
+        let client = self.pool.get().await?;
+        let row = client
+            .query_opt(
+                r#"
+                SELECT id, model_name, model_display_name,
+                       input_cost_per_token, output_cost_per_token,
+                       cache_read_cost_per_token, cost_per_image
+                FROM models
+                WHERE model_name = $1 AND is_active = true
+                "#,
+                &[&model_name],
+            )
+            .await?;
+
+        Ok(row.map(|row| ModelPricingSnapshot {
+            id: row.get("id"),
+            model_name: row.get("model_name"),
+            model_display_name: row.get("model_display_name"),
+            input_cost_per_token: row.get("input_cost_per_token"),
+            output_cost_per_token: row.get("output_cost_per_token"),
+            cache_read_cost_per_token: row.get("cache_read_cost_per_token"),
+            cost_per_image: row.get("cost_per_image"),
+        }))
+    }
+
+    async fn list_pricing_change_recipients(
+        &self,
+        model_names: &[String],
+        since: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Vec<PricingChangeRecipientRow>> {
+        let client = self.pool.get().await?;
+        let rows = client
+            .query(
+                r#"
+                SELECT DISTINCT
+                    u.id AS user_id,
+                    u.email AS email,
+                    o.id AS organization_id,
+                    o.name AS organization_name,
+                    names.canonical_name AS model_name
+                FROM (
+                    SELECT m.model_name AS canonical_name, m.model_name AS usage_name
+                    FROM models m
+                    WHERE m.model_name = ANY($1)
+                    UNION
+                    SELECT m.model_name AS canonical_name, ma.alias_name AS usage_name
+                    FROM model_aliases ma
+                    JOIN models m ON m.id = ma.canonical_model_id
+                    WHERE m.model_name = ANY($1)
+                      AND ma.is_active = true
+                ) names
+                JOIN organization_usage_log ul ON ul.model_name = names.usage_name
+                JOIN organizations o ON o.id = ul.organization_id
+                JOIN organization_members om ON om.organization_id = o.id
+                JOIN users u ON u.id = om.user_id
+                WHERE ul.created_at >= $2
+                  AND o.is_active = true
+                  AND u.is_active = true
+                  AND om.role IN ('owner', 'admin')
+                ORDER BY email, organization_name, model_name
+                "#,
+                &[&model_names, &since],
+            )
+            .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(|row| PricingChangeRecipientRow {
+                user_id: row.get("user_id"),
+                email: row.get("email"),
+                organization_id: row.get("organization_id"),
+                organization_name: row.get("organization_name"),
+                model_name: row.get("model_name"),
+            })
+            .collect())
+    }
+
+    async fn insert_scheduled_pricing_changes(
+        &self,
+        batch_id: Uuid,
+        changes: Vec<ScheduledPricingChangeInsert>,
+        created_by_user_id: Option<Uuid>,
+        created_by_user_email: Option<String>,
+        change_reason: Option<String>,
+    ) -> Result<Vec<ScheduledPricingChange>> {
+        let mut client = self.pool.get().await?;
+
+        // Idempotent confirm retry: if this batch was already persisted,
+        // return the existing rows instead of inserting (the partial unique
+        // index would otherwise reject the batch as a conflict with itself).
+        let existing = client
+            .query(
+                r#"
+                SELECT * FROM scheduled_model_pricing_changes
+                WHERE batch_id = $1
+                ORDER BY model_name
+                "#,
+                &[&batch_id],
+            )
+            .await?;
+        if !existing.is_empty() {
+            return existing
+                .iter()
+                .map(row_to_scheduled_pricing_change)
+                .collect();
+        }
+
+        let tx = client.transaction().await?;
+        let mut inserted = Vec::with_capacity(changes.len());
+        for change in changes {
+            let row = tx
+                .query_one(
+                    r#"
+                    INSERT INTO scheduled_model_pricing_changes (
+                        batch_id, model_id, model_name, model_display_name,
+                        new_input_cost_per_token, new_output_cost_per_token,
+                        new_cache_read_cost_per_token, new_cost_per_image,
+                        old_input_cost_per_token, old_output_cost_per_token,
+                        old_cache_read_cost_per_token, old_cost_per_image,
+                        effective_at, created_by_user_id, created_by_user_email,
+                        change_reason
+                    ) VALUES (
+                        $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
+                        $13, $14, $15, $16
+                    )
+                    RETURNING *
+                    "#,
+                    &[
+                        &batch_id,
+                        &change.model_id,
+                        &change.model_name,
+                        &change.model_display_name,
+                        &change.new_input_cost_per_token,
+                        &change.new_output_cost_per_token,
+                        &change.new_cache_read_cost_per_token,
+                        &change.new_cost_per_image,
+                        &change.old_input_cost_per_token,
+                        &change.old_output_cost_per_token,
+                        &change.old_cache_read_cost_per_token,
+                        &change.old_cost_per_image,
+                        &change.effective_at,
+                        &created_by_user_id,
+                        &created_by_user_email,
+                        &change_reason,
+                    ],
+                )
+                .await
+                .map_err(|e| {
+                    let is_open_conflict = e
+                        .as_db_error()
+                        .map(|db| {
+                            db.code() == &tokio_postgres::error::SqlState::UNIQUE_VIOLATION
+                                && db.constraint()
+                                    == Some("uq_scheduled_pricing_change_open_per_model")
+                        })
+                        .unwrap_or(false);
+                    if is_open_conflict {
+                        anyhow::Error::new(PricingChangeOpenConflictError {
+                            model_name: change.model_name.clone(),
+                        })
+                    } else {
+                        anyhow::Error::new(e)
+                    }
+                })?;
+            inserted.push(row_to_scheduled_pricing_change(&row)?);
+        }
+        tx.commit().await?;
+
+        Ok(inserted)
+    }
+
+    async fn list_scheduled_pricing_changes(
+        &self,
+        status: Option<ScheduledPricingChangeStatus>,
+        limit: i64,
+        offset: i64,
+    ) -> Result<(Vec<ScheduledPricingChange>, i64)> {
+        let client = self.pool.get().await?;
+        let status_str = status.map(|s| s.as_str());
+        let rows = client
+            .query(
+                r#"
+                SELECT * FROM scheduled_model_pricing_changes
+                WHERE ($1::text IS NULL OR status = $1)
+                ORDER BY effective_at ASC, model_name ASC
+                LIMIT $2 OFFSET $3
+                "#,
+                &[&status_str, &limit, &offset],
+            )
+            .await?;
+        let total: i64 = client
+            .query_one(
+                r#"
+                SELECT COUNT(*) FROM scheduled_model_pricing_changes
+                WHERE ($1::text IS NULL OR status = $1)
+                "#,
+                &[&status_str],
+            )
+            .await?
+            .get(0);
+
+        let changes = rows
+            .iter()
+            .map(row_to_scheduled_pricing_change)
+            .collect::<Result<Vec<_>>>()?;
+        Ok((changes, total))
+    }
+
+    async fn cancel_scheduled_pricing_change(
+        &self,
+        id: Uuid,
+        cancelled_by_user_id: Option<Uuid>,
+        cancelled_by_user_email: Option<String>,
+    ) -> Result<Option<ScheduledPricingChange>> {
+        let client = self.pool.get().await?;
+        let row = client
+            .query_opt(
+                r#"
+                UPDATE scheduled_model_pricing_changes
+                SET status = 'cancelled',
+                    cancelled_at = NOW(),
+                    cancelled_by_user_id = $2,
+                    cancelled_by_user_email = $3,
+                    updated_at = NOW()
+                WHERE id = $1 AND status = 'pending'
+                RETURNING *
+                "#,
+                &[&id, &cancelled_by_user_id, &cancelled_by_user_email],
+            )
+            .await?;
+
+        row.as_ref()
+            .map(row_to_scheduled_pricing_change)
+            .transpose()
+    }
+
+    async fn claim_due_pricing_changes(&self, limit: i64) -> Result<Vec<ScheduledPricingChange>> {
+        let client = self.pool.get().await?;
+        let rows = client
+            .query(
+                r#"
+                UPDATE scheduled_model_pricing_changes
+                SET status = 'applying',
+                    apply_attempts = apply_attempts + 1,
+                    updated_at = NOW()
+                WHERE id IN (
+                    SELECT id FROM scheduled_model_pricing_changes
+                    WHERE status = 'pending' AND effective_at <= NOW()
+                    ORDER BY effective_at
+                    FOR UPDATE SKIP LOCKED
+                    LIMIT $1
+                )
+                RETURNING *
+                "#,
+                &[&limit],
+            )
+            .await?;
+
+        rows.iter().map(row_to_scheduled_pricing_change).collect()
+    }
+
+    async fn mark_pricing_change_applied(&self, id: Uuid) -> Result<()> {
+        let client = self.pool.get().await?;
+        client
+            .execute(
+                r#"
+                UPDATE scheduled_model_pricing_changes
+                SET status = 'applied', applied_at = NOW(), last_error = NULL,
+                    updated_at = NOW()
+                WHERE id = $1 AND status = 'applying'
+                "#,
+                &[&id],
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn mark_pricing_change_failed(
+        &self,
+        id: Uuid,
+        error: &str,
+        retryable: bool,
+    ) -> Result<()> {
+        let client = self.pool.get().await?;
+        client
+            .execute(
+                r#"
+                UPDATE scheduled_model_pricing_changes
+                SET status = CASE WHEN $3 THEN 'pending' ELSE 'failed' END,
+                    last_error = $2,
+                    updated_at = NOW()
+                WHERE id = $1 AND status = 'applying'
+                "#,
+                &[&id, &error, &retryable],
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn recover_stale_applying_pricing_changes(
+        &self,
+        stale_after: chrono::Duration,
+        max_attempts: i32,
+    ) -> Result<u64> {
+        let client = self.pool.get().await?;
+        let stale_secs = stale_after.num_seconds() as f64;
+        let count = client
+            .execute(
+                r#"
+                UPDATE scheduled_model_pricing_changes
+                SET status = CASE WHEN apply_attempts >= $2 THEN 'failed' ELSE 'pending' END,
+                    last_error = CASE
+                        WHEN apply_attempts >= $2
+                            THEN COALESCE(last_error, 'apply timed out')
+                        ELSE last_error
+                    END,
+                    updated_at = NOW()
+                WHERE status = 'applying'
+                  AND updated_at < NOW() - make_interval(secs => $1)
+                "#,
+                &[&stale_secs, &max_attempts],
+            )
+            .await?;
+        Ok(count)
+    }
+
+    async fn list_sent_pricing_change_delivery_keys(
+        &self,
+        batch_id: Uuid,
+    ) -> Result<Vec<(Uuid, Uuid)>> {
+        let client = self.pool.get().await?;
+        let rows = client
+            .query(
+                r#"
+                SELECT recipient_user_id, organization_id
+                FROM model_pricing_change_email_deliveries
+                WHERE batch_id = $1 AND status = 'sent'
+                "#,
+                &[&batch_id],
+            )
+            .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(|row| (row.get("recipient_user_id"), row.get("organization_id")))
+            .collect())
+    }
+
+    async fn record_pricing_change_delivery(
+        &self,
+        record: PricingChangeDeliveryRecord,
+    ) -> Result<()> {
+        let client = self.pool.get().await?;
+        let status = record.status.as_str();
+        let email_sent_at = if record.status == ModelDeprecationEmailStatus::Sent {
+            Some(chrono::Utc::now())
+        } else {
+            None
+        };
+
+        client
+            .execute(
+                r#"
+                INSERT INTO model_pricing_change_email_deliveries (
+                    batch_id, recipient_user_id, recipient_email,
+                    organization_id, organization_name, model_names, status,
+                    email_sent_at, email_message_id, email_last_error,
+                    initiated_by_user_id, initiated_by_user_email
+                ) VALUES (
+                    $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12
+                )
+                ON CONFLICT (batch_id, recipient_user_id, organization_id)
+                DO UPDATE SET
+                    recipient_email = EXCLUDED.recipient_email,
+                    organization_name = EXCLUDED.organization_name,
+                    model_names = EXCLUDED.model_names,
+                    status = EXCLUDED.status,
+                    email_sent_at = EXCLUDED.email_sent_at,
+                    email_message_id = EXCLUDED.email_message_id,
+                    email_last_error = EXCLUDED.email_last_error,
+                    initiated_by_user_id = EXCLUDED.initiated_by_user_id,
+                    initiated_by_user_email = EXCLUDED.initiated_by_user_email,
+                    updated_at = NOW()
+                "#,
+                &[
+                    &record.batch_id,
+                    &record.recipient_user_id,
+                    &record.recipient_email,
+                    &record.organization_id,
+                    &record.organization_name,
+                    &record.model_names,
                     &status,
                     &email_sent_at,
                     &record.email_message_id,

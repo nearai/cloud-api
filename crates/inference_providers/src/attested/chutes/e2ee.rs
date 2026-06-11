@@ -75,6 +75,8 @@ pub enum E2eeError {
         #[source]
         source: base64::DecodeError,
     },
+    #[error("OS RNG unavailable: {0}")]
+    Rng(String),
 }
 
 fn gzip(plain: &[u8]) -> Result<Vec<u8>, E2eeError> {
@@ -136,10 +138,12 @@ fn aead_open(
         .map_err(|_| E2eeError::AeadOpen)
 }
 
-fn random_nonce() -> [u8; NONCE_LEN] {
+fn random_nonce() -> Result<[u8; NONCE_LEN], E2eeError> {
     let mut out = [0u8; NONCE_LEN];
-    getrandom::fill(&mut out).expect("OS RNG must be available for nonce generation");
-    out
+    // Fail closed: this runs on the request path, so a (rare) RNG failure must
+    // surface as an error to the caller, never panic the task.
+    getrandom::fill(&mut out).map_err(|e| E2eeError::Rng(e.to_string()))?;
+    Ok(out)
 }
 
 fn b64(bytes: &[u8]) -> String {
@@ -201,7 +205,7 @@ pub fn build_request(
         serde_json::to_vec(&payload).map_err(|e| E2eeError::Serialize(e.to_string()))?;
     let compressed = gzip(&json_bytes)?;
 
-    let nonce = random_nonce();
+    let nonce = random_nonce()?;
     let ct_and_tag = aead_seal(&sym_key, &nonce, &compressed);
 
     let mut blob = Vec::with_capacity(MLKEM_CT_LEN + NONCE_LEN + ct_and_tag.len());
@@ -336,7 +340,7 @@ mod tests {
         let (mlkem_ct, ss) = ek.encapsulate();
         let key = derive_key(ss.as_slice(), mlkem_ct.as_slice(), INFO_RESPONSE);
         let compressed = gzip(&serde_json::to_vec(response_json).unwrap()).unwrap();
-        let nonce = random_nonce();
+        let nonce = random_nonce().unwrap();
         let ct_and_tag = aead_seal(&key, &nonce, &compressed);
         let mut blob = Vec::new();
         blob.extend_from_slice(mlkem_ct.as_slice());
@@ -351,7 +355,7 @@ mod tests {
         let ek = EncapsulationKey768::new_from_slice(client_response_pk).unwrap();
         let (mlkem_ct, ss) = ek.encapsulate();
         let key = derive_key(ss.as_slice(), mlkem_ct.as_slice(), INFO_STREAM);
-        let nonce = random_nonce();
+        let nonce = random_nonce().unwrap();
         let ct_and_tag = aead_seal(&key, &nonce, chunk);
         let mut frame = Vec::new();
         frame.extend_from_slice(&nonce);

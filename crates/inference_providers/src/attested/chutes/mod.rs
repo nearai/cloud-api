@@ -444,11 +444,15 @@ impl InferenceProvider for Provider {
             .map_err(|e| CompletionError::CompletionError(format!("E2EE decrypt: {e}")))?;
         let response: ChatCompletionResponse = serde_json::from_slice(&plaintext)
             .map_err(|e| CompletionError::CompletionError(format!("parse response: {e}")))?;
-        let raw_bytes = serde_json::to_vec(&response)
-            .map_err(|e| CompletionError::CompletionError(format!("re-serialize: {e}")))?;
+        // The decrypted plaintext IS the backend's exact JSON body, so use it
+        // verbatim as `raw_bytes` rather than re-serializing the parsed struct.
+        // Re-serialization would change the byte representation (key order /
+        // whitespace) and silently drop any provider fields our typed struct
+        // doesn't model (e.g. `hidden_states`); `raw_bytes` is documented as the
+        // exact provider bytes and is what we hand back to the client.
         Ok(ChatCompletionResponseWithBytes {
             response,
-            raw_bytes,
+            raw_bytes: plaintext,
         })
     }
 

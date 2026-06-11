@@ -612,6 +612,116 @@ pub async fn init_domain_services_with_pool_and_search_providers(
     domain_services
 }
 
+/// Ensure a Chutes (attested) model has a catalog row in the `models` table.
+///
+/// The data plane rejects any model without an active `models` row *before*
+/// reaching the provider pool (`resolve_and_get_model` in completions), so a
+/// pinned Chutes provider registered purely in-memory would 404 every request
+/// even with `ENABLE_CHUTES=true` and a valid key. Worse, usage rows carry a
+/// `FOREIGN KEY (model_id) REFERENCES models(id)` — a synthesized id can't be
+/// billed — so the row must genuinely exist. Seed it here at startup.
+///
+/// Idempotent and non-clobbering: if an active row already exists (operator
+/// pre-seeded it with real pricing/metadata via the admin API) we leave it
+/// untouched. We only INSERT when missing, with attestation flags set and
+/// **zero pricing** — the operator must set real per-token rates via
+/// `PATCH /v1/admin/models` before serving paid traffic, which we warn about.
+async fn ensure_chutes_catalog_row(
+    models_repo: &database::repositories::ModelRepository,
+    model_name: &str,
+) {
+    // Use the *unfiltered* lookup (not get_active_model_by_name): a deliberately
+    // disabled row (is_active=false) must be respected, not silently re-activated
+    // and clobbered by the seed path below.
+    match models_repo.get_by_internal_name(model_name).await {
+        Ok(Some(existing)) => {
+            // Already in the catalog — respect operator configuration verbatim.
+            // Surface a warning if the metadata contradicts attested serving so
+            // a misconfigured row (e.g. attestation_supported=false) is visible.
+            if !existing.is_active {
+                tracing::warn!(
+                    model = %model_name,
+                    "Chutes model has a DISABLED catalog row (is_active=false); requests will \
+                     404 by design — re-enable via PATCH /v1/admin/models if that's unintended"
+                );
+            } else if !existing.attestation_supported {
+                tracing::warn!(
+                    model = %model_name,
+                    "Chutes model has an existing catalog row with attestation_supported=false; \
+                     E2EE/signature handling may misbehave — fix via PATCH /v1/admin/models"
+                );
+            } else {
+                tracing::info!(model = %model_name, "Chutes model already in catalog");
+            }
+        }
+        Ok(None) => {
+            // Friendly display name = last path segment; owner = leading segment.
+            let display_name = model_name.rsplit('/').next().unwrap_or(model_name);
+            let owned_by = model_name.split('/').next().unwrap_or("chutes");
+            let req = database::models::UpdateModelPricingRequest {
+                model_display_name: Some(display_name.to_string()),
+                model_description: Some(
+                    "Attested model served via Chutes TEE (verified end-to-end by NEAR AI)."
+                        .to_string(),
+                ),
+                // Generous default; operator should set the model's real context
+                // window via the admin API. Not enforced as a hard reject here.
+                context_length: Some(128_000),
+                verifiable: Some(true),
+                attestation_supported: Some(true),
+                // Seed INACTIVE. `is_active=false` is the only field that actually
+                // gates serving (`resolve_and_get_model` filters `WHERE is_active`;
+                // `is_ready` is pure display metadata and does NOT gate). Seeding
+                // inactive makes it *impossible* to serve — and therefore bill at
+                // the zero default pricing — until an operator explicitly sets real
+                // per-token rates AND flips is_active=true (one admin PATCH). This
+                // closes the unpriced-serving window rather than merely warning.
+                is_active: Some(false),
+                is_ready: Some(Some(false)),
+                provider_type: Some("chutes".to_string()),
+                owned_by: Some(owned_by.to_string()),
+                input_modalities: Some(vec!["text".to_string()]),
+                output_modalities: Some(vec!["text".to_string()]),
+                // Pricing left None -> defaults to 0 on INSERT. The inactive seed
+                // above prevents this zero price from ever being charged.
+                ..Default::default()
+            };
+            // INSERT ... ON CONFLICT DO NOTHING: if an operator created/activated
+            // the row concurrently with startup, their row wins and is left
+            // untouched (no clobbering is_active/pricing back to the seed defaults).
+            match models_repo.seed_model_if_absent(model_name, &req).await {
+                Ok(Some(_)) => {
+                    tracing::warn!(
+                        model = %model_name,
+                        "Seeded Chutes catalog row as INACTIVE with zero pricing — set real \
+                         per-token rates AND is_active=true via PATCH /v1/admin/models to serve \
+                         (kept inactive so paid traffic can't be billed at $0)"
+                    );
+                }
+                Ok(None) => {
+                    tracing::info!(
+                        model = %model_name,
+                        "Chutes catalog row already present (created concurrently); left untouched"
+                    );
+                }
+                Err(e) => {
+                    tracing::error!(
+                        model = %model_name, error = %e,
+                        "Failed to seed Chutes catalog row; requests for this model will 404 \
+                         until a row exists (create it via PATCH /v1/admin/models)"
+                    );
+                }
+            }
+        }
+        Err(e) => {
+            tracing::warn!(
+                model = %model_name, error = %e,
+                "Could not check catalog for Chutes model; skipping auto-seed"
+            );
+        }
+    }
+}
+
 /// Initialize inference provider pool
 ///
 /// Loads inference_url models and external providers from the database,
@@ -634,6 +744,30 @@ pub async fn init_inference_providers(
     ));
     let models_source =
         models_repo.clone() as Arc<dyn services::inference_provider_pool::ExternalModelsSource>;
+
+    // Fail-closed reservation (MUST run before external/discovery loads below):
+    // when Chutes is enabled, reserve EVERY configured canonical id as a pinned
+    // (verifiable) model up front — even before we try to build the providers. This
+    // guarantees a plaintext external/OpenRouter row sharing a canonical id can
+    // never register for it, even if the Chutes provider fails to build (missing
+    // key / construction error). A reserved id then serves only its attested
+    // provider(s) or fails closed (404); it can never silently serve plaintext for
+    // a model an operator configured as verifiable.
+    if config.external_providers.enable_chutes {
+        let canonical_ids: Vec<String> = config
+            .external_providers
+            .chutes_models
+            .iter()
+            .map(|e| e.canonical_id.clone())
+            .collect();
+        if !canonical_ids.is_empty() {
+            pool.reserve_pinned_models(&canonical_ids);
+            tracing::info!(
+                count = canonical_ids.len(),
+                "Reserved Chutes canonical ids as verifiable (fail-closed) before external load"
+            );
+        }
+    }
 
     // Load inference_url models (our own vLLM/SGLang backends)
     match models_source.fetch_inference_url_models().await {
@@ -668,6 +802,92 @@ pub async fn init_inference_providers(
     pool.clone()
         .start_refresh_task(models_source, refresh_interval)
         .await;
+
+    // Chutes attested provider — hard-off by default (`ENABLE_CHUTES`). Each model
+    // is served over a verified ML-KEM E2EE channel: every request attests the
+    // chosen instance (TDX quote + report_data bindings + register-pinned
+    // measurement + GPU) before encapsulating, so an unverified backend can never
+    // serve a Chutes response. Registration is gated on the flag + an API key +
+    // at least one model id.
+    if config.external_providers.enable_chutes {
+        match &config.external_providers.chutes_api_key {
+            Some(api_key) if !config.external_providers.chutes_models.is_empty() => {
+                let pccs_url = config.external_providers.pccs_url.clone();
+                let allow_streaming = config.external_providers.chutes_enable_streaming;
+                let verifier: Arc<
+                    dyn inference_providers::attested::chutes::verifier_port::ChutesInstanceVerifier,
+                > = Arc::new(services::attestation::chutes::ChutesBackendVerifier::new(
+                    services::attestation::chutes::vetted_golden_measurements(),
+                    pccs_url,
+                ));
+                for entry in &config.external_providers.chutes_models {
+                    // The provider talks to Chutes with the chute SLUG (request_body
+                    // pins it + cached_chute_id resolves it); we expose/route under
+                    // the CANONICAL id (the NEAR-served id when NEAR also serves the
+                    // model, else the OpenRouter id) — never the raw `-TEE` slug.
+                    let cfg = inference_providers::attested::chutes::Config::new(
+                        api_key.clone(),
+                        entry.chute_slug.clone(),
+                        config.external_providers.timeout_seconds,
+                    )
+                    .with_canonical_id(entry.canonical_id.clone())
+                    .with_streaming(allow_streaming);
+                    match inference_providers::attested::chutes::Provider::new(
+                        cfg,
+                        verifier.clone(),
+                    ) {
+                        Ok(provider) => {
+                            // Ensure a catalog row exists under the canonical id so the
+                            // data plane resolves the model (and usage bills against a
+                            // real id). If NEAR already serves this id, its row is left
+                            // untouched and we just add Chutes as a fallback provider.
+                            ensure_chutes_catalog_row(&models_repo, &entry.canonical_id).await;
+                            // Pinned SECONDARY: pushed onto the canonical id's provider
+                            // list (coexists with NEAR's own providers) and excluded from
+                            // discovery's stale-removal/overwrite. Tier ordering puts NEAR
+                            // first and Chutes as fallback; a Chutes-only id has just this
+                            // provider, so it serves as primary.
+                            pool.register_pinned_secondary_provider(
+                                entry.canonical_id.clone(),
+                                Arc::new(provider),
+                            )
+                            .await;
+                            tracing::info!(
+                                canonical = %entry.canonical_id,
+                                chute_slug = %entry.chute_slug,
+                                "Registered Chutes attested provider (fallback tier)"
+                            );
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                canonical = %entry.canonical_id,
+                                chute_slug = %entry.chute_slug,
+                                error = %e,
+                                "Failed to build Chutes provider"
+                            );
+                        }
+                    }
+                }
+            }
+            _ => {
+                tracing::warn!(
+                    "ENABLE_CHUTES is set but CHUTES_API_KEY or CHUTES_MODELS is missing; \
+                     not registering any Chutes provider"
+                );
+            }
+        }
+    } else if !config.external_providers.chutes_models.is_empty() {
+        // Flag off but models still listed: any *active* catalog row left over
+        // from a previous run would resolve to a model with no registered provider
+        // (per-request provider errors, not a clean 404). Warn so an operator
+        // notices and deactivates those rows (PATCH is_active=false).
+        tracing::warn!(
+            models = ?config.external_providers.chutes_models,
+            "ENABLE_CHUTES is off but CHUTES_MODELS is set; if any of these have an active \
+             catalog row, requests will surface provider errors — deactivate them via \
+             PATCH /v1/admin/models or re-enable ENABLE_CHUTES"
+        );
+    }
 
     pool
 }
@@ -1519,15 +1739,18 @@ pub fn build_admin_routes(
 ) -> Router {
     use crate::middleware::admin_middleware;
     use crate::routes::admin::{
-        batch_upsert_models, confirm_model_deprecation, create_admin_access_token, create_service,
+        batch_upsert_models, cancel_model_pricing_change, confirm_model_deprecation,
+        confirm_model_pricing_changes, create_admin_access_token, create_service,
         delete_admin_access_token, delete_model, deprecate_model, get_admin_organization_balance,
         get_billing_summary, get_infra_summary, get_model_history, get_model_revenue,
-        get_org_revenue, get_organization_concurrent_limit, get_organization_limits_history,
+        get_org_revenue, get_organization as get_admin_organization,
+        get_organization_concurrent_limit, get_organization_limits_history,
         get_organization_metrics, get_organization_timeseries, get_platform_metrics,
         get_platform_timeseries, list_admin_access_tokens, list_invitation_email_deliveries,
-        list_models as admin_list_models, list_organizations, list_users,
-        preview_model_deprecation, resend_invitation_email, update_organization_concurrent_limit,
-        update_organization_limits, update_service, AdminAppState,
+        list_model_pricing_changes, list_models as admin_list_models, list_organization_members,
+        list_organizations, list_users, preview_model_deprecation, preview_model_pricing_changes,
+        resend_invitation_email, update_organization_concurrent_limit, update_organization_limits,
+        update_service, AdminAppState,
     };
     use database::repositories::{AdminAccessTokenRepository, AdminCompositeRepository};
     use services::admin::AdminServiceImpl;
@@ -1585,6 +1808,22 @@ pub fn build_admin_routes(
         .route(
             "/admin/models/deprecate",
             axum::routing::post(deprecate_model),
+        )
+        .route(
+            "/admin/models/pricing-changes",
+            axum::routing::get(list_model_pricing_changes),
+        )
+        .route(
+            "/admin/models/pricing-changes/preview",
+            axum::routing::post(preview_model_pricing_changes),
+        )
+        .route(
+            "/admin/models/pricing-changes/confirm",
+            axum::routing::post(confirm_model_pricing_changes),
+        )
+        .route(
+            "/admin/models/pricing-changes/{id}",
+            axum::routing::delete(cancel_model_pricing_change),
         )
         .route(
             "/admin/models/{model_name}",
@@ -1665,6 +1904,14 @@ pub fn build_admin_routes(
         .route(
             "/admin/organizations",
             axum::routing::get(list_organizations),
+        )
+        .route(
+            "/admin/organizations/{org_id}",
+            axum::routing::get(get_admin_organization),
+        )
+        .route(
+            "/admin/organizations/{org_id}/members",
+            axum::routing::get(list_organization_members),
         )
         .route(
             "/admin/access-tokens",
@@ -1793,6 +2040,32 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_openapi_conversation_action_paths_use_v1_prefix() {
+        let spec = serde_json::to_value(ApiDoc::openapi()).unwrap();
+        let paths = spec["paths"].as_object().unwrap();
+
+        // Pin/unpin and archive/unarchive share path keys with different methods.
+        for path in [
+            "/v1/conversations/{conversation_id}/archive",
+            "/v1/conversations/{conversation_id}/clone",
+            "/v1/conversations/{conversation_id}/pin",
+        ] {
+            assert!(paths.contains_key(path), "missing OpenAPI path: {path}");
+        }
+
+        for path in [
+            "/conversations/{conversation_id}/archive",
+            "/conversations/{conversation_id}/clone",
+            "/conversations/{conversation_id}/pin",
+        ] {
+            assert!(
+                !paths.contains_key(path),
+                "OpenAPI path is missing /v1 prefix: {path}"
+            );
+        }
+    }
+
     /// Example of how to set up the application for E2E testing
     #[tokio::test]
     #[ignore] // Remove ignore to run with a real database and Patroni cluster
@@ -1802,6 +2075,7 @@ mod tests {
             server: config::ServerConfig {
                 host: "127.0.0.1".to_string(),
                 port: 0, // Use port 0 for testing to get a random available port
+                pricing_change_apply_interval_secs: 0,
             },
             inference_api_key: Some("test-key".to_string()),
             internal_usage_token: None,
@@ -1904,6 +2178,7 @@ mod tests {
             server: config::ServerConfig {
                 host: "127.0.0.1".to_string(),
                 port: 0,
+                pricing_change_apply_interval_secs: 0,
             },
             inference_api_key: Some("test-key".to_string()),
             internal_usage_token: None,

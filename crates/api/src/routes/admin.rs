@@ -460,6 +460,15 @@ pub async fn batch_upsert_models(
         // model — would leave an active catalog row with no serving provider until
         // restart. Pricing/metadata still applied via batch_upsert_models above;
         // serving is gated by the catalog `is_active`, not by this in-memory entry.
+        //
+        // NOTE: with tiered fallback this now also covers a NEAR-served canonical id
+        // that has a Chutes fallback (it's `is_pinned`). So a PATCH that changes its
+        // `inference_url` or deactivates it skips the eager `unregister_provider`
+        // cleanup here: the NEW url is still re-registered below (the merge keeps
+        // Chutes), but the stale OLD-url NEAR provider + its pubkey/failure-counter
+        // entries linger until the next periodic refresh prunes them. Behavior stays
+        // safe (pubkey intersection + catalog `is_active` gating); it just isn't
+        // instantaneously clean for a runtime url change on a Chutes-fallback model.
         if app_state.inference_provider_pool.is_pinned(model_name) {
             continue;
         }

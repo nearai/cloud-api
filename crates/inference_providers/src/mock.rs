@@ -629,6 +629,10 @@ pub struct MockProvider {
     /// `true`. Set via [`MockProvider::with_streaming_support`] to exercise the
     /// streaming-capability filter (e.g. a Chutes-like fallback with streaming off).
     supports_streaming: bool,
+    /// Value reported by [`InferenceProvider::supports_client_e2ee`]; defaults to
+    /// `true`. Set via [`MockProvider::with_client_e2ee_support`] to exercise the
+    /// client-E2EE-capability filter (e.g. a Chutes-like fallback that rejects it).
+    supports_client_e2ee: bool,
 }
 
 impl MockProvider {
@@ -654,6 +658,7 @@ impl MockProvider {
             fail_attestation: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tier: crate::ProviderTier::NonAttested,
             supports_streaming: true,
+            supports_client_e2ee: true,
         }
     }
 
@@ -675,6 +680,7 @@ impl MockProvider {
             fail_attestation: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tier: crate::ProviderTier::NonAttested,
             supports_streaming: true,
+            supports_client_e2ee: true,
         }
     }
 
@@ -694,6 +700,7 @@ impl MockProvider {
             fail_attestation: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tier: crate::ProviderTier::NonAttested,
             supports_streaming: true,
+            supports_client_e2ee: true,
         }
     }
 
@@ -709,6 +716,13 @@ impl MockProvider {
     /// exercise the streaming-capability filter (a streaming-disabled fallback).
     pub fn with_streaming_support(mut self, supported: bool) -> Self {
         self.supports_streaming = supported;
+        self
+    }
+
+    /// Set whether this mock reports client-E2EE support (default `true`). Used to
+    /// exercise the client-E2EE-capability filter (a Chutes-like fallback).
+    pub fn with_client_e2ee_support(mut self, supported: bool) -> Self {
+        self.supports_client_e2ee = supported;
         self
     }
 
@@ -897,6 +911,10 @@ impl crate::InferenceProvider for MockProvider {
 
     fn supports_streaming(&self) -> bool {
         self.supports_streaming
+    }
+
+    fn supports_client_e2ee(&self) -> bool {
+        self.supports_client_e2ee
     }
 
     async fn models(&self) -> Result<ModelsResponse, ListModelsError> {

@@ -1858,6 +1858,26 @@ impl InferenceProviderPool {
         }
     }
 
+    /// Mirror of [`Self::filter_streaming_capable`] for client-facing E2EE: when a
+    /// request carries `x_client_pub_key` (`needs_client_e2ee`) and ANY provider can
+    /// serve it, drop the ones that can't (e.g. Chutes, which rejects client-E2EE
+    /// non-retryably) — so a retryable NEAR failure doesn't fall through to that hard
+    /// rejection, which would mask the NEAR error and suppress its retry. If NONE can
+    /// (a Chutes-only model), the list is kept so the clear rejection still surfaces.
+    fn filter_client_e2ee_capable(
+        providers: Vec<Arc<InferenceProviderTrait>>,
+        needs_client_e2ee: bool,
+    ) -> Vec<Arc<InferenceProviderTrait>> {
+        if needs_client_e2ee && providers.iter().any(|p| p.supports_client_e2ee()) {
+            providers
+                .into_iter()
+                .filter(|p| p.supports_client_e2ee())
+                .collect()
+        } else {
+            providers
+        }
+    }
+
     /// Combine the discovered (e.g. NEAR) providers for the models in THIS cycle
     /// with the out-of-band pinned providers (e.g. Chutes), upholding the invariant
     /// that DB discovery can never DROP or overwrite a pinned (attested) provider:
@@ -1961,11 +1981,34 @@ impl InferenceProviderPool {
     /// Generic retry helper that tries each provider in order with automatic fallback.
     /// Returns both the result and the provider that succeeded (for chat_id mapping).
     /// If model_pub_key is provided, routes to the specific provider by signing public key.
+    /// Thin wrapper that requests no extra capability (see [`Self::retry_with_fallback_caps`]).
     async fn retry_with_fallback<T, F, Fut>(
         &self,
         model_id: &str,
         operation_name: &str,
         model_pub_key: Option<&str>,
+        provider_fn: F,
+    ) -> Result<(T, Arc<InferenceProviderTrait>), CompletionError>
+    where
+        F: Fn(Arc<InferenceProviderTrait>) -> Fut,
+        Fut: std::future::Future<Output = Result<T, CompletionError>>,
+    {
+        self.retry_with_fallback_caps(model_id, operation_name, model_pub_key, false, provider_fn)
+            .await
+    }
+
+    /// As [`Self::retry_with_fallback`], but filters the provider list to those that
+    /// can serve the request's capabilities before the fallback loop: streaming
+    /// (by `operation_name`) and — when `needs_client_e2ee` — client-facing E2EE. A
+    /// capability-incapable provider is dropped only when a capable sibling exists,
+    /// so it can't mask the primary's failure / suppress retry, while a model whose
+    /// only provider lacks the capability still surfaces that provider's clear error.
+    async fn retry_with_fallback_caps<T, F, Fut>(
+        &self,
+        model_id: &str,
+        operation_name: &str,
+        model_pub_key: Option<&str>,
+        needs_client_e2ee: bool,
         provider_fn: F,
     ) -> Result<(T, Arc<InferenceProviderTrait>), CompletionError>
     where
@@ -2028,6 +2071,7 @@ impl InferenceProviderPool {
         };
 
         let providers = Self::filter_streaming_capable(providers, operation_name);
+        let providers = Self::filter_client_e2ee_capable(providers, needs_client_e2ee);
 
         tracing::info!(
             model_id = %model_id,
@@ -2396,6 +2440,12 @@ impl InferenceProviderPool {
             .and_then(|v| v.as_str().map(|s| s.to_string()));
         let model_pub_key = model_pub_key_str.as_deref();
 
+        // Client-facing E2EE intent: keep such requests on a capable (NEAR) provider
+        // so a retryable NEAR failure doesn't fall through to Chutes' hard rejection.
+        let needs_client_e2ee = params
+            .extra
+            .contains_key(encryption_headers::CLIENT_PUB_KEY);
+
         let params_for_provider = params.clone();
 
         tracing::debug!(
@@ -2404,10 +2454,11 @@ impl InferenceProviderPool {
         );
 
         let (stream, provider) = self
-            .retry_with_fallback(
+            .retry_with_fallback_caps(
                 &model_id,
                 "chat_completion_stream",
                 model_pub_key,
+                needs_client_e2ee,
                 |provider| {
                     let params = params_for_provider.clone();
                     let request_hash = request_hash.clone();
@@ -2486,6 +2537,12 @@ impl InferenceProviderPool {
             .and_then(|v| v.as_str().map(|s| s.to_string()));
         let model_pub_key = model_pub_key_str.as_deref();
 
+        // Client-facing E2EE intent: keep such requests on a capable (NEAR) provider
+        // so a retryable NEAR failure doesn't fall through to Chutes' hard rejection.
+        let needs_client_e2ee = params
+            .extra
+            .contains_key(encryption_headers::CLIENT_PUB_KEY);
+
         tracing::debug!(
             model = %model_id,
             "Starting chat completion request"
@@ -2495,11 +2552,17 @@ impl InferenceProviderPool {
         let params_for_provider = params.clone();
 
         let (response, provider) = self
-            .retry_with_fallback(&model_id, "chat_completion", model_pub_key, |provider| {
-                let params = params_for_provider.clone();
-                let request_hash = request_hash.clone();
-                async move { provider.chat_completion(params, request_hash).await }
-            })
+            .retry_with_fallback_caps(
+                &model_id,
+                "chat_completion",
+                model_pub_key,
+                needs_client_e2ee,
+                |provider| {
+                    let params = params_for_provider.clone();
+                    let request_hash = request_hash.clone();
+                    async move { provider.chat_completion(params, request_hash).await }
+                },
+            )
             .await?;
 
         // Store the chat_id mapping SYNCHRONOUSLY before returning
@@ -3643,13 +3706,20 @@ impl InferenceProviderPool {
     /// Remove models from provider_mappings that are not in `valid_model_names`.
     /// Also cleans up load_balancer_index and provider_failure_counts for removed providers.
     async fn remove_stale_providers(&self, valid_model_names: &std::collections::HashSet<String>) {
-        // Pinned models (e.g. the config-registered Chutes provider) are not in
-        // the DB-backed `valid_model_names`; never treat them as stale.
-        let pinned = self
-            .pinned_models
+        // Skip ids that have an actual pinned PROVIDER (e.g. a registered Chutes
+        // fallback) — they're served out-of-band and aren't in the DB-backed
+        // `valid_model_names`. A *reserved-only* id (in `pinned_models` for the
+        // fail-closed external block, but with no provider because Chutes failed to
+        // build / the key was missing) is deliberately NOT skipped: if NEAR also
+        // drops it, it has no serving provider and must be removed (fail-closed 404)
+        // with full cleanup rather than lingering as a dead NEAR mapping.
+        let pinned: std::collections::HashSet<String> = self
+            .pinned_providers
             .read()
             .unwrap_or_else(|e| e.into_inner())
-            .clone();
+            .keys()
+            .cloned()
+            .collect();
         let mut mappings = self.provider_mappings.write().await;
 
         let stale_models: Vec<String> = mappings
@@ -5144,6 +5214,90 @@ mod tests {
     #[test]
     fn streaming_operations_list_is_explicit() {
         assert!(InferenceProviderPool::STREAMING_OPERATIONS.contains(&"chat_completion_stream"));
+    }
+
+    /// Client-E2EE capability filter (review round 3 blocking): when a request needs
+    /// client-facing E2EE and a capable (NEAR) provider exists, a non-capable Chutes
+    /// fallback is dropped — so a NEAR failure can't fall through to Chutes' hard
+    /// "client E2EE not supported" rejection. When the request doesn't need it, or no
+    /// provider supports it, the list is unchanged (clear error still surfaces).
+    #[test]
+    fn filter_client_e2ee_capable_prefers_capable_providers() {
+        use inference_providers::mock::MockProvider;
+        use inference_providers::ProviderTier;
+
+        let near = Arc::new(MockProvider::new().with_tier(ProviderTier::Near))
+            as Arc<InferenceProviderTrait>;
+        let chutes_no_client_e2ee = Arc::new(
+            MockProvider::new()
+                .with_tier(ProviderTier::Attested3p)
+                .with_client_e2ee_support(false),
+        ) as Arc<InferenceProviderTrait>;
+
+        // needs client-E2EE, NEAR supports it + Chutes doesn't → Chutes dropped.
+        let out = InferenceProviderPool::filter_client_e2ee_capable(
+            vec![near.clone(), chutes_no_client_e2ee.clone()],
+            true,
+        );
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].tier(), ProviderTier::Near);
+
+        // request doesn't need client-E2EE → no filtering.
+        let out = InferenceProviderPool::filter_client_e2ee_capable(
+            vec![near.clone(), chutes_no_client_e2ee.clone()],
+            false,
+        );
+        assert_eq!(out.len(), 2);
+
+        // needs it, but the ONLY provider can't → kept (clear rejection surfaces).
+        let out = InferenceProviderPool::filter_client_e2ee_capable(
+            vec![chutes_no_client_e2ee.clone()],
+            true,
+        );
+        assert_eq!(out.len(), 1);
+    }
+
+    /// Reserved-only cleanup (review round 3 important): a fail-closed RESERVATION
+    /// (in `pinned_models` but with no actual pinned provider — Chutes failed to
+    /// build) must NOT be exempt from stale removal. If NEAR also drops it, it's
+    /// removed entirely (fail-closed 404). A real pinned provider still survives.
+    #[tokio::test]
+    async fn reserved_only_pinned_id_is_removed_when_stale_but_real_pinned_survives() {
+        use inference_providers::mock::MockProvider;
+        use inference_providers::ProviderTier;
+        use std::collections::HashSet;
+
+        let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
+
+        // Reserved-only: reserved (fail-closed) + a NEAR provider, but Chutes never
+        // built, so it is NOT in pinned_providers.
+        let reserved_only = "reserved/only".to_string();
+        pool.reserve_pinned_models(std::slice::from_ref(&reserved_only));
+        pool.register_provider(
+            reserved_only.clone(),
+            Arc::new(MockProvider::new().with_tier(ProviderTier::Near)),
+        )
+        .await;
+
+        // Real pinned: has an actual Chutes provider.
+        let real_pinned = "real/pinned".to_string();
+        pool.register_pinned_secondary_provider(
+            real_pinned.clone(),
+            Arc::new(MockProvider::new().with_tier(ProviderTier::Attested3p)),
+        )
+        .await;
+
+        // A refresh where NEAR serves neither (empty valid set).
+        pool.remove_stale_providers(&HashSet::new()).await;
+
+        assert!(
+            !pool.has_provider(&reserved_only).await,
+            "reserved-only id (no pinned provider) must be removed when stale — fail-closed"
+        );
+        assert!(
+            pool.has_provider(&real_pinned).await,
+            "a real pinned (Chutes) provider must survive stale removal"
+        );
     }
 
     /// Fail-closed reservation (review #1): a configured Chutes canonical id is

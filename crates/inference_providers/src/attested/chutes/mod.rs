@@ -683,6 +683,12 @@ impl InferenceProvider for Provider {
     /// per-response signature — so the attestation flow skips the signature
     /// fetch/store step entirely (rather than calling `get_signature` and
     /// erroring on every completion).
+    ///
+    /// CLIENT-VISIBLE TRADE-OFF (#758): under one canonical id with tiered fallback,
+    /// a NEAR-served response is signature-available but a response that fell back to
+    /// Chutes is not — so per-request signature availability is non-deterministic for
+    /// such a model. This should be documented for clients of any model that lists
+    /// both a NEAR and a Chutes provider.
     fn supports_chat_signatures(&self) -> bool {
         false
     }
@@ -700,6 +706,14 @@ impl InferenceProvider for Provider {
     /// instead of falling through to a hard streaming-disabled error.
     fn supports_streaming(&self) -> bool {
         self.allow_streaming
+    }
+
+    /// Chutes can't serve client-facing E2EE (responses ride its own ML-KEM
+    /// channel; `reject_client_e2ee` refuses the `x_client_pub_key` headers). The
+    /// pool uses this to keep such requests on a NEAR sibling rather than falling
+    /// through to that hard rejection.
+    fn supports_client_e2ee(&self) -> bool {
+        false
     }
 
     async fn get_signature(

@@ -796,10 +796,14 @@ pub async fn init_inference_providers(
                     services::attestation::chutes::vetted_golden_measurements(),
                     pccs_url,
                 ));
-                for model in &config.external_providers.chutes_models {
+                for entry in &config.external_providers.chutes_models {
+                    // The provider talks to Chutes with the chute SLUG (request_body
+                    // pins it + cached_chute_id resolves it); we expose/route under
+                    // the CANONICAL id (the NEAR-served id when NEAR also serves the
+                    // model, else the OpenRouter id) — never the raw `-TEE` slug.
                     let cfg = inference_providers::attested::chutes::Config::new(
                         api_key.clone(),
-                        model.clone(),
+                        entry.chute_slug.clone(),
                         config.external_providers.timeout_seconds,
                     )
                     .with_streaming(allow_streaming);
@@ -808,18 +812,34 @@ pub async fn init_inference_providers(
                         verifier.clone(),
                     ) {
                         Ok(provider) => {
-                            // Ensure a catalog row exists so the data plane resolves
-                            // the model (and usage can be billed against a real id).
-                            ensure_chutes_catalog_row(&models_repo, model).await;
-                            // Pinned: registered out-of-band (not DB discovery), so
-                            // excluded from the refresh's stale-removal; also skips the
-                            // signing-key discovery Chutes never satisfies.
-                            pool.register_pinned_provider(model.clone(), Arc::new(provider))
-                                .await;
-                            tracing::info!(model = %model, "Registered Chutes attested provider");
+                            // Ensure a catalog row exists under the canonical id so the
+                            // data plane resolves the model (and usage bills against a
+                            // real id). If NEAR already serves this id, its row is left
+                            // untouched and we just add Chutes as a fallback provider.
+                            ensure_chutes_catalog_row(&models_repo, &entry.canonical_id).await;
+                            // Pinned SECONDARY: pushed onto the canonical id's provider
+                            // list (coexists with NEAR's own providers) and excluded from
+                            // discovery's stale-removal/overwrite. Tier ordering puts NEAR
+                            // first and Chutes as fallback; a Chutes-only id has just this
+                            // provider, so it serves as primary.
+                            pool.register_pinned_secondary_provider(
+                                entry.canonical_id.clone(),
+                                Arc::new(provider),
+                            )
+                            .await;
+                            tracing::info!(
+                                canonical = %entry.canonical_id,
+                                chute_slug = %entry.chute_slug,
+                                "Registered Chutes attested provider (fallback tier)"
+                            );
                         }
                         Err(e) => {
-                            tracing::warn!(model = %model, error = %e, "Failed to build Chutes provider");
+                            tracing::warn!(
+                                canonical = %entry.canonical_id,
+                                chute_slug = %entry.chute_slug,
+                                error = %e,
+                                "Failed to build Chutes provider"
+                            );
                         }
                     }
                 }

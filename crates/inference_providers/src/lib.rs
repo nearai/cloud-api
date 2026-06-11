@@ -326,6 +326,16 @@ pub trait InferenceProvider {
         true
     }
 
+    /// The trust tier of this provider — see [`ProviderTier`]. Drives provider
+    /// ordering in the pool (NEAR-served models prefer their own attested fleet
+    /// and fall back to an attested third party like Chutes only when the NEAR
+    /// backends can't fulfill the request). Default [`ProviderTier::NonAttested`];
+    /// `attested::nearai` returns [`ProviderTier::Near`] and `attested::chutes`
+    /// returns [`ProviderTier::Attested3p`].
+    fn tier(&self) -> ProviderTier {
+        ProviderTier::NonAttested
+    }
+
     /// Clean up the dedicated client for a chat_id after signature fetching.
     fn unpin_chat_connection(&self, _chat_id: &str) {}
 

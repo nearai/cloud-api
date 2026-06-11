@@ -2079,6 +2079,12 @@ impl InferenceProvider for Fleet {
 /// to its Fleet, which holds all NEAR-AI model-proxy state and logic.
 #[async_trait]
 impl InferenceProvider for Provider {
+    /// NEAR AI's own attested TEE fleet — the primary tier for any model NEAR
+    /// serves; an attested third party (Chutes) sits behind it as fallback.
+    fn tier(&self) -> crate::ProviderTier {
+        crate::ProviderTier::Near
+    }
+
     async fn models(&self) -> Result<ModelsResponse, ListModelsError> {
         self.fleet.models().await
     }

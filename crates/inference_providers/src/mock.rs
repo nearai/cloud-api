@@ -621,6 +621,10 @@ pub struct MockProvider {
     last_chat_params: Arc<Mutex<Option<ChatCompletionParams>>>,
     /// When true, get_attestation_report returns an error (simulates blocked/broken backend)
     fail_attestation: Arc<std::sync::atomic::AtomicBool>,
+    /// Trust tier reported by [`InferenceProvider::tier`]; defaults to
+    /// `NonAttested`. Set via [`MockProvider::with_tier`] to exercise tiered
+    /// provider selection (e.g. a `Near` primary with an `Attested3p` fallback).
+    tier: crate::ProviderTier,
 }
 
 impl MockProvider {
@@ -644,6 +648,7 @@ impl MockProvider {
             })),
             last_chat_params: Arc::new(Mutex::new(None)),
             fail_attestation: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            tier: crate::ProviderTier::NonAttested,
         }
     }
 
@@ -663,6 +668,7 @@ impl MockProvider {
             })),
             last_chat_params: Arc::new(Mutex::new(None)),
             fail_attestation: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            tier: crate::ProviderTier::NonAttested,
         }
     }
 
@@ -680,7 +686,16 @@ impl MockProvider {
             })),
             last_chat_params: Arc::new(Mutex::new(None)),
             fail_attestation: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            tier: crate::ProviderTier::NonAttested,
         }
+    }
+
+    /// Set the trust tier this mock reports from [`InferenceProvider::tier`].
+    /// Used to exercise tiered provider selection (NEAR-primary / Chutes-fallback
+    /// and the verifiable-never-falls-back-to-plaintext rule).
+    pub fn with_tier(mut self, tier: crate::ProviderTier) -> Self {
+        self.tier = tier;
+        self
     }
 
     /// Make get_attestation_report return an error (simulates blocked/broken backend).
@@ -862,6 +877,10 @@ impl Default for MockProvider {
 
 #[async_trait]
 impl crate::InferenceProvider for MockProvider {
+    fn tier(&self) -> crate::ProviderTier {
+        self.tier
+    }
+
     async fn models(&self) -> Result<ModelsResponse, ListModelsError> {
         Ok(ModelsResponse {
             object: "list".to_string(),

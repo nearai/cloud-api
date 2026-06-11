@@ -687,6 +687,13 @@ impl InferenceProvider for Provider {
         false
     }
 
+    /// Attested third party: a NEAR-served model prefers its own fleet and only
+    /// falls back to Chutes when the NEAR backends can't fulfill the request;
+    /// a Chutes-only model has no NEAR tier so this provider is primary.
+    fn tier(&self) -> crate::ProviderTier {
+        crate::ProviderTier::Attested3p
+    }
+
     async fn get_signature(
         &self,
         _chat_id: &str,

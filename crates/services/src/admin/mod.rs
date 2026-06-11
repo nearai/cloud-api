@@ -9,15 +9,26 @@ pub use analytics::{
     TimeSeriesPoint, TopModelMetrics, TopOrganizationMetrics, WorkspaceMetrics,
 };
 pub mod infra;
+pub mod pricing_scheduler;
 pub use infra::{InfraService, InfraSummary};
 pub use ports::{PlatformServiceInfo, *};
+pub use pricing_scheduler::ModelPricingScheduler;
 use std::sync::Arc;
 
 use crate::completions::CompletionServiceTrait;
-use crate::email::{EmailDeliveryOutcome, EmailSender, ModelDeprecationEmail};
+use crate::email::{
+    EmailDeliveryOutcome, EmailSender, ModelDeprecationEmail, PricingChangeEmail,
+    PricingChangeEmailModel,
+};
 use crate::models::ModelsServiceTrait;
 
 const MODEL_DEPRECATION_USAGE_WINDOW_DAYS: i64 = 30;
+const MODEL_PRICING_CHANGE_USAGE_WINDOW_DAYS: i64 = 30;
+/// Minimum lead time between confirming a pricing change and its effective
+/// date, so recipients are notified before the new pricing lands.
+const MIN_PRICING_CHANGE_LEAD_SECS: i64 = 3600;
+/// Maximum number of models in one scheduled pricing change batch.
+const MAX_PRICING_CHANGE_BATCH_SIZE: usize = 50;
 
 pub struct AdminServiceImpl {
     repository: Arc<dyn AdminRepository>,
@@ -120,6 +131,195 @@ impl AdminServiceImpl {
             recipient_count,
             organization_count,
             usage_window_days: MODEL_DEPRECATION_USAGE_WINDOW_DAYS,
+        }
+    }
+
+    /// Validate a scheduled pricing change batch and load the affected
+    /// models' current pricing snapshots plus the (user, org, model)
+    /// recipient rows for the whole batch.
+    /// Validate a NEW scheduled pricing change batch (shape, amounts, lead
+    /// time) and load the affected models' current pricing snapshots.
+    /// Retries of an already-persisted batch must NOT go through this — the
+    /// lead-time check would reject a legitimate resume once the effective
+    /// date is near (see `confirm_pricing_changes`).
+    async fn validate_pricing_changes(
+        &self,
+        changes: &[PricingChangeInput],
+    ) -> Result<Vec<(PricingChangeInput, ModelPricingSnapshot)>, AdminError> {
+        if changes.is_empty() {
+            return Err(AdminError::InvalidPricing(
+                "At least one pricing change must be provided".to_string(),
+            ));
+        }
+        if changes.len() > MAX_PRICING_CHANGE_BATCH_SIZE {
+            return Err(AdminError::InvalidPricing(format!(
+                "At most {MAX_PRICING_CHANGE_BATCH_SIZE} pricing changes are allowed per batch"
+            )));
+        }
+
+        let mut seen = std::collections::HashSet::new();
+        let min_effective_at =
+            chrono::Utc::now() + chrono::Duration::seconds(MIN_PRICING_CHANGE_LEAD_SECS);
+        let mut loaded = Vec::with_capacity(changes.len());
+        for change in changes {
+            let model_name = change.model_name.trim();
+            if model_name.is_empty() {
+                return Err(AdminError::InvalidPricing(
+                    "modelId is required for every pricing change".to_string(),
+                ));
+            }
+            if !seen.insert(model_name.to_string()) {
+                return Err(AdminError::InvalidPricing(format!(
+                    "model '{model_name}' appears more than once in the batch"
+                )));
+            }
+            let new_amounts = [
+                change.new_input_cost_per_token,
+                change.new_output_cost_per_token,
+                change.new_cache_read_cost_per_token,
+                change.new_cost_per_image,
+            ];
+            if new_amounts.iter().all(Option::is_none) {
+                return Err(AdminError::InvalidPricing(format!(
+                    "model '{model_name}': at least one pricing field must be provided"
+                )));
+            }
+            if new_amounts.iter().flatten().any(|amount| *amount < 0) {
+                return Err(AdminError::InvalidPricing(format!(
+                    "model '{model_name}': pricing amounts must be non-negative"
+                )));
+            }
+            if change.effective_at < min_effective_at {
+                return Err(AdminError::InvalidPricing(format!(
+                    "model '{model_name}': effectiveAt must be at least {} minutes in the future",
+                    MIN_PRICING_CHANGE_LEAD_SECS / 60
+                )));
+            }
+
+            let snapshot = self
+                .repository
+                .get_model_pricing_snapshot(model_name)
+                .await
+                .map_err(|e| AdminError::InternalError(e.to_string()))?
+                .ok_or_else(|| {
+                    AdminError::ModelNotFound(format!("Model '{model_name}' not found or inactive"))
+                })?;
+            let mut change = change.clone();
+            change.model_name = model_name.to_string();
+            loaded.push((change, snapshot));
+        }
+
+        Ok(loaded)
+    }
+
+    /// Owner/admin recipients (one row per user/org/model) for a set of
+    /// canonical model names, over the standard usage window.
+    async fn load_pricing_change_recipients(
+        &self,
+        model_names: &[String],
+    ) -> Result<Vec<PricingChangeRecipientRow>, AdminError> {
+        let since =
+            chrono::Utc::now() - chrono::Duration::days(MODEL_PRICING_CHANGE_USAGE_WINDOW_DAYS);
+        self.repository
+            .list_pricing_change_recipients(model_names, since)
+            .await
+            .map_err(|e| AdminError::InternalError(e.to_string()))
+    }
+
+    /// Reject a confirm whose request body does not describe the batch that
+    /// is already persisted under its `batch_id`. Without this, a reused
+    /// idempotency key would return the old schedule rows while the
+    /// notification emails were built from the new, unscheduled request.
+    fn verify_batch_matches(
+        rows: &[ScheduledPricingChange],
+        changes: &[PricingChangeInput],
+    ) -> Result<(), AdminError> {
+        let conflict = |detail: String| {
+            AdminError::PricingChangeConflict(format!(
+                "batchId was already used for a different set of changes ({detail}); use a new batchId"
+            ))
+        };
+        if rows.len() != changes.len() {
+            return Err(conflict(format!(
+                "{} models persisted, {} requested",
+                rows.len(),
+                changes.len()
+            )));
+        }
+        let by_name: std::collections::HashMap<&str, &ScheduledPricingChange> =
+            rows.iter().map(|r| (r.model_name.as_str(), r)).collect();
+        for change in changes {
+            let model_name = change.model_name.trim();
+            let row = by_name
+                .get(model_name)
+                .ok_or_else(|| conflict(format!("model '{model_name}' is not in the batch")))?;
+            let matches = row.effective_at == change.effective_at
+                && row.new_input_cost_per_token == change.new_input_cost_per_token
+                && row.new_output_cost_per_token == change.new_output_cost_per_token
+                && row.new_cache_read_cost_per_token == change.new_cache_read_cost_per_token
+                && row.new_cost_per_image == change.new_cost_per_image;
+            if !matches {
+                return Err(conflict(format!(
+                    "model '{model_name}' differs from the persisted change"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn pricing_change_preview_from_loaded(
+        loaded: &[(PricingChangeInput, ModelPricingSnapshot)],
+        recipients: &[PricingChangeRecipientRow],
+    ) -> PricingChangePreview {
+        let recipient_count = recipients
+            .iter()
+            .map(|r| r.email.to_lowercase())
+            .collect::<std::collections::HashSet<_>>()
+            .len() as i64;
+        let organization_count = recipients
+            .iter()
+            .map(|r| r.organization_id)
+            .collect::<std::collections::HashSet<_>>()
+            .len() as i64;
+
+        let models = loaded
+            .iter()
+            .map(|(change, snapshot)| {
+                let model_rows = recipients
+                    .iter()
+                    .filter(|r| r.model_name == change.model_name)
+                    .collect::<Vec<_>>();
+                PricingChangeModelPreview {
+                    model_name: change.model_name.clone(),
+                    model_display_name: snapshot.model_display_name.clone(),
+                    effective_at: change.effective_at,
+                    recipient_count: model_rows
+                        .iter()
+                        .map(|r| r.email.to_lowercase())
+                        .collect::<std::collections::HashSet<_>>()
+                        .len() as i64,
+                    organization_count: model_rows
+                        .iter()
+                        .map(|r| r.organization_id)
+                        .collect::<std::collections::HashSet<_>>()
+                        .len() as i64,
+                    old_input_cost_per_token: snapshot.input_cost_per_token,
+                    old_output_cost_per_token: snapshot.output_cost_per_token,
+                    old_cache_read_cost_per_token: snapshot.cache_read_cost_per_token,
+                    old_cost_per_image: snapshot.cost_per_image,
+                    new_input_cost_per_token: change.new_input_cost_per_token,
+                    new_output_cost_per_token: change.new_output_cost_per_token,
+                    new_cache_read_cost_per_token: change.new_cache_read_cost_per_token,
+                    new_cost_per_image: change.new_cost_per_image,
+                }
+            })
+            .collect();
+
+        PricingChangePreview {
+            recipient_count,
+            organization_count,
+            usage_window_days: MODEL_PRICING_CHANGE_USAGE_WINDOW_DAYS,
+            models,
         }
     }
 }
@@ -569,6 +769,270 @@ impl AdminService for AdminServiceImpl {
             failed_count,
             skipped_count,
         })
+    }
+
+    async fn preview_pricing_changes(
+        &self,
+        changes: Vec<PricingChangeInput>,
+    ) -> Result<PricingChangePreview, AdminError> {
+        let loaded = self.validate_pricing_changes(&changes).await?;
+        let model_names: Vec<String> = loaded
+            .iter()
+            .map(|(change, _)| change.model_name.clone())
+            .collect();
+        let recipients = self.load_pricing_change_recipients(&model_names).await?;
+        Ok(Self::pricing_change_preview_from_loaded(
+            &loaded,
+            &recipients,
+        ))
+    }
+
+    async fn confirm_pricing_changes(
+        &self,
+        batch_id: uuid::Uuid,
+        changes: Vec<PricingChangeInput>,
+        change_reason: Option<String>,
+        changed_by_user_id: Option<uuid::Uuid>,
+        changed_by_user_email: Option<String>,
+    ) -> Result<PricingChangeConfirmResult, AdminError> {
+        // A retry of an already-persisted batch must skip schedule
+        // validation: the lead-time check would reject a legitimate resume
+        // (e.g. retrying after a timeout or partial email failure) once the
+        // effective date is less than the minimum lead away.
+        let existing = self
+            .repository
+            .list_scheduled_pricing_changes_by_batch(batch_id)
+            .await
+            .map_err(|e| AdminError::InternalError(e.to_string()))?;
+
+        let inserted = if existing.is_empty() {
+            let loaded = self.validate_pricing_changes(&changes).await?;
+
+            // Persist the schedule first: notifying users about a change
+            // that failed to persist would be worse than the reverse (the
+            // confirm is idempotent per batch_id, so a retry resumes the
+            // email sending).
+            let inserts = loaded
+                .iter()
+                .map(|(change, snapshot)| ScheduledPricingChangeInsert {
+                    model_id: snapshot.id,
+                    model_name: change.model_name.clone(),
+                    model_display_name: snapshot.model_display_name.clone(),
+                    new_input_cost_per_token: change.new_input_cost_per_token,
+                    new_output_cost_per_token: change.new_output_cost_per_token,
+                    new_cache_read_cost_per_token: change.new_cache_read_cost_per_token,
+                    new_cost_per_image: change.new_cost_per_image,
+                    old_input_cost_per_token: snapshot.input_cost_per_token,
+                    old_output_cost_per_token: snapshot.output_cost_per_token,
+                    old_cache_read_cost_per_token: snapshot.cache_read_cost_per_token,
+                    old_cost_per_image: snapshot.cost_per_image,
+                    effective_at: change.effective_at,
+                })
+                .collect();
+            self.repository
+                .insert_scheduled_pricing_changes(
+                    batch_id,
+                    inserts,
+                    changed_by_user_id,
+                    changed_by_user_email.clone(),
+                    change_reason,
+                )
+                .await
+                .map_err(
+                    |e| match e.downcast_ref::<PricingChangeOpenConflictError>() {
+                        Some(conflict) => AdminError::PricingChangeConflict(format!(
+                            "A pending pricing change already exists for model '{}'; cancel it first",
+                            conflict.model_name
+                        )),
+                        None => AdminError::InternalError(e.to_string()),
+                    },
+                )?
+        } else {
+            existing
+        };
+
+        // Whether freshly inserted or resumed, the request body must
+        // describe the batch that is actually persisted — emails below are
+        // built from the persisted rows, never from the request.
+        Self::verify_batch_matches(&inserted, &changes)?;
+
+        let model_names: Vec<String> = inserted.iter().map(|c| c.model_name.clone()).collect();
+        let recipients = self.load_pricing_change_recipients(&model_names).await?;
+
+        // Per-model email payload from the persisted rows, keyed by
+        // canonical model name.
+        let email_models: std::collections::HashMap<String, PricingChangeEmailModel> = inserted
+            .iter()
+            .map(|row| {
+                (
+                    row.model_name.clone(),
+                    PricingChangeEmailModel {
+                        model_id: row.model_name.clone(),
+                        model_display_name: row.model_display_name.clone(),
+                        effective_at: row.effective_at,
+                        old_input_cost_per_token: row.old_input_cost_per_token,
+                        new_input_cost_per_token: row.new_input_cost_per_token,
+                        old_output_cost_per_token: row.old_output_cost_per_token,
+                        new_output_cost_per_token: row.new_output_cost_per_token,
+                        old_cache_read_cost_per_token: row.old_cache_read_cost_per_token,
+                        new_cache_read_cost_per_token: row.new_cache_read_cost_per_token,
+                        old_cost_per_image: row.old_cost_per_image,
+                        new_cost_per_image: row.new_cost_per_image,
+                    },
+                )
+            })
+            .collect();
+
+        // Consolidate: one email per distinct recipient address, listing
+        // every batch model at least one of their org memberships used.
+        struct RecipientAggregate<'a> {
+            rows: Vec<&'a PricingChangeRecipientRow>,
+            model_names: std::collections::BTreeSet<&'a str>,
+        }
+        let mut per_email: std::collections::BTreeMap<String, RecipientAggregate> =
+            std::collections::BTreeMap::new();
+        for row in &recipients {
+            let aggregate = per_email
+                .entry(row.email.to_lowercase())
+                .or_insert_with(|| RecipientAggregate {
+                    rows: Vec::new(),
+                    model_names: std::collections::BTreeSet::new(),
+                });
+            aggregate.rows.push(row);
+            aggregate.model_names.insert(row.model_name.as_str());
+        }
+
+        let already_sent: std::collections::HashSet<(uuid::Uuid, uuid::Uuid)> = self
+            .repository
+            .list_sent_pricing_change_delivery_keys(batch_id)
+            .await
+            .map_err(|e| AdminError::InternalError(e.to_string()))?
+            .into_iter()
+            .collect();
+
+        let mut sent_count = 0_i64;
+        let mut failed_count = 0_i64;
+        let mut skipped_count = 0_i64;
+        let mut organization_ids = std::collections::HashSet::new();
+
+        for aggregate in per_email.values() {
+            let model_names: Vec<String> = aggregate
+                .model_names
+                .iter()
+                .map(|name| name.to_string())
+                .collect();
+            let any_row_sent = aggregate
+                .rows
+                .iter()
+                .any(|row| already_sent.contains(&(row.user_id, row.organization_id)));
+            let result = if any_row_sent {
+                (
+                    ModelDeprecationEmailStatus::Skipped,
+                    None,
+                    Some("Already sent for this batch".to_string()),
+                )
+            } else {
+                let email = PricingChangeEmail {
+                    recipient_email: aggregate.rows[0].email.clone(),
+                    models: aggregate
+                        .model_names
+                        .iter()
+                        .filter_map(|name| email_models.get(*name).cloned())
+                        .collect(),
+                };
+                match self.email_sender.send_pricing_change(&email).await {
+                    Ok(EmailDeliveryOutcome::Sent { message_id }) => {
+                        (ModelDeprecationEmailStatus::Sent, message_id, None)
+                    }
+                    Ok(EmailDeliveryOutcome::Skipped) => {
+                        (ModelDeprecationEmailStatus::Skipped, None, None)
+                    }
+                    Err(e) => (
+                        ModelDeprecationEmailStatus::Failed,
+                        None,
+                        Some(e.sanitized_message()),
+                    ),
+                }
+            };
+
+            match result.0 {
+                ModelDeprecationEmailStatus::Sent => sent_count += 1,
+                ModelDeprecationEmailStatus::Failed => failed_count += 1,
+                ModelDeprecationEmailStatus::Skipped => skipped_count += 1,
+            }
+
+            for row in &aggregate.rows {
+                organization_ids.insert(row.organization_id);
+                if already_sent.contains(&(row.user_id, row.organization_id)) {
+                    continue;
+                }
+                self.repository
+                    .record_pricing_change_delivery(PricingChangeDeliveryRecord {
+                        batch_id,
+                        recipient_user_id: row.user_id,
+                        recipient_email: row.email.clone(),
+                        organization_id: row.organization_id,
+                        organization_name: row.organization_name.clone(),
+                        model_names: model_names.clone(),
+                        status: result.0,
+                        email_message_id: result.1.clone(),
+                        email_last_error: result.2.clone(),
+                        initiated_by_user_id: changed_by_user_id,
+                        initiated_by_user_email: changed_by_user_email.clone(),
+                    })
+                    .await
+                    .map_err(|e| AdminError::InternalError(e.to_string()))?;
+            }
+        }
+
+        Ok(PricingChangeConfirmResult {
+            batch_id,
+            recipient_count: per_email.len() as i64,
+            organization_count: organization_ids.len() as i64,
+            sent_count,
+            failed_count,
+            skipped_count,
+            changes: inserted,
+        })
+    }
+
+    async fn list_pricing_changes(
+        &self,
+        status: Option<ScheduledPricingChangeStatus>,
+        limit: i64,
+        offset: i64,
+    ) -> Result<(Vec<ScheduledPricingChange>, i64), AdminError> {
+        if limit <= 0 || limit > 1000 {
+            return Err(AdminError::InvalidPricing(
+                "limit must be between 1 and 1000".to_string(),
+            ));
+        }
+        if offset < 0 {
+            return Err(AdminError::InvalidPricing(
+                "offset must be non-negative".to_string(),
+            ));
+        }
+        self.repository
+            .list_scheduled_pricing_changes(status, limit, offset)
+            .await
+            .map_err(|e| AdminError::InternalError(e.to_string()))
+    }
+
+    async fn cancel_pricing_change(
+        &self,
+        id: uuid::Uuid,
+        cancelled_by_user_id: Option<uuid::Uuid>,
+        cancelled_by_user_email: Option<String>,
+    ) -> Result<ScheduledPricingChange, AdminError> {
+        self.repository
+            .cancel_scheduled_pricing_change(id, cancelled_by_user_id, cancelled_by_user_email)
+            .await
+            .map_err(|e| AdminError::InternalError(e.to_string()))?
+            .ok_or_else(|| {
+                AdminError::PricingChangeNotFound(format!(
+                    "Scheduled pricing change '{id}' not found or no longer pending"
+                ))
+            })
     }
 
     async fn update_organization_concurrent_limit(

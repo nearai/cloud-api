@@ -1536,6 +1536,15 @@ fn pricing_change_inputs_from_request(
                 price
                     .validate()
                     .map_err(|e| invalid(format!("model '{}': {e}", item.model_id)))?;
+                // Only the amount is stored; responses and notification
+                // emails label it USD, so any other currency would silently
+                // be billed as USD.
+                if !price.currency.eq_ignore_ascii_case("USD") {
+                    return Err(invalid(format!(
+                        "model '{}': currency must be 'USD'",
+                        item.model_id
+                    )));
+                }
             }
             Ok(services::admin::PricingChangeInput {
                 model_name: item.model_id.clone(),

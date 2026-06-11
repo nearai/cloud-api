@@ -287,6 +287,127 @@ async fn test_conflict_and_idempotent_retry() {
 }
 
 #[tokio::test]
+async fn test_currency_must_be_usd() {
+    let server = setup_test_server().await;
+    let model = format!("pricing-change-currency-{}", uuid::Uuid::new_v4());
+    create_model(&server, &model).await;
+
+    let resp = post_pricing_changes(
+        &server,
+        "confirm",
+        serde_json::json!({ "changes": [{
+            "modelId": model,
+            "effectiveAt": "2030-01-01",
+            "inputCostPerToken": { "amount": 1_500, "currency": "EUR" },
+        }] }),
+    )
+    .await;
+    assert_eq!(resp.status_code(), 400, "{}", resp.text());
+    assert!(resp.text().contains("currency must be 'USD'"));
+}
+
+#[tokio::test]
+async fn test_reused_batch_id_with_different_changes_conflicts() {
+    let server = setup_test_server().await;
+    let model_a = format!("pricing-change-reuse-a-{}", uuid::Uuid::new_v4());
+    let model_b = format!("pricing-change-reuse-b-{}", uuid::Uuid::new_v4());
+    create_model(&server, &model_a).await;
+    create_model(&server, &model_b).await;
+
+    let batch_id = uuid::Uuid::new_v4();
+    let first = post_pricing_changes(
+        &server,
+        "confirm",
+        serde_json::json!({
+            "batchId": batch_id,
+            "changes": [change_item(&model_a, "2030-01-01", 1_500)],
+        }),
+    )
+    .await;
+    assert_eq!(first.status_code(), 200, "{}", first.text());
+
+    // Same batchId, different amount -> must not silently send emails for
+    // the unscheduled request.
+    let different_amount = post_pricing_changes(
+        &server,
+        "confirm",
+        serde_json::json!({
+            "batchId": batch_id,
+            "changes": [change_item(&model_a, "2030-01-01", 1_600)],
+        }),
+    )
+    .await;
+    assert_eq!(
+        different_amount.status_code(),
+        409,
+        "{}",
+        different_amount.text()
+    );
+
+    // Same batchId, different model set -> conflict as well.
+    let different_model = post_pricing_changes(
+        &server,
+        "confirm",
+        serde_json::json!({
+            "batchId": batch_id,
+            "changes": [change_item(&model_b, "2030-01-01", 1_500)],
+        }),
+    )
+    .await;
+    assert_eq!(
+        different_model.status_code(),
+        409,
+        "{}",
+        different_model.text()
+    );
+}
+
+#[tokio::test]
+async fn test_retry_of_persisted_batch_skips_lead_time_validation() {
+    let (server, database) = setup_test_server_with_database().await;
+    let model = format!("pricing-change-resume-{}", uuid::Uuid::new_v4());
+    create_model(&server, &model).await;
+
+    let batch_id = uuid::Uuid::new_v4();
+    let first = post_pricing_changes(
+        &server,
+        "confirm",
+        serde_json::json!({
+            "batchId": batch_id,
+            "changes": [change_item(&model, "2030-01-01T00:00:00Z", 1_500)],
+        }),
+    )
+    .await;
+    assert_eq!(first.status_code(), 200, "{}", first.text());
+
+    // Simulate the effective date arriving before the retry (e.g. emails
+    // partially failed and the admin retries close to / past the deadline).
+    let client = database.pool().get().await.unwrap();
+    client
+        .execute(
+            "UPDATE scheduled_model_pricing_changes
+             SET effective_at = '2020-01-01T00:00:00Z'
+             WHERE batch_id = $1",
+            &[&batch_id],
+        )
+        .await
+        .unwrap();
+
+    // The retry describes the persisted batch; it must resume (200), not be
+    // rejected by the lead-time validation that applies to NEW schedules.
+    let retry = post_pricing_changes(
+        &server,
+        "confirm",
+        serde_json::json!({
+            "batchId": batch_id,
+            "changes": [change_item(&model, "2020-01-01T00:00:00Z", 1_500)],
+        }),
+    )
+    .await;
+    assert_eq!(retry.status_code(), 200, "{}", retry.text());
+}
+
+#[tokio::test]
 async fn test_concurrent_same_batch_confirms_are_idempotent() {
     let server = setup_test_server().await;
     let model = format!("pricing-change-race-batch-{}", uuid::Uuid::new_v4());
@@ -458,6 +579,41 @@ async fn test_scheduler_applies_due_changes() {
         .add_header("User-Agent", MOCK_USER_AGENT)
         .await;
     assert_eq!(cancel.status_code(), 404, "{}", cancel.text());
+
+    // Crash-recovery re-apply must be value-idempotent: force the applied
+    // row back to pending (as stale-claim recovery would after a crash
+    // between the model update and the applied mark) and re-run the
+    // scheduler — the row is re-marked applied WITHOUT a duplicate
+    // model_history entry.
+    let client = database.pool().get().await.unwrap();
+    client
+        .execute(
+            "UPDATE scheduled_model_pricing_changes
+             SET status = 'pending', applied_at = NULL
+             WHERE id = $1",
+            &[&uuid::Uuid::parse_str(change_id).unwrap()],
+        )
+        .await
+        .unwrap();
+    scheduler.run_once().await.unwrap();
+
+    let listed = list_pricing_changes(&server, "?status=applied&limit=500").await;
+    assert!(listed["changes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|c| c["id"] == change_id));
+    let history_resp = server
+        .get(&format!("/v1/admin/models/{model}/history"))
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .add_header("User-Agent", MOCK_USER_AGENT)
+        .await;
+    let history: serde_json::Value = serde_json::from_str(&history_resp.text()).unwrap();
+    assert_eq!(
+        history["history"].as_array().unwrap().len(),
+        2,
+        "re-apply of identical values must not add a history entry: {history}"
+    );
 }
 
 #[tokio::test]

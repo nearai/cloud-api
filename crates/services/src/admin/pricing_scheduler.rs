@@ -131,6 +131,41 @@ impl ModelPricingScheduler {
                     "Model pricing changed since the scheduled change was confirmed; applying the announced change anyway"
                 );
             }
+
+            // Value-idempotent re-apply: if a previous attempt already wrote
+            // the new pricing but crashed before marking the row applied,
+            // skip the upsert so the retry doesn't record a duplicate
+            // model_history entry for identical values.
+            let already_at_target = change
+                .new_input_cost_per_token
+                .is_none_or(|v| v == current.input_cost_per_token)
+                && change
+                    .new_output_cost_per_token
+                    .is_none_or(|v| v == current.output_cost_per_token)
+                && change
+                    .new_cache_read_cost_per_token
+                    .is_none_or(|v| v == current.cache_read_cost_per_token)
+                && change
+                    .new_cost_per_image
+                    .is_none_or(|v| v == current.cost_per_image);
+            if already_at_target {
+                if let Err(e) = self.repository.mark_pricing_change_applied(change.id).await {
+                    error!(
+                        change_id = %change.id,
+                        error = %e,
+                        "Pricing already at target values but failed to mark change applied"
+                    );
+                    return;
+                }
+                self.models_service.invalidate_models_cache().await;
+                info!(
+                    change_id = %change.id,
+                    batch_id = %change.batch_id,
+                    model_id = %change.model_id,
+                    "Model pricing already at the scheduled values; marked applied without re-updating"
+                );
+                return;
+            }
         }
 
         let change_reason = match &change.change_reason {

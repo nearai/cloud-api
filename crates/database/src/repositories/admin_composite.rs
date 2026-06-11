@@ -1124,6 +1124,24 @@ impl AdminRepository for AdminCompositeRepository {
         Ok(inserted)
     }
 
+    async fn list_scheduled_pricing_changes_by_batch(
+        &self,
+        batch_id: Uuid,
+    ) -> Result<Vec<ScheduledPricingChange>> {
+        let client = self.pool.get().await?;
+        let rows = client
+            .query(
+                r#"
+                SELECT * FROM scheduled_model_pricing_changes
+                WHERE batch_id = $1
+                ORDER BY model_name
+                "#,
+                &[&batch_id],
+            )
+            .await?;
+        rows.iter().map(row_to_scheduled_pricing_change).collect()
+    }
+
     async fn list_scheduled_pricing_changes(
         &self,
         status: Option<ScheduledPricingChangeStatus>,

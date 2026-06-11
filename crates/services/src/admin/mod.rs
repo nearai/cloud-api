@@ -137,16 +137,15 @@ impl AdminServiceImpl {
     /// Validate a scheduled pricing change batch and load the affected
     /// models' current pricing snapshots plus the (user, org, model)
     /// recipient rows for the whole batch.
-    async fn validate_and_load_pricing_changes(
+    /// Validate a NEW scheduled pricing change batch (shape, amounts, lead
+    /// time) and load the affected models' current pricing snapshots.
+    /// Retries of an already-persisted batch must NOT go through this — the
+    /// lead-time check would reject a legitimate resume once the effective
+    /// date is near (see `confirm_pricing_changes`).
+    async fn validate_pricing_changes(
         &self,
         changes: &[PricingChangeInput],
-    ) -> Result<
-        (
-            Vec<(PricingChangeInput, ModelPricingSnapshot)>,
-            Vec<PricingChangeRecipientRow>,
-        ),
-        AdminError,
-    > {
+    ) -> Result<Vec<(PricingChangeInput, ModelPricingSnapshot)>, AdminError> {
         if changes.is_empty() {
             return Err(AdminError::InvalidPricing(
                 "At least one pricing change must be provided".to_string(),
@@ -210,19 +209,62 @@ impl AdminServiceImpl {
             loaded.push((change, snapshot));
         }
 
+        Ok(loaded)
+    }
+
+    /// Owner/admin recipients (one row per user/org/model) for a set of
+    /// canonical model names, over the standard usage window.
+    async fn load_pricing_change_recipients(
+        &self,
+        model_names: &[String],
+    ) -> Result<Vec<PricingChangeRecipientRow>, AdminError> {
         let since =
             chrono::Utc::now() - chrono::Duration::days(MODEL_PRICING_CHANGE_USAGE_WINDOW_DAYS);
-        let model_names: Vec<String> = loaded
-            .iter()
-            .map(|(change, _)| change.model_name.clone())
-            .collect();
-        let recipients = self
-            .repository
-            .list_pricing_change_recipients(&model_names, since)
+        self.repository
+            .list_pricing_change_recipients(model_names, since)
             .await
-            .map_err(|e| AdminError::InternalError(e.to_string()))?;
+            .map_err(|e| AdminError::InternalError(e.to_string()))
+    }
 
-        Ok((loaded, recipients))
+    /// Reject a confirm whose request body does not describe the batch that
+    /// is already persisted under its `batch_id`. Without this, a reused
+    /// idempotency key would return the old schedule rows while the
+    /// notification emails were built from the new, unscheduled request.
+    fn verify_batch_matches(
+        rows: &[ScheduledPricingChange],
+        changes: &[PricingChangeInput],
+    ) -> Result<(), AdminError> {
+        let conflict = |detail: String| {
+            AdminError::PricingChangeConflict(format!(
+                "batchId was already used for a different set of changes ({detail}); use a new batchId"
+            ))
+        };
+        if rows.len() != changes.len() {
+            return Err(conflict(format!(
+                "{} models persisted, {} requested",
+                rows.len(),
+                changes.len()
+            )));
+        }
+        let by_name: std::collections::HashMap<&str, &ScheduledPricingChange> =
+            rows.iter().map(|r| (r.model_name.as_str(), r)).collect();
+        for change in changes {
+            let model_name = change.model_name.trim();
+            let row = by_name
+                .get(model_name)
+                .ok_or_else(|| conflict(format!("model '{model_name}' is not in the batch")))?;
+            let matches = row.effective_at == change.effective_at
+                && row.new_input_cost_per_token == change.new_input_cost_per_token
+                && row.new_output_cost_per_token == change.new_output_cost_per_token
+                && row.new_cache_read_cost_per_token == change.new_cache_read_cost_per_token
+                && row.new_cost_per_image == change.new_cost_per_image;
+            if !matches {
+                return Err(conflict(format!(
+                    "model '{model_name}' differs from the persisted change"
+                )));
+            }
+        }
+        Ok(())
     }
 
     fn pricing_change_preview_from_loaded(
@@ -733,7 +775,12 @@ impl AdminService for AdminServiceImpl {
         &self,
         changes: Vec<PricingChangeInput>,
     ) -> Result<PricingChangePreview, AdminError> {
-        let (loaded, recipients) = self.validate_and_load_pricing_changes(&changes).await?;
+        let loaded = self.validate_pricing_changes(&changes).await?;
+        let model_names: Vec<String> = loaded
+            .iter()
+            .map(|(change, _)| change.model_name.clone())
+            .collect();
+        let recipients = self.load_pricing_change_recipients(&model_names).await?;
         Ok(Self::pricing_change_preview_from_loaded(
             &loaded,
             &recipients,
@@ -748,66 +795,89 @@ impl AdminService for AdminServiceImpl {
         changed_by_user_id: Option<uuid::Uuid>,
         changed_by_user_email: Option<String>,
     ) -> Result<PricingChangeConfirmResult, AdminError> {
-        let (loaded, recipients) = self.validate_and_load_pricing_changes(&changes).await?;
-
-        // Persist the schedule first: notifying users about a change that
-        // failed to persist would be worse than the reverse (the confirm is
-        // idempotent per batch_id, so a retry resumes the email sending).
-        let inserts = loaded
-            .iter()
-            .map(|(change, snapshot)| ScheduledPricingChangeInsert {
-                model_id: snapshot.id,
-                model_name: change.model_name.clone(),
-                model_display_name: snapshot.model_display_name.clone(),
-                new_input_cost_per_token: change.new_input_cost_per_token,
-                new_output_cost_per_token: change.new_output_cost_per_token,
-                new_cache_read_cost_per_token: change.new_cache_read_cost_per_token,
-                new_cost_per_image: change.new_cost_per_image,
-                old_input_cost_per_token: snapshot.input_cost_per_token,
-                old_output_cost_per_token: snapshot.output_cost_per_token,
-                old_cache_read_cost_per_token: snapshot.cache_read_cost_per_token,
-                old_cost_per_image: snapshot.cost_per_image,
-                effective_at: change.effective_at,
-            })
-            .collect();
-        let inserted = self
+        // A retry of an already-persisted batch must skip schedule
+        // validation: the lead-time check would reject a legitimate resume
+        // (e.g. retrying after a timeout or partial email failure) once the
+        // effective date is less than the minimum lead away.
+        let existing = self
             .repository
-            .insert_scheduled_pricing_changes(
-                batch_id,
-                inserts,
-                changed_by_user_id,
-                changed_by_user_email.clone(),
-                change_reason,
-            )
+            .list_scheduled_pricing_changes_by_batch(batch_id)
             .await
-            .map_err(
-                |e| match e.downcast_ref::<PricingChangeOpenConflictError>() {
-                    Some(conflict) => AdminError::PricingChangeConflict(format!(
-                        "A pending pricing change already exists for model '{}'; cancel it first",
-                        conflict.model_name
-                    )),
-                    None => AdminError::InternalError(e.to_string()),
-                },
-            )?;
+            .map_err(|e| AdminError::InternalError(e.to_string()))?;
 
-        // Per-model email payload, keyed by canonical model name.
-        let email_models: std::collections::HashMap<String, PricingChangeEmailModel> = loaded
+        let inserted = if existing.is_empty() {
+            let loaded = self.validate_pricing_changes(&changes).await?;
+
+            // Persist the schedule first: notifying users about a change
+            // that failed to persist would be worse than the reverse (the
+            // confirm is idempotent per batch_id, so a retry resumes the
+            // email sending).
+            let inserts = loaded
+                .iter()
+                .map(|(change, snapshot)| ScheduledPricingChangeInsert {
+                    model_id: snapshot.id,
+                    model_name: change.model_name.clone(),
+                    model_display_name: snapshot.model_display_name.clone(),
+                    new_input_cost_per_token: change.new_input_cost_per_token,
+                    new_output_cost_per_token: change.new_output_cost_per_token,
+                    new_cache_read_cost_per_token: change.new_cache_read_cost_per_token,
+                    new_cost_per_image: change.new_cost_per_image,
+                    old_input_cost_per_token: snapshot.input_cost_per_token,
+                    old_output_cost_per_token: snapshot.output_cost_per_token,
+                    old_cache_read_cost_per_token: snapshot.cache_read_cost_per_token,
+                    old_cost_per_image: snapshot.cost_per_image,
+                    effective_at: change.effective_at,
+                })
+                .collect();
+            self.repository
+                .insert_scheduled_pricing_changes(
+                    batch_id,
+                    inserts,
+                    changed_by_user_id,
+                    changed_by_user_email.clone(),
+                    change_reason,
+                )
+                .await
+                .map_err(
+                    |e| match e.downcast_ref::<PricingChangeOpenConflictError>() {
+                        Some(conflict) => AdminError::PricingChangeConflict(format!(
+                            "A pending pricing change already exists for model '{}'; cancel it first",
+                            conflict.model_name
+                        )),
+                        None => AdminError::InternalError(e.to_string()),
+                    },
+                )?
+        } else {
+            existing
+        };
+
+        // Whether freshly inserted or resumed, the request body must
+        // describe the batch that is actually persisted — emails below are
+        // built from the persisted rows, never from the request.
+        Self::verify_batch_matches(&inserted, &changes)?;
+
+        let model_names: Vec<String> = inserted.iter().map(|c| c.model_name.clone()).collect();
+        let recipients = self.load_pricing_change_recipients(&model_names).await?;
+
+        // Per-model email payload from the persisted rows, keyed by
+        // canonical model name.
+        let email_models: std::collections::HashMap<String, PricingChangeEmailModel> = inserted
             .iter()
-            .map(|(change, snapshot)| {
+            .map(|row| {
                 (
-                    change.model_name.clone(),
+                    row.model_name.clone(),
                     PricingChangeEmailModel {
-                        model_id: change.model_name.clone(),
-                        model_display_name: snapshot.model_display_name.clone(),
-                        effective_at: change.effective_at,
-                        old_input_cost_per_token: snapshot.input_cost_per_token,
-                        new_input_cost_per_token: change.new_input_cost_per_token,
-                        old_output_cost_per_token: snapshot.output_cost_per_token,
-                        new_output_cost_per_token: change.new_output_cost_per_token,
-                        old_cache_read_cost_per_token: snapshot.cache_read_cost_per_token,
-                        new_cache_read_cost_per_token: change.new_cache_read_cost_per_token,
-                        old_cost_per_image: snapshot.cost_per_image,
-                        new_cost_per_image: change.new_cost_per_image,
+                        model_id: row.model_name.clone(),
+                        model_display_name: row.model_display_name.clone(),
+                        effective_at: row.effective_at,
+                        old_input_cost_per_token: row.old_input_cost_per_token,
+                        new_input_cost_per_token: row.new_input_cost_per_token,
+                        old_output_cost_per_token: row.old_output_cost_per_token,
+                        new_output_cost_per_token: row.new_output_cost_per_token,
+                        old_cache_read_cost_per_token: row.old_cache_read_cost_per_token,
+                        new_cache_read_cost_per_token: row.new_cache_read_cost_per_token,
+                        old_cost_per_image: row.old_cost_per_image,
+                        new_cost_per_image: row.new_cost_per_image,
                     },
                 )
             })

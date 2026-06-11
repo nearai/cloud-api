@@ -736,6 +736,12 @@ pub trait AdminRepository: Send + Sync {
         change_reason: Option<String>,
     ) -> Result<Vec<ScheduledPricingChange>, anyhow::Error>;
 
+    /// List all rows of one batch (any status), ordered by model name.
+    async fn list_scheduled_pricing_changes_by_batch(
+        &self,
+        batch_id: uuid::Uuid,
+    ) -> Result<Vec<ScheduledPricingChange>, anyhow::Error>;
+
     /// List scheduled pricing changes, optionally filtered by status,
     /// newest effective date first. Returns (rows, total).
     async fn list_scheduled_pricing_changes(

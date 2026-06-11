@@ -51,7 +51,7 @@ use crate::{
     ImageGenerationError, ImageGenerationParams, ImageGenerationResponseWithBytes,
     InferenceProvider, ListModelsError, ModelInfo, ModelsResponse, PrivacyClassifyError,
     RerankError, RerankParams, RerankResponse, SSEEvent, ScoreError, ScoreParams, ScoreResponse,
-    StreamingResult,
+    StreamChunk, StreamingResult,
 };
 
 /// Sane fallback when a non-positive timeout is supplied; a non-positive value
@@ -370,16 +370,19 @@ const INTERNAL_KEYS: &[&str] = {
     ]
 };
 
-/// Rewrite the `model` field of a decrypted OpenAI SSE event's `data:` JSON to the
-/// canonical id, so a streamed `model` never leaks the chute slug. Only touches
-/// chunk-bearing data lines; control events ([DONE], blanks, the keyed init) have
-/// no chunk and pass through unchanged. On any parse failure the event is returned
-/// as-is (never drop a chunk over a rewrite). `chunk` is left as parsed — it's
-/// internal-only (clients receive `raw_bytes`; usage/billing keys on the resolved
-/// canonical model, not the chunk).
-fn rewrite_sse_event_model(ev: SSEEvent, canonical: &str) -> SSEEvent {
+/// Rewrite the `model` field of a decrypted OpenAI SSE event to the canonical id —
+/// in BOTH `raw_bytes` (the byte-exact passthrough path) AND the parsed `chunk`
+/// (the route re-serializes from `chunk`, not `raw_bytes`, on the auto-redact /
+/// alias-served paths — so leaving the slug there would still leak it). Only
+/// touches chunk-bearing data lines; control events ([DONE], blanks, the keyed
+/// init) have no chunk and pass through unchanged. On any parse failure the event
+/// is returned as-is (never drop a chunk over a rewrite).
+fn rewrite_sse_event_model(mut ev: SSEEvent, canonical: &str) -> SSEEvent {
     if ev.chunk.is_none() {
         return ev;
+    }
+    if let Some(StreamChunk::Chat(c)) = &mut ev.chunk {
+        c.model = canonical.to_string();
     }
     let Ok(s) = std::str::from_utf8(&ev.raw_bytes) else {
         return ev;
@@ -469,12 +472,13 @@ const UNSUPPORTED: &str =
 #[async_trait]
 impl InferenceProvider for Provider {
     async fn models(&self) -> Result<ModelsResponse, ListModelsError> {
-        // The model set is configured explicitly; advertise just this one.
+        // The model set is configured explicitly; advertise just this one, under the
+        // CANONICAL id (never the upstream `-TEE` chute slug).
         Ok(ModelsResponse {
             object: "list".to_string(),
             data: vec![ModelInfo {
                 created: 0,
-                id: self.model_name.clone(),
+                id: self.canonical_id.clone(),
                 object: "model".to_string(),
                 owned_by: "chutes".to_string(),
             }],
@@ -742,7 +746,8 @@ impl InferenceProvider for Provider {
             let mut m = serde_json::Map::new();
             m.insert("provider".to_string(), json!("chutes"));
             m.insert("verified".to_string(), json!(true));
-            m.insert("model".to_string(), json!(self.model_name));
+            // Client-visible surface: report the canonical id, never the chute slug.
+            m.insert("model".to_string(), json!(self.canonical_id));
             m.insert("instance_id".to_string(), json!(info.instance_id));
             m.insert(
                 "measurement_config".to_string(),
@@ -913,9 +918,18 @@ mod tests {
         let s = std::str::from_utf8(&out.raw_bytes).unwrap();
         assert!(
             s.contains("zai-org/GLM-5.1-FP8"),
-            "data chunk model rewritten"
+            "data chunk model rewritten in raw_bytes"
         );
-        assert!(!s.contains("GLM-5.1-TEE"), "slug must not leak");
+        assert!(
+            !s.contains("GLM-5.1-TEE"),
+            "slug must not leak in raw_bytes"
+        );
+        // The PARSED chunk's model must also be canonical — the route re-serializes
+        // from `chunk` (not raw_bytes) on the auto-redact / alias-served paths.
+        match &out.chunk {
+            Some(StreamChunk::Chat(c)) => assert_eq!(c.model, "zai-org/GLM-5.1-FP8"),
+            other => panic!("expected a rewritten Chat chunk, got {other:?}"),
+        }
 
         // A control event (no chunk: [DONE]/blank) passes through unchanged.
         let ctrl = SSEEvent {

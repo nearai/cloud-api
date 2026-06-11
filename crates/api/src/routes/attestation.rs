@@ -1,4 +1,4 @@
-use crate::routes::api::AppState;
+use crate::{models::ErrorResponse, routes::api::AppState};
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
@@ -68,23 +68,14 @@ pub async fn get_signature(
     Query(params): Query<SignatureQuery>,
     State(app_state): State<AppState>,
 ) -> Result<ResponseJson<serde_json::Value>, (StatusCode, ResponseJson<ErrorResponse>)> {
+    validate_signing_algo(params.signing_algo.as_deref())?;
+
     let signing_algo = params.signing_algo;
     let result = app_state
         .attestation_service
         .get_chat_signature(chat_id.as_str(), signing_algo)
         .await
-        .map_err(|e| {
-            let status_code = match e {
-                AttestationError::SignatureNotFound(_) => StatusCode::NOT_FOUND,
-                _ => StatusCode::INTERNAL_SERVER_ERROR,
-            };
-            (
-                status_code,
-                ResponseJson(ErrorResponse {
-                    error: e.to_string(),
-                }),
-            )
-        })?;
+        .map_err(signature_error_response)?;
 
     // Handle both Found and Unavailable results
     match result {
@@ -93,12 +84,7 @@ pub async fn get_signature(
             serde_json::to_value(response)
                 .map(ResponseJson)
                 .map_err(|e| {
-                    (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        ResponseJson(ErrorResponse {
-                            error: format!("Failed to serialize signature response: {e}"),
-                        }),
-                    )
+                    internal_error_response(format!("Failed to serialize signature response: {e}"))
                 })
         }
         SignatureLookupResult::Unavailable {
@@ -112,12 +98,9 @@ pub async fn get_signature(
             serde_json::to_value(response)
                 .map(ResponseJson)
                 .map_err(|e| {
-                    (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        ResponseJson(ErrorResponse {
-                            error: format!("Failed to serialize unavailable response: {e}"),
-                        }),
-                    )
+                    internal_error_response(format!(
+                        "Failed to serialize unavailable response: {e}"
+                    ))
                 })
         }
     }
@@ -257,15 +240,17 @@ pub async fn get_attestation_report(
                 if crate::routes::common::no_aliasing_requested(&headers) {
                     return Err((
                         StatusCode::BAD_REQUEST,
-                        ResponseJson(ErrorResponse {
-                            error: format!(
+                        ResponseJson(ErrorResponse::with_param(
+                            format!(
                                 "Model '{requested}' is an alias of '{}' and the request set \
                                  {}. Use the canonical model name '{}'.",
                                 m.model_name,
                                 crate::routes::common::HEADER_NO_ALIASING,
                                 m.model_name
                             ),
-                        }),
+                            "invalid_request_error".to_string(),
+                            "model".to_string(),
+                        )),
                     ));
                 }
                 alias_resolved = Some((requested.clone(), m.model_name));
@@ -283,9 +268,10 @@ pub async fn get_attestation_report(
                 if crate::routes::common::no_aliasing_requested(&headers) {
                     return Err((
                         StatusCode::INTERNAL_SERVER_ERROR,
-                        ResponseJson(ErrorResponse {
-                            error: "Failed to resolve model for x-no-aliasing check".to_string(),
-                        }),
+                        ResponseJson(ErrorResponse::new(
+                            "Failed to resolve model for x-no-aliasing check".to_string(),
+                            "internal_server_error".to_string(),
+                        )),
                     ));
                 }
             }
@@ -302,14 +288,7 @@ pub async fn get_attestation_report(
             params.include_tls_fingerprint.unwrap_or(false),
         )
         .await
-        .map_err(|e| {
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                ResponseJson(ErrorResponse {
-                    error: e.to_string(),
-                }),
-            )
-        })?;
+        .map_err(attestation_report_error_response)?;
 
     let response: AttestationResponse = report.into();
     let mut http_response = axum::response::IntoResponse::into_response(ResponseJson(response));
@@ -366,8 +345,182 @@ impl From<services::attestation::models::DstackCpuQuote> for QuoteResponse {
     }
 }
 
-/// Error response
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct ErrorResponse {
-    pub error: String,
+fn validate_signing_algo(
+    signing_algo: Option<&str>,
+) -> Result<(), (StatusCode, ResponseJson<ErrorResponse>)> {
+    match signing_algo.map(str::to_ascii_lowercase).as_deref() {
+        None | Some("ecdsa") | Some("ed25519") => Ok(()),
+        Some(signing_algo) => Err(error_response(
+            StatusCode::BAD_REQUEST,
+            format!("Invalid signing algorithm: {signing_algo}, must be 'ecdsa' or 'ed25519'"),
+            "invalid_request_error",
+            Some("signing_algo"),
+        )),
+    }
+}
+
+fn signature_error_response(error: AttestationError) -> (StatusCode, ResponseJson<ErrorResponse>) {
+    let message = error.to_string();
+    match &error {
+        AttestationError::SignatureNotFound(_) => {
+            error_response(StatusCode::NOT_FOUND, message, "not_found_error", None)
+        }
+        AttestationError::InvalidParameter(detail) => error_response(
+            StatusCode::BAD_REQUEST,
+            message,
+            "invalid_request_error",
+            invalid_parameter_name(detail),
+        ),
+        AttestationError::ClientError(_) => error_response(
+            StatusCode::BAD_REQUEST,
+            message,
+            "invalid_request_error",
+            None,
+        ),
+        AttestationError::ProviderError(_)
+        | AttestationError::RepositoryError(_)
+        | AttestationError::InternalError(_) => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            message,
+            "internal_server_error",
+            None,
+        ),
+    }
+}
+
+fn attestation_report_error_response(
+    error: AttestationError,
+) -> (StatusCode, ResponseJson<ErrorResponse>) {
+    let message = error.to_string();
+    match &error {
+        AttestationError::InvalidParameter(detail) => error_response(
+            StatusCode::BAD_REQUEST,
+            message,
+            "invalid_request_error",
+            invalid_parameter_name(detail),
+        ),
+        AttestationError::ClientError(_) => error_response(
+            StatusCode::BAD_REQUEST,
+            message,
+            "invalid_request_error",
+            None,
+        ),
+        AttestationError::ProviderError(_) => error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            message,
+            "provider_error",
+            None,
+        ),
+        AttestationError::SignatureNotFound(_) => {
+            error_response(StatusCode::NOT_FOUND, message, "not_found_error", None)
+        }
+        AttestationError::RepositoryError(_) | AttestationError::InternalError(_) => {
+            error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                message,
+                "internal_server_error",
+                None,
+            )
+        }
+    }
+}
+
+fn internal_error_response(message: String) -> (StatusCode, ResponseJson<ErrorResponse>) {
+    error_response(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        message,
+        "internal_server_error",
+        None,
+    )
+}
+
+fn error_response(
+    status: StatusCode,
+    message: String,
+    error_type: &str,
+    param: Option<&str>,
+) -> (StatusCode, ResponseJson<ErrorResponse>) {
+    let body = match param {
+        Some(param) => {
+            ErrorResponse::with_param(message, error_type.to_string(), param.to_string())
+        }
+        None => ErrorResponse::new(message, error_type.to_string()),
+    };
+
+    (status, ResponseJson(body))
+}
+
+fn invalid_parameter_name(message: &str) -> Option<&'static str> {
+    let message = message.to_ascii_lowercase();
+    if message.contains("nonce") {
+        Some("nonce")
+    } else if message.contains("signing algorithm") || message.contains("signing_algo") {
+        Some("signing_algo")
+    } else if message.contains("signing address") {
+        Some("signing_address")
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn signature_not_found_uses_standard_not_found_envelope() {
+        let (status, ResponseJson(body)) = signature_error_response(
+            AttestationError::SignatureNotFound("chatcmpl-test:ecdsa".to_string()),
+        );
+
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(
+            body.error.message,
+            "Signature not found: chatcmpl-test:ecdsa"
+        );
+        assert_eq!(body.error.r#type, "not_found_error");
+        assert_eq!(body.error.param, None);
+        assert_eq!(body.error.code, None);
+    }
+
+    #[test]
+    fn invalid_report_nonce_is_400_with_param() {
+        let (status, ResponseJson(body)) =
+            attestation_report_error_response(AttestationError::InvalidParameter(
+                "Nonce must be exactly 32 bytes, got 1 bytes".to_string(),
+            ));
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            body.error.message,
+            "Invalid parameter: Nonce must be exactly 32 bytes, got 1 bytes"
+        );
+        assert_eq!(body.error.r#type, "invalid_request_error");
+        assert_eq!(body.error.param.as_deref(), Some("nonce"));
+        assert_eq!(body.error.code, None);
+    }
+
+    #[test]
+    fn invalid_signature_algorithm_is_rejected_before_lookup() {
+        let (status, ResponseJson(body)) =
+            validate_signing_algo(Some("rsa")).expect_err("rsa must be rejected");
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            body.error.message,
+            "Invalid signing algorithm: rsa, must be 'ecdsa' or 'ed25519'"
+        );
+        assert_eq!(body.error.r#type, "invalid_request_error");
+        assert_eq!(body.error.param.as_deref(), Some("signing_algo"));
+        assert_eq!(body.error.code, None);
+    }
+
+    #[test]
+    fn supported_signature_algorithms_are_accepted() {
+        assert!(validate_signing_algo(None).is_ok());
+        assert!(validate_signing_algo(Some("ecdsa")).is_ok());
+        assert!(validate_signing_algo(Some("ed25519")).is_ok());
+        assert!(validate_signing_algo(Some("ECDSA")).is_ok());
+        assert!(validate_signing_algo(Some("ED25519")).is_ok());
+    }
 }

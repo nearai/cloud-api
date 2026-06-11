@@ -221,11 +221,12 @@ impl ChutesInstanceVerifier for ChutesBackendVerifier {
 /// Live cross-checks against genuine, DCAP-signature-verified, report-data-bound
 /// quotes (the measurement check runs only *after* the Intel signature chain and
 /// the nonce/e2e-key/SPKI bindings pass, so observed registers are trustworthy):
-///   - `8xh200 v1.3.0`         — GLM-5.1-TEE, 6/6 quotes (2026-06-10); and
-///                               kimi-k2.5 / deepseek-v3.2 / minimax-m2.5 served
-///                               live over E2EE (2026-06-11).
-///   - `8xRTX_PRO_6000 v1.3.0` — Qwen3-32B-TEE, observed register set matched the
-///                               published row byte-for-byte (2026-06-11).
+///
+/// - `8xh200 v1.3.0` — GLM-5.1-TEE, 6/6 quotes (2026-06-10); and kimi-k2.5 /
+///   deepseek-v3.2 / minimax-m2.5 served live over E2EE (2026-06-11).
+/// - `8xRTX_PRO_6000 v1.3.0` — Qwen3-32B-TEE, observed register set matched the
+///   published row byte-for-byte (2026-06-11).
+///
 /// The remaining Blackwell rows (b200 / b200-eth / b300) are taken from the same
 /// published v1.3.0 release and carry the identical software identity; they are
 /// accepted so a model scheduled onto Blackwell hardware serves without a
@@ -257,8 +258,8 @@ pub fn vetted_golden_measurements() -> ChutesMeasurementPolicy {
 
     ChutesMeasurementPolicy::new(
         hardware_rows
-            .iter()
-            .map(|&(name, rtmr0)| {
+            .into_iter()
+            .map(|(name, rtmr0)| {
                 ExpectedMeasurement::new(name, "1.3.0", MRTD, rtmr0, RTMR1, RTMR2, RTMR3)
             })
             .collect(),
@@ -350,11 +351,60 @@ mod tests {
         // Per-hardware RTMR0 (the only register that differs within v1.3.0).
         const RTMR0_H200: &str = "2864b11878e8129095d62a5dd7c3e3aae178d3a077606a825617324768f189ad05aed08376947df92d6c75865d915cbf";
         const RTMR0_RTX_PRO_6000: &str = "5064826bfd530ca9f823ceecb74899d7dbd014b60897a77317a14200c8706f2368ecbbc0a04cec8ceef90474b8c955e1";
+        const RTMR0_B200: &str = "734628b9a715ec492c2b14b409907f32d91847f439ba8bac2fa985b41c01245536348fefb2e021ed574c290c8c50347a";
+        const RTMR0_B200_ETH: &str = "724c1d0d20c11a479d2874fa543b0f1b920be32f2a5b9707fa5bcf6176fff31aeac9436e541e1125f78a0b61f7c2e165";
+        const RTMR0_B300: &str = "31f6446add906b7d56132c600549270a8ea780193e0c89586f784b20b25136de441ca715d5ecf86ae72f0b40f7a47f39";
+
+        // Accept the v1.3.0 software identity on `rtmr0`, asserting the matched
+        // row is `name`. Drives the full register set through `verify()`.
+        fn accepts(rtmr0: &str, name: &str) {
+            let policy = vetted_golden_measurements();
+            let matched = policy
+                .verify(
+                    &reg(MRTD),
+                    &reg(rtmr0),
+                    &reg(RTMR1),
+                    &reg(RTMR2),
+                    &reg(RTMR3),
+                )
+                .unwrap_or_else(|e| panic!("{name} v1.3.0 must be accepted: {e}"));
+            assert_eq!(matched.name, name);
+            assert_eq!(matched.version, "1.3.0");
+        }
+
+        #[test]
+        fn every_vetted_row_is_well_formed_48_byte_hex() {
+            // Guards against a transcription typo (wrong length / non-hex char) in
+            // any pinned row — especially the three Blackwell rows whose RTMR0 is
+            // only exercised positively by the per-SKU tests below. `verify()`
+            // runs `assert_enforceable()` per-request, so an InvalidGolden row
+            // would otherwise only surface in production as a fail-closed reject.
+            vetted_golden_measurements()
+                .assert_enforceable()
+                .expect("all pinned golden rows must be valid 48-byte hex");
+        }
 
         #[test]
         fn covers_the_full_v130_hardware_family() {
-            // All five published v1.3.0 hardware platforms are accepted.
+            // All five published v1.3.0 hardware platforms are accepted — by name,
+            // so swapping a row for a different config (count unchanged) still fails.
             assert_eq!(vetted_golden_measurements().len(), 5);
+            accepts(RTMR0_H200, "8xh200");
+            accepts(RTMR0_RTX_PRO_6000, "8xRTX_PRO_6000");
+            accepts(RTMR0_B200, "8xb200");
+            accepts(RTMR0_B200_ETH, "8xb200-eth");
+            accepts(RTMR0_B300, "8xb300");
+        }
+
+        #[test]
+        fn accepts_the_three_blackwell_rows() {
+            // The b200 / b200-eth / b300 rows have no live signature-verified
+            // cross-check yet (documented trade-off); these assert the pinned
+            // RTMR0 literals were copied correctly and map to the right SKU, so a
+            // typo fails a specific test rather than only the count check.
+            accepts(RTMR0_B200, "8xb200");
+            accepts(RTMR0_B200_ETH, "8xb200-eth");
+            accepts(RTMR0_B300, "8xb300");
         }
 
         #[test]

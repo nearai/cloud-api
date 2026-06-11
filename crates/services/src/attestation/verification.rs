@@ -127,6 +127,15 @@ impl AttestationVerifier {
         Self::with_policy(MeasurementPolicy::near_from_env(), pccs_url)
     }
 
+    /// Same as [`Self::from_env`] but takes `pccs_url` from the already-parsed
+    /// config instead of re-reading `PCCS_URL` from the environment. This keeps a
+    /// single source of truth for the PCCS endpoint: the pool's NEAR verifier and
+    /// the Chutes verifier (which is constructed from `config.pccs_url`) can no
+    /// longer disagree if the env is mutated after config parse.
+    pub fn near_with_pccs(pccs_url: Option<String>) -> Self {
+        Self::with_policy(MeasurementPolicy::near_from_env(), pccs_url)
+    }
+
     /// Verify an attestation report from an inference backend.
     ///
     /// Performs:

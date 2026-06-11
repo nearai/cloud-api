@@ -197,17 +197,24 @@ impl Provider {
         Ok(hex::encode(b))
     }
 
+    /// Resolve `model_name` → `chute_id`, memoized: the mapping is static, so the
+    /// `/v1/models` lookup happens once per provider. Shared by the data path
+    /// (`verify_and_prepare`) and the attestation-report path so they can't
+    /// diverge (and the report path doesn't re-hit the network each call).
+    async fn cached_chute_id(&self) -> Result<String, String> {
+        self.chute_id_cache
+            .get_or_try_init(|| self.client.resolve_chute_id(&self.model_name))
+            .await
+            .map_err(|e| format!("resolve chute_id: {e}"))
+            .cloned()
+    }
+
     /// Discover → fetch evidence → **verify** a Chutes instance, then build the
     /// E2EE request blob for `request_json`. Returns an error (never an
     /// unverified channel) if any stage fails.
     async fn verify_and_prepare(&self, request_json: &Value) -> Result<PreparedInvoke, String> {
         // Cached: the model→chute_id mapping is static, so resolve once.
-        let chute_id = self
-            .chute_id_cache
-            .get_or_try_init(|| self.client.resolve_chute_id(&self.model_name))
-            .await
-            .map_err(|e| format!("resolve chute_id: {e}"))?
-            .clone();
+        let chute_id = self.cached_chute_id().await?;
 
         let instances = self
             .client
@@ -344,10 +351,21 @@ fn request_body(model: &str, params: &ChatCompletionParams, stream: bool) -> Res
             // billed and counted against org limits (the OpenAI-compatible
             // default omits it, and our SSE adapter drops Chutes' outer
             // usage-only events). Matches every other provider.
-            obj.insert(
-                "stream_options".to_string(),
-                json!({ "include_usage": true }),
-            );
+            //
+            // Merge into any client-supplied `stream_options` (e.g.
+            // `continuous_usage_stats`) rather than clobbering the whole object —
+            // we only need to *guarantee* `include_usage`.
+            match obj.get_mut("stream_options").and_then(Value::as_object_mut) {
+                Some(existing) => {
+                    existing.insert("include_usage".to_string(), json!(true));
+                }
+                None => {
+                    obj.insert(
+                        "stream_options".to_string(),
+                        json!({ "include_usage": true }),
+                    );
+                }
+            }
         }
         // Strip internal identifiers + client-E2EE markers so they never reach
         // Chutes inside the (encrypted) request body.
@@ -556,23 +574,29 @@ impl InferenceProvider for Provider {
         _signing_address: Option<String>,
         _include_tls_fingerprint: bool,
     ) -> Result<serde_json::Map<String, serde_json::Value>, AttestationError> {
+        // Same memoized chute_id + candidate-iteration as the data path
+        // (`verify_and_prepare`), so the report can't verify a different instance
+        // than the one that would actually serve, and a single bad instance
+        // doesn't fail the whole report.
         let chute_id = self
-            .client
-            .resolve_chute_id(&self.model_name)
+            .cached_chute_id()
             .await
-            .map_err(|e| AttestationError::FetchError(format!("resolve chute_id: {e}")))?;
+            .map_err(AttestationError::FetchError)?;
         let instances = self
             .client
             .discover_instances(&chute_id)
             .await
             .map_err(|e| AttestationError::FetchError(format!("discover instances: {e}")))?;
-        let inst = instances
+        let candidates: Vec<&client::E2eInstance> = instances
             .instances
             .iter()
-            .find(|i| !i.e2e_pubkey.is_empty())
-            .ok_or_else(|| {
-                AttestationError::FetchError("no E2E-capable Chutes instance".to_string())
-            })?;
+            .filter(|i| !i.e2e_pubkey.is_empty())
+            .collect();
+        if candidates.is_empty() {
+            return Err(AttestationError::FetchError(
+                "no E2E-capable Chutes instance".to_string(),
+            ));
+        }
 
         // Honor the caller's nonce only if it's a **bare** 32-byte hex value (no
         // `0x`) — one consistent policy with `ChutesReportDataVerifier`, which
@@ -590,36 +614,53 @@ impl InferenceProvider for Provider {
             .fetch_evidence(&chute_id, &boot_nonce)
             .await
             .map_err(|e| AttestationError::FetchError(format!("fetch evidence: {e}")))?;
-        let evidence = evidence_resp.instance(&inst.instance_id).ok_or_else(|| {
-            AttestationError::FetchError("chosen instance not present in /evidence".to_string())
-        })?;
 
-        // Trim to match the data path's canonicalization (verify_and_prepare).
-        let e2e_pubkey = inst.e2e_pubkey.trim();
-        let info = self
-            .verifier
-            .attest_instance(evidence, &boot_nonce, e2e_pubkey)
-            .await
-            .map_err(|e| AttestationError::FetchError(format!("attestation failed: {e}")))?;
+        // Try each candidate until one verifies (mirrors verify_and_prepare).
+        let mut last_err = String::from("no candidate instances");
+        for inst in candidates {
+            let evidence = match evidence_resp.instance(&inst.instance_id) {
+                Some(e) => e,
+                None => {
+                    last_err = format!("instance {} not present in /evidence", inst.instance_id);
+                    continue;
+                }
+            };
+            // Trim to match the data path's canonicalization (verify_and_prepare).
+            let e2e_pubkey = inst.e2e_pubkey.trim();
+            let info = match self
+                .verifier
+                .attest_instance(evidence, &boot_nonce, e2e_pubkey)
+                .await
+            {
+                Ok(info) => info,
+                Err(e) => {
+                    last_err = format!("instance {} attestation failed: {e}", inst.instance_id);
+                    continue;
+                }
+            };
 
-        // A self-describing, independently re-verifiable report: the verdict plus
-        // the raw quote + cert so a client can recompute the bindings themselves.
-        let mut m = serde_json::Map::new();
-        m.insert("provider".to_string(), json!("chutes"));
-        m.insert("verified".to_string(), json!(true));
-        m.insert("model".to_string(), json!(self.model_name));
-        m.insert("instance_id".to_string(), json!(info.instance_id));
-        m.insert(
-            "measurement_config".to_string(),
-            json!(info.measurement_config),
-        );
-        m.insert("tcb_status".to_string(), json!(info.tcb_status));
-        m.insert("gpu_verdict".to_string(), json!(info.gpu_verdict));
-        m.insert("e2e_pubkey".to_string(), json!(info.e2e_pubkey));
-        m.insert("nonce".to_string(), json!(boot_nonce));
-        m.insert("quote_b64".to_string(), json!(evidence.quote));
-        m.insert("certificate_b64".to_string(), json!(evidence.certificate));
-        Ok(m)
+            // A self-describing, independently re-verifiable report: the verdict
+            // plus the raw quote + cert so a client can recompute the bindings.
+            let mut m = serde_json::Map::new();
+            m.insert("provider".to_string(), json!("chutes"));
+            m.insert("verified".to_string(), json!(true));
+            m.insert("model".to_string(), json!(self.model_name));
+            m.insert("instance_id".to_string(), json!(info.instance_id));
+            m.insert(
+                "measurement_config".to_string(),
+                json!(info.measurement_config),
+            );
+            m.insert("tcb_status".to_string(), json!(info.tcb_status));
+            m.insert("gpu_verdict".to_string(), json!(info.gpu_verdict));
+            m.insert("e2e_pubkey".to_string(), json!(info.e2e_pubkey));
+            m.insert("nonce".to_string(), json!(boot_nonce));
+            m.insert("quote_b64".to_string(), json!(evidence.quote));
+            m.insert("certificate_b64".to_string(), json!(evidence.certificate));
+            return Ok(m);
+        }
+        Err(AttestationError::FetchError(format!(
+            "all candidate Chutes instances failed attestation; last: {last_err}"
+        )))
     }
 
     /// Chutes' response integrity is the ML-KEM E2EE channel's AEAD tag, not a
@@ -726,6 +767,22 @@ mod tests {
         let body = request_body("m", &params, false).unwrap();
         assert_eq!(body["stream"], false);
         assert!(body.get("stream_options").is_none());
+    }
+
+    #[test]
+    fn request_body_merges_client_stream_options() {
+        // A client-supplied stream_options (here arriving via `extra`, e.g.
+        // continuous_usage_stats) must be preserved — we only force include_usage
+        // for billing, we don't clobber the whole object.
+        let mut params: ChatCompletionParams =
+            serde_json::from_value(json!({"model": "m", "messages": []})).unwrap();
+        params.extra.insert(
+            "stream_options".to_string(),
+            json!({"continuous_usage_stats": true}),
+        );
+        let body = request_body("m", &params, true).unwrap();
+        assert_eq!(body["stream_options"]["include_usage"], true);
+        assert_eq!(body["stream_options"]["continuous_usage_stats"], true);
     }
 
     #[test]

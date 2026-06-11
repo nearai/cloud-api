@@ -483,6 +483,11 @@ impl PoolBackendVerifier {
 impl InferenceProviderPool {
     /// Create a new pool with optional API key for backend authentication
     pub fn new(api_key: Option<String>, external_configs: ExternalProvidersConfig) -> Self {
+        // Single source of truth for the PCCS endpoint: build the NEAR verifier
+        // from the parsed config's `pccs_url` rather than re-reading `PCCS_URL`
+        // from the environment, so it can't diverge from the Chutes verifier
+        // (which is constructed from the same config field).
+        let pccs_url = external_configs.pccs_url.clone();
         Self {
             api_key,
             provider_mappings: Arc::new(RwLock::new(ProviderMappings::new())),
@@ -494,7 +499,7 @@ impl InferenceProviderPool {
             inference_url_providers: Arc::new(RwLock::new(HashMap::new())),
             inference_url_fingerprint_states: Arc::new(RwLock::new(HashMap::new())),
             tls_roots: SharedTlsRoots::load(),
-            attestation_verifier: Arc::new(AttestationVerifier::from_env()),
+            attestation_verifier: Arc::new(AttestationVerifier::near_with_pccs(pccs_url)),
             pinned_models: Arc::new(std::sync::RwLock::new(std::collections::HashSet::new())),
         }
     }

@@ -60,6 +60,13 @@ fn done_event() -> SSEEvent {
 fn inner_event(plaintext: &[u8]) -> Result<Option<SSEEvent>, CompletionError> {
     let s = String::from_utf8_lossy(plaintext);
     let s = s.trim();
+    // An SSE comment / keepalive line (e.g. `: ping`) — vLLM/SGLang backends emit
+    // these, so a decrypted frame can legitimately be one. Skip it: feeding `:
+    // ping` to the JSON parser below would be a fatal error that kills an
+    // otherwise-healthy stream. (The outer loop skips these too, line ~177.)
+    if s.is_empty() || s.starts_with(':') {
+        return Ok(None);
+    }
     // Tolerate either a full `data: ...` SSE line or a bare JSON payload.
     let content = s.strip_prefix("data:").map(str::trim).unwrap_or(s);
     if content.is_empty() {
@@ -249,6 +256,17 @@ mod tests {
             .unwrap()
             .is_done_marker());
         assert!(inner_event(b"   ").unwrap().is_none());
+    }
+
+    #[test]
+    fn inner_event_skips_keepalive_comment() {
+        // A decrypted SSE comment / keepalive line (vLLM/SGLang emit these) must
+        // be skipped, not fed to the JSON parser — otherwise a healthy stream dies
+        // with a parse error mid-flight.
+        assert!(inner_event(b": ping").unwrap().is_none());
+        assert!(inner_event(b":keepalive").unwrap().is_none());
+        // Still a fatal error for genuinely non-JSON data content.
+        assert!(inner_event(b"data: not json").is_err());
     }
 
     #[tokio::test]

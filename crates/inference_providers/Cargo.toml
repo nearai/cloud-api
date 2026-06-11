@@ -32,9 +32,10 @@ regex = "1"
 sha2 = "0.11"
 url = "2.5"
 # Chutes E2EE transport: ML-KEM-768 (FIPS 203) + HKDF-SHA256 + ChaCha20-Poly1305.
-# ml-kem 0.3.2 is pinned to match Chutes' own RustCrypto reference client
-# (github.com/chutesai/e2ee-test), which interoperates with their server.
-ml-kem = { version = "0.3.2", features = ["getrandom"] }
+# Exact-pinned (`=`) to match Chutes' own RustCrypto reference client
+# (github.com/chutesai/e2ee-test), which interoperates with their server — a
+# floated minor could change the KEM wire encoding and silently break interop.
+ml-kem = { version = "=0.3.2", features = ["getrandom"] }
 hkdf = "0.13"
 chacha20poly1305 = "0.10"
 flate2 = "1"

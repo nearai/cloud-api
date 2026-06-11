@@ -321,6 +321,63 @@ fn sse_error_frame(e: &inference_providers::CompletionError) -> Bytes {
     Bytes::from(format!("data: {payload}\n\n"))
 }
 
+fn chat_stream_include_usage_requested(request: &ChatCompletionRequest) -> bool {
+    request
+        .extra
+        .get("stream_options")
+        .cloned()
+        .and_then(|stream_options| {
+            serde_json::from_value::<inference_providers::models::StreamOptions>(stream_options)
+                .ok()
+        })
+        .and_then(|stream_options| stream_options.include_usage)
+        .unwrap_or(false)
+}
+
+fn chat_stream_has_non_text_modalities(request: &ChatCompletionRequest) -> bool {
+    request
+        .extra
+        .get("modalities")
+        .and_then(|modalities| serde_json::from_value::<Vec<String>>(modalities.clone()).ok())
+        .is_some_and(|modalities| {
+            modalities
+                .iter()
+                .any(|modality| !modality.eq_ignore_ascii_case("text"))
+        })
+}
+
+fn prepare_chat_stream_chunk_for_client(
+    chunk: &mut inference_providers::models::ChatCompletionChunk,
+    include_usage: bool,
+) -> bool {
+    let is_usage_only_chunk = chunk.choices.is_empty() && chunk.usage.is_some();
+    if !include_usage && is_usage_only_chunk {
+        return false;
+    }
+
+    let has_terminal_choice = chunk
+        .choices
+        .iter()
+        .any(|choice| choice.finish_reason.is_some());
+    let has_final_usage = is_usage_only_chunk || has_terminal_choice;
+    if !include_usage || !has_final_usage {
+        chunk.usage = None;
+    }
+    true
+}
+
+fn prepare_stream_chunk_for_client(
+    chunk: &mut inference_providers::StreamChunk,
+    include_usage: bool,
+) -> bool {
+    match chunk {
+        inference_providers::StreamChunk::Chat(chat) => {
+            prepare_chat_stream_chunk_for_client(chat, include_usage)
+        }
+        inference_providers::StreamChunk::Text(_) => true,
+    }
+}
+
 // Helper function to extract inference ID from a parsed stream chunk
 fn extract_inference_id_from_chunk(chunk: &inference_providers::StreamChunk) -> Uuid {
     let id = match chunk {
@@ -1174,6 +1231,9 @@ async fn chat_completions_inner(
     // Add validated headers to service_request.extra
     insert_encryption_headers(&encryption_headers, &mut service_request.extra);
     let e2ee_active = e2ee_requested(&encryption_headers);
+    let include_stream_usage_in_response = chat_stream_include_usage_requested(&request);
+    let rewrite_public_stream_usage =
+        !e2ee_active && !chat_stream_has_non_text_modalities(&request);
 
     // Strict alias mode: refuse to serve through an alias before any
     // inference happens (issue #573).
@@ -1344,14 +1404,16 @@ async fn chat_completions_inner(
                         let map = redaction_map_for_chunks.clone();
                         let pending_warning = alias_warning_pending.clone();
                         let upstream_done = upstream_done_forwarded.clone();
+                        let include_stream_usage_in_response = include_stream_usage_in_response;
+                        let rewrite_public_stream_usage = rewrite_public_stream_usage;
                         async move {
                             match result {
                                 Ok(event) => {
-                                    // Byte-exact passthrough (issue #701): the upstream
-                                    // emits OpenAI-format SSE and no chunk rewriting is
-                                    // active, so forward the wire bytes untouched. This
-                                    // keeps sha256(received bytes) reproducible against
-                                    // the response hash signed inside the inference TEE.
+                                    // Byte-exact passthrough (issue #701): when no public
+                                    // chunk rewriting is active, forward the upstream wire
+                                    // bytes untouched. Public stream usage shaping (#646)
+                                    // needs parsed-chunk serialization for normal responses;
+                                    // encrypted streams stay opaque and preserve passthrough.
                                     //
                                     // Disabled for alias-served responses: those inject
                                     // a top-level `warning` into the first chunk (below),
@@ -1361,6 +1423,7 @@ async fn chat_completions_inner(
                                     if event.raw_passthrough
                                         && !auto_redact_enabled
                                         && !alias_served
+                                        && !rewrite_public_stream_usage
                                     {
                                         if event.is_done_marker() {
                                             upstream_done
@@ -1376,6 +1439,14 @@ async fn chat_completions_inner(
                                     // here; the end-of-stream tail appends the gateway's
                                     // own [DONE] terminator.
                                     let mut chunk = event.chunk?;
+                                    if rewrite_public_stream_usage
+                                        && !prepare_stream_chunk_for_client(
+                                            &mut chunk,
+                                            include_stream_usage_in_response,
+                                        )
+                                    {
+                                        return None;
+                                    }
 
                                     if auto_redact_enabled {
                                         // Cache a template for the synthetic
@@ -2479,6 +2550,169 @@ mod tests {
             modality: None,
             extra: Default::default(),
         })
+    }
+
+    fn chat_request_with_include_usage(include_usage: Option<bool>) -> ChatCompletionRequest {
+        let mut extra = std::collections::HashMap::new();
+        if let Some(include_usage) = include_usage {
+            extra.insert(
+                "stream_options".to_string(),
+                serde_json::json!({ "include_usage": include_usage }),
+            );
+        }
+        ChatCompletionRequest {
+            model: "test-model".to_string(),
+            messages: vec![],
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            n: None,
+            stream: Some(true),
+            stop: None,
+            presence_penalty: None,
+            frequency_penalty: None,
+            extra,
+        }
+    }
+
+    fn chat_stream_chunk_with_usage(
+        choices: Vec<inference_providers::models::ChatChoice>,
+    ) -> inference_providers::models::ChatCompletionChunk {
+        inference_providers::models::ChatCompletionChunk {
+            id: "chatcmpl-test".to_string(),
+            object: "chat.completion.chunk".to_string(),
+            created: 1234567890,
+            model: "test-model".to_string(),
+            system_fingerprint: None,
+            choices,
+            usage: Some(inference_providers::models::TokenUsage::new(10, 5)),
+            prompt_token_ids: None,
+            modality: None,
+            extra: Default::default(),
+        }
+    }
+
+    fn chat_stream_content_choice() -> inference_providers::models::ChatChoice {
+        inference_providers::models::ChatChoice {
+            index: 0,
+            delta: Some(inference_providers::models::ChatDelta {
+                role: None,
+                content: Some("hello".to_string()),
+                name: None,
+                tool_call_id: None,
+                tool_calls: None,
+                reasoning_content: None,
+                reasoning: None,
+                extra: Default::default(),
+            }),
+            logprobs: None,
+            finish_reason: None,
+            token_ids: None,
+        }
+    }
+
+    fn chat_stream_finish_choice() -> inference_providers::models::ChatChoice {
+        inference_providers::models::ChatChoice {
+            finish_reason: Some(inference_providers::models::FinishReason::Stop),
+            ..chat_stream_content_choice()
+        }
+    }
+
+    #[test]
+    fn chat_stream_include_usage_defaults_to_false() {
+        let request = chat_request_with_include_usage(None);
+        assert!(!chat_stream_include_usage_requested(&request));
+
+        let request = chat_request_with_include_usage(Some(false));
+        assert!(!chat_stream_include_usage_requested(&request));
+
+        let request = chat_request_with_include_usage(Some(true));
+        assert!(chat_stream_include_usage_requested(&request));
+    }
+
+    #[test]
+    fn chat_stream_non_text_modalities_preserve_raw_passthrough() {
+        let mut request = chat_request_with_include_usage(None);
+        assert!(!chat_stream_has_non_text_modalities(&request));
+
+        request.extra.insert(
+            "modalities".to_string(),
+            serde_json::json!(["text", "audio"]),
+        );
+        assert!(chat_stream_has_non_text_modalities(&request));
+
+        request
+            .extra
+            .insert("modalities".to_string(), serde_json::json!(["TEXT"]));
+        assert!(!chat_stream_has_non_text_modalities(&request));
+    }
+
+    #[test]
+    fn default_chat_stream_suppresses_provider_usage_but_serializes_null() {
+        let mut chunk = chat_stream_chunk_with_usage(vec![chat_stream_content_choice()]);
+
+        assert!(prepare_chat_stream_chunk_for_client(&mut chunk, false));
+        assert!(chunk.usage.is_none());
+
+        let serialized = serde_json::to_value(&chunk).expect("chunk should serialize");
+        assert!(
+            serialized
+                .get("usage")
+                .is_some_and(serde_json::Value::is_null),
+            "ordinary chunks should carry usage:null instead of provider usage"
+        );
+    }
+
+    #[test]
+    fn default_chat_stream_drops_provider_usage_only_chunk() {
+        let mut chunk = chat_stream_chunk_with_usage(vec![]);
+
+        assert!(!prepare_chat_stream_chunk_for_client(&mut chunk, false));
+    }
+
+    #[test]
+    fn include_usage_keeps_only_final_usage_chunk_populated() {
+        let mut content_chunk = chat_stream_chunk_with_usage(vec![chat_stream_content_choice()]);
+        assert!(prepare_chat_stream_chunk_for_client(
+            &mut content_chunk,
+            true
+        ));
+        assert!(content_chunk.usage.is_none());
+
+        let content_json = serde_json::to_value(&content_chunk).expect("chunk should serialize");
+        assert!(
+            content_json
+                .get("usage")
+                .is_some_and(serde_json::Value::is_null),
+            "intermediate chunks should carry usage:null"
+        );
+
+        let mut final_chunk = chat_stream_chunk_with_usage(vec![]);
+        assert!(prepare_chat_stream_chunk_for_client(&mut final_chunk, true));
+        assert!(final_chunk.usage.is_some());
+
+        let mut final_choice_chunk =
+            chat_stream_chunk_with_usage(vec![chat_stream_finish_choice()]);
+        assert!(prepare_chat_stream_chunk_for_client(
+            &mut final_choice_chunk,
+            true
+        ));
+        assert!(
+            final_choice_chunk.usage.is_some(),
+            "converter-backed providers can attach final usage to a terminal choice chunk"
+        );
+    }
+
+    #[test]
+    fn default_chat_stream_strips_usage_from_terminal_choice_chunk() {
+        let mut final_choice_chunk =
+            chat_stream_chunk_with_usage(vec![chat_stream_finish_choice()]);
+
+        assert!(prepare_chat_stream_chunk_for_client(
+            &mut final_choice_chunk,
+            false
+        ));
+        assert!(final_choice_chunk.usage.is_none());
     }
 
     #[test]

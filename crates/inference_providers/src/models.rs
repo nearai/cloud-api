@@ -425,8 +425,8 @@ pub struct ChatCompletionChunk {
     /// List of completion choices
     pub choices: Vec<ChatChoice>,
 
-    /// Usage statistics (typically only in final chunk)
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Usage statistics (typically only in final chunk). OpenAI-compatible
+    /// streaming chunks carry this as `null` until final usage is available.
     pub usage: Option<TokenUsage>,
 
     /// Token IDs for the prompt (typically only in first chunk)

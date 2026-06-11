@@ -354,33 +354,66 @@ fn chat_stream_has_non_text_modalities(request: &ChatCompletionRequest) -> bool 
         })
 }
 
+#[cfg(test)]
 fn prepare_chat_stream_chunk_for_client(
     chunk: &mut inference_providers::models::ChatCompletionChunk,
     include_usage: bool,
+) -> bool {
+    let mut final_usage_emitted = false;
+    prepare_chat_stream_chunk_for_client_with_state(chunk, include_usage, &mut final_usage_emitted)
+}
+
+fn prepare_chat_stream_chunk_for_client_with_state(
+    chunk: &mut inference_providers::models::ChatCompletionChunk,
+    include_usage: bool,
+    final_usage_emitted: &mut bool,
 ) -> bool {
     let is_usage_only_chunk = chunk.choices.is_empty() && chunk.usage.is_some();
     if !include_usage && is_usage_only_chunk {
         return false;
     }
 
+    if !include_usage {
+        chunk.usage = None;
+        return true;
+    }
+
     let is_terminal_choice_chunk = chunk
         .choices
         .iter()
         .any(|choice| choice.finish_reason.is_some());
-    let is_final_chunk = is_usage_only_chunk || is_terminal_choice_chunk;
-    if !include_usage || !is_final_chunk {
+    let is_final_usage_chunk =
+        chunk.usage.is_some() && (is_usage_only_chunk || is_terminal_choice_chunk);
+
+    if !is_final_usage_chunk {
         chunk.usage = None;
+        return true;
     }
+
+    if *final_usage_emitted {
+        if is_usage_only_chunk {
+            return false;
+        }
+        chunk.usage = None;
+    } else {
+        *final_usage_emitted = true;
+    }
+
     true
 }
 
 fn prepare_stream_chunk_for_client(
     chunk: &mut inference_providers::StreamChunk,
     include_usage: bool,
+    final_usage_emitted: &mut bool,
 ) -> bool {
     match chunk {
         inference_providers::StreamChunk::Chat(chat) => {
-            prepare_chat_stream_chunk_for_client(chat, include_usage)
+            prepare_chat_stream_chunk_for_client_with_state(
+                chat,
+                include_usage,
+                final_usage_emitted,
+            )
         }
         inference_providers::StreamChunk::Text(_) => true,
     }
@@ -1403,6 +1436,7 @@ async fn chat_completions_inner(
                 let public_signature_enabled = rewrite_public_stream_usage;
                 let public_signature_bytes = Arc::new(tokio::sync::Mutex::new(Vec::new()));
                 let public_signature_chat_id = Arc::new(tokio::sync::Mutex::new(None::<String>));
+                let final_stream_usage_emitted = Arc::new(tokio::sync::Mutex::new(false));
                 let public_signature_bytes_for_chain = public_signature_bytes.clone();
                 let public_signature_chat_id_for_chain = public_signature_chat_id.clone();
                 let attestation_service_for_chain = app_state.attestation_service.clone();
@@ -1424,6 +1458,7 @@ async fn chat_completions_inner(
                         let rewrite_public_stream_usage = rewrite_public_stream_usage;
                         let public_signature_bytes = public_signature_bytes.clone();
                         let public_signature_chat_id = public_signature_chat_id.clone();
+                        let final_stream_usage_emitted = final_stream_usage_emitted.clone();
                         async move {
                             match result {
                                 Ok(event) => {
@@ -1457,13 +1492,16 @@ async fn chat_completions_inner(
                                     // here; the end-of-stream tail appends the gateway's
                                     // own [DONE] terminator.
                                     let mut chunk = event.chunk?;
-                                    if rewrite_public_stream_usage
-                                        && !prepare_stream_chunk_for_client(
+                                    if rewrite_public_stream_usage {
+                                        let mut final_usage_emitted =
+                                            final_stream_usage_emitted.lock().await;
+                                        if !prepare_stream_chunk_for_client(
                                             &mut chunk,
                                             include_stream_usage_in_response,
-                                        )
-                                    {
-                                        return None;
+                                            &mut final_usage_emitted,
+                                        ) {
+                                            return None;
+                                        }
                                     }
 
                                     if auto_redact_enabled {
@@ -2781,6 +2819,26 @@ mod tests {
             final_choice_chunk.usage.is_some(),
             "converter-backed providers can attach final usage to a terminal choice chunk"
         );
+    }
+
+    #[test]
+    fn include_usage_drops_duplicate_usage_only_chunk_after_terminal_usage() {
+        let mut final_usage_emitted = false;
+        let mut final_choice_chunk =
+            chat_stream_chunk_with_usage(vec![chat_stream_finish_choice()]);
+        assert!(prepare_chat_stream_chunk_for_client_with_state(
+            &mut final_choice_chunk,
+            true,
+            &mut final_usage_emitted
+        ));
+        assert!(final_choice_chunk.usage.is_some());
+
+        let mut usage_only_chunk = chat_stream_chunk_with_usage(vec![]);
+        assert!(!prepare_chat_stream_chunk_for_client_with_state(
+            &mut usage_only_chunk,
+            true,
+            &mut final_usage_emitted
+        ));
     }
 
     #[test]

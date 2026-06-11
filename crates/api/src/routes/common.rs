@@ -43,6 +43,10 @@ pub const HEADER_NO_ALIASING: &str = "x-no-aliasing";
 /// parse the body.
 pub const HEADER_MODEL_ALIAS_RESOLVED: &str = "x-model-alias-resolved";
 
+/// Response header honored by OpenAI SDKs to suppress retries for permanent errors.
+pub const HEADER_SHOULD_RETRY: &str = "x-should-retry";
+pub const SHOULD_RETRY_FALSE: &str = "false";
+
 /// True when the client opted into strict (no-alias) model resolution via
 /// the `x-no-aliasing` header. Presence enables it; an explicit value of
 /// `false` or `0` (case-insensitive) disables it so clients with

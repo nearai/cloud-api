@@ -1,6 +1,7 @@
 use crate::{
     middleware::{auth::AuthenticatedApiKey, RequestBodyHash},
     models::{ErrorResponse, ResponseInputItemList},
+    routes::common::{HEADER_SHOULD_RETRY, SHOULD_RETRY_FALSE},
 };
 use axum::{
     body::Body,
@@ -21,6 +22,44 @@ use std::convert::Infallible;
 use std::sync::Arc;
 use tracing::debug;
 use uuid::Uuid;
+
+type NotImplementedErrorResponse = (
+    StatusCode,
+    [(&'static str, &'static str); 1],
+    ResponseJson<ErrorResponse>,
+);
+
+fn not_implemented_error(message: impl Into<String>) -> NotImplementedErrorResponse {
+    (
+        StatusCode::NOT_IMPLEMENTED,
+        [(HEADER_SHOULD_RETRY, SHOULD_RETRY_FALSE)],
+        ResponseJson(ErrorResponse::new(
+            message.into(),
+            "not_implemented".to_string(),
+        )),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::not_implemented_error;
+    use crate::routes::common::{HEADER_SHOULD_RETRY, SHOULD_RETRY_FALSE};
+    use axum::{http::StatusCode, response::IntoResponse};
+
+    #[test]
+    fn not_implemented_error_disables_sdk_retries() {
+        let response = not_implemented_error("Permanent error").into_response();
+
+        assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+        assert_eq!(
+            response
+                .headers()
+                .get(HEADER_SHOULD_RETRY)
+                .and_then(|value| value.to_str().ok()),
+            Some(SHOULD_RETRY_FALSE)
+        );
+    }
+}
 
 // Helper function to convert service ResponseContentItem to API ResponseContentPart (input-only)
 fn convert_to_input_part(
@@ -663,15 +702,9 @@ pub async fn get_response(
     Query(_params): Query<GetResponseQuery>,
     State(_state): State<ResponseRouteState>,
     Extension(_api_key): Extension<AuthenticatedApiKey>,
-) -> Result<ResponseJson<ResponseObject>, (StatusCode, ResponseJson<ErrorResponse>)> {
+) -> Result<ResponseJson<ResponseObject>, NotImplementedErrorResponse> {
     // TODO: Implement get_response method in ResponseService
-    Err((
-        StatusCode::NOT_IMPLEMENTED,
-        ResponseJson(ErrorResponse::new(
-            "Get response not yet implemented".to_string(),
-            "not_implemented".to_string(),
-        )),
-    ))
+    Err(not_implemented_error("Get response not yet implemented"))
 }
 
 /// Delete a response
@@ -698,15 +731,9 @@ pub async fn delete_response(
     Path(_response_id): Path<String>,
     State(_state): State<ResponseRouteState>,
     Extension(_api_key): Extension<AuthenticatedApiKey>,
-) -> Result<ResponseJson<ResponseDeleteResult>, (StatusCode, ResponseJson<ErrorResponse>)> {
+) -> Result<ResponseJson<ResponseDeleteResult>, NotImplementedErrorResponse> {
     // TODO: Implement delete_response method in ResponseService
-    Err((
-        StatusCode::NOT_IMPLEMENTED,
-        ResponseJson(ErrorResponse::new(
-            "Delete response not yet implemented".to_string(),
-            "not_implemented".to_string(),
-        )),
-    ))
+    Err(not_implemented_error("Delete response not yet implemented"))
 }
 
 /// Cancel a response (for background responses)
@@ -733,15 +760,9 @@ pub async fn cancel_response(
     Path(_response_id): Path<String>,
     State(_state): State<ResponseRouteState>,
     Extension(_api_key): Extension<AuthenticatedApiKey>,
-) -> Result<ResponseJson<ResponseObject>, (StatusCode, ResponseJson<ErrorResponse>)> {
+) -> Result<ResponseJson<ResponseObject>, NotImplementedErrorResponse> {
     // TODO: Implement cancel_response method in ResponseService
-    Err((
-        StatusCode::NOT_IMPLEMENTED,
-        ResponseJson(ErrorResponse::new(
-            "Cancel response not yet implemented".to_string(),
-            "not_implemented".to_string(),
-        )),
-    ))
+    Err(not_implemented_error("Cancel response not yet implemented"))
 }
 
 /// List input items for a response

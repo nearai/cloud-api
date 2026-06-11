@@ -329,7 +329,9 @@ fn compute_sha256(data: &[u8]) -> String {
     hex::encode(hasher.finalize())
 }
 
-fn chat_stream_include_usage_requested(request: &ChatCompletionRequest) -> bool {
+fn chat_stream_options(
+    request: &ChatCompletionRequest,
+) -> Option<inference_providers::models::StreamOptions> {
     request
         .extra
         .get("stream_options")
@@ -338,7 +340,17 @@ fn chat_stream_include_usage_requested(request: &ChatCompletionRequest) -> bool 
             serde_json::from_value::<inference_providers::models::StreamOptions>(stream_options)
                 .ok()
         })
+}
+
+fn chat_stream_include_usage_requested(request: &ChatCompletionRequest) -> bool {
+    chat_stream_options(request)
         .and_then(|stream_options| stream_options.include_usage)
+        .unwrap_or(false)
+}
+
+fn chat_stream_continuous_usage_requested(request: &ChatCompletionRequest) -> bool {
+    chat_stream_options(request)
+        .and_then(|stream_options| stream_options.continuous_usage_stats)
         .unwrap_or(false)
 }
 
@@ -359,18 +371,24 @@ fn prepare_chat_stream_chunk_for_client(
     chunk: &mut inference_providers::models::ChatCompletionChunk,
     include_usage: bool,
 ) -> bool {
-    let mut final_usage_emitted = false;
-    prepare_chat_stream_chunk_for_client_with_state(chunk, include_usage, &mut final_usage_emitted)
+    let mut final_usage = None;
+    prepare_chat_stream_chunk_for_client_with_state(chunk, include_usage, &mut final_usage)
 }
 
 fn prepare_chat_stream_chunk_for_client_with_state(
     chunk: &mut inference_providers::models::ChatCompletionChunk,
     include_usage: bool,
-    final_usage_emitted: &mut bool,
+    final_usage: &mut Option<inference_providers::models::TokenUsage>,
 ) -> bool {
     let is_usage_only_chunk = chunk.choices.is_empty() && chunk.usage.is_some();
     if !include_usage && is_usage_only_chunk {
         return false;
+    }
+
+    if include_usage {
+        if let Some(usage) = chunk.usage.take() {
+            *final_usage = Some(usage);
+        }
     }
 
     if !include_usage {
@@ -378,25 +396,8 @@ fn prepare_chat_stream_chunk_for_client_with_state(
         return true;
     }
 
-    let is_terminal_choice_chunk = chunk
-        .choices
-        .iter()
-        .any(|choice| choice.finish_reason.is_some());
-    let is_final_usage_chunk =
-        chunk.usage.is_some() && (is_usage_only_chunk || is_terminal_choice_chunk);
-
-    if !is_final_usage_chunk {
-        chunk.usage = None;
-        return true;
-    }
-
-    if *final_usage_emitted {
-        if is_usage_only_chunk {
-            return false;
-        }
-        chunk.usage = None;
-    } else {
-        *final_usage_emitted = true;
+    if is_usage_only_chunk {
+        return false;
     }
 
     true
@@ -405,15 +406,11 @@ fn prepare_chat_stream_chunk_for_client_with_state(
 fn prepare_stream_chunk_for_client(
     chunk: &mut inference_providers::StreamChunk,
     include_usage: bool,
-    final_usage_emitted: &mut bool,
+    final_usage: &mut Option<inference_providers::models::TokenUsage>,
 ) -> bool {
     match chunk {
         inference_providers::StreamChunk::Chat(chat) => {
-            prepare_chat_stream_chunk_for_client_with_state(
-                chat,
-                include_usage,
-                final_usage_emitted,
-            )
+            prepare_chat_stream_chunk_for_client_with_state(chat, include_usage, final_usage)
         }
         inference_providers::StreamChunk::Text(_) => true,
     }
@@ -506,6 +503,7 @@ fn convert_chat_request_to_service(
         store: None,
         body_hash: body_hash.hash.clone(),
         response_id: None, // Direct chat completions API calls don't have a response_id
+        skip_provider_chat_signature: false,
         extra,
     }
 }
@@ -1133,6 +1131,7 @@ fn convert_text_request_to_service(
         store: None,
         body_hash: body_hash.hash.clone(),
         response_id: None, // Direct text completions API calls don't have a response_id
+        skip_provider_chat_signature: false,
         extra,
     }
 }
@@ -1275,6 +1274,16 @@ async fn chat_completions_inner(
     insert_encryption_headers(&encryption_headers, &mut service_request.extra);
     let e2ee_active = e2ee_requested(&encryption_headers);
     let include_stream_usage_in_response = chat_stream_include_usage_requested(&request);
+    if request.stream == Some(true) && chat_stream_continuous_usage_requested(&request) {
+        return (
+            StatusCode::BAD_REQUEST,
+            ResponseJson(ErrorResponse::new(
+                "stream_options.continuous_usage_stats is not supported by this API; use stream_options.include_usage for a single final usage chunk".to_string(),
+                "invalid_request_error".to_string(),
+            )),
+        )
+            .into_response();
+    }
 
     // Strict alias mode: refuse to serve through an alias before any
     // inference happens (issue #573).
@@ -1297,6 +1306,7 @@ async fn chat_completions_inner(
         .await;
     let rewrite_public_stream_usage =
         !e2ee_active && !chat_stream_has_non_text_modalities(&request);
+    service_request.skip_provider_chat_signature = rewrite_public_stream_usage;
 
     // Auto-redact (opt-in via x-auto-redact header or auto_redact body field).
     // On success this may rewrite service_request.messages to substitute
@@ -1436,7 +1446,10 @@ async fn chat_completions_inner(
                 let public_signature_enabled = rewrite_public_stream_usage;
                 let public_signature_bytes = Arc::new(tokio::sync::Mutex::new(Vec::new()));
                 let public_signature_chat_id = Arc::new(tokio::sync::Mutex::new(None::<String>));
-                let final_stream_usage_emitted = Arc::new(tokio::sync::Mutex::new(false));
+                let final_stream_usage = Arc::new(tokio::sync::Mutex::new(
+                    None::<inference_providers::TokenUsage>,
+                ));
+                let final_stream_usage_for_chain = final_stream_usage.clone();
                 let public_signature_bytes_for_chain = public_signature_bytes.clone();
                 let public_signature_chat_id_for_chain = public_signature_chat_id.clone();
                 let attestation_service_for_chain = app_state.attestation_service.clone();
@@ -1458,7 +1471,7 @@ async fn chat_completions_inner(
                         let rewrite_public_stream_usage = rewrite_public_stream_usage;
                         let public_signature_bytes = public_signature_bytes.clone();
                         let public_signature_chat_id = public_signature_chat_id.clone();
-                        let final_stream_usage_emitted = final_stream_usage_emitted.clone();
+                        let final_stream_usage = final_stream_usage.clone();
                         async move {
                             match result {
                                 Ok(event) => {
@@ -1492,37 +1505,38 @@ async fn chat_completions_inner(
                                     // here; the end-of-stream tail appends the gateway's
                                     // own [DONE] terminator.
                                     let mut chunk = event.chunk?;
+                                    if let inference_providers::StreamChunk::Chat(chat) = &chunk {
+                                        {
+                                            let mut t = template.lock().await;
+                                            if t.is_none() {
+                                                *t = Some((
+                                                    chat.id.clone(),
+                                                    chat.model.clone(),
+                                                    chat.created,
+                                                    chat.system_fingerprint.clone(),
+                                                ));
+                                            }
+                                        }
+                                        if public_signature_enabled {
+                                            let mut chat_id =
+                                                public_signature_chat_id.lock().await;
+                                            if chat_id.is_none() {
+                                                *chat_id = Some(chat.id.clone());
+                                            }
+                                        }
+                                    }
                                     if rewrite_public_stream_usage {
-                                        let mut final_usage_emitted =
-                                            final_stream_usage_emitted.lock().await;
+                                        let mut final_usage = final_stream_usage.lock().await;
                                         if !prepare_stream_chunk_for_client(
                                             &mut chunk,
                                             include_stream_usage_in_response,
-                                            &mut final_usage_emitted,
+                                            &mut final_usage,
                                         ) {
                                             return None;
                                         }
                                     }
 
                                     if auto_redact_enabled {
-                                        // Cache a template for the synthetic
-                                        // flush chunk we may emit at end-of-stream.
-                                        {
-                                            let mut t = template.lock().await;
-                                            if t.is_none() {
-                                                if let inference_providers::StreamChunk::Chat(c) =
-                                                    &chunk
-                                                {
-                                                    *t = Some((
-                                                        c.id.clone(),
-                                                        c.model.clone(),
-                                                        c.created,
-                                                        c.system_fingerprint.clone(),
-                                                    ));
-                                                }
-                                            }
-                                        }
-
                                         // Swap minted placeholders in this
                                         // chunk's text deltas back to originals.
                                         let mut s = states.lock().await;
@@ -1621,6 +1635,52 @@ async fn chat_completions_inner(
                                     }
                                 }
 
+                                if rewrite_public_stream_usage && include_stream_usage_in_response {
+                                    let final_usage = final_stream_usage_for_chain.lock().await.clone();
+                                    let template = chunk_template_for_chain.lock().await.clone();
+                                    match (final_usage, template) {
+                                        (Some(usage), Some((id, model, created, system_fingerprint))) => {
+                                            let final_usage_chunk =
+                                                inference_providers::StreamChunk::Chat(
+                                                    inference_providers::models::ChatCompletionChunk {
+                                                        id,
+                                                        object: "chat.completion.chunk".to_string(),
+                                                        created,
+                                                        model,
+                                                        system_fingerprint,
+                                                        choices: Vec::new(),
+                                                        usage: Some(usage),
+                                                        prompt_token_ids: None,
+                                                        modality: None,
+                                                        extra: std::collections::HashMap::new(),
+                                                    },
+                                                );
+                                            match serde_json::to_string(&final_usage_chunk) {
+                                                Ok(json_data) => {
+                                                    combined.extend_from_slice(
+                                                        format!("data: {json_data}\n\n").as_bytes(),
+                                                    );
+                                                }
+                                                Err(e) => {
+                                                    tracing::error!(
+                                                        %organization_id,
+                                                        model = %model_name,
+                                                        "Failed to serialize final usage chunk: {e}"
+                                                    );
+                                                }
+                                            }
+                                        }
+                                        (Some(_), None) => {
+                                            tracing::warn!(
+                                                %organization_id,
+                                                model = %model_name,
+                                                "Cannot emit final usage chunk: no chat chunk template observed"
+                                            );
+                                        }
+                                        (None, _) => {}
+                                    }
+                                }
+
                                 let error_count_final =
                                     stream_error_count.load(std::sync::atomic::Ordering::Relaxed);
                                 if error_count_final > 1 {
@@ -1648,35 +1708,41 @@ async fn chat_completions_inner(
                                     if let Some(chat_id) =
                                         public_signature_chat_id_for_chain.lock().await.clone()
                                     {
-                                        match tokio::time::timeout(
-                                            Duration::from_secs(
-                                                STREAM_SIGNATURE_STORE_TIMEOUT_SECS,
-                                            ),
-                                            attestation_service_for_chain.store_chat_signature(
-                                                &chat_id,
-                                                request_hash,
-                                                response_hash,
-                                            ),
-                                        )
-                                        .await
-                                        {
-                                            Ok(Ok(())) => {}
-                                            Ok(Err(e)) => {
-                                                tracing::error!(
-                                                    %organization_id,
-                                                    model = %model_name,
-                                                    error = %e,
-                                                    "Failed to store public stream chat signature"
-                                                );
+                                        let attestation_service =
+                                            attestation_service_for_chain.clone();
+                                        let request_hash = request_hash.clone();
+                                        let model_name = model_name.clone();
+                                        tokio::spawn(async move {
+                                            match tokio::time::timeout(
+                                                Duration::from_secs(
+                                                    STREAM_SIGNATURE_STORE_TIMEOUT_SECS,
+                                                ),
+                                                attestation_service.store_chat_signature(
+                                                    &chat_id,
+                                                    request_hash,
+                                                    response_hash,
+                                                ),
+                                            )
+                                            .await
+                                            {
+                                                Ok(Ok(())) => {}
+                                                Ok(Err(e)) => {
+                                                    tracing::error!(
+                                                        %organization_id,
+                                                        model = %model_name,
+                                                        error = %e,
+                                                        "Failed to store public stream chat signature"
+                                                    );
+                                                }
+                                                Err(_) => {
+                                                    tracing::error!(
+                                                        %organization_id,
+                                                        model = %model_name,
+                                                        "Timeout storing public stream chat signature"
+                                                    );
+                                                }
                                             }
-                                            Err(_) => {
-                                                tracing::error!(
-                                                    %organization_id,
-                                                    model = %model_name,
-                                                    "Timeout storing public stream chat signature"
-                                                );
-                                            }
-                                        }
+                                        });
                                     } else {
                                         tracing::warn!(
                                             %organization_id,
@@ -2749,6 +2815,20 @@ mod tests {
     }
 
     #[test]
+    fn chat_stream_continuous_usage_is_detected() {
+        let mut request = chat_request_with_include_usage(Some(true));
+        request.extra.insert(
+            "stream_options".to_string(),
+            serde_json::json!({
+                "include_usage": true,
+                "continuous_usage_stats": true
+            }),
+        );
+
+        assert!(chat_stream_continuous_usage_requested(&request));
+    }
+
+    #[test]
     fn chat_stream_non_text_modalities_preserve_raw_passthrough() {
         let mut request = chat_request_with_include_usage(None);
         assert!(!chat_stream_has_non_text_modalities(&request));
@@ -2789,13 +2869,19 @@ mod tests {
     }
 
     #[test]
-    fn include_usage_keeps_only_final_usage_chunk_populated() {
+    fn include_usage_records_usage_for_synthetic_final_chunk() {
+        let mut final_usage = None;
         let mut content_chunk = chat_stream_chunk_with_usage(vec![chat_stream_content_choice()]);
-        assert!(prepare_chat_stream_chunk_for_client(
+        assert!(prepare_chat_stream_chunk_for_client_with_state(
             &mut content_chunk,
-            true
+            true,
+            &mut final_usage
         ));
         assert!(content_chunk.usage.is_none());
+        assert_eq!(
+            final_usage.as_ref().map(|usage| usage.total_tokens),
+            Some(15)
+        );
 
         let content_json = serde_json::to_value(&content_chunk).expect("chunk should serialize");
         assert!(
@@ -2805,40 +2891,48 @@ mod tests {
             "intermediate chunks should carry usage:null"
         );
 
-        let mut final_chunk = chat_stream_chunk_with_usage(vec![]);
-        assert!(prepare_chat_stream_chunk_for_client(&mut final_chunk, true));
-        assert!(final_chunk.usage.is_some());
-
         let mut final_choice_chunk =
             chat_stream_chunk_with_usage(vec![chat_stream_finish_choice()]);
-        assert!(prepare_chat_stream_chunk_for_client(
+        final_choice_chunk.usage = Some(inference_providers::TokenUsage::new(10, 7));
+        assert!(prepare_chat_stream_chunk_for_client_with_state(
             &mut final_choice_chunk,
-            true
+            true,
+            &mut final_usage
         ));
-        assert!(
-            final_choice_chunk.usage.is_some(),
-            "converter-backed providers can attach final usage to a terminal choice chunk"
+        assert!(final_choice_chunk.usage.is_none());
+        assert_eq!(
+            final_usage.as_ref().map(|usage| usage.total_tokens),
+            Some(17)
+        );
+
+        let mut usage_only_chunk = chat_stream_chunk_with_usage(vec![]);
+        usage_only_chunk.usage = Some(inference_providers::TokenUsage::new(10, 9));
+        assert!(!prepare_chat_stream_chunk_for_client_with_state(
+            &mut usage_only_chunk,
+            true,
+            &mut final_usage
+        ));
+        assert_eq!(
+            final_usage.as_ref().map(|usage| usage.total_tokens),
+            Some(19)
         );
     }
 
     #[test]
-    fn include_usage_drops_duplicate_usage_only_chunk_after_terminal_usage() {
-        let mut final_usage_emitted = false;
+    fn include_usage_preserves_converter_only_usage_for_tail() {
+        let mut final_usage = None;
         let mut final_choice_chunk =
             chat_stream_chunk_with_usage(vec![chat_stream_finish_choice()]);
         assert!(prepare_chat_stream_chunk_for_client_with_state(
             &mut final_choice_chunk,
             true,
-            &mut final_usage_emitted
+            &mut final_usage
         ));
-        assert!(final_choice_chunk.usage.is_some());
-
-        let mut usage_only_chunk = chat_stream_chunk_with_usage(vec![]);
-        assert!(!prepare_chat_stream_chunk_for_client_with_state(
-            &mut usage_only_chunk,
-            true,
-            &mut final_usage_emitted
-        ));
+        assert!(final_choice_chunk.usage.is_none());
+        assert_eq!(
+            final_usage.as_ref().map(|usage| usage.total_tokens),
+            Some(15)
+        );
     }
 
     #[test]

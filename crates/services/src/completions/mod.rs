@@ -97,6 +97,8 @@ where
     state: StreamState,
     /// Whether the model supports TEE attestation (false for external providers)
     attestation_supported: bool,
+    /// Whether to fetch/store provider chat signatures before ending the stream.
+    store_provider_chat_signature: bool,
 }
 
 impl<S> InterceptStream<S>
@@ -108,7 +110,9 @@ where
     /// Skipped for external providers that don't support TEE attestation.
     fn create_signature_future(&self) -> FinalizeFuture {
         // Skip attestation for external providers (OpenAI, Anthropic, Gemini, etc.)
-        if !self.attestation_supported {
+        // and for streams whose API route will store a gateway signature over
+        // rewritten public bytes instead.
+        if !self.attestation_supported || !self.store_provider_chat_signature {
             return Box::pin(async {});
         }
 
@@ -1093,6 +1097,7 @@ impl CompletionServiceImpl {
         concurrent_counter: Option<Arc<AtomicU32>>,
         response_id: Option<ResponseId>,
         attestation_supported: bool,
+        store_provider_chat_signature: bool,
     ) -> StreamingResult {
         // Create low-cardinality metric tags (no org/workspace/key - those go to database)
         let metric_tags = Self::create_metric_tags(&model_name);
@@ -1135,6 +1140,7 @@ impl CompletionServiceImpl {
             last_error: None,
             state: StreamState::Streaming,
             attestation_supported,
+            store_provider_chat_signature,
         };
         Box::pin(intercepted_stream)
     }
@@ -1305,6 +1311,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
                 counter,
                 request.response_id,
                 model.attestation_supported,
+                !request.skip_provider_chat_signature,
             )
             .await;
 
@@ -1941,6 +1948,7 @@ mod tests {
             last_error: None,
             state: StreamState::Streaming,
             attestation_supported: true,
+            store_provider_chat_signature: true,
         };
 
         // Consume the stream
@@ -2104,6 +2112,7 @@ mod tests {
             last_error: None,
             state: StreamState::Streaming,
             attestation_supported: true,
+            store_provider_chat_signature: true,
         };
 
         // Consume the stream
@@ -2224,6 +2233,7 @@ mod tests {
             last_error: None,
             state: StreamState::Streaming,
             attestation_supported: true,
+            store_provider_chat_signature: true,
         };
 
         let _ = intercept_stream.collect::<Vec<_>>().await;
@@ -2428,6 +2438,7 @@ mod tests {
                 last_error: None,
                 state: StreamState::Streaming,
                 attestation_supported: true,
+                store_provider_chat_signature: true,
             };
             // InterceptStream goes out of scope here and Drop is called
         }

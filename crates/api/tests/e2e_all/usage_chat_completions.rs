@@ -3,9 +3,37 @@
 //! Does not use the manual usage-recording endpoint (`/v1/internal/usage`).
 
 use crate::common::*;
+use api::models::BatchUpdateModelApiRequest;
 use inference_providers::StreamChunk;
 use serde_json::json;
 use services::usage::compute_token_cost;
+
+async fn setup_non_verifiable_qwen_model(server: &axum_test::TestServer) -> String {
+    let mut batch = BatchUpdateModelApiRequest::new();
+    batch.insert(
+        E2E_QWEN_MODEL_NAME.to_string(),
+        serde_json::from_value(serde_json::json!({
+            "inputCostPerToken": {
+                "amount": E2E_QWEN_INPUT_COST_PER_TOKEN,
+                "currency": "USD"
+            },
+            "outputCostPerToken": {
+                "amount": E2E_QWEN_OUTPUT_COST_PER_TOKEN,
+                "currency": "USD"
+            },
+            "modelDisplayName": "Updated Model Name",
+            "modelDescription": "Updated model description",
+            "contextLength": 128000,
+            "verifiable": false,
+            "isActive": true
+        }))
+        .unwrap(),
+    );
+    let updated = admin_batch_upsert_models(server, batch, get_session_id()).await;
+    assert_eq!(updated.len(), 1, "Should have updated 1 model");
+    tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+    E2E_QWEN_MODEL_NAME.to_string()
+}
 
 /// Call chat/completions (non-streaming), assert usage in response, then verify org usage
 /// history contains a matching entry (including cache_read_tokens).
@@ -214,7 +242,7 @@ async fn test_chat_completions_stream_records_usage_in_history() {
 async fn test_chat_completions_stream_default_emits_usage_null() {
     let server = setup_test_server().await;
 
-    setup_qwen_model(&server).await;
+    setup_non_verifiable_qwen_model(&server).await;
     let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
     let api_key = get_api_key_for_org(&server, org.id.clone()).await;
 
@@ -267,7 +295,7 @@ async fn test_chat_completions_stream_default_emits_usage_null() {
 async fn test_chat_completions_stream_include_usage_true_emits_final_usage_only() {
     let server = setup_test_server().await;
 
-    setup_qwen_model(&server).await;
+    setup_non_verifiable_qwen_model(&server).await;
     let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
     let api_key = get_api_key_for_org(&server, org.id.clone()).await;
 
@@ -306,12 +334,14 @@ async fn test_chat_completions_stream_include_usage_true_emits_final_usage_only(
             .get("choices")
             .and_then(serde_json::Value::as_array)
             .expect("stream chunk should have choices");
-        if choices.is_empty() {
+        let is_terminal_chunk = choices.is_empty()
+            || choices.iter().any(|choice| {
+                choice
+                    .get("finish_reason")
+                    .is_some_and(|finish_reason| !finish_reason.is_null())
+            });
+        if is_terminal_chunk && value.get("usage").is_some_and(serde_json::Value::is_object) {
             final_usage_chunks += 1;
-            assert!(
-                value.get("usage").is_some_and(serde_json::Value::is_object),
-                "final usage chunk should carry populated usage, got {value}"
-            );
         } else {
             content_chunks += 1;
             assert!(

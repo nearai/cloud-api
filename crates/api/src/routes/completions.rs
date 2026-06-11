@@ -23,6 +23,7 @@ use services::completions::{
     hash_inference_id_to_uuid,
     ports::{CompletionMessage, CompletionRequest as ServiceCompletionRequest},
 };
+use sha2::{Digest, Sha256};
 use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::Duration;
@@ -40,6 +41,7 @@ const USAGE_RECORDING_TIMEOUT_SECS: u64 = 5;
 // unbounded. Past the cap we proceed without an Inference-Id header and let
 // the remaining stream (including the buffered control events) flow through.
 const MAX_LEADING_CONTROL_EVENTS: usize = 32;
+const STREAM_SIGNATURE_STORE_TIMEOUT_SECS: u64 = 5;
 
 /// Insert validated E2EE headers into a provider `extra` HashMap.
 fn insert_encryption_headers(
@@ -321,6 +323,12 @@ fn sse_error_frame(e: &inference_providers::CompletionError) -> Bytes {
     Bytes::from(format!("data: {payload}\n\n"))
 }
 
+fn compute_sha256(data: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(data);
+    hex::encode(hasher.finalize())
+}
+
 fn chat_stream_include_usage_requested(request: &ChatCompletionRequest) -> bool {
     request
         .extra
@@ -355,12 +363,7 @@ fn prepare_chat_stream_chunk_for_client(
         return false;
     }
 
-    let has_terminal_choice = chunk
-        .choices
-        .iter()
-        .any(|choice| choice.finish_reason.is_some());
-    let has_final_usage = is_usage_only_chunk || has_terminal_choice;
-    if !include_usage || !has_final_usage {
+    if !include_usage || !is_usage_only_chunk {
         chunk.usage = None;
     }
     true
@@ -1210,6 +1213,8 @@ async fn chat_completions_inner(
     request: ChatCompletionRequest,
     request_id: Uuid,
 ) -> axum::response::Response {
+    let request_hash = body_hash.hash.clone();
+
     // Convert HTTP request to service parameters
     // Note: Names are not passed - high-cardinality data is tracked via database, not metrics
     let mut service_request = convert_chat_request_to_service(
@@ -1232,8 +1237,6 @@ async fn chat_completions_inner(
     insert_encryption_headers(&encryption_headers, &mut service_request.extra);
     let e2ee_active = e2ee_requested(&encryption_headers);
     let include_stream_usage_in_response = chat_stream_include_usage_requested(&request);
-    let rewrite_public_stream_usage =
-        !e2ee_active && !chat_stream_has_non_text_modalities(&request);
 
     // Strict alias mode: refuse to serve through an alias before any
     // inference happens (issue #573).
@@ -1254,6 +1257,16 @@ async fn chat_completions_inner(
         .models_service
         .resolve_alias_cached(&request.model)
         .await;
+    let resolved_model_name = alias_canonical.as_deref().unwrap_or(&request.model);
+    let model_attestation_supported = app_state
+        .models_service
+        .get_model_by_name(resolved_model_name)
+        .await
+        .map(|model| model.attestation_supported)
+        .unwrap_or(false);
+    let rewrite_public_stream_usage = !e2ee_active
+        && !model_attestation_supported
+        && !chat_stream_has_non_text_modalities(&request);
 
     // Auto-redact (opt-in via x-auto-redact header or auto_redact body field).
     // On success this may rewrite service_request.messages to substitute
@@ -1390,6 +1403,12 @@ async fn chat_completions_inner(
                 let chunk_template_for_chain = chunk_template.clone();
                 let unredact_states_for_chain = unredact_states.clone();
                 let redaction_map_for_chunks = redaction_map.clone();
+                let public_signature_enabled = rewrite_public_stream_usage;
+                let public_signature_bytes = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+                let public_signature_chat_id = Arc::new(tokio::sync::Mutex::new(None::<String>));
+                let public_signature_bytes_for_chain = public_signature_bytes.clone();
+                let public_signature_chat_id_for_chain = public_signature_chat_id.clone();
+                let attestation_service_for_chain = app_state.attestation_service.clone();
 
                 // Re-attach any stashed leading control events, then convert
                 // to a raw bytes stream.
@@ -1406,6 +1425,8 @@ async fn chat_completions_inner(
                         let upstream_done = upstream_done_forwarded.clone();
                         let include_stream_usage_in_response = include_stream_usage_in_response;
                         let rewrite_public_stream_usage = rewrite_public_stream_usage;
+                        let public_signature_bytes = public_signature_bytes.clone();
+                        let public_signature_chat_id = public_signature_chat_id.clone();
                         async move {
                             match result {
                                 Ok(event) => {
@@ -1511,6 +1532,20 @@ async fn chat_completions_inner(
                                     }
                                     // Format as SSE event with proper newlines
                                     let sse_bytes = Bytes::from(format!("data: {json_data}\n\n"));
+                                    if public_signature_enabled {
+                                        if let inference_providers::StreamChunk::Chat(chat) = &chunk
+                                        {
+                                            let mut chat_id =
+                                                public_signature_chat_id.lock().await;
+                                            if chat_id.is_none() {
+                                                *chat_id = Some(chat.id.clone());
+                                            }
+                                        }
+                                        public_signature_bytes
+                                            .lock()
+                                            .await
+                                            .extend_from_slice(&sse_bytes);
+                                    }
                                     Some(Ok::<Bytes, Infallible>(sse_bytes))
                                 }
                                 Err(e) => {
@@ -1566,6 +1601,54 @@ async fn chat_completions_inner(
                                     .load(std::sync::atomic::Ordering::Relaxed)
                                 {
                                     combined.extend_from_slice(b"data: [DONE]\n\n");
+                                }
+                                if public_signature_enabled && error_count_final == 0 {
+                                    let response_hash = {
+                                        let mut accumulated =
+                                            public_signature_bytes_for_chain.lock().await;
+                                        accumulated.extend_from_slice(&combined);
+                                        compute_sha256(&accumulated)
+                                    };
+
+                                    if let Some(chat_id) =
+                                        public_signature_chat_id_for_chain.lock().await.clone()
+                                    {
+                                        match tokio::time::timeout(
+                                            Duration::from_secs(
+                                                STREAM_SIGNATURE_STORE_TIMEOUT_SECS,
+                                            ),
+                                            attestation_service_for_chain.store_chat_signature(
+                                                &chat_id,
+                                                request_hash,
+                                                response_hash,
+                                            ),
+                                        )
+                                        .await
+                                        {
+                                            Ok(Ok(())) => {}
+                                            Ok(Err(e)) => {
+                                                tracing::error!(
+                                                    %organization_id,
+                                                    model = %model_name,
+                                                    error = %e,
+                                                    "Failed to store public stream chat signature"
+                                                );
+                                            }
+                                            Err(_) => {
+                                                tracing::error!(
+                                                    %organization_id,
+                                                    model = %model_name,
+                                                    "Timeout storing public stream chat signature"
+                                                );
+                                            }
+                                        }
+                                    } else {
+                                        tracing::warn!(
+                                            %organization_id,
+                                            model = %model_name,
+                                            "Cannot store public stream chat signature: no chat_id observed"
+                                        );
+                                    }
                                 }
                                 if combined.is_empty() {
                                     // Avoid emitting an empty body frame.
@@ -2698,8 +2781,8 @@ mod tests {
             true
         ));
         assert!(
-            final_choice_chunk.usage.is_some(),
-            "converter-backed providers can attach final usage to a terminal choice chunk"
+            final_choice_chunk.usage.is_none(),
+            "choice-bearing chunks should carry usage:null; final usage is emitted by the usage-only chunk"
         );
     }
 

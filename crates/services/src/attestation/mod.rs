@@ -325,6 +325,106 @@ impl AttestationService {
         }
     }
 
+    async fn store_gateway_signature(
+        &self,
+        signature_id: &str,
+        id_label: &str,
+        request_hash: String,
+        response_hash: String,
+    ) -> Result<(), AttestationError> {
+        let start_time = std::time::Instant::now();
+        let environment = get_environment();
+        let env_tag = format!("{TAG_ENVIRONMENT}:{environment}");
+
+        // Create signature text in format "request_hash:response_hash"
+        let signature_text = format!("{request_hash}:{response_hash}");
+
+        // Generate and store both ECDSA and ED25519 signatures
+        for algo in ["ecdsa", "ed25519"] {
+            let (signature_hex, signing_address) = match algo {
+                "ed25519" => {
+                    let signature_bytes = self.ed25519_signing_key.sign(signature_text.as_bytes());
+                    let sig_hex = hex::encode(signature_bytes.to_bytes());
+                    let addr = self.get_signing_address_hex("ed25519")?;
+                    Ok((sig_hex, addr))
+                }
+                "ecdsa" => {
+                    // Sign using ECDSA with recovery ID and Ethereum signed message format.
+                    let message_bytes = signature_text.as_bytes();
+                    let prefix = format!("\x19Ethereum Signed Message:\n{}", message_bytes.len());
+                    let prefix_bytes = prefix.as_bytes();
+
+                    let mut prefixed_message =
+                        Vec::with_capacity(prefix_bytes.len() + message_bytes.len());
+                    prefixed_message.extend_from_slice(prefix_bytes);
+                    prefixed_message.extend_from_slice(message_bytes);
+
+                    let mut hasher = Keccak256::new();
+                    hasher.update(&prefixed_message);
+                    let message_hash = hasher.finalize();
+
+                    let (signature, recid): (EcdsaSignature, RecoveryId) = self
+                        .ecdsa_signing_key
+                        .sign_prehash_recoverable(&message_hash)
+                        .map_err(|e| {
+                            tracing::error!("Failed to create recoverable ECDSA signature: {}", e);
+                            AttestationError::InternalError(format!(
+                                "Failed to create recoverable ECDSA signature: {e}"
+                            ))
+                        })?;
+
+                    let recovery_byte = recid.to_byte();
+                    let ethereum_v = 27u8 + (recovery_byte & 1);
+
+                    let mut signature_bytes = signature.to_bytes().to_vec();
+                    signature_bytes.push(ethereum_v);
+                    let sig_hex = hex::encode(signature_bytes);
+
+                    let addr = self.get_signing_address_hex("ecdsa")?;
+                    Ok((format!("0x{sig_hex}"), addr))
+                }
+                _ => Err(AttestationError::InvalidParameter(format!(
+                    "Unknown signing algorithm: {algo}"
+                ))),
+            }?;
+
+            let signature = ChatSignature {
+                text: signature_text.clone(),
+                signature: signature_hex,
+                signing_address,
+                signing_algo: algo.to_string(),
+            };
+
+            self.repository
+                .add_chat_signature(signature_id, signature)
+                .await
+                .map_err(|e| {
+                    tracing::error!(
+                        "Failed to store {} signature in repository for algorithm: {}",
+                        id_label,
+                        algo
+                    );
+                    AttestationError::RepositoryError(e.to_string())
+                })?;
+
+            tracing::info!(
+                "Stored {} signature for {}: {} with algorithm: {}",
+                id_label,
+                id_label,
+                signature_id,
+                algo
+            );
+        }
+
+        let duration = start_time.elapsed();
+        self.metrics_service
+            .record_count(METRIC_VERIFICATION_SUCCESS, 1, &[&env_tag]);
+        self.metrics_service
+            .record_latency(METRIC_VERIFICATION_DURATION, duration, &[&env_tag]);
+
+        Ok(())
+    }
+
     /// Check if the response/completion was stopped due to client disconnect
     /// If so, return an Unavailable result instead of NotFound error
     async fn check_fallback_conditions(
@@ -603,110 +703,24 @@ impl ports::AttestationServiceTrait for AttestationService {
         Ok(())
     }
 
+    async fn store_chat_signature(
+        &self,
+        chat_id: &str,
+        request_hash: String,
+        response_hash: String,
+    ) -> Result<(), AttestationError> {
+        self.store_gateway_signature(chat_id, "chat", request_hash, response_hash)
+            .await
+    }
+
     async fn store_response_signature(
         &self,
         response_id: &str,
         request_hash: String,
         response_hash: String,
     ) -> Result<(), AttestationError> {
-        let start_time = std::time::Instant::now();
-        let environment = get_environment();
-        let env_tag = format!("{TAG_ENVIRONMENT}:{environment}");
-
-        // Create signature text in format "request_hash:response_hash"
-        let signature_text = format!("{request_hash}:{response_hash}");
-
-        // Generate and store both ECDSA and ED25519 signatures
-        for algo in ["ecdsa", "ed25519"] {
-            let (signature_hex, signing_address) = match algo {
-                "ed25519" => {
-                    let signature_bytes = self.ed25519_signing_key.sign(signature_text.as_bytes());
-                    let sig_hex = hex::encode(signature_bytes.to_bytes());
-                    let addr = self.get_signing_address_hex("ed25519")?;
-                    Ok((sig_hex, addr))
-                }
-                "ecdsa" => {
-                    // Sign using ECDSA with recovery ID
-                    // Use Ethereum signed message format
-                    let message_bytes = signature_text.as_bytes();
-                    let prefix = format!("\x19Ethereum Signed Message:\n{}", message_bytes.len());
-                    let prefix_bytes = prefix.as_bytes();
-
-                    // Concatenate prefix + message
-                    let mut prefixed_message =
-                        Vec::with_capacity(prefix_bytes.len() + message_bytes.len());
-                    prefixed_message.extend_from_slice(prefix_bytes);
-                    prefixed_message.extend_from_slice(message_bytes);
-
-                    // Hash with Keccak256 (manually hash the prefixed message)
-                    let mut hasher = Keccak256::new();
-                    hasher.update(&prefixed_message);
-                    let message_hash = hasher.finalize();
-
-                    // Use sign_prehash_recoverable with the pre-hashed message
-                    let (signature, recid): (EcdsaSignature, RecoveryId) = self
-                        .ecdsa_signing_key
-                        .sign_prehash_recoverable(&message_hash)
-                        .map_err(|e| {
-                            tracing::error!("Failed to create recoverable ECDSA signature: {}", e);
-                            AttestationError::InternalError(format!(
-                                "Failed to create recoverable ECDSA signature: {e}"
-                            ))
-                        })?;
-
-                    // Convert signature to bytes and append recovery ID
-                    // Convert k256 RecoveryId (0-3) to Ethereum v format (27-28)
-                    // Ethereum v = 27 + (recovery_id & 1) where bit 0 is the y-coordinate parity
-                    let recovery_byte = recid.to_byte();
-                    let ethereum_v = 27u8 + (recovery_byte & 1);
-
-                    // This creates a 65-byte signature (64 bytes r||s + 1 byte Ethereum v)
-                    let mut signature_bytes = signature.to_bytes().to_vec();
-                    signature_bytes.push(ethereum_v);
-                    let sig_hex = hex::encode(signature_bytes);
-
-                    let addr = self.get_signing_address_hex("ecdsa")?;
-                    Ok((format!("0x{sig_hex}"), addr))
-                }
-                _ => Err(AttestationError::InvalidParameter(format!(
-                    "Unknown signing algorithm: {algo}"
-                ))),
-            }?;
-
-            let signature = ChatSignature {
-                text: signature_text.clone(),
-                signature: signature_hex,
-                signing_address,
-                signing_algo: algo.to_string(),
-            };
-
-            // Store in repository using response_id as the key
-            self.repository
-                .add_chat_signature(response_id, signature)
-                .await
-                .map_err(|e| {
-                    tracing::error!(
-                        "Failed to store response signature in repository for algorithm: {}",
-                        algo
-                    );
-                    AttestationError::RepositoryError(e.to_string())
-                })?;
-
-            tracing::info!(
-                "Stored response signature for response_id: {} with algorithm: {}",
-                response_id,
-                algo
-            );
-        }
-
-        // Record successful verification
-        let duration = start_time.elapsed();
-        self.metrics_service
-            .record_count(METRIC_VERIFICATION_SUCCESS, 1, &[&env_tag]);
-        self.metrics_service
-            .record_latency(METRIC_VERIFICATION_DURATION, duration, &[&env_tag]);
-
-        Ok(())
+        self.store_gateway_signature(response_id, "response", request_hash, response_hash)
+            .await
     }
 
     async fn get_attestation_report(

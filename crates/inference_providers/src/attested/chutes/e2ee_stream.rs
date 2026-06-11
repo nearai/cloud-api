@@ -21,11 +21,16 @@
 //! as a clean terminus; a *plaintext outer* `[DONE]` is forgeable (the gateway
 //! could inject it after dropping frames) and is ignored, so a truncated stream
 //! surfaces an error instead of a fake success. Frame *ordering* is still not
-//! cryptographically guaranteed. **Open (verify on staging):** confirm Chutes
-//! emits the terminator *inside* the encrypted channel; if it only sends the
-//! outer plaintext `[DONE]`, the terminator is forgeable — add it to the tracked
-//! Chutes asks (alongside missing frame sequence numbers + unsigned measurements)
-//! and reconsider exposing streaming as attested.
+//! cryptographically guaranteed.
+//!
+//! **Terminator confirmed (2026-06-11):** a live round-trip against GLM-5.1-TEE
+//! (see the `live_chutes_streaming_done_probe` test in `super`) showed Chutes
+//! emits the terminator *inside* the encrypted channel — the stream ends on an
+//! authenticated inner `[DONE]`, so the inner-terminus assumption holds and
+//! streaming can be exposed as attested. The remaining residual is frame
+//! *reorder* (undetectable without sequence numbers — an accepted limitation;
+//! truncation IS caught). Sequence numbers + signed measurements stay on the
+//! tracked Chutes asks.
 
 use async_stream::try_stream;
 use base64::Engine;

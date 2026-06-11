@@ -1183,6 +1183,12 @@ impl ExternalProvidersConfig {
                     continue;
                 }
                 if !seen.insert(entry.canonical_id.clone()) {
+                    // `eprintln!` (not `tracing::warn!`) on purpose: the `config`
+                    // crate has no `tracing` dependency, and `from_env` runs during
+                    // startup config parsing — potentially before the tracing
+                    // subscriber is installed, where a `tracing::warn!` would be
+                    // dropped. stderr is always captured by the container log
+                    // pipeline. Consistent with the sibling CHUTES_API_KEY_FILE warn.
                     eprintln!(
                         "WARN: duplicate CHUTES_MODELS canonical id '{}' ignored (first wins)",
                         entry.canonical_id

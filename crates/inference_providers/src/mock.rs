@@ -1405,9 +1405,7 @@ impl crate::InferenceProvider for MockProvider {
             && params
                 .timestamp_granularities
                 .as_deref()
-                .map_or(true, |granularities| {
-                    granularities.iter().any(|value| value == "segment")
-                });
+                .is_none_or(|granularities| granularities.iter().any(|value| value == "segment"));
 
         Ok(AudioTranscriptionResponse {
             text: mock_text.clone(),

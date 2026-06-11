@@ -669,21 +669,30 @@ async fn ensure_chutes_catalog_row(
                 context_length: Some(128_000),
                 verifiable: Some(true),
                 attestation_supported: Some(true),
-                is_active: Some(true),
-                is_ready: Some(Some(true)),
+                // Seed INACTIVE. `is_active=false` is the only field that actually
+                // gates serving (`resolve_and_get_model` filters `WHERE is_active`;
+                // `is_ready` is pure display metadata and does NOT gate). Seeding
+                // inactive makes it *impossible* to serve — and therefore bill at
+                // the zero default pricing — until an operator explicitly sets real
+                // per-token rates AND flips is_active=true (one admin PATCH). This
+                // closes the unpriced-serving window rather than merely warning.
+                is_active: Some(false),
+                is_ready: Some(Some(false)),
                 provider_type: Some("chutes".to_string()),
                 owned_by: Some(owned_by.to_string()),
                 input_modalities: Some(vec!["text".to_string()]),
                 output_modalities: Some(vec!["text".to_string()]),
-                // Pricing left None -> defaults to 0 on INSERT. See warning below.
+                // Pricing left None -> defaults to 0 on INSERT. The inactive seed
+                // above prevents this zero price from ever being charged.
                 ..Default::default()
             };
             match models_repo.upsert_model_pricing(model_name, &req).await {
                 Ok(_) => {
                     tracing::warn!(
                         model = %model_name,
-                        "Seeded Chutes catalog row with ZERO pricing — set real per-token \
-                         rates via PATCH /v1/admin/models before serving paid traffic"
+                        "Seeded Chutes catalog row as INACTIVE with zero pricing — set real \
+                         per-token rates AND is_active=true via PATCH /v1/admin/models to serve \
+                         (kept inactive so paid traffic can't be billed at $0)"
                     );
                 }
                 Err(e) => {

@@ -23,6 +23,8 @@ pub enum ChutesClientError {
     Http(#[from] reqwest::Error),
     #[error("Chutes returned HTTP {status}{}", body_suffix(.body))]
     Status { status: u16, body: String },
+    #[error("Chutes response body exceeds the {max_bytes}-byte cap ({what})")]
+    BodyTooLarge { max_bytes: u64, what: &'static str },
     #[error("model '{0}' not found in Chutes /v1/models (no matching id)")]
     ModelNotFound(String),
     #[error("model '{0}' has no chute_id in /v1/models")]
@@ -105,14 +107,24 @@ pub struct InvokeRequest<'a> {
 /// Client for Chutes' discovery + invoke endpoints. Holds the API key (a secret;
 /// never derives `Debug`).
 pub struct ChutesClient {
+    /// Non-streaming client: `connect_timeout` only, **no** `read_timeout`. Every
+    /// non-stream call adds a per-request total `.timeout(request_timeout_secs)`,
+    /// so a long completion is bounded by that total — NOT by an inactivity clock.
+    /// (A client-wide `read_timeout` would also bound the wait for response
+    /// *headers*, so the non-streaming `/e2e/invoke` — which emits nothing until
+    /// generation finishes — would wrongly time out at `READ_TIMEOUT_SECS` for any
+    /// completion longer than that. See the streaming client below.)
     http: reqwest::Client,
+    /// Streaming client: `connect_timeout` + `read_timeout(READ_TIMEOUT_SECS)`. The
+    /// inactivity clock resets on each SSE frame, so it bounds a *stalled* stream
+    /// without capping an actively-progressing long generation. Streaming sets no
+    /// per-request total timeout (a stream may legitimately run a long time).
+    stream_http: reqwest::Client,
     api_base: String,
     models_base: String,
     api_key: String,
     /// Total-request timeout (seconds) applied per-request to the *non-streaming*
-    /// calls (discovery, evidence, non-stream invoke). It is deliberately NOT a
-    /// client-wide timeout: that would also cap streamed body reads and cut off
-    /// long generations on `invoke_stream` (which relies on `connect_timeout`).
+    /// calls (discovery, evidence, non-stream invoke) via `.timeout(...)`.
     request_timeout_secs: u64,
 }
 
@@ -123,10 +135,14 @@ pub const DEFAULT_MODELS_BASE: &str = "https://llm.chutes.ai";
 /// Connection-establishment timeout (bounds connect for every request, including
 /// streaming, without capping the streamed body).
 const CONNECT_TIMEOUT_SECS: u64 = 15;
-/// No-progress (inactivity) timeout between successive body reads. Bounds a
-/// stalled stream/response — a gateway that goes quiet after headers won't hold
-/// a request (and its concurrency slot) forever — **without** capping an actively
-/// streaming long generation (the clock resets on each chunk).
+/// No-progress (inactivity) timeout between successive body reads, applied to the
+/// **streaming** client only. Bounds a stalled stream — a gateway that goes quiet
+/// mid-stream won't hold a request (and its concurrency slot) forever — **without**
+/// capping an actively streaming long generation (the clock resets on each frame).
+/// Deliberately NOT applied to the non-stream client: there it would also bound the
+/// wait for response headers, cutting off a non-stream completion that (correctly)
+/// sends nothing until generation finishes. Non-stream is bounded by the per-request
+/// total `request_timeout_secs` instead.
 const READ_TIMEOUT_SECS: u64 = 90;
 /// Upper bound on a non-streaming response body (the E2EE response blob is small;
 /// this caps a misbehaving/hostile gateway, consistent with the gunzip guard).
@@ -139,12 +155,21 @@ impl ChutesClient {
     /// Build a client with the default hosts and a per-request timeout (seconds)
     /// for the non-streaming calls.
     pub fn new(api_key: String, timeout_seconds: u64) -> Result<Self, ChutesClientError> {
+        // Non-stream: connect bound only; the per-request total `.timeout` bounds
+        // the whole call (so a long completion that sends nothing until done is
+        // bounded by `request_timeout_secs`, not a header-wait inactivity clock).
         let http = reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(CONNECT_TIMEOUT_SECS))
+            .build()?;
+        // Stream: add the inactivity `read_timeout` (resets per frame) and set no
+        // per-request total timeout — correct for a long-lived SSE stream.
+        let stream_http = reqwest::Client::builder()
             .connect_timeout(std::time::Duration::from_secs(CONNECT_TIMEOUT_SECS))
             .read_timeout(std::time::Duration::from_secs(READ_TIMEOUT_SECS))
             .build()?;
         Ok(Self {
             http,
+            stream_http,
             api_base: DEFAULT_API_BASE.to_string(),
             models_base: DEFAULT_MODELS_BASE.to_string(),
             api_key,
@@ -258,7 +283,14 @@ impl ChutesClient {
     pub fn invoke_request(&self, req: &InvokeRequest<'_>) -> reqwest::RequestBuilder {
         let url = format!("{}/e2e/invoke", self.api_base);
         let stream = matches!(req.mode, InvokeMode::Stream);
-        self.http
+        // Streaming uses the inactivity-bounded client; non-stream uses the
+        // connect-only client (bounded by the caller's per-request `.timeout`).
+        let client = if stream {
+            &self.stream_http
+        } else {
+            &self.http
+        };
+        client
             .post(&url)
             .bearer_auth(&self.api_key)
             .header("Content-Type", "application/octet-stream")
@@ -296,9 +328,9 @@ async fn error_for_status(resp: reqwest::Response) -> Result<reqwest::Response, 
 async fn read_body_capped(resp: reqwest::Response, max: u64) -> Result<Vec<u8>, ChutesClientError> {
     use futures_util::StreamExt;
     if resp.content_length().is_some_and(|n| n > max) {
-        return Err(ChutesClientError::Status {
-            status: 0,
-            body: format!("response Content-Length exceeds {max} bytes"),
+        return Err(ChutesClientError::BodyTooLarge {
+            max_bytes: max,
+            what: "Content-Length",
         });
     }
     let mut stream = resp.bytes_stream();
@@ -306,9 +338,9 @@ async fn read_body_capped(resp: reqwest::Response, max: u64) -> Result<Vec<u8>, 
     while let Some(chunk) = stream.next().await {
         let chunk = chunk?;
         if out.len() as u64 + chunk.len() as u64 > max {
-            return Err(ChutesClientError::Status {
-                status: 0,
-                body: format!("response body exceeds {max} bytes"),
+            return Err(ChutesClientError::BodyTooLarge {
+                max_bytes: max,
+                what: "streamed body",
             });
         }
         out.extend_from_slice(&chunk);

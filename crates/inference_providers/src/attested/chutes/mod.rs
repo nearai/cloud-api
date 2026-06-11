@@ -947,6 +947,39 @@ mod tests {
     }
 
     #[test]
+    fn rewrite_sse_event_model_leaves_chunk_bearing_event_untouched_on_rewrite_failure() {
+        use crate::{ChatCompletionChunk, StreamChunk};
+        // Pins the ATOMIC invariant: if the raw_bytes rewrite fails (here the
+        // payload isn't a JSON object so set_model_in_json returns None), the event
+        // is returned fully unchanged — raw_bytes AND the parsed chunk's model both
+        // keep their original value. Guards against a future refactor reintroducing
+        // a half-rewritten state (chunk mutated to canonical while raw_bytes still
+        // leaks the slug). This failure path is unreachable in practice (the decoder
+        // only sets chunk: Some when raw_bytes parsed as valid JSON) but is cheap to
+        // pin and the only thing the atomicity reorder protects.
+        let chunk: ChatCompletionChunk = serde_json::from_value(json!({
+            "id":"c","object":"chat.completion.chunk","created":0,
+            "model":"zai-org/GLM-5.1-TEE","choices":[]
+        }))
+        .unwrap();
+        let ev = SSEEvent {
+            // Non-object JSON → set_model_in_json returns None → rewrite bails.
+            raw_bytes: bytes::Bytes::from_static(b"data: [1,2,3]\n\n"),
+            chunk: Some(StreamChunk::Chat(chunk)),
+            raw_passthrough: true,
+        };
+        let out = rewrite_sse_event_model(ev, "zai-org/GLM-5.1-FP8");
+        // raw_bytes untouched (no canonical id introduced, no reframing).
+        assert_eq!(&out.raw_bytes[..], b"data: [1,2,3]\n\n");
+        // The parsed chunk's model must NOT have been mutated to canonical.
+        match &out.chunk {
+            Some(StreamChunk::Chat(c)) => assert_eq!(c.model, "zai-org/GLM-5.1-TEE"),
+            other => panic!("expected the original Chat chunk, got {other:?}"),
+        }
+        assert!(out.raw_passthrough, "raw_passthrough preserved");
+    }
+
+    #[test]
     fn request_body_pins_model_and_stream() {
         let params: ChatCompletionParams = serde_json::from_value(json!({
             "model": "ignored", "messages": [{"role":"user","content":"hi"}]

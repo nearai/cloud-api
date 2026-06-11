@@ -376,13 +376,14 @@ const INTERNAL_KEYS: &[&str] = {
 /// alias-served paths — so leaving the slug there would still leak it). Only
 /// touches chunk-bearing data lines; control events ([DONE], blanks, the keyed
 /// init) have no chunk and pass through unchanged. On any parse failure the event
-/// is returned as-is (never drop a chunk over a rewrite).
+/// is returned as-is (never drop a chunk over a rewrite). The rewrite is ATOMIC:
+/// we compute the rewritten `raw_bytes` first and bail (returning the event
+/// unchanged) on any failure, mutating the parsed `chunk` only once that succeeds —
+/// so the event can never end up with `chunk` carrying the canonical id while
+/// `raw_bytes` still leaks the slug.
 fn rewrite_sse_event_model(mut ev: SSEEvent, canonical: &str) -> SSEEvent {
     if ev.chunk.is_none() {
         return ev;
-    }
-    if let Some(StreamChunk::Chat(c)) = &mut ev.chunk {
-        c.model = canonical.to_string();
     }
     let Ok(s) = std::str::from_utf8(&ev.raw_bytes) else {
         return ev;
@@ -394,6 +395,10 @@ fn rewrite_sse_event_model(mut ev: SSEEvent, canonical: &str) -> SSEEvent {
     let Ok(json) = String::from_utf8(rewritten) else {
         return ev;
     };
+    // raw_bytes rewrite succeeded — now mutate the parsed chunk to match.
+    if let Some(StreamChunk::Chat(c)) = &mut ev.chunk {
+        c.model = canonical.to_string();
+    }
     SSEEvent {
         raw_bytes: bytes::Bytes::from(format!("data: {json}\n\n")),
         chunk: ev.chunk,
@@ -940,6 +945,39 @@ mod tests {
         };
         let out = rewrite_sse_event_model(ctrl, "zai-org/GLM-5.1-FP8");
         assert_eq!(&out.raw_bytes[..], b"data: [DONE]\n\n");
+    }
+
+    #[test]
+    fn rewrite_sse_event_model_leaves_chunk_bearing_event_untouched_on_rewrite_failure() {
+        use crate::{ChatCompletionChunk, StreamChunk};
+        // Pins the ATOMIC invariant: if the raw_bytes rewrite fails (here the
+        // payload isn't a JSON object so set_model_in_json returns None), the event
+        // is returned fully unchanged — raw_bytes AND the parsed chunk's model both
+        // keep their original value. Guards against a future refactor reintroducing
+        // a half-rewritten state (chunk mutated to canonical while raw_bytes still
+        // leaks the slug). This failure path is unreachable in practice (the decoder
+        // only sets chunk: Some when raw_bytes parsed as valid JSON) but is cheap to
+        // pin and the only thing the atomicity reorder protects.
+        let chunk: ChatCompletionChunk = serde_json::from_value(json!({
+            "id":"c","object":"chat.completion.chunk","created":0,
+            "model":"zai-org/GLM-5.1-TEE","choices":[]
+        }))
+        .unwrap();
+        let ev = SSEEvent {
+            // Non-object JSON → set_model_in_json returns None → rewrite bails.
+            raw_bytes: bytes::Bytes::from_static(b"data: [1,2,3]\n\n"),
+            chunk: Some(StreamChunk::Chat(chunk)),
+            raw_passthrough: true,
+        };
+        let out = rewrite_sse_event_model(ev, "zai-org/GLM-5.1-FP8");
+        // raw_bytes untouched (no canonical id introduced, no reframing).
+        assert_eq!(&out.raw_bytes[..], b"data: [1,2,3]\n\n");
+        // The parsed chunk's model must NOT have been mutated to canonical.
+        match &out.chunk {
+            Some(StreamChunk::Chat(c)) => assert_eq!(c.model, "zai-org/GLM-5.1-TEE"),
+            other => panic!("expected the original Chat chunk, got {other:?}"),
+        }
+        assert!(out.raw_passthrough, "raw_passthrough preserved");
     }
 
     #[test]

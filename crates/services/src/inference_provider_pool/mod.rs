@@ -2978,6 +2978,24 @@ impl InferenceProviderPool {
         }
     }
 
+    /// Drop the per-provider failure counters for providers replaced this refresh.
+    ///
+    /// `candidate_ptrs` is the over-approximate "replaced" set built from the old
+    /// `model_to_providers` (it can include a pinned provider, which is never in the
+    /// URL-cache reused set). `live_ptrs` is the set of pointers still backing some
+    /// model after the merge. A counter is pruned only when its provider is a
+    /// candidate AND no longer live — so a still-served pinned fallback, or an Arc
+    /// shared by another still-served model, keeps its consecutive-failure counter
+    /// and can stay demoted. Pure so the invariant is unit-testable without driving
+    /// the (network/attestation-bound) refresh path.
+    fn prune_replaced_failure_counts(
+        counts: &mut HashMap<usize, u32>,
+        candidate_ptrs: &std::collections::HashSet<usize>,
+        live_ptrs: &std::collections::HashSet<usize>,
+    ) {
+        counts.retain(|ptr, _| live_ptrs.contains(ptr) || !candidate_ptrs.contains(ptr));
+    }
+
     /// Load models with inference_url as nearai::Providers into provider_mappings.
     ///
     /// For each model, reuses the existing provider (and its warm TLS connections)
@@ -3605,6 +3623,32 @@ impl InferenceProviderPool {
                     });
                     !providers.is_empty()
                 });
+                // Prune the per-provider failure counters for genuinely-replaced
+                // providers. `old_provider_ptrs` OVER-approximates "replaced": a
+                // pinned (Chutes) provider is collected into it on every refresh — it
+                // isn't in the URL-cache `reused_provider_ptrs` set — yet it is
+                // re-merged into `model_to_providers` just above, and one Arc can back
+                // several models. So filter against the post-merge live pointers
+                // (mirrors `prune_stale_pinned`'s shared-Arc guard): a counter is
+                // dropped only when its provider is replaced AND no longer referenced.
+                // Without this the prune would reset a still-served pinned fallback's
+                // consecutive-failure counter every refresh, so it could never stay
+                // demoted (demotion needs >=10 consecutive failures); the map is also
+                // keyed by Arc pointer address, so a stale entry could let a future
+                // provider at a recycled address inherit a demotion-level count.
+                let live_ptrs: std::collections::HashSet<usize> = mappings
+                    .model_to_providers
+                    .values()
+                    .flat_map(|ps| ps.iter().map(|p| Arc::as_ptr(p) as *const () as usize))
+                    .collect();
+                Self::prune_replaced_failure_counts(
+                    &mut self
+                        .provider_failure_counts
+                        .write()
+                        .unwrap_or_else(|e| e.into_inner()),
+                    &old_provider_ptrs,
+                    &live_ptrs,
+                );
             }
 
             for (key, provider) in pub_key_updates {
@@ -5143,6 +5187,51 @@ mod tests {
         // the partial-batch safety the admin PATCH path depends on.
         assert!(!merged.contains_key("other-pinned"));
         assert_eq!(merged.len(), 1);
+    }
+
+    /// The refresh failure-counter prune (review round 3, Pierre's blocking) must
+    /// NOT reset a still-served pinned (Chutes) fallback's consecutive-failure
+    /// counter. `old_provider_ptrs` over-approximates "replaced" — a pinned provider
+    /// lands in it every refresh (it's never in the URL-cache reused set) yet stays
+    /// in `model_to_providers` — so the prune is filtered against the post-merge live
+    /// pointers. Without that filter a persistently-failing Chutes fallback would be
+    /// re-promoted every ~5 min and could never stay demoted.
+    #[test]
+    fn prune_replaced_failure_counts_keeps_live_pinned_and_shared_drops_replaced() {
+        use std::collections::{HashMap, HashSet};
+
+        // 1 = replaced NEAR provider: a candidate, no longer live  -> pruned
+        // 2 = pinned Chutes fallback: a candidate (not in reused set) but STILL live
+        //     after the merge                                       -> kept
+        // 3 = Arc shared with another still-served model: candidate but live -> kept
+        // 4 = untouched provider for an unrelated model: not a candidate    -> kept
+        let mut counts: HashMap<usize, u32> = [(1usize, 12u32), (2, 9), (3, 7), (4, 3)]
+            .into_iter()
+            .collect();
+        let candidates: HashSet<usize> = [1usize, 2, 3].into_iter().collect();
+        let live: HashSet<usize> = [2usize, 3, 4].into_iter().collect();
+
+        InferenceProviderPool::prune_replaced_failure_counts(&mut counts, &candidates, &live);
+
+        assert!(
+            !counts.contains_key(&1),
+            "a genuinely-replaced provider's counter must be pruned"
+        );
+        assert_eq!(
+            counts.get(&2),
+            Some(&9),
+            "a still-served pinned fallback must keep its counter (would have caught the round-3 bug)"
+        );
+        assert_eq!(
+            counts.get(&3),
+            Some(&7),
+            "a still-referenced shared Arc must keep its counter"
+        );
+        assert_eq!(
+            counts.get(&4),
+            Some(&3),
+            "an untouched provider's counter must survive"
+        );
     }
 
     /// Complete-set stale-prune (review round 2): on the refresh path, a pinned id

@@ -552,10 +552,11 @@ impl InferenceProvider for Provider {
         _request_hash: String,
     ) -> Result<StreamingResult, CompletionError> {
         // Streaming is off by default: Chutes' stream protocol has no
-        // authenticated frame ordering (a gateway could drop/reorder AEAD-valid
-        // frames undetectably), so it isn't honestly attested until Chutes adds
-        // sequence numbers and the inner-terminator behavior is confirmed on
-        // staging. Opt in with CHUTES_ENABLE_STREAMING. Non-streaming is attested.
+        // authenticated frame ordering (content frames carry no sequence numbers),
+        // so an on-path gateway could drop, reorder, or replay AEAD-valid frames
+        // undetectably. It isn't honestly attested until Chutes adds sequence
+        // numbers or a transcript MAC. Opt in with CHUTES_ENABLE_STREAMING.
+        // Non-streaming is attested.
         if !self.allow_streaming {
             return Err(CompletionError::CompletionError(
                 "Chutes streaming is not enabled as an attested path (frame ordering is not \
@@ -1075,13 +1076,13 @@ mod tests {
     /// Uses the real E2EE path with a stub verifier (we're testing the stream
     /// protocol, not re-verifying attestation — the encaps pubkey still comes from
     /// the live discovered instance). Run:
-    ///   CHUTES_KEY=cpk_... cargo test -p inference_providers --lib \
+    ///   CHUTES_API_KEY=cpk_... cargo test -p inference_providers --lib \
     ///     attested::chutes::tests::live_chutes_streaming_done_probe -- --ignored --nocapture
     #[tokio::test]
-    #[ignore = "live Chutes streaming probe; needs CHUTES_KEY + network"]
+    #[ignore = "live Chutes streaming probe; needs CHUTES_API_KEY + network"]
     async fn live_chutes_streaming_done_probe() {
         use futures_util::StreamExt;
-        let key = std::env::var("CHUTES_KEY").expect("set CHUTES_KEY for the live probe");
+        let key = std::env::var("CHUTES_API_KEY").expect("set CHUTES_API_KEY for the live probe");
         let provider = Provider::new(
             Config::new(key, "zai-org/GLM-5.1-TEE".to_string(), 120).with_streaming(true),
             Arc::new(StubVerifier { ok: true }),
@@ -1107,11 +1108,15 @@ mod tests {
             match item {
                 Ok(ev) => {
                     events += 1;
-                    let s = String::from_utf8_lossy(&ev.raw_bytes).to_string();
-                    if s.contains("[DONE]") {
+                    // The decoder filters the forgeable *outer* `[DONE]`
+                    // (`handle_outer_payload` returns `Ok(None)`), so the only
+                    // yielded done-marker is the authenticated inner one. Use the
+                    // precise predicate rather than a raw-bytes substring scan,
+                    // which model text containing "[DONE]" could false-positive.
+                    if ev.is_done_marker() {
                         inner_done = true;
                     }
-                    last = s;
+                    last = String::from_utf8_lossy(&ev.raw_bytes).to_string();
                 }
                 Err(e) => {
                     err = Some(format!("{e}"));

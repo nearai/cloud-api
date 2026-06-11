@@ -495,7 +495,9 @@ pub struct AudioTranscriptionRequestSchema {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub response_format: Option<String>,
 
-    /// Timestamp granularities (optional) - supports "segment" and "word" with verbose_json
+    /// Timestamp granularities (optional) - supports "segment" and "word" with verbose_json.
+    /// Multipart requests may send repeated timestamp_granularities[] fields,
+    /// repeated timestamp_granularities fields, or comma-separated values.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timestamp_granularities: Option<Vec<String>>,
 }
@@ -527,7 +529,9 @@ pub struct AudioTranscriptionRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f32>,
 
-    /// Timestamp granularities: "word", "segment"
+    /// Timestamp granularities: "word", "segment". Parsed from repeated
+    /// timestamp_granularities[] fields, repeated timestamp_granularities
+    /// fields, or comma-separated values.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timestamp_granularities: Option<Vec<String>>,
 }

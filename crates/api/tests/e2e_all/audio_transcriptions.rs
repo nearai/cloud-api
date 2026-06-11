@@ -511,7 +511,9 @@ async fn test_audio_transcription_unsupported_response_formats() {
     }
 }
 
-/// Test that word-level timestamps are accepted and returned when available
+/// Smoke test that word-level timestamps are accepted at the API boundary and
+/// returned when the provider supplies them. Provider multipart forwarding is
+/// covered by inference_providers wire tests.
 #[tokio::test]
 async fn test_audio_transcription_word_timestamps_supported() {
     let server = setup_test_server().await;

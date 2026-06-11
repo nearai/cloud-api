@@ -21,11 +21,20 @@
 //! as a clean terminus; a *plaintext outer* `[DONE]` is forgeable (the gateway
 //! could inject it after dropping frames) and is ignored, so a truncated stream
 //! surfaces an error instead of a fake success. Frame *ordering* is still not
-//! cryptographically guaranteed. **Open (verify on staging):** confirm Chutes
-//! emits the terminator *inside* the encrypted channel; if it only sends the
-//! outer plaintext `[DONE]`, the terminator is forgeable — add it to the tracked
-//! Chutes asks (alongside missing frame sequence numbers + unsigned measurements)
-//! and reconsider exposing streaming as attested.
+//! cryptographically guaranteed.
+//!
+//! **Terminator confirmed (2026-06-11):** a live round-trip against GLM-5.1-TEE
+//! (see the `live_chutes_streaming_done_probe` test in `super`) showed Chutes
+//! emits the terminator *inside* the encrypted channel — the stream ends on an
+//! authenticated inner `[DONE]`. This narrowly establishes that an EOF *without*
+//! an inner `[DONE]` is detected (surfaced as a truncation error). It does **not**
+//! make streaming tamper-evident: because content frames carry no sequence
+//! numbers, an on-path gateway can still **drop** encrypted content frames and
+//! forward the (authenticated) inner `[DONE]`, or **reorder** / **replay** frames,
+//! and the decoder cannot detect any of it. So drop, reorder, replay, and
+//! truncation-*with*-a-forwarded-inner-`[DONE]` all remain **undetectable** until
+//! Chutes adds sequence numbers or a transcript MAC — these stay on the tracked
+//! Chutes asks. The only guarantee added here is "no inner `[DONE]` ⇒ error".
 
 use async_stream::try_stream;
 use base64::Engine;
@@ -99,8 +108,8 @@ fn handle_outer_payload(
         // frames to fake a successful-but-truncated stream. Ignore it: only the
         // **authenticated inner** `[DONE]` (decrypted from an `e2e` frame, handled
         // in `inner_event`) is a valid terminus. If no inner `[DONE]` arrives, the
-        // stream ends as truncation. (If staging shows Chutes terminates only with
-        // the outer `[DONE]`, that's a forgeable terminator — see the module note.)
+        // stream ends as truncation. Chutes is confirmed to emit the inner
+        // terminator (see the module note), so ignoring the outer one is safe.
         return Ok(None);
     }
     let v: serde_json::Value = match serde_json::from_str(payload) {

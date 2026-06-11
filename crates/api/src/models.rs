@@ -622,6 +622,12 @@ pub struct RerankRequest {
     pub query: String,
     /// Documents to rerank
     pub documents: Vec<String>,
+    /// Maximum number of ranked results to return
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub top_n: Option<usize>,
+    /// Whether to include document text in each result. Defaults to true.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub return_documents: Option<bool>,
 }
 
 impl RerankRequest {
@@ -645,6 +651,10 @@ impl RerankRequest {
         // Documents must not exceed 1000 items
         if self.documents.len() > 1000 {
             return Err("documents must contain at most 1000 items".to_string());
+        }
+
+        if self.top_n == Some(0) {
+            return Err("top_n must be at least 1".to_string());
         }
 
         // Each document must not be empty or whitespace-only
@@ -1085,6 +1095,41 @@ impl ChatCompletionRequest {
         if let Some(top_p) = self.top_p {
             if !(0.0..=1.0).contains(&top_p) {
                 return Err("top_p must be between 0 and 1".to_string());
+            }
+        }
+
+        if let Some(StopSequences::Many(sequences)) = &self.stop {
+            if sequences.len() > 4 {
+                return Err("stop array may contain at most 4 sequences".to_string());
+            }
+        }
+
+        let logprobs = self
+            .extra
+            .get("logprobs")
+            .filter(|value| !value.is_null())
+            .map(|value| {
+                value
+                    .as_bool()
+                    .ok_or_else(|| "logprobs must be a boolean".to_string())
+            })
+            .transpose()?;
+
+        if let Some(top_logprobs_value) = self
+            .extra
+            .get("top_logprobs")
+            .filter(|value| !value.is_null())
+        {
+            let top_logprobs = top_logprobs_value
+                .as_i64()
+                .ok_or_else(|| "top_logprobs must be an integer".to_string())?;
+
+            if !(0..=20).contains(&top_logprobs) {
+                return Err("top_logprobs must be in the range 0..=20".to_string());
+            }
+
+            if logprobs != Some(true) {
+                return Err("top_logprobs requires logprobs to be true".to_string());
             }
         }
 
@@ -2537,6 +2582,16 @@ pub struct AdminOrganizationResponse {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ListOrganizationsAdminResponse {
     pub organizations: Vec<AdminOrganizationResponse>,
+    pub total: i64,
+    pub limit: i64,
+    pub offset: i64,
+}
+
+/// List organization members response model (admin only).
+/// Exposes full user details (email, last login, active status) for each member.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ListAdminOrganizationMembersResponse {
+    pub members: Vec<AdminOrganizationMemberResponse>,
     pub total: i64,
     pub limit: i64,
     pub offset: i64,
@@ -4020,6 +4075,135 @@ mod tests {
             "temperature must not default to Some(1.0)"
         );
         assert_eq!(req.top_p, None, "top_p must not default to Some(1.0)");
+    }
+
+    #[test]
+    fn test_chat_completion_top_logprobs_requires_logprobs_true() {
+        for logprobs in [None, Some(false)] {
+            let mut body = serde_json::json!({
+                "model": "gpt-4",
+                "messages": [{"role": "user", "content": "hi"}],
+                "top_logprobs": 2,
+            });
+            if let Some(value) = logprobs {
+                body["logprobs"] = serde_json::json!(value);
+            }
+
+            let req: ChatCompletionRequest =
+                serde_json::from_value(body).expect("request should deserialize");
+            assert_eq!(
+                req.validate().unwrap_err(),
+                "top_logprobs requires logprobs to be true"
+            );
+        }
+    }
+
+    #[test]
+    fn test_chat_completion_logprobs_must_be_boolean() {
+        for logprobs in [serde_json::json!("true"), serde_json::json!(1)] {
+            let req: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+                "model": "gpt-4",
+                "messages": [{"role": "user", "content": "hi"}],
+                "logprobs": logprobs,
+            }))
+            .expect("request should deserialize");
+            assert_eq!(req.validate().unwrap_err(), "logprobs must be a boolean");
+        }
+    }
+
+    #[test]
+    fn test_chat_completion_logprobs_null_is_treated_as_unset() {
+        let req: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "gpt-4",
+            "messages": [{"role": "user", "content": "hi"}],
+            "logprobs": null,
+        }))
+        .expect("request should deserialize");
+        assert!(req.validate().is_ok());
+    }
+
+    #[test]
+    fn test_chat_completion_top_logprobs_range_is_validated() {
+        for top_logprobs in [-1, 21] {
+            let req: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+                "model": "gpt-4",
+                "messages": [{"role": "user", "content": "hi"}],
+                "logprobs": true,
+                "top_logprobs": top_logprobs,
+            }))
+            .expect("request should deserialize");
+            assert_eq!(
+                req.validate().unwrap_err(),
+                "top_logprobs must be in the range 0..=20"
+            );
+        }
+
+        for top_logprobs in [0, 20] {
+            let req: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+                "model": "gpt-4",
+                "messages": [{"role": "user", "content": "hi"}],
+                "logprobs": true,
+                "top_logprobs": top_logprobs,
+            }))
+            .expect("request should deserialize");
+            assert!(req.validate().is_ok());
+        }
+    }
+
+    #[test]
+    fn test_chat_completion_top_logprobs_must_be_integer() {
+        let req: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "gpt-4",
+            "messages": [{"role": "user", "content": "hi"}],
+            "logprobs": true,
+            "top_logprobs": 1.5,
+        }))
+        .expect("request should deserialize");
+        assert_eq!(
+            req.validate().unwrap_err(),
+            "top_logprobs must be an integer"
+        );
+    }
+
+    #[test]
+    fn test_chat_completion_top_logprobs_null_is_treated_as_unset() {
+        let req: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "gpt-4",
+            "messages": [{"role": "user", "content": "hi"}],
+            "top_logprobs": null,
+        }))
+        .expect("request should deserialize");
+        assert!(req.validate().is_ok());
+    }
+
+    #[test]
+    fn test_chat_completion_stop_array_may_contain_at_most_four_sequences() {
+        let req: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "gpt-4",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stop": ["a", "b", "c", "d", "e"],
+        }))
+        .expect("request should deserialize");
+        assert_eq!(
+            req.validate().unwrap_err(),
+            "stop array may contain at most 4 sequences"
+        );
+
+        let req: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "gpt-4",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stop": ["a", "b", "c", "d"],
+        }))
+        .expect("request should deserialize");
+        assert!(req.validate().is_ok());
+
+        let req: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "gpt-4",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stop": "done",
+        }))
+        .expect("request should deserialize");
+        assert!(req.validate().is_ok());
     }
 
     #[test]

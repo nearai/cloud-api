@@ -1743,11 +1743,12 @@ pub fn build_admin_routes(
         confirm_model_pricing_changes, create_admin_access_token, create_service,
         delete_admin_access_token, delete_model, deprecate_model, get_admin_organization_balance,
         get_billing_summary, get_infra_summary, get_model_history, get_model_revenue,
-        get_org_revenue, get_organization_concurrent_limit, get_organization_limits_history,
+        get_org_revenue, get_organization as get_admin_organization,
+        get_organization_concurrent_limit, get_organization_limits_history,
         get_organization_metrics, get_organization_timeseries, get_platform_metrics,
         get_platform_timeseries, list_admin_access_tokens, list_invitation_email_deliveries,
-        list_model_pricing_changes, list_models as admin_list_models, list_organizations,
-        list_users, preview_model_deprecation, preview_model_pricing_changes,
+        list_model_pricing_changes, list_models as admin_list_models, list_organization_members,
+        list_organizations, list_users, preview_model_deprecation, preview_model_pricing_changes,
         resend_invitation_email, update_organization_concurrent_limit, update_organization_limits,
         update_service, AdminAppState,
     };
@@ -1905,6 +1906,14 @@ pub fn build_admin_routes(
             axum::routing::get(list_organizations),
         )
         .route(
+            "/admin/organizations/{org_id}",
+            axum::routing::get(get_admin_organization),
+        )
+        .route(
+            "/admin/organizations/{org_id}/members",
+            axum::routing::get(list_organization_members),
+        )
+        .route(
             "/admin/access-tokens",
             axum::routing::post(create_admin_access_token),
         )
@@ -2029,6 +2038,32 @@ mod tests {
             serde_json::json!([{}]),
             "/v1/models must explicitly override global OpenAPI security"
         );
+    }
+
+    #[test]
+    fn test_openapi_conversation_action_paths_use_v1_prefix() {
+        let spec = serde_json::to_value(ApiDoc::openapi()).unwrap();
+        let paths = spec["paths"].as_object().unwrap();
+
+        // Pin/unpin and archive/unarchive share path keys with different methods.
+        for path in [
+            "/v1/conversations/{conversation_id}/archive",
+            "/v1/conversations/{conversation_id}/clone",
+            "/v1/conversations/{conversation_id}/pin",
+        ] {
+            assert!(paths.contains_key(path), "missing OpenAPI path: {path}");
+        }
+
+        for path in [
+            "/conversations/{conversation_id}/archive",
+            "/conversations/{conversation_id}/clone",
+            "/conversations/{conversation_id}/pin",
+        ] {
+            assert!(
+                !paths.contains_key(path),
+                "OpenAPI path is missing /v1 prefix: {path}"
+            );
+        }
     }
 
     /// Example of how to set up the application for E2E testing

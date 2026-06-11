@@ -557,10 +557,11 @@ impl InferenceProvider for Provider {
         _request_hash: String,
     ) -> Result<StreamingResult, CompletionError> {
         // Streaming is off by default: Chutes' stream protocol has no
-        // authenticated frame ordering (a gateway could drop/reorder AEAD-valid
-        // frames undetectably), so it isn't honestly attested until Chutes adds
-        // sequence numbers and the inner-terminator behavior is confirmed on
-        // staging. Opt in with CHUTES_ENABLE_STREAMING. Non-streaming is attested.
+        // authenticated frame ordering (content frames carry no sequence numbers),
+        // so an on-path gateway could drop, reorder, or replay AEAD-valid frames
+        // undetectably. It isn't honestly attested until Chutes adds sequence
+        // numbers or a transcript MAC. Opt in with CHUTES_ENABLE_STREAMING.
+        // Non-streaming is attested.
         if !self.allow_streaming {
             return Err(CompletionError::CompletionError(
                 "Chutes streaming is not enabled as an attested path (frame ordering is not \
@@ -1102,5 +1103,80 @@ mod tests {
     #[tokio::test]
     async fn get_signature_is_unsupported() {
         assert!(provider().get_signature("c", None).await.is_err());
+    }
+
+    /// LIVE probe (ignored) — the open question gating `CHUTES_ENABLE_STREAMING`:
+    /// does Chutes terminate a stream with an **authenticated inner `[DONE]`**
+    /// (decrypted from an `e2e` frame → our decoder yields it and ends cleanly) or
+    /// only an **outer plaintext `[DONE]`** (which the decoder ignores as forgeable
+    /// → EOF without an inner terminus → a fatal truncation error)?
+    ///
+    /// Uses the real E2EE path with a stub verifier (we're testing the stream
+    /// protocol, not re-verifying attestation — the encaps pubkey still comes from
+    /// the live discovered instance). The model defaults to `zai-org/GLM-5.1-TEE`
+    /// but can be overridden via `CHUTES_PROBE_MODEL` so re-running the probe after
+    /// that model is decommissioned needs no code edit. Run:
+    ///   CHUTES_API_KEY=cpk_... cargo test -p inference_providers --lib \
+    ///     attested::chutes::tests::live_chutes_streaming_done_probe -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore = "live Chutes streaming probe; needs CHUTES_API_KEY + network"]
+    async fn live_chutes_streaming_done_probe() {
+        use futures_util::StreamExt;
+        let key = std::env::var("CHUTES_API_KEY").expect("set CHUTES_API_KEY for the live probe");
+        let model =
+            std::env::var("CHUTES_PROBE_MODEL").unwrap_or_else(|_| "zai-org/GLM-5.1-TEE".into());
+        let provider = Provider::new(
+            Config::new(key, model.clone(), 120).with_streaming(true),
+            Arc::new(StubVerifier { ok: true }),
+        )
+        .unwrap();
+        let params: ChatCompletionParams = serde_json::from_value(json!({
+            "model": model,
+            "messages": [{"role": "user", "content": "Count: 1 2 3, then stop."}],
+            "max_tokens": 64,
+            "temperature": 0,
+            "stream": true
+        }))
+        .unwrap();
+        let mut stream = provider
+            .chat_completion_stream(params, "probe".to_string())
+            .await
+            .expect("stream should start");
+        let mut events = 0usize;
+        let mut inner_done = false;
+        let mut err: Option<String> = None;
+        let mut last = String::new();
+        while let Some(item) = stream.next().await {
+            match item {
+                Ok(ev) => {
+                    events += 1;
+                    // The decoder filters the forgeable *outer* `[DONE]`
+                    // (`handle_outer_payload` returns `Ok(None)`), so the only
+                    // yielded done-marker is the authenticated inner one. Use the
+                    // precise predicate rather than a raw-bytes substring scan,
+                    // which model text containing "[DONE]" could false-positive.
+                    if ev.is_done_marker() {
+                        inner_done = true;
+                    }
+                    last = String::from_utf8_lossy(&ev.raw_bytes).to_string();
+                }
+                Err(e) => {
+                    err = Some(format!("{e}"));
+                    break;
+                }
+            }
+        }
+        eprintln!("PROBE: events={events} inner_done={inner_done} err={err:?}");
+        eprintln!("PROBE last_event: {last}");
+        assert!(
+            err.is_none(),
+            "stream errored before a clean terminus — Chutes likely sends only an \
+             outer plaintext [DONE] (truncation): {err:?}"
+        );
+        assert!(
+            inner_done,
+            "stream ended without an inner [DONE] — streaming can't be honestly \
+             attested until Chutes emits the terminator inside the channel"
+        );
     }
 }

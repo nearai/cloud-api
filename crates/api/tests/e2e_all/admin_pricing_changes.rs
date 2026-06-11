@@ -286,6 +286,37 @@ async fn test_conflict_and_idempotent_retry() {
     assert_eq!(retry_body["changes"][0]["id"].as_str().unwrap(), change_id);
 }
 
+#[tokio::test]
+async fn test_concurrent_same_batch_confirms_are_idempotent() {
+    let server = setup_test_server().await;
+    let model = format!("pricing-change-race-batch-{}", uuid::Uuid::new_v4());
+    create_model(&server, &model).await;
+
+    let body = serde_json::json!({
+        "batchId": uuid::Uuid::new_v4(),
+        "changes": [change_item(&model, "2030-01-01", 1_500)],
+    });
+
+    // A network-retry race: the same confirm fired twice concurrently must
+    // not surface a 409 from the open-change index — both requests resolve
+    // to the same scheduled row (advisory lock serializes them).
+    let (a, b) = tokio::join!(
+        post_pricing_changes(&server, "confirm", body.clone()),
+        post_pricing_changes(&server, "confirm", body.clone()),
+    );
+    assert_eq!(a.status_code(), 200, "{}", a.text());
+    assert_eq!(b.status_code(), 200, "{}", b.text());
+
+    let a: serde_json::Value = serde_json::from_str(&a.text()).unwrap();
+    let b: serde_json::Value = serde_json::from_str(&b.text()).unwrap();
+    assert_eq!(a["changes"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        a["changes"][0]["id"].as_str().unwrap(),
+        b["changes"][0]["id"].as_str().unwrap(),
+        "both confirms must resolve to the same scheduled row"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Cancel
 // ---------------------------------------------------------------------------

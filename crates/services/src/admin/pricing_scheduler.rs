@@ -109,6 +109,30 @@ impl ModelPricingScheduler {
     }
 
     async fn apply_change(&self, change: ScheduledPricingChange) {
+        // Direct edits via PATCH /v1/admin/models are not blocked by a
+        // pending schedule, so the live pricing can have drifted from the
+        // snapshot captured (and announced by email) at confirm time. The
+        // announced change is the source of truth — apply it regardless —
+        // but surface the drift for operators.
+        if let Ok(Some(current)) = self
+            .repository
+            .get_model_pricing_snapshot(&change.model_name)
+            .await
+        {
+            let drifted = current.input_cost_per_token != change.old_input_cost_per_token
+                || current.output_cost_per_token != change.old_output_cost_per_token
+                || current.cache_read_cost_per_token != change.old_cache_read_cost_per_token
+                || current.cost_per_image != change.old_cost_per_image;
+            if drifted {
+                warn!(
+                    change_id = %change.id,
+                    batch_id = %change.batch_id,
+                    model_id = %change.model_id,
+                    "Model pricing changed since the scheduled change was confirmed; applying the announced change anyway"
+                );
+            }
+        }
+
         let change_reason = match &change.change_reason {
             Some(reason) => format!(
                 "Scheduled pricing change (batch {}): {reason}",

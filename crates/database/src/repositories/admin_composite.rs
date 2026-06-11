@@ -1029,11 +1029,23 @@ impl AdminRepository for AdminCompositeRepository {
         change_reason: Option<String>,
     ) -> Result<Vec<ScheduledPricingChange>> {
         let mut client = self.pool.get().await?;
+        let tx = client.transaction().await?;
+
+        // Serialize concurrent confirms of the same batch so the idempotency
+        // check below sees the winner's committed rows instead of racing it
+        // into the open-change unique index (which would surface a spurious
+        // 409 to an idempotent retry). The lock is transaction-scoped and
+        // keyed on batch_id, so unrelated batches are unaffected.
+        tx.execute(
+            "SELECT pg_advisory_xact_lock(hashtextextended($1::text, 0))",
+            &[&batch_id.to_string()],
+        )
+        .await?;
 
         // Idempotent confirm retry: if this batch was already persisted,
         // return the existing rows instead of inserting (the partial unique
         // index would otherwise reject the batch as a conflict with itself).
-        let existing = client
+        let existing = tx
             .query(
                 r#"
                 SELECT * FROM scheduled_model_pricing_changes
@@ -1049,8 +1061,6 @@ impl AdminRepository for AdminCompositeRepository {
                 .map(row_to_scheduled_pricing_change)
                 .collect();
         }
-
-        let tx = client.transaction().await?;
         let mut inserted = Vec::with_capacity(changes.len());
         for change in changes {
             let row = tx

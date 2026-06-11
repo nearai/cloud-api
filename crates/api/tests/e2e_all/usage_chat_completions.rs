@@ -212,9 +212,10 @@ async fn test_chat_completions_stream_records_usage_in_history() {
 
 #[tokio::test]
 async fn test_chat_completions_stream_default_emits_usage_null() {
-    let server = setup_test_server().await;
+    let (server, inference_provider_pool, mock_provider, _) = setup_test_server_with_pool().await;
 
-    setup_qwen_model(&server).await;
+    let model_name =
+        setup_non_verifiable_qwen_model(&server, &inference_provider_pool, &mock_provider).await;
     let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
     let api_key = get_api_key_for_org(&server, org.id.clone()).await;
 
@@ -222,7 +223,7 @@ async fn test_chat_completions_stream_default_emits_usage_null() {
         .post("/v1/chat/completions")
         .add_header("Authorization", format!("Bearer {api_key}"))
         .json(&json!({
-            "model": E2E_QWEN_MODEL_NAME,
+            "model": model_name,
             "messages": [{ "role": "user", "content": "hello" }],
             "stream": true
         }))
@@ -265,9 +266,10 @@ async fn test_chat_completions_stream_default_emits_usage_null() {
 
 #[tokio::test]
 async fn test_chat_completions_stream_include_usage_true_emits_final_usage_only() {
-    let server = setup_test_server().await;
+    let (server, inference_provider_pool, mock_provider, _) = setup_test_server_with_pool().await;
 
-    setup_qwen_model(&server).await;
+    let model_name =
+        setup_non_verifiable_qwen_model(&server, &inference_provider_pool, &mock_provider).await;
     let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
     let api_key = get_api_key_for_org(&server, org.id.clone()).await;
 
@@ -275,7 +277,7 @@ async fn test_chat_completions_stream_include_usage_true_emits_final_usage_only(
         .post("/v1/chat/completions")
         .add_header("Authorization", format!("Bearer {api_key}"))
         .json(&json!({
-            "model": E2E_QWEN_MODEL_NAME,
+            "model": model_name,
             "messages": [{ "role": "user", "content": "hello" }],
             "stream": true,
             "stream_options": { "include_usage": true }

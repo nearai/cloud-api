@@ -35,15 +35,6 @@ impl AttestationServiceTrait for MockAttestationService {
         Ok(())
     }
 
-    async fn store_chat_signature(
-        &self,
-        _chat_id: &str,
-        _request_hash: String,
-        _response_hash: String,
-    ) -> Result<(), AttestationError> {
-        Ok(())
-    }
-
     async fn store_response_signature(
         &self,
         _response_id: &str,

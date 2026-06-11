@@ -21,16 +21,6 @@ pub trait AttestationServiceTrait: Send + Sync {
         chat_id: &str,
     ) -> Result<(), AttestationError>;
 
-    /// Store a chat signature directly over gateway-emitted bytes.
-    /// Creates a signature with text format "request_hash:response_hash"
-    /// and stores both ECDSA and ED25519 signatures.
-    async fn store_chat_signature(
-        &self,
-        chat_id: &str,
-        request_hash: String,
-        response_hash: String,
-    ) -> Result<(), AttestationError>;
-
     /// Store a response signature directly (for response streams)
     /// Creates a signature with text format "request_hash:response_hash"
     /// Stores both ECDSA and ED25519 signatures

@@ -38,6 +38,8 @@ pub const MOCK_USER_ID: &str = "11111111-1111-1111-1111-111111111111";
 /// Shared pricing constants for e2e tests that use setup_qwen_model / setup_qwen_model_with_cache_pricing.
 /// Cost verification in usage tests should use the matching helper so pricing stays in sync.
 pub const E2E_QWEN_MODEL_NAME: &str = "Qwen/Qwen3-30B-A3B-Instruct-2507";
+pub const E2E_NON_VERIFIABLE_QWEN_MODEL_NAME: &str =
+    "Qwen/Qwen3-30B-A3B-Instruct-2507-NonVerifiable";
 pub const E2E_QWEN_INPUT_COST_PER_TOKEN: i64 = 1_000_000;
 pub const E2E_QWEN_OUTPUT_COST_PER_TOKEN: i64 = 2_000_000;
 /// Cache-read cost when setup_qwen_model is used (no cache pricing in API).
@@ -790,6 +792,55 @@ pub async fn setup_qwen_model(server: &axum_test::TestServer) -> String {
     // Ensure mock provider registers model before test proceeds
     tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
     E2E_QWEN_MODEL_NAME.to_string()
+}
+
+pub async fn setup_non_verifiable_qwen_model(
+    server: &axum_test::TestServer,
+    inference_provider_pool: &Arc<services::inference_provider_pool::InferenceProviderPool>,
+    mock_provider: &Arc<inference_providers::mock::MockProvider>,
+) -> String {
+    let provider: Arc<dyn inference_providers::InferenceProvider + Send + Sync> =
+        mock_provider.clone();
+    inference_provider_pool
+        .register_providers(vec![(
+            E2E_NON_VERIFIABLE_QWEN_MODEL_NAME.to_string(),
+            provider,
+        )])
+        .await;
+
+    let mut batch = BatchUpdateModelApiRequest::new();
+    batch.insert(
+        E2E_NON_VERIFIABLE_QWEN_MODEL_NAME.to_string(),
+        serde_json::from_value(serde_json::json!({
+            "inputCostPerToken": {
+                "amount": E2E_QWEN_INPUT_COST_PER_TOKEN,
+                "currency": "USD"
+            },
+            "outputCostPerToken": {
+                "amount": E2E_QWEN_OUTPUT_COST_PER_TOKEN,
+                "currency": "USD"
+            },
+            "modelDisplayName": "Updated Non-Verifiable Model Name",
+            "modelDescription": "Updated non-verifiable model description",
+            "contextLength": 128000,
+            "verifiable": false,
+            "attestationSupported": false,
+            "isActive": true
+        }))
+        .unwrap(),
+    );
+    let updated = admin_batch_upsert_models(server, batch, get_session_id()).await;
+    assert_eq!(updated.len(), 1, "Should have updated 1 model");
+    assert_eq!(
+        updated[0].input_cost_per_token.amount, E2E_QWEN_INPUT_COST_PER_TOKEN,
+        "Input cost per token should match E2E_QWEN_INPUT_COST_PER_TOKEN"
+    );
+    assert_eq!(
+        updated[0].output_cost_per_token.amount, E2E_QWEN_OUTPUT_COST_PER_TOKEN,
+        "Output cost per token should match E2E_QWEN_OUTPUT_COST_PER_TOKEN"
+    );
+    tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+    E2E_NON_VERIFIABLE_QWEN_MODEL_NAME.to_string()
 }
 
 /// Setup Qwen chat model with cache-read pricing enabled for testing.

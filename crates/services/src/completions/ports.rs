@@ -70,9 +70,6 @@ pub struct CompletionRequest {
     pub body_hash: String,
     /// Response ID when called from Responses API (for usage tracking FK)
     pub response_id: Option<ResponseId>,
-    /// Skip provider-side chat signature fetch/storage because the API route
-    /// will store a gateway signature over bytes it rewrites before returning.
-    pub skip_provider_chat_signature: bool,
 
     pub extra: std::collections::HashMap<String, serde_json::Value>,
 }

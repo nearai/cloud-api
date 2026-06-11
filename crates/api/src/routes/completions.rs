@@ -23,7 +23,6 @@ use services::completions::{
     hash_inference_id_to_uuid,
     ports::{CompletionMessage, CompletionRequest as ServiceCompletionRequest},
 };
-use sha2::{Digest, Sha256};
 use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::Duration;
@@ -41,7 +40,6 @@ const USAGE_RECORDING_TIMEOUT_SECS: u64 = 5;
 // unbounded. Past the cap we proceed without an Inference-Id header and let
 // the remaining stream (including the buffered control events) flow through.
 const MAX_LEADING_CONTROL_EVENTS: usize = 32;
-const STREAM_SIGNATURE_STORE_TIMEOUT_SECS: u64 = 5;
 
 /// Insert validated E2EE headers into a provider `extra` HashMap.
 fn insert_encryption_headers(
@@ -323,12 +321,6 @@ fn sse_error_frame(e: &inference_providers::CompletionError) -> Bytes {
     Bytes::from(format!("data: {payload}\n\n"))
 }
 
-fn compute_sha256(data: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(data);
-    hex::encode(hasher.finalize())
-}
-
 fn chat_stream_options(
     request: &ChatCompletionRequest,
 ) -> Option<inference_providers::models::StreamOptions> {
@@ -503,7 +495,6 @@ fn convert_chat_request_to_service(
         store: None,
         body_hash: body_hash.hash.clone(),
         response_id: None, // Direct chat completions API calls don't have a response_id
-        skip_provider_chat_signature: false,
         extra,
     }
 }
@@ -1131,7 +1122,6 @@ fn convert_text_request_to_service(
         store: None,
         body_hash: body_hash.hash.clone(),
         response_id: None, // Direct text completions API calls don't have a response_id
-        skip_provider_chat_signature: false,
         extra,
     }
 }
@@ -1250,8 +1240,6 @@ async fn chat_completions_inner(
     request: ChatCompletionRequest,
     request_id: Uuid,
 ) -> axum::response::Response {
-    let request_hash = body_hash.hash.clone();
-
     // Convert HTTP request to service parameters
     // Note: Names are not passed - high-cardinality data is tracked via database, not metrics
     let mut service_request = convert_chat_request_to_service(
@@ -1304,9 +1292,16 @@ async fn chat_completions_inner(
         .models_service
         .resolve_alias_cached(&request.model)
         .await;
-    let rewrite_public_stream_usage =
-        !e2ee_active && !chat_stream_has_non_text_modalities(&request);
-    service_request.skip_provider_chat_signature = rewrite_public_stream_usage;
+    let resolved_model_name = alias_canonical.as_deref().unwrap_or(&request.model);
+    let model_attestation_supported = app_state
+        .models_service
+        .get_model_by_name(resolved_model_name)
+        .await
+        .map(|model| model.attestation_supported)
+        .unwrap_or(false);
+    let rewrite_public_stream_usage = !e2ee_active
+        && !model_attestation_supported
+        && !chat_stream_has_non_text_modalities(&request);
 
     // Auto-redact (opt-in via x-auto-redact header or auto_redact body field).
     // On success this may rewrite service_request.messages to substitute
@@ -1443,16 +1438,10 @@ async fn chat_completions_inner(
                 let chunk_template_for_chain = chunk_template.clone();
                 let unredact_states_for_chain = unredact_states.clone();
                 let redaction_map_for_chunks = redaction_map.clone();
-                let public_signature_enabled = rewrite_public_stream_usage;
-                let public_signature_bytes = Arc::new(tokio::sync::Mutex::new(Vec::new()));
-                let public_signature_chat_id = Arc::new(tokio::sync::Mutex::new(None::<String>));
                 let final_stream_usage = Arc::new(tokio::sync::Mutex::new(
                     None::<inference_providers::TokenUsage>,
                 ));
                 let final_stream_usage_for_chain = final_stream_usage.clone();
-                let public_signature_bytes_for_chain = public_signature_bytes.clone();
-                let public_signature_chat_id_for_chain = public_signature_chat_id.clone();
-                let attestation_service_for_chain = app_state.attestation_service.clone();
 
                 // Re-attach any stashed leading control events, then convert
                 // to a raw bytes stream.
@@ -1469,8 +1458,6 @@ async fn chat_completions_inner(
                         let upstream_done = upstream_done_forwarded.clone();
                         let include_stream_usage_in_response = include_stream_usage_in_response;
                         let rewrite_public_stream_usage = rewrite_public_stream_usage;
-                        let public_signature_bytes = public_signature_bytes.clone();
-                        let public_signature_chat_id = public_signature_chat_id.clone();
                         let final_stream_usage = final_stream_usage.clone();
                         async move {
                             match result {
@@ -1501,10 +1488,25 @@ async fn chat_completions_inner(
                                     // Re-serialization path: auto-redact rewrites chunk
                                     // text, and non-OpenAI upstreams (Gemini native,
                                     // Anthropic) need normalization to OpenAI format.
-                                    // Control lines carry no parsed payload — drop them
-                                    // here; the end-of-stream tail appends the gateway's
-                                    // own [DONE] terminator.
-                                    let mut chunk = event.chunk?;
+                                    // Control lines carry no parsed payload; forward
+                                    // them raw so keepalives/comments are preserved.
+                                    // Hold [DONE] back only when the tail must emit
+                                    // gateway-generated chunks before the terminator.
+                                    let Some(mut chunk) = event.chunk else {
+                                        if event.is_done_marker() {
+                                            if auto_redact_enabled
+                                                || (rewrite_public_stream_usage
+                                                    && include_stream_usage_in_response)
+                                            {
+                                                return None;
+                                            }
+                                            upstream_done.store(
+                                                true,
+                                                std::sync::atomic::Ordering::Relaxed,
+                                            );
+                                        }
+                                        return Some(Ok::<Bytes, Infallible>(event.raw_bytes));
+                                    };
                                     if let inference_providers::StreamChunk::Chat(chat) = &chunk {
                                         {
                                             let mut t = template.lock().await;
@@ -1515,13 +1517,6 @@ async fn chat_completions_inner(
                                                     chat.created,
                                                     chat.system_fingerprint.clone(),
                                                 ));
-                                            }
-                                        }
-                                        if public_signature_enabled {
-                                            let mut chat_id =
-                                                public_signature_chat_id.lock().await;
-                                            if chat_id.is_none() {
-                                                *chat_id = Some(chat.id.clone());
                                             }
                                         }
                                     }
@@ -1581,20 +1576,6 @@ async fn chat_completions_inner(
                                     }
                                     // Format as SSE event with proper newlines
                                     let sse_bytes = Bytes::from(format!("data: {json_data}\n\n"));
-                                    if public_signature_enabled {
-                                        if let inference_providers::StreamChunk::Chat(chat) = &chunk
-                                        {
-                                            let mut chat_id =
-                                                public_signature_chat_id.lock().await;
-                                            if chat_id.is_none() {
-                                                *chat_id = Some(chat.id.clone());
-                                            }
-                                        }
-                                        public_signature_bytes
-                                            .lock()
-                                            .await
-                                            .extend_from_slice(&sse_bytes);
-                                    }
                                     Some(Ok::<Bytes, Infallible>(sse_bytes))
                                 }
                                 Err(e) => {
@@ -1696,60 +1677,6 @@ async fn chat_completions_inner(
                                     .load(std::sync::atomic::Ordering::Relaxed)
                                 {
                                     combined.extend_from_slice(b"data: [DONE]\n\n");
-                                }
-                                if public_signature_enabled && error_count_final == 0 {
-                                    let response_hash = {
-                                        let mut accumulated =
-                                            public_signature_bytes_for_chain.lock().await;
-                                        accumulated.extend_from_slice(&combined);
-                                        compute_sha256(&accumulated)
-                                    };
-
-                                    if let Some(chat_id) =
-                                        public_signature_chat_id_for_chain.lock().await.clone()
-                                    {
-                                        let attestation_service =
-                                            attestation_service_for_chain.clone();
-                                        let request_hash = request_hash.clone();
-                                        let model_name = model_name.clone();
-                                        tokio::spawn(async move {
-                                            match tokio::time::timeout(
-                                                Duration::from_secs(
-                                                    STREAM_SIGNATURE_STORE_TIMEOUT_SECS,
-                                                ),
-                                                attestation_service.store_chat_signature(
-                                                    &chat_id,
-                                                    request_hash,
-                                                    response_hash,
-                                                ),
-                                            )
-                                            .await
-                                            {
-                                                Ok(Ok(())) => {}
-                                                Ok(Err(e)) => {
-                                                    tracing::error!(
-                                                        %organization_id,
-                                                        model = %model_name,
-                                                        error = %e,
-                                                        "Failed to store public stream chat signature"
-                                                    );
-                                                }
-                                                Err(_) => {
-                                                    tracing::error!(
-                                                        %organization_id,
-                                                        model = %model_name,
-                                                        "Timeout storing public stream chat signature"
-                                                    );
-                                                }
-                                            }
-                                        });
-                                    } else {
-                                        tracing::warn!(
-                                            %organization_id,
-                                            model = %model_name,
-                                            "Cannot store public stream chat signature: no chat_id observed"
-                                        );
-                                    }
                                 }
                                 if combined.is_empty() {
                                     // Avoid emitting an empty body frame.

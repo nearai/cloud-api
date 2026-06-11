@@ -1412,7 +1412,6 @@ impl ResponseServiceImpl {
                 store: process_context.request.store,
                 body_hash: process_context.body_hash.to_string(),
                 response_id: Some(ctx.response_id.clone()),
-                skip_provider_chat_signature: false,
                 n: None,
                 extra,
             };
@@ -2981,7 +2980,6 @@ impl ResponseServiceImpl {
             store: None,
             body_hash: String::new(),
             response_id: None, // Title generation is not tied to a specific response
-            skip_provider_chat_signature: false,
             n: None,
             extra: std::collections::HashMap::from([(
                 "chat_template_kwargs".to_string(),

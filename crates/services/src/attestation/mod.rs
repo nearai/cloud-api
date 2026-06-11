@@ -699,16 +699,6 @@ impl ports::AttestationServiceTrait for AttestationService {
         Ok(())
     }
 
-    async fn store_chat_signature(
-        &self,
-        chat_id: &str,
-        request_hash: String,
-        response_hash: String,
-    ) -> Result<(), AttestationError> {
-        self.store_gateway_signature(chat_id, "chat", request_hash, response_hash)
-            .await
-    }
-
     async fn store_response_signature(
         &self,
         response_id: &str,

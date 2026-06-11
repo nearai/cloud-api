@@ -3605,6 +3605,19 @@ impl InferenceProviderPool {
                     });
                     !providers.is_empty()
                 });
+                // Prune the per-provider failure counters for the replaced providers
+                // too. The map is keyed by Arc pointer address; leaving a replaced
+                // provider's entry would let a future provider allocated at a
+                // recycled address inherit its (possibly demotion-level) count — for
+                // a tiered model that could start a fresh NEAR provider deprioritized
+                // below its Chutes fallback until its first success resets it. This
+                // mirrors the `pubkey_to_providers` prune above and honors this
+                // struct's "cleaned up on refresh" contract for the replace-in-place
+                // case (remove_stale_providers only covers models dropped entirely).
+                self.provider_failure_counts
+                    .write()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .retain(|key, _| !old_provider_ptrs.contains(key));
             }
 
             for (key, provider) in pub_key_updates {

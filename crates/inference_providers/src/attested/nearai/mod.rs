@@ -103,8 +103,10 @@ pub(crate) mod tracing_headers {
     pub const WORKSPACE_ID: &str = "x_workspace_id";
 }
 
-/// Encryption header keys used in params.extra for passing encryption information
-mod encryption_headers {
+/// Encryption header keys used in params.extra for passing encryption information.
+/// `pub(crate)` so other providers (e.g. the Chutes path) can strip/reject these
+/// internal client-E2EE markers instead of hardcoding the strings.
+pub(crate) mod encryption_headers {
     /// Key for signing algorithm (x-signing-algo header)
     pub const SIGNING_ALGO: &str = "x_signing_algo";
     /// Key for client public key (x-client-pub-key header)
@@ -1064,6 +1066,13 @@ impl Fleet {
 
 #[async_trait]
 impl InferenceProvider for Fleet {
+    /// NEAR's own attested fleet. `Provider` (which wraps `Fleet`) is what the pool
+    /// actually registers, but mirror the tier here too so the verifiable filter can
+    /// never misclassify a `Fleet` as plaintext if one is ever pooled directly.
+    fn tier(&self) -> crate::ProviderTier {
+        crate::ProviderTier::Near
+    }
+
     async fn get_signature(
         &self,
         chat_id: &str,
@@ -2077,6 +2086,12 @@ impl InferenceProvider for Fleet {
 /// to its Fleet, which holds all NEAR-AI model-proxy state and logic.
 #[async_trait]
 impl InferenceProvider for Provider {
+    /// NEAR AI's own attested TEE fleet — the primary tier for any model NEAR
+    /// serves; an attested third party (Chutes) sits behind it as fallback.
+    fn tier(&self) -> crate::ProviderTier {
+        crate::ProviderTier::Near
+    }
+
     async fn models(&self) -> Result<ModelsResponse, ListModelsError> {
         self.fleet.models().await
     }

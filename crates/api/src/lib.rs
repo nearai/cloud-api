@@ -745,6 +745,30 @@ pub async fn init_inference_providers(
     let models_source =
         models_repo.clone() as Arc<dyn services::inference_provider_pool::ExternalModelsSource>;
 
+    // Fail-closed reservation (MUST run before external/discovery loads below):
+    // when Chutes is enabled, reserve EVERY configured canonical id as a pinned
+    // (verifiable) model up front — even before we try to build the providers. This
+    // guarantees a plaintext external/OpenRouter row sharing a canonical id can
+    // never register for it, even if the Chutes provider fails to build (missing
+    // key / construction error). A reserved id then serves only its attested
+    // provider(s) or fails closed (404); it can never silently serve plaintext for
+    // a model an operator configured as verifiable.
+    if config.external_providers.enable_chutes {
+        let canonical_ids: Vec<String> = config
+            .external_providers
+            .chutes_models
+            .iter()
+            .map(|e| e.canonical_id.clone())
+            .collect();
+        if !canonical_ids.is_empty() {
+            pool.reserve_pinned_models(&canonical_ids);
+            tracing::info!(
+                count = canonical_ids.len(),
+                "Reserved Chutes canonical ids as verifiable (fail-closed) before external load"
+            );
+        }
+    }
+
     // Load inference_url models (our own vLLM/SGLang backends)
     match models_source.fetch_inference_url_models().await {
         Ok(models) if !models.is_empty() => {
@@ -796,30 +820,51 @@ pub async fn init_inference_providers(
                     services::attestation::chutes::vetted_golden_measurements(),
                     pccs_url,
                 ));
-                for model in &config.external_providers.chutes_models {
+                for entry in &config.external_providers.chutes_models {
+                    // The provider talks to Chutes with the chute SLUG (request_body
+                    // pins it + cached_chute_id resolves it); we expose/route under
+                    // the CANONICAL id (the NEAR-served id when NEAR also serves the
+                    // model, else the OpenRouter id) — never the raw `-TEE` slug.
                     let cfg = inference_providers::attested::chutes::Config::new(
                         api_key.clone(),
-                        model.clone(),
+                        entry.chute_slug.clone(),
                         config.external_providers.timeout_seconds,
                     )
+                    .with_canonical_id(entry.canonical_id.clone())
                     .with_streaming(allow_streaming);
                     match inference_providers::attested::chutes::Provider::new(
                         cfg,
                         verifier.clone(),
                     ) {
                         Ok(provider) => {
-                            // Ensure a catalog row exists so the data plane resolves
-                            // the model (and usage can be billed against a real id).
-                            ensure_chutes_catalog_row(&models_repo, model).await;
-                            // Pinned: registered out-of-band (not DB discovery), so
-                            // excluded from the refresh's stale-removal; also skips the
-                            // signing-key discovery Chutes never satisfies.
-                            pool.register_pinned_provider(model.clone(), Arc::new(provider))
-                                .await;
-                            tracing::info!(model = %model, "Registered Chutes attested provider");
+                            // Ensure a catalog row exists under the canonical id so the
+                            // data plane resolves the model (and usage bills against a
+                            // real id). If NEAR already serves this id, its row is left
+                            // untouched and we just add Chutes as a fallback provider.
+                            ensure_chutes_catalog_row(&models_repo, &entry.canonical_id).await;
+                            // Pinned SECONDARY: pushed onto the canonical id's provider
+                            // list (coexists with NEAR's own providers) and excluded from
+                            // discovery's stale-removal/overwrite. Tier ordering puts NEAR
+                            // first and Chutes as fallback; a Chutes-only id has just this
+                            // provider, so it serves as primary.
+                            pool.register_pinned_secondary_provider(
+                                entry.canonical_id.clone(),
+                                Arc::new(provider),
+                            )
+                            .await;
+                            tracing::info!(
+                                canonical = %entry.canonical_id,
+                                chute_slug = %entry.chute_slug,
+                                "Registered Chutes attested provider (fallback tier)"
+                            );
                         }
                         Err(e) => {
-                            tracing::warn!(model = %model, error = %e, "Failed to build Chutes provider");
+                            tracing::warn!(
+                                canonical = %entry.canonical_id,
+                                chute_slug = %entry.chute_slug,
+                                error = %e,
+                                "Failed to build Chutes provider"
+                            );
                         }
                     }
                 }

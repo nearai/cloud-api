@@ -491,11 +491,11 @@ pub struct AudioTranscriptionRequestSchema {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub language: Option<String>,
 
-    /// Response format (optional) - one of: "json", "text", "srt", "verbose_json", "vtt"
+    /// Response format (optional) - one of: "json", "text", "verbose_json"
     #[serde(skip_serializing_if = "Option::is_none")]
     pub response_format: Option<String>,
 
-    /// Timestamp granularities (optional) - currently supports "segment" with verbose_json
+    /// Timestamp granularities (optional) - supports "segment" and "word" with verbose_json
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timestamp_granularities: Option<Vec<String>>,
 }
@@ -519,7 +519,7 @@ pub struct AudioTranscriptionRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub language: Option<String>,
 
-    /// Response format: "json", "text", "srt", "verbose_json", "vtt"
+    /// Response format: "json", "text", "verbose_json"
     #[serde(skip_serializing_if = "Option::is_none")]
     pub response_format: Option<String>,
 
@@ -673,7 +673,7 @@ pub fn normalize_audio_transcription_language(language: &str) -> String {
     language
         .split(['-', '_'])
         .next()
-        .unwrap_or(language)
+        .unwrap()
         .to_ascii_lowercase()
 }
 
@@ -4217,6 +4217,16 @@ mod tests {
         assert_eq!(normalize_audio_transcription_language("en-US"), "en");
         assert_eq!(normalize_audio_transcription_language("fr_CA"), "fr");
         assert_eq!(normalize_audio_transcription_language("yue"), "yue");
+    }
+
+    #[test]
+    fn test_audio_transcription_language_codes_are_sorted_and_unique() {
+        for pair in AUDIO_TRANSCRIPTION_LANGUAGE_CODES.windows(2) {
+            assert!(
+                pair[0] < pair[1],
+                "language codes must stay sorted and unique"
+            );
+        }
     }
 
     #[test]

@@ -458,7 +458,7 @@ pub async fn delete_conversation(
 /// Pins a conversation to keep it at the top of the list.
 #[utoipa::path(
     post,
-    path = "/conversations/{conversation_id}/pin",
+    path = "/v1/conversations/{conversation_id}/pin",
     tag = "Conversations",
     params(
         ("conversation_id" = String, Path, description = "Conversation ID")
@@ -525,7 +525,7 @@ pub async fn pin_conversation(
 /// Unpins a conversation.
 #[utoipa::path(
     delete,
-    path = "/conversations/{conversation_id}/pin",
+    path = "/v1/conversations/{conversation_id}/pin",
     tag = "Conversations",
     params(
         ("conversation_id" = String, Path, description = "Conversation ID")
@@ -592,7 +592,7 @@ pub async fn unpin_conversation(
 /// Archives a conversation to hide it from the main list.
 #[utoipa::path(
     post,
-    path = "/conversations/{conversation_id}/archive",
+    path = "/v1/conversations/{conversation_id}/archive",
     tag = "Conversations",
     params(
         ("conversation_id" = String, Path, description = "Conversation ID")
@@ -659,7 +659,7 @@ pub async fn archive_conversation(
 /// Unarchives a conversation to show it in the main list again.
 #[utoipa::path(
     delete,
-    path = "/conversations/{conversation_id}/archive",
+    path = "/v1/conversations/{conversation_id}/archive",
     tag = "Conversations",
     params(
         ("conversation_id" = String, Path, description = "Conversation ID")
@@ -726,7 +726,7 @@ pub async fn unarchive_conversation(
 /// Creates a copy of an existing conversation with a new ID.
 #[utoipa::path(
     post,
-    path = "/conversations/{conversation_id}/clone",
+    path = "/v1/conversations/{conversation_id}/clone",
     tag = "Conversations",
     params(
         ("conversation_id" = String, Path, description = "Conversation ID")

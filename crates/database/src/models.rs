@@ -492,7 +492,7 @@ pub struct Model {
 
 /// Request to update model pricing
 /// All costs use fixed scale of 9 (nano-dollars) and USD currency
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 pub struct UpdateModelPricingRequest {
     pub input_cost_per_token: Option<i64>,
     pub output_cost_per_token: Option<i64>,

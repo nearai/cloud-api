@@ -81,6 +81,12 @@ pub fn tls_cert_fingerprint(instance: &InstanceEvidence) -> Result<String, Trans
     compute_spki_fingerprint_from_der(&der).map_err(TransformError::InvalidCertificate)
 }
 
+/// The instance certificate as raw DER (base64-decoded). The Chutes verifier
+/// needs the DER to check `report_data[32:64] == SHA256(SPKI(cert))`.
+pub fn certificate_der(instance: &InstanceEvidence) -> Result<Vec<u8>, TransformError> {
+    decode_b64("certificate", &instance.certificate)
+}
+
 /// Assemble the NVIDIA NRAS-submittable payload from the per-GPU evidence.
 ///
 /// The nonce the NVIDIA evidence is bound to is Chutes-derived (not the raw
@@ -130,6 +136,15 @@ pub fn nvidia_payload(instance: &InstanceEvidence) -> Result<Value, TransformErr
 /// verifier (next PR) consumes this partial map and additionally checks the
 /// Chutes-shaped bindings (`report_data[0:32] = SHA256(nonce ‖ e2e_pubkey)`,
 /// `[32:64] = tls_cert_fingerprint`, GPU nonce, register-pin measurement).
+///
+/// **Do not route this map through NEAR's `verify_attestation_report`.** It
+/// carries a `request_nonce` field, which NEAR's verifier compares against
+/// `report_data[32:64]` — but Chutes seals `SHA256(nonce ‖ e2e_pubkey)` there,
+/// so that path would fail confusingly. The Chutes verifier
+/// (`services::attestation::chutes`) deliberately consumes the individual
+/// helpers (`intel_quote_hex`, `nvidia_payload`, `certificate_der`) and the
+/// derived GPU nonce instead; this whole-map form exists only for tests /
+/// documentation of the shared-shape fields.
 ///
 /// Fail-closed: any malformed/absent required field errors.
 pub fn to_near_report(

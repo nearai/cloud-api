@@ -55,6 +55,8 @@ pub fn test_config() -> ApiConfig {
                 .ok()
                 .and_then(|p| p.parse().ok())
                 .unwrap_or(0),
+            // Tests drive the pricing scheduler's run_once() directly.
+            pricing_change_apply_interval_secs: 0,
         },
         inference_api_key: std::env::var("INFERENCE_API_KEY")
             .or_else(|_| std::env::var("MODEL_DISCOVERY_API_KEY"))

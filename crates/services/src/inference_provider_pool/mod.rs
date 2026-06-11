@@ -657,8 +657,35 @@ impl InferenceProviderPool {
             .write()
             .unwrap_or_else(|e| e.into_inner())
             .insert(model_id.clone());
+        // Record in pinned_providers too so the discovery-refresh merge re-attaches
+        // it: a same-name DB inference_url row can never overwrite this pinned
+        // provider (the security invariant the old skip-if-pinned guard enforced).
+        // Sole-provider semantics: this is THE provider for the id, so replace any
+        // prior pinned entry.
+        self.pinned_providers
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(model_id.clone(), vec![provider.clone()]);
         let mut mappings = self.provider_mappings.write().await;
         mappings.model_to_providers.insert(model_id, vec![provider]);
+    }
+
+    /// Reserve `model_ids` as pinned (verifiable) **before** any external/discovery
+    /// load, WITHOUT attaching a provider. Fail-closed guard for configured Chutes
+    /// canonical ids: marking them pinned makes [`Self::load_external_providers`]
+    /// (and every periodic refresh) skip them, so a plaintext external/OpenRouter
+    /// row sharing a canonical id can never register — even if the Chutes provider
+    /// later fails to build (missing key / construction error). A reserved id with
+    /// no attested provider then fails closed (404); it never silently serves
+    /// plaintext for a model an operator configured as verifiable.
+    pub fn reserve_pinned_models(&self, model_ids: &[String]) {
+        let mut pinned = self
+            .pinned_models
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+        for id in model_ids {
+            pinned.insert(id.clone());
+        }
     }
 
     /// Register a pinned (out-of-band) provider as a **secondary** under a model
@@ -674,25 +701,41 @@ impl InferenceProviderPool {
     /// [`Self::pinned_models`] so the discovery guards never overwrite/evict it.
     /// Tier ordering (NEAR before Attested3p) is applied at selection time, so the
     /// push order here does not matter.
+    ///
+    /// Like [`Self::register_pinned_provider`], this does NOT populate
+    /// `pubkey_to_providers` (no signing-key discovery). So a pubkey-routed (E2EE)
+    /// request — which selects via `model_pub_key` — gets NO Chutes fallback by
+    /// design: Chutes has no per-response signing key, its integrity is the ML-KEM
+    /// AEAD channel itself. Chutes fallback applies to the non-pubkey selection path.
     pub async fn register_pinned_secondary_provider(
         &self,
         model_id: String,
         provider: Arc<InferenceProviderTrait>,
     ) {
+        let ptr = Arc::as_ptr(&provider) as *const () as usize;
         self.pinned_models
             .write()
             .unwrap_or_else(|e| e.into_inner())
             .insert(model_id.clone());
-        self.pinned_providers
-            .write()
-            .unwrap_or_else(|e| e.into_inner())
-            .entry(model_id.clone())
-            .or_default()
-            .push(provider.clone());
+        {
+            // Dedup by Arc pointer here too (symmetric with model_to_providers
+            // below) so a repeated registration can't stack duplicate providers
+            // that every refresh would re-attach.
+            let mut pinned_providers = self
+                .pinned_providers
+                .write()
+                .unwrap_or_else(|e| e.into_inner());
+            let entry = pinned_providers.entry(model_id.clone()).or_default();
+            if !entry
+                .iter()
+                .any(|p| Arc::as_ptr(p) as *const () as usize == ptr)
+            {
+                entry.push(provider.clone());
+            }
+        }
         let mut mappings = self.provider_mappings.write().await;
         let entry = mappings.model_to_providers.entry(model_id).or_default();
         // Avoid a duplicate if this exact Arc is somehow already present.
-        let ptr = Arc::as_ptr(&provider) as *const () as usize;
         if !entry
             .iter()
             .any(|p| Arc::as_ptr(p) as *const () as usize == ptr)
@@ -1441,54 +1484,15 @@ impl InferenceProviderPool {
             return Some(providers);
         }
 
-        // Apply round-robin load balancing
-        let index_key = if let Some(pub_key) = model_pub_key {
-            format!("pubkey:{}", pub_key)
-        } else {
-            format!("id:{}", model_id)
-        };
-
-        let mut indices = self
-            .load_balancer_index
-            .write()
-            .unwrap_or_else(|e| e.into_inner());
-        let index = indices.entry(index_key.clone()).or_insert(0);
-        let selected_index = *index % providers.len();
-
-        // Increment for next request
-        *index = (*index + 1) % providers.len();
-        drop(indices);
-
-        // Build ordered list following round-robin pattern:
-        // selected provider first, then continue round-robin (selected+1, selected+2, ...)
-        let mut ordered_providers = Vec::with_capacity(providers.len());
-        for i in 0..providers.len() {
-            let provider_index = (selected_index + i) % providers.len();
-            ordered_providers.push(providers[provider_index].clone());
-        }
-
-        // Partition providers by failure count: healthy providers first, then demoted.
-        // Demoted providers (>= MAX_CONSECUTIVE_FAILURES) are still included as last resort
-        // but healthy providers are tried first, avoiding unnecessary timeout waits.
+        // Order providers by (health, trust tier), then round-robin WITHIN the
+        // leading group. The leading group is the healthy providers of the lowest
+        // tier — a NEAR-served model's own attested fleet; requests rotate evenly
+        // among them and only fall through to the next tier (an attested third
+        // party like Chutes) or to demoted providers when the leading group can't
+        // fulfill the request. Rotating within the group (rather than over the full
+        // list before sorting) keeps same-tier load balancing even.
+        //   tier rank: Near (0) < Attested3p (1) < NonAttested (2)
         const MAX_CONSECUTIVE_FAILURES: u32 = 10;
-        let counts = self
-            .provider_failure_counts
-            .read()
-            .unwrap_or_else(|e| e.into_inner());
-        let (mut healthy, mut demoted): (Vec<_>, Vec<_>) =
-            ordered_providers.into_iter().partition(|p| {
-                let key = Arc::as_ptr(p) as *const () as usize;
-                let failures = counts.get(&key).copied().unwrap_or(0);
-                failures < MAX_CONSECUTIVE_FAILURES
-            });
-        drop(counts);
-
-        // Within each health group, order by trust tier so a NEAR-served model
-        // prefers its own attested fleet and only falls back to an attested third
-        // party (Chutes) when the NEAR backends can't fulfill the request. Stable
-        // sort preserves the round-robin order within a tier. A Chutes-only model
-        // has a single provider and never reaches here (early return above).
-        //   Near (0) < Attested3p (1) < NonAttested (2)
         fn tier_rank(p: &Arc<InferenceProviderTrait>) -> u8 {
             match p.tier() {
                 inference_providers::ProviderTier::Near => 0,
@@ -1496,24 +1500,52 @@ impl InferenceProviderPool {
                 inference_providers::ProviderTier::NonAttested => 2,
             }
         }
-        healthy.sort_by_key(tier_rank);
-        demoted.sort_by_key(tier_rank);
+        // (demoted, tier_rank): healthy-before-demoted, NEAR-before-Chutes-before-plaintext.
+        let (mut ordered, group_len) = {
+            let counts = self
+                .provider_failure_counts
+                .read()
+                .unwrap_or_else(|e| e.into_inner());
+            let key_of = |p: &Arc<InferenceProviderTrait>| -> (u8, u8) {
+                let failures = counts
+                    .get(&(Arc::as_ptr(p) as *const () as usize))
+                    .copied()
+                    .unwrap_or(0);
+                let demoted = u8::from(failures >= MAX_CONSECUTIVE_FAILURES);
+                (demoted, tier_rank(p))
+            };
+            let mut ordered = providers;
+            ordered.sort_by_key(&key_of); // stable
+            let head_key = key_of(&ordered[0]);
+            let group_len = ordered.iter().take_while(|p| key_of(p) == head_key).count();
+            (ordered, group_len)
+        };
 
-        // Healthy providers first (tier-ordered, round-robin within a tier), then
-        // demoted as last resort. This way, if 1 of 2 providers is down, requests
-        // immediately go to the healthy one instead of waiting 5s for the dead
-        // one's connect timeout.
-        healthy.append(&mut demoted);
-        let ordered_providers = healthy;
+        // Round-robin rotate the leading group so its members share load evenly.
+        if group_len > 1 {
+            let index_key = if let Some(pub_key) = model_pub_key {
+                format!("pubkey:{}", pub_key)
+            } else {
+                format!("id:{}", model_id)
+            };
+            let mut indices = self
+                .load_balancer_index
+                .write()
+                .unwrap_or_else(|e| e.into_inner());
+            let index = indices.entry(index_key).or_insert(0);
+            let rot = *index % group_len;
+            *index = (*index + 1) % group_len;
+            drop(indices);
+            ordered[..group_len].rotate_left(rot);
+        }
 
         tracing::debug!(
-            index_key = %index_key,
-            providers_count = ordered_providers.len(),
-            selected_index = selected_index,
-            "Prepared providers for fallback with round-robin priority and failure demotion"
+            providers_count = ordered.len(),
+            leading_group = group_len,
+            "Prepared providers for fallback (tier-ordered, round-robin within leading tier)"
         );
 
-        Some(ordered_providers)
+        Some(ordered)
     }
 
     /// Sanitize a CompletionError by preserving its variant structure while sanitizing messages
@@ -1795,6 +1827,72 @@ impl InferenceProviderPool {
         sanitized
     }
 
+    /// Streaming ops: prefer streaming-capable providers. A NEAR-served model's
+    /// Chutes fallback may have streaming disabled (`CHUTES_ENABLE_STREAMING` off);
+    /// keeping it in the list means a retryable NEAR failure falls through to
+    /// Chutes, whose "streaming not enabled" error would overwrite the retryable
+    /// NEAR decision — masking the real error AND suppressing NEAR's backoff retry.
+    /// So when the operation streams and ANY provider can stream, drop the ones that
+    /// can't. If NONE can stream (e.g. a Chutes-only model with streaming off), keep
+    /// the list as-is so the provider's own clear error still surfaces.
+    fn filter_streaming_capable(
+        providers: Vec<Arc<InferenceProviderTrait>>,
+        operation_name: &str,
+    ) -> Vec<Arc<InferenceProviderTrait>> {
+        if operation_name.ends_with("_stream") && providers.iter().any(|p| p.supports_streaming()) {
+            providers
+                .into_iter()
+                .filter(|p| p.supports_streaming())
+                .collect()
+        } else {
+            providers
+        }
+    }
+
+    /// Combine a discovery cycle's per-model provider lists with the out-of-band
+    /// pinned providers, upholding the invariant that DB discovery can never DROP
+    /// or overwrite a pinned (attested, e.g. Chutes) provider:
+    ///   - each discovered model keeps its providers PLUS any pinned providers for
+    ///     it, re-appended and deduped by Arc pointer (`[fresh NEAR..] + [Chutes]`);
+    ///   - each pinned model ABSENT from this discovery cycle is rebuilt from its
+    ///     pinned providers alone, dropping a now-stale discovered backend (NEAR
+    ///     stopped serving it) so the attested fallback serves immediately rather
+    ///     than after ~10 failure-demotions. A Chutes-only id is absent every cycle,
+    ///     so this just re-asserts its pinned-only list.
+    ///
+    /// Pure (no I/O / no locks) so the riskiest refresh logic is unit-testable.
+    /// Callers must only invoke this with a COMPLETE discovery set (the pool does:
+    /// `load_inference_url_models` early-returns on an empty list and
+    /// `fetch_inference_url_models` is an all-or-error DB SELECT), so an absent
+    /// pinned id genuinely is no longer discovery-served.
+    fn merge_discovered_and_pinned(
+        discovered: HashMap<String, Vec<Arc<InferenceProviderTrait>>>,
+        pinned: &HashMap<String, Vec<Arc<InferenceProviderTrait>>>,
+    ) -> Vec<(String, Vec<Arc<InferenceProviderTrait>>)> {
+        let ptr = |p: &Arc<InferenceProviderTrait>| Arc::as_ptr(p) as *const () as usize;
+        let discovered_names: std::collections::HashSet<String> =
+            discovered.keys().cloned().collect();
+        let mut out: Vec<(String, Vec<Arc<InferenceProviderTrait>>)> = Vec::new();
+        for (name, mut providers) in discovered {
+            if let Some(extra) = pinned.get(&name) {
+                let present: std::collections::HashSet<usize> =
+                    providers.iter().map(&ptr).collect();
+                for p in extra {
+                    if !present.contains(&ptr(p)) {
+                        providers.push(p.clone());
+                    }
+                }
+            }
+            out.push((name, providers));
+        }
+        for (name, pin) in pinned {
+            if !discovered_names.contains(name) {
+                out.push((name.clone(), pin.clone()));
+            }
+        }
+        out
+    }
+
     /// Generic retry helper that tries each provider in order with automatic fallback.
     /// Returns both the result and the provider that succeeded (for chat_id mapping).
     /// If model_pub_key is provided, routes to the specific provider by signing public key.
@@ -1863,6 +1961,8 @@ impl InferenceProviderPool {
                 }
             }
         };
+
+        let providers = Self::filter_streaming_capable(providers, operation_name);
 
         tracing::info!(
             model_id = %model_id,
@@ -3377,32 +3477,18 @@ impl InferenceProviderPool {
                 }
             }
 
-            // Never let DB discovery DROP a pinned (out-of-band, attested) provider
-            // — silently substituting the per-request-verified E2EE provider with an
-            // unverified one is the exact attack the pinning prevents. But a pinned
-            // name CAN also be NEAR-served (Chutes as fallback under a canonical id),
-            // so instead of skipping the whole model we rebuild its list as
-            // [fresh discovered NEAR..] + [re-attached pinned providers]. The pinned
-            // providers come from `pinned_providers` (the source of truth), so they
-            // survive every refresh; discovery never produces a Chutes provider, so
-            // it can only ADD/REFRESH the NEAR side, never overwrite the pinned one.
+            // Combine the discovered (NEAR) providers with the out-of-band pinned
+            // (Chutes) ones so discovery can never DROP or overwrite a pinned
+            // provider — see [`Self::merge_discovered_and_pinned`]. This is the exact
+            // substitution-prevention the pinning exists for.
             let pinned_providers = self
                 .pinned_providers
                 .read()
                 .unwrap_or_else(|e| e.into_inner())
                 .clone();
-            for (model_name, mut providers) in model_providers {
-                if let Some(extra) = pinned_providers.get(&model_name) {
-                    let present: std::collections::HashSet<usize> = providers
-                        .iter()
-                        .map(|p| Arc::as_ptr(p) as *const () as usize)
-                        .collect();
-                    for p in extra {
-                        if !present.contains(&(Arc::as_ptr(p) as *const () as usize)) {
-                            providers.push(p.clone());
-                        }
-                    }
-                }
+            for (model_name, providers) in
+                Self::merge_discovered_and_pinned(model_providers, &pinned_providers)
+            {
                 mappings.model_to_providers.insert(model_name, providers);
             }
 
@@ -4844,6 +4930,123 @@ mod tests {
             tiers,
             vec![ProviderTier::Near, ProviderTier::Attested3p],
             "DB NEAR provider and pinned Chutes secondary must coexist, NEAR first"
+        );
+    }
+
+    /// Streaming-capability filter (review #2 / F1): for a streaming op, a Chutes
+    /// fallback with streaming disabled is dropped when a streaming-capable NEAR
+    /// sibling exists — so a NEAR failure doesn't fall through to Chutes' hard
+    /// "streaming disabled" error. A non-streaming op is untouched; a model whose
+    /// only provider can't stream keeps it so the clear error still surfaces.
+    #[test]
+    fn filter_streaming_capable_prefers_streaming_providers() {
+        use inference_providers::mock::MockProvider;
+        use inference_providers::ProviderTier;
+
+        let near = Arc::new(MockProvider::new().with_tier(ProviderTier::Near))
+            as Arc<InferenceProviderTrait>;
+        let chutes_no_stream = Arc::new(
+            MockProvider::new()
+                .with_tier(ProviderTier::Attested3p)
+                .with_streaming_support(false),
+        ) as Arc<InferenceProviderTrait>;
+
+        // Streaming op, NEAR can stream + Chutes can't → Chutes dropped.
+        let out = InferenceProviderPool::filter_streaming_capable(
+            vec![near.clone(), chutes_no_stream.clone()],
+            "chat_completion_stream",
+        );
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].tier(), ProviderTier::Near);
+
+        // Non-streaming op → no filtering, both kept.
+        let out = InferenceProviderPool::filter_streaming_capable(
+            vec![near.clone(), chutes_no_stream.clone()],
+            "chat_completion",
+        );
+        assert_eq!(out.len(), 2);
+
+        // Streaming op, the ONLY provider can't stream → kept (clear error surfaces).
+        let out = InferenceProviderPool::filter_streaming_capable(
+            vec![chutes_no_stream.clone()],
+            "chat_completion_stream",
+        );
+        assert_eq!(out.len(), 1);
+    }
+
+    /// Refresh merge (review #3 + the highest-risk path): discovery can never DROP
+    /// or overwrite a pinned provider, and a pinned id that falls out of discovery
+    /// is rebuilt pinned-only (stale NEAR dropped).
+    #[test]
+    fn merge_discovered_and_pinned_never_drops_pinned_and_prunes_stale() {
+        use inference_providers::mock::MockProvider;
+        use inference_providers::ProviderTier;
+        use std::collections::HashMap;
+
+        let near = Arc::new(MockProvider::new().with_tier(ProviderTier::Near))
+            as Arc<InferenceProviderTrait>;
+        let chutes = Arc::new(MockProvider::new().with_tier(ProviderTier::Attested3p))
+            as Arc<InferenceProviderTrait>;
+
+        let mut pinned: HashMap<String, Vec<Arc<InferenceProviderTrait>>> = HashMap::new();
+        pinned.insert("near+chutes".to_string(), vec![chutes.clone()]);
+        pinned.insert("chutes-only".to_string(), vec![chutes.clone()]);
+
+        // This discovery cycle finds NEAR for "near+chutes" only; "chutes-only" and
+        // the previously-NEAR-served "dropped" id are absent.
+        let mut discovered: HashMap<String, Vec<Arc<InferenceProviderTrait>>> = HashMap::new();
+        discovered.insert("near+chutes".to_string(), vec![near.clone()]);
+
+        let merged: HashMap<String, Vec<ProviderTier>> =
+            InferenceProviderPool::merge_discovered_and_pinned(discovered, &pinned)
+                .into_iter()
+                .map(|(k, v)| (k, v.iter().map(|p| p.tier()).collect()))
+                .collect();
+
+        // NEAR-served pinned id: NEAR refreshed + Chutes re-attached (never dropped).
+        assert_eq!(
+            merged.get("near+chutes"),
+            Some(&vec![ProviderTier::Near, ProviderTier::Attested3p])
+        );
+        // Chutes-only id absent from discovery: rebuilt pinned-only.
+        assert_eq!(
+            merged.get("chutes-only"),
+            Some(&vec![ProviderTier::Attested3p])
+        );
+    }
+
+    /// Fail-closed reservation (review #1): a configured Chutes canonical id is
+    /// reserved BEFORE external load, so a colliding plaintext external/OpenRouter
+    /// row can never register for it — even if the Chutes provider fails to build.
+    /// The model serves only attested providers or fails closed (no plaintext).
+    #[tokio::test]
+    async fn reserved_canonical_id_blocks_plaintext_external_collision() {
+        let pool = InferenceProviderPool::new(
+            None,
+            ExternalProvidersConfig {
+                openai_api_key: Some("sk-test-key".to_string()),
+                timeout_seconds: 60,
+                refresh_interval_secs: 0,
+                ..Default::default()
+            },
+        );
+        let model = "zai-org/GLM-5.1-FP8".to_string();
+
+        // Fail-closed: reserve the canonical id up front (Chutes build may fail, so
+        // no attested provider is ever registered for it).
+        pool.reserve_pinned_models(std::slice::from_ref(&model));
+
+        // A plaintext external row collides on the same canonical id.
+        let _ = pool
+            .load_external_providers(vec![(
+                model.clone(),
+                serde_json::json!({"backend": "openai_compatible", "base_url": "https://api.openai.com/v1"}),
+            )])
+            .await;
+
+        assert!(
+            !pool.has_provider(&model).await,
+            "a reserved (verifiable) canonical id must NOT get a plaintext external provider"
         );
     }
 

@@ -336,6 +336,16 @@ pub trait InferenceProvider {
         ProviderTier::NonAttested
     }
 
+    /// Whether this provider can serve **streaming** completions. Default `true`.
+    /// A provider that gates streaming (e.g. Chutes when `CHUTES_ENABLE_STREAMING`
+    /// is off — its stream protocol has no authenticated frame ordering) returns
+    /// `false`, so the pool prefers a streaming-capable sibling for streaming
+    /// requests instead of falling through to a hard "streaming not enabled" error
+    /// that would mask the primary's failure and suppress its retry.
+    fn supports_streaming(&self) -> bool {
+        true
+    }
+
     /// Clean up the dedicated client for a chat_id after signature fetching.
     fn unpin_chat_connection(&self, _chat_id: &str) {}
 

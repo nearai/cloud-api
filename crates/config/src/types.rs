@@ -1017,6 +1017,34 @@ mod tests {
         let cfg = ExternalProvidersConfig::from_env();
         assert!(cfg.chutes_models.is_empty());
     }
+
+    #[test]
+    #[serial]
+    fn chutes_models_dedup_duplicate_canonical_ids_first_wins() {
+        // Duplicate canonical id (even with a different slug) is dropped so a
+        // misconfig can't register redundant fallback providers — first wins.
+        std::env::set_var(
+            "CHUTES_MODELS",
+            "zai-org/GLM-5.1-FP8=zai-org/GLM-5.1-TEE,zai-org/GLM-5.1-FP8=zai-org/GLM-5-TEE,other/model",
+        );
+        let cfg = ExternalProvidersConfig::from_env();
+        std::env::remove_var("CHUTES_MODELS");
+
+        assert_eq!(
+            cfg.chutes_models,
+            vec![
+                ChutesModelEntry {
+                    canonical_id: "zai-org/GLM-5.1-FP8".to_string(),
+                    chute_slug: "zai-org/GLM-5.1-TEE".to_string(),
+                },
+                ChutesModelEntry {
+                    canonical_id: "other/model".to_string(),
+                    chute_slug: "other/model".to_string(),
+                },
+            ],
+            "duplicate canonical id dropped (first wins); the second slug is ignored"
+        );
+    }
 }
 
 /// One Chutes model to register, parsed from a single `CHUTES_MODELS` token.
@@ -1133,24 +1161,38 @@ impl ExternalProvidersConfig {
         // secret can't pass as Some("") and silently fail at request time.
         .filter(|s| !s.is_empty());
         // `canonical_id=chute_slug` per comma-separated token; a bare token means
-        // canonical_id == chute_slug. Drop tokens missing either side.
-        let chutes_models = env::var("CHUTES_MODELS")
-            .unwrap_or_default()
-            .split(',')
-            .map(|s| s.trim())
-            .filter(|s| !s.is_empty())
-            .map(|tok| match tok.split_once('=') {
-                Some((canonical, slug)) => ChutesModelEntry {
-                    canonical_id: canonical.trim().to_string(),
-                    chute_slug: slug.trim().to_string(),
-                },
-                None => ChutesModelEntry {
-                    canonical_id: tok.to_string(),
-                    chute_slug: tok.to_string(),
-                },
-            })
-            .filter(|e| !e.canonical_id.is_empty() && !e.chute_slug.is_empty())
-            .collect();
+        // canonical_id == chute_slug. Drop tokens missing either side, and dedup by
+        // canonical id (first wins) so a misconfig can't register duplicate
+        // fallback providers that every refresh would re-attach.
+        let chutes_models = {
+            let raw = env::var("CHUTES_MODELS").unwrap_or_default();
+            let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+            let mut entries: Vec<ChutesModelEntry> = Vec::new();
+            for tok in raw.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
+                let entry = match tok.split_once('=') {
+                    Some((canonical, slug)) => ChutesModelEntry {
+                        canonical_id: canonical.trim().to_string(),
+                        chute_slug: slug.trim().to_string(),
+                    },
+                    None => ChutesModelEntry {
+                        canonical_id: tok.to_string(),
+                        chute_slug: tok.to_string(),
+                    },
+                };
+                if entry.canonical_id.is_empty() || entry.chute_slug.is_empty() {
+                    continue;
+                }
+                if !seen.insert(entry.canonical_id.clone()) {
+                    eprintln!(
+                        "WARN: duplicate CHUTES_MODELS canonical id '{}' ignored (first wins)",
+                        entry.canonical_id
+                    );
+                    continue;
+                }
+                entries.push(entry);
+            }
+            entries
+        };
         let chutes_enable_streaming = env::var("CHUTES_ENABLE_STREAMING")
             .ok()
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))

@@ -745,6 +745,30 @@ pub async fn init_inference_providers(
     let models_source =
         models_repo.clone() as Arc<dyn services::inference_provider_pool::ExternalModelsSource>;
 
+    // Fail-closed reservation (MUST run before external/discovery loads below):
+    // when Chutes is enabled, reserve EVERY configured canonical id as a pinned
+    // (verifiable) model up front — even before we try to build the providers. This
+    // guarantees a plaintext external/OpenRouter row sharing a canonical id can
+    // never register for it, even if the Chutes provider fails to build (missing
+    // key / construction error). A reserved id then serves only its attested
+    // provider(s) or fails closed (404); it can never silently serve plaintext for
+    // a model an operator configured as verifiable.
+    if config.external_providers.enable_chutes {
+        let canonical_ids: Vec<String> = config
+            .external_providers
+            .chutes_models
+            .iter()
+            .map(|e| e.canonical_id.clone())
+            .collect();
+        if !canonical_ids.is_empty() {
+            pool.reserve_pinned_models(&canonical_ids);
+            tracing::info!(
+                count = canonical_ids.len(),
+                "Reserved Chutes canonical ids as verifiable (fail-closed) before external load"
+            );
+        }
+    }
+
     // Load inference_url models (our own vLLM/SGLang backends)
     match models_source.fetch_inference_url_models().await {
         Ok(models) if !models.is_empty() => {

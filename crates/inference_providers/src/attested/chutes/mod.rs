@@ -694,6 +694,14 @@ impl InferenceProvider for Provider {
         crate::ProviderTier::Attested3p
     }
 
+    /// Chutes only serves an attested STREAM when streaming is explicitly enabled
+    /// (its stream protocol has no authenticated frame ordering, so it's gated).
+    /// Reporting this lets the pool route a streaming request to a NEAR sibling
+    /// instead of falling through to a hard streaming-disabled error.
+    fn supports_streaming(&self) -> bool {
+        self.allow_streaming
+    }
+
     async fn get_signature(
         &self,
         _chat_id: &str,

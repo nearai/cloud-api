@@ -625,6 +625,10 @@ pub struct MockProvider {
     /// `NonAttested`. Set via [`MockProvider::with_tier`] to exercise tiered
     /// provider selection (e.g. a `Near` primary with an `Attested3p` fallback).
     tier: crate::ProviderTier,
+    /// Value reported by [`InferenceProvider::supports_streaming`]; defaults to
+    /// `true`. Set via [`MockProvider::with_streaming_support`] to exercise the
+    /// streaming-capability filter (e.g. a Chutes-like fallback with streaming off).
+    supports_streaming: bool,
 }
 
 impl MockProvider {
@@ -649,6 +653,7 @@ impl MockProvider {
             last_chat_params: Arc::new(Mutex::new(None)),
             fail_attestation: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tier: crate::ProviderTier::NonAttested,
+            supports_streaming: true,
         }
     }
 
@@ -669,6 +674,7 @@ impl MockProvider {
             last_chat_params: Arc::new(Mutex::new(None)),
             fail_attestation: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tier: crate::ProviderTier::NonAttested,
+            supports_streaming: true,
         }
     }
 
@@ -687,6 +693,7 @@ impl MockProvider {
             last_chat_params: Arc::new(Mutex::new(None)),
             fail_attestation: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tier: crate::ProviderTier::NonAttested,
+            supports_streaming: true,
         }
     }
 
@@ -695,6 +702,13 @@ impl MockProvider {
     /// and the verifiable-never-falls-back-to-plaintext rule).
     pub fn with_tier(mut self, tier: crate::ProviderTier) -> Self {
         self.tier = tier;
+        self
+    }
+
+    /// Set whether this mock reports streaming support (default `true`). Used to
+    /// exercise the streaming-capability filter (a streaming-disabled fallback).
+    pub fn with_streaming_support(mut self, supported: bool) -> Self {
+        self.supports_streaming = supported;
         self
     }
 
@@ -879,6 +893,10 @@ impl Default for MockProvider {
 impl crate::InferenceProvider for MockProvider {
     fn tier(&self) -> crate::ProviderTier {
         self.tier
+    }
+
+    fn supports_streaming(&self) -> bool {
+        self.supports_streaming
     }
 
     async fn models(&self) -> Result<ModelsResponse, ListModelsError> {

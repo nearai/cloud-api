@@ -1,4 +1,5 @@
 use crate::models::ErrorResponse;
+use crate::routes::common::{HEADER_SHOULD_RETRY, SHOULD_RETRY_FALSE};
 use axum::extract::OriginalUri;
 use axum::http::{Method, StatusCode};
 use axum::routing::{any, get, post};
@@ -28,7 +29,11 @@ pub fn openai_compat_routes() -> Router {
 pub async fn openai_endpoint_not_implemented(
     method: Method,
     OriginalUri(uri): OriginalUri,
-) -> (StatusCode, Json<ErrorResponse>) {
+) -> (
+    StatusCode,
+    [(&'static str, &'static str); 1],
+    Json<ErrorResponse>,
+) {
     let message = format!(
         "{} {} is not implemented by NEAR AI Cloud yet",
         method,
@@ -37,6 +42,7 @@ pub async fn openai_endpoint_not_implemented(
 
     (
         StatusCode::NOT_IMPLEMENTED,
+        [(HEADER_SHOULD_RETRY, SHOULD_RETRY_FALSE)],
         Json(ErrorResponse::new(message, "not_implemented".to_string())),
     )
 }
@@ -95,6 +101,14 @@ mod tests {
                     .get(CONTENT_TYPE)
                     .map(|value| value.to_str().unwrap()),
                 Some("application/json"),
+                "{method} {path}"
+            );
+            assert_eq!(
+                response
+                    .headers()
+                    .get(HEADER_SHOULD_RETRY)
+                    .map(|value| value.to_str().unwrap()),
+                Some(SHOULD_RETRY_FALSE),
                 "{method} {path}"
             );
 

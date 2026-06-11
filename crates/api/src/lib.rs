@@ -1694,15 +1694,17 @@ pub fn build_admin_routes(
 ) -> Router {
     use crate::middleware::admin_middleware;
     use crate::routes::admin::{
-        batch_upsert_models, confirm_model_deprecation, create_admin_access_token, create_service,
+        batch_upsert_models, cancel_model_pricing_change, confirm_model_deprecation,
+        confirm_model_pricing_changes, create_admin_access_token, create_service,
         delete_admin_access_token, delete_model, deprecate_model, get_admin_organization_balance,
         get_billing_summary, get_infra_summary, get_model_history, get_model_revenue,
         get_org_revenue, get_organization_concurrent_limit, get_organization_limits_history,
         get_organization_metrics, get_organization_timeseries, get_platform_metrics,
         get_platform_timeseries, list_admin_access_tokens, list_invitation_email_deliveries,
-        list_models as admin_list_models, list_organizations, list_users,
-        preview_model_deprecation, resend_invitation_email, update_organization_concurrent_limit,
-        update_organization_limits, update_service, AdminAppState,
+        list_model_pricing_changes, list_models as admin_list_models, list_organizations,
+        list_users, preview_model_deprecation, preview_model_pricing_changes,
+        resend_invitation_email, update_organization_concurrent_limit, update_organization_limits,
+        update_service, AdminAppState,
     };
     use database::repositories::{AdminAccessTokenRepository, AdminCompositeRepository};
     use services::admin::AdminServiceImpl;
@@ -1760,6 +1762,22 @@ pub fn build_admin_routes(
         .route(
             "/admin/models/deprecate",
             axum::routing::post(deprecate_model),
+        )
+        .route(
+            "/admin/models/pricing-changes",
+            axum::routing::get(list_model_pricing_changes),
+        )
+        .route(
+            "/admin/models/pricing-changes/preview",
+            axum::routing::post(preview_model_pricing_changes),
+        )
+        .route(
+            "/admin/models/pricing-changes/confirm",
+            axum::routing::post(confirm_model_pricing_changes),
+        )
+        .route(
+            "/admin/models/pricing-changes/{id}",
+            axum::routing::delete(cancel_model_pricing_change),
         )
         .route(
             "/admin/models/{model_name}",
@@ -1977,6 +1995,7 @@ mod tests {
             server: config::ServerConfig {
                 host: "127.0.0.1".to_string(),
                 port: 0, // Use port 0 for testing to get a random available port
+                pricing_change_apply_interval_secs: 0,
             },
             inference_api_key: Some("test-key".to_string()),
             internal_usage_token: None,
@@ -2079,6 +2098,7 @@ mod tests {
             server: config::ServerConfig {
                 host: "127.0.0.1".to_string(),
                 port: 0,
+                pricing_change_apply_interval_secs: 0,
             },
             inference_api_key: Some("test-key".to_string()),
             internal_usage_token: None,

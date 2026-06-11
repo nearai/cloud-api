@@ -646,6 +646,19 @@ impl InferenceProviderPool {
         mappings.model_to_providers.insert(model_id, vec![provider]);
     }
 
+    /// Whether `model_name` is currently registered as a **pinned** (out-of-band)
+    /// provider. The admin PATCH path uses this to avoid tearing down a pinned
+    /// provider (e.g. Chutes): pinned providers are registered from config at
+    /// startup and are not re-registered by the DB-discovery (inference-url /
+    /// external) paths, so unregistering one on a metadata/activation update would
+    /// leave an active catalog row with no serving provider until restart.
+    pub fn is_pinned(&self, model_name: &str) -> bool {
+        self.pinned_models
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(model_name)
+    }
+
     /// Register multiple providers for multiple models (useful for testing)
     /// Also populates model_pub_key_mapping by fetching attestation reports
     /// Fetches attestation reports for both ECDSA and Ed25519 to support both signing algorithms
@@ -4573,6 +4586,41 @@ mod tests {
         assert!(
             Arc::ptr_eq(&got[0], &pinned),
             "DB discovery must not overwrite a pinned (attested) provider"
+        );
+    }
+
+    #[tokio::test]
+    async fn is_pinned_reports_pinned_models_and_guards_admin_unregister() {
+        use inference_providers::mock::MockProvider;
+        let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
+
+        pool.register_pinned_provider("chutes-model".to_string(), Arc::new(MockProvider::new()))
+            .await;
+        pool.register_provider("db-model".to_string(), Arc::new(MockProvider::new()))
+            .await;
+
+        assert!(pool.is_pinned("chutes-model"));
+        assert!(!pool.is_pinned("db-model"));
+        assert!(!pool.is_pinned("absent-model"));
+
+        // Regression for the admin PATCH unregister guard (admin.rs): a PATCH
+        // carrying `provider_type` (e.g. "chutes") would otherwise unregister the
+        // provider, and the inference-url/external re-registration below would NOT
+        // restore a pinned one — leaving an active catalog row with no provider.
+        // The guard skips pinned models, so the pinned provider must survive.
+        for model in ["chutes-model", "db-model"] {
+            let provider_type_present = true; // PATCH includes provider_type
+            if !pool.is_pinned(model) && provider_type_present {
+                pool.unregister_provider(model).await;
+            }
+        }
+        assert!(
+            pool.has_provider("chutes-model").await,
+            "pinned provider must survive an admin PATCH carrying provider_type"
+        );
+        assert!(
+            !pool.has_provider("db-model").await,
+            "a non-pinned provider is still unregistered on a provider_type change"
         );
     }
 

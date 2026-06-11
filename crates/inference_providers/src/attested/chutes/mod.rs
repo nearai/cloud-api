@@ -245,8 +245,20 @@ impl Provider {
         // instance doesn't take down all requests. Verification failure is never
         // a fallback to an unverified channel — we just move to the next attested
         // candidate, and fail if none verify.
+        //
+        // Rotate the *starting* candidate (wrapping counter) so traffic from one
+        // gateway process doesn't always hot-spot the first-listed instance —
+        // `X-Instance-Id` pinning prevents Chutes-side rebalancing, so we spread
+        // it here. Every candidate is still attempted, just in a rotated order.
+        let n = candidates.len();
+        let start = {
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            static INSTANCE_RR: AtomicUsize = AtomicUsize::new(0);
+            INSTANCE_RR.fetch_add(1, Ordering::Relaxed) % n
+        };
         let mut last_err = String::from("no candidate instances");
-        for inst in candidates {
+        for off in 0..n {
+            let inst = candidates[(start + off) % n];
             let evidence = match evidence_resp.instance(&inst.instance_id) {
                 Some(e) => e,
                 None => {

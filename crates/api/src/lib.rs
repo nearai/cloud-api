@@ -686,13 +686,22 @@ async fn ensure_chutes_catalog_row(
                 // above prevents this zero price from ever being charged.
                 ..Default::default()
             };
-            match models_repo.upsert_model_pricing(model_name, &req).await {
-                Ok(_) => {
+            // INSERT ... ON CONFLICT DO NOTHING: if an operator created/activated
+            // the row concurrently with startup, their row wins and is left
+            // untouched (no clobbering is_active/pricing back to the seed defaults).
+            match models_repo.seed_model_if_absent(model_name, &req).await {
+                Ok(Some(_)) => {
                     tracing::warn!(
                         model = %model_name,
                         "Seeded Chutes catalog row as INACTIVE with zero pricing — set real \
                          per-token rates AND is_active=true via PATCH /v1/admin/models to serve \
                          (kept inactive so paid traffic can't be billed at $0)"
+                    );
+                }
+                Ok(None) => {
+                    tracing::info!(
+                        model = %model_name,
+                        "Chutes catalog row already present (created concurrently); left untouched"
                     );
                 }
                 Err(e) => {
@@ -822,6 +831,17 @@ pub async fn init_inference_providers(
                 );
             }
         }
+    } else if !config.external_providers.chutes_models.is_empty() {
+        // Flag off but models still listed: any *active* catalog row left over
+        // from a previous run would resolve to a model with no registered provider
+        // (per-request provider errors, not a clean 404). Warn so an operator
+        // notices and deactivates those rows (PATCH is_active=false).
+        tracing::warn!(
+            models = ?config.external_providers.chutes_models,
+            "ENABLE_CHUTES is off but CHUTES_MODELS is set; if any of these have an active \
+             catalog row, requests will surface provider errors — deactivate them via \
+             PATCH /v1/admin/models or re-enable ENABLE_CHUTES"
+        );
     }
 
     pool

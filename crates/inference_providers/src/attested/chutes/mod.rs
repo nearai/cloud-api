@@ -220,29 +220,60 @@ impl Provider {
     /// `/v1/models` lookup happens once per provider. Shared by the data path
     /// (`verify_and_prepare`) and the attestation-report path so they can't
     /// diverge (and the report path doesn't re-hit the network each call).
-    async fn cached_chute_id(&self) -> Result<String, String> {
+    ///
+    /// Returns the typed [`client::ChutesClientError`] so each caller maps it
+    /// appropriately: the data path routes it through [`Self::map_client_error`]
+    /// (preserving a `/v1/models` 429 as retryable — `OnceCell` doesn't cache
+    /// failures, so a retry genuinely re-resolves), while the attestation-report
+    /// path keeps its own `AttestationError::FetchError` formatting.
+    async fn cached_chute_id(&self) -> Result<String, client::ChutesClientError> {
         self.chute_id_cache
             .get_or_try_init(|| self.client.resolve_chute_id(&self.model_name))
             .await
-            .map_err(|e| format!("resolve chute_id: {e}"))
             .cloned()
     }
 
-    /// Map a Chutes HTTP-client error to a `CompletionError`, PRESERVING the
-    /// upstream HTTP status. This is what lets a 429 from the rate-limited
-    /// `/e2e/instances` (and any 5xx from discovery / evidence / invoke) reach the
-    /// pool's classifier as a RETRYABLE `HttpError { status_code }` instead of a
-    /// flat, non-retryable `CompletionError(String)` that masks as a 502 and never
-    /// retries. `ctx` labels the failing stage for logs/messages.
+    /// Map a Chutes HTTP-client error to a `CompletionError`. Only statuses that
+    /// the pool's classifier treats as RETRYABLE or correctly masks are preserved
+    /// as `HttpError { status_code, is_external: true }`:
+    ///
+    /// * `429` → `RateLimitExceeded` (retryable) — the headline `/e2e/instances`
+    ///   rate-limit case this fix targets;
+    /// * `408` → `ProviderError 504` (timed out, retry) and `5xx` → masked
+    ///   `ProviderError 502` / `ServiceOverloaded` (retryable for 503).
+    ///
+    /// Every other status — notably `400 / 413 / 422` — is deliberately collapsed
+    /// to a generic `CompletionError(msg)` (which masks as a 502). Discovery /
+    /// evidence / invoke requests are internally constructed, so a 4xx there is
+    /// never the customer's fault; preserving it would hit `map_provider_error`'s
+    /// `InvalidParams` arms and leak the stage label, provider name, and raw
+    /// upstream body to the client as a misattributed HTTP 400. This keeps the
+    /// retryability win with no client-facing contract change. `ctx` labels the
+    /// failing stage for logs/messages.
     fn map_client_error(ctx: &str, e: client::ChutesClientError) -> CompletionError {
         let msg = format!("{ctx}: {e}");
         match e {
-            client::ChutesClientError::Status { status, .. } => CompletionError::HttpError {
+            // Retryable / correctly-masked upstream statuses: preserve so the
+            // pool classifier can act on them.
+            client::ChutesClientError::Status {
+                status: status @ (408 | 429 | 500..=599),
+                ..
+            } => CompletionError::HttpError {
                 status_code: status,
                 message: msg,
                 is_external: true,
             },
-            _ => CompletionError::CompletionError(msg),
+            // Any other upstream status (400/413/422/…) on an internally-built
+            // request, plus all non-status client errors (transport / oversized
+            // body / model-not-found / missing-chute-id / decode), mask as the
+            // prior generic 502. Listed explicitly (no `_`) so a new
+            // `ChutesClientError` variant forces this mapping to be revisited.
+            client::ChutesClientError::Status { .. }
+            | client::ChutesClientError::Http(_)
+            | client::ChutesClientError::BodyTooLarge { .. }
+            | client::ChutesClientError::ModelNotFound(_)
+            | client::ChutesClientError::MissingChuteId(_)
+            | client::ChutesClientError::Decode { .. } => CompletionError::CompletionError(msg),
         }
     }
 
@@ -255,11 +286,12 @@ impl Provider {
         &self,
         request_json: &Value,
     ) -> Result<PreparedInvoke, CompletionError> {
-        // Cached: the model→chute_id mapping is static, so resolve once.
+        // Cached: the model→chute_id mapping is static, so resolve once. A
+        // `/v1/models` rate-limit 429 here is preserved as retryable too.
         let chute_id = self
             .cached_chute_id()
             .await
-            .map_err(CompletionError::CompletionError)?;
+            .map_err(|e| Self::map_client_error("resolve chute_id", e))?;
 
         let instances = self
             .client
@@ -709,7 +741,7 @@ impl InferenceProvider for Provider {
         let chute_id = self
             .cached_chute_id()
             .await
-            .map_err(AttestationError::FetchError)?;
+            .map_err(|e| AttestationError::FetchError(format!("resolve chute_id: {e}")))?;
         let instances = self
             .client
             .discover_instances(&chute_id)
@@ -880,7 +912,21 @@ mod tests {
             other => panic!("429 must map to HttpError, got {other:?}"),
         }
 
-        // A 5xx is preserved too (503 → ServiceOverloaded downstream).
+        // 408 (provider timeout, retryable → 504) and 5xx (503 → ServiceOverloaded)
+        // are preserved too.
+        assert!(matches!(
+            Provider::map_client_error(
+                "Chutes /e2e/invoke",
+                ChutesClientError::Status {
+                    status: 408,
+                    body: String::new()
+                },
+            ),
+            CompletionError::HttpError {
+                status_code: 408,
+                ..
+            }
+        ));
         assert!(matches!(
             Provider::map_client_error(
                 "fetch evidence",
@@ -901,6 +947,32 @@ mod tests {
             Provider::map_client_error("x", ChutesClientError::ModelNotFound("m".into())),
             CompletionError::CompletionError(_)
         ));
+    }
+
+    /// A 4xx that is NOT 408/429 (e.g. 400/413/422) on an internally-constructed
+    /// discovery/evidence/invoke request is NOT the client's fault, so it must be
+    /// collapsed to a generic `CompletionError` (masked 502) rather than preserved
+    /// as an `HttpError`. Otherwise `map_provider_error` would route it to its
+    /// `InvalidParams` arms and echo the stage label, provider name, and raw
+    /// upstream body back to the customer as a misattributed HTTP 400.
+    #[test]
+    fn map_client_error_masks_internal_4xx_to_avoid_client_blame_and_leak() {
+        use client::ChutesClientError;
+
+        for status in [400u16, 413, 422] {
+            let mapped = Provider::map_client_error(
+                "Chutes /e2e/invoke",
+                ChutesClientError::Status {
+                    status,
+                    // A nonce/token error body that must never reach the client.
+                    body: "consumed nonce token: secret-internal-detail".into(),
+                },
+            );
+            match mapped {
+                CompletionError::CompletionError(_) => {}
+                other => panic!("internal {status} must mask to CompletionError, got {other:?}"),
+            }
+        }
     }
 
     /// A verifier stub for unit tests (no DCAP/network): records calls and

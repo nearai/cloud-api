@@ -3038,7 +3038,8 @@ mod tests {
             "stream_options".to_string(),
             serde_json::json!({
                 "include_usage": true,
-                "continuous_usage_stats": false
+                "continuous_usage_stats": false,
+                "future_vendor_option": "preserved"
             }),
         );
 
@@ -3047,6 +3048,10 @@ mod tests {
 
         assert_eq!(stream_options.include_usage, Some(true));
         assert_eq!(stream_options.continuous_usage_stats, Some(false));
+        assert_eq!(
+            stream_options.extra.get("future_vendor_option"),
+            Some(&serde_json::json!("preserved"))
+        );
         assert!(
             !extra.contains_key("stream_options"),
             "typed stream_options should not also serialize through extra"

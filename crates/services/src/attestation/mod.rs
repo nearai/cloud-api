@@ -408,19 +408,21 @@ impl AttestationService {
                 })?;
 
             tracing::info!(
-                "Stored {} signature for {}: {} with algorithm: {}",
-                id_label,
-                id_label,
-                signature_id,
-                algo
+                signature_kind = id_label,
+                signature_id = signature_id,
+                signing_algo = algo,
+                "Stored gateway signature"
             );
         }
 
         let duration = start_time.elapsed();
         self.metrics_service
-            .record_count(METRIC_VERIFICATION_SUCCESS, 1, &[&env_tag]);
-        self.metrics_service
-            .record_latency(METRIC_VERIFICATION_DURATION, duration, &[&env_tag]);
+            .record_count(METRIC_SIGNATURE_CREATION_SUCCESS, 1, &[&env_tag]);
+        self.metrics_service.record_latency(
+            METRIC_SIGNATURE_CREATION_DURATION,
+            duration,
+            &[&env_tag],
+        );
 
         Ok(())
     }

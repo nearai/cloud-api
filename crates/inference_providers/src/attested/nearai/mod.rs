@@ -1405,6 +1405,7 @@ impl InferenceProvider for Fleet {
         streaming_params.stream_options = Some(StreamOptions {
             include_usage: Some(true),
             continuous_usage_stats: Some(true),
+            extra: Default::default(),
         });
 
         let mut headers = self
@@ -1666,6 +1667,7 @@ impl InferenceProvider for Fleet {
         streaming_params.stream_options = Some(StreamOptions {
             include_usage: Some(true),
             continuous_usage_stats: Some(true),
+            extra: Default::default(),
         });
 
         let headers = self

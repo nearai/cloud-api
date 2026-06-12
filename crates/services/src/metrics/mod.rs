@@ -69,6 +69,9 @@ impl MetricsServiceTrait for OtlpMetricsService {
                     "Time from first token to last token (decoding phase)"
                 }
                 consts::METRIC_VERIFICATION_DURATION => "Time to complete verification operation",
+                consts::METRIC_SIGNATURE_CREATION_DURATION => {
+                    "Time to create and store gateway signatures"
+                }
                 consts::METRIC_HTTP_DURATION => "HTTP request processing time",
                 _ => "Latency measurement",
             };
@@ -93,6 +96,9 @@ impl MetricsServiceTrait for OtlpMetricsService {
                 consts::METRIC_TOKENS_OUTPUT => "Output tokens generated",
                 consts::METRIC_VERIFICATION_SUCCESS => "Successful verification operations",
                 consts::METRIC_VERIFICATION_FAILURE => "Failed verification operations",
+                consts::METRIC_SIGNATURE_CREATION_SUCCESS => {
+                    "Successful gateway signature creation operations"
+                }
                 consts::METRIC_HTTP_REQUESTS => {
                     "Total HTTP requests by endpoint, method, and status"
                 }

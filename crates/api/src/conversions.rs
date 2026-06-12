@@ -904,7 +904,10 @@ mod tests {
         let mut extra = HashMap::new();
         extra.insert(
             "stream_options".to_string(),
-            serde_json::json!({ "include_usage": true }),
+            serde_json::json!({
+                "include_usage": true,
+                "future_vendor_option": "preserved"
+            }),
         );
         extra.insert("custom".to_string(), serde_json::json!("kept"));
 
@@ -943,6 +946,13 @@ mod tests {
                 .and_then(|stream_options| stream_options.include_usage),
             Some(true)
         );
+        assert_eq!(
+            domain_params
+                .stream_options
+                .as_ref()
+                .and_then(|stream_options| stream_options.extra.get("future_vendor_option")),
+            Some(&serde_json::json!("preserved"))
+        );
         assert!(
             !domain_params.extra.contains_key("stream_options"),
             "typed stream_options should not be duplicated in flattened extra"
@@ -950,6 +960,12 @@ mod tests {
         assert_eq!(
             domain_params.extra.get("custom"),
             Some(&serde_json::json!("kept"))
+        );
+
+        let wire = serde_json::to_value(&domain_params).unwrap();
+        assert_eq!(
+            wire["stream_options"]["future_vendor_option"],
+            serde_json::json!("preserved")
         );
     }
 

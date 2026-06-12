@@ -119,99 +119,11 @@ async fn test_chat_completions_records_usage_and_history() {
     );
 }
 
-/// Call chat/completions with stream: true, consume the stream, then verify usage was
-/// recorded in org usage history (limit=1).
+/// Call chat/completions with the default stream mode, consume the stream, then verify usage was
+/// still recorded in org usage history (limit=1). The public response may stay on raw passthrough
+/// for attested models to preserve provider signatures; billing capture must remain independent.
 #[tokio::test]
 async fn test_chat_completions_stream_records_usage_in_history() {
-    let server = setup_test_server().await;
-
-    setup_qwen_model(&server).await;
-    let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
-    let api_key = get_api_key_for_org(&server, org.id.clone()).await;
-
-    let stream_resp = server
-        .post("/v1/chat/completions")
-        .add_header("Authorization", format!("Bearer {api_key}"))
-        .json(&json!({
-            "model": E2E_QWEN_MODEL_NAME,
-            "messages": [{ "role": "user", "content": "hello" }],
-            "stream": true,
-            "stream_options": { "include_usage": true }
-        }))
-        .await;
-
-    assert_eq!(
-        stream_resp.status_code(),
-        200,
-        "streaming chat/completions should succeed: {}",
-        stream_resp.text()
-    );
-
-    let text = stream_resp.text();
-    let mut last_usage = None::<(i32, i32)>;
-    for line in text.lines() {
-        if let Some(data) = line.strip_prefix("data: ") {
-            if data.trim() == "[DONE]" {
-                break;
-            }
-            if let Ok(StreamChunk::Chat(chat)) = serde_json::from_str::<StreamChunk>(data) {
-                if let Some(usage) = &chat.usage {
-                    last_usage = Some((usage.prompt_tokens, usage.completion_tokens));
-                }
-            }
-        }
-    }
-    assert!(
-        last_usage.is_some(),
-        "stream should contain at least one chunk with usage"
-    );
-    let (prompt_tokens, completion_tokens) = last_usage.unwrap();
-    assert!(prompt_tokens > 0 && completion_tokens > 0);
-
-    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-
-    let history_resp = server
-        .get(&format!(
-            "/v1/organizations/{}/usage/history?limit=1&offset=0",
-            org.id
-        ))
-        .add_header("Authorization", format!("Bearer {}", get_session_id()))
-        .add_header("User-Agent", MOCK_USER_AGENT)
-        .await;
-
-    assert_eq!(
-        history_resp.status_code(),
-        200,
-        "usage history should succeed"
-    );
-    let history: api::routes::usage::UsageHistoryResponse = history_resp.json();
-    assert!(!history.data.is_empty(), "should have usage history entry");
-    let entry = &history.data[0];
-    assert_eq!(entry.input_tokens, prompt_tokens);
-    assert_eq!(entry.output_tokens, completion_tokens);
-    assert_eq!(
-        entry.total_tokens,
-        prompt_tokens + completion_tokens,
-        "total_tokens should equal input + output"
-    );
-
-    // Verify cost matches tokens and pricing (same as setup_qwen_model).
-    let pricing = e2e_qwen_model_pricing_no_cache();
-    let cost = compute_token_cost(
-        entry.input_tokens,
-        entry.output_tokens,
-        entry.cache_read_tokens,
-        &pricing,
-    )
-    .expect("cost calculation should succeed");
-    assert_eq!(
-        entry.total_cost, cost.total_cost,
-        "total_cost should match input/output tokens and configured pricing for streaming completions"
-    );
-}
-
-#[tokio::test]
-async fn test_chat_completions_stream_default_emits_usage_null() {
     let server = setup_test_server().await;
 
     setup_qwen_model(&server).await;
@@ -238,6 +150,87 @@ async fn test_chat_completions_stream_default_emits_usage_null() {
     let text = stream_resp.text();
     let mut saw_chunk = false;
     for line in text.lines() {
+        if let Some(data) = line.strip_prefix("data: ") {
+            if data.trim() == "[DONE]" {
+                break;
+            }
+            let _: StreamChunk = serde_json::from_str(data).expect("stream data should be JSON");
+            saw_chunk = true;
+        }
+    }
+    assert!(saw_chunk, "stream should contain at least one chunk");
+
+    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+
+    let history_resp = server
+        .get(&format!(
+            "/v1/organizations/{}/usage/history?limit=1&offset=0",
+            org.id
+        ))
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .add_header("User-Agent", MOCK_USER_AGENT)
+        .await;
+
+    assert_eq!(
+        history_resp.status_code(),
+        200,
+        "usage history should succeed"
+    );
+    let history: api::routes::usage::UsageHistoryResponse = history_resp.json();
+    assert!(!history.data.is_empty(), "should have usage history entry");
+    let entry = &history.data[0];
+    assert!(entry.input_tokens > 0);
+    assert!(entry.output_tokens > 0);
+    assert_eq!(
+        entry.total_tokens,
+        entry.input_tokens + entry.output_tokens,
+        "total_tokens should equal input + output"
+    );
+
+    // Verify cost matches tokens and pricing (same as setup_qwen_model).
+    let pricing = e2e_qwen_model_pricing_no_cache();
+    let cost = compute_token_cost(
+        entry.input_tokens,
+        entry.output_tokens,
+        entry.cache_read_tokens,
+        &pricing,
+    )
+    .expect("cost calculation should succeed");
+    assert_eq!(
+        entry.total_cost, cost.total_cost,
+        "total_cost should match input/output tokens and configured pricing for streaming completions"
+    );
+}
+
+#[tokio::test]
+async fn test_chat_completions_stream_include_usage_false_preserves_passthrough() {
+    let server = setup_test_server().await;
+
+    setup_qwen_model(&server).await;
+    let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
+    let api_key = get_api_key_for_org(&server, org.id.clone()).await;
+
+    let stream_resp = server
+        .post("/v1/chat/completions")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .json(&json!({
+            "model": E2E_QWEN_MODEL_NAME,
+            "messages": [{ "role": "user", "content": "hello" }],
+            "stream": true,
+            "stream_options": { "include_usage": false }
+        }))
+        .await;
+
+    assert_eq!(
+        stream_resp.status_code(),
+        200,
+        "streaming chat/completions should succeed: {}",
+        stream_resp.text()
+    );
+
+    let text = stream_resp.text();
+    let mut saw_chunk = false;
+    for line in text.lines() {
         let Some(data) = line.strip_prefix("data: ") else {
             continue;
         };
@@ -246,19 +239,7 @@ async fn test_chat_completions_stream_default_emits_usage_null() {
         }
 
         saw_chunk = true;
-        let value: serde_json::Value =
-            serde_json::from_str(data).expect("stream data should be JSON");
-        assert!(
-            value.get("usage").is_some_and(serde_json::Value::is_null),
-            "default stream chunks should expose usage:null, got {value}"
-        );
-        assert!(
-            value
-                .get("choices")
-                .and_then(serde_json::Value::as_array)
-                .is_some_and(|choices| !choices.is_empty()),
-            "default stream should not expose provider usage-only chunks: {value}"
-        );
+        let _: StreamChunk = serde_json::from_str(data).expect("stream data should be JSON");
     }
     assert!(saw_chunk, "stream should contain at least one chunk");
 }

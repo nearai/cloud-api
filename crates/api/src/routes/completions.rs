@@ -372,6 +372,8 @@ fn chat_stream_usage_mode(
     e2ee_active: bool,
 ) -> ChatStreamUsageMode {
     let rewrite_public_stream_usage = request.stream == Some(true)
+        && chat_stream_include_usage_requested(request)
+        && !chat_stream_continuous_usage_requested(request)
         && model_attestation_supported.is_some()
         && !e2ee_active
         && !chat_stream_has_non_text_modalities(request);
@@ -381,13 +383,6 @@ fn chat_stream_usage_mode(
         gateway_signature_enabled: rewrite_public_stream_usage
             && model_attestation_supported.unwrap_or(false),
     }
-}
-
-fn reject_continuous_stream_usage(
-    request: &ChatCompletionRequest,
-    mode: ChatStreamUsageMode,
-) -> bool {
-    mode.rewrite_public_stream_usage && chat_stream_continuous_usage_requested(request)
 }
 
 #[cfg(test)]
@@ -447,7 +442,13 @@ fn rewritten_control_event_bytes(event: &inference_providers::SSEEvent) -> Optio
 
     let line = String::from_utf8_lossy(&event.raw_bytes);
     if line.trim_start().starts_with(':') {
-        Some(event.raw_bytes.clone())
+        let mut bytes = event.raw_bytes.to_vec();
+        if bytes.ends_with(b"\n") {
+            bytes.push(b'\n');
+        } else {
+            bytes.extend_from_slice(b"\n\n");
+        }
+        Some(Bytes::from(bytes))
     } else {
         None
     }
@@ -1380,16 +1381,6 @@ async fn chat_completions_inner(
     let rewrite_public_stream_usage = usage_mode.rewrite_public_stream_usage;
     let gateway_signature_enabled = usage_mode.gateway_signature_enabled;
     service_request.skip_provider_chat_signature = gateway_signature_enabled;
-    if reject_continuous_stream_usage(&request, usage_mode) {
-        return (
-            StatusCode::BAD_REQUEST,
-            ResponseJson(ErrorResponse::new(
-                "stream_options.continuous_usage_stats is not supported by this API; use stream_options.include_usage for a single final usage chunk".to_string(),
-                "invalid_request_error".to_string(),
-            )),
-        )
-            .into_response();
-    }
 
     // Auto-redact (opt-in via x-auto-redact header or auto_redact body field).
     // On success this may rewrite service_request.messages to substitute
@@ -1560,9 +1551,9 @@ async fn chat_completions_inner(
                                 Ok(event) => {
                                     // Byte-exact passthrough (issue #701): when no public
                                     // chunk rewriting is active, forward the upstream wire
-                                    // bytes untouched. Public stream usage shaping (#646)
-                                    // needs parsed-chunk serialization for normal responses;
-                                    // encrypted streams stay opaque and preserve passthrough.
+                                    // bytes untouched. Explicit include_usage shaping needs
+                                    // parsed-chunk serialization; encrypted, default, and
+                                    // continuous-usage streams preserve passthrough.
                                     //
                                     // Disabled for alias-served responses: those inject
                                     // a top-level `warning` into the first chunk (below),
@@ -2925,21 +2916,47 @@ mod tests {
     }
 
     #[test]
-    fn chat_stream_usage_mode_signs_rewritten_attested_streams() {
-        let request = chat_request_with_include_usage(None);
+    fn include_usage_rewrites_and_signs_attested_streams() {
+        let request = chat_request_with_include_usage(Some(true));
         let mode = chat_stream_usage_mode(&request, Some(true), false);
 
         assert!(mode.rewrite_public_stream_usage);
         assert!(mode.gateway_signature_enabled);
-        assert!(!reject_continuous_stream_usage(&request, mode));
     }
 
     #[test]
-    fn chat_stream_usage_mode_rewrites_non_attested_without_gateway_signature() {
-        let request = chat_request_with_include_usage(None);
+    fn include_usage_rewrites_non_attested_without_gateway_signature() {
+        let request = chat_request_with_include_usage(Some(true));
         let mode = chat_stream_usage_mode(&request, Some(false), false);
 
         assert!(mode.rewrite_public_stream_usage);
+        assert!(!mode.gateway_signature_enabled);
+    }
+
+    #[test]
+    fn default_attested_stream_preserves_provider_passthrough() {
+        let request = chat_request_with_include_usage(None);
+        let mode = chat_stream_usage_mode(&request, Some(true), false);
+
+        assert!(!mode.rewrite_public_stream_usage);
+        assert!(!mode.gateway_signature_enabled);
+    }
+
+    #[test]
+    fn include_usage_false_attested_stream_preserves_provider_passthrough() {
+        let request = chat_request_with_include_usage(Some(false));
+        let mode = chat_stream_usage_mode(&request, Some(true), false);
+
+        assert!(!mode.rewrite_public_stream_usage);
+        assert!(!mode.gateway_signature_enabled);
+    }
+
+    #[test]
+    fn default_non_attested_stream_preserves_provider_passthrough() {
+        let request = chat_request_with_include_usage(None);
+        let mode = chat_stream_usage_mode(&request, Some(false), false);
+
+        assert!(!mode.rewrite_public_stream_usage);
         assert!(!mode.gateway_signature_enabled);
     }
 
@@ -2954,29 +2971,32 @@ mod tests {
 
         assert!(!mode.rewrite_public_stream_usage);
         assert!(!mode.gateway_signature_enabled);
-        assert!(!reject_continuous_stream_usage(&request, mode));
     }
 
     #[test]
-    fn continuous_usage_stats_is_rejected_only_for_rewritten_public_streams() {
-        let mut request = chat_request_with_include_usage(None);
+    fn continuous_usage_stats_opts_out_of_rewrite() {
+        let mut request = chat_request_with_include_usage(Some(true));
         request.extra.insert(
             "stream_options".to_string(),
-            serde_json::json!({ "continuous_usage_stats": true }),
+            serde_json::json!({
+                "include_usage": true,
+                "continuous_usage_stats": true
+            }),
         );
 
-        let rewritten = chat_stream_usage_mode(&request, Some(true), false);
-        assert!(reject_continuous_stream_usage(&request, rewritten));
+        let passthrough = chat_stream_usage_mode(&request, Some(true), false);
+        assert!(!passthrough.rewrite_public_stream_usage);
+        assert!(!passthrough.gateway_signature_enabled);
 
         let e2ee_passthrough = chat_stream_usage_mode(&request, Some(true), true);
-        assert!(!reject_continuous_stream_usage(&request, e2ee_passthrough));
+        assert!(!e2ee_passthrough.rewrite_public_stream_usage);
 
         request.extra.insert(
             "modalities".to_string(),
             serde_json::json!(["text", "audio"]),
         );
         let audio_passthrough = chat_stream_usage_mode(&request, Some(true), false);
-        assert!(!reject_continuous_stream_usage(&request, audio_passthrough));
+        assert!(!audio_passthrough.rewrite_public_stream_usage);
     }
 
     #[test]
@@ -3134,7 +3154,7 @@ mod tests {
         };
         assert_eq!(
             rewritten_control_event_bytes(&comment),
-            Some(Bytes::from_static(b": keepalive\n"))
+            Some(Bytes::from_static(b": keepalive\n\n"))
         );
 
         let done = inference_providers::SSEEvent {

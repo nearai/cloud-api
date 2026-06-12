@@ -187,6 +187,7 @@ impl ExternalBackend for OpenAiCompatibleBackend {
         streaming_params.stream_options = Some(StreamOptions {
             include_usage: Some(true),
             continuous_usage_stats: None, // Not all providers support this
+            extra: Default::default(),
         });
 
         // Convert max_tokens to max_completion_tokens for newer OpenAI models
@@ -591,6 +592,7 @@ mod tests {
         let options = StreamOptions {
             include_usage: Some(true),
             continuous_usage_stats: None,
+            extra: Default::default(),
         };
 
         let json = serde_json::to_string(&options).unwrap();
@@ -602,6 +604,7 @@ mod tests {
         let options = StreamOptions {
             include_usage: Some(true),
             continuous_usage_stats: Some(true),
+            extra: Default::default(),
         };
 
         let json = serde_json::to_string(&options).unwrap();

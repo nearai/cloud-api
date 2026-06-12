@@ -387,16 +387,14 @@ const STRIPPED_CHOICE_FIELDS: &[&str] = &["matched_stop"];
 
 /// Remove the Chutes-internal/serving fields ([`STRIPPED_TOP_LEVEL_FIELDS`] at the
 /// top level + [`STRIPPED_CHOICE_FIELDS`] inside each `choices` element) from a
-/// decrypted response JSON, in place. Surgical by design: it touches ONLY the named
-/// keys, so `chutes_verification` and any unmodeled passthrough field (e.g.
-/// `hidden_states`) are left exactly as-is. A no-op on a non-object value (the
-/// caller keeps such bodies verbatim). Used on both non-stream paths and per
-/// `data:` chunk on the stream path (the chunk shape — `choices[].delta` — also
-/// carries `matched_stop` per choice at the final chunk).
-fn strip_internal_response_fields(v: &mut Value) {
-    let Some(obj) = v.as_object_mut() else {
-        return;
-    };
+/// decrypted response object, in place. Surgical by design: it touches ONLY the
+/// named keys, so `chutes_verification` and any unmodeled passthrough field (e.g.
+/// `hidden_states`) are left exactly as-is. Takes the object map directly — the
+/// caller has already established it's a JSON object (a non-object body is kept
+/// verbatim). Used on both non-stream paths and per `data:` chunk on the stream
+/// path (the chunk shape — `choices[].delta` — also carries `matched_stop` per
+/// choice at the final chunk).
+fn strip_internal_response_fields(obj: &mut serde_json::Map<String, Value>) {
     for k in STRIPPED_TOP_LEVEL_FIELDS {
         obj.remove(*k);
     }
@@ -416,13 +414,20 @@ fn strip_internal_response_fields(v: &mut Value) {
 /// (#780) — in BOTH `raw_bytes` (the byte-exact passthrough path) AND the parsed
 /// `chunk` (the route re-serializes from `chunk`, not `raw_bytes`, on the
 /// auto-redact / alias-served paths — so leaving the slug/internal fields there
-/// would still leak them). Only touches chunk-bearing data lines; control events
-/// ([DONE], blanks, the keyed init) have no chunk and pass through unchanged. On
+/// would still leak them). The chunk-side strip targets `ChatCompletionChunk::extra`,
+/// the `#[serde(flatten)]` catch-all that captures exactly the stripped top-level
+/// keys (`matched_stop` has no slot on `ChatChoice` and is dropped on parse, so the
+/// per-choice strip is `raw_bytes`-only). Only touches chunk-bearing data lines;
+/// control events ([DONE], blanks, the keyed init) have no chunk and pass through
+/// unchanged. As a cheap fast path, an event that needs neither a model rewrite
+/// (`canonical == None`) nor any strip (none of the stripped keys appear as a
+/// substring in the raw line) is returned verbatim without a JSON round-trip. On
 /// any parse failure the event is returned as-is (never drop a chunk over a
 /// rewrite). The rewrite is ATOMIC: we compute the rewritten `raw_bytes` first and
 /// bail (returning the event unchanged) on any failure, mutating the parsed `chunk`
 /// only once that succeeds — so the event can never end up with `chunk` carrying
-/// the canonical id while `raw_bytes` still leaks the slug.
+/// the canonical id (or the stripped keys) while `raw_bytes` is already clean, or
+/// vice versa.
 fn rewrite_sse_event_model(mut ev: SSEEvent, canonical: Option<&str>) -> SSEEvent {
     if ev.chunk.is_none() {
         return ev;
@@ -430,6 +435,11 @@ fn rewrite_sse_event_model(mut ev: SSEEvent, canonical: Option<&str>) -> SSEEven
     let Ok(s) = std::str::from_utf8(&ev.raw_bytes) else {
         return ev;
     };
+    // Fast path: nothing to rewrite (already canonical) and a cheap substring scan
+    // finds none of the stripped keys → pure passthrough, no JSON round-trip.
+    if canonical.is_none() && !contains_any_stripped_key(s) {
+        return ev;
+    }
     let content = s.strip_prefix("data:").map(str::trim).unwrap_or(s.trim());
     let Some(rewritten) = transform_response_json(content.as_bytes(), canonical) else {
         return ev;
@@ -437,15 +447,35 @@ fn rewrite_sse_event_model(mut ev: SSEEvent, canonical: Option<&str>) -> SSEEven
     let Ok(json) = String::from_utf8(rewritten) else {
         return ev;
     };
-    // raw_bytes rewrite succeeded — now mutate the parsed chunk to match.
-    if let (Some(canonical), Some(StreamChunk::Chat(c))) = (canonical, &mut ev.chunk) {
-        c.model = canonical.to_string();
+    // raw_bytes rewrite succeeded — now mutate the parsed chunk to match, so the
+    // re-serialized-chunk route paths emit the same sanitized payload. The strip
+    // runs regardless of `canonical`: `ChatCompletionChunk::extra` holds exactly
+    // the stripped top-level keys.
+    if let Some(StreamChunk::Chat(c)) = &mut ev.chunk {
+        if let Some(canonical) = canonical {
+            c.model = canonical.to_string();
+        }
+        for k in STRIPPED_TOP_LEVEL_FIELDS {
+            c.extra.remove(*k);
+        }
     }
     SSEEvent {
         raw_bytes: bytes::Bytes::from(format!("data: {json}\n\n")),
         chunk: ev.chunk,
         raw_passthrough: ev.raw_passthrough,
     }
+}
+
+/// Cheap substring scan over a raw SSE line for any stripped key, used to skip the
+/// JSON round-trip when there's nothing to strip and no model rewrite is needed. A
+/// false positive (the key name appears inside string content) only costs a
+/// round-trip that produces identical output; a false negative is impossible since
+/// a present key must appear literally. Per-choice keys are included too.
+fn contains_any_stripped_key(raw: &str) -> bool {
+    STRIPPED_TOP_LEVEL_FIELDS
+        .iter()
+        .chain(STRIPPED_CHOICE_FIELDS)
+        .any(|k| raw.contains(*k))
 }
 
 /// Transform a decrypted OpenAI JSON body: optionally set `model` to `canonical`,
@@ -459,7 +489,7 @@ fn transform_response_json(bytes: &[u8], canonical: Option<&str>) -> Option<Vec<
     if let Some(canonical) = canonical {
         obj.insert("model".to_string(), Value::String(canonical.to_string()));
     }
-    strip_internal_response_fields(&mut v);
+    strip_internal_response_fields(obj);
     serde_json::to_vec(&v).ok()
 }
 
@@ -997,16 +1027,15 @@ mod tests {
     }
 
     #[test]
-    fn strip_internal_response_fields_is_noop_on_non_object() {
-        // The caller keeps non-object bodies verbatim; the helper must not panic.
-        let mut v = json!([1, 2, 3]);
-        strip_internal_response_fields(&mut v);
-        assert_eq!(v, json!([1, 2, 3]));
-        // No `choices` array → only top-level keys removed, no panic.
+    fn strip_internal_response_fields_handles_missing_choices() {
+        // No `choices` array → only top-level keys removed, no panic. (The
+        // non-object case is the caller's concern — `transform_response_json`
+        // returns `None` and the body is kept verbatim; covered above.)
         let mut v = json!({"id":"x","prompt_sha256":"d","choices":"not-an-array"});
-        strip_internal_response_fields(&mut v);
-        assert!(v.get("prompt_sha256").is_none());
-        assert_eq!(v["choices"], "not-an-array");
+        let obj = v.as_object_mut().unwrap();
+        strip_internal_response_fields(obj);
+        assert!(obj.get("prompt_sha256").is_none());
+        assert_eq!(obj["choices"], "not-an-array");
     }
 
     #[test]
@@ -1053,28 +1082,27 @@ mod tests {
 
     #[test]
     fn rewrite_sse_event_model_strips_internal_fields_per_chunk() {
-        use crate::{ChatCompletionChunk, StreamChunk};
+        use crate::StreamChunk;
         // A final stream chunk carrying the Chutes-internal/serving fields (#780).
         // canonical == None (slug == canonical) is the strip-only mode that the
         // stream path uses for a Chutes-only model.
-        let raw = br#"data: {"id":"c","object":"chat.completion.chunk","created":0,"model":"zai-org/GLM-5.1-TEE","prompt_sha256":"deadbeef","template_sha256":"cafef00d","metadata":{"weight_version":"v3"},"chutes_verification":{"quote":"abc"},"hidden_states":[7,8],"choices":[{"index":0,"matched_stop":151643,"delta":{}}]}"#;
-        let mut full = raw.to_vec();
-        full.extend_from_slice(b"\n\n");
-        let chunk: ChatCompletionChunk = serde_json::from_value(json!({
-            "id":"c","object":"chat.completion.chunk","created":0,
-            "model":"zai-org/GLM-5.1-TEE","choices":[]
-        }))
-        .unwrap();
+        let payload = r#"{"id":"c","object":"chat.completion.chunk","created":0,"model":"zai-org/GLM-5.1-TEE","prompt_sha256":"deadbeef","template_sha256":"cafef00d","metadata":{"weight_version":"v3"},"chutes_verification":{"quote":"abc"},"hidden_states":[7,8],"choices":[{"index":0,"matched_stop":151643,"delta":{}}]}"#;
+        // Build the parsed `chunk` from the SAME raw payload that production
+        // deserializes (e2ee_stream), so the catch-all `extra` map actually
+        // captures the internal fields — otherwise the chunk-side leak is invisible.
+        let chunk: StreamChunk =
+            StreamChunk::Chat(serde_json::from_str(payload).expect("parse chunk"));
         let ev = SSEEvent {
-            raw_bytes: bytes::Bytes::from(full),
-            chunk: Some(StreamChunk::Chat(chunk)),
+            raw_bytes: bytes::Bytes::from(format!("data: {payload}\n\n")),
+            chunk: Some(chunk),
             raw_passthrough: true,
         };
         let out = rewrite_sse_event_model(ev, None);
+
+        // raw_bytes: internal/serving fields stripped from the streamed line.
         let s = std::str::from_utf8(&out.raw_bytes).unwrap();
-        let payload = s.strip_prefix("data: ").unwrap().trim_end();
-        let v: Value = serde_json::from_str(payload).unwrap();
-        // Internal/serving fields stripped from the streamed chunk.
+        let raw_payload = s.strip_prefix("data: ").unwrap().trim_end();
+        let v: Value = serde_json::from_str(raw_payload).unwrap();
         assert!(v.get("prompt_sha256").is_none(), "prompt_sha256 stripped");
         assert!(
             v.get("template_sha256").is_none(),
@@ -1088,29 +1116,59 @@ mod tests {
         // canonical == None → `model` (the slug here) is left as-is by this helper;
         // the strip happened regardless of any model rewrite.
         assert_eq!(v["model"], "zai-org/GLM-5.1-TEE");
-        // Attestation receipt + unmodeled passthrough survive.
+        // Attestation receipt + unmodeled passthrough survive in raw_bytes.
         assert_eq!(v["chutes_verification"]["quote"], "abc");
         assert_eq!(v["hidden_states"], json!([7, 8]));
+
+        // PARSED chunk: the route re-serializes from `chunk` (not raw_bytes) on the
+        // auto-redact / alias-served paths, so the chunk MUST be sanitized too. Its
+        // `extra` catch-all captured the internal top-level keys at parse time.
+        let Some(StreamChunk::Chat(c)) = &out.chunk else {
+            panic!("expected a Chat chunk");
+        };
+        let cv = serde_json::to_value(c).expect("serialize chunk");
+        assert!(
+            cv.get("prompt_sha256").is_none(),
+            "prompt_sha256 must be stripped from the parsed chunk (extra)"
+        );
+        assert!(
+            cv.get("template_sha256").is_none(),
+            "template_sha256 must be stripped from the parsed chunk (extra)"
+        );
+        assert!(
+            cv.get("metadata").is_none(),
+            "metadata must be stripped from the parsed chunk (extra)"
+        );
+        // matched_stop has no slot on ChatChoice and is dropped on parse, so it's
+        // already absent from the chunk regardless of the strip.
+        assert!(
+            cv["choices"][0].get("matched_stop").is_none(),
+            "choices[].matched_stop absent from parsed chunk"
+        );
+        // The attestation receipt + unmodeled passthrough survive on the chunk too
+        // (both land in `extra` and are deliberately NOT stripped).
+        assert_eq!(cv["chutes_verification"]["quote"], "abc");
+        assert_eq!(cv["hidden_states"], json!([7, 8]));
     }
 
     #[test]
     fn rewrite_sse_event_model_leaves_chunk_bearing_event_untouched_on_rewrite_failure() {
         use crate::{ChatCompletionChunk, StreamChunk};
         // Pins the ATOMIC invariant: if the raw_bytes rewrite fails (here the
-        // payload isn't a JSON object so set_model_in_json returns None), the event
-        // is returned fully unchanged — raw_bytes AND the parsed chunk's model both
-        // keep their original value. Guards against a future refactor reintroducing
-        // a half-rewritten state (chunk mutated to canonical while raw_bytes still
-        // leaks the slug). This failure path is unreachable in practice (the decoder
-        // only sets chunk: Some when raw_bytes parsed as valid JSON) but is cheap to
-        // pin and the only thing the atomicity reorder protects.
+        // payload isn't a JSON object so transform_response_json returns None), the
+        // event is returned fully unchanged — raw_bytes AND the parsed chunk both
+        // keep their original value (model unchanged, no strip applied). Guards
+        // against a future refactor reintroducing a half-rewritten state (chunk
+        // mutated while raw_bytes still leaks). This failure path is unreachable in
+        // practice (the decoder only sets chunk: Some when raw_bytes parsed as valid
+        // JSON) but is cheap to pin and the only thing the atomicity reorder protects.
         let chunk: ChatCompletionChunk = serde_json::from_value(json!({
             "id":"c","object":"chat.completion.chunk","created":0,
             "model":"zai-org/GLM-5.1-TEE","choices":[]
         }))
         .unwrap();
         let ev = SSEEvent {
-            // Non-object JSON → set_model_in_json returns None → rewrite bails.
+            // Non-object JSON → transform_response_json returns None → rewrite bails.
             raw_bytes: bytes::Bytes::from_static(b"data: [1,2,3]\n\n"),
             chunk: Some(StreamChunk::Chat(chunk)),
             raw_passthrough: true,

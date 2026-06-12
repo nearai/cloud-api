@@ -370,18 +370,60 @@ const INTERNAL_KEYS: &[&str] = {
     ]
 };
 
-/// Rewrite the `model` field of a decrypted OpenAI SSE event to the canonical id —
-/// in BOTH `raw_bytes` (the byte-exact passthrough path) AND the parsed `chunk`
-/// (the route re-serializes from `chunk`, not `raw_bytes`, on the auto-redact /
-/// alias-served paths — so leaving the slug there would still leak it). Only
-/// touches chunk-bearing data lines; control events ([DONE], blanks, the keyed
-/// init) have no chunk and pass through unchanged. On any parse failure the event
-/// is returned as-is (never drop a chunk over a rewrite). The rewrite is ATOMIC:
-/// we compute the rewritten `raw_bytes` first and bail (returning the event
-/// unchanged) on any failure, mutating the parsed `chunk` only once that succeeds —
-/// so the event can never end up with `chunk` carrying the canonical id while
-/// `raw_bytes` still leaks the slug.
-fn rewrite_sse_event_model(mut ev: SSEEvent, canonical: &str) -> SSEEvent {
+/// Chutes-internal / serving fields that must be stripped from the decrypted
+/// response before it reaches a client (#780). `prompt_sha256` is the genuine
+/// privacy concern — a deterministic SHA-256 fingerprint of the rendered user
+/// prompt — while the others are sglang/serving internals that a NEAR/Anthropic/
+/// OpenAI response on the same endpoint never carries.
+///
+/// `chutes_verification` (the attestation receipt) is deliberately NOT listed —
+/// it's kept untouched. We strip ONLY these named keys, so unmodeled fields the
+/// repo intentionally passes through (e.g. `hidden_states`) survive.
+const STRIPPED_TOP_LEVEL_FIELDS: &[&str] = &["prompt_sha256", "template_sha256", "metadata"];
+
+/// Per-choice serving internal stripped from every element of `choices` (#780):
+/// sglang's matched stop-token id.
+const STRIPPED_CHOICE_FIELDS: &[&str] = &["matched_stop"];
+
+/// Remove the Chutes-internal/serving fields ([`STRIPPED_TOP_LEVEL_FIELDS`] at the
+/// top level + [`STRIPPED_CHOICE_FIELDS`] inside each `choices` element) from a
+/// decrypted response JSON, in place. Surgical by design: it touches ONLY the named
+/// keys, so `chutes_verification` and any unmodeled passthrough field (e.g.
+/// `hidden_states`) are left exactly as-is. A no-op on a non-object value (the
+/// caller keeps such bodies verbatim). Used on both non-stream paths and per
+/// `data:` chunk on the stream path (the chunk shape — `choices[].delta` — also
+/// carries `matched_stop` per choice at the final chunk).
+fn strip_internal_response_fields(v: &mut Value) {
+    let Some(obj) = v.as_object_mut() else {
+        return;
+    };
+    for k in STRIPPED_TOP_LEVEL_FIELDS {
+        obj.remove(*k);
+    }
+    if let Some(choices) = obj.get_mut("choices").and_then(Value::as_array_mut) {
+        for choice in choices {
+            if let Some(choice_obj) = choice.as_object_mut() {
+                for k in STRIPPED_CHOICE_FIELDS {
+                    choice_obj.remove(*k);
+                }
+            }
+        }
+    }
+}
+
+/// Rewrite the `model` field of a decrypted OpenAI SSE event to the canonical id
+/// (when `canonical` is `Some`) AND strip the Chutes-internal/serving fields
+/// (#780) — in BOTH `raw_bytes` (the byte-exact passthrough path) AND the parsed
+/// `chunk` (the route re-serializes from `chunk`, not `raw_bytes`, on the
+/// auto-redact / alias-served paths — so leaving the slug/internal fields there
+/// would still leak them). Only touches chunk-bearing data lines; control events
+/// ([DONE], blanks, the keyed init) have no chunk and pass through unchanged. On
+/// any parse failure the event is returned as-is (never drop a chunk over a
+/// rewrite). The rewrite is ATOMIC: we compute the rewritten `raw_bytes` first and
+/// bail (returning the event unchanged) on any failure, mutating the parsed `chunk`
+/// only once that succeeds — so the event can never end up with `chunk` carrying
+/// the canonical id while `raw_bytes` still leaks the slug.
+fn rewrite_sse_event_model(mut ev: SSEEvent, canonical: Option<&str>) -> SSEEvent {
     if ev.chunk.is_none() {
         return ev;
     }
@@ -389,14 +431,14 @@ fn rewrite_sse_event_model(mut ev: SSEEvent, canonical: &str) -> SSEEvent {
         return ev;
     };
     let content = s.strip_prefix("data:").map(str::trim).unwrap_or(s.trim());
-    let Some(rewritten) = set_model_in_json(content.as_bytes(), canonical) else {
+    let Some(rewritten) = transform_response_json(content.as_bytes(), canonical) else {
         return ev;
     };
     let Ok(json) = String::from_utf8(rewritten) else {
         return ev;
     };
     // raw_bytes rewrite succeeded — now mutate the parsed chunk to match.
-    if let Some(StreamChunk::Chat(c)) = &mut ev.chunk {
+    if let (Some(canonical), Some(StreamChunk::Chat(c))) = (canonical, &mut ev.chunk) {
         c.model = canonical.to_string();
     }
     SSEEvent {
@@ -406,13 +448,18 @@ fn rewrite_sse_event_model(mut ev: SSEEvent, canonical: &str) -> SSEEvent {
     }
 }
 
-/// Set `model` to `canonical` in an OpenAI JSON body, preserving every other field
-/// (so unmodeled provider fields survive). Returns the re-serialized bytes, or
-/// `None` if the body isn't a JSON object or (de)serialization fails.
-fn set_model_in_json(bytes: &[u8], canonical: &str) -> Option<Vec<u8>> {
+/// Transform a decrypted OpenAI JSON body: optionally set `model` to `canonical`,
+/// then strip the Chutes-internal/serving fields (#780). Preserves every other
+/// field (so unmodeled provider fields like `hidden_states` survive). Returns the
+/// re-serialized bytes, or `None` if the body isn't a JSON object or
+/// (de)serialization fails.
+fn transform_response_json(bytes: &[u8], canonical: Option<&str>) -> Option<Vec<u8>> {
     let mut v: Value = serde_json::from_slice(bytes).ok()?;
-    v.as_object_mut()?
-        .insert("model".to_string(), Value::String(canonical.to_string()));
+    let obj = v.as_object_mut()?;
+    if let Some(canonical) = canonical {
+        obj.insert("model".to_string(), Value::String(canonical.to_string()));
+    }
+    strip_internal_response_fields(&mut v);
     serde_json::to_vec(&v).ok()
 }
 
@@ -524,30 +571,25 @@ impl InferenceProvider for Provider {
         // The upstream body carries the chute SLUG in `model`. When the canonical id
         // differs (NEAR-served / OpenRouter-id case), rewrite `model` to the
         // canonical id so the slug never leaks to clients and `response.model`
-        // matches an id listable in /v1/models. We rewrite the JSON *value* (not the
-        // typed struct) so any unmodeled provider fields survive. When canonical ==
-        // slug, keep the plaintext verbatim (byte-exact, preserves unmodeled fields
-        // like `hidden_states`). No signature is sacrificed — Chutes responses aren't
-        // separately signed (`supports_chat_signatures == false`).
-        if self.canonical_id != self.model_name {
-            let raw_bytes = set_model_in_json(&plaintext, &self.canonical_id).ok_or_else(|| {
-                CompletionError::CompletionError(
-                    "failed to rewrite Chutes response model to the canonical id".to_string(),
-                )
-            })?;
-            let response: ChatCompletionResponse = serde_json::from_slice(&raw_bytes)
-                .map_err(|e| CompletionError::CompletionError(format!("parse response: {e}")))?;
-            return Ok(ChatCompletionResponseWithBytes {
-                response,
-                raw_bytes,
-            });
-        }
-
-        let response: ChatCompletionResponse = serde_json::from_slice(&plaintext)
+        // matches an id listable in /v1/models. In BOTH cases we also strip the
+        // Chutes-internal/serving fields (#780: `prompt_sha256` — a user-prompt
+        // fingerprint — plus `template_sha256`/`metadata`/`choices[].matched_stop`)
+        // so a Chutes response matches the clean shape returned for first-party /
+        // Anthropic / OpenAI models. We transform the JSON *value* (not the typed
+        // struct), removing ONLY those named keys — so `chutes_verification` (the
+        // attestation receipt) and any unmodeled passthrough field (e.g.
+        // `hidden_states`) survive. No signature is sacrificed — Chutes responses
+        // aren't separately signed (`supports_chat_signatures == false`).
+        let canonical =
+            (self.canonical_id != self.model_name).then_some(self.canonical_id.as_str());
+        let raw_bytes = transform_response_json(&plaintext, canonical).ok_or_else(|| {
+            CompletionError::CompletionError("failed to sanitize Chutes response body".to_string())
+        })?;
+        let response: ChatCompletionResponse = serde_json::from_slice(&raw_bytes)
             .map_err(|e| CompletionError::CompletionError(format!("parse response: {e}")))?;
         Ok(ChatCompletionResponseWithBytes {
             response,
-            raw_bytes: plaintext,
+            raw_bytes,
         })
     }
 
@@ -598,16 +640,15 @@ impl InferenceProvider for Provider {
             r.map_err(|e| CompletionError::CompletionError(format!("Chutes stream transport: {e}")))
         });
         let decoded = e2ee_stream::decrypt_e2ee_sse(Box::pin(byte_stream), prep.session);
-        // Same canonical-id rewrite as the non-stream path: when the canonical id
-        // differs from the chute slug, rewrite `model` in each decrypted `data:`
-        // line so streamed chunks never leak the slug to clients. No-op (and no
-        // per-chunk re-serialization) when canonical == slug.
-        if self.canonical_id == self.model_name {
-            return Ok(decoded);
-        }
-        let canonical = self.canonical_id.clone();
+        // Per-chunk transform, mirroring the non-stream path: strip the
+        // Chutes-internal/serving fields (#780) from every decrypted `data:` line,
+        // and — only when the canonical id differs from the chute slug — also rewrite
+        // `model` so streamed chunks never leak the slug. We ALWAYS run the strip
+        // (even when canonical == slug), since `prompt_sha256`/`template_sha256`/
+        // `metadata`/`choices[].matched_stop` can appear on the stream regardless.
+        let canonical = (self.canonical_id != self.model_name).then(|| self.canonical_id.clone());
         Ok(Box::pin(decoded.map(move |item| {
-            item.map(|ev| rewrite_sse_event_model(ev, &canonical))
+            item.map(|ev| rewrite_sse_event_model(ev, canonical.as_deref()))
         })))
     }
 
@@ -890,19 +931,82 @@ mod tests {
     }
 
     #[test]
-    fn set_model_in_json_rewrites_model_and_preserves_other_fields() {
+    fn transform_response_json_rewrites_model_and_preserves_other_fields() {
         // The canonical-id rewrite that keeps the chute slug out of `response.model`
         // while preserving every other (incl. unmodeled) field.
         let body =
             br#"{"id":"x","model":"zai-org/GLM-5.1-TEE","choices":[],"hidden_states":[1,2]}"#;
-        let out = set_model_in_json(body, "zai-org/GLM-5.1-FP8").expect("rewrite");
+        let out = transform_response_json(body, Some("zai-org/GLM-5.1-FP8")).expect("rewrite");
         let v: Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(v["model"], "zai-org/GLM-5.1-FP8");
         assert_eq!(v["id"], "x");
         // Unmodeled provider field survives the rewrite.
         assert_eq!(v["hidden_states"], json!([1, 2]));
         // Non-object body → None (left untouched by callers).
-        assert!(set_model_in_json(b"[1,2,3]", "x").is_none());
+        assert!(transform_response_json(b"[1,2,3]", Some("x")).is_none());
+        // With canonical == None, `model` is left as-is (strip-only mode).
+        let out = transform_response_json(body, None).expect("strip-only");
+        let v: Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["model"], "zai-org/GLM-5.1-TEE");
+        assert_eq!(v["hidden_states"], json!([1, 2]));
+    }
+
+    #[test]
+    fn transform_response_json_strips_internal_fields_keeps_verification_and_hidden_states() {
+        // A Chutes-shaped non-stream body (#780): internal/serving fields present.
+        let body = br#"{
+            "id":"x",
+            "model":"zai-org/GLM-5.1-TEE",
+            "prompt_sha256":"deadbeef",
+            "template_sha256":"cafef00d",
+            "metadata":{"weight_version":"v3"},
+            "chutes_verification":{"quote":"abc","instance_id":"i"},
+            "hidden_states":[1,2,3],
+            "choices":[
+                {"index":0,"matched_stop":151643,"message":{"role":"assistant","content":"hi"}}
+            ]
+        }"#;
+        // Strip-only mode (canonical == slug) and rewrite mode (canonical != slug)
+        // must BOTH remove the internal fields.
+        for canonical in [None, Some("zai-org/GLM-5.1-FP8")] {
+            let out = transform_response_json(body, canonical).expect("transform");
+            let v: Value = serde_json::from_slice(&out).unwrap();
+            // The genuine privacy concern and the serving internals are gone.
+            assert!(
+                v.get("prompt_sha256").is_none(),
+                "prompt_sha256 must be stripped"
+            );
+            assert!(
+                v.get("template_sha256").is_none(),
+                "template_sha256 must be stripped"
+            );
+            assert!(v.get("metadata").is_none(), "metadata must be stripped");
+            // The attestation receipt is KEPT untouched.
+            assert_eq!(v["chutes_verification"]["quote"], "abc");
+            assert_eq!(v["chutes_verification"]["instance_id"], "i");
+            // Unmodeled passthrough field survives.
+            assert_eq!(v["hidden_states"], json!([1, 2, 3]));
+            // Per-choice serving internal removed; other choice fields kept.
+            assert!(
+                v["choices"][0].get("matched_stop").is_none(),
+                "choices[].matched_stop must be stripped"
+            );
+            assert_eq!(v["choices"][0]["index"], 0);
+            assert_eq!(v["choices"][0]["message"]["content"], "hi");
+        }
+    }
+
+    #[test]
+    fn strip_internal_response_fields_is_noop_on_non_object() {
+        // The caller keeps non-object bodies verbatim; the helper must not panic.
+        let mut v = json!([1, 2, 3]);
+        strip_internal_response_fields(&mut v);
+        assert_eq!(v, json!([1, 2, 3]));
+        // No `choices` array → only top-level keys removed, no panic.
+        let mut v = json!({"id":"x","prompt_sha256":"d","choices":"not-an-array"});
+        strip_internal_response_fields(&mut v);
+        assert!(v.get("prompt_sha256").is_none());
+        assert_eq!(v["choices"], "not-an-array");
     }
 
     #[test]
@@ -920,7 +1024,7 @@ mod tests {
             chunk: Some(StreamChunk::Chat(chunk)),
             raw_passthrough: true,
         };
-        let out = rewrite_sse_event_model(ev, "zai-org/GLM-5.1-FP8");
+        let out = rewrite_sse_event_model(ev, Some("zai-org/GLM-5.1-FP8"));
         let s = std::str::from_utf8(&out.raw_bytes).unwrap();
         assert!(
             s.contains("zai-org/GLM-5.1-FP8"),
@@ -943,8 +1047,50 @@ mod tests {
             chunk: None,
             raw_passthrough: true,
         };
-        let out = rewrite_sse_event_model(ctrl, "zai-org/GLM-5.1-FP8");
+        let out = rewrite_sse_event_model(ctrl, Some("zai-org/GLM-5.1-FP8"));
         assert_eq!(&out.raw_bytes[..], b"data: [DONE]\n\n");
+    }
+
+    #[test]
+    fn rewrite_sse_event_model_strips_internal_fields_per_chunk() {
+        use crate::{ChatCompletionChunk, StreamChunk};
+        // A final stream chunk carrying the Chutes-internal/serving fields (#780).
+        // canonical == None (slug == canonical) is the strip-only mode that the
+        // stream path uses for a Chutes-only model.
+        let raw = br#"data: {"id":"c","object":"chat.completion.chunk","created":0,"model":"zai-org/GLM-5.1-TEE","prompt_sha256":"deadbeef","template_sha256":"cafef00d","metadata":{"weight_version":"v3"},"chutes_verification":{"quote":"abc"},"hidden_states":[7,8],"choices":[{"index":0,"matched_stop":151643,"delta":{}}]}"#;
+        let mut full = raw.to_vec();
+        full.extend_from_slice(b"\n\n");
+        let chunk: ChatCompletionChunk = serde_json::from_value(json!({
+            "id":"c","object":"chat.completion.chunk","created":0,
+            "model":"zai-org/GLM-5.1-TEE","choices":[]
+        }))
+        .unwrap();
+        let ev = SSEEvent {
+            raw_bytes: bytes::Bytes::from(full),
+            chunk: Some(StreamChunk::Chat(chunk)),
+            raw_passthrough: true,
+        };
+        let out = rewrite_sse_event_model(ev, None);
+        let s = std::str::from_utf8(&out.raw_bytes).unwrap();
+        let payload = s.strip_prefix("data: ").unwrap().trim_end();
+        let v: Value = serde_json::from_str(payload).unwrap();
+        // Internal/serving fields stripped from the streamed chunk.
+        assert!(v.get("prompt_sha256").is_none(), "prompt_sha256 stripped");
+        assert!(
+            v.get("template_sha256").is_none(),
+            "template_sha256 stripped"
+        );
+        assert!(v.get("metadata").is_none(), "metadata stripped");
+        assert!(
+            v["choices"][0].get("matched_stop").is_none(),
+            "choices[].matched_stop stripped"
+        );
+        // canonical == None → `model` (the slug here) is left as-is by this helper;
+        // the strip happened regardless of any model rewrite.
+        assert_eq!(v["model"], "zai-org/GLM-5.1-TEE");
+        // Attestation receipt + unmodeled passthrough survive.
+        assert_eq!(v["chutes_verification"]["quote"], "abc");
+        assert_eq!(v["hidden_states"], json!([7, 8]));
     }
 
     #[test]
@@ -969,7 +1115,7 @@ mod tests {
             chunk: Some(StreamChunk::Chat(chunk)),
             raw_passthrough: true,
         };
-        let out = rewrite_sse_event_model(ev, "zai-org/GLM-5.1-FP8");
+        let out = rewrite_sse_event_model(ev, Some("zai-org/GLM-5.1-FP8"));
         // raw_bytes untouched (no canonical id introduced, no reframing).
         assert_eq!(&out.raw_bytes[..], b"data: [1,2,3]\n\n");
         // The parsed chunk's model must NOT have been mutated to canonical.

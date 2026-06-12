@@ -559,47 +559,87 @@ const INTERNAL_KEYS: &[&str] = {
     ]
 };
 
-/// Chutes-internal / serving fields that must be stripped from the decrypted
-/// response before it reaches a client (#780). `prompt_sha256` is the genuine
-/// privacy concern — a deterministic SHA-256 fingerprint of the rendered user
-/// prompt — while the others are sglang/serving internals that a NEAR/Anthropic/
-/// OpenAI response on the same endpoint never carries.
+/// Standard OpenAI chat-response / chunk fields kept at the TOP LEVEL, plus the two
+/// extras this crate deliberately passes through. This is an ALLOWLIST (#780 →
+/// #781 follow-up): model-specific serving internals vary too much to denylist
+/// reliably (e.g. kimi-k2.6 emits `templated_prompt`, `prompt_token_ids`,
+/// `prompt_logprobs`, `kv_transfer_params`, … alongside the already-known
+/// `prompt_sha256`/`template_sha256`/`metadata`), so anything NOT on this list is
+/// dropped by default.
 ///
-/// `chutes_verification` (the attestation receipt) is deliberately NOT listed —
-/// it's kept untouched. We strip ONLY these named keys, so unmodeled fields the
-/// repo intentionally passes through (e.g. `hidden_states`) survive.
-const STRIPPED_TOP_LEVEL_FIELDS: &[&str] = &["prompt_sha256", "template_sha256", "metadata"];
+/// Kept:
+/// - the standard OpenAI top-level fields — incl. `system_fingerprint` and
+///   `service_tier`, which ARE standard (do NOT confuse them with serving internals);
+/// - `chutes_verification` — the attestation receipt, deliberately surfaced;
+/// - `hidden_states` — the intentional unmodeled passthrough.
+const ALLOWED_TOP_LEVEL_FIELDS: &[&str] = &[
+    "id",
+    "object",
+    "created",
+    "model",
+    "choices",
+    "usage",
+    "system_fingerprint",
+    "service_tier",
+    "chutes_verification",
+    "hidden_states",
+];
 
-/// Per-choice serving internal stripped from every element of `choices` (#780):
-/// sglang's matched stop-token id.
-const STRIPPED_CHOICE_FIELDS: &[&str] = &["matched_stop"];
+/// Standard OpenAI fields kept on each element of `choices` (both the non-stream
+/// `message`-bearing shape and the stream `delta`-bearing shape). Anything else
+/// (e.g. sglang's `matched_stop`, `token_ids`, `stop_reason`) is dropped. `message`
+/// and `delta` are recursed into via [`ALLOWED_MESSAGE_FIELDS`].
+const ALLOWED_CHOICE_FIELDS: &[&str] = &["index", "delta", "message", "finish_reason", "logprobs"];
 
-/// Remove the Chutes-internal/serving fields ([`STRIPPED_TOP_LEVEL_FIELDS`] at the
-/// top level + [`STRIPPED_CHOICE_FIELDS`] inside each `choices` element, AND inside
-/// each `choices[].delta` on the stream shape) from a decrypted response object, in
-/// place. Surgical by design: it touches ONLY the named keys, so
-/// `chutes_verification` and any unmodeled passthrough field (e.g. `hidden_states`)
-/// are left exactly as-is. Takes the object map directly — the caller has already
+/// Standard OpenAI fields kept on a `choices[].message` (non-stream) or
+/// `choices[].delta` (stream). Drops model-specific message internals (e.g. a
+/// delta-nested `matched_stop`/`token_ids`). `reasoning` and `reasoning_content`
+/// are BOTH kept (some models emit one, some the other, some both — we never drop a
+/// legit reasoning field).
+const ALLOWED_MESSAGE_FIELDS: &[&str] = &[
+    "role",
+    "content",
+    "reasoning_content",
+    "reasoning",
+    "tool_calls",
+    "function_call",
+    "refusal",
+    "annotations",
+    "name",
+    "tool_call_id",
+];
+
+/// Drop from `obj` every key that is NOT on `allowed`, in place.
+fn retain_allowed(obj: &mut serde_json::Map<String, Value>, allowed: &[&str]) {
+    obj.retain(|k, _| allowed.contains(&k.as_str()));
+}
+
+/// Sanitize a decrypted response object to the standard OpenAI shape by ALLOWLIST
+/// (#780 → #781 follow-up), in place: keep only [`ALLOWED_TOP_LEVEL_FIELDS`] at the
+/// top level, [`ALLOWED_CHOICE_FIELDS`] on each `choices[]` element, and
+/// [`ALLOWED_MESSAGE_FIELDS`] on each `choices[].message` / `choices[].delta`.
+/// Everything else — known internals (`prompt_sha256`, `template_sha256`,
+/// `metadata`, `matched_stop`, …) AND unknown future internals — is dropped, so a
+/// Chutes response matches the clean shape returned for first-party / Anthropic /
+/// OpenAI models. The deliberately-kept extras `chutes_verification` (attestation
+/// receipt) and `hidden_states` (passthrough) are on the top-level allowlist and
+/// survive untouched. Takes the object map directly — the caller has already
 /// established it's a JSON object (a non-object body is kept verbatim). Used on both
-/// non-stream paths and per `data:` chunk on the stream path. sglang currently emits
-/// `matched_stop` at the choice level, but stripping the `delta` too is cheap
-/// defense-in-depth (`ChatDelta` also has a `#[serde(flatten)]` catch-all, so a
-/// delta-nested `matched_stop` would otherwise survive re-serialization).
+/// non-stream paths and per `data:` chunk on the stream path.
+///
+/// Conservative under-strip: when in doubt a field is added to the allowlist
+/// (keeping a stray field is safer than dropping a legitimate one), but the known
+/// serving internals above are deliberately absent and therefore dropped.
 fn strip_internal_response_fields(obj: &mut serde_json::Map<String, Value>) {
-    for k in STRIPPED_TOP_LEVEL_FIELDS {
-        obj.remove(*k);
-    }
+    retain_allowed(obj, ALLOWED_TOP_LEVEL_FIELDS);
     if let Some(choices) = obj.get_mut("choices").and_then(Value::as_array_mut) {
         for choice in choices {
             if let Some(choice_obj) = choice.as_object_mut() {
-                for k in STRIPPED_CHOICE_FIELDS {
-                    choice_obj.remove(*k);
-                }
-                // Defense-in-depth: also strip from `delta` (the stream shape).
-                if let Some(delta_obj) = choice_obj.get_mut("delta").and_then(Value::as_object_mut)
-                {
-                    for k in STRIPPED_CHOICE_FIELDS {
-                        delta_obj.remove(*k);
+                retain_allowed(choice_obj, ALLOWED_CHOICE_FIELDS);
+                // Recurse into the message (non-stream) and delta (stream) shapes.
+                for inner in ["message", "delta"] {
+                    if let Some(m) = choice_obj.get_mut(inner).and_then(Value::as_object_mut) {
+                        retain_allowed(m, ALLOWED_MESSAGE_FIELDS);
                     }
                 }
             }
@@ -607,28 +647,64 @@ fn strip_internal_response_fields(obj: &mut serde_json::Map<String, Value>) {
     }
 }
 
+/// Gate the `usage` field of a streamed chunk object to the OpenAI spec (#781 L1),
+/// in place. Per spec, intermediate chunks carry `usage: null`; `usage` appears only
+/// on the FINAL chunk, and only when the request set `stream_options.include_usage`.
+/// We force `include_usage: true` upstream so billing always sees usage (see
+/// [`request_body`]), so this gates only what reaches the CLIENT:
+///
+/// - a chunk with a non-empty `choices` array is an INTERMEDIATE content chunk → its
+///   `usage` is always stripped (covers vLLM's `continuous_usage_stats`, which would
+///   otherwise populate `usage` on every chunk);
+/// - a chunk with an empty `choices` array is the FINAL usage-only chunk → its
+///   `usage` is kept iff `include_usage` was requested, else stripped.
+///
+/// NOTE: this gates only `raw_bytes` (the bytes the passthrough route forwards to the
+/// client). The parsed `chunk.usage` is left intact so `InterceptStream` can still
+/// read it for billing/limits — see [`rewrite_sse_event_model`].
+fn gate_stream_usage(obj: &mut serde_json::Map<String, Value>, include_usage: bool) {
+    if !obj.contains_key("usage") {
+        return;
+    }
+    let is_final = obj
+        .get("choices")
+        .and_then(Value::as_array)
+        .is_none_or(|c| c.is_empty());
+    if !is_final || !include_usage {
+        obj.remove("usage");
+    }
+}
+
 /// Rewrite the `model` field of a decrypted OpenAI SSE event to the canonical id
-/// (when `canonical` is `Some`) AND strip the Chutes-internal/serving fields
-/// (#780) — in BOTH `raw_bytes` (the byte-exact passthrough path) AND the parsed
-/// `chunk` (the route re-serializes from `chunk`, not `raw_bytes`, on the
-/// auto-redact / alias-served paths — so leaving the slug/internal fields there
-/// would still leak them). The chunk-side strip targets `ChatCompletionChunk::extra`,
-/// the `#[serde(flatten)]` catch-all that captures exactly the stripped top-level
-/// keys, plus each `choices[].delta.extra` for the per-choice keys (`matched_stop`
-/// has no slot on `ChatChoice` and is dropped on parse, so the choice-level strip is
-/// `raw_bytes`-only; the `delta` strip is cheap defense-in-depth). Only touches
-/// chunk-bearing data lines; control events ([DONE], blanks, the keyed init) have no
-/// chunk and pass through unchanged. We ALWAYS round-trip a chunk-bearing line
-/// through the JSON sanitizer rather than guarding with a substring scan: this is a
-/// privacy-critical control and a unicode-escaped key (e.g. `"prompt_sha256"`)
-/// would defeat a literal-substring fast path while still parsing into `extra`. On
-/// any parse failure the event is returned as-is (never drop a chunk over a
-/// rewrite). The rewrite is ATOMIC: we compute the rewritten `raw_bytes` first and
-/// bail (returning the event unchanged) on any failure, mutating the parsed `chunk`
-/// only once that succeeds — so the event can never end up with `chunk` carrying
-/// the canonical id (or the stripped keys) while `raw_bytes` is already clean, or
-/// vice versa.
-fn rewrite_sse_event_model(mut ev: SSEEvent, canonical: Option<&str>) -> SSEEvent {
+/// (when `canonical` is `Some`), sanitize the Chutes response shape to the standard
+/// OpenAI allowlist (#780 → #781), and gate the streamed `usage` field (#781 L1) —
+/// in BOTH `raw_bytes` (the byte-exact passthrough path) AND the parsed `chunk` (the
+/// route re-serializes from `chunk`, not `raw_bytes`, on the auto-redact /
+/// alias-served paths — so leaving the slug/internal fields there would still leak
+/// them).
+///
+/// The parsed chunk is re-derived from the already-sanitized `raw_bytes` rather than
+/// patched field-by-field: that guarantees the chunk and `raw_bytes` carry the exact
+/// same allowlisted shape, and — crucially — also drops TYPED internal slots
+/// (`prompt_token_ids`, `modality`, per-choice `token_ids`) that a `chunk.extra`-only
+/// strip would miss (they aren't in the flatten catch-all). The one deliberate
+/// difference: the chunk is re-derived from the sanitized value BEFORE the usage
+/// gate runs, so it keeps `usage` for `InterceptStream` billing; only the
+/// client-facing `raw_bytes` honor the usage gate (see [`gate_stream_usage`]).
+///
+/// Only touches chunk-bearing data lines; control events ([DONE], blanks, the keyed
+/// init) have no chunk and pass through unchanged. We ALWAYS round-trip a
+/// chunk-bearing line through the JSON sanitizer rather than guarding with a
+/// substring scan: this is a privacy-critical control and a unicode-escaped key
+/// (e.g. `"prompt_sha256"`) would defeat a literal-substring fast path while still
+/// parsing into `extra`. On any parse/sanitize failure the event is returned as-is
+/// (never drop a chunk over a rewrite). The rewrite is ATOMIC: `raw_bytes` is
+/// computed first and the parsed chunk is replaced only once that succeeds.
+fn rewrite_sse_event_model(
+    mut ev: SSEEvent,
+    canonical: Option<&str>,
+    include_usage: bool,
+) -> SSEEvent {
     if ev.chunk.is_none() {
         return ev;
     }
@@ -636,31 +712,37 @@ fn rewrite_sse_event_model(mut ev: SSEEvent, canonical: Option<&str>) -> SSEEven
         return ev;
     };
     let content = s.strip_prefix("data:").map(str::trim).unwrap_or(s.trim());
-    let Some(rewritten) = transform_response_json(content.as_bytes(), canonical) else {
+    // Sanitize + canonical-rewrite the value once; reuse it for both the
+    // client-facing `raw_bytes` (usage-gated) and the billing-facing parsed chunk
+    // (usage preserved).
+    let Ok(mut v) = serde_json::from_slice::<Value>(content.as_bytes()) else {
         return ev;
     };
-    let Ok(json) = String::from_utf8(rewritten) else {
-        return ev;
-    };
-    // raw_bytes rewrite succeeded — now mutate the parsed chunk to match, so the
-    // re-serialized-chunk route paths emit the same sanitized payload. The strip
-    // runs regardless of `canonical`: `ChatCompletionChunk::extra` holds the stripped
-    // top-level keys, and each `delta.extra` can hold a per-choice key.
-    if let Some(StreamChunk::Chat(c)) = &mut ev.chunk {
+    {
+        let Some(obj) = v.as_object_mut() else {
+            return ev;
+        };
         if let Some(canonical) = canonical {
-            c.model = canonical.to_string();
+            obj.insert("model".to_string(), Value::String(canonical.to_string()));
         }
-        for k in STRIPPED_TOP_LEVEL_FIELDS {
-            c.extra.remove(*k);
-        }
-        for choice in &mut c.choices {
-            if let Some(delta) = &mut choice.delta {
-                for k in STRIPPED_CHOICE_FIELDS {
-                    delta.extra.remove(*k);
-                }
-            }
-        }
+        strip_internal_response_fields(obj);
     }
+
+    // Re-derive the parsed chunk from the sanitized value, BEFORE usage-gating, so
+    // it keeps `usage` for `InterceptStream` billing while carrying the allowlisted
+    // (internals-stripped, canonical-id) shape the re-serialized route paths emit.
+    if let Ok(c) = serde_json::from_value::<crate::ChatCompletionChunk>(v.clone()) {
+        ev.chunk = Some(StreamChunk::Chat(c));
+    }
+
+    // Client-facing `raw_bytes`: apply the streamed-usage gate (#781 L1). The parsed
+    // chunk above is untouched by this gate, so billing still sees `usage`.
+    if let Some(obj) = v.as_object_mut() {
+        gate_stream_usage(obj, include_usage);
+    }
+    let Ok(json) = serde_json::to_string(&v) else {
+        return ev;
+    };
     SSEEvent {
         raw_bytes: bytes::Bytes::from(format!("data: {json}\n\n")),
         chunk: ev.chunk,
@@ -669,10 +751,10 @@ fn rewrite_sse_event_model(mut ev: SSEEvent, canonical: Option<&str>) -> SSEEven
 }
 
 /// Transform a decrypted OpenAI JSON body: optionally set `model` to `canonical`,
-/// then strip the Chutes-internal/serving fields (#780). Preserves every other
-/// field (so unmodeled provider fields like `hidden_states` survive). Returns the
-/// re-serialized bytes, or `None` if the body isn't a JSON object or
-/// (de)serialization fails.
+/// then sanitize the Chutes response shape to the standard OpenAI allowlist (#780 →
+/// #781). The deliberately-kept extras `chutes_verification` and `hidden_states`
+/// survive (they're on the allowlist). Returns the re-serialized bytes, or `None`
+/// if the body isn't a JSON object or (de)serialization fails.
 fn transform_response_json(bytes: &[u8], canonical: Option<&str>) -> Option<Vec<u8>> {
     let mut v: Value = serde_json::from_slice(bytes).ok()?;
     let obj = v.as_object_mut()?;
@@ -947,6 +1029,14 @@ impl InferenceProvider for Provider {
             ));
         }
         reject_client_e2ee(&params)?;
+        // Capture the CLIENT's usage intent before `request_body` force-sets
+        // `include_usage: true` upstream (we always request usage so billing sees
+        // it; #781 L1 gates what the client receives). A client opts in via
+        // `stream_options.include_usage: true`, OR vLLM's `continuous_usage_stats`
+        // (which also expects a usage-bearing final chunk).
+        let client_wants_usage = params.stream_options.as_ref().is_some_and(|so| {
+            so.include_usage == Some(true) || so.continuous_usage_stats == Some(true)
+        });
         let body = request_body(&self.model_name, &params, true)
             .map_err(CompletionError::CompletionError)?;
         let prep = self.verify_and_prepare(&body).await?;
@@ -969,15 +1059,16 @@ impl InferenceProvider for Provider {
             r.map_err(|e| CompletionError::CompletionError(format!("Chutes stream transport: {e}")))
         });
         let decoded = e2ee_stream::decrypt_e2ee_sse(Box::pin(byte_stream), prep.session);
-        // Per-chunk transform, mirroring the non-stream path: strip the
-        // Chutes-internal/serving fields (#780) from every decrypted `data:` line,
-        // and — only when the canonical id differs from the chute slug — also rewrite
-        // `model` so streamed chunks never leak the slug. We ALWAYS run the strip
-        // (even when canonical == slug), since `prompt_sha256`/`template_sha256`/
-        // `metadata`/`choices[].matched_stop` can appear on the stream regardless.
+        // Per-chunk transform, mirroring the non-stream path: sanitize each decrypted
+        // `data:` line to the standard OpenAI allowlist (#780 → #781), gate the
+        // streamed `usage` field to the spec (#781 L1), and — only when the canonical
+        // id differs from the chute slug — also rewrite `model` so streamed chunks
+        // never leak the slug. We ALWAYS run the sanitize/gate (even when
+        // canonical == slug), since serving internals and per-chunk `usage` can appear
+        // on the stream regardless of whether a model rewrite is needed.
         let canonical = (self.canonical_id != self.model_name).then(|| self.canonical_id.clone());
         Ok(Box::pin(decoded.map(move |item| {
-            item.map(|ev| rewrite_sse_event_model(ev, canonical.as_deref()))
+            item.map(|ev| rewrite_sse_event_model(ev, canonical.as_deref(), client_wants_usage))
         })))
     }
 
@@ -1596,12 +1687,13 @@ mod tests {
         .unwrap();
         let ev = SSEEvent {
             raw_bytes: bytes::Bytes::from_static(
-                b"data: {\"model\":\"zai-org/GLM-5.1-TEE\",\"id\":\"c\"}\n\n",
+                b"data: {\"id\":\"c\",\"object\":\"chat.completion.chunk\",\"created\":0,\
+                  \"model\":\"zai-org/GLM-5.1-TEE\",\"choices\":[]}\n\n",
             ),
             chunk: Some(StreamChunk::Chat(chunk)),
             raw_passthrough: true,
         };
-        let out = rewrite_sse_event_model(ev, Some("zai-org/GLM-5.1-FP8"));
+        let out = rewrite_sse_event_model(ev, Some("zai-org/GLM-5.1-FP8"), false);
         let s = std::str::from_utf8(&out.raw_bytes).unwrap();
         assert!(
             s.contains("zai-org/GLM-5.1-FP8"),
@@ -1624,7 +1716,7 @@ mod tests {
             chunk: None,
             raw_passthrough: true,
         };
-        let out = rewrite_sse_event_model(ctrl, Some("zai-org/GLM-5.1-FP8"));
+        let out = rewrite_sse_event_model(ctrl, Some("zai-org/GLM-5.1-FP8"), false);
         assert_eq!(&out.raw_bytes[..], b"data: [DONE]\n\n");
     }
 
@@ -1648,7 +1740,7 @@ mod tests {
             chunk: Some(chunk),
             raw_passthrough: true,
         };
-        let out = rewrite_sse_event_model(ev, None);
+        let out = rewrite_sse_event_model(ev, None, false);
 
         // raw_bytes: internal/serving fields stripped from the streamed line.
         let s = std::str::from_utf8(&out.raw_bytes).unwrap();
@@ -1713,6 +1805,231 @@ mod tests {
         // (both land in `extra` and are deliberately NOT stripped).
         assert_eq!(cv["chutes_verification"]["quote"], "abc");
         assert_eq!(cv["hidden_states"], json!([7, 8]));
+    }
+
+    #[test]
+    fn transform_response_json_allowlist_drops_unknown_internals_keeps_standard() {
+        // #781 allowlist: model-specific internals vary per model (kimi-k2.6 emits
+        // `templated_prompt`/`prompt_token_ids`/`prompt_logprobs`/`kv_transfer_params`/
+        // `choices[].token_ids`/`choices[].stop_reason`, etc.) so we drop by default.
+        // Every standard OpenAI field — incl. `system_fingerprint`/`service_tier`,
+        // which are STANDARD (not internals) — plus the kept extras
+        // `chutes_verification`/`hidden_states` and the message-level
+        // `reasoning_content`/`reasoning` MUST survive.
+        let body = br#"{
+            "id":"x","object":"chat.completion","created":1,"model":"moonshotai/Kimi-K2-TEE",
+            "system_fingerprint":"fp_abc","service_tier":"default",
+            "templated_prompt":"<rendered>","prompt_token_ids":[1,2,3],
+            "prompt_logprobs":null,"kv_transfer_params":{"x":1},
+            "prompt_sha256":"deadbeef","template_sha256":"cafef00d","metadata":{"w":"v3"},
+            "chutes_verification":{"quote":"abc"},"hidden_states":[7,8],
+            "choices":[{
+                "index":0,"finish_reason":"stop","logprobs":null,
+                "token_ids":[9,10],"stop_reason":151643,"matched_stop":151643,
+                "message":{
+                    "role":"assistant","content":"hi","reasoning_content":"because",
+                    "reasoning":"because","refusal":null,"tool_calls":[],
+                    "token_ids":[9,10],"stop_reason":151643
+                }
+            }],
+            "usage":{"prompt_tokens":3,"completion_tokens":1,"total_tokens":4}
+        }"#;
+        let out = transform_response_json(body, None).expect("transform");
+        let v: Value = serde_json::from_slice(&out).unwrap();
+
+        // Standard top-level fields survive.
+        for k in [
+            "id",
+            "object",
+            "created",
+            "model",
+            "choices",
+            "usage",
+            "system_fingerprint",
+            "service_tier",
+        ] {
+            assert!(
+                v.get(k).is_some(),
+                "standard top-level field {k} must survive"
+            );
+        }
+        // The deliberately-kept extras survive.
+        assert_eq!(v["chutes_verification"]["quote"], "abc");
+        assert_eq!(v["hidden_states"], json!([7, 8]));
+
+        // Unknown / known internals dropped at the top level.
+        for k in [
+            "templated_prompt",
+            "prompt_token_ids",
+            "prompt_logprobs",
+            "kv_transfer_params",
+            "prompt_sha256",
+            "template_sha256",
+            "metadata",
+        ] {
+            assert!(
+                v.get(k).is_none(),
+                "internal top-level field {k} must be dropped"
+            );
+        }
+
+        // Choice-level: standard kept, internals dropped.
+        let choice = &v["choices"][0];
+        assert_eq!(choice["index"], 0);
+        assert_eq!(choice["finish_reason"], "stop");
+        for k in ["token_ids", "stop_reason", "matched_stop"] {
+            assert!(
+                choice.get(k).is_none(),
+                "choice-level internal {k} must be dropped"
+            );
+        }
+        // Message-level: standard incl. both reasoning fields kept, internals dropped.
+        let msg = &choice["message"];
+        assert_eq!(msg["role"], "assistant");
+        assert_eq!(msg["content"], "hi");
+        assert_eq!(msg["reasoning_content"], "because");
+        assert_eq!(msg["reasoning"], "because");
+        for k in ["token_ids", "stop_reason"] {
+            assert!(
+                msg.get(k).is_none(),
+                "message-level internal {k} must be dropped"
+            );
+        }
+    }
+
+    #[test]
+    fn rewrite_sse_event_model_allowlist_drops_typed_internal_slots_on_chunk() {
+        // The chunk side is re-derived from the sanitized raw_bytes, so even TYPED
+        // internal slots on `ChatCompletionChunk` (`prompt_token_ids`, `modality`) and
+        // `ChatChoice` (`token_ids`) — which a `chunk.extra`-only strip would miss —
+        // are dropped from the re-serialized chunk. Standard fields + kept extras
+        // survive on BOTH raw_bytes and the chunk.
+        use crate::StreamChunk;
+        let payload = r#"{"id":"c","object":"chat.completion.chunk","created":0,"model":"moonshotai/Kimi-K2-TEE","prompt_token_ids":[1,2],"modality":"text","prompt_sha256":"x","hidden_states":[7],"chutes_verification":{"q":"r"},"choices":[{"index":0,"token_ids":[9],"matched_stop":151643,"delta":{"content":"hi","reasoning_content":"why","token_ids":[9]}}]}"#;
+        let chunk = StreamChunk::Chat(serde_json::from_str(payload).expect("parse chunk"));
+        let ev = SSEEvent {
+            raw_bytes: bytes::Bytes::from(format!("data: {payload}\n\n")),
+            chunk: Some(chunk),
+            raw_passthrough: true,
+        };
+        let out = rewrite_sse_event_model(ev, None, false);
+
+        // raw_bytes: typed + extra internals dropped, standard + extras kept.
+        let s = std::str::from_utf8(&out.raw_bytes).unwrap();
+        let v: Value = serde_json::from_str(s.strip_prefix("data: ").unwrap().trim_end()).unwrap();
+        for k in ["prompt_token_ids", "modality", "prompt_sha256"] {
+            assert!(v.get(k).is_none(), "raw_bytes: {k} dropped");
+        }
+        assert_eq!(v["hidden_states"], json!([7]));
+        assert_eq!(v["chutes_verification"]["q"], "r");
+        assert!(v["choices"][0].get("token_ids").is_none());
+        assert!(v["choices"][0].get("matched_stop").is_none());
+        assert_eq!(v["choices"][0]["delta"]["content"], "hi");
+        assert_eq!(v["choices"][0]["delta"]["reasoning_content"], "why");
+        assert!(v["choices"][0]["delta"].get("token_ids").is_none());
+
+        // Parsed chunk (re-serialized route paths): same allowlisted shape, incl. the
+        // TYPED slots that a chunk.extra-only strip would have left behind.
+        let Some(StreamChunk::Chat(c)) = &out.chunk else {
+            panic!("expected a Chat chunk");
+        };
+        let cv = serde_json::to_value(c).expect("serialize chunk");
+        assert!(
+            cv.get("prompt_token_ids").is_none(),
+            "typed prompt_token_ids dropped from re-derived chunk"
+        );
+        assert!(
+            cv.get("modality").is_none(),
+            "typed modality dropped from re-derived chunk"
+        );
+        assert!(
+            cv["choices"][0].get("token_ids").is_none(),
+            "typed choice token_ids dropped from re-derived chunk"
+        );
+        assert_eq!(cv["hidden_states"], json!([7]));
+        assert_eq!(cv["chutes_verification"]["q"], "r");
+        assert_eq!(cv["choices"][0]["delta"]["content"], "hi");
+    }
+
+    /// Build an SSE event from a raw chunk payload, run `rewrite_sse_event_model`,
+    /// and return the client-facing `raw_bytes` parsed back to a JSON value.
+    fn rewrite_raw(payload: &str, include_usage: bool) -> Value {
+        use crate::StreamChunk;
+        let chunk = StreamChunk::Chat(serde_json::from_str(payload).expect("parse chunk"));
+        let ev = SSEEvent {
+            raw_bytes: bytes::Bytes::from(format!("data: {payload}\n\n")),
+            chunk: Some(chunk),
+            raw_passthrough: true,
+        };
+        let out = rewrite_sse_event_model(ev, None, include_usage);
+        let s = std::str::from_utf8(&out.raw_bytes).unwrap();
+        serde_json::from_str(s.strip_prefix("data: ").unwrap().trim_end()).unwrap()
+    }
+
+    #[test]
+    fn stream_usage_gate_strips_usage_from_intermediate_chunks() {
+        // #781 L1: an intermediate content chunk (non-empty `choices`) must carry
+        // `usage: null` regardless of include_usage — even when vLLM's
+        // continuous_usage_stats populated it on every chunk.
+        let intermediate = r#"{"id":"c","object":"chat.completion.chunk","created":0,"model":"m","choices":[{"index":0,"delta":{"content":"hi"}}],"usage":{"prompt_tokens":3,"completion_tokens":1,"total_tokens":4}}"#;
+        for include_usage in [false, true] {
+            let v = rewrite_raw(intermediate, include_usage);
+            assert!(
+                v.get("usage").is_none(),
+                "intermediate chunk must drop usage (include_usage={include_usage})"
+            );
+            // Content is untouched by the usage gate.
+            assert_eq!(v["choices"][0]["delta"]["content"], "hi");
+        }
+    }
+
+    #[test]
+    fn stream_usage_gate_final_chunk_honors_include_usage() {
+        // The FINAL usage-only chunk has an empty `choices` array. Its `usage` is kept
+        // only when the client requested include_usage; otherwise it is dropped.
+        let final_chunk = r#"{"id":"c","object":"chat.completion.chunk","created":0,"model":"m","choices":[],"usage":{"prompt_tokens":3,"completion_tokens":5,"total_tokens":8}}"#;
+
+        // include_usage unset → no usage reaches the client.
+        let v = rewrite_raw(final_chunk, false);
+        assert!(
+            v.get("usage").is_none(),
+            "final chunk usage dropped when include_usage unset"
+        );
+
+        // include_usage set → usage survives on the final chunk only.
+        let v = rewrite_raw(final_chunk, true);
+        assert_eq!(
+            v["usage"]["total_tokens"], 8,
+            "final chunk usage kept when include_usage set"
+        );
+    }
+
+    #[test]
+    fn stream_usage_gate_preserves_chunk_usage_for_billing() {
+        // The client-facing raw_bytes honor the gate, but the parsed `chunk.usage`
+        // (read by InterceptStream for billing) is preserved even when the client did
+        // NOT request usage — billing must never be starved.
+        use crate::StreamChunk;
+        let final_chunk = r#"{"id":"c","object":"chat.completion.chunk","created":0,"model":"m","choices":[],"usage":{"prompt_tokens":3,"completion_tokens":5,"total_tokens":8}}"#;
+        let chunk = StreamChunk::Chat(serde_json::from_str(final_chunk).expect("parse chunk"));
+        let ev = SSEEvent {
+            raw_bytes: bytes::Bytes::from(format!("data: {final_chunk}\n\n")),
+            chunk: Some(chunk),
+            raw_passthrough: true,
+        };
+        let out = rewrite_sse_event_model(ev, None, /* include_usage */ false);
+
+        // Client-facing raw_bytes: usage stripped.
+        let s = std::str::from_utf8(&out.raw_bytes).unwrap();
+        let v: Value = serde_json::from_str(s.strip_prefix("data: ").unwrap().trim_end()).unwrap();
+        assert!(v.get("usage").is_none(), "client raw_bytes usage gated out");
+
+        // Parsed chunk: usage preserved for InterceptStream billing.
+        let Some(StreamChunk::Chat(c)) = &out.chunk else {
+            panic!("expected a Chat chunk");
+        };
+        let usage = c.usage.as_ref().expect("chunk.usage preserved for billing");
+        assert_eq!(usage.total_tokens, 8);
     }
 
     #[test]
@@ -1960,7 +2277,7 @@ mod tests {
             chunk: Some(StreamChunk::Chat(chunk)),
             raw_passthrough: true,
         };
-        let out = rewrite_sse_event_model(ev, Some("zai-org/GLM-5.1-FP8"));
+        let out = rewrite_sse_event_model(ev, Some("zai-org/GLM-5.1-FP8"), false);
         // raw_bytes untouched (no canonical id introduced, no reframing).
         assert_eq!(&out.raw_bytes[..], b"data: [1,2,3]\n\n");
         // The parsed chunk's model must NOT have been mutated to canonical.

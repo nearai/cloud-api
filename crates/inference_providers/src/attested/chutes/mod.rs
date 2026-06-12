@@ -386,14 +386,16 @@ const STRIPPED_TOP_LEVEL_FIELDS: &[&str] = &["prompt_sha256", "template_sha256",
 const STRIPPED_CHOICE_FIELDS: &[&str] = &["matched_stop"];
 
 /// Remove the Chutes-internal/serving fields ([`STRIPPED_TOP_LEVEL_FIELDS`] at the
-/// top level + [`STRIPPED_CHOICE_FIELDS`] inside each `choices` element) from a
-/// decrypted response object, in place. Surgical by design: it touches ONLY the
-/// named keys, so `chutes_verification` and any unmodeled passthrough field (e.g.
-/// `hidden_states`) are left exactly as-is. Takes the object map directly — the
-/// caller has already established it's a JSON object (a non-object body is kept
-/// verbatim). Used on both non-stream paths and per `data:` chunk on the stream
-/// path (the chunk shape — `choices[].delta` — also carries `matched_stop` per
-/// choice at the final chunk).
+/// top level + [`STRIPPED_CHOICE_FIELDS`] inside each `choices` element, AND inside
+/// each `choices[].delta` on the stream shape) from a decrypted response object, in
+/// place. Surgical by design: it touches ONLY the named keys, so
+/// `chutes_verification` and any unmodeled passthrough field (e.g. `hidden_states`)
+/// are left exactly as-is. Takes the object map directly — the caller has already
+/// established it's a JSON object (a non-object body is kept verbatim). Used on both
+/// non-stream paths and per `data:` chunk on the stream path. sglang currently emits
+/// `matched_stop` at the choice level, but stripping the `delta` too is cheap
+/// defense-in-depth (`ChatDelta` also has a `#[serde(flatten)]` catch-all, so a
+/// delta-nested `matched_stop` would otherwise survive re-serialization).
 fn strip_internal_response_fields(obj: &mut serde_json::Map<String, Value>) {
     for k in STRIPPED_TOP_LEVEL_FIELDS {
         obj.remove(*k);
@@ -403,6 +405,13 @@ fn strip_internal_response_fields(obj: &mut serde_json::Map<String, Value>) {
             if let Some(choice_obj) = choice.as_object_mut() {
                 for k in STRIPPED_CHOICE_FIELDS {
                     choice_obj.remove(*k);
+                }
+                // Defense-in-depth: also strip from `delta` (the stream shape).
+                if let Some(delta_obj) = choice_obj.get_mut("delta").and_then(Value::as_object_mut)
+                {
+                    for k in STRIPPED_CHOICE_FIELDS {
+                        delta_obj.remove(*k);
+                    }
                 }
             }
         }
@@ -416,12 +425,14 @@ fn strip_internal_response_fields(obj: &mut serde_json::Map<String, Value>) {
 /// auto-redact / alias-served paths — so leaving the slug/internal fields there
 /// would still leak them). The chunk-side strip targets `ChatCompletionChunk::extra`,
 /// the `#[serde(flatten)]` catch-all that captures exactly the stripped top-level
-/// keys (`matched_stop` has no slot on `ChatChoice` and is dropped on parse, so the
-/// per-choice strip is `raw_bytes`-only). Only touches chunk-bearing data lines;
-/// control events ([DONE], blanks, the keyed init) have no chunk and pass through
-/// unchanged. As a cheap fast path, an event that needs neither a model rewrite
-/// (`canonical == None`) nor any strip (none of the stripped keys appear as a
-/// substring in the raw line) is returned verbatim without a JSON round-trip. On
+/// keys, plus each `choices[].delta.extra` for the per-choice keys (`matched_stop`
+/// has no slot on `ChatChoice` and is dropped on parse, so the choice-level strip is
+/// `raw_bytes`-only; the `delta` strip is cheap defense-in-depth). Only touches
+/// chunk-bearing data lines; control events ([DONE], blanks, the keyed init) have no
+/// chunk and pass through unchanged. We ALWAYS round-trip a chunk-bearing line
+/// through the JSON sanitizer rather than guarding with a substring scan: this is a
+/// privacy-critical control and a unicode-escaped key (e.g. `"prompt_sha256"`)
+/// would defeat a literal-substring fast path while still parsing into `extra`. On
 /// any parse failure the event is returned as-is (never drop a chunk over a
 /// rewrite). The rewrite is ATOMIC: we compute the rewritten `raw_bytes` first and
 /// bail (returning the event unchanged) on any failure, mutating the parsed `chunk`
@@ -435,11 +446,6 @@ fn rewrite_sse_event_model(mut ev: SSEEvent, canonical: Option<&str>) -> SSEEven
     let Ok(s) = std::str::from_utf8(&ev.raw_bytes) else {
         return ev;
     };
-    // Fast path: nothing to rewrite (already canonical) and a cheap substring scan
-    // finds none of the stripped keys → pure passthrough, no JSON round-trip.
-    if canonical.is_none() && !contains_any_stripped_key(s) {
-        return ev;
-    }
     let content = s.strip_prefix("data:").map(str::trim).unwrap_or(s.trim());
     let Some(rewritten) = transform_response_json(content.as_bytes(), canonical) else {
         return ev;
@@ -449,8 +455,8 @@ fn rewrite_sse_event_model(mut ev: SSEEvent, canonical: Option<&str>) -> SSEEven
     };
     // raw_bytes rewrite succeeded — now mutate the parsed chunk to match, so the
     // re-serialized-chunk route paths emit the same sanitized payload. The strip
-    // runs regardless of `canonical`: `ChatCompletionChunk::extra` holds exactly
-    // the stripped top-level keys.
+    // runs regardless of `canonical`: `ChatCompletionChunk::extra` holds the stripped
+    // top-level keys, and each `delta.extra` can hold a per-choice key.
     if let Some(StreamChunk::Chat(c)) = &mut ev.chunk {
         if let Some(canonical) = canonical {
             c.model = canonical.to_string();
@@ -458,24 +464,19 @@ fn rewrite_sse_event_model(mut ev: SSEEvent, canonical: Option<&str>) -> SSEEven
         for k in STRIPPED_TOP_LEVEL_FIELDS {
             c.extra.remove(*k);
         }
+        for choice in &mut c.choices {
+            if let Some(delta) = &mut choice.delta {
+                for k in STRIPPED_CHOICE_FIELDS {
+                    delta.extra.remove(*k);
+                }
+            }
+        }
     }
     SSEEvent {
         raw_bytes: bytes::Bytes::from(format!("data: {json}\n\n")),
         chunk: ev.chunk,
         raw_passthrough: ev.raw_passthrough,
     }
-}
-
-/// Cheap substring scan over a raw SSE line for any stripped key, used to skip the
-/// JSON round-trip when there's nothing to strip and no model rewrite is needed. A
-/// false positive (the key name appears inside string content) only costs a
-/// round-trip that produces identical output; a false negative is impossible since
-/// a present key must appear literally. Per-choice keys are included too.
-fn contains_any_stripped_key(raw: &str) -> bool {
-    STRIPPED_TOP_LEVEL_FIELDS
-        .iter()
-        .chain(STRIPPED_CHOICE_FIELDS)
-        .any(|k| raw.contains(*k))
 }
 
 /// Transform a decrypted OpenAI JSON body: optionally set `model` to `canonical`,
@@ -1086,7 +1087,10 @@ mod tests {
         // A final stream chunk carrying the Chutes-internal/serving fields (#780).
         // canonical == None (slug == canonical) is the strip-only mode that the
         // stream path uses for a Chutes-only model.
-        let payload = r#"{"id":"c","object":"chat.completion.chunk","created":0,"model":"zai-org/GLM-5.1-TEE","prompt_sha256":"deadbeef","template_sha256":"cafef00d","metadata":{"weight_version":"v3"},"chutes_verification":{"quote":"abc"},"hidden_states":[7,8],"choices":[{"index":0,"matched_stop":151643,"delta":{}}]}"#;
+        // `matched_stop` appears BOTH at the choice level (no slot on `ChatChoice`,
+        // dropped on parse) and nested in `delta` (captured by `ChatDelta::extra`) to
+        // pin the defense-in-depth delta strip.
+        let payload = r#"{"id":"c","object":"chat.completion.chunk","created":0,"model":"zai-org/GLM-5.1-TEE","prompt_sha256":"deadbeef","template_sha256":"cafef00d","metadata":{"weight_version":"v3"},"chutes_verification":{"quote":"abc"},"hidden_states":[7,8],"choices":[{"index":0,"matched_stop":151643,"delta":{"matched_stop":151643,"content":"hi"}}]}"#;
         // Build the parsed `chunk` from the SAME raw payload that production
         // deserializes (e2ee_stream), so the catch-all `extra` map actually
         // captures the internal fields — otherwise the chunk-side leak is invisible.
@@ -1113,6 +1117,12 @@ mod tests {
             v["choices"][0].get("matched_stop").is_none(),
             "choices[].matched_stop stripped"
         );
+        assert!(
+            v["choices"][0]["delta"].get("matched_stop").is_none(),
+            "choices[].delta.matched_stop stripped (defense-in-depth)"
+        );
+        // The legitimate delta content survives the strip.
+        assert_eq!(v["choices"][0]["delta"]["content"], "hi");
         // canonical == None → `model` (the slug here) is left as-is by this helper;
         // the strip happened regardless of any model rewrite.
         assert_eq!(v["model"], "zai-org/GLM-5.1-TEE");
@@ -1145,10 +1155,49 @@ mod tests {
             cv["choices"][0].get("matched_stop").is_none(),
             "choices[].matched_stop absent from parsed chunk"
         );
+        // The delta-nested matched_stop IS captured by ChatDelta::extra, so the
+        // defense-in-depth strip must remove it from the parsed chunk too.
+        assert!(
+            cv["choices"][0]["delta"].get("matched_stop").is_none(),
+            "choices[].delta.matched_stop must be stripped from the parsed chunk"
+        );
+        assert_eq!(cv["choices"][0]["delta"]["content"], "hi");
         // The attestation receipt + unmodeled passthrough survive on the chunk too
         // (both land in `extra` and are deliberately NOT stripped).
         assert_eq!(cv["chutes_verification"]["quote"], "abc");
         assert_eq!(cv["hidden_states"], json!([7, 8]));
+    }
+
+    #[test]
+    fn transform_response_json_strips_unicode_escaped_key() {
+        // A JSON key whose first char is unicode-escaped — "prompt_sha256" —
+        // decodes to the plain field name `prompt_sha256`, so it must still be
+        // stripped. The strip is by parsed key, not literal substring. This pins the
+        // correctness reason we always round-trip rather than guarding with a cheap
+        // substring scan, which such an escaped key would defeat. (Note: `\\u` here is
+        // a single backslash in the Rust string, i.e. a real JSON `\u` escape.)
+        let body = format!(
+            r#"{{"id":"x","{}":"deadbeef","choices":[]}}"#,
+            "\\u0070rompt_sha256"
+        );
+        // Sanity: the escaped key really does decode to the plain field name, and
+        // the literal `prompt_sha256` substring is NOT present in the raw bytes.
+        let parsed: Value = serde_json::from_str(&body).unwrap();
+        assert!(
+            parsed.get("prompt_sha256").is_some(),
+            "escape decodes to key"
+        );
+        assert!(
+            !body.contains("prompt_sha256"),
+            "a literal-substring fast path would miss this key"
+        );
+        let out = transform_response_json(body.as_bytes(), None).expect("transform");
+        let v: Value = serde_json::from_slice(&out).unwrap();
+        assert!(
+            v.get("prompt_sha256").is_none(),
+            "unicode-escaped prompt_sha256 must be stripped"
+        );
+        assert_eq!(v["id"], "x");
     }
 
     #[test]

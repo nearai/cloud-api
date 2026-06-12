@@ -44,6 +44,9 @@ fn assert_openai_invalid_request(response: &axum_test::TestResponse, expected_st
         !err.error.message.is_empty(),
         "error message should be populated, got empty string"
     );
+    // Full envelope shape: ErrorResponse::new leaves param/code null.
+    assert_eq!(err.error.param, None, "param should be null");
+    assert_eq!(err.error.code, None, "code should be null");
 }
 
 #[tokio::test]

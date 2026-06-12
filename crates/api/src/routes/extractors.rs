@@ -71,14 +71,16 @@ impl IntoResponse for OpenAiJsonRejection {
     fn into_response(self) -> Response {
         let rejection = self.0;
 
-        // Prefer 400 for malformed JSON and shape/type errors (OpenAI uses 400
-        // for these; axum defaults JsonDataError to 422). Other rejection
-        // variants (missing/incorrect Content-Type -> 415, body-too-large ->
-        // 413/400) keep their own status — only the body SHAPE is normalized.
+        // Prefer 400 for malformed JSON, shape/type errors, and a missing/wrong
+        // Content-Type — OpenAI returns 400 for all of these, whereas axum
+        // defaults JsonDataError to 422 and MissingJsonContentType to 415. The
+        // remaining variant (BytesRejection: body read/too-large) keeps its own
+        // status. JsonRejection is #[non_exhaustive], so a catch-all arm is
+        // required; only the body SHAPE is normalized for it.
         let status = match &rejection {
-            JsonRejection::JsonDataError(_) | JsonRejection::JsonSyntaxError(_) => {
-                StatusCode::BAD_REQUEST
-            }
+            JsonRejection::JsonDataError(_)
+            | JsonRejection::JsonSyntaxError(_)
+            | JsonRejection::MissingJsonContentType(_) => StatusCode::BAD_REQUEST,
             other => other.status(),
         };
 
@@ -143,6 +145,9 @@ mod tests {
                 String::from_utf8_lossy(&bytes)
             )
         });
+        // Full envelope parity: ErrorResponse::new leaves param/code null.
+        assert_eq!(envelope.error.param, None);
+        assert_eq!(envelope.error.code, None);
         (status, envelope)
     }
 
@@ -167,6 +172,31 @@ mod tests {
     async fn wrong_type_field_is_400_envelope() {
         // `messages` is the wrong type (string, not array of strings).
         let (status, envelope) = post_json("{ \"model\": \"x\", \"messages\": \"oops\" }").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(envelope.error.r#type, INVALID_REQUEST_ERROR);
+        assert!(!envelope.error.message.is_empty());
+    }
+
+    #[tokio::test]
+    async fn missing_content_type_is_400_envelope() {
+        // No Content-Type header -> axum's MissingJsonContentType (415); we map
+        // it to 400 + envelope to match OpenAI.
+        let response = app()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/")
+                    .body(Body::from("{ \"model\": \"x\", \"messages\": [\"hi\"] }"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let envelope: ErrorResponse = serde_json::from_slice(&bytes)
+            .expect("response body should be the OpenAI envelope, not a bare string");
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(envelope.error.r#type, INVALID_REQUEST_ERROR);
         assert!(!envelope.error.message.is_empty());

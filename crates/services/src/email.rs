@@ -27,6 +27,31 @@ pub struct ModelDeprecationEmail {
     pub successor_model_id: String,
 }
 
+/// One model's entry in a consolidated pricing change email.
+/// Amounts are nano-dollars (scale 9); `new_*` is `None` when unchanged.
+#[derive(Debug, Clone)]
+pub struct PricingChangeEmailModel {
+    pub model_id: String,
+    pub model_display_name: String,
+    pub effective_at: DateTime<Utc>,
+    pub old_input_cost_per_token: i64,
+    pub new_input_cost_per_token: Option<i64>,
+    pub old_output_cost_per_token: i64,
+    pub new_output_cost_per_token: Option<i64>,
+    pub old_cache_read_cost_per_token: i64,
+    pub new_cache_read_cost_per_token: Option<i64>,
+    pub old_cost_per_image: i64,
+    pub new_cost_per_image: Option<i64>,
+}
+
+/// Consolidated pricing change notification: one email per recipient
+/// covering every affected model their organization(s) used.
+#[derive(Debug, Clone)]
+pub struct PricingChangeEmail {
+    pub recipient_email: String,
+    pub models: Vec<PricingChangeEmailModel>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EmailDeliveryOutcome {
     Sent { message_id: Option<String> },
@@ -62,6 +87,11 @@ pub trait EmailSender: Send + Sync {
         &self,
         email: &ModelDeprecationEmail,
     ) -> Result<EmailDeliveryOutcome, EmailError>;
+
+    async fn send_pricing_change(
+        &self,
+        email: &PricingChangeEmail,
+    ) -> Result<EmailDeliveryOutcome, EmailError>;
 }
 
 pub struct NoopEmailSender;
@@ -78,6 +108,13 @@ impl EmailSender for NoopEmailSender {
     async fn send_model_deprecation(
         &self,
         _email: &ModelDeprecationEmail,
+    ) -> Result<EmailDeliveryOutcome, EmailError> {
+        Ok(EmailDeliveryOutcome::Skipped)
+    }
+
+    async fn send_pricing_change(
+        &self,
+        _email: &PricingChangeEmail,
     ) -> Result<EmailDeliveryOutcome, EmailError> {
         Ok(EmailDeliveryOutcome::Skipped)
     }
@@ -241,6 +278,26 @@ impl EmailSender for ResendEmailSender {
             message_id: Some(response.id),
         })
     }
+
+    async fn send_pricing_change(
+        &self,
+        email: &PricingChangeEmail,
+    ) -> Result<EmailDeliveryOutcome, EmailError> {
+        let rendered = render_pricing_change_email(email);
+        let request = ResendSendEmailRequest {
+            from: self.from_email.clone(),
+            to: vec![email.recipient_email.clone()],
+            subject: rendered.subject,
+            html: rendered.html_body,
+            text: rendered.text_body,
+            reply_to: self.reply_to.clone(),
+        };
+        let response = self.transport.send_email(&self.api_key, request).await?;
+
+        Ok(EmailDeliveryOutcome::Sent {
+            message_id: Some(response.id),
+        })
+    }
 }
 
 pub fn sender_from_config(
@@ -358,6 +415,133 @@ pub fn render_model_deprecation_email(email: &ModelDeprecationEmail) -> Rendered
         "NEAR AI Cloud model deprecation notice\n\nThe model {model_label} ({model_id}) is scheduled for deprecation on {deprecation_date}.\n\nWe recommend migrating affected workloads to {successor} before that date.\n\nNo traffic has been rerouted automatically. Existing calls continue to use the current model until it is removed in a later step.\n",
         model_id = email.model_id,
         successor = email.successor_model_id,
+    );
+
+    RenderedEmail {
+        subject,
+        html_body,
+        text_body,
+    }
+}
+
+/// Format a nano-dollar-per-token amount as USD per 1M tokens.
+fn format_usd_per_million_tokens(nano_dollars_per_token: i64) -> String {
+    format_usd(nano_dollars_per_token as f64 / 1_000.0)
+}
+
+/// Format a nano-dollar amount as USD.
+fn format_usd_per_image(nano_dollars: i64) -> String {
+    format_usd(nano_dollars as f64 / 1_000_000_000.0)
+}
+
+fn format_usd(dollars: f64) -> String {
+    let formatted = format!("{dollars:.6}");
+    let trimmed = formatted.trim_end_matches('0').trim_end_matches('.');
+    // Always keep at least two decimals for readability ("$5" -> "$5.00").
+    if trimmed.split('.').nth(1).map_or(0, str::len) < 2 {
+        format!("${dollars:.2}")
+    } else {
+        format!("${trimmed}")
+    }
+}
+
+fn pricing_change_lines(model: &PricingChangeEmailModel) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut per_million = |label: &str, old: i64, new: Option<i64>| {
+        if let Some(new) = new {
+            lines.push(format!(
+                "{label}: {} → {} per 1M tokens",
+                format_usd_per_million_tokens(old),
+                format_usd_per_million_tokens(new),
+            ));
+        }
+    };
+    per_million(
+        "Input tokens",
+        model.old_input_cost_per_token,
+        model.new_input_cost_per_token,
+    );
+    per_million(
+        "Output tokens",
+        model.old_output_cost_per_token,
+        model.new_output_cost_per_token,
+    );
+    per_million(
+        "Cache reads",
+        model.old_cache_read_cost_per_token,
+        model.new_cache_read_cost_per_token,
+    );
+    if let Some(new) = model.new_cost_per_image {
+        lines.push(format!(
+            "Images: {} → {} per image",
+            format_usd_per_image(model.old_cost_per_image),
+            format_usd_per_image(new),
+        ));
+    }
+    lines
+}
+
+pub fn render_pricing_change_email(email: &PricingChangeEmail) -> RenderedEmail {
+    let subject = match email.models.as_slice() {
+        [only] => format!("NEAR AI Cloud pricing update: {}", only.model_id),
+        models => format!("NEAR AI Cloud pricing update for {} models", models.len()),
+    };
+    let intro = if email.models.len() == 1 {
+        "The pricing of the following NEAR AI Cloud model your organization recently used will change."
+    } else {
+        "The pricing of the following NEAR AI Cloud models your organization recently used will change."
+    };
+
+    let mut html_sections = String::new();
+    let mut text_sections = String::new();
+    for model in &email.models {
+        let model_display_name = model.model_display_name.trim();
+        let model_label = if model_display_name.is_empty() {
+            model.model_id.as_str()
+        } else {
+            model_display_name
+        };
+        let effective_at = model.effective_at.format("%B %-d, %Y at %H:%M UTC");
+        let lines = pricing_change_lines(model);
+
+        let html_lines = lines
+            .iter()
+            .map(|line| format!("      <li>{}</li>\n", escape_html(line)))
+            .collect::<String>();
+        html_sections.push_str(&format!(
+            r#"    <h2 style="font-size:16px;margin:24px 0 4px;">{model_label} (<code>{model_id}</code>)</h2>
+    <p style="margin:4px 0;">Effective <strong>{effective_at}</strong>:</p>
+    <ul style="margin:4px 0 16px;">
+{html_lines}    </ul>
+"#,
+            model_label = escape_html(model_label),
+            model_id = escape_html(&model.model_id),
+            effective_at = escape_html(&effective_at.to_string()),
+        ));
+
+        text_sections.push_str(&format!(
+            "{model_label} ({model_id})\nEffective {effective_at}:\n",
+            model_id = model.model_id,
+        ));
+        for line in &lines {
+            text_sections.push_str(&format!("- {line}\n"));
+        }
+        text_sections.push('\n');
+    }
+
+    let html_body = format!(
+        r#"<!doctype html>
+<html lang="en">
+  <body style="font-family:Arial,sans-serif;line-height:1.5;color:#111827;">
+    <h1 style="font-size:20px;margin-bottom:16px;">Pricing update notice</h1>
+    <p>{intro}</p>
+{html_sections}    <p>No action is required; your API usage will be billed at the new rates from each effective time.</p>
+  </body>
+</html>"#,
+    );
+
+    let text_body = format!(
+        "NEAR AI Cloud pricing update notice\n\n{intro}\n\n{text_sections}No action is required; your API usage will be billed at the new rates from each effective time.\n",
     );
 
     RenderedEmail {
@@ -499,6 +683,120 @@ mod tests {
         assert!(rendered.html_body.contains("&lt;Old &amp; Model&gt;"));
         assert!(rendered.html_body.contains("nearai/new-model"));
         assert!(rendered.text_body.contains("July 1, 2026"));
+    }
+
+    fn example_pricing_change_email() -> PricingChangeEmail {
+        PricingChangeEmail {
+            recipient_email: "admin@example.com".to_string(),
+            models: vec![
+                PricingChangeEmailModel {
+                    model_id: "nearai/model-a".to_string(),
+                    model_display_name: "<Model & A>".to_string(),
+                    effective_at: Utc.with_ymd_and_hms(2026, 7, 1, 13, 0, 0).unwrap(),
+                    old_input_cost_per_token: 250,
+                    new_input_cost_per_token: Some(280),
+                    old_output_cost_per_token: 850,
+                    new_output_cost_per_token: None,
+                    old_cache_read_cost_per_token: 25,
+                    new_cache_read_cost_per_token: None,
+                    old_cost_per_image: 0,
+                    new_cost_per_image: None,
+                },
+                PricingChangeEmailModel {
+                    model_id: "nearai/model-b".to_string(),
+                    model_display_name: "Model B".to_string(),
+                    effective_at: Utc.with_ymd_and_hms(2026, 8, 15, 0, 0, 0).unwrap(),
+                    old_input_cost_per_token: 5_000,
+                    new_input_cost_per_token: None,
+                    old_output_cost_per_token: 15_000,
+                    new_output_cost_per_token: Some(12_000),
+                    old_cache_read_cost_per_token: 0,
+                    new_cache_read_cost_per_token: None,
+                    old_cost_per_image: 2_000_000_000,
+                    new_cost_per_image: Some(2_500_000_000),
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn render_pricing_change_email_lists_all_models_and_escapes_html() {
+        let rendered = render_pricing_change_email(&example_pricing_change_email());
+
+        assert_eq!(
+            rendered.subject,
+            "NEAR AI Cloud pricing update for 2 models"
+        );
+        assert!(rendered.html_body.contains("&lt;Model &amp; A&gt;"));
+        assert!(rendered.html_body.contains("nearai/model-a"));
+        assert!(rendered.html_body.contains("nearai/model-b"));
+        assert!(rendered.text_body.contains("July 1, 2026 at 13:00 UTC"));
+        assert!(rendered.text_body.contains("August 15, 2026 at 00:00 UTC"));
+    }
+
+    #[test]
+    fn render_pricing_change_email_only_renders_changed_fields() {
+        let rendered = render_pricing_change_email(&example_pricing_change_email());
+
+        // Model A: input changed ($0.25 -> $0.28 per 1M), output/cache/image not.
+        assert!(rendered
+            .text_body
+            .contains("Input tokens: $0.25 → $0.28 per 1M tokens"));
+        assert!(!rendered.text_body.contains("$0.85"));
+        // Model B: output ($15 -> $12 per 1M) and image ($2 -> $2.50) changed.
+        assert!(rendered
+            .text_body
+            .contains("Output tokens: $15.00 → $12.00 per 1M tokens"));
+        assert!(rendered
+            .text_body
+            .contains("Images: $2.00 → $2.50 per image"));
+        assert!(!rendered.text_body.contains("Cache reads"));
+    }
+
+    #[test]
+    fn render_pricing_change_email_single_model_subject() {
+        let mut email = example_pricing_change_email();
+        email.models.truncate(1);
+
+        let rendered = render_pricing_change_email(&email);
+
+        assert_eq!(
+            rendered.subject,
+            "NEAR AI Cloud pricing update: nearai/model-a"
+        );
+    }
+
+    #[tokio::test]
+    async fn resend_sender_builds_pricing_change_payload() {
+        let transport = Arc::new(StubResendTransport {
+            outcome: Ok(ResendSendEmailResponse {
+                id: "pricing-email-id".to_string(),
+            }),
+            requests: Mutex::new(Vec::new()),
+        });
+        let sender = ResendEmailSender::new_with_transport(
+            "NEAR AI Cloud <no-reply@near.ai>".to_string(),
+            None,
+            "re_test".to_string(),
+            transport.clone(),
+        );
+
+        let result = sender
+            .send_pricing_change(&example_pricing_change_email())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result,
+            EmailDeliveryOutcome::Sent {
+                message_id: Some("pricing-email-id".to_string())
+            }
+        );
+        let requests = transport.requests.lock().unwrap();
+        let (_, request) = &requests[0];
+        assert_eq!(request.to, vec!["admin@example.com"]);
+        assert!(request.subject.contains("2 models"));
+        assert!(request.text.contains("nearai/model-b"));
     }
 
     #[test]

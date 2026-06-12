@@ -1,3 +1,4 @@
+pub mod chutes;
 pub mod measurement;
 pub mod models;
 pub mod report_data;
@@ -458,6 +459,29 @@ impl ports::AttestationServiceTrait for AttestationService {
             .map(|s| s.to_lowercase())
             .unwrap_or_else(|| "ecdsa".to_string());
 
+        // Some attested providers (e.g. Chutes) have no per-response signature —
+        // their integrity is the ML-KEM E2EE channel's AEAD tag, so the store path
+        // intentionally writes nothing (see `store_chat_signature_from_provider`).
+        // Without this, every such lookup would fall through to a bare 404, making
+        // "unsupported by design" indistinguishable from "missing/failed
+        // verification". Report it explicitly as SIGNATURE_UNSUPPORTED (a 200
+        // `Unavailable`) when we can still resolve the chat's provider.
+        if let Some(provider) = self
+            .inference_provider_pool
+            .get_provider_by_chat_id(chat_id)
+            .await
+        {
+            if !provider.supports_chat_signatures() {
+                return Ok(SignatureLookupResult::Unavailable {
+                    error_code: "SIGNATURE_UNSUPPORTED".to_string(),
+                    message: "This model's responses are integrity-protected by an \
+                              end-to-end encrypted channel, not a per-response signature; \
+                              there is no signature to retrieve."
+                        .to_string(),
+                });
+            }
+        }
+
         // Try to get signature from repository
         match self
             .repository
@@ -487,6 +511,15 @@ impl ports::AttestationServiceTrait for AttestationService {
             .ok_or_else(|| {
                 AttestationError::ProviderError(format!("No provider found for chat_id: {chat_id}"))
             })?;
+
+        // Some attested providers don't expose per-response signatures — e.g.
+        // Chutes, whose integrity is the ML-KEM E2EE channel's AEAD tag, not a
+        // signed response. For those, there's nothing to fetch/store, so skip the
+        // signature path entirely (calling get_signature would just error and add
+        // failure-metric noise on every attested completion).
+        if !provider.supports_chat_signatures() {
+            return Ok(());
+        }
 
         let environment = get_environment();
         let env_tag = format!("{TAG_ENVIRONMENT}:{environment}");

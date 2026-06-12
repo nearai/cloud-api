@@ -621,6 +621,18 @@ pub struct MockProvider {
     last_chat_params: Arc<Mutex<Option<ChatCompletionParams>>>,
     /// When true, get_attestation_report returns an error (simulates blocked/broken backend)
     fail_attestation: Arc<std::sync::atomic::AtomicBool>,
+    /// Trust tier reported by [`InferenceProvider::tier`]; defaults to
+    /// `NonAttested`. Set via [`MockProvider::with_tier`] to exercise tiered
+    /// provider selection (e.g. a `Near` primary with an `Attested3p` fallback).
+    tier: crate::ProviderTier,
+    /// Value reported by [`InferenceProvider::supports_streaming`]; defaults to
+    /// `true`. Set via [`MockProvider::with_streaming_support`] to exercise the
+    /// streaming-capability filter (e.g. a Chutes-like fallback with streaming off).
+    supports_streaming: bool,
+    /// Value reported by [`InferenceProvider::supports_client_e2ee`]; defaults to
+    /// `true`. Set via [`MockProvider::with_client_e2ee_support`] to exercise the
+    /// client-E2EE-capability filter (e.g. a Chutes-like fallback that rejects it).
+    supports_client_e2ee: bool,
 }
 
 impl MockProvider {
@@ -644,6 +656,9 @@ impl MockProvider {
             })),
             last_chat_params: Arc::new(Mutex::new(None)),
             fail_attestation: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            tier: crate::ProviderTier::NonAttested,
+            supports_streaming: true,
+            supports_client_e2ee: true,
         }
     }
 
@@ -663,6 +678,9 @@ impl MockProvider {
             })),
             last_chat_params: Arc::new(Mutex::new(None)),
             fail_attestation: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            tier: crate::ProviderTier::NonAttested,
+            supports_streaming: true,
+            supports_client_e2ee: true,
         }
     }
 
@@ -680,7 +698,32 @@ impl MockProvider {
             })),
             last_chat_params: Arc::new(Mutex::new(None)),
             fail_attestation: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            tier: crate::ProviderTier::NonAttested,
+            supports_streaming: true,
+            supports_client_e2ee: true,
         }
+    }
+
+    /// Set the trust tier this mock reports from [`InferenceProvider::tier`].
+    /// Used to exercise tiered provider selection (NEAR-primary / Chutes-fallback
+    /// and the verifiable-never-falls-back-to-plaintext rule).
+    pub fn with_tier(mut self, tier: crate::ProviderTier) -> Self {
+        self.tier = tier;
+        self
+    }
+
+    /// Set whether this mock reports streaming support (default `true`). Used to
+    /// exercise the streaming-capability filter (a streaming-disabled fallback).
+    pub fn with_streaming_support(mut self, supported: bool) -> Self {
+        self.supports_streaming = supported;
+        self
+    }
+
+    /// Set whether this mock reports client-E2EE support (default `true`). Used to
+    /// exercise the client-E2EE-capability filter (a Chutes-like fallback).
+    pub fn with_client_e2ee_support(mut self, supported: bool) -> Self {
+        self.supports_client_e2ee = supported;
+        self
     }
 
     /// Make get_attestation_report return an error (simulates blocked/broken backend).
@@ -862,6 +905,18 @@ impl Default for MockProvider {
 
 #[async_trait]
 impl crate::InferenceProvider for MockProvider {
+    fn tier(&self) -> crate::ProviderTier {
+        self.tier
+    }
+
+    fn supports_streaming(&self) -> bool {
+        self.supports_streaming
+    }
+
+    fn supports_client_e2ee(&self) -> bool {
+        self.supports_client_e2ee
+    }
+
     async fn models(&self) -> Result<ModelsResponse, ListModelsError> {
         Ok(ModelsResponse {
             object: "list".to_string(),

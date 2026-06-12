@@ -5,18 +5,21 @@ use crate::conversions::{
 use crate::middleware::AdminUser;
 use crate::models::{
     AdminAccessTokenResponse, AdminInvitationEmailResendResultResponse, AdminModelListResponse,
-    AdminModelWithPricing, AdminOrganizationResponse, AdminServiceResponse,
-    AdminUserOrganizationDetails, AdminUserResponse, BatchUpdateModelApiRequest,
-    CreateAdminAccessTokenRequest, CreateServiceRequest, CreditType, DecimalPrice,
-    DecimalPriceRequest, DeleteAdminAccessTokenRequest, DeleteModelRequest, DeprecateModelRequest,
-    DeprecateModelResponse, ErrorResponse, GetOrganizationConcurrentLimitResponse,
-    ListAdminInvitationEmailDeliveriesResponse, ListOrganizationsAdminResponse, ListUsersResponse,
-    ModelArchitecture, ModelDeprecationConfirmResponse, ModelDeprecationPreviewResponse,
-    ModelDeprecationRequest, ModelHistoryEntry, ModelHistoryResponse, ModelMetadata,
-    ModelWithPricing, OrgLimitsHistoryEntry, OrgLimitsHistoryResponse, OrganizationUsage,
-    SpendLimit, UpdateOrganizationConcurrentLimitRequest,
-    UpdateOrganizationConcurrentLimitResponse, UpdateOrganizationLimitsRequest,
-    UpdateOrganizationLimitsResponse, UpdateServiceRequest,
+    AdminModelWithPricing, AdminOrganizationMemberResponse, AdminOrganizationResponse,
+    AdminServiceResponse, AdminUserOrganizationDetails, AdminUserResponse,
+    BatchUpdateModelApiRequest, CreateAdminAccessTokenRequest, CreateServiceRequest, CreditType,
+    DecimalPrice, DecimalPriceRequest, DeleteAdminAccessTokenRequest, DeleteModelRequest,
+    DeprecateModelRequest, DeprecateModelResponse, ErrorResponse,
+    GetOrganizationConcurrentLimitResponse, ListAdminInvitationEmailDeliveriesResponse,
+    ListAdminOrganizationMembersResponse, ListOrganizationsAdminResponse,
+    ListPricingChangesResponse, ListUsersResponse, MemberRole, ModelArchitecture,
+    ModelDeprecationConfirmResponse, ModelDeprecationPreviewResponse, ModelDeprecationRequest,
+    ModelHistoryEntry, ModelHistoryResponse, ModelMetadata, ModelWithPricing,
+    OrgLimitsHistoryEntry, OrgLimitsHistoryResponse, OrganizationUsage, PricingChangeBatchRequest,
+    PricingChangeConfirmResponse, PricingChangeModelPreviewDto, PricingChangePreviewResponse,
+    PricingFieldUpdates, PricingFields, ScheduledPricingChangeDto, SpendLimit,
+    UpdateOrganizationConcurrentLimitRequest, UpdateOrganizationConcurrentLimitResponse,
+    UpdateOrganizationLimitsRequest, UpdateOrganizationLimitsResponse, UpdateServiceRequest,
 };
 use crate::routes::common::format_amount;
 use crate::routes::usage::{compute_organization_balance_response, OrganizationBalanceResponse};
@@ -34,8 +37,38 @@ use services::auth::AuthServiceTrait;
 use services::github_dispatch::GitHubDispatcher;
 use services::usage::UsageServiceTrait;
 use std::sync::Arc;
-use tracing::{debug, error, Instrument};
+use tracing::{debug, error, warn, Instrument};
 use uuid::Uuid;
+
+/// OpenRouter's fixed `supported_sampling_parameters` vocabulary. Values written
+/// via the admin API are validated against this list, and any pinned/seeded
+/// catalog row (e.g. the Chutes seed in `crate::ensure_chutes_catalog_row`) must
+/// stay a subset of it so `GET /v1/models` only ever emits known values.
+/// See migration V0051 and the OpenRouter provider spec.
+pub(crate) const VALID_SAMPLING_PARAMS: &[&str] = &[
+    "temperature",
+    "top_p",
+    "top_k",
+    "min_p",
+    "top_a",
+    "frequency_penalty",
+    "presence_penalty",
+    "repetition_penalty",
+    "stop",
+    "seed",
+    "max_tokens",
+    "logit_bias",
+];
+
+/// OpenRouter's fixed `supported_features` vocabulary. See `VALID_SAMPLING_PARAMS`.
+pub(crate) const VALID_FEATURES: &[&str] = &[
+    "tools",
+    "json_mode",
+    "structured_outputs",
+    "logprobs",
+    "web_search",
+    "reasoning",
+];
 
 /// Parse an OpenRouter `deprecation_date` into a normalized `DateTime<Utc>`.
 ///
@@ -241,20 +274,6 @@ pub async fn batch_upsert_models(
             }
         }
         if let Some(params) = &request.supported_sampling_parameters {
-            const VALID_SAMPLING_PARAMS: &[&str] = &[
-                "temperature",
-                "top_p",
-                "top_k",
-                "min_p",
-                "top_a",
-                "frequency_penalty",
-                "presence_penalty",
-                "repetition_penalty",
-                "stop",
-                "seed",
-                "max_tokens",
-                "logit_bias",
-            ];
             for p in params {
                 if !VALID_SAMPLING_PARAMS.contains(&p.as_str()) {
                     return Err((
@@ -270,14 +289,6 @@ pub async fn batch_upsert_models(
             }
         }
         if let Some(features) = &request.supported_features {
-            const VALID_FEATURES: &[&str] = &[
-                "tools",
-                "json_mode",
-                "structured_outputs",
-                "logprobs",
-                "web_search",
-                "reasoning",
-            ];
             for f in features {
                 if !VALID_FEATURES.contains(&f.as_str()) {
                     return Err((
@@ -451,6 +462,27 @@ pub async fn batch_upsert_models(
     // This covers: is_active=false, provider_type changed, inference_url cleared.
     // Re-registration below will add back the ones that should still be active.
     for (model_name, request) in &batch_request {
+        // Never tear down a pinned (out-of-band, config-managed) provider such as
+        // Chutes. The re-registration below only covers DB-discovered providers
+        // (inference-url / external), so unregistering a pinned provider here —
+        // e.g. on a PATCH carrying `provider_type: "chutes"` or activating the
+        // model — would leave an active catalog row with no serving provider until
+        // restart. Pricing/metadata still applied via batch_upsert_models above;
+        // serving is gated by the catalog `is_active`, not by this in-memory entry.
+        //
+        // NOTE: with tiered fallback this now also covers a NEAR-served canonical id
+        // that has a Chutes fallback (it's `is_pinned`). So a PATCH that changes its
+        // `inference_url` skips the eager `unregister_provider` here, but the NEW url
+        // is still re-registered below and `load_inference_url_models`' atomic update
+        // drops the *replaced* NEAR provider from `model_to_providers`, prunes its
+        // `pubkey_to_providers` entries, and prunes its per-provider failure counter
+        // (the prune is filtered against still-live pointers, so the coexisting
+        // pinned Chutes fallback keeps its counter) — no stale routing or counter
+        // state for the replaced provider is left behind. Behavior stays safe (pubkey
+        // intersection + catalog `is_active` gating).
+        if app_state.inference_provider_pool.is_pinned(model_name) {
+            continue;
+        }
         let is_inactive = request.is_active == Some(false);
         let has_type_change = request.provider_type.is_some() || request.inference_url.is_some();
         if is_inactive || has_type_change {
@@ -1234,12 +1266,24 @@ pub async fn delete_model(
             }
         })?;
 
-    // Unregister external provider if it was registered
-    // This is a no-op for vLLM models (they are discovered, not registered)
-    app_state
-        .inference_provider_pool
-        .unregister_provider(&model_name)
-        .await;
+    // Unregister external provider if it was registered.
+    // No-op for vLLM models (discovered, not registered). Skip pinned models
+    // (e.g. a NEAR-served canonical id with a Chutes fallback): unregistering would
+    // tear down the config-pinned provider too, recoverable only by restart. The
+    // catalog delete already 404s the model via resolve_and_get_model's is_active
+    // gate; config remains the source of truth for the pinned provider.
+    if app_state.inference_provider_pool.is_pinned(&model_name) {
+        tracing::warn!(
+            model = %model_name,
+            "delete_model: skipping unregister of a pinned (config-managed) provider; \
+             the catalog row is removed (model 404s), pinned provider left intact"
+        );
+    } else {
+        app_state
+            .inference_provider_pool
+            .unregister_provider(&model_name)
+            .await;
+    }
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -1321,10 +1365,22 @@ pub async fn deprecate_model(
     // resolver will route requests with the deprecated model_id to the
     // successor on subsequent calls — so this prevents in-flight resolution
     // from picking up a stale provider reference for the now-inactive model.
-    app_state
-        .inference_provider_pool
-        .unregister_provider(&model_id)
-        .await;
+    // Skip pinned models (e.g. a NEAR-served canonical id with a Chutes fallback):
+    // unregistering would tear down the config-pinned provider too (recoverable
+    // only by restart), and the alias already routes the deprecated id to the
+    // successor, so the pinned provider isn't reached.
+    if app_state.inference_provider_pool.is_pinned(&model_id) {
+        tracing::warn!(
+            model = %model_id,
+            "deprecate_model: skipping unregister of a pinned (config-managed) provider; \
+             the alias routes the deprecated id to its successor, pinned provider left intact"
+        );
+    } else {
+        app_state
+            .inference_provider_pool
+            .unregister_provider(&model_id)
+            .await;
+    }
 
     let to_api = |model_name: String, m: services::admin::ModelPricing| ModelWithPricing {
         model_id: model_name,
@@ -1492,6 +1548,323 @@ pub async fn confirm_model_deprecation(
     }))
 }
 
+fn usd_price(amount: i64) -> DecimalPrice {
+    DecimalPrice {
+        amount,
+        scale: 9,
+        currency: "USD".to_string(),
+    }
+}
+
+/// Validate the request-level shape of a pricing change batch and convert it
+/// to service inputs. Pricing/lead-time/model validation happens in the
+/// service layer.
+fn pricing_change_inputs_from_request(
+    req: &PricingChangeBatchRequest,
+) -> Result<Vec<services::admin::PricingChangeInput>, (StatusCode, ResponseJson<ErrorResponse>)> {
+    let invalid = |msg: String| {
+        (
+            StatusCode::BAD_REQUEST,
+            ResponseJson(ErrorResponse::new(msg, "invalid_request".to_string())),
+        )
+    };
+
+    req.changes
+        .iter()
+        .map(|item| {
+            let effective_at = parse_deprecation_date(&item.effective_at).ok_or_else(|| {
+                invalid(format!(
+                    "model '{}': effectiveAt: '{}' must be a date 'YYYY-MM-DD' (defaults to 13:00 UTC) or a whole-hour UTC instant 'YYYY-MM-DDTHH:00:00Z'",
+                    item.model_id, item.effective_at
+                ))
+            })?;
+            for price in [
+                &item.input_cost_per_token,
+                &item.output_cost_per_token,
+                &item.cache_read_cost_per_token,
+                &item.cost_per_image,
+            ]
+            .into_iter()
+            .flatten()
+            {
+                price
+                    .validate()
+                    .map_err(|e| invalid(format!("model '{}': {e}", item.model_id)))?;
+                // Only the amount is stored; responses and notification
+                // emails label it USD, so any other currency would silently
+                // be billed as USD.
+                if !price.currency.eq_ignore_ascii_case("USD") {
+                    return Err(invalid(format!(
+                        "model '{}': currency must be 'USD'",
+                        item.model_id
+                    )));
+                }
+            }
+            Ok(services::admin::PricingChangeInput {
+                model_name: item.model_id.clone(),
+                effective_at,
+                new_input_cost_per_token: item.input_cost_per_token.as_ref().map(|p| p.amount),
+                new_output_cost_per_token: item.output_cost_per_token.as_ref().map(|p| p.amount),
+                new_cache_read_cost_per_token: item
+                    .cache_read_cost_per_token
+                    .as_ref()
+                    .map(|p| p.amount),
+                new_cost_per_image: item.cost_per_image.as_ref().map(|p| p.amount),
+            })
+        })
+        .collect()
+}
+
+fn scheduled_pricing_change_to_dto(
+    change: services::admin::ScheduledPricingChange,
+) -> ScheduledPricingChangeDto {
+    ScheduledPricingChangeDto {
+        id: change.id.to_string(),
+        batch_id: change.batch_id.to_string(),
+        model_id: change.model_name,
+        model_display_name: change.model_display_name,
+        status: change.status.as_str().to_string(),
+        effective_at: format_deprecation_date(&change.effective_at),
+        old_pricing: PricingFields {
+            input_cost_per_token: usd_price(change.old_input_cost_per_token),
+            output_cost_per_token: usd_price(change.old_output_cost_per_token),
+            cache_read_cost_per_token: usd_price(change.old_cache_read_cost_per_token),
+            cost_per_image: usd_price(change.old_cost_per_image),
+        },
+        new_pricing: PricingFieldUpdates {
+            input_cost_per_token: change.new_input_cost_per_token.map(usd_price),
+            output_cost_per_token: change.new_output_cost_per_token.map(usd_price),
+            cache_read_cost_per_token: change.new_cache_read_cost_per_token.map(usd_price),
+            cost_per_image: change.new_cost_per_image.map(usd_price),
+        },
+        applied_at: change.applied_at.map(|dt| dt.to_rfc3339()),
+        last_error: change.last_error,
+        created_by_user_email: change.created_by_user_email,
+        change_reason: change.change_reason,
+        created_at: change.created_at.to_rfc3339(),
+    }
+}
+
+/// Preview a batch of scheduled pricing changes without mutating state (Admin only).
+#[utoipa::path(
+    post,
+    path = "/v1/admin/models/pricing-changes/preview",
+    tag = "Admin",
+    request_body = PricingChangeBatchRequest,
+    responses(
+        (status = 200, description = "Pricing change notification preview", body = PricingChangePreviewResponse),
+        (status = 400, description = "Invalid request", body = ErrorResponse),
+        (status = 404, description = "Model not found or inactive", body = ErrorResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    ),
+    security(
+        ("session_token" = [])
+    )
+)]
+pub async fn preview_model_pricing_changes(
+    State(app_state): State<AdminAppState>,
+    Extension(_admin_user): Extension<AdminUser>,
+    ResponseJson(req): ResponseJson<PricingChangeBatchRequest>,
+) -> Result<ResponseJson<PricingChangePreviewResponse>, (StatusCode, ResponseJson<ErrorResponse>)> {
+    let changes = pricing_change_inputs_from_request(&req)?;
+
+    let preview = app_state
+        .admin_service
+        .preview_pricing_changes(changes)
+        .await
+        .map_err(admin_error_to_response)?;
+
+    Ok(ResponseJson(PricingChangePreviewResponse {
+        recipient_count: preview.recipient_count,
+        organization_count: preview.organization_count,
+        usage_window_days: preview.usage_window_days,
+        models: preview
+            .models
+            .into_iter()
+            .map(|m| PricingChangeModelPreviewDto {
+                model_id: m.model_name,
+                model_display_name: m.model_display_name,
+                effective_at: format_deprecation_date(&m.effective_at),
+                recipient_count: m.recipient_count,
+                organization_count: m.organization_count,
+                old_pricing: PricingFields {
+                    input_cost_per_token: usd_price(m.old_input_cost_per_token),
+                    output_cost_per_token: usd_price(m.old_output_cost_per_token),
+                    cache_read_cost_per_token: usd_price(m.old_cache_read_cost_per_token),
+                    cost_per_image: usd_price(m.old_cost_per_image),
+                },
+                new_pricing: PricingFieldUpdates {
+                    input_cost_per_token: m.new_input_cost_per_token.map(usd_price),
+                    output_cost_per_token: m.new_output_cost_per_token.map(usd_price),
+                    cache_read_cost_per_token: m.new_cache_read_cost_per_token.map(usd_price),
+                    cost_per_image: m.new_cost_per_image.map(usd_price),
+                },
+            })
+            .collect(),
+    }))
+}
+
+/// Confirm a batch of scheduled pricing changes and notify affected admins (Admin only).
+///
+/// Persists the schedule (the background scheduler applies each change at its
+/// effective date) and sends one consolidated email per affected recipient.
+#[utoipa::path(
+    post,
+    path = "/v1/admin/models/pricing-changes/confirm",
+    tag = "Admin",
+    request_body = PricingChangeBatchRequest,
+    responses(
+        (status = 200, description = "Pricing changes scheduled and notifications attempted", body = PricingChangeConfirmResponse),
+        (status = 400, description = "Invalid request", body = ErrorResponse),
+        (status = 404, description = "Model not found or inactive", body = ErrorResponse),
+        (status = 409, description = "A pending pricing change already exists for a model", body = ErrorResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    ),
+    security(
+        ("session_token" = [])
+    )
+)]
+pub async fn confirm_model_pricing_changes(
+    State(app_state): State<AdminAppState>,
+    Extension(admin_user): Extension<AdminUser>,
+    ResponseJson(req): ResponseJson<PricingChangeBatchRequest>,
+) -> Result<ResponseJson<PricingChangeConfirmResponse>, (StatusCode, ResponseJson<ErrorResponse>)> {
+    let changes = pricing_change_inputs_from_request(&req)?;
+    let batch_id = req.batch_id.unwrap_or_else(Uuid::new_v4);
+
+    let result = app_state
+        .admin_service
+        .confirm_pricing_changes(
+            batch_id,
+            changes,
+            req.change_reason,
+            Some(admin_user.0.id),
+            Some(admin_user.0.email),
+        )
+        .await
+        .map_err(admin_error_to_response)?;
+
+    Ok(ResponseJson(PricingChangeConfirmResponse {
+        batch_id: result.batch_id.to_string(),
+        recipient_count: result.recipient_count,
+        organization_count: result.organization_count,
+        sent_count: result.sent_count,
+        failed_count: result.failed_count,
+        skipped_count: result.skipped_count,
+        changes: result
+            .changes
+            .into_iter()
+            .map(scheduled_pricing_change_to_dto)
+            .collect(),
+    }))
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct ListPricingChangesQueryParams {
+    /// Filter by status (pending, applying, applied, cancelled, failed).
+    pub status: Option<String>,
+    #[serde(default = "default_pricing_changes_limit")]
+    pub limit: i64,
+    #[serde(default)]
+    pub offset: i64,
+}
+
+fn default_pricing_changes_limit() -> i64 {
+    100
+}
+
+/// List scheduled pricing changes (Admin only).
+#[utoipa::path(
+    get,
+    path = "/v1/admin/models/pricing-changes",
+    tag = "Admin",
+    params(
+        ("status" = Option<String>, Query, description = "Filter by status: pending, applying, applied, cancelled, failed. Omit for all."),
+        ("limit" = Option<i64>, Query, description = "Maximum number of changes to return (default: 100)"),
+        ("offset" = Option<i64>, Query, description = "Number of changes to skip (default: 0)")
+    ),
+    responses(
+        (status = 200, description = "Scheduled pricing changes", body = ListPricingChangesResponse),
+        (status = 400, description = "Invalid request", body = ErrorResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    ),
+    security(
+        ("session_token" = [])
+    )
+)]
+pub async fn list_model_pricing_changes(
+    State(app_state): State<AdminAppState>,
+    Extension(_admin_user): Extension<AdminUser>,
+    Query(params): Query<ListPricingChangesQueryParams>,
+) -> Result<ResponseJson<ListPricingChangesResponse>, (StatusCode, ResponseJson<ErrorResponse>)> {
+    let status = params
+        .status
+        .as_deref()
+        .map(|s| {
+            services::admin::ScheduledPricingChangeStatus::parse(s).ok_or_else(|| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    ResponseJson(ErrorResponse::new(
+                        format!(
+                            "status: '{s}' must be one of pending, applying, applied, cancelled, failed"
+                        ),
+                        "invalid_request".to_string(),
+                    )),
+                )
+            })
+        })
+        .transpose()?;
+
+    let (changes, total) = app_state
+        .admin_service
+        .list_pricing_changes(status, params.limit, params.offset)
+        .await
+        .map_err(admin_error_to_response)?;
+
+    Ok(ResponseJson(ListPricingChangesResponse {
+        changes: changes
+            .into_iter()
+            .map(scheduled_pricing_change_to_dto)
+            .collect(),
+        total,
+    }))
+}
+
+/// Cancel a pending scheduled pricing change (Admin only).
+#[utoipa::path(
+    delete,
+    path = "/v1/admin/models/pricing-changes/{id}",
+    tag = "Admin",
+    params(
+        ("id" = uuid::Uuid, Path, description = "Scheduled pricing change ID")
+    ),
+    responses(
+        (status = 200, description = "Pricing change cancelled", body = ScheduledPricingChangeDto),
+        (status = 404, description = "Pricing change not found or no longer pending", body = ErrorResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    ),
+    security(
+        ("session_token" = [])
+    )
+)]
+pub async fn cancel_model_pricing_change(
+    State(app_state): State<AdminAppState>,
+    Path(id): Path<Uuid>,
+    Extension(admin_user): Extension<AdminUser>,
+) -> Result<ResponseJson<ScheduledPricingChangeDto>, (StatusCode, ResponseJson<ErrorResponse>)> {
+    let cancelled = app_state
+        .admin_service
+        .cancel_pricing_change(id, Some(admin_user.0.id), Some(admin_user.0.email))
+        .await
+        .map_err(admin_error_to_response)?;
+
+    Ok(ResponseJson(scheduled_pricing_change_to_dto(cancelled)))
+}
+
 fn admin_error_to_response(
     e: services::admin::AdminError,
 ) -> (StatusCode, ResponseJson<ErrorResponse>) {
@@ -1504,9 +1877,14 @@ fn admin_error_to_response(
         ),
         services::admin::AdminError::ModelNotFound(msg)
         | services::admin::AdminError::ServiceNotFound(msg)
-        | services::admin::AdminError::OrganizationNotFound(msg) => (
+        | services::admin::AdminError::OrganizationNotFound(msg)
+        | services::admin::AdminError::PricingChangeNotFound(msg) => (
             StatusCode::NOT_FOUND,
             ResponseJson(ErrorResponse::new(msg, "not_found".to_string())),
+        ),
+        services::admin::AdminError::PricingChangeConflict(msg) => (
+            StatusCode::CONFLICT,
+            ResponseJson(ErrorResponse::new(msg, "conflict".to_string())),
         ),
         services::admin::AdminError::Unauthorized(msg) => (
             StatusCode::UNAUTHORIZED,
@@ -1756,27 +2134,7 @@ pub async fn list_organizations(
 
     let org_responses: Vec<AdminOrganizationResponse> = organizations
         .into_iter()
-        .map(|org| {
-            let current_usage = org.total_spent.map(|total_spent| OrganizationUsage {
-                total_spent,
-                total_spent_display: format_amount(total_spent),
-                total_requests: org.total_requests.unwrap_or(0),
-                total_tokens: org.total_tokens.unwrap_or(0),
-            });
-
-            AdminOrganizationResponse {
-                id: org.id.to_string(),
-                name: org.name,
-                description: org.description,
-                spend_limit: org.spend_limit.map(|amount| SpendLimit {
-                    amount,
-                    scale: 9,
-                    currency: "USD".to_string(),
-                }),
-                current_usage,
-                created_at: org.created_at,
-            }
-        })
+        .map(admin_org_info_to_response)
         .collect();
 
     let response = ListOrganizationsAdminResponse {
@@ -1787,6 +2145,233 @@ pub async fn list_organizations(
     };
 
     Ok(ResponseJson(response))
+}
+
+/// Get a single organization by id (Admin only)
+///
+/// Returns one organization with its spend limit and usage. Only authenticated
+/// admins can perform this operation. Returns 404 if the organization does not
+/// exist or is inactive (consistent with the admin organizations list, which
+/// hides inactive orgs).
+#[utoipa::path(
+    get,
+    path = "/v1/admin/organizations/{org_id}",
+    tag = "Admin",
+    params(
+        ("org_id" = Uuid, Path, description = "Organization ID")
+    ),
+    responses(
+        (status = 200, description = "Organization retrieved successfully", body = AdminOrganizationResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 404, description = "Organization not found", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    ),
+    security(
+        ("session_token" = [])
+    )
+)]
+pub async fn get_organization(
+    State(app_state): State<AdminAppState>,
+    Extension(_admin_user): Extension<AdminUser>, // Require admin auth
+    Path(org_id): Path<Uuid>,
+) -> Result<ResponseJson<AdminOrganizationResponse>, (StatusCode, ResponseJson<ErrorResponse>)> {
+    debug!("Get organization request: org_id={}", org_id);
+
+    let org = app_state
+        .admin_service
+        .get_organization(org_id)
+        .await
+        .map_err(|e| match e {
+            services::admin::AdminError::OrganizationNotFound(_) => {
+                debug!("Organization not found: org_id={}", org_id);
+                (
+                    StatusCode::NOT_FOUND,
+                    ResponseJson(ErrorResponse::new(
+                        "Organization not found".to_string(),
+                        "not_found".to_string(),
+                    )),
+                )
+            }
+            services::admin::AdminError::Unauthorized(msg) => {
+                warn!("Unauthorized get organization: org_id={}", org_id);
+                (
+                    StatusCode::UNAUTHORIZED,
+                    ResponseJson(ErrorResponse::new(msg, "unauthorized".to_string())),
+                )
+            }
+            other => {
+                error!("Failed to get organization: {:?}", other);
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    ResponseJson(ErrorResponse::new(
+                        "Failed to retrieve organization".to_string(),
+                        "internal_server_error".to_string(),
+                    )),
+                )
+            }
+        })?;
+
+    Ok(ResponseJson(admin_org_info_to_response(org)))
+}
+
+/// Map a service-layer `AdminOrganizationInfo` to the API
+/// `AdminOrganizationResponse`. Shared by `list_organizations` and
+/// `get_organization` so the spend-limit scale and usage block can't drift
+/// between the two.
+fn admin_org_info_to_response(
+    org: services::admin::AdminOrganizationInfo,
+) -> AdminOrganizationResponse {
+    let current_usage = org.total_spent.map(|total_spent| OrganizationUsage {
+        total_spent,
+        total_spent_display: format_amount(total_spent),
+        total_requests: org.total_requests.unwrap_or(0),
+        total_tokens: org.total_tokens.unwrap_or(0),
+    });
+
+    AdminOrganizationResponse {
+        id: org.id.to_string(),
+        name: org.name,
+        description: org.description,
+        spend_limit: org.spend_limit.map(|amount| SpendLimit {
+            amount,
+            scale: 9,
+            currency: "USD".to_string(),
+        }),
+        current_usage,
+        created_at: org.created_at,
+    }
+}
+
+/// Map a raw database role string to the API `MemberRole`. Unknown values fall
+/// back to `Member` (the least-privileged role) so a malformed row can never
+/// be misrepresented as an owner/admin.
+fn member_role_from_db_str(role: &str, member_id: Uuid) -> MemberRole {
+    match role {
+        "owner" => MemberRole::Owner,
+        "admin" => MemberRole::Admin,
+        "member" => MemberRole::Member,
+        _ => {
+            // Unreachable while the `organization_members.role` CHECK constraint
+            // holds, but if it is ever relaxed we must not silently present a
+            // bogus role as a real one. Fall back to the least-privileged role
+            // and surface the anomaly by id only (no raw DB value, per the
+            // project's logging rules).
+            warn!(
+                "Unexpected organization member role for member_id={}; defaulting to 'member'",
+                member_id
+            );
+            MemberRole::Member
+        }
+    }
+}
+
+/// List members of a specific organization (Admin only)
+///
+/// Returns the members of the given organization with full user details
+/// (email, last login, active status), consistent with `/v1/admin/users`.
+/// Only authenticated admins can perform this operation.
+#[utoipa::path(
+    get,
+    path = "/v1/admin/organizations/{org_id}/members",
+    tag = "Admin",
+    params(
+        ("org_id" = Uuid, Path, description = "Organization ID"),
+        ("limit" = Option<i64>, Query, description = "Maximum number of members to return (default: 100)"),
+        ("offset" = Option<i64>, Query, description = "Number of members to skip (default: 0)")
+    ),
+    responses(
+        (status = 200, description = "Organization members retrieved successfully", body = ListAdminOrganizationMembersResponse),
+        (status = 400, description = "Invalid request", body = ErrorResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 404, description = "Organization not found", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    ),
+    security(
+        ("session_token" = [])
+    )
+)]
+pub async fn list_organization_members(
+    State(app_state): State<AdminAppState>,
+    Extension(_admin_user): Extension<AdminUser>, // Require admin auth
+    Path(org_id): Path<Uuid>,
+    Query(params): Query<ListOrganizationsQueryParams>,
+) -> Result<
+    ResponseJson<ListAdminOrganizationMembersResponse>,
+    (StatusCode, ResponseJson<ErrorResponse>),
+> {
+    crate::routes::common::validate_limit_offset(params.limit, params.offset)?;
+
+    debug!(
+        "List organization members request: org_id={}, limit={}, offset={}",
+        org_id, params.limit, params.offset
+    );
+
+    let (members, total) = app_state
+        .admin_service
+        .list_organization_members(org_id, params.limit, params.offset)
+        .await
+        .map_err(|e| match e {
+            services::admin::AdminError::OrganizationNotFound(_) => {
+                // Expected for probes of unknown/deactivated org ids — keep it
+                // out of error-level logs so it can't be used to flood them.
+                debug!("Organization not found for member list: org_id={}", org_id);
+                (
+                    StatusCode::NOT_FOUND,
+                    ResponseJson(ErrorResponse::new(
+                        "Organization not found".to_string(),
+                        "not_found".to_string(),
+                    )),
+                )
+            }
+            services::admin::AdminError::Unauthorized(msg) => {
+                warn!("Unauthorized organization member list: org_id={}", org_id);
+                (
+                    StatusCode::UNAUTHORIZED,
+                    ResponseJson(ErrorResponse::new(msg, "unauthorized".to_string())),
+                )
+            }
+            other => {
+                error!("Failed to list organization members: {:?}", other);
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    ResponseJson(ErrorResponse::new(
+                        "Failed to retrieve organization members".to_string(),
+                        "internal_server_error".to_string(),
+                    )),
+                )
+            }
+        })?;
+
+    let member_responses: Vec<AdminOrganizationMemberResponse> = members
+        .into_iter()
+        .map(|m| AdminOrganizationMemberResponse {
+            id: m.member_id.to_string(),
+            organization_id: m.organization_id.to_string(),
+            role: member_role_from_db_str(&m.role, m.member_id),
+            joined_at: m.joined_at,
+            invited_by: m.invited_by.map(|id| id.to_string()),
+            user: AdminUserResponse {
+                id: m.user.id.to_string(),
+                email: m.user.email,
+                username: Some(m.user.username),
+                display_name: m.user.display_name,
+                avatar_url: m.user.avatar_url,
+                created_at: m.user.created_at,
+                last_login_at: m.user.last_login_at,
+                is_active: m.user.is_active,
+                auth_provider: m.user.auth_provider,
+                provider_user_id: m.user.provider_user_id,
+                organizations: None,
+            },
+        })
+        .collect();
+
+    Ok(ResponseJson(ListAdminOrganizationMembersResponse {
+        members: member_responses,
+        total,
+        limit: params.limit,
+        offset: params.offset,
+    }))
 }
 
 /// List organization invitation email deliveries (Admin only)

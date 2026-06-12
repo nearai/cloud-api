@@ -612,6 +612,36 @@ pub async fn init_domain_services_with_pool_and_search_providers(
     domain_services
 }
 
+/// Standard OpenAI sampling knobs Chutes (sglang) honors, expressed in
+/// OpenRouter's fixed `supported_sampling_parameters` vocabulary. Seeded onto
+/// every auto-created Chutes catalog row so `GET /v1/models` advertises real
+/// capabilities instead of an empty list (which silently disables routing for
+/// OpenRouter-style consumers). `n` is intentionally omitted: it is not part of
+/// OpenRouter's vocabulary. Must remain a subset of `routes::admin::VALID_SAMPLING_PARAMS`.
+pub(crate) const CHUTES_SUPPORTED_SAMPLING_PARAMS: &[&str] = &[
+    "temperature",
+    "top_p",
+    "frequency_penalty",
+    "presence_penalty",
+    "stop",
+    "seed",
+    "max_tokens",
+];
+
+/// Feature capabilities Chutes (sglang) exposes, in OpenRouter's fixed
+/// `supported_features` vocabulary: `tools` => tool/function-calling, `json_mode`
+/// => JSON `response_format`. Streaming is always supported but is not a member
+/// of OpenRouter's feature vocabulary, so it is not advertised here. Must remain
+/// a subset of `routes::admin::VALID_FEATURES`.
+///
+/// `tools` is a *default* assumption, not a universal guarantee: tool-calling in
+/// sglang is model-family specific (needs a compatible chat template + tool-call
+/// parser), so a family without it would be over-advertised here — the inverse of
+/// the empty-array bug. That risk is bounded because the seed lands INACTIVE: an
+/// operator must PATCH the row (and is warned to verify tool support, clearing
+/// `supported_features` if absent) before any traffic is served.
+pub(crate) const CHUTES_SUPPORTED_FEATURES: &[&str] = &["tools", "json_mode"];
+
 /// Ensure a Chutes (attested) model has a catalog row in the `models` table.
 ///
 /// The data plane rejects any model without an active `models` row *before*
@@ -650,6 +680,22 @@ async fn ensure_chutes_catalog_row(
                     "Chutes model has an existing catalog row with attestation_supported=false; \
                      E2EE/signature handling may misbehave — fix via PATCH /v1/admin/models"
                 );
+            } else if existing.supported_sampling_parameters.is_empty()
+                && existing.supported_features.is_empty()
+            {
+                // This is the exact #781 (M1) bug state on a pre-existing row: both
+                // capability arrays are still the empty V0051 default, so
+                // `GET /v1/models` advertises the model as supporting *nothing* and
+                // OpenRouter-style routers won't route tool calls to it. New rows are
+                // seeded non-empty above; existing rows are backfilled by migration
+                // V0060. Warn in case a row predates the migration or was cleared.
+                tracing::warn!(
+                    model = %model_name,
+                    "Chutes model has an existing catalog row with EMPTY supported_features \
+                     and supported_sampling_parameters — OpenRouter-style routers will refuse \
+                     to route tool calls to it; backfilled by migration V0060, or set via \
+                     PATCH /v1/admin/models"
+                );
             } else {
                 tracing::info!(model = %model_name, "Chutes model already in catalog");
             }
@@ -682,6 +728,28 @@ async fn ensure_chutes_catalog_row(
                 owned_by: Some(owned_by.to_string()),
                 input_modalities: Some(vec!["text".to_string()]),
                 output_modalities: Some(vec!["text".to_string()]),
+                // OpenRouter-style routers gate tool/function-calling on these two
+                // arrays; leaving them empty (the SQL default) silently advertises a
+                // Chutes model as supporting *nothing*, so routers refuse to route
+                // tool calls to it. Chutes serves via sglang on an OpenAI-compatible
+                // surface, so seed the standard OpenAI knobs it honors. Operators can
+                // still override via PATCH /v1/admin/models. Both lists are restricted
+                // to OpenRouter's fixed vocabulary (asserted by a unit test below) so
+                // the seeded row would pass the same admin write-path validation.
+                supported_sampling_parameters: Some(
+                    CHUTES_SUPPORTED_SAMPLING_PARAMS
+                        .iter()
+                        .copied()
+                        .map(String::from)
+                        .collect(),
+                ),
+                supported_features: Some(
+                    CHUTES_SUPPORTED_FEATURES
+                        .iter()
+                        .copied()
+                        .map(String::from)
+                        .collect(),
+                ),
                 // Pricing left None -> defaults to 0 on INSERT. The inactive seed
                 // above prevents this zero price from ever being charged.
                 ..Default::default()
@@ -695,7 +763,11 @@ async fn ensure_chutes_catalog_row(
                         model = %model_name,
                         "Seeded Chutes catalog row as INACTIVE with zero pricing — set real \
                          per-token rates AND is_active=true via PATCH /v1/admin/models to serve \
-                         (kept inactive so paid traffic can't be billed at $0)"
+                         (kept inactive so paid traffic can't be billed at $0). The seed \
+                         advertises `tools`/`json_mode`: verify this model family actually \
+                         supports tool-calling in sglang (per-family parser + compatible chat \
+                         template) before activating, and clear `supported_features` via the \
+                         same PATCH if it doesn't"
                     );
                 }
                 Ok(None) => {
@@ -1054,6 +1126,10 @@ pub fn build_app_with_config(
         usage_state.clone(),
         rate_limit_state.clone(),
     );
+    let unsupported_openai_routes = build_unsupported_openai_routes(
+        &auth_components.auth_state_middleware,
+        rate_limit_state.clone(),
+    );
 
     let mcp_routes = build_mcp_routes(
         domain_services.web_search_provider.clone(),
@@ -1153,6 +1229,7 @@ pub fn build_app_with_config(
                 .nest("/auth", auth_routes)
                 .merge(completion_routes)
                 .merge(response_routes)
+                .merge(unsupported_openai_routes)
                 .merge(conversation_routes)
                 .merge(management_routes)
                 .merge(workspace_routes)
@@ -1396,6 +1473,26 @@ pub fn build_response_routes(
         ));
 
     Router::new().merge(inference_routes).merge(other_routes)
+}
+
+/// Build explicit not-implemented handlers for recognized OpenAI-compatible
+/// endpoints that cloud-api does not support yet.
+///
+/// These routes intentionally sit behind the normal API-key middleware, so
+/// unauthenticated callers receive the standard 401 before the 501 placeholder.
+pub fn build_unsupported_openai_routes(
+    auth_state_middleware: &AuthState,
+    rate_limit_state: middleware::RateLimitState,
+) -> Router {
+    routes::unsupported::openai_compat_routes()
+        .layer(from_fn_with_state(
+            rate_limit_state,
+            middleware::api_key_rate_limit_middleware,
+        ))
+        .layer(from_fn_with_state(
+            auth_state_middleware.clone(),
+            middleware::auth::auth_middleware_with_workspace_context,
+        ))
 }
 
 pub fn build_mcp_routes(
@@ -1998,6 +2095,47 @@ async fn swagger_ui_handler() -> Html<String> {
 mod tests {
     use super::*;
     use crate::openapi::ApiDoc;
+
+    /// Regression for issue #781 (M1): the Chutes catalog seed must advertise a
+    /// NON-EMPTY `supported_features` / `supported_sampling_parameters` so
+    /// OpenRouter-style routers don't silently treat the model as supporting
+    /// nothing (which disables tool routing).
+    #[test]
+    fn chutes_seed_advertises_nonempty_capabilities() {
+        assert!(
+            !CHUTES_SUPPORTED_SAMPLING_PARAMS.is_empty(),
+            "Chutes seed must advertise at least one sampling parameter"
+        );
+        assert!(
+            !CHUTES_SUPPORTED_FEATURES.is_empty(),
+            "Chutes seed must advertise at least one feature"
+        );
+        // tool/function-calling is the capability routers gate on; it must be present.
+        assert!(
+            CHUTES_SUPPORTED_FEATURES.contains(&"tools"),
+            "Chutes seed must advertise tool/function-calling support"
+        );
+    }
+
+    /// The seeded values must stay within OpenRouter's fixed vocabulary so the
+    /// auto-seeded row would pass the same validation the admin write path
+    /// (`PATCH /v1/admin/models`) enforces. This guards against the two lists
+    /// drifting apart.
+    #[test]
+    fn chutes_seed_values_are_valid_openrouter_vocabulary() {
+        for p in CHUTES_SUPPORTED_SAMPLING_PARAMS {
+            assert!(
+                crate::routes::admin::VALID_SAMPLING_PARAMS.contains(p),
+                "seeded sampling parameter '{p}' is not in OpenRouter's vocabulary"
+            );
+        }
+        for f in CHUTES_SUPPORTED_FEATURES {
+            assert!(
+                crate::routes::admin::VALID_FEATURES.contains(f),
+                "seeded feature '{f}' is not in OpenRouter's vocabulary"
+            );
+        }
+    }
 
     #[test]
     fn test_openapi_spec_generation() {

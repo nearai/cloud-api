@@ -40,6 +40,36 @@ use std::sync::Arc;
 use tracing::{debug, error, warn, Instrument};
 use uuid::Uuid;
 
+/// OpenRouter's fixed `supported_sampling_parameters` vocabulary. Values written
+/// via the admin API are validated against this list, and any pinned/seeded
+/// catalog row (e.g. the Chutes seed in `crate::ensure_chutes_catalog_row`) must
+/// stay a subset of it so `GET /v1/models` only ever emits known values.
+/// See migration V0051 and the OpenRouter provider spec.
+pub(crate) const VALID_SAMPLING_PARAMS: &[&str] = &[
+    "temperature",
+    "top_p",
+    "top_k",
+    "min_p",
+    "top_a",
+    "frequency_penalty",
+    "presence_penalty",
+    "repetition_penalty",
+    "stop",
+    "seed",
+    "max_tokens",
+    "logit_bias",
+];
+
+/// OpenRouter's fixed `supported_features` vocabulary. See `VALID_SAMPLING_PARAMS`.
+pub(crate) const VALID_FEATURES: &[&str] = &[
+    "tools",
+    "json_mode",
+    "structured_outputs",
+    "logprobs",
+    "web_search",
+    "reasoning",
+];
+
 /// Parse an OpenRouter `deprecation_date` into a normalized `DateTime<Utc>`.
 ///
 /// Follows the OpenRouter provider spec
@@ -244,20 +274,6 @@ pub async fn batch_upsert_models(
             }
         }
         if let Some(params) = &request.supported_sampling_parameters {
-            const VALID_SAMPLING_PARAMS: &[&str] = &[
-                "temperature",
-                "top_p",
-                "top_k",
-                "min_p",
-                "top_a",
-                "frequency_penalty",
-                "presence_penalty",
-                "repetition_penalty",
-                "stop",
-                "seed",
-                "max_tokens",
-                "logit_bias",
-            ];
             for p in params {
                 if !VALID_SAMPLING_PARAMS.contains(&p.as_str()) {
                     return Err((
@@ -273,14 +289,6 @@ pub async fn batch_upsert_models(
             }
         }
         if let Some(features) = &request.supported_features {
-            const VALID_FEATURES: &[&str] = &[
-                "tools",
-                "json_mode",
-                "structured_outputs",
-                "logprobs",
-                "web_search",
-                "reasoning",
-            ];
             for f in features {
                 if !VALID_FEATURES.contains(&f.as_str()) {
                     return Err((
@@ -464,12 +472,14 @@ pub async fn batch_upsert_models(
         //
         // NOTE: with tiered fallback this now also covers a NEAR-served canonical id
         // that has a Chutes fallback (it's `is_pinned`). So a PATCH that changes its
-        // `inference_url` or deactivates it skips the eager `unregister_provider`
-        // cleanup here: the NEW url is still re-registered below (the merge keeps
-        // Chutes), but the stale OLD-url NEAR provider + its pubkey/failure-counter
-        // entries linger until the next periodic refresh prunes them. Behavior stays
-        // safe (pubkey intersection + catalog `is_active` gating); it just isn't
-        // instantaneously clean for a runtime url change on a Chutes-fallback model.
+        // `inference_url` skips the eager `unregister_provider` here, but the NEW url
+        // is still re-registered below and `load_inference_url_models`' atomic update
+        // drops the *replaced* NEAR provider from `model_to_providers`, prunes its
+        // `pubkey_to_providers` entries, and prunes its per-provider failure counter
+        // (the prune is filtered against still-live pointers, so the coexisting
+        // pinned Chutes fallback keeps its counter) — no stale routing or counter
+        // state for the replaced provider is left behind. Behavior stays safe (pubkey
+        // intersection + catalog `is_active` gating).
         if app_state.inference_provider_pool.is_pinned(model_name) {
             continue;
         }

@@ -861,6 +861,391 @@ fn normalize_think_reasoning(obj: &mut serde_json::Map<String, Value>) {
     }
 }
 
+const THINK_OPEN: &str = "<think>";
+const THINK_CLOSE: &str = "</think>";
+
+/// Length of the longest suffix of `buf` that is a proper, non-empty prefix of
+/// `needle` (so it could be the start of a `needle` whose remainder hasn't arrived
+/// yet). Used to hold back only the minimal ambiguous tail when a `<think>` /
+/// `</think>` tag may be split across SSE chunks (e.g. `"<thi"` + `"nk>"`). Returns
+/// `0` when no suffix of `buf` could begin `needle`. We only ever need to consider
+/// suffixes shorter than `needle` (a full match is handled by the caller before
+/// calling this), so the scan is bounded by `needle.len() - 1`.
+fn ambiguous_tail_len(buf: &str, needle: &str) -> usize {
+    let max = needle.len().saturating_sub(1).min(buf.len());
+    // Longest first: the largest k where buf ends with needle[..k] (and needle
+    // starts with that same slice, trivially). Must land on a char boundary so the
+    // held-back tail is valid UTF-8.
+    for k in (1..=max).rev() {
+        if !needle.is_char_boundary(k) {
+            continue;
+        }
+        let prefix = &needle[..k];
+        if buf.len() >= k && buf.is_char_boundary(buf.len() - k) && buf.ends_with(prefix) {
+            return k;
+        }
+    }
+    0
+}
+
+/// Phase of the streaming `<think>…</think>` → `reasoning_content` extraction
+/// (issue #779 stream follow-up).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ThinkPhase {
+    /// Haven't yet decided whether `content` opens with a `<think>` block.
+    Scanning,
+    /// Inside a confirmed `<think>` block; inner text is routed to `reasoning_content`.
+    InThink,
+    /// Transform disabled for the rest of the stream — either we confirmed there is no
+    /// leading `<think>` block, we saw the closing `</think>`, or the model emits native
+    /// `reasoning_content`/`reasoning` (minimax-style). Content passes through verbatim.
+    Done,
+}
+
+/// Stateful, low-latency extraction of a leading `<think>…</think>` block from the
+/// streamed `content` deltas of a Chutes qwen response, mirroring the non-stream
+/// [`normalize_think_reasoning`] across SSE chunk boundaries (issue #779 follow-up).
+///
+/// The streamed equivalent is genuinely harder than the non-stream one because the
+/// `<think>`/`</think>` tags — and the reasoning text between them — can be split
+/// across delta boundaries (`"<thi"` + `"nk>"`). We therefore parse incrementally and
+/// hold back only the **minimal ambiguous suffix** (the longest tail that could be the
+/// start of a tag we're scanning for), so a model that streams token-by-token still
+/// streams with near-zero added latency — we never buffer the whole response.
+///
+/// Contract (matches the issue's hard requirements):
+/// - **No-think model is byte-for-byte unchanged.** As soon as the first non-whitespace
+///   `content` does not begin a `<think>` tag, we latch to [`ThinkPhase::Done`] and
+///   re-emit everything held back, verbatim, as `content`.
+/// - **Native-reasoning model untouched.** If any delta carries a non-empty
+///   `reasoning_content` / `reasoning` while still scanning, we latch to `Done` and
+///   never move anything (so minimax / GLM-5.1 are not clobbered).
+/// - **Never lose content.** Held-back bytes are flushed at end-of-stream
+///   ([`Self::flush`]): a never-resolved leading tail is flushed as `content`; an
+///   unclosed `<think>` flushes its tail as `reasoning_content` (the text was inside the
+///   block — it stays visible to the client, just under reasoning).
+/// - **Single-choice only.** Multi-choice streaming (n>1) or a non-zero choice index
+///   disables the transform (latch to `Done`) — the leading-block heuristic is only
+///   well-defined for a single linear content stream.
+///
+/// The transform mutates the chunk JSON in place (it operates on the same parsed
+/// `Value` that [`rewrite_sse_event_model`] sanitizes), rewriting `choices[0].delta`'s
+/// `content` and inserting `reasoning_content`. It runs BEFORE the allowlist strip /
+/// usage gate so its output is sanitized like any other field.
+///
+/// NOTE: Chutes streaming is opt-in/experimental (`CHUTES_ENABLE_STREAMING`); the inner
+/// frames are not yet order-authenticated (see [`e2ee_stream`]).
+#[derive(Debug)]
+struct ThinkStreamState {
+    phase: ThinkPhase,
+    /// Minimal held-back suffix awaiting disambiguation. In `Scanning` it's the
+    /// (possibly whitespace-prefixed) start that might open `<think>`; in `InThink`
+    /// it's a possible partial `</think>`.
+    pending: String,
+}
+
+impl ThinkStreamState {
+    fn new() -> Self {
+        Self {
+            phase: ThinkPhase::Scanning,
+            pending: String::new(),
+        }
+    }
+
+    /// Apply the extraction to one decrypted chunk's JSON, in place. Mutates
+    /// `choices[0].delta.content` (replacing it with the de-thought text, possibly
+    /// empty) and inserts `choices[0].delta.reasoning_content` with the extracted
+    /// reasoning when in/leaving a `<think>` block. Leaves the chunk untouched once
+    /// in [`ThinkPhase::Done`].
+    fn apply(&mut self, v: &mut Value) {
+        if self.phase == ThinkPhase::Done {
+            return;
+        }
+        let Some(choices) = v.get_mut("choices").and_then(Value::as_array_mut) else {
+            return;
+        };
+        // The leading-`<think>` heuristic is only well-defined for a single linear
+        // content stream. Anything else (n>1, or an unexpected non-zero index) disables
+        // the transform for the rest of the stream rather than guessing.
+        if choices.len() > 1 {
+            self.phase = ThinkPhase::Done;
+            return;
+        }
+        let Some(choice) = choices.first_mut() else {
+            return;
+        };
+        if choice.get("index").and_then(Value::as_i64).unwrap_or(0) != 0 {
+            self.phase = ThinkPhase::Done;
+            return;
+        }
+        let Some(delta) = choice.get_mut("delta").and_then(Value::as_object_mut) else {
+            return; // role-only / finish-only / non-delta chunk: nothing to move.
+        };
+
+        // A native reasoning field (minimax / GLM-5.1) means the model already splits
+        // reasoning out — never transform such a model. Latch off while still scanning.
+        let native_reasoning = ["reasoning_content", "reasoning"].iter().any(|k| {
+            delta
+                .get(*k)
+                .and_then(Value::as_str)
+                .is_some_and(|s| !s.trim().is_empty())
+        });
+        if native_reasoning && self.phase == ThinkPhase::Scanning {
+            self.phase = ThinkPhase::Done;
+            return;
+        }
+
+        // Only a plain-string content participates; absent/null/array content is left
+        // exactly as-is (the chunk may still carry tool_calls, role, etc.).
+        let Some(incoming) = delta.get("content").and_then(Value::as_str) else {
+            return;
+        };
+        let incoming = incoming.to_string();
+
+        let (content_out, reasoning_out) = self.feed(&incoming);
+
+        // Rewrite content: an empty string is still a valid (held-back) delta; we keep
+        // the key present so the client's reassembly sees a content delta of "".
+        delta.insert("content".to_string(), Value::String(content_out));
+        if let Some(r) = reasoning_out {
+            // Merge with any reasoning text already on this delta (there won't normally
+            // be one while we own the transform, but never clobber if there is).
+            let merged = match delta.get("reasoning_content").and_then(Value::as_str) {
+                Some(existing) => format!("{existing}{r}"),
+                None => r,
+            };
+            delta.insert("reasoning_content".to_string(), Value::String(merged));
+        }
+    }
+
+    /// Core incremental state machine: feed one delta's content text, return
+    /// `(content_to_emit, reasoning_to_emit)`. Pure (no JSON), so it's unit-tested
+    /// directly. `pending`/`phase` carry the cross-chunk state.
+    fn feed(&mut self, incoming: &str) -> (String, Option<String>) {
+        match self.phase {
+            ThinkPhase::Done => (incoming.to_string(), None),
+            ThinkPhase::Scanning => self.feed_scanning(incoming),
+            ThinkPhase::InThink => self.feed_in_think(incoming),
+        }
+    }
+
+    fn feed_scanning(&mut self, incoming: &str) -> (String, Option<String>) {
+        self.pending.push_str(incoming);
+        // Whitespace before the block is dropped (matching the non-stream version),
+        // but only ONCE we know a block follows — so keep the raw `pending` around for
+        // the no-block flush and decide on its trimmed view.
+        let trimmed = self.pending.trim_start();
+
+        if let Some(rest) = trimmed.strip_prefix(THINK_OPEN) {
+            // Confirmed: a leading `<think>`. Drop the whitespace + open tag, switch to
+            // InThink, and run the remainder through the in-think handler so a
+            // `</think>` already present in this same chunk is honored immediately.
+            let rest = rest.to_string();
+            self.pending.clear();
+            self.phase = ThinkPhase::InThink;
+            return self.feed_in_think(&rest);
+        }
+
+        // Still ambiguous: the trimmed start could be the beginning of `<think>` that
+        // hasn't fully arrived (e.g. "<thi"). Hold everything, emit nothing yet.
+        if THINK_OPEN.starts_with(trimmed) {
+            return (String::new(), None);
+        }
+
+        // Decided: NOT a think block. Emit everything held back verbatim (whitespace
+        // included — byte-for-byte passthrough) and disable the transform.
+        self.phase = ThinkPhase::Done;
+        let out = std::mem::take(&mut self.pending);
+        (out, None)
+    }
+
+    fn feed_in_think(&mut self, incoming: &str) -> (String, Option<String>) {
+        self.pending.push_str(incoming);
+
+        if let Some(close_idx) = self.pending.find(THINK_CLOSE) {
+            // Close tag found: text before it is the tail of the reasoning; text after
+            // (with the whitespace that separated the block from the answer trimmed,
+            // matching the non-stream version) begins the visible content.
+            let reasoning: String = self.pending[..close_idx].to_string();
+            let after = self.pending[close_idx + THINK_CLOSE.len()..]
+                .trim_start()
+                .to_string();
+            self.pending.clear();
+            self.phase = ThinkPhase::Done;
+            let reasoning = (!reasoning.is_empty()).then_some(reasoning);
+            return (after, reasoning);
+        }
+
+        // No close yet: emit all but the minimal suffix that could be a partial
+        // `</think>`, holding that suffix for the next chunk.
+        let tail = ambiguous_tail_len(&self.pending, THINK_CLOSE);
+        let split = self.pending.len() - tail;
+        let reasoning = self.pending[..split].to_string();
+        self.pending.drain(..split);
+        let reasoning = (!reasoning.is_empty()).then_some(reasoning);
+        (String::new(), reasoning)
+    }
+
+    /// Flush any held-back bytes at end-of-stream so no content is ever lost.
+    /// Returns `(content, reasoning)` to emit in a trailing delta, or `None` if there
+    /// is nothing pending. A never-resolved leading tail (we never confirmed a block)
+    /// is flushed as `content`; an unclosed `<think>` flushes its tail as
+    /// `reasoning_content` (it was inside the block).
+    fn flush(&mut self) -> Option<(Option<String>, Option<String>)> {
+        if self.pending.is_empty() {
+            return None;
+        }
+        let pending = std::mem::take(&mut self.pending);
+        match self.phase {
+            // Scanning: the held tail was a leading-whitespace / partial-`<think>` that
+            // never completed → it's ordinary content, emit verbatim.
+            ThinkPhase::Scanning => {
+                self.phase = ThinkPhase::Done;
+                Some((Some(pending), None))
+            }
+            // InThink: an unclosed `<think>` (a partial `</think>` tail at EOF). The text
+            // was inside the block → keep it as reasoning, don't fabricate content.
+            ThinkPhase::InThink => {
+                self.phase = ThinkPhase::Done;
+                Some((None, Some(pending)))
+            }
+            ThinkPhase::Done => None,
+        }
+    }
+}
+
+/// Build a trailing SSE event carrying the flushed `(content, reasoning)` from
+/// [`ThinkStreamState::flush`], cloning the framing (id/model/created/index) of the
+/// last real chunk so the synthetic delta is a well-formed continuation. Returns
+/// `None` if there's nothing to flush or no template chunk to clone from.
+fn flush_event(
+    content: Option<String>,
+    reasoning: Option<String>,
+    template: Option<&Value>,
+) -> Option<SSEEvent> {
+    let template = template?;
+    let mut delta = serde_json::Map::new();
+    if let Some(c) = content {
+        delta.insert("content".to_string(), Value::String(c));
+    }
+    if let Some(r) = reasoning {
+        delta.insert("reasoning_content".to_string(), Value::String(r));
+    }
+    if delta.is_empty() {
+        return None;
+    }
+    let mut v = json!({
+        "id": template.get("id").cloned().unwrap_or(Value::String(String::new())),
+        "object": "chat.completion.chunk",
+        "created": template.get("created").cloned().unwrap_or(json!(0)),
+        "model": template.get("model").cloned().unwrap_or(Value::String(String::new())),
+        "choices": [{ "index": 0, "delta": Value::Object(delta) }],
+    });
+    // Sanitize the synthetic chunk the same way real ones are (defense-in-depth; the
+    // template only contributes id/model/created so there's nothing to strip, but keep
+    // the shapes identical).
+    if let Some(obj) = v.as_object_mut() {
+        strip_internal_response_fields(obj);
+    }
+    let chunk = serde_json::from_value::<crate::ChatCompletionChunk>(v.clone())
+        .ok()
+        .map(StreamChunk::Chat);
+    let json = serde_json::to_string(&v).ok()?;
+    Some(SSEEvent {
+        raw_bytes: bytes::Bytes::from(format!("data: {json}\n\n")),
+        chunk,
+        raw_passthrough: true,
+    })
+}
+
+/// Parse the JSON value out of an SSE event's `raw_bytes` (`data: {…}`), returning
+/// `None` for control lines ([DONE], blanks) or non-JSON-object payloads. Used so the
+/// stateful think transform and the flush template share the same chunk view.
+fn sse_event_json(ev: &SSEEvent) -> Option<Value> {
+    ev.chunk.as_ref()?;
+    let s = std::str::from_utf8(&ev.raw_bytes).ok()?;
+    let content = s.strip_prefix("data:").map(str::trim).unwrap_or(s.trim());
+    let v: Value = serde_json::from_str(content).ok()?;
+    v.is_object().then_some(v)
+}
+
+/// Apply the stateful `<think>` extraction (issue #779 stream follow-up) to one
+/// decrypted SSE event, in place: re-frame `raw_bytes` and re-derive `chunk` from the
+/// think-transformed JSON. Control lines and non-JSON payloads pass through unchanged
+/// (and don't advance the parser). On ANY parse/serialize failure the event is returned
+/// untouched — we never drop or corrupt a chunk over the rewrite. Returns the (possibly
+/// rewritten) event; the [`ThinkStreamState`] carries the cross-chunk state.
+///
+/// Runs BEFORE [`rewrite_sse_event_model`] so the moved/stripped reasoning text is then
+/// allowlist-sanitized and usage-gated like any other field.
+fn apply_think_to_event(mut ev: SSEEvent, think: &mut ThinkStreamState) -> SSEEvent {
+    let Some(mut v) = sse_event_json(&ev) else {
+        return ev;
+    };
+    think.apply(&mut v);
+    let Ok(json) = serde_json::to_string(&v) else {
+        return ev;
+    };
+    // Re-derive the parsed chunk from the transformed JSON so the chunk and raw_bytes
+    // stay in lockstep (the re-serialized route paths read the chunk, not raw_bytes).
+    // On a parse failure keep the previously-parsed chunk rather than dropping it.
+    if let Ok(c) = serde_json::from_str::<crate::ChatCompletionChunk>(&json) {
+        ev.chunk = Some(StreamChunk::Chat(c));
+    }
+    ev.raw_bytes = bytes::Bytes::from(format!("data: {json}\n\n"));
+    ev
+}
+
+/// Wrap the decrypted Chutes SSE stream with the stateful `<think>` extraction
+/// (issue #779 stream follow-up) followed by the per-chunk allowlist/usage/model
+/// rewrite ([`rewrite_sse_event_model`]).
+///
+/// Stateful across chunks: a single [`ThinkStreamState`] threads the open/closed think
+/// state through the whole stream. The transform holds back only the minimal ambiguous
+/// suffix (a possibly-split tag), so streaming stays low-latency. At end-of-stream — the
+/// authenticated inner `[DONE]` — any held-back bytes are flushed in a synthetic trailing
+/// delta ([`ThinkStreamState::flush`] / [`flush_event`]) BEFORE `[DONE]`, so no content is
+/// ever lost (a never-resolved leading tail → `content`; an unclosed `<think>` →
+/// `reasoning_content`). The flush delta is itself put through `rewrite_sse_event_model`.
+///
+/// Errors propagate unchanged; on a transport/decrypt error the upstream stream surfaces
+/// the error frame (a failed stream — held-back bytes there are moot since the client
+/// already sees the failure).
+fn stream_with_think_extraction(
+    decoded: StreamingResult,
+    canonical: Option<String>,
+    client_wants_usage: bool,
+) -> StreamingResult {
+    let s = async_stream::try_stream! {
+        let mut decoded = decoded;
+        let mut think = ThinkStreamState::new();
+        // The last real chunk JSON, used to frame a synthetic flush delta (id/model/…).
+        let mut last_template: Option<Value> = None;
+
+        while let Some(item) = decoded.next().await {
+            let ev = item?;
+            // At the clean terminus, flush any held-back bytes BEFORE [DONE] so nothing
+            // is lost, then forward [DONE] and end.
+            if ev.is_done_marker() {
+                if let Some((content, reasoning)) = think.flush() {
+                    if let Some(flushed) = flush_event(content, reasoning, last_template.as_ref()) {
+                        yield rewrite_sse_event_model(flushed, canonical.as_deref(), client_wants_usage);
+                    }
+                }
+                yield ev;
+                return;
+            }
+            let ev = apply_think_to_event(ev, &mut think);
+            // Remember a usable template for the flush delta (id/model/created).
+            if let Some(v) = sse_event_json(&ev) {
+                last_template = Some(v);
+            }
+            yield rewrite_sse_event_model(ev, canonical.as_deref(), client_wants_usage);
+        }
+    };
+    Box::pin(s)
+}
+
 /// An OpenAI request body (as JSON) with `model` pinned, `stream` set, and all
 /// internal/tracing/E2EE-marker keys stripped (never sent to the third party).
 fn request_body(model: &str, params: &ChatCompletionParams, stream: bool) -> Result<Value, String> {
@@ -1059,17 +1444,24 @@ impl InferenceProvider for Provider {
             r.map_err(|e| CompletionError::CompletionError(format!("Chutes stream transport: {e}")))
         });
         let decoded = e2ee_stream::decrypt_e2ee_sse(Box::pin(byte_stream), prep.session);
-        // Per-chunk transform, mirroring the non-stream path: sanitize each decrypted
-        // `data:` line to the standard OpenAI allowlist (#780 → #781), gate the
-        // streamed `usage` field to the spec (#781 L1), and — only when the canonical
-        // id differs from the chute slug — also rewrite `model` so streamed chunks
-        // never leak the slug. We ALWAYS run the sanitize/gate (even when
-        // canonical == slug), since serving internals and per-chunk `usage` can appear
-        // on the stream regardless of whether a model rewrite is needed.
+        // Per-chunk transform, mirroring the non-stream path:
+        //  1. stateful `<think>…</think>` → `reasoning_content` extraction (issue #779
+        //     stream follow-up): route a leading chain-of-thought block to streamed
+        //     `reasoning_content` deltas and keep it out of `content`, incrementally
+        //     across SSE chunk boundaries (no whole-stream buffering). No-think and
+        //     native-reasoning models stream through unchanged — see [`ThinkStreamState`];
+        //  2. sanitize each decrypted `data:` line to the standard OpenAI allowlist
+        //     (#780 → #781), gate the streamed `usage` field to the spec (#781 L1), and —
+        //     only when the canonical id differs from the chute slug — rewrite `model` so
+        //     streamed chunks never leak the slug. We ALWAYS run the sanitize/gate (even
+        //     when canonical == slug), since serving internals and per-chunk `usage` can
+        //     appear on the stream regardless of whether a model rewrite is needed.
         let canonical = (self.canonical_id != self.model_name).then(|| self.canonical_id.clone());
-        Ok(Box::pin(decoded.map(move |item| {
-            item.map(|ev| rewrite_sse_event_model(ev, canonical.as_deref(), client_wants_usage))
-        })))
+        Ok(stream_with_think_extraction(
+            decoded,
+            canonical,
+            client_wants_usage,
+        ))
     }
 
     async fn text_completion_stream(
@@ -2486,5 +2878,363 @@ mod tests {
             "stream ended without an inner [DONE] — streaming can't be honestly \
              attested until Chutes emits the terminator inside the channel"
         );
+    }
+
+    // ----------------------------------------------------------------------------
+    // Stream `<think>…</think>` → reasoning_content extraction (issue #779 follow-up).
+    // ----------------------------------------------------------------------------
+
+    /// Build a stream data SSEEvent for a single-choice chunk with the given delta
+    /// content, mirroring what `e2ee_stream::inner_event` produces.
+    fn content_chunk_event(content: &str) -> SSEEvent {
+        let payload = json!({
+            "id": "c1",
+            "object": "chat.completion.chunk",
+            "created": 0,
+            "model": "Qwen/Qwen3-TEE",
+            "choices": [{ "index": 0, "delta": { "content": content } }],
+        });
+        let s = serde_json::to_string(&payload).unwrap();
+        let chunk: crate::ChatCompletionChunk = serde_json::from_str(&s).unwrap();
+        SSEEvent {
+            raw_bytes: bytes::Bytes::from(format!("data: {s}\n\n")),
+            chunk: Some(StreamChunk::Chat(chunk)),
+            raw_passthrough: true,
+        }
+    }
+
+    fn done_marker_event() -> SSEEvent {
+        SSEEvent {
+            raw_bytes: bytes::Bytes::from_static(b"data: [DONE]\n\n"),
+            chunk: None,
+            raw_passthrough: true,
+        }
+    }
+
+    /// Run a list of content deltas (plus a final [DONE]) through the full stateful
+    /// stream transform and collect, per emitted data chunk, the (content, reasoning)
+    /// the client would see. Control lines are skipped. Mirrors production wiring.
+    async fn run_think_stream(contents: &[&str]) -> Vec<(Option<String>, Option<String>)> {
+        use futures_util::StreamExt;
+        let mut events: Vec<Result<SSEEvent, CompletionError>> = contents
+            .iter()
+            .map(|c| Ok(content_chunk_event(c)))
+            .collect();
+        events.push(Ok(done_marker_event()));
+        let decoded: StreamingResult = Box::pin(futures_util::stream::iter(events));
+        let mut out = stream_with_think_extraction(decoded, None, false);
+        let mut seen = Vec::new();
+        while let Some(item) = out.next().await {
+            let ev = item.unwrap();
+            if ev.is_done_marker() {
+                continue;
+            }
+            let s = std::str::from_utf8(&ev.raw_bytes).unwrap();
+            let v: Value =
+                serde_json::from_str(s.strip_prefix("data: ").unwrap().trim_end()).unwrap();
+            let delta = &v["choices"][0]["delta"];
+            seen.push((
+                delta
+                    .get("content")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                delta
+                    .get("reasoning_content")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+            ));
+        }
+        seen
+    }
+
+    /// Concatenate all content / reasoning deltas the client would receive.
+    fn joined(seen: &[(Option<String>, Option<String>)]) -> (String, String) {
+        let content: String = seen.iter().filter_map(|(c, _)| c.clone()).collect();
+        let reasoning: String = seen.iter().filter_map(|(_, r)| r.clone()).collect();
+        (content, reasoning)
+    }
+
+    #[test]
+    fn ambiguous_tail_len_holds_partial_tags_only() {
+        // Only a proper, non-empty prefix of the needle that ends `buf` is held back —
+        // longest first. Full matches are the caller's job (handled before this is hit).
+        // "</thi" (5 chars) is a prefix of "</think>", and buf ends with it → hold 5.
+        assert_eq!(ambiguous_tail_len("hello</thi", THINK_CLOSE), 5);
+        assert_eq!(ambiguous_tail_len("abc</", THINK_CLOSE), 2); // "</" is a prefix → hold 2
+        assert_eq!(ambiguous_tail_len("plain text", THINK_CLOSE), 0); // no tag start → hold none
+        assert_eq!(ambiguous_tail_len("ends with <", THINK_OPEN), 1); // "<" begins "<think>"
+        assert_eq!(ambiguous_tail_len("no tag here", THINK_OPEN), 0);
+        // A fully-present needle is capped at len-1 here (the longest *proper* prefix
+        // that's also a suffix). "</think>" has no shorter prefix that is also a suffix,
+        // so it returns 0 — the caller already handled the full match.
+        assert_eq!(ambiguous_tail_len(THINK_CLOSE, THINK_CLOSE), 0);
+    }
+
+    #[tokio::test]
+    async fn think_block_split_across_three_chunks() {
+        // The reasoning is streamed in pieces and the tags straddle chunk boundaries:
+        // "<thi"|"nk>reaso"|"ning</thi"|"nk>answer". Inner text must surface as
+        // reasoning_content deltas and NOT as content; the answer must be clean content.
+        let seen = run_think_stream(&["<thi", "nk>reaso", "ning</thi", "nk>he", "llo"]).await;
+        let (content, reasoning) = joined(&seen);
+        assert_eq!(
+            reasoning, "reasoning",
+            "inner think text → reasoning_content"
+        );
+        assert_eq!(content, "hello", "answer is clean content, no tags");
+        assert!(
+            !content.contains("<think>") && !content.contains("</think>"),
+            "tags never leak into content"
+        );
+    }
+
+    #[tokio::test]
+    async fn think_block_in_single_chunk() {
+        let seen = run_think_stream(&["<think>because</think>\n\nthe answer"]).await;
+        let (content, reasoning) = joined(&seen);
+        assert_eq!(reasoning, "because");
+        assert_eq!(content, "the answer", "whitespace after </think> trimmed");
+    }
+
+    #[tokio::test]
+    async fn no_think_model_passes_through_unchanged() {
+        // A model that emits no think tags must pass through byte-for-byte: same content,
+        // never any reasoning_content.
+        let seen = run_think_stream(&["Hello", ", ", "world", "!"]).await;
+        let (content, reasoning) = joined(&seen);
+        assert_eq!(content, "Hello, world!");
+        assert_eq!(
+            reasoning, "",
+            "no reasoning fabricated for a no-think model"
+        );
+    }
+
+    #[tokio::test]
+    async fn content_that_merely_mentions_think_is_not_treated_as_block() {
+        // Answer text that talks about "<thinking>" (not the exact open tag) must NOT be
+        // misread as a think block — the first non-ws chars decide.
+        let seen = run_think_stream(&["I will <thinking> about it"]).await;
+        let (content, reasoning) = joined(&seen);
+        assert_eq!(content, "I will <thinking> about it");
+        assert_eq!(reasoning, "");
+    }
+
+    #[tokio::test]
+    async fn leading_text_then_think_is_passthrough() {
+        // `<think>` not at the very start (answer first) → passthrough, matching the
+        // non-stream `split_leading_think_block` contract.
+        let seen = run_think_stream(&["answer first <think>x</think>"]).await;
+        let (content, reasoning) = joined(&seen);
+        assert_eq!(content, "answer first <think>x</think>");
+        assert_eq!(reasoning, "");
+    }
+
+    #[tokio::test]
+    async fn unclosed_think_never_loses_content() {
+        // An unclosed `<think>` at EOF: the inner text was inside the block, so it stays
+        // visible as reasoning_content (never dropped). No content is fabricated.
+        let seen = run_think_stream(&["<think>thinking forever and ever"]).await;
+        let (content, reasoning) = joined(&seen);
+        assert_eq!(
+            content, "",
+            "no content for a reasoning-only (unclosed) stream"
+        );
+        assert_eq!(
+            reasoning, "thinking forever and ever",
+            "all inner text preserved as reasoning_content (never lost)"
+        );
+    }
+
+    #[tokio::test]
+    async fn partial_open_tag_at_eof_flushed_as_content() {
+        // The stream is JUST a partial open tag that never completes — it was never a
+        // confirmed block, so flush it verbatim as content (no loss, no misclassification).
+        let seen = run_think_stream(&["<thi"]).await;
+        let (content, reasoning) = joined(&seen);
+        assert_eq!(
+            content, "<thi",
+            "ambiguous partial open tag flushed as content"
+        );
+        assert_eq!(reasoning, "");
+    }
+
+    #[tokio::test]
+    async fn native_reasoning_model_untouched() {
+        // A minimax-style model that streams native reasoning_content deltas must not be
+        // transformed at all — its content (even if it contained the literal substring)
+        // and reasoning_content pass through verbatim.
+        use futures_util::StreamExt;
+        let payload = json!({
+            "id": "c1", "object": "chat.completion.chunk", "created": 0, "model": "MiniMax-TEE",
+            "choices": [{ "index": 0, "delta": { "reasoning_content": "native thoughts", "content": "" } }],
+        });
+        let s = serde_json::to_string(&payload).unwrap();
+        let chunk: crate::ChatCompletionChunk = serde_json::from_str(&s).unwrap();
+        let ev = SSEEvent {
+            raw_bytes: bytes::Bytes::from(format!("data: {s}\n\n")),
+            chunk: Some(StreamChunk::Chat(chunk)),
+            raw_passthrough: true,
+        };
+        let answer = content_chunk_event("the final answer");
+        let decoded: StreamingResult = Box::pin(futures_util::stream::iter(vec![
+            Ok(ev),
+            Ok(answer),
+            Ok(done_marker_event()),
+        ]));
+        let mut out = stream_with_think_extraction(decoded, None, false);
+        let mut seen = Vec::new();
+        while let Some(item) = out.next().await {
+            let ev = item.unwrap();
+            if ev.is_done_marker() {
+                continue;
+            }
+            let s = std::str::from_utf8(&ev.raw_bytes).unwrap();
+            let v: Value =
+                serde_json::from_str(s.strip_prefix("data: ").unwrap().trim_end()).unwrap();
+            let delta = &v["choices"][0]["delta"];
+            seen.push((
+                delta
+                    .get("content")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                delta
+                    .get("reasoning_content")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+            ));
+        }
+        let (content, reasoning) = joined(&seen);
+        assert_eq!(reasoning, "native thoughts", "native reasoning preserved");
+        assert_eq!(
+            content, "the final answer",
+            "native model content untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_think_block_emits_no_reasoning() {
+        // `<think></think>answer` — empty block: stripped from content, but no spurious
+        // empty reasoning_content (matches the non-stream "empty == unset" rule).
+        let seen = run_think_stream(&["<think></think>answer"]).await;
+        let (content, reasoning) = joined(&seen);
+        assert_eq!(content, "answer");
+        assert_eq!(
+            reasoning, "",
+            "empty think block does not set reasoning_content"
+        );
+    }
+
+    #[tokio::test]
+    async fn think_extraction_composes_with_canonical_rewrite_and_strip() {
+        // End-to-end: think extraction + #787 canonical-id rewrite + internals strip all
+        // compose. The slug must not leak, internals must be gone, and the extracted
+        // reasoning must survive.
+        use futures_util::StreamExt;
+        let payload = r#"{"id":"c1","object":"chat.completion.chunk","created":0,"model":"Qwen/Qwen3-TEE","prompt_sha256":"x","choices":[{"index":0,"matched_stop":1,"delta":{"content":"<think>why</think>hi","token_ids":[1]}}]}"#;
+        let chunk: crate::ChatCompletionChunk = serde_json::from_str(payload).unwrap();
+        let ev = SSEEvent {
+            raw_bytes: bytes::Bytes::from(format!("data: {payload}\n\n")),
+            chunk: Some(StreamChunk::Chat(chunk)),
+            raw_passthrough: true,
+        };
+        let decoded: StreamingResult = Box::pin(futures_util::stream::iter(vec![
+            Ok(ev),
+            Ok(done_marker_event()),
+        ]));
+        let mut out =
+            stream_with_think_extraction(decoded, Some("Qwen/Qwen3-Coder".to_string()), false);
+        let first = out.next().await.unwrap().unwrap();
+        let s = std::str::from_utf8(&first.raw_bytes).unwrap();
+        let v: Value = serde_json::from_str(s.strip_prefix("data: ").unwrap().trim_end()).unwrap();
+        assert_eq!(v["model"], "Qwen/Qwen3-Coder", "canonical id applied");
+        assert!(!s.contains("Qwen3-TEE"), "slug must not leak");
+        assert!(
+            v.get("prompt_sha256").is_none(),
+            "top-level internal stripped"
+        );
+        assert!(
+            v["choices"][0].get("matched_stop").is_none(),
+            "choice internal stripped"
+        );
+        assert!(
+            v["choices"][0]["delta"].get("token_ids").is_none(),
+            "delta internal stripped"
+        );
+        assert_eq!(
+            v["choices"][0]["delta"]["content"], "hi",
+            "answer is clean content"
+        );
+        assert_eq!(
+            v["choices"][0]["delta"]["reasoning_content"], "why",
+            "reasoning extracted"
+        );
+        // Parsed chunk stays in lockstep with raw_bytes.
+        if let Some(StreamChunk::Chat(c)) = &first.chunk {
+            assert_eq!(c.model, "Qwen/Qwen3-Coder");
+        } else {
+            panic!("expected a Chat chunk");
+        }
+    }
+
+    #[tokio::test]
+    async fn role_and_finish_chunks_pass_through_during_think() {
+        // A role-only opener and a finish-reason closer (no content) must pass through
+        // untouched while a think block streams between them.
+        use futures_util::StreamExt;
+        let role = {
+            let p = json!({"id":"c1","object":"chat.completion.chunk","created":0,"model":"Qwen/Qwen3-TEE","choices":[{"index":0,"delta":{"role":"assistant"}}]});
+            let s = serde_json::to_string(&p).unwrap();
+            SSEEvent {
+                raw_bytes: bytes::Bytes::from(format!("data: {s}\n\n")),
+                chunk: Some(StreamChunk::Chat(serde_json::from_str(&s).unwrap())),
+                raw_passthrough: true,
+            }
+        };
+        let finish = {
+            let p = json!({"id":"c1","object":"chat.completion.chunk","created":0,"model":"Qwen/Qwen3-TEE","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]});
+            let s = serde_json::to_string(&p).unwrap();
+            SSEEvent {
+                raw_bytes: bytes::Bytes::from(format!("data: {s}\n\n")),
+                chunk: Some(StreamChunk::Chat(serde_json::from_str(&s).unwrap())),
+                raw_passthrough: true,
+            }
+        };
+        let decoded: StreamingResult = Box::pin(futures_util::stream::iter(vec![
+            Ok(role),
+            Ok(content_chunk_event("<think>r</think>a")),
+            Ok(finish),
+            Ok(done_marker_event()),
+        ]));
+        let mut out = stream_with_think_extraction(decoded, None, false);
+        let mut contents = Vec::new();
+        let mut reasonings = Vec::new();
+        let mut saw_role = false;
+        let mut saw_finish = false;
+        while let Some(item) = out.next().await {
+            let ev = item.unwrap();
+            if ev.is_done_marker() {
+                continue;
+            }
+            let s = std::str::from_utf8(&ev.raw_bytes).unwrap();
+            let v: Value =
+                serde_json::from_str(s.strip_prefix("data: ").unwrap().trim_end()).unwrap();
+            let delta = &v["choices"][0]["delta"];
+            if delta.get("role").is_some() {
+                saw_role = true;
+            }
+            if v["choices"][0].get("finish_reason").and_then(Value::as_str) == Some("stop") {
+                saw_finish = true;
+            }
+            if let Some(c) = delta.get("content").and_then(Value::as_str) {
+                contents.push(c.to_string());
+            }
+            if let Some(r) = delta.get("reasoning_content").and_then(Value::as_str) {
+                reasonings.push(r.to_string());
+            }
+        }
+        assert!(saw_role, "role-only opener forwarded");
+        assert!(saw_finish, "finish_reason chunk forwarded");
+        assert_eq!(contents.concat(), "a");
+        assert_eq!(reasonings.concat(), "r");
     }
 }

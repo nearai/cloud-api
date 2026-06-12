@@ -3367,7 +3367,10 @@ pub async fn image_generations(
     tag = "Audio",
     request_body(content = AudioTranscriptionRequestSchema, content_type = "multipart/form-data"),
     responses(
-        (status = 200, description = "Successful transcription", body = AudioTranscriptionResponse),
+        (status = 200, description = "Successful transcription", content(
+            (AudioTranscriptionResponse = "application/json"),
+            (String = "text/plain")
+        )),
         (status = 400, description = "Invalid request (empty file, unsupported format, file too large)", body = ErrorResponse),
         (status = 401, description = "Unauthorized (missing or invalid API key)", body = ErrorResponse),
         (status = 404, description = "Model not found", body = ErrorResponse),
@@ -3456,8 +3459,9 @@ pub async fn audio_transcriptions(
             }
             "timestamp_granularities[]" | "timestamp_granularities" => {
                 if let Ok(value) = field.text().await {
-                    timestamp_granularities =
-                        Some(value.split(',').map(|s| s.trim().to_string()).collect());
+                    timestamp_granularities
+                        .get_or_insert_with(Vec::new)
+                        .extend(value.split(',').map(|s| s.trim().to_string()));
                 }
             }
             _ => {
@@ -3541,12 +3545,23 @@ pub async fn audio_transcriptions(
     let mut extra = std::collections::HashMap::new();
     insert_encryption_headers(&encryption_headers, &mut extra);
 
+    let requested_response_format = request.response_format.clone();
+    let provider_response_format = match requested_response_format.as_deref() {
+        // Keep provider parsing stable and preserve duration-based billing by
+        // requesting verbose JSON, then returning plain text at the API boundary
+        // after usage is recorded.
+        Some("text") => Some("verbose_json".to_string()),
+        _ => request.response_format.clone(),
+    };
+
     let params = inference_providers::AudioTranscriptionParams {
         model: model_name.clone(),
         file_bytes: request.file_bytes,
         filename: request.filename,
-        language: request.language,
-        response_format: request.response_format,
+        language: request
+            .language
+            .map(|language| crate::models::normalize_audio_transcription_language(&language)),
+        response_format: provider_response_format,
         temperature: request.temperature,
         timestamp_granularities: request.timestamp_granularities,
         extra,
@@ -3640,7 +3655,17 @@ pub async fn audio_transcriptions(
                 "Audio transcription completed and usage recorded successfully"
             );
 
-            (StatusCode::OK, ResponseJson(response)).into_response()
+            if requested_response_format.as_deref() == Some("text") {
+                (
+                    StatusCode::OK,
+                    [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+                    response.text,
+                )
+                    .into_response()
+            } else {
+                let response_body = crate::models::AudioTranscriptionResponse::from(response);
+                (StatusCode::OK, ResponseJson(response_body)).into_response()
+            }
         }
         Err(e) => {
             let (status_code, error_type, message) = match e {

@@ -1056,7 +1056,61 @@ use crate::consts::{
 };
 use crate::routes::common::{validate_max_length, validate_non_empty_field};
 
+/// Reject `max_tokens` values the OpenAI API requires to be `>= 1`.
+///
+/// `None` (unset) is valid. Negative or zero values are rejected with a 400
+/// `invalid_request_error` carrying `param: "max_tokens"` instead of falling
+/// through to upstream and surfacing as a masked 502 (nearai/cloud-api #786).
+fn validate_max_tokens(max_tokens: Option<i64>) -> Result<(), ErrorResponse> {
+    if let Some(value) = max_tokens {
+        if value < 1 {
+            return Err(ErrorResponse::with_param(
+                "max_tokens must be at least 1".to_string(),
+                "invalid_request_error".to_string(),
+                "max_tokens".to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Reject `n` values below 1. `None` (unset) is valid.
+fn validate_n(n: Option<i64>) -> Result<(), ErrorResponse> {
+    if let Some(value) = n {
+        if value < 1 {
+            return Err(ErrorResponse::with_param(
+                "n must be at least 1".to_string(),
+                "invalid_request_error".to_string(),
+                "n".to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
 impl ChatCompletionRequest {
+    /// Pre-flight validation that returns a ready-to-serialize OpenAI error
+    /// envelope (`{error:{message,type,param,code}}`) on failure.
+    ///
+    /// This wraps the message-only [`Self::validate`] (temperature/top_p/stop/
+    /// logprobs) and adds the param-bearing sampling checks (`max_tokens`, `n`)
+    /// that would otherwise fall through to upstream and surface as a masked
+    /// 502 instead of a 4xx (nearai/cloud-api #786). All checks reject only
+    /// genuinely-invalid values; valid requests are untouched.
+    ///
+    /// NOTE: context-length validation is intentionally NOT performed here.
+    /// cloud-api has no per-model tokenizer, so the prompt token count is not
+    /// cleanly knowable pre-dispatch; a character-based estimate would risk
+    /// rejecting valid requests. Over-length prompts are still rejected by the
+    /// upstream provider.
+    pub fn validate_request(&self) -> Result<(), ErrorResponse> {
+        self.validate()
+            .map_err(|message| ErrorResponse::new(message, "invalid_request_error".to_string()))?;
+        validate_max_tokens(self.max_tokens)?;
+        validate_n(self.n)?;
+        Ok(())
+    }
+
     pub fn validate(&self) -> Result<(), String> {
         if self.model.is_empty() {
             return Err("model is required".to_string());
@@ -1161,6 +1215,18 @@ impl ChatCompletionRequest {
 }
 
 impl CompletionRequest {
+    /// Pre-flight validation returning a ready-to-serialize OpenAI error
+    /// envelope on failure. See [`ChatCompletionRequest::validate_request`] for
+    /// the rationale (nearai/cloud-api #786); context-length is likewise
+    /// skipped (no pre-dispatch tokenizer).
+    pub fn validate_request(&self) -> Result<(), ErrorResponse> {
+        self.validate()
+            .map_err(|message| ErrorResponse::new(message, "invalid_request_error".to_string()))?;
+        validate_max_tokens(self.max_tokens)?;
+        validate_n(self.n)?;
+        Ok(())
+    }
+
     pub fn validate(&self) -> Result<(), String> {
         if self.model.is_empty() {
             return Err("model is required".to_string());
@@ -4339,6 +4405,116 @@ mod tests {
 
         // String content should pass validation
         assert!(request.validate().is_ok());
+    }
+
+    // ── max_tokens / n pre-flight validation (nearai/cloud-api #786) ──
+
+    /// Build a minimal valid chat request, overriding `max_tokens` and `n`.
+    fn chat_req(max_tokens: Option<i64>, n: Option<i64>) -> ChatCompletionRequest {
+        ChatCompletionRequest {
+            model: "gpt-4".to_string(),
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: Some(MessageContent::Text("hi".to_string())),
+                name: None,
+                tool_call_id: None,
+                tool_calls: None,
+            }],
+            max_tokens,
+            temperature: None,
+            top_p: None,
+            n,
+            stream: None,
+            stop: None,
+            presence_penalty: None,
+            frequency_penalty: None,
+            extra: std::collections::HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn chat_validate_request_accepts_valid_sampling_params() {
+        // Unset, and positive, max_tokens/n all pass.
+        assert!(chat_req(None, None).validate_request().is_ok());
+        assert!(chat_req(Some(1), Some(1)).validate_request().is_ok());
+        assert!(chat_req(Some(4096), Some(3)).validate_request().is_ok());
+    }
+
+    #[test]
+    fn chat_validate_request_rejects_non_positive_max_tokens() {
+        for bad in [-5, 0] {
+            let err = chat_req(Some(bad), None)
+                .validate_request()
+                .expect_err("non-positive max_tokens must be rejected")
+                .error;
+            assert_eq!(err.r#type, "invalid_request_error");
+            assert_eq!(err.param.as_deref(), Some("max_tokens"));
+            assert_eq!(err.message, "max_tokens must be at least 1");
+        }
+    }
+
+    #[test]
+    fn chat_validate_request_rejects_n_below_one() {
+        for bad in [-1, 0] {
+            let err = chat_req(None, Some(bad))
+                .validate_request()
+                .expect_err("n < 1 must be rejected")
+                .error;
+            assert_eq!(err.r#type, "invalid_request_error");
+            assert_eq!(err.param.as_deref(), Some("n"));
+            assert_eq!(err.message, "n must be at least 1");
+        }
+    }
+
+    #[test]
+    fn chat_validate_request_still_enforces_existing_checks() {
+        // temperature out of range still surfaces (no param, matching the
+        // pre-existing message-only path) and as invalid_request_error.
+        let mut req = chat_req(Some(100), Some(1));
+        req.temperature = Some(5.0);
+        let err = req
+            .validate_request()
+            .expect_err("out-of-range temperature must be rejected")
+            .error;
+        assert_eq!(err.r#type, "invalid_request_error");
+        assert_eq!(err.message, "temperature must be between 0 and 2");
+    }
+
+    #[test]
+    fn completion_validate_request_rejects_invalid_sampling_params() {
+        let base = || CompletionRequest {
+            model: "gpt-4".to_string(),
+            prompt: CompletionPrompt::Text("hi".to_string()),
+            max_tokens: Some(16),
+            temperature: None,
+            top_p: None,
+            n: Some(1),
+            stream: None,
+            logprobs: None,
+            echo: None,
+            stop: None,
+            presence_penalty: None,
+            frequency_penalty: None,
+            best_of: None,
+            extra: std::collections::HashMap::new(),
+        };
+
+        // Valid passes.
+        assert!(base().validate_request().is_ok());
+
+        // max_tokens <= 0 rejected with param.
+        let mut bad = base();
+        bad.max_tokens = Some(-5);
+        let err = bad.validate_request().expect_err("negative").error;
+        assert_eq!(err.param.as_deref(), Some("max_tokens"));
+        assert_eq!(err.r#type, "invalid_request_error");
+
+        // n: 0 rejected with param.
+        let mut bad = base();
+        bad.n = Some(0);
+        let err = bad.validate_request().expect_err("n zero").error;
+        assert_eq!(err.param.as_deref(), Some("n"));
+        assert_eq!(err.r#type, "invalid_request_error");
     }
 
     #[test]

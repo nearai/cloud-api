@@ -1099,15 +1099,8 @@ pub async fn chat_completions(
         request.model, request.stream, api_key.organization.id, api_key.workspace.id.0
     );
     // Validate the request
-    if let Err(error) = request.validate() {
-        return (
-            StatusCode::BAD_REQUEST,
-            ResponseJson(ErrorResponse::new(
-                error,
-                "invalid_request_error".to_string(),
-            )),
-        )
-            .into_response();
+    if let Err(error) = request.validate_request() {
+        return (StatusCode::BAD_REQUEST, ResponseJson(error)).into_response();
     }
 
     // Generate a per-request correlation ID. Reuse the client's X-Request-Id if
@@ -1704,15 +1697,8 @@ pub async fn completions(
     );
 
     // Validate the request
-    if let Err(error) = request.validate() {
-        return (
-            StatusCode::BAD_REQUEST,
-            ResponseJson(ErrorResponse::new(
-                error,
-                "invalid_request_error".to_string(),
-            )),
-        )
-            .into_response();
+    if let Err(error) = request.validate_request() {
+        return (StatusCode::BAD_REQUEST, ResponseJson(error)).into_response();
     }
 
     // Per-request correlation ID: reuse the client's X-Request-Id if present and

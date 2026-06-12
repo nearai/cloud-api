@@ -583,7 +583,7 @@ async fn test_audio_transcription_timestamp_granularities_require_verbose_json()
     assert!(error.error.message.contains("response_format=verbose_json"));
 }
 
-/// Test that invalid language codes are rejected by the API boundary
+/// Test that invalid language values are rejected by the API boundary
 #[tokio::test]
 async fn test_audio_transcription_invalid_language() {
     let server = setup_test_server().await;
@@ -617,7 +617,7 @@ async fn test_audio_transcription_invalid_language() {
     assert!(error
         .error
         .message
-        .contains("supported audio transcription language code"));
+        .contains("supported Whisper language code or name"));
 }
 
 /// Test that usage is tracked with audio duration

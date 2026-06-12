@@ -494,6 +494,91 @@ fn transform_response_json(bytes: &[u8], canonical: Option<&str>) -> Option<Vec<
     serde_json::to_vec(&v).ok()
 }
 
+/// Split a string that BEGINS with a `<think>…</think>` block into
+/// `(reasoning, remaining_content)`. Returns `None` (leave the content untouched)
+/// unless the string — after any leading whitespace — starts with a literal
+/// `<think>` open tag AND has a matching `</think>` close tag. The reasoning is the
+/// text between the tags; the remaining content is everything after `</think>` with
+/// the leading whitespace that separated the block from the answer trimmed off.
+///
+/// Robustness contract (issue #779):
+/// - no `<think>` at the very start (e.g. answer text first, or no tag) → `None`;
+/// - an *unclosed* / malformed `<think>` with no `</think>` → `None` (we never lose
+///   content by guessing where reasoning ends);
+/// - a well-formed block at the start → `Some((reasoning, answer))`, where `answer`
+///   may be empty (a response that is reasoning-only).
+///
+/// We deliberately only handle the block-at-the-very-start case: that is exactly
+/// what the affected Chutes qwen models emit (`<think>…</think>\n\n<answer>`), and
+/// it avoids the false positives a mid-string scan would invite (a model legitimately
+/// discussing `<think>` tags in its answer).
+fn split_leading_think_block(s: &str) -> Option<(String, String)> {
+    const OPEN: &str = "<think>";
+    const CLOSE: &str = "</think>";
+    // The block must be at the very start, modulo leading whitespace.
+    let after_ws = s.trim_start();
+    let inner_start = after_ws.strip_prefix(OPEN)?;
+    // Require a matching close tag; an unclosed tag means we can't know where the
+    // reasoning ends, so we leave the content untouched (never lose content).
+    let close_idx = inner_start.find(CLOSE)?;
+    let reasoning = inner_start[..close_idx].to_string();
+    let remaining = &inner_start[close_idx + CLOSE.len()..];
+    // Drop the whitespace that separated the think block from the actual answer.
+    let answer = remaining.trim_start().to_string();
+    Some((reasoning, answer))
+}
+
+/// Normalize the Chutes qwen reasoning shape on the NON-STREAM response (issue #779):
+/// those models return chain-of-thought as a literal `<think>…</think>` block at the
+/// start of `choices[].message.content` with `reasoning_content` absent/empty, where
+/// minimax (Chutes) and GLM-5.1 (NEAR) correctly populate `reasoning_content`. For
+/// each choice whose `message.content` is a string beginning with a well-formed
+/// `<think>…</think>` block AND whose `reasoning_content` is absent/empty, we MOVE the
+/// inner think text into `message.reasoning_content` and strip the block (and the
+/// whitespace separating it from the answer) from `message.content`.
+///
+/// We never clobber a populated `reasoning_content` (so minimax is untouched), never
+/// touch a `content` that isn't a leading-`<think>` string, and never lose content on
+/// a malformed/unclosed tag (see [`split_leading_think_block`]).
+///
+/// `usage.completion_tokens_details.reasoning_tokens` is deliberately left untouched:
+/// the upstream body carries no separate reasoning-token count and re-tokenizing here
+/// to split `completion_tokens` would require the model tokenizer and risk a fabricated
+/// number. Documented as a known limitation (tracked as a follow-up).
+///
+/// NON-STREAM ONLY: think tags span SSE chunks, so a correct stream parser must be
+/// stateful across chunks — out of scope here (Chutes streaming is opt-in/experimental
+/// anyway). The stream path's per-chunk [`transform_response_json`] does NOT run this.
+fn normalize_think_reasoning(obj: &mut serde_json::Map<String, Value>) {
+    let Some(choices) = obj.get_mut("choices").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for choice in choices {
+        let Some(message) = choice.get_mut("message").and_then(Value::as_object_mut) else {
+            continue;
+        };
+        // Don't clobber a reasoning field the provider already populated
+        // (minimax / GLM-5.1). Absent OR empty/whitespace-only counts as "not set".
+        let reasoning_already_set = message
+            .get("reasoning_content")
+            .and_then(Value::as_str)
+            .is_some_and(|r| !r.trim().is_empty());
+        if reasoning_already_set {
+            continue;
+        }
+        // Only act on a plain-string content (the qwen shape). A content that is an
+        // array of parts, null, or absent is left exactly as-is.
+        let Some(content) = message.get("content").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some((reasoning, answer)) = split_leading_think_block(content) else {
+            continue;
+        };
+        message.insert("content".to_string(), Value::String(answer));
+        message.insert("reasoning_content".to_string(), Value::String(reasoning));
+    }
+}
+
 /// An OpenAI request body (as JSON) with `model` pinned, `stream` set, and all
 /// internal/tracing/E2EE-marker keys stripped (never sent to the third party).
 fn request_body(model: &str, params: &ChatCompletionParams, stream: bool) -> Result<Value, String> {
@@ -616,6 +701,27 @@ impl InferenceProvider for Provider {
         let raw_bytes = transform_response_json(&plaintext, canonical).ok_or_else(|| {
             CompletionError::CompletionError("failed to sanitize Chutes response body".to_string())
         })?;
+        // Normalize the per-model reasoning shape (#779): the Chutes qwen models leak
+        // chain-of-thought as a literal `<think>…</think>` block in `message.content`
+        // with `reasoning_content` null, while minimax/GLM-5.1 correctly populate
+        // `reasoning_content`. Move the think text into `reasoning_content` and strip
+        // it from `content`, without clobbering an already-populated `reasoning_content`
+        // or ever losing content on a malformed tag. Runs ONLY on this non-stream path
+        // (think tags span SSE chunks — the stream path is intentionally not normalized;
+        // see `normalize_think_reasoning`). This is applied AFTER `transform_response_json`
+        // so it composes with the canonical-id rewrite + #780 internal-field strip, and
+        // is the byte payload the route uses for hashing/passthrough.
+        let raw_bytes = {
+            let mut v: Value = serde_json::from_slice(&raw_bytes).map_err(|e| {
+                CompletionError::CompletionError(format!("parse sanitized response: {e}"))
+            })?;
+            if let Some(o) = v.as_object_mut() {
+                normalize_think_reasoning(o);
+            }
+            serde_json::to_vec(&v).map_err(|e| {
+                CompletionError::CompletionError(format!("reserialize response: {e}"))
+            })?
+        };
         let response: ChatCompletionResponse = serde_json::from_slice(&raw_bytes)
             .map_err(|e| CompletionError::CompletionError(format!("parse response: {e}")))?;
         Ok(ChatCompletionResponseWithBytes {
@@ -1198,6 +1304,177 @@ mod tests {
             "unicode-escaped prompt_sha256 must be stripped"
         );
         assert_eq!(v["id"], "x");
+    }
+
+    /// Helper: build a non-stream chat-completion object, run the #779 think
+    /// normalizer over it, and hand back the choice-0 message for assertions.
+    fn normalize_msg(
+        content: Value,
+        reasoning_content: Option<Value>,
+    ) -> serde_json::Map<String, Value> {
+        let mut message = serde_json::Map::new();
+        message.insert("role".to_string(), json!("assistant"));
+        message.insert("content".to_string(), content);
+        if let Some(rc) = reasoning_content {
+            message.insert("reasoning_content".to_string(), rc);
+        }
+        let mut obj = json!({
+            "id": "x",
+            "object": "chat.completion",
+            "model": "qwen/qwen3-32b",
+            "choices": [{"index": 0, "finish_reason": "stop", "message": message}],
+            "usage": {"prompt_tokens": 9, "completion_tokens": 285, "total_tokens": 294}
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        normalize_think_reasoning(&mut obj);
+        obj["choices"][0]["message"].as_object().unwrap().clone()
+    }
+
+    #[test]
+    fn split_leading_think_block_extracts_and_strips() {
+        // Well-formed block at the very start → reasoning + the trailing answer
+        // (with the separating whitespace trimmed).
+        let (r, a) =
+            split_leading_think_block("<think>\nOkay, 2+2 is 4.\n</think>\n\n4").expect("split");
+        assert_eq!(r, "\nOkay, 2+2 is 4.\n");
+        assert_eq!(a, "4");
+    }
+
+    #[test]
+    fn split_leading_think_block_tolerates_leading_whitespace_and_reasoning_only() {
+        // Leading whitespace before <think> is fine.
+        let (r, a) = split_leading_think_block("  <think>hmm</think>answer").expect("split");
+        assert_eq!(r, "hmm");
+        assert_eq!(a, "answer");
+        // A reasoning-only response (nothing after </think>) → empty answer.
+        let (r, a) = split_leading_think_block("<think>just thinking</think>").expect("split");
+        assert_eq!(r, "just thinking");
+        assert_eq!(a, "");
+    }
+
+    #[test]
+    fn split_leading_think_block_returns_none_when_not_applicable() {
+        // No tag at all.
+        assert!(split_leading_think_block("just a plain answer").is_none());
+        // Tag not at the start (answer first) — we don't touch mid-string tags.
+        assert!(split_leading_think_block("the answer is <think>x</think>").is_none());
+        // Unclosed / malformed — must NOT split (never lose content).
+        assert!(split_leading_think_block("<think>unterminated reasoning...").is_none());
+        // Empty string.
+        assert!(split_leading_think_block("").is_none());
+    }
+
+    #[test]
+    fn normalize_think_reasoning_moves_block_to_reasoning_content() {
+        // The qwen #779 shape: <think>…</think> inside content, reasoning_content absent.
+        let msg = normalize_msg(json!("<think>\nLet me work it out.\n</think>\n\n4"), None);
+        assert_eq!(msg["content"], "4", "think block stripped from content");
+        assert_eq!(
+            msg["reasoning_content"], "\nLet me work it out.\n",
+            "reasoning moved to reasoning_content"
+        );
+    }
+
+    #[test]
+    fn normalize_think_reasoning_does_not_clobber_existing_reasoning() {
+        // minimax / GLM-5.1 shape: reasoning_content already populated, content clean.
+        // Even if content somehow had a leading <think>, an already-set reasoning_content
+        // means we leave the whole message untouched.
+        let msg = normalize_msg(
+            json!("<think>raw</think>final"),
+            Some(json!("proper reasoning")),
+        );
+        assert_eq!(
+            msg["reasoning_content"], "proper reasoning",
+            "must not clobber a populated reasoning_content"
+        );
+        assert_eq!(
+            msg["content"], "<think>raw</think>final",
+            "content untouched when reasoning_content is already set"
+        );
+    }
+
+    #[test]
+    fn normalize_think_reasoning_treats_empty_reasoning_as_unset() {
+        // An empty/whitespace-only reasoning_content counts as "not set", so we still
+        // extract the leading think block into it.
+        let msg = normalize_msg(json!("<think>think</think>answer"), Some(json!("   ")));
+        assert_eq!(msg["content"], "answer");
+        assert_eq!(msg["reasoning_content"], "think");
+    }
+
+    #[test]
+    fn normalize_think_reasoning_leaves_content_without_think_intact() {
+        // No think block → content and (absent) reasoning_content both untouched.
+        let msg = normalize_msg(json!("just the answer, no reasoning"), None);
+        assert_eq!(msg["content"], "just the answer, no reasoning");
+        assert!(
+            msg.get("reasoning_content").is_none(),
+            "no reasoning_content fabricated"
+        );
+    }
+
+    #[test]
+    fn normalize_think_reasoning_leaves_malformed_think_intact() {
+        // Unclosed <think> → never split (never lose content), no reasoning_content.
+        let msg = normalize_msg(
+            json!("<think>unterminated reasoning that never closes"),
+            None,
+        );
+        assert_eq!(
+            msg["content"], "<think>unterminated reasoning that never closes",
+            "malformed/unclosed think must leave content intact"
+        );
+        assert!(
+            msg.get("reasoning_content").is_none(),
+            "no reasoning extracted from a malformed block"
+        );
+    }
+
+    #[test]
+    fn normalize_think_reasoning_ignores_non_string_content() {
+        // A content that is an array of parts (multimodal) or null is left as-is —
+        // the qwen leak is a plain-string shape only.
+        let msg = normalize_msg(
+            json!([{"type": "text", "text": "<think>x</think>hi"}]),
+            None,
+        );
+        assert_eq!(
+            msg["content"],
+            json!([{"type": "text", "text": "<think>x</think>hi"}]),
+            "array content untouched"
+        );
+        assert!(msg.get("reasoning_content").is_none());
+    }
+
+    #[test]
+    fn normalize_think_reasoning_does_not_touch_usage() {
+        // Documented limitation (#779): usage.completion_tokens (and any
+        // reasoning_tokens) are left exactly as the upstream reported — we don't
+        // fabricate a reasoning-token split.
+        let mut obj = json!({
+            "id": "x",
+            "object": "chat.completion",
+            "model": "qwen/qwen3-32b",
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": "<think>r</think>a"}}],
+            "usage": {"prompt_tokens": 9, "completion_tokens": 285, "total_tokens": 294}
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        normalize_think_reasoning(&mut obj);
+        assert_eq!(obj["usage"]["completion_tokens"], 285, "usage untouched");
+        assert_eq!(obj["usage"]["total_tokens"], 294);
+        assert!(
+            obj["usage"].get("reasoning_tokens").is_none()
+                && obj["usage"].get("completion_tokens_details").is_none(),
+            "no reasoning-token count fabricated"
+        );
+        // But the content/reasoning_content normalization still happened.
+        assert_eq!(obj["choices"][0]["message"]["content"], "a");
+        assert_eq!(obj["choices"][0]["message"]["reasoning_content"], "r");
     }
 
     #[test]

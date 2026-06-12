@@ -228,18 +228,44 @@ impl Provider {
             .cloned()
     }
 
+    /// Map a Chutes HTTP-client error to a `CompletionError`, PRESERVING the
+    /// upstream HTTP status. This is what lets a 429 from the rate-limited
+    /// `/e2e/instances` (and any 5xx from discovery / evidence / invoke) reach the
+    /// pool's classifier as a RETRYABLE `HttpError { status_code }` instead of a
+    /// flat, non-retryable `CompletionError(String)` that masks as a 502 and never
+    /// retries. `ctx` labels the failing stage for logs/messages.
+    fn map_client_error(ctx: &str, e: client::ChutesClientError) -> CompletionError {
+        let msg = format!("{ctx}: {e}");
+        match e {
+            client::ChutesClientError::Status { status, .. } => CompletionError::HttpError {
+                status_code: status,
+                message: msg,
+                is_external: true,
+            },
+            _ => CompletionError::CompletionError(msg),
+        }
+    }
+
     /// Discover → fetch evidence → **verify** a Chutes instance, then build the
     /// E2EE request blob for `request_json`. Returns an error (never an
-    /// unverified channel) if any stage fails.
-    async fn verify_and_prepare(&self, request_json: &Value) -> Result<PreparedInvoke, String> {
+    /// unverified channel) if any stage fails. Discovery / evidence / invoke
+    /// failures preserve the upstream HTTP status (via [`Self::map_client_error`]),
+    /// so a rate-limit 429 is retryable rather than a flat 502.
+    async fn verify_and_prepare(
+        &self,
+        request_json: &Value,
+    ) -> Result<PreparedInvoke, CompletionError> {
         // Cached: the model→chute_id mapping is static, so resolve once.
-        let chute_id = self.cached_chute_id().await?;
+        let chute_id = self
+            .cached_chute_id()
+            .await
+            .map_err(CompletionError::CompletionError)?;
 
         let instances = self
             .client
             .discover_instances(&chute_id)
             .await
-            .map_err(|e| format!("discover instances: {e}"))?;
+            .map_err(|e| Self::map_client_error("discover instances", e))?;
 
         // Candidate instances: live + E2E-capable + with at least one nonce token.
         let candidates: Vec<&client::E2eInstance> = instances
@@ -248,17 +274,19 @@ impl Provider {
             .filter(|i| !i.e2e_pubkey.is_empty() && !i.nonces.is_empty())
             .collect();
         if candidates.is_empty() {
-            return Err("no E2E-capable Chutes instance with an available nonce token".to_string());
+            return Err(CompletionError::CompletionError(
+                "no E2E-capable Chutes instance with an available nonce token".to_string(),
+            ));
         }
 
         // One chute-wide /evidence fetch bound to a fresh boot nonce; every
         // instance's report_data binds this same nonce + its own e2e_pubkey.
-        let boot_nonce = Self::random_boot_nonce()?;
+        let boot_nonce = Self::random_boot_nonce().map_err(CompletionError::CompletionError)?;
         let evidence_resp = self
             .client
             .fetch_evidence(&chute_id, &boot_nonce)
             .await
-            .map_err(|e| format!("fetch evidence: {e}"))?;
+            .map_err(|e| Self::map_client_error("fetch evidence", e))?;
 
         // Try each candidate until one verifies, so a single bad/unverifiable
         // instance doesn't take down all requests. Verification failure is never
@@ -333,9 +361,9 @@ impl Provider {
                 session,
             });
         }
-        Err(format!(
+        Err(CompletionError::CompletionError(format!(
             "all candidate Chutes instances failed (refusing to send inference); last: {last_err}"
-        ))
+        )))
     }
 }
 
@@ -498,10 +526,7 @@ impl InferenceProvider for Provider {
         reject_client_e2ee(&params)?;
         let body = request_body(&self.model_name, &params, false)
             .map_err(CompletionError::CompletionError)?;
-        let prep = self
-            .verify_and_prepare(&body)
-            .await
-            .map_err(CompletionError::CompletionError)?;
+        let prep = self.verify_and_prepare(&body).await?;
 
         let resp_blob = self
             .client
@@ -514,7 +539,7 @@ impl InferenceProvider for Provider {
                 blob: prep.blob,
             })
             .await
-            .map_err(|e| CompletionError::CompletionError(format!("Chutes /e2e/invoke: {e}")))?;
+            .map_err(|e| Self::map_client_error("Chutes /e2e/invoke", e))?;
 
         let plaintext = prep
             .session
@@ -573,10 +598,7 @@ impl InferenceProvider for Provider {
         reject_client_e2ee(&params)?;
         let body = request_body(&self.model_name, &params, true)
             .map_err(CompletionError::CompletionError)?;
-        let prep = self
-            .verify_and_prepare(&body)
-            .await
-            .map_err(CompletionError::CompletionError)?;
+        let prep = self.verify_and_prepare(&body).await?;
 
         let resp = self
             .client
@@ -589,9 +611,7 @@ impl InferenceProvider for Provider {
                 blob: prep.blob,
             })
             .await
-            .map_err(|e| {
-                CompletionError::CompletionError(format!("Chutes /e2e/invoke (stream): {e}"))
-            })?;
+            .map_err(|e| Self::map_client_error("Chutes /e2e/invoke (stream)", e))?;
 
         // Decrypt the E2EE SSE into OpenAI SSEEvents (transport errors → CompletionError).
         let byte_stream = resp.bytes_stream().map(|r| {
@@ -828,6 +848,60 @@ mod tests {
     use super::*;
     use crate::attested::chutes::evidence::InstanceEvidence;
     use crate::attested::chutes::verifier_port::VerifiedInstanceInfo;
+
+    /// Issue #774: a Chutes upstream HTTP status (notably the `/e2e/instances`
+    /// rate-limit 429) must surface as a RETRYABLE `HttpError { status_code }`, not
+    /// a flat `CompletionError(String)` that the classifier masks as a
+    /// non-retryable 502. Pins the status-preservation seam (`map_client_error`).
+    #[test]
+    fn map_client_error_preserves_http_status_for_retryability() {
+        use client::ChutesClientError;
+
+        // 429 from discovery → retryable HttpError{429} (→ RateLimitExceeded).
+        match Provider::map_client_error(
+            "discover instances",
+            ChutesClientError::Status {
+                status: 429,
+                body: "rate limit exceeded".into(),
+            },
+        ) {
+            CompletionError::HttpError {
+                status_code,
+                is_external,
+                message,
+            } => {
+                assert_eq!(status_code, 429);
+                assert!(is_external, "Chutes is an external upstream");
+                assert!(
+                    message.contains("discover instances") && message.contains("429"),
+                    "message keeps stage + status for logs: {message}"
+                );
+            }
+            other => panic!("429 must map to HttpError, got {other:?}"),
+        }
+
+        // A 5xx is preserved too (503 → ServiceOverloaded downstream).
+        assert!(matches!(
+            Provider::map_client_error(
+                "fetch evidence",
+                ChutesClientError::Status {
+                    status: 503,
+                    body: String::new()
+                },
+            ),
+            CompletionError::HttpError {
+                status_code: 503,
+                ..
+            }
+        ));
+
+        // Non-HTTP-status errors (transport / decode / model-not-found) stay a
+        // generic CompletionError — no fake status code invented.
+        assert!(matches!(
+            Provider::map_client_error("x", ChutesClientError::ModelNotFound("m".into())),
+            CompletionError::CompletionError(_)
+        ));
+    }
 
     /// A verifier stub for unit tests (no DCAP/network): records calls and
     /// returns a fixed verdict or a forced error.

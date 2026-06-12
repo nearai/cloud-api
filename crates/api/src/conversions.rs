@@ -94,7 +94,9 @@ impl From<ChatCompletionRequest> for ChatCompletionParams {
         let mut extra = req.extra;
         extra.remove("modalities");
         extra.remove("tools");
-        extra.remove("stream_options");
+        if stream_options.is_some() {
+            extra.remove("stream_options");
+        }
 
         Self {
             model: req.model,
@@ -948,6 +950,41 @@ mod tests {
         assert_eq!(
             domain_params.extra.get("custom"),
             Some(&serde_json::json!("kept"))
+        );
+    }
+
+    #[test]
+    fn malformed_stream_options_remain_in_extra() {
+        let mut extra = HashMap::new();
+        extra.insert("stream_options".to_string(), serde_json::json!("bad"));
+
+        let http_req = ChatCompletionRequest {
+            model: "gpt-3.5-turbo".to_string(),
+            messages: vec![crate::models::Message {
+                role: "user".to_string(),
+                content: Some(crate::models::MessageContent::Text(
+                    "Test message".to_string(),
+                )),
+                name: None,
+                tool_call_id: None,
+                tool_calls: None,
+            }],
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            n: None,
+            stream: Some(true),
+            stop: None,
+            presence_penalty: None,
+            frequency_penalty: None,
+            extra,
+        };
+
+        let domain_params: ChatCompletionParams = http_req.into();
+        assert!(domain_params.stream_options.is_none());
+        assert_eq!(
+            domain_params.extra.get("stream_options"),
+            Some(&serde_json::json!("bad"))
         );
     }
 

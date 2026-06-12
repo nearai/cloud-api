@@ -237,10 +237,16 @@ impl Provider {
     /// the pool's classifier treats as RETRYABLE or correctly masks are preserved
     /// as `HttpError { status_code, is_external: true }`:
     ///
-    /// * `429` → `RateLimitExceeded` (retryable) — the headline `/e2e/instances`
+    /// * `429` → `RateLimitExceeded`, retried across rounds with rate-limit
+    ///   backoff (`retryable_http_429`) — the headline `/e2e/instances`
     ///   rate-limit case this fix targets;
-    /// * `408` → `ProviderError 504` (timed out, retry) and `5xx` → masked
-    ///   `ProviderError 502` / `ServiceOverloaded` (retryable for 503).
+    /// * `5xx` → masked `ProviderError 502` / `ServiceOverloaded` (503), retried
+    ///   across rounds with backoff;
+    /// * `408` → `ProviderError 504`. NOTE: the pool labels this
+    ///   `non_retryable_http_408` — the next provider in the *same* round is
+    ///   tried, but the round itself is not retried with backoff (only 5xx/429
+    ///   retry the round). Preserving 408 still beats the prior flat 502 because
+    ///   it surfaces the timeout and enables that same-round fallthrough.
     ///
     /// Every other status — notably `400 / 413 / 422` — is deliberately collapsed
     /// to a generic `CompletionError(msg)` (which masks as a 502). Discovery /
@@ -912,7 +918,8 @@ mod tests {
             other => panic!("429 must map to HttpError, got {other:?}"),
         }
 
-        // 408 (provider timeout, retryable → 504) and 5xx (503 → ServiceOverloaded)
+        // 408 (provider timeout → 504; pool tries the next provider in the round
+        // but does not retry the round) and 5xx (503 → ServiceOverloaded, retried)
         // are preserved too.
         assert!(matches!(
             Provider::map_client_error(

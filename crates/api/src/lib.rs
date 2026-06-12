@@ -612,6 +612,29 @@ pub async fn init_domain_services_with_pool_and_search_providers(
     domain_services
 }
 
+/// Standard OpenAI sampling knobs Chutes (sglang) honors, expressed in
+/// OpenRouter's fixed `supported_sampling_parameters` vocabulary. Seeded onto
+/// every auto-created Chutes catalog row so `GET /v1/models` advertises real
+/// capabilities instead of an empty list (which silently disables routing for
+/// OpenRouter-style consumers). `n` is intentionally omitted: it is not part of
+/// OpenRouter's vocabulary. Must remain a subset of `routes::admin::VALID_SAMPLING_PARAMS`.
+pub(crate) const CHUTES_SUPPORTED_SAMPLING_PARAMS: &[&str] = &[
+    "temperature",
+    "top_p",
+    "frequency_penalty",
+    "presence_penalty",
+    "stop",
+    "seed",
+    "max_tokens",
+];
+
+/// Feature capabilities Chutes (sglang) exposes, in OpenRouter's fixed
+/// `supported_features` vocabulary: `tools` => tool/function-calling, `json_mode`
+/// => JSON `response_format`. Streaming is always supported but is not a member
+/// of OpenRouter's feature vocabulary, so it is not advertised here. Must remain
+/// a subset of `routes::admin::VALID_FEATURES`.
+pub(crate) const CHUTES_SUPPORTED_FEATURES: &[&str] = &["tools", "json_mode"];
+
 /// Ensure a Chutes (attested) model has a catalog row in the `models` table.
 ///
 /// The data plane rejects any model without an active `models` row *before*
@@ -682,6 +705,26 @@ async fn ensure_chutes_catalog_row(
                 owned_by: Some(owned_by.to_string()),
                 input_modalities: Some(vec!["text".to_string()]),
                 output_modalities: Some(vec!["text".to_string()]),
+                // OpenRouter-style routers gate tool/function-calling on these two
+                // arrays; leaving them empty (the SQL default) silently advertises a
+                // Chutes model as supporting *nothing*, so routers refuse to route
+                // tool calls to it. Chutes serves via sglang on an OpenAI-compatible
+                // surface, so seed the standard OpenAI knobs it honors. Operators can
+                // still override via PATCH /v1/admin/models. Both lists are restricted
+                // to OpenRouter's fixed vocabulary (asserted by a unit test below) so
+                // the seeded row would pass the same admin write-path validation.
+                supported_sampling_parameters: Some(
+                    CHUTES_SUPPORTED_SAMPLING_PARAMS
+                        .iter()
+                        .map(|s| s.to_string())
+                        .collect(),
+                ),
+                supported_features: Some(
+                    CHUTES_SUPPORTED_FEATURES
+                        .iter()
+                        .map(|s| s.to_string())
+                        .collect(),
+                ),
                 // Pricing left None -> defaults to 0 on INSERT. The inactive seed
                 // above prevents this zero price from ever being charged.
                 ..Default::default()
@@ -2023,6 +2066,47 @@ async fn swagger_ui_handler() -> Html<String> {
 mod tests {
     use super::*;
     use crate::openapi::ApiDoc;
+
+    /// Regression for issue #781 (M1): the Chutes catalog seed must advertise a
+    /// NON-EMPTY `supported_features` / `supported_sampling_parameters` so
+    /// OpenRouter-style routers don't silently treat the model as supporting
+    /// nothing (which disables tool routing).
+    #[test]
+    fn chutes_seed_advertises_nonempty_capabilities() {
+        assert!(
+            !CHUTES_SUPPORTED_SAMPLING_PARAMS.is_empty(),
+            "Chutes seed must advertise at least one sampling parameter"
+        );
+        assert!(
+            !CHUTES_SUPPORTED_FEATURES.is_empty(),
+            "Chutes seed must advertise at least one feature"
+        );
+        // tool/function-calling is the capability routers gate on; it must be present.
+        assert!(
+            CHUTES_SUPPORTED_FEATURES.contains(&"tools"),
+            "Chutes seed must advertise tool/function-calling support"
+        );
+    }
+
+    /// The seeded values must stay within OpenRouter's fixed vocabulary so the
+    /// auto-seeded row would pass the same validation the admin write path
+    /// (`PATCH /v1/admin/models`) enforces. This guards against the two lists
+    /// drifting apart.
+    #[test]
+    fn chutes_seed_values_are_valid_openrouter_vocabulary() {
+        for p in CHUTES_SUPPORTED_SAMPLING_PARAMS {
+            assert!(
+                crate::routes::admin::VALID_SAMPLING_PARAMS.contains(p),
+                "seeded sampling parameter '{p}' is not in OpenRouter's vocabulary"
+            );
+        }
+        for f in CHUTES_SUPPORTED_FEATURES {
+            assert!(
+                crate::routes::admin::VALID_FEATURES.contains(f),
+                "seeded feature '{f}' is not in OpenRouter's vocabulary"
+            );
+        }
+    }
 
     #[test]
     fn test_openapi_spec_generation() {

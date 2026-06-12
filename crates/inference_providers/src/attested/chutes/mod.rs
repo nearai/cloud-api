@@ -997,15 +997,15 @@ impl ThinkStreamState {
             // Those are ordinary content — prepend them to THIS delta's content so they
             // are never lost (Done's `flush` is a no-op, so we can't defer them).
             if !self.pending.is_empty() {
-                let held = std::mem::take(&mut self.pending);
+                // Reuse the owned `held` allocation rather than building a fresh String:
+                // append the delta's existing content onto the held prefix in place.
+                let mut held = std::mem::take(&mut self.pending);
                 let rest = delta
                     .get("content")
                     .and_then(Value::as_str)
                     .unwrap_or_default();
-                delta.insert(
-                    "content".to_string(),
-                    Value::String(format!("{held}{rest}")),
-                );
+                held.push_str(rest);
+                delta.insert("content".to_string(), Value::String(held));
             }
             return;
         }

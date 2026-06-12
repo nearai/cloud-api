@@ -61,6 +61,13 @@ const DEFAULT_TIMEOUT_SECONDS: i64 = 300;
 /// The OpenAI sub-path invoked inside the chute for chat completions.
 const CHAT_PATH: &str = "/v1/chat/completions";
 
+/// Cooldown applied to a discovery cache cell when a refresh returns no usable
+/// (E2E-capable + nonce-bearing) instance. Short enough to recover quickly when
+/// the upstream is briefly empty/all-drained, but long enough that we don't fire
+/// a discovery call on every incoming request (which would hammer the
+/// rate-limited `/e2e/instances` endpoint this cache exists to protect).
+const EMPTY_REFRESH_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Configuration for a Chutes attested provider.
 ///
 /// `api_key` is private with a redacting `Debug` so the `cpk_...` secret can
@@ -293,8 +300,20 @@ impl Provider {
     }
 
     /// Return a fresh-enough `/e2e/instances` snapshot for `chute_id`, refreshing
-    /// via a real discovery call only when the cached entry is expired or carries
-    /// no usable (E2E-capable + nonce-bearing) instance.
+    /// via a real discovery call only when the cached entry has expired (or when
+    /// `force` is set — used by the inline retry after a snapshot→commit nonce
+    /// drain).
+    ///
+    /// FRESHNESS IS TTL-GATED (not usability-gated). An earlier draft refreshed
+    /// whenever no instance still held a nonce (`!usable`), but that opened a
+    /// tight loop: if the upstream returned an empty list or all-drained pools,
+    /// `!usable` stayed true after the refresh, so EVERY subsequent request fired
+    /// another discovery call — hammering the rate-limited endpoint this PR exists
+    /// to protect. Instead, a refresh that yields no usable nonces installs a short
+    /// [`EMPTY_REFRESH_COOLDOWN`] on `expires_at`, so we recover quickly without
+    /// busy-looping; and [`Self::take_nonce`] proactively expires the cell when it
+    /// pops the LAST usable nonce, so a normal drain still refreshes on the next
+    /// request rather than waiting out the full TTL.
     ///
     /// SINGLE-FLIGHT PER CHUTE: the per-chute `tokio::sync::Mutex` is held across
     /// the refresh, so concurrent requests for the SAME chute wait and then observe
@@ -306,33 +325,43 @@ impl Provider {
     async fn discover_cached(
         &self,
         chute_id: &str,
+        force: bool,
     ) -> Result<Vec<client::E2eInstance>, CompletionError> {
         let cell = self.chute_cache(chute_id);
         let mut guard = cell.lock().await;
-        let usable = guard
-            .instances
-            .iter()
-            .any(|i| !i.e2e_pubkey.is_empty() && !i.nonces.is_empty());
-        if guard.expires_at <= std::time::Instant::now() || !usable {
+        if force || guard.expires_at <= std::time::Instant::now() {
             let fresh = self
                 .client
                 .discover_instances(chute_id)
                 .await
                 .map_err(|e| Self::map_client_error("discover instances", e))?;
-            // TTL from the upstream nonce lifetime, clamped to a sane ceiling and
-            // shaved by a safety margin so we refresh BEFORE the live nonces would
-            // expire mid-flight (a stale nonce would 4xx the invoke). A missing /
-            // non-positive value falls back to a conservative 30s.
-            let ttl = fresh
-                .nonce_expires_in
-                .filter(|s| *s > 0)
-                .map(|s| (s as u64).min(120))
-                .unwrap_or(30);
+            // A refresh that yields no E2E-capable, nonce-bearing instance gets a
+            // short cooldown rather than the full TTL, so we retry the upstream
+            // soon WITHOUT a per-request busy loop (see the doc-comment above).
+            let usable = fresh
+                .instances
+                .iter()
+                .any(|i| !i.e2e_pubkey.is_empty() && !i.nonces.is_empty());
+            let expires_at = if usable {
+                // TTL from the upstream nonce lifetime, clamped to a sane ceiling
+                // and shaved by a safety margin so we refresh BEFORE the live
+                // nonces would expire mid-flight (a stale nonce would 4xx the
+                // invoke). A missing / non-positive value falls back to a
+                // conservative 30s.
+                let ttl = fresh
+                    .nonce_expires_in
+                    .filter(|s| *s > 0)
+                    .map(|s| (s as u64).min(120))
+                    .unwrap_or(30);
+                std::time::Instant::now()
+                    + std::time::Duration::from_secs(ttl)
+                        .saturating_sub(std::time::Duration::from_secs(5))
+            } else {
+                std::time::Instant::now() + EMPTY_REFRESH_COOLDOWN
+            };
             *guard = CachedInstances {
                 instances: fresh.instances,
-                expires_at: std::time::Instant::now()
-                    + std::time::Duration::from_secs(ttl)
-                        .saturating_sub(std::time::Duration::from_secs(5)),
+                expires_at,
             };
         }
         Ok(guard.instances.clone())
@@ -342,8 +371,13 @@ impl Provider {
     /// cached snapshot (the point that PREVENTS reuse: a popped token is gone from
     /// the cache, so no concurrent request can hand out the same one). Returns
     /// `None` if the instance is no longer present or its pool is already drained —
-    /// the caller then moves to the next candidate (and a fully drained chute
-    /// refreshes on the next [`Self::discover_cached`]).
+    /// the caller then moves to the next candidate.
+    ///
+    /// When popping this token leaves the WHOLE cell with no usable instance, the
+    /// cell is proactively expired (`expires_at = now`) so the next
+    /// [`Self::discover_cached`] refreshes immediately instead of handing back a
+    /// drained snapshot. A *failed* refresh then installs the cooldown (see
+    /// `discover_cached`), so this expiry never turns into a tight loop.
     async fn take_nonce(&self, chute_id: &str, instance_id: &str) -> Option<String> {
         let cell = self.chute_cache(chute_id);
         let mut guard = cell.lock().await;
@@ -351,7 +385,15 @@ impl Provider {
             .instances
             .iter_mut()
             .find(|i| i.instance_id == instance_id)?;
-        inst.nonces.pop()
+        let nonce = inst.nonces.pop();
+        let still_usable = guard
+            .instances
+            .iter()
+            .any(|i| !i.e2e_pubkey.is_empty() && !i.nonces.is_empty());
+        if !still_usable {
+            guard.expires_at = std::time::Instant::now();
+        }
+        nonce
     }
 
     /// Map a Chutes HTTP-client error to a `CompletionError`. Only statuses that
@@ -415,6 +457,15 @@ impl Provider {
     /// unverified channel) if any stage fails. Discovery / evidence / invoke
     /// failures preserve the upstream HTTP status (via [`Self::map_client_error`]),
     /// so a rate-limit 429 is retryable rather than a flat 502.
+    ///
+    /// Runs [`Self::prepare_from_snapshot`] against the cached discovery snapshot;
+    /// if every candidate's nonce pool drained between the snapshot and the atomic
+    /// `take_nonce` commit (a burst race introduced by caching — see #774 review),
+    /// retries ONCE against a forced-fresh snapshot. The forced refresh refills the
+    /// pools, so the retry resolves in-place rather than surfacing a hard error
+    /// (the all-drained string carries no retryable keyword, so the pool's outer
+    /// retry would otherwise treat it as terminal — and attested models often have
+    /// no fallback provider).
     async fn verify_and_prepare(
         &self,
         request_json: &Value,
@@ -426,11 +477,39 @@ impl Provider {
             .await
             .map_err(|e| Self::map_client_error("resolve chute_id", e))?;
 
+        match self
+            .prepare_from_snapshot(&chute_id, request_json, false)
+            .await
+        {
+            Ok(prepared) => Ok(prepared),
+            // All candidate pools drained between snapshot and commit: force a
+            // fresh discovery (refilling the pools) and try the candidate loop
+            // exactly once more. A second drain is genuinely exhausted upstream.
+            Err(PrepareError::AllDrained) => self
+                .prepare_from_snapshot(&chute_id, request_json, true)
+                .await
+                .map_err(PrepareError::into_completion_error),
+            Err(other) => Err(other.into_completion_error()),
+        }
+    }
+
+    /// One attestation pass over a (possibly forced-fresh) discovery snapshot.
+    /// Returns [`PrepareError::AllDrained`] — distinct from a hard failure — when
+    /// candidates existed in the snapshot but every one's pool was emptied by a
+    /// concurrent request before this task could `take_nonce`, so the caller can
+    /// retry against a fresh snapshot. `force` bypasses the discovery TTL.
+    async fn prepare_from_snapshot(
+        &self,
+        chute_id: &str,
+        request_json: &Value,
+        force: bool,
+    ) -> Result<PreparedInvoke, PrepareError> {
         // Cached `/e2e/instances` discovery (#774): a short-TTL snapshot serves
         // ~50 requests per discovery call (single-flight per chute), cutting the
         // call rate that self-inflicts the 429s. `instances` is an OWNED snapshot;
         // nonces are consumed later via `take_nonce` (the single-use atomic point).
-        let instances = self.discover_cached(&chute_id).await?;
+        let chute_id = chute_id.to_string();
+        let instances = self.discover_cached(&chute_id, force).await?;
 
         // Candidate instances: live + E2E-capable + with at least one nonce token.
         let candidates: Vec<&client::E2eInstance> = instances
@@ -440,7 +519,8 @@ impl Provider {
         if candidates.is_empty() {
             return Err(CompletionError::CompletionError(
                 "no E2E-capable Chutes instance with an available nonce token".to_string(),
-            ));
+            )
+            .into());
         }
 
         // One chute-wide /evidence fetch bound to a fresh boot nonce; every
@@ -468,11 +548,17 @@ impl Provider {
             INSTANCE_RR.fetch_add(1, Ordering::Relaxed) % n
         };
         let mut last_err = String::from("no candidate instances");
+        // True only while EVERY failure so far was a nonce-pool drain (the
+        // snapshot→commit race). Any other failure (attestation, evidence, E2EE)
+        // clears it, so we don't paper over a real verification problem by forcing
+        // a refresh — a forced refresh only helps the drain case.
+        let mut drained_only = true;
         for off in 0..n {
             let inst = candidates[(start + off) % n];
             let evidence = match evidence_resp.instance(&inst.instance_id) {
                 Some(e) => e,
                 None => {
+                    drained_only = false;
                     last_err = format!("instance {} not present in /evidence", inst.instance_id);
                     continue;
                 }
@@ -488,6 +574,7 @@ impl Provider {
             {
                 Ok(info) => info,
                 Err(e) => {
+                    drained_only = false;
                     last_err = format!("instance {} attestation failed: {e}", inst.instance_id);
                     continue;
                 }
@@ -495,6 +582,7 @@ impl Provider {
             let e2e_pk = match base64::engine::general_purpose::STANDARD.decode(e2e_pubkey) {
                 Ok(pk) => pk,
                 Err(e) => {
+                    drained_only = false;
                     last_err = format!("instance {} e2e_pubkey base64: {e}", inst.instance_id);
                     continue;
                 }
@@ -502,6 +590,7 @@ impl Provider {
             let prepared = match e2ee::build_request(&e2e_pk, request_json) {
                 Ok(p) => p,
                 Err(e) => {
+                    drained_only = false;
                     last_err = format!("instance {} E2EE build: {e}", inst.instance_id);
                     continue;
                 }
@@ -510,12 +599,14 @@ impl Provider {
             // Consume a single-use nonce token from the CACHE (not from the local
             // snapshot's `inst.nonces`), so it can never be handed to a concurrent
             // request for the same instance (#774). A token drained between the
-            // snapshot and here just moves us to the next candidate; if every
-            // candidate's pool is drained the request fails (retryable), and the
-            // next request's `discover_cached` refreshes the now-empty chute.
+            // snapshot and here just moves us to the next candidate; if EVERY
+            // candidate's pool drained, we return `AllDrained` so `verify_and_prepare`
+            // forces one fresh-snapshot retry (the drained chute is also proactively
+            // expired by `take_nonce`, so the forced discovery refills the pools).
             let nonce = match self.take_nonce(&chute_id, &inst.instance_id).await {
                 Some(n) => n,
                 None => {
+                    // Drain keeps `drained_only` set — it's the recoverable race.
                     last_err = format!("instance {} nonce pool drained", inst.instance_id);
                     continue;
                 }
@@ -536,9 +627,55 @@ impl Provider {
                 session,
             });
         }
+        // Every candidate failed. If they ALL failed purely because their pools
+        // drained out from under us, signal `AllDrained`: on the first pass the
+        // caller forces a fresh snapshot and retries; on the forced pass it's
+        // genuine upstream exhaustion, which `into_completion_error` maps to a
+        // retryable 429 (so the pool's outer retry/backoff can still take over)
+        // rather than the keyword-less terminal string. A NON-drain failure
+        // (attestation/evidence/E2EE) dominated → a refresh won't help, so surface
+        // it as a hard (terminal) error verbatim.
+        if drained_only {
+            return Err(PrepareError::AllDrained);
+        }
         Err(CompletionError::CompletionError(format!(
             "all candidate Chutes instances failed (refusing to send inference); last: {last_err}"
-        )))
+        ))
+        .into())
+    }
+}
+
+/// Outcome of one [`Provider::prepare_from_snapshot`] pass. `AllDrained` is the
+/// recoverable snapshot→commit nonce-drain race (retry against a fresh snapshot);
+/// `Hard` is a terminal error to propagate to the caller.
+enum PrepareError {
+    AllDrained,
+    Hard(CompletionError),
+}
+
+impl From<CompletionError> for PrepareError {
+    /// Any underlying `CompletionError` (discovery / evidence / boot-nonce
+    /// failure) is a hard, non-drain error — lets `?` flow through
+    /// `prepare_from_snapshot` while keeping `AllDrained` distinct.
+    fn from(e: CompletionError) -> Self {
+        PrepareError::Hard(e)
+    }
+}
+
+impl PrepareError {
+    /// Collapse to the caller-facing error. `AllDrained` only reaches here on the
+    /// SECOND (forced-fresh) pass — genuine upstream exhaustion — so it maps to a
+    /// retryable 429 (the pool's outer retry/backoff handles it; the all-drained
+    /// keyword-less string would otherwise be classified non-retryable).
+    fn into_completion_error(self) -> CompletionError {
+        match self {
+            PrepareError::Hard(e) => e,
+            PrepareError::AllDrained => CompletionError::HttpError {
+                status_code: 429,
+                message: "Chutes instance nonce pools exhausted".to_string(),
+                is_external: true,
+            },
+        }
     }
 }
 
@@ -1379,44 +1516,85 @@ mod tests {
     }
 
     /// The empty/expired seed (`CachedInstances::empty_expired`) must read as
-    /// expired and carry no usable instance, so the FIRST `discover_cached`
-    /// triggers a refresh. Pins the refresh-on-first-use contract without network.
+    /// already expired, so the FIRST `discover_cached` triggers a refresh via the
+    /// TTL gate (`expires_at <= now`). Pins the refresh-on-first-use contract
+    /// without network.
     #[test]
     fn empty_expired_entry_signals_refresh_needed() {
         let c = CachedInstances::empty_expired();
         assert!(
             c.expires_at <= std::time::Instant::now(),
-            "seed entry is already expired"
+            "seed entry is already expired → discover_cached refreshes on first use"
         );
         assert!(c.instances.is_empty(), "seed entry has no instances");
-        // The discover_cached refresh predicate: expired OR no usable instance.
-        let usable = c
-            .instances
-            .iter()
-            .any(|i| !i.e2e_pubkey.is_empty() && !i.nonces.is_empty());
-        assert!(
-            !usable,
-            "seed entry has no usable instance → refresh needed"
-        );
     }
 
-    /// A live snapshot whose instances all have EMPTY nonce pools is treated as
-    /// "no usable instance" even though it hasn't expired — so `discover_cached`
-    /// refreshes rather than handing out a chute with nothing to consume.
+    /// A genuinely-exhausted `AllDrained` (only reaches `into_completion_error` on
+    /// the SECOND, forced-fresh pass) maps to a RETRYABLE 429 — not the
+    /// keyword-less "all candidates failed" string that the pool's classifier
+    /// reads as `non_retryable_no_keyword_match`. Locks the production-safety fix
+    /// from #785 review: the in-flight casualty of a real drain is retried, not
+    /// hard-failed (attested models often have no fallback provider).
     #[test]
-    fn fresh_but_drained_snapshot_signals_refresh_needed() {
-        let c = cached(&[("i1", &[]), ("i2", &[])]); // not expired, but no nonces
+    fn all_drained_maps_to_retryable_429() {
+        match PrepareError::AllDrained.into_completion_error() {
+            CompletionError::HttpError {
+                status_code,
+                is_external,
+                ..
+            } => {
+                assert_eq!(status_code, 429, "drain exhaustion is a 429 (retryable)");
+                assert!(is_external, "it's an upstream/provider condition");
+            }
+            other => panic!("expected retryable HttpError 429, got {other:?}"),
+        }
+    }
+
+    /// A `Hard` error passes through `into_completion_error` verbatim (no
+    /// 429 masking) so genuine verification/discovery failures keep their original
+    /// classification.
+    #[test]
+    fn hard_error_passes_through_unchanged() {
+        let inner = CompletionError::CompletionError("boom".to_string());
+        match PrepareError::Hard(inner).into_completion_error() {
+            CompletionError::CompletionError(m) => assert_eq!(m, "boom"),
+            other => panic!("expected verbatim CompletionError, got {other:?}"),
+        }
+    }
+
+    /// `take_nonce` proactively expires the cell when it pops the LAST usable
+    /// nonce, so the next `discover_cached` refreshes immediately (TTL gate) rather
+    /// than handing back a drained snapshot — WITHOUT the per-request busy loop the
+    /// old `!usable`-based refresh predicate caused on an empty upstream.
+    #[tokio::test]
+    async fn take_nonce_expires_cell_when_last_nonce_drains() {
+        let p = provider();
+        let cell = p.chute_cache("chute-drain");
+        // Two instances, one nonce each: not expired yet.
+        *cell.lock().await = cached(&[("i1", &["t-1"]), ("i2", &["t-2"])]);
         assert!(
-            c.expires_at > std::time::Instant::now(),
-            "snapshot is still within TTL"
+            cell.lock().await.expires_at > std::time::Instant::now(),
+            "snapshot starts within TTL"
         );
-        let usable = c
-            .instances
-            .iter()
-            .any(|i| !i.e2e_pubkey.is_empty() && !i.nonces.is_empty());
+        // Drain the first pool — the OTHER instance still has a nonce, so the cell
+        // stays usable and is NOT expired early.
+        assert_eq!(
+            p.take_nonce("chute-drain", "i1").await.as_deref(),
+            Some("t-1")
+        );
         assert!(
-            !usable,
-            "all-drained snapshot is unusable → discover_cached refreshes"
+            cell.lock().await.expires_at > std::time::Instant::now(),
+            "still usable (i2 has a nonce) → not expired early"
+        );
+        // Drain the last pool — now no instance is usable, so the cell is expired
+        // so the next discover_cached refreshes.
+        assert_eq!(
+            p.take_nonce("chute-drain", "i2").await.as_deref(),
+            Some("t-2")
+        );
+        assert!(
+            cell.lock().await.expires_at <= std::time::Instant::now(),
+            "last nonce drained → cell proactively expired for the next refresh"
         );
     }
 

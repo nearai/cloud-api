@@ -440,6 +440,45 @@ fn prepare_stream_chunk_for_client(
     }
 }
 
+fn rewritten_control_event_bytes(event: &inference_providers::SSEEvent) -> Option<Bytes> {
+    if event.is_done_marker() {
+        return None;
+    }
+
+    let line = String::from_utf8_lossy(&event.raw_bytes);
+    if line.trim_start().starts_with(':') {
+        Some(event.raw_bytes.clone())
+    } else {
+        None
+    }
+}
+
+fn build_final_usage_chunk_bytes(
+    usage: inference_providers::TokenUsage,
+    template: &ChunkTemplate,
+) -> Result<Option<Bytes>, serde_json::Error> {
+    let Some((id, model, created, system_fingerprint)) = template else {
+        return Ok(None);
+    };
+
+    let final_usage_chunk =
+        inference_providers::StreamChunk::Chat(inference_providers::models::ChatCompletionChunk {
+            id: id.clone(),
+            object: "chat.completion.chunk".to_string(),
+            created: *created,
+            model: model.clone(),
+            system_fingerprint: system_fingerprint.clone(),
+            choices: Vec::new(),
+            usage: Some(usage),
+            prompt_token_ids: None,
+            modality: None,
+            extra: std::collections::HashMap::new(),
+        });
+
+    serde_json::to_string(&final_usage_chunk)
+        .map(|json_data| Some(Bytes::from(format!("data: {json_data}\n\n"))))
+}
+
 // Helper function to extract inference ID from a parsed stream chunk
 fn extract_inference_id_from_chunk(chunk: &inference_providers::StreamChunk) -> Uuid {
     let id = match chunk {
@@ -1319,20 +1358,23 @@ async fn chat_completions_inner(
         .resolve_alias_cached(&request.model)
         .await;
     let resolved_model_name = alias_canonical.as_deref().unwrap_or(&request.model);
-    let model_attestation_supported = match app_state.models_service.get_models_with_pricing().await
-    {
-        Ok(models) => models
-            .iter()
-            .find(|model| model.model_name == resolved_model_name)
-            .map(|model| model.attestation_supported),
-        Err(error) => {
-            tracing::warn!(
-                model = %request.model,
-                error = %error,
-                "Failed to read cached model metadata for stream usage shaping; preserving raw passthrough"
-            );
-            None
+    let model_attestation_supported = if request.stream == Some(true) {
+        match app_state.models_service.get_models_with_pricing().await {
+            Ok(models) => models
+                .iter()
+                .find(|model| model.model_name == resolved_model_name)
+                .map(|model| model.attestation_supported),
+            Err(error) => {
+                tracing::warn!(
+                    model = %request.model,
+                    error = %error,
+                    "Failed to read cached model metadata for stream usage shaping; preserving raw passthrough"
+                );
+                None
+            }
         }
+    } else {
+        None
     };
     let usage_mode = chat_stream_usage_mode(&request, model_attestation_supported, e2ee_active);
     let rewrite_public_stream_usage = usage_mode.rewrite_public_stream_usage;
@@ -1557,13 +1599,21 @@ async fn chat_completions_inner(
                                                 std::sync::atomic::Ordering::Relaxed,
                                             );
                                         }
-                                        if gateway_signature_enabled {
-                                            public_signature_hasher
-                                                .lock()
-                                                .await
-                                                .update(&event.raw_bytes);
+                                        let control_bytes = if rewrite_public_stream_usage {
+                                            rewritten_control_event_bytes(&event)
+                                        } else {
+                                            Some(event.raw_bytes)
+                                        };
+                                        if let Some(control_bytes) = control_bytes {
+                                            if gateway_signature_enabled {
+                                                public_signature_hasher
+                                                    .lock()
+                                                    .await
+                                                    .update(&control_bytes);
+                                            }
+                                            return Some(Ok::<Bytes, Infallible>(control_bytes));
                                         }
-                                        return Some(Ok::<Bytes, Infallible>(event.raw_bytes));
+                                        return None;
                                     };
                                     if let inference_providers::StreamChunk::Chat(chat) = &chunk {
                                         {
@@ -1679,6 +1729,8 @@ async fn chat_completions_inner(
                             let request_hash = request_hash.clone();
                             async move {
                                 let mut combined: Vec<u8> = Vec::new();
+                                let error_count_final =
+                                    stream_error_count.load(std::sync::atomic::Ordering::Relaxed);
                                 if auto_redact_enabled {
                                     let mut states = unredact_states_for_chain.lock().await;
                                     let template = chunk_template_for_chain.lock().await.clone();
@@ -1690,27 +1742,26 @@ async fn chat_completions_inner(
                                 if rewrite_public_stream_usage && include_stream_usage_in_response {
                                     let final_usage = final_stream_usage_for_chain.lock().await.clone();
                                     let template = chunk_template_for_chain.lock().await.clone();
-                                    match (final_usage, template) {
-                                        (Some(usage), Some((id, model, created, system_fingerprint))) => {
-                                            let final_usage_chunk =
-                                                inference_providers::StreamChunk::Chat(
-                                                    inference_providers::models::ChatCompletionChunk {
-                                                        id,
-                                                        object: "chat.completion.chunk".to_string(),
-                                                        created,
-                                                        model,
-                                                        system_fingerprint,
-                                                        choices: Vec::new(),
-                                                        usage: Some(usage),
-                                                        prompt_token_ids: None,
-                                                        modality: None,
-                                                        extra: std::collections::HashMap::new(),
-                                                    },
-                                                );
-                                            match serde_json::to_string(&final_usage_chunk) {
-                                                Ok(json_data) => {
-                                                    combined.extend_from_slice(
-                                                        format!("data: {json_data}\n\n").as_bytes(),
+                                    if error_count_final > 0 {
+                                        if final_usage.is_some() {
+                                            tracing::warn!(
+                                                %organization_id,
+                                                model = %model_name,
+                                                total_stream_errors = error_count_final,
+                                                "Suppressing final usage chunk because the stream ended with errors"
+                                            );
+                                        }
+                                    } else {
+                                        match final_usage {
+                                            Some(usage) => match build_final_usage_chunk_bytes(usage, &template) {
+                                                Ok(Some(bytes)) => {
+                                                    combined.extend_from_slice(&bytes);
+                                                }
+                                                Ok(None) => {
+                                                    tracing::warn!(
+                                                        %organization_id,
+                                                        model = %model_name,
+                                                        "Cannot emit final usage chunk: no chat chunk template observed"
                                                     );
                                                 }
                                                 Err(e) => {
@@ -1720,21 +1771,18 @@ async fn chat_completions_inner(
                                                         "Failed to serialize final usage chunk: {e}"
                                                     );
                                                 }
+                                            },
+                                            None => {
+                                                tracing::warn!(
+                                                    %organization_id,
+                                                    model = %model_name,
+                                                    "include_usage was requested but upstream did not provide usage; omitting final usage chunk"
+                                                );
                                             }
                                         }
-                                        (Some(_), None) => {
-                                            tracing::warn!(
-                                                %organization_id,
-                                                model = %model_name,
-                                                "Cannot emit final usage chunk: no chat chunk template observed"
-                                            );
-                                        }
-                                        (None, _) => {}
                                     }
                                 }
 
-                                let error_count_final =
-                                    stream_error_count.load(std::sync::atomic::Ordering::Relaxed);
                                 if error_count_final > 1 {
                                     tracing::error!(
                                         %organization_id,
@@ -3036,6 +3084,65 @@ mod tests {
             final_usage.as_ref().map(|usage| usage.total_tokens),
             Some(15)
         );
+    }
+
+    #[test]
+    fn final_usage_chunk_uses_stream_template_metadata() {
+        let template = Some((
+            "chatcmpl-test".to_string(),
+            "test-model".to_string(),
+            1234567890,
+            Some("fp-test".to_string()),
+        ));
+
+        let bytes =
+            build_final_usage_chunk_bytes(inference_providers::TokenUsage::new(10, 5), &template)
+                .expect("final usage chunk should serialize")
+                .expect("template should produce final usage chunk");
+
+        let body = String::from_utf8(bytes.to_vec()).expect("SSE bytes should be UTF-8");
+        assert!(body.starts_with("data: "));
+        assert!(body.ends_with("\n\n"));
+        let payload = body
+            .trim_start_matches("data: ")
+            .trim_end()
+            .trim_end_matches('\n');
+        let value: serde_json::Value =
+            serde_json::from_str(payload).expect("final usage payload should be JSON");
+        assert_eq!(value["id"], "chatcmpl-test");
+        assert_eq!(value["model"], "test-model");
+        assert_eq!(value["created"], 1234567890);
+        assert_eq!(value["system_fingerprint"], "fp-test");
+        assert!(value["choices"].as_array().is_some_and(Vec::is_empty));
+        assert_eq!(value["usage"]["prompt_tokens"], 10);
+        assert_eq!(value["usage"]["completion_tokens"], 5);
+    }
+
+    #[test]
+    fn rewritten_control_events_keep_comments_and_drop_separators() {
+        let blank = inference_providers::SSEEvent {
+            raw_bytes: Bytes::from_static(b"\n"),
+            chunk: None,
+            raw_passthrough: true,
+        };
+        assert!(rewritten_control_event_bytes(&blank).is_none());
+
+        let comment = inference_providers::SSEEvent {
+            raw_bytes: Bytes::from_static(b": keepalive\n"),
+            chunk: None,
+            raw_passthrough: true,
+        };
+        assert_eq!(
+            rewritten_control_event_bytes(&comment),
+            Some(Bytes::from_static(b": keepalive\n"))
+        );
+
+        let done = inference_providers::SSEEvent {
+            raw_bytes: Bytes::from_static(b"data: [DONE]\n"),
+            chunk: None,
+            raw_passthrough: true,
+        };
+        assert!(rewritten_control_event_bytes(&done).is_none());
     }
 
     #[test]

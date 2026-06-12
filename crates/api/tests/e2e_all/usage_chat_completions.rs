@@ -330,6 +330,78 @@ async fn test_chat_completions_stream_include_usage_true_emits_final_usage_only(
     );
 }
 
+#[tokio::test]
+async fn test_chat_completions_stream_error_does_not_emit_final_usage() {
+    let (server, _pool, mock_provider, _db) = setup_test_server_with_pool().await;
+
+    mock_provider
+        .set_default_response(
+            inference_providers::mock::ResponseTemplate::new("partial usage then error")
+                .with_stream_error_after(
+                    2,
+                    inference_providers::CompletionError::HttpError {
+                        status_code: 503,
+                        message: "upstream stream failed".to_string(),
+                        is_external: false,
+                    },
+                ),
+        )
+        .await;
+
+    setup_qwen_model(&server).await;
+    let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
+    let api_key = get_api_key_for_org(&server, org.id.clone()).await;
+
+    let stream_resp = server
+        .post("/v1/chat/completions")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .json(&json!({
+            "model": E2E_QWEN_MODEL_NAME,
+            "messages": [{ "role": "user", "content": "hello" }],
+            "stream": true,
+            "stream_options": { "include_usage": true }
+        }))
+        .await;
+
+    assert_eq!(
+        stream_resp.status_code(),
+        200,
+        "streaming chat/completions should return an SSE error frame: {}",
+        stream_resp.text()
+    );
+
+    let text = stream_resp.text();
+    let mut saw_error = false;
+    let mut final_usage_chunks = 0;
+    for line in text.lines() {
+        let Some(data) = line.strip_prefix("data: ") else {
+            continue;
+        };
+        if data.trim() == "[DONE]" {
+            break;
+        }
+
+        let value: serde_json::Value =
+            serde_json::from_str(data).expect("stream data should be JSON");
+        if value.get("error").is_some() {
+            saw_error = true;
+            continue;
+        }
+        if value.get("usage").is_some_and(serde_json::Value::is_object) {
+            final_usage_chunks += 1;
+        }
+    }
+
+    assert!(
+        saw_error,
+        "stream should include an SSE error frame: {text}"
+    );
+    assert_eq!(
+        final_usage_chunks, 0,
+        "failed streams must not append a clean final usage chunk: {text}"
+    );
+}
+
 /// Use mock default response with cache_tokens; call completions and verify
 /// cache_read_tokens in response and in usage history.
 /// Cache is set based on the provider's token estimate so it does not exceed prompt_tokens;

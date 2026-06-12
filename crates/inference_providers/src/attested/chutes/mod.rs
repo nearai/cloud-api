@@ -171,6 +171,47 @@ pub struct Provider {
     /// Memoized model→`chute_id` (the mapping is static), so we don't re-fetch
     /// `/v1/models` on every request.
     chute_id_cache: tokio::sync::OnceCell<String>,
+    /// Short-TTL cache of `/e2e/instances` discovery PER chute (#774). One
+    /// discovery response carries ~5 instances × ~10 single-use nonce tokens
+    /// (≈50 tokens) valid for `nonce_expires_in` seconds, so caching it and
+    /// consuming nonces one-at-a-time serves ~50 requests from a single
+    /// rate-limited discovery call — cutting the call rate that self-inflicts the
+    /// `/e2e/instances` 429s.
+    ///
+    /// The OUTER `std::sync::Mutex` guards ONLY a fast get-or-create of the
+    /// per-chute cell (never held across an `await`). Each chute's
+    /// `Arc<tokio::sync::Mutex<CachedInstances>>` serializes refresh + nonce
+    /// consumption for THAT chute only (single-flight per chute; other chutes are
+    /// unaffected). ATTESTATION IS UNCHANGED — only `/e2e/instances` discovery is
+    /// cached; every request still mints a fresh boot nonce, fetches `/evidence`,
+    /// and verifies the chosen instance.
+    instances_cache: Arc<
+        std::sync::Mutex<
+            std::collections::HashMap<String, Arc<tokio::sync::Mutex<CachedInstances>>>,
+        >,
+    >,
+}
+
+/// A cached `/e2e/instances` discovery snapshot for one chute. `instances` is the
+/// owned discovery result; nonce tokens are POPPED from it as they're consumed
+/// (single-use), so the same token is never handed out twice. `expires_at` is the
+/// freshness deadline derived from the upstream `nonce_expires_in` (with a safety
+/// margin); past it — or once an instance's nonce pool empties — the next use
+/// refreshes via a fresh discovery call.
+struct CachedInstances {
+    instances: Vec<client::E2eInstance>,
+    expires_at: std::time::Instant,
+}
+
+impl CachedInstances {
+    /// An empty, already-expired entry: its first use triggers a refresh (the
+    /// `or_insert_with` seed for a chute we haven't discovered yet).
+    fn empty_expired() -> Self {
+        Self {
+            instances: Vec::new(),
+            expires_at: std::time::Instant::now(),
+        }
+    }
 }
 
 /// Everything needed to invoke a verified instance: the targeting headers, the
@@ -203,6 +244,7 @@ impl Provider {
             canonical_id: config.canonical_id,
             allow_streaming,
             chute_id_cache: tokio::sync::OnceCell::new(),
+            instances_cache: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         })
     }
 
@@ -233,6 +275,85 @@ impl Provider {
             .cloned()
     }
 
+    /// Get-or-create the per-chute discovery cache cell. Holds the OUTER
+    /// `std::sync::Mutex` only for the `entry().or_insert_with().clone()` — a
+    /// non-blocking map op, never across an `await` — then returns the cell so the
+    /// caller can lock its own per-chute `tokio::sync::Mutex` for the (awaiting)
+    /// refresh / nonce consumption. `unwrap_or_else(|e| e.into_inner())` recovers
+    /// the map even if a thread panicked while holding it (a poisoned outer lock
+    /// would otherwise wedge discovery for every chute).
+    fn chute_cache(&self, chute_id: &str) -> Arc<tokio::sync::Mutex<CachedInstances>> {
+        let mut map = self
+            .instances_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        map.entry(chute_id.to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(CachedInstances::empty_expired())))
+            .clone()
+    }
+
+    /// Return a fresh-enough `/e2e/instances` snapshot for `chute_id`, refreshing
+    /// via a real discovery call only when the cached entry is expired or carries
+    /// no usable (E2E-capable + nonce-bearing) instance.
+    ///
+    /// SINGLE-FLIGHT PER CHUTE: the per-chute `tokio::sync::Mutex` is held across
+    /// the refresh, so concurrent requests for the SAME chute wait and then observe
+    /// the freshly-cached snapshot (no thundering herd onto the rate-limited
+    /// endpoint); requests for OTHER chutes never block (each has its own cell).
+    /// Returns an OWNED snapshot (`instances.clone()`) for candidate selection +
+    /// verification, releasing the lock after — nonce consumption happens later via
+    /// [`Self::take_nonce`] (the atomic single-use point).
+    async fn discover_cached(
+        &self,
+        chute_id: &str,
+    ) -> Result<Vec<client::E2eInstance>, CompletionError> {
+        let cell = self.chute_cache(chute_id);
+        let mut guard = cell.lock().await;
+        let usable = guard
+            .instances
+            .iter()
+            .any(|i| !i.e2e_pubkey.is_empty() && !i.nonces.is_empty());
+        if guard.expires_at <= std::time::Instant::now() || !usable {
+            let fresh = self
+                .client
+                .discover_instances(chute_id)
+                .await
+                .map_err(|e| Self::map_client_error("discover instances", e))?;
+            // TTL from the upstream nonce lifetime, clamped to a sane ceiling and
+            // shaved by a safety margin so we refresh BEFORE the live nonces would
+            // expire mid-flight (a stale nonce would 4xx the invoke). A missing /
+            // non-positive value falls back to a conservative 30s.
+            let ttl = fresh
+                .nonce_expires_in
+                .filter(|s| *s > 0)
+                .map(|s| (s as u64).min(120))
+                .unwrap_or(30);
+            *guard = CachedInstances {
+                instances: fresh.instances,
+                expires_at: std::time::Instant::now()
+                    + std::time::Duration::from_secs(ttl)
+                        .saturating_sub(std::time::Duration::from_secs(5)),
+            };
+        }
+        Ok(guard.instances.clone())
+    }
+
+    /// Atomically consume one single-use nonce token for `instance_id` from the
+    /// cached snapshot (the point that PREVENTS reuse: a popped token is gone from
+    /// the cache, so no concurrent request can hand out the same one). Returns
+    /// `None` if the instance is no longer present or its pool is already drained —
+    /// the caller then moves to the next candidate (and a fully drained chute
+    /// refreshes on the next [`Self::discover_cached`]).
+    async fn take_nonce(&self, chute_id: &str, instance_id: &str) -> Option<String> {
+        let cell = self.chute_cache(chute_id);
+        let mut guard = cell.lock().await;
+        let inst = guard
+            .instances
+            .iter_mut()
+            .find(|i| i.instance_id == instance_id)?;
+        inst.nonces.pop()
+    }
+
     /// Map a Chutes HTTP-client error to a `CompletionError`. Only statuses that
     /// the pool's classifier treats as RETRYABLE or correctly masks are preserved
     /// as `HttpError { status_code, is_external: true }`:
@@ -260,13 +381,19 @@ impl Provider {
         let msg = format!("{ctx}: {e}");
         match e {
             // Retryable / correctly-masked upstream statuses: preserve so the
-            // pool classifier can act on them.
+            // pool classifier can act on them. The message is the STAGE + STATUS
+            // only — NOT the raw upstream body (#778 follow-up): a 5xx body could
+            // contain keywords (e.g. "image"/"media") that trip the pool's
+            // `is_client_media_fetch_error` substring scan and get misclassified as
+            // a client error. The stage + status is all the classifier and logs
+            // need; the masked arm below keeps its full `msg` (no status carried,
+            // so no such scan applies).
             client::ChutesClientError::Status {
                 status: status @ (408 | 429 | 500..=599),
                 ..
             } => CompletionError::HttpError {
                 status_code: status,
-                message: msg,
+                message: format!("{ctx}: Chutes returned HTTP {status}"),
                 is_external: true,
             },
             // Any other upstream status (400/413/422/…) on an internally-built
@@ -299,15 +426,14 @@ impl Provider {
             .await
             .map_err(|e| Self::map_client_error("resolve chute_id", e))?;
 
-        let instances = self
-            .client
-            .discover_instances(&chute_id)
-            .await
-            .map_err(|e| Self::map_client_error("discover instances", e))?;
+        // Cached `/e2e/instances` discovery (#774): a short-TTL snapshot serves
+        // ~50 requests per discovery call (single-flight per chute), cutting the
+        // call rate that self-inflicts the 429s. `instances` is an OWNED snapshot;
+        // nonces are consumed later via `take_nonce` (the single-use atomic point).
+        let instances = self.discover_cached(&chute_id).await?;
 
         // Candidate instances: live + E2E-capable + with at least one nonce token.
         let candidates: Vec<&client::E2eInstance> = instances
-            .instances
             .iter()
             .filter(|i| !i.e2e_pubkey.is_empty() && !i.nonces.is_empty())
             .collect();
@@ -381,6 +507,19 @@ impl Provider {
                 }
             };
             let e2ee::PreparedRequest { blob, session } = prepared;
+            // Consume a single-use nonce token from the CACHE (not from the local
+            // snapshot's `inst.nonces`), so it can never be handed to a concurrent
+            // request for the same instance (#774). A token drained between the
+            // snapshot and here just moves us to the next candidate; if every
+            // candidate's pool is drained the request fails (retryable), and the
+            // next request's `discover_cached` refreshes the now-empty chute.
+            let nonce = match self.take_nonce(&chute_id, &inst.instance_id).await {
+                Some(n) => n,
+                None => {
+                    last_err = format!("instance {} nonce pool drained", inst.instance_id);
+                    continue;
+                }
+            };
             // IDs only (privacy-safe): which attested instance + vetted config
             // served the request, so an operator can trace it during an incident.
             tracing::info!(
@@ -392,9 +531,7 @@ impl Provider {
             return Ok(PreparedInvoke {
                 chute_id,
                 instance_id: inst.instance_id.clone(),
-                // Random token (not always [0]) to reduce single-use-token
-                // collisions between concurrent requests to the same instance.
-                nonce_token: pick_nonce(&inst.nonces).to_string(),
+                nonce_token: nonce,
                 blob,
                 session,
             });
@@ -403,20 +540,6 @@ impl Provider {
             "all candidate Chutes instances failed (refusing to send inference); last: {last_err}"
         )))
     }
-}
-
-/// Pick a pseudo-random nonce token from a non-empty list, to reduce single-use
-/// token collisions between concurrent requests. Falls back to the first token
-/// if the OS RNG is briefly unavailable (still correct, just less collision-shy).
-fn pick_nonce(nonces: &[String]) -> &str {
-    debug_assert!(!nonces.is_empty());
-    // Wrapping global counter — infallible and contention-correct: concurrent
-    // requests to the same instance get distinct indices (unlike an RNG with a
-    // fixed `[0]` fallback, which would collide exactly when it matters).
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    static COUNTER: AtomicUsize = AtomicUsize::new(0);
-    let idx = COUNTER.fetch_add(1, Ordering::Relaxed) % nonces.len();
-    &nonces[idx]
 }
 
 /// Internal `extra` keys that must never reach Chutes (a third party): the
@@ -1169,6 +1292,160 @@ mod tests {
                 other => panic!("internal {status} must mask to CompletionError, got {other:?}"),
             }
         }
+    }
+
+    /// #774 / #778 follow-up: a preserved (retryable) upstream status must carry
+    /// the STAGE + STATUS only in its message — NEVER the raw upstream body. A 5xx
+    /// body that happened to contain media/image keywords would otherwise trip the
+    /// pool's `is_client_media_fetch_error` substring scan and get misclassified as
+    /// a client error. The masked (non-status) arm keeps its full message (no
+    /// status carried, so that scan never applies to it).
+    #[test]
+    fn map_client_error_preserved_status_message_omits_upstream_body() {
+        use client::ChutesClientError;
+        // A 5xx body crafted to trip a naive keyword scan, plus a generic secret.
+        let leaky = "failed to fetch image media from internal://secret-host";
+        for status in [429u16, 500, 502, 503] {
+            match Provider::map_client_error(
+                "discover instances",
+                ChutesClientError::Status {
+                    status,
+                    body: leaky.into(),
+                },
+            ) {
+                CompletionError::HttpError { message, .. } => {
+                    assert!(
+                        !message.contains("image") && !message.contains("media"),
+                        "preserved-status message must not echo the upstream body: {message}"
+                    );
+                    assert!(
+                        message.contains("discover instances")
+                            && message.contains(&status.to_string()),
+                        "message keeps stage + status: {message}"
+                    );
+                }
+                other => panic!("status {status} must map to HttpError, got {other:?}"),
+            }
+        }
+    }
+
+    /// Build a `CachedInstances` from a list of (instance_id, nonces) pairs with a
+    /// far-future expiry (so freshness checks treat it as live).
+    fn cached(insts: &[(&str, &[&str])]) -> CachedInstances {
+        CachedInstances {
+            instances: insts
+                .iter()
+                .map(|(id, nonces)| client::E2eInstance {
+                    instance_id: (*id).to_string(),
+                    e2e_pubkey: "cGs=".to_string(), // non-empty (base64 "pk")
+                    nonces: nonces.iter().map(|n| (*n).to_string()).collect(),
+                })
+                .collect(),
+            expires_at: std::time::Instant::now() + std::time::Duration::from_secs(3600),
+        }
+    }
+
+    /// A single-use nonce is consumed exactly once: popping drains the pool and a
+    /// given token is never returned twice. This is the reuse-prevention invariant
+    /// `take_nonce` enforces at the cache level (the pool is a `Vec` we `.pop()`).
+    #[test]
+    fn cached_instances_nonce_consumed_at_most_once() {
+        let mut c = cached(&[("i1", &["t-a", "t-b", "t-c"])]);
+        let inst = c
+            .instances
+            .iter_mut()
+            .find(|i| i.instance_id == "i1")
+            .unwrap();
+        let mut seen = std::collections::HashSet::new();
+        let mut handed_out = Vec::new();
+        while let Some(tok) = inst.nonces.pop() {
+            assert!(seen.insert(tok.clone()), "token {tok} handed out twice");
+            handed_out.push(tok);
+        }
+        assert_eq!(handed_out.len(), 3, "every token consumed exactly once");
+        // Pool drained → no more tokens (the caller would move to the next candidate).
+        assert!(inst.nonces.pop().is_none(), "drained pool yields None");
+    }
+
+    /// A missing instance id yields no token (mirrors `take_nonce` returning `None`
+    /// → the caller skips to the next candidate).
+    #[test]
+    fn cached_instances_missing_instance_yields_none() {
+        let c = cached(&[("i1", &["t-a"])]);
+        assert!(
+            !c.instances.iter().any(|i| i.instance_id == "nope"),
+            "unknown instance id is absent → take_nonce returns None"
+        );
+    }
+
+    /// The empty/expired seed (`CachedInstances::empty_expired`) must read as
+    /// expired and carry no usable instance, so the FIRST `discover_cached`
+    /// triggers a refresh. Pins the refresh-on-first-use contract without network.
+    #[test]
+    fn empty_expired_entry_signals_refresh_needed() {
+        let c = CachedInstances::empty_expired();
+        assert!(
+            c.expires_at <= std::time::Instant::now(),
+            "seed entry is already expired"
+        );
+        assert!(c.instances.is_empty(), "seed entry has no instances");
+        // The discover_cached refresh predicate: expired OR no usable instance.
+        let usable = c
+            .instances
+            .iter()
+            .any(|i| !i.e2e_pubkey.is_empty() && !i.nonces.is_empty());
+        assert!(
+            !usable,
+            "seed entry has no usable instance → refresh needed"
+        );
+    }
+
+    /// A live snapshot whose instances all have EMPTY nonce pools is treated as
+    /// "no usable instance" even though it hasn't expired — so `discover_cached`
+    /// refreshes rather than handing out a chute with nothing to consume.
+    #[test]
+    fn fresh_but_drained_snapshot_signals_refresh_needed() {
+        let c = cached(&[("i1", &[]), ("i2", &[])]); // not expired, but no nonces
+        assert!(
+            c.expires_at > std::time::Instant::now(),
+            "snapshot is still within TTL"
+        );
+        let usable = c
+            .instances
+            .iter()
+            .any(|i| !i.e2e_pubkey.is_empty() && !i.nonces.is_empty());
+        assert!(
+            !usable,
+            "all-drained snapshot is unusable → discover_cached refreshes"
+        );
+    }
+
+    /// `chute_cache` returns the SAME per-chute cell across calls (so refresh +
+    /// nonce consumption serialize on one lock per chute), and DISTINCT cells for
+    /// different chutes (so one chute's refresh never blocks another).
+    #[tokio::test]
+    async fn chute_cache_returns_stable_cell_per_chute() {
+        let p = provider();
+        let a1 = p.chute_cache("chute-A");
+        let a2 = p.chute_cache("chute-A");
+        let b1 = p.chute_cache("chute-B");
+        assert!(Arc::ptr_eq(&a1, &a2), "same chute → same cell");
+        assert!(!Arc::ptr_eq(&a1, &b1), "different chutes → distinct cells");
+        // The cell really is the consumption point: seed it and consume via take_nonce.
+        *a1.lock().await = cached(&[("i1", &["only-token"])]);
+        assert_eq!(
+            p.take_nonce("chute-A", "i1").await.as_deref(),
+            Some("only-token"),
+            "take_nonce consumes from the shared cell"
+        );
+        assert!(
+            p.take_nonce("chute-A", "i1").await.is_none(),
+            "second take on a 1-token pool drains it → None (no reuse)"
+        );
+        assert!(
+            p.take_nonce("chute-A", "absent").await.is_none(),
+            "missing instance → None"
+        );
     }
 
     /// A verifier stub for unit tests (no DCAP/network): records calls and

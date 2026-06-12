@@ -539,7 +539,9 @@ fn split_leading_think_block(s: &str) -> Option<(String, String)> {
 ///
 /// We never clobber a populated `reasoning_content` (so minimax is untouched), never
 /// touch a `content` that isn't a leading-`<think>` string, and never lose content on
-/// a malformed/unclosed tag (see [`split_leading_think_block`]).
+/// a malformed/unclosed tag (see [`split_leading_think_block`]). An *empty* block
+/// (`<think></think>answer`) is stripped from `content` but does NOT set an empty
+/// `reasoning_content` — that would contradict the "empty == unset" rule applied above.
 ///
 /// `usage.completion_tokens_details.reasoning_tokens` is deliberately left untouched:
 /// the upstream body carries no separate reasoning-token count and re-tokenizing here
@@ -574,8 +576,17 @@ fn normalize_think_reasoning(obj: &mut serde_json::Map<String, Value>) {
         let Some((reasoning, answer)) = split_leading_think_block(content) else {
             continue;
         };
+        // Always strip the (well-formed) block from content. But only populate
+        // `reasoning_content` when there is actual reasoning text — an empty or
+        // whitespace-only block (e.g. `<think></think>answer`) would otherwise emit
+        // a spurious `reasoning_content: ""`, contradicting the "empty == unset"
+        // contract we apply to the provider's own field above.
         message.insert("content".to_string(), Value::String(answer));
-        message.insert("reasoning_content".to_string(), Value::String(reasoning));
+        if reasoning.trim().is_empty() {
+            message.remove("reasoning_content");
+        } else {
+            message.insert("reasoning_content".to_string(), Value::String(reasoning));
+        }
     }
 }
 
@@ -1413,6 +1424,26 @@ mod tests {
         assert!(
             msg.get("reasoning_content").is_none(),
             "no reasoning_content fabricated"
+        );
+    }
+
+    #[test]
+    fn normalize_think_reasoning_empty_block_strips_without_empty_reasoning() {
+        // An empty/whitespace-only `<think></think>` block: strip the tags from
+        // content but do NOT emit an empty `reasoning_content` (would contradict the
+        // "empty == unset" contract and surface a spurious field to clients).
+        let msg = normalize_msg(json!("<think></think>answer"), None);
+        assert_eq!(msg["content"], "answer", "empty think block stripped");
+        assert!(
+            msg.get("reasoning_content").is_none(),
+            "no empty reasoning_content emitted"
+        );
+        // Whitespace-only block behaves the same.
+        let msg = normalize_msg(json!("<think>   \n  </think>\n\nanswer"), None);
+        assert_eq!(msg["content"], "answer");
+        assert!(
+            msg.get("reasoning_content").is_none(),
+            "whitespace-only think block emits no reasoning_content"
         );
     }
 

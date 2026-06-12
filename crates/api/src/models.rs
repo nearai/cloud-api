@@ -607,7 +607,7 @@ impl AudioTranscriptionRequest {
         if let Some(language) = &self.language {
             if !is_supported_audio_transcription_language(language) {
                 return Err(
-                    "language must be a supported audio transcription language code (e.g. en, fr, yue)".to_string(),
+                    "language must be a supported Whisper language code or name (e.g. en, english, yue)".to_string(),
                 );
             }
         }
@@ -668,12 +668,144 @@ const AUDIO_TRANSCRIPTION_LANGUAGE_CODES: &[&str] = &[
     "vi", "yi", "yo", "yue", "zh",
 ];
 
+const AUDIO_TRANSCRIPTION_LANGUAGE_ALIASES: &[(&str, &str)] = &[
+    ("afrikaans", "af"),
+    ("albanian", "sq"),
+    ("amharic", "am"),
+    ("arabic", "ar"),
+    ("armenian", "hy"),
+    ("assamese", "as"),
+    ("azerbaijani", "az"),
+    ("bashkir", "ba"),
+    ("basque", "eu"),
+    ("belarusian", "be"),
+    ("bengali", "bn"),
+    ("bosnian", "bs"),
+    ("breton", "br"),
+    ("bulgarian", "bg"),
+    ("burmese", "my"),
+    ("cantonese", "yue"),
+    ("castilian", "es"),
+    ("catalan", "ca"),
+    ("chinese", "zh"),
+    ("croatian", "hr"),
+    ("czech", "cs"),
+    ("danish", "da"),
+    ("dutch", "nl"),
+    ("english", "en"),
+    ("estonian", "et"),
+    ("faroese", "fo"),
+    ("finnish", "fi"),
+    ("flemish", "nl"),
+    ("french", "fr"),
+    ("galician", "gl"),
+    ("georgian", "ka"),
+    ("german", "de"),
+    ("greek", "el"),
+    ("gujarati", "gu"),
+    ("haitian", "ht"),
+    ("haitian creole", "ht"),
+    ("hausa", "ha"),
+    ("hawaiian", "haw"),
+    ("hebrew", "he"),
+    ("hindi", "hi"),
+    ("hungarian", "hu"),
+    ("icelandic", "is"),
+    ("indonesian", "id"),
+    ("italian", "it"),
+    ("japanese", "ja"),
+    ("javanese", "jw"),
+    ("kannada", "kn"),
+    ("kazakh", "kk"),
+    ("khmer", "km"),
+    ("korean", "ko"),
+    ("lao", "lo"),
+    ("latin", "la"),
+    ("latvian", "lv"),
+    ("letzeburgesch", "lb"),
+    ("lingala", "ln"),
+    ("lithuanian", "lt"),
+    ("luxembourgish", "lb"),
+    ("macedonian", "mk"),
+    ("malagasy", "mg"),
+    ("malay", "ms"),
+    ("malayalam", "ml"),
+    ("maltese", "mt"),
+    ("maori", "mi"),
+    ("marathi", "mr"),
+    ("moldavian", "ro"),
+    ("moldovan", "ro"),
+    ("mongolian", "mn"),
+    ("myanmar", "my"),
+    ("nepali", "ne"),
+    ("norwegian", "no"),
+    ("nynorsk", "nn"),
+    ("occitan", "oc"),
+    ("panjabi", "pa"),
+    ("pashto", "ps"),
+    ("persian", "fa"),
+    ("polish", "pl"),
+    ("portuguese", "pt"),
+    ("punjabi", "pa"),
+    ("pushto", "ps"),
+    ("romanian", "ro"),
+    ("russian", "ru"),
+    ("sanskrit", "sa"),
+    ("serbian", "sr"),
+    ("shona", "sn"),
+    ("sindhi", "sd"),
+    ("sinhala", "si"),
+    ("sinhalese", "si"),
+    ("slovak", "sk"),
+    ("slovenian", "sl"),
+    ("somali", "so"),
+    ("spanish", "es"),
+    ("sundanese", "su"),
+    ("swahili", "sw"),
+    ("swedish", "sv"),
+    ("tagalog", "tl"),
+    ("tajik", "tg"),
+    ("tamil", "ta"),
+    ("tatar", "tt"),
+    ("telugu", "te"),
+    ("thai", "th"),
+    ("tibetan", "bo"),
+    ("turkish", "tr"),
+    ("turkmen", "tk"),
+    ("ukrainian", "uk"),
+    ("urdu", "ur"),
+    ("uzbek", "uz"),
+    ("valencian", "ca"),
+    ("vietnamese", "vi"),
+    ("welsh", "cy"),
+    ("yiddish", "yi"),
+    ("yoruba", "yo"),
+];
+
 pub fn normalize_audio_transcription_language(language: &str) -> String {
-    language
-        .split(['-', '_'])
-        .next()
-        .unwrap()
-        .to_ascii_lowercase()
+    let normalized = language.trim().to_ascii_lowercase();
+    let code_candidate = normalized.split(['-', '_']).next().unwrap_or_default();
+
+    if AUDIO_TRANSCRIPTION_LANGUAGE_CODES
+        .binary_search(&code_candidate)
+        .is_ok()
+    {
+        return code_candidate.to_string();
+    }
+
+    let alias_candidate = normalized
+        .replace(['-', '_'], " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    if let Ok(index) = AUDIO_TRANSCRIPTION_LANGUAGE_ALIASES
+        .binary_search_by(|entry| entry.0.cmp(&alias_candidate.as_str()))
+    {
+        return AUDIO_TRANSCRIPTION_LANGUAGE_ALIASES[index].1.to_string();
+    }
+
+    code_candidate.to_string()
 }
 
 fn is_supported_audio_transcription_language(language: &str) -> bool {
@@ -4193,7 +4325,7 @@ mod tests {
 
             let err = request.validate().unwrap_err();
             assert!(
-                err.contains("supported audio transcription language code"),
+                err.contains("supported Whisper language code or name"),
                 "got for {language}: {err}"
             );
         }
@@ -4201,7 +4333,21 @@ mod tests {
 
     #[test]
     fn test_audio_transcription_accepts_normalized_language_forms() {
-        for language in ["EN", "En", "en-US", "fr_CA", "yue", "haw", "jw"] {
+        for language in [
+            "EN",
+            "En",
+            "en-US",
+            "fr_CA",
+            "english",
+            "FRENCH",
+            "haitian creole",
+            "Haitian-Creole",
+            "cantonese",
+            "burmese",
+            "yue",
+            "haw",
+            "jw",
+        ] {
             let mut request = audio_transcription_req();
             request.language = Some(language.to_string());
 
@@ -4217,6 +4363,13 @@ mod tests {
         assert_eq!(normalize_audio_transcription_language("EN"), "en");
         assert_eq!(normalize_audio_transcription_language("en-US"), "en");
         assert_eq!(normalize_audio_transcription_language("fr_CA"), "fr");
+        assert_eq!(normalize_audio_transcription_language("english"), "en");
+        assert_eq!(
+            normalize_audio_transcription_language("haitian_creole"),
+            "ht"
+        );
+        assert_eq!(normalize_audio_transcription_language("cantonese"), "yue");
+        assert_eq!(normalize_audio_transcription_language("burmese"), "my");
         assert_eq!(normalize_audio_transcription_language("yue"), "yue");
     }
 
@@ -4226,6 +4379,25 @@ mod tests {
             assert!(
                 pair[0] < pair[1],
                 "language codes must stay sorted and unique"
+            );
+        }
+    }
+
+    #[test]
+    fn test_audio_transcription_language_aliases_are_sorted_and_supported() {
+        for pair in AUDIO_TRANSCRIPTION_LANGUAGE_ALIASES.windows(2) {
+            assert!(
+                pair[0].0 < pair[1].0,
+                "language aliases must stay sorted and unique"
+            );
+        }
+
+        for (_, code) in AUDIO_TRANSCRIPTION_LANGUAGE_ALIASES {
+            assert!(
+                AUDIO_TRANSCRIPTION_LANGUAGE_CODES
+                    .binary_search(code)
+                    .is_ok(),
+                "language alias code {code} must be supported"
             );
         }
     }

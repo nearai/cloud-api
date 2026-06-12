@@ -673,6 +673,22 @@ async fn ensure_chutes_catalog_row(
                     "Chutes model has an existing catalog row with attestation_supported=false; \
                      E2EE/signature handling may misbehave — fix via PATCH /v1/admin/models"
                 );
+            } else if existing.supported_sampling_parameters.is_empty()
+                && existing.supported_features.is_empty()
+            {
+                // This is the exact #781 (M1) bug state on a pre-existing row: both
+                // capability arrays are still the empty V0051 default, so
+                // `GET /v1/models` advertises the model as supporting *nothing* and
+                // OpenRouter-style routers won't route tool calls to it. New rows are
+                // seeded non-empty above; existing rows are backfilled by migration
+                // V0060. Warn in case a row predates the migration or was cleared.
+                tracing::warn!(
+                    model = %model_name,
+                    "Chutes model has an existing catalog row with EMPTY supported_features \
+                     and supported_sampling_parameters — OpenRouter-style routers will refuse \
+                     to route tool calls to it; backfilled by migration V0060, or set via \
+                     PATCH /v1/admin/models"
+                );
             } else {
                 tracing::info!(model = %model_name, "Chutes model already in catalog");
             }

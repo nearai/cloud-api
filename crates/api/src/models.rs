@@ -800,7 +800,7 @@ pub fn normalize_audio_transcription_language(language: &str) -> String {
         .join(" ");
 
     if let Ok(index) = AUDIO_TRANSCRIPTION_LANGUAGE_ALIASES
-        .binary_search_by(|entry| entry.0.cmp(&alias_candidate.as_str()))
+        .binary_search_by(|entry| entry.0.cmp(alias_candidate.as_str()))
     {
         return AUDIO_TRANSCRIPTION_LANGUAGE_ALIASES[index].1.to_string();
     }

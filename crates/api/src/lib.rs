@@ -633,6 +633,13 @@ pub(crate) const CHUTES_SUPPORTED_SAMPLING_PARAMS: &[&str] = &[
 /// => JSON `response_format`. Streaming is always supported but is not a member
 /// of OpenRouter's feature vocabulary, so it is not advertised here. Must remain
 /// a subset of `routes::admin::VALID_FEATURES`.
+///
+/// `tools` is a *default* assumption, not a universal guarantee: tool-calling in
+/// sglang is model-family specific (needs a compatible chat template + tool-call
+/// parser), so a family without it would be over-advertised here — the inverse of
+/// the empty-array bug. That risk is bounded because the seed lands INACTIVE: an
+/// operator must PATCH the row (and is warned to verify tool support, clearing
+/// `supported_features` if absent) before any traffic is served.
 pub(crate) const CHUTES_SUPPORTED_FEATURES: &[&str] = &["tools", "json_mode"];
 
 /// Ensure a Chutes (attested) model has a catalog row in the `models` table.
@@ -756,7 +763,11 @@ async fn ensure_chutes_catalog_row(
                         model = %model_name,
                         "Seeded Chutes catalog row as INACTIVE with zero pricing — set real \
                          per-token rates AND is_active=true via PATCH /v1/admin/models to serve \
-                         (kept inactive so paid traffic can't be billed at $0)"
+                         (kept inactive so paid traffic can't be billed at $0). The seed \
+                         advertises `tools`/`json_mode`: verify this model family actually \
+                         supports tool-calling in sglang (per-family parser + compatible chat \
+                         template) before activating, and clear `supported_features` via the \
+                         same PATCH if it doesn't"
                     );
                 }
                 Ok(None) => {

@@ -147,7 +147,7 @@ pub struct FunctionChoice {
 }
 
 /// Streaming options
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct StreamOptions {
     /// Whether to include usage statistics in the final chunk
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -156,6 +156,10 @@ pub struct StreamOptions {
     /// Whether to send incremental usage stats in every chunk (vLLM-specific)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub continuous_usage_stats: Option<bool>,
+
+    /// Provider-specific streaming options that should survive typed parsing.
+    #[serde(flatten)]
+    pub extra: std::collections::HashMap<String, serde_json::Value>,
 }
 
 /// Parameters for chat completion requests (matches OpenAI API)
@@ -425,8 +429,8 @@ pub struct ChatCompletionChunk {
     /// List of completion choices
     pub choices: Vec<ChatChoice>,
 
-    /// Usage statistics (typically only in final chunk)
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Usage statistics (typically only in final chunk). OpenAI-compatible
+    /// streaming chunks carry this as `null` until final usage is available.
     pub usage: Option<TokenUsage>,
 
     /// Token IDs for the prompt (typically only in first chunk)

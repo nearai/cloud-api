@@ -1,6 +1,6 @@
 use crate::{middleware::AuthenticatedUser, models::*};
 use inference_providers::{
-    ChatCompletionParams, ChatMessage, FinishReason, MessageRole, TokenUsage,
+    ChatCompletionParams, ChatMessage, FinishReason, MessageRole, StreamOptions, TokenUsage,
 };
 use services::completions::CompletionError;
 
@@ -86,9 +86,17 @@ impl From<ChatCompletionRequest> for ChatCompletionParams {
             serde_json::from_value::<Vec<inference_providers::ToolDefinition>>(v.clone()).ok()
         });
 
+        let stream_options = req
+            .extra
+            .get("stream_options")
+            .and_then(|v| serde_json::from_value::<StreamOptions>(v.clone()).ok());
+
         let mut extra = req.extra;
         extra.remove("modalities");
         extra.remove("tools");
+        if stream_options.is_some() {
+            extra.remove("stream_options");
+        }
 
         Self {
             model: req.model,
@@ -112,7 +120,7 @@ impl From<ChatCompletionRequest> for ChatCompletionParams {
             parallel_tool_calls: None,
             metadata: None,
             store: None,
-            stream_options: None,
+            stream_options,
             modalities,
             extra,
         }
@@ -893,6 +901,16 @@ mod tests {
 
     #[test]
     fn test_chat_completion_request_conversion() {
+        let mut extra = HashMap::new();
+        extra.insert(
+            "stream_options".to_string(),
+            serde_json::json!({
+                "include_usage": true,
+                "future_vendor_option": "preserved"
+            }),
+        );
+        extra.insert("custom".to_string(), serde_json::json!("kept"));
+
         let http_req = ChatCompletionRequest {
             model: "gpt-3.5-turbo".to_string(),
             messages: vec![crate::models::Message {
@@ -912,7 +930,7 @@ mod tests {
             stop: Some(crate::models::StopSequences::Many(vec!["\\n".to_string()])),
             presence_penalty: None,
             frequency_penalty: None,
-            extra: HashMap::new(),
+            extra,
         };
 
         let domain_params: ChatCompletionParams = http_req.into();
@@ -921,6 +939,69 @@ mod tests {
         assert_eq!(domain_params.max_tokens, Some(100));
         assert_eq!(domain_params.temperature, Some(0.7));
         assert_eq!(domain_params.stop, Some(vec!["\\n".to_string()]));
+        assert_eq!(
+            domain_params
+                .stream_options
+                .as_ref()
+                .and_then(|stream_options| stream_options.include_usage),
+            Some(true)
+        );
+        assert_eq!(
+            domain_params
+                .stream_options
+                .as_ref()
+                .and_then(|stream_options| stream_options.extra.get("future_vendor_option")),
+            Some(&serde_json::json!("preserved"))
+        );
+        assert!(
+            !domain_params.extra.contains_key("stream_options"),
+            "typed stream_options should not be duplicated in flattened extra"
+        );
+        assert_eq!(
+            domain_params.extra.get("custom"),
+            Some(&serde_json::json!("kept"))
+        );
+
+        let wire = serde_json::to_value(&domain_params).unwrap();
+        assert_eq!(
+            wire["stream_options"]["future_vendor_option"],
+            serde_json::json!("preserved")
+        );
+    }
+
+    #[test]
+    fn malformed_stream_options_remain_in_extra() {
+        let mut extra = HashMap::new();
+        extra.insert("stream_options".to_string(), serde_json::json!("bad"));
+
+        let http_req = ChatCompletionRequest {
+            model: "gpt-3.5-turbo".to_string(),
+            messages: vec![crate::models::Message {
+                role: "user".to_string(),
+                content: Some(crate::models::MessageContent::Text(
+                    "Test message".to_string(),
+                )),
+                name: None,
+                tool_call_id: None,
+                tool_calls: None,
+            }],
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            n: None,
+            stream: Some(true),
+            stop: None,
+            presence_penalty: None,
+            frequency_penalty: None,
+            extra,
+        };
+
+        let domain_params: ChatCompletionParams = http_req.into();
+        assert!(domain_params.stream_options.is_none());
+        assert_eq!(
+            domain_params.extra.get("stream_options"),
+            Some(&serde_json::json!("bad"))
+        );
     }
 
     #[test]

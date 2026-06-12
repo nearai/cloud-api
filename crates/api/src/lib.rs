@@ -716,13 +716,15 @@ async fn ensure_chutes_catalog_row(
                 supported_sampling_parameters: Some(
                     CHUTES_SUPPORTED_SAMPLING_PARAMS
                         .iter()
-                        .map(|s| s.to_string())
+                        .copied()
+                        .map(String::from)
                         .collect(),
                 ),
                 supported_features: Some(
                     CHUTES_SUPPORTED_FEATURES
                         .iter()
-                        .map(|s| s.to_string())
+                        .copied()
+                        .map(String::from)
                         .collect(),
                 ),
                 // Pricing left None -> defaults to 0 on INSERT. The inactive seed

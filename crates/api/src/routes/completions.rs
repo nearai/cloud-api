@@ -7,12 +7,13 @@ use crate::{
             alias_warning_message, inject_warning_field, map_domain_error_to_status,
             no_aliasing_requested, HEADER_MODEL_ALIAS_RESOLVED, HEADER_NO_ALIASING,
         },
+        extractors::OpenAiJson,
         files::MAX_FILE_SIZE,
     },
 };
 use axum::{
     body::{Body, Bytes},
-    extract::{Extension, Json, Multipart, State},
+    extract::{Extension, Multipart, State},
     http::{header, StatusCode},
     response::{IntoResponse, Json as ResponseJson, Response},
 };
@@ -1088,7 +1089,7 @@ pub async fn chat_completions(
     Extension(api_key): Extension<AuthenticatedApiKey>,
     Extension(body_hash): Extension<RequestBodyHash>,
     headers: header::HeaderMap,
-    Json(request): Json<ChatCompletionRequest>,
+    OpenAiJson(request): OpenAiJson<ChatCompletionRequest>,
 ) -> axum::response::Response {
     debug!(
         "Chat completions request from api key: {:?}",
@@ -1685,7 +1686,7 @@ pub async fn completions(
     Extension(api_key): Extension<AuthenticatedApiKey>,
     Extension(body_hash): Extension<RequestBodyHash>,
     headers: header::HeaderMap,
-    Json(request): Json<CompletionRequest>,
+    OpenAiJson(request): OpenAiJson<CompletionRequest>,
 ) -> axum::response::Response {
     debug!(
         "Text completions request from api key: {:?}",
@@ -3129,7 +3130,7 @@ pub async fn image_generations(
     Extension(api_key): Extension<AuthenticatedApiKey>,
     Extension(body_hash): Extension<RequestBodyHash>,
     headers: header::HeaderMap,
-    Json(request): Json<crate::models::ImageGenerationRequest>,
+    OpenAiJson(request): OpenAiJson<crate::models::ImageGenerationRequest>,
 ) -> axum::response::Response {
     debug!(
         "Image generation request from api key: {:?}",
@@ -4220,7 +4221,7 @@ pub async fn rerank(
     Extension(api_key): Extension<AuthenticatedApiKey>,
     Extension(_body_hash): Extension<RequestBodyHash>,
     headers: header::HeaderMap,
-    Json(request): Json<crate::models::RerankRequest>,
+    OpenAiJson(request): OpenAiJson<crate::models::RerankRequest>,
 ) -> axum::response::Response {
     debug!(
         "Rerank request: model={}, org={}, workspace={}",
@@ -5659,7 +5660,7 @@ pub async fn score(
     Extension(api_key): Extension<AuthenticatedApiKey>,
     Extension(body_hash): Extension<RequestBodyHash>,
     headers: header::HeaderMap,
-    Json(request): Json<crate::models::ScoreRequest>,
+    OpenAiJson(request): OpenAiJson<crate::models::ScoreRequest>,
 ) -> axum::response::Response {
     debug!(
         "Score request: model={}, org={}, workspace={}",

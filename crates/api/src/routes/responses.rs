@@ -2,10 +2,11 @@ use crate::{
     middleware::{auth::AuthenticatedApiKey, RequestBodyHash},
     models::{ErrorResponse, ResponseInputItemList},
     routes::common::{HEADER_SHOULD_RETRY, SHOULD_RETRY_FALSE},
+    routes::extractors::OpenAiJson,
 };
 use axum::{
     body::Body,
-    extract::{Extension, Json, Path, Query, State},
+    extract::{Extension, Path, Query, State},
     http::{header, HeaderMap, Response, StatusCode},
     response::{IntoResponse, Json as ResponseJson},
 };
@@ -242,7 +243,7 @@ pub async fn create_response(
     Extension(api_key): Extension<AuthenticatedApiKey>,
     Extension(body_hash): Extension<RequestBodyHash>,
     headers: HeaderMap,
-    Json(mut request): Json<CreateResponseRequest>,
+    OpenAiJson(mut request): OpenAiJson<CreateResponseRequest>,
 ) -> axum::response::Response {
     let service = state.response_service.clone();
     let attestation_service = state.attestation_service.clone();

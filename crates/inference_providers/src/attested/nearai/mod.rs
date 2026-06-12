@@ -1769,8 +1769,9 @@ impl InferenceProvider for Fleet {
         }
 
         if let Some(granularities) = params.timestamp_granularities {
-            // Send as JSON array string
-            form = form.text("timestamp_granularities[]", granularities.join(","));
+            for granularity in granularities {
+                form = form.text("timestamp_granularities[]", granularity);
+            }
         }
 
         // Build headers (no Content-Type - reqwest sets it automatically for multipart)
@@ -2204,6 +2205,8 @@ impl InferenceProvider for Provider {
 mod tests {
     use super::*;
     use serial_test::serial;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn control_event(raw: &'static str) -> SSEEvent {
         SSEEvent {
@@ -2272,6 +2275,56 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    fn audio_transcription_params() -> AudioTranscriptionParams {
+        AudioTranscriptionParams {
+            model: "openai/whisper-large-v3".to_string(),
+            file_bytes: vec![1, 2, 3],
+            filename: "audio.mp3".to_string(),
+            language: Some("en".to_string()),
+            response_format: Some("verbose_json".to_string()),
+            temperature: None,
+            timestamp_granularities: Some(vec!["word".to_string(), "segment".to_string()]),
+            extra: Default::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn audio_transcription_sends_repeated_timestamp_granularity_fields() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/audio/transcriptions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "text": "ok",
+                "duration": 1.0,
+                "words": [{"word": "ok", "start": 0.0, "end": 1.0}]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let provider = Provider::new(Config::new(
+            server.uri(),
+            Some("sk-test".to_string()),
+            Some(5),
+        ));
+
+        let response = provider
+            .audio_transcription(audio_transcription_params(), "request-hash".to_string())
+            .await
+            .unwrap();
+
+        assert_eq!(response.text, "ok");
+        let requests = server.received_requests().await.unwrap();
+        let body = String::from_utf8_lossy(&requests[0].body);
+        assert_eq!(
+            body.matches("name=\"timestamp_granularities[]\"").count(),
+            2
+        );
+        assert!(body.contains("\r\nword\r\n"), "body was: {body}");
+        assert!(body.contains("\r\nsegment\r\n"), "body was: {body}");
+        assert!(!body.contains("word,segment"), "body was: {body}");
     }
 
     /// Happy path: first payload is a parsed data chunk — no rotation, and

@@ -491,9 +491,15 @@ pub struct AudioTranscriptionRequestSchema {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub language: Option<String>,
 
-    /// Response format (optional) - one of: "json", "text", "srt", "verbose_json", "vtt"
+    /// Response format (optional) - one of: "json", "text", "verbose_json"
     #[serde(skip_serializing_if = "Option::is_none")]
     pub response_format: Option<String>,
+
+    /// Timestamp granularities (optional) - supports "segment" and "word" with verbose_json.
+    /// Multipart requests may send repeated timestamp_granularities[] fields,
+    /// repeated timestamp_granularities fields, or comma-separated values.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timestamp_granularities: Option<Vec<String>>,
 }
 
 /// Audio transcription request (internal runtime struct)
@@ -515,7 +521,7 @@ pub struct AudioTranscriptionRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub language: Option<String>,
 
-    /// Response format: "json", "text", "srt", "verbose_json", "vtt"
+    /// Response format: "json", "text", "verbose_json"
     #[serde(skip_serializing_if = "Option::is_none")]
     pub response_format: Option<String>,
 
@@ -523,7 +529,9 @@ pub struct AudioTranscriptionRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f32>,
 
-    /// Timestamp granularities: "word", "segment"
+    /// Timestamp granularities: "word", "segment". Parsed from repeated
+    /// timestamp_granularities[] fields, repeated timestamp_granularities
+    /// fields, or comma-separated values.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timestamp_granularities: Option<Vec<String>>,
 }
@@ -596,19 +604,215 @@ impl AudioTranscriptionRequest {
             }
         }
 
+        if let Some(language) = &self.language {
+            if !is_supported_audio_transcription_language(language) {
+                return Err(
+                    "language must be a supported Whisper language code or name (e.g. en, english, yue)".to_string(),
+                );
+            }
+        }
+
         // Validate response_format if provided
         if let Some(format) = &self.response_format {
-            let valid_formats = ["json", "text", "srt", "verbose_json", "vtt"];
-            if !valid_formats.contains(&format.as_str()) {
+            if matches!(format.as_str(), "srt" | "vtt") {
                 return Err(format!(
-                    "Invalid response_format. Must be one of: {}",
-                    valid_formats.join(", ")
+                    "response_format '{}' is not currently supported. Supported response_format values are: json, text, verbose_json",
+                    format
                 ));
+            }
+
+            let supported_formats = ["json", "text", "verbose_json"];
+            if !supported_formats.contains(&format.as_str()) {
+                return Err(format!(
+                    "Invalid response_format. Supported response_format values are: {}",
+                    supported_formats.join(", ")
+                ));
+            }
+        }
+
+        if let Some(granularities) = &self.timestamp_granularities {
+            if self.response_format.as_deref() != Some("verbose_json") {
+                return Err(
+                    "timestamp_granularities requires response_format=verbose_json".to_string(),
+                );
+            }
+
+            if granularities.is_empty() {
+                return Err("timestamp_granularities must not be empty".to_string());
+            }
+
+            for granularity in granularities {
+                match granularity.as_str() {
+                    "segment" | "word" => {}
+                    _ => {
+                        return Err(
+                            "Invalid timestamp_granularities. Must be one of: segment, word"
+                                .to_string(),
+                        );
+                    }
+                }
             }
         }
 
         Ok(())
     }
+}
+
+const AUDIO_TRANSCRIPTION_LANGUAGE_CODES: &[&str] = &[
+    "af", "am", "ar", "as", "az", "ba", "be", "bg", "bn", "bo", "br", "bs", "ca", "cs", "cy", "da",
+    "de", "el", "en", "es", "et", "eu", "fa", "fi", "fo", "fr", "gl", "gu", "ha", "haw", "he",
+    "hi", "hr", "ht", "hu", "hy", "id", "is", "it", "ja", "jw", "ka", "kk", "km", "kn", "ko", "la",
+    "lb", "ln", "lo", "lt", "lv", "mg", "mi", "mk", "ml", "mn", "mr", "ms", "mt", "my", "ne", "nl",
+    "nn", "no", "oc", "pa", "pl", "ps", "pt", "ro", "ru", "sa", "sd", "si", "sk", "sl", "sn", "so",
+    "sq", "sr", "su", "sv", "sw", "ta", "te", "tg", "th", "tk", "tl", "tr", "tt", "uk", "ur", "uz",
+    "vi", "yi", "yo", "yue", "zh",
+];
+
+const AUDIO_TRANSCRIPTION_LANGUAGE_ALIASES: &[(&str, &str)] = &[
+    ("afrikaans", "af"),
+    ("albanian", "sq"),
+    ("amharic", "am"),
+    ("arabic", "ar"),
+    ("armenian", "hy"),
+    ("assamese", "as"),
+    ("azerbaijani", "az"),
+    ("bashkir", "ba"),
+    ("basque", "eu"),
+    ("belarusian", "be"),
+    ("bengali", "bn"),
+    ("bosnian", "bs"),
+    ("breton", "br"),
+    ("bulgarian", "bg"),
+    ("burmese", "my"),
+    ("cantonese", "yue"),
+    ("castilian", "es"),
+    ("catalan", "ca"),
+    ("chinese", "zh"),
+    ("croatian", "hr"),
+    ("czech", "cs"),
+    ("danish", "da"),
+    ("dutch", "nl"),
+    ("english", "en"),
+    ("estonian", "et"),
+    ("faroese", "fo"),
+    ("finnish", "fi"),
+    ("flemish", "nl"),
+    ("french", "fr"),
+    ("galician", "gl"),
+    ("georgian", "ka"),
+    ("german", "de"),
+    ("greek", "el"),
+    ("gujarati", "gu"),
+    ("haitian", "ht"),
+    ("haitian creole", "ht"),
+    ("hausa", "ha"),
+    ("hawaiian", "haw"),
+    ("hebrew", "he"),
+    ("hindi", "hi"),
+    ("hungarian", "hu"),
+    ("icelandic", "is"),
+    ("indonesian", "id"),
+    ("italian", "it"),
+    ("japanese", "ja"),
+    ("javanese", "jw"),
+    ("kannada", "kn"),
+    ("kazakh", "kk"),
+    ("khmer", "km"),
+    ("korean", "ko"),
+    ("lao", "lo"),
+    ("latin", "la"),
+    ("latvian", "lv"),
+    ("letzeburgesch", "lb"),
+    ("lingala", "ln"),
+    ("lithuanian", "lt"),
+    ("luxembourgish", "lb"),
+    ("macedonian", "mk"),
+    ("malagasy", "mg"),
+    ("malay", "ms"),
+    ("malayalam", "ml"),
+    ("maltese", "mt"),
+    ("maori", "mi"),
+    ("marathi", "mr"),
+    ("moldavian", "ro"),
+    ("moldovan", "ro"),
+    ("mongolian", "mn"),
+    ("myanmar", "my"),
+    ("nepali", "ne"),
+    ("norwegian", "no"),
+    ("nynorsk", "nn"),
+    ("occitan", "oc"),
+    ("panjabi", "pa"),
+    ("pashto", "ps"),
+    ("persian", "fa"),
+    ("polish", "pl"),
+    ("portuguese", "pt"),
+    ("punjabi", "pa"),
+    ("pushto", "ps"),
+    ("romanian", "ro"),
+    ("russian", "ru"),
+    ("sanskrit", "sa"),
+    ("serbian", "sr"),
+    ("shona", "sn"),
+    ("sindhi", "sd"),
+    ("sinhala", "si"),
+    ("sinhalese", "si"),
+    ("slovak", "sk"),
+    ("slovenian", "sl"),
+    ("somali", "so"),
+    ("spanish", "es"),
+    ("sundanese", "su"),
+    ("swahili", "sw"),
+    ("swedish", "sv"),
+    ("tagalog", "tl"),
+    ("tajik", "tg"),
+    ("tamil", "ta"),
+    ("tatar", "tt"),
+    ("telugu", "te"),
+    ("thai", "th"),
+    ("tibetan", "bo"),
+    ("turkish", "tr"),
+    ("turkmen", "tk"),
+    ("ukrainian", "uk"),
+    ("urdu", "ur"),
+    ("uzbek", "uz"),
+    ("valencian", "ca"),
+    ("vietnamese", "vi"),
+    ("welsh", "cy"),
+    ("yiddish", "yi"),
+    ("yoruba", "yo"),
+];
+
+pub fn normalize_audio_transcription_language(language: &str) -> String {
+    let normalized = language.trim().to_ascii_lowercase();
+    let code_candidate = normalized.split(['-', '_']).next().unwrap_or_default();
+
+    if AUDIO_TRANSCRIPTION_LANGUAGE_CODES
+        .binary_search(&code_candidate)
+        .is_ok()
+    {
+        return code_candidate.to_string();
+    }
+
+    let alias_candidate = normalized
+        .replace(['-', '_'], " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    if let Ok(index) = AUDIO_TRANSCRIPTION_LANGUAGE_ALIASES
+        .binary_search_by(|entry| entry.0.cmp(alias_candidate.as_str()))
+    {
+        return AUDIO_TRANSCRIPTION_LANGUAGE_ALIASES[index].1.to_string();
+    }
+
+    code_candidate.to_string()
+}
+
+fn is_supported_audio_transcription_language(language: &str) -> bool {
+    let normalized_language = normalize_audio_transcription_language(language);
+    AUDIO_TRANSCRIPTION_LANGUAGE_CODES
+        .binary_search(&normalized_language.as_str())
+        .is_ok()
 }
 
 // ========== Rerank Models ==========
@@ -692,6 +896,52 @@ pub struct AudioTranscriptionResponse {
     /// Word-level timing information
     #[serde(skip_serializing_if = "Option::is_none")]
     pub words: Option<Vec<TranscriptionWord>>,
+}
+
+impl From<inference_providers::AudioTranscriptionResponse> for AudioTranscriptionResponse {
+    fn from(response: inference_providers::AudioTranscriptionResponse) -> Self {
+        Self {
+            text: response.text,
+            duration: response.duration,
+            language: response.language,
+            segments: response.segments.map(|segments| {
+                segments
+                    .into_iter()
+                    .map(TranscriptionSegment::from)
+                    .collect()
+            }),
+            words: response
+                .words
+                .map(|words| words.into_iter().map(TranscriptionWord::from).collect()),
+        }
+    }
+}
+
+impl From<inference_providers::TranscriptionSegment> for TranscriptionSegment {
+    fn from(segment: inference_providers::TranscriptionSegment) -> Self {
+        Self {
+            id: segment.id,
+            seek: segment.seek,
+            start: segment.start,
+            end: segment.end,
+            text: segment.text,
+            tokens: segment.tokens,
+            temperature: segment.temperature,
+            avg_logprob: segment.avg_logprob,
+            compression_ratio: segment.compression_ratio,
+            no_speech_prob: segment.no_speech_prob,
+        }
+    }
+}
+
+impl From<inference_providers::TranscriptionWord> for TranscriptionWord {
+    fn from(word: inference_providers::TranscriptionWord) -> Self {
+        Self {
+            word: word.word,
+            start: word.start,
+            end: word.end,
+        }
+    }
 }
 
 /// Transcription segment with optional metadata fields
@@ -1056,7 +1306,61 @@ use crate::consts::{
 };
 use crate::routes::common::{validate_max_length, validate_non_empty_field};
 
+/// Reject `max_tokens` values the OpenAI API requires to be `>= 1`.
+///
+/// `None` (unset) is valid. Negative or zero values are rejected with a 400
+/// `invalid_request_error` carrying `param: "max_tokens"` instead of falling
+/// through to upstream and surfacing as a masked 502 (nearai/cloud-api #786).
+fn validate_max_tokens(max_tokens: Option<i64>) -> Result<(), ErrorResponse> {
+    if let Some(value) = max_tokens {
+        if value < 1 {
+            return Err(ErrorResponse::with_param(
+                "max_tokens must be at least 1".to_string(),
+                "invalid_request_error".to_string(),
+                "max_tokens".to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Reject `n` values below 1. `None` (unset) is valid.
+fn validate_n(n: Option<i64>) -> Result<(), ErrorResponse> {
+    if let Some(value) = n {
+        if value < 1 {
+            return Err(ErrorResponse::with_param(
+                "n must be at least 1".to_string(),
+                "invalid_request_error".to_string(),
+                "n".to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
 impl ChatCompletionRequest {
+    /// Pre-flight validation that returns a ready-to-serialize OpenAI error
+    /// envelope (`{error:{message,type,param,code}}`) on failure.
+    ///
+    /// This wraps the message-only [`Self::validate`] (temperature/top_p/stop/
+    /// logprobs) and adds the param-bearing sampling checks (`max_tokens`, `n`)
+    /// that would otherwise fall through to upstream and surface as a masked
+    /// 502 instead of a 4xx (nearai/cloud-api #786). All checks reject only
+    /// genuinely-invalid values; valid requests are untouched.
+    ///
+    /// NOTE: context-length validation is intentionally NOT performed here.
+    /// cloud-api has no per-model tokenizer, so the prompt token count is not
+    /// cleanly knowable pre-dispatch; a character-based estimate would risk
+    /// rejecting valid requests. Over-length prompts are still rejected by the
+    /// upstream provider.
+    pub fn validate_request(&self) -> Result<(), ErrorResponse> {
+        self.validate()
+            .map_err(|message| ErrorResponse::new(message, "invalid_request_error".to_string()))?;
+        validate_max_tokens(self.max_tokens)?;
+        validate_n(self.n)?;
+        Ok(())
+    }
+
     pub fn validate(&self) -> Result<(), String> {
         if self.model.is_empty() {
             return Err("model is required".to_string());
@@ -1161,6 +1465,18 @@ impl ChatCompletionRequest {
 }
 
 impl CompletionRequest {
+    /// Pre-flight validation returning a ready-to-serialize OpenAI error
+    /// envelope on failure. See [`ChatCompletionRequest::validate_request`] for
+    /// the rationale (nearai/cloud-api #786); context-length is likewise
+    /// skipped (no pre-dispatch tokenizer).
+    pub fn validate_request(&self) -> Result<(), ErrorResponse> {
+        self.validate()
+            .map_err(|message| ErrorResponse::new(message, "invalid_request_error".to_string()))?;
+        validate_max_tokens(self.max_tokens)?;
+        validate_n(self.n)?;
+        Ok(())
+    }
+
     pub fn validate(&self) -> Result<(), String> {
         if self.model.is_empty() {
             return Err("model is required".to_string());
@@ -4341,6 +4657,116 @@ mod tests {
         assert!(request.validate().is_ok());
     }
 
+    // ── max_tokens / n pre-flight validation (nearai/cloud-api #786) ──
+
+    /// Build a minimal valid chat request, overriding `max_tokens` and `n`.
+    fn chat_req(max_tokens: Option<i64>, n: Option<i64>) -> ChatCompletionRequest {
+        ChatCompletionRequest {
+            model: "gpt-4".to_string(),
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: Some(MessageContent::Text("hi".to_string())),
+                name: None,
+                tool_call_id: None,
+                tool_calls: None,
+            }],
+            max_tokens,
+            temperature: None,
+            top_p: None,
+            n,
+            stream: None,
+            stop: None,
+            presence_penalty: None,
+            frequency_penalty: None,
+            extra: std::collections::HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn chat_validate_request_accepts_valid_sampling_params() {
+        // Unset, and positive, max_tokens/n all pass.
+        assert!(chat_req(None, None).validate_request().is_ok());
+        assert!(chat_req(Some(1), Some(1)).validate_request().is_ok());
+        assert!(chat_req(Some(4096), Some(3)).validate_request().is_ok());
+    }
+
+    #[test]
+    fn chat_validate_request_rejects_non_positive_max_tokens() {
+        for bad in [-5, 0] {
+            let err = chat_req(Some(bad), None)
+                .validate_request()
+                .expect_err("non-positive max_tokens must be rejected")
+                .error;
+            assert_eq!(err.r#type, "invalid_request_error");
+            assert_eq!(err.param.as_deref(), Some("max_tokens"));
+            assert_eq!(err.message, "max_tokens must be at least 1");
+        }
+    }
+
+    #[test]
+    fn chat_validate_request_rejects_n_below_one() {
+        for bad in [-1, 0] {
+            let err = chat_req(None, Some(bad))
+                .validate_request()
+                .expect_err("n < 1 must be rejected")
+                .error;
+            assert_eq!(err.r#type, "invalid_request_error");
+            assert_eq!(err.param.as_deref(), Some("n"));
+            assert_eq!(err.message, "n must be at least 1");
+        }
+    }
+
+    #[test]
+    fn chat_validate_request_still_enforces_existing_checks() {
+        // temperature out of range still surfaces (no param, matching the
+        // pre-existing message-only path) and as invalid_request_error.
+        let mut req = chat_req(Some(100), Some(1));
+        req.temperature = Some(5.0);
+        let err = req
+            .validate_request()
+            .expect_err("out-of-range temperature must be rejected")
+            .error;
+        assert_eq!(err.r#type, "invalid_request_error");
+        assert_eq!(err.message, "temperature must be between 0 and 2");
+    }
+
+    #[test]
+    fn completion_validate_request_rejects_invalid_sampling_params() {
+        let base = || CompletionRequest {
+            model: "gpt-4".to_string(),
+            prompt: CompletionPrompt::Text("hi".to_string()),
+            max_tokens: Some(16),
+            temperature: None,
+            top_p: None,
+            n: Some(1),
+            stream: None,
+            logprobs: None,
+            echo: None,
+            stop: None,
+            presence_penalty: None,
+            frequency_penalty: None,
+            best_of: None,
+            extra: std::collections::HashMap::new(),
+        };
+
+        // Valid passes.
+        assert!(base().validate_request().is_ok());
+
+        // max_tokens <= 0 rejected with param.
+        let mut bad = base();
+        bad.max_tokens = Some(-5);
+        let err = bad.validate_request().expect_err("negative").error;
+        assert_eq!(err.param.as_deref(), Some("max_tokens"));
+        assert_eq!(err.r#type, "invalid_request_error");
+
+        // n: 0 rejected with param.
+        let mut bad = base();
+        bad.n = Some(0);
+        let err = bad.validate_request().expect_err("n zero").error;
+        assert_eq!(err.param.as_deref(), Some("n"));
+        assert_eq!(err.r#type, "invalid_request_error");
+    }
+
     #[test]
     fn test_is_basic_valid_email_accepts_simple_email() {
         assert!(is_basic_valid_email("user@example.com"));
@@ -4349,6 +4775,158 @@ mod tests {
     #[test]
     fn test_is_basic_valid_email_rejects_multiple_ats() {
         assert!(!is_basic_valid_email("user@domain@example.com"));
+    }
+
+    fn audio_transcription_req() -> AudioTranscriptionRequest {
+        AudioTranscriptionRequest {
+            model: "openai/whisper-large-v3".to_string(),
+            file_bytes: vec![1, 2, 3],
+            filename: "audio.mp3".to_string(),
+            language: None,
+            response_format: None,
+            temperature: None,
+            timestamp_granularities: None,
+        }
+    }
+
+    #[test]
+    fn test_audio_transcription_text_response_format_validates() {
+        let mut request = audio_transcription_req();
+        request.response_format = Some("text".to_string());
+
+        assert!(request.validate().is_ok());
+    }
+
+    #[test]
+    fn test_audio_transcription_rejects_unsupported_subtitle_formats() {
+        for format in ["srt", "vtt"] {
+            let mut request = audio_transcription_req();
+            request.response_format = Some(format.to_string());
+
+            let err = request.validate().unwrap_err();
+            assert!(err.contains("not currently supported"), "got: {err}");
+        }
+    }
+
+    #[test]
+    fn test_audio_transcription_accepts_word_timestamp_granularity() {
+        let mut request = audio_transcription_req();
+        request.response_format = Some("verbose_json".to_string());
+        request.timestamp_granularities = Some(vec!["word".to_string()]);
+
+        assert!(request.validate().is_ok());
+    }
+
+    #[test]
+    fn test_audio_transcription_requires_verbose_json_for_timestamp_granularity() {
+        let mut request = audio_transcription_req();
+        request.timestamp_granularities = Some(vec!["segment".to_string()]);
+
+        let err = request.validate().unwrap_err();
+        assert!(err.contains("response_format=verbose_json"), "got: {err}");
+    }
+
+    #[test]
+    fn test_audio_transcription_rejects_invalid_language() {
+        for language in ["xx", "aa", "kj", "nv"] {
+            let mut request = audio_transcription_req();
+            request.language = Some(language.to_string());
+
+            let err = request.validate().unwrap_err();
+            assert!(
+                err.contains("supported Whisper language code or name"),
+                "got for {language}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_audio_transcription_accepts_normalized_language_forms() {
+        for language in [
+            "EN",
+            "En",
+            "en-US",
+            "fr_CA",
+            "english",
+            "FRENCH",
+            "haitian creole",
+            "Haitian-Creole",
+            "cantonese",
+            "burmese",
+            "yue",
+            "haw",
+            "jw",
+        ] {
+            let mut request = audio_transcription_req();
+            request.language = Some(language.to_string());
+
+            assert!(
+                request.validate().is_ok(),
+                "expected language {language} to pass validation"
+            );
+        }
+    }
+
+    #[test]
+    fn test_normalize_audio_transcription_language() {
+        assert_eq!(normalize_audio_transcription_language("EN"), "en");
+        assert_eq!(normalize_audio_transcription_language("en-US"), "en");
+        assert_eq!(normalize_audio_transcription_language("fr_CA"), "fr");
+        assert_eq!(normalize_audio_transcription_language("english"), "en");
+        assert_eq!(
+            normalize_audio_transcription_language("haitian_creole"),
+            "ht"
+        );
+        assert_eq!(normalize_audio_transcription_language("cantonese"), "yue");
+        assert_eq!(normalize_audio_transcription_language("burmese"), "my");
+        assert_eq!(normalize_audio_transcription_language("yue"), "yue");
+    }
+
+    #[test]
+    fn test_audio_transcription_language_codes_are_sorted_and_unique() {
+        for pair in AUDIO_TRANSCRIPTION_LANGUAGE_CODES.windows(2) {
+            assert!(
+                pair[0] < pair[1],
+                "language codes must stay sorted and unique"
+            );
+        }
+    }
+
+    #[test]
+    fn test_audio_transcription_language_aliases_are_sorted_and_supported() {
+        for pair in AUDIO_TRANSCRIPTION_LANGUAGE_ALIASES.windows(2) {
+            assert!(
+                pair[0].0 < pair[1].0,
+                "language aliases must stay sorted and unique"
+            );
+        }
+
+        for (_, code) in AUDIO_TRANSCRIPTION_LANGUAGE_ALIASES {
+            assert!(
+                AUDIO_TRANSCRIPTION_LANGUAGE_CODES
+                    .binary_search(code)
+                    .is_ok(),
+                "language alias code {code} must be supported"
+            );
+        }
+    }
+
+    #[test]
+    fn test_audio_transcription_response_conversion_omits_provider_id() {
+        let provider_response = inference_providers::AudioTranscriptionResponse {
+            text: "hello".to_string(),
+            duration: Some(1.0),
+            language: Some("en".to_string()),
+            segments: None,
+            words: None,
+            id: Some("trans-internal".to_string()),
+        };
+
+        let response = AudioTranscriptionResponse::from(provider_response);
+        let value = serde_json::to_value(response).unwrap();
+
+        assert!(value.get("id").is_none());
+        assert_eq!(value["text"], "hello");
     }
 
     // ── ImageGenerationRequest size validation ──

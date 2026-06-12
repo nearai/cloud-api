@@ -1012,7 +1012,7 @@ pub struct AudioTranscriptionParams {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub language: Option<String>,
 
-    /// Response format: "json", "text", "srt", "verbose_json", "vtt"
+    /// Response format: "json", "text", "verbose_json"
     #[serde(skip_serializing_if = "Option::is_none")]
     pub response_format: Option<String>,
 

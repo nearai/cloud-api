@@ -80,12 +80,12 @@ use tokio_stream::StreamExt;
 // Re-export commonly used types for convenience
 pub use mock::MockProvider;
 pub use models::{
-    AudioOutput, AudioTranscriptionError, AudioTranscriptionParams, AudioTranscriptionResponse,
-    ChatCompletionParams, ChatCompletionResponse, ChatCompletionResponseChoice,
-    ChatCompletionResponseWithBytes, ChatDelta, ChatMessage, ChatResponseMessage, ChatSignature,
-    CompletionError, CompletionParams, EmbeddingError, FinishReason, FunctionChoice,
-    FunctionDefinition, ImageData, ImageEditError, ImageEditParams, ImageEditResponse,
-    ImageEditResponseWithBytes, ImageGenerationError, ImageGenerationParams,
+    is_client_audio_input_status, AudioOutput, AudioTranscriptionError, AudioTranscriptionParams,
+    AudioTranscriptionResponse, ChatCompletionParams, ChatCompletionResponse,
+    ChatCompletionResponseChoice, ChatCompletionResponseWithBytes, ChatDelta, ChatMessage,
+    ChatResponseMessage, ChatSignature, CompletionError, CompletionParams, EmbeddingError,
+    FinishReason, FunctionChoice, FunctionDefinition, ImageData, ImageEditError, ImageEditParams,
+    ImageEditResponse, ImageEditResponseWithBytes, ImageGenerationError, ImageGenerationParams,
     ImageGenerationResponse, ImageGenerationResponseWithBytes, MessageRole, ModelInfo,
     PrivacyClassifyError, RerankError, RerankParams, RerankResponse, RerankResult, RerankUsage,
     ScoreError, ScoreParams, ScoreResponse, ScoreResult, ScoreUsage, StreamChunk, StreamOptions,

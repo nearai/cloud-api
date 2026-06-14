@@ -750,3 +750,55 @@ async fn test_audio_transcription_provider_5xx_stays_server_error() {
     let err = response.json::<api::models::ErrorResponse>();
     assert_eq!(err.error.r#type, "server_error");
 }
+
+/// Regression for the infra-vs-client-input split: provider 4xx that are NOT
+/// bad audio — 401/403 (creds), 404 (missing/stale route), 408 (timeout) — must
+/// surface as a 5xx `server_error`, not a `400 invalid_request_error` with
+/// misleading bad-audio guidance.
+#[tokio::test]
+async fn test_audio_transcription_provider_infra_4xx_maps_to_server_error() {
+    let (server, _pool, mock_provider, _db) = setup_test_server_with_pool().await;
+
+    let model_name = "Qwen/Qwen-Image-2512";
+    setup_whisper_model(&server, model_name).await;
+
+    let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
+    let api_key = get_api_key_for_org(&server, org.id).await;
+
+    for status in [401u16, 403, 404, 408] {
+        mock_provider
+            .set_audio_transcription_error_override(Some(
+                inference_providers::AudioTranscriptionError::HttpError {
+                    status_code: status,
+                    message: format!("upstream {status}"),
+                },
+            ))
+            .await;
+
+        let response = server
+            .post("/v1/audio/transcriptions")
+            .add_header("Authorization", format!("Bearer {api_key}"))
+            .multipart(
+                axum_test::multipart::MultipartForm::new()
+                    .add_part(
+                        "file",
+                        axum_test::multipart::Part::bytes(create_mock_audio_file(100))
+                            .file_name("test.mp3")
+                            .mime_type("audio/mpeg"),
+                    )
+                    .add_text("model", model_name),
+            )
+            .await;
+
+        assert!(
+            response.status_code().is_server_error(),
+            "provider {status} should surface as a 5xx server error, got {}",
+            response.status_code()
+        );
+        let err = response.json::<api::models::ErrorResponse>();
+        assert_eq!(
+            err.error.r#type, "server_error",
+            "provider {status} should map to server_error, not bad-audio"
+        );
+    }
+}

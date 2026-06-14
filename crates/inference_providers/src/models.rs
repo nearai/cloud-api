@@ -1121,6 +1121,21 @@ pub enum AudioTranscriptionError {
     HttpError { status_code: u16, message: String },
 }
 
+/// Whether an audio-transcription HTTP status returned by the provider is a
+/// genuine client-input rejection (malformed / unsupported / oversized audio)
+/// rather than a provider-side failure.
+///
+/// Client-input 4xx (400/413/415/422) are surfaced to the caller as
+/// `invalid_request_error`, logged at warn (so a burst of bad uploads does not
+/// page on-call), and not retried across providers — the same payload fails
+/// everywhere. Everything else — 401/403 (our backend credentials), 404
+/// (missing/stale route), 408 (timeout), 429 (rate limit), and 5xx — is a
+/// server-side failure: logged at error, eligible for failover, and surfaced as
+/// a 5xx, never as misleading bad-audio guidance.
+pub fn is_client_audio_input_status(status_code: u16) -> bool {
+    matches!(status_code, 400 | 413 | 415 | 422)
+}
+
 /// Utility function to detect audio MIME type from filename extension
 ///
 /// Used by audio transcription providers to set proper Content-Type headers

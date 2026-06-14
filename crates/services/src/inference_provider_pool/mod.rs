@@ -5,6 +5,7 @@ use inference_providers::nearai;
 use inference_providers::rotation;
 use inference_providers::spki_verifier::{FingerprintState, SharedTlsRoots};
 use inference_providers::{
+    is_client_audio_input_status,
     models::{AttestationError, CompletionError},
     AudioTranscriptionError, AudioTranscriptionParams, AudioTranscriptionResponse,
     ChatCompletionParams, ExternalProvider, ExternalProviderConfig, ImageEditError,
@@ -2635,23 +2636,39 @@ impl InferenceProviderPool {
                     provider
                         .audio_transcription(params, request_hash)
                         .await
-                        // Preserve the provider's HTTP status so a non-retryable
-                        // client 4xx (e.g. 400 "Invalid or unsupported audio
-                        // file") survives retry/fallback as a structured
-                        // HttpError instead of being flattened to a string. A
-                        // string would re-enter the service mapper as a generic
-                        // TranscriptionError -> ProviderError{502}, hiding the
-                        // real status from the route handler. is_external=false:
-                        // this is our own vLLM whisper backend, not a third party.
+                        // Classify the provider's failure so the structured HTTP
+                        // status survives retry/fallback only where that is
+                        // correct. Genuine client-input 4xx (400/413/415/422)
+                        // stay structured: the route returns invalid_request_error
+                        // and the pool fast-returns without wasting fallback on a
+                        // payload that fails everywhere. 5xx/429 stay structured
+                        // too, so retry, failover, and the service status mapping
+                        // work. Provider-infra 4xx — 401/403 (our creds), 404
+                        // (missing/stale route), 408 (timeout) — are NOT client
+                        // input: drop them to a generic provider failure so the
+                        // request can fall through to other providers and surfaces
+                        // as a 5xx server error, not misleading bad-audio guidance.
+                        // is_external=false: this is our own vLLM whisper backend.
                         .map_err(|e| match e {
                             AudioTranscriptionError::HttpError {
                                 status_code,
                                 message,
-                            } => CompletionError::HttpError {
+                            } if is_client_audio_input_status(status_code)
+                                || status_code >= 500
+                                || status_code == 429 =>
+                            {
+                                CompletionError::HttpError {
+                                    status_code,
+                                    message,
+                                    is_external: false,
+                                }
+                            }
+                            AudioTranscriptionError::HttpError {
                                 status_code,
                                 message,
-                                is_external: false,
-                            },
+                            } => CompletionError::CompletionError(format!(
+                                "HTTP error {status_code}: {message}"
+                            )),
                             AudioTranscriptionError::TranscriptionError(msg) => {
                                 CompletionError::CompletionError(msg)
                             }
@@ -2660,9 +2677,12 @@ impl InferenceProviderPool {
             })
             .await
             .map_err(|e| match e {
-                // Carry the structured HTTP status back out so the service layer
-                // maps it per-code (400 -> client error, 401/403 -> 500, 5xx ->
-                // 502) instead of collapsing every failure to a generic 502.
+                // Carry the structured status back out for the codes kept
+                // structured above (client-input 4xx, 5xx, 429) so the service
+                // layer maps them per-code (client 4xx -> invalid_request_error,
+                // 5xx -> 502, 503 -> overloaded, 429 -> rate limit). Infra 4xx
+                // were already downgraded to a generic provider failure and fall
+                // through the `other` arm to a 502 server error.
                 CompletionError::HttpError {
                     status_code,
                     message,

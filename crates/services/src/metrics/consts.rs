@@ -11,6 +11,10 @@ pub const METRIC_VERIFICATION_SUCCESS: &str = "cloud_api.verification.success";
 pub const METRIC_VERIFICATION_FAILURE: &str = "cloud_api.verification.failure";
 pub const METRIC_VERIFICATION_DURATION: &str = "cloud_api.verification.duration";
 
+// Gateway signature creation metrics
+pub const METRIC_SIGNATURE_CREATION_SUCCESS: &str = "cloud_api.signature.creation.success";
+pub const METRIC_SIGNATURE_CREATION_DURATION: &str = "cloud_api.signature.creation.duration";
+
 // Usage/engagement metrics
 pub const METRIC_REQUEST_COUNT: &str = "cloud_api.request.count";
 pub const METRIC_TOKENS_INPUT: &str = "cloud_api.tokens.input";

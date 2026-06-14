@@ -187,6 +187,7 @@ impl ExternalBackend for OpenAiCompatibleBackend {
         streaming_params.stream_options = Some(StreamOptions {
             include_usage: Some(true),
             continuous_usage_stats: None, // Not all providers support this
+            extra: Default::default(),
         });
 
         // Convert max_tokens to max_completion_tokens for newer OpenAI models
@@ -412,6 +413,12 @@ impl ExternalBackend for OpenAiCompatibleBackend {
             form = form.text("temperature", temperature.to_string());
         }
 
+        if let Some(granularities) = params.timestamp_granularities {
+            for granularity in granularities {
+                form = form.text("timestamp_granularities[]", granularity);
+            }
+        }
+
         let mut headers = self
             .build_headers(config)
             .map_err(AudioTranscriptionError::TranscriptionError)?;
@@ -463,6 +470,8 @@ impl ExternalBackend for OpenAiCompatibleBackend {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     // ==================== Header Building Tests ====================
 
@@ -531,6 +540,63 @@ mod tests {
         assert!(headers.get("OpenAI-Organization").is_none());
     }
 
+    fn audio_transcription_params() -> AudioTranscriptionParams {
+        AudioTranscriptionParams {
+            model: "openai/whisper-large-v3".to_string(),
+            file_bytes: vec![1, 2, 3],
+            filename: "audio.mp3".to_string(),
+            language: Some("en".to_string()),
+            response_format: Some("verbose_json".to_string()),
+            temperature: None,
+            timestamp_granularities: Some(vec!["word".to_string(), "segment".to_string()]),
+            extra: Default::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn audio_transcription_sends_repeated_timestamp_granularity_fields() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/audio/transcriptions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "text": "ok",
+                "duration": 1.0,
+                "words": [{"word": "ok", "start": 0.0, "end": 1.0}]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let backend = OpenAiCompatibleBackend::new();
+        let config = BackendConfig {
+            base_url: server.uri(),
+            api_key: "sk-test".to_string(),
+            timeout_seconds: 5,
+            extra: HashMap::new(),
+            extra_request_body: HashMap::new(),
+        };
+
+        let response = backend
+            .audio_transcription(
+                &config,
+                "openai/whisper-large-v3",
+                audio_transcription_params(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.text, "ok");
+        let requests = server.received_requests().await.unwrap();
+        let body = String::from_utf8_lossy(&requests[0].body);
+        assert_eq!(
+            body.matches("name=\"timestamp_granularities[]\"").count(),
+            2
+        );
+        assert!(body.contains("\r\nword\r\n"), "body was: {body}");
+        assert!(body.contains("\r\nsegment\r\n"), "body was: {body}");
+        assert!(!body.contains("word,segment"), "body was: {body}");
+    }
+
     // ==================== URL Building Tests ====================
 
     #[test]
@@ -591,6 +657,7 @@ mod tests {
         let options = StreamOptions {
             include_usage: Some(true),
             continuous_usage_stats: None,
+            extra: Default::default(),
         };
 
         let json = serde_json::to_string(&options).unwrap();
@@ -602,6 +669,7 @@ mod tests {
         let options = StreamOptions {
             include_usage: Some(true),
             continuous_usage_stats: Some(true),
+            extra: Default::default(),
         };
 
         let json = serde_json::to_string(&options).unwrap();

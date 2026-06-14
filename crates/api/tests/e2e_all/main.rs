@@ -26,6 +26,7 @@ mod client_disconnect;
 mod concurrent_limit;
 mod conversations;
 mod credit_types;
+mod deser_error_envelope;
 mod duplicate_names;
 mod embeddings;
 mod error_msg;

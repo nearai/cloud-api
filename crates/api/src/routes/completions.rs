@@ -7,12 +7,13 @@ use crate::{
             alias_warning_message, inject_warning_field, map_domain_error_to_status,
             no_aliasing_requested, HEADER_MODEL_ALIAS_RESOLVED, HEADER_NO_ALIASING,
         },
+        extractors::OpenAiJson,
         files::MAX_FILE_SIZE,
     },
 };
 use axum::{
     body::{Body, Bytes},
-    extract::{Extension, Json, Multipart, State},
+    extract::{Extension, Multipart, State},
     http::{header, StatusCode},
     response::{IntoResponse, Json as ResponseJson, Response},
 };
@@ -23,6 +24,7 @@ use services::completions::{
     hash_inference_id_to_uuid,
     ports::{CompletionMessage, CompletionRequest as ServiceCompletionRequest},
 };
+use sha2::{Digest, Sha256};
 use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::Duration;
@@ -40,6 +42,7 @@ const USAGE_RECORDING_TIMEOUT_SECS: u64 = 5;
 // unbounded. Past the cap we proceed without an Inference-Id header and let
 // the remaining stream (including the buffered control events) flow through.
 const MAX_LEADING_CONTROL_EVENTS: usize = 32;
+const STREAM_SIGNATURE_STORE_TIMEOUT_SECS: u64 = 5;
 
 /// Insert validated E2EE headers into a provider `extra` HashMap.
 fn insert_encryption_headers(
@@ -321,6 +324,163 @@ fn sse_error_frame(e: &inference_providers::CompletionError) -> Bytes {
     Bytes::from(format!("data: {payload}\n\n"))
 }
 
+fn chat_stream_options(
+    request: &ChatCompletionRequest,
+) -> Option<inference_providers::models::StreamOptions> {
+    request
+        .extra
+        .get("stream_options")
+        .cloned()
+        .and_then(|stream_options| {
+            serde_json::from_value::<inference_providers::models::StreamOptions>(stream_options)
+                .ok()
+        })
+}
+
+fn chat_stream_include_usage_requested(request: &ChatCompletionRequest) -> bool {
+    chat_stream_options(request)
+        .and_then(|stream_options| stream_options.include_usage)
+        .unwrap_or(false)
+}
+
+fn chat_stream_continuous_usage_requested(request: &ChatCompletionRequest) -> bool {
+    chat_stream_options(request)
+        .and_then(|stream_options| stream_options.continuous_usage_stats)
+        .unwrap_or(false)
+}
+
+fn chat_stream_has_non_text_modalities(request: &ChatCompletionRequest) -> bool {
+    request
+        .extra
+        .get("modalities")
+        .and_then(|modalities| serde_json::from_value::<Vec<String>>(modalities.clone()).ok())
+        .is_some_and(|modalities| {
+            modalities
+                .iter()
+                .any(|modality| !modality.eq_ignore_ascii_case("text"))
+        })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ChatStreamUsageMode {
+    rewrite_public_stream_usage: bool,
+    gateway_signature_enabled: bool,
+}
+
+fn chat_stream_usage_mode(
+    request: &ChatCompletionRequest,
+    model_attestation_supported: Option<bool>,
+    e2ee_active: bool,
+) -> ChatStreamUsageMode {
+    let rewrite_public_stream_usage = request.stream == Some(true)
+        && chat_stream_include_usage_requested(request)
+        && !chat_stream_continuous_usage_requested(request)
+        && model_attestation_supported.is_some()
+        && !e2ee_active
+        && !chat_stream_has_non_text_modalities(request);
+
+    ChatStreamUsageMode {
+        rewrite_public_stream_usage,
+        gateway_signature_enabled: rewrite_public_stream_usage
+            && model_attestation_supported.unwrap_or(false),
+    }
+}
+
+#[cfg(test)]
+fn prepare_chat_stream_chunk_for_client(
+    chunk: &mut inference_providers::models::ChatCompletionChunk,
+    include_usage: bool,
+) -> bool {
+    let mut final_usage = None;
+    prepare_chat_stream_chunk_for_client_with_state(chunk, include_usage, &mut final_usage)
+}
+
+fn prepare_chat_stream_chunk_for_client_with_state(
+    chunk: &mut inference_providers::models::ChatCompletionChunk,
+    include_usage: bool,
+    final_usage: &mut Option<inference_providers::models::TokenUsage>,
+) -> bool {
+    let is_usage_only_chunk = chunk.choices.is_empty() && chunk.usage.is_some();
+    if !include_usage && is_usage_only_chunk {
+        return false;
+    }
+
+    if include_usage {
+        if let Some(usage) = chunk.usage.take() {
+            *final_usage = Some(usage);
+        }
+    }
+
+    if !include_usage {
+        chunk.usage = None;
+        return true;
+    }
+
+    if is_usage_only_chunk {
+        return false;
+    }
+
+    true
+}
+
+fn prepare_stream_chunk_for_client(
+    chunk: &mut inference_providers::StreamChunk,
+    include_usage: bool,
+    final_usage: &mut Option<inference_providers::models::TokenUsage>,
+) -> bool {
+    match chunk {
+        inference_providers::StreamChunk::Chat(chat) => {
+            prepare_chat_stream_chunk_for_client_with_state(chat, include_usage, final_usage)
+        }
+        inference_providers::StreamChunk::Text(_) => true,
+    }
+}
+
+fn rewritten_control_event_bytes(event: &inference_providers::SSEEvent) -> Option<Bytes> {
+    if event.is_done_marker() {
+        return None;
+    }
+
+    let line = String::from_utf8_lossy(&event.raw_bytes);
+    if line.trim_start().starts_with(':') {
+        let mut bytes = event.raw_bytes.to_vec();
+        if bytes.ends_with(b"\n") {
+            bytes.push(b'\n');
+        } else {
+            bytes.extend_from_slice(b"\n\n");
+        }
+        Some(Bytes::from(bytes))
+    } else {
+        None
+    }
+}
+
+fn build_final_usage_chunk_bytes(
+    usage: inference_providers::TokenUsage,
+    template: &ChunkTemplate,
+) -> Result<Option<Bytes>, serde_json::Error> {
+    let Some((id, model, created, system_fingerprint)) = template else {
+        return Ok(None);
+    };
+
+    let final_usage_chunk =
+        inference_providers::StreamChunk::Chat(inference_providers::models::ChatCompletionChunk {
+            id: id.clone(),
+            object: "chat.completion.chunk".to_string(),
+            created: *created,
+            model: model.clone(),
+            system_fingerprint: system_fingerprint.clone(),
+            choices: Vec::new(),
+            usage: Some(usage),
+            prompt_token_ids: None,
+            modality: None,
+            extra: std::collections::HashMap::new(),
+        });
+
+    serde_json::to_string(&final_usage_chunk)
+        .map(|json_data| Some(Bytes::from(format!("data: {json_data}\n\n"))))
+}
+
 // Helper function to extract inference ID from a parsed stream chunk
 fn extract_inference_id_from_chunk(chunk: &inference_providers::StreamChunk) -> Uuid {
     let id = match chunk {
@@ -408,6 +568,7 @@ fn convert_chat_request_to_service(
         store: None,
         body_hash: body_hash.hash.clone(),
         response_id: None, // Direct chat completions API calls don't have a response_id
+        skip_provider_chat_signature: false,
         extra,
     }
 }
@@ -1035,6 +1196,7 @@ fn convert_text_request_to_service(
         store: None,
         body_hash: body_hash.hash.clone(),
         response_id: None, // Direct text completions API calls don't have a response_id
+        skip_provider_chat_signature: false,
         extra,
     }
 }
@@ -1088,7 +1250,7 @@ pub async fn chat_completions(
     Extension(api_key): Extension<AuthenticatedApiKey>,
     Extension(body_hash): Extension<RequestBodyHash>,
     headers: header::HeaderMap,
-    Json(request): Json<ChatCompletionRequest>,
+    OpenAiJson(request): OpenAiJson<ChatCompletionRequest>,
 ) -> axum::response::Response {
     debug!(
         "Chat completions request from api key: {:?}",
@@ -1146,6 +1308,8 @@ async fn chat_completions_inner(
     request: ChatCompletionRequest,
     request_id: Uuid,
 ) -> axum::response::Response {
+    let request_hash = body_hash.hash.clone();
+
     // Convert HTTP request to service parameters
     // Note: Names are not passed - high-cardinality data is tracked via database, not metrics
     let mut service_request = convert_chat_request_to_service(
@@ -1167,6 +1331,7 @@ async fn chat_completions_inner(
     // Add validated headers to service_request.extra
     insert_encryption_headers(&encryption_headers, &mut service_request.extra);
     let e2ee_active = e2ee_requested(&encryption_headers);
+    let include_stream_usage_in_response = chat_stream_include_usage_requested(&request);
 
     // Strict alias mode: refuse to serve through an alias before any
     // inference happens (issue #573).
@@ -1187,6 +1352,29 @@ async fn chat_completions_inner(
         .models_service
         .resolve_alias_cached(&request.model)
         .await;
+    let resolved_model_name = alias_canonical.as_deref().unwrap_or(&request.model);
+    let model_attestation_supported = if request.stream == Some(true) {
+        match app_state.models_service.get_models_with_pricing().await {
+            Ok(models) => models
+                .iter()
+                .find(|model| model.model_name == resolved_model_name)
+                .map(|model| model.attestation_supported),
+            Err(error) => {
+                tracing::warn!(
+                    model = %request.model,
+                    error = %error,
+                    "Failed to read cached model metadata for stream usage shaping; preserving raw passthrough"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let usage_mode = chat_stream_usage_mode(&request, model_attestation_supported, e2ee_active);
+    let rewrite_public_stream_usage = usage_mode.rewrite_public_stream_usage;
+    let gateway_signature_enabled = usage_mode.gateway_signature_enabled;
+    service_request.skip_provider_chat_signature = gateway_signature_enabled;
 
     // Auto-redact (opt-in via x-auto-redact header or auto_redact body field).
     // On success this may rewrite service_request.messages to substitute
@@ -1323,6 +1511,15 @@ async fn chat_completions_inner(
                 let chunk_template_for_chain = chunk_template.clone();
                 let unredact_states_for_chain = unredact_states.clone();
                 let redaction_map_for_chunks = redaction_map.clone();
+                let final_stream_usage = Arc::new(tokio::sync::Mutex::new(
+                    None::<inference_providers::TokenUsage>,
+                ));
+                let final_stream_usage_for_chain = final_stream_usage.clone();
+                let public_signature_hasher = Arc::new(tokio::sync::Mutex::new(Sha256::new()));
+                let public_signature_chat_id = Arc::new(tokio::sync::Mutex::new(None::<String>));
+                let public_signature_hasher_for_chain = public_signature_hasher.clone();
+                let public_signature_chat_id_for_chain = public_signature_chat_id.clone();
+                let attestation_service_for_chain = app_state.attestation_service.clone();
 
                 // Re-attach any stashed leading control events, then convert
                 // to a raw bytes stream.
@@ -1337,14 +1534,20 @@ async fn chat_completions_inner(
                         let map = redaction_map_for_chunks.clone();
                         let pending_warning = alias_warning_pending.clone();
                         let upstream_done = upstream_done_forwarded.clone();
+                        let include_stream_usage_in_response = include_stream_usage_in_response;
+                        let rewrite_public_stream_usage = rewrite_public_stream_usage;
+                        let gateway_signature_enabled = gateway_signature_enabled;
+                        let public_signature_hasher = public_signature_hasher.clone();
+                        let public_signature_chat_id = public_signature_chat_id.clone();
+                        let final_stream_usage = final_stream_usage.clone();
                         async move {
                             match result {
                                 Ok(event) => {
-                                    // Byte-exact passthrough (issue #701): the upstream
-                                    // emits OpenAI-format SSE and no chunk rewriting is
-                                    // active, so forward the wire bytes untouched. This
-                                    // keeps sha256(received bytes) reproducible against
-                                    // the response hash signed inside the inference TEE.
+                                    // Byte-exact passthrough (issue #701): when no public
+                                    // chunk rewriting is active, forward the upstream wire
+                                    // bytes untouched. Explicit include_usage shaping needs
+                                    // parsed-chunk serialization; encrypted, default, and
+                                    // continuous-usage streams preserve passthrough.
                                     //
                                     // Disabled for alias-served responses: those inject
                                     // a top-level `warning` into the first chunk (below),
@@ -1354,6 +1557,7 @@ async fn chat_completions_inner(
                                     if event.raw_passthrough
                                         && !auto_redact_enabled
                                         && !alias_served
+                                        && !rewrite_public_stream_usage
                                     {
                                         if event.is_done_marker() {
                                             upstream_done
@@ -1365,30 +1569,68 @@ async fn chat_completions_inner(
                                     // Re-serialization path: auto-redact rewrites chunk
                                     // text, and non-OpenAI upstreams (Gemini native,
                                     // Anthropic) need normalization to OpenAI format.
-                                    // Control lines carry no parsed payload — drop them
-                                    // here; the end-of-stream tail appends the gateway's
-                                    // own [DONE] terminator.
-                                    let mut chunk = event.chunk?;
-
-                                    if auto_redact_enabled {
-                                        // Cache a template for the synthetic
-                                        // flush chunk we may emit at end-of-stream.
+                                    // Control lines carry no parsed payload; forward
+                                    // them raw so keepalives/comments are preserved.
+                                    // Hold [DONE] back for rewritten streams so the
+                                    // tail can emit final usage, append [DONE], and
+                                    // store any gateway signature before completion.
+                                    let Some(mut chunk) = event.chunk else {
+                                        if event.is_done_marker() {
+                                            if auto_redact_enabled || rewrite_public_stream_usage {
+                                                return None;
+                                            }
+                                            upstream_done.store(
+                                                true,
+                                                std::sync::atomic::Ordering::Relaxed,
+                                            );
+                                        }
+                                        let control_bytes = if rewrite_public_stream_usage {
+                                            rewritten_control_event_bytes(&event)
+                                        } else {
+                                            Some(event.raw_bytes)
+                                        };
+                                        if let Some(control_bytes) = control_bytes {
+                                            if gateway_signature_enabled {
+                                                public_signature_hasher
+                                                    .lock()
+                                                    .await
+                                                    .update(&control_bytes);
+                                            }
+                                            return Some(Ok::<Bytes, Infallible>(control_bytes));
+                                        }
+                                        return None;
+                                    };
+                                    if let inference_providers::StreamChunk::Chat(chat) = &chunk {
                                         {
                                             let mut t = template.lock().await;
                                             if t.is_none() {
-                                                if let inference_providers::StreamChunk::Chat(c) =
-                                                    &chunk
-                                                {
-                                                    *t = Some((
-                                                        c.id.clone(),
-                                                        c.model.clone(),
-                                                        c.created,
-                                                        c.system_fingerprint.clone(),
-                                                    ));
-                                                }
+                                                *t = Some((
+                                                    chat.id.clone(),
+                                                    chat.model.clone(),
+                                                    chat.created,
+                                                    chat.system_fingerprint.clone(),
+                                                ));
                                             }
                                         }
+                                        if gateway_signature_enabled {
+                                            let mut chat_id = public_signature_chat_id.lock().await;
+                                            if chat_id.is_none() {
+                                                *chat_id = Some(chat.id.clone());
+                                            }
+                                        }
+                                    }
+                                    if rewrite_public_stream_usage {
+                                        let mut final_usage = final_stream_usage.lock().await;
+                                        if !prepare_stream_chunk_for_client(
+                                            &mut chunk,
+                                            include_stream_usage_in_response,
+                                            &mut final_usage,
+                                        ) {
+                                            return None;
+                                        }
+                                    }
 
+                                    if auto_redact_enabled {
                                         // Swap minted placeholders in this
                                         // chunk's text deltas back to originals.
                                         let mut s = states.lock().await;
@@ -1433,6 +1675,12 @@ async fn chat_completions_inner(
                                     }
                                     // Format as SSE event with proper newlines
                                     let sse_bytes = Bytes::from(format!("data: {json_data}\n\n"));
+                                    if gateway_signature_enabled {
+                                        public_signature_hasher
+                                            .lock()
+                                            .await
+                                            .update(&sse_bytes);
+                                    }
                                     Some(Ok::<Bytes, Infallible>(sse_bytes))
                                 }
                                 Err(e) => {
@@ -1463,8 +1711,11 @@ async fn chat_completions_inner(
                             // stream must end exactly as the upstream's did.
                             let organization_id = api_key.organization.id.0;
                             let model_name = request.model.clone();
+                            let request_hash = request_hash.clone();
                             async move {
                                 let mut combined: Vec<u8> = Vec::new();
+                                let error_count_final =
+                                    stream_error_count.load(std::sync::atomic::Ordering::Relaxed);
                                 if auto_redact_enabled {
                                     let mut states = unredact_states_for_chain.lock().await;
                                     let template = chunk_template_for_chain.lock().await.clone();
@@ -1473,8 +1724,50 @@ async fn chat_completions_inner(
                                     }
                                 }
 
-                                let error_count_final =
-                                    stream_error_count.load(std::sync::atomic::Ordering::Relaxed);
+                                if rewrite_public_stream_usage && include_stream_usage_in_response {
+                                    let final_usage = final_stream_usage_for_chain.lock().await.clone();
+                                    let template = chunk_template_for_chain.lock().await.clone();
+                                    if error_count_final > 0 {
+                                        if final_usage.is_some() {
+                                            tracing::warn!(
+                                                %organization_id,
+                                                model = %model_name,
+                                                total_stream_errors = error_count_final,
+                                                "Suppressing final usage chunk because the stream ended with errors"
+                                            );
+                                        }
+                                    } else {
+                                        match final_usage {
+                                            Some(usage) => match build_final_usage_chunk_bytes(usage, &template) {
+                                                Ok(Some(bytes)) => {
+                                                    combined.extend_from_slice(&bytes);
+                                                }
+                                                Ok(None) => {
+                                                    tracing::warn!(
+                                                        %organization_id,
+                                                        model = %model_name,
+                                                        "Cannot emit final usage chunk: no chat chunk template observed"
+                                                    );
+                                                }
+                                                Err(e) => {
+                                                    tracing::error!(
+                                                        %organization_id,
+                                                        model = %model_name,
+                                                        "Failed to serialize final usage chunk: {e}"
+                                                    );
+                                                }
+                                            },
+                                            None => {
+                                                tracing::warn!(
+                                                    %organization_id,
+                                                    model = %model_name,
+                                                    "include_usage was requested but upstream did not provide usage; omitting final usage chunk"
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
+
                                 if error_count_final > 1 {
                                     tracing::error!(
                                         %organization_id,
@@ -1489,6 +1782,56 @@ async fn chat_completions_inner(
                                 {
                                     combined.extend_from_slice(b"data: [DONE]\n\n");
                                 }
+
+                                if gateway_signature_enabled && error_count_final == 0 {
+                                    let response_hash = {
+                                        let mut hasher =
+                                            public_signature_hasher_for_chain.lock().await;
+                                        hasher.update(&combined);
+                                        hex::encode(hasher.clone().finalize())
+                                    };
+
+                                    if let Some(chat_id) =
+                                        public_signature_chat_id_for_chain.lock().await.clone()
+                                    {
+                                        match tokio::time::timeout(
+                                            Duration::from_secs(
+                                                STREAM_SIGNATURE_STORE_TIMEOUT_SECS,
+                                            ),
+                                            attestation_service_for_chain.store_chat_signature(
+                                                &chat_id,
+                                                request_hash,
+                                                response_hash,
+                                            ),
+                                        )
+                                        .await
+                                        {
+                                            Ok(Ok(())) => {}
+                                            Ok(Err(e)) => {
+                                                tracing::error!(
+                                                    %organization_id,
+                                                    model = %model_name,
+                                                    error = %e,
+                                                    "Failed to store public stream chat signature"
+                                                );
+                                            }
+                                            Err(_) => {
+                                                tracing::error!(
+                                                    %organization_id,
+                                                    model = %model_name,
+                                                    "Timeout storing public stream chat signature"
+                                                );
+                                            }
+                                        }
+                                    } else {
+                                        tracing::warn!(
+                                            %organization_id,
+                                            model = %model_name,
+                                            "Cannot store public stream chat signature: no chat_id observed"
+                                        );
+                                    }
+                                }
+
                                 if combined.is_empty() {
                                     // Avoid emitting an empty body frame.
                                     None
@@ -1685,7 +2028,7 @@ pub async fn completions(
     Extension(api_key): Extension<AuthenticatedApiKey>,
     Extension(body_hash): Extension<RequestBodyHash>,
     headers: header::HeaderMap,
-    Json(request): Json<CompletionRequest>,
+    OpenAiJson(request): OpenAiJson<CompletionRequest>,
 ) -> axum::response::Response {
     debug!(
         "Text completions request from api key: {:?}",
@@ -2467,6 +2810,360 @@ mod tests {
         })
     }
 
+    fn chat_request_with_include_usage(include_usage: Option<bool>) -> ChatCompletionRequest {
+        let mut extra = std::collections::HashMap::new();
+        if let Some(include_usage) = include_usage {
+            extra.insert(
+                "stream_options".to_string(),
+                serde_json::json!({ "include_usage": include_usage }),
+            );
+        }
+        ChatCompletionRequest {
+            model: "test-model".to_string(),
+            messages: vec![],
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            n: None,
+            stream: Some(true),
+            stop: None,
+            presence_penalty: None,
+            frequency_penalty: None,
+            extra,
+        }
+    }
+
+    fn chat_stream_chunk_with_usage(
+        choices: Vec<inference_providers::models::ChatChoice>,
+    ) -> inference_providers::models::ChatCompletionChunk {
+        inference_providers::models::ChatCompletionChunk {
+            id: "chatcmpl-test".to_string(),
+            object: "chat.completion.chunk".to_string(),
+            created: 1234567890,
+            model: "test-model".to_string(),
+            system_fingerprint: None,
+            choices,
+            usage: Some(inference_providers::models::TokenUsage::new(10, 5)),
+            prompt_token_ids: None,
+            modality: None,
+            extra: Default::default(),
+        }
+    }
+
+    fn chat_stream_content_choice() -> inference_providers::models::ChatChoice {
+        inference_providers::models::ChatChoice {
+            index: 0,
+            delta: Some(inference_providers::models::ChatDelta {
+                role: None,
+                content: Some("hello".to_string()),
+                name: None,
+                tool_call_id: None,
+                tool_calls: None,
+                reasoning_content: None,
+                reasoning: None,
+                extra: Default::default(),
+            }),
+            logprobs: None,
+            finish_reason: None,
+            token_ids: None,
+        }
+    }
+
+    fn chat_stream_finish_choice() -> inference_providers::models::ChatChoice {
+        inference_providers::models::ChatChoice {
+            finish_reason: Some(inference_providers::models::FinishReason::Stop),
+            ..chat_stream_content_choice()
+        }
+    }
+
+    #[test]
+    fn chat_stream_include_usage_defaults_to_false() {
+        let request = chat_request_with_include_usage(None);
+        assert!(!chat_stream_include_usage_requested(&request));
+
+        let request = chat_request_with_include_usage(Some(false));
+        assert!(!chat_stream_include_usage_requested(&request));
+
+        let request = chat_request_with_include_usage(Some(true));
+        assert!(chat_stream_include_usage_requested(&request));
+    }
+
+    #[test]
+    fn chat_stream_continuous_usage_is_detected() {
+        let mut request = chat_request_with_include_usage(Some(true));
+        request.extra.insert(
+            "stream_options".to_string(),
+            serde_json::json!({
+                "include_usage": true,
+                "continuous_usage_stats": true
+            }),
+        );
+
+        assert!(chat_stream_continuous_usage_requested(&request));
+    }
+
+    #[test]
+    fn include_usage_rewrites_and_signs_attested_streams() {
+        let request = chat_request_with_include_usage(Some(true));
+        let mode = chat_stream_usage_mode(&request, Some(true), false);
+
+        assert!(mode.rewrite_public_stream_usage);
+        assert!(mode.gateway_signature_enabled);
+    }
+
+    #[test]
+    fn include_usage_rewrites_non_attested_without_gateway_signature() {
+        let request = chat_request_with_include_usage(Some(true));
+        let mode = chat_stream_usage_mode(&request, Some(false), false);
+
+        assert!(mode.rewrite_public_stream_usage);
+        assert!(!mode.gateway_signature_enabled);
+    }
+
+    #[test]
+    fn default_attested_stream_preserves_provider_passthrough() {
+        let request = chat_request_with_include_usage(None);
+        let mode = chat_stream_usage_mode(&request, Some(true), false);
+
+        assert!(!mode.rewrite_public_stream_usage);
+        assert!(!mode.gateway_signature_enabled);
+    }
+
+    #[test]
+    fn include_usage_false_attested_stream_preserves_provider_passthrough() {
+        let request = chat_request_with_include_usage(Some(false));
+        let mode = chat_stream_usage_mode(&request, Some(true), false);
+
+        assert!(!mode.rewrite_public_stream_usage);
+        assert!(!mode.gateway_signature_enabled);
+    }
+
+    #[test]
+    fn default_non_attested_stream_preserves_provider_passthrough() {
+        let request = chat_request_with_include_usage(None);
+        let mode = chat_stream_usage_mode(&request, Some(false), false);
+
+        assert!(!mode.rewrite_public_stream_usage);
+        assert!(!mode.gateway_signature_enabled);
+    }
+
+    #[test]
+    fn continuous_usage_stats_is_passthrough_when_model_metadata_is_missing() {
+        let mut request = chat_request_with_include_usage(None);
+        request.extra.insert(
+            "stream_options".to_string(),
+            serde_json::json!({ "continuous_usage_stats": true }),
+        );
+        let mode = chat_stream_usage_mode(&request, None, false);
+
+        assert!(!mode.rewrite_public_stream_usage);
+        assert!(!mode.gateway_signature_enabled);
+    }
+
+    #[test]
+    fn continuous_usage_stats_opts_out_of_rewrite() {
+        let mut request = chat_request_with_include_usage(Some(true));
+        request.extra.insert(
+            "stream_options".to_string(),
+            serde_json::json!({
+                "include_usage": true,
+                "continuous_usage_stats": true
+            }),
+        );
+
+        let passthrough = chat_stream_usage_mode(&request, Some(true), false);
+        assert!(!passthrough.rewrite_public_stream_usage);
+        assert!(!passthrough.gateway_signature_enabled);
+
+        let e2ee_passthrough = chat_stream_usage_mode(&request, Some(true), true);
+        assert!(!e2ee_passthrough.rewrite_public_stream_usage);
+
+        request.extra.insert(
+            "modalities".to_string(),
+            serde_json::json!(["text", "audio"]),
+        );
+        let audio_passthrough = chat_stream_usage_mode(&request, Some(true), false);
+        assert!(!audio_passthrough.rewrite_public_stream_usage);
+    }
+
+    #[test]
+    fn chat_stream_non_text_modalities_preserve_raw_passthrough() {
+        let mut request = chat_request_with_include_usage(None);
+        assert!(!chat_stream_has_non_text_modalities(&request));
+
+        request.extra.insert(
+            "modalities".to_string(),
+            serde_json::json!(["text", "audio"]),
+        );
+        assert!(chat_stream_has_non_text_modalities(&request));
+
+        request
+            .extra
+            .insert("modalities".to_string(), serde_json::json!(["TEXT"]));
+        assert!(!chat_stream_has_non_text_modalities(&request));
+    }
+
+    #[test]
+    fn default_chat_stream_suppresses_provider_usage_but_serializes_null() {
+        let mut chunk = chat_stream_chunk_with_usage(vec![chat_stream_content_choice()]);
+
+        assert!(prepare_chat_stream_chunk_for_client(&mut chunk, false));
+        assert!(chunk.usage.is_none());
+
+        let serialized = serde_json::to_value(&chunk).expect("chunk should serialize");
+        assert!(
+            serialized
+                .get("usage")
+                .is_some_and(serde_json::Value::is_null),
+            "ordinary chunks should carry usage:null instead of provider usage"
+        );
+    }
+
+    #[test]
+    fn default_chat_stream_drops_provider_usage_only_chunk() {
+        let mut chunk = chat_stream_chunk_with_usage(vec![]);
+
+        assert!(!prepare_chat_stream_chunk_for_client(&mut chunk, false));
+    }
+
+    #[test]
+    fn include_usage_records_usage_for_synthetic_final_chunk() {
+        let mut final_usage = None;
+        let mut content_chunk = chat_stream_chunk_with_usage(vec![chat_stream_content_choice()]);
+        assert!(prepare_chat_stream_chunk_for_client_with_state(
+            &mut content_chunk,
+            true,
+            &mut final_usage
+        ));
+        assert!(content_chunk.usage.is_none());
+        assert_eq!(
+            final_usage.as_ref().map(|usage| usage.total_tokens),
+            Some(15)
+        );
+
+        let content_json = serde_json::to_value(&content_chunk).expect("chunk should serialize");
+        assert!(
+            content_json
+                .get("usage")
+                .is_some_and(serde_json::Value::is_null),
+            "intermediate chunks should carry usage:null"
+        );
+
+        let mut final_choice_chunk =
+            chat_stream_chunk_with_usage(vec![chat_stream_finish_choice()]);
+        final_choice_chunk.usage = Some(inference_providers::TokenUsage::new(10, 7));
+        assert!(prepare_chat_stream_chunk_for_client_with_state(
+            &mut final_choice_chunk,
+            true,
+            &mut final_usage
+        ));
+        assert!(final_choice_chunk.usage.is_none());
+        assert_eq!(
+            final_usage.as_ref().map(|usage| usage.total_tokens),
+            Some(17)
+        );
+
+        let mut usage_only_chunk = chat_stream_chunk_with_usage(vec![]);
+        usage_only_chunk.usage = Some(inference_providers::TokenUsage::new(10, 9));
+        assert!(!prepare_chat_stream_chunk_for_client_with_state(
+            &mut usage_only_chunk,
+            true,
+            &mut final_usage
+        ));
+        assert_eq!(
+            final_usage.as_ref().map(|usage| usage.total_tokens),
+            Some(19)
+        );
+    }
+
+    #[test]
+    fn include_usage_preserves_converter_only_usage_for_tail() {
+        let mut final_usage = None;
+        let mut final_choice_chunk =
+            chat_stream_chunk_with_usage(vec![chat_stream_finish_choice()]);
+        assert!(prepare_chat_stream_chunk_for_client_with_state(
+            &mut final_choice_chunk,
+            true,
+            &mut final_usage
+        ));
+        assert!(final_choice_chunk.usage.is_none());
+        assert_eq!(
+            final_usage.as_ref().map(|usage| usage.total_tokens),
+            Some(15)
+        );
+    }
+
+    #[test]
+    fn final_usage_chunk_uses_stream_template_metadata() {
+        let template = Some((
+            "chatcmpl-test".to_string(),
+            "test-model".to_string(),
+            1234567890,
+            Some("fp-test".to_string()),
+        ));
+
+        let bytes =
+            build_final_usage_chunk_bytes(inference_providers::TokenUsage::new(10, 5), &template)
+                .expect("final usage chunk should serialize")
+                .expect("template should produce final usage chunk");
+
+        let body = String::from_utf8(bytes.to_vec()).expect("SSE bytes should be UTF-8");
+        assert!(body.starts_with("data: "));
+        assert!(body.ends_with("\n\n"));
+        let payload = body
+            .trim_start_matches("data: ")
+            .trim_end()
+            .trim_end_matches('\n');
+        let value: serde_json::Value =
+            serde_json::from_str(payload).expect("final usage payload should be JSON");
+        assert_eq!(value["id"], "chatcmpl-test");
+        assert_eq!(value["model"], "test-model");
+        assert_eq!(value["created"], 1234567890);
+        assert_eq!(value["system_fingerprint"], "fp-test");
+        assert!(value["choices"].as_array().is_some_and(Vec::is_empty));
+        assert_eq!(value["usage"]["prompt_tokens"], 10);
+        assert_eq!(value["usage"]["completion_tokens"], 5);
+    }
+
+    #[test]
+    fn rewritten_control_events_keep_comments_and_drop_separators() {
+        let blank = inference_providers::SSEEvent {
+            raw_bytes: Bytes::from_static(b"\n"),
+            chunk: None,
+            raw_passthrough: true,
+        };
+        assert!(rewritten_control_event_bytes(&blank).is_none());
+
+        let comment = inference_providers::SSEEvent {
+            raw_bytes: Bytes::from_static(b": keepalive\n"),
+            chunk: None,
+            raw_passthrough: true,
+        };
+        assert_eq!(
+            rewritten_control_event_bytes(&comment),
+            Some(Bytes::from_static(b": keepalive\n\n"))
+        );
+
+        let done = inference_providers::SSEEvent {
+            raw_bytes: Bytes::from_static(b"data: [DONE]\n"),
+            chunk: None,
+            raw_passthrough: true,
+        };
+        assert!(rewritten_control_event_bytes(&done).is_none());
+    }
+
+    #[test]
+    fn default_chat_stream_strips_usage_from_terminal_choice_chunk() {
+        let mut final_choice_chunk =
+            chat_stream_chunk_with_usage(vec![chat_stream_finish_choice()]);
+
+        assert!(prepare_chat_stream_chunk_for_client(
+            &mut final_choice_chunk,
+            false
+        ));
+        assert!(final_choice_chunk.usage.is_none());
+    }
+
     #[test]
     fn test_extract_inference_id_from_chunk_valid() {
         let chunk = make_chat_chunk("chatcmpl-123abc");
@@ -3129,7 +3826,7 @@ pub async fn image_generations(
     Extension(api_key): Extension<AuthenticatedApiKey>,
     Extension(body_hash): Extension<RequestBodyHash>,
     headers: header::HeaderMap,
-    Json(request): Json<crate::models::ImageGenerationRequest>,
+    OpenAiJson(request): OpenAiJson<crate::models::ImageGenerationRequest>,
 ) -> axum::response::Response {
     debug!(
         "Image generation request from api key: {:?}",
@@ -3366,7 +4063,10 @@ pub async fn image_generations(
     tag = "Audio",
     request_body(content = AudioTranscriptionRequestSchema, content_type = "multipart/form-data"),
     responses(
-        (status = 200, description = "Successful transcription", body = AudioTranscriptionResponse),
+        (status = 200, description = "Successful transcription", content(
+            (AudioTranscriptionResponse = "application/json"),
+            (String = "text/plain")
+        )),
         (status = 400, description = "Invalid request (empty file, unsupported format, file too large)", body = ErrorResponse),
         (status = 401, description = "Unauthorized (missing or invalid API key)", body = ErrorResponse),
         (status = 404, description = "Model not found", body = ErrorResponse),
@@ -3455,8 +4155,9 @@ pub async fn audio_transcriptions(
             }
             "timestamp_granularities[]" | "timestamp_granularities" => {
                 if let Ok(value) = field.text().await {
-                    timestamp_granularities =
-                        Some(value.split(',').map(|s| s.trim().to_string()).collect());
+                    timestamp_granularities
+                        .get_or_insert_with(Vec::new)
+                        .extend(value.split(',').map(|s| s.trim().to_string()));
                 }
             }
             _ => {
@@ -3540,12 +4241,23 @@ pub async fn audio_transcriptions(
     let mut extra = std::collections::HashMap::new();
     insert_encryption_headers(&encryption_headers, &mut extra);
 
+    let requested_response_format = request.response_format.clone();
+    let provider_response_format = match requested_response_format.as_deref() {
+        // Keep provider parsing stable and preserve duration-based billing by
+        // requesting verbose JSON, then returning plain text at the API boundary
+        // after usage is recorded.
+        Some("text") => Some("verbose_json".to_string()),
+        _ => request.response_format.clone(),
+    };
+
     let params = inference_providers::AudioTranscriptionParams {
         model: model_name.clone(),
         file_bytes: request.file_bytes,
         filename: request.filename,
-        language: request.language,
-        response_format: request.response_format,
+        language: request
+            .language
+            .map(|language| crate::models::normalize_audio_transcription_language(&language)),
+        response_format: provider_response_format,
         temperature: request.temperature,
         timestamp_granularities: request.timestamp_granularities,
         extra,
@@ -3639,7 +4351,17 @@ pub async fn audio_transcriptions(
                 "Audio transcription completed and usage recorded successfully"
             );
 
-            (StatusCode::OK, ResponseJson(response)).into_response()
+            if requested_response_format.as_deref() == Some("text") {
+                (
+                    StatusCode::OK,
+                    [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+                    response.text,
+                )
+                    .into_response()
+            } else {
+                let response_body = crate::models::AudioTranscriptionResponse::from(response);
+                (StatusCode::OK, ResponseJson(response_body)).into_response()
+            }
         }
         Err(e) => {
             let (status_code, error_type, message) = match e {
@@ -4220,7 +4942,7 @@ pub async fn rerank(
     Extension(api_key): Extension<AuthenticatedApiKey>,
     Extension(_body_hash): Extension<RequestBodyHash>,
     headers: header::HeaderMap,
-    Json(request): Json<crate::models::RerankRequest>,
+    OpenAiJson(request): OpenAiJson<crate::models::RerankRequest>,
 ) -> axum::response::Response {
     debug!(
         "Rerank request: model={}, org={}, workspace={}",
@@ -5659,7 +6381,7 @@ pub async fn score(
     Extension(api_key): Extension<AuthenticatedApiKey>,
     Extension(body_hash): Extension<RequestBodyHash>,
     headers: header::HeaderMap,
-    Json(request): Json<crate::models::ScoreRequest>,
+    OpenAiJson(request): OpenAiJson<crate::models::ScoreRequest>,
 ) -> axum::response::Response {
     debug!(
         "Score request: model={}, org={}, workspace={}",

@@ -980,6 +980,87 @@ mod tests {
         std::env::remove_var("RESEND_API_KEY_FILE");
         std::env::remove_var("CLOUD_UI_BASE_URL");
     }
+
+    #[test]
+    #[serial]
+    fn chutes_models_parses_canonical_slug_pairs_and_bare_entries() {
+        // `canonical=chute_slug` pairs; a bare entry means canonical == slug.
+        // Surrounding whitespace is trimmed; empty/half-empty tokens dropped.
+        std::env::set_var(
+            "CHUTES_MODELS",
+            "zai-org/GLM-5.1-FP8=zai-org/GLM-5.1-TEE , moonshotai/Kimi-K2.6-TEE ,, =bad, alsobad=",
+        );
+        let cfg = ExternalProvidersConfig::from_env();
+        std::env::remove_var("CHUTES_MODELS");
+
+        assert_eq!(
+            cfg.chutes_models,
+            vec![
+                ChutesModelEntry {
+                    canonical_id: "zai-org/GLM-5.1-FP8".to_string(),
+                    chute_slug: "zai-org/GLM-5.1-TEE".to_string(),
+                },
+                // Bare entry: canonical == slug.
+                ChutesModelEntry {
+                    canonical_id: "moonshotai/Kimi-K2.6-TEE".to_string(),
+                    chute_slug: "moonshotai/Kimi-K2.6-TEE".to_string(),
+                },
+            ],
+            "pairs split on '='; bare => canonical==slug; empty/half-empty tokens dropped"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn chutes_models_empty_when_unset() {
+        std::env::remove_var("CHUTES_MODELS");
+        let cfg = ExternalProvidersConfig::from_env();
+        assert!(cfg.chutes_models.is_empty());
+    }
+
+    #[test]
+    #[serial]
+    fn chutes_models_dedup_duplicate_canonical_ids_first_wins() {
+        // Duplicate canonical id (even with a different slug) is dropped so a
+        // misconfig can't register redundant fallback providers — first wins.
+        std::env::set_var(
+            "CHUTES_MODELS",
+            "zai-org/GLM-5.1-FP8=zai-org/GLM-5.1-TEE,zai-org/GLM-5.1-FP8=zai-org/GLM-5-TEE,other/model",
+        );
+        let cfg = ExternalProvidersConfig::from_env();
+        std::env::remove_var("CHUTES_MODELS");
+
+        assert_eq!(
+            cfg.chutes_models,
+            vec![
+                ChutesModelEntry {
+                    canonical_id: "zai-org/GLM-5.1-FP8".to_string(),
+                    chute_slug: "zai-org/GLM-5.1-TEE".to_string(),
+                },
+                ChutesModelEntry {
+                    canonical_id: "other/model".to_string(),
+                    chute_slug: "other/model".to_string(),
+                },
+            ],
+            "duplicate canonical id dropped (first wins); the second slug is ignored"
+        );
+    }
+}
+
+/// One Chutes model to register, parsed from a single `CHUTES_MODELS` token.
+///
+/// The token is `canonical_id=chute_slug` (e.g. `zai-org/GLM-5.1-FP8=zai-org/GLM-5.1-TEE`),
+/// or a bare `name` meaning `canonical_id == chute_slug`. We deliberately keep
+/// the two ids distinct: the **canonical id** is what we expose in `/v1/models`
+/// and route under (the NEAR-served id when NEAR also serves the model, else the
+/// OpenRouter id) — never the raw `-TEE` chute slug; the **chute slug** is the
+/// internal upstream identity we send to Chutes and resolve to a `chute_id`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChutesModelEntry {
+    /// User-facing / catalog model id (e.g. `zai-org/GLM-5.1-FP8`).
+    pub canonical_id: String,
+    /// Chutes chute slug sent upstream (e.g. `zai-org/GLM-5.1-TEE`).
+    pub chute_slug: String,
 }
 
 /// External providers configuration for third-party AI providers
@@ -1001,9 +1082,10 @@ pub struct ExternalProvidersConfig {
     pub enable_chutes: bool,
     /// Chutes API key (`cpk_...`), from `CHUTES_API_KEY[_FILE]`. A secret.
     pub chutes_api_key: Option<String>,
-    /// Comma-separated Chutes model ids to register (e.g. `zai-org/GLM-5.1-TEE`),
-    /// from `CHUTES_MODELS`.
-    pub chutes_models: Vec<String>,
+    /// Chutes models to register, from `CHUTES_MODELS` (comma-separated
+    /// `canonical_id=chute_slug` pairs; a bare entry means the two are equal).
+    /// See [`ChutesModelEntry`].
+    pub chutes_models: Vec<ChutesModelEntry>,
     /// Expose Chutes **streaming** as an attested path (`CHUTES_ENABLE_STREAMING`,
     /// default off). Off because Chutes' stream protocol has no authenticated
     /// frame sequence numbers, so an on-path gateway could drop/reorder frames
@@ -1078,12 +1160,45 @@ impl ExternalProvidersConfig {
         // An empty key is not a key — treat "" as absent so a misconfigured
         // secret can't pass as Some("") and silently fail at request time.
         .filter(|s| !s.is_empty());
-        let chutes_models = env::var("CHUTES_MODELS")
-            .unwrap_or_default()
-            .split(',')
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect();
+        // `canonical_id=chute_slug` per comma-separated token; a bare token means
+        // canonical_id == chute_slug. Drop tokens missing either side, and dedup by
+        // canonical id (first wins) so a misconfig can't register duplicate
+        // fallback providers that every refresh would re-attach.
+        let chutes_models = {
+            let raw = env::var("CHUTES_MODELS").unwrap_or_default();
+            let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+            let mut entries: Vec<ChutesModelEntry> = Vec::new();
+            for tok in raw.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
+                let entry = match tok.split_once('=') {
+                    Some((canonical, slug)) => ChutesModelEntry {
+                        canonical_id: canonical.trim().to_string(),
+                        chute_slug: slug.trim().to_string(),
+                    },
+                    None => ChutesModelEntry {
+                        canonical_id: tok.to_string(),
+                        chute_slug: tok.to_string(),
+                    },
+                };
+                if entry.canonical_id.is_empty() || entry.chute_slug.is_empty() {
+                    continue;
+                }
+                if !seen.insert(entry.canonical_id.clone()) {
+                    // `eprintln!` (not `tracing::warn!`) on purpose: the `config`
+                    // crate has no `tracing` dependency, and `from_env` runs during
+                    // startup config parsing — potentially before the tracing
+                    // subscriber is installed, where a `tracing::warn!` would be
+                    // dropped. stderr is always captured by the container log
+                    // pipeline. Consistent with the sibling CHUTES_API_KEY_FILE warn.
+                    eprintln!(
+                        "WARN: duplicate CHUTES_MODELS canonical id '{}' ignored (first wins)",
+                        entry.canonical_id
+                    );
+                    continue;
+                }
+                entries.push(entry);
+            }
+            entries
+        };
         let chutes_enable_streaming = env::var("CHUTES_ENABLE_STREAMING")
             .ok()
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))

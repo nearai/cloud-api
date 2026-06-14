@@ -623,6 +623,18 @@ pub struct MockProvider {
     last_chat_params: Arc<Mutex<Option<ChatCompletionParams>>>,
     /// When true, get_attestation_report returns an error (simulates blocked/broken backend)
     fail_attestation: Arc<std::sync::atomic::AtomicBool>,
+    /// Trust tier reported by [`InferenceProvider::tier`]; defaults to
+    /// `NonAttested`. Set via [`MockProvider::with_tier`] to exercise tiered
+    /// provider selection (e.g. a `Near` primary with an `Attested3p` fallback).
+    tier: crate::ProviderTier,
+    /// Value reported by [`InferenceProvider::supports_streaming`]; defaults to
+    /// `true`. Set via [`MockProvider::with_streaming_support`] to exercise the
+    /// streaming-capability filter (e.g. a Chutes-like fallback with streaming off).
+    supports_streaming: bool,
+    /// Value reported by [`InferenceProvider::supports_client_e2ee`]; defaults to
+    /// `true`. Set via [`MockProvider::with_client_e2ee_support`] to exercise the
+    /// client-E2EE-capability filter (e.g. a Chutes-like fallback that rejects it).
+    supports_client_e2ee: bool,
 }
 
 impl MockProvider {
@@ -647,6 +659,9 @@ impl MockProvider {
             })),
             last_chat_params: Arc::new(Mutex::new(None)),
             fail_attestation: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            tier: crate::ProviderTier::NonAttested,
+            supports_streaming: true,
+            supports_client_e2ee: true,
         }
     }
 
@@ -667,6 +682,9 @@ impl MockProvider {
             })),
             last_chat_params: Arc::new(Mutex::new(None)),
             fail_attestation: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            tier: crate::ProviderTier::NonAttested,
+            supports_streaming: true,
+            supports_client_e2ee: true,
         }
     }
 
@@ -685,7 +703,32 @@ impl MockProvider {
             })),
             last_chat_params: Arc::new(Mutex::new(None)),
             fail_attestation: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            tier: crate::ProviderTier::NonAttested,
+            supports_streaming: true,
+            supports_client_e2ee: true,
         }
+    }
+
+    /// Set the trust tier this mock reports from [`InferenceProvider::tier`].
+    /// Used to exercise tiered provider selection (NEAR-primary / Chutes-fallback
+    /// and the verifiable-never-falls-back-to-plaintext rule).
+    pub fn with_tier(mut self, tier: crate::ProviderTier) -> Self {
+        self.tier = tier;
+        self
+    }
+
+    /// Set whether this mock reports streaming support (default `true`). Used to
+    /// exercise the streaming-capability filter (a streaming-disabled fallback).
+    pub fn with_streaming_support(mut self, supported: bool) -> Self {
+        self.supports_streaming = supported;
+        self
+    }
+
+    /// Set whether this mock reports client-E2EE support (default `true`). Used to
+    /// exercise the client-E2EE-capability filter (a Chutes-like fallback).
+    pub fn with_client_e2ee_support(mut self, supported: bool) -> Self {
+        self.supports_client_e2ee = supported;
+        self
     }
 
     /// Make get_attestation_report return an error (simulates blocked/broken backend).
@@ -877,6 +920,18 @@ impl Default for MockProvider {
 
 #[async_trait]
 impl crate::InferenceProvider for MockProvider {
+    fn tier(&self) -> crate::ProviderTier {
+        self.tier
+    }
+
+    fn supports_streaming(&self) -> bool {
+        self.supports_streaming
+    }
+
+    fn supports_client_e2ee(&self) -> bool {
+        self.supports_client_e2ee
+    }
+
     async fn models(&self) -> Result<ModelsResponse, ListModelsError> {
         Ok(ModelsResponse {
             object: "list".to_string(),
@@ -1415,35 +1470,51 @@ impl crate::InferenceProvider for MockProvider {
         // Mock implementation returns simple transcription with mock timing
         let file_size_kb = params.file_bytes.len() / 1024;
         let mock_duration = (file_size_kb as f64) * 0.1; // Assume ~0.1s per KB
+        let mock_text = format!("Mock transcription for file: {}", params.filename);
+        let verbose_json = params.response_format.as_deref() == Some("verbose_json");
+        let wants_word_timestamps = verbose_json
+            && params
+                .timestamp_granularities
+                .as_deref()
+                .is_some_and(|granularities| granularities.iter().any(|value| value == "word"));
+        let wants_segment_timestamps = verbose_json
+            && params
+                .timestamp_granularities
+                .as_deref()
+                .is_none_or(|granularities| granularities.iter().any(|value| value == "segment"));
 
         Ok(AudioTranscriptionResponse {
-            text: format!("Mock transcription for file: {}", params.filename),
+            text: mock_text.clone(),
             duration: Some(mock_duration),
             language: params.language.or(Some("en".to_string())),
-            segments: Some(vec![TranscriptionSegment {
-                id: 0,
-                seek: 0,
-                start: 0.0,
-                end: mock_duration,
-                text: format!("Mock transcription for file: {}", params.filename),
-                tokens: vec![50364, 15947],
-                temperature: 0.0,
-                avg_logprob: Some(-0.5),
-                compression_ratio: Some(1.0),
-                no_speech_prob: Some(0.0),
-            }]),
-            words: Some(vec![
-                TranscriptionWord {
-                    word: "Mock".to_string(),
+            segments: wants_segment_timestamps.then(|| {
+                vec![TranscriptionSegment {
+                    id: 0,
+                    seek: 0,
                     start: 0.0,
-                    end: 0.5,
-                },
-                TranscriptionWord {
-                    word: "transcription".to_string(),
-                    start: 0.5,
-                    end: 1.5,
-                },
-            ]),
+                    end: mock_duration,
+                    text: mock_text,
+                    tokens: vec![50364, 15947],
+                    temperature: 0.0,
+                    avg_logprob: Some(-0.5),
+                    compression_ratio: Some(1.0),
+                    no_speech_prob: Some(0.0),
+                }]
+            }),
+            words: wants_word_timestamps.then(|| {
+                vec![
+                    TranscriptionWord {
+                        word: "Mock".to_string(),
+                        start: 0.0,
+                        end: 0.5,
+                    },
+                    TranscriptionWord {
+                        word: "transcription".to_string(),
+                        start: 0.5,
+                        end: 1.5,
+                    },
+                ]
+            }),
             id: None,
         })
     }

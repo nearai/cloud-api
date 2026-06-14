@@ -97,6 +97,8 @@ where
     state: StreamState,
     /// Whether the model supports TEE attestation (false for external providers)
     attestation_supported: bool,
+    /// Whether to fetch/store provider chat signatures before ending the stream.
+    store_provider_chat_signature: bool,
 }
 
 impl<S> InterceptStream<S>
@@ -108,7 +110,7 @@ where
     /// Skipped for external providers that don't support TEE attestation.
     fn create_signature_future(&self) -> FinalizeFuture {
         // Skip attestation for external providers (OpenAI, Anthropic, Gemini, etc.)
-        if !self.attestation_supported {
+        if !self.attestation_supported || !self.store_provider_chat_signature {
             return Box::pin(async {});
         }
 
@@ -628,6 +630,24 @@ impl CompletionServiceImpl {
         (tools, tool_choice)
     }
 
+    /// Extract typed OpenAI stream options from flattened request extras.
+    /// Removing the parsed key avoids serializing duplicate `stream_options`
+    /// fields once `ChatCompletionParams.stream_options` is populated.
+    fn extract_stream_options_from_extra(
+        extra: &mut std::collections::HashMap<String, serde_json::Value>,
+    ) -> Option<inference_providers::StreamOptions> {
+        match extra.get("stream_options").cloned() {
+            Some(raw) => match serde_json::from_value::<inference_providers::StreamOptions>(raw) {
+                Ok(parsed) => {
+                    extra.remove("stream_options");
+                    Some(parsed)
+                }
+                Err(_) => None,
+            },
+            None => None,
+        }
+    }
+
     /// Get the concurrent request limit for an organization (cached)
     async fn get_org_concurrent_limit(&self, organization_id: Uuid) -> u32 {
         let default_limit = self.concurrent_limit;
@@ -1075,6 +1095,7 @@ impl CompletionServiceImpl {
         concurrent_counter: Option<Arc<AtomicU32>>,
         response_id: Option<ResponseId>,
         attestation_supported: bool,
+        store_provider_chat_signature: bool,
     ) -> StreamingResult {
         // Create low-cardinality metric tags (no org/workspace/key - those go to database)
         let metric_tags = Self::create_metric_tags(&model_name);
@@ -1117,6 +1138,7 @@ impl CompletionServiceImpl {
             last_error: None,
             state: StreamState::Streaming,
             attestation_supported,
+            store_provider_chat_signature,
         };
         Box::pin(intercepted_stream)
     }
@@ -1149,6 +1171,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         // Extract tools from extra if present (Responses API puts them there)
         let mut extra = request.extra.clone();
         let (tools, tool_choice) = Self::extract_tools_from_extra(&mut extra);
+        let stream_options = Self::extract_stream_options_from_extra(&mut extra);
 
         // Inject tracing correlation IDs into extra so the inference provider
         // forwards them as X-Request-Id / X-Org-Id / X-Workspace-Id headers.
@@ -1181,7 +1204,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
                 None
             },
             store: request.store,
-            stream_options: None,
+            stream_options,
             modalities: None,
             extra,
         };
@@ -1286,6 +1309,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
                 counter,
                 request.response_id,
                 model.attestation_supported,
+                !request.skip_provider_chat_signature,
             )
             .await;
 
@@ -1305,6 +1329,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         // Extract tools from extra if present (Responses API puts them there)
         let mut extra = request.extra.clone();
         let (tools, tool_choice) = Self::extract_tools_from_extra(&mut extra);
+        let stream_options = Self::extract_stream_options_from_extra(&mut extra);
 
         // Inject tracing correlation IDs into extra so the inference provider
         // forwards them as X-Request-Id / X-Org-Id / X-Workspace-Id headers.
@@ -1337,7 +1362,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
                 None
             },
             store: request.store,
-            stream_options: None,
+            stream_options,
             modalities: None,
             extra,
         };
@@ -1921,6 +1946,7 @@ mod tests {
             last_error: None,
             state: StreamState::Streaming,
             attestation_supported: true,
+            store_provider_chat_signature: true,
         };
 
         // Consume the stream
@@ -2084,6 +2110,7 @@ mod tests {
             last_error: None,
             state: StreamState::Streaming,
             attestation_supported: true,
+            store_provider_chat_signature: true,
         };
 
         // Consume the stream
@@ -2204,6 +2231,7 @@ mod tests {
             last_error: None,
             state: StreamState::Streaming,
             attestation_supported: true,
+            store_provider_chat_signature: true,
         };
 
         let _ = intercept_stream.collect::<Vec<_>>().await;
@@ -2408,6 +2436,7 @@ mod tests {
                 last_error: None,
                 state: StreamState::Streaming,
                 attestation_supported: true,
+                store_provider_chat_signature: true,
             };
             // InterceptStream goes out of scope here and Drop is called
         }
@@ -3000,5 +3029,49 @@ mod tests {
 
         assert!(tool_choice.is_none());
         assert!(extra.contains_key("tool_choice"));
+    }
+
+    #[test]
+    fn extract_stream_options_consumes_typed_options() {
+        let mut extra = std::collections::HashMap::new();
+        extra.insert(
+            "stream_options".to_string(),
+            serde_json::json!({
+                "include_usage": true,
+                "continuous_usage_stats": false,
+                "future_vendor_option": "preserved"
+            }),
+        );
+
+        let stream_options = CompletionServiceImpl::extract_stream_options_from_extra(&mut extra)
+            .expect("stream_options should parse");
+
+        assert_eq!(stream_options.include_usage, Some(true));
+        assert_eq!(stream_options.continuous_usage_stats, Some(false));
+        assert_eq!(
+            stream_options.extra.get("future_vendor_option"),
+            Some(&serde_json::json!("preserved"))
+        );
+        assert!(
+            !extra.contains_key("stream_options"),
+            "typed stream_options should not also serialize through extra"
+        );
+    }
+
+    #[test]
+    fn extract_stream_options_passes_through_malformed_options() {
+        let mut extra = std::collections::HashMap::new();
+        extra.insert(
+            "stream_options".to_string(),
+            serde_json::json!("not-an-object"),
+        );
+
+        let stream_options = CompletionServiceImpl::extract_stream_options_from_extra(&mut extra);
+
+        assert!(stream_options.is_none());
+        assert!(
+            extra.contains_key("stream_options"),
+            "malformed stream_options should be left for upstream handling"
+        );
     }
 }

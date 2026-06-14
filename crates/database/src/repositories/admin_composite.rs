@@ -7,13 +7,14 @@ use crate::repositories::{
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use services::admin::{
-    AdminModelInfo, AdminOrganizationInfo, AdminRepository, DeprecateModelOutcome,
-    ModelDeprecationDeliveryRecord, ModelDeprecationEmailStatus, ModelDeprecationModel,
-    ModelDeprecationRecipient, ModelHistoryEntry, ModelPricing, ModelPricingSnapshot,
-    OrganizationLimits, OrganizationLimitsHistoryEntry, OrganizationLimitsUpdate,
-    PlatformServiceInfo, PricingChangeDeliveryRecord, PricingChangeOpenConflictError,
-    PricingChangeRecipientRow, ScheduledPricingChange, ScheduledPricingChangeInsert,
-    ScheduledPricingChangeStatus, UpdateModelAdminRequest, UserInfo, UserOrganizationInfo,
+    AdminModelInfo, AdminOrganizationInfo, AdminOrganizationMemberInfo, AdminRepository,
+    DeprecateModelOutcome, ModelDeprecationDeliveryRecord, ModelDeprecationEmailStatus,
+    ModelDeprecationModel, ModelDeprecationRecipient, ModelHistoryEntry, ModelPricing,
+    ModelPricingSnapshot, OrganizationLimits, OrganizationLimitsHistoryEntry,
+    OrganizationLimitsUpdate, PlatformServiceInfo, PricingChangeDeliveryRecord,
+    PricingChangeOpenConflictError, PricingChangeRecipientRow, ScheduledPricingChange,
+    ScheduledPricingChangeInsert, ScheduledPricingChangeStatus, UpdateModelAdminRequest, UserInfo,
+    UserOrganizationInfo,
 };
 use services::service_usage::ports::ServiceUnit;
 use std::sync::Arc;
@@ -73,6 +74,23 @@ fn row_to_scheduled_pricing_change(
         change_reason: row.get("change_reason"),
         created_at: row.get("created_at"),
     })
+}
+
+/// Map a row from the admin organization SELECT (used by both the list and
+/// single-org queries) to `AdminOrganizationInfo`. The row must select
+/// `id, name, description, created_at, spend_limit, total_spent,
+/// total_requests, total_tokens`.
+fn row_to_admin_org_info(row: &tokio_postgres::Row) -> AdminOrganizationInfo {
+    AdminOrganizationInfo {
+        id: row.get("id"),
+        name: row.get("name"),
+        description: row.get("description"),
+        spend_limit: row.get("spend_limit"),
+        total_spent: row.get("total_spent"),
+        total_requests: row.get("total_requests"),
+        total_tokens: row.get("total_tokens"),
+        created_at: row.get("created_at"),
+    }
 }
 
 fn service_to_info(s: &crate::models::Service) -> Result<PlatformServiceInfo, anyhow::Error> {
@@ -1457,21 +1475,45 @@ impl AdminRepository for AdminCompositeRepository {
             )
             .await?;
 
-        let organizations = rows
-            .into_iter()
-            .map(|row| AdminOrganizationInfo {
-                id: row.get("id"),
-                name: row.get("name"),
-                description: row.get("description"),
-                spend_limit: row.get("spend_limit"),
-                total_spent: row.get("total_spent"),
-                total_requests: row.get("total_requests"),
-                total_tokens: row.get("total_tokens"),
-                created_at: row.get("created_at"),
-            })
-            .collect();
+        let organizations = rows.iter().map(row_to_admin_org_info).collect();
 
         Ok(organizations)
+    }
+
+    async fn get_organization(
+        &self,
+        organization_id: Uuid,
+    ) -> Result<Option<AdminOrganizationInfo>> {
+        let client = self.pool.get().await?;
+
+        let row = client
+            .query_opt(
+                r#"
+                SELECT
+                    o.id,
+                    o.name,
+                    o.description,
+                    o.created_at,
+                    olh.spend_limit,
+                    ob.total_spent,
+                    ob.total_requests,
+                    ob.total_tokens
+                FROM organizations o
+                LEFT JOIN LATERAL (
+                    SELECT SUM(spend_limit)::BIGINT AS spend_limit
+                    FROM organization_limits_history
+                    WHERE organization_id = o.id
+                      AND effective_until IS NULL
+                ) olh ON true
+                LEFT JOIN organization_balance ob ON o.id = ob.organization_id
+                WHERE o.id = $1
+                  AND o.is_active = true
+                "#,
+                &[&organization_id],
+            )
+            .await?;
+
+        Ok(row.as_ref().map(row_to_admin_org_info))
     }
 
     async fn count_all_organizations(&self) -> Result<i64> {
@@ -1489,6 +1531,123 @@ impl AdminRepository for AdminCompositeRepository {
             .await?;
 
         Ok(row.get::<_, i64>("count"))
+    }
+
+    async fn list_organization_members(
+        &self,
+        organization_id: Uuid,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<AdminOrganizationMemberInfo>> {
+        let client = self.pool.get().await?;
+
+        // Inactive (soft-deleted) *users* are INCLUDED — users are soft-deleted
+        // in place (`users.is_active = false`), the response exposes
+        // `user.is_active`, and `/v1/admin/users` likewise returns inactive
+        // users by default.
+        //
+        // Inactive (soft-deleted) *organizations* are EXCLUDED via the
+        // `organizations` join, matching `/v1/admin/organizations`, which hides
+        // inactive orgs. Org deletion is a soft delete that leaves member rows
+        // behind, so without this join a deactivated org would still list
+        // members — and would flip between 200 and 404 depending on whether it
+        // had any (the service's existence check only runs when `total == 0`).
+        // Count applies the identical join so totals stay consistent.
+        //
+        // `m.id` is a unique tiebreaker on the sort: members bulk-inserted in
+        // one transaction share `joined_at`, so without it paginated pages can
+        // repeat or skip rows.
+        let rows = client
+            .query(
+                r#"
+                SELECT
+                    m.id            AS member_id,
+                    m.organization_id,
+                    m.role,
+                    m.joined_at,
+                    m.invited_by,
+                    u.id            AS user_id,
+                    u.email,
+                    u.username,
+                    u.display_name,
+                    u.avatar_url,
+                    u.created_at    AS user_created_at,
+                    u.last_login_at,
+                    u.is_active,
+                    u.auth_provider,
+                    u.provider_user_id
+                FROM organization_members m
+                JOIN users u ON u.id = m.user_id
+                JOIN organizations o ON o.id = m.organization_id AND o.is_active = true
+                WHERE m.organization_id = $1
+                ORDER BY m.joined_at DESC, m.id
+                LIMIT $2 OFFSET $3
+                "#,
+                &[&organization_id, &limit, &offset],
+            )
+            .await?;
+
+        let members = rows
+            .into_iter()
+            .map(|row| AdminOrganizationMemberInfo {
+                member_id: row.get("member_id"),
+                organization_id: row.get("organization_id"),
+                role: row.get("role"),
+                joined_at: row.get("joined_at"),
+                invited_by: row.get("invited_by"),
+                user: UserInfo {
+                    id: row.get("user_id"),
+                    email: row.get("email"),
+                    username: row.get("username"),
+                    display_name: row.get("display_name"),
+                    avatar_url: row.get("avatar_url"),
+                    created_at: row.get("user_created_at"),
+                    last_login_at: row.get("last_login_at"),
+                    is_active: row.get("is_active"),
+                    auth_provider: row.get("auth_provider"),
+                    provider_user_id: row.get("provider_user_id"),
+                },
+            })
+            .collect();
+
+        Ok(members)
+    }
+
+    async fn count_organization_members(&self, organization_id: Uuid) -> Result<i64> {
+        let client = self.pool.get().await?;
+
+        let row = client
+            .query_one(
+                r#"
+                SELECT COUNT(*) as count
+                FROM organization_members m
+                JOIN users u ON u.id = m.user_id
+                JOIN organizations o ON o.id = m.organization_id AND o.is_active = true
+                WHERE m.organization_id = $1
+                "#,
+                &[&organization_id],
+            )
+            .await?;
+
+        Ok(row.get::<_, i64>("count"))
+    }
+
+    async fn organization_exists(&self, organization_id: Uuid) -> Result<bool> {
+        let client = self.pool.get().await?;
+
+        let row = client
+            .query_one(
+                r#"
+                SELECT EXISTS (
+                    SELECT 1 FROM organizations
+                    WHERE id = $1 AND is_active = true
+                ) AS exists
+                "#,
+                &[&organization_id],
+            )
+            .await?;
+
+        Ok(row.get::<_, bool>("exists"))
     }
 
     async fn list_services(

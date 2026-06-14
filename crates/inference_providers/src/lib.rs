@@ -326,6 +326,37 @@ pub trait InferenceProvider {
         true
     }
 
+    /// The trust tier of this provider — see [`ProviderTier`]. Drives provider
+    /// ordering in the pool (NEAR-served models prefer their own attested fleet
+    /// and fall back to an attested third party like Chutes only when the NEAR
+    /// backends can't fulfill the request). Default [`ProviderTier::NonAttested`];
+    /// `attested::nearai` returns [`ProviderTier::Near`] and `attested::chutes`
+    /// returns [`ProviderTier::Attested3p`].
+    fn tier(&self) -> ProviderTier {
+        ProviderTier::NonAttested
+    }
+
+    /// Whether this provider can serve **streaming** completions. Default `true`.
+    /// A provider that gates streaming (e.g. Chutes when `CHUTES_ENABLE_STREAMING`
+    /// is off — its stream protocol has no authenticated frame ordering) returns
+    /// `false`, so the pool prefers a streaming-capable sibling for streaming
+    /// requests instead of falling through to a hard "streaming not enabled" error
+    /// that would mask the primary's failure and suppress its retry.
+    fn supports_streaming(&self) -> bool {
+        true
+    }
+
+    /// Whether this provider can serve a request carrying **client-facing E2EE**
+    /// intent (the client asked cloud-api to encrypt the response to its own key,
+    /// via `x_client_pub_key`). Default `true`. A provider that can't (e.g. Chutes,
+    /// whose responses arrive over its own ML-KEM channel and which rejects the
+    /// client encryption headers) returns `false`, so the pool prefers a capable
+    /// sibling for such requests instead of falling through to a hard rejection
+    /// that masks the primary's failure and suppresses its retry.
+    fn supports_client_e2ee(&self) -> bool {
+        true
+    }
+
     /// Clean up the dedicated client for a chat_id after signature fetching.
     fn unpin_chat_connection(&self, _chat_id: &str) {}
 

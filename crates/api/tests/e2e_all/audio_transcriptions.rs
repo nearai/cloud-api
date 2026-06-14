@@ -157,6 +157,46 @@ async fn test_audio_transcription_verbose_json() {
     assert!(!body.text.is_empty());
 }
 
+/// Test that response_format=text returns a plain-text body
+#[tokio::test]
+async fn test_audio_transcription_text_response_format_returns_plain_text() {
+    let server = setup_test_server().await;
+
+    let model_name = "Qwen/Qwen-Image-2512";
+    setup_whisper_model(&server, model_name).await;
+
+    let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
+    let api_key = get_api_key_for_org(&server, org.id).await;
+
+    let audio_bytes = create_mock_audio_file(100);
+
+    let response = server
+        .post("/v1/audio/transcriptions")
+        .add_header("Authorization", format!("Bearer {}", api_key))
+        .multipart(
+            axum_test::multipart::MultipartForm::new()
+                .add_part(
+                    "file",
+                    axum_test::multipart::Part::bytes(audio_bytes)
+                        .file_name("test.mp3")
+                        .mime_type("audio/mpeg"),
+                )
+                .add_text("model", model_name)
+                .add_text("response_format", "text"),
+        )
+        .await;
+
+    assert_eq!(response.status_code(), 200);
+    let content_type = response
+        .headers()
+        .get("content-type")
+        .unwrap()
+        .to_str()
+        .unwrap();
+    assert_eq!(content_type, "text/plain; charset=utf-8");
+    assert_eq!(response.text(), "Mock transcription for file: test.mp3");
+}
+
 /// Test that very large files are rejected
 /// Note: File size validation is implemented and triggers for files > 25 MB
 #[tokio::test]
@@ -433,6 +473,151 @@ async fn test_audio_transcription_invalid_response_format() {
     assert!(
         error.error.message.contains("response_format") || error.error.message.contains("Invalid")
     );
+}
+
+/// Test that recognized but unsupported subtitle formats return a client error
+#[tokio::test]
+async fn test_audio_transcription_unsupported_response_formats() {
+    let server = setup_test_server().await;
+
+    let model_name = "Qwen/Qwen-Image-2512";
+    setup_whisper_model(&server, model_name).await;
+
+    let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
+    let api_key = get_api_key_for_org(&server, org.id).await;
+
+    for response_format in ["srt", "vtt"] {
+        let audio_bytes = create_mock_audio_file(100);
+
+        let response = server
+            .post("/v1/audio/transcriptions")
+            .add_header("Authorization", format!("Bearer {}", api_key))
+            .multipart(
+                axum_test::multipart::MultipartForm::new()
+                    .add_part(
+                        "file",
+                        axum_test::multipart::Part::bytes(audio_bytes)
+                            .file_name("test.mp3")
+                            .mime_type("audio/mpeg"),
+                    )
+                    .add_text("model", model_name)
+                    .add_text("response_format", response_format),
+            )
+            .await;
+
+        assert_eq!(response.status_code(), 400);
+        let error: api::models::ErrorResponse = response.json();
+        assert!(error.error.message.contains("not currently supported"));
+    }
+}
+
+/// Smoke test that word-level timestamps are accepted at the API boundary and
+/// returned when the provider supplies them. Provider multipart forwarding is
+/// covered by inference_providers wire tests.
+#[tokio::test]
+async fn test_audio_transcription_word_timestamps_supported() {
+    let server = setup_test_server().await;
+
+    let model_name = "Qwen/Qwen-Image-2512";
+    setup_whisper_model(&server, model_name).await;
+
+    let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
+    let api_key = get_api_key_for_org(&server, org.id).await;
+
+    let audio_bytes = create_mock_audio_file(100);
+
+    let response = server
+        .post("/v1/audio/transcriptions")
+        .add_header("Authorization", format!("Bearer {}", api_key))
+        .multipart(
+            axum_test::multipart::MultipartForm::new()
+                .add_part(
+                    "file",
+                    axum_test::multipart::Part::bytes(audio_bytes)
+                        .file_name("test.mp3")
+                        .mime_type("audio/mpeg"),
+                )
+                .add_text("model", model_name)
+                .add_text("response_format", "verbose_json")
+                .add_text("timestamp_granularities[]", "word"),
+        )
+        .await;
+
+    assert_eq!(response.status_code(), 200);
+    let body: api::models::AudioTranscriptionResponse = response.json();
+    let words = body.words.expect("expected word timestamps");
+    assert!(!words.is_empty());
+}
+
+/// Test that timestamp granularities require verbose_json
+#[tokio::test]
+async fn test_audio_transcription_timestamp_granularities_require_verbose_json() {
+    let server = setup_test_server().await;
+
+    let model_name = "Qwen/Qwen-Image-2512";
+    setup_whisper_model(&server, model_name).await;
+
+    let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
+    let api_key = get_api_key_for_org(&server, org.id).await;
+
+    let audio_bytes = create_mock_audio_file(100);
+
+    let response = server
+        .post("/v1/audio/transcriptions")
+        .add_header("Authorization", format!("Bearer {}", api_key))
+        .multipart(
+            axum_test::multipart::MultipartForm::new()
+                .add_part(
+                    "file",
+                    axum_test::multipart::Part::bytes(audio_bytes)
+                        .file_name("test.mp3")
+                        .mime_type("audio/mpeg"),
+                )
+                .add_text("model", model_name)
+                .add_text("timestamp_granularities[]", "segment"),
+        )
+        .await;
+
+    assert_eq!(response.status_code(), 400);
+    let error: api::models::ErrorResponse = response.json();
+    assert!(error.error.message.contains("response_format=verbose_json"));
+}
+
+/// Test that invalid language values are rejected by the API boundary
+#[tokio::test]
+async fn test_audio_transcription_invalid_language() {
+    let server = setup_test_server().await;
+
+    let model_name = "Qwen/Qwen-Image-2512";
+    setup_whisper_model(&server, model_name).await;
+
+    let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
+    let api_key = get_api_key_for_org(&server, org.id).await;
+
+    let audio_bytes = create_mock_audio_file(100);
+
+    let response = server
+        .post("/v1/audio/transcriptions")
+        .add_header("Authorization", format!("Bearer {}", api_key))
+        .multipart(
+            axum_test::multipart::MultipartForm::new()
+                .add_part(
+                    "file",
+                    axum_test::multipart::Part::bytes(audio_bytes)
+                        .file_name("test.mp3")
+                        .mime_type("audio/mpeg"),
+                )
+                .add_text("model", model_name)
+                .add_text("language", "xx"),
+        )
+        .await;
+
+    assert_eq!(response.status_code(), 400);
+    let error: api::models::ErrorResponse = response.json();
+    assert!(error
+        .error
+        .message
+        .contains("supported Whisper language code or name"));
 }
 
 /// Test that usage is tracked with audio duration

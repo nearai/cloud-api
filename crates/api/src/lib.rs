@@ -612,6 +612,36 @@ pub async fn init_domain_services_with_pool_and_search_providers(
     domain_services
 }
 
+/// Standard OpenAI sampling knobs Chutes (sglang) honors, expressed in
+/// OpenRouter's fixed `supported_sampling_parameters` vocabulary. Seeded onto
+/// every auto-created Chutes catalog row so `GET /v1/models` advertises real
+/// capabilities instead of an empty list (which silently disables routing for
+/// OpenRouter-style consumers). `n` is intentionally omitted: it is not part of
+/// OpenRouter's vocabulary. Must remain a subset of `routes::admin::VALID_SAMPLING_PARAMS`.
+pub(crate) const CHUTES_SUPPORTED_SAMPLING_PARAMS: &[&str] = &[
+    "temperature",
+    "top_p",
+    "frequency_penalty",
+    "presence_penalty",
+    "stop",
+    "seed",
+    "max_tokens",
+];
+
+/// Feature capabilities Chutes (sglang) exposes, in OpenRouter's fixed
+/// `supported_features` vocabulary: `tools` => tool/function-calling, `json_mode`
+/// => JSON `response_format`. Streaming is always supported but is not a member
+/// of OpenRouter's feature vocabulary, so it is not advertised here. Must remain
+/// a subset of `routes::admin::VALID_FEATURES`.
+///
+/// `tools` is a *default* assumption, not a universal guarantee: tool-calling in
+/// sglang is model-family specific (needs a compatible chat template + tool-call
+/// parser), so a family without it would be over-advertised here — the inverse of
+/// the empty-array bug. That risk is bounded because the seed lands INACTIVE: an
+/// operator must PATCH the row (and is warned to verify tool support, clearing
+/// `supported_features` if absent) before any traffic is served.
+pub(crate) const CHUTES_SUPPORTED_FEATURES: &[&str] = &["tools", "json_mode"];
+
 /// Ensure a Chutes (attested) model has a catalog row in the `models` table.
 ///
 /// The data plane rejects any model without an active `models` row *before*
@@ -650,6 +680,22 @@ async fn ensure_chutes_catalog_row(
                     "Chutes model has an existing catalog row with attestation_supported=false; \
                      E2EE/signature handling may misbehave — fix via PATCH /v1/admin/models"
                 );
+            } else if existing.supported_sampling_parameters.is_empty()
+                && existing.supported_features.is_empty()
+            {
+                // This is the exact #781 (M1) bug state on a pre-existing row: both
+                // capability arrays are still the empty V0051 default, so
+                // `GET /v1/models` advertises the model as supporting *nothing* and
+                // OpenRouter-style routers won't route tool calls to it. New rows are
+                // seeded non-empty above; existing rows are backfilled by migration
+                // V0060. Warn in case a row predates the migration or was cleared.
+                tracing::warn!(
+                    model = %model_name,
+                    "Chutes model has an existing catalog row with EMPTY supported_features \
+                     and supported_sampling_parameters — OpenRouter-style routers will refuse \
+                     to route tool calls to it; backfilled by migration V0060, or set via \
+                     PATCH /v1/admin/models"
+                );
             } else {
                 tracing::info!(model = %model_name, "Chutes model already in catalog");
             }
@@ -682,6 +728,28 @@ async fn ensure_chutes_catalog_row(
                 owned_by: Some(owned_by.to_string()),
                 input_modalities: Some(vec!["text".to_string()]),
                 output_modalities: Some(vec!["text".to_string()]),
+                // OpenRouter-style routers gate tool/function-calling on these two
+                // arrays; leaving them empty (the SQL default) silently advertises a
+                // Chutes model as supporting *nothing*, so routers refuse to route
+                // tool calls to it. Chutes serves via sglang on an OpenAI-compatible
+                // surface, so seed the standard OpenAI knobs it honors. Operators can
+                // still override via PATCH /v1/admin/models. Both lists are restricted
+                // to OpenRouter's fixed vocabulary (asserted by a unit test below) so
+                // the seeded row would pass the same admin write-path validation.
+                supported_sampling_parameters: Some(
+                    CHUTES_SUPPORTED_SAMPLING_PARAMS
+                        .iter()
+                        .copied()
+                        .map(String::from)
+                        .collect(),
+                ),
+                supported_features: Some(
+                    CHUTES_SUPPORTED_FEATURES
+                        .iter()
+                        .copied()
+                        .map(String::from)
+                        .collect(),
+                ),
                 // Pricing left None -> defaults to 0 on INSERT. The inactive seed
                 // above prevents this zero price from ever being charged.
                 ..Default::default()
@@ -695,7 +763,11 @@ async fn ensure_chutes_catalog_row(
                         model = %model_name,
                         "Seeded Chutes catalog row as INACTIVE with zero pricing — set real \
                          per-token rates AND is_active=true via PATCH /v1/admin/models to serve \
-                         (kept inactive so paid traffic can't be billed at $0)"
+                         (kept inactive so paid traffic can't be billed at $0). The seed \
+                         advertises `tools`/`json_mode`: verify this model family actually \
+                         supports tool-calling in sglang (per-family parser + compatible chat \
+                         template) before activating, and clear `supported_features` via the \
+                         same PATCH if it doesn't"
                     );
                 }
                 Ok(None) => {
@@ -744,6 +816,30 @@ pub async fn init_inference_providers(
     ));
     let models_source =
         models_repo.clone() as Arc<dyn services::inference_provider_pool::ExternalModelsSource>;
+
+    // Fail-closed reservation (MUST run before external/discovery loads below):
+    // when Chutes is enabled, reserve EVERY configured canonical id as a pinned
+    // (verifiable) model up front — even before we try to build the providers. This
+    // guarantees a plaintext external/OpenRouter row sharing a canonical id can
+    // never register for it, even if the Chutes provider fails to build (missing
+    // key / construction error). A reserved id then serves only its attested
+    // provider(s) or fails closed (404); it can never silently serve plaintext for
+    // a model an operator configured as verifiable.
+    if config.external_providers.enable_chutes {
+        let canonical_ids: Vec<String> = config
+            .external_providers
+            .chutes_models
+            .iter()
+            .map(|e| e.canonical_id.clone())
+            .collect();
+        if !canonical_ids.is_empty() {
+            pool.reserve_pinned_models(&canonical_ids);
+            tracing::info!(
+                count = canonical_ids.len(),
+                "Reserved Chutes canonical ids as verifiable (fail-closed) before external load"
+            );
+        }
+    }
 
     // Load inference_url models (our own vLLM/SGLang backends)
     match models_source.fetch_inference_url_models().await {
@@ -796,30 +892,51 @@ pub async fn init_inference_providers(
                     services::attestation::chutes::vetted_golden_measurements(),
                     pccs_url,
                 ));
-                for model in &config.external_providers.chutes_models {
+                for entry in &config.external_providers.chutes_models {
+                    // The provider talks to Chutes with the chute SLUG (request_body
+                    // pins it + cached_chute_id resolves it); we expose/route under
+                    // the CANONICAL id (the NEAR-served id when NEAR also serves the
+                    // model, else the OpenRouter id) — never the raw `-TEE` slug.
                     let cfg = inference_providers::attested::chutes::Config::new(
                         api_key.clone(),
-                        model.clone(),
+                        entry.chute_slug.clone(),
                         config.external_providers.timeout_seconds,
                     )
+                    .with_canonical_id(entry.canonical_id.clone())
                     .with_streaming(allow_streaming);
                     match inference_providers::attested::chutes::Provider::new(
                         cfg,
                         verifier.clone(),
                     ) {
                         Ok(provider) => {
-                            // Ensure a catalog row exists so the data plane resolves
-                            // the model (and usage can be billed against a real id).
-                            ensure_chutes_catalog_row(&models_repo, model).await;
-                            // Pinned: registered out-of-band (not DB discovery), so
-                            // excluded from the refresh's stale-removal; also skips the
-                            // signing-key discovery Chutes never satisfies.
-                            pool.register_pinned_provider(model.clone(), Arc::new(provider))
-                                .await;
-                            tracing::info!(model = %model, "Registered Chutes attested provider");
+                            // Ensure a catalog row exists under the canonical id so the
+                            // data plane resolves the model (and usage bills against a
+                            // real id). If NEAR already serves this id, its row is left
+                            // untouched and we just add Chutes as a fallback provider.
+                            ensure_chutes_catalog_row(&models_repo, &entry.canonical_id).await;
+                            // Pinned SECONDARY: pushed onto the canonical id's provider
+                            // list (coexists with NEAR's own providers) and excluded from
+                            // discovery's stale-removal/overwrite. Tier ordering puts NEAR
+                            // first and Chutes as fallback; a Chutes-only id has just this
+                            // provider, so it serves as primary.
+                            pool.register_pinned_secondary_provider(
+                                entry.canonical_id.clone(),
+                                Arc::new(provider),
+                            )
+                            .await;
+                            tracing::info!(
+                                canonical = %entry.canonical_id,
+                                chute_slug = %entry.chute_slug,
+                                "Registered Chutes attested provider (fallback tier)"
+                            );
                         }
                         Err(e) => {
-                            tracing::warn!(model = %model, error = %e, "Failed to build Chutes provider");
+                            tracing::warn!(
+                                canonical = %entry.canonical_id,
+                                chute_slug = %entry.chute_slug,
+                                error = %e,
+                                "Failed to build Chutes provider"
+                            );
                         }
                     }
                 }
@@ -1009,6 +1126,10 @@ pub fn build_app_with_config(
         usage_state.clone(),
         rate_limit_state.clone(),
     );
+    let unsupported_openai_routes = build_unsupported_openai_routes(
+        &auth_components.auth_state_middleware,
+        rate_limit_state.clone(),
+    );
 
     let mcp_routes = build_mcp_routes(
         domain_services.web_search_provider.clone(),
@@ -1108,6 +1229,7 @@ pub fn build_app_with_config(
                 .nest("/auth", auth_routes)
                 .merge(completion_routes)
                 .merge(response_routes)
+                .merge(unsupported_openai_routes)
                 .merge(conversation_routes)
                 .merge(management_routes)
                 .merge(workspace_routes)
@@ -1351,6 +1473,26 @@ pub fn build_response_routes(
         ));
 
     Router::new().merge(inference_routes).merge(other_routes)
+}
+
+/// Build explicit not-implemented handlers for recognized OpenAI-compatible
+/// endpoints that cloud-api does not support yet.
+///
+/// These routes intentionally sit behind the normal API-key middleware, so
+/// unauthenticated callers receive the standard 401 before the 501 placeholder.
+pub fn build_unsupported_openai_routes(
+    auth_state_middleware: &AuthState,
+    rate_limit_state: middleware::RateLimitState,
+) -> Router {
+    routes::unsupported::openai_compat_routes()
+        .layer(from_fn_with_state(
+            rate_limit_state,
+            middleware::api_key_rate_limit_middleware,
+        ))
+        .layer(from_fn_with_state(
+            auth_state_middleware.clone(),
+            middleware::auth::auth_middleware_with_workspace_context,
+        ))
 }
 
 pub fn build_mcp_routes(
@@ -1698,11 +1840,12 @@ pub fn build_admin_routes(
         confirm_model_pricing_changes, create_admin_access_token, create_service,
         delete_admin_access_token, delete_model, deprecate_model, get_admin_organization_balance,
         get_billing_summary, get_infra_summary, get_model_history, get_model_revenue,
-        get_org_revenue, get_organization_concurrent_limit, get_organization_limits_history,
+        get_org_revenue, get_organization as get_admin_organization,
+        get_organization_concurrent_limit, get_organization_limits_history,
         get_organization_metrics, get_organization_timeseries, get_platform_metrics,
         get_platform_timeseries, list_admin_access_tokens, list_invitation_email_deliveries,
-        list_model_pricing_changes, list_models as admin_list_models, list_organizations,
-        list_users, preview_model_deprecation, preview_model_pricing_changes,
+        list_model_pricing_changes, list_models as admin_list_models, list_organization_members,
+        list_organizations, list_users, preview_model_deprecation, preview_model_pricing_changes,
         resend_invitation_email, update_organization_concurrent_limit, update_organization_limits,
         update_service, AdminAppState,
     };
@@ -1860,6 +2003,14 @@ pub fn build_admin_routes(
             axum::routing::get(list_organizations),
         )
         .route(
+            "/admin/organizations/{org_id}",
+            axum::routing::get(get_admin_organization),
+        )
+        .route(
+            "/admin/organizations/{org_id}/members",
+            axum::routing::get(list_organization_members),
+        )
+        .route(
             "/admin/access-tokens",
             axum::routing::post(create_admin_access_token),
         )
@@ -1945,6 +2096,47 @@ mod tests {
     use super::*;
     use crate::openapi::ApiDoc;
 
+    /// Regression for issue #781 (M1): the Chutes catalog seed must advertise a
+    /// NON-EMPTY `supported_features` / `supported_sampling_parameters` so
+    /// OpenRouter-style routers don't silently treat the model as supporting
+    /// nothing (which disables tool routing).
+    #[test]
+    fn chutes_seed_advertises_nonempty_capabilities() {
+        assert!(
+            !CHUTES_SUPPORTED_SAMPLING_PARAMS.is_empty(),
+            "Chutes seed must advertise at least one sampling parameter"
+        );
+        assert!(
+            !CHUTES_SUPPORTED_FEATURES.is_empty(),
+            "Chutes seed must advertise at least one feature"
+        );
+        // tool/function-calling is the capability routers gate on; it must be present.
+        assert!(
+            CHUTES_SUPPORTED_FEATURES.contains(&"tools"),
+            "Chutes seed must advertise tool/function-calling support"
+        );
+    }
+
+    /// The seeded values must stay within OpenRouter's fixed vocabulary so the
+    /// auto-seeded row would pass the same validation the admin write path
+    /// (`PATCH /v1/admin/models`) enforces. This guards against the two lists
+    /// drifting apart.
+    #[test]
+    fn chutes_seed_values_are_valid_openrouter_vocabulary() {
+        for p in CHUTES_SUPPORTED_SAMPLING_PARAMS {
+            assert!(
+                crate::routes::admin::VALID_SAMPLING_PARAMS.contains(p),
+                "seeded sampling parameter '{p}' is not in OpenRouter's vocabulary"
+            );
+        }
+        for f in CHUTES_SUPPORTED_FEATURES {
+            assert!(
+                crate::routes::admin::VALID_FEATURES.contains(f),
+                "seeded feature '{f}' is not in OpenRouter's vocabulary"
+            );
+        }
+    }
+
     #[test]
     fn test_openapi_spec_generation() {
         // Test that we can generate the OpenAPI spec without errors
@@ -1984,6 +2176,32 @@ mod tests {
             serde_json::json!([{}]),
             "/v1/models must explicitly override global OpenAPI security"
         );
+    }
+
+    #[test]
+    fn test_openapi_conversation_action_paths_use_v1_prefix() {
+        let spec = serde_json::to_value(ApiDoc::openapi()).unwrap();
+        let paths = spec["paths"].as_object().unwrap();
+
+        // Pin/unpin and archive/unarchive share path keys with different methods.
+        for path in [
+            "/v1/conversations/{conversation_id}/archive",
+            "/v1/conversations/{conversation_id}/clone",
+            "/v1/conversations/{conversation_id}/pin",
+        ] {
+            assert!(paths.contains_key(path), "missing OpenAPI path: {path}");
+        }
+
+        for path in [
+            "/conversations/{conversation_id}/archive",
+            "/conversations/{conversation_id}/clone",
+            "/conversations/{conversation_id}/pin",
+        ] {
+            assert!(
+                !paths.contains_key(path),
+                "OpenAPI path is missing /v1 prefix: {path}"
+            );
+        }
     }
 
     /// Example of how to set up the application for E2E testing

@@ -3668,37 +3668,35 @@ pub async fn audio_transcriptions(
                     let http_status = StatusCode::from_u16(status_code)
                         .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
                     if http_status.is_client_error() {
-                        // A provider 4xx means the client's request/audio was
+                        // A provider 4xx means the client's audio/request was
                         // rejected as a bad request (malformed, unsupported,
-                        // empty, or too long). That is not a service fault: log
-                        // at warn so a burst of bad uploads does not page
-                        // on-call, and return an actionable invalid_request_error
-                        // instead of a misleading "server_error / try again
-                        // later" (which also encourages doomed retries). Mirrors
-                        // the chat path in completion_stream_error_openai_type.
+                        // empty, or too long). Not a service fault: log at warn
+                        // so a burst of bad uploads does not page on-call, and
+                        // return an actionable invalid_request_error instead of a
+                        // misleading "server_error / try again later" (which also
+                        // encourages doomed retries). Mirrors the chat path in
+                        // completion_stream_error_openai_type.
+                        //
+                        // services::completions::audio_transcription already
+                        // remaps the provider's own-infra failures before they
+                        // reach here: 401/403 -> 500 and 5xx -> 502 (so they fall
+                        // into the `else` branch and still page), and 429 ->
+                        // RateLimitExceeded (handled by the arm above). So this
+                        // branch only ever sees genuine client 4xx.
                         tracing::warn!(
                             status_code,
                             %organization_id,
                             workspace_id = %api_key.workspace.id.0,
                             "Audio transcription rejected by provider (client input)"
                         );
-                        if status_code == 429 {
-                            (
-                                http_status,
-                                "rate_limit_error",
-                                "Audio transcription rate limit exceeded. Please retry with backoff."
-                                    .to_string(),
-                            )
-                        } else {
-                            (
-                                http_status,
-                                "invalid_request_error",
-                                "Audio could not be processed. Ensure the file is valid, \
-                                 non-empty audio in a supported format and within size and \
-                                 duration limits."
-                                    .to_string(),
-                            )
-                        }
+                        (
+                            http_status,
+                            "invalid_request_error",
+                            "Audio could not be processed. Ensure the file is valid, \
+                             non-empty audio in a supported format and within size and \
+                             duration limits."
+                                .to_string(),
+                        )
                     } else {
                         tracing::error!(
                             status_code,

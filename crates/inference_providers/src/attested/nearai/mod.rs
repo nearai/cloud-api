@@ -1806,8 +1806,9 @@ impl InferenceProvider for Fleet {
                 .unwrap_or_else(|_| "Unknown error".to_string());
             // Provider 4xx = client-supplied audio/request rejected as a bad
             // request; log at warn so a burst of bad uploads does not page
-            // on-call. 5xx (a real backend fault) stays at error.
-            if (400..500).contains(&status_code) {
+            // on-call. 401/403 (our backend credentials) and 5xx are real infra
+            // faults, not client input, so they stay at error and still alert.
+            if (400..500).contains(&status_code) && status_code != 401 && status_code != 403 {
                 tracing::warn!(
                     status_code,
                     "Audio transcription request rejected by provider (client input)"

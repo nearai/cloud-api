@@ -467,3 +467,101 @@ async fn test_audio_transcription_usage_tracking() {
     // Usage should be recorded - we verify by checking the response is successful
     // In a real test, we would query the usage database to verify exact amounts
 }
+
+/// Regression: a provider 4xx (e.g. whisper's 400 "Invalid or unsupported audio
+/// file") must reach the client as HTTP 400 `invalid_request_error`, not a
+/// generic 502 `server_error`. This regressed because the provider pool
+/// flattened the structured `HttpError` into a string, collapsing every failure
+/// to 502 and hiding the real status from the route handler.
+#[tokio::test]
+async fn test_audio_transcription_provider_4xx_maps_to_invalid_request() {
+    let (server, _pool, mock_provider, _db) = setup_test_server_with_pool().await;
+
+    let model_name = "Qwen/Qwen-Image-2512";
+    setup_whisper_model(&server, model_name).await;
+
+    let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
+    let api_key = get_api_key_for_org(&server, org.id).await;
+
+    // Provider rejects the audio as a bad request.
+    mock_provider
+        .set_audio_transcription_error_override(Some(
+            inference_providers::AudioTranscriptionError::HttpError {
+                status_code: 400,
+                message: "{\"error\":{\"message\":\"Invalid or unsupported audio file.\",\
+                          \"type\":\"BadRequestError\"}}"
+                    .to_string(),
+            },
+        ))
+        .await;
+
+    let response = server
+        .post("/v1/audio/transcriptions")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .multipart(
+            axum_test::multipart::MultipartForm::new()
+                .add_part(
+                    "file",
+                    axum_test::multipart::Part::bytes(create_mock_audio_file(100))
+                        .file_name("test.mp3")
+                        .mime_type("audio/mpeg"),
+                )
+                .add_text("model", model_name),
+        )
+        .await;
+
+    assert_eq!(
+        response.status_code(),
+        400,
+        "provider 4xx should surface as a client 400, got {}",
+        response.status_code()
+    );
+    let err = response.json::<api::models::ErrorResponse>();
+    assert_eq!(err.error.r#type, "invalid_request_error");
+}
+
+/// A provider 5xx must stay a server error (502 / `server_error`) so genuine
+/// backend failures still page on-call after the 4xx reclassification.
+#[tokio::test]
+async fn test_audio_transcription_provider_5xx_stays_server_error() {
+    let (server, _pool, mock_provider, _db) = setup_test_server_with_pool().await;
+
+    let model_name = "Qwen/Qwen-Image-2512";
+    setup_whisper_model(&server, model_name).await;
+
+    let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
+    let api_key = get_api_key_for_org(&server, org.id).await;
+
+    mock_provider
+        .set_audio_transcription_error_override(Some(
+            inference_providers::AudioTranscriptionError::HttpError {
+                status_code: 500,
+                message: "internal error".to_string(),
+            },
+        ))
+        .await;
+
+    let response = server
+        .post("/v1/audio/transcriptions")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .multipart(
+            axum_test::multipart::MultipartForm::new()
+                .add_part(
+                    "file",
+                    axum_test::multipart::Part::bytes(create_mock_audio_file(100))
+                        .file_name("test.mp3")
+                        .mime_type("audio/mpeg"),
+                )
+                .add_text("model", model_name),
+        )
+        .await;
+
+    assert_eq!(
+        response.status_code(),
+        502,
+        "provider 5xx should surface as 502, got {}",
+        response.status_code()
+    );
+    let err = response.json::<api::models::ErrorResponse>();
+    assert_eq!(err.error.r#type, "server_error");
+}

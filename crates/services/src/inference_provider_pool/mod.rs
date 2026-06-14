@@ -2339,14 +2339,45 @@ impl InferenceProviderPool {
                     provider
                         .audio_transcription(params, request_hash)
                         .await
-                        .map_err(|e| CompletionError::CompletionError(e.to_string()))
+                        // Preserve the provider's HTTP status so a non-retryable
+                        // client 4xx (e.g. 400 "Invalid or unsupported audio
+                        // file") survives retry/fallback as a structured
+                        // HttpError instead of being flattened to a string. A
+                        // string would re-enter the service mapper as a generic
+                        // TranscriptionError -> ProviderError{502}, hiding the
+                        // real status from the route handler. is_external=false:
+                        // this is our own vLLM whisper backend, not a third party.
+                        .map_err(|e| match e {
+                            AudioTranscriptionError::HttpError {
+                                status_code,
+                                message,
+                            } => CompletionError::HttpError {
+                                status_code,
+                                message,
+                                is_external: false,
+                            },
+                            AudioTranscriptionError::TranscriptionError(msg) => {
+                                CompletionError::CompletionError(msg)
+                            }
+                        })
                 }
             })
             .await
-            .map_err(|e| {
-                AudioTranscriptionError::TranscriptionError(Self::sanitize_error_message(
-                    &e.to_string(),
-                ))
+            .map_err(|e| match e {
+                // Carry the structured HTTP status back out so the service layer
+                // maps it per-code (400 -> client error, 401/403 -> 500, 5xx ->
+                // 502) instead of collapsing every failure to a generic 502.
+                CompletionError::HttpError {
+                    status_code,
+                    message,
+                    ..
+                } => AudioTranscriptionError::HttpError {
+                    status_code,
+                    message: Self::sanitize_error_message(&message),
+                },
+                other => AudioTranscriptionError::TranscriptionError(Self::sanitize_error_message(
+                    &other.to_string(),
+                )),
             })?;
 
         tracing::info!(

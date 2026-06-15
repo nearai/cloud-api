@@ -415,8 +415,13 @@ mod tests {
           {"name":"leader1","role":"leader","state":"running","host":"postgres-a.dstack.internal","port":5432,"timeline":3},
           {"name":"newrep","role":"replica","state":"creating replica","timeline":3}
         ],"scope":"pg-cluster"}"#;
-        let info: ClusterInfo = serde_json::from_str(json).expect("must parse despite half-registered member");
-        assert_eq!(info.members.len(), 1, "the not-yet-ready member should be dropped");
+        let info: ClusterInfo =
+            serde_json::from_str(json).expect("must parse despite half-registered member");
+        assert_eq!(
+            info.members.len(),
+            1,
+            "the not-yet-ready member should be dropped"
+        );
         assert_eq!(info.members[0].name, "leader1");
         assert_eq!(info.members[0].role, "leader");
     }
@@ -433,7 +438,11 @@ mod tests {
           {"name":"leader","role":"leader","state":"running","host":"postgres-ew3zj5pk.dstack.internal","port":5432,"timeline":3}
         ],"scope":"pg-cluster"}"#;
         let info: ClusterInfo = serde_json::from_str(json).expect("must parse");
-        assert_eq!(info.members.len(), 3, "only the 3 fully-registered members survive");
+        assert_eq!(
+            info.members.len(),
+            3,
+            "only the 3 fully-registered members survive"
+        );
         assert!(info.members.iter().any(|m| m.role == "leader"));
         assert!(info.members.iter().all(|m| m.name != "newrep"));
     }

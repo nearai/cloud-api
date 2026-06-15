@@ -590,6 +590,8 @@ struct MockConfig {
     stream_error_override: Option<CompletionError>,
     /// When set, all embeddings calls return this error instead of generating a response
     embedding_error_override: Option<EmbeddingError>,
+    /// When set, all audio transcription calls return this error instead of a response.
+    audio_transcription_error_override: Option<AudioTranscriptionError>,
 }
 
 /// Builder for configuring a single expectation
@@ -653,6 +655,7 @@ impl MockProvider {
                 error_override: None,
                 stream_error_override: None,
                 embedding_error_override: None,
+                audio_transcription_error_override: None,
             })),
             last_chat_params: Arc::new(Mutex::new(None)),
             fail_attestation: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -675,6 +678,7 @@ impl MockProvider {
                 error_override: None,
                 stream_error_override: None,
                 embedding_error_override: None,
+                audio_transcription_error_override: None,
             })),
             last_chat_params: Arc::new(Mutex::new(None)),
             fail_attestation: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -695,6 +699,7 @@ impl MockProvider {
                 error_override: None,
                 stream_error_override: None,
                 embedding_error_override: None,
+                audio_transcription_error_override: None,
             })),
             last_chat_params: Arc::new(Mutex::new(None)),
             fail_attestation: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -789,6 +794,16 @@ impl MockProvider {
     pub async fn set_embedding_error_override(&self, error: Option<EmbeddingError>) {
         let mut config = self.config.lock().await;
         config.embedding_error_override = error;
+    }
+
+    /// Override the audio transcription response with an error (useful for
+    /// testing the provider-error mapping path). Pass `None` to clear.
+    pub async fn set_audio_transcription_error_override(
+        &self,
+        error: Option<AudioTranscriptionError>,
+    ) {
+        let mut config = self.config.lock().await;
+        config.audio_transcription_error_override = error;
     }
 
     /// Generate a completion ID
@@ -1446,6 +1461,12 @@ impl crate::InferenceProvider for MockProvider {
         params: AudioTranscriptionParams,
         _request_hash: String,
     ) -> Result<AudioTranscriptionResponse, AudioTranscriptionError> {
+        // Test hook: when set, return the injected error (e.g. a provider
+        // HttpError) so tests can exercise the error-mapping path.
+        if let Some(ref error) = self.config.lock().await.audio_transcription_error_override {
+            return Err(error.clone());
+        }
+
         // Mock implementation returns simple transcription with mock timing
         let file_size_kb = params.file_bytes.len() / 1024;
         let mock_duration = (file_size_kb as f64) * 0.1; // Assume ~0.1s per KB

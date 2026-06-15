@@ -1814,10 +1814,22 @@ impl InferenceProvider for Fleet {
                 .text()
                 .await
                 .unwrap_or_else(|_| "Unknown error".to_string());
-            tracing::error!(
-                status_code,
-                "Audio transcription request failed with HTTP error"
-            );
+            // Log genuine client-input 4xx (malformed/unsupported/oversized
+            // audio) at warn so a burst of bad uploads does not page on-call.
+            // Everything else — 401/403 (our backend creds), 404 (missing/stale
+            // route), 408 (timeout), 429, and 5xx — is a real infra/transient
+            // fault and stays at error so it still alerts.
+            if is_client_audio_input_status(status_code) {
+                tracing::warn!(
+                    status_code,
+                    "Audio transcription request rejected by provider (client input)"
+                );
+            } else {
+                tracing::error!(
+                    status_code,
+                    "Audio transcription request failed with HTTP error"
+                );
+            }
             return Err(AudioTranscriptionError::HttpError {
                 status_code,
                 message,

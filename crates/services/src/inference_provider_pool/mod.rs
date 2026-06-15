@@ -5,6 +5,7 @@ use inference_providers::nearai;
 use inference_providers::rotation;
 use inference_providers::spki_verifier::{FingerprintState, SharedTlsRoots};
 use inference_providers::{
+    is_client_audio_input_status,
     models::{AttestationError, CompletionError},
     AudioTranscriptionError, AudioTranscriptionParams, AudioTranscriptionResponse,
     ChatCompletionParams, ExternalProvider, ExternalProviderConfig, ImageEditError,
@@ -2635,14 +2636,64 @@ impl InferenceProviderPool {
                     provider
                         .audio_transcription(params, request_hash)
                         .await
-                        .map_err(|e| CompletionError::CompletionError(e.to_string()))
+                        // Classify the provider's failure so the structured HTTP
+                        // status survives retry/fallback only where that is
+                        // correct. Genuine client-input 4xx (400/413/415/422)
+                        // stay structured: the route returns invalid_request_error
+                        // and the pool fast-returns without wasting fallback on a
+                        // payload that fails everywhere. 5xx/429 stay structured
+                        // too, so retry, failover, and the service status mapping
+                        // work. Provider-infra 4xx — 401/403 (our creds), 404
+                        // (missing/stale route), 408 (timeout) — are NOT client
+                        // input: drop them to a generic provider failure so the
+                        // request can fall through to other providers and surfaces
+                        // as a 5xx server error, not misleading bad-audio guidance.
+                        // is_external=false: this is our own vLLM whisper backend.
+                        .map_err(|e| match e {
+                            AudioTranscriptionError::HttpError {
+                                status_code,
+                                message,
+                            } if is_client_audio_input_status(status_code)
+                                || status_code >= 500
+                                || status_code == 429 =>
+                            {
+                                CompletionError::HttpError {
+                                    status_code,
+                                    message,
+                                    is_external: false,
+                                }
+                            }
+                            AudioTranscriptionError::HttpError {
+                                status_code,
+                                message,
+                            } => CompletionError::CompletionError(format!(
+                                "HTTP error {status_code}: {message}"
+                            )),
+                            AudioTranscriptionError::TranscriptionError(msg) => {
+                                CompletionError::CompletionError(msg)
+                            }
+                        })
                 }
             })
             .await
-            .map_err(|e| {
-                AudioTranscriptionError::TranscriptionError(Self::sanitize_error_message(
-                    &e.to_string(),
-                ))
+            .map_err(|e| match e {
+                // Carry the structured status back out for the codes kept
+                // structured above (client-input 4xx, 5xx, 429) so the service
+                // layer maps them per-code (client 4xx -> invalid_request_error,
+                // 5xx -> 502, 503 -> overloaded, 429 -> rate limit). Infra 4xx
+                // were already downgraded to a generic provider failure and fall
+                // through the `other` arm to a 502 server error.
+                CompletionError::HttpError {
+                    status_code,
+                    message,
+                    ..
+                } => AudioTranscriptionError::HttpError {
+                    status_code,
+                    message: Self::sanitize_error_message(&message),
+                },
+                other => AudioTranscriptionError::TranscriptionError(Self::sanitize_error_message(
+                    &other.to_string(),
+                )),
             })?;
 
         tracing::info!(

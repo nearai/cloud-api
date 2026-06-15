@@ -4373,14 +4373,51 @@ pub async fn audio_transcriptions(
                     status_code,
                     ..
                 } => {
-                    tracing::error!("Audio transcription provider error");
                     let http_status = StatusCode::from_u16(status_code)
                         .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-                    (
-                        http_status,
-                        "server_error",
-                        "Audio transcription failed. Please try again later.".to_string(),
-                    )
+                    if inference_providers::is_client_audio_input_status(status_code) {
+                        // A genuine client-input 4xx (400/413/415/422 — malformed,
+                        // unsupported, empty, or oversized audio). Not a service
+                        // fault: log at warn so a burst of bad uploads does not
+                        // page on-call, and return an actionable
+                        // invalid_request_error instead of a misleading
+                        // "server_error / try again later" (which also encourages
+                        // doomed retries). Mirrors the chat path in
+                        // completion_stream_error_openai_type.
+                        //
+                        // The pool classifies provider-infra failures (401/403
+                        // creds, 404 missing route, 408 timeout, 429, 5xx) into
+                        // server errors / RateLimitExceeded before they reach
+                        // here, so they take the `else` branch (or the arm above)
+                        // and still page. This predicate is the shared source of
+                        // truth for the client-input vs infra split.
+                        tracing::warn!(
+                            status_code,
+                            %organization_id,
+                            workspace_id = %api_key.workspace.id.0,
+                            "Audio transcription rejected by provider (client input)"
+                        );
+                        (
+                            http_status,
+                            "invalid_request_error",
+                            "Audio could not be processed. Ensure the file is valid, \
+                             non-empty audio in a supported format and within size and \
+                             duration limits."
+                                .to_string(),
+                        )
+                    } else {
+                        tracing::error!(
+                            status_code,
+                            %organization_id,
+                            workspace_id = %api_key.workspace.id.0,
+                            "Audio transcription provider error"
+                        );
+                        (
+                            http_status,
+                            "server_error",
+                            "Audio transcription failed. Please try again later.".to_string(),
+                        )
+                    }
                 }
                 services::completions::ports::CompletionError::ServiceOverloaded(_) => {
                     tracing::warn!("Audio transcription service overloaded");

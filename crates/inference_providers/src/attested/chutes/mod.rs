@@ -992,6 +992,21 @@ impl ThinkStreamState {
         });
         if native_reasoning && self.phase == ThinkPhase::Scanning {
             self.phase = ThinkPhase::Done;
+            // We may still be holding leading bytes from earlier scanning chunks (a
+            // whitespace run or a partial-`<think>` prefix that was never confirmed).
+            // Those are ordinary content — prepend them to THIS delta's content so they
+            // are never lost (Done's `flush` is a no-op, so we can't defer them).
+            if !self.pending.is_empty() {
+                // Reuse the owned `held` allocation rather than building a fresh String:
+                // append the delta's existing content onto the held prefix in place.
+                let mut held = std::mem::take(&mut self.pending);
+                let rest = delta
+                    .get("content")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                held.push_str(rest);
+                delta.insert("content".to_string(), Value::String(held));
+            }
             return;
         }
 
@@ -1176,8 +1191,10 @@ fn sse_event_json(ev: &SSEEvent) -> Option<Value> {
 /// untouched — we never drop or corrupt a chunk over the rewrite. Returns the (possibly
 /// rewritten) event; the [`ThinkStreamState`] carries the cross-chunk state.
 ///
-/// Runs BEFORE [`rewrite_sse_event_model`] so the moved/stripped reasoning text is then
-/// allowlist-sanitized and usage-gated like any other field.
+/// The rewrite is ATOMIC: `raw_bytes` is updated only once the parsed `chunk` re-derives
+/// successfully, so `chunk` and `raw_bytes` never temporarily de-sync (mirrors
+/// [`rewrite_sse_event_model`]). Runs BEFORE that helper so the moved/stripped reasoning
+/// text is then allowlist-sanitized and usage-gated like any other field.
 fn apply_think_to_event(mut ev: SSEEvent, think: &mut ThinkStreamState) -> SSEEvent {
     let Some(mut v) = sse_event_json(&ev) else {
         return ev;
@@ -1188,10 +1205,12 @@ fn apply_think_to_event(mut ev: SSEEvent, think: &mut ThinkStreamState) -> SSEEv
     };
     // Re-derive the parsed chunk from the transformed JSON so the chunk and raw_bytes
     // stay in lockstep (the re-serialized route paths read the chunk, not raw_bytes).
-    // On a parse failure keep the previously-parsed chunk rather than dropping it.
-    if let Ok(c) = serde_json::from_str::<crate::ChatCompletionChunk>(&json) {
-        ev.chunk = Some(StreamChunk::Chat(c));
-    }
+    // If the re-parse fails, leave the event entirely untouched rather than rewriting
+    // raw_bytes alone (which would de-sync chunk vs raw_bytes).
+    let Ok(c) = serde_json::from_str::<crate::ChatCompletionChunk>(&json) else {
+        return ev;
+    };
+    ev.chunk = Some(StreamChunk::Chat(c));
     ev.raw_bytes = bytes::Bytes::from(format!("data: {json}\n\n"));
     ev
 }
@@ -3109,6 +3128,54 @@ mod tests {
             content, "the final answer",
             "native model content untouched"
         );
+    }
+
+    #[tokio::test]
+    async fn native_reasoning_after_held_whitespace_does_not_lose_content() {
+        // Regression: a stream that first emits leading whitespace (held back while
+        // scanning) and THEN reveals itself as a native-reasoning model must not drop
+        // the held whitespace — it's ordinary content and must reappear.
+        use futures_util::StreamExt;
+        let ws = content_chunk_event("  "); // held back (could still open <think>)
+        let native = {
+            let p = json!({"id":"c1","object":"chat.completion.chunk","created":0,"model":"MiniMax-TEE","choices":[{"index":0,"delta":{"reasoning_content":"thoughts","content":"hi"}}]});
+            let s = serde_json::to_string(&p).unwrap();
+            SSEEvent {
+                raw_bytes: bytes::Bytes::from(format!("data: {s}\n\n")),
+                chunk: Some(StreamChunk::Chat(serde_json::from_str(&s).unwrap())),
+                raw_passthrough: true,
+            }
+        };
+        let decoded: StreamingResult = Box::pin(futures_util::stream::iter(vec![
+            Ok(ws),
+            Ok(native),
+            Ok(done_marker_event()),
+        ]));
+        let mut out = stream_with_think_extraction(decoded, None, false);
+        let mut seen = Vec::new();
+        while let Some(item) = out.next().await {
+            let ev = item.unwrap();
+            if ev.is_done_marker() {
+                continue;
+            }
+            let s = std::str::from_utf8(&ev.raw_bytes).unwrap();
+            let v: Value =
+                serde_json::from_str(s.strip_prefix("data: ").unwrap().trim_end()).unwrap();
+            let delta = &v["choices"][0]["delta"];
+            seen.push((
+                delta
+                    .get("content")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                delta
+                    .get("reasoning_content")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+            ));
+        }
+        let (content, reasoning) = joined(&seen);
+        assert_eq!(content, "  hi", "held whitespace prepended, not lost");
+        assert_eq!(reasoning, "thoughts", "native reasoning preserved");
     }
 
     #[tokio::test]

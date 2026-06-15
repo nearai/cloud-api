@@ -119,8 +119,9 @@ async fn test_chat_completions_records_usage_and_history() {
     );
 }
 
-/// Call chat/completions with stream: true, consume the stream, then verify usage was
-/// recorded in org usage history (limit=1).
+/// Call chat/completions with the default stream mode, consume the stream, then verify usage was
+/// still recorded in org usage history (limit=1). The public response may stay on raw passthrough
+/// for attested models to preserve provider signatures; billing capture must remain independent.
 #[tokio::test]
 async fn test_chat_completions_stream_records_usage_in_history() {
     let server = setup_test_server().await;
@@ -147,25 +148,17 @@ async fn test_chat_completions_stream_records_usage_in_history() {
     );
 
     let text = stream_resp.text();
-    let mut last_usage = None::<(i32, i32)>;
+    let mut saw_chunk = false;
     for line in text.lines() {
         if let Some(data) = line.strip_prefix("data: ") {
             if data.trim() == "[DONE]" {
                 break;
             }
-            if let Ok(StreamChunk::Chat(chat)) = serde_json::from_str::<StreamChunk>(data) {
-                if let Some(usage) = &chat.usage {
-                    last_usage = Some((usage.prompt_tokens, usage.completion_tokens));
-                }
-            }
+            let _: StreamChunk = serde_json::from_str(data).expect("stream data should be JSON");
+            saw_chunk = true;
         }
     }
-    assert!(
-        last_usage.is_some(),
-        "stream should contain at least one chunk with usage"
-    );
-    let (prompt_tokens, completion_tokens) = last_usage.unwrap();
-    assert!(prompt_tokens > 0 && completion_tokens > 0);
+    assert!(saw_chunk, "stream should contain at least one chunk");
 
     tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
 
@@ -186,11 +179,11 @@ async fn test_chat_completions_stream_records_usage_in_history() {
     let history: api::routes::usage::UsageHistoryResponse = history_resp.json();
     assert!(!history.data.is_empty(), "should have usage history entry");
     let entry = &history.data[0];
-    assert_eq!(entry.input_tokens, prompt_tokens);
-    assert_eq!(entry.output_tokens, completion_tokens);
+    assert!(entry.input_tokens > 0);
+    assert!(entry.output_tokens > 0);
     assert_eq!(
         entry.total_tokens,
-        prompt_tokens + completion_tokens,
+        entry.input_tokens + entry.output_tokens,
         "total_tokens should equal input + output"
     );
 
@@ -206,6 +199,187 @@ async fn test_chat_completions_stream_records_usage_in_history() {
     assert_eq!(
         entry.total_cost, cost.total_cost,
         "total_cost should match input/output tokens and configured pricing for streaming completions"
+    );
+}
+
+#[tokio::test]
+async fn test_chat_completions_stream_include_usage_false_preserves_passthrough() {
+    let server = setup_test_server().await;
+
+    setup_qwen_model(&server).await;
+    let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
+    let api_key = get_api_key_for_org(&server, org.id.clone()).await;
+
+    let stream_resp = server
+        .post("/v1/chat/completions")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .json(&json!({
+            "model": E2E_QWEN_MODEL_NAME,
+            "messages": [{ "role": "user", "content": "hello" }],
+            "stream": true,
+            "stream_options": { "include_usage": false }
+        }))
+        .await;
+
+    assert_eq!(
+        stream_resp.status_code(),
+        200,
+        "streaming chat/completions should succeed: {}",
+        stream_resp.text()
+    );
+
+    let text = stream_resp.text();
+    let mut saw_chunk = false;
+    for line in text.lines() {
+        let Some(data) = line.strip_prefix("data: ") else {
+            continue;
+        };
+        if data.trim() == "[DONE]" {
+            break;
+        }
+
+        saw_chunk = true;
+        let _: StreamChunk = serde_json::from_str(data).expect("stream data should be JSON");
+    }
+    assert!(saw_chunk, "stream should contain at least one chunk");
+}
+
+#[tokio::test]
+async fn test_chat_completions_stream_include_usage_true_emits_final_usage_only() {
+    let server = setup_test_server().await;
+
+    setup_qwen_model(&server).await;
+    let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
+    let api_key = get_api_key_for_org(&server, org.id.clone()).await;
+
+    let stream_resp = server
+        .post("/v1/chat/completions")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .json(&json!({
+            "model": E2E_QWEN_MODEL_NAME,
+            "messages": [{ "role": "user", "content": "hello" }],
+            "stream": true,
+            "stream_options": { "include_usage": true }
+        }))
+        .await;
+
+    assert_eq!(
+        stream_resp.status_code(),
+        200,
+        "streaming chat/completions should succeed: {}",
+        stream_resp.text()
+    );
+
+    let text = stream_resp.text();
+    let mut final_usage_chunks = 0;
+    let mut content_chunks = 0;
+    for line in text.lines() {
+        let Some(data) = line.strip_prefix("data: ") else {
+            continue;
+        };
+        if data.trim() == "[DONE]" {
+            break;
+        }
+
+        let value: serde_json::Value =
+            serde_json::from_str(data).expect("stream data should be JSON");
+        let choices = value
+            .get("choices")
+            .and_then(serde_json::Value::as_array)
+            .expect("stream chunk should have choices");
+        let is_terminal_chunk = choices.is_empty()
+            || choices.iter().any(|choice| {
+                choice
+                    .get("finish_reason")
+                    .is_some_and(|finish_reason| !finish_reason.is_null())
+            });
+        if is_terminal_chunk && value.get("usage").is_some_and(serde_json::Value::is_object) {
+            final_usage_chunks += 1;
+        } else {
+            content_chunks += 1;
+            assert!(
+                value.get("usage").is_some_and(serde_json::Value::is_null),
+                "intermediate chunks should carry usage:null, got {value}"
+            );
+        }
+    }
+
+    assert!(content_chunks > 0, "stream should include content chunks");
+    assert_eq!(
+        final_usage_chunks, 1,
+        "include_usage=true should expose exactly one final usage chunk"
+    );
+}
+
+#[tokio::test]
+async fn test_chat_completions_stream_error_does_not_emit_final_usage() {
+    let (server, _pool, mock_provider, _db) = setup_test_server_with_pool().await;
+
+    mock_provider
+        .set_default_response(
+            inference_providers::mock::ResponseTemplate::new("partial usage then error")
+                .with_stream_error_after(
+                    2,
+                    inference_providers::CompletionError::HttpError {
+                        status_code: 503,
+                        message: "upstream stream failed".to_string(),
+                        is_external: false,
+                    },
+                ),
+        )
+        .await;
+
+    setup_qwen_model(&server).await;
+    let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
+    let api_key = get_api_key_for_org(&server, org.id.clone()).await;
+
+    let stream_resp = server
+        .post("/v1/chat/completions")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .json(&json!({
+            "model": E2E_QWEN_MODEL_NAME,
+            "messages": [{ "role": "user", "content": "hello" }],
+            "stream": true,
+            "stream_options": { "include_usage": true }
+        }))
+        .await;
+
+    assert_eq!(
+        stream_resp.status_code(),
+        200,
+        "streaming chat/completions should return an SSE error frame: {}",
+        stream_resp.text()
+    );
+
+    let text = stream_resp.text();
+    let mut saw_error = false;
+    let mut final_usage_chunks = 0;
+    for line in text.lines() {
+        let Some(data) = line.strip_prefix("data: ") else {
+            continue;
+        };
+        if data.trim() == "[DONE]" {
+            break;
+        }
+
+        let value: serde_json::Value =
+            serde_json::from_str(data).expect("stream data should be JSON");
+        if value.get("error").is_some() {
+            saw_error = true;
+            continue;
+        }
+        if value.get("usage").is_some_and(serde_json::Value::is_object) {
+            final_usage_chunks += 1;
+        }
+    }
+
+    assert!(
+        saw_error,
+        "stream should include an SSE error frame: {text}"
+    );
+    assert_eq!(
+        final_usage_chunks, 0,
+        "failed streams must not append a clean final usage chunk: {text}"
     );
 }
 
@@ -304,7 +478,8 @@ async fn test_chat_completions_stream_with_cache_records_cache_in_history() {
         .json(&json!({
             "model": E2E_QWEN_MODEL_NAME,
             "messages": [{ "role": "user", "content": message }],
-            "stream": true
+            "stream": true,
+            "stream_options": { "include_usage": true }
         }))
         .await;
 

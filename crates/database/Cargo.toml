@@ -10,7 +10,7 @@ description.workspace = true
 # PostgreSQL client library for async Rust
 # Documentation: https://docs.rs/tokio-postgres/latest/tokio_postgres/
 # Crate: https://crates.io/crates/tokio-postgres
-tokio-postgres = { version = "0.7", features = ["with-chrono-0_4", "with-uuid-1", "with-serde_json-1"] }
+tokio-postgres = { version = "0.7.18", features = ["with-chrono-0_4", "with-uuid-1", "with-serde_json-1"] }
 
 # Connection pooling for tokio-postgres
 # Documentation: https://docs.rs/deadpool-postgres/latest/deadpool_postgres/
@@ -28,7 +28,7 @@ rustls = { version = "0.23", features = ["ring"] }
 rustls-platform-verifier = "0.7"
 
 # PostgreSQL types
-postgres-types = { version = "0.2", features = ["derive", "with-chrono-0_4", "with-uuid-1", "with-serde_json-1"] }
+postgres-types = { version = "0.2.14", features = ["derive", "with-chrono-0_4", "with-uuid-1", "with-serde_json-1"] }
 
 # Core dependencies
 tokio = { version = "1", features = ["full"] }

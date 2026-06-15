@@ -80,12 +80,12 @@ use tokio_stream::StreamExt;
 // Re-export commonly used types for convenience
 pub use mock::MockProvider;
 pub use models::{
-    AudioOutput, AudioTranscriptionError, AudioTranscriptionParams, AudioTranscriptionResponse,
-    ChatCompletionParams, ChatCompletionResponse, ChatCompletionResponseChoice,
-    ChatCompletionResponseWithBytes, ChatDelta, ChatMessage, ChatResponseMessage, ChatSignature,
-    CompletionError, CompletionParams, EmbeddingError, FinishReason, FunctionChoice,
-    FunctionDefinition, ImageData, ImageEditError, ImageEditParams, ImageEditResponse,
-    ImageEditResponseWithBytes, ImageGenerationError, ImageGenerationParams,
+    is_client_audio_input_status, AudioOutput, AudioTranscriptionError, AudioTranscriptionParams,
+    AudioTranscriptionResponse, ChatCompletionParams, ChatCompletionResponse,
+    ChatCompletionResponseChoice, ChatCompletionResponseWithBytes, ChatDelta, ChatMessage,
+    ChatResponseMessage, ChatSignature, CompletionError, CompletionParams, EmbeddingError,
+    FinishReason, FunctionChoice, FunctionDefinition, ImageData, ImageEditError, ImageEditParams,
+    ImageEditResponse, ImageEditResponseWithBytes, ImageGenerationError, ImageGenerationParams,
     ImageGenerationResponse, ImageGenerationResponseWithBytes, MessageRole, ModelInfo,
     PrivacyClassifyError, RerankError, RerankParams, RerankResponse, RerankResult, RerankUsage,
     ScoreError, ScoreParams, ScoreResponse, ScoreResult, ScoreUsage, StreamChunk, StreamOptions,
@@ -315,6 +315,47 @@ pub trait InferenceProvider {
     /// For L4 load-balanced backends, this ensures the signature fetch
     /// goes over the same TLS connection that served the completion.
     fn pin_chat_connection(&self, _request_hash: &str, _chat_id: &str) {}
+
+    /// Whether this provider exposes per-response chat signatures via
+    /// [`Self::get_signature`]. Default `true` (the historical behavior). A
+    /// provider whose response integrity is the transport itself — e.g. Chutes,
+    /// where it's the ML-KEM E2EE channel's AEAD tag rather than a signed
+    /// response — returns `false`, so the attestation flow skips the
+    /// signature-fetch/store step instead of erroring on every completion.
+    fn supports_chat_signatures(&self) -> bool {
+        true
+    }
+
+    /// The trust tier of this provider — see [`ProviderTier`]. Drives provider
+    /// ordering in the pool (NEAR-served models prefer their own attested fleet
+    /// and fall back to an attested third party like Chutes only when the NEAR
+    /// backends can't fulfill the request). Default [`ProviderTier::NonAttested`];
+    /// `attested::nearai` returns [`ProviderTier::Near`] and `attested::chutes`
+    /// returns [`ProviderTier::Attested3p`].
+    fn tier(&self) -> ProviderTier {
+        ProviderTier::NonAttested
+    }
+
+    /// Whether this provider can serve **streaming** completions. Default `true`.
+    /// A provider that gates streaming (e.g. Chutes when `CHUTES_ENABLE_STREAMING`
+    /// is off — its stream protocol has no authenticated frame ordering) returns
+    /// `false`, so the pool prefers a streaming-capable sibling for streaming
+    /// requests instead of falling through to a hard "streaming not enabled" error
+    /// that would mask the primary's failure and suppress its retry.
+    fn supports_streaming(&self) -> bool {
+        true
+    }
+
+    /// Whether this provider can serve a request carrying **client-facing E2EE**
+    /// intent (the client asked cloud-api to encrypt the response to its own key,
+    /// via `x_client_pub_key`). Default `true`. A provider that can't (e.g. Chutes,
+    /// whose responses arrive over its own ML-KEM channel and which rejects the
+    /// client encryption headers) returns `false`, so the pool prefers a capable
+    /// sibling for such requests instead of falling through to a hard rejection
+    /// that masks the primary's failure and suppresses its retry.
+    fn supports_client_e2ee(&self) -> bool {
+        true
+    }
 
     /// Clean up the dedicated client for a chat_id after signature fetching.
     fn unpin_chat_connection(&self, _chat_id: &str) {}

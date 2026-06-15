@@ -638,6 +638,138 @@ impl ModelRepository {
         Ok(self.row_to_model(&row))
     }
 
+    /// Insert a model row **only if one doesn't already exist** for `model_name`
+    /// (`INSERT ... ON CONFLICT (model_name) DO NOTHING`). Returns `Ok(Some(model))`
+    /// when this call inserted the row, or `Ok(None)` when a row already existed
+    /// (left completely untouched).
+    ///
+    /// Unlike [`Self::upsert_model_pricing`], the conflict path does **not** update
+    /// — so a concurrent create/activate (e.g. an operator priming the catalog at
+    /// the same moment as startup seeding) is never clobbered. Used to seed
+    /// out-of-band providers (Chutes) without racing operator changes.
+    pub async fn seed_model_if_absent(
+        &self,
+        model_name: &str,
+        req: &UpdateModelPricingRequest,
+    ) -> Result<Option<Model>> {
+        // Required for any new row (validated before the retry block).
+        let display_name = req
+            .model_display_name
+            .as_ref()
+            .cloned()
+            .context("model_display_name is required to seed a model")?;
+        let description = req
+            .model_description
+            .as_ref()
+            .cloned()
+            .context("model_description is required to seed a model")?;
+        let context_length = req
+            .context_length
+            .context("context_length is required to seed a model")?;
+        let owned_by = req.owned_by.as_ref().cloned();
+        let input_modalities_json =
+            serialize_modalities(&req.input_modalities, "input_modalities")?;
+        let output_modalities_json =
+            serialize_modalities(&req.output_modalities, "output_modalities")?;
+        let is_ready_value: Option<bool> = req.is_ready.flatten();
+        let deprecation_date_value: Option<DateTime<Utc>> = req.deprecation_date.flatten();
+        let openrouter_slug_value: Option<String> = req.openrouter_slug.clone().flatten();
+
+        let row = retry_db!("seed_model_if_absent", {
+            let client = self
+                .pool
+                .get()
+                .await
+                .context("Failed to get database connection")
+                .map_err(RepositoryError::PoolError)?;
+
+            // Column list mirrors the INSERT in `upsert_model_pricing` (schema-safe)
+            // — the only difference is `ON CONFLICT DO NOTHING` (no UPDATE).
+            let inserted = client
+                .query_opt(
+                    r#"
+                    INSERT INTO models (
+                        model_name,
+                        input_cost_per_token, output_cost_per_token, cost_per_image, cache_read_cost_per_token,
+                        model_display_name, model_description, model_icon,
+                        context_length, verifiable, is_active, owned_by,
+                        provider_type, provider_config, attestation_supported,
+                        input_modalities, output_modalities, inference_url, hugging_face_id, quantization, max_output_length, supported_sampling_parameters, supported_features, datacenters,
+                        is_ready, deprecation_date, openrouter_slug
+                    ) VALUES (
+                        $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11,
+                        COALESCE($12, $13),
+                        COALESCE($14, 'vllm'),
+                        $15,
+                        COALESCE($16, CASE WHEN COALESCE($14, 'vllm') = 'external' THEN false ELSE true END),
+                        $17, $18, $19,
+                        $20, $21, $22,
+                        COALESCE($23, ARRAY[]::TEXT[]),
+                        COALESCE($24, ARRAY[]::TEXT[]),
+                        $25, $26, $27, $28
+                    )
+                    ON CONFLICT (model_name) DO NOTHING
+                    RETURNING id, model_name, model_display_name, model_description, model_icon,
+                              input_cost_per_token, output_cost_per_token, cost_per_image, cache_read_cost_per_token,
+                              context_length, verifiable, is_active, owned_by, created_at, updated_at,
+                              provider_type, provider_config, attestation_supported,
+                              input_modalities, output_modalities, inference_url, hugging_face_id, quantization, max_output_length, supported_sampling_parameters, supported_features, datacenters, is_ready, deprecation_date, openrouter_slug
+                    "#,
+                    &[
+                        &model_name,
+                        &req.input_cost_per_token.unwrap_or(0),
+                        &req.output_cost_per_token.unwrap_or(0),
+                        &req.cost_per_image.unwrap_or(0),
+                        &req.cache_read_cost_per_token.unwrap_or(0),
+                        &display_name,
+                        &description,
+                        &req.model_icon,
+                        &context_length,
+                        &req.verifiable.unwrap_or(true),
+                        &req.is_active.unwrap_or(true),
+                        &owned_by,
+                        &DEFAULT_MODEL_OWNED_BY,
+                        &req.provider_type,
+                        &req.provider_config,
+                        &req.attestation_supported,
+                        &input_modalities_json,
+                        &output_modalities_json,
+                        &req.inference_url,
+                        &req.hugging_face_id,
+                        &req.quantization,
+                        &req.max_output_length,
+                        &req.supported_sampling_parameters,
+                        &req.supported_features,
+                        &req.datacenters,
+                        &is_ready_value,
+                        &deprecation_date_value,
+                        &openrouter_slug_value,
+                    ],
+                )
+                .await
+                .map_err(map_db_error)?;
+
+            // Record history only when we actually inserted (conflict -> None).
+            if let Some(inserted_row) = &inserted {
+                let model_id: uuid::Uuid = inserted_row.get("id");
+                self.record_model_history(
+                    &client,
+                    model_id,
+                    inserted_row,
+                    &req.change_reason,
+                    req.changed_by_user_id,
+                    req.changed_by_user_email.clone(),
+                )
+                .await
+                .map_err(RepositoryError::DatabaseError)?;
+            }
+
+            Ok(inserted)
+        })?;
+
+        Ok(row.as_ref().map(|r| self.row_to_model(r)))
+    }
+
     /// Create a new model with pricing
     pub async fn create_model(&self, model: &Model) -> Result<Model> {
         // Serialize modalities before entering retry block to propagate errors

@@ -147,7 +147,7 @@ pub struct FunctionChoice {
 }
 
 /// Streaming options
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct StreamOptions {
     /// Whether to include usage statistics in the final chunk
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -156,6 +156,10 @@ pub struct StreamOptions {
     /// Whether to send incremental usage stats in every chunk (vLLM-specific)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub continuous_usage_stats: Option<bool>,
+
+    /// Provider-specific streaming options that should survive typed parsing.
+    #[serde(flatten)]
+    pub extra: std::collections::HashMap<String, serde_json::Value>,
 }
 
 /// Parameters for chat completion requests (matches OpenAI API)
@@ -425,8 +429,8 @@ pub struct ChatCompletionChunk {
     /// List of completion choices
     pub choices: Vec<ChatChoice>,
 
-    /// Usage statistics (typically only in final chunk)
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Usage statistics (typically only in final chunk). OpenAI-compatible
+    /// streaming chunks carry this as `null` until final usage is available.
     pub usage: Option<TokenUsage>,
 
     /// Token IDs for the prompt (typically only in first chunk)
@@ -1008,7 +1012,7 @@ pub struct AudioTranscriptionParams {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub language: Option<String>,
 
-    /// Response format: "json", "text", "srt", "verbose_json", "vtt"
+    /// Response format: "json", "text", "verbose_json"
     #[serde(skip_serializing_if = "Option::is_none")]
     pub response_format: Option<String>,
 
@@ -1115,6 +1119,21 @@ pub enum AudioTranscriptionError {
 
     #[error("HTTP error {status_code}: {message}")]
     HttpError { status_code: u16, message: String },
+}
+
+/// Whether an audio-transcription HTTP status returned by the provider is a
+/// genuine client-input rejection (malformed / unsupported / oversized audio)
+/// rather than a provider-side failure.
+///
+/// Client-input 4xx (400/413/415/422) are surfaced to the caller as
+/// `invalid_request_error`, logged at warn (so a burst of bad uploads does not
+/// page on-call), and not retried across providers — the same payload fails
+/// everywhere. Everything else — 401/403 (our backend credentials), 404
+/// (missing/stale route), 408 (timeout), 429 (rate limit), and 5xx — is a
+/// server-side failure: logged at error, eligible for failover, and surfaced as
+/// a 5xx, never as misleading bad-audio guidance.
+pub fn is_client_audio_input_status(status_code: u16) -> bool {
+    matches!(status_code, 400 | 413 | 415 | 422)
 }
 
 /// Utility function to detect audio MIME type from filename extension

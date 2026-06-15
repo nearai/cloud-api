@@ -103,8 +103,10 @@ pub(crate) mod tracing_headers {
     pub const WORKSPACE_ID: &str = "x_workspace_id";
 }
 
-/// Encryption header keys used in params.extra for passing encryption information
-mod encryption_headers {
+/// Encryption header keys used in params.extra for passing encryption information.
+/// `pub(crate)` so other providers (e.g. the Chutes path) can strip/reject these
+/// internal client-E2EE markers instead of hardcoding the strings.
+pub(crate) mod encryption_headers {
     /// Key for signing algorithm (x-signing-algo header)
     pub const SIGNING_ALGO: &str = "x_signing_algo";
     /// Key for client public key (x-client-pub-key header)
@@ -1064,6 +1066,13 @@ impl Fleet {
 
 #[async_trait]
 impl InferenceProvider for Fleet {
+    /// NEAR's own attested fleet. `Provider` (which wraps `Fleet`) is what the pool
+    /// actually registers, but mirror the tier here too so the verifiable filter can
+    /// never misclassify a `Fleet` as plaintext if one is ever pooled directly.
+    fn tier(&self) -> crate::ProviderTier {
+        crate::ProviderTier::Near
+    }
+
     async fn get_signature(
         &self,
         chat_id: &str,
@@ -1396,6 +1405,7 @@ impl InferenceProvider for Fleet {
         streaming_params.stream_options = Some(StreamOptions {
             include_usage: Some(true),
             continuous_usage_stats: Some(true),
+            extra: Default::default(),
         });
 
         let mut headers = self
@@ -1657,6 +1667,7 @@ impl InferenceProvider for Fleet {
         streaming_params.stream_options = Some(StreamOptions {
             include_usage: Some(true),
             continuous_usage_stats: Some(true),
+            extra: Default::default(),
         });
 
         let headers = self
@@ -1758,8 +1769,9 @@ impl InferenceProvider for Fleet {
         }
 
         if let Some(granularities) = params.timestamp_granularities {
-            // Send as JSON array string
-            form = form.text("timestamp_granularities[]", granularities.join(","));
+            for granularity in granularities {
+                form = form.text("timestamp_granularities[]", granularity);
+            }
         }
 
         // Build headers (no Content-Type - reqwest sets it automatically for multipart)
@@ -1802,10 +1814,22 @@ impl InferenceProvider for Fleet {
                 .text()
                 .await
                 .unwrap_or_else(|_| "Unknown error".to_string());
-            tracing::error!(
-                status_code,
-                "Audio transcription request failed with HTTP error"
-            );
+            // Log genuine client-input 4xx (malformed/unsupported/oversized
+            // audio) at warn so a burst of bad uploads does not page on-call.
+            // Everything else — 401/403 (our backend creds), 404 (missing/stale
+            // route), 408 (timeout), 429, and 5xx — is a real infra/transient
+            // fault and stays at error so it still alerts.
+            if is_client_audio_input_status(status_code) {
+                tracing::warn!(
+                    status_code,
+                    "Audio transcription request rejected by provider (client input)"
+                );
+            } else {
+                tracing::error!(
+                    status_code,
+                    "Audio transcription request failed with HTTP error"
+                );
+            }
             return Err(AudioTranscriptionError::HttpError {
                 status_code,
                 message,
@@ -2077,6 +2101,12 @@ impl InferenceProvider for Fleet {
 /// to its Fleet, which holds all NEAR-AI model-proxy state and logic.
 #[async_trait]
 impl InferenceProvider for Provider {
+    /// NEAR AI's own attested TEE fleet — the primary tier for any model NEAR
+    /// serves; an attested third party (Chutes) sits behind it as fallback.
+    fn tier(&self) -> crate::ProviderTier {
+        crate::ProviderTier::Near
+    }
+
     async fn models(&self) -> Result<ModelsResponse, ListModelsError> {
         self.fleet.models().await
     }
@@ -2187,6 +2217,8 @@ impl InferenceProvider for Provider {
 mod tests {
     use super::*;
     use serial_test::serial;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn control_event(raw: &'static str) -> SSEEvent {
         SSEEvent {
@@ -2255,6 +2287,56 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    fn audio_transcription_params() -> AudioTranscriptionParams {
+        AudioTranscriptionParams {
+            model: "openai/whisper-large-v3".to_string(),
+            file_bytes: vec![1, 2, 3],
+            filename: "audio.mp3".to_string(),
+            language: Some("en".to_string()),
+            response_format: Some("verbose_json".to_string()),
+            temperature: None,
+            timestamp_granularities: Some(vec!["word".to_string(), "segment".to_string()]),
+            extra: Default::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn audio_transcription_sends_repeated_timestamp_granularity_fields() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/audio/transcriptions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "text": "ok",
+                "duration": 1.0,
+                "words": [{"word": "ok", "start": 0.0, "end": 1.0}]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let provider = Provider::new(Config::new(
+            server.uri(),
+            Some("sk-test".to_string()),
+            Some(5),
+        ));
+
+        let response = provider
+            .audio_transcription(audio_transcription_params(), "request-hash".to_string())
+            .await
+            .unwrap();
+
+        assert_eq!(response.text, "ok");
+        let requests = server.received_requests().await.unwrap();
+        let body = String::from_utf8_lossy(&requests[0].body);
+        assert_eq!(
+            body.matches("name=\"timestamp_granularities[]\"").count(),
+            2
+        );
+        assert!(body.contains("\r\nword\r\n"), "body was: {body}");
+        assert!(body.contains("\r\nsegment\r\n"), "body was: {body}");
+        assert!(!body.contains("word,segment"), "body was: {body}");
     }
 
     /// Happy path: first payload is a parsed data chunk — no rotation, and

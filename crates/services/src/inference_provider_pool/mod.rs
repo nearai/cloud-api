@@ -3123,15 +3123,11 @@ impl InferenceProviderPool {
         counts.retain(|ptr, _| live_ptrs.contains(ptr) || !candidate_ptrs.contains(ptr));
     }
 
-    /// Load models with inference_url as nearai::Providers into provider_mappings.
-    ///
-    /// For each model, reuses the existing provider (and its warm TLS connections)
-    /// if the inference_url hasn't changed since last load. Only creates new providers
-    /// for models whose URL changed or that are new.
-    ///
-    /// # Arguments
-    /// * `models` - List of (model_name, inference_url) tuples
     /// Load (or refresh) a set of inference_url models into the provider pool.
+    ///
+    /// Reuses the existing provider (and its warm TLS connections) for each model
+    /// whose inference_url hasn't changed since last load; creates new providers
+    /// only for models whose URL changed or that are new.
     ///
     /// The `partial` flag controls whether this is a merge or a replace.
     /// Pass `partial = true` from the admin PATCH path to upsert only the

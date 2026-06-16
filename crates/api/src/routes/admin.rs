@@ -519,7 +519,7 @@ pub async fn batch_upsert_models(
         );
         app_state
             .inference_provider_pool
-            .load_inference_url_models(inference_url_models)
+            .load_inference_url_models(inference_url_models, true)
             .await;
     }
 

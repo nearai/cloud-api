@@ -3131,7 +3131,15 @@ impl InferenceProviderPool {
     ///
     /// # Arguments
     /// * `models` - List of (model_name, inference_url) tuples
-    pub async fn load_inference_url_models(&self, models: Vec<(String, String)>) {
+    /// Load (or refresh) a set of inference_url models into the provider pool.
+    ///
+    /// When `partial = true` (called from the admin PATCH path), only the
+    /// provided models are upserted — existing state for untouched models is
+    /// preserved.  When `partial = false` (called from the periodic sync path
+    /// via `sync_inference_url_models`), the URL-provider cache and fingerprint
+    /// state map are replaced wholesale, pruning entries for models that are no
+    /// longer in the active set.
+    pub async fn load_inference_url_models(&self, models: Vec<(String, String)>, partial: bool) {
         if models.is_empty() {
             return;
         }
@@ -3808,23 +3816,42 @@ impl InferenceProviderPool {
             "pubkey_to_providers state after update"
         );
 
-        // Update the URL→provider cache
-        *self.inference_url_providers.write().await = new_url_cache;
+        // Update the URL→provider cache.
+        //
+        // Partial mode (admin PATCH): merge new entries into the existing map
+        // so that untouched models keep their warm providers and fingerprint
+        // state.  Full mode (periodic sync): replace the map entirely so that
+        // URLs for models that have been removed are pruned.
+        {
+            let mut cache = self.inference_url_providers.write().await;
+            if partial {
+                // Merge: only insert/replace the URLs we just processed.
+                for (url, provider) in new_url_cache {
+                    cache.insert(url, provider);
+                }
+            } else {
+                *cache = new_url_cache;
+            }
+        }
 
         // Rebuild the URL → FingerprintState map so its key set exactly
         // matches the active inference_url set:
         // - Newly-created URLs take the freshly-discovered state.
         // - Reused URLs keep their existing entries (cumulative discovery
         //   mutated the Arc in place).
-        // - URLs no longer in the active set are pruned — prevents a slow
-        //   leak of stale per-URL state as models are added and removed.
+        // - URLs no longer in the active set are pruned on a full sync —
+        //   prevents a slow leak of stale per-URL state as models are added
+        //   and removed.  On a partial sync we only insert new states and
+        //   leave existing ones untouched.
         {
             let mut states = self.inference_url_fingerprint_states.write().await;
             for (url, state) in new_fingerprint_states {
                 states.insert(url, state);
             }
-            let active_urls = self.inference_url_providers.read().await;
-            states.retain(|url, _| active_urls.contains_key(url));
+            if !partial {
+                let active_urls = self.inference_url_providers.read().await;
+                states.retain(|url, _| active_urls.contains_key(url));
+            }
         }
 
         info!(
@@ -3848,7 +3875,7 @@ impl InferenceProviderPool {
         // load_inference_url_models directly (partial batch, no prune).
         let complete_names: std::collections::HashSet<String> =
             models.iter().map(|(name, _)| name.clone()).collect();
-        self.load_inference_url_models(models).await;
+        self.load_inference_url_models(models, false).await;
         self.prune_stale_pinned(&complete_names).await;
     }
 
@@ -5670,7 +5697,7 @@ mod tests {
 
         // Call load_inference_url_models — the provider should be reused and
         // the self-healing path should detect missing pubkeys and re-fetch them.
-        pool.load_inference_url_models(vec![(model_id.clone(), url)])
+        pool.load_inference_url_models(vec![(model_id.clone(), url)], false)
             .await;
 
         // Verify pubkeys were recovered
@@ -6228,7 +6255,7 @@ mod tests {
         mock_provider.set_fail_attestation(true);
 
         // Load — the provider is reused, pubkeys are missing, re-fetch fails
-        pool.load_inference_url_models(vec![(model_id.clone(), url.clone())])
+        pool.load_inference_url_models(vec![(model_id.clone(), url.clone())], false)
             .await;
 
         // The URL should have been evicted from the cache
@@ -6303,7 +6330,7 @@ mod tests {
                 .insert("pretend-pubkey".to_string(), vec![mock.clone()]);
         }
 
-        pool.load_inference_url_models(vec![(model_id.clone(), url.clone())])
+        pool.load_inference_url_models(vec![(model_id.clone(), url.clone())], false)
             .await;
 
         // Blocked URL evicted from URL cache
@@ -7001,5 +7028,77 @@ mod tests {
         assert_eq!(primary.len(), 1);
         assert!(primary[0].iter().any(|t| t == "provider_tier:near"));
         assert!(primary[0].iter().any(|t| t == "fallback:false"));
+
+    /// When `load_inference_url_models` is called in partial mode (`partial = true`),
+    /// it must merge into the existing URL-provider cache and fingerprint-state map
+    /// rather than replacing them.  Providers for models not in the input set must
+    /// be preserved so they do not need to re-attest on the next periodic refresh.
+    ///
+    /// Regression test for issue #775: `batch_upsert_models` was calling
+    /// `load_inference_url_models` with only the PATCHed models, which caused the
+    /// full URL cache and fingerprint-state map to be replaced by a subset, evicting
+    /// all untouched providers and forcing unnecessary re-attestation.
+    #[tokio::test]
+    async fn test_partial_load_preserves_untouched_providers() {
+        use inference_providers::mock::MockProvider;
+
+        let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
+
+        // Pre-seed the URL cache with two "existing" models as if they were
+        // loaded during a prior full sync.
+        let untouched_model = "model-untouched".to_string();
+        let untouched_url = "https://untouched.completions.near.ai".to_string();
+        let untouched_provider = Arc::new(MockProvider::new());
+
+        let patched_model = "model-patched".to_string();
+        let patched_url = "https://patched.completions.near.ai".to_string();
+        let patched_provider = Arc::new(MockProvider::new());
+
+        {
+            let mut cache = pool.inference_url_providers.write().await;
+            cache.insert(
+                untouched_url.clone(),
+                untouched_provider.clone() as Arc<InferenceProviderTrait>,
+            );
+            cache.insert(
+                patched_url.clone(),
+                patched_provider.clone() as Arc<InferenceProviderTrait>,
+            );
+        }
+
+        // Also seed fingerprint states for both.
+        {
+            let mut states = pool.inference_url_fingerprint_states.write().await;
+            states.insert(
+                untouched_url.clone(),
+                Arc::new(std::sync::RwLock::new(FingerprintState::Bootstrap)),
+            );
+            states.insert(
+                patched_url.clone(),
+                Arc::new(std::sync::RwLock::new(FingerprintState::Bootstrap)),
+            );
+        }
+
+        // Partial load — only the patched model is included.
+        pool.load_inference_url_models(vec![(patched_model.clone(), patched_url.clone())], true)
+            .await;
+
+        // The untouched model's URL must still be present in the URL cache.
+        {
+            let cache = pool.inference_url_providers.read().await;
+            assert!(
+                cache.contains_key(&untouched_url),
+                "partial load must not evict untouched provider from URL cache"
+            );
+        }
+
+        // The untouched model's fingerprint state must also be preserved.
+        {
+            let states = pool.inference_url_fingerprint_states.read().await;
+            assert!(
+                states.contains_key(&untouched_url),
+                "partial load must not prune fingerprint state for untouched provider"
+            );
+        }
     }
 }

@@ -84,6 +84,21 @@ fn insert_encryption_headers(
 // Custom header for exposing the inference ID as a UUID
 const HEADER_INFERENCE_ID: &str = "Inference-Id";
 
+// Custom header surfacing which trust tier served a completion.
+// Value is "near" for NEAR AI's own TEE fleet, "chutes" for the attested Chutes
+// fallback, or "non-attested" for external (non-TEE) providers.
+const HEADER_SERVING_PROVIDER: &str = "x-serving-provider";
+
+/// Map a [`inference_providers::ProviderTier`] to the string value emitted in
+/// the `x-serving-provider` response header.
+fn provider_tier_to_str(tier: inference_providers::ProviderTier) -> &'static str {
+    match tier {
+        inference_providers::ProviderTier::Near => "near",
+        inference_providers::ProviderTier::Attested3p => "chutes",
+        inference_providers::ProviderTier::NonAttested => "non-attested",
+    }
+}
+
 /// True when any E2EE encryption header was supplied. E2EE bodies are opaque
 /// to the gateway, so alias warnings can't be injected into them — the
 /// `x-model-alias-resolved` response header is the only signal in that mode.
@@ -1442,10 +1457,18 @@ async fn chat_completions_inner(
                 let mut leading_control: Vec<
                     Result<inference_providers::SSEEvent, inference_providers::CompletionError>,
                 > = Vec::new();
+                // Raw chat_id string captured alongside the hashed UUID so we can
+                // look up the serving-provider tier from the pool's chat_id mapping.
+                let mut stream_chat_id: Option<String> = None;
                 let inference_id = loop {
                     let is_control = match peekable_stream.as_mut().peek().await {
                         Some(Ok(event)) => {
                             if let Some(chunk) = &event.chunk {
+                                // Capture the raw chat_id for the tier lookup below.
+                                stream_chat_id = Some(match chunk {
+                                    inference_providers::StreamChunk::Chat(c) => c.id.clone(),
+                                    inference_providers::StreamChunk::Text(c) => c.id.clone(),
+                                });
                                 break Some(extract_inference_id_from_chunk(chunk));
                             }
                             true
@@ -1843,6 +1866,19 @@ async fn chat_completions_inner(
                         .filter_map(std::future::ready),
                     );
 
+                // Look up which trust tier served this stream. The pool stores a
+                // chat_id → provider mapping when the first chunk arrives; we read
+                // it now (synchronously, before streaming starts) so the header is
+                // present on the initial HTTP/1.1 response line.
+                let serving_tier = if let Some(ref chat_id) = stream_chat_id {
+                    app_state
+                        .inference_provider_pool
+                        .get_provider_tier_for_chat_id(chat_id)
+                        .await
+                } else {
+                    None
+                };
+
                 // Return raw streaming response with SSE headers
                 let mut response_builder = Response::builder()
                     .status(StatusCode::OK)
@@ -1861,6 +1897,13 @@ async fn chat_completions_inner(
                     response_builder =
                         response_builder.header(HEADER_INFERENCE_ID, uuid.to_string());
                     exposed_headers.push(HEADER_INFERENCE_ID);
+                }
+
+                // Surface which provider tier served this streaming completion.
+                if let Some(tier) = serving_tier {
+                    response_builder = response_builder
+                        .header(HEADER_SERVING_PROVIDER, provider_tier_to_str(tier));
+                    exposed_headers.push(HEADER_SERVING_PROVIDER);
                 }
 
                 // Announce alias substitution so it is never silent (issue #573).
@@ -1970,6 +2013,13 @@ async fn chat_completions_inner(
                         response_builder.header(HEADER_INFERENCE_ID, uuid.to_string());
                     exposed_headers.push(HEADER_INFERENCE_ID);
                 }
+
+                // Surface which provider tier served this non-streaming completion.
+                response_builder = response_builder.header(
+                    HEADER_SERVING_PROVIDER,
+                    provider_tier_to_str(response_with_bytes.serving_tier),
+                );
+                exposed_headers.push(HEADER_SERVING_PROVIDER);
 
                 // Announce alias substitution so it is never silent (issue #573).
                 // Guarded HeaderValue construction: a header-invalid byte in a
@@ -2208,10 +2258,15 @@ async fn completions_inner(
                 // response: past the cap we proceed without an Inference-Id.
                 let mut peekable_stream = Box::pin(stream.peekable());
                 let mut control_skipped = 0usize;
+                let mut stream_chat_id: Option<String> = None;
                 let inference_id = loop {
                     let is_control = match peekable_stream.as_mut().peek().await {
                         Some(Ok(event)) => {
                             if let Some(chunk) = &event.chunk {
+                                stream_chat_id = Some(match chunk {
+                                    inference_providers::StreamChunk::Chat(c) => c.id.clone(),
+                                    inference_providers::StreamChunk::Text(c) => c.id.clone(),
+                                });
                                 break Some(extract_inference_id_from_chunk(chunk));
                             }
                             true
@@ -2234,6 +2289,15 @@ async fn completions_inner(
                         "Could not extract inference ID from first chunk for text completion (streaming)"
                     );
                 }
+
+                let serving_tier = if let Some(ref chat_id) = stream_chat_id {
+                    app_state
+                        .inference_provider_pool
+                        .get_provider_tier_for_chat_id(chat_id)
+                        .await
+                } else {
+                    None
+                };
 
                 let organization_id = api_key.organization.id.0;
                 let model_for_err = request.model.clone();
@@ -2314,6 +2378,11 @@ async fn completions_inner(
                         response_builder.header(HEADER_INFERENCE_ID, uuid.to_string());
                     exposed_headers.push(HEADER_INFERENCE_ID);
                 }
+                if let Some(tier) = serving_tier {
+                    response_builder = response_builder
+                        .header(HEADER_SERVING_PROVIDER, provider_tier_to_str(tier));
+                    exposed_headers.push(HEADER_SERVING_PROVIDER);
+                }
                 // Announce alias substitution so it is never silent (issue #573)
                 if let Some(canonical) = &alias_canonical {
                     if let Ok(value) = header::HeaderValue::from_str(&format!(
@@ -2386,6 +2455,11 @@ async fn completions_inner(
                     .header(HEADER_INFERENCE_ID, inference_id.to_string());
 
                 let mut exposed_headers: Vec<&str> = vec![HEADER_INFERENCE_ID];
+                response_builder = response_builder.header(
+                    HEADER_SERVING_PROVIDER,
+                    provider_tier_to_str(response_with_bytes.serving_tier),
+                );
+                exposed_headers.push(HEADER_SERVING_PROVIDER);
                 // Announce alias substitution so it is never silent (issue #573)
                 if let Some(canonical) = &alias_canonical {
                     if let Ok(value) = header::HeaderValue::from_str(&format!(

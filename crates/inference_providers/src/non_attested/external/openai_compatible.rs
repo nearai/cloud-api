@@ -326,6 +326,7 @@ impl ExternalBackend for OpenAiCompatibleBackend {
         Ok(ChatCompletionResponseWithBytes {
             response: parsed,
             raw_bytes,
+            serving_tier: crate::ProviderTier::NonAttested,
         })
     }
 

@@ -365,6 +365,12 @@ fn chat_stream_has_non_text_modalities(request: &ChatCompletionRequest) -> bool 
 struct ChatStreamUsageMode {
     rewrite_public_stream_usage: bool,
     gateway_signature_enabled: bool,
+    /// Strip `usage` from intermediate chunks without adding a final usage chunk.
+    /// Active for the default case (no `include_usage`) and `include_usage: false`.
+    /// Per OpenAI spec, intermediate chunks must carry `usage: null`; populated
+    /// usage only appears in the one synthetic final chunk emitted when
+    /// `include_usage: true` is explicitly requested.
+    strip_intermediate_usage: bool,
 }
 
 fn chat_stream_usage_mode(
@@ -379,10 +385,22 @@ fn chat_stream_usage_mode(
         && !e2ee_active
         && !chat_stream_has_non_text_modalities(request);
 
+    // For default streaming (no include_usage or include_usage:false), strip populated
+    // usage from all chunks so intermediate ones carry `usage: null` per OpenAI spec.
+    // Skipped when the client explicitly requested continuous stats, uses E2EE (chunks
+    // are opaque), has non-text modalities, or when rewrite_public_stream_usage already
+    // handles usage shaping.
+    let strip_intermediate_usage = request.stream == Some(true)
+        && !rewrite_public_stream_usage
+        && !chat_stream_continuous_usage_requested(request)
+        && !e2ee_active
+        && !chat_stream_has_non_text_modalities(request);
+
     ChatStreamUsageMode {
         rewrite_public_stream_usage,
         gateway_signature_enabled: rewrite_public_stream_usage
             && model_attestation_supported.unwrap_or(false),
+        strip_intermediate_usage,
     }
 }
 
@@ -1374,6 +1392,7 @@ async fn chat_completions_inner(
     let usage_mode = chat_stream_usage_mode(&request, model_attestation_supported, e2ee_active);
     let rewrite_public_stream_usage = usage_mode.rewrite_public_stream_usage;
     let gateway_signature_enabled = usage_mode.gateway_signature_enabled;
+    let strip_intermediate_usage = usage_mode.strip_intermediate_usage;
     service_request.skip_provider_chat_signature = gateway_signature_enabled;
 
     // Auto-redact (opt-in via x-auto-redact header or auto_redact body field).
@@ -1536,6 +1555,7 @@ async fn chat_completions_inner(
                         let upstream_done = upstream_done_forwarded.clone();
                         let include_stream_usage_in_response = include_stream_usage_in_response;
                         let rewrite_public_stream_usage = rewrite_public_stream_usage;
+                        let strip_intermediate_usage = strip_intermediate_usage;
                         let gateway_signature_enabled = gateway_signature_enabled;
                         let public_signature_hasher = public_signature_hasher.clone();
                         let public_signature_chat_id = public_signature_chat_id.clone();
@@ -1546,7 +1566,7 @@ async fn chat_completions_inner(
                                     // Byte-exact passthrough (issue #701): when no public
                                     // chunk rewriting is active, forward the upstream wire
                                     // bytes untouched. Explicit include_usage shaping needs
-                                    // parsed-chunk serialization; encrypted, default, and
+                                    // parsed-chunk serialization; encrypted and
                                     // continuous-usage streams preserve passthrough.
                                     //
                                     // Disabled for alias-served responses: those inject
@@ -1554,10 +1574,15 @@ async fn chat_completions_inner(
                                     // and are non-byte-verifiable anyway since the TEE
                                     // signs under the canonical model name, not the alias
                                     // the client requested.
+                                    //
+                                    // Also disabled when strip_intermediate_usage is active:
+                                    // per OpenAI spec intermediate chunks must carry
+                                    // `usage: null`, so we re-serialize to null it out.
                                     if event.raw_passthrough
                                         && !auto_redact_enabled
                                         && !alias_served
                                         && !rewrite_public_stream_usage
+                                        && !strip_intermediate_usage
                                     {
                                         if event.is_done_marker() {
                                             upstream_done
@@ -1625,6 +1650,18 @@ async fn chat_completions_inner(
                                             &mut chunk,
                                             include_stream_usage_in_response,
                                             &mut final_usage,
+                                        ) {
+                                            return None;
+                                        }
+                                    } else if strip_intermediate_usage {
+                                        // Default streaming and include_usage:false: null out
+                                        // usage on all chunks (usage-only chunks are dropped).
+                                        // No final usage chunk is emitted (include_usage:false).
+                                        let mut discarded = None;
+                                        if !prepare_stream_chunk_for_client(
+                                            &mut chunk,
+                                            false, // include_usage = false
+                                            &mut discarded,
                                         ) {
                                             return None;
                                         }
@@ -2909,6 +2946,8 @@ mod tests {
 
         assert!(mode.rewrite_public_stream_usage);
         assert!(mode.gateway_signature_enabled);
+        // rewrite already handles usage shaping; strip is not additionally needed
+        assert!(!mode.strip_intermediate_usage);
     }
 
     #[test]
@@ -2918,46 +2957,56 @@ mod tests {
 
         assert!(mode.rewrite_public_stream_usage);
         assert!(!mode.gateway_signature_enabled);
+        assert!(!mode.strip_intermediate_usage);
     }
 
     #[test]
-    fn default_attested_stream_preserves_provider_passthrough() {
+    fn default_attested_stream_strips_intermediate_usage() {
+        // Default streaming (no include_usage): per OpenAI spec intermediate
+        // chunks must carry `usage: null`; no final usage chunk is emitted.
         let request = chat_request_with_include_usage(None);
         let mode = chat_stream_usage_mode(&request, Some(true), false);
 
         assert!(!mode.rewrite_public_stream_usage);
         assert!(!mode.gateway_signature_enabled);
+        assert!(mode.strip_intermediate_usage, "default stream must strip intermediate usage");
     }
 
     #[test]
-    fn include_usage_false_attested_stream_preserves_provider_passthrough() {
+    fn include_usage_false_strips_intermediate_usage() {
+        // Explicit include_usage:false: same as default — null out intermediate usage.
         let request = chat_request_with_include_usage(Some(false));
         let mode = chat_stream_usage_mode(&request, Some(true), false);
 
         assert!(!mode.rewrite_public_stream_usage);
         assert!(!mode.gateway_signature_enabled);
+        assert!(mode.strip_intermediate_usage);
     }
 
     #[test]
-    fn default_non_attested_stream_preserves_provider_passthrough() {
+    fn default_non_attested_stream_strips_intermediate_usage() {
         let request = chat_request_with_include_usage(None);
         let mode = chat_stream_usage_mode(&request, Some(false), false);
 
         assert!(!mode.rewrite_public_stream_usage);
         assert!(!mode.gateway_signature_enabled);
+        assert!(mode.strip_intermediate_usage);
     }
 
     #[test]
-    fn continuous_usage_stats_is_passthrough_when_model_metadata_is_missing() {
+    fn continuous_usage_stats_preserves_passthrough() {
         let mut request = chat_request_with_include_usage(None);
         request.extra.insert(
             "stream_options".to_string(),
             serde_json::json!({ "continuous_usage_stats": true }),
         );
+        // continuous_usage_stats is an explicit request for per-chunk usage;
+        // strip_intermediate_usage must be false so those stats flow through.
         let mode = chat_stream_usage_mode(&request, None, false);
 
         assert!(!mode.rewrite_public_stream_usage);
         assert!(!mode.gateway_signature_enabled);
+        assert!(!mode.strip_intermediate_usage);
     }
 
     #[test]
@@ -2974,9 +3023,11 @@ mod tests {
         let passthrough = chat_stream_usage_mode(&request, Some(true), false);
         assert!(!passthrough.rewrite_public_stream_usage);
         assert!(!passthrough.gateway_signature_enabled);
+        assert!(!passthrough.strip_intermediate_usage);
 
         let e2ee_passthrough = chat_stream_usage_mode(&request, Some(true), true);
         assert!(!e2ee_passthrough.rewrite_public_stream_usage);
+        assert!(!e2ee_passthrough.strip_intermediate_usage);
 
         request.extra.insert(
             "modalities".to_string(),
@@ -2984,6 +3035,32 @@ mod tests {
         );
         let audio_passthrough = chat_stream_usage_mode(&request, Some(true), false);
         assert!(!audio_passthrough.rewrite_public_stream_usage);
+        assert!(!audio_passthrough.strip_intermediate_usage);
+    }
+
+    #[test]
+    fn e2ee_stream_preserves_passthrough() {
+        // E2EE chunks are opaque; cannot modify them.
+        let request = chat_request_with_include_usage(None);
+        let mode = chat_stream_usage_mode(&request, Some(true), true);
+
+        assert!(!mode.rewrite_public_stream_usage);
+        assert!(!mode.gateway_signature_enabled);
+        assert!(!mode.strip_intermediate_usage);
+    }
+
+    #[test]
+    fn non_text_modality_stream_preserves_passthrough() {
+        let mut request = chat_request_with_include_usage(None);
+        request.extra.insert(
+            "modalities".to_string(),
+            serde_json::json!(["text", "audio"]),
+        );
+        let mode = chat_stream_usage_mode(&request, Some(true), false);
+
+        assert!(!mode.rewrite_public_stream_usage);
+        assert!(!mode.gateway_signature_enabled);
+        assert!(!mode.strip_intermediate_usage);
     }
 
     #[test]

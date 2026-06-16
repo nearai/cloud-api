@@ -203,7 +203,57 @@ async fn test_chat_completions_stream_records_usage_in_history() {
 }
 
 #[tokio::test]
-async fn test_chat_completions_stream_include_usage_false_preserves_passthrough() {
+async fn test_chat_completions_stream_default_emits_usage_null_in_all_chunks() {
+    // Default streaming (no stream_options): per OpenAI spec, `usage` must be
+    // `null` in every chunk and no final usage-only chunk is emitted.
+    let server = setup_test_server().await;
+
+    setup_qwen_model(&server).await;
+    let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
+    let api_key = get_api_key_for_org(&server, org.id.clone()).await;
+
+    let stream_resp = server
+        .post("/v1/chat/completions")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .json(&json!({
+            "model": E2E_QWEN_MODEL_NAME,
+            "messages": [{ "role": "user", "content": "hello" }],
+            "stream": true
+        }))
+        .await;
+
+    assert_eq!(
+        stream_resp.status_code(),
+        200,
+        "streaming chat/completions should succeed: {}",
+        stream_resp.text()
+    );
+
+    let text = stream_resp.text();
+    let mut saw_chunk = false;
+    for line in text.lines() {
+        let Some(data) = line.strip_prefix("data: ") else {
+            continue;
+        };
+        if data.trim() == "[DONE]" {
+            break;
+        }
+
+        saw_chunk = true;
+        let value: serde_json::Value =
+            serde_json::from_str(data).expect("stream data should be JSON");
+        assert!(
+            value.get("usage").is_some_and(serde_json::Value::is_null),
+            "default streaming: all chunks must carry usage:null (got {value})"
+        );
+    }
+    assert!(saw_chunk, "stream should contain at least one chunk");
+}
+
+#[tokio::test]
+async fn test_chat_completions_stream_include_usage_false_emits_usage_null_in_all_chunks() {
+    // Explicit include_usage:false: same as default — all chunks must carry
+    // `usage: null` and no final usage-only chunk is emitted.
     let server = setup_test_server().await;
 
     setup_qwen_model(&server).await;
@@ -239,7 +289,12 @@ async fn test_chat_completions_stream_include_usage_false_preserves_passthrough(
         }
 
         saw_chunk = true;
-        let _: StreamChunk = serde_json::from_str(data).expect("stream data should be JSON");
+        let value: serde_json::Value =
+            serde_json::from_str(data).expect("stream data should be JSON");
+        assert!(
+            value.get("usage").is_some_and(serde_json::Value::is_null),
+            "include_usage:false streaming: all chunks must carry usage:null (got {value})"
+        );
     }
     assert!(saw_chunk, "stream should contain at least one chunk");
 }

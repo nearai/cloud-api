@@ -202,13 +202,41 @@ async fn test_chat_completions_stream_records_usage_in_history() {
     );
 }
 
+/// Setup a non-attested (external) chat model for usage-stripping tests.
+/// For attested models, usage in intermediate chunks is preserved byte-exactly
+/// for TEE signature verification. Only non-attested models get usage stripped.
+async fn setup_non_attested_model(server: &axum_test::TestServer) -> String {
+    let model_name = "openai/gpt-oss-120b".to_string();
+    let mut batch = api::models::BatchUpdateModelApiRequest::new();
+    batch.insert(
+        model_name.clone(),
+        serde_json::from_value(json!({
+            "inputCostPerToken": { "amount": 1_000_000, "currency": "USD" },
+            "outputCostPerToken": { "amount": 2_000_000, "currency": "USD" },
+            "modelDisplayName": "Non-attested test model",
+            "modelDescription": "Test model (non-attested)",
+            "contextLength": 128000,
+            "verifiable": false,
+            "isActive": true,
+            "attestationSupported": false
+        }))
+        .unwrap(),
+    );
+    let updated = admin_batch_upsert_models(server, batch, get_session_id()).await;
+    assert_eq!(updated.len(), 1, "Should have updated 1 model");
+    tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+    model_name
+}
+
 #[tokio::test]
 async fn test_chat_completions_stream_default_emits_usage_null_in_all_chunks() {
     // Default streaming (no stream_options): per OpenAI spec, `usage` must be
     // `null` in every chunk and no final usage-only chunk is emitted.
+    // Only verified for non-attested models; attested model streams are forwarded
+    // byte-exactly for TEE signature verification.
     let server = setup_test_server().await;
 
-    setup_qwen_model(&server).await;
+    let model_name = setup_non_attested_model(&server).await;
     let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
     let api_key = get_api_key_for_org(&server, org.id.clone()).await;
 
@@ -216,7 +244,7 @@ async fn test_chat_completions_stream_default_emits_usage_null_in_all_chunks() {
         .post("/v1/chat/completions")
         .add_header("Authorization", format!("Bearer {api_key}"))
         .json(&json!({
-            "model": E2E_QWEN_MODEL_NAME,
+            "model": model_name,
             "messages": [{ "role": "user", "content": "hello" }],
             "stream": true
         }))
@@ -254,9 +282,11 @@ async fn test_chat_completions_stream_default_emits_usage_null_in_all_chunks() {
 async fn test_chat_completions_stream_include_usage_false_emits_usage_null_in_all_chunks() {
     // Explicit include_usage:false: same as default — all chunks must carry
     // `usage: null` and no final usage-only chunk is emitted.
+    // Only verified for non-attested models; attested model streams are forwarded
+    // byte-exactly for TEE signature verification.
     let server = setup_test_server().await;
 
-    setup_qwen_model(&server).await;
+    let model_name = setup_non_attested_model(&server).await;
     let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
     let api_key = get_api_key_for_org(&server, org.id.clone()).await;
 
@@ -264,7 +294,7 @@ async fn test_chat_completions_stream_include_usage_false_emits_usage_null_in_al
         .post("/v1/chat/completions")
         .add_header("Authorization", format!("Bearer {api_key}"))
         .json(&json!({
-            "model": E2E_QWEN_MODEL_NAME,
+            "model": model_name,
             "messages": [{ "role": "user", "content": "hello" }],
             "stream": true,
             "stream_options": { "include_usage": false }

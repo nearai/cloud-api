@@ -387,10 +387,20 @@ fn chat_stream_usage_mode(
 
     // For default streaming (no include_usage or include_usage:false), strip populated
     // usage from all chunks so intermediate ones carry `usage: null` per OpenAI spec.
-    // Skipped when the client explicitly requested continuous stats, uses E2EE (chunks
-    // are opaque), has non-text modalities, or when rewrite_public_stream_usage already
-    // handles usage shaping.
+    //
+    // Only applied for non-attested (external) models. Attested models (e.g. nearai,
+    // chutes) sign the raw upstream bytes; stripping usage before forwarding to the
+    // client would break byte-exact TEE signature verification because the client
+    // would hash different bytes than what the inference proxy signed. For those
+    // models the provider-signed stream MUST be forwarded verbatim (the
+    // `rewrite_public_stream_usage` path handles `include_usage:true` via the
+    // separately-computed gateway signature).
+    //
+    // Also skipped when: the client requested continuous stats (explicit per-chunk
+    // usage), E2EE is active (chunks are opaque), non-text modalities are in use,
+    // or `rewrite_public_stream_usage` already handles usage shaping.
     let strip_intermediate_usage = request.stream == Some(true)
+        && model_attestation_supported == Some(false)
         && !rewrite_public_stream_usage
         && !chat_stream_continuous_usage_requested(request)
         && !e2ee_active
@@ -2961,25 +2971,40 @@ mod tests {
     }
 
     #[test]
-    fn default_attested_stream_strips_intermediate_usage() {
-        // Default streaming (no include_usage): per OpenAI spec intermediate
-        // chunks must carry `usage: null`; no final usage chunk is emitted.
+    fn default_attested_stream_preserves_passthrough_for_tee_verification() {
+        // Default streaming for ATTESTED models: byte-exact passthrough is preserved
+        // so the client can verify the inference TEE's provider signature.
+        // Stripping usage would change the bytes the client sees vs what the provider
+        // signed, breaking TEE signature verification.
         let request = chat_request_with_include_usage(None);
         let mode = chat_stream_usage_mode(&request, Some(true), false);
 
         assert!(!mode.rewrite_public_stream_usage);
         assert!(!mode.gateway_signature_enabled);
         assert!(
-            mode.strip_intermediate_usage,
-            "default stream must strip intermediate usage"
+            !mode.strip_intermediate_usage,
+            "attested streams must preserve raw passthrough for TEE verification"
         );
     }
 
     #[test]
-    fn include_usage_false_strips_intermediate_usage() {
-        // Explicit include_usage:false: same as default — null out intermediate usage.
+    fn include_usage_false_attested_stream_preserves_passthrough_for_tee_verification() {
+        // Explicit include_usage:false for ATTESTED model: same as default,
+        // preserve passthrough for TEE signature verification.
         let request = chat_request_with_include_usage(Some(false));
         let mode = chat_stream_usage_mode(&request, Some(true), false);
+
+        assert!(!mode.rewrite_public_stream_usage);
+        assert!(!mode.gateway_signature_enabled);
+        assert!(!mode.strip_intermediate_usage);
+    }
+
+    #[test]
+    fn default_non_attested_stream_strips_intermediate_usage() {
+        // Non-attested (external) models: no TEE signature to preserve.
+        // Strip usage so intermediate chunks carry `usage: null` per OpenAI spec.
+        let request = chat_request_with_include_usage(None);
+        let mode = chat_stream_usage_mode(&request, Some(false), false);
 
         assert!(!mode.rewrite_public_stream_usage);
         assert!(!mode.gateway_signature_enabled);
@@ -2987,8 +3012,8 @@ mod tests {
     }
 
     #[test]
-    fn default_non_attested_stream_strips_intermediate_usage() {
-        let request = chat_request_with_include_usage(None);
+    fn include_usage_false_non_attested_stream_strips_intermediate_usage() {
+        let request = chat_request_with_include_usage(Some(false));
         let mode = chat_stream_usage_mode(&request, Some(false), false);
 
         assert!(!mode.rewrite_public_stream_usage);

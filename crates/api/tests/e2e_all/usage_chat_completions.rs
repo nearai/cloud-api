@@ -202,11 +202,22 @@ async fn test_chat_completions_stream_records_usage_in_history() {
     );
 }
 
-/// Setup a non-attested (external) chat model for usage-stripping tests.
-/// For attested models, usage in intermediate chunks is preserved byte-exactly
-/// for TEE signature verification. Only non-attested models get usage stripped.
-async fn setup_non_attested_model(server: &axum_test::TestServer) -> String {
-    let model_name = "openai/gpt-oss-120b".to_string();
+/// Register a non-attested (external) chat model in both the provider pool and the DB.
+/// For attested models, usage in intermediate chunks is preserved byte-exactly for TEE
+/// signature verification. Only non-attested models have usage stripped to `null`.
+async fn setup_non_attested_model(
+    server: &axum_test::TestServer,
+    pool: &std::sync::Arc<services::inference_provider_pool::InferenceProviderPool>,
+    mock_provider: &std::sync::Arc<inference_providers::mock::MockProvider>,
+) -> String {
+    let model_name = "nearai/non-attested-test-model".to_string();
+
+    // Register the mock provider in the pool for this model
+    let mock_trait: std::sync::Arc<dyn inference_providers::InferenceProvider + Send + Sync> =
+        mock_provider.clone();
+    pool.register_provider(model_name.clone(), mock_trait).await;
+
+    // Configure the model in the DB as non-attested
     let mut batch = api::models::BatchUpdateModelApiRequest::new();
     batch.insert(
         model_name.clone(),
@@ -214,7 +225,7 @@ async fn setup_non_attested_model(server: &axum_test::TestServer) -> String {
             "inputCostPerToken": { "amount": 1_000_000, "currency": "USD" },
             "outputCostPerToken": { "amount": 2_000_000, "currency": "USD" },
             "modelDisplayName": "Non-attested test model",
-            "modelDescription": "Test model (non-attested)",
+            "modelDescription": "Test model (non-attested) for usage-stripping tests",
             "contextLength": 128000,
             "verifiable": false,
             "isActive": true,
@@ -223,7 +234,7 @@ async fn setup_non_attested_model(server: &axum_test::TestServer) -> String {
         .unwrap(),
     );
     let updated = admin_batch_upsert_models(server, batch, get_session_id()).await;
-    assert_eq!(updated.len(), 1, "Should have updated 1 model");
+    assert_eq!(updated.len(), 1, "Should have configured 1 model");
     tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
     model_name
 }
@@ -234,9 +245,9 @@ async fn test_chat_completions_stream_default_emits_usage_null_in_all_chunks() {
     // `null` in every chunk and no final usage-only chunk is emitted.
     // Only verified for non-attested models; attested model streams are forwarded
     // byte-exactly for TEE signature verification.
-    let server = setup_test_server().await;
+    let (server, pool, mock_provider, _db) = setup_test_server_with_pool().await;
+    let model_name = setup_non_attested_model(&server, &pool, &mock_provider).await;
 
-    let model_name = setup_non_attested_model(&server).await;
     let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
     let api_key = get_api_key_for_org(&server, org.id.clone()).await;
 
@@ -284,9 +295,9 @@ async fn test_chat_completions_stream_include_usage_false_emits_usage_null_in_al
     // `usage: null` and no final usage-only chunk is emitted.
     // Only verified for non-attested models; attested model streams are forwarded
     // byte-exactly for TEE signature verification.
-    let server = setup_test_server().await;
+    let (server, pool, mock_provider, _db) = setup_test_server_with_pool().await;
+    let model_name = setup_non_attested_model(&server, &pool, &mock_provider).await;
 
-    let model_name = setup_non_attested_model(&server).await;
     let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
     let api_key = get_api_key_for_org(&server, org.id.clone()).await;
 

@@ -14,9 +14,12 @@
 -- path for organization_usage_log is append-only (INSERT only, no UPDATEs to
 -- these columns), so index maintenance cost is a one-time insert cost.
 --
--- Use CONCURRENTLY so the build does not lock the table in production.
+-- NOTE: CONCURRENTLY cannot run inside a transaction (which Refinery uses).
+-- If the table already has millions of rows in production, build the index
+-- manually with CONCURRENTLY before deploying this migration, then it will
+-- be a no-op thanks to IF NOT EXISTS.
 
-CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_org_usage_created_covering
+CREATE INDEX IF NOT EXISTS idx_org_usage_created_covering
     ON organization_usage_log (created_at DESC)
     INCLUDE (model_name, total_cost, total_tokens, output_tokens, ttft_ms, stop_reason);
 
@@ -25,7 +28,7 @@ COMMENT ON INDEX idx_org_usage_created_covering IS
 
 -- Separate index for the model-filtered performance-timeseries path
 -- (AND ul.model_name = $3), which benefits from model_name as the lead column.
-CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_org_usage_model_name_created
+CREATE INDEX IF NOT EXISTS idx_org_usage_model_name_created
     ON organization_usage_log (model_name, created_at DESC)
     INCLUDE (total_tokens, output_tokens, ttft_ms, stop_reason);
 

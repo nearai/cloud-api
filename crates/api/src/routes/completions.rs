@@ -398,10 +398,14 @@ fn chat_stream_usage_mode(
     //
     // Also skipped when: the client requested continuous stats (explicit per-chunk
     // usage), E2EE is active (chunks are opaque), non-text modalities are in use,
-    // or `rewrite_public_stream_usage` already handles usage shaping.
+    // `rewrite_public_stream_usage` already handles usage shaping, or the client
+    // explicitly requested `include_usage:true` (fall back to byte-exact passthrough
+    // so the client receives the usage it asked for even if model metadata is
+    // temporarily unavailable).
     let strip_intermediate_usage = request.stream == Some(true)
         && model_attestation_supported == Some(false)
         && !rewrite_public_stream_usage
+        && !chat_stream_include_usage_requested(request)
         && !chat_stream_continuous_usage_requested(request)
         && !e2ee_active
         && !chat_stream_has_non_text_modalities(request);
@@ -3035,6 +3039,45 @@ mod tests {
         assert!(!mode.rewrite_public_stream_usage);
         assert!(!mode.gateway_signature_enabled);
         assert!(!mode.strip_intermediate_usage);
+    }
+
+    #[test]
+    fn include_usage_true_with_metadata_lookup_failure_preserves_passthrough() {
+        // Regression test: when the client explicitly requests include_usage:true but
+        // model metadata is unavailable (model_attestation_supported == None, e.g. the
+        // model is absent from the catalog or get_models_with_pricing() errored), both
+        // rewrite_public_stream_usage and strip_intermediate_usage must be false so
+        // the stream falls back to byte-exact passthrough. Before the fix, this path
+        // could activate strip_intermediate_usage, silently dropping all usage from the
+        // response — strictly worse than the prior passthrough behaviour.
+        let request = chat_request_with_include_usage(Some(true));
+        let mode = chat_stream_usage_mode(&request, None, false);
+
+        assert!(
+            !mode.rewrite_public_stream_usage,
+            "rewrite requires model metadata; must be false when metadata unavailable"
+        );
+        assert!(
+            !mode.strip_intermediate_usage,
+            "explicit include_usage:true must never strip usage, even on metadata lookup failure"
+        );
+    }
+
+    #[test]
+    fn include_usage_true_non_attested_does_not_strip() {
+        // When include_usage:true and model_attestation_supported == Some(false),
+        // rewrite_public_stream_usage handles usage shaping; strip must not also fire.
+        let request = chat_request_with_include_usage(Some(true));
+        let mode = chat_stream_usage_mode(&request, Some(false), false);
+
+        assert!(
+            mode.rewrite_public_stream_usage,
+            "non-attested + include_usage:true should use the rewrite path"
+        );
+        assert!(
+            !mode.strip_intermediate_usage,
+            "strip must not fire when include_usage:true — client asked for usage"
+        );
     }
 
     #[test]

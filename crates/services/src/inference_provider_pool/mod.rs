@@ -6735,7 +6735,10 @@ mod tests {
             .await
             .expect("healthy NEAR must serve");
         let body = String::from_utf8_lossy(&resp.raw_bytes);
-        assert!(body.contains("served-by-near-primary"), "NEAR must serve, got: {body}");
+        assert!(
+            body.contains("served-by-near-primary"),
+            "NEAR must serve, got: {body}"
+        );
         assert!(
             chutes.last_chat_params().await.is_none(),
             "Chutes must NOT be invoked when the NEAR primary succeeds"

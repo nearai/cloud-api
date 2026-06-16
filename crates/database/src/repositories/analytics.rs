@@ -956,23 +956,39 @@ impl AnalyticsRepository for PgAnalyticsRepository {
             .await
             .map_err(|e| RepositoryError::DatabaseError(e.into()))?;
 
-        let mut model_labels_ordered: Vec<String> = Vec::new();
+        // Accumulate total cost per label across all buckets, then sort descending
+        // so model_labels reflects true global top-N rank (not first-bucket order).
+        let mut label_totals: std::collections::HashMap<String, i64> =
+            std::collections::HashMap::new();
         let data: Vec<ModelConsumptionPoint> = rows
             .iter()
             .map(|row| {
                 let label: String = row.get(1);
-                if !model_labels_ordered.contains(&label) {
-                    model_labels_ordered.push(label.clone());
-                }
+                let cost_nano: i64 = row.get(2);
+                *label_totals.entry(label.clone()).or_insert(0) += cost_nano;
                 ModelConsumptionPoint {
                     bucket: row.get(0),
                     model_label: label,
-                    consumed_cost_usd: nano_to_usd(row.get::<_, i64>(2)),
+                    consumed_cost_usd: nano_to_usd(cost_nano),
                     requests: row.get(3),
                     tokens: row.get(4),
                 }
             })
             .collect();
+
+        // Sort: top models by total period cost DESC; "Other" always last.
+        let mut model_labels_ordered: Vec<String> = label_totals.keys().cloned().collect();
+        model_labels_ordered.sort_by(|a, b| {
+            if a == "Other" {
+                return std::cmp::Ordering::Greater;
+            }
+            if b == "Other" {
+                return std::cmp::Ordering::Less;
+            }
+            let ta = label_totals.get(a).copied().unwrap_or(0);
+            let tb = label_totals.get(b).copied().unwrap_or(0);
+            tb.cmp(&ta)
+        });
 
         Ok(ModelConsumptionTimeseries {
             period_start: query.start,

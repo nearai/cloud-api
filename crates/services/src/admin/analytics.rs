@@ -339,6 +339,98 @@ pub struct TimeSeriesMetrics {
     pub data: Vec<TimeSeriesPoint>,
 }
 
+/// One time-bucket × model row for the consumption timeseries.
+///
+/// Models outside the top-N are collapsed to `model_label = "Other"` server-side.
+/// `model_id` is `None` for the "Other" bucket.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ModelConsumptionPoint {
+    /// ISO 8601 bucket start (truncated to granularity)
+    pub bucket: String,
+    /// Current canonical model name (from `models.model_name`), or "Other"
+    pub model_label: String,
+    /// Consumed usage cost for this (bucket, model) pair, USD
+    pub consumed_cost_usd: f64,
+    pub requests: i64,
+    /// input_tokens + output_tokens
+    pub tokens: i64,
+}
+
+/// Per-model consumption timeseries response.
+///
+/// Top N models by total period cost are returned as separate series; the rest
+/// are collapsed into a single "Other" series. The frontend can zero-fill missing
+/// (bucket, model) pairs — the query only emits rows where usage > 0.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ModelConsumptionTimeseries {
+    pub period_start: DateTime<Utc>,
+    pub period_end: DateTime<Utc>,
+    pub granularity: String,
+    /// Ordered list of model labels in the response (top-N + "Other" if present)
+    pub model_labels: Vec<String>,
+    pub data: Vec<ModelConsumptionPoint>,
+}
+
+/// Query params for the model consumption timeseries endpoint.
+#[derive(Debug, Clone)]
+pub struct ModelConsumptionTimeseriesQuery {
+    pub start: DateTime<Utc>,
+    pub end: DateTime<Utc>,
+    /// Allowlisted granularity — must come from `allowlisted_date_trunc`.
+    pub granularity: String,
+    /// Number of top models to return as separate series (rest → "Other"). Default 15.
+    pub top_n: i64,
+}
+
+/// One time-bucket of platform-wide performance metrics.
+///
+/// TTFT percentiles cover **streaming requests only** (ttft_ms IS NOT NULL).
+/// `ttft_sample_count` exposes the denominator so callers know the coverage fraction.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct PerformancePoint {
+    /// ISO 8601 bucket start (truncated to granularity)
+    pub bucket: String,
+    pub requests: i64,
+    /// input_tokens + output_tokens
+    pub total_tokens: i64,
+    /// output_tokens only (generation throughput, prompt-inflation-free)
+    pub output_tokens: i64,
+    /// Number of requests with ttft_ms recorded (streaming only). Use this as the
+    /// denominator when interpreting TTFT percentiles.
+    pub ttft_sample_count: i64,
+    /// 50th-percentile TTFT, ms (streaming requests only; None if no samples)
+    pub p50_ttft_ms: Option<f64>,
+    /// 95th-percentile TTFT, ms (streaming requests only; None if no samples)
+    pub p95_ttft_ms: Option<f64>,
+    /// 99th-percentile TTFT, ms (streaming requests only; None if no samples)
+    pub p99_ttft_ms: Option<f64>,
+    /// stop_reason IN ('provider_error','timeout') / requests WHERE stop_reason IS NOT NULL.
+    /// Excludes pre-V0037 rows (stop_reason IS NULL) from both numerator and denominator.
+    pub error_rate: Option<f64>,
+}
+
+/// Platform-wide performance timeseries response.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct PerformanceTimeseries {
+    pub period_start: DateTime<Utc>,
+    pub period_end: DateTime<Utc>,
+    pub granularity: String,
+    /// Optional model filter applied (None = platform-wide)
+    pub model_filter: Option<String>,
+    pub data: Vec<PerformancePoint>,
+}
+
+/// Query params for the performance timeseries endpoint.
+#[derive(Debug, Clone)]
+pub struct PerformanceTimeseriesQuery {
+    pub start: DateTime<Utc>,
+    pub end: DateTime<Utc>,
+    /// Allowlisted granularity — must come from `allowlisted_date_trunc`.
+    pub granularity: String,
+    /// Optional exact model name filter.
+    pub model_name: Option<String>,
+}
+
 /// Repository trait for analytics queries
 #[async_trait]
 pub trait AnalyticsRepository: Send + Sync {
@@ -388,6 +480,18 @@ pub trait AnalyticsRepository: Send + Sync {
         &self,
         query: OrgRevenueQuery,
     ) -> Result<OrgRevenueReport, RepositoryError>;
+
+    /// Per-model consumption timeseries (top-N models + "Other" collapsed bucket)
+    async fn get_model_consumption_timeseries(
+        &self,
+        query: ModelConsumptionTimeseriesQuery,
+    ) -> Result<ModelConsumptionTimeseries, RepositoryError>;
+
+    /// Platform-wide (or per-model) performance timeseries: TTFT percentiles, throughput, error rate
+    async fn get_performance_timeseries(
+        &self,
+        query: PerformanceTimeseriesQuery,
+    ) -> Result<PerformanceTimeseries, RepositoryError>;
 }
 
 /// Analytics service implementation
@@ -492,6 +596,28 @@ impl AnalyticsService {
     ) -> Result<OrgRevenueReport, super::AdminError> {
         self.repository
             .get_org_revenue(query)
+            .await
+            .map_err(|e| super::AdminError::InternalError(e.to_string()))
+    }
+
+    /// Per-model consumption timeseries (top-N + "Other")
+    pub async fn get_model_consumption_timeseries(
+        &self,
+        query: ModelConsumptionTimeseriesQuery,
+    ) -> Result<ModelConsumptionTimeseries, super::AdminError> {
+        self.repository
+            .get_model_consumption_timeseries(query)
+            .await
+            .map_err(|e| super::AdminError::InternalError(e.to_string()))
+    }
+
+    /// Platform-wide (or per-model) performance timeseries
+    pub async fn get_performance_timeseries(
+        &self,
+        query: PerformanceTimeseriesQuery,
+    ) -> Result<PerformanceTimeseries, super::AdminError> {
+        self.repository
+            .get_performance_timeseries(query)
             .await
             .map_err(|e| super::AdminError::InternalError(e.to_string()))
     }

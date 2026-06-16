@@ -1839,11 +1839,12 @@ pub fn build_admin_routes(
         batch_upsert_models, cancel_model_pricing_change, confirm_model_deprecation,
         confirm_model_pricing_changes, create_admin_access_token, create_service,
         delete_admin_access_token, delete_model, deprecate_model, get_admin_organization_balance,
-        get_billing_summary, get_infra_summary, get_model_history, get_model_revenue,
-        get_org_revenue, get_organization as get_admin_organization,
-        get_organization_concurrent_limit, get_organization_limits_history,
-        get_organization_metrics, get_organization_timeseries, get_platform_metrics,
-        get_platform_timeseries, list_admin_access_tokens, list_invitation_email_deliveries,
+        get_billing_summary, get_infra_summary, get_model_consumption_timeseries,
+        get_model_history, get_model_revenue, get_org_revenue,
+        get_organization as get_admin_organization, get_organization_concurrent_limit,
+        get_organization_limits_history, get_organization_metrics, get_organization_timeseries,
+        get_performance_timeseries, get_platform_metrics, get_platform_timeseries,
+        list_admin_access_tokens, list_invitation_email_deliveries,
         list_model_pricing_changes, list_models as admin_list_models, list_organization_members,
         list_organizations, list_users, preview_model_deprecation, preview_model_pricing_changes,
         resend_invitation_email, update_organization_concurrent_limit, update_organization_limits,
@@ -1988,6 +1989,14 @@ pub fn build_admin_routes(
         .route(
             "/admin/platform/infra-summary",
             axum::routing::get(get_infra_summary),
+        )
+        .route(
+            "/admin/platform/model-consumption-timeseries",
+            axum::routing::get(get_model_consumption_timeseries),
+        )
+        .route(
+            "/admin/platform/performance-timeseries",
+            axum::routing::get(get_performance_timeseries),
         )
         .route(
             "/admin/invitation-email-deliveries",

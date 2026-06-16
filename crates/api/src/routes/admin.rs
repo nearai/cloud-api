@@ -3459,6 +3459,170 @@ fn default_granularity() -> String {
     "day".to_string()
 }
 
+#[derive(Debug, serde::Deserialize)]
+pub struct ModelConsumptionTimeseriesParams {
+    pub start: Option<String>,
+    pub end: Option<String>,
+    #[serde(default = "default_granularity")]
+    pub granularity: String,
+    /// Number of top models returned as separate series (rest → "Other"). Max 20.
+    #[serde(default = "default_top_n")]
+    pub top_n: i64,
+}
+
+fn default_top_n() -> i64 {
+    15
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct PerformanceTimeseriesParams {
+    pub start: Option<String>,
+    pub end: Option<String>,
+    #[serde(default = "default_granularity")]
+    pub granularity: String,
+    /// Optional exact model name filter (platform-wide if omitted)
+    pub model_name: Option<String>,
+}
+
+/// Get per-model consumption timeseries (Admin only)
+///
+/// Returns consumed cost, requests, and tokens per time bucket broken down by model.
+/// Top N models by total period cost are returned as separate series; all others
+/// are collapsed into a single "Other" bucket. Model labels use the current canonical
+/// name from the models table (joined on model_id, rename-safe).
+///
+/// The query does **not** zero-fill missing (bucket, model) pairs — the frontend
+/// must impute zeros for models absent from a bucket.
+///
+/// Consumed cost = metered inference cost, NOT cash revenue (includes grant credits).
+#[utoipa::path(
+    get,
+    path = "/v1/admin/platform/model-consumption-timeseries",
+    tag = "Admin",
+    params(
+        ("start" = Option<String>, Query, description = "Start of time range (ISO 8601). Defaults to 30 days ago."),
+        ("end" = Option<String>, Query, description = "End of time range (ISO 8601). Defaults to now."),
+        ("granularity" = Option<String>, Query, description = "Time granularity: hour (≤31d), day (≤366d, default), week (≤3y), month (≤5y)"),
+        ("top_n" = Option<i64>, Query, description = "Top-N models to return as separate series (1-20, default 15); rest → 'Other'")
+    ),
+    responses(
+        (status = 200, description = "Model consumption timeseries retrieved successfully", body = services::admin::ModelConsumptionTimeseries),
+        (status = 400, description = "Invalid request", body = ErrorResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    ),
+    security(("session_token" = []))
+)]
+pub async fn get_model_consumption_timeseries(
+    State(app_state): State<AdminAppState>,
+    Query(params): Query<ModelConsumptionTimeseriesParams>,
+    Extension(_admin_user): Extension<AdminUser>,
+) -> Result<
+    ResponseJson<services::admin::ModelConsumptionTimeseries>,
+    (StatusCode, ResponseJson<ErrorResponse>),
+> {
+    let top_n = params.top_n.clamp(1, 20);
+
+    let granularity = crate::routes::common::allowlisted_date_trunc(&params.granularity)?;
+    let (start, end) = crate::routes::common::parse_metrics_range(
+        params.start.as_deref(),
+        params.end.as_deref(),
+        Some(granularity),
+        31,
+    )?;
+
+    let result = app_state
+        .analytics_service
+        .get_model_consumption_timeseries(services::admin::ModelConsumptionTimeseriesQuery {
+            start,
+            end,
+            granularity: granularity.to_string(),
+            top_n,
+        })
+        .await
+        .map_err(|e| {
+            error!("Failed to get model consumption timeseries: {:?}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ResponseJson(ErrorResponse::new(
+                    format!("Failed to retrieve model consumption timeseries: {e}"),
+                    "internal_server_error".to_string(),
+                )),
+            )
+        })?;
+
+    Ok(ResponseJson(result))
+}
+
+/// Get platform-wide performance timeseries (Admin only)
+///
+/// Returns per-time-bucket: request count, token throughput (total and output-only),
+/// TTFT percentiles (p50/p95/p99), and error rate.
+///
+/// **TTFT percentiles cover streaming requests only** (`ttft_ms IS NOT NULL`). The
+/// `ttft_sample_count` field in each bucket exposes the denominator so callers can
+/// compute coverage fraction (`ttft_sample_count / requests`).
+///
+/// **Error rate** = `stop_reason IN ('provider_error','timeout')` / requests with a
+/// recorded `stop_reason`. Pre-V0037 rows (stop_reason IS NULL) are excluded from both
+/// numerator and denominator.
+#[utoipa::path(
+    get,
+    path = "/v1/admin/platform/performance-timeseries",
+    tag = "Admin",
+    params(
+        ("start" = Option<String>, Query, description = "Start of time range (ISO 8601). Defaults to 30 days ago."),
+        ("end" = Option<String>, Query, description = "End of time range (ISO 8601). Defaults to now."),
+        ("granularity" = Option<String>, Query, description = "Time granularity: hour (≤31d), day (≤366d, default), week (≤3y), month (≤5y)"),
+        ("model_name" = Option<String>, Query, description = "Filter to a single model name (platform-wide if omitted)")
+    ),
+    responses(
+        (status = 200, description = "Performance timeseries retrieved successfully", body = services::admin::PerformanceTimeseries),
+        (status = 400, description = "Invalid request", body = ErrorResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    ),
+    security(("session_token" = []))
+)]
+pub async fn get_performance_timeseries(
+    State(app_state): State<AdminAppState>,
+    Query(params): Query<PerformanceTimeseriesParams>,
+    Extension(_admin_user): Extension<AdminUser>,
+) -> Result<
+    ResponseJson<services::admin::PerformanceTimeseries>,
+    (StatusCode, ResponseJson<ErrorResponse>),
+> {
+    let granularity = crate::routes::common::allowlisted_date_trunc(&params.granularity)?;
+    let (start, end) = crate::routes::common::parse_metrics_range(
+        params.start.as_deref(),
+        params.end.as_deref(),
+        Some(granularity),
+        31,
+    )?;
+
+    let result = app_state
+        .analytics_service
+        .get_performance_timeseries(services::admin::PerformanceTimeseriesQuery {
+            start,
+            end,
+            granularity: granularity.to_string(),
+            model_name: params.model_name,
+        })
+        .await
+        .map_err(|e| {
+            error!("Failed to get performance timeseries: {:?}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ResponseJson(ErrorResponse::new(
+                    format!("Failed to retrieve performance timeseries: {e}"),
+                    "internal_server_error".to_string(),
+                )),
+            )
+        })?;
+
+    Ok(ResponseJson(result))
+}
+
 /// Get time series metrics for an organization (Admin only)
 ///
 /// Returns daily/weekly/hourly aggregations for charting:
@@ -3523,18 +3687,13 @@ pub async fn get_organization_timeseries(
         }
     };
 
-    // Parse time range with defaults
-    let end = params
-        .end
-        .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
-        .map(|dt| dt.with_timezone(&Utc))
-        .unwrap_or_else(Utc::now);
-
-    let start = params
-        .start
-        .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
-        .map(|dt| dt.with_timezone(&Utc))
-        .unwrap_or_else(|| end - Duration::days(30));
+    // Parse time range — hard error on bad input, 366-day cap for non-hour granularities
+    let (start, end) = crate::routes::common::parse_metrics_range(
+        params.start.as_deref(),
+        params.end.as_deref(),
+        Some(granularity),
+        31,
+    )?;
 
     // Get timeseries from analytics service
     let metrics = app_state

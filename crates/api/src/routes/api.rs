@@ -85,6 +85,10 @@ pub fn build_management_router(app_state: AppState, auth_state: AuthState) -> Ro
             delete(cancel_organization_invitation),
         )
         .route(
+            "/{id}/invitations/{invitation_id}",
+            delete(cancel_invitation),
+        )
+        .route(
             "/{id}/members/{user_id}",
             put(update_organization_member).delete(remove_organization_member),
         )

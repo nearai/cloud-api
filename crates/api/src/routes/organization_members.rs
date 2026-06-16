@@ -541,6 +541,43 @@ pub async fn cancel_organization_invitation(
     }
 }
 
+/// Cancel an organization invitation (short path)
+///
+/// Cancels a pending invitation for the organization. Only owners and admins can cancel invitations.
+/// This endpoint is an alias for `DELETE /v1/organizations/{org_id}/members/invitations/{invitation_id}`.
+#[utoipa::path(
+    delete,
+    path = "/v1/organizations/{org_id}/invitations/{invitation_id}",
+    tag = "Organization Members",
+    params(
+        ("org_id" = Uuid, Path, description = "Organization ID"),
+        ("invitation_id" = Uuid, Path, description = "Invitation ID")
+    ),
+    responses(
+        (status = 204, description = "Invitation cancelled successfully"),
+        (status = 400, description = "Bad request - invitation is not pending", body = ErrorResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 403, description = "Forbidden - not an admin or owner", body = ErrorResponse),
+        (status = 404, description = "Organization or invitation not found", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    ),
+    security(
+        ("session_token" = [])
+    )
+)]
+pub async fn cancel_invitation(
+    State(app_state): State<AppState>,
+    Extension(user): Extension<AuthenticatedUser>,
+    Path((org_id, invitation_id)): Path<(Uuid, Uuid)>,
+) -> Result<StatusCode, (StatusCode, Json<ErrorResponse>)> {
+    cancel_organization_invitation(
+        State(app_state),
+        Extension(user),
+        Path((org_id, invitation_id)),
+    )
+    .await
+}
+
 /// List organization members with limited user information
 ///
 /// Returns limited user information for privacy and security:

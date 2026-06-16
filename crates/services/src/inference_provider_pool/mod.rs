@@ -6544,4 +6544,201 @@ mod tests {
             other => panic!("Expected RequestFailed, got: {:?}", other),
         }
     }
+
+    // ==================== Per-request NEAR→Chutes fallback ====================
+    //
+    // These exercise the END-TO-END per-request fallback through
+    // `chat_completion` (→ `retry_with_fallback_caps`), the behavior a staging
+    // backend-drain could NOT validate: cloud-api holds sticky keepalive
+    // connections to NEAR backends, so a model-proxy registry change never makes
+    // the live request fail. The fallback only triggers on a genuine
+    // request-level failure, which is deterministic to inject with a mock.
+
+    fn fallback_params(model: &str) -> inference_providers::ChatCompletionParams {
+        inference_providers::ChatCompletionParams {
+            model: model.to_string(),
+            messages: vec![inference_providers::ChatMessage {
+                role: inference_providers::MessageRole::User,
+                content: Some(serde_json::Value::String("hello".to_string())),
+                name: None,
+                tool_call_id: None,
+                tool_calls: None,
+            }],
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            stop: None,
+            stream: Some(false),
+            tools: None,
+            max_completion_tokens: None,
+            n: None,
+            frequency_penalty: None,
+            presence_penalty: None,
+            logit_bias: None,
+            logprobs: None,
+            top_logprobs: None,
+            user: None,
+            seed: None,
+            tool_choice: None,
+            parallel_tool_calls: None,
+            metadata: None,
+            store: None,
+            stream_options: None,
+            modalities: None,
+            extra: std::collections::HashMap::new(),
+        }
+    }
+
+    /// A retryable NEAR primary failure (upstream 5xx) MUST fall through to the
+    /// Chutes (Attested3p) provider within the SAME request — the client sees a
+    /// success, not the NEAR error. Also asserts NEAR is attempted first (it's
+    /// the primary tier) and that the fallback is immediate (no long backoff
+    /// before trying the next tier).
+    #[tokio::test]
+    async fn near_5xx_falls_back_to_chutes_within_one_request() {
+        use inference_providers::mock::{MockProvider, RequestMatcher, ResponseTemplate};
+        use inference_providers::{CompletionError, ProviderTier};
+
+        let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
+        let model_id = "z-ai/glm-5.1".to_string();
+
+        // NEAR primary: always returns a retryable upstream 5xx.
+        let near = Arc::new(MockProvider::new_accept_all().with_tier(ProviderTier::Near));
+        near.set_error_override(Some(CompletionError::HttpError {
+            status_code: 503,
+            message: "backend overloaded".to_string(),
+            is_external: true,
+        }))
+        .await;
+
+        // Chutes fallback: healthy, returns a recognizable response.
+        let chutes = Arc::new(MockProvider::new_accept_all().with_tier(ProviderTier::Attested3p));
+        chutes
+            .when(RequestMatcher::Any)
+            .respond_with(ResponseTemplate::new("served-by-chutes-fallback"))
+            .await;
+
+        {
+            let mut m = pool.provider_mappings.write().await;
+            m.model_to_providers.insert(
+                model_id.clone(),
+                vec![
+                    near.clone() as Arc<InferenceProviderTrait>,
+                    chutes.clone() as Arc<InferenceProviderTrait>,
+                ],
+            );
+        }
+
+        let started = std::time::Instant::now();
+        let resp = pool
+            .chat_completion(fallback_params(&model_id), "test-hash".to_string())
+            .await
+            .expect("NEAR 5xx must fall back to Chutes, not fail the client request");
+        let elapsed = started.elapsed();
+
+        // NEAR was attempted first (primary tier), not skipped.
+        assert!(
+            near.last_chat_params().await.is_some(),
+            "NEAR (primary) must be attempted before falling back"
+        );
+        // Chutes actually served the request.
+        assert!(
+            chutes.last_chat_params().await.is_some(),
+            "Chutes must serve the fallback after the NEAR 5xx"
+        );
+        let body = String::from_utf8_lossy(&resp.raw_bytes);
+        assert!(
+            body.contains("served-by-chutes-fallback"),
+            "response must be the Chutes one, got: {body}"
+        );
+        // Fallback is within the same round (next provider tried immediately) —
+        // no client-facing retry/backoff latency.
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "fallback should be immediate, took {elapsed:?}"
+        );
+    }
+
+    /// When the NEAR primary AND the Chutes fallback both fail with a retryable
+    /// 5xx, the error must SURFACE to the client — the pool must not invent a
+    /// false success once every provider is exhausted.
+    #[tokio::test]
+    async fn all_providers_5xx_surfaces_error() {
+        use inference_providers::mock::MockProvider;
+        use inference_providers::{CompletionError, ProviderTier};
+
+        let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
+        let model_id = "z-ai/glm-5.1".to_string();
+        let err = || CompletionError::HttpError {
+            status_code: 503,
+            message: "down".to_string(),
+            is_external: true,
+        };
+
+        let near = Arc::new(MockProvider::new_accept_all().with_tier(ProviderTier::Near));
+        near.set_error_override(Some(err())).await;
+        let chutes = Arc::new(MockProvider::new_accept_all().with_tier(ProviderTier::Attested3p));
+        chutes.set_error_override(Some(err())).await;
+
+        {
+            let mut m = pool.provider_mappings.write().await;
+            m.model_to_providers.insert(
+                model_id.clone(),
+                vec![
+                    near.clone() as Arc<InferenceProviderTrait>,
+                    chutes.clone() as Arc<InferenceProviderTrait>,
+                ],
+            );
+        }
+
+        let result = pool
+            .chat_completion(fallback_params(&model_id), "test-hash".to_string())
+            .await;
+        assert!(
+            result.is_err(),
+            "all providers failing must surface an error, not a false success"
+        );
+        // Both tiers were genuinely attempted.
+        assert!(near.last_chat_params().await.is_some());
+        assert!(chutes.last_chat_params().await.is_some());
+    }
+
+    /// A healthy NEAR primary serves the request itself; the Chutes fallback must
+    /// NOT be invoked when the primary succeeds (no needless fallback / billing).
+    #[tokio::test]
+    async fn healthy_near_serves_without_invoking_chutes() {
+        use inference_providers::mock::{MockProvider, RequestMatcher, ResponseTemplate};
+        use inference_providers::ProviderTier;
+
+        let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
+        let model_id = "z-ai/glm-5.1".to_string();
+
+        let near = Arc::new(MockProvider::new_accept_all().with_tier(ProviderTier::Near));
+        near.when(RequestMatcher::Any)
+            .respond_with(ResponseTemplate::new("served-by-near-primary"))
+            .await;
+        let chutes = Arc::new(MockProvider::new_accept_all().with_tier(ProviderTier::Attested3p));
+
+        {
+            let mut m = pool.provider_mappings.write().await;
+            m.model_to_providers.insert(
+                model_id.clone(),
+                vec![
+                    near.clone() as Arc<InferenceProviderTrait>,
+                    chutes.clone() as Arc<InferenceProviderTrait>,
+                ],
+            );
+        }
+
+        let resp = pool
+            .chat_completion(fallback_params(&model_id), "test-hash".to_string())
+            .await
+            .expect("healthy NEAR must serve");
+        let body = String::from_utf8_lossy(&resp.raw_bytes);
+        assert!(body.contains("served-by-near-primary"), "NEAR must serve, got: {body}");
+        assert!(
+            chutes.last_chat_params().await.is_none(),
+            "Chutes must NOT be invoked when the NEAR primary succeeds"
+        );
+    }
 }

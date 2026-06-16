@@ -136,6 +136,29 @@ pub fn default_limit() -> i64 {
     100
 }
 
+/// Map an analytics granularity string to the PostgreSQL `DATE_TRUNC` literal.
+///
+/// Returns a `&'static str` — the only values that can reach `format!()` are the
+/// four hardcoded literals below. Callers cannot pass user-controlled strings through
+/// to the SQL even if the allowlist check is accidentally skipped elsewhere.
+pub fn allowlisted_date_trunc(
+    granularity: &str,
+) -> Result<&'static str, (StatusCode, ResponseJson<ErrorResponse>)> {
+    match granularity {
+        "hour" => Ok("hour"),
+        "day" => Ok("day"),
+        "week" => Ok("week"),
+        "month" => Ok("month"),
+        other => Err((
+            StatusCode::BAD_REQUEST,
+            ResponseJson(ErrorResponse::new(
+                format!("Invalid granularity '{other}'; expected one of: hour, day, week, month"),
+                "invalid_granularity".to_string(),
+            )),
+        )),
+    }
+}
+
 /// Parse + validate an analytics `start`/`end` window.
 ///
 /// Unlike the old "parse-or-default" behavior, a malformed `start`/`end` is a
@@ -143,7 +166,12 @@ pub fn default_limit() -> i64 {
 /// - missing `end` defaults to now; missing `start` defaults to `end - 30d`
 /// - a present-but-unparseable value → 400
 /// - `start >= end` → 400
-/// - for `hour` granularity, a window longer than `max_hour_days` → 400
+/// - per-granularity absolute caps prevent unbounded full-table scans:
+///   - `hour`  → max `max_hour_days` days (caller-specified)
+///   - `day`   → max 366 days
+///   - `week`  → max 3 years (1096 days)
+///   - `month` → max 5 years (1826 days)
+///   - `None`  → max 366 days (non-timeseries endpoints)
 #[allow(clippy::type_complexity)]
 pub fn parse_metrics_range(
     start: Option<&str>,
@@ -163,6 +191,12 @@ pub fn parse_metrics_range(
             )),
         )
     };
+    let range_err = |msg: String| {
+        (
+            StatusCode::BAD_REQUEST,
+            ResponseJson(ErrorResponse::new(msg, "invalid_parameter".to_string())),
+        )
+    };
 
     let end = match end {
         Some(s) => chrono::DateTime::parse_from_rfc3339(s)
@@ -178,23 +212,40 @@ pub fn parse_metrics_range(
     };
 
     if start >= end {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            ResponseJson(ErrorResponse::new(
-                "'start' must be before 'end'".to_string(),
-                "invalid_parameter".to_string(),
-            )),
-        ));
+        return Err(range_err("'start' must be before 'end'".to_string()));
     }
 
-    if granularity == Some("hour") && (end - start) > chrono::Duration::days(max_hour_days) {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            ResponseJson(ErrorResponse::new(
-                format!("'hour' granularity is limited to {max_hour_days} days; use a coarser granularity or a shorter range"),
-                "invalid_parameter".to_string(),
-            )),
-        ));
+    let window = end - start;
+    match granularity {
+        Some("hour") => {
+            if window > chrono::Duration::days(max_hour_days) {
+                return Err(range_err(format!(
+                    "'hour' granularity is limited to {max_hour_days} days; use a coarser granularity or a shorter range"
+                )));
+            }
+        }
+        Some("week") => {
+            if window > chrono::Duration::days(1096) {
+                return Err(range_err(
+                    "'week' granularity is limited to 3 years".to_string(),
+                ));
+            }
+        }
+        Some("month") => {
+            if window > chrono::Duration::days(1826) {
+                return Err(range_err(
+                    "'month' granularity is limited to 5 years".to_string(),
+                ));
+            }
+        }
+        // "day" or None: absolute cap of 366 days
+        _ => {
+            if window > chrono::Duration::days(366) {
+                return Err(range_err(
+                    "'day' granularity is limited to 366 days".to_string(),
+                ));
+            }
+        }
     }
 
     Ok((start, end))

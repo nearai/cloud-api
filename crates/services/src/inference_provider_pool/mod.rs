@@ -3133,13 +3133,11 @@ impl InferenceProviderPool {
     /// * `models` - List of (model_name, inference_url) tuples
     /// Load (or refresh) a set of inference_url models into the provider pool.
     ///
-    /// The `partial` flag controls whether this is a merge or a replace:
-    ///
-    /// - `partial = true` (admin PATCH path): only the provided models are
-    ///   upserted — existing state for untouched models is preserved.
-    /// - `partial = false` (periodic sync / startup): the URL-provider cache
-    ///   and fingerprint-state map are replaced wholesale, pruning entries for
-    ///   models that are no longer in the active set.
+    /// The `partial` flag controls whether this is a merge or a replace.
+    /// Pass `partial = true` from the admin PATCH path to upsert only the
+    /// provided models without evicting untouched entries.  Pass
+    /// `partial = false` from the periodic sync / startup paths to replace
+    /// the URL-provider cache wholesale and prune stale entries.
     pub async fn load_inference_url_models(&self, models: Vec<(String, String)>, partial: bool) {
         if models.is_empty() {
             return;

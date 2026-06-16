@@ -2969,7 +2969,10 @@ mod tests {
 
         assert!(!mode.rewrite_public_stream_usage);
         assert!(!mode.gateway_signature_enabled);
-        assert!(mode.strip_intermediate_usage, "default stream must strip intermediate usage");
+        assert!(
+            mode.strip_intermediate_usage,
+            "default stream must strip intermediate usage"
+        );
     }
 
     #[test]

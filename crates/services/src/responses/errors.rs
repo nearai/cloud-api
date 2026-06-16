@@ -160,7 +160,7 @@ fn completion_http_status_code(error: &crate::completions::CompletionError) -> u
         | crate::completions::CompletionError::InvalidParams(_) => 400,
         crate::completions::CompletionError::RateLimitExceeded(_) => 429,
         crate::completions::CompletionError::ProviderError { status_code, .. } => *status_code,
-        crate::completions::CompletionError::ServiceOverloaded(_) => 529,
+        crate::completions::CompletionError::ServiceOverloaded(_) => 429,
         crate::completions::CompletionError::InternalError(_) => 500,
     }
 }

@@ -34,8 +34,10 @@ fn responses_request(model: &str, stream: bool) -> serde_json::Value {
 // ============================================
 
 /// Test that a 503 from the provider, after `retry_with_fallback` exhausts
-/// every backend, surfaces to the client as HTTP 529 ("Site Is Overloaded").
-/// 503 stays reserved for narrower per-handler "this dependency is down" cases.
+/// every backend, surfaces to the client as HTTP 429 ("Too Many Requests").
+/// The error body uses `"type": "service_overloaded"` to distinguish it from
+/// per-org rate-limit 429s (`"type": "rate_limit_exceeded"`). 503 stays
+/// reserved for narrower per-handler "this dependency is down" cases.
 #[tokio::test]
 async fn test_provider_error_503_propagated() {
     let (server, _pool, mock_provider, _db) = setup_test_server_with_pool().await;
@@ -60,8 +62,8 @@ async fn test_provider_error_503_propagated() {
 
     assert_eq!(
         response.status_code(),
-        529,
-        "Expected 529 (all backends overloaded), got {}",
+        429,
+        "Expected 429 (all backends overloaded), got {}",
         response.status_code()
     );
 
@@ -378,8 +380,8 @@ async fn test_provider_error_message_preserved_in_streaming() {
 
     assert_eq!(
         response.status_code(),
-        529,
-        "Expected 529 (all backends overloaded) for streaming request, got {}",
+        429,
+        "Expected 429 (all backends overloaded) for streaming request, got {}",
         response.status_code()
     );
 

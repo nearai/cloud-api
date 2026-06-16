@@ -3133,12 +3133,13 @@ impl InferenceProviderPool {
     /// * `models` - List of (model_name, inference_url) tuples
     /// Load (or refresh) a set of inference_url models into the provider pool.
     ///
-    /// When `partial = true` (called from the admin PATCH path), only the
-    /// provided models are upserted — existing state for untouched models is
-    /// preserved.  When `partial = false` (called from the periodic sync path
-    /// via `sync_inference_url_models`), the URL-provider cache and fingerprint
-    /// state map are replaced wholesale, pruning entries for models that are no
-    /// longer in the active set.
+    /// The `partial` flag controls whether this is a merge or a replace:
+    ///
+    /// - `partial = true` (admin PATCH path): only the provided models are
+    ///   upserted — existing state for untouched models is preserved.
+    /// - `partial = false` (periodic sync / startup): the URL-provider cache
+    ///   and fingerprint-state map are replaced wholesale, pruning entries for
+    ///   models that are no longer in the active set.
     pub async fn load_inference_url_models(&self, models: Vec<(String, String)>, partial: bool) {
         if models.is_empty() {
             return;
@@ -7046,7 +7047,7 @@ mod tests {
 
         // Pre-seed the URL cache with two "existing" models as if they were
         // loaded during a prior full sync.
-        let untouched_model = "model-untouched".to_string();
+        let _untouched_model = "model-untouched".to_string();
         let untouched_url = "https://untouched.completions.near.ai".to_string();
         let untouched_provider = Arc::new(MockProvider::new());
 

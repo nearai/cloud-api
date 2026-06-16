@@ -296,7 +296,12 @@ pub async fn get_attestation_report(
     // Parse ?provider= into a ProviderTier filter.
     // Accepted values: "near" → Near, "chutes" → Attested3p.
     // Unknown values are rejected with 400 so callers notice typos immediately.
-    let provider_filter = match params.provider.as_deref().map(str::to_ascii_lowercase).as_deref() {
+    let provider_filter = match params
+        .provider
+        .as_deref()
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
         None => None,
         Some("near") => Some(ProviderTier::Near),
         Some("chutes") => Some(ProviderTier::Attested3p),

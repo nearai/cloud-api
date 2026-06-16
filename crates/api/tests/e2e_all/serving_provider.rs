@@ -67,10 +67,7 @@ async fn test_serving_provider_header_non_streaming() {
         .expect("x-serving-provider must be valid ASCII");
 
     // The default mock uses ProviderTier::NonAttested → "non-attested"
-    assert_eq!(
-        tier, "non-attested",
-        "unexpected serving tier: {tier}"
-    );
+    assert_eq!(tier, "non-attested", "unexpected serving tier: {tier}");
 }
 
 /// Streaming chat completion must carry `x-serving-provider` as a *response header*
@@ -102,10 +99,7 @@ async fn test_serving_provider_header_streaming() {
         .to_str()
         .expect("x-serving-provider must be valid ASCII");
 
-    assert_eq!(
-        tier, "non-attested",
-        "unexpected serving tier: {tier}"
-    );
+    assert_eq!(tier, "non-attested", "unexpected serving tier: {tier}");
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -248,8 +242,7 @@ async fn test_attestation_report_provider_filter_case_insensitive() {
         url::form_urlencoded::byte_serialize(E2E_QWEN_MODEL_NAME.as_bytes()).collect::<String>();
 
     for value in &["NEAR", "CHUTES", "Near", "Chutes"] {
-        let url =
-            format!("/v1/attestation/report?model={encoded_model}&provider={value}");
+        let url = format!("/v1/attestation/report?model={encoded_model}&provider={value}");
         let response = server
             .get(&url)
             .add_header("Authorization", format!("Bearer {api_key}"))

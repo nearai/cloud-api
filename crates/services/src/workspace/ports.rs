@@ -166,6 +166,13 @@ pub trait WorkspaceRepository: Send + Sync {
         &self,
         organization_id: OrganizationId,
     ) -> Result<i64, RepositoryError>;
+
+    /// List all workspaces accessible to a user across all their organizations in a single query
+    async fn list_by_user(
+        &self,
+        user_id: UserId,
+        limit: i64,
+    ) -> Result<Vec<Workspace>, RepositoryError>;
 }
 
 // Repository trait for API key data access
@@ -343,6 +350,16 @@ pub trait WorkspaceServiceTrait: Send + Sync {
         workspace_id: WorkspaceId,
         requester_id: UserId,
     ) -> Result<bool, WorkspaceError>;
+
+    /// List all workspaces accessible to a user across all their organizations in a single query.
+    ///
+    /// This is the efficient replacement for the N+1 pattern of looping over orgs and calling
+    /// `list_workspaces_for_organization` for each one.
+    async fn list_workspaces_for_user(
+        &self,
+        user_id: UserId,
+        limit: i64,
+    ) -> Result<Vec<Workspace>, WorkspaceError>;
 
     /// Count workspaces for an organization with permission checking
     async fn count_workspaces_by_organization(

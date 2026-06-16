@@ -232,7 +232,7 @@ impl ModelRepository {
                         input_cost_per_token, output_cost_per_token, cost_per_image, cache_read_cost_per_token,
                         context_length, verifiable, is_active, owned_by, created_at, updated_at,
                         provider_type, provider_config, attestation_supported,
-                        input_modalities, output_modalities, inference_url, hugging_face_id, quantization, max_output_length, supported_sampling_parameters, supported_features, datacenters, is_ready, deprecation_date, openrouter_slug
+                        input_modalities, output_modalities, inference_url, hugging_face_id, quantization, max_output_length, supported_sampling_parameters, supported_features, datacenters, is_ready, deprecation_date, openrouter_slug, allow_free
                     FROM models
                     WHERE model_name = $1
                     "#,
@@ -267,7 +267,7 @@ impl ModelRepository {
                         input_cost_per_token, output_cost_per_token, cost_per_image, cache_read_cost_per_token,
                         context_length, verifiable, is_active, owned_by, created_at, updated_at,
                         provider_type, provider_config, attestation_supported,
-                        input_modalities, output_modalities, inference_url, hugging_face_id, quantization, max_output_length, supported_sampling_parameters, supported_features, datacenters, is_ready, deprecation_date, openrouter_slug
+                        input_modalities, output_modalities, inference_url, hugging_face_id, quantization, max_output_length, supported_sampling_parameters, supported_features, datacenters, is_ready, deprecation_date, openrouter_slug, allow_free
                     FROM models
                     WHERE id = $1
                     "#,
@@ -454,13 +454,14 @@ impl ModelRepository {
                             is_ready = CASE WHEN $27 THEN NULL ELSE COALESCE($25, is_ready) END,
                             deprecation_date = CASE WHEN $28 THEN NULL ELSE COALESCE($26, deprecation_date) END,
                             openrouter_slug = CASE WHEN $30 THEN NULL ELSE COALESCE($29, openrouter_slug) END,
+                            allow_free = COALESCE($31, allow_free),
                             updated_at = NOW()
                         WHERE model_name = $1
                         RETURNING id, model_name, model_display_name, model_description, model_icon,
                                   input_cost_per_token, output_cost_per_token, cost_per_image, cache_read_cost_per_token,
                                   context_length, verifiable, is_active, owned_by, created_at, updated_at,
                                   provider_type, provider_config, attestation_supported,
-                                  input_modalities, output_modalities, inference_url, hugging_face_id, quantization, max_output_length, supported_sampling_parameters, supported_features, datacenters, is_ready, deprecation_date, openrouter_slug
+                                  input_modalities, output_modalities, inference_url, hugging_face_id, quantization, max_output_length, supported_sampling_parameters, supported_features, datacenters, is_ready, deprecation_date, openrouter_slug, allow_free
                         "#,
                         &[
                             &model_name,
@@ -493,6 +494,7 @@ impl ModelRepository {
                             &deprecation_date_clear,
                             &openrouter_slug_value,
                             &openrouter_slug_clear,
+                            &update_request.allow_free,
                         ],
                     )
                     .await
@@ -526,7 +528,7 @@ impl ModelRepository {
                             context_length, verifiable, is_active, owned_by,
                             provider_type, provider_config, attestation_supported,
                             input_modalities, output_modalities, inference_url, hugging_face_id, quantization, max_output_length, supported_sampling_parameters, supported_features, datacenters,
-                            is_ready, deprecation_date, openrouter_slug
+                            is_ready, deprecation_date, openrouter_slug, allow_free
                         ) VALUES (
                             $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11,
                             COALESCE($12, $13),
@@ -540,7 +542,8 @@ impl ModelRepository {
                             $20, $21, $22,
                             COALESCE($23, ARRAY[]::TEXT[]),
                             COALESCE($24, ARRAY[]::TEXT[]),
-                            $25, $26, $27, $30
+                            $25, $26, $27, $30,
+                            COALESCE($32, false)
                         )
                         ON CONFLICT (model_name) DO UPDATE SET
                             input_cost_per_token = EXCLUDED.input_cost_per_token,
@@ -572,12 +575,13 @@ impl ModelRepository {
                             is_ready = CASE WHEN $28 THEN NULL ELSE COALESCE($26, models.is_ready) END,
                             deprecation_date = CASE WHEN $29 THEN NULL ELSE COALESCE($27, models.deprecation_date) END,
                             openrouter_slug = CASE WHEN $31 THEN NULL ELSE COALESCE($30, models.openrouter_slug) END,
+                            allow_free = COALESCE($32, models.allow_free),
                             updated_at = NOW()
                         RETURNING id, model_name, model_display_name, model_description, model_icon,
                                   input_cost_per_token, output_cost_per_token, cost_per_image, cache_read_cost_per_token,
                                   context_length, verifiable, is_active, owned_by, created_at, updated_at,
                                   provider_type, provider_config, attestation_supported,
-                                  input_modalities, output_modalities, inference_url, hugging_face_id, quantization, max_output_length, supported_sampling_parameters, supported_features, datacenters, is_ready, deprecation_date, openrouter_slug
+                                  input_modalities, output_modalities, inference_url, hugging_face_id, quantization, max_output_length, supported_sampling_parameters, supported_features, datacenters, is_ready, deprecation_date, openrouter_slug, allow_free
                         "#,
                         &[
                             &model_name,
@@ -611,6 +615,7 @@ impl ModelRepository {
                             &deprecation_date_clear,
                             &openrouter_slug_value,
                             &openrouter_slug_clear,
+                            &update_request.allow_free,
                         ],
                     )
                     .await
@@ -695,7 +700,7 @@ impl ModelRepository {
                         context_length, verifiable, is_active, owned_by,
                         provider_type, provider_config, attestation_supported,
                         input_modalities, output_modalities, inference_url, hugging_face_id, quantization, max_output_length, supported_sampling_parameters, supported_features, datacenters,
-                        is_ready, deprecation_date, openrouter_slug
+                        is_ready, deprecation_date, openrouter_slug, allow_free
                     ) VALUES (
                         $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11,
                         COALESCE($12, $13),
@@ -706,14 +711,15 @@ impl ModelRepository {
                         $20, $21, $22,
                         COALESCE($23, ARRAY[]::TEXT[]),
                         COALESCE($24, ARRAY[]::TEXT[]),
-                        $25, $26, $27, $28
+                        $25, $26, $27, $28,
+                        COALESCE($29, false)
                     )
                     ON CONFLICT (model_name) DO NOTHING
                     RETURNING id, model_name, model_display_name, model_description, model_icon,
                               input_cost_per_token, output_cost_per_token, cost_per_image, cache_read_cost_per_token,
                               context_length, verifiable, is_active, owned_by, created_at, updated_at,
                               provider_type, provider_config, attestation_supported,
-                              input_modalities, output_modalities, inference_url, hugging_face_id, quantization, max_output_length, supported_sampling_parameters, supported_features, datacenters, is_ready, deprecation_date, openrouter_slug
+                              input_modalities, output_modalities, inference_url, hugging_face_id, quantization, max_output_length, supported_sampling_parameters, supported_features, datacenters, is_ready, deprecation_date, openrouter_slug, allow_free
                     "#,
                     &[
                         &model_name,
@@ -744,6 +750,7 @@ impl ModelRepository {
                         &is_ready_value,
                         &deprecation_date_value,
                         &openrouter_slug_value,
+                        &req.allow_free,
                     ],
                 )
                 .await
@@ -795,17 +802,17 @@ impl ModelRepository {
                         context_length, verifiable, is_active, owned_by,
                         provider_type, provider_config, attestation_supported,
                         input_modalities, output_modalities, inference_url, hugging_face_id, quantization, max_output_length, supported_sampling_parameters, supported_features, datacenters,
-                        is_ready, deprecation_date, openrouter_slug
+                        is_ready, deprecation_date, openrouter_slug, allow_free
                     ) VALUES (
                         $1, $2, $3, $4, $5, $6, $7, $8,
                         $9, $10, $11, $12, $13, $14, $15, $16, $17, $18,
-                        $19, $20, $21, $22, $23, $24, $25, $26, $27
+                        $19, $20, $21, $22, $23, $24, $25, $26, $27, $28
                     )
                     RETURNING id, model_name, model_display_name, model_description, model_icon,
                               input_cost_per_token, output_cost_per_token, cost_per_image, cache_read_cost_per_token,
                               context_length, verifiable, is_active, owned_by, created_at, updated_at,
                               provider_type, provider_config, attestation_supported,
-                              input_modalities, output_modalities, inference_url, hugging_face_id, quantization, max_output_length, supported_sampling_parameters, supported_features, datacenters, is_ready, deprecation_date, openrouter_slug
+                              input_modalities, output_modalities, inference_url, hugging_face_id, quantization, max_output_length, supported_sampling_parameters, supported_features, datacenters, is_ready, deprecation_date, openrouter_slug, allow_free
                     "#,
                     &[
                         &model.model_name,
@@ -835,6 +842,7 @@ impl ModelRepository {
                         &model.is_ready,
                         &model.deprecation_date,
                         &model.openrouter_slug,
+                        &model.allow_free,
                     ],
                 )
                 .await
@@ -1029,7 +1037,7 @@ impl ModelRepository {
                               input_cost_per_token, output_cost_per_token, cost_per_image, cache_read_cost_per_token,
                               context_length, verifiable, is_active, owned_by, created_at, updated_at,
                               provider_type, provider_config, attestation_supported,
-                              input_modalities, output_modalities, inference_url, hugging_face_id, quantization, max_output_length, supported_sampling_parameters, supported_features, datacenters, is_ready, deprecation_date, openrouter_slug
+                              input_modalities, output_modalities, inference_url, hugging_face_id, quantization, max_output_length, supported_sampling_parameters, supported_features, datacenters, is_ready, deprecation_date, openrouter_slug, allow_free
                     "#,
                     &[&model_name],
                 )
@@ -1370,6 +1378,7 @@ impl ModelRepository {
             is_ready: row.try_get("is_ready").ok().flatten(),
             deprecation_date: row.try_get("deprecation_date").ok().flatten(),
             openrouter_slug: row.try_get("openrouter_slug").ok().flatten(),
+            allow_free: row.try_get("allow_free").unwrap_or(false),
         }
     }
 

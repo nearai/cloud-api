@@ -616,6 +616,7 @@ impl AdminService for AdminServiceImpl {
             context_length: None,
             verifiable: None,
             is_active: None,
+            allow_free: None,
             aliases: None,
             owned_by: None,
             provider_type: None,
@@ -1241,7 +1242,7 @@ impl AdminServiceImpl {
     async fn validate_model_request(
         model_name: &str,
         request: &UpdateModelAdminRequest,
-        _repository: Arc<dyn AdminRepository>,
+        repository: Arc<dyn AdminRepository>,
     ) -> Result<(), AdminError> {
         // All costs use fixed scale 9 (nano-dollars) and USD - no scale/currency validation needed
 
@@ -1267,6 +1268,38 @@ impl AdminServiceImpl {
                 return Err(AdminError::InvalidPricing(
                     "Model description cannot be empty".to_string(),
                 ));
+            }
+        }
+
+        // Activation pricing gate: reject is_active=true when the effective
+        // input+output costs are both 0 unless allow_free is explicitly set.
+        if request.is_active == Some(true) {
+            // Look up existing model costs (None = new model being created)
+            let existing = repository
+                .get_model_costs(model_name)
+                .await
+                .map_err(|e| AdminError::InternalError(e.to_string()))?;
+
+            let (existing_input, existing_output, existing_allow_free) = existing
+                .unwrap_or((0, 0, false));
+
+            let effective_input = request
+                .input_cost_per_token
+                .unwrap_or(existing_input);
+            let effective_output = request
+                .output_cost_per_token
+                .unwrap_or(existing_output);
+            let effective_allow_free = request
+                .allow_free
+                .unwrap_or(existing_allow_free);
+
+            if effective_input == 0 && effective_output == 0 && !effective_allow_free {
+                return Err(AdminError::InvalidPricing(format!(
+                    "Cannot activate model '{}' with zero pricing. \
+                     Set allowFree=true to explicitly allow free serving, \
+                     or set inputCostPerToken or outputCostPerToken > 0.",
+                    model_name
+                )));
             }
         }
 

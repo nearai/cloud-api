@@ -127,6 +127,7 @@ impl AdminRepository for AdminCompositeRepository {
             context_length: request.context_length,
             verifiable: request.verifiable,
             is_active: request.is_active,
+            allow_free: request.allow_free,
             aliases: request.aliases.clone(),
             owned_by: request.owned_by,
             provider_type: request.provider_type,
@@ -190,6 +191,14 @@ impl AdminRepository for AdminCompositeRepository {
             deprecation_date: model.deprecation_date,
             openrouter_slug: model.openrouter_slug,
         })
+    }
+
+    async fn get_model_costs(
+        &self,
+        model_name: &str,
+    ) -> Result<Option<(i64, i64, bool)>> {
+        let model = self.model_repo.get_by_internal_name(model_name).await?;
+        Ok(model.map(|m| (m.input_cost_per_token, m.output_cost_per_token, m.allow_free)))
     }
 
     async fn get_model_history(

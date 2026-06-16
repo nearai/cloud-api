@@ -389,6 +389,7 @@ pub async fn batch_upsert_models(
                     context_length: request.context_length,
                     verifiable: request.verifiable,
                     is_active: request.is_active,
+                    allow_free: request.allow_free,
                     aliases: request.aliases.clone(),
                     owned_by: request.owned_by.clone(),
                     provider_type: request.provider_type.clone(),

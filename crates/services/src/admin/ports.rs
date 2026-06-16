@@ -15,6 +15,8 @@ pub struct UpdateModelAdminRequest {
     pub context_length: Option<i32>,
     pub verifiable: Option<bool>,
     pub is_active: Option<bool>,
+    /// If true, allows activation even with zero pricing.
+    pub allow_free: Option<bool>,
     pub aliases: Option<Vec<String>>,
     pub owned_by: Option<String>,
     // Provider configuration
@@ -592,6 +594,14 @@ pub trait AdminRepository: Send + Sync {
         model_name: &str,
         request: UpdateModelAdminRequest,
     ) -> Result<ModelPricing, anyhow::Error>;
+
+    /// Fetch the current pricing costs and allow_free flag for a model by name.
+    /// Returns `None` if the model does not exist (new model).
+    /// Returns `Some((input_cost, output_cost, allow_free))`.
+    async fn get_model_costs(
+        &self,
+        model_name: &str,
+    ) -> Result<Option<(i64, i64, bool)>, anyhow::Error>;
 
     /// Get complete history for a model with pagination (includes pricing and other attributes)
     async fn get_model_history(

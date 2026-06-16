@@ -3476,6 +3476,10 @@ pub struct UpdateModelApiRequest {
     pub verifiable: Option<bool>,
     #[serde(rename = "isActive")]
     pub is_active: Option<bool>,
+    /// If true, this model may be activated even when both cost fields are 0.
+    /// Required to be set explicitly when activating a zero-price model.
+    #[serde(rename = "allowFree", skip_serializing_if = "Option::is_none")]
+    pub allow_free: Option<bool>,
     pub aliases: Option<Vec<String>>,
     #[serde(rename = "ownedBy")]
     pub owned_by: Option<String>,

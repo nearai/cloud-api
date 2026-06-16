@@ -1686,6 +1686,27 @@ impl InferenceProviderPool {
         None
     }
 
+    /// A provider's "this model isn't served here" response — OpenAI-compatible
+    /// engines (vLLM/SGLang) answer an unknown model with a 404/400 like
+    /// "The model `X` does not exist." Unlike a genuine client 4xx (bad params),
+    /// this is NOT the request's fault: a *different* provider for the same
+    /// canonical id (e.g. a Chutes fallback) may serve the model. So the inner
+    /// loop falls through to the next provider instead of fast-returning, while
+    /// staying non-retryable for the round (re-hitting the same provider would
+    /// just repeat the answer, and it's not a backend-health signal).
+    ///
+    /// Fixes nearai/cloud-api#797: a NEAR backend that didn't recognize a renamed
+    /// canonical id (`z-ai/glm-5.1`) 4xx'd and the request never reached the
+    /// configured Chutes fallback.
+    fn is_model_not_found_error(status_code: u16, message: &str) -> bool {
+        if status_code != 400 && status_code != 404 {
+            return false;
+        }
+        let m = message.to_ascii_lowercase();
+        m.contains("model_not_found")
+            || (m.contains("model") && (m.contains("does not exist") || m.contains("not found")))
+    }
+
     /// Single source of truth for the retry decision: the inner retry loop
     /// gates on `starts_with("retryable_")`, and the terminal error log emits
     /// the label directly so the rationale is visible in production logs.
@@ -2138,10 +2159,25 @@ impl InferenceProviderPool {
                         // as other providers may have capacity or better connectivity.
                         // NOTE: Don't increment the failure counter for non-retryable 4xx —
                         // these indicate invalid requests, not unhealthy providers.
-                        if let CompletionError::HttpError { status_code, .. } = &e {
+                        if let CompletionError::HttpError {
+                            status_code,
+                            message,
+                            ..
+                        } = &e
+                        {
+                            // A "model not found" 4xx means THIS provider doesn't
+                            // serve the model — fall through to the next provider
+                            // (e.g. a Chutes fallback under the same canonical id)
+                            // instead of fast-returning, just like 408/429.
+                            // (nearai/cloud-api#797.) It is NOT marked retryable
+                            // below, so the round isn't re-run against this same
+                            // provider and the failure counter isn't bumped; if no
+                            // other provider serves it, the error still propagates
+                            // after the loop.
                             if (400..=499).contains(status_code)
                                 && *status_code != 429
                                 && *status_code != 408
+                                && !Self::is_model_not_found_error(*status_code, message)
                             {
                                 tracing::warn!(
                                     model_id = %model_id,
@@ -6742,6 +6778,112 @@ mod tests {
         assert!(
             chutes.last_chat_params().await.is_none(),
             "Chutes must NOT be invoked when the NEAR primary succeeds"
+        );
+    }
+
+    /// nearai/cloud-api#797: a NEAR provider that returns a "model not found"
+    /// 4xx (OpenAI-compatible engines do this for an unrecognized model id, e.g.
+    /// a renamed canonical the backend hasn't picked up) must fall through to the
+    /// Chutes fallback — NOT fast-return as a client error. Both 404 and 400
+    /// phrasings are exercised.
+    #[tokio::test]
+    async fn near_model_not_found_falls_back_to_chutes() {
+        use inference_providers::mock::{MockProvider, RequestMatcher, ResponseTemplate};
+        use inference_providers::{CompletionError, ProviderTier};
+
+        for (status_code, message) in [
+            (404u16, "The model `z-ai/glm-5.1` does not exist."),
+            (400u16, "The model `z-ai/glm-5.1` does not exist."),
+        ] {
+            let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
+            let model_id = "z-ai/glm-5.1".to_string();
+
+            let near = Arc::new(MockProvider::new_accept_all().with_tier(ProviderTier::Near));
+            near.set_error_override(Some(CompletionError::HttpError {
+                status_code,
+                message: message.to_string(),
+                is_external: true,
+            }))
+            .await;
+
+            let chutes =
+                Arc::new(MockProvider::new_accept_all().with_tier(ProviderTier::Attested3p));
+            chutes
+                .when(RequestMatcher::Any)
+                .respond_with(ResponseTemplate::new("served-by-chutes-fallback"))
+                .await;
+
+            {
+                let mut m = pool.provider_mappings.write().await;
+                m.model_to_providers.insert(
+                    model_id.clone(),
+                    vec![
+                        near.clone() as Arc<InferenceProviderTrait>,
+                        chutes.clone() as Arc<InferenceProviderTrait>,
+                    ],
+                );
+            }
+
+            let resp = pool
+                .chat_completion(fallback_params(&model_id), "test-hash".to_string())
+                .await
+                .unwrap_or_else(|e| {
+                    panic!("NEAR {status_code} model-not-found must fall back to Chutes, got: {e}")
+                });
+            assert!(
+                near.last_chat_params().await.is_some(),
+                "NEAR must be attempted first ({status_code})"
+            );
+            assert!(
+                chutes.last_chat_params().await.is_some(),
+                "Chutes must serve after NEAR model-not-found ({status_code})"
+            );
+            let body = String::from_utf8_lossy(&resp.raw_bytes);
+            assert!(
+                body.contains("served-by-chutes-fallback"),
+                "response must be Chutes's ({status_code}), got: {body}"
+            );
+        }
+    }
+
+    /// Guard against over-reaching the #797 fix: a GENUINE client 4xx (bad
+    /// params, not model-not-found) must still fast-return without trying the
+    /// fallback — retrying an invalid request on Chutes would only waste it.
+    #[tokio::test]
+    async fn genuine_client_4xx_does_not_fall_back() {
+        use inference_providers::mock::MockProvider;
+        use inference_providers::{CompletionError, ProviderTier};
+
+        let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
+        let model_id = "z-ai/glm-5.1".to_string();
+
+        let near = Arc::new(MockProvider::new_accept_all().with_tier(ProviderTier::Near));
+        near.set_error_override(Some(CompletionError::HttpError {
+            status_code: 400,
+            message: "max_tokens exceeds the model's context length".to_string(),
+            is_external: true,
+        }))
+        .await;
+        let chutes = Arc::new(MockProvider::new_accept_all().with_tier(ProviderTier::Attested3p));
+
+        {
+            let mut m = pool.provider_mappings.write().await;
+            m.model_to_providers.insert(
+                model_id.clone(),
+                vec![
+                    near.clone() as Arc<InferenceProviderTrait>,
+                    chutes.clone() as Arc<InferenceProviderTrait>,
+                ],
+            );
+        }
+
+        let result = pool
+            .chat_completion(fallback_params(&model_id), "test-hash".to_string())
+            .await;
+        assert!(result.is_err(), "a genuine client 4xx must propagate");
+        assert!(
+            chutes.last_chat_params().await.is_none(),
+            "Chutes must NOT be tried for a genuine client 4xx"
         );
     }
 }

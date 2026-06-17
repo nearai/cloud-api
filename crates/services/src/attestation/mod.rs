@@ -748,25 +748,28 @@ impl ports::AttestationServiceTrait for AttestationService {
         signing_address: Option<String>,
         include_tls_fingerprint: bool,
     ) -> Result<AttestationReport, AttestationError> {
-        // Resolve model name (could be an alias) and get model details
-        let mut model_attestations = vec![];
-        // Create a nonce if none was provided
-        let nonce = nonce.unwrap_or_else(|| {
+        // Track whether the caller supplied a nonce. Only caller-supplied nonces are
+        // forwarded to inference-proxy: when None, inference-proxy can serve its
+        // 5-minute cached report (skipping a fresh GPU-evidence NVIDIA NRAS round-trip
+        // that serializes behind a per-backend Mutex and costs ~700 ms per call).
+        let user_provided_nonce = nonce.clone();
+
+        // Generate a nonce for the gateway TDX quote if the caller didn't provide one.
+        let gateway_nonce = nonce.unwrap_or_else(|| {
             let mut nonce_bytes = [0u8; 32];
             OsRng.fill_bytes(&mut nonce_bytes);
-            let generated_nonce = nonce_bytes
+            let generated = nonce_bytes
                 .into_iter()
                 .map(|byte| format!("{byte:02x}"))
                 .collect::<String>();
             tracing::debug!(
                 "No nonce provided for attestation report, generated nonce: {}",
-                generated_nonce
+                generated
             );
-            generated_nonce
+            generated
         });
 
-        // Parse nonce: handle hex string or generate if needed
-        let nonce_bytes = hex::decode(&nonce).map_err(|e| {
+        let nonce_bytes = hex::decode(&gateway_nonce).map_err(|e| {
             tracing::error!("Failed to decode nonce hex string: {}", e);
             AttestationError::InvalidParameter(format!("Invalid nonce format: {e}"))
         })?;
@@ -790,52 +793,37 @@ impl ports::AttestationServiceTrait for AttestationService {
             )));
         }
 
-        if let Some(model) = model {
+        // Resolve model alias synchronously (fast DB lookup ~10 ms) before spawning
+        // the parallel futures below.
+        let resolved_canonical = if let Some(ref m) = model {
             let resolved_model = self
                 .models_repository
-                .resolve_and_get_model(&model)
+                .resolve_and_get_model(m)
                 .await
                 .map_err(|e| {
                     AttestationError::ProviderError(format!("Failed to resolve model: {e}"))
                 })?
                 .ok_or_else(|| {
                     AttestationError::ProviderError(format!(
-                        "Model '{model}' not found. It's not a valid model name or alias."
+                        "Model '{m}' not found. It's not a valid model name or alias."
                     ))
                 })?;
-
-            let canonical_name = &resolved_model.model_name;
-
-            // Log if we resolved an alias
-            if canonical_name != &model {
+            let canonical = resolved_model.model_name.clone();
+            if &canonical != m {
                 tracing::debug!(
-                    requested_model = %model,
-                    canonical_model = %canonical_name,
+                    requested_model = %m,
+                    canonical_model = %canonical,
                     "Resolved alias to canonical model name for attestation report"
                 );
             }
+            Some(canonical)
+        } else {
+            None
+        };
 
-            model_attestations = self
-                .inference_provider_pool
-                .get_attestation_report(
-                    canonical_name.clone(),
-                    signing_algo.clone(),
-                    Some(nonce.clone()),
-                    signing_address,
-                    include_tls_fingerprint,
-                )
-                .await
-                .map_err(|e| AttestationError::ProviderError(e.to_string()))?;
-        }
-
-        // Use VPC info loaded at initialization
+        // Prepare gateway-quote inputs synchronously (no await needed).
         let vpc = self.vpc_info.clone();
-
-        // Get signing address (public key) for report_data
-        // Store in owned String to avoid lifetime issues
         let signing_address_to_use = self.get_signing_address_hex(&algo)?;
-
-        // Parse signing address from hex (remove 0x prefix if present)
         let signing_address_clean = signing_address_to_use
             .strip_prefix("0x")
             .unwrap_or(&signing_address_to_use);
@@ -843,35 +831,18 @@ impl ports::AttestationServiceTrait for AttestationService {
             tracing::error!("Failed to decode signing address hex string: {}", e);
             AttestationError::InvalidParameter(format!("Invalid signing address format: {e}"))
         })?;
-
-        // For report_data, we need exactly 32 bytes for the signing address
-        // ECDSA returns Ethereum address (20 bytes), ed25519 returns public key (32 bytes)
-        // We'll pad to 32 bytes if needed (left-justified with zeros)
         let signing_address_for_report = if signing_address_bytes.len() > 32 {
-            // Take first 32 bytes if longer (shouldn't happen with current implementation)
             signing_address_bytes[..32].to_vec()
         } else {
             signing_address_bytes
         };
 
-        // Resolve TLS cert fingerprint if requested
         let tls_fingerprint = if include_tls_fingerprint {
             Some(self.tls_cert_fingerprint.clone().ok_or_else(|| {
                 AttestationError::InternalError(
                     "include_tls_fingerprint=true but TLS_CERT_PATH is not set or fingerprint could not be computed".to_string(),
                 )
             })?)
-        } else {
-            None
-        };
-
-        // Read TLS certificate PEM if fingerprint is requested (for the response body)
-        let tls_certificate = if include_tls_fingerprint {
-            if let Ok(path) = std::env::var("TLS_CERT_PATH") {
-                tokio::fs::read_to_string(&path).await.ok()
-            } else {
-                None
-            }
         } else {
             None
         };
@@ -896,99 +867,52 @@ impl ports::AttestationServiceTrait for AttestationService {
         }
         report_data[32..64].copy_from_slice(&nonce_bytes);
 
-        // Fake attestation data is only available in debug builds with DEV set.
-        // In release builds, real dstack attestation is always required.
-        // Both the fake data branch and real dstack branch are gated with #[cfg] so
-        // fake attestation strings are physically absent from release binaries.
-        let gateway_attestation;
-        #[cfg(debug_assertions)]
-        {
-            if std::env::var("DEV").is_ok() {
-                gateway_attestation = DstackCpuQuote {
-                    signing_address: signing_address_to_use,
-                    signing_algo: algo,
-                    intel_quote: "0x1234567890abcdef".to_string(),
-                    event_log: "0x1234567890abcdef".to_string(),
-                    report_data: hex::encode(&report_data),
-                    request_nonce: nonce.clone(),
-                    info: serde_json::json!({
-                        "app_id": "dev-app-id",
-                        "instance_id": "dev-instance-id",
-                        "app_cert": "dev-app-cert",
-                        "tcb_info": {},
-                        "app_name": "dev-app-name",
-                        "device_id": "dev-device-id",
-                        "mr_aggregated": "dev-mr-aggregated",
-                        "os_image_hash": "dev-os-image-id",
-                        "key_provider_info": "dev-key-provider-info",
-                        "compose_hash": "dev-compose-hash",
-                        "vm_config": {},
-                    }),
-                    vpc,
-                    tls_cert_fingerprint: tls_fingerprint.clone(),
-                };
+        // Read TLS certificate PEM if fingerprint is requested (for the response body).
+        let tls_certificate = if include_tls_fingerprint {
+            if let Ok(path) = std::env::var("TLS_CERT_PATH") {
+                tokio::fs::read_to_string(&path).await.ok()
             } else {
-                let client = dstack_client::DstackClient::new(None);
-
-                let info = client.info().await.map_err(|e| {
-                    tracing::error!(
-                        "Failed to get cloud API attestation info, are you running in a CVM?: {e:?}"
-                    );
-                    AttestationError::InternalError(
-                        "failed to get cloud API attestation info".to_string(),
-                    )
-                })?;
-
-                let cpu_quote = client.get_quote(report_data).await.map_err(|e| {
-                    tracing::error!(
-                        "Failed to get cloud API attestation, are you running in a CVM?: {:?}",
-                        e
-                    );
-                    AttestationError::InternalError(
-                        "failed to get cloud API attestation".to_string(),
-                    )
-                })?;
-                gateway_attestation = DstackCpuQuote::from_quote_and_nonce(
-                    signing_address_to_use,
-                    algo,
-                    vpc,
-                    info,
-                    cpu_quote,
-                    nonce,
-                    tls_fingerprint.clone(),
-                );
+                None
             }
-        }
-        #[cfg(not(debug_assertions))]
-        {
-            let client = dstack_client::DstackClient::new(None);
+        } else {
+            None
+        };
 
-            let info = client.info().await.map_err(|e| {
-                tracing::error!(
-                    "Failed to get cloud API attestation info, are you running in a CVM?: {e:?}"
-                );
-                AttestationError::InternalError(
-                    "failed to get cloud API attestation info".to_string(),
-                )
-            })?;
+        // Run model-attestation fetch and gateway TDX-quote generation concurrently.
+        // These are independent: the model fetch is an outbound HTTP call to the
+        // inference backend; the gateway quote is a local dstack Unix-socket call.
+        let model_fut = {
+            let pool = &self.inference_provider_pool;
+            async move {
+                if let Some(canonical) = resolved_canonical {
+                    pool.get_attestation_report(
+                        canonical,
+                        signing_algo,
+                        // Key fix: only forward the nonce when the caller supplied one.
+                        // When None, inference-proxy serves its 5-min cached report
+                        // instead of forcing a fresh GPU-evidence collection (~700 ms).
+                        user_provided_nonce,
+                        signing_address,
+                        include_tls_fingerprint,
+                    )
+                    .await
+                    .map_err(|e| AttestationError::ProviderError(e.to_string()))
+                } else {
+                    Ok(vec![])
+                }
+            }
+        };
 
-            let cpu_quote = client.get_quote(report_data).await.map_err(|e| {
-                tracing::error!(
-                    "Failed to get cloud API attestation, are you running in a CVM?: {:?}",
-                    e
-                );
-                AttestationError::InternalError("failed to get cloud API attestation".to_string())
-            })?;
-            gateway_attestation = DstackCpuQuote::from_quote_and_nonce(
-                signing_address_to_use,
-                algo,
-                vpc,
-                info,
-                cpu_quote,
-                nonce,
-                tls_fingerprint,
-            );
-        }
+        let gateway_fut = build_gateway_quote(
+            signing_address_to_use,
+            algo,
+            vpc,
+            report_data,
+            gateway_nonce,
+            tls_fingerprint,
+        );
+
+        let (model_attestations, gateway_attestation) = tokio::try_join!(model_fut, gateway_fut)?;
 
         Ok(AttestationReport {
             gateway_attestation,
@@ -1040,4 +964,72 @@ impl ports::AttestationServiceTrait for AttestationService {
             }
         }
     }
+}
+
+/// Generate the gateway CVM's TDX quote for an attestation report.
+///
+/// Fake attestation strings are only available in debug builds with `DEV` set —
+/// they are physically absent from release binaries (the early-return block is
+/// gated with `#[cfg(debug_assertions)]`).
+async fn build_gateway_quote(
+    signing_address: String,
+    algo: String,
+    vpc: Option<VpcInfo>,
+    report_data: Vec<u8>,
+    nonce: String,
+    tls_fingerprint: Option<String>,
+) -> Result<DstackCpuQuote, AttestationError> {
+    #[cfg(debug_assertions)]
+    if std::env::var("DEV").is_ok() {
+        return Ok(DstackCpuQuote {
+            signing_address,
+            signing_algo: algo,
+            intel_quote: "0x1234567890abcdef".to_string(),
+            event_log: "0x1234567890abcdef".to_string(),
+            report_data: hex::encode(&report_data),
+            request_nonce: nonce,
+            info: serde_json::json!({
+                "app_id": "dev-app-id",
+                "instance_id": "dev-instance-id",
+                "app_cert": "dev-app-cert",
+                "tcb_info": {},
+                "app_name": "dev-app-name",
+                "device_id": "dev-device-id",
+                "mr_aggregated": "dev-mr-aggregated",
+                "os_image_hash": "dev-os-image-id",
+                "key_provider_info": "dev-key-provider-info",
+                "compose_hash": "dev-compose-hash",
+                "vm_config": {},
+            }),
+            vpc,
+            tls_cert_fingerprint: tls_fingerprint,
+        });
+    }
+
+    let client = dstack_client::DstackClient::new(None);
+
+    let info = client.info().await.map_err(|e| {
+        tracing::error!(
+            "Failed to get cloud API attestation info, are you running in a CVM?: {e:?}"
+        );
+        AttestationError::InternalError("failed to get cloud API attestation info".to_string())
+    })?;
+
+    let cpu_quote = client.get_quote(report_data).await.map_err(|e| {
+        tracing::error!(
+            "Failed to get cloud API attestation, are you running in a CVM?: {:?}",
+            e
+        );
+        AttestationError::InternalError("failed to get cloud API attestation".to_string())
+    })?;
+
+    Ok(DstackCpuQuote::from_quote_and_nonce(
+        signing_address,
+        algo,
+        vpc,
+        info,
+        cpu_quote,
+        nonce,
+        tls_fingerprint,
+    ))
 }

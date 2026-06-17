@@ -7148,7 +7148,6 @@ mod tests {
 
         // Pre-seed the URL cache with two "existing" models as if they were
         // loaded during a prior full sync.
-        let _untouched_model = "model-untouched".to_string();
         let untouched_url = "https://untouched.completions.near.ai".to_string();
         let untouched_provider = Arc::new(MockProvider::new());
 

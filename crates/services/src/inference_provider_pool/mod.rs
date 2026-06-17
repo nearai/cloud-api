@@ -650,8 +650,7 @@ impl InferenceProviderPool {
                 {
                     let mut cache = self.inference_url_providers.write().await;
                     cache.retain(|_, p| {
-                        !exclusively_removed
-                            .contains(&(Arc::as_ptr(p) as *const () as usize))
+                        !exclusively_removed.contains(&(Arc::as_ptr(p) as *const () as usize))
                     });
                 }
                 {

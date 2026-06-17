@@ -293,6 +293,25 @@ impl AttestationService {
         address_bytes.to_vec()
     }
 
+    /// Returns the raw Ed25519 private key seed for OHTTP key derivation.
+    ///
+    /// The OHTTP gateway derives its HPKE keypair from this seed via `KeyConfig::derive`,
+    /// which uses a different derivation path than the E2EE X25519 key — domain-separated.
+    pub fn ed25519_secret_bytes(&self) -> [u8; 32] {
+        self.ed25519_signing_key.to_bytes()
+    }
+
+    /// Signs `data` with the Ed25519 key; returns `(hex_signature, hex_public_key)`.
+    ///
+    /// Used to produce the `ohttp_attestation` payload: clients can verify the OHTTP
+    /// key config bytes are signed by the attested TEE Ed25519 key.
+    pub fn sign_ohttp_attestation(&self, data: &[u8]) -> (String, String) {
+        let sig = self.ed25519_signing_key.sign(data);
+        let signature = hex::encode(sig.to_bytes());
+        let signing_key_hex = hex::encode(self.ed25519_verifying_key.as_bytes());
+        (signature, signing_key_hex)
+    }
+
     /// Get the signing address (public key) as a hex string for the specified algorithm
     /// For ECDSA, returns Ethereum address (20 bytes = 40 hex chars)
     /// For ed25519, returns the public key bytes

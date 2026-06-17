@@ -14,6 +14,7 @@ pub mod gateway;
 pub mod health;
 pub mod mcp_server;
 pub mod models;
+pub mod ohttp;
 pub mod organization_members;
 pub mod organizations;
 pub mod responses;

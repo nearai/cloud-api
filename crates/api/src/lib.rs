@@ -2,10 +2,13 @@ pub mod consts;
 pub mod conversions;
 pub mod middleware;
 pub mod models;
+pub mod ohttp_gateway;
 pub mod openapi;
 pub mod routes;
 
+use crate::ohttp_gateway::{OhttpAttestation, OhttpGateway};
 use crate::routes::mcp_server::{handle_mcp_request, McpRouteState};
+use crate::routes::ohttp::{ohttp_config, ohttp_relay};
 use crate::{
     middleware::{auth::auth_middleware_with_api_key, auth_middleware, AuthState},
     openapi::ApiDoc,
@@ -1066,6 +1069,37 @@ pub fn build_app_with_config(
         analytics_repository as Arc<dyn services::admin::AnalyticsRepository>,
     ));
 
+    // Initialize OHTTP gateway (RFC 9458) if OHTTP_ENABLED=true.
+    // The gateway key is deterministically derived from the same dstack KMS Ed25519 seed
+    // used for chat-completion signing — all instances share the same HPKE public key.
+    let (ohttp_gateway, ohttp_attestation) = if config.server.ohttp_enabled {
+        let seed = domain_services.attestation_service.ed25519_secret_bytes();
+        match OhttpGateway::new(&seed) {
+            Ok(gw) => {
+                tracing::info!(
+                    ohttp_key_config = %hex::encode(gw.config_bytes()),
+                    "OHTTP gateway enabled"
+                );
+                let (signature, signing_key) = domain_services
+                    .attestation_service
+                    .sign_ohttp_attestation(gw.config_bytes());
+                let attestation = OhttpAttestation {
+                    signing_algo: "ed25519".to_string(),
+                    signing_key,
+                    key_config: hex::encode(gw.config_bytes()),
+                    signature,
+                };
+                (Some(Arc::new(gw)), Some(attestation))
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "Failed to initialize OHTTP gateway");
+                (None, None)
+            }
+        }
+    } else {
+        (None, None)
+    };
+
     // Create app state for completions and management routes
     let app_state = AppState {
         organization_service: domain_services.organization_service.clone(),
@@ -1083,6 +1117,9 @@ pub fn build_app_with_config(
         metrics_service: domain_services.metrics_service.clone(),
         analytics_service: analytics_service.clone(),
         config: config.clone(),
+        ohttp_gateway,
+        ohttp_attestation,
+        http_client: reqwest::Client::new(),
     };
 
     // Create usage state for middleware
@@ -1227,6 +1264,14 @@ pub fn build_app_with_config(
         .allow_headers(Any)
         .expose_headers(Any);
 
+    // OHTTP routes: `POST /ohttp` and `GET /.well-known/ohttp-gateway` are at the
+    // root (not under /v1) so clients can reach them without version-prefixing.
+    // `GET /v1/ohttp/config` is a convenience alias nested under /v1.
+    let ohttp_root_routes = Router::new()
+        .route("/ohttp", post(ohttp_relay))
+        .route("/.well-known/ohttp-gateway", get(ohttp_config))
+        .with_state(app_state.clone());
+
     Router::new()
         .nest(
             "/v1",
@@ -1249,10 +1294,13 @@ pub fn build_app_with_config(
                 .merge(billing_routes)
                 .merge(gateway_routes)
                 .merge(internal_routes)
-                .merge(health_routes),
+                .merge(health_routes)
+                // GET /v1/ohttp/config — convenience alias for the key config endpoint
+                .route("/ohttp/config", get(ohttp_config).with_state(app_state.clone())),
         )
         .merge(openapi_routes)
         .merge(mcp_routes)
+        .merge(ohttp_root_routes)
         .layer(cors)
         // Add HTTP metrics middleware to track all requests
         .layer(from_fn_with_state(

@@ -1,6 +1,7 @@
 pub mod admin;
 pub mod api;
 pub mod attestation;
+pub mod ohttp;
 pub mod auth;
 pub mod auth_vpc;
 pub mod billing;

@@ -1286,11 +1286,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
             canonical_name,
         )?;
 
-        Self::reject_n_gt_1_if_unsupported(
-            model.attestation_supported,
-            request.n,
-            canonical_name,
-        )?;
+        Self::reject_n_gt_1_if_unsupported(model.attestation_supported, request.n, canonical_name)?;
 
         let provider_start_time = Instant::now();
 
@@ -1459,11 +1455,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
             canonical_name,
         )?;
 
-        Self::reject_n_gt_1_if_unsupported(
-            model.attestation_supported,
-            request.n,
-            canonical_name,
-        )?;
+        Self::reject_n_gt_1_if_unsupported(model.attestation_supported, request.n, canonical_name)?;
 
         let provider_start_time = Instant::now();
         let result = self
@@ -3157,7 +3149,10 @@ mod tests {
             None,
             "anthropic/claude-haiku-4-5",
         );
-        assert!(result.is_ok(), "n=None on external provider must be allowed");
+        assert!(
+            result.is_ok(),
+            "n=None on external provider must be allowed"
+        );
     }
 
     #[test]

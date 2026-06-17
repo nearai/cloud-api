@@ -477,6 +477,17 @@ impl WorkspaceServiceTrait for WorkspaceServiceImpl {
             .map_err(Self::map_repository_error)
     }
 
+    async fn list_workspaces_for_user(
+        &self,
+        user_id: UserId,
+        limit: i64,
+    ) -> Result<Vec<Workspace>, WorkspaceError> {
+        self.workspace_repository
+            .list_by_user(user_id, limit)
+            .await
+            .map_err(Self::map_repository_error)
+    }
+
     async fn count_workspaces_by_organization(
         &self,
         organization_id: OrganizationId,

@@ -931,11 +931,7 @@ mod tests {
         async fn count_by_organization(&self, _: OrganizationId) -> Result<i64, RepositoryError> {
             unimplemented!()
         }
-        async fn list_by_user(
-            &self,
-            _: UserId,
-            _: i64,
-        ) -> Result<Vec<Workspace>, RepositoryError> {
+        async fn list_by_user(&self, _: UserId, _: i64) -> Result<Vec<Workspace>, RepositoryError> {
             unimplemented!()
         }
     }

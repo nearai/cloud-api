@@ -7,8 +7,9 @@ pub use analytics::{
     ModelConsumptionTimeseriesQuery, ModelMetrics, ModelRevenueEntry, ModelRevenueQuery,
     ModelRevenueReport, OrgRevenueEntry, OrgRevenueQuery, OrgRevenueReport, OrganizationMetrics,
     PerformancePoint, PerformanceTimeseries, PerformanceTimeseriesQuery, PlatformMetrics,
-    PlatformTimeSeriesMetrics, PlatformTimeSeriesPoint, RevenueSort, TimeSeriesMetrics,
-    TimeSeriesPoint, TopModelMetrics, TopOrganizationMetrics, WorkspaceMetrics,
+    PlatformTimeSeriesMetrics, PlatformTimeSeriesPoint, RevenueDensityModelRow,
+    RevenueDensityQuery, RevenueDensityReport, RevenueSort, TimeSeriesMetrics, TimeSeriesPoint,
+    TopModelMetrics, TopOrganizationMetrics, WorkspaceMetrics,
 };
 pub mod infra;
 pub mod pricing_scheduler;

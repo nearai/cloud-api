@@ -3630,6 +3630,8 @@ pub async fn get_performance_timeseries(
 pub struct RevenueDensityParams {
     pub start: Option<String>,
     pub end: Option<String>,
+    /// Optional provider type filter (e.g. "nearai", "external").
+    pub provider_type: Option<String>,
 }
 
 /// Get revenue density percentiles (Admin only)
@@ -3656,7 +3658,11 @@ pub async fn get_revenue_density(
 
     let result = app_state
         .analytics_service
-        .get_revenue_density(services::admin::RevenueDensityQuery { start, end })
+        .get_revenue_density(services::admin::RevenueDensityQuery {
+            start,
+            end,
+            provider_type: params.provider_type,
+        })
         .await
         .map_err(|e| {
             error!("Failed to get revenue density: {:?}", e);

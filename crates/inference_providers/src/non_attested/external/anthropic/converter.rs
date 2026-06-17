@@ -227,6 +227,13 @@ pub struct AnthropicError {
 pub struct AnthropicResponse {
     pub id: String,
     pub content: Vec<AnthropicContentBlock>,
+    // #632: Anthropic returns the upstream dated canonical name here (e.g.
+    // `claude-haiku-4-5-20251001`). We deserialize it for completeness/parity
+    // with the wire payload, but intentionally do NOT surface it on our
+    // response: the non-streaming path echoes the requested/sent model name to
+    // stay consistent with the streaming path (which never sees this field).
+    // Hence it is read only in tests; allow dead_code in non-test builds.
+    #[allow(dead_code)]
     pub model: String,
     pub stop_reason: Option<String>,
     pub usage: AnthropicUsage,

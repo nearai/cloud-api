@@ -25,7 +25,7 @@ jobs:
       packages: write
       attestations: write
       id-token: write
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, infra]
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6

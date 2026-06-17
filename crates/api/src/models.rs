@@ -3491,6 +3491,10 @@ pub struct UpdateModelApiRequest {
     pub verifiable: Option<bool>,
     #[serde(rename = "isActive")]
     pub is_active: Option<bool>,
+    /// If true, this model may be activated even when both cost fields are 0.
+    /// Required to be set explicitly when activating a zero-price model.
+    #[serde(rename = "allowFree", skip_serializing_if = "Option::is_none")]
+    pub allow_free: Option<bool>,
     pub aliases: Option<Vec<String>>,
     #[serde(rename = "ownedBy")]
     pub owned_by: Option<String>,
@@ -3919,6 +3923,9 @@ pub struct ModelHistoryEntry {
     /// OpenRouter `openrouter.slug` override the model carried at this point.
     #[serde(rename = "openrouterSlug", skip_serializing_if = "Option::is_none")]
     pub openrouter_slug: Option<String>,
+    /// If true, this model was allowed to serve without pricing at this point in time.
+    #[serde(rename = "allowFree")]
+    pub allow_free: bool,
 }
 
 /// Model history response - complete history of model changes

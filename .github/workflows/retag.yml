@@ -29,7 +29,7 @@ env:
 jobs:
   retag:
     name: Re-tag ${{ inputs.target }} → ${{ inputs.source }}
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, infra]
     steps:
       - name: Validate inputs
         env:

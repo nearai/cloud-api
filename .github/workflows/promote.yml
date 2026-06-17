@@ -39,7 +39,7 @@ jobs:
     if: >-
       github.event_name == 'schedule' ||
       (github.event_name == 'workflow_dispatch' && inputs.target == 'prod')
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, infra]
     environment: production
     steps:
       - name: Checkout repository

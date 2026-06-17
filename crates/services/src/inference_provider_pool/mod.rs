@@ -616,6 +616,20 @@ impl InferenceProviderPool {
                 !providers.is_empty()
             });
 
+            // Check whether any other model still references these providers.
+            // A provider Arc can serve multiple model names (e.g. aliases), so we
+            // must not evict its URL-cache entries if it is still live elsewhere.
+            let still_live_ptrs: std::collections::HashSet<usize> = mappings
+                .model_to_providers
+                .values()
+                .flat_map(|ps| ps.iter().map(|p| Arc::as_ptr(p) as *const () as usize))
+                .collect();
+            let exclusively_removed: std::collections::HashSet<usize> = removed_ptrs
+                .iter()
+                .copied()
+                .filter(|ptr| !still_live_ptrs.contains(ptr))
+                .collect();
+
             // Clean up load balancer index and failure counts for removed providers
             self.load_balancer_index
                 .write()
@@ -625,6 +639,27 @@ impl InferenceProviderPool {
                 .write()
                 .unwrap_or_else(|e| e.into_inner())
                 .retain(|key, _| !removed_ptrs.contains(key));
+
+            // Evict stale URL-cache and fingerprint-state entries for providers that
+            // are no longer referenced by any model.  This prevents a subsequent
+            // partial `load_inference_url_models` call (admin PATCH URL change) from
+            // seeing a warm cache entry for the old URL and skipping re-attestation,
+            // which would leave a stale provider Arc in the cache pointing to a model
+            // that no longer exists.
+            if !exclusively_removed.is_empty() {
+                {
+                    let mut cache = self.inference_url_providers.write().await;
+                    cache.retain(|_, p| {
+                        !exclusively_removed
+                            .contains(&(Arc::as_ptr(p) as *const () as usize))
+                    });
+                }
+                {
+                    let mut states = self.inference_url_fingerprint_states.write().await;
+                    let url_cache = self.inference_url_providers.read().await;
+                    states.retain(|url, _| url_cache.contains_key(url));
+                }
+            }
 
             info!(model = %model_name, "Unregistered provider");
         }
@@ -3706,6 +3741,66 @@ impl InferenceProviderPool {
             new_fingerprint_states.insert(url.clone(), state.clone());
         }
 
+        // In partial mode (admin PATCH), identify stale URL-cache entries for models
+        // whose `inference_url` is changing.  Two cases arise:
+        //
+        // 1. Non-pinned models: the admin route calls `unregister_provider` before
+        //    this function, which already evicts the old URL entries from both caches
+        //    (see the cleanup added to `unregister_provider`).  No further action
+        //    needed here for that case.
+        //
+        // 2. Pinned models: the admin route skips `unregister_provider` for pinned
+        //    models (a model with a Chutes fallback, for example).  For those models
+        //    the old NEAR provider is still in `model_to_providers` when we arrive
+        //    here.  We capture the old provider pointers for models being replaced,
+        //    excluding reused providers, and use them to evict the corresponding old
+        //    URL entries from the caches.
+        //
+        // Lock ordering: we read `provider_mappings` here (before the write below),
+        // drop it, then separately read `inference_url_providers` — no two locks are
+        // held simultaneously.
+        let stale_url_cache_entries: std::collections::HashSet<String> = if partial {
+            let reused_ptrs: std::collections::HashSet<usize> = reused
+                .iter()
+                .map(|(_, _, p)| Arc::as_ptr(p) as *const () as usize)
+                .collect();
+            let new_urls: std::collections::HashSet<&str> =
+                new_url_cache.keys().map(|u| u.as_str()).collect();
+            let old_ptrs: std::collections::HashSet<usize> = {
+                let mappings = self.provider_mappings.read().await;
+                let mut ptrs = std::collections::HashSet::new();
+                for model_name in model_providers.keys() {
+                    if let Some(old) = mappings.model_to_providers.get(model_name) {
+                        for p in old {
+                            let ptr = Arc::as_ptr(p) as *const () as usize;
+                            if !reused_ptrs.contains(&ptr) {
+                                ptrs.insert(ptr);
+                            }
+                        }
+                    }
+                }
+                ptrs
+            };
+            if old_ptrs.is_empty() {
+                std::collections::HashSet::new()
+            } else {
+                let cache = self.inference_url_providers.read().await;
+                cache
+                    .iter()
+                    .filter_map(|(url, p)| {
+                        let ptr = Arc::as_ptr(p) as *const () as usize;
+                        if old_ptrs.contains(&ptr) && !new_urls.contains(url.as_str()) {
+                            Some(url.clone())
+                        } else {
+                            None
+                        }
+                    })
+                    .collect()
+            }
+        } else {
+            std::collections::HashSet::new()
+        };
+
         // Atomic update: replace model providers and rebuild pubkey mappings
         {
             let mut mappings = self.provider_mappings.write().await;
@@ -3820,6 +3915,12 @@ impl InferenceProviderPool {
         {
             let mut cache = self.inference_url_providers.write().await;
             if partial {
+                // Evict stale URL entries for models whose inference_url changed.
+                // Without this, the old URL key would stay warm in the cache even
+                // after the model's URL was updated via a PATCH, leaking state.
+                for url in &stale_url_cache_entries {
+                    cache.remove(url);
+                }
                 // Merge: only insert/replace the URLs we just processed.
                 for (url, provider) in new_url_cache {
                     cache.insert(url, provider);
@@ -3837,9 +3938,15 @@ impl InferenceProviderPool {
         // - URLs no longer in the active set are pruned on a full sync —
         //   prevents a slow leak of stale per-URL state as models are added
         //   and removed.  On a partial sync we only insert new states and
-        //   leave existing ones untouched.
+        //   leave existing ones untouched, except stale entries for models
+        //   whose URL changed are evicted to match the URL cache cleanup above.
         {
             let mut states = self.inference_url_fingerprint_states.write().await;
+            if partial {
+                for url in &stale_url_cache_entries {
+                    states.remove(url);
+                }
+            }
             for (url, state) in new_fingerprint_states {
                 states.insert(url, state);
             }
@@ -7093,6 +7200,88 @@ mod tests {
             assert!(
                 states.contains_key(&untouched_url),
                 "partial load must not prune fingerprint state for untouched provider"
+            );
+        }
+    }
+
+    /// When a model's `inference_url` changes via a partial PATCH, the old URL key must
+    /// be evicted from `inference_url_providers` and `inference_url_fingerprint_states`.
+    ///
+    /// Without the fix, the old URL would stay warm in both maps after a URL change,
+    /// pointing to a stale/leaked provider that is no longer registered for any model.
+    ///
+    /// Regression test for the lloydmak99 "changes requested" review on PR #802.
+    #[tokio::test]
+    async fn test_partial_load_evicts_old_url_on_url_change() {
+        use inference_providers::mock::MockProvider;
+
+        let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
+
+        let model_name = "my-model".to_string();
+        let old_url = "https://old.completions.near.ai".to_string();
+        let new_url = "https://new.completions.near.ai".to_string();
+
+        // Seed the pool as if a prior full sync registered the model at old_url.
+        let old_provider = Arc::new(MockProvider::new()) as Arc<InferenceProviderTrait>;
+        {
+            let mut cache = pool.inference_url_providers.write().await;
+            cache.insert(old_url.clone(), old_provider.clone());
+        }
+        {
+            let mut states = pool.inference_url_fingerprint_states.write().await;
+            states.insert(
+                old_url.clone(),
+                Arc::new(std::sync::RwLock::new(FingerprintState::Bootstrap)),
+            );
+        }
+        {
+            let mut mappings = pool.provider_mappings.write().await;
+            mappings
+                .model_to_providers
+                .insert(model_name.clone(), vec![old_provider.clone()]);
+        }
+
+        // Simulate the admin PATCH path: unregister (removes from model_to_providers),
+        // then call load_inference_url_models in partial mode with the new URL.
+        pool.unregister_provider(&model_name).await;
+
+        // Partial load with the new URL — as if the admin PATCH changed inference_url.
+        pool.load_inference_url_models(vec![(model_name.clone(), new_url.clone())], true)
+            .await;
+
+        // The new URL must be present in the URL cache.
+        {
+            let cache = pool.inference_url_providers.read().await;
+            assert!(
+                cache.contains_key(&new_url),
+                "new URL must be present in the URL cache after a URL change"
+            );
+        }
+
+        // The old URL must have been evicted from the URL cache.
+        {
+            let cache = pool.inference_url_providers.read().await;
+            assert!(
+                !cache.contains_key(&old_url),
+                "old URL must be evicted from the URL cache when inference_url changes"
+            );
+        }
+
+        // The old URL's fingerprint state must also have been evicted.
+        {
+            let states = pool.inference_url_fingerprint_states.read().await;
+            assert!(
+                !states.contains_key(&old_url),
+                "old URL fingerprint state must be evicted when inference_url changes"
+            );
+        }
+
+        // The new URL's fingerprint state must be present (freshly created).
+        {
+            let states = pool.inference_url_fingerprint_states.read().await;
+            assert!(
+                states.contains_key(&new_url),
+                "new URL fingerprint state must be created after a URL change"
             );
         }
     }

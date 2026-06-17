@@ -14,7 +14,7 @@ use crate::models::ErrorResponse;
 use crate::routes::api::AppState;
 
 /// Simple error type local to this module — maps to HTTP status + OpenAI error envelope.
-pub(crate) enum OhttpError {
+pub enum OhttpError {
     NotEnabled,
     BadRequest(String),
     Internal(String),
@@ -23,11 +23,23 @@ pub(crate) enum OhttpError {
 impl IntoResponse for OhttpError {
     fn into_response(self) -> Response {
         let (status, msg, kind) = match self {
-            OhttpError::NotEnabled => (StatusCode::NOT_FOUND, "OHTTP not enabled".to_string(), "not_found_error"),
+            OhttpError::NotEnabled => (
+                StatusCode::NOT_FOUND,
+                "OHTTP not enabled".to_string(),
+                "not_found_error",
+            ),
             OhttpError::BadRequest(m) => (StatusCode::BAD_REQUEST, m, "invalid_request_error"),
-            OhttpError::Internal(m) => (StatusCode::INTERNAL_SERVER_ERROR, m, "internal_server_error"),
+            OhttpError::Internal(m) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                m,
+                "internal_server_error",
+            ),
         };
-        (status, axum::response::Json(ErrorResponse::new(msg, kind.to_string()))).into_response()
+        (
+            status,
+            axum::response::Json(ErrorResponse::new(msg, kind.to_string())),
+        )
+            .into_response()
     }
 }
 
@@ -36,10 +48,7 @@ impl IntoResponse for OhttpError {
 /// Returns the OHTTP key configuration (HPKE public key + ciphersuites)
 /// in the RFC 9458 wire format (`application/ohttp-keys`).
 pub async fn ohttp_config(State(state): State<AppState>) -> Result<Response, OhttpError> {
-    let gateway = state
-        .ohttp_gateway
-        .as_ref()
-        .ok_or(OhttpError::NotEnabled)?;
+    let gateway = state.ohttp_gateway.as_ref().ok_or(OhttpError::NotEnabled)?;
 
     Ok((
         StatusCode::OK,
@@ -69,10 +78,7 @@ pub async fn ohttp_relay(
     State(state): State<AppState>,
     request: axum::extract::Request,
 ) -> Result<Response, OhttpError> {
-    let gateway = state
-        .ohttp_gateway
-        .as_ref()
-        .ok_or(OhttpError::NotEnabled)?;
+    let gateway = state.ohttp_gateway.as_ref().ok_or(OhttpError::NotEnabled)?;
 
     let outer_authorization = request.headers().get(header::AUTHORIZATION).cloned();
 
@@ -138,9 +144,9 @@ async fn ohttp_relay_standard(
         .write_bhttp(bhttp::Mode::KnownLength, &mut bhttp_bytes)
         .map_err(|e| OhttpError::Internal(format!("Binary HTTP encoding failed: {e}")))?;
 
-    let enc_response = server_response.encapsulate(&bhttp_bytes).map_err(|e| {
-        OhttpError::Internal(format!("OHTTP encapsulation failed: {e}"))
-    })?;
+    let enc_response = server_response
+        .encapsulate(&bhttp_bytes)
+        .map_err(|e| OhttpError::Internal(format!("OHTTP encapsulation failed: {e}")))?;
 
     info!(
         decap_ms,
@@ -368,9 +374,9 @@ fn parse_bhttp_and_build_loopback(
     })?;
 
     let control = inner_msg.control();
-    let method_bytes = control
-        .method()
-        .ok_or_else(|| OhttpError::BadRequest("OHTTP inner message is not a request".to_string()))?;
+    let method_bytes = control.method().ok_or_else(|| {
+        OhttpError::BadRequest("OHTTP inner message is not a request".to_string())
+    })?;
     let path_bytes = control.path().unwrap_or(b"/");
 
     let method_str = std::str::from_utf8(method_bytes)
@@ -382,18 +388,13 @@ fn parse_bhttp_and_build_loopback(
         .parse()
         .map_err(|_| OhttpError::BadRequest(format!("Unsupported HTTP method: {method_str}")))?;
 
-    let loopback_url = format!(
-        "http://127.0.0.1:{}{}",
-        state.config.server.port, path_str
-    );
+    let loopback_url = format!("http://127.0.0.1:{}{}", state.config.server.port, path_str);
     let mut request_builder = state.http_client.request(method, &loopback_url);
 
     // Treat outer `Authorization: Bearer …` as relay-injected — it overrides the
     // inner auth and scrubs trusted-only inner headers.
-    let relay_outer_bearer = outer_authorization.filter(|v| {
-        v.to_str()
-            .is_ok_and(|h| h.starts_with("Bearer "))
-    });
+    let relay_outer_bearer =
+        outer_authorization.filter(|v| v.to_str().is_ok_and(|h| h.starts_with("Bearer ")));
 
     for field in inner_msg.header().fields() {
         let name_bytes = field.name();
@@ -402,10 +403,8 @@ fn parse_bhttp_and_build_loopback(
         let skip = name_bytes.eq_ignore_ascii_case(b"host")
             || name_bytes.eq_ignore_ascii_case(b"transfer-encoding")
             || name_bytes.eq_ignore_ascii_case(b"connection")
-            || (relay_outer_bearer.is_some()
-                && name_bytes.eq_ignore_ascii_case(b"authorization"))
-            || (relay_outer_bearer.is_some()
-                && name_bytes.eq_ignore_ascii_case(b"x-request-hash"));
+            || (relay_outer_bearer.is_some() && name_bytes.eq_ignore_ascii_case(b"authorization"))
+            || (relay_outer_bearer.is_some() && name_bytes.eq_ignore_ascii_case(b"x-request-hash"));
 
         if skip {
             continue;
@@ -439,7 +438,9 @@ fn parse_bhttp_and_build_loopback(
     Ok((request_builder, path_str.to_string()))
 }
 
-async fn send_loopback(request_builder: reqwest::RequestBuilder) -> Result<reqwest::Response, OhttpError> {
+async fn send_loopback(
+    request_builder: reqwest::RequestBuilder,
+) -> Result<reqwest::Response, OhttpError> {
     request_builder.send().await.map_err(|e| {
         warn!(error = %e, "OHTTP loopback request failed");
         OhttpError::Internal(format!("Loopback request failed: {e}"))

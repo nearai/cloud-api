@@ -1,7 +1,6 @@
 pub mod admin;
 pub mod api;
 pub mod attestation;
-pub mod ohttp;
 pub mod auth;
 pub mod auth_vpc;
 pub mod billing;
@@ -15,6 +14,7 @@ pub mod gateway;
 pub mod health;
 pub mod mcp_server;
 pub mod models;
+pub mod ohttp;
 pub mod organization_members;
 pub mod organizations;
 pub mod responses;

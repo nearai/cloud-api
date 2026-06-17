@@ -1296,7 +1296,10 @@ pub fn build_app_with_config(
                 .merge(internal_routes)
                 .merge(health_routes)
                 // GET /v1/ohttp/config — convenience alias for the key config endpoint
-                .route("/ohttp/config", get(ohttp_config).with_state(app_state.clone())),
+                .route(
+                    "/ohttp/config",
+                    get(ohttp_config).with_state(app_state.clone()),
+                ),
         )
         .merge(openapi_routes)
         .merge(mcp_routes)

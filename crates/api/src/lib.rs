@@ -2,10 +2,13 @@ pub mod consts;
 pub mod conversions;
 pub mod middleware;
 pub mod models;
+pub mod ohttp_gateway;
 pub mod openapi;
 pub mod routes;
 
+use crate::ohttp_gateway::{OhttpAttestation, OhttpGateway};
 use crate::routes::mcp_server::{handle_mcp_request, McpRouteState};
+use crate::routes::ohttp::{ohttp_config, ohttp_relay};
 use crate::{
     middleware::{auth::auth_middleware_with_api_key, auth_middleware, AuthState},
     openapi::ApiDoc,
@@ -66,6 +69,11 @@ const AUDIO_TRANSCRIPTION_MAX_BODY_SIZE: usize = 25 * 1024 * 1024; // 25 MB
 // Privacy classify input is text only, model context is small (e.g. 512 tokens).
 // Cap at 256 KB so the route doesn't inherit the 25 MB audio-transcription limit.
 const PRIVACY_CLASSIFY_MAX_BODY_SIZE: usize = 256 * 1024; // 256 KB
+
+// OHTTP outer body is the HPKE-encrypted inner BHTTP request. Set to 32 MB to
+// cover audio-transcription payloads (≤25 MB) plus HPKE overhead, while
+// bounding unauthenticated memory use before the inner request is decrypted.
+const OHTTP_MAX_BODY_SIZE: usize = 32 * 1024 * 1024; // 32 MB
 
 /// Service initialization components
 #[derive(Clone)]
@@ -295,6 +303,11 @@ pub async fn init_domain_services_with_pool(
     inference_provider_pool: Arc<services::inference_provider_pool::InferenceProviderPool>,
     metrics_service: Arc<dyn services::metrics::MetricsServiceTrait>,
 ) -> DomainServices {
+    // Give the provider pool the metrics sink so it can emit the per-tier /
+    // fallback counter (cloud_api.provider.requests) from the one layer that
+    // knows which trust tier served each request.
+    inference_provider_pool.set_metrics_service(metrics_service.clone());
+
     // Create shared repositories
     let conversation_repo = Arc::new(database::PgConversationRepository::new(
         database.pool().clone(),
@@ -1061,6 +1074,37 @@ pub fn build_app_with_config(
         analytics_repository as Arc<dyn services::admin::AnalyticsRepository>,
     ));
 
+    // Initialize OHTTP gateway (RFC 9458) if OHTTP_ENABLED=true.
+    // The gateway key is deterministically derived from the same dstack KMS Ed25519 seed
+    // used for chat-completion signing — all instances share the same HPKE public key.
+    let (ohttp_gateway, ohttp_attestation) = if config.server.ohttp_enabled {
+        let seed = domain_services.attestation_service.ed25519_secret_bytes();
+        match OhttpGateway::new(&seed) {
+            Ok(gw) => {
+                tracing::info!(
+                    ohttp_key_config = %hex::encode(gw.config_bytes()),
+                    "OHTTP gateway enabled"
+                );
+                let (signature, signing_key) = domain_services
+                    .attestation_service
+                    .sign_ohttp_attestation(gw.config_bytes());
+                let attestation = OhttpAttestation {
+                    signing_algo: "ed25519".to_string(),
+                    signing_key,
+                    key_config: hex::encode(gw.config_bytes()),
+                    signature,
+                };
+                (Some(Arc::new(gw)), Some(attestation))
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "Failed to initialize OHTTP gateway");
+                (None, None)
+            }
+        }
+    } else {
+        (None, None)
+    };
+
     // Create app state for completions and management routes
     let app_state = AppState {
         organization_service: domain_services.organization_service.clone(),
@@ -1078,6 +1122,9 @@ pub fn build_app_with_config(
         metrics_service: domain_services.metrics_service.clone(),
         analytics_service: analytics_service.clone(),
         config: config.clone(),
+        ohttp_gateway,
+        ohttp_attestation,
+        http_client: reqwest::Client::new(),
     };
 
     // Create usage state for middleware
@@ -1222,6 +1269,17 @@ pub fn build_app_with_config(
         .allow_headers(Any)
         .expose_headers(Any);
 
+    // OHTTP routes: `POST /ohttp` and `GET /.well-known/ohttp-gateway` are at the
+    // root (not under /v1) so clients can reach them without version-prefixing.
+    // `GET /v1/ohttp/config` is a convenience alias nested under /v1.
+    let ohttp_root_routes = Router::new()
+        .route(
+            "/ohttp",
+            post(ohttp_relay).layer(DefaultBodyLimit::max(OHTTP_MAX_BODY_SIZE)),
+        )
+        .route("/.well-known/ohttp-gateway", get(ohttp_config))
+        .with_state(app_state.clone());
+
     Router::new()
         .nest(
             "/v1",
@@ -1244,10 +1302,16 @@ pub fn build_app_with_config(
                 .merge(billing_routes)
                 .merge(gateway_routes)
                 .merge(internal_routes)
-                .merge(health_routes),
+                .merge(health_routes)
+                // GET /v1/ohttp/config — convenience alias for the key config endpoint
+                .route(
+                    "/ohttp/config",
+                    get(ohttp_config).with_state(app_state.clone()),
+                ),
         )
         .merge(openapi_routes)
         .merge(mcp_routes)
+        .merge(ohttp_root_routes)
         .layer(cors)
         // Add HTTP metrics middleware to track all requests
         .layer(from_fn_with_state(
@@ -1844,9 +1908,9 @@ pub fn build_admin_routes(
         get_organization as get_admin_organization, get_organization_concurrent_limit,
         get_organization_limits_history, get_organization_metrics, get_organization_timeseries,
         get_performance_timeseries, get_platform_metrics, get_platform_timeseries,
-        list_admin_access_tokens, list_invitation_email_deliveries, list_model_pricing_changes,
-        list_models as admin_list_models, list_organization_members, list_organizations,
-        list_users, preview_model_deprecation, preview_model_pricing_changes,
+        get_revenue_density, list_admin_access_tokens, list_invitation_email_deliveries,
+        list_model_pricing_changes, list_models as admin_list_models, list_organization_members,
+        list_organizations, list_users, preview_model_deprecation, preview_model_pricing_changes,
         resend_invitation_email, update_organization_concurrent_limit, update_organization_limits,
         update_service, AdminAppState,
     };
@@ -1997,6 +2061,10 @@ pub fn build_admin_routes(
         .route(
             "/admin/platform/performance-timeseries",
             axum::routing::get(get_performance_timeseries),
+        )
+        .route(
+            "/admin/platform/revenue-density",
+            axum::routing::get(get_revenue_density),
         )
         .route(
             "/admin/invitation-email-deliveries",
@@ -2223,6 +2291,7 @@ mod tests {
                 host: "127.0.0.1".to_string(),
                 port: 0, // Use port 0 for testing to get a random available port
                 pricing_change_apply_interval_secs: 0,
+                ohttp_enabled: false,
             },
             inference_api_key: Some("test-key".to_string()),
             internal_usage_token: None,
@@ -2326,6 +2395,7 @@ mod tests {
                 host: "127.0.0.1".to_string(),
                 port: 0,
                 pricing_change_apply_interval_secs: 0,
+                ohttp_enabled: false,
             },
             inference_api_key: Some("test-key".to_string()),
             internal_usage_token: None,

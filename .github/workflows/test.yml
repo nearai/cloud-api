@@ -14,7 +14,7 @@ env:
 jobs:
   lint:
     name: Lint
-    runs-on: ubuntu_large_x64
+    runs-on: [self-hosted, infra]
 
     steps:
     - uses: actions/checkout@v6
@@ -37,7 +37,7 @@ jobs:
 
   test:
     name: Test Suite
-    runs-on: ubuntu_large_x64
+    runs-on: [self-hosted, infra]
     environment: Cloud API test env
 
     services:

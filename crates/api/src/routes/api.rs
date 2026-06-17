@@ -1,4 +1,5 @@
 use crate::middleware::{auth_middleware, AuthState};
+use crate::ohttp_gateway::{OhttpAttestation, OhttpGateway};
 use axum::{
     middleware::from_fn_with_state,
     routing::{delete, get, put},
@@ -31,6 +32,12 @@ pub struct AppState {
     pub metrics_service: Arc<dyn services::metrics::MetricsServiceTrait>,
     pub analytics_service: Arc<services::admin::AnalyticsService>,
     pub config: Arc<config::ApiConfig>,
+    /// OHTTP gateway for RFC 9458 decapsulation/encapsulation. `None` when OHTTP_ENABLED is unset.
+    pub ohttp_gateway: Option<Arc<OhttpGateway>>,
+    /// Pre-built attestation payload for the OHTTP key config; included in GET /v1/attestation/report.
+    pub ohttp_attestation: Option<OhttpAttestation>,
+    /// HTTP client used exclusively for OHTTP loopback requests to self.
+    pub http_client: reqwest::Client,
 }
 
 // Import route handlers

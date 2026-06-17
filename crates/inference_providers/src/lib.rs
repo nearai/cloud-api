@@ -79,6 +79,7 @@ use tokio_stream::StreamExt;
 
 // Re-export commonly used types for convenience
 pub use mock::MockProvider;
+pub use models::strip_cache_control;
 pub use models::{
     is_client_audio_input_status, AudioOutput, AudioTranscriptionError, AudioTranscriptionParams,
     AudioTranscriptionResponse, ChatCompletionParams, ChatCompletionResponse,
@@ -144,6 +145,15 @@ impl ProviderTier {
     /// [`NonAttested`](ProviderTier::NonAttested).
     pub fn is_attested(self) -> bool {
         matches!(self, ProviderTier::Near | ProviderTier::Attested3p)
+    }
+
+    /// Stable, lowercase label for logs and metric tags (low cardinality).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ProviderTier::Near => "near",
+            ProviderTier::Attested3p => "attested_3p",
+            ProviderTier::NonAttested => "non_attested",
+        }
     }
 }
 

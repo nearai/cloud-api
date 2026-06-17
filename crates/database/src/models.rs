@@ -485,6 +485,9 @@ pub struct Model {
 
     // Tracking fields
     pub is_active: bool,
+    /// If true, this model may be activated even when both cost fields are 0.
+    /// Intended for intentionally-free models (e.g. community previews).
+    pub allow_free: bool,
     pub owned_by: String,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -504,6 +507,8 @@ pub struct UpdateModelPricingRequest {
     pub context_length: Option<i32>,
     pub verifiable: Option<bool>,
     pub is_active: Option<bool>,
+    /// If true, allows activation even with zero pricing.
+    pub allow_free: Option<bool>,
     pub aliases: Option<Vec<String>>,
     pub owned_by: Option<String>,
     // Provider configuration
@@ -596,6 +601,9 @@ pub struct ModelHistory {
     pub changed_by_user_email: Option<String>,
     pub change_reason: Option<String>,
     pub created_at: DateTime<Utc>,
+
+    /// If true, this model was allowed to serve without pricing at this point in time.
+    pub allow_free: bool,
 }
 
 /// Model alias - maps client-facing alias names to canonical vLLM model names

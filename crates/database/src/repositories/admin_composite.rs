@@ -127,6 +127,7 @@ impl AdminRepository for AdminCompositeRepository {
             context_length: request.context_length,
             verifiable: request.verifiable,
             is_active: request.is_active,
+            allow_free: request.allow_free,
             aliases: request.aliases.clone(),
             owned_by: request.owned_by,
             provider_type: request.provider_type,
@@ -192,6 +193,22 @@ impl AdminRepository for AdminCompositeRepository {
         })
     }
 
+    async fn get_model_costs(
+        &self,
+        model_name: &str,
+    ) -> Result<Option<(i64, i64, i64, i64, bool)>> {
+        let model = self.model_repo.get_by_internal_name(model_name).await?;
+        Ok(model.map(|m| {
+            (
+                m.input_cost_per_token,
+                m.output_cost_per_token,
+                m.cost_per_image,
+                m.cache_read_cost_per_token,
+                m.allow_free,
+            )
+        }))
+    }
+
     async fn get_model_history(
         &self,
         model_name: &str,
@@ -237,6 +254,7 @@ impl AdminRepository for AdminCompositeRepository {
                 is_ready: h.is_ready,
                 deprecation_date: h.deprecation_date,
                 openrouter_slug: h.openrouter_slug,
+                allow_free: h.allow_free,
                 effective_from: h.effective_from,
                 effective_until: h.effective_until,
                 changed_by_user_id: h.changed_by_user_id,
@@ -362,7 +380,7 @@ impl AdminRepository for AdminCompositeRepository {
                           attestation_supported, input_modalities, output_modalities, inference_url,
                           datacenters, hugging_face_id, quantization, max_output_length,
                           supported_sampling_parameters, supported_features,
-                          is_ready, deprecation_date, openrouter_slug
+                          is_ready, deprecation_date, openrouter_slug, allow_free
                 "#,
                 &[&deprecated_id],
             )
@@ -395,7 +413,7 @@ impl AdminRepository for AdminCompositeRepository {
                 provider_config, attestation_supported, input_modalities, output_modalities,
                 inference_url, datacenters, hugging_face_id, quantization, max_output_length,
                 supported_sampling_parameters, supported_features, is_ready, deprecation_date,
-                openrouter_slug,
+                openrouter_slug, allow_free,
                 effective_from, effective_until, changed_by_user_id,
                 changed_by_user_email, change_reason, created_at
             ) VALUES (
@@ -403,8 +421,8 @@ impl AdminRepository for AdminCompositeRepository {
                 $20, $21, $22, $23,
                 COALESCE($24, ARRAY[]::TEXT[]),
                 COALESCE($25, ARRAY[]::TEXT[]),
-                $26, $27, $28,
-                NOW(), NULL, $29, $30, $31, NOW()
+                $26, $27, $28, $29,
+                NOW(), NULL, $30, $31, $32, NOW()
             )
             "#,
             &[
@@ -476,6 +494,9 @@ impl AdminRepository for AdminCompositeRepository {
                     .try_get::<_, Option<String>>("openrouter_slug")
                     .ok()
                     .flatten(),
+                &deprecated_row_after
+                    .try_get::<_, bool>("allow_free")
+                    .unwrap_or(false),
                 &changed_by_user_id,
                 &changed_by_user_email,
                 &reason,

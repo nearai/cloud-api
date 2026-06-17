@@ -763,6 +763,29 @@ impl CompletionServiceImpl {
         Ok(())
     }
 
+    /// Reject `n > 1` requests for models that don't support multiple completions
+    /// (i.e. external passthrough providers: Anthropic, Gemini, OpenAI, moonshotai).
+    ///
+    /// Self-hosted vLLM/SGLang models have `attestation_supported = true` and honour
+    /// `n` natively. External providers silently return a single choice, so we surface
+    /// the unsupported parameter as a client error (HTTP 400 / invalid_request_error)
+    /// instead of silently dropping it.
+    fn reject_n_gt_1_if_unsupported(
+        attestation_supported: bool,
+        n: Option<i64>,
+        model_name: &str,
+    ) -> Result<(), ports::CompletionError> {
+        if !attestation_supported && n.is_some_and(|v| v > 1) {
+            return Err(ports::CompletionError::InvalidParams(format!(
+                "n>1 is not supported for model '{}'. \
+                 External providers do not support multiple completions per request. \
+                 Use a self-hosted model or make N separate requests.",
+                model_name
+            )));
+        }
+        Ok(())
+    }
+
     /// These tags are used for OTLP/Datadog metrics and should only include
     /// low-cardinality values to minimize costs (~98% savings vs high-cardinality).
     /// High-cardinality data (org/workspace/key) is tracked via database analytics.
@@ -1332,6 +1355,8 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
             canonical_name,
         )?;
 
+        Self::reject_n_gt_1_if_unsupported(model.attestation_supported, request.n, canonical_name)?;
+
         let provider_start_time = Instant::now();
 
         // Get the LLM stream
@@ -1499,6 +1524,8 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
             &chat_params.extra,
             canonical_name,
         )?;
+
+        Self::reject_n_gt_1_if_unsupported(model.attestation_supported, request.n, canonical_name)?;
 
         let provider_start_time = Instant::now();
         let result = self
@@ -3275,6 +3302,71 @@ mod tests {
         assert!(
             extra.contains_key("stream_options"),
             "malformed stream_options should be left for upstream handling"
+        );
+    }
+
+    // ── reject_n_gt_1_if_unsupported ──────────────────────────────────────
+
+    #[test]
+    fn reject_n_gt_1_external_provider_n_is_2() {
+        // External providers (attestation_supported = false) must reject n > 1.
+        let result = CompletionServiceImpl::reject_n_gt_1_if_unsupported(
+            false,
+            Some(2),
+            "anthropic/claude-haiku-4-5",
+        );
+        assert!(result.is_err(), "n=2 on external provider must be rejected");
+        match result.unwrap_err() {
+            ports::CompletionError::InvalidParams(msg) => {
+                assert!(
+                    msg.contains("n>1"),
+                    "Error message must mention n>1, got: {msg}"
+                );
+                assert!(
+                    msg.contains("anthropic/claude-haiku-4-5"),
+                    "Error message must include model name, got: {msg}"
+                );
+            }
+            other => panic!("Expected InvalidParams, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn reject_n_gt_1_external_provider_n_is_1_allowed() {
+        // n=1 is fine even for external providers.
+        let result = CompletionServiceImpl::reject_n_gt_1_if_unsupported(
+            false,
+            Some(1),
+            "anthropic/claude-haiku-4-5",
+        );
+        assert!(result.is_ok(), "n=1 on external provider must be allowed");
+    }
+
+    #[test]
+    fn reject_n_gt_1_external_provider_n_none_allowed() {
+        // n not set is fine even for external providers.
+        let result = CompletionServiceImpl::reject_n_gt_1_if_unsupported(
+            false,
+            None,
+            "anthropic/claude-haiku-4-5",
+        );
+        assert!(
+            result.is_ok(),
+            "n=None on external provider must be allowed"
+        );
+    }
+
+    #[test]
+    fn reject_n_gt_1_self_hosted_n_is_large_allowed() {
+        // Self-hosted models (attestation_supported = true) support n > 1.
+        let result = CompletionServiceImpl::reject_n_gt_1_if_unsupported(
+            true,
+            Some(5),
+            "openai/gpt-oss-120b",
+        );
+        assert!(
+            result.is_ok(),
+            "n=5 on self-hosted model must be allowed, self-hosted supports n>1"
         );
     }
 }

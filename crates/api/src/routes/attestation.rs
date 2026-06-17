@@ -1,4 +1,4 @@
-use crate::{models::ErrorResponse, routes::api::AppState};
+use crate::{models::ErrorResponse, ohttp_gateway::OhttpAttestation, routes::api::AppState};
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
@@ -192,6 +192,14 @@ pub struct AttestationResponse {
     /// TLS certificate file (PEM) from TLS_CERT_PATH; report_data binds via SHA256 of these exact bytes
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tls_certificate: Option<String>,
+    /// Hex-encoded OHTTP key configuration (RFC 9458). Present only when OHTTP_ENABLED=true.
+    /// Legacy flat field; mirrors `ohttp_attestation.key_config` when present.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ohttp_key_config: Option<String>,
+    /// OHTTP key attestation payload. Includes an Ed25519 signature over the decoded
+    /// `key_config` bytes so clients can verify the HPKE key is bound to the TEE.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ohttp_attestation: Option<OhttpAttestation>,
 }
 
 impl From<services::attestation::models::AttestationReport> for AttestationResponse {
@@ -200,6 +208,8 @@ impl From<services::attestation::models::AttestationReport> for AttestationRespo
             gateway_attestation: report.gateway_attestation.into(),
             model_attestations: report.model_attestations,
             tls_certificate: report.tls_certificate,
+            ohttp_key_config: None,
+            ohttp_attestation: None,
         }
     }
 }
@@ -290,7 +300,11 @@ pub async fn get_attestation_report(
         .await
         .map_err(attestation_report_error_response)?;
 
-    let response: AttestationResponse = report.into();
+    let mut response: AttestationResponse = report.into();
+    if let Some(ohttp) = &app_state.ohttp_attestation {
+        response.ohttp_key_config = Some(ohttp.key_config.clone());
+        response.ohttp_attestation = Some(ohttp.clone());
+    }
     let mut http_response = axum::response::IntoResponse::into_response(ResponseJson(response));
     if let Some((requested, canonical)) = alias_resolved {
         if let Ok(value) = axum::http::HeaderValue::from_str(&format!("{requested} -> {canonical}"))

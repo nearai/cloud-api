@@ -389,6 +389,7 @@ pub async fn batch_upsert_models(
                     context_length: request.context_length,
                     verifiable: request.verifiable,
                     is_active: request.is_active,
+                    allow_free: request.allow_free,
                     aliases: request.aliases.clone(),
                     owned_by: request.owned_by.clone(),
                     provider_type: request.provider_type.clone(),
@@ -894,6 +895,7 @@ pub async fn get_model_history(
             is_ready: h.is_ready,
             deprecation_date: h.deprecation_date.as_ref().map(format_deprecation_date),
             openrouter_slug: h.openrouter_slug,
+            allow_free: h.allow_free,
         })
         .collect();
 
@@ -3615,6 +3617,59 @@ pub async fn get_performance_timeseries(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 ResponseJson(ErrorResponse::new(
                     format!("Failed to retrieve performance timeseries: {e}"),
+                    "internal_server_error".to_string(),
+                )),
+            )
+        })?;
+
+    Ok(ResponseJson(result))
+}
+
+/// Query params for the revenue density endpoint
+#[derive(Debug, serde::Deserialize)]
+pub struct RevenueDensityParams {
+    pub start: Option<String>,
+    pub end: Option<String>,
+    /// Optional provider type filter (e.g. "nearai", "external").
+    pub provider_type: Option<String>,
+}
+
+/// Get revenue density percentiles (Admin only)
+///
+/// Buckets usage into 1-minute windows, computes revenue/second per bucket,
+/// then returns P50/P95/P99/peak over active buckets — platform-wide and per model.
+/// Use the annualized figures to estimate potential revenue if a given demand
+/// rate were sustained continuously.
+pub async fn get_revenue_density(
+    State(app_state): State<AdminAppState>,
+    Query(params): Query<RevenueDensityParams>,
+    Extension(_admin_user): Extension<AdminUser>,
+) -> Result<
+    ResponseJson<services::admin::RevenueDensityReport>,
+    (StatusCode, ResponseJson<ErrorResponse>),
+> {
+    // Default to last 30 days; cap at 90 days (43k–129k minute-buckets).
+    let (start, end) = crate::routes::common::parse_metrics_range(
+        params.start.as_deref(),
+        params.end.as_deref(),
+        None,
+        90,
+    )?;
+
+    let result = app_state
+        .analytics_service
+        .get_revenue_density(services::admin::RevenueDensityQuery {
+            start,
+            end,
+            provider_type: params.provider_type,
+        })
+        .await
+        .map_err(|e| {
+            error!("Failed to get revenue density: {:?}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ResponseJson(ErrorResponse::new(
+                    format!("Failed to retrieve revenue density: {e}"),
                     "internal_server_error".to_string(),
                 )),
             )

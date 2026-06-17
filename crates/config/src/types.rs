@@ -251,6 +251,8 @@ pub struct ServerConfig {
     /// Interval in seconds between scheduled-pricing-change apply passes.
     /// Set to 0 to disable the background scheduler. Default: 60.
     pub pricing_change_apply_interval_secs: u64,
+    /// Enable the OHTTP gateway (RFC 9458).  Set OHTTP_ENABLED=true to enable.
+    pub ohttp_enabled: bool,
 }
 
 impl ServerConfig {
@@ -266,6 +268,9 @@ impl ServerConfig {
                 .unwrap_or_else(|_| "60".to_string())
                 .parse()
                 .map_err(|_| "PRICING_CHANGE_APPLY_INTERVAL_SECS must be a non-negative integer")?,
+            ohttp_enabled: env::var("OHTTP_ENABLED")
+                .map(|v| v == "true" || v == "1")
+                .unwrap_or(false),
         })
     }
 }

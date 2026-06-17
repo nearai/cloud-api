@@ -113,63 +113,53 @@ pub async fn get_current_user(
         }
     };
 
-    // Get user's organizations with roles
+    // Get user's organizations with roles — single JOIN query (replaces prior N+1 pattern of
+    // list_organizations_for_user + N × get_user_role).
     let organizations = match app_state
         .organization_service
-        .list_organizations_for_user(user_id.clone(), 100, 0, None, None)
+        .list_organizations_with_roles_for_user(user_id.clone(), 100, 0, None, None)
         .await
     {
-        Ok(orgs) => {
-            let mut user_orgs = Vec::new();
-            for org in orgs {
-                // Get user's role in this organization
-                if let Ok(Some(role)) = app_state
-                    .organization_service
-                    .get_user_role(org.id.clone(), user_id.clone())
-                    .await
-                {
-                    user_orgs.push(crate::models::UserOrganizationResponse {
-                        id: org.id.0.to_string(),
-                        name: org.name,
-                        description: org.description,
-                        role: crate::conversions::services_role_to_api_role(role),
-                        is_active: org.is_active,
-                        created_at: org.created_at,
-                    });
-                }
-            }
-            user_orgs
-        }
+        Ok(orgs) => orgs
+            .into_iter()
+            .map(|org_with_role| crate::models::UserOrganizationResponse {
+                id: org_with_role.organization.id.0.to_string(),
+                name: org_with_role.organization.name,
+                description: org_with_role.organization.description,
+                role: crate::conversions::services_role_to_api_role(org_with_role.role),
+                is_active: org_with_role.organization.is_active,
+                created_at: org_with_role.organization.created_at,
+            })
+            .collect(),
         Err(_) => {
             error!("Failed to list organizations for user");
             Vec::new()
         }
     };
 
-    // Get user's workspaces from all their organizations
-    let mut workspaces = Vec::new();
-    for org_response in &organizations {
-        let org_id = match Uuid::parse_str(&org_response.id) {
-            Ok(id) => services::organization::OrganizationId(id),
-            Err(_) => continue,
-        };
-
-        if let Ok(org_workspaces) = app_state
-            .workspace_service
-            .list_workspaces_for_organization(org_id.clone(), user_id.clone())
-            .await
-        {
-            for workspace in org_workspaces {
-                workspaces.push(crate::models::UserWorkspaceResponse {
-                    id: workspace.id.0.to_string(),
-                    name: workspace.name,
-                    organization_id: workspace.organization_id.0.to_string(),
-                    is_active: workspace.is_active,
-                    created_at: workspace.created_at,
-                });
-            }
+    // Get user's workspaces across all their organizations — single JOIN query (replaces prior
+    // N+1 pattern of iterating over orgs and calling list_workspaces_for_organization per org,
+    // which also triggered an is_member check per org).
+    let workspaces = match app_state
+        .workspace_service
+        .list_workspaces_for_user(user_id.clone(), 500)
+        .await
+    {
+        Ok(ws) => ws
+            .into_iter()
+            .map(|workspace| crate::models::UserWorkspaceResponse {
+                id: workspace.id.0.to_string(),
+                name: workspace.name,
+                organization_id: workspace.organization_id.0.to_string(),
+                is_active: workspace.is_active,
+                created_at: workspace.created_at,
+            })
+            .collect(),
+        Err(_) => {
+            error!("Failed to list workspaces for user");
+            Vec::new()
         }
-    }
+    };
 
     // Build response with all data
     let response = crate::conversions::services_user_to_api_user_with_relations(

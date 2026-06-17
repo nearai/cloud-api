@@ -186,6 +186,7 @@ impl ModelPricingScheduler {
             context_length: None,
             verifiable: None,
             is_active: None,
+            allow_free: None,
             aliases: None,
             owned_by: None,
             provider_type: None,

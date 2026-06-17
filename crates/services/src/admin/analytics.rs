@@ -422,23 +422,23 @@ pub struct PerformanceTimeseries {
 
 /// Per-model revenue density row.
 ///
-/// All rate fields are in USD/second, derived from 1-minute buckets.
+/// All rate fields are in USD/minute, derived from 1-minute buckets.
 /// Percentiles are computed over **active minutes only** (buckets with >0 revenue)
 /// to reflect the rate during actual serving windows, not idle time.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct RevenueDensityModelRow {
     pub model_name: String,
-    /// P50 revenue rate during active minutes, USD/s
-    pub p50_usd_per_sec: f64,
-    /// P95 revenue rate during active minutes, USD/s
-    pub p95_usd_per_sec: f64,
-    /// P99 revenue rate during active minutes, USD/s
-    pub p99_usd_per_sec: f64,
-    /// Maximum observed revenue rate, USD/s
-    pub peak_usd_per_sec: f64,
-    /// Annualized revenue if p99 rate were constant: p99 × 86400 × 365, USD
+    /// P50 revenue rate during active minutes, USD/min
+    pub p50_usd_per_min: f64,
+    /// P95 revenue rate during active minutes, USD/min
+    pub p95_usd_per_min: f64,
+    /// P99 revenue rate during active minutes, USD/min
+    pub p99_usd_per_min: f64,
+    /// Maximum observed revenue rate, USD/min
+    pub peak_usd_per_min: f64,
+    /// Annualized revenue if p99 rate were constant: p99 × 60 × 24 × 365, USD
     pub p99_annualized_usd: f64,
-    /// Annualized revenue if peak rate were constant: peak × 86400 × 365, USD
+    /// Annualized revenue if peak rate were constant: peak × 60 × 24 × 365, USD
     pub peak_annualized_usd: f64,
     /// Number of 1-minute buckets with revenue > 0 in the period
     pub active_minutes: i64,
@@ -454,10 +454,10 @@ pub struct RevenueDensityReport {
     /// Buckets with any revenue > 0
     pub active_minutes: i64,
     // Platform-wide percentiles (over active minutes, all models combined)
-    pub p50_usd_per_sec: f64,
-    pub p95_usd_per_sec: f64,
-    pub p99_usd_per_sec: f64,
-    pub peak_usd_per_sec: f64,
+    pub p50_usd_per_min: f64,
+    pub p95_usd_per_min: f64,
+    pub p99_usd_per_min: f64,
+    pub peak_usd_per_min: f64,
     pub p99_annualized_usd: f64,
     pub peak_annualized_usd: f64,
     /// Per-model breakdown, sorted by total consumed cost DESC
@@ -469,6 +469,8 @@ pub struct RevenueDensityReport {
 pub struct RevenueDensityQuery {
     pub start: DateTime<Utc>,
     pub end: DateTime<Utc>,
+    /// Optional provider_type filter (e.g. "nearai", "external").
+    pub provider_type: Option<String>,
 }
 
 /// Query params for the performance timeseries endpoint.

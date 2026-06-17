@@ -895,6 +895,7 @@ pub async fn get_model_history(
             is_ready: h.is_ready,
             deprecation_date: h.deprecation_date.as_ref().map(format_deprecation_date),
             openrouter_slug: h.openrouter_slug,
+            allow_free: h.allow_free,
         })
         .collect();
 

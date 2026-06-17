@@ -3908,6 +3908,9 @@ pub struct ModelHistoryEntry {
     /// OpenRouter `openrouter.slug` override the model carried at this point.
     #[serde(rename = "openrouterSlug", skip_serializing_if = "Option::is_none")]
     pub openrouter_slug: Option<String>,
+    /// If true, this model was allowed to serve without pricing at this point in time.
+    #[serde(rename = "allowFree")]
+    pub allow_free: bool,
 }
 
 /// Model history response - complete history of model changes

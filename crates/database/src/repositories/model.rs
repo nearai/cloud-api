@@ -1127,6 +1127,7 @@ impl ModelRepository {
                     is_ready,
                     deprecation_date,
                     openrouter_slug,
+                    allow_free,
                     effective_from,
                     effective_until,
                     changed_by_user_id,
@@ -1138,8 +1139,8 @@ impl ModelRepository {
                     $20, $21, $22,
                     COALESCE($23, ARRAY[]::TEXT[]),
                     COALESCE($24, ARRAY[]::TEXT[]),
-                    $25, $26, $27, $28,
-                    NOW(), NULL, $29, $30, $31, NOW()
+                    $25, $26, $27, $28, $29,
+                    NOW(), NULL, $30, $31, $32, NOW()
                 )
                 "#,
                 &[
@@ -1206,6 +1207,7 @@ impl ModelRepository {
                         .try_get::<_, Option<String>>("openrouter_slug")
                         .ok()
                         .flatten(),
+                    &model_row.try_get::<_, bool>("allow_free").unwrap_or(false),
                     &changed_by_user_id,
                     &changed_by_user_email,
                     change_reason,
@@ -1429,6 +1431,7 @@ impl ModelRepository {
             is_ready: row.try_get("is_ready").ok().flatten(),
             deprecation_date: row.try_get("deprecation_date").ok().flatten(),
             openrouter_slug: row.try_get("openrouter_slug").ok().flatten(),
+            allow_free: row.try_get("allow_free").unwrap_or(false),
             effective_from: row.get("effective_from"),
             effective_until: row.get("effective_until"),
             changed_by_user_id: row.get("changed_by_user_id"),

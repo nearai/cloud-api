@@ -139,6 +139,8 @@ pub struct ModelHistoryEntry {
     pub deprecation_date: Option<chrono::DateTime<chrono::Utc>>,
     /// OpenRouter `openrouter.slug` override the model carried at this point.
     pub openrouter_slug: Option<String>,
+    /// If true, this model was allowed to serve without pricing at this point in time.
+    pub allow_free: bool,
     pub effective_from: chrono::DateTime<chrono::Utc>,
     pub effective_until: Option<chrono::DateTime<chrono::Utc>>,
     pub changed_by_user_id: Option<uuid::Uuid>,
@@ -597,11 +599,11 @@ pub trait AdminRepository: Send + Sync {
 
     /// Fetch the current pricing costs and allow_free flag for a model by name.
     /// Returns `None` if the model does not exist (new model).
-    /// Returns `Some((input_cost, output_cost, allow_free))`.
+    /// Returns `Some((input_cost, output_cost, cost_per_image, cache_read_cost_per_token, allow_free))`.
     async fn get_model_costs(
         &self,
         model_name: &str,
-    ) -> Result<Option<(i64, i64, bool)>, anyhow::Error>;
+    ) -> Result<Option<(i64, i64, i64, i64, bool)>, anyhow::Error>;
 
     /// Get complete history for a model with pagination (includes pricing and other attributes)
     async fn get_model_history(

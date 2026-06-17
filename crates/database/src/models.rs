@@ -601,6 +601,9 @@ pub struct ModelHistory {
     pub changed_by_user_email: Option<String>,
     pub change_reason: Option<String>,
     pub created_at: DateTime<Utc>,
+
+    /// If true, this model was allowed to serve without pricing at this point in time.
+    pub allow_free: bool,
 }
 
 /// Model alias - maps client-facing alias names to canonical vLLM model names

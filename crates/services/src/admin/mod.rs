@@ -1271,33 +1271,60 @@ impl AdminServiceImpl {
             }
         }
 
-        // Activation pricing gate: reject is_active=true when the effective
-        // input+output costs are both 0 unless allow_free is explicitly set.
-        if request.is_active == Some(true) {
-            // Look up existing model costs (None = new model being created)
-            let existing = repository
-                .get_model_costs(model_name)
-                .await
-                .map_err(|e| AdminError::InternalError(e.to_string()))?;
+        // Activation pricing gate: reject requests that would result in an
+        // active model with all-zero pricing unless allow_free is set.
+        //
+        // The gate fires when:
+        //   - is_active is explicitly Some(true), OR
+        //   - is_active is None AND the model does not exist yet (new model
+        //     inserts default is_active to true, so omitting it on create is
+        //     equivalent to passing is_active=true).
+        //
+        // The free-check covers all four cost fields: input, output, image,
+        // and cache_read.  A model with non-zero cost on any field is treated
+        // as priced and is not blocked.
+        let existing = repository
+            .get_model_costs(model_name)
+            .await
+            .map_err(|e| AdminError::InternalError(e.to_string()))?;
 
-            let (existing_input, existing_output, existing_allow_free) = existing
-                .unwrap_or((0, 0, false));
+        let is_new_model = existing.is_none();
 
-            let effective_input = request
-                .input_cost_per_token
-                .unwrap_or(existing_input);
-            let effective_output = request
-                .output_cost_per_token
-                .unwrap_or(existing_output);
-            let effective_allow_free = request
-                .allow_free
-                .unwrap_or(existing_allow_free);
+        // Evaluate whether this request will result in an active model.
+        let (
+            existing_input,
+            existing_output,
+            existing_image,
+            existing_cache_read,
+            existing_allow_free,
+        ) = existing.unwrap_or((0, 0, 0, 0, false));
 
-            if effective_input == 0 && effective_output == 0 && !effective_allow_free {
+        let effective_is_active =
+            request
+                .is_active
+                .unwrap_or(if is_new_model { true } else { false });
+
+        if effective_is_active {
+            let effective_input = request.input_cost_per_token.unwrap_or(existing_input);
+            let effective_output = request.output_cost_per_token.unwrap_or(existing_output);
+            let effective_image = request.cost_per_image.unwrap_or(existing_image);
+            let effective_cache_read = request
+                .cache_read_cost_per_token
+                .unwrap_or(existing_cache_read);
+            let effective_allow_free = request.allow_free.unwrap_or(existing_allow_free);
+
+            if effective_input == 0
+                && effective_output == 0
+                && effective_image == 0
+                && effective_cache_read == 0
+                && !effective_allow_free
+            {
                 return Err(AdminError::InvalidPricing(format!(
                     "Cannot activate model '{}' with zero pricing. \
                      Set allowFree=true to explicitly allow free serving, \
-                     or set inputCostPerToken or outputCostPerToken > 0.",
+                     or set a non-zero cost on at least one of: \
+                     inputCostPerToken, outputCostPerToken, costPerImage, \
+                     cacheReadCostPerToken.",
                     model_name
                 )));
             }

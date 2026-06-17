@@ -196,9 +196,17 @@ impl AdminRepository for AdminCompositeRepository {
     async fn get_model_costs(
         &self,
         model_name: &str,
-    ) -> Result<Option<(i64, i64, bool)>> {
+    ) -> Result<Option<(i64, i64, i64, i64, bool)>> {
         let model = self.model_repo.get_by_internal_name(model_name).await?;
-        Ok(model.map(|m| (m.input_cost_per_token, m.output_cost_per_token, m.allow_free)))
+        Ok(model.map(|m| {
+            (
+                m.input_cost_per_token,
+                m.output_cost_per_token,
+                m.cost_per_image,
+                m.cache_read_cost_per_token,
+                m.allow_free,
+            )
+        }))
     }
 
     async fn get_model_history(
@@ -246,6 +254,7 @@ impl AdminRepository for AdminCompositeRepository {
                 is_ready: h.is_ready,
                 deprecation_date: h.deprecation_date,
                 openrouter_slug: h.openrouter_slug,
+                allow_free: h.allow_free,
                 effective_from: h.effective_from,
                 effective_until: h.effective_until,
                 changed_by_user_id: h.changed_by_user_id,

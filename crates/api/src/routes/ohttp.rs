@@ -128,8 +128,10 @@ async fn ohttp_relay_standard(
     let loopback_response = send_loopback(request_builder).await?;
 
     let response_status = loopback_response.status().as_u16();
-    let bhttp_status =
-        bhttp::StatusCode::try_from(response_status).unwrap_or(bhttp::StatusCode::OK);
+    // reqwest status codes are always 100-599, so try_from succeeds in practice;
+    // fall back to 500 (not 200) so an unmappable code is never silently treated as success.
+    let bhttp_status = bhttp::StatusCode::try_from(response_status)
+        .unwrap_or_else(|_| bhttp::StatusCode::try_from(500u16).unwrap());
     let mut bhttp_response = bhttp::Message::response(bhttp_status);
     copy_response_headers(&loopback_response, &mut bhttp_response);
 

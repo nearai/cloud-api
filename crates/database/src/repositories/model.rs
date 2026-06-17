@@ -871,7 +871,7 @@ impl ModelRepository {
                         model_icon, verifiable, is_active, owned_by,
                         provider_type, provider_config, attestation_supported,
                         input_modalities, output_modalities, inference_url, hugging_face_id, quantization, max_output_length, supported_sampling_parameters, supported_features, datacenters,
-                        is_ready, deprecation_date, openrouter_slug,
+                        is_ready, deprecation_date, openrouter_slug, allow_free,
                         effective_from, effective_until, changed_by_user_id, changed_by_user_email,
                         change_reason, created_at
                     FROM model_history
@@ -914,7 +914,7 @@ impl ModelRepository {
                         model_icon, verifiable, is_active, owned_by,
                         provider_type, provider_config, attestation_supported,
                         input_modalities, output_modalities, inference_url, hugging_face_id, quantization, max_output_length, supported_sampling_parameters, supported_features, datacenters,
-                        is_ready, deprecation_date, openrouter_slug,
+                        is_ready, deprecation_date, openrouter_slug, allow_free,
                         effective_from, effective_until, changed_by_user_id, changed_by_user_email,
                         change_reason, created_at
                     FROM model_history
@@ -989,7 +989,7 @@ impl ModelRepository {
                         h.input_modalities, h.output_modalities, h.inference_url,
                         h.hugging_face_id, h.quantization, h.max_output_length,
                         h.supported_sampling_parameters, h.supported_features, h.datacenters,
-                        h.is_ready, h.deprecation_date, h.openrouter_slug,
+                        h.is_ready, h.deprecation_date, h.openrouter_slug, h.allow_free,
                         h.effective_from, h.effective_until, h.changed_by_user_id, h.changed_by_user_email,
                         h.change_reason, h.created_at
                     FROM model_history h

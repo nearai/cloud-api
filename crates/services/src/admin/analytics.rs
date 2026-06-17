@@ -420,6 +420,57 @@ pub struct PerformanceTimeseries {
     pub data: Vec<PerformancePoint>,
 }
 
+/// Per-model revenue density row.
+///
+/// All rate fields are in USD/second, derived from 1-minute buckets.
+/// Percentiles are computed over **active minutes only** (buckets with >0 revenue)
+/// to reflect the rate during actual serving windows, not idle time.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct RevenueDensityModelRow {
+    pub model_name: String,
+    /// P50 revenue rate during active minutes, USD/s
+    pub p50_usd_per_sec: f64,
+    /// P95 revenue rate during active minutes, USD/s
+    pub p95_usd_per_sec: f64,
+    /// P99 revenue rate during active minutes, USD/s
+    pub p99_usd_per_sec: f64,
+    /// Maximum observed revenue rate, USD/s
+    pub peak_usd_per_sec: f64,
+    /// Annualized revenue if p99 rate were constant: p99 × 86400 × 365, USD
+    pub p99_annualized_usd: f64,
+    /// Annualized revenue if peak rate were constant: peak × 86400 × 365, USD
+    pub peak_annualized_usd: f64,
+    /// Number of 1-minute buckets with revenue > 0 in the period
+    pub active_minutes: i64,
+}
+
+/// Platform-wide revenue density report with per-model breakdown.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct RevenueDensityReport {
+    pub period_start: DateTime<Utc>,
+    pub period_end: DateTime<Utc>,
+    /// Total 1-minute buckets sampled in the period
+    pub sampled_minutes: i64,
+    /// Buckets with any revenue > 0
+    pub active_minutes: i64,
+    // Platform-wide percentiles (over active minutes, all models combined)
+    pub p50_usd_per_sec: f64,
+    pub p95_usd_per_sec: f64,
+    pub p99_usd_per_sec: f64,
+    pub peak_usd_per_sec: f64,
+    pub p99_annualized_usd: f64,
+    pub peak_annualized_usd: f64,
+    /// Per-model breakdown, sorted by total consumed cost DESC
+    pub by_model: Vec<RevenueDensityModelRow>,
+}
+
+/// Query params for the revenue density endpoint.
+#[derive(Debug, Clone)]
+pub struct RevenueDensityQuery {
+    pub start: DateTime<Utc>,
+    pub end: DateTime<Utc>,
+}
+
 /// Query params for the performance timeseries endpoint.
 #[derive(Debug, Clone)]
 pub struct PerformanceTimeseriesQuery {
@@ -492,6 +543,13 @@ pub trait AnalyticsRepository: Send + Sync {
         &self,
         query: PerformanceTimeseriesQuery,
     ) -> Result<PerformanceTimeseries, RepositoryError>;
+
+    /// Revenue density percentiles (p50/p95/p99/peak USD/s) over 1-minute buckets,
+    /// platform-wide and per-model.
+    async fn get_revenue_density(
+        &self,
+        query: RevenueDensityQuery,
+    ) -> Result<RevenueDensityReport, RepositoryError>;
 }
 
 /// Analytics service implementation
@@ -618,6 +676,17 @@ impl AnalyticsService {
     ) -> Result<PerformanceTimeseries, super::AdminError> {
         self.repository
             .get_performance_timeseries(query)
+            .await
+            .map_err(|e| super::AdminError::InternalError(e.to_string()))
+    }
+
+    /// Revenue density percentiles (p50/p95/p99/peak USD/s)
+    pub async fn get_revenue_density(
+        &self,
+        query: RevenueDensityQuery,
+    ) -> Result<RevenueDensityReport, super::AdminError> {
+        self.repository
+            .get_revenue_density(query)
             .await
             .map_err(|e| super::AdminError::InternalError(e.to_string()))
     }

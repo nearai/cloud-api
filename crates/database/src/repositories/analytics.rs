@@ -11,8 +11,9 @@ use services::admin::{
     ModelMetrics, ModelRevenueEntry, ModelRevenueQuery, ModelRevenueReport, OrgRevenueEntry,
     OrgRevenueQuery, OrgRevenueReport, OrganizationMetrics, PerformancePoint,
     PerformanceTimeseries, PerformanceTimeseriesQuery, PlatformMetrics, PlatformTimeSeriesMetrics,
-    PlatformTimeSeriesPoint, RevenueSort, TimeSeriesMetrics, TimeSeriesPoint, TopModelMetrics,
-    TopOrganizationMetrics, WorkspaceMetrics,
+    PlatformTimeSeriesPoint, RevenueDensityModelRow, RevenueDensityQuery, RevenueDensityReport,
+    RevenueSort, TimeSeriesMetrics, TimeSeriesPoint, TopModelMetrics, TopOrganizationMetrics,
+    WorkspaceMetrics,
 };
 use services::common::RepositoryError;
 use std::collections::BTreeMap;
@@ -1062,6 +1063,144 @@ impl AnalyticsRepository for PgAnalyticsRepository {
             granularity: query.granularity,
             model_filter: query.model_name,
             data,
+        })
+    }
+
+    async fn get_revenue_density(
+        &self,
+        query: RevenueDensityQuery,
+    ) -> Result<RevenueDensityReport, RepositoryError> {
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| RepositoryError::PoolError(e.into()))?;
+
+        // ── Platform-wide percentiles ─────────────────────────────────────────
+        // Inner CTE: one row per minute bucket with sum(cost)/60 = nano-USD/s.
+        // Outer query: PERCENTILE_CONT + MAX over active minutes only (cost > 0).
+        let platform_row = client
+            .query_one(
+                r#"
+                WITH per_minute AS (
+                    SELECT
+                        DATE_TRUNC('minute', created_at)    AS bucket,
+                        SUM(total_cost)::float8 / 60.0      AS revenue_per_sec
+                    FROM organization_usage_log
+                    WHERE created_at >= $1
+                      AND created_at < $2
+                    GROUP BY 1
+                )
+                SELECT
+                    COALESCE(
+                        PERCENTILE_CONT(0.50) WITHIN GROUP (ORDER BY revenue_per_sec)
+                            FILTER (WHERE revenue_per_sec > 0), 0.0
+                    )::float8 AS p50,
+                    COALESCE(
+                        PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY revenue_per_sec)
+                            FILTER (WHERE revenue_per_sec > 0), 0.0
+                    )::float8 AS p95,
+                    COALESCE(
+                        PERCENTILE_CONT(0.99) WITHIN GROUP (ORDER BY revenue_per_sec)
+                            FILTER (WHERE revenue_per_sec > 0), 0.0
+                    )::float8 AS p99,
+                    COALESCE(MAX(revenue_per_sec), 0.0)::float8              AS peak,
+                    COUNT(*) FILTER (WHERE revenue_per_sec > 0)::bigint       AS active_minutes,
+                    COUNT(*)::bigint                                           AS sampled_minutes
+                FROM per_minute
+                "#,
+                &[&query.start, &query.end],
+            )
+            .await
+            .map_err(|e| RepositoryError::DatabaseError(e.into()))?;
+
+        let p50_nano: f64 = platform_row.get(0);
+        let p95_nano: f64 = platform_row.get(1);
+        let p99_nano: f64 = platform_row.get(2);
+        let peak_nano: f64 = platform_row.get(3);
+        let active_minutes: i64 = platform_row.get(4);
+        let sampled_minutes: i64 = platform_row.get(5);
+
+        const NANO_TO_USD: f64 = 1.0 / 1_000_000_000.0;
+        const YEAR_SECONDS: f64 = 86400.0 * 365.0;
+
+        let p50 = p50_nano * NANO_TO_USD;
+        let p95 = p95_nano * NANO_TO_USD;
+        let p99 = p99_nano * NANO_TO_USD;
+        let peak = peak_nano * NANO_TO_USD;
+
+        // ── Per-model percentiles ─────────────────────────────────────────────
+        let model_rows = client
+            .query(
+                r#"
+                WITH per_minute AS (
+                    SELECT
+                        model_name,
+                        DATE_TRUNC('minute', created_at)    AS bucket,
+                        SUM(total_cost)::float8 / 60.0      AS revenue_per_sec
+                    FROM organization_usage_log
+                    WHERE created_at >= $1
+                      AND created_at < $2
+                    GROUP BY 1, 2
+                )
+                SELECT
+                    model_name,
+                    COALESCE(
+                        PERCENTILE_CONT(0.50) WITHIN GROUP (ORDER BY revenue_per_sec)
+                            FILTER (WHERE revenue_per_sec > 0), 0.0
+                    )::float8 AS p50,
+                    COALESCE(
+                        PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY revenue_per_sec)
+                            FILTER (WHERE revenue_per_sec > 0), 0.0
+                    )::float8 AS p95,
+                    COALESCE(
+                        PERCENTILE_CONT(0.99) WITHIN GROUP (ORDER BY revenue_per_sec)
+                            FILTER (WHERE revenue_per_sec > 0), 0.0
+                    )::float8 AS p99,
+                    COALESCE(MAX(revenue_per_sec), 0.0)::float8              AS peak,
+                    COUNT(*) FILTER (WHERE revenue_per_sec > 0)::bigint       AS active_minutes,
+                    SUM(revenue_per_sec * 60.0)::float8                       AS total_cost_nano
+                FROM per_minute
+                GROUP BY model_name
+                ORDER BY total_cost_nano DESC
+                "#,
+                &[&query.start, &query.end],
+            )
+            .await
+            .map_err(|e| RepositoryError::DatabaseError(e.into()))?;
+
+        let by_model: Vec<RevenueDensityModelRow> = model_rows
+            .iter()
+            .map(|row| {
+                let model_p50 = row.get::<_, f64>(1) * NANO_TO_USD;
+                let model_p95 = row.get::<_, f64>(2) * NANO_TO_USD;
+                let model_p99 = row.get::<_, f64>(3) * NANO_TO_USD;
+                let model_peak = row.get::<_, f64>(4) * NANO_TO_USD;
+                RevenueDensityModelRow {
+                    model_name: row.get(0),
+                    p50_usd_per_sec: model_p50,
+                    p95_usd_per_sec: model_p95,
+                    p99_usd_per_sec: model_p99,
+                    peak_usd_per_sec: model_peak,
+                    p99_annualized_usd: model_p99 * YEAR_SECONDS,
+                    peak_annualized_usd: model_peak * YEAR_SECONDS,
+                    active_minutes: row.get(5),
+                }
+            })
+            .collect();
+
+        Ok(RevenueDensityReport {
+            period_start: query.start,
+            period_end: query.end,
+            sampled_minutes,
+            active_minutes,
+            p50_usd_per_sec: p50,
+            p95_usd_per_sec: p95,
+            p99_usd_per_sec: p99,
+            peak_usd_per_sec: peak,
+            p99_annualized_usd: p99 * YEAR_SECONDS,
+            peak_annualized_usd: peak * YEAR_SECONDS,
+            by_model,
         })
     }
 }

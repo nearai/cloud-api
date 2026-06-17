@@ -31,7 +31,10 @@ async fn test_cancel_invitation_short_path() {
     );
     let invite_body =
         invite_response.json::<api::models::InviteOrganizationMemberByEmailResponse>();
-    assert_eq!(invite_body.successful, 1, "Invitation should have been created");
+    assert_eq!(
+        invite_body.successful, 1,
+        "Invitation should have been created"
+    );
 
     // Retrieve the invitation ID from the list endpoint (longer path)
     let list_response = server
@@ -39,7 +42,11 @@ async fn test_cancel_invitation_short_path() {
         .add_header("Authorization", format!("Bearer {}", get_session_id()))
         .add_header("User-Agent", MOCK_USER_AGENT)
         .await;
-    assert_eq!(list_response.status_code(), 200, "List invitations should succeed");
+    assert_eq!(
+        list_response.status_code(),
+        200,
+        "List invitations should succeed"
+    );
     let invitations = list_response.json::<Vec<api::models::OrganizationInvitationResponse>>();
     let inv = invitations
         .iter()
@@ -52,7 +59,9 @@ async fn test_cancel_invitation_short_path() {
     // Add the new user as a member (not admin) of the org
     let org_uuid = uuid::Uuid::parse_str(org_id).unwrap();
     let non_admin_user_id = uuid::Uuid::parse_str(
-        non_admin_session.strip_prefix("rt_").unwrap_or(&non_admin_session),
+        non_admin_session
+            .strip_prefix("rt_")
+            .unwrap_or(&non_admin_session),
     )
     .unwrap();
     {
@@ -67,13 +76,8 @@ async fn test_cancel_invitation_short_path() {
             .expect("Failed to add non-admin member");
     }
     let forbidden_response = server
-        .delete(
-            format!("/v1/organizations/{org_id}/invitations/{invitation_id}").as_str(),
-        )
-        .add_header(
-            "Authorization",
-            format!("Bearer {}", non_admin_session),
-        )
+        .delete(format!("/v1/organizations/{org_id}/invitations/{invitation_id}").as_str())
+        .add_header("Authorization", format!("Bearer {}", non_admin_session))
         .add_header("User-Agent", MOCK_USER_AGENT)
         .await;
     assert_eq!(
@@ -85,9 +89,7 @@ async fn test_cancel_invitation_short_path() {
 
     // --- Admin path: cancel via short path ---
     let delete_response = server
-        .delete(
-            format!("/v1/organizations/{org_id}/invitations/{invitation_id}").as_str(),
-        )
+        .delete(format!("/v1/organizations/{org_id}/invitations/{invitation_id}").as_str())
         .add_header("Authorization", format!("Bearer {}", get_session_id()))
         .add_header("User-Agent", MOCK_USER_AGENT)
         .await;
@@ -100,18 +102,14 @@ async fn test_cancel_invitation_short_path() {
 
     // Verify the invitation is no longer pending (list should not contain it)
     let list_after = server
-        .get(
-            format!("/v1/organizations/{org_id}/members/invitations?status=pending").as_str(),
-        )
+        .get(format!("/v1/organizations/{org_id}/members/invitations?status=pending").as_str())
         .add_header("Authorization", format!("Bearer {}", get_session_id()))
         .add_header("User-Agent", MOCK_USER_AGENT)
         .await;
     assert_eq!(list_after.status_code(), 200);
     let invitations_after = list_after.json::<Vec<api::models::OrganizationInvitationResponse>>();
     assert!(
-        !invitations_after
-            .iter()
-            .any(|i| i.id == *invitation_id),
+        !invitations_after.iter().any(|i| i.id == *invitation_id),
         "Cancelled invitation should not appear in pending list"
     );
 }

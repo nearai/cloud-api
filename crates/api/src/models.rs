@@ -71,12 +71,27 @@ pub enum MessageContent {
 #[serde(tag = "type")]
 pub enum MessageContentPart {
     #[serde(rename = "text")]
-    Text { text: String },
+    Text {
+        text: String,
+        /// Anthropic prompt-caching breakpoint (`{"type":"ephemeral"}`), forwarded
+        /// verbatim (#666). Without this field serde drops the breakpoint at
+        /// deserialization, so it never survives the re-serialize in
+        /// `From<Message> for ChatMessage` to reach the Anthropic converter.
+        /// Stripped before any non-Anthropic upstream sees it (see
+        /// `inference_providers::strip_cache_control`). Omitted on the wire when
+        /// absent so the common (uncached) request is byte-identical to before.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cache_control: Option<serde_json::Value>,
+    },
     #[serde(rename = "image_url")]
     ImageUrl {
         image_url: MessageImageUrl,
         #[serde(skip_serializing_if = "Option::is_none")]
         detail: Option<String>,
+        /// Prompt-caching breakpoint on an image content part (#666). Same
+        /// verbatim forwarding and same non-Anthropic stripping as `Text`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cache_control: Option<serde_json::Value>,
     },
     // OpenAI format: input_audio with data + format
     #[serde(rename = "input_audio")]
@@ -4358,9 +4373,11 @@ mod tests {
                 content: Some(MessageContent::Parts(vec![
                     MessageContentPart::Text {
                         text: "Hello".to_string(),
+                        cache_control: None,
                     },
                     MessageContentPart::Text {
                         text: "World".to_string(),
+                        cache_control: None,
                     },
                 ])),
                 name: None,
@@ -4538,12 +4555,14 @@ mod tests {
                 content: Some(MessageContent::Parts(vec![
                     MessageContentPart::Text {
                         text: "What's in this image?".to_string(),
+                        cache_control: None,
                     },
                     MessageContentPart::ImageUrl {
                         image_url: MessageImageUrl::String(
                             "data:image/jpeg;base64,/9j/4AAQSkZJRg==".to_string(),
                         ),
                         detail: Some("low".to_string()),
+                        cache_control: None,
                     },
                 ])),
                 name: None,

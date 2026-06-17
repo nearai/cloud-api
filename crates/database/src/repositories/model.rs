@@ -83,7 +83,7 @@ impl ModelRepository {
                         m.input_modalities, m.output_modalities, m.inference_url,
                         m.hugging_face_id, m.quantization, m.max_output_length,
                         m.supported_sampling_parameters, m.supported_features, m.datacenters,
-                        m.is_ready, m.deprecation_date, m.openrouter_slug,
+                        m.is_ready, m.deprecation_date, m.openrouter_slug, m.allow_free,
                         COALESCE(array_agg(a.alias_name) FILTER (WHERE a.alias_name IS NOT NULL), '{}') AS aliases
                     FROM models m
                     LEFT JOIN model_aliases a ON a.canonical_model_id = m.id AND a.is_active = true
@@ -166,7 +166,7 @@ impl ModelRepository {
                             m.input_modalities, m.output_modalities, m.inference_url,
                             m.hugging_face_id, m.quantization, m.max_output_length,
                             m.supported_sampling_parameters, m.supported_features, m.datacenters,
-                            m.is_ready, m.deprecation_date, m.openrouter_slug,
+                            m.is_ready, m.deprecation_date, m.openrouter_slug, m.allow_free,
                             COALESCE(array_agg(a.alias_name) FILTER (WHERE a.alias_name IS NOT NULL), '{}') AS aliases
                         FROM models m
                         LEFT JOIN model_aliases a ON a.canonical_model_id = m.id AND a.is_active = true
@@ -190,7 +190,7 @@ impl ModelRepository {
                             m.input_modalities, m.output_modalities, m.inference_url,
                             m.hugging_face_id, m.quantization, m.max_output_length,
                             m.supported_sampling_parameters, m.supported_features, m.datacenters,
-                            m.is_ready, m.deprecation_date, m.openrouter_slug,
+                            m.is_ready, m.deprecation_date, m.openrouter_slug, m.allow_free,
                             COALESCE(array_agg(a.alias_name) FILTER (WHERE a.alias_name IS NOT NULL), '{}') AS aliases
                         FROM models m
                         LEFT JOIN model_aliases a ON a.canonical_model_id = m.id AND a.is_active = true
@@ -329,6 +329,7 @@ impl ModelRepository {
                         m.is_ready,
                         m.deprecation_date,
                         m.openrouter_slug,
+                        m.allow_free,
                         COALESCE(
                             array_agg(ma.alias_name)
                             FILTER (WHERE ma.alias_name IS NOT NULL),
@@ -1297,6 +1298,7 @@ impl ModelRepository {
                         m.is_ready,
                         m.deprecation_date,
                         m.openrouter_slug,
+                        m.allow_free,
                         COALESCE(
                             array_agg(ma_all.alias_name)
                             FILTER (WHERE ma_all.alias_name IS NOT NULL),
@@ -1499,7 +1501,7 @@ impl ModelRepository {
                         m.input_modalities, m.output_modalities, m.inference_url,
                         m.hugging_face_id, m.quantization, m.max_output_length,
                         m.supported_sampling_parameters, m.supported_features, m.datacenters,
-                        m.is_ready, m.deprecation_date, m.openrouter_slug,
+                        m.is_ready, m.deprecation_date, m.openrouter_slug, m.allow_free,
                         COALESCE(array_agg(a.alias_name) FILTER (WHERE a.alias_name IS NOT NULL), '{}') AS aliases
                     FROM models m
                     LEFT JOIN model_aliases a ON a.canonical_model_id = m.id AND a.is_active = true

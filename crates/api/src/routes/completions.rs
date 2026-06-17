@@ -1716,14 +1716,12 @@ async fn chat_completions_inner(
                                         );
                                         "{}".to_string()
                                     });
-                                    // Suppress per-chunk debug logging when
-                                    // auto_redact is enabled: the chunk now
-                                    // holds the user's original PII (we just
-                                    // un-redacted it). Logging it would
-                                    // defeat the privacy guarantee at debug.
-                                    if !auto_redact_enabled {
-                                        tracing::debug!("Completion stream event: {}", json_data);
-                                    }
+                                    // Do not log json_data: it contains AI response content
+                                    // (text deltas) which must never appear in logs even at
+                                    // debug level (CLAUDE.md logging policy). The
+                                    // re-serialization path is reached by non-attested models
+                                    // when strip_intermediate_usage is active, so user message
+                                    // context can be reflected back in these chunks.
                                     // Format as SSE event with proper newlines
                                     let sse_bytes = Bytes::from(format!("data: {json_data}\n\n"));
                                     if gateway_signature_enabled {

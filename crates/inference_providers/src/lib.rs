@@ -145,6 +145,15 @@ impl ProviderTier {
     pub fn is_attested(self) -> bool {
         matches!(self, ProviderTier::Near | ProviderTier::Attested3p)
     }
+
+    /// Stable, lowercase label for logs and metric tags (low cardinality).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ProviderTier::Near => "near",
+            ProviderTier::Attested3p => "attested_3p",
+            ProviderTier::NonAttested => "non_attested",
+        }
+    }
 }
 
 /// Creates a verified `reqwest::Client` with an H2 connection to a specific backend.

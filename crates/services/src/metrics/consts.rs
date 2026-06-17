@@ -20,6 +20,12 @@ pub const METRIC_REQUEST_COUNT: &str = "cloud_api.request.count";
 pub const METRIC_TOKENS_INPUT: &str = "cloud_api.tokens.input";
 pub const METRIC_TOKENS_OUTPUT: &str = "cloud_api.tokens.output";
 
+// Tiered-routing visibility: one increment per served request, tagged with
+// `model`, `provider_tier` (near|attested_3p|non_attested), `fallback`
+// (true when the primary tier failed and a fallback served), and `operation`.
+// Lets dashboards show Chutes-served traffic and the NEAR->fallback rate.
+pub const METRIC_PROVIDER_REQUESTS: &str = "cloud_api.provider.requests";
+
 // Error metrics
 pub const METRIC_REQUEST_ERRORS: &str = "cloud_api.request.errors";
 

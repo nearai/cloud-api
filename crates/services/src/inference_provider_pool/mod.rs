@@ -241,6 +241,11 @@ pub struct InferenceProviderPool {
     /// Distinct from [`Self::pinned_models`] (just the name set the no-overwrite /
     /// no-evict / no-stale-remove guards consult).
     pinned_providers: Arc<std::sync::RwLock<HashMap<String, Vec<Arc<InferenceProviderTrait>>>>>,
+    /// Optional metrics sink for tiered-routing visibility (set once after
+    /// construction via [`Self::set_metrics_service`]; absent in tests). The pool
+    /// is the only layer that knows which trust tier served a request and whether
+    /// it was a fallback, so the per-tier / fallback counter is emitted from here.
+    metrics_service: std::sync::OnceLock<Arc<dyn crate::metrics::MetricsServiceTrait>>,
 }
 
 /// Backend verifier that creates verified reqwest clients by connecting to a backend,
@@ -511,7 +516,17 @@ impl InferenceProviderPool {
             attestation_verifier: Arc::new(AttestationVerifier::near_with_pccs(pccs_url)),
             pinned_models: Arc::new(std::sync::RwLock::new(std::collections::HashSet::new())),
             pinned_providers: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            metrics_service: std::sync::OnceLock::new(),
         }
+    }
+
+    /// Attach a metrics sink for tiered-routing/fallback visibility. Set once
+    /// during app setup (the pool is shared as `Arc` immediately, so this uses
+    /// interior mutability rather than a `new()` arg — keeping the many test
+    /// `InferenceProviderPool::new(...)` call sites untouched). A second call is
+    /// a no-op.
+    pub fn set_metrics_service(&self, metrics: Arc<dyn crate::metrics::MetricsServiceTrait>) {
+        let _ = self.metrics_service.set(metrics);
     }
 
     /// Load external providers (OpenAI, Anthropic, Gemini, etc.) into provider_mappings.
@@ -2143,13 +2158,38 @@ impl InferenceProviderPool {
                             let key = Arc::as_ptr(provider) as *const () as usize;
                             counts.insert(key, 0);
                         }
+                        // Visibility into tiered routing: which trust tier actually
+                        // served, and whether we fell back off the primary. `attempt`
+                        // is the 0-based index into the tier-ordered provider list, so
+                        // anything past index 0 means the leading (primary, e.g. NEAR)
+                        // tier failed and a fallback (e.g. Chutes) served the request.
+                        let tier = provider.tier();
+                        let is_fallback = attempt > 0;
                         tracing::info!(
                             model_id = %model_id,
                             attempt = attempt + 1,
                             retry = retry_count,
                             operation = operation_name,
+                            provider_tier = tier.as_str(),
+                            is_fallback,
                             "Successfully completed request with provider"
                         );
+                        // Emit a fallback counter (every served request, tagged) so
+                        // dashboards can show Chutes-served traffic and the
+                        // NEAR→fallback rate per model. Recorded here — the only point
+                        // that knows the serving provider's tier and the attempt index.
+                        if let Some(metrics) = self.metrics_service.get() {
+                            metrics.record_count(
+                                crate::metrics::consts::METRIC_PROVIDER_REQUESTS,
+                                1,
+                                &[
+                                    &format!("model:{model_id}"),
+                                    &format!("provider_tier:{}", tier.as_str()),
+                                    &format!("fallback:{is_fallback}"),
+                                    &format!("operation:{operation_name}"),
+                                ],
+                            );
+                        }
                         return Ok((result, provider.clone()));
                     }
                     Err(e) => {
@@ -6885,5 +6925,81 @@ mod tests {
             chutes.last_chat_params().await.is_none(),
             "Chutes must NOT be tried for a genuine client 4xx"
         );
+    }
+
+    /// Observability: the pool emits `cloud_api.provider.requests` tagged with the
+    /// serving tier and a `fallback` flag, so dashboards can see Chutes-served
+    /// traffic and the NEAR→fallback rate. A NEAR-5xx→Chutes request must record
+    /// `provider_tier:attested_3p, fallback:true`; a healthy NEAR primary must
+    /// record `provider_tier:near, fallback:false`.
+    #[tokio::test]
+    async fn provider_requests_metric_tags_tier_and_fallback() {
+        use crate::metrics::capturing::{CapturingMetricsService, MetricValue};
+        use crate::metrics::consts::METRIC_PROVIDER_REQUESTS;
+        use inference_providers::mock::{MockProvider, RequestMatcher, ResponseTemplate};
+        use inference_providers::{CompletionError, ProviderTier};
+
+        // Helper: run one request through a pool wired with capturing metrics and
+        // return the recorded provider-requests tag sets.
+        async fn served_tags(near_fails: bool) -> Vec<Vec<String>> {
+            let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
+            let metrics = Arc::new(CapturingMetricsService::new());
+            pool.set_metrics_service(metrics.clone());
+            let model_id = "z-ai/glm-5.1".to_string();
+
+            let near = Arc::new(MockProvider::new_accept_all().with_tier(ProviderTier::Near));
+            if near_fails {
+                near.set_error_override(Some(CompletionError::HttpError {
+                    status_code: 503,
+                    message: "overloaded".to_string(),
+                    is_external: true,
+                }))
+                .await;
+            } else {
+                near.when(RequestMatcher::Any)
+                    .respond_with(ResponseTemplate::new("near"))
+                    .await;
+            }
+            let chutes =
+                Arc::new(MockProvider::new_accept_all().with_tier(ProviderTier::Attested3p));
+            chutes
+                .when(RequestMatcher::Any)
+                .respond_with(ResponseTemplate::new("chutes"))
+                .await;
+            {
+                let mut m = pool.provider_mappings.write().await;
+                m.model_to_providers.insert(
+                    model_id.clone(),
+                    vec![
+                        near.clone() as Arc<InferenceProviderTrait>,
+                        chutes.clone() as Arc<InferenceProviderTrait>,
+                    ],
+                );
+            }
+            pool.chat_completion(fallback_params(&model_id), "h".to_string())
+                .await
+                .expect("served");
+
+            metrics
+                .get_metrics()
+                .into_iter()
+                .filter(|m| m.name == METRIC_PROVIDER_REQUESTS)
+                .inspect(|m| assert!(matches!(m.value, MetricValue::Count(1))))
+                .map(|m| m.tags)
+                .collect()
+        }
+
+        // NEAR 5xx → served by Chutes fallback.
+        let fb = served_tags(true).await;
+        assert_eq!(fb.len(), 1, "exactly one provider-requests metric");
+        assert!(fb[0].iter().any(|t| t == "provider_tier:attested_3p"));
+        assert!(fb[0].iter().any(|t| t == "fallback:true"));
+        assert!(fb[0].iter().any(|t| t == "model:z-ai/glm-5.1"));
+
+        // Healthy NEAR → served by primary, no fallback.
+        let primary = served_tags(false).await;
+        assert_eq!(primary.len(), 1);
+        assert!(primary[0].iter().any(|t| t == "provider_tier:near"));
+        assert!(primary[0].iter().any(|t| t == "fallback:false"));
     }
 }

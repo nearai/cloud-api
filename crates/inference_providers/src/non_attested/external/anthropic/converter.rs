@@ -323,6 +323,21 @@ fn per_part_cache_controls(content: &serde_json::Value) -> Vec<Option<serde_json
     }
 }
 
+/// The `cache_control` breakpoint to attach to a single, flattened text block
+/// (the assistant turn rebuilds all text parts into one block via
+/// `text_from_content`). Anthropic allows a cache breakpoint on an assistant
+/// content block, so a cached prefix that ends at an assistant turn must keep
+/// its breakpoint (#666). When several text parts each carry a breakpoint, the
+/// LAST one is the prefix boundary, so we surface that — attaching it to the one
+/// block that represents the concatenated text. Returns `None` when no text part
+/// carries a breakpoint (the common case stays the bare-string form).
+fn flattened_text_cache_control(content: &serde_json::Value) -> Option<serde_json::Value> {
+    per_part_cache_controls(content)
+        .into_iter()
+        .flatten()
+        .next_back()
+}
+
 /// Build the Anthropic `system` value from a raw OpenAI system message content.
 ///
 /// Uses a bare string in the common case (no cache_control) so the request is
@@ -449,6 +464,14 @@ pub fn convert_messages(
                 }
             }
             MessageRole::Assistant => {
+                // Per-part cache_control, aligned the same way the user branch
+                // does — Anthropic allows a breakpoint on an assistant content
+                // block, so a cached prefix ending at an assistant turn keeps it
+                // (#666). The assistant text is flattened into a single block, so
+                // we attach the last (prefix-boundary) breakpoint to that block.
+                let text_cache_control =
+                    msg.content.as_ref().and_then(flattened_text_cache_control);
+
                 // Check if the assistant message contains tool calls
                 if let Some(tool_calls) = &msg.tool_calls {
                     if !tool_calls.is_empty() {
@@ -460,7 +483,7 @@ pub fn convert_messages(
                             if !text.is_empty() {
                                 blocks.push(AnthropicContentPart::Text {
                                     text,
-                                    cache_control: None,
+                                    cache_control: text_cache_control,
                                 });
                             }
                         }
@@ -487,16 +510,32 @@ pub fn convert_messages(
                     }
                 }
 
-                // No tool calls - just text content
+                // No tool calls - just text content.
                 let content = msg
                     .content
                     .as_ref()
                     .map(&extract_content)
                     .unwrap_or_default();
-                anthropic_messages.push(AnthropicMessage {
-                    role: "assistant".to_string(),
-                    content: AnthropicMessageContent::Text(content),
-                });
+                // A bare string can't carry a breakpoint, so when this turn has a
+                // cache_control we emit the block-array form (mirroring the user
+                // branch). The common (uncached) case keeps the bare string so the
+                // request is byte-identical to before.
+                if let Some(cache_control) = text_cache_control {
+                    anthropic_messages.push(AnthropicMessage {
+                        role: "assistant".to_string(),
+                        content: AnthropicMessageContent::Blocks(vec![
+                            AnthropicContentPart::Text {
+                                text: content,
+                                cache_control: Some(cache_control),
+                            },
+                        ]),
+                    });
+                } else {
+                    anthropic_messages.push(AnthropicMessage {
+                        role: "assistant".to_string(),
+                        content: AnthropicMessageContent::Text(content),
+                    });
+                }
             }
             MessageRole::Tool => {
                 // Tool results need special formatting for Anthropic
@@ -1217,6 +1256,123 @@ mod tests {
                 );
             }
             other => panic!("expected text block, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_cache_control_on_assistant_text_part_forwards_breakpoint() {
+        // #666: Anthropic allows a cache breakpoint on an assistant
+        // content block, so a prefix ending at an assistant turn must keep it.
+        // A plain-text assistant turn carrying cache_control must become the
+        // block-array form with the breakpoint on the rebuilt text block.
+        let messages = vec![ChatMessage {
+            role: MessageRole::Assistant,
+            content: Some(serde_json::json!([
+                {
+                    "type": "text",
+                    "text": "Assistant prefix to cache",
+                    "cache_control": {"type": "ephemeral"}
+                }
+            ])),
+            name: None,
+            tool_call_id: None,
+            tool_calls: None,
+        }];
+
+        let (_system, anthropic_messages) = convert_messages(&messages);
+        assert_eq!(anthropic_messages.len(), 1);
+        let blocks = match &anthropic_messages[0].content {
+            AnthropicMessageContent::Blocks(b) => b,
+            AnthropicMessageContent::Text(t) => {
+                panic!("assistant cache_control should force the block form, got text: {t}")
+            }
+        };
+        assert_eq!(blocks.len(), 1);
+        match &blocks[0] {
+            AnthropicContentPart::Text {
+                text,
+                cache_control,
+            } => {
+                assert_eq!(text, "Assistant prefix to cache");
+                assert_eq!(
+                    *cache_control,
+                    Some(serde_json::json!({"type": "ephemeral"}))
+                );
+            }
+            other => panic!("expected text block, got {other:?}"),
+        }
+
+        // Serialized assistant message carries the verbatim breakpoint.
+        let json = serde_json::to_string(&anthropic_messages[0]).unwrap();
+        assert!(json.contains("\"cache_control\""));
+        assert!(json.contains("\"role\":\"assistant\""));
+    }
+
+    #[test]
+    fn test_cache_control_on_assistant_with_tool_calls_forwards_breakpoint() {
+        // Assistant turn with BOTH text (carrying a breakpoint) and tool calls:
+        // the breakpoint must land on the text block, the tool_use blocks follow.
+        let messages = vec![ChatMessage {
+            role: MessageRole::Assistant,
+            content: Some(serde_json::json!([
+                {
+                    "type": "text",
+                    "text": "Let me look that up.",
+                    "cache_control": {"type": "ephemeral"}
+                }
+            ])),
+            name: None,
+            tool_call_id: None,
+            tool_calls: Some(vec![ToolCall {
+                id: Some("call_1".to_string()),
+                type_: Some("function".to_string()),
+                function: FunctionCall {
+                    name: Some("search".to_string()),
+                    arguments: Some("{\"q\":\"x\"}".to_string()),
+                },
+                index: None,
+                thought_signature: None,
+            }]),
+        }];
+
+        let (_system, anthropic_messages) = convert_messages(&messages);
+        let blocks = match &anthropic_messages[0].content {
+            AnthropicMessageContent::Blocks(b) => b,
+            AnthropicMessageContent::Text(t) => panic!("expected block form, got text: {t}"),
+        };
+        assert_eq!(blocks.len(), 2, "text block + tool_use block");
+        match &blocks[0] {
+            AnthropicContentPart::Text {
+                text,
+                cache_control,
+            } => {
+                assert_eq!(text, "Let me look that up.");
+                assert_eq!(
+                    *cache_control,
+                    Some(serde_json::json!({"type": "ephemeral"}))
+                );
+            }
+            other => panic!("expected text block first, got {other:?}"),
+        }
+        assert!(matches!(blocks[1], AnthropicContentPart::ToolUse { .. }));
+    }
+
+    #[test]
+    fn test_assistant_without_cache_control_stays_bare_string() {
+        // Regression guard: an assistant turn with no breakpoint keeps the
+        // bare-string form (byte-identical to pre-#666).
+        let messages = vec![ChatMessage {
+            role: MessageRole::Assistant,
+            content: Some(serde_json::Value::String("Plain answer".to_string())),
+            name: None,
+            tool_call_id: None,
+            tool_calls: None,
+        }];
+
+        let (_system, anthropic_messages) = convert_messages(&messages);
+        match &anthropic_messages[0].content {
+            AnthropicMessageContent::Text(t) => assert_eq!(t, "Plain answer"),
+            other => panic!("expected bare-string assistant content, got {other:?}"),
         }
     }
 

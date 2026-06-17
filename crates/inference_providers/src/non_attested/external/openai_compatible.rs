@@ -182,6 +182,10 @@ impl ExternalBackend for OpenAiCompatibleBackend {
 
         // Ensure streaming and usage are enabled
         let mut streaming_params = params;
+        // #666: drop Anthropic prompt-caching breakpoints — they ride on the API
+        // model's content parts but openai_compatible upstreams (OpenAI, Azure,
+        // Together, …) may 400 on an unknown `cache_control` content-part field.
+        crate::strip_cache_control(&mut streaming_params.messages);
         streaming_params.model = model.to_string();
         streaming_params.stream = Some(true);
         streaming_params.stream_options = Some(StreamOptions {
@@ -251,6 +255,9 @@ impl ExternalBackend for OpenAiCompatibleBackend {
 
         // Ensure non-streaming
         let mut non_streaming_params = params;
+        // #666: drop Anthropic prompt-caching breakpoints before forwarding (see
+        // the streaming path for the rationale).
+        crate::strip_cache_control(&mut non_streaming_params.messages);
         non_streaming_params.model = model.to_string();
         non_streaming_params.stream = Some(false);
 
@@ -1007,6 +1014,41 @@ mod tests {
         ));
         // malformed URL → not OpenAI-source (and never panics)
         assert!(!is_openai_source("not a url"));
+    }
+
+    /// #666 NO-LEAK at the openai_compatible serialization boundary: the strip
+    /// the backend applies before `.json(&params)` must leave NO `cache_control`
+    /// in the bytes sent to an openai_compatible upstream (OpenAI may 400 on an
+    /// unknown content-part field). Build params with a breakpoint, strip, then
+    /// serialize exactly as the backend does.
+    #[test]
+    fn test_cache_control_stripped_before_serializing_to_openai() {
+        let mut params = make_chat_params(None, None);
+        params.messages = vec![crate::ChatMessage {
+            role: crate::MessageRole::User,
+            content: Some(serde_json::json!([
+                {
+                    "type": "text",
+                    "text": "Cached context",
+                    "cache_control": {"type": "ephemeral"}
+                },
+                {"type": "text", "text": "Volatile"}
+            ])),
+            name: None,
+            tool_call_id: None,
+            tool_calls: None,
+        }];
+
+        // The exact strip the backend runs before `.json(&streaming_params)`.
+        crate::strip_cache_control(&mut params.messages);
+
+        let wire = serde_json::to_string(&params).unwrap();
+        assert!(
+            !wire.contains("cache_control"),
+            "cache_control must not reach an openai_compatible upstream: {wire}"
+        );
+        assert!(wire.contains("Cached context"));
+        assert!(wire.contains("Volatile"));
     }
 
     /// A look-alike host must keep the sampling knobs (we only strip for the

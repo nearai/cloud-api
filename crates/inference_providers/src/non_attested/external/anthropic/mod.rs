@@ -3,7 +3,7 @@
 //! This backend handles HTTP communication with Anthropic's Messages API.
 //! Format conversion is handled by the `anthropic_converter` module.
 
-mod converter;
+pub mod converter;
 
 use super::backend::{BackendConfig, ExternalBackend};
 use crate::{

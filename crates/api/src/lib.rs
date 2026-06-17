@@ -2283,6 +2283,7 @@ mod tests {
                 host: "127.0.0.1".to_string(),
                 port: 0, // Use port 0 for testing to get a random available port
                 pricing_change_apply_interval_secs: 0,
+                ohttp_enabled: false,
             },
             inference_api_key: Some("test-key".to_string()),
             internal_usage_token: None,
@@ -2386,6 +2387,7 @@ mod tests {
                 host: "127.0.0.1".to_string(),
                 port: 0,
                 pricing_change_apply_interval_secs: 0,
+                ohttp_enabled: false,
             },
             inference_api_key: Some("test-key".to_string()),
             internal_usage_token: None,

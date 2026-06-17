@@ -1299,10 +1299,7 @@ impl AdminServiceImpl {
             existing_allow_free,
         ) = existing.unwrap_or((0, 0, 0, 0, false));
 
-        let effective_is_active =
-            request
-                .is_active
-                .unwrap_or(if is_new_model { true } else { false });
+        let effective_is_active = request.is_active.unwrap_or(is_new_model);
 
         if effective_is_active {
             let effective_input = request.input_cost_per_token.unwrap_or(existing_input);

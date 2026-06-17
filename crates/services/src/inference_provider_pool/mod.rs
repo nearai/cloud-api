@@ -7129,6 +7129,7 @@ mod tests {
         assert_eq!(primary.len(), 1);
         assert!(primary[0].iter().any(|t| t == "provider_tier:near"));
         assert!(primary[0].iter().any(|t| t == "fallback:false"));
+    }
 
     /// When `load_inference_url_models` is called in partial mode (`partial = true`),
     /// it must merge into the existing URL-provider cache and fingerprint-state map

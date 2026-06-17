@@ -388,6 +388,16 @@ fn parse_bhttp_and_build_loopback(
         .parse()
         .map_err(|_| OhttpError::BadRequest(format!("Unsupported HTTP method: {method_str}")))?;
 
+    // Validate path before URL construction: must start with '/' (BHTTP origin-form,
+    // RFC 9110 §7.1) and must not start with '//' (avoids protocol-relative parsing).
+    // Concatenating an unvalidated path into format!("http://host{path}") allows
+    // userinfo injection — e.g. path="@evil.com/x" → host=evil.com (SSRF).
+    if !path_str.starts_with('/') || path_str.starts_with("//") {
+        return Err(OhttpError::BadRequest(format!(
+            "Invalid inner request path: must start with '/' and not '//' (got {path_str:?})"
+        )));
+    }
+
     let loopback_url = format!("http://127.0.0.1:{}{}", state.config.server.port, path_str);
     let mut request_builder = state.http_client.request(method, &loopback_url);
 

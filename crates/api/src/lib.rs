@@ -70,6 +70,11 @@ const AUDIO_TRANSCRIPTION_MAX_BODY_SIZE: usize = 25 * 1024 * 1024; // 25 MB
 // Cap at 256 KB so the route doesn't inherit the 25 MB audio-transcription limit.
 const PRIVACY_CLASSIFY_MAX_BODY_SIZE: usize = 256 * 1024; // 256 KB
 
+// OHTTP outer body is the HPKE-encrypted inner BHTTP request. Set to 32 MB to
+// cover audio-transcription payloads (≤25 MB) plus HPKE overhead, while
+// bounding unauthenticated memory use before the inner request is decrypted.
+const OHTTP_MAX_BODY_SIZE: usize = 32 * 1024 * 1024; // 32 MB
+
 /// Service initialization components
 #[derive(Clone)]
 pub struct AuthComponents {
@@ -1268,7 +1273,10 @@ pub fn build_app_with_config(
     // root (not under /v1) so clients can reach them without version-prefixing.
     // `GET /v1/ohttp/config` is a convenience alias nested under /v1.
     let ohttp_root_routes = Router::new()
-        .route("/ohttp", post(ohttp_relay))
+        .route(
+            "/ohttp",
+            post(ohttp_relay).layer(DefaultBodyLimit::max(OHTTP_MAX_BODY_SIZE)),
+        )
         .route("/.well-known/ohttp-gateway", get(ohttp_config))
         .with_state(app_state.clone());
 

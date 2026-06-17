@@ -3133,6 +3133,44 @@ mod tests {
     }
 
     #[test]
+    fn e2ee_non_attested_stream_does_not_strip_intermediate_usage() {
+        // Regression guard: E2EE chunks are opaque ciphertext — stripping usage
+        // requires parsing and re-serializing, which would corrupt or discard
+        // encrypted payload bytes. The `!e2ee_active` guard in
+        // `chat_stream_usage_mode` must hold even when
+        // `model_attestation_supported == Some(false)`, i.e. the non-attested
+        // path that would otherwise activate strip_intermediate_usage.
+        let request = chat_request_with_include_usage(None);
+        let mode = chat_stream_usage_mode(&request, Some(false), true /* e2ee_active */);
+
+        assert!(
+            !mode.strip_intermediate_usage,
+            "E2EE streams must never activate strip_intermediate_usage: \
+             chunks are opaque ciphertext and cannot be re-serialized"
+        );
+    }
+
+    #[test]
+    fn non_text_modality_non_attested_stream_does_not_strip_intermediate_usage() {
+        // Regression guard: non-text modality streams (e.g. audio) carry binary
+        // or provider-specific payloads that must not be re-serialized. The
+        // `!chat_stream_has_non_text_modalities` guard in `chat_stream_usage_mode`
+        // must hold even when `model_attestation_supported == Some(false)`.
+        let mut request = chat_request_with_include_usage(None);
+        request.extra.insert(
+            "modalities".to_string(),
+            serde_json::json!(["text", "audio"]),
+        );
+        let mode = chat_stream_usage_mode(&request, Some(false), false);
+
+        assert!(
+            !mode.strip_intermediate_usage,
+            "non-text modality streams must never activate strip_intermediate_usage: \
+             payloads may be binary/provider-specific and cannot be re-serialized"
+        );
+    }
+
+    #[test]
     fn chat_stream_non_text_modalities_preserve_raw_passthrough() {
         let mut request = chat_request_with_include_usage(None);
         assert!(!chat_stream_has_non_text_modalities(&request));

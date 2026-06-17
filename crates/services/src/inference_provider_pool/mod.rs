@@ -5806,6 +5806,13 @@ mod tests {
             }
             other => panic!("Expected HttpError, got: {:?}", other),
         }
+        assert!(
+            pool.provider_failure_counts
+                .read()
+                .expect("provider failure counts lock")
+                .is_empty(),
+            "client 4xx responses must not mark a provider unhealthy"
+        );
     }
 
     /// Multi-provider, alternating-error test pinning Pierre's blocker: provider

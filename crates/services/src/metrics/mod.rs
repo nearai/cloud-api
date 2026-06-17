@@ -92,6 +92,9 @@ impl MetricsServiceTrait for OtlpMetricsService {
         let counter = counters.entry(name.to_string()).or_insert_with(|| {
             let description = match name {
                 consts::METRIC_REQUEST_COUNT => "Total number of API requests",
+                consts::METRIC_PROVIDER_REQUESTS => {
+                    "Served requests by provider tier + fallback (Chutes-served traffic, NEAR->fallback rate)"
+                }
                 consts::METRIC_TOKENS_INPUT => "Input tokens consumed",
                 consts::METRIC_TOKENS_OUTPUT => "Output tokens generated",
                 consts::METRIC_VERIFICATION_SUCCESS => "Successful verification operations",

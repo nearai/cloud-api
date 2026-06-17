@@ -705,15 +705,13 @@ impl CompletionServiceImpl {
         n: Option<i64>,
         model_name: &str,
     ) -> Result<(), ports::CompletionError> {
-        if !attestation_supported {
-            if n.is_some_and(|v| v > 1) {
-                return Err(ports::CompletionError::InvalidParams(format!(
-                    "n>1 is not supported for model '{}'. \
-                     External providers do not support multiple completions per request. \
-                     Use a self-hosted model or make N separate requests.",
-                    model_name
-                )));
-            }
+        if !attestation_supported && n.is_some_and(|v| v > 1) {
+            return Err(ports::CompletionError::InvalidParams(format!(
+                "n>1 is not supported for model '{}'. \
+                 External providers do not support multiple completions per request. \
+                 Use a self-hosted model or make N separate requests.",
+                model_name
+            )));
         }
         Ok(())
     }

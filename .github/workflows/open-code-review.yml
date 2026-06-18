@@ -1,7 +1,7 @@
 name: OpenCodeReview
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.event.issue.number || github.ref }}
   cancel-in-progress: true
 
 on:
@@ -18,8 +18,8 @@ jobs:
   code-review:
     runs-on: ubuntu-latest
     if: |
-      (github.event_name == 'pull_request_target' && !github.event.pull_request.draft) ||
-      (github.event_name == 'issue_comment' && github.event.issue.pull_request && startsWith(github.event.comment.body, '/ocr'))
+      (github.event_name == 'pull_request_target' && !github.event.pull_request.draft && github.event.pull_request.head.repo.full_name == github.repository) ||
+      (github.event_name == 'issue_comment' && github.event.issue.pull_request && contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association) && startsWith(github.event.comment.body, '/ocr'))
     steps:
       - name: Get PR context
         id: pr-context

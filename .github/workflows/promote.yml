@@ -52,10 +52,10 @@ jobs:
           username: ${{ vars.DOCKER_REGISTRY_USER }}
           password: ${{ secrets.DOCKER_REGISTRY_TOKEN }}
 
-      - name: Install skopeo and jq
+      - name: Install skopeo, jq, and gh
         run: |
           sudo apt-get update
-          sudo apt-get install -y skopeo jq
+          sudo apt-get install -y skopeo jq gh
 
       # Resolve the source digest BEFORE copying to :prod. This avoids the
       # inspect-after-write race where reading back :prod could in theory hit a
@@ -66,6 +66,10 @@ jobs:
         run: |
           set -euo pipefail
           DIGEST_INPUT="${{ inputs.digest }}"
+          if [ -n "$DIGEST_INPUT" ] && ! echo "$DIGEST_INPUT" | grep -qE '^sha256:[a-f0-9]{64}$'; then
+            echo "::error::digest input must be 'sha256:<64 hex chars>', got: '${DIGEST_INPUT}'"
+            exit 1
+          fi
           if [ -n "$DIGEST_INPUT" ]; then
             echo "Promoting by digest: ${DIGEST_INPUT}"
             SOURCE="${{ env.IMAGE }}@${DIGEST_INPUT}"

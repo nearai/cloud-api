@@ -19,6 +19,7 @@ use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 const FINALIZE_TIMEOUT_SECS: u64 = 5;
+const DEEPSEEK_V4_FLASH_MODEL: &str = "deepseek-ai/DeepSeek-V4-Flash";
 
 type FinalizeFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
 
@@ -648,6 +649,75 @@ impl CompletionServiceImpl {
         }
     }
 
+    fn is_json_object_response_format(
+        extra: &std::collections::HashMap<String, serde_json::Value>,
+    ) -> bool {
+        extra
+            .get("response_format")
+            .and_then(|format| format.get("type"))
+            .and_then(|kind| kind.as_str())
+            == Some("json_object")
+    }
+
+    fn has_forced_function_tool_choice(
+        tool_choice: &Option<inference_providers::ToolChoice>,
+    ) -> bool {
+        matches!(
+            tool_choice,
+            Some(inference_providers::ToolChoice::Function { .. })
+        )
+    }
+
+    fn disable_chat_template_thinking(
+        extra: &mut std::collections::HashMap<String, serde_json::Value>,
+    ) -> bool {
+        let Some(kwargs) = extra
+            .get_mut("chat_template_kwargs")
+            .and_then(|value| value.as_object_mut())
+        else {
+            return false;
+        };
+
+        let mut changed = false;
+        for key in ["thinking", "enable_thinking"] {
+            if kwargs.get(key).and_then(|value| value.as_bool()) == Some(true) {
+                kwargs.insert(key.to_string(), serde_json::Value::Bool(false));
+                changed = true;
+            }
+        }
+
+        changed
+    }
+
+    fn apply_deepseek_v4_flash_thinking_compat(
+        model_name: &str,
+        params: &mut inference_providers::ChatCompletionParams,
+    ) {
+        if model_name != DEEPSEEK_V4_FLASH_MODEL {
+            return;
+        }
+
+        let has_json_object = Self::is_json_object_response_format(&params.extra);
+        let has_forced_tool_choice = Self::has_forced_function_tool_choice(&params.tool_choice);
+        if !has_json_object && !has_forced_tool_choice {
+            return;
+        }
+
+        if Self::disable_chat_template_thinking(&mut params.extra) {
+            let reason = match (has_json_object, has_forced_tool_choice) {
+                (true, true) => "json_object_and_forced_tool_choice",
+                (true, false) => "json_object",
+                (false, true) => "forced_tool_choice",
+                (false, false) => unreachable!(),
+            };
+            tracing::warn!(
+                model = model_name,
+                reason,
+                "Disabled DeepSeek-V4-Flash SGLang thinking for OpenAI-compatible response contract"
+            );
+        }
+    }
+
     /// Get the concurrent request limit for an organization (cached)
     async fn get_org_concurrent_limit(&self, organization_id: Uuid) -> u32 {
         let default_limit = self.concurrent_limit;
@@ -1269,6 +1339,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
             );
             chat_params.model = canonical_name.clone();
         }
+        Self::apply_deepseek_v4_flash_thinking_compat(canonical_name, &mut chat_params);
 
         let counter = self
             .try_acquire_concurrent_slot(organization_id, model.id, canonical_name)
@@ -1438,6 +1509,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
             );
             chat_params.model = canonical_name.clone();
         }
+        Self::apply_deepseek_v4_flash_thinking_compat(canonical_name, &mut chat_params);
 
         let organization_id = request.organization_id;
         let counter = self
@@ -2901,6 +2973,137 @@ mod tests {
             }
             other => panic!("Expected ProviderError with 504, got {:?}", other),
         }
+    }
+
+    fn chat_params_for_compat_tests(model: &str) -> inference_providers::ChatCompletionParams {
+        inference_providers::ChatCompletionParams {
+            model: model.to_string(),
+            messages: vec![inference_providers::ChatMessage {
+                role: inference_providers::MessageRole::User,
+                content: Some(serde_json::json!("hi")),
+                name: None,
+                tool_call_id: None,
+                tool_calls: None,
+            }],
+            max_tokens: None,
+            max_completion_tokens: None,
+            temperature: None,
+            top_p: None,
+            n: None,
+            stream: Some(false),
+            stop: None,
+            frequency_penalty: None,
+            presence_penalty: None,
+            logit_bias: None,
+            logprobs: None,
+            top_logprobs: None,
+            user: None,
+            seed: None,
+            tools: None,
+            tool_choice: None,
+            parallel_tool_calls: None,
+            metadata: None,
+            store: None,
+            stream_options: None,
+            modalities: None,
+            extra: std::collections::HashMap::new(),
+        }
+    }
+
+    fn thinking_kwargs(params: &inference_providers::ChatCompletionParams) -> &serde_json::Value {
+        params
+            .extra
+            .get("chat_template_kwargs")
+            .expect("chat_template_kwargs should be present")
+    }
+
+    #[test]
+    fn deepseek_compat_disables_thinking_for_json_object() {
+        let mut params = chat_params_for_compat_tests(DEEPSEEK_V4_FLASH_MODEL);
+        params.extra.insert(
+            "response_format".to_string(),
+            serde_json::json!({"type": "json_object"}),
+        );
+        params.extra.insert(
+            "chat_template_kwargs".to_string(),
+            serde_json::json!({"thinking": true, "enable_thinking": true}),
+        );
+
+        CompletionServiceImpl::apply_deepseek_v4_flash_thinking_compat(
+            DEEPSEEK_V4_FLASH_MODEL,
+            &mut params,
+        );
+
+        let kwargs = thinking_kwargs(&params);
+        assert_eq!(kwargs["thinking"], serde_json::json!(false));
+        assert_eq!(kwargs["enable_thinking"], serde_json::json!(false));
+    }
+
+    #[test]
+    fn deepseek_compat_disables_thinking_for_forced_tool_choice() {
+        let mut params = chat_params_for_compat_tests(DEEPSEEK_V4_FLASH_MODEL);
+        params.tool_choice = Some(inference_providers::ToolChoice::Function {
+            type_: "function".to_string(),
+            function: inference_providers::FunctionChoice {
+                name: "calculate".to_string(),
+            },
+        });
+        params.extra.insert(
+            "chat_template_kwargs".to_string(),
+            serde_json::json!({"thinking": true, "enable_thinking": true}),
+        );
+
+        CompletionServiceImpl::apply_deepseek_v4_flash_thinking_compat(
+            DEEPSEEK_V4_FLASH_MODEL,
+            &mut params,
+        );
+
+        let kwargs = thinking_kwargs(&params);
+        assert_eq!(kwargs["thinking"], serde_json::json!(false));
+        assert_eq!(kwargs["enable_thinking"], serde_json::json!(false));
+    }
+
+    #[test]
+    fn deepseek_compat_leaves_plain_reasoning_request_unchanged() {
+        let mut params = chat_params_for_compat_tests(DEEPSEEK_V4_FLASH_MODEL);
+        params
+            .extra
+            .insert("reasoning_effort".to_string(), serde_json::json!("high"));
+        params.extra.insert(
+            "chat_template_kwargs".to_string(),
+            serde_json::json!({"thinking": true, "enable_thinking": true}),
+        );
+
+        CompletionServiceImpl::apply_deepseek_v4_flash_thinking_compat(
+            DEEPSEEK_V4_FLASH_MODEL,
+            &mut params,
+        );
+
+        let kwargs = thinking_kwargs(&params);
+        assert_eq!(kwargs["thinking"], serde_json::json!(true));
+        assert_eq!(kwargs["enable_thinking"], serde_json::json!(true));
+    }
+
+    #[test]
+    fn deepseek_compat_is_model_gated() {
+        let mut params = chat_params_for_compat_tests("Qwen/Qwen3.6-35B-A3B-FP8");
+        params.extra.insert(
+            "response_format".to_string(),
+            serde_json::json!({"type": "json_object"}),
+        );
+        params.extra.insert(
+            "chat_template_kwargs".to_string(),
+            serde_json::json!({"thinking": true, "enable_thinking": true}),
+        );
+
+        CompletionServiceImpl::apply_deepseek_v4_flash_thinking_compat(
+            "Qwen/Qwen3.6-35B-A3B-FP8",
+            &mut params,
+        );
+
+        let kwargs = thinking_kwargs(&params);
+        assert_eq!(kwargs["thinking"], serde_json::json!(true));
+        assert_eq!(kwargs["enable_thinking"], serde_json::json!(true));
     }
 
     // ── extract_tools_from_extra ───────────────────────────────────

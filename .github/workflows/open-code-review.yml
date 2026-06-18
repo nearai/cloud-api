@@ -59,6 +59,10 @@ jobs:
           ocr config set llm.url "${{ secrets.OCR_LLM_URL }}"
           ocr config set llm.auth_token "${{ secrets.OCR_LLM_AUTH_TOKEN }}"
           ocr config set llm.model "${{ secrets.OCR_LLM_MODEL }}"
+          ocr config set llm.use_anthropic false
+
+      - name: Test LLM connectivity
+        run: ocr llm test
 
       - name: Run OpenCodeReview
         id: review
@@ -78,6 +82,9 @@ jobs:
             --to "${HEAD_SHA}" \
             --format json \
             > /tmp/ocr-result.json 2>/tmp/ocr-stderr.log || true
+
+          echo "=== OCR stderr ==="
+          cat /tmp/ocr-stderr.log || true
 
       - name: Post review comments to PR
         uses: actions/github-script@v7

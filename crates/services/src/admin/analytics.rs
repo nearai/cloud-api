@@ -469,7 +469,7 @@ pub struct RevenueDensityReport {
 pub struct RevenueDensityQuery {
     pub start: DateTime<Utc>,
     pub end: DateTime<Utc>,
-    /// Optional provider_type filter (e.g. "nearai", "external").
+    /// Optional provider_type filter (e.g. "vllm", "external", "chutes").
     pub provider_type: Option<String>,
 }
 

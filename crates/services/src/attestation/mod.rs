@@ -754,32 +754,31 @@ impl ports::AttestationServiceTrait for AttestationService {
         // that serializes behind a per-backend Mutex and costs ~700 ms per call).
         let user_provided_nonce = nonce.clone();
 
-        // Generate a nonce for the gateway TDX quote if the caller didn't provide one.
-        let gateway_nonce = nonce.unwrap_or_else(|| {
-            let mut nonce_bytes = [0u8; 32];
-            OsRng.fill_bytes(&mut nonce_bytes);
-            let generated = nonce_bytes
-                .into_iter()
-                .map(|byte| format!("{byte:02x}"))
-                .collect::<String>();
-            tracing::debug!(
-                "No nonce provided for attestation report, generated nonce: {}",
-                generated
-            );
-            generated
-        });
-
-        let nonce_bytes = hex::decode(&gateway_nonce).map_err(|e| {
-            tracing::error!("Failed to decode nonce hex string: {}", e);
-            AttestationError::InvalidParameter(format!("Invalid nonce format: {e}"))
-        })?;
-
-        if nonce_bytes.len() != 32 {
-            return Err(AttestationError::InvalidParameter(format!(
-                "Nonce must be exactly 32 bytes, got {} bytes",
-                nonce_bytes.len()
-            )));
-        }
+        // Produce (gateway_nonce: String, nonce_bytes: Vec<u8>) in one pass:
+        // – caller-supplied nonce: validate hex, decode once.
+        // – auto-generated nonce: fill random bytes, hex-encode once (no round-trip).
+        let (gateway_nonce, nonce_bytes) = match nonce {
+            Some(n) => {
+                let bytes = hex::decode(&n).map_err(|e| {
+                    tracing::error!("Failed to decode nonce hex string: {}", e);
+                    AttestationError::InvalidParameter(format!("Invalid nonce format: {e}"))
+                })?;
+                if bytes.len() != 32 {
+                    return Err(AttestationError::InvalidParameter(format!(
+                        "Nonce must be exactly 32 bytes, got {} bytes",
+                        bytes.len()
+                    )));
+                }
+                (n, bytes)
+            }
+            None => {
+                let mut bytes = vec![0u8; 32];
+                OsRng.fill_bytes(&mut bytes);
+                let hex = hex::encode(&bytes);
+                tracing::debug!("No nonce provided for attestation report, generated nonce: {hex}");
+                (hex, bytes)
+            }
+        };
 
         // Determine which signing algorithm to use for report_data (default to ed25519)
         let algo = signing_algo

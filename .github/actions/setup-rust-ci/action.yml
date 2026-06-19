@@ -52,9 +52,11 @@ runs:
         TARBALL="mold-${MOLD_VERSION}-${TARBALL_ARCH}-linux.tar.gz"
         URL="https://github.com/rui314/mold/releases/download/v${MOLD_VERSION}/${TARBALL}"
         curl -fsSL "$URL" -o "/tmp/${TARBALL}"
-        sudo tar -xzf "/tmp/${TARBALL}" -C /usr/local --strip-components=2 "mold-${MOLD_VERSION}-${TARBALL_ARCH}-linux/bin/mold"
+        # Extract bin/mold from the tarball directly into /usr/local/bin.
+        sudo tar -xzf "/tmp/${TARBALL}" -C /usr/local/bin --strip-components=2 "mold-${MOLD_VERSION}-${TARBALL_ARCH}-linux/bin/mold"
         rm -f "/tmp/${TARBALL}"
         echo "Installed: $(mold --version)"
+        command -v mold
 
     - name: Cache Rust dependencies
       uses: swatinem/rust-cache@v2

@@ -1118,6 +1118,7 @@ impl crate::InferenceProvider for MockProvider {
         Ok(ChatCompletionResponseWithBytes {
             response,
             raw_bytes,
+            serving_tier: self.tier(),
         })
     }
 

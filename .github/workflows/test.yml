@@ -32,10 +32,19 @@ env:
   # no actions/cache step is needed.
   RUSTC_WRAPPER: sccache
   # Use the mold linker on Linux for much faster linking of the large test
-  # binaries (5-crate workspace, ~400 deps). Set via env var rather than in
-  # .cargo/config.toml so the Docker reproducible build (which copies
-  # .cargo/config.toml into the image) is unaffected and keeps using ld.
-  CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: mold
+  # binaries (5-crate workspace, ~400 deps). We pass -fuse-ld=mold through
+  # the default cc driver rather than setting mold as the linker directly,
+  # because mold is a linker, not a driver, and does not understand gcc
+  # driver flags like -m64.
+  #
+  # NOTE: Setting RUSTFLAGS here replaces the target.cfg.rustflags from
+  # .cargo/config.toml (cargo treats these as mutually exclusive sources).
+  # That is intentional for CI: the dropped flags (--remap-path-prefix,
+  # --build-id=none, --hash-style=gnu, --no-undefined) are reproducibility-
+  # only and irrelevant for tests. We keep -C debuginfo=0 for faster test
+  # compiles. The Docker reproducible build does not set RUSTFLAGS, so it
+  # keeps using the full .cargo/config.toml rustflags with ld.
+  RUSTFLAGS: "-C debuginfo=0 -C link-arg=-fuse-ld=mold"
 
 jobs:
   lint:

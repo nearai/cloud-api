@@ -747,6 +747,7 @@ impl ports::AttestationServiceTrait for AttestationService {
         nonce: Option<String>,
         signing_address: Option<String>,
         include_tls_fingerprint: bool,
+        provider_filter: Option<inference_providers::ProviderTier>,
     ) -> Result<AttestationReport, AttestationError> {
         // Track whether the caller supplied a nonce. Only caller-supplied nonces are
         // forwarded to inference-proxy: when None, inference-proxy can serve its
@@ -893,6 +894,7 @@ impl ports::AttestationServiceTrait for AttestationService {
                         user_provided_nonce,
                         signing_address,
                         include_tls_fingerprint,
+                        provider_filter,
                     )
                     .await
                     .map_err(|e| AttestationError::ProviderError(e.to_string()))

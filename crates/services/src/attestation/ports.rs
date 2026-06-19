@@ -2,6 +2,7 @@ use crate::attestation::models::{
     AttestationError, AttestationReport, ChatSignature, SignatureLookupResult,
 };
 use async_trait::async_trait;
+use inference_providers::ProviderTier;
 
 #[async_trait]
 pub trait AttestationServiceTrait: Send + Sync {
@@ -41,6 +42,10 @@ pub trait AttestationServiceTrait: Send + Sync {
         response_hash: String,
     ) -> Result<(), AttestationError>;
 
+    /// Fetch a hardware attestation report.
+    ///
+    /// `provider_filter`: when `Some`, only the matching trust tier is queried.
+    /// `None` keeps the existing behaviour (first successful provider wins).
     async fn get_attestation_report(
         &self,
         model: Option<String>,
@@ -48,6 +53,7 @@ pub trait AttestationServiceTrait: Send + Sync {
         nonce: Option<String>,
         signing_address: Option<String>,
         include_tls_fingerprint: bool,
+        provider_filter: Option<ProviderTier>,
     ) -> Result<AttestationReport, AttestationError>;
 
     /// Verify a VPC shared secret signature

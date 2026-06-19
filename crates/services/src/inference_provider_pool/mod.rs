@@ -1434,6 +1434,21 @@ impl InferenceProviderPool {
         mapping.get(chat_id).cloned()
     }
 
+    /// Return the trust tier of the provider that served a given streaming completion.
+    /// The pool stores a chat_id → provider mapping when a stream starts; callers
+    /// (e.g. the API route building response headers) can use this to know whether
+    /// the request was served by NEAR's own fleet or a Chutes fallback.
+    ///
+    /// Returns `None` if no mapping exists (e.g. stream failed before the first chunk
+    /// carried a chat_id).
+    pub async fn get_provider_tier_for_chat_id(
+        &self,
+        chat_id: &str,
+    ) -> Option<inference_providers::ProviderTier> {
+        let mapping = self.chat_id_mapping.read().await;
+        mapping.get(chat_id).map(|p| p.tier())
+    }
+
     /// Get providers with load balancing support
     ///
     /// This function handles provider selection based on model_id and optional model_pub_key:
@@ -2466,6 +2481,8 @@ impl InferenceProviderPool {
         }
     }
 
+    /// `provider_filter`: when `Some`, only providers whose `tier()` matches are
+    /// tried. `None` preserves the existing behaviour (first successful wins).
     pub async fn get_attestation_report(
         &self,
         model: String,
@@ -2473,11 +2490,25 @@ impl InferenceProviderPool {
         nonce: Option<String>,
         signing_address: Option<String>,
         include_tls_fingerprint: bool,
+        provider_filter: Option<inference_providers::ProviderTier>,
     ) -> Result<Vec<serde_json::Map<String, serde_json::Value>>, AttestationError> {
-        let providers = self
+        let all_providers = self
             .get_providers_for_model(&model)
             .await
             .ok_or_else(|| AttestationError::ProviderNotFound(model.clone()))?;
+
+        // Apply tier filter when requested.
+        let providers: Vec<_> = match provider_filter {
+            Some(tier) => all_providers
+                .into_iter()
+                .filter(|p| p.tier() == tier)
+                .collect(),
+            None => all_providers,
+        };
+
+        if providers.is_empty() {
+            return Err(AttestationError::ProviderNotFound(model));
+        }
 
         // Each inference_url points to a proxy that load-balances across CVMs.
         // All CVMs behind the proxy share the same signing key (derived from model

@@ -3630,7 +3630,7 @@ pub async fn get_performance_timeseries(
 pub struct RevenueDensityParams {
     pub start: Option<String>,
     pub end: Option<String>,
-    /// Optional provider type filter (e.g. "nearai", "external").
+    /// Optional provider type filter (e.g. "vllm", "external", "chutes").
     pub provider_type: Option<String>,
 }
 

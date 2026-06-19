@@ -858,7 +858,7 @@ pub async fn init_inference_providers(
     match models_source.fetch_inference_url_models().await {
         Ok(models) if !models.is_empty() => {
             tracing::info!(count = models.len(), "Loading inference_url models");
-            pool.load_inference_url_models(models).await;
+            pool.load_inference_url_models(models, false).await;
         }
         Ok(_) => {
             tracing::info!("No inference_url models found in database");

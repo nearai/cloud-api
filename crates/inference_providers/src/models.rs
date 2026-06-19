@@ -670,6 +670,11 @@ pub struct ChatCompletionResponseWithBytes {
     /// For external backends, `raw_bytes` are the bytes of our synthesized response,
     /// not the original provider HTTP body.
     pub raw_bytes: Vec<u8>,
+
+    /// Which trust tier served this completion.
+    /// Populated by each provider implementation so callers can surface it as an
+    /// `x-serving-provider` response header without reaching back into the pool.
+    pub serving_tier: crate::ProviderTier,
 }
 
 /// Choice in a complete (non-streaming) chat completion response

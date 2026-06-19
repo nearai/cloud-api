@@ -1,0 +1,63 @@
+name: 'Setup Rust CI'
+description: |
+  Sets up the Rust toolchain, sccache, the mold linker, cargo-nextest, and the
+  swatinem/rust-cache. Used by every job in test.yml to share setup logic and
+  to avoid apt lock contention from parallel jobs installing mold on the same
+  self-hosted runner.
+
+  Mold is installed via GitHub release binary (not apt) so concurrent jobs do
+  not contend on dpkg locks. It is placed on PATH at /usr/local/bin/mold.
+
+inputs:
+  cache-key:
+    description: 'Suffix for the swatinem/rust-cache key (per-job isolation).'
+    required: true
+  components:
+    description: 'Extra Rust components (e.g. "rustfmt, clippy").'
+    required: false
+    default: ''
+
+runs:
+  using: composite
+  steps:
+    - name: Install Rust
+      uses: actions-rust-lang/setup-rust-toolchain@v1
+      with:
+        components: ${{ inputs.components }}
+
+    - name: Install cargo-nextest
+      uses: taiki-e/install-action@nextest
+
+    - name: Install sccache
+      uses: taiki-e/install-action@v2
+      with:
+        tool: sccache
+
+    - name: Install mold linker
+      shell: bash
+      run: |
+        # Install mold via release binary to avoid dpkg lock contention when
+        # multiple jobs run in parallel on the same self-hosted runner.
+        if command -v mold >/dev/null 2>&1; then
+          echo "mold already installed: $(mold --version)"
+          exit 0
+        fi
+        MOLD_VERSION=2.41.0
+        ARCH=$(uname -m)
+        case "$ARCH" in
+          x86_64) TARBALL_ARCH=x86_64 ;;
+          aarch64) TARBALL_ARCH=aarch64 ;;
+          *) echo "Unsupported arch for mold: $ARCH" >&2; exit 1 ;;
+        esac
+        TARBALL="mold-${MOLD_VERSION}-${TARBALL_ARCH}-linux.tar.gz"
+        URL="https://github.com/rui314/mold/releases/download/v${MOLD_VERSION}/${TARBALL}"
+        curl -fsSL "$URL" -o "/tmp/${TARBALL}"
+        sudo tar -xzf "/tmp/${TARBALL}" -C /usr/local --strip-components=2 "mold-${MOLD_VERSION}-${TARBALL_ARCH}-linux/bin/mold"
+        rm -f "/tmp/${TARBALL}"
+        echo "Installed: $(mold --version)"
+
+    - name: Cache Rust dependencies
+      uses: swatinem/rust-cache@v2
+      with:
+        cache-on-failure: true
+        key: ${{ inputs.cache-key }}

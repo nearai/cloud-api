@@ -38,7 +38,13 @@ runs:
       run: |
         # Install mold via release binary to avoid dpkg lock contention when
         # multiple jobs run in parallel on the same self-hosted runner.
-        if command -v mold >/dev/null 2>&1; then
+        #
+        # We install both `mold` and `ld.mold`. Rustc invokes the cc driver
+        # with -fuse-ld=mold (set via RUSTFLAGS in test.yml), which makes cc
+        # look for `ld.mold` on PATH. Rustc also passes its own
+        # -fuse-ld=lld + a -B path to its bundled lld; the last -fuse-ld
+        # flag wins, so -fuse-ld=mold takes effect and cc finds ld.mold.
+        if command -v mold >/dev/null 2>&1 && [ -x /usr/local/bin/ld.mold ]; then
           echo "mold already installed: $(mold --version)"
           exit 0
         fi
@@ -52,11 +58,13 @@ runs:
         TARBALL="mold-${MOLD_VERSION}-${TARBALL_ARCH}-linux.tar.gz"
         URL="https://github.com/rui314/mold/releases/download/v${MOLD_VERSION}/${TARBALL}"
         curl -fsSL "$URL" -o "/tmp/${TARBALL}"
-        # Extract bin/mold from the tarball directly into /usr/local/bin.
-        sudo tar -xzf "/tmp/${TARBALL}" -C /usr/local/bin --strip-components=2 "mold-${MOLD_VERSION}-${TARBALL_ARCH}-linux/bin/mold"
+        # Extract both mold and ld.mold into /usr/local/bin.
+        sudo tar -xzf "/tmp/${TARBALL}" -C /usr/local/bin --strip-components=2 \
+          "mold-${MOLD_VERSION}-${TARBALL_ARCH}-linux/bin/mold" \
+          "mold-${MOLD_VERSION}-${TARBALL_ARCH}-linux/bin/ld.mold"
         rm -f "/tmp/${TARBALL}"
         echo "Installed: $(mold --version)"
-        command -v mold
+        echo "ld.mold at: $(command -v ld.mold)"
 
     - name: Cache Rust dependencies
       uses: swatinem/rust-cache@v2

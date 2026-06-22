@@ -228,6 +228,49 @@ async fn test_responses_partial_output_then_stream_error_429_non_streaming() {
     assert_eq!(err.error.r#type, "rate_limit_exceeded");
 }
 
+/// Test that the Responses API returns HTTP 429 with `type=service_overloaded`
+/// when all inference backends are exhausted — mirrors the chat completions path
+/// in `test_provider_error_503_propagated` and covers the mapping in
+/// `crates/services/src/responses/errors.rs`.
+#[tokio::test]
+async fn test_responses_service_overloaded_returns_429() {
+    let (server, _pool, mock_provider, _db) = setup_test_server_with_pool().await;
+    setup_qwen_model(&server).await;
+    let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
+    let api_key = get_api_key_for_org(&server, org.id).await;
+
+    mock_provider
+        .set_error_override(Some(inference_providers::CompletionError::HttpError {
+            status_code: 503,
+            message: "GPU out of memory".to_string(),
+            is_external: false,
+        }))
+        .await;
+
+    let response = server
+        .post("/v1/responses")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .json(&responses_request(
+            "Qwen/Qwen3-30B-A3B-Instruct-2507",
+            false,
+        ))
+        .await;
+
+    assert_eq!(
+        response.status_code(),
+        429,
+        "Responses API: expected 429 (all backends overloaded), got {}",
+        response.status_code()
+    );
+
+    let err = response.json::<api::models::ErrorResponse>();
+    assert_eq!(
+        err.error.r#type, "service_overloaded",
+        "Responses API: overloaded error should carry type=service_overloaded, got {}",
+        err.error.r#type
+    );
+}
+
 /// Test that initial inference failures in non-streaming Responses API surface
 /// as HTTP errors rather than fallback ResponseObjects with status=failed.
 #[tokio::test]

@@ -30,7 +30,7 @@ async fn get_admin_user_by_id(
         .await
     {
         Ok(user) => {
-            debug!("Found admin user: {}", user.email);
+            debug!(admin_user_id = %user.id, "Found admin user");
             Ok(convert_user_to_db_user(user))
         }
         Err(_) => {
@@ -58,10 +58,13 @@ pub async fn auth_middleware_with_api_key(
         .get("authorization")
         .and_then(|h| h.to_str().ok());
 
-    tracing::debug!("Auth API KEY middleware: {:?}", auth_header);
+    tracing::debug!(
+        authorization_present = auth_header.is_some(),
+        "Auth API KEY middleware"
+    );
 
     let auth_result = if let Some(auth_value) = auth_header {
-        debug!("Found Authorization header: {}", auth_value);
+        debug!("Found Authorization header");
         if let Some(token) = auth_value.strip_prefix("Bearer ") {
             authenticate_api_key(&state, token).await
         } else {
@@ -87,7 +90,7 @@ pub async fn auth_middleware_with_api_key(
     match auth_result {
         Ok(api_key) => {
             // Clone request to add extension
-            debug!("Adding API key to request: {:?}", api_key);
+            debug!(api_key_id = %api_key.id.0, "Adding API key to request");
             let mut request = request;
             request.extensions_mut().insert(api_key);
             Ok(next.run(request).await)
@@ -107,10 +110,13 @@ pub async fn auth_middleware_with_workspace_context(
         .get("authorization")
         .and_then(|h| h.to_str().ok());
 
-    tracing::debug!("Auth API KEY with workspace middleware: {:?}", auth_header);
+    tracing::debug!(
+        authorization_present = auth_header.is_some(),
+        "Auth API KEY with workspace middleware"
+    );
 
     let auth_result = if let Some(auth_value) = auth_header {
-        debug!("Found Authorization header: {}", auth_value);
+        debug!("Found Authorization header");
         if let Some(token) = auth_value.strip_prefix("Bearer ") {
             authenticate_api_key_with_context(&state, token).await
         } else {
@@ -157,14 +163,14 @@ pub async fn auth_middleware(
         .and_then(|h| h.to_str().ok());
 
     tracing::debug!(
-        "Auth middleware (session access token only): {:?}",
-        auth_header
+        authorization_present = auth_header.is_some(),
+        "Auth middleware (session access token only)"
     );
 
     let auth_result = if let Some(auth_value) = auth_header {
-        debug!("Found Authorization header: {}", auth_value);
+        debug!("Found Authorization header");
         if let Some(token) = auth_value.strip_prefix("Bearer ") {
-            debug!("Extracted Bearer token: {}", token);
+            debug!("Extracted Bearer token");
             authenticate_session_access(&state, token.to_string()).await
         } else {
             debug!("Authorization header does not start with 'Bearer '");
@@ -216,19 +222,26 @@ pub async fn admin_middleware(
         .and_then(|h| h.to_str().ok())
         .map(|s| s.to_string());
 
-    tracing::debug!("Admin auth middleware: {:?}", auth_header);
+    tracing::debug!(
+        authorization_present = auth_header.is_some(),
+        "Admin auth middleware"
+    );
 
     let auth_result = if let Some(auth_value) = auth_header {
-        debug!("Found Authorization header: {}", auth_value);
+        debug!("Found Authorization header");
         if let Some(token) = auth_value.strip_prefix("Bearer ") {
-            debug!("Extracted Bearer token for admin auth: {}", token);
+            debug!("Extracted Bearer token for admin auth");
 
             // Check if this looks like an admin access token (starts with "adm_")
             // Admin access tokens should ONLY be validated as admin tokens, no fallback
             if token.starts_with("adm_") {
                 match authenticate_admin_access_token(&state, token, user_agent.as_deref()).await {
                     Ok(admin_token) => {
-                        debug!("Authenticated via admin access token: {}", admin_token.name);
+                        debug!(
+                            admin_access_token_id = %admin_token.id,
+                            authenticated = true,
+                            "Authenticated via admin access token"
+                        );
 
                         // Check if this is an admin access token management endpoint
                         let path = request.uri().path();
@@ -249,8 +262,10 @@ pub async fn admin_middleware(
                         match get_admin_user_by_id(&state, admin_token.created_by_user_id).await {
                             Ok(admin_user) => {
                                 debug!(
-                                    "Retrieved admin user: {} for access token: {}",
-                                    admin_user.email, admin_token.name
+                                    admin_user_id = %admin_user.id,
+                                    admin_access_token_id = %admin_token.id,
+                                    authenticated = true,
+                                    "Retrieved admin user for access token"
                                 );
                                 Ok(admin_user)
                             }
@@ -314,10 +329,7 @@ pub async fn admin_middleware(
                 ));
             }
 
-            debug!(
-                "Admin access granted for user: {} ({})",
-                user.id, user.email
-            );
+            debug!(admin_user_id = %user.id, authenticated = true, "Admin access granted");
 
             // Add both AuthenticatedUser and AdminUser extensions
             let mut request = request;
@@ -357,7 +369,7 @@ async fn authenticate_admin_access_token(
     database::models::AdminAccessToken,
     (StatusCode, axum::Json<crate::models::ErrorResponse>),
 > {
-    debug!("Authenticating admin access token: {}", token);
+    debug!("Authenticating admin access token");
 
     match state
         .admin_access_token_repository
@@ -366,8 +378,9 @@ async fn authenticate_admin_access_token(
     {
         Ok(Some(admin_token)) => {
             debug!(
-                "Admin access token validated successfully: {}",
-                admin_token.name
+                admin_access_token_id = %admin_token.id,
+                validated = true,
+                "Admin access token validated successfully"
             );
             Ok(admin_token)
         }
@@ -398,7 +411,7 @@ async fn authenticate_session_access(
     state: &AuthState,
     token: String, // jwt
 ) -> Result<DbUser, (StatusCode, axum::Json<crate::models::ErrorResponse>)> {
-    debug!("Authenticating session access token: {}", token);
+    debug!("Authenticating session access token");
     // Use auth service
 
     let auth_service = &state.auth_service;
@@ -409,7 +422,7 @@ async fn authenticate_session_access(
             .await
         {
             Ok(user) => {
-                debug!("Authenticated user {} via session", user.email);
+                debug!(user_id = %user.id.0, authenticated = true, "Authenticated user via session");
                 return Ok(convert_user_to_db_user(user));
             }
             Err(AuthError::SessionNotFound) | Err(AuthError::UserNotFound) => {
@@ -458,15 +471,15 @@ pub async fn refresh_middleware(
         .and_then(|h| h.to_str().ok());
 
     tracing::debug!(
-        "Auth middleware (refresh token): refresh token: {:?}, user agent: {:?}",
-        auth_header,
-        user_agent
+        authorization_present = auth_header.is_some(),
+        user_agent_present = user_agent.is_some(),
+        "Auth middleware (refresh token)"
     );
 
     let auth_result = if let Some(auth_value) = auth_header {
-        debug!("Found Authorization header: {}", auth_value);
+        debug!("Found Authorization header");
         if let Some(token) = auth_value.strip_prefix("Bearer ") {
-            debug!("Extracted Bearer token: {}", token);
+            debug!("Extracted Bearer token");
             if let Some(user_agent_value) = user_agent {
                 authenticate_session_refresh(
                     &state,
@@ -505,7 +518,7 @@ async fn authenticate_session_refresh(
     token: SessionToken,
     user_agent: &str,
 ) -> Result<(services::auth::Session, DbUser), StatusCode> {
-    debug!("Authenticating session refresh token: {}", token);
+    debug!("Authenticating session refresh token");
     // Use auth service to validate session with refresh token and user agent
     {
         let auth_service = &state.auth_service;
@@ -515,7 +528,7 @@ async fn authenticate_session_refresh(
             .await
         {
             Ok((session, user)) => {
-                debug!("Authenticated user {} via session", user.email);
+                debug!(user_id = %user.id.0, authenticated = true, "Authenticated user via session");
                 return Ok((session, convert_user_to_db_user(user)));
             }
             Err(AuthError::SessionNotFound) | Err(AuthError::UserNotFound) => {
@@ -540,11 +553,11 @@ async fn authenticate_api_key(
     api_key: &str,
 ) -> Result<services::workspace::ApiKey, (StatusCode, axum::Json<crate::models::ErrorResponse>)> {
     let auth_service = &state.auth_service;
-    debug!("Calling auth service to validate API key: {}", api_key);
+    debug!("Calling auth service to validate API key");
 
     match auth_service.validate_api_key(api_key.to_string()).await {
         Ok(api_key) => {
-            debug!("Authenticated via API key: {:?}", api_key);
+            debug!(api_key_id = %api_key.id.0, "Authenticated via API key");
             Ok(api_key)
         }
         Err(AuthError::Unauthorized) => {
@@ -604,8 +617,8 @@ async fn authenticate_api_key_with_context(
     {
         Ok(Some((workspace, organization))) => {
             debug!(
-                "Resolved workspace: {} and organization: {} for API key",
-                workspace.name, organization.name
+                "Resolved workspace_id={} organization_id={} workspace_active={} organization_active={} for API key",
+                workspace.id, organization.id, workspace.is_active, organization.is_active
             );
             Ok(AuthenticatedApiKey {
                 api_key: validated_api_key,

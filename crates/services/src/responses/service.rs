@@ -31,6 +31,7 @@ struct ProcessStreamContext {
     request: models::CreateResponseRequest,
     user_id: crate::UserId,
     api_key_id: String,
+    request_id: uuid::Uuid,
     organization_id: uuid::Uuid,
     workspace_id: uuid::Uuid,
     body_hash: String,
@@ -141,6 +142,7 @@ impl ports::ResponseServiceTrait for ResponseServiceImpl {
         request: models::CreateResponseRequest,
         user_id: crate::UserId,
         api_key_id: String,
+        request_id: uuid::Uuid,
         organization_id: uuid::Uuid,
         workspace_id: uuid::Uuid,
         body_hash: String,
@@ -210,6 +212,7 @@ impl ports::ResponseServiceTrait for ResponseServiceImpl {
                 request,
                 user_id,
                 api_key_id,
+                request_id,
                 organization_id,
                 workspace_id,
                 body_hash,
@@ -1011,6 +1014,7 @@ impl ResponseServiceImpl {
             &context.request,
             context.user_id.clone(),
             context.api_key_id.clone(),
+            context.request_id,
             context.organization_id,
             context.workspace_id,
             context.conversation_service.clone(),
@@ -1396,7 +1400,7 @@ impl ResponseServiceImpl {
 
             // Create completion request (names not included - tracked via database analytics)
             let completion_request = CompletionRequest {
-                request_id: uuid::Uuid::new_v4(),
+                request_id: process_context.request_id,
                 model: process_context.request.model.clone(),
                 messages: messages.clone(),
                 max_tokens: process_context.request.max_output_tokens,
@@ -2820,6 +2824,7 @@ impl ResponseServiceImpl {
         request: &models::CreateResponseRequest,
         user_id: crate::UserId,
         api_key_id: String,
+        request_id: uuid::Uuid,
         organization_id: uuid::Uuid,
         workspace_id: uuid::Uuid,
         conversation_service: Arc<dyn ConversationServiceTrait>,
@@ -2890,6 +2895,7 @@ impl ResponseServiceImpl {
                 user_id,
                 user_message,
                 api_key_id,
+                request_id,
                 organization_id,
                 workspace_id,
                 conversation_service,
@@ -2909,6 +2915,7 @@ impl ResponseServiceImpl {
         user_id: crate::UserId,
         user_message: String,
         api_key_id: String,
+        request_id: uuid::Uuid,
         organization_id: uuid::Uuid,
         workspace_id: uuid::Uuid,
         conversation_service: Arc<dyn ConversationServiceTrait>,
@@ -2960,7 +2967,7 @@ impl ResponseServiceImpl {
         let title_model = std::env::var("TITLE_GENERATION_MODEL")
             .unwrap_or_else(|_| "Qwen/Qwen3-30B-A3B-Instruct-2507".to_string());
         let completion_request = crate::completions::ports::CompletionRequest {
-            request_id: uuid::Uuid::new_v4(),
+            request_id,
             model: title_model,
             messages: vec![crate::completions::ports::CompletionMessage {
                 role: "user".to_string(),

@@ -1693,14 +1693,14 @@ async fn test_high_context_length_completion() {
 
         // Common acceptable errors:
         // - Model not found (404)
+        // - All backends overloaded (429 service_overloaded) — retry_with_fallback exhausted
         // - Model not available (503) — narrow per-handler dependency-down case
-        // - All backends overloaded (529) — retry_with_fallback exhausted
         assert!(
             response.status_code() == 404
+                || response.status_code() == 429
                 || response.status_code() == 503
-                || response.status_code() == 529
                 || response.status_code() == 500,
-            "Expected 200, 404, 500, 503, or 529, got: {}",
+            "Expected 200, 404, 429, 500, or 503, got: {}",
             response.status_code()
         );
 

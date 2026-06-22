@@ -6,11 +6,22 @@ use crate::common::*;
 use inference_providers::StreamChunk;
 use serde_json::json;
 use services::usage::compute_token_cost;
+use std::sync::OnceLock;
+
+static DEV_ENV: OnceLock<()> = OnceLock::new();
+
+fn ensure_usage_chat_completions_env() {
+    DEV_ENV.get_or_init(|| {
+        std::env::set_var("DEV", "1");
+        std::env::set_var("BRAVE_SEARCH_PRO_API_KEY", "request-id-contract-test");
+    });
+}
 
 /// Call chat/completions (non-streaming), assert usage in response, then verify org usage
 /// history contains a matching entry (including cache_read_tokens).
 #[tokio::test]
 async fn test_chat_completions_records_usage_and_history() {
+    ensure_usage_chat_completions_env();
     let server = setup_test_server().await;
 
     setup_qwen_model(&server).await;
@@ -124,6 +135,7 @@ async fn test_chat_completions_records_usage_and_history() {
 /// for attested models to preserve provider signatures; billing capture must remain independent.
 #[tokio::test]
 async fn test_chat_completions_stream_records_usage_in_history() {
+    ensure_usage_chat_completions_env();
     let server = setup_test_server().await;
 
     setup_qwen_model(&server).await;
@@ -342,6 +354,7 @@ async fn test_chat_completions_stream_include_usage_false_emits_usage_null_in_al
 
 #[tokio::test]
 async fn test_chat_completions_stream_include_usage_true_emits_final_usage_only() {
+    ensure_usage_chat_completions_env();
     let server = setup_test_server().await;
 
     setup_qwen_model(&server).await;
@@ -409,6 +422,7 @@ async fn test_chat_completions_stream_include_usage_true_emits_final_usage_only(
 
 #[tokio::test]
 async fn test_chat_completions_stream_error_does_not_emit_final_usage() {
+    ensure_usage_chat_completions_env();
     let (server, _pool, mock_provider, _db) = setup_test_server_with_pool().await;
 
     mock_provider
@@ -485,6 +499,7 @@ async fn test_chat_completions_stream_error_does_not_emit_final_usage() {
 /// we assert equality without clamping in the test.
 #[tokio::test]
 async fn test_chat_completions_with_cache_records_cache_in_history() {
+    ensure_usage_chat_completions_env();
     let (server, _pool, mock_provider, _db) = setup_test_server_with_pool().await;
 
     let message = "hello world";
@@ -552,6 +567,7 @@ async fn test_chat_completions_with_cache_records_cache_in_history() {
 /// Stream version: cache based on provider token estimate; assert equality without clamping.
 #[tokio::test]
 async fn test_chat_completions_stream_with_cache_records_cache_in_history() {
+    ensure_usage_chat_completions_env();
     let (server, _pool, mock_provider, _db) = setup_test_server_with_pool().await;
 
     let message = "hello world";

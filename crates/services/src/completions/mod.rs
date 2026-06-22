@@ -17,6 +17,7 @@ use futures_util::{Future, Stream};
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
+use tracing::Instrument;
 
 const FINALIZE_TIMEOUT_SECS: u64 = 5;
 const DEEPSEEK_V4_FLASH_MODEL: &str = "deepseek-ai/DeepSeek-V4-Flash";
@@ -262,81 +263,95 @@ where
         let mut metric_tags = self.metric_tags.clone();
         metric_tags.push(format!("{TAG_INPUT_BUCKET}:{input_bucket}"));
 
-        // Spawn critical billing operations on blocking thread pool with timeout
+        // Spawn critical billing operations on blocking thread pool with timeout.
         // The tokio runtime waits for blocking tasks during graceful shutdown,
-        // which helps prevent data loss compared to regular spawn
+        // which helps prevent data loss compared to regular spawn.
         let handle_clone = handle.clone();
         handle.spawn_blocking(move || {
-            let _span_guard = span.enter();
-            handle_clone.block_on(async move {
-                let result = tokio::time::timeout(Duration::from_secs(2), async move {
-                    let stop_reason = if let Some(ref err) = last_error {
-                        Some(crate::usage::StopReason::from_completion_error(err))
-                    } else if !stream_completed {
-                        Some(crate::usage::StopReason::ClientDisconnect)
-                    } else if let Some(ref finish_reason) = last_finish_reason {
-                        Some(crate::usage::StopReason::from_provider_finish_reason(
-                            finish_reason,
-                        ))
-                    } else {
-                        Some(crate::usage::StopReason::Completed)
-                    };
+            handle_clone.block_on(
+                async move {
+                    let result = tokio::time::timeout(Duration::from_secs(2), async move {
+                        let stop_reason = if let Some(ref err) = last_error {
+                            Some(crate::usage::StopReason::from_completion_error(err))
+                        } else if !stream_completed {
+                            Some(crate::usage::StopReason::ClientDisconnect)
+                        } else if let Some(ref finish_reason) = last_finish_reason {
+                            Some(crate::usage::StopReason::from_provider_finish_reason(
+                                finish_reason,
+                            ))
+                        } else {
+                            Some(crate::usage::StopReason::Completed)
+                        };
 
-                    if usage_service
-                        .record_usage(RecordUsageServiceRequest {
-                            organization_id,
-                            workspace_id,
-                            api_key_id,
-                            model_id,
-                            input_tokens,
-                            output_tokens,
-                            cache_read_tokens,
-                            inference_type,
-                            ttft_ms,
-                            avg_itl_ms,
-                            inference_id: Some(inference_id),
-                            provider_request_id: Some(chat_id),
-                            stop_reason,
-                            response_id,
-                            image_count: None,
-                        })
-                        .await
-                        .is_err()
-                    {
-                        tracing::error!("Failed to record usage");
-                    }
+                        if usage_service
+                            .record_usage(RecordUsageServiceRequest {
+                                organization_id,
+                                workspace_id,
+                                api_key_id,
+                                model_id,
+                                input_tokens,
+                                output_tokens,
+                                cache_read_tokens,
+                                inference_type,
+                                ttft_ms,
+                                avg_itl_ms,
+                                inference_id: Some(inference_id),
+                                provider_request_id: Some(chat_id),
+                                stop_reason,
+                                response_id,
+                                image_count: None,
+                            })
+                            .await
+                            .is_err()
+                        {
+                            tracing::error!("Failed to record usage");
+                        }
 
-                    // Record metrics
-                    let tags: Vec<&str> = metric_tags.iter().map(|s| s.as_str()).collect();
-                    metrics_service.record_latency(METRIC_LATENCY_TOTAL, e2e_duration, &tags);
+                        // Record metrics
+                        let tags: Vec<&str> = metric_tags.iter().map(|s| s.as_str()).collect();
+                        metrics_service.record_latency(METRIC_LATENCY_TOTAL, e2e_duration, &tags);
 
-                    if let Some(first_token_instant) = first_token_time {
-                        let decoding_duration = first_token_instant.elapsed();
-                        metrics_service.record_latency(
-                            METRIC_LATENCY_DECODING_TIME,
-                            decoding_duration,
+                        if let Some(first_token_instant) = first_token_time {
+                            let decoding_duration = first_token_instant.elapsed();
+                            metrics_service.record_latency(
+                                METRIC_LATENCY_DECODING_TIME,
+                                decoding_duration,
+                                &tags,
+                            );
+
+                            let decode_secs = decoding_duration.as_secs_f64();
+                            if decode_secs > 0.0 {
+                                let tps = output_tokens as f64 / decode_secs;
+                                metrics_service.record_histogram(
+                                    METRIC_TOKENS_PER_SECOND,
+                                    tps,
+                                    &tags,
+                                );
+                            }
+                        }
+
+                        metrics_service.record_count(
+                            METRIC_TOKENS_INPUT,
+                            input_tokens as i64,
                             &tags,
                         );
+                        metrics_service.record_count(
+                            METRIC_TOKENS_OUTPUT,
+                            output_tokens as i64,
+                            &tags,
+                        );
+                    })
+                    .await;
 
-                        let decode_secs = decoding_duration.as_secs_f64();
-                        if decode_secs > 0.0 {
-                            let tps = output_tokens as f64 / decode_secs;
-                            metrics_service.record_histogram(METRIC_TOKENS_PER_SECOND, tps, &tags);
-                        }
+                    if result.is_err() {
+                        tracing::error!(
+                            "Timeout recording usage and metrics (2s exceeded), inference_id={}",
+                            inference_id
+                        );
                     }
-
-                    metrics_service.record_count(METRIC_TOKENS_INPUT, input_tokens as i64, &tags);
-                    metrics_service.record_count(METRIC_TOKENS_OUTPUT, output_tokens as i64, &tags);
-                })
-                .await;
-
-                if result.is_err() {
-                    tracing::error!(
-                        "Timeout recording usage and metrics (2s exceeded), inference_id={}",
-                        inference_id
-                    );
                 }
-            })
+                .instrument(span),
+            )
         });
     }
 }
@@ -1172,6 +1187,7 @@ impl CompletionServiceImpl {
         }
     }
 
+    // CLIPPY-ALLOW: InterceptStream construction needs the full tracing, billing, timing, and concurrency context at one ownership boundary.
     #[allow(clippy::too_many_arguments)]
     async fn handle_stream_with_context(
         &self,

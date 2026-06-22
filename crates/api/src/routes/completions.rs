@@ -1,5 +1,5 @@
 use crate::{
-    middleware::{auth::AuthenticatedApiKey, RequestBodyHash},
+    middleware::{auth::AuthenticatedApiKey, RequestBodyHash, RequestCorrelation},
     models::*,
     routes::{
         api::AppState,
@@ -79,6 +79,16 @@ fn insert_encryption_headers(
             serde_json::Value::String(encrypt_all_fields.clone()),
         );
     }
+}
+
+fn insert_request_id_header(
+    correlation: RequestCorrelation,
+    extra: &mut std::collections::HashMap<String, serde_json::Value>,
+) {
+    extra.insert(
+        "x_request_id".to_string(),
+        serde_json::Value::String(correlation.request_id.to_string()),
+    );
 }
 
 // Custom header for exposing the inference ID as a UUID
@@ -1296,6 +1306,7 @@ pub async fn chat_completions(
     State(app_state): State<AppState>,
     Extension(api_key): Extension<AuthenticatedApiKey>,
     Extension(body_hash): Extension<RequestBodyHash>,
+    Extension(correlation): Extension<RequestCorrelation>,
     headers: header::HeaderMap,
     OpenAiJson(request): OpenAiJson<ChatCompletionRequest>,
 ) -> axum::response::Response {
@@ -1312,14 +1323,7 @@ pub async fn chat_completions(
         return (StatusCode::BAD_REQUEST, ResponseJson(error)).into_response();
     }
 
-    // Generate a per-request correlation ID. Reuse the client's X-Request-Id if
-    // present and parseable as a UUID; otherwise generate a fresh one. This ID
-    // propagates downstream as X-Request-Id on every outbound inference call.
-    let request_id = headers
-        .get("x-request-id")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| Uuid::parse_str(s).ok())
-        .unwrap_or_else(Uuid::new_v4);
+    let request_id = correlation.request_id;
 
     // Create a span carrying correlation IDs so every log line within this
     // request carries request_id/org_id/workspace_id in Datadog.
@@ -1739,12 +1743,48 @@ async fn chat_completions_inner(
                                         );
                                         "{}".to_string()
                                     });
-                                    // Do not log json_data: it contains AI response content
-                                    // (text deltas) which must never appear in logs even at
-                                    // debug level (CLAUDE.md logging policy). The
-                                    // re-serialization path is reached by non-attested models
-                                    // when strip_intermediate_usage is active, so user message
-                                    // context can be reflected back in these chunks.
+                                    let (
+                                        serialized_chunk_len,
+                                        choices_count,
+                                        finish_reason_count,
+                                        usage_present,
+                                    ) = match &chunk {
+                                        inference_providers::StreamChunk::Chat(chat) => (
+                                            json_data.len(),
+                                            chat.choices.len(),
+                                            chat.choices
+                                                .iter()
+                                                .filter(|choice| choice.finish_reason.is_some())
+                                                .count(),
+                                            chat.usage.is_some(),
+                                        ),
+                                        inference_providers::StreamChunk::Text(text) => (
+                                            json_data.len(),
+                                            text.choices.len(),
+                                            text.choices
+                                                .iter()
+                                                .filter(|choice| choice.finish_reason.is_some())
+                                                .count(),
+                                            text.usage.is_some(),
+                                        ),
+                                    };
+                                    // Suppress per-chunk debug logging when
+                                    // auto_redact is enabled: the chunk now
+                                    // holds the user's original PII (we just
+                                    // un-redacted it). Logging it would
+                                    // defeat the privacy guarantee at debug.
+                                    if !auto_redact_enabled {
+                                        tracing::debug!(
+                                            %request_id,
+                                            serialized_chunk_len,
+                                            choices_count,
+                                            has_choices = choices_count > 0,
+                                            finish_reason_count,
+                                            has_finish_reason = finish_reason_count > 0,
+                                            usage_present,
+                                            "Completion stream event serialized"
+                                        );
+                                    }
                                     // Format as SSE event with proper newlines
                                     let sse_bytes = Bytes::from(format!("data: {json_data}\n\n"));
                                     if gateway_signature_enabled {
@@ -2126,6 +2166,7 @@ pub async fn completions(
     State(app_state): State<AppState>,
     Extension(api_key): Extension<AuthenticatedApiKey>,
     Extension(body_hash): Extension<RequestBodyHash>,
+    Extension(correlation): Extension<RequestCorrelation>,
     headers: header::HeaderMap,
     OpenAiJson(request): OpenAiJson<CompletionRequest>,
 ) -> axum::response::Response {
@@ -2143,13 +2184,7 @@ pub async fn completions(
         return (StatusCode::BAD_REQUEST, ResponseJson(error)).into_response();
     }
 
-    // Per-request correlation ID: reuse the client's X-Request-Id if present and
-    // parseable as a UUID, otherwise generate one. Matches chat_completions.
-    let request_id = headers
-        .get("x-request-id")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| Uuid::parse_str(s).ok())
-        .unwrap_or_else(Uuid::new_v4);
+    let request_id = correlation.request_id;
 
     // See chat_completions: do NOT span.enter() in async code; .instrument() the
     // inner future so the span wraps every await without leaking across tasks.
@@ -4083,6 +4118,7 @@ pub async fn image_generations(
     State(app_state): State<AppState>,
     Extension(api_key): Extension<AuthenticatedApiKey>,
     Extension(body_hash): Extension<RequestBodyHash>,
+    Extension(correlation): Extension<RequestCorrelation>,
     headers: header::HeaderMap,
     OpenAiJson(request): OpenAiJson<crate::models::ImageGenerationRequest>,
 ) -> axum::response::Response {
@@ -4172,6 +4208,7 @@ pub async fn image_generations(
     // Convert API request to provider params
     let mut extra = std::collections::HashMap::new();
     insert_encryption_headers(&encryption_headers, &mut extra);
+    insert_request_id_header(correlation, &mut extra);
 
     let params = inference_providers::ImageGenerationParams {
         model: request.model.clone(),
@@ -4337,6 +4374,7 @@ pub async fn audio_transcriptions(
     State(app_state): State<AppState>,
     Extension(api_key): Extension<AuthenticatedApiKey>,
     Extension(body_hash): Extension<RequestBodyHash>,
+    Extension(correlation): Extension<RequestCorrelation>,
     headers: header::HeaderMap,
     mut multipart: Multipart,
 ) -> axum::response::Response {
@@ -4498,6 +4536,7 @@ pub async fn audio_transcriptions(
     // Convert API request to provider params
     let mut extra = std::collections::HashMap::new();
     insert_encryption_headers(&encryption_headers, &mut extra);
+    insert_request_id_header(correlation, &mut extra);
 
     let requested_response_format = request.response_format.clone();
     let provider_response_format = match requested_response_format.as_deref() {
@@ -5235,6 +5274,7 @@ pub async fn rerank(
     State(app_state): State<AppState>,
     Extension(api_key): Extension<AuthenticatedApiKey>,
     Extension(_body_hash): Extension<RequestBodyHash>,
+    Extension(correlation): Extension<RequestCorrelation>,
     headers: header::HeaderMap,
     OpenAiJson(request): OpenAiJson<crate::models::RerankRequest>,
 ) -> axum::response::Response {
@@ -5297,6 +5337,7 @@ pub async fn rerank(
     // Convert API request to provider params
     let mut extra = std::collections::HashMap::new();
     insert_encryption_headers(&encryption_headers, &mut extra);
+    insert_request_id_header(correlation, &mut extra);
 
     let params = inference_providers::RerankParams {
         model: request.model.clone(),
@@ -5580,6 +5621,7 @@ pub async fn embeddings(
     State(app_state): State<AppState>,
     Extension(api_key): Extension<AuthenticatedApiKey>,
     Extension(_body_hash): Extension<RequestBodyHash>,
+    Extension(correlation): Extension<RequestCorrelation>,
     headers: header::HeaderMap,
     body: Bytes,
 ) -> axum::response::Response {
@@ -5647,6 +5689,7 @@ pub async fn embeddings(
     };
     let mut extra = std::collections::HashMap::new();
     insert_encryption_headers(&encryption_headers, &mut extra);
+    insert_request_id_header(correlation, &mut extra);
 
     match app_state
         .completion_service
@@ -5884,6 +5927,7 @@ pub async fn privacy_classify(
     State(app_state): State<AppState>,
     Extension(api_key): Extension<AuthenticatedApiKey>,
     Extension(_body_hash): Extension<RequestBodyHash>,
+    Extension(correlation): Extension<RequestCorrelation>,
     headers: header::HeaderMap,
     body: Bytes,
 ) -> axum::response::Response {
@@ -5949,6 +5993,7 @@ pub async fn privacy_classify(
     };
     let mut extra = std::collections::HashMap::new();
     insert_encryption_headers(&encryption_headers, &mut extra);
+    insert_request_id_header(correlation, &mut extra);
 
     match app_state
         .completion_service
@@ -6210,6 +6255,7 @@ pub async fn privacy_redact(
     State(app_state): State<AppState>,
     Extension(api_key): Extension<AuthenticatedApiKey>,
     Extension(_body_hash): Extension<RequestBodyHash>,
+    Extension(correlation): Extension<RequestCorrelation>,
     headers: header::HeaderMap,
     body: Bytes,
 ) -> axum::response::Response {
@@ -6348,6 +6394,7 @@ pub async fn privacy_redact(
     };
     let mut extra = std::collections::HashMap::new();
     insert_encryption_headers(&encryption_headers, &mut extra);
+    insert_request_id_header(correlation, &mut extra);
 
     // Forward a normalized classify request to the upstream model. We
     // deliberately rebuild the body rather than passing the client body
@@ -6671,6 +6718,7 @@ pub async fn score(
     State(app_state): State<AppState>,
     Extension(api_key): Extension<AuthenticatedApiKey>,
     Extension(body_hash): Extension<RequestBodyHash>,
+    Extension(correlation): Extension<RequestCorrelation>,
     headers: header::HeaderMap,
     OpenAiJson(request): OpenAiJson<crate::models::ScoreRequest>,
 ) -> axum::response::Response {
@@ -6743,6 +6791,7 @@ pub async fn score(
                     };
                 let mut extra = std::collections::HashMap::new();
                 insert_encryption_headers(&encryption_headers, &mut extra);
+                insert_request_id_header(correlation, &mut extra);
 
                 inference_providers::ScoreParams {
                     model: request.model.clone(),

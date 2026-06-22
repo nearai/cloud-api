@@ -184,8 +184,8 @@ impl OrganizationInvitationRepository for PgOrganizationInvitationRepository {
         let expires_at = Utc::now() + Duration::hours(request.expires_in_hours);
 
         debug!(
-            "Creating invitation for {} to organization {} with role {}",
-            request.email, org_id, role
+            "Creating invitation for organization {} with role {}",
+            org_id, role
         );
 
         let row = retry_db!("create_organization_invitation", {

@@ -54,6 +54,7 @@ mod privacy_redact;
 mod provider_errors;
 mod reasoning;
 mod repositories;
+mod request_id_contract;
 mod rerank;
 mod response_signature_verification;
 mod score;

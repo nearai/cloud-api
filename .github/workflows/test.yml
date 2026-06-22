@@ -177,6 +177,26 @@ jobs:
         RUST_LOG: debug
         DEV: "true"
 
+  # Aggregates all test jobs into a single required status check. Branch
+  # protection requires "Test Suite"; this job satisfies that requirement
+  # without running any extra work.
+  test-suite:
+    name: Test Suite
+    runs-on: [self-hosted, infra]
+    needs: [lint, unit-test, integration-test, e2e-test]
+    if: always()
+    steps:
+      - name: Check all tests passed
+        run: |
+          if [[ "${{ needs.lint.result }}" != "success" || \
+                "${{ needs.unit-test.result }}" != "success" || \
+                "${{ needs.integration-test.result }}" != "success" || \
+                "${{ needs.e2e-test.result }}" != "success" ]]; then
+            echo "One or more test jobs failed"
+            exit 1
+          fi
+          echo "All test jobs passed"
+
   # Release build, only on main pushes. Split into its own job so it does
   # not block the test jobs and does not pull in PostgreSQL or test env vars
   # (there is no build.rs; cargo build --release needs none of them).

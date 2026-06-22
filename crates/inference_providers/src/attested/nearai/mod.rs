@@ -895,6 +895,7 @@ impl Fleet {
             return Ok(ChatCompletionResponseWithBytes {
                 response: chat_completion_response,
                 raw_bytes,
+                serving_tier: crate::ProviderTier::Near,
             });
         }
         Err(last_error)
@@ -1659,6 +1660,7 @@ impl InferenceProvider for Fleet {
         Ok(ChatCompletionResponseWithBytes {
             response: chat_completion_response,
             raw_bytes,
+            serving_tier: crate::ProviderTier::Near,
         })
     }
 

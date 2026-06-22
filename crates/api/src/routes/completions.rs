@@ -81,6 +81,16 @@ fn insert_encryption_headers(
     }
 }
 
+fn insert_request_id_header(
+    correlation: RequestCorrelation,
+    extra: &mut std::collections::HashMap<String, serde_json::Value>,
+) {
+    extra.insert(
+        "x_request_id".to_string(),
+        serde_json::Value::String(correlation.request_id.to_string()),
+    );
+}
+
 // Custom header for exposing the inference ID as a UUID
 const HEADER_INFERENCE_ID: &str = "Inference-Id";
 
@@ -4108,6 +4118,7 @@ pub async fn image_generations(
     State(app_state): State<AppState>,
     Extension(api_key): Extension<AuthenticatedApiKey>,
     Extension(body_hash): Extension<RequestBodyHash>,
+    Extension(correlation): Extension<RequestCorrelation>,
     headers: header::HeaderMap,
     OpenAiJson(request): OpenAiJson<crate::models::ImageGenerationRequest>,
 ) -> axum::response::Response {
@@ -4197,6 +4208,7 @@ pub async fn image_generations(
     // Convert API request to provider params
     let mut extra = std::collections::HashMap::new();
     insert_encryption_headers(&encryption_headers, &mut extra);
+    insert_request_id_header(correlation, &mut extra);
 
     let params = inference_providers::ImageGenerationParams {
         model: request.model.clone(),
@@ -4362,6 +4374,7 @@ pub async fn audio_transcriptions(
     State(app_state): State<AppState>,
     Extension(api_key): Extension<AuthenticatedApiKey>,
     Extension(body_hash): Extension<RequestBodyHash>,
+    Extension(correlation): Extension<RequestCorrelation>,
     headers: header::HeaderMap,
     mut multipart: Multipart,
 ) -> axum::response::Response {
@@ -4523,6 +4536,7 @@ pub async fn audio_transcriptions(
     // Convert API request to provider params
     let mut extra = std::collections::HashMap::new();
     insert_encryption_headers(&encryption_headers, &mut extra);
+    insert_request_id_header(correlation, &mut extra);
 
     let requested_response_format = request.response_format.clone();
     let provider_response_format = match requested_response_format.as_deref() {
@@ -5260,6 +5274,7 @@ pub async fn rerank(
     State(app_state): State<AppState>,
     Extension(api_key): Extension<AuthenticatedApiKey>,
     Extension(_body_hash): Extension<RequestBodyHash>,
+    Extension(correlation): Extension<RequestCorrelation>,
     headers: header::HeaderMap,
     OpenAiJson(request): OpenAiJson<crate::models::RerankRequest>,
 ) -> axum::response::Response {
@@ -5322,6 +5337,7 @@ pub async fn rerank(
     // Convert API request to provider params
     let mut extra = std::collections::HashMap::new();
     insert_encryption_headers(&encryption_headers, &mut extra);
+    insert_request_id_header(correlation, &mut extra);
 
     let params = inference_providers::RerankParams {
         model: request.model.clone(),
@@ -5605,6 +5621,7 @@ pub async fn embeddings(
     State(app_state): State<AppState>,
     Extension(api_key): Extension<AuthenticatedApiKey>,
     Extension(_body_hash): Extension<RequestBodyHash>,
+    Extension(correlation): Extension<RequestCorrelation>,
     headers: header::HeaderMap,
     body: Bytes,
 ) -> axum::response::Response {
@@ -5672,6 +5689,7 @@ pub async fn embeddings(
     };
     let mut extra = std::collections::HashMap::new();
     insert_encryption_headers(&encryption_headers, &mut extra);
+    insert_request_id_header(correlation, &mut extra);
 
     match app_state
         .completion_service
@@ -5909,6 +5927,7 @@ pub async fn privacy_classify(
     State(app_state): State<AppState>,
     Extension(api_key): Extension<AuthenticatedApiKey>,
     Extension(_body_hash): Extension<RequestBodyHash>,
+    Extension(correlation): Extension<RequestCorrelation>,
     headers: header::HeaderMap,
     body: Bytes,
 ) -> axum::response::Response {
@@ -5974,6 +5993,7 @@ pub async fn privacy_classify(
     };
     let mut extra = std::collections::HashMap::new();
     insert_encryption_headers(&encryption_headers, &mut extra);
+    insert_request_id_header(correlation, &mut extra);
 
     match app_state
         .completion_service
@@ -6235,6 +6255,7 @@ pub async fn privacy_redact(
     State(app_state): State<AppState>,
     Extension(api_key): Extension<AuthenticatedApiKey>,
     Extension(_body_hash): Extension<RequestBodyHash>,
+    Extension(correlation): Extension<RequestCorrelation>,
     headers: header::HeaderMap,
     body: Bytes,
 ) -> axum::response::Response {
@@ -6373,6 +6394,7 @@ pub async fn privacy_redact(
     };
     let mut extra = std::collections::HashMap::new();
     insert_encryption_headers(&encryption_headers, &mut extra);
+    insert_request_id_header(correlation, &mut extra);
 
     // Forward a normalized classify request to the upstream model. We
     // deliberately rebuild the body rather than passing the client body
@@ -6696,6 +6718,7 @@ pub async fn score(
     State(app_state): State<AppState>,
     Extension(api_key): Extension<AuthenticatedApiKey>,
     Extension(body_hash): Extension<RequestBodyHash>,
+    Extension(correlation): Extension<RequestCorrelation>,
     headers: header::HeaderMap,
     OpenAiJson(request): OpenAiJson<crate::models::ScoreRequest>,
 ) -> axum::response::Response {
@@ -6768,6 +6791,7 @@ pub async fn score(
                     };
                 let mut extra = std::collections::HashMap::new();
                 insert_encryption_headers(&encryption_headers, &mut extra);
+                insert_request_id_header(correlation, &mut extra);
 
                 inference_providers::ScoreParams {
                     model: request.model.clone(),

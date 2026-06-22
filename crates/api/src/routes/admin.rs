@@ -519,7 +519,7 @@ pub async fn batch_upsert_models(
         );
         app_state
             .inference_provider_pool
-            .load_inference_url_models(inference_url_models)
+            .load_inference_url_models(inference_url_models, true)
             .await;
     }
 
@@ -3630,7 +3630,7 @@ pub async fn get_performance_timeseries(
 pub struct RevenueDensityParams {
     pub start: Option<String>,
     pub end: Option<String>,
-    /// Optional provider type filter (e.g. "nearai", "external").
+    /// Optional provider type filter (e.g. "vllm", "external", "chutes").
     pub provider_type: Option<String>,
 }
 

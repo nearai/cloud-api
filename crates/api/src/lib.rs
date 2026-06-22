@@ -1325,6 +1325,7 @@ pub fn build_app_with_config(
         // endpoints) sign the *request* body hash, not the HTTP response body,
         // so compression is safe for them as well.
         .layer(CompressionLayer::new())
+        .layer(from_fn(middleware::request_correlation_middleware))
 }
 
 /// Build VPC authentication routes

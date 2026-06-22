@@ -479,7 +479,7 @@ pub async fn list_user_invitations(
     Json<Vec<crate::models::OrganizationInvitationWithOrgResponse>>,
     (StatusCode, Json<ErrorResponse>),
 > {
-    debug!("Listing invitations for user: {}", user.0.email);
+    debug!("Listing invitations for user_id={}", user.0.id);
 
     match app_state
         .organization_service
@@ -534,12 +534,13 @@ pub async fn accept_invitation(
     Extension(user): Extension<AuthenticatedUser>,
     Path(invitation_id): Path<Uuid>,
 ) -> Result<Json<crate::models::AcceptInvitationResponse>, (StatusCode, Json<ErrorResponse>)> {
-    debug!(
-        "User {} accepting invitation {}",
-        user.0.email, invitation_id
-    );
-
     let user_id = authenticated_user_to_user_id(user.clone());
+    debug!(
+        user_id = %user_id.0,
+        invitation_id = %invitation_id,
+        action = "accept",
+        "User invitation action requested"
+    );
 
     match app_state
         .organization_service
@@ -615,9 +616,12 @@ pub async fn decline_invitation(
     Extension(user): Extension<AuthenticatedUser>,
     Path(invitation_id): Path<Uuid>,
 ) -> Result<StatusCode, (StatusCode, Json<ErrorResponse>)> {
+    let user_id = authenticated_user_to_user_id(user.clone());
     debug!(
-        "User {} declining invitation {}",
-        user.0.email, invitation_id
+        user_id = %user_id.0,
+        invitation_id = %invitation_id,
+        action = "decline",
+        "User invitation action requested"
     );
 
     match app_state
@@ -741,7 +745,7 @@ pub async fn accept_invitation_by_token(
     Extension(user): Extension<AuthenticatedUser>,
     Path(token): Path<String>,
 ) -> Result<Json<crate::models::AcceptInvitationResponse>, (StatusCode, Json<ErrorResponse>)> {
-    debug!("User {} accepting invitation by token", user.0.email);
+    debug!("User_id={} accepting invitation by token", user.0.id);
 
     let user_id = authenticated_user_to_user_id(user.clone());
 

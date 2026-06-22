@@ -262,13 +262,24 @@ where
         let mut metric_tags = self.metric_tags.clone();
         metric_tags.push(format!("{TAG_INPUT_BUCKET}:{input_bucket}"));
 
-        // Spawn critical billing operations on blocking thread pool with timeout
+        // Spawn critical billing operations on blocking thread pool with timeout.
         // The tokio runtime waits for blocking tasks during graceful shutdown,
-        // which helps prevent data loss compared to regular spawn
-        let handle_clone = handle.clone();
+        // which helps prevent data loss compared to regular spawn.
         handle.spawn_blocking(move || {
             let _span_guard = span.enter();
-            handle_clone.block_on(async move {
+
+            let runtime = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    tracing::error!(%error, "Failed to create usage recording runtime");
+                    return;
+                }
+            };
+
+            runtime.block_on(async move {
                 let result = tokio::time::timeout(Duration::from_secs(2), async move {
                     let stop_reason = if let Some(ref err) = last_error {
                         Some(crate::usage::StopReason::from_completion_error(err))
@@ -1172,6 +1183,7 @@ impl CompletionServiceImpl {
         }
     }
 
+    // CLIPPY-ALLOW: InterceptStream construction needs the full tracing, billing, timing, and concurrency context at one ownership boundary.
     #[allow(clippy::too_many_arguments)]
     async fn handle_stream_with_context(
         &self,

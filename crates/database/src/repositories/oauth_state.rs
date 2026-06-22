@@ -92,7 +92,9 @@ impl OAuthStateRepository {
                 Ok(Some(oauth_state))
             }
             None => {
-                debug!("OAuth state not found or expired: {}", state);
+                let state_present = !state.is_empty();
+                let state_len = state.len();
+                debug!(state_present, state_len, "OAuth state not found or expired");
                 Ok(None)
             }
         }

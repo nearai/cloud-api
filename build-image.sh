@@ -22,14 +22,36 @@ while [[ $# -gt 0 ]]; do
             ;;
     esac
 done
-# Check if buildkit_20 already exists before creating it
-if ! docker buildx inspect buildkit_20 &>/dev/null; then
-    docker buildx create --use --driver-opt image=moby/buildkit:v0.20.2 --name buildkit_20
-fi
+# Use a unique, freshly-created BuildKit builder pinned to a specific version.
+# Two reasons:
+#   1. Reproducibility: OCI layer serialization and compression differ between
+#      BuildKit versions, so the builder image must be pinned. Creating it fresh
+#      each run guarantees the pinned version -- a long-lived, reused builder
+#      only honored the pin on first creation, so a host whose builder predated
+#      the pin silently drifted (e.g. gpu11 ran v0.27.1 while the rest of the
+#      fleet ran the pinned v0.20.2, producing a different digest for identical
+#      inputs).
+#   2. Parallelism: the CI fleet runs builds on shared Docker daemons. A unique
+#      per-invocation builder name means concurrent builds never reuse or tear
+#      down each other's builder.
+# The builder is removed on exit so buildkitd containers do not accumulate on
+# shared hosts.
+BUILDKIT_IMAGE="moby/buildkit:v0.20.2"
+BUILDER_NAME="cloud-api-buildkit-$$-${RANDOM}"
+docker buildx create --driver-opt image="${BUILDKIT_IMAGE}" --name "${BUILDER_NAME}" >/dev/null
+trap 'docker buildx rm "${BUILDER_NAME}" >/dev/null 2>&1 || true' EXIT
 touch pinned-packages-builder.txt pinned-packages-runtime.txt
 git rev-parse HEAD > .GIT_REV
-TEMP_TAG="cloud-api-temp:$(date +%s)"
-docker buildx build --builder buildkit_20 --no-cache --platform linux/amd64 \
+# Unique tag so two builds co-located on one daemon cannot collide (and one's
+# `docker rmi` cannot yank an image the other is still reading).
+TEMP_TAG="cloud-api-temp:$(date +%s)-$$-${RANDOM}"
+# --ulimit nofile: raise the open-file limit for RUN steps. The default soft
+# limit on the self-hosted runners is low enough that the parallel `cargo build`
+# exhausts file descriptors ("Too many open files (os error 24)"). This only
+# affects build-time resource limits, never the output bytes, so it is safe for
+# reproducibility.
+docker buildx build --builder "${BUILDER_NAME}" --no-cache --platform linux/amd64 \
+    --ulimit nofile=1048576:1048576 \
     --build-arg SOURCE_DATE_EPOCH="0" \
     --output type=oci,dest=./oci.tar,rewrite-timestamp=true \
     --output type=docker,name="$TEMP_TAG",rewrite-timestamp=true .

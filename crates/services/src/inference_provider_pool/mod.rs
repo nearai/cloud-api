@@ -118,6 +118,51 @@ fn record_provider_attempt(
 /// stream return or growing the stash unbounded (issue #701).
 const MAX_LEADING_CONTROL_EVENTS: usize = 32;
 
+/// EMA α for TTFT during warmup (first TTFT_WARMUP_SAMPLES observations).
+const TTFT_EWMA_ALPHA_WARMUP: f64 = 0.5;
+/// EMA α for TTFT after warmup (stable tracking).
+const TTFT_EWMA_ALPHA_STABLE: f64 = 0.1;
+/// Observations before switching from warmup to stable α.
+const TTFT_WARMUP_SAMPLES: u32 = 8;
+/// A provider is "latency-demoted" when its TTFT EMA exceeds this multiple
+/// of the fastest peer's EMA (AND the absolute floor below).
+const TTFT_SLOW_RATIO: f64 = 2.0;
+/// Absolute TTFT floor (ms): no provider is latency-demoted unless its EMA
+/// exceeds this, avoiding penalty for minor variance among fast backends.
+const TTFT_SLOW_FLOOR_MS: f64 = 500.0;
+/// Number of messages hashed from the front of the request for prefix-based
+/// cache-hit routing (system prompt + first user turn covers most prefix cache).
+pub const PREFIX_HASH_MESSAGES: usize = 2;
+
+/// Per-provider latency and capacity state for adaptive routing.
+#[derive(Default, Clone)]
+struct ProviderLatencyState {
+    /// Exponential moving average of TTFT in milliseconds.
+    ttft_ewma_ms: f64,
+    /// Number of TTFT samples used in the EMA (for warmup α adjustment).
+    ttft_samples: u32,
+    /// Maximum context length (tokens) this provider is configured to handle.
+    /// None = no limit configured; treat as unlimited.
+    max_context_tokens: Option<u32>,
+}
+
+/// Routing hints derived from the request content to guide provider selection.
+#[derive(Default)]
+pub struct ChatRoutingHints {
+    /// Consistent hash of the first PREFIX_HASH_MESSAGES messages for KV-cache routing.
+    /// When set, provider selection within the leading tier uses this hash instead of
+    /// pure round-robin, so requests with the same prefix tend to land on the same backend.
+    pub prefix_hash: Option<u64>,
+    /// Rough token count estimate (total chars / 4). Providers whose
+    /// max_context_tokens < this value are sorted after capable providers.
+    pub estimated_tokens: Option<u32>,
+}
+
+/// Callback for reporting observed TTFT (ms) back to the pool for future routing.
+/// The pool creates this when returning a stream from chat_completion_stream and
+/// passes it to InterceptStream, which calls it once on Drop.
+pub type ProviderLatencyReporter = Arc<dyn Fn(i32) + Send + Sync>;
+
 /// Trait for fetching external model configurations from a data source (e.g., database).
 /// This decouples the InferenceProviderPool from the database crate (hexagonal architecture).
 #[async_trait::async_trait]
@@ -125,9 +170,11 @@ pub trait ExternalModelsSource: Send + Sync {
     async fn fetch_external_models(&self) -> Result<Vec<(String, serde_json::Value)>, String>;
 
     /// Fetch models that have a direct inference URL configured.
-    /// Returns (model_name, inference_url) pairs for active models with inference_url set.
+    /// Returns (model_name, inference_url, context_length) triples for active models with inference_url set.
     /// These models are routed directly to the URL, bypassing the discovery server.
-    async fn fetch_inference_url_models(&self) -> Result<Vec<(String, String)>, String>;
+    async fn fetch_inference_url_models(
+        &self,
+    ) -> Result<Vec<(String, String, Option<u32>)>, String>;
 }
 
 /// Result of an attestation-discovery pass against a model URL.
@@ -299,6 +346,9 @@ pub struct InferenceProviderPool {
     /// Uses std::sync::RwLock (not tokio) because all operations are non-blocking
     /// HashMap lookups/inserts — no .await while holding the lock.
     provider_failure_counts: Arc<std::sync::RwLock<HashMap<usize, u32>>>,
+    /// Per-provider latency and capacity state for adaptive routing.
+    /// Keyed by Arc pointer address (same convention as provider_failure_counts).
+    provider_load_state: Arc<std::sync::RwLock<HashMap<usize, ProviderLatencyState>>>,
     /// Cache of inference_url → serving provider. When a model's URL hasn't changed
     /// across refreshes, the existing provider (and its warm reqwest::Client with
     /// pooled TLS connections) is reused instead of creating a new one.
@@ -603,6 +653,7 @@ impl InferenceProviderPool {
             chat_id_mapping: Arc::new(RwLock::new(HashMap::new())),
             refresh_task_handle: Arc::new(Mutex::new(None)),
             provider_failure_counts: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            provider_load_state: Arc::new(std::sync::RwLock::new(HashMap::new())),
             inference_url_providers: Arc::new(RwLock::new(HashMap::new())),
             inference_url_fingerprint_states: Arc::new(RwLock::new(HashMap::new())),
             tls_roots: SharedTlsRoots::load(),
@@ -1602,6 +1653,7 @@ impl InferenceProviderPool {
         &self,
         model_id: &str,
         model_pub_key: Option<&str>,
+        hints: &ChatRoutingHints,
     ) -> Option<Vec<Arc<InferenceProviderTrait>>> {
         let mappings = self.provider_mappings.read().await;
 
@@ -1675,42 +1727,86 @@ impl InferenceProviderPool {
                 inference_providers::ProviderTier::NonAttested => 2,
             }
         }
-        // (demoted, tier_rank): healthy-before-demoted, NEAR-before-Chutes-before-plaintext.
+        // (context_overflow, demoted, latency_demoted, tier_rank): prefer capable, healthy, fast, NEAR.
         let (mut ordered, group_len) = {
             let counts = self
                 .provider_failure_counts
                 .read()
                 .unwrap_or_else(|e| e.into_inner());
-            let key_of = |p: &Arc<InferenceProviderTrait>| -> (u8, u8) {
-                let failures = counts
-                    .get(&(Arc::as_ptr(p) as *const () as usize))
-                    .copied()
-                    .unwrap_or(0);
+            let states = self
+                .provider_load_state
+                .read()
+                .unwrap_or_else(|e| e.into_inner());
+
+            // Find the minimum warmed-up TTFT EMA across all providers for relative comparison.
+            let min_ttft_ms = providers
+                .iter()
+                .filter_map(|p| {
+                    let ptr = Arc::as_ptr(p) as *const () as usize;
+                    states
+                        .get(&ptr)
+                        .filter(|s| s.ttft_samples >= TTFT_WARMUP_SAMPLES && s.ttft_ewma_ms > 0.0)
+                })
+                .map(|s| s.ttft_ewma_ms)
+                .fold(f64::MAX, f64::min);
+
+            // Sort key: (context_overflow, hard_demoted, latency_demoted, tier_rank)
+            // Lower = preferred.
+            let key_of = |p: &Arc<InferenceProviderTrait>| -> (u8, u8, u8, u8) {
+                let ptr = Arc::as_ptr(p) as *const () as usize;
+                let failures = counts.get(&ptr).copied().unwrap_or(0);
+                let (ttft_ewma_ms, ttft_samples, max_context_tokens) = states
+                    .get(&ptr)
+                    .map(|s| (s.ttft_ewma_ms, s.ttft_samples, s.max_context_tokens))
+                    .unwrap_or((0.0, 0, None));
+
                 let demoted = u8::from(failures >= MAX_CONSECUTIVE_FAILURES);
-                (demoted, tier_rank(p))
+                // Provider can't handle the estimated request size.
+                let context_overflow = u8::from(
+                    hints
+                        .estimated_tokens
+                        .zip(max_context_tokens)
+                        .is_some_and(|(req, cap)| req > cap),
+                );
+                // Provider's TTFT EMA is significantly worse than the fastest peer.
+                let latency_demoted = u8::from(
+                    ttft_samples >= TTFT_WARMUP_SAMPLES
+                        && ttft_ewma_ms > TTFT_SLOW_FLOOR_MS
+                        && min_ttft_ms.is_finite()
+                        && ttft_ewma_ms > TTFT_SLOW_RATIO * min_ttft_ms,
+                );
+                (context_overflow, demoted, latency_demoted, tier_rank(p))
             };
             let mut ordered = providers;
-            ordered.sort_by_key(&key_of); // stable
+            ordered.sort_by_key(&key_of); // stable sort
             let head_key = key_of(&ordered[0]);
             let group_len = ordered.iter().take_while(|p| key_of(p) == head_key).count();
             (ordered, group_len)
         };
 
-        // Round-robin rotate the leading group so its members share load evenly.
+        // Select within the leading group. When the request carries a prefix hash
+        // (computed from the first message(s)), use it for consistent placement so
+        // same-prefix requests land on the same backend — maximising KV-cache hits.
+        // Fall back to round-robin for requests without a meaningful prefix.
         if group_len > 1 {
             let index_key = if let Some(pub_key) = model_pub_key {
                 format!("pubkey:{}", pub_key)
             } else {
                 format!("id:{}", model_id)
             };
-            let mut indices = self
-                .load_balancer_index
-                .write()
-                .unwrap_or_else(|e| e.into_inner());
-            let index = indices.entry(index_key).or_insert(0);
-            let rot = *index % group_len;
-            *index = (*index + 1) % group_len;
-            drop(indices);
+            let rot = if let Some(hash) = hints.prefix_hash {
+                // Consistent prefix-based placement: don't advance the round-robin counter.
+                (hash as usize) % group_len
+            } else {
+                let mut indices = self
+                    .load_balancer_index
+                    .write()
+                    .unwrap_or_else(|e| e.into_inner());
+                let index = indices.entry(index_key).or_insert(0);
+                let r = *index % group_len;
+                *index = (*index + 1) % group_len;
+                r
+            };
             ordered[..group_len].rotate_left(rot);
         }
 
@@ -2198,8 +2294,15 @@ impl InferenceProviderPool {
         F: Fn(Arc<InferenceProviderTrait>) -> Fut,
         Fut: std::future::Future<Output = Result<T, CompletionError>>,
     {
-        self.retry_with_fallback_caps(model_id, operation_name, model_pub_key, false, provider_fn)
-            .await
+        self.retry_with_fallback_caps(
+            model_id,
+            operation_name,
+            model_pub_key,
+            false,
+            &ChatRoutingHints::default(),
+            provider_fn,
+        )
+        .await
     }
 
     /// As [`Self::retry_with_fallback`], but filters the provider list to those that
@@ -2214,6 +2317,7 @@ impl InferenceProviderPool {
         operation_name: &str,
         model_pub_key: Option<&str>,
         needs_client_e2ee: bool,
+        hints: &ChatRoutingHints,
         provider_fn: F,
     ) -> Result<ServedProviderResult<T>, CompletionError>
     where
@@ -2221,7 +2325,7 @@ impl InferenceProviderPool {
         Fut: std::future::Future<Output = Result<T, CompletionError>>,
     {
         let providers = match self
-            .get_providers_with_fallback(model_id, model_pub_key)
+            .get_providers_with_fallback(model_id, model_pub_key, hints)
             .await
         {
             Some(p) => p,
@@ -2766,9 +2870,10 @@ impl InferenceProviderPool {
         &self,
         params: ChatCompletionParams,
         request_hash: String,
+        hints: ChatRoutingHints,
     ) -> Result<StreamingResult, CompletionError> {
         Ok(self
-            .chat_completion_stream_with_attribution(params, request_hash)
+            .chat_completion_stream_with_attribution(params, request_hash, hints)
             .await?
             .stream)
     }
@@ -2777,6 +2882,7 @@ impl InferenceProviderPool {
         &self,
         mut params: ChatCompletionParams,
         request_hash: String,
+        hints: ChatRoutingHints,
     ) -> Result<AttributedChatCompletionStream, CompletionError> {
         let model_id = params.model.clone();
 
@@ -2806,6 +2912,7 @@ impl InferenceProviderPool {
                 "chat_completion_stream",
                 model_pub_key,
                 needs_client_e2ee,
+                &hints,
                 |provider| {
                     let params = params_for_provider.clone();
                     let request_hash = request_hash.clone();
@@ -2816,6 +2923,30 @@ impl InferenceProviderPool {
         let stream = served.value;
         let provider = served.provider.clone();
         let provider_attribution = served.provider_attribution;
+
+        // Create TTFT reporter: called by InterceptStream on Drop to feed back
+        // the observed TTFT for this provider, enabling latency-aware routing on
+        // future requests for the same model.
+        let load_state = self.provider_load_state.clone();
+        let provider_ptr = Arc::as_ptr(&provider) as *const () as usize;
+        let latency_reporter: ProviderLatencyReporter = Arc::new(move |ttft_ms: i32| {
+            if ttft_ms <= 0 {
+                return;
+            }
+            let mut states = load_state.write().unwrap_or_else(|e| e.into_inner());
+            let state = states.entry(provider_ptr).or_default();
+            let alpha = if state.ttft_samples < TTFT_WARMUP_SAMPLES {
+                TTFT_EWMA_ALPHA_WARMUP
+            } else {
+                TTFT_EWMA_ALPHA_STABLE
+            };
+            state.ttft_ewma_ms = if state.ttft_ewma_ms == 0.0 {
+                ttft_ms as f64
+            } else {
+                alpha * ttft_ms as f64 + (1.0 - alpha) * state.ttft_ewma_ms
+            };
+            state.ttft_samples = state.ttft_samples.saturating_add(1);
+        });
 
         // Store chat_id mapping for sticky routing by peeking at the first event
         // Must be synchronous to ensure attestation service can find the provider
@@ -2870,6 +3001,7 @@ impl InferenceProviderPool {
         Ok(AttributedChatCompletionStream {
             stream,
             provider_attribution,
+            latency_reporter,
         })
     }
 
@@ -2920,6 +3052,7 @@ impl InferenceProviderPool {
                 "chat_completion",
                 model_pub_key,
                 needs_client_e2ee,
+                &ChatRoutingHints::default(),
                 |provider| {
                     let params = params_for_provider.clone();
                     let request_hash = request_hash.clone();
@@ -3182,7 +3315,10 @@ impl InferenceProviderPool {
             "Starting rerank request"
         );
 
-        let providers = match self.get_providers_with_fallback(&model_id, None).await {
+        let providers = match self
+            .get_providers_with_fallback(&model_id, None, &ChatRoutingHints::default())
+            .await
+        {
             Some(p) => p,
             None => {
                 return Err(RerankError::GenerationError(format!(
@@ -3231,7 +3367,10 @@ impl InferenceProviderPool {
     ) -> Result<bytes::Bytes, inference_providers::EmbeddingError> {
         tracing::debug!(model = %model, "Starting embeddings request");
 
-        let providers = match self.get_providers_with_fallback(model, None).await {
+        let providers = match self
+            .get_providers_with_fallback(model, None, &ChatRoutingHints::default())
+            .await
+        {
             Some(p) => p,
             None => {
                 return Err(inference_providers::EmbeddingError::RequestFailed(format!(
@@ -3287,7 +3426,10 @@ impl InferenceProviderPool {
     ) -> Result<bytes::Bytes, inference_providers::PrivacyClassifyError> {
         tracing::debug!(model = %model, "Starting privacy classify request");
 
-        let providers = match self.get_providers_with_fallback(model, None).await {
+        let providers = match self
+            .get_providers_with_fallback(model, None, &ChatRoutingHints::default())
+            .await
+        {
             Some(p) => p,
             None => {
                 return Err(inference_providers::PrivacyClassifyError::RequestFailed(
@@ -3351,7 +3493,10 @@ impl InferenceProviderPool {
 
         tracing::debug!(model = %model_id, "Starting score request");
 
-        let providers = match self.get_providers_with_fallback(&model_id, None).await {
+        let providers = match self
+            .get_providers_with_fallback(&model_id, None, &ChatRoutingHints::default())
+            .await
+        {
             Some(p) => p,
             None => {
                 return Err(inference_providers::ScoreError::GenerationError(format!(
@@ -3483,23 +3628,28 @@ impl InferenceProviderPool {
     /// provided models without evicting untouched entries.  Pass
     /// `partial = false` from the periodic sync / startup paths to replace
     /// the URL-provider cache wholesale and prune stale entries.
-    pub async fn load_inference_url_models(&self, models: Vec<(String, String)>, partial: bool) {
+    pub async fn load_inference_url_models(
+        &self,
+        models: Vec<(String, String, Option<u32>)>,
+        partial: bool,
+    ) {
         if models.is_empty() {
             return;
         }
 
         let api_key = self.api_key.clone();
+        let pool_load_state = self.provider_load_state.clone();
 
         // Check which models can reuse their existing provider (URL unchanged)
         let existing_cache = self.inference_url_providers.read().await;
         let mut reused: Vec<(String, String, Arc<InferenceProviderTrait>)> = Vec::new();
-        let mut needs_creation: Vec<(String, String)> = Vec::new();
+        let mut needs_creation: Vec<(String, String, Option<u32>)> = Vec::new();
 
-        for (model_name, url) in &models {
+        for (model_name, url, context_length) in &models {
             if let Some(existing) = existing_cache.get(url) {
                 reused.push((model_name.clone(), url.clone(), existing.clone()));
             } else {
-                needs_creation.push((model_name.clone(), url.clone()));
+                needs_creation.push((model_name.clone(), url.clone(), *context_length));
             }
         }
         drop(existing_cache);
@@ -3521,12 +3671,14 @@ impl InferenceProviderPool {
         let tls_roots = self.tls_roots.clone();
         let endpoint_futures: Vec<_> = needs_creation
             .iter()
-            .map(|(model_name, url)| {
+            .map(|(model_name, url, context_length)| {
                 let model_name = model_name.clone();
                 let url = url.clone();
+                let context_length = *context_length;
                 let api_key = api_key.clone();
                 let verifier = verifier.clone();
                 let tls_roots = tls_roots.clone();
+                let pool_load_state = pool_load_state.clone();
                 async move {
                     let state =
                         Arc::new(std::sync::RwLock::new(FingerprintState::Bootstrap));
@@ -3564,6 +3716,17 @@ impl InferenceProviderPool {
                     // on the first 5xx — without this, the very first 5xx
                     // before any refresh cycle would skip rotation entirely.
                     serving_provider.set_backend_count(outcome.backend_count);
+
+                    // Store the configured context length so latency routing can
+                    // filter out providers that can't serve oversized requests.
+                    if let Some(ctx_tokens) = context_length {
+                        let ptr = Arc::as_ptr(&serving_provider) as *const () as usize;
+                        let mut states = pool_load_state
+                            .write()
+                            .unwrap_or_else(|e| e.into_inner());
+                        states.entry(ptr).or_default().max_context_tokens =
+                            Some(ctx_tokens);
+                    }
 
                     if outcome.total_pinned == 0 {
                         // Fail closed: reject all TLS until a future refresh's
@@ -4281,7 +4444,7 @@ impl InferenceProviderPool {
 
     /// Refresh inference_url models from the database.
     /// Existing entries in provider_mappings are overwritten with new providers.
-    async fn sync_inference_url_models(&self, models: Vec<(String, String)>) {
+    async fn sync_inference_url_models(&self, models: Vec<(String, String, Option<u32>)>) {
         // Complete-set discovery path (periodic refresh): re-append pinned providers
         // for the discovered models (inside load_inference_url_models's merge), then
         // prune any pinned id that has LEFT discovery to pinned-only. The complete
@@ -4291,7 +4454,7 @@ impl InferenceProviderPool {
         // rebuilds those. Only the refresh calls this; the admin PATCH path calls
         // load_inference_url_models directly (partial batch, no prune).
         let complete_names: std::collections::HashSet<String> =
-            models.iter().map(|(name, _)| name.clone()).collect();
+            models.iter().map(|(name, _, _)| name.clone()).collect();
         self.load_inference_url_models(models, false).await;
         self.prune_stale_pinned(&complete_names).await;
     }
@@ -4359,6 +4522,10 @@ impl InferenceProviderPool {
             .write()
             .unwrap_or_else(|e| e.into_inner())
             .retain(|key, _| !removed_ptrs.contains(key));
+        self.provider_load_state
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|key, _| !removed_ptrs.contains(key));
 
         info!(
             removed = stale_models.len(),
@@ -4401,7 +4568,7 @@ impl InferenceProviderPool {
                     // Refresh inference_url models
                     match source.fetch_inference_url_models().await {
                         Ok(models) => {
-                            for (name, _) in &models {
+                            for (name, _, _) in &models {
                                 valid_model_names.insert(name.clone());
                             }
                             pool.sync_inference_url_models(models).await;
@@ -5233,7 +5400,11 @@ mod tests {
         };
 
         let mut stream = pool
-            .chat_completion_stream(params, "test-request-hash".to_string())
+            .chat_completion_stream(
+                params,
+                "test-request-hash".to_string(),
+                ChatRoutingHints::default(),
+            )
             .await
             .expect("Should create stream");
 
@@ -5584,7 +5755,7 @@ mod tests {
         .await;
 
         let providers = pool
-            .get_providers_with_fallback(&model, None)
+            .get_providers_with_fallback(&model, None, &ChatRoutingHints::default())
             .await
             .expect("model has providers");
         let tiers: Vec<ProviderTier> = providers.iter().map(|p| p.tier()).collect();
@@ -5611,7 +5782,7 @@ mod tests {
         .await;
 
         let providers = pool
-            .get_providers_with_fallback(&model, None)
+            .get_providers_with_fallback(&model, None, &ChatRoutingHints::default())
             .await
             .expect("model has providers");
         assert_eq!(providers.len(), 1);
@@ -5634,7 +5805,7 @@ mod tests {
         .await;
 
         let providers = pool
-            .get_providers_with_fallback(&model, None)
+            .get_providers_with_fallback(&model, None, &ChatRoutingHints::default())
             .await
             .expect("model has providers");
         assert_eq!(providers.len(), 1);
@@ -5667,7 +5838,7 @@ mod tests {
 
         assert!(pool.is_pinned(&model));
         let providers = pool
-            .get_providers_with_fallback(&model, None)
+            .get_providers_with_fallback(&model, None, &ChatRoutingHints::default())
             .await
             .expect("model has providers");
         let tiers: Vec<ProviderTier> = providers.iter().map(|p| p.tier()).collect();
@@ -5832,7 +6003,7 @@ mod tests {
         complete.insert(model.clone());
         pool.prune_stale_pinned(&complete).await;
         let tiers: Vec<ProviderTier> = pool
-            .get_providers_with_fallback(&model, None)
+            .get_providers_with_fallback(&model, None, &ChatRoutingHints::default())
             .await
             .expect("providers")
             .iter()
@@ -5843,7 +6014,7 @@ mod tests {
         // NEAR dropped it (absent from the complete set) → rebuilt pinned-only.
         pool.prune_stale_pinned(&HashSet::new()).await;
         let tiers: Vec<ProviderTier> = pool
-            .get_providers_with_fallback(&model, None)
+            .get_providers_with_fallback(&model, None, &ChatRoutingHints::default())
             .await
             .expect("providers")
             .iter()
@@ -6114,7 +6285,7 @@ mod tests {
 
         // Call load_inference_url_models — the provider should be reused and
         // the self-healing path should detect missing pubkeys and re-fetch them.
-        pool.load_inference_url_models(vec![(model_id.clone(), url)], false)
+        pool.load_inference_url_models(vec![(model_id.clone(), url, None)], false)
             .await;
 
         // Verify pubkeys were recovered
@@ -6679,7 +6850,7 @@ mod tests {
         mock_provider.set_fail_attestation(true);
 
         // Load — the provider is reused, pubkeys are missing, re-fetch fails
-        pool.load_inference_url_models(vec![(model_id.clone(), url.clone())], false)
+        pool.load_inference_url_models(vec![(model_id.clone(), url.clone(), None)], false)
             .await;
 
         // The URL should have been evicted from the cache
@@ -6754,7 +6925,7 @@ mod tests {
                 .insert("pretend-pubkey".to_string(), vec![mock.clone()]);
         }
 
-        pool.load_inference_url_models(vec![(model_id.clone(), url.clone())], false)
+        pool.load_inference_url_models(vec![(model_id.clone(), url.clone(), None)], false)
             .await;
 
         // Blocked URL evicted from URL cache
@@ -8201,8 +8372,11 @@ mod tests {
         }
 
         // Partial load — only the patched model is included.
-        pool.load_inference_url_models(vec![(patched_model.clone(), patched_url.clone())], true)
-            .await;
+        pool.load_inference_url_models(
+            vec![(patched_model.clone(), patched_url.clone(), None)],
+            true,
+        )
+        .await;
 
         // The untouched model's URL must still be present in the URL cache.
         {
@@ -8265,7 +8439,7 @@ mod tests {
         pool.unregister_provider(&model_name).await;
 
         // Partial load with the new URL — as if the admin PATCH changed inference_url.
-        pool.load_inference_url_models(vec![(model_name.clone(), new_url.clone())], true)
+        pool.load_inference_url_models(vec![(model_name.clone(), new_url.clone(), None)], true)
             .await;
 
         // The new URL must be present in the URL cache.

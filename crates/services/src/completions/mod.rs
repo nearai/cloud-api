@@ -46,7 +46,11 @@ fn cache_hit_rate_percent(cached_tokens: i32, prompt_tokens: i32) -> Option<f64>
     if prompt_tokens <= 0 {
         return None;
     }
-    Some((cached_tokens.max(0) as f64 / prompt_tokens as f64) * 100.0)
+    // Clamp to [0, prompt] so the result is provably within [0, 100], even if a
+    // provider ever reports cached > prompt. `TokenUsage::cached_tokens()` already
+    // clamps to this range, so this is belt-and-suspenders.
+    let cached = cached_tokens.clamp(0, prompt_tokens);
+    Some((cached as f64 / prompt_tokens as f64) * 100.0)
 }
 
 fn get_input_bucket(token_count: i32) -> &'static str {
@@ -2235,6 +2239,8 @@ mod tests {
         // Defensive: a negative cached count clamps to 0 (cached_tokens() never
         // returns negative, but the helper must not emit a negative rate).
         assert_eq!(cache_hit_rate_percent(-5, 100), Some(0.0));
+        // Defensive: cached > prompt clamps to prompt -> capped at 100%.
+        assert_eq!(cache_hit_rate_percent(150, 100), Some(100.0));
     }
 
     #[tokio::test]
@@ -2305,6 +2311,7 @@ mod tests {
             latency_reporter: None,
         };
         let _ = intercept_stream.collect::<Vec<_>>().await;
+        // Wait for the fire-and-forget usage/metrics task spawned in Drop to finish.
         tokio::time::sleep(Duration::from_millis(100)).await;
         let metrics = metrics_service.get_metrics();
 

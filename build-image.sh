@@ -63,12 +63,12 @@ echo ""
 
 # Extract package information from the built image
 echo "Extracting package information from built image: $TEMP_TAG"
-# Extract builder stage package information
-docker run --rm "$TEMP_TAG" cat /app/pinned-packages-builder.txt > pinned-packages-builder.txt
-echo "Package information extracted to pinned-packages-builder.txt ($(wc -l < pinned-packages-builder.txt) packages)"
-# Extract runtime stage package information
-docker run --rm --entrypoint bash "$TEMP_TAG" -c "dpkg -l | grep '^ii' | awk '{print \$2\"=\"\$3}' | sort" > pinned-packages-runtime.txt
-echo "Package information extracted to pinned-packages-runtime.txt ($(wc -l < pinned-packages-runtime.txt) packages)"
+# Extract builder stage package information (resolved = what apt actually installed)
+docker run --rm "$TEMP_TAG" cat /app/pinned-packages-builder.txt > pinned-packages-builder.resolved.txt
+echo "Package information extracted to pinned-packages-builder.resolved.txt ($(wc -l < pinned-packages-builder.resolved.txt) packages)"
+# Extract runtime stage package information (resolved = what apt actually installed)
+docker run --rm --entrypoint bash "$TEMP_TAG" -c "dpkg -l | grep '^ii' | awk '{print \$2\"=\"\$3}' | sort" > pinned-packages-runtime.resolved.txt
+echo "Package information extracted to pinned-packages-runtime.resolved.txt ($(wc -l < pinned-packages-runtime.resolved.txt) packages)"
 
 # Clean up the temporary image from Docker daemon
 docker rmi "$TEMP_TAG" 2>/dev/null || true

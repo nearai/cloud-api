@@ -11,6 +11,8 @@ config/examples/production.yaml
 oci.tar
 .idea
 .claude
+.slim/
+*.resolved.txt
 .DS_Store
 secret
 repro_*.sh

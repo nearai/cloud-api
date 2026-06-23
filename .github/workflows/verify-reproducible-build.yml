@@ -39,6 +39,14 @@ jobs:
           # Save digest to file for artifact upload
           echo "${DIGEST}" > digest.txt
 
+      - name: Guard: committed pins match resolved pins
+        if: matrix.runner == 'ubuntu-latest'
+        run: |
+          set -e
+          diff -u pinned-packages-builder.txt pinned-packages-builder.resolved.txt
+          diff -u pinned-packages-runtime.txt pinned-packages-runtime.resolved.txt
+          echo "Committed pins are satisfiable in the snapshot."
+
       - name: Upload digest artifact
         uses: actions/upload-artifact@v7
         with:

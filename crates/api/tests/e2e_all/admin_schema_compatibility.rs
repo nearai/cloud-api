@@ -55,8 +55,6 @@ fn admin_provider_attribution_openapi_schema_exports() {
         "served_provider_breakdown",
         "fallback_requests",
         "fallback_consumed_cost_usd",
-        "chutes_requests",
-        "chutes_consumed_cost_usd",
     ] {
         assert!(
             model_revenue_properties.contains_key(field),
@@ -87,24 +85,6 @@ fn admin_provider_attribution_openapi_schema_exports() {
         .expect("OpenAPI document should include paths");
     assert!(paths.contains_key("/v1/admin/platform/metrics"));
     assert!(paths.contains_key("/v1/admin/platform/model-revenue"));
-    println!(
-        "admin_provider_attribution_openapi_snippet={}",
-        serde_json::json!({
-            "PlatformMetrics": ["provider_usage"],
-            "ModelRevenueEntry": [
-                "served_provider_breakdown",
-                "fallback_requests",
-                "fallback_consumed_cost_usd",
-                "chutes_requests",
-                "chutes_consumed_cost_usd"
-            ],
-            "UsageHistoryEntryResponse_absent": [
-                "served_provider_tier",
-                "served_provider_type",
-                "served_via_fallback"
-            ]
-        })
-    );
 }
 
 #[test]
@@ -178,8 +158,6 @@ fn admin_provider_attribution_preserves_existing_response_fields() {
             }],
             fallback_requests: 3,
             fallback_consumed_cost_usd: 0.75,
-            chutes_requests: 3,
-            chutes_consumed_cost_usd: 0.75,
         }],
         total: 1,
         limit: 100,
@@ -226,10 +204,6 @@ fn admin_provider_attribution_preserves_existing_response_fields() {
         true
     );
     assert_eq!(model_revenue_json["data"][0]["fallback_requests"], 3);
-    assert_eq!(
-        model_revenue_json["data"][0]["chutes_consumed_cost_usd"],
-        0.75
-    );
 
     // Then: customer-facing usage history keeps its old JSON shape and excludes raw attribution.
     assert_eq!(usage_json["model"], "qwen/test");
@@ -244,26 +218,4 @@ fn admin_provider_attribution_preserves_existing_response_fields() {
     ] {
         assert!(!usage_object.contains_key(forbidden_field));
     }
-    println!(
-        "admin_provider_attribution_response_snippet={}",
-        serde_json::json!({
-            "platform_metrics": {
-                "total_requests": platform_json["total_requests"],
-                "total_consumed_usd": platform_json["total_consumed_usd"],
-                "provider_usage": platform_json["provider_usage"],
-            },
-            "model_revenue_entry": {
-                "model_name": model_revenue_json["data"][0]["model_name"],
-                "consumed_cost_usd": model_revenue_json["data"][0]["consumed_cost_usd"],
-                "served_provider_breakdown": model_revenue_json["data"][0]["served_provider_breakdown"],
-                "fallback_requests": model_revenue_json["data"][0]["fallback_requests"],
-                "chutes_consumed_cost_usd": model_revenue_json["data"][0]["chutes_consumed_cost_usd"],
-            },
-            "customer_usage_history": {
-                "model": usage_json["model"],
-                "total_cost": usage_json["total_cost"],
-                "served_provider_fields_present": false,
-            }
-        })
-    );
 }

@@ -60,7 +60,7 @@ pub fn parse_content(value: &serde_json::Value) -> Vec<ContentPart> {
     }
 }
 
-fn parse_content_part(item: &serde_json::Value) -> Option<ContentPart> {
+pub(crate) fn parse_content_part(item: &serde_json::Value) -> Option<ContentPart> {
     let obj = item.as_object()?;
 
     match obj.get("type").and_then(|t| t.as_str()) {

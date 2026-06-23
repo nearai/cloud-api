@@ -11,6 +11,16 @@ pub struct AttributedChatCompletionStream {
     pub provider_attribution: crate::usage::ProviderAttribution,
 }
 
+pub struct AttributedImageGeneration {
+    pub response: inference_providers::ImageGenerationResponseWithBytes,
+    pub provider_attribution: crate::usage::ProviderAttribution,
+}
+
+pub struct AttributedImageEdit {
+    pub response: inference_providers::ImageEditResponseWithBytes,
+    pub provider_attribution: crate::usage::ProviderAttribution,
+}
+
 pub(super) struct ServedProviderResult<T> {
     pub(super) value: T,
     pub(super) provider: Arc<dyn InferenceProvider + Send + Sync>,

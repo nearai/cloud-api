@@ -24,7 +24,10 @@ use tracing::{debug, info, warn};
 
 mod provider_attribution;
 use provider_attribution::{served_provider_attribution, ServedProviderResult};
-pub use provider_attribution::{AttributedChatCompletion, AttributedChatCompletionStream};
+pub use provider_attribution::{
+    AttributedChatCompletion, AttributedChatCompletionStream, AttributedImageEdit,
+    AttributedImageGeneration,
+};
 
 type InferenceProviderTrait = dyn InferenceProvider + Send + Sync;
 
@@ -250,6 +253,12 @@ pub struct InferenceProviderPool {
     /// is the only layer that knows which trust tier served a request and whether
     /// it was a fallback, so the per-tier / fallback counter is emitted from here.
     metrics_service: std::sync::OnceLock<Arc<dyn crate::metrics::MetricsServiceTrait>>,
+    /// Model ids that have been observed with both a NEAR provider and an
+    /// out-of-band pinned provider. If discovery later drops the NEAR side and
+    /// leaves the pinned provider as the only live option, the pinned provider is
+    /// still serving as fallback for that canonical id rather than as a
+    /// Chutes-only primary.
+    fallback_pinned_models: Arc<std::sync::RwLock<std::collections::HashSet<String>>>,
 }
 
 /// Backend verifier that creates verified reqwest clients by connecting to a backend,
@@ -521,6 +530,9 @@ impl InferenceProviderPool {
             pinned_models: Arc::new(std::sync::RwLock::new(std::collections::HashSet::new())),
             pinned_providers: Arc::new(std::sync::RwLock::new(HashMap::new())),
             metrics_service: std::sync::OnceLock::new(),
+            fallback_pinned_models: Arc::new(std::sync::RwLock::new(
+                std::collections::HashSet::new(),
+            )),
         }
     }
 
@@ -531,6 +543,47 @@ impl InferenceProviderPool {
     /// a no-op.
     pub fn set_metrics_service(&self, metrics: Arc<dyn crate::metrics::MetricsServiceTrait>) {
         let _ = self.metrics_service.set(metrics);
+    }
+
+    fn note_fallback_pinned_model(
+        &self,
+        model_id: &str,
+        providers: &[Arc<InferenceProviderTrait>],
+    ) {
+        let has_near = providers
+            .iter()
+            .any(|provider| provider.tier() == inference_providers::ProviderTier::Near);
+        let has_attested_3p = providers
+            .iter()
+            .any(|provider| provider.tier() == inference_providers::ProviderTier::Attested3p);
+        if has_near && has_attested_3p {
+            self.fallback_pinned_models
+                .write()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(model_id.to_string());
+        }
+    }
+
+    fn served_via_fallback(
+        &self,
+        model_id: &str,
+        attempt: usize,
+        provider: &Arc<InferenceProviderTrait>,
+        has_near_primary: bool,
+    ) -> bool {
+        if attempt > 0 {
+            return true;
+        }
+        let tier = provider.tier();
+        if has_near_primary {
+            return tier != inference_providers::ProviderTier::Near;
+        }
+        tier != inference_providers::ProviderTier::Near
+            && self
+                .fallback_pinned_models
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains(model_id)
     }
 
     /// Load external providers (OpenAI, Anthropic, Gemini, etc.) into provider_mappings.
@@ -620,6 +673,20 @@ impl InferenceProviderPool {
                 !providers.is_empty()
             });
 
+            // Check whether any other model still references these providers.
+            // A provider Arc can serve multiple model names (e.g. aliases), so we
+            // must not evict its URL-cache entries if it is still live elsewhere.
+            let still_live_ptrs: std::collections::HashSet<usize> = mappings
+                .model_to_providers
+                .values()
+                .flat_map(|ps| ps.iter().map(|p| Arc::as_ptr(p) as *const () as usize))
+                .collect();
+            let exclusively_removed: std::collections::HashSet<usize> = removed_ptrs
+                .iter()
+                .copied()
+                .filter(|ptr| !still_live_ptrs.contains(ptr))
+                .collect();
+
             // Clean up load balancer index and failure counts for removed providers
             self.load_balancer_index
                 .write()
@@ -629,6 +696,26 @@ impl InferenceProviderPool {
                 .write()
                 .unwrap_or_else(|e| e.into_inner())
                 .retain(|key, _| !removed_ptrs.contains(key));
+
+            // Evict stale URL-cache and fingerprint-state entries for providers that
+            // are no longer referenced by any model.  This prevents a subsequent
+            // partial `load_inference_url_models` call (admin PATCH URL change) from
+            // seeing a warm cache entry for the old URL and skipping re-attestation,
+            // which would leave a stale provider Arc in the cache pointing to a model
+            // that no longer exists.
+            if !exclusively_removed.is_empty() {
+                {
+                    let mut cache = self.inference_url_providers.write().await;
+                    cache.retain(|_, p| {
+                        !exclusively_removed.contains(&(Arc::as_ptr(p) as *const () as usize))
+                    });
+                }
+                {
+                    let mut states = self.inference_url_fingerprint_states.write().await;
+                    let url_cache = self.inference_url_providers.read().await;
+                    states.retain(|url, _| url_cache.contains_key(url));
+                }
+            }
 
             info!(model = %model_name, "Unregistered provider");
         }
@@ -723,7 +810,10 @@ impl InferenceProviderPool {
             }
         }
         let mut mappings = self.provider_mappings.write().await;
-        let entry = mappings.model_to_providers.entry(model_id).or_default();
+        let entry = mappings
+            .model_to_providers
+            .entry(model_id.clone())
+            .or_default();
         // Avoid a duplicate if this exact Arc is somehow already present.
         if !entry
             .iter()
@@ -731,6 +821,7 @@ impl InferenceProviderPool {
         {
             entry.push(provider);
         }
+        self.note_fallback_pinned_model(&model_id, entry);
     }
 
     /// Whether `model_name` is currently registered as a **pinned** (out-of-band)
@@ -1402,6 +1493,21 @@ impl InferenceProviderPool {
     ) -> Option<Arc<dyn InferenceProvider + Send + Sync>> {
         let mapping = self.chat_id_mapping.read().await;
         mapping.get(chat_id).cloned()
+    }
+
+    /// Return the trust tier of the provider that served a given streaming completion.
+    /// The pool stores a chat_id → provider mapping when a stream starts; callers
+    /// (e.g. the API route building response headers) can use this to know whether
+    /// the request was served by NEAR's own fleet or a Chutes fallback.
+    ///
+    /// Returns `None` if no mapping exists (e.g. stream failed before the first chunk
+    /// carried a chat_id).
+    pub async fn get_provider_tier_for_chat_id(
+        &self,
+        chat_id: &str,
+    ) -> Option<inference_providers::ProviderTier> {
+        let mapping = self.chat_id_mapping.read().await;
+        mapping.get(chat_id).map(|p| p.tier())
     }
 
     /// Get providers with load balancing support
@@ -2171,9 +2277,8 @@ impl InferenceProviderPool {
                         // catches sustained NEAR outages where the failure counter has
                         // demoted NEAR behind a healthy fallback provider.
                         let tier = provider.tier();
-                        let is_fallback = attempt > 0
-                            || (has_near_primary
-                                && tier != inference_providers::ProviderTier::Near);
+                        let is_fallback =
+                            self.served_via_fallback(model_id, attempt, provider, has_near_primary);
                         tracing::info!(
                             model_id = %model_id,
                             attempt = attempt + 1,
@@ -2448,6 +2553,8 @@ impl InferenceProviderPool {
         }
     }
 
+    /// `provider_filter`: when `Some`, only providers whose `tier()` matches are
+    /// tried. `None` preserves the existing behaviour (first successful wins).
     pub async fn get_attestation_report(
         &self,
         model: String,
@@ -2455,11 +2562,25 @@ impl InferenceProviderPool {
         nonce: Option<String>,
         signing_address: Option<String>,
         include_tls_fingerprint: bool,
+        provider_filter: Option<inference_providers::ProviderTier>,
     ) -> Result<Vec<serde_json::Map<String, serde_json::Value>>, AttestationError> {
-        let providers = self
+        let all_providers = self
             .get_providers_for_model(&model)
             .await
             .ok_or_else(|| AttestationError::ProviderNotFound(model.clone()))?;
+
+        // Apply tier filter when requested.
+        let providers: Vec<_> = match provider_filter {
+            Some(tier) => all_providers
+                .into_iter()
+                .filter(|p| p.tier() == tier)
+                .collect(),
+            None => all_providers,
+        };
+
+        if providers.is_empty() {
+            return Err(AttestationError::ProviderNotFound(model));
+        }
 
         // Each inference_url points to a proxy that load-balances across CVMs.
         // All CVMs behind the proxy share the same signing key (derived from model
@@ -2688,9 +2809,20 @@ impl InferenceProviderPool {
     /// Generate images using the specified model
     pub async fn image_generation(
         &self,
-        mut params: ImageGenerationParams,
+        params: ImageGenerationParams,
         request_hash: String,
     ) -> Result<ImageGenerationResponseWithBytes, ImageGenerationError> {
+        Ok(self
+            .image_generation_with_attribution(params, request_hash)
+            .await?
+            .response)
+    }
+
+    pub async fn image_generation_with_attribution(
+        &self,
+        mut params: ImageGenerationParams,
+        request_hash: String,
+    ) -> Result<AttributedImageGeneration, ImageGenerationError> {
         let model_id = params.model.clone();
 
         // Extract model_pub_key from params.extra for routing before any cloning.
@@ -2727,6 +2859,7 @@ impl InferenceProviderPool {
             .map_err(|e| ImageGenerationError::GenerationError(e.to_string()))?;
         let response = served.value;
         let provider = served.provider;
+        let provider_attribution = served.provider_attribution;
 
         // Store the chat_id mapping so attestation service can find the provider
         // (same pattern as chat_completion)
@@ -2737,7 +2870,10 @@ impl InferenceProviderPool {
         );
         self.store_chat_id_mapping(image_id, provider).await;
 
-        Ok(response)
+        Ok(AttributedImageGeneration {
+            response,
+            provider_attribution,
+        })
     }
 
     pub async fn audio_transcription(
@@ -2838,6 +2974,17 @@ impl InferenceProviderPool {
         params: ImageEditParams,
         request_hash: String,
     ) -> Result<ImageEditResponseWithBytes, ImageEditError> {
+        Ok(self
+            .image_edit_with_attribution(params, request_hash)
+            .await?
+            .response)
+    }
+
+    pub async fn image_edit_with_attribution(
+        &self,
+        params: ImageEditParams,
+        request_hash: String,
+    ) -> Result<AttributedImageEdit, ImageEditError> {
         let model_id = params.model.clone();
 
         tracing::debug!(
@@ -2865,6 +3012,7 @@ impl InferenceProviderPool {
             .map_err(|e| ImageEditError::EditError(e.to_string()))?;
         let response = served.value;
         let provider = served.provider;
+        let provider_attribution = served.provider_attribution;
 
         // Store the chat_id mapping so attestation service can find the provider
         // (same pattern as image_generation)
@@ -2875,7 +3023,10 @@ impl InferenceProviderPool {
         );
         self.store_chat_id_mapping(image_id, provider).await;
 
-        Ok(response)
+        Ok(AttributedImageEdit {
+            response,
+            provider_attribution,
+        })
     }
 
     pub async fn rerank(&self, params: RerankParams) -> Result<RerankResponse, RerankError> {
@@ -3177,15 +3328,18 @@ impl InferenceProviderPool {
         counts.retain(|ptr, _| live_ptrs.contains(ptr) || !candidate_ptrs.contains(ptr));
     }
 
-    /// Load models with inference_url as nearai::Providers into provider_mappings.
+    /// Load (or refresh) a set of inference_url models into the provider pool.
     ///
-    /// For each model, reuses the existing provider (and its warm TLS connections)
-    /// if the inference_url hasn't changed since last load. Only creates new providers
-    /// for models whose URL changed or that are new.
+    /// Reuses the existing provider (and its warm TLS connections) for each model
+    /// whose inference_url hasn't changed since last load; creates new providers
+    /// only for models whose URL changed or that are new.
     ///
-    /// # Arguments
-    /// * `models` - List of (model_name, inference_url) tuples
-    pub async fn load_inference_url_models(&self, models: Vec<(String, String)>) {
+    /// The `partial` flag controls whether this is a merge or a replace.
+    /// Pass `partial = true` from the admin PATCH path to upsert only the
+    /// provided models without evicting untouched entries.  Pass
+    /// `partial = false` from the periodic sync / startup paths to replace
+    /// the URL-provider cache wholesale and prune stale entries.
+    pub async fn load_inference_url_models(&self, models: Vec<(String, String)>, partial: bool) {
         if models.is_empty() {
             return;
         }
@@ -3757,6 +3911,66 @@ impl InferenceProviderPool {
             new_fingerprint_states.insert(url.clone(), state.clone());
         }
 
+        // In partial mode (admin PATCH), identify stale URL-cache entries for models
+        // whose `inference_url` is changing.  Two cases arise:
+        //
+        // 1. Non-pinned models: the admin route calls `unregister_provider` before
+        //    this function, which already evicts the old URL entries from both caches
+        //    (see the cleanup added to `unregister_provider`).  No further action
+        //    needed here for that case.
+        //
+        // 2. Pinned models: the admin route skips `unregister_provider` for pinned
+        //    models (a model with a Chutes fallback, for example).  For those models
+        //    the old NEAR provider is still in `model_to_providers` when we arrive
+        //    here.  We capture the old provider pointers for models being replaced,
+        //    excluding reused providers, and use them to evict the corresponding old
+        //    URL entries from the caches.
+        //
+        // Lock ordering: we read `provider_mappings` here (before the write below),
+        // drop it, then separately read `inference_url_providers` — no two locks are
+        // held simultaneously.
+        let stale_url_cache_entries: std::collections::HashSet<String> = if partial {
+            let reused_ptrs: std::collections::HashSet<usize> = reused
+                .iter()
+                .map(|(_, _, p)| Arc::as_ptr(p) as *const () as usize)
+                .collect();
+            let new_urls: std::collections::HashSet<&str> =
+                new_url_cache.keys().map(|u| u.as_str()).collect();
+            let old_ptrs: std::collections::HashSet<usize> = {
+                let mappings = self.provider_mappings.read().await;
+                let mut ptrs = std::collections::HashSet::new();
+                for model_name in model_providers.keys() {
+                    if let Some(old) = mappings.model_to_providers.get(model_name) {
+                        for p in old {
+                            let ptr = Arc::as_ptr(p) as *const () as usize;
+                            if !reused_ptrs.contains(&ptr) {
+                                ptrs.insert(ptr);
+                            }
+                        }
+                    }
+                }
+                ptrs
+            };
+            if old_ptrs.is_empty() {
+                std::collections::HashSet::new()
+            } else {
+                let cache = self.inference_url_providers.read().await;
+                cache
+                    .iter()
+                    .filter_map(|(url, p)| {
+                        let ptr = Arc::as_ptr(p) as *const () as usize;
+                        if old_ptrs.contains(&ptr) && !new_urls.contains(url.as_str()) {
+                            Some(url.clone())
+                        } else {
+                            None
+                        }
+                    })
+                    .collect()
+            }
+        } else {
+            std::collections::HashSet::new()
+        };
+
         // Atomic update: replace model providers and rebuild pubkey mappings
         {
             let mut mappings = self.provider_mappings.write().await;
@@ -3794,6 +4008,7 @@ impl InferenceProviderPool {
             for (model_name, providers) in
                 Self::merge_discovered_and_pinned(model_providers, &pinned_providers)
             {
+                self.note_fallback_pinned_model(&model_name, &providers);
                 mappings.model_to_providers.insert(model_name, providers);
             }
 
@@ -3862,23 +4077,54 @@ impl InferenceProviderPool {
             "pubkey_to_providers state after update"
         );
 
-        // Update the URL→provider cache
-        *self.inference_url_providers.write().await = new_url_cache;
+        // Update the URL→provider cache.
+        //
+        // Partial mode (admin PATCH): merge new entries into the existing map
+        // so that untouched models keep their warm providers and fingerprint
+        // state.  Full mode (periodic sync): replace the map entirely so that
+        // URLs for models that have been removed are pruned.
+        {
+            let mut cache = self.inference_url_providers.write().await;
+            if partial {
+                // Evict stale URL entries for models whose inference_url changed.
+                // Without this, the old URL key would stay warm in the cache even
+                // after the model's URL was updated via a PATCH, leaking state.
+                for url in &stale_url_cache_entries {
+                    cache.remove(url);
+                }
+                // Merge: only insert/replace the URLs we just processed.
+                for (url, provider) in new_url_cache {
+                    cache.insert(url, provider);
+                }
+            } else {
+                *cache = new_url_cache;
+            }
+        }
 
         // Rebuild the URL → FingerprintState map so its key set exactly
         // matches the active inference_url set:
         // - Newly-created URLs take the freshly-discovered state.
         // - Reused URLs keep their existing entries (cumulative discovery
         //   mutated the Arc in place).
-        // - URLs no longer in the active set are pruned — prevents a slow
-        //   leak of stale per-URL state as models are added and removed.
+        // - URLs no longer in the active set are pruned on a full sync —
+        //   prevents a slow leak of stale per-URL state as models are added
+        //   and removed.  On a partial sync we only insert new states and
+        //   leave existing ones untouched, except stale entries for models
+        //   whose URL changed are evicted to match the URL cache cleanup above.
         {
             let mut states = self.inference_url_fingerprint_states.write().await;
+            if partial {
+                for url in &stale_url_cache_entries {
+                    states.remove(url);
+                }
+            }
             for (url, state) in new_fingerprint_states {
                 states.insert(url, state);
             }
-            let active_urls = self.inference_url_providers.read().await;
-            states.retain(|url, _| active_urls.contains_key(url));
+            if !partial {
+                let active_urls = self.inference_url_providers.read().await;
+                states.retain(|url, _| active_urls.contains_key(url));
+            }
         }
 
         info!(
@@ -3902,7 +4148,7 @@ impl InferenceProviderPool {
         // load_inference_url_models directly (partial batch, no prune).
         let complete_names: std::collections::HashSet<String> =
             models.iter().map(|(name, _)| name.clone()).collect();
-        self.load_inference_url_models(models).await;
+        self.load_inference_url_models(models, false).await;
         self.prune_stale_pinned(&complete_names).await;
     }
 
@@ -5724,7 +5970,7 @@ mod tests {
 
         // Call load_inference_url_models — the provider should be reused and
         // the self-healing path should detect missing pubkeys and re-fetch them.
-        pool.load_inference_url_models(vec![(model_id.clone(), url)])
+        pool.load_inference_url_models(vec![(model_id.clone(), url)], false)
             .await;
 
         // Verify pubkeys were recovered
@@ -5860,6 +6106,13 @@ mod tests {
             }
             other => panic!("Expected HttpError, got: {:?}", other),
         }
+        assert!(
+            pool.provider_failure_counts
+                .read()
+                .expect("provider failure counts lock")
+                .is_empty(),
+            "client 4xx responses must not mark a provider unhealthy"
+        );
     }
 
     /// Multi-provider, alternating-error test pinning Pierre's blocker: provider
@@ -6282,7 +6535,7 @@ mod tests {
         mock_provider.set_fail_attestation(true);
 
         // Load — the provider is reused, pubkeys are missing, re-fetch fails
-        pool.load_inference_url_models(vec![(model_id.clone(), url.clone())])
+        pool.load_inference_url_models(vec![(model_id.clone(), url.clone())], false)
             .await;
 
         // The URL should have been evicted from the cache
@@ -6357,7 +6610,7 @@ mod tests {
                 .insert("pretend-pubkey".to_string(), vec![mock.clone()]);
         }
 
-        pool.load_inference_url_models(vec![(model_id.clone(), url.clone())])
+        pool.load_inference_url_models(vec![(model_id.clone(), url.clone())], false)
             .await;
 
         // Blocked URL evicted from URL cache
@@ -7044,7 +7297,6 @@ mod tests {
         }
 
         let fb = served_tags(true).await;
-        println!("provider_requests_metric_tags_tier_and_fallback fallback_records={fb:?}");
         assert_eq!(fb.len(), 1, "exactly one provider-requests metric");
         assert_eq!(
             fb[0],
@@ -7057,7 +7309,6 @@ mod tests {
         );
 
         let primary = served_tags(false).await;
-        println!("provider_requests_metric_tags_tier_and_fallback primary_records={primary:?}");
         assert_eq!(primary.len(), 1, "exactly one provider-requests metric");
         assert_eq!(
             primary[0],
@@ -7128,10 +7379,6 @@ mod tests {
             chutes.last_chat_params().await.is_some(),
             "Chutes should be the first successful provider"
         );
-        println!(
-            "demoted_near_chutes_first_success_is_still_fallback_attribution attribution={:?}",
-            served.provider_attribution
-        );
         assert_eq!(
             served.provider_attribution.served_provider_tier,
             Some(crate::usage::ServedProviderTier::Attested3p)
@@ -7143,6 +7390,104 @@ mod tests {
         assert!(
             served.provider_attribution.served_via_fallback,
             "Chutes/attested_3p service under a demoted NEAR primary must be fallback even at attempt index 0"
+        );
+    }
+
+    #[tokio::test]
+    async fn pinned_only_chutes_preserves_fallback_attribution_after_near_disappears() {
+        use inference_providers::mock::{MockProvider, RequestMatcher, ResponseTemplate};
+        use inference_providers::{ProviderSource, ProviderTier};
+        use std::collections::HashSet;
+
+        let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
+        let model_id = "z-ai/glm-5.1".to_string();
+
+        let near = Arc::new(
+            MockProvider::new_accept_all()
+                .with_tier(ProviderTier::Near)
+                .with_provider_source(ProviderSource::Vllm),
+        );
+        let chutes = Arc::new(
+            MockProvider::new_accept_all()
+                .with_tier(ProviderTier::Attested3p)
+                .with_provider_source(ProviderSource::Chutes),
+        );
+        chutes
+            .when(RequestMatcher::Any)
+            .respond_with(ResponseTemplate::new("served-by-pinned-chutes"))
+            .await;
+
+        pool.register_provider(model_id.clone(), near).await;
+        pool.register_pinned_secondary_provider(model_id.clone(), chutes)
+            .await;
+        pool.prune_stale_pinned(&HashSet::new()).await;
+
+        let served = pool
+            .chat_completion_with_attribution(fallback_params(&model_id), "h".to_string())
+            .await
+            .expect("pinned Chutes should serve after NEAR disappears");
+
+        let body = String::from_utf8_lossy(&served.response.raw_bytes);
+        assert!(
+            body.contains("served-by-pinned-chutes"),
+            "pinned Chutes should serve, got: {body}"
+        );
+        assert_eq!(
+            served.provider_attribution.served_provider_tier,
+            Some(crate::usage::ServedProviderTier::Attested3p)
+        );
+        assert_eq!(
+            served.provider_attribution.served_provider_type,
+            Some(crate::usage::ServedProviderType::Chutes)
+        );
+        assert!(
+            served.provider_attribution.served_via_fallback,
+            "a Chutes provider pinned for a former NEAR model must remain attributed as fallback after pruning"
+        );
+    }
+
+    #[tokio::test]
+    async fn chutes_only_pinned_model_remains_primary_attribution() {
+        use inference_providers::mock::{MockProvider, RequestMatcher, ResponseTemplate};
+        use inference_providers::{ProviderSource, ProviderTier};
+
+        let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
+        let model_id = "chutes-only/model".to_string();
+
+        let chutes = Arc::new(
+            MockProvider::new_accept_all()
+                .with_tier(ProviderTier::Attested3p)
+                .with_provider_source(ProviderSource::Chutes),
+        );
+        chutes
+            .when(RequestMatcher::Any)
+            .respond_with(ResponseTemplate::new("served-by-primary-chutes"))
+            .await;
+
+        pool.register_pinned_secondary_provider(model_id.clone(), chutes)
+            .await;
+
+        let served = pool
+            .chat_completion_with_attribution(fallback_params(&model_id), "h".to_string())
+            .await
+            .expect("Chutes-only model should serve");
+
+        let body = String::from_utf8_lossy(&served.response.raw_bytes);
+        assert!(
+            body.contains("served-by-primary-chutes"),
+            "Chutes-only model should serve, got: {body}"
+        );
+        assert_eq!(
+            served.provider_attribution.served_provider_tier,
+            Some(crate::usage::ServedProviderTier::Attested3p)
+        );
+        assert_eq!(
+            served.provider_attribution.served_provider_type,
+            Some(crate::usage::ServedProviderType::Chutes)
+        );
+        assert!(
+            !served.provider_attribution.served_via_fallback,
+            "a true Chutes-only model should not be labeled as NEAR fallback"
         );
     }
 
@@ -7199,12 +7544,163 @@ mod tests {
             .into_iter()
             .filter(|m| m.name == METRIC_PROVIDER_REQUESTS)
             .collect();
-        println!(
-            "provider_requests_metric_not_emitted_when_all_providers_fail records={provider_request_metrics:?}"
-        );
         assert!(
             provider_request_metrics.is_empty(),
             "provider-requests metric must only count served requests, got: {provider_request_metrics:?}"
         );
+    }
+
+    /// When `load_inference_url_models` is called in partial mode (`partial = true`),
+    /// it must merge into the existing URL-provider cache and fingerprint-state map
+    /// rather than replacing them.  Providers for models not in the input set must
+    /// be preserved so they do not need to re-attest on the next periodic refresh.
+    ///
+    /// Regression test for issue #775: `batch_upsert_models` was calling
+    /// `load_inference_url_models` with only the PATCHed models, which caused the
+    /// full URL cache and fingerprint-state map to be replaced by a subset, evicting
+    /// all untouched providers and forcing unnecessary re-attestation.
+    #[tokio::test]
+    async fn test_partial_load_preserves_untouched_providers() {
+        use inference_providers::mock::MockProvider;
+
+        let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
+
+        // Pre-seed the URL cache with two "existing" models as if they were
+        // loaded during a prior full sync.
+        let untouched_url = "https://untouched.completions.near.ai".to_string();
+        let untouched_provider = Arc::new(MockProvider::new());
+
+        let patched_model = "model-patched".to_string();
+        let patched_url = "https://patched.completions.near.ai".to_string();
+        let patched_provider = Arc::new(MockProvider::new());
+
+        {
+            let mut cache = pool.inference_url_providers.write().await;
+            cache.insert(
+                untouched_url.clone(),
+                untouched_provider.clone() as Arc<InferenceProviderTrait>,
+            );
+            cache.insert(
+                patched_url.clone(),
+                patched_provider.clone() as Arc<InferenceProviderTrait>,
+            );
+        }
+
+        // Also seed fingerprint states for both.
+        {
+            let mut states = pool.inference_url_fingerprint_states.write().await;
+            states.insert(
+                untouched_url.clone(),
+                Arc::new(std::sync::RwLock::new(FingerprintState::Bootstrap)),
+            );
+            states.insert(
+                patched_url.clone(),
+                Arc::new(std::sync::RwLock::new(FingerprintState::Bootstrap)),
+            );
+        }
+
+        // Partial load — only the patched model is included.
+        pool.load_inference_url_models(vec![(patched_model.clone(), patched_url.clone())], true)
+            .await;
+
+        // The untouched model's URL must still be present in the URL cache.
+        {
+            let cache = pool.inference_url_providers.read().await;
+            assert!(
+                cache.contains_key(&untouched_url),
+                "partial load must not evict untouched provider from URL cache"
+            );
+        }
+
+        // The untouched model's fingerprint state must also be preserved.
+        {
+            let states = pool.inference_url_fingerprint_states.read().await;
+            assert!(
+                states.contains_key(&untouched_url),
+                "partial load must not prune fingerprint state for untouched provider"
+            );
+        }
+    }
+
+    /// When a model's `inference_url` changes via a partial PATCH, the old URL key must
+    /// be evicted from `inference_url_providers` and `inference_url_fingerprint_states`.
+    ///
+    /// Without the fix, the old URL would stay warm in both maps after a URL change,
+    /// pointing to a stale/leaked provider that is no longer registered for any model.
+    ///
+    /// Regression test for the lloydmak99 "changes requested" review on PR #802.
+    #[tokio::test]
+    async fn test_partial_load_evicts_old_url_on_url_change() {
+        use inference_providers::mock::MockProvider;
+
+        let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
+
+        let model_name = "my-model".to_string();
+        let old_url = "https://old.completions.near.ai".to_string();
+        let new_url = "https://new.completions.near.ai".to_string();
+
+        // Seed the pool as if a prior full sync registered the model at old_url.
+        let old_provider = Arc::new(MockProvider::new()) as Arc<InferenceProviderTrait>;
+        {
+            let mut cache = pool.inference_url_providers.write().await;
+            cache.insert(old_url.clone(), old_provider.clone());
+        }
+        {
+            let mut states = pool.inference_url_fingerprint_states.write().await;
+            states.insert(
+                old_url.clone(),
+                Arc::new(std::sync::RwLock::new(FingerprintState::Bootstrap)),
+            );
+        }
+        {
+            let mut mappings = pool.provider_mappings.write().await;
+            mappings
+                .model_to_providers
+                .insert(model_name.clone(), vec![old_provider.clone()]);
+        }
+
+        // Simulate the admin PATCH path: unregister (removes from model_to_providers),
+        // then call load_inference_url_models in partial mode with the new URL.
+        pool.unregister_provider(&model_name).await;
+
+        // Partial load with the new URL — as if the admin PATCH changed inference_url.
+        pool.load_inference_url_models(vec![(model_name.clone(), new_url.clone())], true)
+            .await;
+
+        // The new URL must be present in the URL cache.
+        {
+            let cache = pool.inference_url_providers.read().await;
+            assert!(
+                cache.contains_key(&new_url),
+                "new URL must be present in the URL cache after a URL change"
+            );
+        }
+
+        // The old URL must have been evicted from the URL cache.
+        {
+            let cache = pool.inference_url_providers.read().await;
+            assert!(
+                !cache.contains_key(&old_url),
+                "old URL must be evicted from the URL cache when inference_url changes"
+            );
+        }
+
+        // The old URL's fingerprint state must also have been evicted.
+        {
+            let states = pool.inference_url_fingerprint_states.read().await;
+            assert!(
+                !states.contains_key(&old_url),
+                "old URL fingerprint state must be evicted when inference_url changes"
+            );
+        }
+
+        // The new URL's fingerprint state must be present (freshly created).
+        {
+            let states = pool.inference_url_fingerprint_states.read().await;
+            assert!(
+                states.contains_key(&new_url),
+                "new URL fingerprint state must be created after a URL change"
+            );
+        }
     }
 }

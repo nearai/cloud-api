@@ -12,6 +12,7 @@ use crate::{
     },
 };
 use async_trait::async_trait;
+use inference_providers::ProviderTier;
 use uuid::Uuid;
 
 pub struct MockAttestationService;
@@ -60,6 +61,7 @@ impl AttestationServiceTrait for MockAttestationService {
         _nonce: Option<String>,
         _signing_address: Option<String>,
         _include_tls_fingerprint: bool,
+        _provider_filter: Option<ProviderTier>,
     ) -> Result<AttestationReport, AttestationError> {
         Err(AttestationError::InternalError(
             "Not implemented".to_string(),

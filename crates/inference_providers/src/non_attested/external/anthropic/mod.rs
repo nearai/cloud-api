@@ -3,7 +3,7 @@
 //! This backend handles HTTP communication with Anthropic's Messages API.
 //! Format conversion is handled by the `anthropic_converter` module.
 
-mod converter;
+pub mod converter;
 
 use super::backend::{BackendConfig, ExternalBackend};
 use crate::{
@@ -16,7 +16,7 @@ use bytes::Bytes;
 use converter::{
     convert_messages, convert_tool_choice, convert_tools, extract_response_content,
     map_finish_reason_string, AnthropicEventParser, AnthropicParserState, AnthropicRequest,
-    AnthropicResponse,
+    AnthropicResponse, AnthropicUsage,
 };
 use futures_util::Stream;
 use reqwest::{header::HeaderValue, Client};
@@ -85,6 +85,33 @@ fn strip_json_code_fence(content: &str) -> String {
     inner.trim().to_string()
 }
 
+/// Map a non-streaming Anthropic `usage` block to OpenAI-shaped [`TokenUsage`].
+///
+/// #666: surface Anthropic prompt-cache stats so the existing billing path
+/// (which reads `usage.cached_tokens()` and bills `cache_read_tokens`) lights
+/// up. CRITICAL accounting: Anthropic reports cache reads and cache creation
+/// SEPARATELY from `input_tokens`, whereas OpenAI's `cached_tokens` is a SUBSET
+/// of `prompt_tokens` (and `TokenUsage::cached_tokens()` caps it to
+/// `[0, prompt_tokens]`). To preserve that invariant AND bill the cache-read
+/// cost, we ADD both cache figures into `prompt_tokens` and report the read
+/// portion as `cached_tokens`. When there is no cache read, `prompt_tokens_details`
+/// stays `None` so an uncached response is byte-identical to before.
+fn map_usage(usage: &AnthropicUsage) -> TokenUsage {
+    let prompt_tokens =
+        usage.input_tokens + usage.cache_read_input_tokens + usage.cache_creation_input_tokens;
+    let prompt_tokens_details = if usage.cache_read_input_tokens > 0 {
+        Some(serde_json::json!({ "cached_tokens": usage.cache_read_input_tokens }))
+    } else {
+        None
+    };
+    TokenUsage {
+        prompt_tokens,
+        completion_tokens: usage.output_tokens,
+        total_tokens: prompt_tokens + usage.output_tokens,
+        prompt_tokens_details,
+    }
+}
+
 /// Pick the allowlisted reasoning-control fields out of `extra`.
 fn extract_passthrough(
     extra: &std::collections::HashMap<String, serde_json::Value>,
@@ -93,6 +120,73 @@ fn extract_passthrough(
         .iter()
         .filter_map(|&key| extra.get(key).map(|value| (key.to_string(), value.clone())))
         .collect()
+}
+
+/// Build our normalized OpenAI-shaped response from a parsed Anthropic
+/// non-streaming response.
+///
+/// `sent_model` is the model name cloud-api sent to Anthropic (the `model`
+/// argument threaded through the backend call), NOT `anthropic_response.model`.
+///
+/// #632: the response `model` field uses the requested/sent model name to stay
+/// consistent with the streaming path, which seeds its chunk model from the
+/// same sent name (see `AnthropicParserState::new` in `converter.rs`).
+/// Upstream's dated canonical name (e.g. `claude-haiku-4-5-20251001`) is
+/// intentionally NOT surfaced, so both transports echo the same value for an
+/// identical request.
+fn build_openai_response(
+    anthropic_response: AnthropicResponse,
+    sent_model: &str,
+    wants_json: bool,
+) -> ChatCompletionResponse {
+    // Convert to OpenAI format using the converter
+    let (content, tool_calls) = extract_response_content(&anthropic_response.content);
+
+    // #668: Anthropic has no native JSON-output mode, so when the caller
+    // requested `response_format: json_object`/`json_schema` it tends to
+    // wrap the JSON in a markdown ```json … ``` fence, breaking
+    // `JSON.parse`. Strip that fence so the content is raw parseable JSON.
+    let content = if wants_json {
+        content.map(|c| strip_json_code_fence(&c))
+    } else {
+        content
+    };
+
+    ChatCompletionResponse {
+        id: anthropic_response.id,
+        object: "chat.completion".to_string(),
+        created: chrono::Utc::now().timestamp(),
+        // #632: echo the requested/sent model name (not upstream's dated name)
+        // so non-streaming matches the streaming path for the same request.
+        model: sent_model.to_string(),
+        choices: vec![ChatCompletionResponseChoice {
+            index: 0,
+            message: ChatResponseMessage {
+                role: MessageRole::Assistant,
+                content,
+                refusal: None,
+                annotations: None,
+                audio: None,
+                function_call: None,
+                tool_calls,
+                reasoning_content: None,
+                reasoning: None,
+            },
+            logprobs: None,
+            finish_reason: map_finish_reason_string(anthropic_response.stop_reason),
+            token_ids: None,
+            extra: Default::default(),
+        }],
+        service_tier: None,
+        system_fingerprint: None,
+        // #666: fold Anthropic cache-read/creation tokens into prompt_tokens and
+        // surface the read portion as prompt_tokens_details.cached_tokens.
+        usage: map_usage(&anthropic_response.usage),
+        prompt_logprobs: None,
+        prompt_token_ids: None,
+        kv_transfer_params: None,
+        extra: Default::default(),
+    }
 }
 
 /// Anthropic backend - handles HTTP communication with Anthropic's API
@@ -309,56 +403,8 @@ impl ExternalBackend for AnthropicBackend {
                 CompletionError::CompletionError(format!("Failed to parse response: {e}"))
             })?;
 
-        // Convert to OpenAI format using the converter
-        let (content, tool_calls) = extract_response_content(&anthropic_response.content);
-
-        // #668: Anthropic has no native JSON-output mode, so when the caller
-        // requested `response_format: json_object`/`json_schema` it tends to
-        // wrap the JSON in a markdown ```json … ``` fence, breaking
-        // `JSON.parse`. Strip that fence so the content is raw parseable JSON.
-        let content = if wants_json_output(&params.extra) {
-            content.map(|c| strip_json_code_fence(&c))
-        } else {
-            content
-        };
-
-        let openai_response = ChatCompletionResponse {
-            id: anthropic_response.id,
-            object: "chat.completion".to_string(),
-            created: chrono::Utc::now().timestamp(),
-            model: anthropic_response.model,
-            choices: vec![ChatCompletionResponseChoice {
-                index: 0,
-                message: ChatResponseMessage {
-                    role: MessageRole::Assistant,
-                    content,
-                    refusal: None,
-                    annotations: None,
-                    audio: None,
-                    function_call: None,
-                    tool_calls,
-                    reasoning_content: None,
-                    reasoning: None,
-                },
-                logprobs: None,
-                finish_reason: map_finish_reason_string(anthropic_response.stop_reason),
-                token_ids: None,
-                extra: Default::default(),
-            }],
-            service_tier: None,
-            system_fingerprint: None,
-            usage: TokenUsage {
-                prompt_tokens: anthropic_response.usage.input_tokens,
-                completion_tokens: anthropic_response.usage.output_tokens,
-                total_tokens: anthropic_response.usage.input_tokens
-                    + anthropic_response.usage.output_tokens,
-                prompt_tokens_details: None,
-            },
-            prompt_logprobs: None,
-            prompt_token_ids: None,
-            kv_transfer_params: None,
-            extra: Default::default(),
-        };
+        let openai_response =
+            build_openai_response(anthropic_response, model, wants_json_output(&params.extra));
 
         // Serialize our normalized response. We intentionally overwrite fields
         // like `usage` (and any future cost-related fields derived from it) instead of passing
@@ -371,6 +417,7 @@ impl ExternalBackend for AnthropicBackend {
         Ok(ChatCompletionResponseWithBytes {
             response: openai_response,
             raw_bytes: serialized_bytes,
+            serving_tier: crate::ProviderTier::NonAttested,
         })
     }
 }
@@ -730,6 +777,106 @@ mod tests {
     fn test_strip_json_code_fence_passes_through_raw_json() {
         let raw = "{\"city\":\"Paris\"}";
         assert_eq!(strip_json_code_fence(raw), raw);
+    }
+
+    // ── #666: non-streaming usage maps cache reads -> cached_tokens ──────────
+
+    #[test]
+    fn test_map_usage_folds_cache_into_prompt_tokens() {
+        // Anthropic reports cache reads/creation separately from input_tokens.
+        // map_usage adds them into prompt_tokens and reports the read portion as
+        // cached_tokens, so cached <= prompt holds and the cache read is billed.
+        let usage = AnthropicUsage {
+            input_tokens: 10,
+            output_tokens: 30,
+            cache_read_input_tokens: 80,
+            cache_creation_input_tokens: 5,
+        };
+        let mapped = map_usage(&usage);
+
+        // prompt_tokens = 10 + 80 + 5 = 95.
+        assert_eq!(mapped.prompt_tokens, 95);
+        assert_eq!(mapped.completion_tokens, 30);
+        assert_eq!(mapped.total_tokens, 125);
+        // cached_tokens surfaced via prompt_tokens_details, and clamped helper
+        // confirms the invariant cached <= prompt.
+        assert_eq!(mapped.cached_tokens(), 80);
+        assert!(mapped.cached_tokens() <= mapped.prompt_tokens);
+    }
+
+    #[test]
+    fn test_map_usage_no_cache_omits_details() {
+        // No cache reads -> prompt_tokens_details stays None (no regression).
+        let usage = AnthropicUsage {
+            input_tokens: 100,
+            output_tokens: 20,
+            cache_read_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+        };
+        let mapped = map_usage(&usage);
+        assert_eq!(mapped.prompt_tokens, 100);
+        assert_eq!(mapped.total_tokens, 120);
+        assert!(mapped.prompt_tokens_details.is_none());
+        assert_eq!(mapped.cached_tokens(), 0);
+    }
+
+    // ── #632: non-streaming response echoes the SENT model name ─────────────
+
+    /// Build a minimal Anthropic non-streaming response whose `model` field is
+    /// the upstream dated canonical name, as Anthropic actually returns.
+    fn make_anthropic_response(upstream_dated_model: &str) -> AnthropicResponse {
+        serde_json::from_value(serde_json::json!({
+            "id": "msg_test_632",
+            "model": upstream_dated_model,
+            "stop_reason": "end_turn",
+            "content": [{ "type": "text", "text": "Hello" }],
+            "usage": { "input_tokens": 3, "output_tokens": 1 }
+        }))
+        .expect("test AnthropicResponse should deserialize")
+    }
+
+    #[test]
+    fn test_non_streaming_response_model_is_sent_name_not_upstream_dated() {
+        // For the SAME request, streaming echoes the SENT name (the `model` arg
+        // threaded into the backend, seeded into AnthropicParserState), while
+        // Anthropic's non-streaming JSON carries the UPSTREAM dated name. Plan A
+        // for #632 makes non-streaming match streaming: the response `model`
+        // must be the sent name, not the upstream dated name.
+        let sent = "claude-haiku-4-5";
+        let upstream_dated = "claude-haiku-4-5-20251001";
+
+        let anthropic_response = make_anthropic_response(upstream_dated);
+        // Sanity: the parsed upstream payload really carries the dated name, so
+        // this test would catch a regression that surfaces it.
+        assert_eq!(anthropic_response.model, upstream_dated);
+
+        let openai_response = build_openai_response(anthropic_response, sent, false);
+
+        assert_eq!(
+            openai_response.model, sent,
+            "non-streaming response must echo the SENT model name (transport consistency, #632)"
+        );
+        assert_ne!(
+            openai_response.model, upstream_dated,
+            "non-streaming response must NOT surface upstream's dated canonical name"
+        );
+    }
+
+    #[test]
+    fn test_non_streaming_response_model_matches_streaming_seed() {
+        // The streaming path seeds its per-chunk `model` from the same sent name
+        // via AnthropicParserState::new(model). Confirm the non-streaming helper
+        // and the streaming parser state agree on the model echoed for an
+        // identical request, regardless of what upstream returned (#632).
+        let sent = "claude-sonnet-4-5";
+        let upstream_dated = "claude-sonnet-4-5-20250929";
+
+        let non_streaming =
+            build_openai_response(make_anthropic_response(upstream_dated), sent, false);
+        let streaming_state = AnthropicParserState::new(sent.to_string());
+
+        assert_eq!(non_streaming.model, streaming_state.model);
+        assert_eq!(non_streaming.model, sent);
     }
 
     #[tokio::test]

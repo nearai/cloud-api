@@ -758,9 +758,7 @@ impl AnalyticsRepository for PgAnalyticsRepository {
                 AVG(ul.ttft_ms)::double precision as avg_ttft_ms,
                 PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY ul.ttft_ms)::double precision as p95_ttft_ms,
                 COUNT(*) FILTER (WHERE ul.served_via_fallback)::bigint as fallback_requests,
-                COALESCE(SUM(ul.total_cost) FILTER (WHERE ul.served_via_fallback), 0)::bigint as fallback_cost_nano,
-                COUNT(*) FILTER (WHERE ul.served_provider_type = 'chutes')::bigint as chutes_requests,
-                COALESCE(SUM(ul.total_cost) FILTER (WHERE ul.served_provider_type = 'chutes'), 0)::bigint as chutes_cost_nano
+                COALESCE(SUM(ul.total_cost) FILTER (WHERE ul.served_via_fallback), 0)::bigint as fallback_cost_nano
             FROM organization_usage_log ul
             LEFT JOIN models m ON m.id = ul.model_id
             {where_clause}
@@ -800,8 +798,6 @@ impl AnalyticsRepository for PgAnalyticsRepository {
                 served_provider_breakdown: Vec::new(),
                 fallback_requests: row.get(9),
                 fallback_consumed_cost_usd: nano_to_usd(row.get::<_, i64>(10)),
-                chutes_requests: row.get(11),
-                chutes_consumed_cost_usd: nano_to_usd(row.get::<_, i64>(12)),
             })
             .collect();
 
@@ -1100,40 +1096,46 @@ impl AnalyticsRepository for PgAnalyticsRepository {
             .await
             .map_err(|e| RepositoryError::PoolError(e.into()))?;
 
+        const NANO_TO_USD: f64 = 1.0 / 1_000_000_000.0;
+        // 1 minute × 60 min/h × 24 h/d × 365 d/yr
+        const YEAR_MINUTES: f64 = 60.0 * 24.0 * 365.0;
+
         // ── Platform-wide percentiles ─────────────────────────────────────────
-        // Inner CTE: one row per minute bucket with sum(cost)/60 = nano-USD/s.
+        // Inner CTE: one row per minute bucket with sum(cost) = nano-USD/min.
         // Outer query: PERCENTILE_CONT + MAX over active minutes only (cost > 0).
         let platform_row = client
             .query_one(
                 r#"
                 WITH per_minute AS (
                     SELECT
-                        DATE_TRUNC('minute', created_at)    AS bucket,
-                        SUM(total_cost)::float8 / 60.0      AS revenue_per_sec
-                    FROM organization_usage_log
-                    WHERE created_at >= $1
-                      AND created_at < $2
+                        DATE_TRUNC('minute', ul.created_at) AS bucket,
+                        SUM(ul.total_cost)::float8          AS revenue_per_min
+                    FROM organization_usage_log ul
+                    LEFT JOIN models m ON m.id = ul.model_id
+                    WHERE ul.created_at >= $1
+                      AND ul.created_at < $2
+                      AND ($3::text IS NULL OR m.provider_type = $3)
                     GROUP BY 1
                 )
                 SELECT
                     COALESCE(
-                        PERCENTILE_CONT(0.50) WITHIN GROUP (ORDER BY revenue_per_sec)
-                            FILTER (WHERE revenue_per_sec > 0), 0.0
+                        PERCENTILE_CONT(0.50) WITHIN GROUP (ORDER BY revenue_per_min)
+                            FILTER (WHERE revenue_per_min > 0), 0.0
                     )::float8 AS p50,
                     COALESCE(
-                        PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY revenue_per_sec)
-                            FILTER (WHERE revenue_per_sec > 0), 0.0
+                        PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY revenue_per_min)
+                            FILTER (WHERE revenue_per_min > 0), 0.0
                     )::float8 AS p95,
                     COALESCE(
-                        PERCENTILE_CONT(0.99) WITHIN GROUP (ORDER BY revenue_per_sec)
-                            FILTER (WHERE revenue_per_sec > 0), 0.0
+                        PERCENTILE_CONT(0.99) WITHIN GROUP (ORDER BY revenue_per_min)
+                            FILTER (WHERE revenue_per_min > 0), 0.0
                     )::float8 AS p99,
-                    COALESCE(MAX(revenue_per_sec), 0.0)::float8              AS peak,
-                    COUNT(*) FILTER (WHERE revenue_per_sec > 0)::bigint       AS active_minutes,
+                    COALESCE(MAX(revenue_per_min), 0.0)::float8              AS peak,
+                    COUNT(*) FILTER (WHERE revenue_per_min > 0)::bigint       AS active_minutes,
                     COUNT(*)::bigint                                           AS sampled_minutes
                 FROM per_minute
                 "#,
-                &[&query.start, &query.end],
+                &[&query.start, &query.end, &query.provider_type],
             )
             .await
             .map_err(|e| RepositoryError::DatabaseError(e.into()))?;
@@ -1144,9 +1146,6 @@ impl AnalyticsRepository for PgAnalyticsRepository {
         let peak_nano: f64 = platform_row.get(3);
         let active_minutes: i64 = platform_row.get(4);
         let sampled_minutes: i64 = platform_row.get(5);
-
-        const NANO_TO_USD: f64 = 1.0 / 1_000_000_000.0;
-        const YEAR_SECONDS: f64 = 86400.0 * 365.0;
 
         let p50 = p50_nano * NANO_TO_USD;
         let p95 = p95_nano * NANO_TO_USD;
@@ -1159,36 +1158,38 @@ impl AnalyticsRepository for PgAnalyticsRepository {
                 r#"
                 WITH per_minute AS (
                     SELECT
-                        model_name,
-                        DATE_TRUNC('minute', created_at)    AS bucket,
-                        SUM(total_cost)::float8 / 60.0      AS revenue_per_sec
-                    FROM organization_usage_log
-                    WHERE created_at >= $1
-                      AND created_at < $2
+                        ul.model_name,
+                        DATE_TRUNC('minute', ul.created_at) AS bucket,
+                        SUM(ul.total_cost)::float8          AS revenue_per_min
+                    FROM organization_usage_log ul
+                    LEFT JOIN models m ON m.id = ul.model_id
+                    WHERE ul.created_at >= $1
+                      AND ul.created_at < $2
+                      AND ($3::text IS NULL OR m.provider_type = $3)
                     GROUP BY 1, 2
                 )
                 SELECT
                     model_name,
                     COALESCE(
-                        PERCENTILE_CONT(0.50) WITHIN GROUP (ORDER BY revenue_per_sec)
-                            FILTER (WHERE revenue_per_sec > 0), 0.0
+                        PERCENTILE_CONT(0.50) WITHIN GROUP (ORDER BY revenue_per_min)
+                            FILTER (WHERE revenue_per_min > 0), 0.0
                     )::float8 AS p50,
                     COALESCE(
-                        PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY revenue_per_sec)
-                            FILTER (WHERE revenue_per_sec > 0), 0.0
+                        PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY revenue_per_min)
+                            FILTER (WHERE revenue_per_min > 0), 0.0
                     )::float8 AS p95,
                     COALESCE(
-                        PERCENTILE_CONT(0.99) WITHIN GROUP (ORDER BY revenue_per_sec)
-                            FILTER (WHERE revenue_per_sec > 0), 0.0
+                        PERCENTILE_CONT(0.99) WITHIN GROUP (ORDER BY revenue_per_min)
+                            FILTER (WHERE revenue_per_min > 0), 0.0
                     )::float8 AS p99,
-                    COALESCE(MAX(revenue_per_sec), 0.0)::float8              AS peak,
-                    COUNT(*) FILTER (WHERE revenue_per_sec > 0)::bigint       AS active_minutes,
-                    SUM(revenue_per_sec * 60.0)::float8                       AS total_cost_nano
+                    COALESCE(MAX(revenue_per_min), 0.0)::float8              AS peak,
+                    COUNT(*) FILTER (WHERE revenue_per_min > 0)::bigint       AS active_minutes,
+                    SUM(revenue_per_min)::float8                              AS total_cost_nano
                 FROM per_minute
                 GROUP BY model_name
                 ORDER BY total_cost_nano DESC
                 "#,
-                &[&query.start, &query.end],
+                &[&query.start, &query.end, &query.provider_type],
             )
             .await
             .map_err(|e| RepositoryError::DatabaseError(e.into()))?;
@@ -1202,12 +1203,12 @@ impl AnalyticsRepository for PgAnalyticsRepository {
                 let model_peak = row.get::<_, f64>(4) * NANO_TO_USD;
                 RevenueDensityModelRow {
                     model_name: row.get(0),
-                    p50_usd_per_sec: model_p50,
-                    p95_usd_per_sec: model_p95,
-                    p99_usd_per_sec: model_p99,
-                    peak_usd_per_sec: model_peak,
-                    p99_annualized_usd: model_p99 * YEAR_SECONDS,
-                    peak_annualized_usd: model_peak * YEAR_SECONDS,
+                    p50_usd_per_min: model_p50,
+                    p95_usd_per_min: model_p95,
+                    p99_usd_per_min: model_p99,
+                    peak_usd_per_min: model_peak,
+                    p99_annualized_usd: model_p99 * YEAR_MINUTES,
+                    peak_annualized_usd: model_peak * YEAR_MINUTES,
                     active_minutes: row.get(5),
                 }
             })
@@ -1218,12 +1219,12 @@ impl AnalyticsRepository for PgAnalyticsRepository {
             period_end: query.end,
             sampled_minutes,
             active_minutes,
-            p50_usd_per_sec: p50,
-            p95_usd_per_sec: p95,
-            p99_usd_per_sec: p99,
-            peak_usd_per_sec: peak,
-            p99_annualized_usd: p99 * YEAR_SECONDS,
-            peak_annualized_usd: peak * YEAR_SECONDS,
+            p50_usd_per_min: p50,
+            p95_usd_per_min: p95,
+            p99_usd_per_min: p99,
+            peak_usd_per_min: peak,
+            p99_annualized_usd: p99 * YEAR_MINUTES,
+            peak_annualized_usd: peak * YEAR_MINUTES,
             by_model,
         })
     }

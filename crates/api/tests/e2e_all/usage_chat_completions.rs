@@ -6,11 +6,22 @@ use crate::common::*;
 use inference_providers::StreamChunk;
 use serde_json::json;
 use services::usage::compute_token_cost;
+use std::sync::OnceLock;
+
+static DEV_ENV: OnceLock<()> = OnceLock::new();
+
+fn ensure_usage_chat_completions_env() {
+    DEV_ENV.get_or_init(|| {
+        std::env::set_var("DEV", "1");
+        std::env::set_var("BRAVE_SEARCH_PRO_API_KEY", "request-id-contract-test");
+    });
+}
 
 /// Call chat/completions (non-streaming), assert usage in response, then verify org usage
 /// history contains a matching entry (including cache_read_tokens).
 #[tokio::test]
 async fn test_chat_completions_records_usage_and_history() {
+    ensure_usage_chat_completions_env();
     let server = setup_test_server().await;
 
     setup_qwen_model(&server).await;
@@ -124,6 +135,7 @@ async fn test_chat_completions_records_usage_and_history() {
 /// for attested models to preserve provider signatures; billing capture must remain independent.
 #[tokio::test]
 async fn test_chat_completions_stream_records_usage_in_history() {
+    ensure_usage_chat_completions_env();
     let server = setup_test_server().await;
 
     setup_qwen_model(&server).await;
@@ -202,11 +214,52 @@ async fn test_chat_completions_stream_records_usage_in_history() {
     );
 }
 
-#[tokio::test]
-async fn test_chat_completions_stream_include_usage_false_preserves_passthrough() {
-    let server = setup_test_server().await;
+/// Register a non-attested (external) chat model in both the provider pool and the DB.
+/// For attested models, usage in intermediate chunks is preserved byte-exactly for TEE
+/// signature verification. Only non-attested models have usage stripped to `null`.
+async fn setup_non_attested_model(
+    server: &axum_test::TestServer,
+    pool: &std::sync::Arc<services::inference_provider_pool::InferenceProviderPool>,
+    mock_provider: &std::sync::Arc<inference_providers::mock::MockProvider>,
+) -> String {
+    let model_name = "nearai/non-attested-test-model".to_string();
 
-    setup_qwen_model(&server).await;
+    // Register the mock provider in the pool for this model
+    let mock_trait: std::sync::Arc<dyn inference_providers::InferenceProvider + Send + Sync> =
+        mock_provider.clone();
+    pool.register_provider(model_name.clone(), mock_trait).await;
+
+    // Configure the model in the DB as non-attested
+    let mut batch = api::models::BatchUpdateModelApiRequest::new();
+    batch.insert(
+        model_name.clone(),
+        serde_json::from_value(json!({
+            "inputCostPerToken": { "amount": 1_000_000, "currency": "USD" },
+            "outputCostPerToken": { "amount": 2_000_000, "currency": "USD" },
+            "modelDisplayName": "Non-attested test model",
+            "modelDescription": "Test model (non-attested) for usage-stripping tests",
+            "contextLength": 128000,
+            "verifiable": false,
+            "isActive": true,
+            "attestationSupported": false
+        }))
+        .unwrap(),
+    );
+    let updated = admin_batch_upsert_models(server, batch, get_session_id()).await;
+    assert_eq!(updated.len(), 1, "Should have configured 1 model");
+    tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+    model_name
+}
+
+#[tokio::test]
+async fn test_chat_completions_stream_default_emits_usage_null_in_all_chunks() {
+    // Default streaming (no stream_options): per OpenAI spec, `usage` must be
+    // `null` in every chunk and no final usage-only chunk is emitted.
+    // Only verified for non-attested models; attested model streams are forwarded
+    // byte-exactly for TEE signature verification.
+    let (server, pool, mock_provider, _db) = setup_test_server_with_pool().await;
+    let model_name = setup_non_attested_model(&server, &pool, &mock_provider).await;
+
     let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
     let api_key = get_api_key_for_org(&server, org.id.clone()).await;
 
@@ -214,7 +267,57 @@ async fn test_chat_completions_stream_include_usage_false_preserves_passthrough(
         .post("/v1/chat/completions")
         .add_header("Authorization", format!("Bearer {api_key}"))
         .json(&json!({
-            "model": E2E_QWEN_MODEL_NAME,
+            "model": model_name,
+            "messages": [{ "role": "user", "content": "hello" }],
+            "stream": true
+        }))
+        .await;
+
+    assert_eq!(
+        stream_resp.status_code(),
+        200,
+        "streaming chat/completions should succeed: {}",
+        stream_resp.text()
+    );
+
+    let text = stream_resp.text();
+    let mut saw_chunk = false;
+    for line in text.lines() {
+        let Some(data) = line.strip_prefix("data: ") else {
+            continue;
+        };
+        if data.trim() == "[DONE]" {
+            break;
+        }
+
+        saw_chunk = true;
+        let value: serde_json::Value =
+            serde_json::from_str(data).expect("stream data should be JSON");
+        assert!(
+            value.get("usage").is_some_and(serde_json::Value::is_null),
+            "default streaming: all chunks must carry usage:null (got {value})"
+        );
+    }
+    assert!(saw_chunk, "stream should contain at least one chunk");
+}
+
+#[tokio::test]
+async fn test_chat_completions_stream_include_usage_false_emits_usage_null_in_all_chunks() {
+    // Explicit include_usage:false: same as default — all chunks must carry
+    // `usage: null` and no final usage-only chunk is emitted.
+    // Only verified for non-attested models; attested model streams are forwarded
+    // byte-exactly for TEE signature verification.
+    let (server, pool, mock_provider, _db) = setup_test_server_with_pool().await;
+    let model_name = setup_non_attested_model(&server, &pool, &mock_provider).await;
+
+    let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
+    let api_key = get_api_key_for_org(&server, org.id.clone()).await;
+
+    let stream_resp = server
+        .post("/v1/chat/completions")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .json(&json!({
+            "model": model_name,
             "messages": [{ "role": "user", "content": "hello" }],
             "stream": true,
             "stream_options": { "include_usage": false }
@@ -239,13 +342,19 @@ async fn test_chat_completions_stream_include_usage_false_preserves_passthrough(
         }
 
         saw_chunk = true;
-        let _: StreamChunk = serde_json::from_str(data).expect("stream data should be JSON");
+        let value: serde_json::Value =
+            serde_json::from_str(data).expect("stream data should be JSON");
+        assert!(
+            value.get("usage").is_some_and(serde_json::Value::is_null),
+            "include_usage:false streaming: all chunks must carry usage:null (got {value})"
+        );
     }
     assert!(saw_chunk, "stream should contain at least one chunk");
 }
 
 #[tokio::test]
 async fn test_chat_completions_stream_include_usage_true_emits_final_usage_only() {
+    ensure_usage_chat_completions_env();
     let server = setup_test_server().await;
 
     setup_qwen_model(&server).await;
@@ -313,6 +422,7 @@ async fn test_chat_completions_stream_include_usage_true_emits_final_usage_only(
 
 #[tokio::test]
 async fn test_chat_completions_stream_error_does_not_emit_final_usage() {
+    ensure_usage_chat_completions_env();
     let (server, _pool, mock_provider, _db) = setup_test_server_with_pool().await;
 
     mock_provider
@@ -389,6 +499,7 @@ async fn test_chat_completions_stream_error_does_not_emit_final_usage() {
 /// we assert equality without clamping in the test.
 #[tokio::test]
 async fn test_chat_completions_with_cache_records_cache_in_history() {
+    ensure_usage_chat_completions_env();
     let (server, _pool, mock_provider, _db) = setup_test_server_with_pool().await;
 
     let message = "hello world";
@@ -456,6 +567,7 @@ async fn test_chat_completions_with_cache_records_cache_in_history() {
 /// Stream version: cache based on provider token estimate; assert equality without clamping.
 #[tokio::test]
 async fn test_chat_completions_stream_with_cache_records_cache_in_history() {
+    ensure_usage_chat_completions_env();
     let (server, _pool, mock_provider, _db) = setup_test_server_with_pool().await;
 
     let message = "hello world";

@@ -79,6 +79,7 @@ use tokio_stream::StreamExt;
 
 // Re-export commonly used types for convenience
 pub use mock::MockProvider;
+pub use models::strip_cache_control;
 pub use models::{
     is_client_audio_input_status, AudioOutput, AudioTranscriptionError, AudioTranscriptionParams,
     AudioTranscriptionResponse, ChatCompletionParams, ChatCompletionResponse,
@@ -137,10 +138,17 @@ pub enum ProviderTier {
     NonAttested,
 }
 
+/// Concrete inference-engine implementation backing a provider.
+///
+/// Used for usage attribution and analytics so requests can be grouped by the
+/// serving implementation even when multiple implementations share a trust tier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ProviderSource {
+    /// NEAR AI's own attested vLLM/SGLang fleet (`attested::nearai`).
     Vllm,
+    /// A plaintext, non-attested third party (`non_attested::external`).
     External,
+    /// A Chutes-attested third party (`attested::chutes`).
     Chutes,
 }
 
@@ -362,6 +370,8 @@ pub trait InferenceProvider {
         ProviderTier::NonAttested
     }
 
+    /// Concrete provider implementation backing this instance. Defaults to
+    /// [`ProviderSource::External`]; NEAR and Chutes providers override it.
     fn provider_source(&self) -> ProviderSource {
         ProviderSource::External
     }

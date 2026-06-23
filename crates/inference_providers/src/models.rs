@@ -16,6 +16,34 @@ pub struct ChatMessage {
     pub tool_calls: Option<Vec<ToolCall>>,
 }
 
+/// Remove every `cache_control` breakpoint from a chat message's content parts.
+///
+/// #666: the API model now preserves `cache_control` on text/image content parts
+/// so it survives the re-serialize into [`ChatMessage::content`] and reaches the
+/// Anthropic converter. Every OTHER upstream (self-hosted vLLM, openai_compatible,
+/// gemini, Chutes) serializes `ChatMessage.content` verbatim into its outgoing
+/// request, and those APIs may 400 on an unknown `cache_control` field on a
+/// content part. Pre-#666 the breakpoint was silently dropped at deserialization,
+/// so it never reached them; this restores that exact behaviour for the
+/// non-Anthropic paths. Anthropic must NOT call this — it reads `cache_control`
+/// off the content to build its native breakpoints.
+///
+/// Only touches array-shaped content (the OpenAI content-parts form); a bare
+/// string content never carries a breakpoint and is left untouched, so the
+/// common (uncached / string-content) request stays byte-identical to before.
+pub fn strip_cache_control(messages: &mut [ChatMessage]) {
+    for msg in messages.iter_mut() {
+        let Some(serde_json::Value::Array(parts)) = msg.content.as_mut() else {
+            continue;
+        };
+        for part in parts.iter_mut() {
+            if let Some(obj) = part.as_object_mut() {
+                obj.remove("cache_control");
+            }
+        }
+    }
+}
+
 /// Delta message in streaming chat completions
 /// All fields are optional as they may not be present in every chunk
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -642,6 +670,11 @@ pub struct ChatCompletionResponseWithBytes {
     /// For external backends, `raw_bytes` are the bytes of our synthesized response,
     /// not the original provider HTTP body.
     pub raw_bytes: Vec<u8>,
+
+    /// Which trust tier served this completion.
+    /// Populated by each provider implementation so callers can surface it as an
+    /// `x-serving-provider` response header without reaching back into the pool.
+    pub serving_tier: crate::ProviderTier,
 }
 
 /// Choice in a complete (non-streaming) chat completion response
@@ -1166,6 +1199,63 @@ pub fn detect_audio_content_type(filename: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #666 NO-LEAK: `strip_cache_control` removes the breakpoint from each
+    /// content part so the JSON serialized toward a non-Anthropic upstream
+    /// (vLLM / openai_compatible / Chutes) carries no `cache_control` — restoring
+    /// the exact bytes those upstreams received before #666.
+    #[test]
+    fn test_strip_cache_control_removes_breakpoints_from_parts() {
+        let mut messages = vec![ChatMessage {
+            role: MessageRole::User,
+            content: Some(serde_json::json!([
+                {
+                    "type": "text",
+                    "text": "Cached context",
+                    "cache_control": {"type": "ephemeral"}
+                },
+                {
+                    "type": "image_url",
+                    "image_url": {"url": "https://example.com/a.png"},
+                    "cache_control": {"type": "ephemeral"}
+                },
+                {"type": "text", "text": "Volatile"}
+            ])),
+            name: None,
+            tool_call_id: None,
+            tool_calls: None,
+        }];
+
+        strip_cache_control(&mut messages);
+
+        let json = serde_json::to_string(&messages).unwrap();
+        assert!(
+            !json.contains("cache_control"),
+            "no cache_control may reach a non-Anthropic upstream: {json}"
+        );
+        // Content survives intact — only the breakpoint is removed.
+        assert!(json.contains("Cached context"));
+        assert!(json.contains("Volatile"));
+        assert!(json.contains("https://example.com/a.png"));
+    }
+
+    /// String content never carries a breakpoint and must be left untouched, so
+    /// the common (uncached / string-content) request stays byte-identical.
+    #[test]
+    fn test_strip_cache_control_leaves_string_content_untouched() {
+        let original = ChatMessage {
+            role: MessageRole::User,
+            content: Some(serde_json::Value::String("Hello".to_string())),
+            name: None,
+            tool_call_id: None,
+            tool_calls: None,
+        };
+        let mut messages = vec![original.clone()];
+        let before = serde_json::to_string(&messages).unwrap();
+        strip_cache_control(&mut messages);
+        let after = serde_json::to_string(&messages).unwrap();
+        assert_eq!(before, after, "string content must be byte-identical");
+    }
 
     #[test]
     fn test_chat_completion_response_deserialization() {

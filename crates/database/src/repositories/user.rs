@@ -65,7 +65,7 @@ impl UserRepository {
                 .map_err(map_db_error)
         })?;
 
-        debug!("Created/updated user: {} ({})", email, id);
+        debug!("Created/updated user: {}", id);
         self.row_to_user(row)
     }
 

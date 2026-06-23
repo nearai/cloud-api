@@ -289,8 +289,8 @@ impl AuthServiceTrait for AuthService {
 
         // Create default organization and workspace for new user
         debug!(
-            "Creating default organization and workspace for new user: {}",
-            new_user.email
+            user_id = %new_user.id.0,
+            "Creating default organization and workspace for new user"
         );
 
         // Generate organization name from user email with random suffix
@@ -316,8 +316,9 @@ impl AuthServiceTrait for AuthService {
         {
             Ok(organization) => {
                 debug!(
-                    "Created default organization: {} for user: {}",
-                    organization.id.0, new_user.email
+                    organization_id = %organization.id.0,
+                    user_id = %new_user.id.0,
+                    "Created default organization for user"
                 );
 
                 // Create default workspace
@@ -334,8 +335,9 @@ impl AuthServiceTrait for AuthService {
                 match workspace_result {
                     Ok(workspace) => {
                         debug!(
-                            "Created default workspace: {} for user: {}",
-                            workspace.id.0, new_user.email
+                            workspace_id = %workspace.id.0,
+                            user_id = %new_user.id.0,
+                            "Created default workspace for user"
                         );
                     }
                     Err(_) => {
@@ -929,6 +931,9 @@ mod tests {
             unimplemented!()
         }
         async fn count_by_organization(&self, _: OrganizationId) -> Result<i64, RepositoryError> {
+            unimplemented!()
+        }
+        async fn list_by_user(&self, _: UserId, _: i64) -> Result<Vec<Workspace>, RepositoryError> {
             unimplemented!()
         }
     }

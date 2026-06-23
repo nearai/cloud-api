@@ -5,6 +5,8 @@ use crate::admin_provider_attribution_support::{
 use crate::common::*;
 use services::admin::PlatformMetrics;
 
+const COST_EPSILON: f64 = 1e-9;
+
 #[tokio::test]
 async fn admin_platform_metrics_reports_fallback_and_chutes_usage() {
     let fixture = setup_platform_provider_usage_fixture().await;
@@ -72,16 +74,6 @@ async fn admin_platform_metrics_reports_fallback_and_chutes_usage() {
     assert_eq!(response.status_code(), 200, "platform metrics succeeds");
     let response_json: serde_json::Value =
         serde_json::from_str(&response.text()).expect("response is json");
-    println!(
-        "provider_usage fallback: {}",
-        serde_json::to_string_pretty(&response_json["provider_usage"]["fallback"])
-            .expect("fallback json")
-    );
-    println!(
-        "provider_usage by_provider_type: {}",
-        serde_json::to_string_pretty(&response_json["provider_usage"]["by_provider_type"])
-            .expect("by_provider_type json")
-    );
     let metrics: PlatformMetrics =
         serde_json::from_value(response_json).expect("parse PlatformMetrics");
 
@@ -92,10 +84,10 @@ async fn admin_platform_metrics_reports_fallback_and_chutes_usage() {
     assert_eq!(metrics.provider_usage.fallback.output_tokens, 100);
     assert_eq!(metrics.provider_usage.fallback.total_tokens, 180);
     assert_eq!(metrics.provider_usage.fallback.cache_read_tokens, 5);
-    assert!((metrics.provider_usage.fallback.consumed_cost_usd - 18.0).abs() < f64::EPSILON);
+    assert!((metrics.provider_usage.fallback.consumed_cost_usd - 18.0).abs() < COST_EPSILON);
     assert_eq!(metrics.provider_usage.non_fallback.requests, 2);
     assert_eq!(metrics.provider_usage.non_fallback.total_tokens, 41);
-    assert!((metrics.provider_usage.non_fallback.consumed_cost_usd - 4.0).abs() < f64::EPSILON);
+    assert!((metrics.provider_usage.non_fallback.consumed_cost_usd - 4.0).abs() < COST_EPSILON);
 
     let chutes = provider_type_usage(&metrics, Some("chutes"));
     assert_eq!(chutes.requests, 1);
@@ -103,7 +95,7 @@ async fn admin_platform_metrics_reports_fallback_and_chutes_usage() {
     assert_eq!(chutes.output_tokens, 60);
     assert_eq!(chutes.total_tokens, 110);
     assert_eq!(chutes.cache_read_tokens, 3);
-    assert!((chutes.consumed_cost_usd - 11.0).abs() < f64::EPSILON);
+    assert!((chutes.consumed_cost_usd - 11.0).abs() < COST_EPSILON);
     assert_eq!(provider_type_usage(&metrics, None).requests, 1);
     assert_eq!(
         provider_tier_usage(&metrics, Some("attested_3p")).requests,
@@ -148,18 +140,13 @@ async fn admin_platform_metrics_prefers_served_attribution_over_model_metadata()
     assert_eq!(response.status_code(), 200, "platform metrics succeeds");
     let response_json: serde_json::Value =
         serde_json::from_str(&response.text()).expect("response is json");
-    println!(
-        "provider_usage by_provider_type: {}",
-        serde_json::to_string_pretty(&response_json["provider_usage"]["by_provider_type"])
-            .expect("by_provider_type json")
-    );
     let metrics: PlatformMetrics =
         serde_json::from_value(response_json).expect("parse PlatformMetrics");
 
     let chutes = provider_type_usage(&metrics, Some("chutes"));
     assert_eq!(chutes.requests, 1);
     assert_eq!(chutes.total_tokens, 36);
-    assert!((chutes.consumed_cost_usd - 5.0).abs() < f64::EPSILON);
+    assert!((chutes.consumed_cost_usd - 5.0).abs() < COST_EPSILON);
     assert!(
         metrics
             .provider_usage

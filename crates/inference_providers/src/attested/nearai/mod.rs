@@ -895,6 +895,7 @@ impl Fleet {
             return Ok(ChatCompletionResponseWithBytes {
                 response: chat_completion_response,
                 raw_bytes,
+                serving_tier: crate::ProviderTier::Near,
             });
         }
         Err(last_error)
@@ -1405,6 +1406,11 @@ impl InferenceProvider for Fleet {
 
         // Ensure streaming and token usage are enabled
         let mut streaming_params = params;
+        // #666: self-hosted vLLM serves a verbatim copy of `ChatMessage.content`,
+        // so drop Anthropic prompt-caching breakpoints before routing and
+        // serialization — vLLM may 400 on an unknown `cache_control` content-part
+        // field (the breakpoint only matters on the Anthropic upstream).
+        crate::strip_cache_control(&mut streaming_params.messages);
         streaming_params.stream = Some(true);
         streaming_params.stream_options = Some(StreamOptions {
             include_usage: Some(true),
@@ -1536,6 +1542,9 @@ impl InferenceProvider for Fleet {
         let url = format!("{}/v1/chat/completions", self.config.base_url);
 
         let mut non_streaming_params = params;
+        // #666: drop Anthropic prompt-caching breakpoints before forwarding to
+        // self-hosted vLLM (see the streaming path for the rationale).
+        crate::strip_cache_control(&mut non_streaming_params.messages);
 
         let mut headers = self
             .build_headers()
@@ -1655,6 +1664,7 @@ impl InferenceProvider for Fleet {
         Ok(ChatCompletionResponseWithBytes {
             response: chat_completion_response,
             raw_bytes,
+            serving_tier: crate::ProviderTier::Near,
         })
     }
 

@@ -273,7 +273,12 @@ pub async fn github_login(
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
 
-    debug!("Redirecting to GitHub with state: {}", state);
+    let state_present = !state.is_empty();
+    let state_len = state.len();
+    debug!(
+        state_present,
+        state_len, "Redirecting to GitHub OAuth provider"
+    );
     Ok(Redirect::to(&auth_url))
 }
 
@@ -316,7 +321,12 @@ pub async fn google_login(
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
 
-    debug!("Redirecting to Google with state: {}", state);
+    let state_present = !state.is_empty();
+    let state_len = state.len();
+    debug!(
+        state_present,
+        state_len, "Redirecting to Google OAuth provider"
+    );
     Ok(Redirect::to(&auth_url))
 }
 
@@ -331,7 +341,9 @@ pub async fn oauth_callback(
     State((oauth, state_store, auth_service, config)): State<AuthState>,
     request: Request,
 ) -> Response {
-    debug!("OAuth callback received with state: {}", params.state);
+    let state_present = !params.state.is_empty();
+    let state_len = params.state.len();
+    debug!(state_present, state_len, "OAuth callback received");
 
     let user_agent_header = match request
         .headers()
@@ -356,7 +368,7 @@ pub async fn oauth_callback(
     let oauth_state_row = match state_store.get_and_delete(&params.state).await {
         Ok(Some(row)) => row,
         Ok(None) => {
-            tracing::warn!("Invalid or expired OAuth state: {}", params.state);
+            tracing::warn!(state_present, state_len, "Invalid or expired OAuth state");
             return (
                 StatusCode::BAD_REQUEST,
                 Json(serde_json::json!({
@@ -452,9 +464,10 @@ pub async fn oauth_callback(
     };
 
     // Create session for the user (24 hours)
+    let user_id = user.id.clone();
     let session_result = auth_service
         .create_session(
-            user.id,
+            user_id.clone(),
             None,
             user_agent_header.to_string(),
             config.auth.encoding_key.to_string(),
@@ -465,7 +478,7 @@ pub async fn oauth_callback(
 
     match session_result {
         Ok((access_token, refresh_session, refresh_token)) => {
-            debug!("Session created successfully for user: {}", user.email);
+            debug!(user_id = %user_id.0, "Session created successfully for user");
 
             if let Some(frontend_url) = oauth_state_row.frontend_callback {
                 let validated_url = match validate_frontend_callback(&frontend_url, &config.cors) {
@@ -535,7 +548,7 @@ pub async fn current_user(Extension(user): Extension<AuthenticatedUser>) -> Json
 
 /// Logout endpoint
 pub async fn logout(Extension(user): Extension<AuthenticatedUser>) -> Response {
-    debug!("Logging out user: {}", user.0.email);
+    debug!("Logging out user_id={}", user.0.id);
 
     // This would need the session_id from cookie in real implementation
     // For now, just clear the cookie

@@ -1019,6 +1019,143 @@ mod tests {
         assert_eq!(domain.stop, Some(vec!["a".to_string(), "b".to_string()]));
     }
 
+    /// END-TO-END (#666): cache_control must survive the REAL public path —
+    /// `api::models::Message` (deserialized from the HTTP body) -> `From<Message>
+    /// for ChatMessage` (which re-serializes the converted content into
+    /// `ChatMessage.content`) -> the Anthropic converter's `convert_messages`.
+    ///
+    /// Before the Part-1 change, `MessageContentPart::Text`/`ImageUrl` had no
+    /// `cache_control` field, so serde dropped the breakpoint at deserialization
+    /// and the re-serialize produced cache-control-free content; this test would
+    /// then find a bare-string `system` and no breakpoint, and fail. With the
+    /// field present, the breakpoint rides through to the Anthropic request.
+    #[test]
+    fn cache_control_survives_message_to_anthropic_request() {
+        use inference_providers::non_attested::external::anthropic::converter::{
+            convert_messages, AnthropicContentPart, AnthropicMessageContent, AnthropicSystem,
+        };
+
+        // Deserialize from a wire body so the WHOLE path is exercised: the HTTP
+        // JSON -> `MessageContentPart` (the enum the reviewer flagged) -> the rest.
+        let system: crate::models::Message = serde_json::from_value(serde_json::json!({
+            "role": "system",
+            "content": [
+                {
+                    "type": "text",
+                    "text": "Large shared preamble",
+                    "cache_control": {"type": "ephemeral"}
+                }
+            ]
+        }))
+        .expect("system message should deserialize");
+        let user: crate::models::Message = serde_json::from_value(serde_json::json!({
+            "role": "user",
+            "content": [
+                {
+                    "type": "text",
+                    "text": "Cached context",
+                    "cache_control": {"type": "ephemeral", "ttl": "1h"}
+                },
+                {"type": "text", "text": "Volatile question"}
+            ]
+        }))
+        .expect("user message should deserialize");
+
+        // The REAL From impl: re-serializes converted content into ChatMessage.content.
+        let chat_messages: Vec<ChatMessage> = vec![system.into(), user.into()];
+
+        let (anthropic_system, anthropic_messages) = convert_messages(&chat_messages);
+
+        // `system` must be the block-array form carrying the verbatim breakpoint.
+        match anthropic_system.expect("system present") {
+            AnthropicSystem::Blocks(blocks) => {
+                assert_eq!(blocks.len(), 1);
+                assert_eq!(blocks[0].text, "Large shared preamble");
+                assert_eq!(
+                    blocks[0].cache_control,
+                    Some(serde_json::json!({"type": "ephemeral"}))
+                );
+            }
+            other => panic!("expected block-array system, got {other:?}"),
+        }
+
+        // The user turn must carry the breakpoint on the cached text block only.
+        assert_eq!(anthropic_messages.len(), 1);
+        let blocks = match &anthropic_messages[0].content {
+            AnthropicMessageContent::Blocks(b) => b,
+            AnthropicMessageContent::Text(t) => {
+                panic!("cache_control should force the block form, got text: {t}")
+            }
+        };
+        assert_eq!(blocks.len(), 2);
+        match &blocks[0] {
+            AnthropicContentPart::Text {
+                text,
+                cache_control,
+            } => {
+                assert_eq!(text, "Cached context");
+                assert_eq!(
+                    *cache_control,
+                    Some(serde_json::json!({"type": "ephemeral", "ttl": "1h"}))
+                );
+            }
+            other => panic!("expected text block, got {other:?}"),
+        }
+        match &blocks[1] {
+            AnthropicContentPart::Text {
+                text,
+                cache_control,
+            } => {
+                assert_eq!(text, "Volatile question");
+                assert!(
+                    cache_control.is_none(),
+                    "breakpoint must not bleed onto the volatile part"
+                );
+            }
+            other => panic!("expected text block, got {other:?}"),
+        }
+    }
+
+    /// Companion guard: the SAME public path must NOT leak cache_control toward a
+    /// non-Anthropic upstream. `strip_cache_control` (called by the vLLM /
+    /// openai_compatible / Chutes backends) removes the breakpoint from the
+    /// re-serialized `ChatMessage.content`, restoring the exact pre-#666 bytes
+    /// those upstreams used to receive.
+    #[test]
+    fn cache_control_stripped_for_non_anthropic_path() {
+        let user: crate::models::Message = serde_json::from_value(serde_json::json!({
+            "role": "user",
+            "content": [
+                {
+                    "type": "text",
+                    "text": "Cached context",
+                    "cache_control": {"type": "ephemeral"}
+                },
+                {"type": "text", "text": "Volatile question"}
+            ]
+        }))
+        .unwrap();
+
+        let mut chat_messages: Vec<ChatMessage> = vec![user.into()];
+        // Sanity: the breakpoint is present before stripping (Part-1 preserved it).
+        let before = serde_json::to_string(&chat_messages).unwrap();
+        assert!(
+            before.contains("cache_control"),
+            "cache_control must reach ChatMessage.content before stripping"
+        );
+
+        inference_providers::strip_cache_control(&mut chat_messages);
+
+        let after = serde_json::to_string(&chat_messages).unwrap();
+        assert!(
+            !after.contains("cache_control"),
+            "cache_control must be stripped before a non-Anthropic upstream sees it"
+        );
+        // The actual content/text is untouched — only the breakpoint is gone.
+        assert!(after.contains("Cached context"));
+        assert!(after.contains("Volatile question"));
+    }
+
     /// The mechanistic-interpretability workflow sends `return_hidden_states`
     /// / `layers` on the chat-completions request. We deliberately do NOT
     /// model these as typed fields: they ride the flattened `extra` catch-all

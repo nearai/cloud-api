@@ -5,6 +5,7 @@
 #[path = "../common/mod.rs"]
 mod common;
 
+mod admin_activation_pricing_gate;
 mod admin_analytics;
 mod admin_deprecate_model;
 mod admin_invitation_email_deliveries;
@@ -57,9 +58,11 @@ mod privacy_redact;
 mod provider_errors;
 mod reasoning;
 mod repositories;
+mod request_id_contract;
 mod rerank;
 mod response_signature_verification;
 mod score;
+mod serving_provider;
 mod signature_verification;
 mod usage_chat_completions;
 mod usage_provider_attribution;

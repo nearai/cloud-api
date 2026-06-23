@@ -6,6 +6,8 @@ use crate::admin_provider_attribution_support::{
 use crate::common::*;
 use services::admin::ModelRevenueReport;
 
+const COST_EPSILON: f64 = 1e-9;
+
 #[tokio::test]
 async fn admin_model_revenue_filters_chutes_served_usage() {
     let fixture = setup_platform_provider_usage_fixture().await;
@@ -110,10 +112,6 @@ async fn admin_model_revenue_filters_chutes_served_usage() {
     assert_eq!(chutes.status_code(), 200, "chutes filter should 200");
     let chutes_json: serde_json::Value =
         serde_json::from_str(&chutes.text()).expect("parse chutes response");
-    println!(
-        "model_revenue chutes response: {}",
-        serde_json::to_string_pretty(&chutes_json).expect("chutes json")
-    );
     let chutes_report: ModelRevenueReport =
         serde_json::from_value(chutes_json).expect("parse chutes report");
     let chutes_entry = model_revenue_entry(&chutes_report, &fixture.model_name);
@@ -121,13 +119,13 @@ async fn admin_model_revenue_filters_chutes_served_usage() {
     assert_eq!(chutes_entry.provider_type.as_deref(), Some("vllm"));
     assert_eq!(chutes_entry.requests, 1);
     assert_eq!(chutes_entry.tokens, 65);
-    assert!((chutes_entry.consumed_cost_usd - 16.0).abs() < f64::EPSILON);
+    assert!((chutes_entry.consumed_cost_usd - 16.0).abs() < COST_EPSILON);
     assert_eq!(chutes_entry.fallback_requests, 1);
-    assert_eq!(chutes_entry.chutes_requests, 1);
     let chutes_breakdown =
         model_provider_breakdown(chutes_entry, Some("chutes"), Some("attested_3p"), true);
     assert_eq!(chutes_breakdown.requests, 1);
     assert_eq!(chutes_breakdown.tokens, 65);
+    assert!((chutes_breakdown.consumed_cost_usd - 16.0).abs() < COST_EPSILON);
 
     let vllm = fixture
         .server
@@ -147,7 +145,6 @@ async fn admin_model_revenue_filters_chutes_served_usage() {
     assert_eq!(vllm_entry.requests, 2);
     assert_eq!(vllm_entry.tokens, 110);
     assert_eq!(vllm_entry.fallback_requests, 0);
-    assert_eq!(vllm_entry.chutes_requests, 0);
     assert_eq!(
         model_provider_breakdown(vllm_entry, Some("vllm"), Some("near"), false).requests,
         1
@@ -175,7 +172,6 @@ async fn admin_model_revenue_filters_chutes_served_usage() {
     assert_eq!(external_entry.requests, 1);
     assert_eq!(external_entry.tokens, 45);
     assert_eq!(external_entry.fallback_requests, 1);
-    assert_eq!(external_entry.chutes_requests, 0);
     assert_eq!(
         model_provider_breakdown(external_entry, Some("external"), Some("non_attested"), true)
             .requests,
@@ -205,5 +201,4 @@ async fn admin_model_revenue_rejects_invalid_provider_type() {
         error.error.message,
         "invalid provider_type 'banana'; expected one of: vllm, external, chutes"
     );
-    println!("model_revenue invalid provider_type response: {error:?}");
 }

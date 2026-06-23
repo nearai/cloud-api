@@ -118,11 +118,14 @@ async fn wait_for_usage_requests(
             if requests.len() >= expected {
                 return requests;
             }
-            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(2)).await;
         }
     })
     .await
-    .unwrap_or_else(|_| usage_service.get_requests())
+    .unwrap_or_else(|_| {
+        let actual = usage_service.get_requests().len();
+        panic!("timed out waiting for {expected} usage requests, only {actual} recorded")
+    })
 }
 
 async fn completion_service_with_mock_providers(
@@ -207,10 +210,7 @@ async fn fallback_chutes_attribution_reaches_usage_request() {
     let requests = wait_for_usage_requests(&usage_service, 1).await;
     assert_eq!(requests.len(), 1, "expected one usage request");
     let attribution = requests[0].provider_attribution;
-    println!(
-        "fallback_chutes_attribution_reaches_usage_request response_id={} attribution={:?}",
-        response.response.id, attribution
-    );
+    assert!(!response.response.id.is_empty());
     assert_eq!(
         attribution.served_provider_tier,
         Some(crate::usage::ServedProviderTier::Attested3p)
@@ -236,10 +236,7 @@ async fn primary_near_attribution_reaches_usage_request() {
     let requests = wait_for_usage_requests(&usage_service, 1).await;
     assert_eq!(requests.len(), 1, "expected one usage request");
     let attribution = requests[0].provider_attribution;
-    println!(
-        "primary_near_attribution_reaches_usage_request response_id={} attribution={:?}",
-        response.response.id, attribution
-    );
+    assert!(!response.response.id.is_empty());
     assert_eq!(
         attribution.served_provider_tier,
         Some(crate::usage::ServedProviderTier::Near)
@@ -263,7 +260,6 @@ async fn failed_providers_do_not_record_served_attribution() {
 
     assert!(result.is_err(), "all providers should fail the request");
     let requests = usage_service.get_requests();
-    println!("failed_providers_do_not_record_served_attribution usage_requests={requests:?}");
     assert!(
         requests.is_empty(),
         "terminal provider failures must not record successful usage"

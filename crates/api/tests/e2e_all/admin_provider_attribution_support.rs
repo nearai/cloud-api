@@ -1,5 +1,8 @@
 use crate::common::*;
 use services::admin::{ModelRevenueReport, PlatformMetrics};
+use std::sync::OnceLock;
+
+static HARNESS_ENV: OnceLock<()> = OnceLock::new();
 
 pub(super) struct PlatformProviderUsageFixture {
     pub(super) server: axum_test::TestServer,
@@ -74,12 +77,10 @@ pub(super) async fn setup_platform_provider_usage_fixture() -> PlatformProviderU
 }
 
 pub(super) fn ensure_platform_provider_usage_harness_env() {
-    if std::env::var_os("DEV").is_none() {
+    HARNESS_ENV.get_or_init(|| {
         std::env::set_var("DEV", "1");
-    }
-    if std::env::var_os("BRAVE_SEARCH_PRO_API_KEY").is_none() {
         std::env::set_var("BRAVE_SEARCH_PRO_API_KEY", "test");
-    }
+    });
 }
 
 pub(super) async fn insert_platform_provider_usage_row(
@@ -139,7 +140,7 @@ pub(super) fn provider_type_usage<'a>(
         .by_provider_type
         .iter()
         .find(|usage| usage.provider_type.as_deref() == provider_type)
-        .expect("provider type usage exists")
+        .unwrap_or_else(|| panic!("provider type usage not found for: {provider_type:?}"))
 }
 
 pub(super) fn provider_tier_usage<'a>(
@@ -151,7 +152,7 @@ pub(super) fn provider_tier_usage<'a>(
         .by_provider_tier
         .iter()
         .find(|usage| usage.provider_tier.as_deref() == provider_tier)
-        .expect("provider tier usage exists")
+        .unwrap_or_else(|| panic!("provider tier usage not found for: {provider_tier:?}"))
 }
 
 pub(super) fn model_revenue_entry<'a>(
@@ -162,7 +163,7 @@ pub(super) fn model_revenue_entry<'a>(
         .data
         .iter()
         .find(|entry| entry.model_name == model_name)
-        .expect("model revenue entry exists")
+        .unwrap_or_else(|| panic!("model revenue entry not found for: {model_name}"))
 }
 
 pub(super) fn model_provider_breakdown<'a>(
@@ -179,7 +180,11 @@ pub(super) fn model_provider_breakdown<'a>(
                 && breakdown.provider_tier.as_deref() == provider_tier
                 && breakdown.served_via_fallback == served_via_fallback
         })
-        .expect("model provider breakdown exists")
+        .unwrap_or_else(|| {
+            panic!(
+                "model provider breakdown not found for provider_type={provider_type:?}, provider_tier={provider_tier:?}, served_via_fallback={served_via_fallback}"
+            )
+        })
 }
 
 pub(super) fn isolated_provider_usage_window(

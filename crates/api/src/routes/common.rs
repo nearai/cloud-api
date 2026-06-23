@@ -4,14 +4,18 @@ use services::completions::CompletionError;
 use services::organization::OrganizationError;
 use uuid::Uuid;
 
-/// HTTP 529 "Site Is Overloaded" — non-standard but widely used (Cloudflare,
-/// Anthropic) for "all backends exhausted; please retry with exponential
-/// backoff." Surfaced when `retry_with_fallback` has tried every inference
-/// backend for a model and they all rejected with 5xx — typically SGLang
-/// `--max-queued-requests` 503s under load. 503 stays reserved for narrower
-/// per-handler "this dependency is down" cases.
+/// HTTP 429 "Too Many Requests" — used here for the "all backends exhausted;
+/// please retry with exponential backoff" case. Surfaced when
+/// `retry_with_fallback` has tried every inference backend for a model and
+/// they all rejected with 5xx — typically SGLang `--max-queued-requests`
+/// 503s under load. 503 stays reserved for narrower per-handler "this
+/// dependency is down" cases. The error body carries `"type":
+/// "service_overloaded"` to distinguish it from per-org rate-limit 429s
+/// (`"type": "rate_limit_exceeded"`). 429 is the universally understood
+/// "back off and retry" signal; 529 is non-standard and some clients (e.g.
+/// OpenRouter) count non-2xx/4xx as downtime, degrading our routing rank.
 pub fn status_overloaded() -> StatusCode {
-    StatusCode::from_u16(529).expect("529 is a valid HTTP status code")
+    StatusCode::TOO_MANY_REQUESTS
 }
 
 /// Map domain errors to HTTP status codes
@@ -727,7 +731,7 @@ mod tests {
     #[test]
     fn test_map_domain_error_service_overloaded() {
         let error = CompletionError::ServiceOverloaded("overloaded".to_string());
-        assert_eq!(map_domain_error_to_status(&error).as_u16(), 529);
+        assert_eq!(map_domain_error_to_status(&error).as_u16(), 429);
     }
 
     #[test]

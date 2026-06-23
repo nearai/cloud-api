@@ -1,5 +1,5 @@
 use crate::{
-    middleware::{auth::AuthenticatedApiKey, RequestBodyHash},
+    middleware::{auth::AuthenticatedApiKey, RequestBodyHash, RequestCorrelation},
     models::*,
     routes::{
         api::AppState,
@@ -81,8 +81,33 @@ fn insert_encryption_headers(
     }
 }
 
+fn insert_request_id_header(
+    correlation: RequestCorrelation,
+    extra: &mut std::collections::HashMap<String, serde_json::Value>,
+) {
+    extra.insert(
+        "x_request_id".to_string(),
+        serde_json::Value::String(correlation.request_id.to_string()),
+    );
+}
+
 // Custom header for exposing the inference ID as a UUID
 const HEADER_INFERENCE_ID: &str = "Inference-Id";
+
+// Custom header surfacing which trust tier served a completion.
+// Value is "near" for NEAR AI's own TEE fleet, "chutes" for the attested Chutes
+// fallback, or "non-attested" for external (non-TEE) providers.
+const HEADER_SERVING_PROVIDER: &str = "x-serving-provider";
+
+/// Map a [`inference_providers::ProviderTier`] to the string value emitted in
+/// the `x-serving-provider` response header.
+fn provider_tier_to_str(tier: inference_providers::ProviderTier) -> &'static str {
+    match tier {
+        inference_providers::ProviderTier::Near => "near",
+        inference_providers::ProviderTier::Attested3p => "chutes",
+        inference_providers::ProviderTier::NonAttested => "non-attested",
+    }
+}
 
 /// True when any E2EE encryption header was supplied. E2EE bodies are opaque
 /// to the gateway, so alias warnings can't be injected into them — the
@@ -140,33 +165,38 @@ async fn reject_if_aliased(
     }
 }
 
-/// Build a `RecordUsageServiceRequest` for image operations (generation or editing).
-fn build_image_usage_request(
+struct ImageUsageRecord<'a> {
     organization_id: Uuid,
     workspace_id: Uuid,
     api_key_id: Uuid,
     model_id: Uuid,
-    provider_request_id: &str,
+    provider_request_id: &'a str,
     image_count: i32,
+    provider_attribution: services::usage::ProviderAttribution,
     inference_type: services::usage::InferenceType,
+}
+
+/// Build a `RecordUsageServiceRequest` for image operations (generation or editing).
+fn build_image_usage_request(
+    record: ImageUsageRecord<'_>,
 ) -> services::usage::RecordUsageServiceRequest {
     services::usage::RecordUsageServiceRequest {
-        organization_id,
-        workspace_id,
-        api_key_id,
-        model_id,
+        organization_id: record.organization_id,
+        workspace_id: record.workspace_id,
+        api_key_id: record.api_key_id,
+        model_id: record.model_id,
         input_tokens: 0,
         output_tokens: 0,
         cache_read_tokens: 0,
-        inference_type,
+        inference_type: record.inference_type,
         ttft_ms: None,
         avg_itl_ms: None,
-        inference_id: Some(hash_inference_id_to_uuid(provider_request_id)),
-        provider_request_id: Some(provider_request_id.to_string()),
+        inference_id: Some(hash_inference_id_to_uuid(record.provider_request_id)),
+        provider_request_id: Some(record.provider_request_id.to_string()),
         stop_reason: Some(services::usage::StopReason::Completed),
         response_id: None,
-        image_count: Some(image_count),
-        provider_attribution: services::usage::ProviderAttribution::default(),
+        image_count: Some(record.image_count),
+        provider_attribution: record.provider_attribution,
     }
 }
 
@@ -366,6 +396,12 @@ fn chat_stream_has_non_text_modalities(request: &ChatCompletionRequest) -> bool 
 struct ChatStreamUsageMode {
     rewrite_public_stream_usage: bool,
     gateway_signature_enabled: bool,
+    /// Strip `usage` from intermediate chunks without adding a final usage chunk.
+    /// Active for the default case (no `include_usage`) and `include_usage: false`.
+    /// Per OpenAI spec, intermediate chunks must carry `usage: null`; populated
+    /// usage only appears in the one synthetic final chunk emitted when
+    /// `include_usage: true` is explicitly requested.
+    strip_intermediate_usage: bool,
 }
 
 fn chat_stream_usage_mode(
@@ -380,10 +416,36 @@ fn chat_stream_usage_mode(
         && !e2ee_active
         && !chat_stream_has_non_text_modalities(request);
 
+    // For default streaming (no include_usage or include_usage:false), strip populated
+    // usage from all chunks so intermediate ones carry `usage: null` per OpenAI spec.
+    //
+    // Only applied for non-attested (external) models. Attested models (e.g. nearai,
+    // chutes) sign the raw upstream bytes; stripping usage before forwarding to the
+    // client would break byte-exact TEE signature verification because the client
+    // would hash different bytes than what the inference proxy signed. For those
+    // models the provider-signed stream MUST be forwarded verbatim (the
+    // `rewrite_public_stream_usage` path handles `include_usage:true` via the
+    // separately-computed gateway signature).
+    //
+    // Also skipped when: the client requested continuous stats (explicit per-chunk
+    // usage), E2EE is active (chunks are opaque), non-text modalities are in use,
+    // `rewrite_public_stream_usage` already handles usage shaping, or the client
+    // explicitly requested `include_usage:true` (fall back to byte-exact passthrough
+    // so the client receives the usage it asked for even if model metadata is
+    // temporarily unavailable).
+    let strip_intermediate_usage = request.stream == Some(true)
+        && model_attestation_supported == Some(false)
+        && !rewrite_public_stream_usage
+        && !chat_stream_include_usage_requested(request)
+        && !chat_stream_continuous_usage_requested(request)
+        && !e2ee_active
+        && !chat_stream_has_non_text_modalities(request);
+
     ChatStreamUsageMode {
         rewrite_public_stream_usage,
         gateway_signature_enabled: rewrite_public_stream_usage
             && model_attestation_supported.unwrap_or(false),
+        strip_intermediate_usage,
     }
 }
 
@@ -1241,7 +1303,7 @@ fn unsupported_completion_param(request: &CompletionRequest) -> Option<&'static 
         (status = 401, description = "Invalid or missing API key", body = ErrorResponse),
         (status = 402, description = "Insufficient credits", body = ErrorResponse),
         (status = 500, description = "Server error", body = ErrorResponse),
-        (status = 529, description = "All inference backends overloaded; retry with exponential backoff", body = ErrorResponse)
+        (status = 429, description = "Rate limited or overloaded — retry with backoff. Check error.type: rate_limit_exceeded or service_overloaded.", body = ErrorResponse)
     ),
     security(
         ("api_key" = [])
@@ -1251,6 +1313,7 @@ pub async fn chat_completions(
     State(app_state): State<AppState>,
     Extension(api_key): Extension<AuthenticatedApiKey>,
     Extension(body_hash): Extension<RequestBodyHash>,
+    Extension(correlation): Extension<RequestCorrelation>,
     headers: header::HeaderMap,
     OpenAiJson(request): OpenAiJson<ChatCompletionRequest>,
 ) -> axum::response::Response {
@@ -1267,14 +1330,7 @@ pub async fn chat_completions(
         return (StatusCode::BAD_REQUEST, ResponseJson(error)).into_response();
     }
 
-    // Generate a per-request correlation ID. Reuse the client's X-Request-Id if
-    // present and parseable as a UUID; otherwise generate a fresh one. This ID
-    // propagates downstream as X-Request-Id on every outbound inference call.
-    let request_id = headers
-        .get("x-request-id")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| Uuid::parse_str(s).ok())
-        .unwrap_or_else(Uuid::new_v4);
+    let request_id = correlation.request_id;
 
     // Create a span carrying correlation IDs so every log line within this
     // request carries request_id/org_id/workspace_id in Datadog.
@@ -1376,6 +1432,7 @@ async fn chat_completions_inner(
     let usage_mode = chat_stream_usage_mode(&request, model_attestation_supported, e2ee_active);
     let rewrite_public_stream_usage = usage_mode.rewrite_public_stream_usage;
     let gateway_signature_enabled = usage_mode.gateway_signature_enabled;
+    let strip_intermediate_usage = usage_mode.strip_intermediate_usage;
     service_request.skip_provider_chat_signature = gateway_signature_enabled;
 
     // Auto-redact (opt-in via x-auto-redact header or auto_redact body field).
@@ -1444,10 +1501,18 @@ async fn chat_completions_inner(
                 let mut leading_control: Vec<
                     Result<inference_providers::SSEEvent, inference_providers::CompletionError>,
                 > = Vec::new();
+                // Raw chat_id string captured alongside the hashed UUID so we can
+                // look up the serving-provider tier from the pool's chat_id mapping.
+                let mut stream_chat_id: Option<String> = None;
                 let inference_id = loop {
                     let is_control = match peekable_stream.as_mut().peek().await {
                         Some(Ok(event)) => {
                             if let Some(chunk) = &event.chunk {
+                                // Capture the raw chat_id for the tier lookup below.
+                                stream_chat_id = Some(match chunk {
+                                    inference_providers::StreamChunk::Chat(c) => c.id.clone(),
+                                    inference_providers::StreamChunk::Text(c) => c.id.clone(),
+                                });
                                 break Some(extract_inference_id_from_chunk(chunk));
                             }
                             true
@@ -1538,6 +1603,7 @@ async fn chat_completions_inner(
                         let upstream_done = upstream_done_forwarded.clone();
                         let include_stream_usage_in_response = include_stream_usage_in_response;
                         let rewrite_public_stream_usage = rewrite_public_stream_usage;
+                        let strip_intermediate_usage = strip_intermediate_usage;
                         let gateway_signature_enabled = gateway_signature_enabled;
                         let public_signature_hasher = public_signature_hasher.clone();
                         let public_signature_chat_id = public_signature_chat_id.clone();
@@ -1548,7 +1614,7 @@ async fn chat_completions_inner(
                                     // Byte-exact passthrough (issue #701): when no public
                                     // chunk rewriting is active, forward the upstream wire
                                     // bytes untouched. Explicit include_usage shaping needs
-                                    // parsed-chunk serialization; encrypted, default, and
+                                    // parsed-chunk serialization; encrypted and
                                     // continuous-usage streams preserve passthrough.
                                     //
                                     // Disabled for alias-served responses: those inject
@@ -1556,10 +1622,15 @@ async fn chat_completions_inner(
                                     // and are non-byte-verifiable anyway since the TEE
                                     // signs under the canonical model name, not the alias
                                     // the client requested.
+                                    //
+                                    // Also disabled when strip_intermediate_usage is active:
+                                    // per OpenAI spec intermediate chunks must carry
+                                    // `usage: null`, so we re-serialize to null it out.
                                     if event.raw_passthrough
                                         && !auto_redact_enabled
                                         && !alias_served
                                         && !rewrite_public_stream_usage
+                                        && !strip_intermediate_usage
                                     {
                                         if event.is_done_marker() {
                                             upstream_done
@@ -1630,6 +1701,18 @@ async fn chat_completions_inner(
                                         ) {
                                             return None;
                                         }
+                                    } else if strip_intermediate_usage {
+                                        // Default streaming and include_usage:false: null out
+                                        // usage on all chunks (usage-only chunks are dropped).
+                                        // No final usage chunk is emitted (include_usage:false).
+                                        let mut discarded = None;
+                                        if !prepare_stream_chunk_for_client(
+                                            &mut chunk,
+                                            false, // include_usage = false
+                                            &mut discarded,
+                                        ) {
+                                            return None;
+                                        }
                                     }
 
                                     if auto_redact_enabled {
@@ -1667,13 +1750,47 @@ async fn chat_completions_inner(
                                         );
                                         "{}".to_string()
                                     });
+                                    let (
+                                        serialized_chunk_len,
+                                        choices_count,
+                                        finish_reason_count,
+                                        usage_present,
+                                    ) = match &chunk {
+                                        inference_providers::StreamChunk::Chat(chat) => (
+                                            json_data.len(),
+                                            chat.choices.len(),
+                                            chat.choices
+                                                .iter()
+                                                .filter(|choice| choice.finish_reason.is_some())
+                                                .count(),
+                                            chat.usage.is_some(),
+                                        ),
+                                        inference_providers::StreamChunk::Text(text) => (
+                                            json_data.len(),
+                                            text.choices.len(),
+                                            text.choices
+                                                .iter()
+                                                .filter(|choice| choice.finish_reason.is_some())
+                                                .count(),
+                                            text.usage.is_some(),
+                                        ),
+                                    };
                                     // Suppress per-chunk debug logging when
                                     // auto_redact is enabled: the chunk now
                                     // holds the user's original PII (we just
                                     // un-redacted it). Logging it would
                                     // defeat the privacy guarantee at debug.
                                     if !auto_redact_enabled {
-                                        tracing::debug!("Completion stream event: {}", json_data);
+                                        tracing::debug!(
+                                            %request_id,
+                                            serialized_chunk_len,
+                                            choices_count,
+                                            has_choices = choices_count > 0,
+                                            finish_reason_count,
+                                            has_finish_reason = finish_reason_count > 0,
+                                            usage_present,
+                                            "Completion stream event serialized"
+                                        );
                                     }
                                     // Format as SSE event with proper newlines
                                     let sse_bytes = Bytes::from(format!("data: {json_data}\n\n"));
@@ -1845,6 +1962,19 @@ async fn chat_completions_inner(
                         .filter_map(std::future::ready),
                     );
 
+                // Look up which trust tier served this stream. The pool stores a
+                // chat_id → provider mapping when the first chunk arrives; we read
+                // it now (synchronously, before streaming starts) so the header is
+                // present on the initial HTTP/1.1 response line.
+                let serving_tier = if let Some(ref chat_id) = stream_chat_id {
+                    app_state
+                        .inference_provider_pool
+                        .get_provider_tier_for_chat_id(chat_id)
+                        .await
+                } else {
+                    None
+                };
+
                 // Return raw streaming response with SSE headers
                 let mut response_builder = Response::builder()
                     .status(StatusCode::OK)
@@ -1863,6 +1993,13 @@ async fn chat_completions_inner(
                     response_builder =
                         response_builder.header(HEADER_INFERENCE_ID, uuid.to_string());
                     exposed_headers.push(HEADER_INFERENCE_ID);
+                }
+
+                // Surface which provider tier served this streaming completion.
+                if let Some(tier) = serving_tier {
+                    response_builder = response_builder
+                        .header(HEADER_SERVING_PROVIDER, provider_tier_to_str(tier));
+                    exposed_headers.push(HEADER_SERVING_PROVIDER);
                 }
 
                 // Announce alias substitution so it is never silent (issue #573).
@@ -1973,6 +2110,13 @@ async fn chat_completions_inner(
                     exposed_headers.push(HEADER_INFERENCE_ID);
                 }
 
+                // Surface which provider tier served this non-streaming completion.
+                response_builder = response_builder.header(
+                    HEADER_SERVING_PROVIDER,
+                    provider_tier_to_str(response_with_bytes.serving_tier),
+                );
+                exposed_headers.push(HEADER_SERVING_PROVIDER);
+
                 // Announce alias substitution so it is never silent (issue #573).
                 // Guarded HeaderValue construction: a header-invalid byte in a
                 // model name must not panic the `.body().unwrap()` below.
@@ -2019,7 +2163,7 @@ async fn chat_completions_inner(
         (status = 400, description = "Invalid request parameters", body = ErrorResponse),
         (status = 401, description = "Invalid or missing API key", body = ErrorResponse),
         (status = 500, description = "Server error", body = ErrorResponse),
-        (status = 529, description = "All inference backends overloaded; retry with exponential backoff", body = ErrorResponse)
+        (status = 429, description = "Rate limited or overloaded — retry with backoff. Check error.type: rate_limit_exceeded or service_overloaded.", body = ErrorResponse)
     ),
     security(
         ("api_key" = [])
@@ -2029,6 +2173,7 @@ pub async fn completions(
     State(app_state): State<AppState>,
     Extension(api_key): Extension<AuthenticatedApiKey>,
     Extension(body_hash): Extension<RequestBodyHash>,
+    Extension(correlation): Extension<RequestCorrelation>,
     headers: header::HeaderMap,
     OpenAiJson(request): OpenAiJson<CompletionRequest>,
 ) -> axum::response::Response {
@@ -2046,13 +2191,7 @@ pub async fn completions(
         return (StatusCode::BAD_REQUEST, ResponseJson(error)).into_response();
     }
 
-    // Per-request correlation ID: reuse the client's X-Request-Id if present and
-    // parseable as a UUID, otherwise generate one. Matches chat_completions.
-    let request_id = headers
-        .get("x-request-id")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| Uuid::parse_str(s).ok())
-        .unwrap_or_else(Uuid::new_v4);
+    let request_id = correlation.request_id;
 
     // See chat_completions: do NOT span.enter() in async code; .instrument() the
     // inner future so the span wraps every await without leaking across tasks.
@@ -2210,10 +2349,15 @@ async fn completions_inner(
                 // response: past the cap we proceed without an Inference-Id.
                 let mut peekable_stream = Box::pin(stream.peekable());
                 let mut control_skipped = 0usize;
+                let mut stream_chat_id: Option<String> = None;
                 let inference_id = loop {
                     let is_control = match peekable_stream.as_mut().peek().await {
                         Some(Ok(event)) => {
                             if let Some(chunk) = &event.chunk {
+                                stream_chat_id = Some(match chunk {
+                                    inference_providers::StreamChunk::Chat(c) => c.id.clone(),
+                                    inference_providers::StreamChunk::Text(c) => c.id.clone(),
+                                });
                                 break Some(extract_inference_id_from_chunk(chunk));
                             }
                             true
@@ -2236,6 +2380,15 @@ async fn completions_inner(
                         "Could not extract inference ID from first chunk for text completion (streaming)"
                     );
                 }
+
+                let serving_tier = if let Some(ref chat_id) = stream_chat_id {
+                    app_state
+                        .inference_provider_pool
+                        .get_provider_tier_for_chat_id(chat_id)
+                        .await
+                } else {
+                    None
+                };
 
                 let organization_id = api_key.organization.id.0;
                 let model_for_err = request.model.clone();
@@ -2316,6 +2469,11 @@ async fn completions_inner(
                         response_builder.header(HEADER_INFERENCE_ID, uuid.to_string());
                     exposed_headers.push(HEADER_INFERENCE_ID);
                 }
+                if let Some(tier) = serving_tier {
+                    response_builder = response_builder
+                        .header(HEADER_SERVING_PROVIDER, provider_tier_to_str(tier));
+                    exposed_headers.push(HEADER_SERVING_PROVIDER);
+                }
                 // Announce alias substitution so it is never silent (issue #573)
                 if let Some(canonical) = &alias_canonical {
                     if let Ok(value) = header::HeaderValue::from_str(&format!(
@@ -2388,6 +2546,11 @@ async fn completions_inner(
                     .header(HEADER_INFERENCE_ID, inference_id.to_string());
 
                 let mut exposed_headers: Vec<&str> = vec![HEADER_INFERENCE_ID];
+                response_builder = response_builder.header(
+                    HEADER_SERVING_PROVIDER,
+                    provider_tier_to_str(response_with_bytes.serving_tier),
+                );
+                exposed_headers.push(HEADER_SERVING_PROVIDER);
                 // Announce alias substitution so it is never silent (issue #573)
                 if let Some(canonical) = &alias_canonical {
                     if let Ok(value) = header::HeaderValue::from_str(&format!(
@@ -2911,6 +3074,8 @@ mod tests {
 
         assert!(mode.rewrite_public_stream_usage);
         assert!(mode.gateway_signature_enabled);
+        // rewrite already handles usage shaping; strip is not additionally needed
+        assert!(!mode.strip_intermediate_usage);
     }
 
     #[test]
@@ -2920,46 +3085,113 @@ mod tests {
 
         assert!(mode.rewrite_public_stream_usage);
         assert!(!mode.gateway_signature_enabled);
+        assert!(!mode.strip_intermediate_usage);
     }
 
     #[test]
-    fn default_attested_stream_preserves_provider_passthrough() {
+    fn default_attested_stream_preserves_passthrough_for_tee_verification() {
+        // Default streaming for ATTESTED models: byte-exact passthrough is preserved
+        // so the client can verify the inference TEE's provider signature.
+        // Stripping usage would change the bytes the client sees vs what the provider
+        // signed, breaking TEE signature verification.
         let request = chat_request_with_include_usage(None);
         let mode = chat_stream_usage_mode(&request, Some(true), false);
 
         assert!(!mode.rewrite_public_stream_usage);
         assert!(!mode.gateway_signature_enabled);
+        assert!(
+            !mode.strip_intermediate_usage,
+            "attested streams must preserve raw passthrough for TEE verification"
+        );
     }
 
     #[test]
-    fn include_usage_false_attested_stream_preserves_provider_passthrough() {
+    fn include_usage_false_attested_stream_preserves_passthrough_for_tee_verification() {
+        // Explicit include_usage:false for ATTESTED model: same as default,
+        // preserve passthrough for TEE signature verification.
         let request = chat_request_with_include_usage(Some(false));
         let mode = chat_stream_usage_mode(&request, Some(true), false);
 
         assert!(!mode.rewrite_public_stream_usage);
         assert!(!mode.gateway_signature_enabled);
+        assert!(!mode.strip_intermediate_usage);
     }
 
     #[test]
-    fn default_non_attested_stream_preserves_provider_passthrough() {
+    fn default_non_attested_stream_strips_intermediate_usage() {
+        // Non-attested (external) models: no TEE signature to preserve.
+        // Strip usage so intermediate chunks carry `usage: null` per OpenAI spec.
         let request = chat_request_with_include_usage(None);
         let mode = chat_stream_usage_mode(&request, Some(false), false);
 
         assert!(!mode.rewrite_public_stream_usage);
         assert!(!mode.gateway_signature_enabled);
+        assert!(mode.strip_intermediate_usage);
     }
 
     #[test]
-    fn continuous_usage_stats_is_passthrough_when_model_metadata_is_missing() {
+    fn include_usage_false_non_attested_stream_strips_intermediate_usage() {
+        let request = chat_request_with_include_usage(Some(false));
+        let mode = chat_stream_usage_mode(&request, Some(false), false);
+
+        assert!(!mode.rewrite_public_stream_usage);
+        assert!(!mode.gateway_signature_enabled);
+        assert!(mode.strip_intermediate_usage);
+    }
+
+    #[test]
+    fn continuous_usage_stats_preserves_passthrough() {
         let mut request = chat_request_with_include_usage(None);
         request.extra.insert(
             "stream_options".to_string(),
             serde_json::json!({ "continuous_usage_stats": true }),
         );
+        // continuous_usage_stats is an explicit request for per-chunk usage;
+        // strip_intermediate_usage must be false so those stats flow through.
         let mode = chat_stream_usage_mode(&request, None, false);
 
         assert!(!mode.rewrite_public_stream_usage);
         assert!(!mode.gateway_signature_enabled);
+        assert!(!mode.strip_intermediate_usage);
+    }
+
+    #[test]
+    fn include_usage_true_with_metadata_lookup_failure_preserves_passthrough() {
+        // Regression test: when the client explicitly requests include_usage:true but
+        // model metadata is unavailable (model_attestation_supported == None, e.g. the
+        // model is absent from the catalog or get_models_with_pricing() errored), both
+        // rewrite_public_stream_usage and strip_intermediate_usage must be false so
+        // the stream falls back to byte-exact passthrough. Before the fix, this path
+        // could activate strip_intermediate_usage, silently dropping all usage from the
+        // response — strictly worse than the prior passthrough behaviour.
+        let request = chat_request_with_include_usage(Some(true));
+        let mode = chat_stream_usage_mode(&request, None, false);
+
+        assert!(
+            !mode.rewrite_public_stream_usage,
+            "rewrite requires model metadata; must be false when metadata unavailable"
+        );
+        assert!(
+            !mode.strip_intermediate_usage,
+            "explicit include_usage:true must never strip usage, even on metadata lookup failure"
+        );
+    }
+
+    #[test]
+    fn include_usage_true_non_attested_does_not_strip() {
+        // When include_usage:true and model_attestation_supported == Some(false),
+        // rewrite_public_stream_usage handles usage shaping; strip must not also fire.
+        let request = chat_request_with_include_usage(Some(true));
+        let mode = chat_stream_usage_mode(&request, Some(false), false);
+
+        assert!(
+            mode.rewrite_public_stream_usage,
+            "non-attested + include_usage:true should use the rewrite path"
+        );
+        assert!(
+            !mode.strip_intermediate_usage,
+            "strip must not fire when include_usage:true — client asked for usage"
+        );
     }
 
     #[test]
@@ -2976,9 +3208,11 @@ mod tests {
         let passthrough = chat_stream_usage_mode(&request, Some(true), false);
         assert!(!passthrough.rewrite_public_stream_usage);
         assert!(!passthrough.gateway_signature_enabled);
+        assert!(!passthrough.strip_intermediate_usage);
 
         let e2ee_passthrough = chat_stream_usage_mode(&request, Some(true), true);
         assert!(!e2ee_passthrough.rewrite_public_stream_usage);
+        assert!(!e2ee_passthrough.strip_intermediate_usage);
 
         request.extra.insert(
             "modalities".to_string(),
@@ -2986,6 +3220,70 @@ mod tests {
         );
         let audio_passthrough = chat_stream_usage_mode(&request, Some(true), false);
         assert!(!audio_passthrough.rewrite_public_stream_usage);
+        assert!(!audio_passthrough.strip_intermediate_usage);
+    }
+
+    #[test]
+    fn e2ee_stream_preserves_passthrough() {
+        // E2EE chunks are opaque; cannot modify them.
+        let request = chat_request_with_include_usage(None);
+        let mode = chat_stream_usage_mode(&request, Some(true), true);
+
+        assert!(!mode.rewrite_public_stream_usage);
+        assert!(!mode.gateway_signature_enabled);
+        assert!(!mode.strip_intermediate_usage);
+    }
+
+    #[test]
+    fn non_text_modality_stream_preserves_passthrough() {
+        let mut request = chat_request_with_include_usage(None);
+        request.extra.insert(
+            "modalities".to_string(),
+            serde_json::json!(["text", "audio"]),
+        );
+        let mode = chat_stream_usage_mode(&request, Some(true), false);
+
+        assert!(!mode.rewrite_public_stream_usage);
+        assert!(!mode.gateway_signature_enabled);
+        assert!(!mode.strip_intermediate_usage);
+    }
+
+    #[test]
+    fn e2ee_non_attested_stream_does_not_strip_intermediate_usage() {
+        // Regression guard: E2EE chunks are opaque ciphertext — stripping usage
+        // requires parsing and re-serializing, which would corrupt or discard
+        // encrypted payload bytes. The `!e2ee_active` guard in
+        // `chat_stream_usage_mode` must hold even when
+        // `model_attestation_supported == Some(false)`, i.e. the non-attested
+        // path that would otherwise activate strip_intermediate_usage.
+        let request = chat_request_with_include_usage(None);
+        let mode = chat_stream_usage_mode(&request, Some(false), true /* e2ee_active */);
+
+        assert!(
+            !mode.strip_intermediate_usage,
+            "E2EE streams must never activate strip_intermediate_usage: \
+             chunks are opaque ciphertext and cannot be re-serialized"
+        );
+    }
+
+    #[test]
+    fn non_text_modality_non_attested_stream_does_not_strip_intermediate_usage() {
+        // Regression guard: non-text modality streams (e.g. audio) carry binary
+        // or provider-specific payloads that must not be re-serialized. The
+        // `!chat_stream_has_non_text_modalities` guard in `chat_stream_usage_mode`
+        // must hold even when `model_attestation_supported == Some(false)`.
+        let mut request = chat_request_with_include_usage(None);
+        request.extra.insert(
+            "modalities".to_string(),
+            serde_json::json!(["text", "audio"]),
+        );
+        let mode = chat_stream_usage_mode(&request, Some(false), false);
+
+        assert!(
+            !mode.strip_intermediate_usage,
+            "non-text modality streams must never activate strip_intermediate_usage: \
+             payloads may be binary/provider-specific and cannot be re-serialized"
+        );
     }
 
     #[test]
@@ -3817,7 +4115,7 @@ mod tests {
         (status = 400, description = "Invalid request parameters", body = ErrorResponse),
         (status = 401, description = "Invalid or missing API key", body = ErrorResponse),
         (status = 500, description = "Server error", body = ErrorResponse),
-        (status = 529, description = "All inference backends overloaded; retry with exponential backoff", body = ErrorResponse)
+        (status = 429, description = "Rate limited or overloaded — retry with backoff. Check error.type: rate_limit_exceeded or service_overloaded.", body = ErrorResponse)
     ),
     security(
         ("api_key" = [])
@@ -3827,6 +4125,7 @@ pub async fn image_generations(
     State(app_state): State<AppState>,
     Extension(api_key): Extension<AuthenticatedApiKey>,
     Extension(body_hash): Extension<RequestBodyHash>,
+    Extension(correlation): Extension<RequestCorrelation>,
     headers: header::HeaderMap,
     OpenAiJson(request): OpenAiJson<crate::models::ImageGenerationRequest>,
 ) -> axum::response::Response {
@@ -3916,6 +4215,7 @@ pub async fn image_generations(
     // Convert API request to provider params
     let mut extra = std::collections::HashMap::new();
     insert_encryption_headers(&encryption_headers, &mut extra);
+    insert_request_id_header(correlation, &mut extra);
 
     let params = inference_providers::ImageGenerationParams {
         model: request.model.clone(),
@@ -3931,10 +4231,12 @@ pub async fn image_generations(
     // Call the inference provider pool
     match app_state
         .inference_provider_pool
-        .image_generation(params, body_hash.hash.clone())
+        .image_generation_with_attribution(params, body_hash.hash.clone())
         .await
     {
-        Ok(response_with_bytes) => {
+        Ok(attributed_response) => {
+            let response_with_bytes = attributed_response.response;
+            let provider_attribution = attributed_response.provider_attribution;
             // Store attestation signature for image generation (same pattern as chat completions)
             let attestation_service = app_state.attestation_service.clone();
             let image_id_for_sig = response_with_bytes.response.id.clone();
@@ -3986,15 +4288,16 @@ pub async fn image_generations(
                 }
             };
 
-            let usage_request = build_image_usage_request(
+            let usage_request = build_image_usage_request(ImageUsageRecord {
                 organization_id,
                 workspace_id,
                 api_key_id,
                 model_id,
-                &provider_request_id,
+                provider_request_id: &provider_request_id,
                 image_count,
-                services::usage::InferenceType::ImageGeneration,
-            );
+                provider_attribution,
+                inference_type: services::usage::InferenceType::ImageGeneration,
+            });
             record_usage_with_sync_fallback(usage_service, usage_request, "Image generation").await;
 
             // Return the exact bytes from the provider for hash verification
@@ -4073,7 +4376,7 @@ pub async fn image_generations(
         (status = 401, description = "Unauthorized (missing or invalid API key)", body = ErrorResponse),
         (status = 404, description = "Model not found", body = ErrorResponse),
         (status = 500, description = "Server error", body = ErrorResponse),
-        (status = 529, description = "All inference backends overloaded; retry with exponential backoff", body = ErrorResponse),
+        (status = 429, description = "Rate limited or overloaded — retry with backoff. Check error.type: rate_limit_exceeded or service_overloaded.", body = ErrorResponse),
     ),
     security(("ApiKeyAuth" = []))
 )]
@@ -4081,6 +4384,7 @@ pub async fn audio_transcriptions(
     State(app_state): State<AppState>,
     Extension(api_key): Extension<AuthenticatedApiKey>,
     Extension(body_hash): Extension<RequestBodyHash>,
+    Extension(correlation): Extension<RequestCorrelation>,
     headers: header::HeaderMap,
     mut multipart: Multipart,
 ) -> axum::response::Response {
@@ -4242,6 +4546,7 @@ pub async fn audio_transcriptions(
     // Convert API request to provider params
     let mut extra = std::collections::HashMap::new();
     insert_encryption_headers(&encryption_headers, &mut extra);
+    insert_request_id_header(correlation, &mut extra);
 
     let requested_response_format = request.response_format.clone();
     let provider_response_format = match requested_response_format.as_deref() {
@@ -4467,7 +4772,7 @@ pub async fn audio_transcriptions(
         (status = 404, description = "Model not found", body = ErrorResponse),
         (status = 413, description = "Payload too large", body = ErrorResponse),
         (status = 500, description = "Server error", body = ErrorResponse),
-        (status = 529, description = "All inference backends overloaded; retry with exponential backoff", body = ErrorResponse)
+        (status = 429, description = "Rate limited or overloaded — retry with backoff. Check error.type: rate_limit_exceeded or service_overloaded.", body = ErrorResponse)
     ),
     security(
         ("api_key" = [])
@@ -4714,10 +5019,12 @@ pub async fn image_edits(
     // Call the inference provider pool
     match app_state
         .inference_provider_pool
-        .image_edit(params, body_hash.hash.clone())
+        .image_edit_with_attribution(params, body_hash.hash.clone())
         .await
     {
-        Ok(response_with_bytes) => {
+        Ok(attributed_response) => {
+            let response_with_bytes = attributed_response.response;
+            let provider_attribution = attributed_response.provider_attribution;
             // Store attestation signature for image edit (same pattern as image generation)
             let attestation_service = app_state.attestation_service.clone();
             let image_id_for_sig = response_with_bytes.response.id.clone();
@@ -4769,15 +5076,16 @@ pub async fn image_edits(
                 }
             };
 
-            let usage_request = build_image_usage_request(
+            let usage_request = build_image_usage_request(ImageUsageRecord {
                 organization_id,
                 workspace_id,
                 api_key_id,
                 model_id,
-                &provider_request_id,
+                provider_request_id: &provider_request_id,
                 image_count,
-                services::usage::InferenceType::ImageEdit,
-            );
+                provider_attribution,
+                inference_type: services::usage::InferenceType::ImageEdit,
+            });
             record_usage_with_sync_fallback(usage_service, usage_request, "Image edit").await;
 
             // Return the exact bytes from the provider for hash verification
@@ -4971,9 +5279,8 @@ mod rerank_response_options_tests {
         (status = 400, description = "Invalid request (empty documents, invalid model, etc.)", body = ErrorResponse),
         (status = 401, description = "Unauthorized (missing or invalid API key)", body = ErrorResponse),
         (status = 404, description = "Model not found", body = ErrorResponse),
-        (status = 429, description = "Concurrent request limit exceeded for the organization. Max concurrent requests per model: 64 (configurable)", body = ErrorResponse),
+        (status = 429, description = "Rate limited or overloaded — retry with backoff. Check error.type: rate_limit_exceeded or service_overloaded.", body = ErrorResponse),
         (status = 500, description = "Server error (billing failure, provider error)", body = ErrorResponse),
-        (status = 529, description = "All inference backends overloaded; retry with exponential backoff", body = ErrorResponse),
     ),
     security(("ApiKeyAuth" = []))
 )]
@@ -4981,6 +5288,7 @@ pub async fn rerank(
     State(app_state): State<AppState>,
     Extension(api_key): Extension<AuthenticatedApiKey>,
     Extension(_body_hash): Extension<RequestBodyHash>,
+    Extension(correlation): Extension<RequestCorrelation>,
     headers: header::HeaderMap,
     OpenAiJson(request): OpenAiJson<crate::models::RerankRequest>,
 ) -> axum::response::Response {
@@ -5043,6 +5351,7 @@ pub async fn rerank(
     // Convert API request to provider params
     let mut extra = std::collections::HashMap::new();
     insert_encryption_headers(&encryption_headers, &mut extra);
+    insert_request_id_header(correlation, &mut extra);
 
     let params = inference_providers::RerankParams {
         model: request.model.clone(),
@@ -5316,9 +5625,8 @@ fn classify_provider_error(
         (status = 400, description = "Invalid request", body = ErrorResponse),
         (status = 401, description = "Unauthorized", body = ErrorResponse),
         (status = 404, description = "Model not found", body = ErrorResponse),
-        (status = 429, description = "Rate limit exceeded", body = ErrorResponse),
+        (status = 429, description = "Rate limited or overloaded — retry with backoff. Check error.type: rate_limit_exceeded or service_overloaded.", body = ErrorResponse),
         (status = 500, description = "Server error", body = ErrorResponse),
-        (status = 529, description = "All inference backends overloaded; retry with exponential backoff", body = ErrorResponse)
     ),
     security(
         ("api_key" = [])
@@ -5328,6 +5636,7 @@ pub async fn embeddings(
     State(app_state): State<AppState>,
     Extension(api_key): Extension<AuthenticatedApiKey>,
     Extension(_body_hash): Extension<RequestBodyHash>,
+    Extension(correlation): Extension<RequestCorrelation>,
     headers: header::HeaderMap,
     body: Bytes,
 ) -> axum::response::Response {
@@ -5395,6 +5704,7 @@ pub async fn embeddings(
     };
     let mut extra = std::collections::HashMap::new();
     insert_encryption_headers(&encryption_headers, &mut extra);
+    insert_request_id_header(correlation, &mut extra);
 
     match app_state
         .completion_service
@@ -5622,8 +5932,7 @@ struct PrivacyClassifyResponseDoc {
         (status = 400, description = "Invalid request", body = ErrorResponse),
         (status = 401, description = "Unauthorized", body = ErrorResponse),
         (status = 404, description = "Model not found", body = ErrorResponse),
-        (status = 429, description = "Rate limit exceeded", body = ErrorResponse),
-        (status = 529, description = "All inference backends overloaded; retry with exponential backoff", body = ErrorResponse),
+        (status = 429, description = "Rate limited or overloaded — retry with backoff. Check error.type: rate_limit_exceeded or service_overloaded.", body = ErrorResponse),
         (status = 500, description = "Server error", body = ErrorResponse)
     ),
     security(
@@ -5634,6 +5943,7 @@ pub async fn privacy_classify(
     State(app_state): State<AppState>,
     Extension(api_key): Extension<AuthenticatedApiKey>,
     Extension(_body_hash): Extension<RequestBodyHash>,
+    Extension(correlation): Extension<RequestCorrelation>,
     headers: header::HeaderMap,
     body: Bytes,
 ) -> axum::response::Response {
@@ -5699,6 +6009,7 @@ pub async fn privacy_classify(
     };
     let mut extra = std::collections::HashMap::new();
     insert_encryption_headers(&encryption_headers, &mut extra);
+    insert_request_id_header(correlation, &mut extra);
 
     match app_state
         .completion_service
@@ -5950,7 +6261,7 @@ struct PrivacyRedactResponseDoc {
         (status = 400, description = "Invalid request", body = ErrorResponse),
         (status = 401, description = "Unauthorized", body = ErrorResponse),
         (status = 404, description = "Model not found", body = ErrorResponse),
-        (status = 429, description = "Rate limit exceeded", body = ErrorResponse),
+        (status = 429, description = "Rate limited or overloaded — retry with backoff. Check error.type: rate_limit_exceeded or service_overloaded.", body = ErrorResponse),
         (status = 500, description = "Server error", body = ErrorResponse)
     ),
     security(
@@ -5961,6 +6272,7 @@ pub async fn privacy_redact(
     State(app_state): State<AppState>,
     Extension(api_key): Extension<AuthenticatedApiKey>,
     Extension(_body_hash): Extension<RequestBodyHash>,
+    Extension(correlation): Extension<RequestCorrelation>,
     headers: header::HeaderMap,
     body: Bytes,
 ) -> axum::response::Response {
@@ -6099,6 +6411,7 @@ pub async fn privacy_redact(
     };
     let mut extra = std::collections::HashMap::new();
     insert_encryption_headers(&encryption_headers, &mut extra);
+    insert_request_id_header(correlation, &mut extra);
 
     // Forward a normalized classify request to the upstream model. We
     // deliberately rebuild the body rather than passing the client body
@@ -6414,9 +6727,8 @@ pub async fn privacy_redact(
         (status = 400, description = "Invalid request (empty texts, invalid model, etc.)", body = ErrorResponse),
         (status = 401, description = "Unauthorized (missing or invalid API key)", body = ErrorResponse),
         (status = 404, description = "Model not found", body = ErrorResponse),
-        (status = 429, description = "Concurrent request limit exceeded for the organization. Max concurrent requests per model: 64 (configurable)", body = ErrorResponse),
+        (status = 429, description = "Rate limited or overloaded — retry with backoff. Check error.type: rate_limit_exceeded or service_overloaded.", body = ErrorResponse),
         (status = 500, description = "Server error (billing failure, provider error)", body = ErrorResponse),
-        (status = 529, description = "All inference backends overloaded; retry with exponential backoff", body = ErrorResponse),
     ),
     security(("ApiKeyAuth" = []))
 )]
@@ -6424,6 +6736,7 @@ pub async fn score(
     State(app_state): State<AppState>,
     Extension(api_key): Extension<AuthenticatedApiKey>,
     Extension(body_hash): Extension<RequestBodyHash>,
+    Extension(correlation): Extension<RequestCorrelation>,
     headers: header::HeaderMap,
     OpenAiJson(request): OpenAiJson<crate::models::ScoreRequest>,
 ) -> axum::response::Response {
@@ -6496,6 +6809,7 @@ pub async fn score(
                     };
                 let mut extra = std::collections::HashMap::new();
                 insert_encryption_headers(&encryption_headers, &mut extra);
+                insert_request_id_header(correlation, &mut extra);
 
                 inference_providers::ScoreParams {
                     model: request.model.clone(),

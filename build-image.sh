@@ -29,7 +29,13 @@ fi
 touch pinned-packages-builder.txt pinned-packages-runtime.txt
 git rev-parse HEAD > .GIT_REV
 TEMP_TAG="cloud-api-temp:$(date +%s)"
+# --ulimit nofile: raise the open-file limit for RUN steps. The default soft
+# limit on the self-hosted runners is low enough that the parallel `cargo build`
+# exhausts file descriptors ("Too many open files (os error 24)"). This only
+# affects build-time resource limits, never the output bytes, so it is safe for
+# reproducibility.
 docker buildx build --builder buildkit_20 --no-cache --platform linux/amd64 \
+    --ulimit nofile=1048576:1048576 \
     --build-arg SOURCE_DATE_EPOCH="0" \
     --output type=oci,dest=./oci.tar,rewrite-timestamp=true \
     --output type=docker,name="$TEMP_TAG",rewrite-timestamp=true .

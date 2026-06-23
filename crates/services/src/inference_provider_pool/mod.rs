@@ -172,7 +172,9 @@ pub trait ExternalModelsSource: Send + Sync {
     /// Fetch models that have a direct inference URL configured.
     /// Returns (model_name, inference_url, context_length) triples for active models with inference_url set.
     /// These models are routed directly to the URL, bypassing the discovery server.
-    async fn fetch_inference_url_models(&self) -> Result<Vec<(String, String, Option<u32>)>, String>;
+    async fn fetch_inference_url_models(
+        &self,
+    ) -> Result<Vec<(String, String, Option<u32>)>, String>;
 }
 
 /// Result of an attestation-discovery pass against a model URL.
@@ -1741,7 +1743,9 @@ impl InferenceProviderPool {
                 .iter()
                 .filter_map(|p| {
                     let ptr = Arc::as_ptr(p) as *const () as usize;
-                    states.get(&ptr).filter(|s| s.ttft_samples >= TTFT_WARMUP_SAMPLES && s.ttft_ewma_ms > 0.0)
+                    states
+                        .get(&ptr)
+                        .filter(|s| s.ttft_samples >= TTFT_WARMUP_SAMPLES && s.ttft_ewma_ms > 0.0)
                 })
                 .map(|s| s.ttft_ewma_ms)
                 .fold(f64::MAX, f64::min);
@@ -1776,10 +1780,7 @@ impl InferenceProviderPool {
             let mut ordered = providers;
             ordered.sort_by_key(&key_of); // stable sort
             let head_key = key_of(&ordered[0]);
-            let group_len = ordered
-                .iter()
-                .take_while(|p| key_of(p) == head_key)
-                .count();
+            let group_len = ordered.iter().take_while(|p| key_of(p) == head_key).count();
             (ordered, group_len)
         };
 
@@ -3314,7 +3315,10 @@ impl InferenceProviderPool {
             "Starting rerank request"
         );
 
-        let providers = match self.get_providers_with_fallback(&model_id, None, &ChatRoutingHints::default()).await {
+        let providers = match self
+            .get_providers_with_fallback(&model_id, None, &ChatRoutingHints::default())
+            .await
+        {
             Some(p) => p,
             None => {
                 return Err(RerankError::GenerationError(format!(
@@ -3363,7 +3367,10 @@ impl InferenceProviderPool {
     ) -> Result<bytes::Bytes, inference_providers::EmbeddingError> {
         tracing::debug!(model = %model, "Starting embeddings request");
 
-        let providers = match self.get_providers_with_fallback(model, None, &ChatRoutingHints::default()).await {
+        let providers = match self
+            .get_providers_with_fallback(model, None, &ChatRoutingHints::default())
+            .await
+        {
             Some(p) => p,
             None => {
                 return Err(inference_providers::EmbeddingError::RequestFailed(format!(
@@ -3419,7 +3426,10 @@ impl InferenceProviderPool {
     ) -> Result<bytes::Bytes, inference_providers::PrivacyClassifyError> {
         tracing::debug!(model = %model, "Starting privacy classify request");
 
-        let providers = match self.get_providers_with_fallback(model, None, &ChatRoutingHints::default()).await {
+        let providers = match self
+            .get_providers_with_fallback(model, None, &ChatRoutingHints::default())
+            .await
+        {
             Some(p) => p,
             None => {
                 return Err(inference_providers::PrivacyClassifyError::RequestFailed(
@@ -3483,7 +3493,10 @@ impl InferenceProviderPool {
 
         tracing::debug!(model = %model_id, "Starting score request");
 
-        let providers = match self.get_providers_with_fallback(&model_id, None, &ChatRoutingHints::default()).await {
+        let providers = match self
+            .get_providers_with_fallback(&model_id, None, &ChatRoutingHints::default())
+            .await
+        {
             Some(p) => p,
             None => {
                 return Err(inference_providers::ScoreError::GenerationError(format!(
@@ -3615,7 +3628,11 @@ impl InferenceProviderPool {
     /// provided models without evicting untouched entries.  Pass
     /// `partial = false` from the periodic sync / startup paths to replace
     /// the URL-provider cache wholesale and prune stale entries.
-    pub async fn load_inference_url_models(&self, models: Vec<(String, String, Option<u32>)>, partial: bool) {
+    pub async fn load_inference_url_models(
+        &self,
+        models: Vec<(String, String, Option<u32>)>,
+        partial: bool,
+    ) {
         if models.is_empty() {
             return;
         }
@@ -5383,7 +5400,11 @@ mod tests {
         };
 
         let mut stream = pool
-            .chat_completion_stream(params, "test-request-hash".to_string(), ChatRoutingHints::default())
+            .chat_completion_stream(
+                params,
+                "test-request-hash".to_string(),
+                ChatRoutingHints::default(),
+            )
             .await
             .expect("Should create stream");
 
@@ -8351,8 +8372,11 @@ mod tests {
         }
 
         // Partial load — only the patched model is included.
-        pool.load_inference_url_models(vec![(patched_model.clone(), patched_url.clone(), None)], true)
-            .await;
+        pool.load_inference_url_models(
+            vec![(patched_model.clone(), patched_url.clone(), None)],
+            true,
+        )
+        .await;
 
         // The untouched model's URL must still be present in the URL cache.
         {

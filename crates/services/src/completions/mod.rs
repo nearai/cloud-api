@@ -1445,7 +1445,11 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         // Get the LLM stream
         let attributed_stream = match self
             .inference_provider_pool
-            .chat_completion_stream_with_attribution(chat_params, request.body_hash.clone(), routing_hints)
+            .chat_completion_stream_with_attribution(
+                chat_params,
+                request.body_hash.clone(),
+                routing_hints,
+            )
             .await
         {
             Ok(pair) => pair,

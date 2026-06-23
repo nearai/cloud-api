@@ -1543,7 +1543,9 @@ impl services::inference_provider_pool::ExternalModelsSource for ModelRepository
             .collect())
     }
 
-    async fn fetch_inference_url_models(&self) -> Result<Vec<(String, String, Option<u32>)>, String> {
+    async fn fetch_inference_url_models(
+        &self,
+    ) -> Result<Vec<(String, String, Option<u32>)>, String> {
         self.get_inference_url_models()
             .await
             .map_err(|e| format!("Failed to fetch inference_url models: {e}"))

@@ -502,10 +502,13 @@ pub async fn batch_upsert_models(
             let is_active = request.is_active != Some(false);
             let is_external = request.provider_type.as_deref() == Some("external");
             if is_active && !is_external {
-                request
-                    .inference_url
-                    .clone()
-                    .map(|url| (model_name.clone(), url, request.context_length.map(|c| c as u32)))
+                request.inference_url.clone().map(|url| {
+                    (
+                        model_name.clone(),
+                        url,
+                        request.context_length.map(|c| c as u32),
+                    )
+                })
             } else {
                 None
             }

@@ -22,9 +22,20 @@ while [[ $# -gt 0 ]]; do
             ;;
     esac
 done
-# Check if buildkit_20 already exists before creating it
-if ! docker buildx inspect buildkit_20 &>/dev/null; then
-    docker buildx create --use --driver-opt image=moby/buildkit:v0.20.2 --name buildkit_20
+# The buildx builder MUST run the pinned BuildKit version. OCI layer
+# serialization and compression differ between BuildKit versions, so a builder
+# created with a different image silently produces a different image digest and
+# breaks cross-machine reproducibility. The previous "create only if absent"
+# check honored the pin only on first creation, so any host whose buildkit_20
+# was created without it (or with a newer default) drifted -- e.g. gpu11 ran
+# BuildKit v0.27.1 while the rest of the fleet ran the pinned v0.20.2, producing
+# a different digest for identical inputs. Recreate the builder unless it
+# already uses the pinned image.
+BUILDKIT_IMAGE="moby/buildkit:v0.20.2"
+if ! docker buildx inspect buildkit_20 2>/dev/null | grep -qF "${BUILDKIT_IMAGE}"; then
+    echo "Creating buildx builder 'buildkit_20' pinned to ${BUILDKIT_IMAGE}"
+    docker buildx rm buildkit_20 2>/dev/null || true
+    docker buildx create --use --driver-opt image="${BUILDKIT_IMAGE}" --name buildkit_20
 fi
 touch pinned-packages-builder.txt pinned-packages-runtime.txt
 git rev-parse HEAD > .GIT_REV

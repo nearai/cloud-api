@@ -275,6 +275,10 @@ impl ExternalProvider {
 
 #[async_trait]
 impl InferenceProvider for ExternalProvider {
+    fn provider_source(&self) -> crate::ProviderSource {
+        crate::ProviderSource::External
+    }
+
     /// Lists models - external providers don't support dynamic model listing
     async fn models(&self) -> Result<ModelsResponse, ListModelsError> {
         // External providers don't support dynamic model discovery

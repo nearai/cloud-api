@@ -166,6 +166,7 @@ fn build_image_usage_request(
         stop_reason: Some(services::usage::StopReason::Completed),
         response_id: None,
         image_count: Some(image_count),
+        provider_attribution: services::usage::ProviderAttribution::default(),
     }
 }
 
@@ -735,6 +736,7 @@ async fn bill_auto_redact_classify(
         stop_reason: Some(services::usage::StopReason::Completed),
         response_id: None,
         image_count: None,
+        provider_attribution: services::usage::ProviderAttribution::default(),
     };
 
     if let Err(e) = app_state.usage_service.record_usage(usage_request).await {
@@ -4324,6 +4326,7 @@ pub async fn audio_transcriptions(
                 stop_reason: Some(services::usage::StopReason::Completed),
                 response_id: None,
                 image_count: None,
+                provider_attribution: services::usage::ProviderAttribution::default(),
             };
 
             // Record usage synchronously - fail the request if usage recording fails
@@ -5166,6 +5169,7 @@ pub async fn rerank(
                 stop_reason: Some(services::usage::StopReason::Completed),
                 response_id: None,
                 image_count: None,
+                provider_attribution: services::usage::ProviderAttribution::default(),
             };
 
             // Record usage synchronously - this is billing-critical and must succeed
@@ -5503,6 +5507,7 @@ pub async fn embeddings(
                 stop_reason: Some(services::usage::StopReason::Completed),
                 response_id: None,
                 image_count: None,
+                provider_attribution: services::usage::ProviderAttribution::default(),
             };
 
             if let Err(e) = app_state.usage_service.record_usage(usage_request).await {
@@ -5821,6 +5826,7 @@ pub async fn privacy_classify(
                 stop_reason: Some(services::usage::StopReason::Completed),
                 response_id: None,
                 image_count: None,
+                provider_attribution: services::usage::ProviderAttribution::default(),
             };
 
             if let Err(e) = app_state.usage_service.record_usage(usage_request).await {
@@ -6334,6 +6340,7 @@ pub async fn privacy_redact(
         stop_reason: Some(services::usage::StopReason::Completed),
         response_id: None,
         image_count: None,
+        provider_attribution: services::usage::ProviderAttribution::default(),
     };
 
     if let Err(e) = app_state.usage_service.record_usage(usage_request).await {
@@ -6541,6 +6548,7 @@ pub async fn score(
                 stop_reason: Some(services::usage::StopReason::Completed),
                 response_id: None,
                 image_count: None,
+                provider_attribution: services::usage::ProviderAttribution::default(),
             };
 
             // Record usage with timeout to prevent blocking responses
@@ -6574,6 +6582,7 @@ pub async fn score(
                         stop_reason: Some(services::usage::StopReason::Completed),
                         response_id: None,
                         image_count: None,
+                        provider_attribution: services::usage::ProviderAttribution::default(),
                     };
                     tokio::spawn(async move {
                         if let Err(e) = usage_service_clone.record_usage(usage_request_retry).await
@@ -6610,6 +6619,7 @@ pub async fn score(
                         stop_reason: Some(services::usage::StopReason::Completed),
                         response_id: None,
                         image_count: None,
+                        provider_attribution: services::usage::ProviderAttribution::default(),
                     };
                     tokio::spawn(async move {
                         if let Err(e) = usage_service_clone.record_usage(usage_request_retry).await

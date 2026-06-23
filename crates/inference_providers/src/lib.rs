@@ -137,6 +137,23 @@ pub enum ProviderTier {
     NonAttested,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ProviderSource {
+    Vllm,
+    External,
+    Chutes,
+}
+
+impl ProviderSource {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            ProviderSource::Vllm => "vllm",
+            ProviderSource::External => "external",
+            ProviderSource::Chutes => "chutes",
+        }
+    }
+}
+
 impl ProviderTier {
     /// Whether this tier carries a verifiable TEE attestation we gate a
     /// "verified" badge on. True for [`Near`](ProviderTier::Near) and
@@ -343,6 +360,10 @@ pub trait InferenceProvider {
     /// returns [`ProviderTier::Attested3p`].
     fn tier(&self) -> ProviderTier {
         ProviderTier::NonAttested
+    }
+
+    fn provider_source(&self) -> ProviderSource {
+        ProviderSource::External
     }
 
     /// Whether this provider can serve **streaming** completions. Default `true`.

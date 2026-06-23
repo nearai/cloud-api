@@ -895,7 +895,6 @@ async fn test_admin_platform_metrics_splits_reconcile() {
 
     println!("✅ Platform metrics verifiable split reconciles to total");
 }
-
 #[tokio::test]
 async fn test_admin_platform_timeseries() {
     let server = setup_test_server().await;

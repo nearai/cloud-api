@@ -33,6 +33,9 @@ impl services::usage::ports::UsageRepository for OrganizationUsageRepository {
             stop_reason: request.stop_reason,
             response_id: request.response_id,
             image_count: request.image_count,
+            served_provider_tier: request.provider_attribution.served_provider_tier,
+            served_provider_type: request.provider_attribution.served_provider_type,
+            served_via_fallback: request.provider_attribution.served_via_fallback,
         };
 
         let log = self.record_usage(db_request).await?;
@@ -64,6 +67,11 @@ impl services::usage::ports::UsageRepository for OrganizationUsageRepository {
             response_id: log.response_id,
             image_count: log.image_count,
             was_inserted: log.was_inserted,
+            provider_attribution: services::usage::ProviderAttribution {
+                served_provider_tier: log.served_provider_tier,
+                served_provider_type: log.served_provider_type,
+                served_via_fallback: log.served_via_fallback,
+            },
         })
     }
 
@@ -124,6 +132,11 @@ impl services::usage::ports::UsageRepository for OrganizationUsageRepository {
                 response_id: log.response_id,
                 image_count: log.image_count,
                 was_inserted: true,
+                provider_attribution: services::usage::ProviderAttribution {
+                    served_provider_tier: log.served_provider_tier,
+                    served_provider_type: log.served_provider_type,
+                    served_via_fallback: log.served_via_fallback,
+                },
             })
             .collect();
 
@@ -171,6 +184,11 @@ impl services::usage::ports::UsageRepository for OrganizationUsageRepository {
                 response_id: log.response_id,
                 image_count: log.image_count,
                 was_inserted: true,
+                provider_attribution: services::usage::ProviderAttribution {
+                    served_provider_tier: log.served_provider_tier,
+                    served_provider_type: log.served_provider_type,
+                    served_via_fallback: log.served_via_fallback,
+                },
             })
             .collect();
 

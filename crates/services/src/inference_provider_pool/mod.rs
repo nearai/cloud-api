@@ -22,6 +22,10 @@ use std::{
 use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, info, warn};
 
+mod provider_attribution;
+use provider_attribution::{served_provider_attribution, ServedProviderResult};
+pub use provider_attribution::{AttributedChatCompletion, AttributedChatCompletionStream};
+
 type InferenceProviderTrait = dyn InferenceProvider + Send + Sync;
 
 /// Upper bound on leading SSE control events (keepalive comments, blank
@@ -2003,7 +2007,7 @@ impl InferenceProviderPool {
         operation_name: &str,
         model_pub_key: Option<&str>,
         provider_fn: F,
-    ) -> Result<(T, Arc<InferenceProviderTrait>), CompletionError>
+    ) -> Result<ServedProviderResult<T>, CompletionError>
     where
         F: Fn(Arc<InferenceProviderTrait>) -> Fut,
         Fut: std::future::Future<Output = Result<T, CompletionError>>,
@@ -2025,7 +2029,7 @@ impl InferenceProviderPool {
         model_pub_key: Option<&str>,
         needs_client_e2ee: bool,
         provider_fn: F,
-    ) -> Result<(T, Arc<InferenceProviderTrait>), CompletionError>
+    ) -> Result<ServedProviderResult<T>, CompletionError>
     where
         F: Fn(Arc<InferenceProviderTrait>) -> Fut,
         Fut: std::future::Future<Output = Result<T, CompletionError>>,
@@ -2087,6 +2091,9 @@ impl InferenceProviderPool {
 
         let providers = Self::filter_streaming_capable(providers, operation_name);
         let providers = Self::filter_client_e2ee_capable(providers, needs_client_e2ee);
+        let has_near_primary = providers
+            .iter()
+            .any(|provider| provider.tier() == inference_providers::ProviderTier::Near);
 
         tracing::info!(
             model_id = %model_id,
@@ -2160,11 +2167,13 @@ impl InferenceProviderPool {
                         }
                         // Visibility into tiered routing: which trust tier actually
                         // served, and whether we fell back off the primary. `attempt`
-                        // is the 0-based index into the tier-ordered provider list, so
-                        // anything past index 0 means the leading (primary, e.g. NEAR)
-                        // tier failed and a fallback (e.g. Chutes) served the request.
+                        // catches transient same-order fallback. The tier/source check
+                        // catches sustained NEAR outages where the failure counter has
+                        // demoted NEAR behind a healthy fallback provider.
                         let tier = provider.tier();
-                        let is_fallback = attempt > 0;
+                        let is_fallback = attempt > 0
+                            || (has_near_primary
+                                && tier != inference_providers::ProviderTier::Near);
                         tracing::info!(
                             model_id = %model_id,
                             attempt = attempt + 1,
@@ -2190,7 +2199,14 @@ impl InferenceProviderPool {
                                 ],
                             );
                         }
-                        return Ok((result, provider.clone()));
+                        return Ok(ServedProviderResult {
+                            value: result,
+                            provider: provider.clone(),
+                            provider_attribution: served_provider_attribution(
+                                provider.as_ref(),
+                                is_fallback,
+                            ),
+                        });
                     }
                     Err(e) => {
                         // For HTTP client errors (4xx), don't retry with other providers.
@@ -2483,9 +2499,20 @@ impl InferenceProviderPool {
 
     pub async fn chat_completion_stream(
         &self,
-        mut params: ChatCompletionParams,
+        params: ChatCompletionParams,
         request_hash: String,
     ) -> Result<StreamingResult, CompletionError> {
+        Ok(self
+            .chat_completion_stream_with_attribution(params, request_hash)
+            .await?
+            .stream)
+    }
+
+    pub async fn chat_completion_stream_with_attribution(
+        &self,
+        mut params: ChatCompletionParams,
+        request_hash: String,
+    ) -> Result<AttributedChatCompletionStream, CompletionError> {
         let model_id = params.model.clone();
 
         // Extract model_pub_key from params.extra for routing
@@ -2508,7 +2535,7 @@ impl InferenceProviderPool {
             "Starting chat completion stream request"
         );
 
-        let (stream, provider) = self
+        let served = self
             .retry_with_fallback_caps(
                 &model_id,
                 "chat_completion_stream",
@@ -2521,6 +2548,9 @@ impl InferenceProviderPool {
                 },
             )
             .await?;
+        let stream = served.value;
+        let provider = served.provider.clone();
+        let provider_attribution = served.provider_attribution;
 
         // Store chat_id mapping for sticky routing by peeking at the first event
         // Must be synchronous to ensure attestation service can find the provider
@@ -2566,21 +2596,34 @@ impl InferenceProviderPool {
             provider.pin_chat_connection(&request_hash, "");
             provider.unpin_chat_connection("");
         }
-        if leading_control.is_empty() {
-            Ok(Box::pin(peekable))
+        let stream: StreamingResult = if leading_control.is_empty() {
+            Box::pin(peekable)
         } else {
             use futures::StreamExt as _;
-            Ok(Box::pin(
-                futures::stream::iter(leading_control).chain(peekable),
-            ))
-        }
+            Box::pin(futures::stream::iter(leading_control).chain(peekable))
+        };
+        Ok(AttributedChatCompletionStream {
+            stream,
+            provider_attribution,
+        })
     }
 
     pub async fn chat_completion(
         &self,
-        mut params: ChatCompletionParams,
+        params: ChatCompletionParams,
         request_hash: String,
     ) -> Result<inference_providers::ChatCompletionResponseWithBytes, CompletionError> {
+        Ok(self
+            .chat_completion_with_attribution(params, request_hash)
+            .await?
+            .response)
+    }
+
+    pub async fn chat_completion_with_attribution(
+        &self,
+        mut params: ChatCompletionParams,
+        request_hash: String,
+    ) -> Result<AttributedChatCompletion, CompletionError> {
         let model_id = params.model.clone();
 
         // Extract model_pub_key from params.extra for routing before any cloning.
@@ -2606,7 +2649,7 @@ impl InferenceProviderPool {
         // Clone params after removing model_pub_key to ensure it's not in the cloned version
         let params_for_provider = params.clone();
 
-        let (response, provider) = self
+        let served = self
             .retry_with_fallback_caps(
                 &model_id,
                 "chat_completion",
@@ -2619,6 +2662,9 @@ impl InferenceProviderPool {
                 },
             )
             .await?;
+        let response = served.value;
+        let provider = served.provider;
+        let provider_attribution = served.provider_attribution;
 
         // Store the chat_id mapping SYNCHRONOUSLY before returning
         // This ensures the attestation service can find the provider
@@ -2633,7 +2679,10 @@ impl InferenceProviderPool {
             "Stored chat_id mapping before returning response"
         );
 
-        Ok(response)
+        Ok(AttributedChatCompletion {
+            response,
+            provider_attribution,
+        })
     }
 
     /// Generate images using the specified model
@@ -2663,7 +2712,7 @@ impl InferenceProviderPool {
         // the provider. We clone once here and reuse across retries rather than cloning on each attempt.
         let cloned_params = params.clone();
 
-        let (response, provider) = self
+        let served = self
             .retry_with_fallback(&model_id, "image_generation", model_pub_key, |provider| {
                 let params = cloned_params.clone();
                 let request_hash = request_hash.clone();
@@ -2676,6 +2725,8 @@ impl InferenceProviderPool {
             })
             .await
             .map_err(|e| ImageGenerationError::GenerationError(e.to_string()))?;
+        let response = served.value;
+        let provider = served.provider;
 
         // Store the chat_id mapping so attestation service can find the provider
         // (same pattern as chat_completion)
@@ -2704,7 +2755,7 @@ impl InferenceProviderPool {
             "Starting audio transcription request"
         );
 
-        let (response, _provider) = self
+        let served = self
             .retry_with_fallback(&model_id, "audio_transcription", None, |provider| {
                 let params = params.clone();
                 let request_hash = request_hash.clone();
@@ -2771,6 +2822,7 @@ impl InferenceProviderPool {
                     &other.to_string(),
                 )),
             })?;
+        let response = served.value;
 
         tracing::info!(
             model = %model_id,
@@ -2798,7 +2850,7 @@ impl InferenceProviderPool {
         // Each retry clones the Arc pointer (8 bytes) instead of the entire struct.
         let params = Arc::new(params);
 
-        let (response, provider) = self
+        let served = self
             .retry_with_fallback(&model_id, "image_edit", None, |provider| {
                 let params = params.clone();
                 let request_hash = request_hash.clone();
@@ -2811,6 +2863,8 @@ impl InferenceProviderPool {
             })
             .await
             .map_err(|e| ImageEditError::EditError(e.to_string()))?;
+        let response = served.value;
+        let provider = served.provider;
 
         // Store the chat_id mapping so attestation service can find the provider
         // (same pattern as image_generation)
@@ -5683,7 +5737,7 @@ mod tests {
         }
 
         // Verify E2EE routing works
-        let result: Result<((), _), _> = pool
+        let result: Result<ServedProviderResult<()>, _> = pool
             .retry_with_fallback(&model_id, "test_op", Some(ecdsa_key), |_provider| async {
                 Ok(())
             })
@@ -5713,13 +5767,13 @@ mod tests {
         let ecdsa_key = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
         // Test 1: routing WITHOUT pubkey should work
-        let result: Result<((), _), _> = pool
+        let result: Result<ServedProviderResult<()>, _> = pool
             .retry_with_fallback(&model_id, "test_op", None, |_provider| async { Ok(()) })
             .await;
         assert!(result.is_ok(), "Routing without pubkey should succeed");
 
         // Test 2: routing WITH correct pubkey should work
-        let result: Result<((), _), _> = pool
+        let result: Result<ServedProviderResult<()>, _> = pool
             .retry_with_fallback(&model_id, "test_op", Some(ecdsa_key), |_provider| async {
                 Ok(())
             })
@@ -5731,7 +5785,7 @@ mod tests {
         );
 
         // Test 3: routing with WRONG pubkey should fail
-        let result: Result<((), _), _> = pool
+        let result: Result<ServedProviderResult<()>, _> = pool
             .retry_with_fallback(
                 &model_id,
                 "test_op",
@@ -5788,7 +5842,7 @@ mod tests {
     async fn test_4xx_error_does_not_retry() {
         let (pool, model_id) = pool_with_mock_provider().await;
 
-        let result: Result<((), _), _> = pool
+        let result: Result<ServedProviderResult<()>, _> = pool
             .retry_with_fallback(&model_id, "test_op", None, |_provider| async {
                 Err(CompletionError::HttpError {
                     status_code: 400,
@@ -5832,7 +5886,7 @@ mod tests {
         let attempt_count = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
         let count_clone = attempt_count.clone();
 
-        let result: Result<((), _), _> = pool
+        let result: Result<ServedProviderResult<()>, _> = pool
             .retry_with_fallback(&model_id, "test_op", None, move |_provider| {
                 let count = count_clone.clone();
                 async move {
@@ -5883,7 +5937,7 @@ mod tests {
         let count_clone = attempt_count.clone();
 
         // 429 should retry with exponential backoff across all rounds
-        let result: Result<((), _), _> = pool
+        let result: Result<ServedProviderResult<()>, _> = pool
             .retry_with_fallback(&model_id, "test_op", None, move |_provider| {
                 let count = count_clone.clone();
                 async move {
@@ -5918,7 +5972,7 @@ mod tests {
         let (pool, model_id) = pool_with_mock_provider().await;
 
         // 408 should NOT short-circuit - it should fall through to the normal retry path
-        let result: Result<((), _), _> = pool
+        let result: Result<ServedProviderResult<()>, _> = pool
             .retry_with_fallback(&model_id, "test_op", None, |_provider| async {
                 Err(CompletionError::HttpError {
                     status_code: 408,
@@ -5945,7 +5999,7 @@ mod tests {
         let attempt_count = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
         let count_clone = attempt_count.clone();
 
-        let result: Result<((), _), _> = pool
+        let result: Result<ServedProviderResult<()>, _> = pool
             .retry_with_fallback(&model_id, "test_op", None, move |_provider| {
                 let count = count_clone.clone();
                 async move {
@@ -5973,7 +6027,7 @@ mod tests {
         let attempt_count = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
         let count_clone = attempt_count.clone();
 
-        let result: Result<((), _), _> = pool
+        let result: Result<ServedProviderResult<()>, _> = pool
             .retry_with_fallback(&model_id, "test_op", None, move |_provider| {
                 let count = count_clone.clone();
                 async move {
@@ -6004,7 +6058,7 @@ mod tests {
         let attempt_count = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
         let count_clone = attempt_count.clone();
 
-        let result: Result<((), _), _> = pool
+        let result: Result<ServedProviderResult<()>, _> = pool
             .retry_with_fallback(&model_id, "test_op", None, move |_provider| {
                 let count = count_clone.clone();
                 async move {
@@ -6047,7 +6101,7 @@ mod tests {
         let attempt_count = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
         let count_clone = attempt_count.clone();
 
-        let result: Result<((), _), _> = pool
+        let result: Result<ServedProviderResult<()>, _> = pool
             .retry_with_fallback(&model_id, "test_op", None, move |_provider| {
                 let count = count_clone.clone();
                 async move {
@@ -6078,7 +6132,7 @@ mod tests {
         let attempt_count = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
         let count_clone = attempt_count.clone();
 
-        let result: Result<((), _), _> = pool
+        let result: Result<ServedProviderResult<()>, _> = pool
             .retry_with_fallback(&model_id, "test_op", None, move |_provider| {
                 let count = count_clone.clone();
                 async move {
@@ -6105,7 +6159,7 @@ mod tests {
         let attempt_count = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
         let count_clone = attempt_count.clone();
 
-        let result: Result<((), _), _> = pool
+        let result: Result<ServedProviderResult<()>, _> = pool
             .retry_with_fallback(&model_id, "test_op", None, move |_provider| {
                 let count = count_clone.clone();
                 async move {
@@ -6135,7 +6189,7 @@ mod tests {
         let attempt_count = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
         let count_clone = attempt_count.clone();
 
-        let result: Result<((), _), _> = pool
+        let result: Result<ServedProviderResult<()>, _> = pool
             .retry_with_fallback(&model_id, "test_op", None, move |_provider| {
                 let count = count_clone.clone();
                 async move {
@@ -6159,7 +6213,7 @@ mod tests {
     async fn test_4xx_error_is_sanitized() {
         let (pool, model_id) = pool_with_mock_provider().await;
 
-        let result: Result<((), _), _> = pool
+        let result: Result<ServedProviderResult<()>, _> = pool
             .retry_with_fallback(&model_id, "test_op", None, |_provider| async {
                 Err(CompletionError::HttpError {
                     status_code: 400,
@@ -6989,17 +7043,168 @@ mod tests {
                 .collect()
         }
 
-        // NEAR 5xx → served by Chutes fallback.
         let fb = served_tags(true).await;
+        println!("provider_requests_metric_tags_tier_and_fallback fallback_records={fb:?}");
         assert_eq!(fb.len(), 1, "exactly one provider-requests metric");
-        assert!(fb[0].iter().any(|t| t == "provider_tier:attested_3p"));
-        assert!(fb[0].iter().any(|t| t == "fallback:true"));
-        assert!(fb[0].iter().any(|t| t == "model:z-ai/glm-5.1"));
+        assert_eq!(
+            fb[0],
+            vec![
+                "model:z-ai/glm-5.1".to_string(),
+                "provider_tier:attested_3p".to_string(),
+                "fallback:true".to_string(),
+                "operation:chat_completion".to_string(),
+            ]
+        );
 
-        // Healthy NEAR → served by primary, no fallback.
         let primary = served_tags(false).await;
-        assert_eq!(primary.len(), 1);
-        assert!(primary[0].iter().any(|t| t == "provider_tier:near"));
-        assert!(primary[0].iter().any(|t| t == "fallback:false"));
+        println!("provider_requests_metric_tags_tier_and_fallback primary_records={primary:?}");
+        assert_eq!(primary.len(), 1, "exactly one provider-requests metric");
+        assert_eq!(
+            primary[0],
+            vec![
+                "model:z-ai/glm-5.1".to_string(),
+                "provider_tier:near".to_string(),
+                "fallback:false".to_string(),
+                "operation:chat_completion".to_string(),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn demoted_near_chutes_first_success_is_still_fallback_attribution() {
+        use inference_providers::mock::{MockProvider, RequestMatcher, ResponseTemplate};
+        use inference_providers::{ProviderSource, ProviderTier};
+
+        let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
+        let model_id = "z-ai/glm-5.1".to_string();
+
+        let near = Arc::new(
+            MockProvider::new_accept_all()
+                .with_tier(ProviderTier::Near)
+                .with_provider_source(ProviderSource::Vllm),
+        );
+        let chutes = Arc::new(
+            MockProvider::new_accept_all()
+                .with_tier(ProviderTier::Attested3p)
+                .with_provider_source(ProviderSource::Chutes),
+        );
+        chutes
+            .when(RequestMatcher::Any)
+            .respond_with(ResponseTemplate::new("served-by-demotion-fallback"))
+            .await;
+
+        let near_provider = near.clone() as Arc<InferenceProviderTrait>;
+        let chutes_provider = chutes.clone() as Arc<InferenceProviderTrait>;
+        {
+            let mut mappings = pool.provider_mappings.write().await;
+            mappings.model_to_providers.insert(
+                model_id.clone(),
+                vec![near_provider.clone(), chutes_provider],
+            );
+        }
+        {
+            let near_key = Arc::as_ptr(&near_provider) as *const () as usize;
+            pool.provider_failure_counts
+                .write()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(near_key, 10);
+        }
+
+        let served = pool
+            .chat_completion_with_attribution(fallback_params(&model_id), "h".to_string())
+            .await
+            .expect("demoted NEAR should allow Chutes to serve");
+
+        let body = String::from_utf8_lossy(&served.response.raw_bytes);
+        assert!(
+            body.contains("served-by-demotion-fallback"),
+            "Chutes should serve while demoted NEAR is behind it, got: {body}"
+        );
+        assert!(
+            near.last_chat_params().await.is_none(),
+            "demoted NEAR should not be attempted before healthy Chutes succeeds"
+        );
+        assert!(
+            chutes.last_chat_params().await.is_some(),
+            "Chutes should be the first successful provider"
+        );
+        println!(
+            "demoted_near_chutes_first_success_is_still_fallback_attribution attribution={:?}",
+            served.provider_attribution
+        );
+        assert_eq!(
+            served.provider_attribution.served_provider_tier,
+            Some(crate::usage::ServedProviderTier::Attested3p)
+        );
+        assert_eq!(
+            served.provider_attribution.served_provider_type,
+            Some(crate::usage::ServedProviderType::Chutes)
+        );
+        assert!(
+            served.provider_attribution.served_via_fallback,
+            "Chutes/attested_3p service under a demoted NEAR primary must be fallback even at attempt index 0"
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_requests_metric_not_emitted_when_all_providers_fail() {
+        use crate::metrics::capturing::CapturingMetricsService;
+        use crate::metrics::consts::METRIC_PROVIDER_REQUESTS;
+        use inference_providers::mock::MockProvider;
+        use inference_providers::{CompletionError, ProviderTier};
+
+        let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
+        let metrics = Arc::new(CapturingMetricsService::new());
+        pool.set_metrics_service(metrics.clone());
+        let model_id = "z-ai/glm-5.1".to_string();
+
+        let near = Arc::new(MockProvider::new_accept_all().with_tier(ProviderTier::Near));
+        near.set_error_override(Some(CompletionError::HttpError {
+            status_code: 503,
+            message: "near overloaded".to_string(),
+            is_external: true,
+        }))
+        .await;
+
+        let chutes = Arc::new(MockProvider::new_accept_all().with_tier(ProviderTier::Attested3p));
+        chutes
+            .set_error_override(Some(CompletionError::HttpError {
+                status_code: 503,
+                message: "chutes overloaded".to_string(),
+                is_external: true,
+            }))
+            .await;
+
+        {
+            let mut m = pool.provider_mappings.write().await;
+            m.model_to_providers.insert(
+                model_id.clone(),
+                vec![
+                    near.clone() as Arc<InferenceProviderTrait>,
+                    chutes.clone() as Arc<InferenceProviderTrait>,
+                ],
+            );
+        }
+
+        let result = pool
+            .chat_completion(fallback_params(&model_id), "h".to_string())
+            .await;
+
+        assert!(
+            result.is_err(),
+            "all providers failing must return an error"
+        );
+        let provider_request_metrics: Vec<_> = metrics
+            .get_metrics()
+            .into_iter()
+            .filter(|m| m.name == METRIC_PROVIDER_REQUESTS)
+            .collect();
+        println!(
+            "provider_requests_metric_not_emitted_when_all_providers_fail records={provider_request_metrics:?}"
+        );
+        assert!(
+            provider_request_metrics.is_empty(),
+            "provider-requests metric must only count served requests, got: {provider_request_metrics:?}"
+        );
     }
 }

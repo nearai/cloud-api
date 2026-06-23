@@ -7,8 +7,8 @@ use crate::{
     },
     usage::{
         CostBreakdown, InferenceType, OrganizationBalanceInfo, OrganizationLimit,
-        RecordUsageApiRequest, RecordUsageServiceRequest, UsageCheckResult, UsageError,
-        UsageLogEntry, UsageServiceTrait,
+        ProviderAttribution, RecordUsageApiRequest, RecordUsageServiceRequest, UsageCheckResult,
+        UsageError, UsageLogEntry, UsageServiceTrait,
     },
 };
 use async_trait::async_trait;
@@ -121,6 +121,7 @@ impl UsageServiceTrait for MockUsageService {
             response_id: _request.response_id,
             image_count: _request.image_count,
             was_inserted: true,
+            provider_attribution: _request.provider_attribution,
         })
     }
 
@@ -230,6 +231,7 @@ impl UsageServiceTrait for MockUsageService {
             response_id: None,
             image_count,
             was_inserted: true,
+            provider_attribution: ProviderAttribution::default(),
         })
     }
 
@@ -358,6 +360,7 @@ impl UsageServiceTrait for CapturingUsageService {
             response_id: request.response_id.clone(),
             image_count: request.image_count,
             was_inserted: true,
+            provider_attribution: request.provider_attribution,
         };
         self.requests.lock().unwrap().push(request);
         Ok(entry)
@@ -469,6 +472,7 @@ impl UsageServiceTrait for CapturingUsageService {
             response_id: None,
             image_count,
             was_inserted: true,
+            provider_attribution: ProviderAttribution::default(),
         })
     }
 

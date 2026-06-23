@@ -660,7 +660,7 @@ pub struct UpdateOrganizationLimitsDbRequest {
 // ============================================
 
 // Re-export StopReason from services for convenience
-pub use services::usage::StopReason;
+pub use services::usage::{ServedProviderTier, ServedProviderType, StopReason};
 
 /// Organization usage log entry - records individual API calls with costs
 /// All costs use fixed scale of 9 (nano-dollars) and USD currency
@@ -696,6 +696,9 @@ pub struct OrganizationUsageLog {
     pub image_count: Option<i32>,
     /// Cached prompt tokens (subset of input_tokens) when provider reports cache hits
     pub cache_read_tokens: i32,
+    pub served_provider_tier: Option<ServedProviderTier>,
+    pub served_provider_type: Option<ServedProviderType>,
+    pub served_via_fallback: bool,
     pub was_inserted: bool,
 }
 
@@ -742,6 +745,9 @@ pub struct RecordUsageRequest {
     pub image_count: Option<i32>,
     /// Cached prompt tokens (subset of input_tokens) when provider reports cache hits
     pub cache_read_tokens: i32,
+    pub served_provider_tier: Option<ServedProviderTier>,
+    pub served_provider_type: Option<ServedProviderType>,
+    pub served_via_fallback: bool,
 }
 
 // ============================================

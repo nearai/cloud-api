@@ -38,6 +38,17 @@ pub fn hash_inference_id_to_uuid(full_id: &str) -> Uuid {
 
 /// Get input bucket tag based on token count for metrics breakdown
 /// Buckets: 0-1k, 1-4k, 4-16k, 16-32k, 32-64k, 64-128k, 128k+
+/// Per-request prefix-cache hit rate as a percentage (cache-read / prompt
+/// tokens). `None` when there are no prompt tokens (avoids div-by-zero and keeps
+/// empty-prompt requests out of the distribution). `cached` is already clamped to
+/// `[0, prompt]` by `TokenUsage::cached_tokens()`, so the result is in `[0, 100]`.
+fn cache_hit_rate_percent(cached_tokens: i32, prompt_tokens: i32) -> Option<f64> {
+    if prompt_tokens <= 0 {
+        return None;
+    }
+    Some((cached_tokens.max(0) as f64 / prompt_tokens as f64) * 100.0)
+}
+
 fn get_input_bucket(token_count: i32) -> &'static str {
     match token_count {
         0..=1000 => "0-1k",
@@ -352,6 +363,18 @@ where
                             output_tokens as i64,
                             &tags,
                         );
+                        // Prefix-cache-hit observability: cache-read token count
+                        // (token-weighted hit rate = cached/input) + per-request
+                        // hit-rate distribution.
+                        metrics_service.record_count(
+                            METRIC_TOKENS_CACHED,
+                            cache_read_tokens as i64,
+                            &tags,
+                        );
+                        if let Some(rate) = cache_hit_rate_percent(cache_read_tokens, input_tokens)
+                        {
+                            metrics_service.record_histogram(METRIC_CACHE_HIT_RATE, rate, &tags);
+                        }
                     })
                     .await;
 
@@ -1666,6 +1689,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         let metrics_service = self.metrics_service.clone();
         let input_tokens = response_with_bytes.response.usage.prompt_tokens;
         let output_tokens = response_with_bytes.response.usage.completion_tokens;
+        let cache_read_tokens = response_with_bytes.response.usage.cached_tokens();
         let model_name = model.model_name.clone();
 
         tokio::spawn(async move {
@@ -1687,6 +1711,11 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
 
             metrics_service.record_count(METRIC_TOKENS_INPUT, input_tokens as i64, &tags_str);
             metrics_service.record_count(METRIC_TOKENS_OUTPUT, output_tokens as i64, &tags_str);
+            // Prefix-cache-hit observability (mirrors the streaming path).
+            metrics_service.record_count(METRIC_TOKENS_CACHED, cache_read_tokens as i64, &tags_str);
+            if let Some(rate) = cache_hit_rate_percent(cache_read_tokens, input_tokens) {
+                metrics_service.record_histogram(METRIC_CACHE_HIT_RATE, rate, &tags_str);
+            }
         });
 
         // Record usage with model UUID
@@ -2191,6 +2220,107 @@ mod tests {
             assert!(val > 0.0);
         } else {
             panic!("TPS should be a histogram");
+        }
+    }
+
+    #[test]
+    fn cache_hit_rate_percent_computes_and_guards_zero_prompt() {
+        // No prompt tokens -> excluded from the distribution (no div-by-zero).
+        assert_eq!(cache_hit_rate_percent(0, 0), None);
+        assert_eq!(cache_hit_rate_percent(5, 0), None);
+        // cached/prompt as a percentage.
+        assert_eq!(cache_hit_rate_percent(0, 100), Some(0.0));
+        assert_eq!(cache_hit_rate_percent(50, 100), Some(50.0));
+        assert_eq!(cache_hit_rate_percent(100, 100), Some(100.0));
+        // Defensive: a negative cached count clamps to 0 (cached_tokens() never
+        // returns negative, but the helper must not emit a negative rate).
+        assert_eq!(cache_hit_rate_percent(-5, 100), Some(0.0));
+    }
+
+    #[tokio::test]
+    async fn test_intercept_stream_emits_cache_hit_metrics() {
+        let metrics_service = Arc::new(CapturingMetricsService::new());
+        let now = Instant::now();
+        // prompt=10, of which 7 were prefix-cache hits -> 70% hit rate.
+        let usage_chunk = SSEEvent {
+            raw_bytes: Bytes::from("data: ..."),
+            raw_passthrough: true,
+            chunk: Some(StreamChunk::Chat(ChatCompletionChunk {
+                id: "chat-1".to_string(),
+                object: "chat.completion.chunk".to_string(),
+                created: 1234567890,
+                model: "test-model".to_string(),
+                choices: vec![ChatChoice {
+                    index: 0,
+                    delta: None,
+                    logprobs: None,
+                    finish_reason: Some(FinishReason::Stop),
+                    token_ids: None,
+                }],
+                usage: Some(TokenUsage {
+                    prompt_tokens: 10,
+                    completion_tokens: 20,
+                    total_tokens: 30,
+                    prompt_tokens_details: Some(serde_json::json!({"cached_tokens": 7})),
+                }),
+                prompt_token_ids: None,
+                system_fingerprint: None,
+                modality: None,
+                extra: Default::default(),
+            })),
+        };
+        let stream = stream::iter(vec![Ok(usage_chunk)]);
+        let intercept_stream = InterceptStream {
+            inner: stream,
+            attestation_service: Arc::new(MockAttestationService),
+            usage_service: Arc::new(MockUsageService),
+            metrics_service: metrics_service.clone(),
+            request_id: Uuid::new_v4(),
+            organization_id: Uuid::new_v4(),
+            workspace_id: Uuid::new_v4(),
+            api_key_id: Uuid::new_v4(),
+            model_id: Uuid::new_v4(),
+            model_name: "test-model".to_string(),
+            inference_type: crate::usage::ports::InferenceType::ChatCompletionStream,
+            service_start_time: now,
+            provider_start_time: now,
+            first_token_received: false,
+            first_token_time: None,
+            ttft_ms: None,
+            token_count: 0,
+            last_token_time: None,
+            total_itl_ms: 0.0,
+            metric_tags: CompletionServiceImpl::create_metric_tags("test-model"),
+            concurrent_counter: None,
+            last_usage_stats: None,
+            last_chat_id: None,
+            stream_completed: false,
+            response_id: None,
+            last_finish_reason: None,
+            last_error: None,
+            state: StreamState::Streaming,
+            attestation_supported: true,
+            store_provider_chat_signature: true,
+            provider_attribution: crate::usage::ProviderAttribution::default(),
+            latency_reporter: None,
+        };
+        let _ = intercept_stream.collect::<Vec<_>>().await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let metrics = metrics_service.get_metrics();
+
+        let cached = metrics
+            .iter()
+            .find(|m| m.name == METRIC_TOKENS_CACHED)
+            .expect("tokens.cached metric missing");
+        assert!(matches!(cached.value, MetricValue::Count(7)));
+
+        let rate = metrics
+            .iter()
+            .find(|m| m.name == METRIC_CACHE_HIT_RATE)
+            .expect("cache.hit_rate metric missing");
+        match rate.value {
+            MetricValue::Histogram(v) => assert!((v - 70.0).abs() < 1e-9, "hit rate = {v}"),
+            _ => panic!("cache.hit_rate should be a histogram"),
         }
     }
 

@@ -31,6 +31,86 @@ pub use provider_attribution::{
 
 type InferenceProviderTrait = dyn InferenceProvider + Send + Sync;
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ProviderAttemptResult {
+    Success,
+    Failed,
+    ShortCircuited,
+}
+
+struct ProviderAttemptMetric<'a> {
+    model_id: &'a str,
+    provider_tier: inference_providers::ProviderTier,
+    provider_source: inference_providers::ProviderSource,
+    is_fallback: bool,
+    operation_name: &'a str,
+    attempt_result: ProviderAttemptResult,
+    retry_decision: &'static str,
+    retry_round: usize,
+    attempt_index: usize,
+}
+
+const fn provider_tier_metric_tag(tier: inference_providers::ProviderTier) -> &'static str {
+    match tier {
+        inference_providers::ProviderTier::Near => "provider_tier:near",
+        inference_providers::ProviderTier::Attested3p => "provider_tier:attested_3p",
+        inference_providers::ProviderTier::NonAttested => "provider_tier:non_attested",
+    }
+}
+
+const fn provider_source_metric_tag(source: inference_providers::ProviderSource) -> &'static str {
+    match source {
+        inference_providers::ProviderSource::Vllm => "provider_type:vllm",
+        inference_providers::ProviderSource::External => "provider_type:external",
+        inference_providers::ProviderSource::Chutes => "provider_type:chutes",
+    }
+}
+
+const fn fallback_metric_tag(is_fallback: bool) -> &'static str {
+    if is_fallback {
+        "fallback:true"
+    } else {
+        "fallback:false"
+    }
+}
+
+const fn attempt_result_metric_tag(result: ProviderAttemptResult) -> &'static str {
+    match result {
+        ProviderAttemptResult::Success => "attempt_result:success",
+        ProviderAttemptResult::Failed => "attempt_result:failed",
+        ProviderAttemptResult::ShortCircuited => "attempt_result:short_circuited",
+    }
+}
+
+fn record_provider_attempt(
+    metrics: Option<&Arc<dyn crate::metrics::MetricsServiceTrait>>,
+    attempt: ProviderAttemptMetric<'_>,
+) {
+    if let Some(metrics) = metrics {
+        let model_tag = format!("model:{}", attempt.model_id);
+        let operation_tag = format!("operation:{}", attempt.operation_name);
+        let retry_decision_tag = format!("retry_decision:{}", attempt.retry_decision);
+        let retry_round_tag = format!("retry_round:{}", attempt.retry_round);
+        let attempt_index_tag = format!("attempt_index:{}", attempt.attempt_index);
+        let tag_refs = [
+            model_tag.as_str(),
+            provider_tier_metric_tag(attempt.provider_tier),
+            provider_source_metric_tag(attempt.provider_source),
+            fallback_metric_tag(attempt.is_fallback),
+            operation_tag.as_str(),
+            attempt_result_metric_tag(attempt.attempt_result),
+            retry_decision_tag.as_str(),
+            retry_round_tag.as_str(),
+            attempt_index_tag.as_str(),
+        ];
+        metrics.record_count(
+            crate::metrics::consts::METRIC_PROVIDER_ATTEMPTS,
+            1,
+            &tag_refs,
+        );
+    }
+}
+
 /// Upper bound on leading SSE control events (keepalive comments, blank
 /// lines — chunk-less `SSEEvent`s) consumed while peeking for the first
 /// parsed chunk to establish sticky-routing. Real upstreams emit zero before
@@ -2279,6 +2359,7 @@ impl InferenceProviderPool {
                         let tier = provider.tier();
                         let is_fallback =
                             self.served_via_fallback(model_id, attempt, provider, has_near_primary);
+                        let provider_source = provider.provider_source();
                         tracing::info!(
                             model_id = %model_id,
                             attempt = attempt + 1,
@@ -2287,6 +2368,20 @@ impl InferenceProviderPool {
                             provider_tier = tier.as_str(),
                             is_fallback,
                             "Successfully completed request with provider"
+                        );
+                        record_provider_attempt(
+                            self.metrics_service.get(),
+                            ProviderAttemptMetric {
+                                model_id,
+                                provider_tier: tier,
+                                provider_source,
+                                is_fallback,
+                                operation_name,
+                                attempt_result: ProviderAttemptResult::Success,
+                                retry_decision: "none",
+                                retry_round: retry_count,
+                                attempt_index: attempt + 1,
+                            },
                         );
                         // Emit a fallback counter (every served request, tagged) so
                         // dashboards can show Chutes-served traffic and the
@@ -2314,6 +2409,12 @@ impl InferenceProviderPool {
                         });
                     }
                     Err(e) => {
+                        let tier = provider.tier();
+                        let provider_source = provider.provider_source();
+                        let is_fallback = attempt > 0
+                            || (has_near_primary
+                                && tier != inference_providers::ProviderTier::Near);
+
                         // For HTTP client errors (4xx), don't retry with other providers.
                         // The request itself is invalid (e.g., too many tokens), so retrying won't help.
                         // Exception: 429 (rate limit) and 408 (request timeout) are retryable
@@ -2348,6 +2449,20 @@ impl InferenceProviderPool {
                                     operation = operation_name,
                                     "Client error from provider, not retrying"
                                 );
+                                record_provider_attempt(
+                                    self.metrics_service.get(),
+                                    ProviderAttemptMetric {
+                                        model_id,
+                                        provider_tier: tier,
+                                        provider_source,
+                                        is_fallback,
+                                        operation_name,
+                                        attempt_result: ProviderAttemptResult::ShortCircuited,
+                                        retry_decision: "non_retryable_client_4xx",
+                                        retry_round: retry_count,
+                                        attempt_index: attempt + 1,
+                                    },
+                                );
                                 return Err(Self::sanitize_completion_error(e, model_id));
                             }
                         }
@@ -2374,6 +2489,20 @@ impl InferenceProviderPool {
                                 operation = operation_name,
                                 "Client media-fetch failure, not retrying or trying other providers"
                             );
+                            record_provider_attempt(
+                                self.metrics_service.get(),
+                                ProviderAttemptMetric {
+                                    model_id,
+                                    provider_tier: tier,
+                                    provider_source,
+                                    is_fallback,
+                                    operation_name,
+                                    attempt_result: ProviderAttemptResult::ShortCircuited,
+                                    retry_decision,
+                                    retry_round: retry_count,
+                                    attempt_index: attempt + 1,
+                                },
+                            );
                             // Carry the decision as a typed variant (classified
                             // here on the RAW body) so the status mapping maps it
                             // to 400 directly, instead of re-deriving it from the
@@ -2385,6 +2514,21 @@ impl InferenceProviderPool {
                                 model_id,
                             ));
                         }
+
+                        record_provider_attempt(
+                            self.metrics_service.get(),
+                            ProviderAttemptMetric {
+                                model_id,
+                                provider_tier: tier,
+                                provider_source,
+                                is_fallback,
+                                operation_name,
+                                attempt_result: ProviderAttemptResult::Failed,
+                                retry_decision,
+                                retry_round: retry_count,
+                                attempt_index: attempt + 1,
+                            },
+                        );
 
                         // Increment failure counter only for retryable errors —
                         // backend-health signals (5xx, timeouts, network errors).
@@ -7319,6 +7463,463 @@ mod tests {
                 "operation:chat_completion".to_string(),
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn provider_attempts_metric_records_success_attempt() {
+        use crate::metrics::capturing::{CapturingMetricsService, MetricValue};
+        use crate::metrics::consts::METRIC_PROVIDER_ATTEMPTS;
+        use inference_providers::mock::{MockProvider, RequestMatcher, ResponseTemplate};
+        use inference_providers::{ProviderSource, ProviderTier};
+
+        let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
+        let metrics = Arc::new(CapturingMetricsService::new());
+        pool.set_metrics_service(metrics.clone());
+        let model_id = "z-ai/glm-5.1".to_string();
+
+        let near = Arc::new(
+            MockProvider::new_accept_all()
+                .with_tier(ProviderTier::Near)
+                .with_provider_source(ProviderSource::Vllm),
+        );
+        near.when(RequestMatcher::Any)
+            .respond_with(ResponseTemplate::new("near-success"))
+            .await;
+
+        {
+            let mut mappings = pool.provider_mappings.write().await;
+            mappings.model_to_providers.insert(
+                model_id.clone(),
+                vec![near.clone() as Arc<InferenceProviderTrait>],
+            );
+        }
+
+        pool.chat_completion(fallback_params(&model_id), "h".to_string())
+            .await
+            .expect("NEAR primary should serve");
+
+        let attempt_metrics: Vec<_> = metrics
+            .get_metrics()
+            .into_iter()
+            .filter(|metric| metric.name == METRIC_PROVIDER_ATTEMPTS)
+            .inspect(|metric| assert!(matches!(metric.value, MetricValue::Count(1))))
+            .collect();
+        assert_eq!(
+            attempt_metrics.len(),
+            1,
+            "exactly one provider-attempt metric"
+        );
+        assert_eq!(
+            attempt_metrics[0].tags,
+            vec![
+                "model:z-ai/glm-5.1".to_string(),
+                "provider_tier:near".to_string(),
+                "provider_type:vllm".to_string(),
+                "fallback:false".to_string(),
+                "operation:chat_completion".to_string(),
+                "attempt_result:success".to_string(),
+                "retry_decision:none".to_string(),
+                "retry_round:0".to_string(),
+                "attempt_index:1".to_string(),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_attempts_metric_records_failed_retry_and_chutes_success() {
+        use crate::metrics::capturing::{CapturingMetricsService, MetricValue};
+        use crate::metrics::consts::METRIC_PROVIDER_ATTEMPTS;
+        use inference_providers::mock::{MockProvider, RequestMatcher, ResponseTemplate};
+        use inference_providers::{CompletionError, ProviderSource, ProviderTier};
+
+        let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
+        let metrics = Arc::new(CapturingMetricsService::new());
+        pool.set_metrics_service(metrics.clone());
+        let model_id = "z-ai/glm-5.1".to_string();
+
+        let near = Arc::new(
+            MockProvider::new_accept_all()
+                .with_tier(ProviderTier::Near)
+                .with_provider_source(ProviderSource::Vllm),
+        );
+        near.set_error_override(Some(CompletionError::HttpError {
+            status_code: 503,
+            message: "overloaded".to_string(),
+            is_external: true,
+        }))
+        .await;
+
+        let chutes = Arc::new(
+            MockProvider::new_accept_all()
+                .with_tier(ProviderTier::Attested3p)
+                .with_provider_source(ProviderSource::Chutes),
+        );
+        chutes
+            .when(RequestMatcher::Any)
+            .respond_with(ResponseTemplate::new("chutes-success"))
+            .await;
+
+        {
+            let mut mappings = pool.provider_mappings.write().await;
+            mappings.model_to_providers.insert(
+                model_id.clone(),
+                vec![
+                    near.clone() as Arc<InferenceProviderTrait>,
+                    chutes.clone() as Arc<InferenceProviderTrait>,
+                ],
+            );
+        }
+
+        pool.chat_completion(fallback_params(&model_id), "h".to_string())
+            .await
+            .expect("Chutes fallback should serve after retryable NEAR failure");
+
+        let attempt_metrics: Vec<_> = metrics
+            .get_metrics()
+            .into_iter()
+            .filter(|metric| metric.name == METRIC_PROVIDER_ATTEMPTS)
+            .inspect(|metric| assert!(matches!(metric.value, MetricValue::Count(1))))
+            .collect();
+        assert_eq!(
+            attempt_metrics.len(),
+            2,
+            "exactly two provider-attempt metrics"
+        );
+        assert_eq!(
+            attempt_metrics[0].tags,
+            vec![
+                "model:z-ai/glm-5.1".to_string(),
+                "provider_tier:near".to_string(),
+                "provider_type:vllm".to_string(),
+                "fallback:false".to_string(),
+                "operation:chat_completion".to_string(),
+                "attempt_result:failed".to_string(),
+                "retry_decision:retryable_http_5xx".to_string(),
+                "retry_round:0".to_string(),
+                "attempt_index:1".to_string(),
+            ]
+        );
+        assert_eq!(
+            attempt_metrics[1].tags,
+            vec![
+                "model:z-ai/glm-5.1".to_string(),
+                "provider_tier:attested_3p".to_string(),
+                "provider_type:chutes".to_string(),
+                "fallback:true".to_string(),
+                "operation:chat_completion".to_string(),
+                "attempt_result:success".to_string(),
+                "retry_decision:none".to_string(),
+                "retry_round:0".to_string(),
+                "attempt_index:2".to_string(),
+            ]
+        );
+        assert!(
+            !attempt_metrics
+                .iter()
+                .flat_map(|metric| metric.tags.iter())
+                .any(|tag| tag.contains("overloaded")),
+            "provider-attempt metric tags must not include raw provider errors: {attempt_metrics:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_attempts_metric_records_all_failed_retries() {
+        use crate::metrics::capturing::{CapturingMetricsService, MetricValue};
+        use crate::metrics::consts::{METRIC_PROVIDER_ATTEMPTS, METRIC_PROVIDER_REQUESTS};
+        use inference_providers::mock::MockProvider;
+        use inference_providers::{CompletionError, ProviderSource, ProviderTier};
+
+        let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
+        let metrics = Arc::new(CapturingMetricsService::new());
+        pool.set_metrics_service(metrics.clone());
+        let model_id = "z-ai/glm-5.1".to_string();
+
+        let near = Arc::new(
+            MockProvider::new_accept_all()
+                .with_tier(ProviderTier::Near)
+                .with_provider_source(ProviderSource::Vllm),
+        );
+        near.set_error_override(Some(CompletionError::HttpError {
+            status_code: 503,
+            message: "near overloaded".to_string(),
+            is_external: true,
+        }))
+        .await;
+
+        let chutes = Arc::new(
+            MockProvider::new_accept_all()
+                .with_tier(ProviderTier::Attested3p)
+                .with_provider_source(ProviderSource::Chutes),
+        );
+        chutes
+            .set_error_override(Some(CompletionError::HttpError {
+                status_code: 503,
+                message: "chutes overloaded".to_string(),
+                is_external: true,
+            }))
+            .await;
+
+        {
+            let mut mappings = pool.provider_mappings.write().await;
+            mappings.model_to_providers.insert(
+                model_id.clone(),
+                vec![
+                    near.clone() as Arc<InferenceProviderTrait>,
+                    chutes.clone() as Arc<InferenceProviderTrait>,
+                ],
+            );
+        }
+
+        let result = pool
+            .chat_completion(fallback_params(&model_id), "h".to_string())
+            .await;
+
+        assert!(
+            result.is_err(),
+            "all providers failing must return an error"
+        );
+        let captured_metrics = metrics.get_metrics();
+        let attempt_metrics: Vec<_> = captured_metrics
+            .iter()
+            .filter(|metric| metric.name == METRIC_PROVIDER_ATTEMPTS)
+            .inspect(|metric| assert!(matches!(metric.value, MetricValue::Count(1))))
+            .collect();
+        assert_eq!(
+            attempt_metrics.len(),
+            8,
+            "MAX_RETRIES=3 means 4 rounds x 2 providers"
+        );
+
+        let mut expected_tags = Vec::new();
+        for retry_round in 0..=3 {
+            expected_tags.push(vec![
+                "model:z-ai/glm-5.1".to_string(),
+                "provider_tier:near".to_string(),
+                "provider_type:vllm".to_string(),
+                "fallback:false".to_string(),
+                "operation:chat_completion".to_string(),
+                "attempt_result:failed".to_string(),
+                "retry_decision:retryable_http_5xx".to_string(),
+                format!("retry_round:{retry_round}"),
+                "attempt_index:1".to_string(),
+            ]);
+            expected_tags.push(vec![
+                "model:z-ai/glm-5.1".to_string(),
+                "provider_tier:attested_3p".to_string(),
+                "provider_type:chutes".to_string(),
+                "fallback:true".to_string(),
+                "operation:chat_completion".to_string(),
+                "attempt_result:failed".to_string(),
+                "retry_decision:retryable_http_5xx".to_string(),
+                format!("retry_round:{retry_round}"),
+                "attempt_index:2".to_string(),
+            ]);
+        }
+        assert_eq!(
+            attempt_metrics
+                .iter()
+                .map(|metric| metric.tags.clone())
+                .collect::<Vec<_>>(),
+            expected_tags
+        );
+        assert!(
+            attempt_metrics
+                .iter()
+                .flat_map(|metric| metric.tags.iter())
+                .all(|tag| tag.contains("attempt_result:failed")
+                    || !tag.starts_with("attempt_result:")),
+            "all all-provider-fail attempt records must be failed: {attempt_metrics:?}"
+        );
+        assert!(
+            !captured_metrics
+                .iter()
+                .any(|metric| metric.name == METRIC_PROVIDER_REQUESTS),
+            "provider-requests metric must remain served-only on total failure: {captured_metrics:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_attempts_metric_records_short_circuit_failures() {
+        use crate::metrics::capturing::{CapturingMetricsService, MetricValue, RecordedMetric};
+        use crate::metrics::consts::METRIC_PROVIDER_ATTEMPTS;
+        use inference_providers::mock::{MockProvider, RequestMatcher, ResponseTemplate};
+        use inference_providers::{CompletionError, ProviderSource, ProviderTier};
+
+        fn provider_attempt_metrics(metrics: &CapturingMetricsService) -> Vec<RecordedMetric> {
+            metrics
+                .get_metrics()
+                .into_iter()
+                .filter(|metric| metric.name == METRIC_PROVIDER_ATTEMPTS)
+                .inspect(|metric| assert!(matches!(metric.value, MetricValue::Count(1))))
+                .collect()
+        }
+
+        fn assert_no_forbidden_attempt_labels(attempt_metrics: &[RecordedMetric]) {
+            let forbidden_fragments = [
+                ["org", "_id"].concat(),
+                ["workspace", "_id"].concat(),
+                ["api", "_key"].concat(),
+                ["api", "-key"].concat(),
+                ["tok", "en"].concat(),
+                ["author", "ization"].concat(),
+                ["pro", "mpt"].concat(),
+                ["res", "ponse"].concat(),
+                ["u", "rl"].concat(),
+                ["bo", "dy"].concat(),
+                ["sign", "ature"].concat(),
+                ["oa", "uth"].concat(),
+                ["em", "ail"].concat(),
+                ["error", "_detail"].concat(),
+                ["cannot identify ", "image file"].concat(),
+            ];
+            let leaked_tags: Vec<_> = attempt_metrics
+                .iter()
+                .flat_map(|metric| metric.tags.iter())
+                .filter(|tag| {
+                    forbidden_fragments
+                        .iter()
+                        .any(|fragment| tag.contains(fragment.as_str()))
+                })
+                .collect();
+            assert!(
+                leaked_tags.is_empty(),
+                "provider-attempt metric tags must stay bounded and private: {leaked_tags:?}"
+            );
+        }
+
+        let model_id = "z-ai/glm-5.1".to_string();
+
+        let genuine_4xx_pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
+        let genuine_4xx_metrics = Arc::new(CapturingMetricsService::new());
+        genuine_4xx_pool.set_metrics_service(genuine_4xx_metrics.clone());
+        let genuine_4xx_near = Arc::new(
+            MockProvider::new_accept_all()
+                .with_tier(ProviderTier::Near)
+                .with_provider_source(ProviderSource::Vllm),
+        );
+        genuine_4xx_near
+            .set_error_override(Some(CompletionError::HttpError {
+                status_code: 400,
+                message: "requested length exceeds the model context".to_string(),
+                is_external: true,
+            }))
+            .await;
+        let genuine_4xx_chutes = Arc::new(
+            MockProvider::new_accept_all()
+                .with_tier(ProviderTier::Attested3p)
+                .with_provider_source(ProviderSource::Chutes),
+        );
+        genuine_4xx_chutes
+            .when(RequestMatcher::Any)
+            .respond_with(ResponseTemplate::new("must-not-be-tried"))
+            .await;
+        {
+            let mut mappings = genuine_4xx_pool.provider_mappings.write().await;
+            mappings.model_to_providers.insert(
+                model_id.clone(),
+                vec![
+                    genuine_4xx_near.clone() as Arc<InferenceProviderTrait>,
+                    genuine_4xx_chutes.clone() as Arc<InferenceProviderTrait>,
+                ],
+            );
+        }
+
+        let genuine_4xx_result = genuine_4xx_pool
+            .chat_completion(fallback_params(&model_id), "h".to_string())
+            .await;
+        assert!(
+            genuine_4xx_result.is_err(),
+            "genuine client 4xx must still return the provider error"
+        );
+        assert!(
+            genuine_4xx_chutes.last_chat_params().await.is_none(),
+            "fallback provider must not be tried for genuine client 4xx"
+        );
+        let genuine_4xx_attempts = provider_attempt_metrics(&genuine_4xx_metrics);
+        assert_eq!(genuine_4xx_attempts.len(), 1);
+        assert_eq!(
+            genuine_4xx_attempts[0].tags,
+            vec![
+                "model:z-ai/glm-5.1".to_string(),
+                "provider_tier:near".to_string(),
+                "provider_type:vllm".to_string(),
+                "fallback:false".to_string(),
+                "operation:chat_completion".to_string(),
+                "attempt_result:short_circuited".to_string(),
+                "retry_decision:non_retryable_client_4xx".to_string(),
+                "retry_round:0".to_string(),
+                "attempt_index:1".to_string(),
+            ]
+        );
+        assert_no_forbidden_attempt_labels(&genuine_4xx_attempts);
+
+        let client_media_pool =
+            InferenceProviderPool::new(None, ExternalProvidersConfig::default());
+        let client_media_metrics = Arc::new(CapturingMetricsService::new());
+        client_media_pool.set_metrics_service(client_media_metrics.clone());
+        let client_media_near = Arc::new(
+            MockProvider::new_accept_all()
+                .with_tier(ProviderTier::Near)
+                .with_provider_source(ProviderSource::Vllm),
+        );
+        client_media_near
+            .set_error_override(Some(CompletionError::HttpError {
+                status_code: 500,
+                message: "Internal server error: An exception occurred while loading IMAGE data at index 0: cannot identify image file".to_string(),
+                is_external: true,
+            }))
+            .await;
+        let client_media_chutes = Arc::new(
+            MockProvider::new_accept_all()
+                .with_tier(ProviderTier::Attested3p)
+                .with_provider_source(ProviderSource::Chutes),
+        );
+        client_media_chutes
+            .when(RequestMatcher::Any)
+            .respond_with(ResponseTemplate::new("must-not-be-tried"))
+            .await;
+        {
+            let mut mappings = client_media_pool.provider_mappings.write().await;
+            mappings.model_to_providers.insert(
+                model_id.clone(),
+                vec![
+                    client_media_near.clone() as Arc<InferenceProviderTrait>,
+                    client_media_chutes.clone() as Arc<InferenceProviderTrait>,
+                ],
+            );
+        }
+
+        let client_media_result = client_media_pool
+            .chat_completion(fallback_params(&model_id), "h".to_string())
+            .await;
+        assert!(
+            matches!(
+                client_media_result,
+                Err(CompletionError::ClientMediaError(_))
+            ),
+            "client media failures must keep returning the typed client-media verdict"
+        );
+        assert!(
+            client_media_chutes.last_chat_params().await.is_none(),
+            "fallback provider must not be tried for client-media short-circuit"
+        );
+        let client_media_attempts = provider_attempt_metrics(&client_media_metrics);
+        assert_eq!(client_media_attempts.len(), 1);
+        assert_eq!(
+            client_media_attempts[0].tags,
+            vec![
+                "model:z-ai/glm-5.1".to_string(),
+                "provider_tier:near".to_string(),
+                "provider_type:vllm".to_string(),
+                "fallback:false".to_string(),
+                "operation:chat_completion".to_string(),
+                "attempt_result:short_circuited".to_string(),
+                "retry_decision:non_retryable_client_media_error".to_string(),
+                "retry_round:0".to_string(),
+                "attempt_index:1".to_string(),
+            ]
+        );
+        assert_no_forbidden_attempt_labels(&client_media_attempts);
     }
 
     #[tokio::test]

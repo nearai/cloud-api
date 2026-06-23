@@ -26,6 +26,8 @@ pub const METRIC_TOKENS_OUTPUT: &str = "cloud_api.tokens.output";
 // Lets dashboards show Chutes-served traffic and the NEAR->fallback rate.
 pub const METRIC_PROVIDER_REQUESTS: &str = "cloud_api.provider.requests";
 
+pub const METRIC_PROVIDER_ATTEMPTS: &str = "cloud_api.provider.attempts";
+
 // Error metrics
 pub const METRIC_REQUEST_ERRORS: &str = "cloud_api.request.errors";
 

@@ -165,32 +165,38 @@ async fn reject_if_aliased(
     }
 }
 
-/// Build a `RecordUsageServiceRequest` for image operations (generation or editing).
-fn build_image_usage_request(
+struct ImageUsageRecord<'a> {
     organization_id: Uuid,
     workspace_id: Uuid,
     api_key_id: Uuid,
     model_id: Uuid,
-    provider_request_id: &str,
+    provider_request_id: &'a str,
     image_count: i32,
+    provider_attribution: services::usage::ProviderAttribution,
     inference_type: services::usage::InferenceType,
+}
+
+/// Build a `RecordUsageServiceRequest` for image operations (generation or editing).
+fn build_image_usage_request(
+    record: ImageUsageRecord<'_>,
 ) -> services::usage::RecordUsageServiceRequest {
     services::usage::RecordUsageServiceRequest {
-        organization_id,
-        workspace_id,
-        api_key_id,
-        model_id,
+        organization_id: record.organization_id,
+        workspace_id: record.workspace_id,
+        api_key_id: record.api_key_id,
+        model_id: record.model_id,
         input_tokens: 0,
         output_tokens: 0,
         cache_read_tokens: 0,
-        inference_type,
+        inference_type: record.inference_type,
         ttft_ms: None,
         avg_itl_ms: None,
-        inference_id: Some(hash_inference_id_to_uuid(provider_request_id)),
-        provider_request_id: Some(provider_request_id.to_string()),
+        inference_id: Some(hash_inference_id_to_uuid(record.provider_request_id)),
+        provider_request_id: Some(record.provider_request_id.to_string()),
         stop_reason: Some(services::usage::StopReason::Completed),
         response_id: None,
-        image_count: Some(image_count),
+        image_count: Some(record.image_count),
+        provider_attribution: record.provider_attribution,
     }
 }
 
@@ -792,6 +798,7 @@ async fn bill_auto_redact_classify(
         stop_reason: Some(services::usage::StopReason::Completed),
         response_id: None,
         image_count: None,
+        provider_attribution: services::usage::ProviderAttribution::default(),
     };
 
     if let Err(e) = app_state.usage_service.record_usage(usage_request).await {
@@ -4224,10 +4231,12 @@ pub async fn image_generations(
     // Call the inference provider pool
     match app_state
         .inference_provider_pool
-        .image_generation(params, body_hash.hash.clone())
+        .image_generation_with_attribution(params, body_hash.hash.clone())
         .await
     {
-        Ok(response_with_bytes) => {
+        Ok(attributed_response) => {
+            let response_with_bytes = attributed_response.response;
+            let provider_attribution = attributed_response.provider_attribution;
             // Store attestation signature for image generation (same pattern as chat completions)
             let attestation_service = app_state.attestation_service.clone();
             let image_id_for_sig = response_with_bytes.response.id.clone();
@@ -4279,15 +4288,16 @@ pub async fn image_generations(
                 }
             };
 
-            let usage_request = build_image_usage_request(
+            let usage_request = build_image_usage_request(ImageUsageRecord {
                 organization_id,
                 workspace_id,
                 api_key_id,
                 model_id,
-                &provider_request_id,
+                provider_request_id: &provider_request_id,
                 image_count,
-                services::usage::InferenceType::ImageGeneration,
-            );
+                provider_attribution,
+                inference_type: services::usage::InferenceType::ImageGeneration,
+            });
             record_usage_with_sync_fallback(usage_service, usage_request, "Image generation").await;
 
             // Return the exact bytes from the provider for hash verification
@@ -4621,6 +4631,7 @@ pub async fn audio_transcriptions(
                 stop_reason: Some(services::usage::StopReason::Completed),
                 response_id: None,
                 image_count: None,
+                provider_attribution: services::usage::ProviderAttribution::default(),
             };
 
             // Record usage synchronously - fail the request if usage recording fails
@@ -5008,10 +5019,12 @@ pub async fn image_edits(
     // Call the inference provider pool
     match app_state
         .inference_provider_pool
-        .image_edit(params, body_hash.hash.clone())
+        .image_edit_with_attribution(params, body_hash.hash.clone())
         .await
     {
-        Ok(response_with_bytes) => {
+        Ok(attributed_response) => {
+            let response_with_bytes = attributed_response.response;
+            let provider_attribution = attributed_response.provider_attribution;
             // Store attestation signature for image edit (same pattern as image generation)
             let attestation_service = app_state.attestation_service.clone();
             let image_id_for_sig = response_with_bytes.response.id.clone();
@@ -5063,15 +5076,16 @@ pub async fn image_edits(
                 }
             };
 
-            let usage_request = build_image_usage_request(
+            let usage_request = build_image_usage_request(ImageUsageRecord {
                 organization_id,
                 workspace_id,
                 api_key_id,
                 model_id,
-                &provider_request_id,
+                provider_request_id: &provider_request_id,
                 image_count,
-                services::usage::InferenceType::ImageEdit,
-            );
+                provider_attribution,
+                inference_type: services::usage::InferenceType::ImageEdit,
+            });
             record_usage_with_sync_fallback(usage_service, usage_request, "Image edit").await;
 
             // Return the exact bytes from the provider for hash verification
@@ -5464,6 +5478,7 @@ pub async fn rerank(
                 stop_reason: Some(services::usage::StopReason::Completed),
                 response_id: None,
                 image_count: None,
+                provider_attribution: services::usage::ProviderAttribution::default(),
             };
 
             // Record usage synchronously - this is billing-critical and must succeed
@@ -5802,6 +5817,7 @@ pub async fn embeddings(
                 stop_reason: Some(services::usage::StopReason::Completed),
                 response_id: None,
                 image_count: None,
+                provider_attribution: services::usage::ProviderAttribution::default(),
             };
 
             if let Err(e) = app_state.usage_service.record_usage(usage_request).await {
@@ -6121,6 +6137,7 @@ pub async fn privacy_classify(
                 stop_reason: Some(services::usage::StopReason::Completed),
                 response_id: None,
                 image_count: None,
+                provider_attribution: services::usage::ProviderAttribution::default(),
             };
 
             if let Err(e) = app_state.usage_service.record_usage(usage_request).await {
@@ -6636,6 +6653,7 @@ pub async fn privacy_redact(
         stop_reason: Some(services::usage::StopReason::Completed),
         response_id: None,
         image_count: None,
+        provider_attribution: services::usage::ProviderAttribution::default(),
     };
 
     if let Err(e) = app_state.usage_service.record_usage(usage_request).await {
@@ -6844,6 +6862,7 @@ pub async fn score(
                 stop_reason: Some(services::usage::StopReason::Completed),
                 response_id: None,
                 image_count: None,
+                provider_attribution: services::usage::ProviderAttribution::default(),
             };
 
             // Record usage with timeout to prevent blocking responses
@@ -6877,6 +6896,7 @@ pub async fn score(
                         stop_reason: Some(services::usage::StopReason::Completed),
                         response_id: None,
                         image_count: None,
+                        provider_attribution: services::usage::ProviderAttribution::default(),
                     };
                     tokio::spawn(async move {
                         if let Err(e) = usage_service_clone.record_usage(usage_request_retry).await
@@ -6913,6 +6933,7 @@ pub async fn score(
                         stop_reason: Some(services::usage::StopReason::Completed),
                         response_id: None,
                         image_count: None,
+                        provider_attribution: services::usage::ProviderAttribution::default(),
                     };
                     tokio::spawn(async move {
                         if let Err(e) = usage_service_clone.record_usage(usage_request_retry).await

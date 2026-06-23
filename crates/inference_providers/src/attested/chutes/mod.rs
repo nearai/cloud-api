@@ -1674,6 +1674,10 @@ impl InferenceProvider for Provider {
         crate::ProviderTier::Attested3p
     }
 
+    fn provider_source(&self) -> crate::ProviderSource {
+        crate::ProviderSource::Chutes
+    }
+
     /// Chutes only serves an attested STREAM when streaming is explicitly enabled
     /// (its stream protocol has no authenticated frame ordering, so it's gated).
     /// Reporting this lets the pool route a streaming request to a NEAR sibling

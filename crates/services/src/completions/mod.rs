@@ -101,6 +101,7 @@ where
     attestation_supported: bool,
     /// Whether to fetch/store provider chat signatures before ending the stream.
     store_provider_chat_signature: bool,
+    provider_attribution: crate::usage::ProviderAttribution,
 }
 
 impl<S> InterceptStream<S>
@@ -252,6 +253,7 @@ where
         let e2e_duration = self.service_start_time.elapsed();
         let first_token_time = self.first_token_time;
         let stream_completed = self.stream_completed;
+        let provider_attribution = self.provider_attribution;
 
         let avg_itl_ms = if self.token_count > 0 {
             Some(self.total_itl_ms / self.token_count as f64)
@@ -300,6 +302,7 @@ where
                                 stop_reason,
                                 response_id,
                                 image_count: None,
+                                provider_attribution,
                             })
                             .await
                             .is_err()
@@ -1205,6 +1208,7 @@ impl CompletionServiceImpl {
         response_id: Option<ResponseId>,
         attestation_supported: bool,
         store_provider_chat_signature: bool,
+        provider_attribution: crate::usage::ProviderAttribution,
     ) -> StreamingResult {
         // Create low-cardinality metric tags (no org/workspace/key - those go to database)
         let metric_tags = Self::create_metric_tags(&model_name);
@@ -1248,6 +1252,7 @@ impl CompletionServiceImpl {
             state: StreamState::Streaming,
             attestation_supported,
             store_provider_chat_signature,
+            provider_attribution,
         };
         Box::pin(intercepted_stream)
     }
@@ -1376,9 +1381,9 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         let provider_start_time = Instant::now();
 
         // Get the LLM stream
-        let llm_stream = match self
+        let attributed_stream = match self
             .inference_provider_pool
-            .chat_completion_stream(chat_params, request.body_hash.clone())
+            .chat_completion_stream_with_attribution(chat_params, request.body_hash.clone())
             .await
         {
             Ok(stream) => stream,
@@ -1394,6 +1399,8 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
                 return Err(err);
             }
         };
+        let llm_stream = attributed_stream.stream;
+        let provider_attribution = attributed_stream.provider_attribution;
 
         // Transfer counter ownership to InterceptStream (which decrements on drop)
         let counter = guard.disarm();
@@ -1422,6 +1429,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
                 request.response_id,
                 model.attestation_supported,
                 !request.skip_provider_chat_signature,
+                provider_attribution,
             )
             .await;
 
@@ -1546,10 +1554,10 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         let provider_start_time = Instant::now();
         let result = self
             .inference_provider_pool
-            .chat_completion(chat_params, request.body_hash.clone())
+            .chat_completion_with_attribution(chat_params, request.body_hash.clone())
             .await;
 
-        let response_with_bytes = match result {
+        let attributed_response = match result {
             Ok(response) => response,
             Err(e) => {
                 let err = Self::map_provider_error(
@@ -1562,6 +1570,8 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
                 return Err(err);
             }
         };
+        let response_with_bytes = attributed_response.response;
+        let provider_attribution = attributed_response.provider_attribution;
 
         let e2e_latency = service_start_time.elapsed();
         let backend_latency = provider_start_time.elapsed();
@@ -1651,6 +1661,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
                     stop_reason: Some(stop_reason),
                     response_id,
                     image_count: None,
+                    provider_attribution,
                 })
                 .await
                 .is_err()
@@ -1960,6 +1971,9 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
 pub use ports::*;
 
 #[cfg(test)]
+mod provider_attribution_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::metrics::capturing::{CapturingMetricsService, MetricValue};
@@ -2062,6 +2076,7 @@ mod tests {
             state: StreamState::Streaming,
             attestation_supported: true,
             store_provider_chat_signature: true,
+            provider_attribution: crate::usage::ProviderAttribution::default(),
         };
 
         // Consume the stream
@@ -2226,6 +2241,7 @@ mod tests {
             state: StreamState::Streaming,
             attestation_supported: true,
             store_provider_chat_signature: true,
+            provider_attribution: crate::usage::ProviderAttribution::default(),
         };
 
         // Consume the stream
@@ -2347,6 +2363,7 @@ mod tests {
             state: StreamState::Streaming,
             attestation_supported: true,
             store_provider_chat_signature: true,
+            provider_attribution: crate::usage::ProviderAttribution::default(),
         };
 
         let _ = intercept_stream.collect::<Vec<_>>().await;
@@ -2552,6 +2569,7 @@ mod tests {
                 state: StreamState::Streaming,
                 attestation_supported: true,
                 store_provider_chat_signature: true,
+                provider_attribution: crate::usage::ProviderAttribution::default(),
             };
             // InterceptStream goes out of scope here and Drop is called
         }

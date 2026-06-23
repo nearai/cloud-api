@@ -3242,7 +3242,7 @@ pub struct ModelRevenueQueryParams {
     pub offset: i64,
     /// Filter by verifiable (TEE) models only / non-verifiable only.
     pub verifiable: Option<bool>,
-    /// Filter by provider type ("vllm" or "external").
+    /// Filter by provider type ("vllm", "external", or "chutes").
     pub provider_type: Option<String>,
     /// Case-insensitive substring match on model name.
     pub model_search: Option<String>,
@@ -3264,7 +3264,7 @@ pub struct ModelRevenueQueryParams {
         ("limit" = Option<i64>, Query, description = "Page size (1-1000, default 100)"),
         ("offset" = Option<i64>, Query, description = "Page offset (default 0)"),
         ("verifiable" = Option<bool>, Query, description = "Filter to verifiable (true) or non-verifiable (false) models"),
-        ("provider_type" = Option<String>, Query, description = "Filter by provider type (e.g. vllm, external)"),
+        ("provider_type" = Option<String>, Query, description = "Filter by provider type (e.g. vllm, external, chutes)"),
         ("sort" = Option<String>, Query, description = "Sort: revenue (default), requests, tokens")
     ),
     responses(
@@ -3299,9 +3299,9 @@ pub async fn get_model_revenue(
     let sort = services::admin::RevenueSort::from_query(params.sort.as_deref())
         .map_err(|m| bad_request(m, "invalid_parameter"))?;
     if let Some(pt) = params.provider_type.as_deref() {
-        if pt != "vllm" && pt != "external" {
+        if !matches!(pt, "vllm" | "external" | "chutes") {
             return Err(bad_request(
-                format!("invalid provider_type '{pt}'; expected 'vllm' or 'external'"),
+                format!("invalid provider_type '{pt}'; expected one of: vllm, external, chutes"),
                 "invalid_parameter",
             ));
         }

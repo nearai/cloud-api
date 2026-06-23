@@ -2,6 +2,8 @@
 //!
 //! All costs use fixed scale 9 (nano-dollars) and USD currency.
 
+mod provider_attribution;
+
 use crate::pool::DbPool;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -321,6 +323,9 @@ impl AnalyticsRepository for PgAnalyticsRepository {
             0.0
         };
 
+        let provider_usage =
+            provider_attribution::get_platform_provider_usage(&client, start, end).await?;
+
         // Get top 10 models by request count
         let top_models_rows = client
             .query(
@@ -400,6 +405,7 @@ impl AnalyticsRepository for PgAnalyticsRepository {
             non_verifiable_requests,
             provider_error_or_timeout_rate,
             p95_ttft_ms,
+            provider_usage,
             top_models,
             top_organizations,
         })
@@ -714,7 +720,7 @@ impl AnalyticsRepository for PgAnalyticsRepository {
         let where_clause = r#"
             WHERE ul.created_at >= $1 AND ul.created_at < $2
               AND ($3::bool IS NULL OR COALESCE(m.verifiable, false) = $3)
-              AND ($4::text IS NULL OR m.provider_type = $4)
+              AND ($4::text IS NULL OR COALESCE(ul.served_provider_type, m.provider_type) = $4)
               AND ($5::text IS NULL OR ul.model_name ILIKE $5)
         "#;
         let model_like = query.model_search.as_ref().map(|s| format!("%{s}%"));
@@ -750,7 +756,9 @@ impl AnalyticsRepository for PgAnalyticsRepository {
                 BOOL_OR(COALESCE(m.verifiable, false)) as verifiable,
                 MAX(m.provider_type) as provider_type,
                 AVG(ul.ttft_ms)::double precision as avg_ttft_ms,
-                PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY ul.ttft_ms)::double precision as p95_ttft_ms
+                PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY ul.ttft_ms)::double precision as p95_ttft_ms,
+                COUNT(*) FILTER (WHERE ul.served_via_fallback)::bigint as fallback_requests,
+                COALESCE(SUM(ul.total_cost) FILTER (WHERE ul.served_via_fallback), 0)::bigint as fallback_cost_nano
             FROM organization_usage_log ul
             LEFT JOIN models m ON m.id = ul.model_id
             {where_clause}
@@ -775,7 +783,7 @@ impl AnalyticsRepository for PgAnalyticsRepository {
             .await
             .map_err(|e| RepositoryError::DatabaseError(e.into()))?;
 
-        let data: Vec<ModelRevenueEntry> = rows
+        let mut data: Vec<ModelRevenueEntry> = rows
             .iter()
             .map(|row| ModelRevenueEntry {
                 model_name: row.get(0),
@@ -787,8 +795,20 @@ impl AnalyticsRepository for PgAnalyticsRepository {
                 provider_type: row.get(6),
                 avg_ttft_ms: row.get(7),
                 p95_ttft_ms: row.get(8),
+                served_provider_breakdown: Vec::new(),
+                fallback_requests: row.get(9),
+                fallback_consumed_cost_usd: nano_to_usd(row.get::<_, i64>(10)),
             })
             .collect();
+
+        provider_attribution::load_model_provider_breakdowns(
+            &client,
+            &query,
+            where_clause,
+            &model_like,
+            &mut data,
+        )
+        .await?;
 
         Ok(ModelRevenueReport {
             period_start: query.start,

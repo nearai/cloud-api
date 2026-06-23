@@ -1074,6 +1074,10 @@ impl InferenceProvider for Fleet {
         crate::ProviderTier::Near
     }
 
+    fn provider_source(&self) -> crate::ProviderSource {
+        crate::ProviderSource::Vllm
+    }
+
     async fn get_signature(
         &self,
         chat_id: &str,
@@ -2115,6 +2119,10 @@ impl InferenceProvider for Provider {
     /// serves; an attested third party (Chutes) sits behind it as fallback.
     fn tier(&self) -> crate::ProviderTier {
         crate::ProviderTier::Near
+    }
+
+    fn provider_source(&self) -> crate::ProviderSource {
+        crate::ProviderSource::Vllm
     }
 
     async fn models(&self) -> Result<ModelsResponse, ListModelsError> {

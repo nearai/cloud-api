@@ -182,7 +182,7 @@ async fn admin_model_revenue_filters_chutes_served_usage() {
 #[tokio::test]
 async fn admin_model_revenue_rejects_invalid_provider_type() {
     ensure_platform_provider_usage_harness_env();
-    let server = setup_test_server().await;
+    let (server, _) = setup_test_server_with_mock_web_search().await;
 
     let response = server
         .get("/v1/admin/platform/model-revenue?provider_type=banana")

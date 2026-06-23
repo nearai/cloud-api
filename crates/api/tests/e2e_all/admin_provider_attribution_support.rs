@@ -3,6 +3,7 @@ use services::admin::{ModelRevenueReport, PlatformMetrics};
 use std::sync::OnceLock;
 
 static HARNESS_ENV: OnceLock<()> = OnceLock::new();
+type ProviderUsageWindow = (chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>);
 
 pub(super) struct PlatformProviderUsageFixture {
     pub(super) server: axum_test::TestServer,
@@ -187,8 +188,7 @@ pub(super) fn model_provider_breakdown<'a>(
         })
 }
 
-pub(super) fn isolated_provider_usage_window(
-) -> (chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>) {
+pub(super) fn isolated_provider_usage_window() -> ProviderUsageWindow {
     let offset_minutes = (uuid::Uuid::new_v4().as_u128() % 1_000_000) as i64 * 10;
     let start = chrono::Utc::now()
         + chrono::Duration::days(3650)

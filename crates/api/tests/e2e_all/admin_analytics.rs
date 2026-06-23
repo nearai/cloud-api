@@ -1017,16 +1017,37 @@ async fn test_admin_platform_org_revenue() {
         }))
         .await;
     assert_eq!(response.status_code(), 200);
-    tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
 
-    let response = server
-        .get("/v1/admin/platform/org-revenue")
-        .add_header("Authorization", format!("Bearer {}", get_session_id()))
-        .add_header("User-Agent", MOCK_USER_AGENT)
-        .await;
-    assert_eq!(response.status_code(), 200);
-    let report: OrgRevenueReport =
-        serde_json::from_str(&response.text()).expect("parse OrgRevenueReport");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let query_start = (chrono::Utc::now() - chrono::Duration::minutes(5))
+        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let report = loop {
+        let query_end = (chrono::Utc::now() + chrono::Duration::seconds(5))
+            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        let response = server
+            .get(
+                format!(
+                    "/v1/admin/platform/org-revenue?start={query_start}&end={query_end}&search={}&sort=requests",
+                    org.name
+                )
+                .as_str(),
+            )
+            .add_header("Authorization", format!("Bearer {}", get_session_id()))
+            .add_header("User-Agent", MOCK_USER_AGENT)
+            .await;
+        assert_eq!(response.status_code(), 200);
+        let report: OrgRevenueReport =
+            serde_json::from_str(&response.text()).expect("parse OrgRevenueReport");
+        if report
+            .data
+            .iter()
+            .any(|o| o.organization_id.to_string() == org.id)
+            || std::time::Instant::now() >= deadline
+        {
+            break report;
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    };
 
     // The org that made requests must be attributed; verifiable split reconciles; sorted desc.
     let found = report

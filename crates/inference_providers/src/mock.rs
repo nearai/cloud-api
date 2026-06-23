@@ -646,6 +646,9 @@ impl MockProvider {
             object: "model".to_string(),
             created: 1762544256,
             owned_by: "vllm".to_string(),
+            context_length: None,
+            max_model_len: None,
+            top_provider: None,
         }];
         Self {
             models,

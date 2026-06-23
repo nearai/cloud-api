@@ -26,6 +26,7 @@ async fn setup_embedding_model(server: &axum_test::TestServer) -> String {
             "modelDisplayName": "Qwen3 Embedding",
             "modelDescription": "Qwen3 text embedding model",
             "contextLength": 32768,
+            "maxOutputLength": 1024,
             "verifiable": false,
             "isActive": true
         }))

@@ -37,6 +37,7 @@ async fn admin_patch_with_provider_type_keeps_pinned_provider() {
             "modelDisplayName":   "Chutes Pin Test",
             "modelDescription":   "Synthetic pinned model for the admin-PATCH regression",
             "contextLength":      4096,
+            "maxOutputLength": 1024,
             "providerType":       "chutes",
             "isActive":           true,
         }))

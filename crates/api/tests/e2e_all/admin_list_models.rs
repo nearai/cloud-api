@@ -63,6 +63,7 @@ async fn test_admin_list_models_with_models() {
             "modelDisplayName": "Test Model",
             "modelDescription": "A test model for e2e testing",
             "contextLength": 4096,
+            "maxOutputLength": 1024,
             "verifiable": false,
             "isActive": true,
             "inputModalities": ["text", "image"],
@@ -140,6 +141,7 @@ async fn test_admin_upsert_is_ready_and_deprecation_date_round_trip() {
             "modelDisplayName": "Test is_ready Model",
             "modelDescription": "Round-trips is_ready and deprecation_date",
             "contextLength": 4096,
+            "maxOutputLength": 1024,
             "isActive": true,
             "isReady": true,
             "deprecationDate": "2030-01-01"
@@ -291,6 +293,7 @@ async fn test_admin_clear_deprecation_date_and_is_ready() {
             "modelDisplayName": "Clearable Model",
             "modelDescription": "Tri-state clear semantics",
             "contextLength": 4096,
+            "maxOutputLength": 1024,
             "isActive": true,
             "isReady": false,
             "deprecationDate": "2030-01-01"
@@ -396,6 +399,7 @@ async fn test_admin_upsert_rejects_invalid_deprecation_date() {
             "modelDisplayName": "Bad deprecation date",
             "modelDescription": "Should be rejected",
             "contextLength": 4096,
+            "maxOutputLength": 1024,
             "deprecationDate": "not-a-date"
         }))
         .unwrap(),
@@ -421,6 +425,187 @@ async fn test_admin_upsert_rejects_invalid_deprecation_date() {
 }
 
 #[tokio::test]
+async fn test_admin_rejects_active_model_create_without_max_output_length() {
+    let server = setup_test_server().await;
+
+    let model_name = format!("test-no-max-active-{}", uuid::Uuid::new_v4());
+    let body = serde_json::json!({
+        model_name: {
+            "inputCostPerToken": { "amount": 1000, "currency": "USD" },
+            "outputCostPerToken": { "amount": 2000, "currency": "USD" },
+            "modelDisplayName": "No Max Active Model",
+            "modelDescription": "Active creates must declare output limits",
+            "contextLength": 4096
+        }
+    });
+
+    let response = server
+        .patch("/v1/admin/models")
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .add_header("User-Agent", MOCK_USER_AGENT)
+        .json(&body)
+        .await;
+
+    assert_eq!(
+        response.status_code(),
+        400,
+        "active model create without maxOutputLength must be rejected, got: {}",
+        response.text()
+    );
+    assert!(
+        response.text().contains("maxOutputLength"),
+        "error should mention maxOutputLength, got: {}",
+        response.text()
+    );
+}
+
+#[tokio::test]
+async fn test_admin_allows_inactive_model_create_without_max_output_length() {
+    let server = setup_test_server().await;
+
+    let model_name = format!("test-no-max-inactive-{}", uuid::Uuid::new_v4());
+    let mut batch = BatchUpdateModelApiRequest::new();
+    batch.insert(
+        model_name.clone(),
+        serde_json::from_value(serde_json::json!({
+            "inputCostPerToken": { "amount": 1000, "currency": "USD" },
+            "outputCostPerToken": { "amount": 2000, "currency": "USD" },
+            "modelDisplayName": "No Max Inactive Model",
+            "modelDescription": "Inactive rows may wait for catalog metadata",
+            "contextLength": 4096,
+            "isActive": false
+        }))
+        .unwrap(),
+    );
+
+    let updated = admin_batch_upsert_models(&server, batch, get_session_id()).await;
+    let model = updated
+        .iter()
+        .find(|m| m.model_id == model_name)
+        .expect("upsert should return the inactive model");
+
+    assert_eq!(
+        model.metadata.max_output_length, None,
+        "inactive rows may omit maxOutputLength"
+    );
+
+    let response = server
+        .get("/v1/admin/models?limit=500")
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .add_header("User-Agent", MOCK_USER_AGENT)
+        .await;
+    assert_eq!(response.status_code(), 200);
+    let list_response: AdminModelListResponse =
+        serde_json::from_str(&response.text()).expect("Failed to parse response");
+    assert!(
+        !list_response
+            .models
+            .iter()
+            .any(|m| m.model_id == model_name),
+        "inactive create should not appear in the active-only list"
+    );
+}
+
+#[tokio::test]
+async fn test_admin_rejects_reactivation_without_max_output_length() {
+    let server = setup_test_server().await;
+
+    let model_name = format!("test-reactivate-no-max-{}", uuid::Uuid::new_v4());
+    let mut batch = BatchUpdateModelApiRequest::new();
+    batch.insert(
+        model_name.clone(),
+        serde_json::from_value(serde_json::json!({
+            "inputCostPerToken": { "amount": 1000, "currency": "USD" },
+            "outputCostPerToken": { "amount": 2000, "currency": "USD" },
+            "modelDisplayName": "No Max Reactivation Model",
+            "modelDescription": "Starts inactive without output limit",
+            "contextLength": 4096,
+            "isActive": false
+        }))
+        .unwrap(),
+    );
+    admin_batch_upsert_models(&server, batch, get_session_id()).await;
+
+    let body = serde_json::json!({
+        model_name: {
+            "isActive": true
+        }
+    });
+    let response = server
+        .patch("/v1/admin/models")
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .add_header("User-Agent", MOCK_USER_AGENT)
+        .json(&body)
+        .await;
+
+    assert_eq!(
+        response.status_code(),
+        400,
+        "reactivation without maxOutputLength must be rejected, got: {}",
+        response.text()
+    );
+    assert!(
+        response.text().contains("maxOutputLength"),
+        "error should mention maxOutputLength, got: {}",
+        response.text()
+    );
+}
+
+#[tokio::test]
+async fn test_admin_reactivates_when_max_output_length_supplied() {
+    let server = setup_test_server().await;
+
+    let model_name = format!("test-reactivate-with-max-{}", uuid::Uuid::new_v4());
+    let mut batch = BatchUpdateModelApiRequest::new();
+    batch.insert(
+        model_name.clone(),
+        serde_json::from_value(serde_json::json!({
+            "inputCostPerToken": { "amount": 1000, "currency": "USD" },
+            "outputCostPerToken": { "amount": 2000, "currency": "USD" },
+            "modelDisplayName": "Max Reactivation Model",
+            "modelDescription": "Starts inactive and becomes active once complete",
+            "contextLength": 4096,
+            "isActive": false
+        }))
+        .unwrap(),
+    );
+    admin_batch_upsert_models(&server, batch, get_session_id()).await;
+
+    let mut reactivate = BatchUpdateModelApiRequest::new();
+    reactivate.insert(
+        model_name.clone(),
+        serde_json::from_value(serde_json::json!({
+            "isActive": true,
+            "maxOutputLength": 2048
+        }))
+        .unwrap(),
+    );
+    let updated = admin_batch_upsert_models(&server, reactivate, get_session_id()).await;
+    let model = updated
+        .iter()
+        .find(|m| m.model_id == model_name)
+        .expect("reactivation should return the model");
+
+    assert_eq!(model.metadata.max_output_length, Some(2048));
+
+    let response = server
+        .get("/v1/admin/models?limit=500")
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .add_header("User-Agent", MOCK_USER_AGENT)
+        .await;
+    assert_eq!(response.status_code(), 200);
+    let list_response: AdminModelListResponse =
+        serde_json::from_str(&response.text()).expect("Failed to parse response");
+    assert!(
+        list_response
+            .models
+            .iter()
+            .any(|m| m.model_id == model_name),
+        "reactivated model should appear in the active-only list"
+    );
+}
+
+#[tokio::test]
 async fn test_admin_list_models_include_inactive() {
     let server = setup_test_server().await;
 
@@ -435,6 +620,7 @@ async fn test_admin_list_models_include_inactive() {
             "modelDisplayName": "Active Model",
             "modelDescription": "An active model",
             "contextLength": 4096,
+            "maxOutputLength": 1024,
             "verifiable": false,
             "isActive": true
         }))
@@ -453,6 +639,7 @@ async fn test_admin_list_models_include_inactive() {
             "modelDisplayName": "Inactive Model",
             "modelDescription": "An inactive model",
             "contextLength": 4096,
+            "maxOutputLength": 1024,
             "verifiable": false,
             "isActive": false
         }))
@@ -545,6 +732,7 @@ async fn test_admin_list_models_pagination() {
                 "modelDisplayName": format!("Pagination Model {}", i),
                 "modelDescription": "A model for pagination testing",
                 "contextLength": 4096,
+                "maxOutputLength": 1024,
                 "verifiable": false,
                 "isActive": true
             }))
@@ -602,6 +790,7 @@ async fn test_admin_list_models_has_timestamps() {
             "modelDisplayName": "Timestamp Model",
             "modelDescription": "A model for timestamp testing",
             "contextLength": 4096,
+            "maxOutputLength": 1024,
             "verifiable": false,
             "isActive": true
         }))
@@ -717,6 +906,7 @@ async fn test_admin_list_models_after_soft_delete() {
             "modelDisplayName": "Delete Test Model",
             "modelDescription": "A model for soft delete testing",
             "contextLength": 4096,
+            "maxOutputLength": 1024,
             "verifiable": false,
             "isActive": true
         }))
@@ -820,6 +1010,7 @@ async fn test_admin_list_models_datacenters_round_trip() {
             "modelDisplayName": "Datacenters Model",
             "modelDescription": "A model with datacenters set",
             "contextLength": 4096,
+            "maxOutputLength": 1024,
             "verifiable": false,
             "isActive": true,
             "datacenters": [{ "country_code": "US" }, { "country_code": "FR" }]
@@ -872,6 +1063,7 @@ async fn test_admin_upsert_rejects_invalid_datacenters() {
             "modelDisplayName": "Bad Datacenters Model",
             "modelDescription": "Has an invalid country code",
             "contextLength": 4096,
+            "maxOutputLength": 1024,
             "verifiable": false,
             "isActive": true,
             "datacenters": [{ "country_code": "usa" }]
@@ -900,6 +1092,7 @@ async fn test_admin_upsert_rejects_invalid_datacenters() {
             "modelDisplayName": "Bad Datacenters Model",
             "modelDescription": "Has a lowercase country code",
             "contextLength": 4096,
+            "maxOutputLength": 1024,
             "verifiable": false,
             "isActive": true,
             "datacenters": [{ "country_code": "us" }]
@@ -942,6 +1135,7 @@ async fn test_admin_openrouter_slug_round_trip_and_clear() {
             "modelDisplayName": "OpenRouter Slug Model",
             "modelDescription": "Round-trips openrouter.slug override",
             "contextLength": 4096,
+            "maxOutputLength": 1024,
             "isActive": true,
             "openrouterSlug": "z-ai/glm-5.1"
         }))
@@ -1057,6 +1251,7 @@ async fn test_admin_upsert_rejects_invalid_openrouter_slug() {
                 "modelDisplayName": "Bad OpenRouter Slug Model",
                 "modelDescription": "Has an invalid openrouter slug",
                 "contextLength": 4096,
+                "maxOutputLength": 1024,
                 "isActive": true,
                 "openrouterSlug": bad
             }

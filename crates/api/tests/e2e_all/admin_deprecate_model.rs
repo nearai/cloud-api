@@ -14,6 +14,7 @@ fn minimal_model_upsert(extra_aliases: &[&str]) -> serde_json::Value {
         "modelDisplayName":   "Deprecation Test Model",
         "modelDescription":   "Synthetic model for deprecation e2e",
         "contextLength":      4096,
+        "maxOutputLength": 1024,
         "verifiable":         false,
         "isActive":           true,
     });

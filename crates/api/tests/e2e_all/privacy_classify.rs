@@ -26,6 +26,7 @@ async fn setup_privacy_filter_model(server: &axum_test::TestServer) -> String {
             "modelDisplayName": "Privacy Filter",
             "modelDescription": "PII span detection (token classification)",
             "contextLength": 512,
+            "maxOutputLength": 1024,
             "verifiable": false,
             "isActive": true
         }))

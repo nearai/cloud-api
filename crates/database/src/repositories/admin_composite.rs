@@ -8,13 +8,13 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use services::admin::{
     AdminModelInfo, AdminOrganizationInfo, AdminOrganizationMemberInfo, AdminRepository,
-    DeprecateModelOutcome, ModelDeprecationDeliveryRecord, ModelDeprecationEmailStatus,
-    ModelDeprecationModel, ModelDeprecationRecipient, ModelHistoryEntry, ModelPricing,
-    ModelPricingSnapshot, OrganizationLimits, OrganizationLimitsHistoryEntry,
-    OrganizationLimitsUpdate, PlatformServiceInfo, PricingChangeDeliveryRecord,
-    PricingChangeOpenConflictError, PricingChangeRecipientRow, ScheduledPricingChange,
-    ScheduledPricingChangeInsert, ScheduledPricingChangeStatus, UpdateModelAdminRequest, UserInfo,
-    UserOrganizationInfo,
+    DeprecateModelOutcome, ModelCatalogState, ModelDeprecationDeliveryRecord,
+    ModelDeprecationEmailStatus, ModelDeprecationModel, ModelDeprecationRecipient,
+    ModelHistoryEntry, ModelPricing, ModelPricingSnapshot, OrganizationLimits,
+    OrganizationLimitsHistoryEntry, OrganizationLimitsUpdate, PlatformServiceInfo,
+    PricingChangeDeliveryRecord, PricingChangeOpenConflictError, PricingChangeRecipientRow,
+    ScheduledPricingChange, ScheduledPricingChangeInsert, ScheduledPricingChangeStatus,
+    UpdateModelAdminRequest, UserInfo, UserOrganizationInfo,
 };
 use services::service_usage::ports::ServiceUnit;
 use std::sync::Arc;
@@ -207,6 +207,17 @@ impl AdminRepository for AdminCompositeRepository {
                 m.allow_free,
             )
         }))
+    }
+
+    async fn get_model_catalog_state(&self, model_name: &str) -> Result<Option<ModelCatalogState>> {
+        Ok(self
+            .model_repo
+            .get_by_internal_name(model_name)
+            .await?
+            .map(|model| ModelCatalogState {
+                is_active: model.is_active,
+                max_output_length: model.max_output_length,
+            }))
     }
 
     async fn get_model_history(

@@ -42,6 +42,7 @@ async fn setup_whisper_model(server: &axum_test::TestServer, model_name: &str) {
             "modelDisplayName": "Test Model for Audio",
             "modelDescription": "Test model for audio transcription",
             "contextLength": 4096,
+            "maxOutputLength": 1024,
             "verifiable": false,
             "isActive": true,
             "inputModalities": ["text"],

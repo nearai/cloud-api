@@ -11,6 +11,7 @@ use fleet::Fleet;
 use prefix_router::PrefixRouter;
 use reqwest::{header::HeaderValue, Client};
 use serde::Serialize;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Semaphore;
@@ -194,6 +195,85 @@ impl Config {
     pub fn control_timeout(&self) -> Duration {
         Duration::from_secs(self.control_timeout_seconds.max(0) as u64)
     }
+}
+
+fn merge_model_responses(responses: Vec<ModelsResponse>) -> ModelsResponse {
+    let mut responses = responses.into_iter();
+    let Some(mut merged) = responses.next() else {
+        return ModelsResponse {
+            object: "list".to_string(),
+            data: Vec::new(),
+        };
+    };
+
+    let mut by_id: HashMap<String, usize> = merged
+        .data
+        .iter()
+        .enumerate()
+        .map(|(index, model)| (model.id.clone(), index))
+        .collect();
+
+    for response in responses {
+        for model in response.data {
+            if let Some(index) = by_id.get(&model.id).copied() {
+                merge_model_context_length(&mut merged.data[index], &model);
+            } else {
+                by_id.insert(model.id.clone(), merged.data.len());
+                merged.data.push(model);
+            }
+        }
+    }
+
+    merged
+}
+
+fn merge_model_context_length(existing: &mut ModelInfo, candidate: &ModelInfo) {
+    if let Some(context_length) = [
+        existing.advertised_context_length(),
+        candidate.advertised_context_length(),
+    ]
+    .into_iter()
+    .flatten()
+    .max()
+    {
+        existing.context_length = Some(context_length);
+        if let Some(provider) = existing.top_provider.as_mut() {
+            provider.context_length = Some(context_length);
+        }
+    }
+}
+
+struct ModelsRequest {
+    client: Client,
+    headers: reqwest::header::HeaderMap,
+    timeout: Duration,
+    url: String,
+}
+
+async fn send_models_request(request: ModelsRequest) -> Result<ModelsResponse, ListModelsError> {
+    let response = request
+        .client
+        .get(&request.url)
+        .headers(request.headers)
+        .timeout(request.timeout)
+        .send()
+        .await
+        .map_err(|e| ListModelsError::FetchError(format!("{e:?}")))?;
+
+    if !response.status().is_success() {
+        return Err(ListModelsError::FetchError(format!(
+            "HTTP {}: {}",
+            response.status(),
+            response.status().canonical_reason().unwrap_or("Unknown")
+        )));
+    }
+
+    let models_response = response
+        .json()
+        .await
+        .map_err(|_| ListModelsError::InvalidResponse)?;
+
+    Ok(models_response)
 }
 
 /// vLLM provider implementation
@@ -1367,33 +1447,68 @@ impl InferenceProvider for Fleet {
 
     /// Lists all available models from the vLLM server
     async fn models(&self) -> Result<ModelsResponse, ListModelsError> {
-        let url = format!("{}/v1/models", self.config.base_url);
-        tracing::debug!("Listing models from vLLM server, url: {}", url);
+        let canonical_url = format!("{}/v1/models", self.config.base_url);
+        tracing::debug!("Listing models from vLLM server, url: {}", canonical_url);
 
         let headers = self.build_headers().map_err(ListModelsError::FetchError)?;
-        let response = self
-            .client
-            .get(&url)
-            .headers(headers)
-            .timeout(self.config.control_timeout())
-            .send()
-            .await
-            .map_err(|e| ListModelsError::FetchError(format!("{e:?}")))?;
+        let timeout = self.config.control_timeout();
+        let client = self.client.clone();
+        let rotation_count = self.rotation_count();
+        let mut requests = Vec::with_capacity(rotation_count + 1);
+        requests.push((
+            canonical_url.clone(),
+            ModelsRequest {
+                client: client.clone(),
+                headers: headers.clone(),
+                timeout,
+                url: canonical_url,
+            },
+        ));
 
-        if !response.status().is_success() {
-            return Err(ListModelsError::FetchError(format!(
-                "HTTP {}: {}",
-                response.status(),
-                response.status().canonical_reason().unwrap_or("Unknown")
-            )));
+        requests.extend((0..rotation_count).filter_map(|index| {
+            self.rotation_url(index as u64, "/v1/models").map(|url| {
+                (
+                    url.clone(),
+                    ModelsRequest {
+                        client: client.clone(),
+                        headers: headers.clone(),
+                        timeout,
+                        url,
+                    },
+                )
+            })
+        }));
+
+        let results = futures_util::future::join_all(
+            requests
+                .into_iter()
+                .map(|(url, request)| async move { (url, send_models_request(request).await) }),
+        )
+        .await;
+
+        let mut responses = Vec::with_capacity(results.len());
+        let mut first_error = None;
+        for (url, result) in results {
+            match result {
+                Ok(response) => responses.push(response),
+                Err(error) => {
+                    tracing::warn!(
+                        url = %url,
+                        error = %error,
+                        "Failed to list models from backend"
+                    );
+                    if first_error.is_none() {
+                        first_error = Some(error);
+                    }
+                }
+            }
         }
 
-        let models_response = response
-            .json()
-            .await
-            .map_err(|_| ListModelsError::InvalidResponse)?;
+        if responses.is_empty() {
+            return Err(first_error.unwrap_or(ListModelsError::Unknown));
+        }
 
-        Ok(models_response)
+        Ok(merge_model_responses(responses))
     }
 
     /// Performs a streaming chat completion request
@@ -3541,6 +3656,39 @@ mod tests {
         assert!(!Fleet::is_rotation_retryable_status(401));
         assert!(!Fleet::is_rotation_retryable_status(404));
         assert!(!Fleet::is_rotation_retryable_status(422));
+    }
+
+    #[test]
+    fn merge_model_responses_uses_max_context_length_across_backends() {
+        let merged = merge_model_responses(vec![
+            ModelsResponse {
+                object: "list".to_string(),
+                data: vec![ModelInfo {
+                    id: "test/model".to_string(),
+                    object: "model".to_string(),
+                    created: 1,
+                    owned_by: "vllm".to_string(),
+                    context_length: Some(8_192),
+                    max_model_len: None,
+                    top_provider: None,
+                }],
+            },
+            ModelsResponse {
+                object: "list".to_string(),
+                data: vec![ModelInfo {
+                    id: "test/model".to_string(),
+                    object: "model".to_string(),
+                    created: 1,
+                    owned_by: "vllm".to_string(),
+                    context_length: Some(32_768),
+                    max_model_len: None,
+                    top_provider: None,
+                }],
+            },
+        ]);
+
+        assert_eq!(merged.data.len(), 1);
+        assert_eq!(merged.data[0].context_length, Some(32_768));
     }
 
     #[test]

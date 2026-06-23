@@ -25,6 +25,17 @@ const MODELS_LIST_CACHE_CAPACITY: u64 = 1;
 /// Cache key used for the single model-list entry.
 const MODELS_LIST_CACHE_KEY: &str = "all";
 
+fn apply_backend_context_lengths(
+    models: &mut [ModelWithPricing],
+    context_lengths: &std::collections::HashMap<String, i32>,
+) {
+    for model in models {
+        if let Some(context_length) = context_lengths.get(&model.model_name) {
+            model.context_length = *context_length;
+        }
+    }
+}
+
 pub struct ModelsServiceImpl {
     pub inference_provider_pool: Arc<InferenceProviderPool>,
     pub models_repository: Arc<dyn ModelsRepository>,
@@ -92,7 +103,13 @@ impl ModelsServiceTrait for ModelsServiceImpl {
 
     async fn get_models_with_pricing(&self) -> Result<Vec<ModelWithPricing>, ModelsError> {
         let arc = self.cached_models().await?;
-        Ok((*arc).clone())
+        let mut models = (*arc).clone();
+        let context_lengths = self
+            .inference_provider_pool
+            .max_context_lengths_by_model()
+            .await;
+        apply_backend_context_lengths(&mut models, &context_lengths);
+        Ok(models)
     }
 
     async fn get_model_by_name(&self, model_name: &str) -> Result<ModelWithPricing, ModelsError> {

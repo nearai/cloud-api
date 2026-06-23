@@ -773,6 +773,7 @@ pub async fn setup_qwen_model(server: &axum_test::TestServer) -> String {
             "modelDisplayName": "Updated Model Name",
             "modelDescription": "Updated model description",
             "contextLength": 128000,
+            "maxOutputLength": 1024,
             "verifiable": true,
             "isActive": true
         }))
@@ -815,6 +816,7 @@ pub async fn setup_qwen_model_with_cache_pricing(server: &axum_test::TestServer)
             "modelDisplayName": "Updated Model Name",
             "modelDescription": "Updated model description",
             "contextLength": 128000,
+            "maxOutputLength": 1024,
             "verifiable": true,
             "isActive": true
         }))
@@ -879,6 +881,7 @@ pub async fn setup_glm_model(server: &axum_test::TestServer) -> String {
             "modelDisplayName": "GLM-4.6",
             "modelDescription": "GLM 4.6 model for testing",
             "contextLength": 128000,
+            "maxOutputLength": 1024,
             "verifiable": true,
             "isActive": true
         }))
@@ -941,6 +944,7 @@ pub async fn setup_deepseek_model(server: &axum_test::TestServer) -> String {
             "modelDisplayName": "DeepSeek V3.1",
             "modelDescription": "DeepSeek V3.1 model with encryption support",
             "contextLength": 128000,
+            "maxOutputLength": 1024,
             "verifiable": true,
             "isActive": true
         }))
@@ -969,6 +973,7 @@ pub async fn setup_qwen_omni_model(server: &axum_test::TestServer) -> String {
             "modelDisplayName": "Qwen3-Omni 30B",
             "modelDescription": "Qwen3-Omni model with audio input/output support",
             "contextLength": 128000,
+            "maxOutputLength": 1024,
             "verifiable": true,
             "isActive": true
         }))
@@ -1000,6 +1005,7 @@ pub async fn setup_qwen_image_model(server: &axum_test::TestServer) -> String {
             "modelDisplayName": "Qwen-Image",
             "modelDescription": "Qwen Image generation model",
             "contextLength": 4096,
+            "maxOutputLength": 1024,
             "verifiable": true,
             "isActive": true
         }))
@@ -1027,6 +1033,7 @@ pub async fn setup_qwen_reranker_model(server: &axum_test::TestServer) -> String
             "modelDisplayName": "Qwen3-Reranker 0.6B",
             "modelDescription": "Qwen3 Text Similarity Scoring (Reranker) model",
             "contextLength": 8192,
+            "maxOutputLength": 1024,
             "verifiable": true,
             "isActive": true
         }))
@@ -1058,6 +1065,7 @@ pub async fn setup_rerank_model(server: &axum_test::TestServer) -> String {
             "modelDisplayName": "Qwen3 Reranker",
             "modelDescription": "Qwen3 document reranking model",
             "contextLength": 32768,
+            "maxOutputLength": 1024,
             "verifiable": false,
             "isActive": true
         }))

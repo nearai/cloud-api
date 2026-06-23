@@ -764,6 +764,34 @@ pub struct ModelInfo {
     pub object: String,
     /// The organization that owns the model
     pub owned_by: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_length: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_model_len: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top_provider: Option<TopProviderInfo>,
+}
+
+impl ModelInfo {
+    pub fn advertised_context_length(&self) -> Option<i32> {
+        [
+            self.context_length,
+            self.max_model_len,
+            self.top_provider
+                .as_ref()
+                .and_then(|provider| provider.context_length),
+        ]
+        .into_iter()
+        .flatten()
+        .filter(|value| *value > 0)
+        .max()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TopProviderInfo {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_length: Option<i32>,
 }
 
 /// vLLM returns OpenAI-compatible models response
@@ -1199,6 +1227,23 @@ pub fn detect_audio_content_type(filename: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn model_info_advertised_context_length_uses_backend_metadata() {
+        let model = ModelInfo {
+            id: "test/model".to_string(),
+            object: "model".to_string(),
+            created: 0,
+            owned_by: "vllm".to_string(),
+            context_length: Some(16_384),
+            max_model_len: Some(32_768),
+            top_provider: Some(TopProviderInfo {
+                context_length: Some(65_536),
+            }),
+        };
+
+        assert_eq!(model.advertised_context_length(), Some(65_536));
+    }
 
     /// #666 NO-LEAK: `strip_cache_control` removes the breakpoint from each
     /// content part so the JSON serialized toward a non-Anthropic upstream

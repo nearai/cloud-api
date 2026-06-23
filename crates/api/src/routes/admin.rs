@@ -496,16 +496,19 @@ pub async fn batch_upsert_models(
 
     // Register inference_url models (our own vLLM/SGLang backends)
     // Only for active, non-external models with an inference_url set
-    let inference_url_models: Vec<(String, String)> = batch_request
+    let inference_url_models: Vec<(String, String, Option<u32>)> = batch_request
         .iter()
         .filter_map(|(model_name, request)| {
             let is_active = request.is_active != Some(false);
             let is_external = request.provider_type.as_deref() == Some("external");
             if is_active && !is_external {
-                request
-                    .inference_url
-                    .clone()
-                    .map(|url| (model_name.clone(), url))
+                request.inference_url.clone().map(|url| {
+                    (
+                        model_name.clone(),
+                        url,
+                        request.context_length.map(|c| c as u32),
+                    )
+                })
             } else {
                 None
             }

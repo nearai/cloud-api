@@ -42,9 +42,9 @@ async fn setup_provider_usage_fixture() -> ProviderUsageFixture {
              ), model AS (
                 INSERT INTO models (
                     model_name, model_display_name, model_description,
-                    input_cost_per_token, output_cost_per_token, context_length, verifiable, is_active
+                    input_cost_per_token, output_cost_per_token, context_length, max_output_length, verifiable, is_active
                 ) VALUES ($5, 'Provider Attribution Model', 'Provider attribution storage test model',
-                    1000000, 2000000, 128000, true, true)
+                    1000000, 2000000, 128000, 1024, true, true)
                 RETURNING id
              )
              SELECT org.id AS organization_id, workspace.id AS workspace_id,

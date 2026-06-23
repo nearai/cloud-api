@@ -17,6 +17,7 @@ deactivated_models AS (
     SET is_active = FALSE,
         updated_at = NOW()
     FROM invalid_active_models invalid
+    LEFT JOIN closed_history ch ON ch.model_id = invalid.id
     WHERE m.id = invalid.id
     RETURNING m.*
 )

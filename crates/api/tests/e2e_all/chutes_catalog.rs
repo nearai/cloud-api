@@ -87,6 +87,7 @@ async fn seed_model_if_absent_does_not_clobber_existing() {
             is_active: Some(true),
             input_cost_per_token: Some(1_234),
             output_cost_per_token: Some(5_678),
+            max_output_length: Some(1024),
             ..Default::default()
         },
     )

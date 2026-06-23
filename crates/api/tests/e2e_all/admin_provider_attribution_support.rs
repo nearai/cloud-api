@@ -52,11 +52,11 @@ pub(super) async fn setup_platform_provider_usage_fixture() -> PlatformProviderU
             r#"
             INSERT INTO models (
                 model_name, model_display_name, model_description,
-                input_cost_per_token, output_cost_per_token, context_length,
+                input_cost_per_token, output_cost_per_token, context_length, max_output_length,
                 verifiable, is_active, provider_type, attestation_supported,
                 created_at, updated_at
             )
-            VALUES ($1, $2, $3, 1, 1, 4096, true, true, 'external', false, NOW(), NOW())
+            VALUES ($1, $2, $3, 1, 1, 4096, 1024, true, true, 'external', false, NOW(), NOW())
             RETURNING id
             "#,
             &[&model_name, &model_name, &"Provider usage fixture model"],

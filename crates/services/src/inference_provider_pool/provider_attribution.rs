@@ -9,6 +9,10 @@ pub struct AttributedChatCompletion {
 pub struct AttributedChatCompletionStream {
     pub stream: StreamingResult,
     pub provider_attribution: crate::usage::ProviderAttribution,
+    /// Callback to report observed TTFT back to the pool for latency-aware
+    /// routing (see [`super::ProviderLatencyReporter`]). Invoked once by the
+    /// caller's `InterceptStream` on drop with the backend TTFT.
+    pub latency_reporter: super::ProviderLatencyReporter,
 }
 
 pub struct AttributedImageGeneration {

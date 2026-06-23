@@ -102,6 +102,9 @@ where
     /// Whether to fetch/store provider chat signatures before ending the stream.
     store_provider_chat_signature: bool,
     provider_attribution: crate::usage::ProviderAttribution,
+    /// Callback to report observed TTFT back to the provider pool for latency-aware
+    /// routing. Called once with the backend TTFT (ms) from record_usage_and_metrics.
+    latency_reporter: Option<super::inference_provider_pool::ProviderLatencyReporter>,
 }
 
 impl<S> InterceptStream<S>
@@ -250,6 +253,12 @@ where
         let usage_service = self.usage_service.clone();
         let metrics_service = self.metrics_service.clone();
         let ttft_ms = self.ttft_ms;
+
+        // Feed TTFT back to the provider pool for latency-aware routing.
+        if let (Some(ttft), Some(reporter)) = (self.ttft_ms, &self.latency_reporter) {
+            reporter(ttft);
+        }
+
         let e2e_duration = self.service_start_time.elapsed();
         let first_token_time = self.first_token_time;
         let stream_completed = self.stream_completed;
@@ -523,6 +532,51 @@ const ORG_LIMIT_CACHE_TTL_SECS: u64 = 300;
 /// Trade-off: if legitimate long-running requests are still in-flight when the TTL fires,
 /// the limit can be temporarily exceeded until those old requests complete.
 const CONCURRENT_COUNT_TTL_SECS: u64 = 600;
+
+/// Compute a prefix hash from the first PREFIX_HASH_MESSAGES messages for cache-hit routing.
+/// We only hash text content (not image URLs) since only text lands in the KV cache.
+fn compute_prefix_hash(messages: &[inference_providers::ChatMessage]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    for msg in messages
+        .iter()
+        .take(super::inference_provider_pool::PREFIX_HASH_MESSAGES)
+    {
+        // Hash role as its debug string since MessageRole doesn't implement Hash.
+        format!("{:?}", msg.role).hash(&mut hasher);
+        match &msg.content {
+            Some(serde_json::Value::String(s)) => s.hash(&mut hasher),
+            Some(serde_json::Value::Array(parts)) => {
+                for part in parts {
+                    if let Some("text") = part.get("type").and_then(|t| t.as_str()) {
+                        if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
+                            text.hash(&mut hasher);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    hasher.finish()
+}
+
+/// Rough token count estimate for context-length routing (4 chars ≈ 1 token).
+fn estimate_input_tokens(messages: &[inference_providers::ChatMessage]) -> u32 {
+    let chars: usize = messages
+        .iter()
+        .map(|m| match &m.content {
+            Some(serde_json::Value::String(s)) => s.len(),
+            Some(serde_json::Value::Array(parts)) => parts
+                .iter()
+                .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
+                .map(|s| s.len())
+                .sum(),
+            _ => 0,
+        })
+        .sum();
+    (chars / 4).max(1) as u32
+}
 
 impl CompletionServiceImpl {
     /// Inject tracing correlation IDs into the `extra` map that is forwarded
@@ -1209,6 +1263,7 @@ impl CompletionServiceImpl {
         attestation_supported: bool,
         store_provider_chat_signature: bool,
         provider_attribution: crate::usage::ProviderAttribution,
+        latency_reporter: Option<super::inference_provider_pool::ProviderLatencyReporter>,
     ) -> StreamingResult {
         // Create low-cardinality metric tags (no org/workspace/key - those go to database)
         let metric_tags = Self::create_metric_tags(&model_name);
@@ -1253,6 +1308,7 @@ impl CompletionServiceImpl {
             attestation_supported,
             store_provider_chat_signature,
             provider_attribution,
+            latency_reporter,
         };
         Box::pin(intercepted_stream)
     }
@@ -1380,13 +1436,19 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
 
         let provider_start_time = Instant::now();
 
+        // Compute routing hints from the request messages for adaptive load balancing.
+        let routing_hints = super::inference_provider_pool::ChatRoutingHints {
+            prefix_hash: Some(compute_prefix_hash(&chat_params.messages)),
+            estimated_tokens: Some(estimate_input_tokens(&chat_params.messages)),
+        };
+
         // Get the LLM stream
         let attributed_stream = match self
             .inference_provider_pool
-            .chat_completion_stream_with_attribution(chat_params, request.body_hash.clone())
+            .chat_completion_stream_with_attribution(chat_params, request.body_hash.clone(), routing_hints)
             .await
         {
-            Ok(stream) => stream,
+            Ok(pair) => pair,
             Err(e) => {
                 // Guard will decrement counter on drop
                 let err = Self::map_provider_error(
@@ -1401,6 +1463,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         };
         let llm_stream = attributed_stream.stream;
         let provider_attribution = attributed_stream.provider_attribution;
+        let latency_reporter = attributed_stream.latency_reporter;
 
         // Transfer counter ownership to InterceptStream (which decrements on drop)
         let counter = guard.disarm();
@@ -1430,6 +1493,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
                 model.attestation_supported,
                 !request.skip_provider_chat_signature,
                 provider_attribution,
+                Some(latency_reporter),
             )
             .await;
 
@@ -2077,6 +2141,7 @@ mod tests {
             attestation_supported: true,
             store_provider_chat_signature: true,
             provider_attribution: crate::usage::ProviderAttribution::default(),
+            latency_reporter: None,
         };
 
         // Consume the stream
@@ -2242,6 +2307,7 @@ mod tests {
             attestation_supported: true,
             store_provider_chat_signature: true,
             provider_attribution: crate::usage::ProviderAttribution::default(),
+            latency_reporter: None,
         };
 
         // Consume the stream
@@ -2364,6 +2430,7 @@ mod tests {
             attestation_supported: true,
             store_provider_chat_signature: true,
             provider_attribution: crate::usage::ProviderAttribution::default(),
+            latency_reporter: None,
         };
 
         let _ = intercept_stream.collect::<Vec<_>>().await;
@@ -2570,6 +2637,7 @@ mod tests {
                 attestation_supported: true,
                 store_provider_chat_signature: true,
                 provider_attribution: crate::usage::ProviderAttribution::default(),
+                latency_reporter: None,
             };
             // InterceptStream goes out of scope here and Drop is called
         }

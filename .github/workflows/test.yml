@@ -39,9 +39,10 @@ env:
   RUSTFLAGS: "-C debuginfo=0 -C link-arg=-fuse-ld=mold"
 
 jobs:
-  # Decide whether the Rust test jobs need to run. Mirrors the path set that
-  # used to live in the `on:` filter. Fails safe: anything we can't classify
-  # (new branch, detection error) is treated as "run the tests".
+  # Decide whether the Rust test jobs need to run. Covers the same path set the
+  # old `on:` filter used, plus rust-toolchain.toml and .cargo/config.toml (which
+  # affect the build but the old filter omitted). Fails safe: anything we can't
+  # classify (new branch, detection error) is treated as "run the tests".
   changes:
     name: Detect changes
     runs-on: [self-hosted, infra]
@@ -72,7 +73,7 @@ jobs:
           # and none of it is Rust-relevant.
           RUST=true
           if [ -n "$CHANGED" ] && ! echo "$CHANGED" | grep -qE \
-            '(\.rs$|(^|/)Cargo\.(toml|lock)$|^crates/database/src/migrations/|^\.github/workflows/test\.yml$|^\.github/actions/setup-rust-ci/|^\.config/nextest\.toml$)'; then
+            '(\.rs$|(^|/)Cargo\.(toml|lock)$|^crates/database/src/migrations/|^\.github/workflows/test\.yml$|^\.github/actions/setup-rust-ci/|^\.config/nextest\.toml$|^rust-toolchain\.toml$|^\.cargo/config\.toml$)'; then
             RUST=false
           fi
           echo "rust=$RUST" >> "$GITHUB_OUTPUT"

@@ -95,6 +95,9 @@ impl MetricsServiceTrait for OtlpMetricsService {
                 consts::METRIC_PROVIDER_REQUESTS => {
                     "Served requests by provider tier + fallback (Chutes-served traffic, NEAR->fallback rate)"
                 }
+                consts::METRIC_PROVIDER_ATTEMPTS => {
+                    "Provider attempts by bounded provider tier, source, fallback, operation, result, retry decision, retry round, and attempt index"
+                }
                 consts::METRIC_TOKENS_INPUT => "Input tokens consumed",
                 consts::METRIC_TOKENS_OUTPUT => "Output tokens generated",
                 consts::METRIC_VERIFICATION_SUCCESS => "Successful verification operations",

@@ -1154,7 +1154,7 @@ impl CreateResponseRequest {
         }
 
         if let Some(max_tokens) = self.max_output_tokens {
-            if max_tokens == 0 {
+            if max_tokens < 1 {
                 return Err("max_output_tokens must be greater than 0".to_string());
             }
         }
@@ -1556,6 +1556,49 @@ mod tests {
                 );
             }
             _ => panic!("Expected Message variant"),
+        }
+    }
+
+    #[test]
+    fn test_create_response_request_rejects_non_positive_max_output_tokens() {
+        let base_request = CreateResponseRequest {
+            model: "gpt-4".to_string(),
+            input: None,
+            instructions: None,
+            conversation: None,
+            previous_response_id: None,
+            max_output_tokens: None,
+            max_tool_calls: None,
+            temperature: None,
+            top_p: None,
+            stream: None,
+            store: None,
+            background: None,
+            tools: None,
+            tool_choice: None,
+            parallel_tool_calls: None,
+            reasoning: None,
+            include: None,
+            metadata: None,
+            safety_identifier: None,
+            prompt_cache_key: None,
+        };
+
+        for max_output_tokens in [-1, 0] {
+            let mut request = base_request.clone();
+            request.max_output_tokens = Some(max_output_tokens);
+
+            assert_eq!(
+                request.validate().unwrap_err(),
+                "max_output_tokens must be greater than 0"
+            );
+        }
+
+        for max_output_tokens in [None, Some(1), Some(1000)] {
+            let mut request = base_request.clone();
+            request.max_output_tokens = max_output_tokens;
+
+            assert!(request.validate().is_ok());
         }
     }
 

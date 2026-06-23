@@ -51,7 +51,7 @@ pub(super) fn update_ema(stat: &mut BackendStat, ttft_ms: f64) {
     } else {
         TTFT_EWMA_ALPHA_STABLE
     };
-    stat.ttft_ewma_ms = if stat.ttft_ewma_ms == 0.0 {
+    stat.ttft_ewma_ms = if stat.samples == 0 {
         ttft_ms
     } else {
         alpha * ttft_ms + (1.0 - alpha) * stat.ttft_ewma_ms
@@ -176,27 +176,34 @@ impl Fleet {
         }
         let preferred = self.prefix_router.route(messages) % count;
         let stats = lock(&self.backend_stats);
-        let warmed =
-            |i: usize| stats[i].samples >= TTFT_WARMUP_SAMPLES && stats[i].ttft_ewma_ms > 0.0;
-        let min_warm = (0..count)
-            .filter(|&i| warmed(i))
-            .map(|i| stats[i].ttft_ewma_ms)
-            .fold(f64::MAX, f64::min);
-        if warmed(preferred)
-            && stats[preferred].ttft_ewma_ms > TTFT_SLOW_FLOOR_MS
-            && min_warm.is_finite()
-            && stats[preferred].ttft_ewma_ms > TTFT_SLOW_RATIO * min_warm
-        {
-            // Steer to the fastest warmed backend; ties/unwarmed keep preferred.
-            let mut best = preferred;
-            let mut best_ms = stats[preferred].ttft_ewma_ms;
-            for i in 0..count {
-                if warmed(i) && stats[i].ttft_ewma_ms < best_ms {
-                    best = i;
-                    best_ms = stats[i].ttft_ewma_ms;
+        // Warmed EMA for index `i`, or None if out of range / not yet warmed.
+        // `.get()` keeps this panic-free regardless of how `count` relates to
+        // the stats vec length (it is `MAX_FANOUT` by construction).
+        let ema = |i: usize| -> Option<f64> {
+            stats
+                .get(i)
+                .filter(|s| s.samples >= TTFT_WARMUP_SAMPLES && s.ttft_ewma_ms > 0.0)
+                .map(|s| s.ttft_ewma_ms)
+        };
+        let min_warm = (0..count).filter_map(ema).fold(f64::MAX, f64::min);
+        if let Some(pref_ema) = ema(preferred) {
+            if pref_ema > TTFT_SLOW_FLOOR_MS
+                && min_warm.is_finite()
+                && pref_ema > TTFT_SLOW_RATIO * min_warm
+            {
+                // Steer to the fastest warmed backend; ties/unwarmed keep preferred.
+                let mut best = preferred;
+                let mut best_ms = pref_ema;
+                for i in 0..count {
+                    if let Some(e) = ema(i) {
+                        if e < best_ms {
+                            best = i;
+                            best_ms = e;
+                        }
+                    }
                 }
+                return Some(best);
             }
-            return Some(best);
         }
         Some(preferred)
     }
@@ -289,8 +296,17 @@ impl Fleet {
             // index↔backend binding via `-iN` is only stable while the healthy
             // count is stable; drop pinned clients + EMA so we re-verify and
             // re-measure against the new mapping.
-            for slot in &self.index_clients {
-                *lock(slot) = None;
+            //
+            // Only clear clients in verifier mode: there, a `None` slot is
+            // lazily re-verified on next use. In legacy/test mode (no verifier)
+            // the slots are eagerly pre-created and there is nothing to re-create
+            // them — clearing would wedge the provider with "no backend verifier
+            // configured". Those legacy clients aren't backend-pinned by
+            // attestation anyway, so leaving them is correct.
+            if self.backend_verifier.is_some() {
+                for slot in &self.index_clients {
+                    *lock(slot) = None;
+                }
             }
             let mut stats = lock(&self.backend_stats);
             for s in stats.iter_mut() {

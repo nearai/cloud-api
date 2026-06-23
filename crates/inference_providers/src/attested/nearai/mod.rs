@@ -3917,18 +3917,39 @@ mod tests {
     #[test]
     fn store_backend_count_change_clears_clients_and_resets_stats() {
         use crate::InferenceProvider;
-        // A count CHANGE must drop the pinned index clients (the index↔backend
-        // binding is only stable while the count is) and reset the per-index
-        // EMA. Start at a fixed count, then pin a client + seed an EMA so we can
-        // observe the clear/reset on the next change.
-        let provider = rotation_provider(4);
-        // Manually pin a client into slot 0 and seed an EMA on index 0.
+        use std::sync::Arc;
+        // Verifier mode (the production path): a count CHANGE must drop the
+        // pinned index clients — the index↔backend binding is only stable while
+        // the count is — so each `None` slot is lazily re-verified against the
+        // new mapping. It also resets the per-index EMA. Seed a count, pin a
+        // client + EMA on index 0, then observe the clear/reset on the change.
+        struct NoopVerifier;
+        #[async_trait::async_trait]
+        impl crate::BackendVerifier for NoopVerifier {
+            async fn create_verified_client(
+                &self,
+                _base_url: &str,
+            ) -> Result<reqwest::Client, String> {
+                Ok(reqwest::Client::new())
+            }
+        }
+        let provider = Provider::new_with_verifier(
+            Config {
+                base_url: "https://glm-5-1.completions.near.ai".to_string(),
+                api_key: None,
+                completion_timeout_seconds: 30,
+                control_timeout_seconds: 30,
+            },
+            Arc::new(std::sync::RwLock::new(
+                crate::spki_verifier::FingerprintState::Bootstrap,
+            )),
+            Arc::new(NoopVerifier),
+        );
+        provider.set_backend_count(4);
         *provider.fleet.index_clients[0].lock().unwrap() = Some(reqwest::Client::new());
         for _ in 0..super::fleet::TTFT_WARMUP_SAMPLES {
             provider.fleet.record_ttft(0, 123.0);
         }
-        assert!(provider.fleet.index_clients[0].lock().unwrap().is_some());
-        assert!(provider.fleet.backend_stats.lock().unwrap()[0].samples > 0);
 
         // Same count → no reset (clients + stats preserved).
         provider.set_backend_count(4);
@@ -3939,7 +3960,7 @@ mod tests {
         provider.set_backend_count(6);
         assert!(
             provider.fleet.index_clients[0].lock().unwrap().is_none(),
-            "count change must clear pinned index clients"
+            "count change must clear pinned index clients in verifier mode"
         );
         let stats = provider.fleet.backend_stats.lock().unwrap();
         assert!(
@@ -3947,6 +3968,33 @@ mod tests {
                 .iter()
                 .all(|s| s.samples == 0 && s.ttft_ewma_ms == 0.0),
             "count change must reset all backend stats"
+        );
+    }
+
+    #[test]
+    fn store_backend_count_change_keeps_legacy_clients_but_resets_stats() {
+        use crate::InferenceProvider;
+        // Legacy/no-verifier mode: index clients are eagerly pre-created and
+        // there is no verifier to lazily re-create them, so a count change must
+        // NOT clear them (clearing would wedge the provider with "no backend
+        // verifier configured"). Stats are still reset.
+        let provider = rotation_provider(4); // Provider::new → no verifier
+        for _ in 0..super::fleet::TTFT_WARMUP_SAMPLES {
+            provider.fleet.record_ttft(0, 123.0);
+        }
+        assert!(provider.fleet.index_clients[0].lock().unwrap().is_some());
+
+        provider.set_backend_count(6);
+        assert!(
+            provider.fleet.index_clients[0].lock().unwrap().is_some(),
+            "legacy eager clients must survive a count change (no verifier to rebuild them)"
+        );
+        let stats = provider.fleet.backend_stats.lock().unwrap();
+        assert!(
+            stats
+                .iter()
+                .all(|s| s.samples == 0 && s.ttft_ewma_ms == 0.0),
+            "count change must still reset all backend stats in legacy mode"
         );
     }
 

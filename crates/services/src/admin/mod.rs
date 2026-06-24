@@ -1272,35 +1272,6 @@ impl AdminServiceImpl {
             }
         }
 
-        if matches!(request.max_output_length, Some(max_output_length) if max_output_length <= 0) {
-            return Err(AdminError::InvalidPricing(format!(
-                "model '{model_name}': maxOutputLength must be positive"
-            )));
-        }
-
-        let existing_catalog = repository
-            .get_model_catalog_state(model_name)
-            .await
-            .map_err(|e| AdminError::InternalError(e.to_string()))?;
-        let effective_catalog_is_active = request.is_active.unwrap_or_else(|| {
-            existing_catalog
-                .as_ref()
-                .is_none_or(|model| model.is_active)
-        });
-        let effective_max_output_length = request.max_output_length.or_else(|| {
-            existing_catalog
-                .as_ref()
-                .and_then(|model| model.max_output_length)
-        });
-
-        if effective_catalog_is_active
-            && !matches!(effective_max_output_length, Some(max_output_length) if max_output_length > 0)
-        {
-            return Err(AdminError::InvalidPricing(format!(
-                "model '{model_name}': maxOutputLength is required and must be positive for active models"
-            )));
-        }
-
         // Activation pricing gate: reject requests that would result in an
         // active model with all-zero pricing unless allow_free is set.
         //

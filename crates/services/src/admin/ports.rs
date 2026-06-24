@@ -106,12 +106,6 @@ pub struct ModelPricing {
     pub openrouter_slug: Option<String>,
 }
 
-#[derive(Debug, Clone)]
-pub struct ModelCatalogState {
-    pub is_active: bool,
-    pub max_output_length: Option<i32>,
-}
-
 /// Model history entry - includes pricing, context length, and other model attributes
 /// All costs use fixed scale of 9 (nano-dollars) and USD currency
 #[derive(Debug, Clone)]
@@ -602,11 +596,6 @@ pub trait AdminRepository: Send + Sync {
         model_name: &str,
         request: UpdateModelAdminRequest,
     ) -> Result<ModelPricing, anyhow::Error>;
-
-    async fn get_model_catalog_state(
-        &self,
-        model_name: &str,
-    ) -> Result<Option<ModelCatalogState>, anyhow::Error>;
 
     /// Fetch the current pricing costs and allow_free flag for a model by name.
     /// Returns `None` if the model does not exist (new model).

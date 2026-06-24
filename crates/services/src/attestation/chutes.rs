@@ -317,9 +317,9 @@ pub fn vetted_golden_measurements() -> ChutesMeasurementPolicy {
         FAMILIES
             .iter()
             .flat_map(|f| {
-                f.hardware_rows.iter().map(move |(name, rtmr0)| {
+                f.hardware_rows.iter().map(move |&(name, rtmr0)| {
                     ExpectedMeasurement::new(
-                        *name, f.version, f.mrtd, rtmr0, f.rtmr1, f.rtmr2, f.rtmr3,
+                        name, f.version, f.mrtd, rtmr0, f.rtmr1, f.rtmr2, f.rtmr3,
                     )
                 })
             })

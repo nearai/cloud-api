@@ -1,11 +1,14 @@
 pub mod ports;
 
+use std::collections::HashMap;
+use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use moka::future::Cache;
 pub use ports::{ModelInfo, ModelWithPricing, ModelsError, ModelsRepository, ModelsServiceTrait};
+use tracing::warn;
 
 use crate::inference_provider_pool::InferenceProviderPool;
 
@@ -19,6 +22,7 @@ use crate::inference_provider_pool::InferenceProviderPool;
 /// in-process for a short window and invalidate explicitly on admin writes
 /// (see `invalidate_models_cache`).
 const MODELS_LIST_CACHE_TTL_SECS: u64 = 300;
+const BACKEND_CONTEXT_LENGTH_FETCH_TIMEOUT_SECS: u64 = 5;
 
 /// Capacity for the model-list cache. We only ever store one entry
 /// (keyed by `"all"`), so 1 is sufficient.
@@ -29,11 +33,27 @@ const MODELS_LIST_CACHE_KEY: &str = "all";
 
 fn apply_backend_context_lengths(
     models: &mut [ModelWithPricing],
-    context_lengths: &std::collections::HashMap<String, i32>,
+    context_lengths: &HashMap<String, i32>,
 ) {
     for model in models {
         if let Some(context_length) = context_lengths.get(&model.model_name) {
             model.context_length = *context_length;
+        }
+    }
+}
+
+async fn backend_context_lengths_with_timeout<F>(
+    fetch: F,
+    timeout: Duration,
+) -> HashMap<String, i32>
+where
+    F: Future<Output = HashMap<String, i32>>,
+{
+    match tokio::time::timeout(timeout, fetch).await {
+        Ok(context_lengths) => context_lengths,
+        Err(_) => {
+            warn!("Timed out fetching backend model metadata");
+            HashMap::new()
         }
     }
 }
@@ -83,7 +103,11 @@ impl ModelsServiceImpl {
                     .get_all_active_models()
                     .await
                     .map_err(|e| ModelsError::InternalError(e.to_string()))?;
-                let context_lengths = inference_provider_pool.max_context_lengths_by_model().await;
+                let context_lengths = backend_context_lengths_with_timeout(
+                    inference_provider_pool.max_context_lengths_by_model(),
+                    Duration::from_secs(BACKEND_CONTEXT_LENGTH_FETCH_TIMEOUT_SECS),
+                )
+                .await;
                 apply_backend_context_lengths(&mut models, &context_lengths);
                 Ok(Arc::new(models))
             })
@@ -230,6 +254,31 @@ mod tests {
             max_model_len: None,
             top_provider: None,
         }
+    }
+
+    #[tokio::test]
+    async fn backend_context_lengths_with_timeout_returns_values_before_deadline() {
+        let result = backend_context_lengths_with_timeout(
+            async { std::collections::HashMap::from([("test/model".to_string(), 65_536)]) },
+            Duration::from_secs(1),
+        )
+        .await;
+
+        assert_eq!(result.get("test/model"), Some(&65_536));
+    }
+
+    #[tokio::test]
+    async fn backend_context_lengths_with_timeout_returns_empty_after_deadline() {
+        let result = backend_context_lengths_with_timeout(
+            async {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                std::collections::HashMap::from([("test/model".to_string(), 65_536)])
+            },
+            Duration::from_millis(1),
+        )
+        .await;
+
+        assert!(result.is_empty());
     }
 
     #[tokio::test]

@@ -3592,6 +3592,67 @@ impl InferenceProviderPool {
         mappings.model_to_providers.keys().cloned().collect()
     }
 
+    pub async fn max_context_lengths_by_model(&self) -> HashMap<String, i32> {
+        let model_providers: Vec<(String, Vec<Arc<InferenceProviderTrait>>)> = {
+            let mappings = self.provider_mappings.read().await;
+            mappings
+                .model_to_providers
+                .iter()
+                .map(|(model_name, providers)| (model_name.clone(), providers.clone()))
+                .collect()
+        };
+
+        let tasks: Vec<_> = model_providers
+            .into_iter()
+            .flat_map(|(model_name, providers)| {
+                providers.into_iter().map(move |provider| {
+                    let model_name = model_name.clone();
+                    async move {
+                        let response = provider.models().await;
+                        (model_name, response)
+                    }
+                })
+            })
+            .collect();
+
+        let mut max_lengths: HashMap<String, i32> = HashMap::new();
+        for (model_name, result) in futures::future::join_all(tasks).await {
+            match result {
+                Ok(response) => {
+                    let exact = response
+                        .data
+                        .iter()
+                        .filter(|model| model.id == model_name)
+                        .filter_map(|model| model.advertised_context_length())
+                        .max();
+                    let single = if response.data.len() == 1 {
+                        response
+                            .data
+                            .first()
+                            .and_then(|model| model.advertised_context_length())
+                    } else {
+                        None
+                    };
+                    if let Some(context_length) = exact.or(single).filter(|value| *value > 0) {
+                        max_lengths
+                            .entry(model_name)
+                            .and_modify(|stored| *stored = (*stored).max(context_length))
+                            .or_insert(context_length);
+                    }
+                }
+                Err(error) => {
+                    warn!(
+                        model = %model_name,
+                        error = %error,
+                        "Failed to fetch backend model metadata"
+                    );
+                }
+            }
+        }
+
+        max_lengths
+    }
+
     /// Sync external providers — just re-loads them into provider_mappings.
     async fn sync_external_providers(&self, models: Vec<(String, serde_json::Value)>) {
         if let Err(e) = self.load_external_providers(models).await {
@@ -4665,6 +4726,28 @@ mod tests {
         (0..n_calls)
             .map(|i| (i % backend_count.max(1), algos[i % algos.len()]))
             .collect()
+    }
+
+    #[tokio::test]
+    async fn max_context_lengths_by_model_reads_backend_metadata() {
+        let model_id = "test/model".to_string();
+        let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
+        let provider = Arc::new(inference_providers::mock::MockProvider::with_models(vec![
+            inference_providers::ModelInfo {
+                id: model_id.clone(),
+                object: "model".to_string(),
+                created: 0,
+                owned_by: "test".to_string(),
+                context_length: Some(32_768),
+                max_model_len: None,
+                top_provider: None,
+            },
+        ]));
+
+        pool.register_provider(model_id.clone(), provider).await;
+        let context_lengths = pool.max_context_lengths_by_model().await;
+
+        assert_eq!(context_lengths.get(&model_id), Some(&32_768));
     }
 
     #[test]

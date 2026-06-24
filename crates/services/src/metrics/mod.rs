@@ -108,6 +108,9 @@ impl MetricsServiceTrait for OtlpMetricsService {
                 consts::METRIC_SIGNATURE_CREATION_SUCCESS => {
                     "Successful gateway signature creation operations"
                 }
+                consts::METRIC_ATTESTATION_REPORT_CACHE => {
+                    "Attestation-report cache outcomes by result (hit|miss|bypass)"
+                }
                 consts::METRIC_HTTP_REQUESTS => {
                     "Total HTTP requests by endpoint, method, and status"
                 }

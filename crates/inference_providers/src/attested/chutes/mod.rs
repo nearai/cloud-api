@@ -1335,6 +1335,9 @@ impl InferenceProvider for Provider {
                 id: self.canonical_id.clone(),
                 object: "model".to_string(),
                 owned_by: "chutes".to_string(),
+                context_length: None,
+                max_model_len: None,
+                top_provider: None,
             }],
         })
     }

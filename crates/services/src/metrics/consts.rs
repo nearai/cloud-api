@@ -15,6 +15,13 @@ pub const METRIC_VERIFICATION_DURATION: &str = "cloud_api.verification.duration"
 pub const METRIC_SIGNATURE_CREATION_SUCCESS: &str = "cloud_api.signature.creation.success";
 pub const METRIC_SIGNATURE_CREATION_DURATION: &str = "cloud_api.signature.creation.duration";
 
+// Attestation-report cache: one increment per /v1/attestation/report, tagged
+// `result` (hit|miss|bypass) + environment. Lets dashboards see the no-nonce
+// cache collapse the monitoring thundering-herd (bypass = nonce-bearing request
+// served fresh; hit = no-nonce request served from the short-TTL cache).
+pub const METRIC_ATTESTATION_REPORT_CACHE: &str = "cloud_api.attestation.report_cache";
+pub const TAG_RESULT: &str = "result";
+
 // Usage/engagement metrics
 pub const METRIC_REQUEST_COUNT: &str = "cloud_api.request.count";
 pub const METRIC_TOKENS_INPUT: &str = "cloud_api.tokens.input";

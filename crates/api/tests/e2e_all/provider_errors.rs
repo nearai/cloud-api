@@ -366,6 +366,7 @@ async fn test_model_not_found_in_provider_returns_400() {
             "modelDisplayName": "Fake Model",
             "modelDescription": "A model that does not exist in any provider",
             "contextLength": 4096,
+            "maxOutputLength": 1024,
             "verifiable": false,
             "isActive": true
         }))

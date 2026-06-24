@@ -1052,8 +1052,10 @@ pub struct ModelPricing {
     pub image: String,
     /// OpenRouter: USD per request, as a string ("0" when not applicable).
     pub request: String,
-    /// OpenRouter: USD per cached input token, as a string ("0" when not applicable).
-    pub input_cache_read: String,
+    /// OpenRouter: USD per cached input token, as a string. Omitted when cache-read
+    /// pricing is disabled or unknown.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_cache_read: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]

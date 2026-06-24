@@ -11,6 +11,7 @@ fn minimal_model_upsert() -> serde_json::Value {
         "modelDisplayName":   "Pricing Change Test Model",
         "modelDescription":   "Synthetic model for pricing change e2e",
         "contextLength":      4096,
+        "maxOutputLength": 1024,
         "verifiable":         false,
         "isActive":           true,
     })

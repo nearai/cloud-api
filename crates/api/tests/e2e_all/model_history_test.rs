@@ -65,6 +65,7 @@ async fn test_upsert_model_creates_history_record() {
             "modelDisplayName": "Test Model History",
             "modelDescription": "Testing history recording",
             "contextLength": 4096,
+            "maxOutputLength": 1024,
             "verifiable": true,
             "isActive": true,
             "changeReason": "Initial model creation"
@@ -133,6 +134,7 @@ async fn test_second_upsert_closes_previous_history() {
             "modelDisplayName": "Test Model V1",
             "modelDescription": "Version 1",
             "contextLength": 4096,
+            "maxOutputLength": 1024,
             "verifiable": true,
             "isActive": true,
             "changeReason": "Initial creation"
@@ -166,6 +168,7 @@ async fn test_second_upsert_closes_previous_history() {
             "modelDisplayName": "Test Model V2",
             "modelDescription": "Version 2 - pricing updated",
             "contextLength": 8192,
+            "maxOutputLength": 1024,
             "verifiable": true,
             "isActive": true,
             "changeReason": "Pricing update"
@@ -234,6 +237,7 @@ async fn test_soft_delete_creates_history_record() {
             "modelDisplayName": "Test Model Delete",
             "modelDescription": "Will be deleted",
             "contextLength": 4096,
+            "maxOutputLength": 1024,
             "verifiable": true,
             "isActive": true
         }))
@@ -315,6 +319,7 @@ async fn test_user_tracking_in_history() {
             "modelDisplayName": "User Tracking Test",
             "modelDescription": "Testing user tracking",
             "contextLength": 4096,
+            "maxOutputLength": 1024,
             "verifiable": true,
             "isActive": true,
             "changeReason": "Testing user audit"
@@ -377,6 +382,7 @@ async fn test_history_progression_multiple_updates() {
                 "modelDisplayName": format!("Model V{}", i + 1),
                 "modelDescription": format!("Version {}", i + 1),
                 "contextLength": 4096 * (i + 1) as i32,
+                "maxOutputLength": 1024,
                 "verifiable": true,
                 "isActive": true,
                 "changeReason": reason
@@ -436,6 +442,7 @@ async fn test_soft_delete_with_custom_reason() {
             "modelDisplayName": "Test Model Delete Custom",
             "modelDescription": "Will be deleted with custom reason",
             "contextLength": 4096,
+            "maxOutputLength": 1024,
             "verifiable": true,
             "isActive": true
         }))
@@ -495,6 +502,7 @@ async fn test_soft_delete_without_reason_backward_compatibility() {
             "modelDisplayName": "Test Model Delete No Reason",
             "modelDescription": "Will be deleted without reason",
             "contextLength": 4096,
+            "maxOutputLength": 1024,
             "verifiable": true,
             "isActive": true
         }))
@@ -551,6 +559,7 @@ async fn test_model_history_tracks_modalities() {
             "modelDisplayName": "Multimodal Model",
             "modelDescription": "A model with text and image input",
             "contextLength": 4096,
+            "maxOutputLength": 1024,
             "verifiable": true,
             "isActive": true,
             "inputModalities": ["text", "image"],
@@ -607,6 +616,7 @@ async fn test_model_history_tracks_modalities() {
             "modelDisplayName": "Multimodal Model V2",
             "modelDescription": "Now supports audio input too",
             "contextLength": 8192,
+            "maxOutputLength": 1024,
             "verifiable": true,
             "isActive": true,
             "inputModalities": ["text", "image", "audio"],
@@ -676,6 +686,7 @@ async fn test_model_history_records_datacenters() {
             "modelDisplayName": "Datacenters History Model",
             "modelDescription": "Testing datacenters history recording",
             "contextLength": 4096,
+            "maxOutputLength": 1024,
             "verifiable": true,
             "isActive": true,
             "datacenters": [{ "country_code": "US" }],
@@ -763,6 +774,7 @@ async fn test_soft_delete_preserves_datacenters_in_history() {
             "modelDisplayName": "Datacenters Delete Model",
             "modelDescription": "Testing datacenters survive soft delete",
             "contextLength": 4096,
+            "maxOutputLength": 1024,
             "verifiable": true,
             "isActive": true,
             "datacenters": [{ "country_code": "US" }]

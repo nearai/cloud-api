@@ -239,6 +239,7 @@ async fn setup_non_attested_model(
             "modelDisplayName": "Non-attested test model",
             "modelDescription": "Test model (non-attested) for usage-stripping tests",
             "contextLength": 128000,
+            "maxOutputLength": 1024,
             "verifiable": false,
             "isActive": true,
             "attestationSupported": false

@@ -31,6 +31,7 @@ async fn setup_privacy_filter_model(server: &axum_test::TestServer) {
             "modelDisplayName": "Privacy Filter",
             "modelDescription": "PII span detection",
             "contextLength": 512,
+            "maxOutputLength": 1024,
             "verifiable": false,
             "isActive": true,
             "allowFree": true

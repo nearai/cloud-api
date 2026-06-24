@@ -51,7 +51,7 @@ jobs:
     outputs:
       rust: ${{ steps.detect.outputs.rust }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0  # need history to diff the PR / push range
 
@@ -86,7 +86,7 @@ jobs:
     runs-on: [self-hosted, infra]
 
     steps:
-    - uses: actions/checkout@v6
+    - uses: actions/checkout@v7
 
     - name: Setup Rust CI
       uses: ./.github/actions/setup-rust-ci
@@ -111,7 +111,7 @@ jobs:
     runs-on: [self-hosted, infra]
 
     steps:
-    - uses: actions/checkout@v6
+    - uses: actions/checkout@v7
 
     - name: Setup Rust CI
       uses: ./.github/actions/setup-rust-ci
@@ -147,7 +147,7 @@ jobs:
     runs-on: [self-hosted, infra]
 
     steps:
-    - uses: actions/checkout@v6
+    - uses: actions/checkout@v7
 
     - name: Setup Rust CI
       uses: ./.github/actions/setup-rust-ci
@@ -190,7 +190,7 @@ jobs:
           - 5432:5432
 
     steps:
-    - uses: actions/checkout@v6
+    - uses: actions/checkout@v7
 
     - name: Setup Rust CI
       uses: ./.github/actions/setup-rust-ci
@@ -272,7 +272,7 @@ jobs:
     runs-on: [self-hosted, infra]
 
     steps:
-    - uses: actions/checkout@v6
+    - uses: actions/checkout@v7
 
     - name: Setup Rust CI
       uses: ./.github/actions/setup-rust-ci

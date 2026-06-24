@@ -63,6 +63,7 @@ async fn test_admin_list_models_with_models() {
             "modelDisplayName": "Test Model",
             "modelDescription": "A test model for e2e testing",
             "contextLength": 4096,
+            "maxOutputLength": 1024,
             "verifiable": false,
             "isActive": true,
             "inputModalities": ["text", "image"],
@@ -140,6 +141,7 @@ async fn test_admin_upsert_is_ready_and_deprecation_date_round_trip() {
             "modelDisplayName": "Test is_ready Model",
             "modelDescription": "Round-trips is_ready and deprecation_date",
             "contextLength": 4096,
+            "maxOutputLength": 1024,
             "isActive": true,
             "isReady": true,
             "deprecationDate": "2030-01-01"
@@ -291,6 +293,7 @@ async fn test_admin_clear_deprecation_date_and_is_ready() {
             "modelDisplayName": "Clearable Model",
             "modelDescription": "Tri-state clear semantics",
             "contextLength": 4096,
+            "maxOutputLength": 1024,
             "isActive": true,
             "isReady": false,
             "deprecationDate": "2030-01-01"
@@ -396,6 +399,7 @@ async fn test_admin_upsert_rejects_invalid_deprecation_date() {
             "modelDisplayName": "Bad deprecation date",
             "modelDescription": "Should be rejected",
             "contextLength": 4096,
+            "maxOutputLength": 1024,
             "deprecationDate": "not-a-date"
         }))
         .unwrap(),
@@ -435,6 +439,7 @@ async fn test_admin_list_models_include_inactive() {
             "modelDisplayName": "Active Model",
             "modelDescription": "An active model",
             "contextLength": 4096,
+            "maxOutputLength": 1024,
             "verifiable": false,
             "isActive": true
         }))
@@ -453,6 +458,7 @@ async fn test_admin_list_models_include_inactive() {
             "modelDisplayName": "Inactive Model",
             "modelDescription": "An inactive model",
             "contextLength": 4096,
+            "maxOutputLength": 1024,
             "verifiable": false,
             "isActive": false
         }))
@@ -545,6 +551,7 @@ async fn test_admin_list_models_pagination() {
                 "modelDisplayName": format!("Pagination Model {}", i),
                 "modelDescription": "A model for pagination testing",
                 "contextLength": 4096,
+                "maxOutputLength": 1024,
                 "verifiable": false,
                 "isActive": true
             }))
@@ -602,6 +609,7 @@ async fn test_admin_list_models_has_timestamps() {
             "modelDisplayName": "Timestamp Model",
             "modelDescription": "A model for timestamp testing",
             "contextLength": 4096,
+            "maxOutputLength": 1024,
             "verifiable": false,
             "isActive": true
         }))
@@ -717,6 +725,7 @@ async fn test_admin_list_models_after_soft_delete() {
             "modelDisplayName": "Delete Test Model",
             "modelDescription": "A model for soft delete testing",
             "contextLength": 4096,
+            "maxOutputLength": 1024,
             "verifiable": false,
             "isActive": true
         }))
@@ -820,6 +829,7 @@ async fn test_admin_list_models_datacenters_round_trip() {
             "modelDisplayName": "Datacenters Model",
             "modelDescription": "A model with datacenters set",
             "contextLength": 4096,
+            "maxOutputLength": 1024,
             "verifiable": false,
             "isActive": true,
             "datacenters": [{ "country_code": "US" }, { "country_code": "FR" }]
@@ -872,6 +882,7 @@ async fn test_admin_upsert_rejects_invalid_datacenters() {
             "modelDisplayName": "Bad Datacenters Model",
             "modelDescription": "Has an invalid country code",
             "contextLength": 4096,
+            "maxOutputLength": 1024,
             "verifiable": false,
             "isActive": true,
             "datacenters": [{ "country_code": "usa" }]
@@ -900,6 +911,7 @@ async fn test_admin_upsert_rejects_invalid_datacenters() {
             "modelDisplayName": "Bad Datacenters Model",
             "modelDescription": "Has a lowercase country code",
             "contextLength": 4096,
+            "maxOutputLength": 1024,
             "verifiable": false,
             "isActive": true,
             "datacenters": [{ "country_code": "us" }]
@@ -942,6 +954,7 @@ async fn test_admin_openrouter_slug_round_trip_and_clear() {
             "modelDisplayName": "OpenRouter Slug Model",
             "modelDescription": "Round-trips openrouter.slug override",
             "contextLength": 4096,
+            "maxOutputLength": 1024,
             "isActive": true,
             "openrouterSlug": "z-ai/glm-5.1"
         }))
@@ -1057,6 +1070,7 @@ async fn test_admin_upsert_rejects_invalid_openrouter_slug() {
                 "modelDisplayName": "Bad OpenRouter Slug Model",
                 "modelDescription": "Has an invalid openrouter slug",
                 "contextLength": 4096,
+                "maxOutputLength": 1024,
                 "isActive": true,
                 "openrouterSlug": bad
             }

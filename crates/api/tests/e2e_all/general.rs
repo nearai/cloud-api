@@ -201,6 +201,7 @@ async fn test_get_model_by_name() {
             "modelDisplayName": "Test Model Display Name",
             "modelDescription": "Test model description for get_model_by_name",
             "contextLength": 128000,
+            "maxOutputLength": 1024,
             "verifiable": true,
             "isActive": true
         }))
@@ -315,6 +316,7 @@ async fn test_admin_model_custom_owned_by() {
             "modelDisplayName": "Custom Model",
             "modelDescription": "Test custom owned_by",
             "contextLength": 128000,
+            "maxOutputLength": 1024,
             "verifiable": true,
             "ownedBy": "openai"
         }))
@@ -419,6 +421,7 @@ async fn test_admin_model_default_owned_by() {
             "modelDisplayName": "Test Default Owned By",
             "modelDescription": "Testing default owned_by value",
             "contextLength": 128000,
+            "maxOutputLength": 1024,
             "verifiable": true
             // NOTE: No ownedBy field - should default to DEFAULT_MODEL_OWNED_BY
         }))
@@ -1611,6 +1614,7 @@ async fn test_high_context_length_completion() {
             "modelDisplayName": "Qwen3 30B Instruct",
             "modelDescription": "High context length model for testing (260k tokens)",
             "contextLength": 262144,  // 260k context length
+            "maxOutputLength": 1024,
             "verifiable": true,
             "isActive": true
         }))
@@ -1729,6 +1733,7 @@ async fn test_high_context_streaming() {
             "modelDisplayName": "Qwen3 30B Instruct",
             "modelDescription": "High context length model for streaming (260k tokens)",
             "contextLength": 262144,
+            "maxOutputLength": 1024,
             "verifiable": true,
             "isActive": true
         }))
@@ -1856,6 +1861,7 @@ async fn test_model_aliases() {
             "modelDisplayName": "GPT OSS 120B",
             "modelDescription": "Open source 120B parameter model",
             "contextLength": 32768,
+            "maxOutputLength": 1024,
             "verifiable": true,
             "isActive": true,
             "aliases": [
@@ -1880,6 +1886,7 @@ async fn test_model_aliases() {
             "modelDisplayName": "DeepSeek V3.1",
             "modelDescription": "DeepSeek V3.1 reasoning model",
             "contextLength": 65536,
+            "maxOutputLength": 1024,
             "verifiable": false,
             "isActive": true,
             "aliases": [
@@ -2050,6 +2057,7 @@ async fn test_model_alias_consistency() {
             "modelDisplayName": "Qwen3 30B A3B Instruct",
             "modelDescription": "Qwen3 30B model with A3B quantization",
             "contextLength": 32768,
+            "maxOutputLength": 1024,
             "verifiable": true,
             "isActive": true,
             "aliases": [

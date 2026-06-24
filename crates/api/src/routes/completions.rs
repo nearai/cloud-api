@@ -2724,7 +2724,8 @@ fn model_with_pricing_to_info(model: services::models::ModelWithPricing) -> Mode
         completion: nano_dollars_to_per_token_string(model.output_cost_per_token),
         image: nano_dollars_to_per_token_string(model.cost_per_image),
         request: "0".to_string(),
-        input_cache_read: nano_dollars_to_per_token_string(model.cache_read_cost_per_token),
+        input_cache_read: (model.cache_read_cost_per_token > 0)
+            .then(|| nano_dollars_to_per_token_string(model.cache_read_cost_per_token)),
     };
 
     // OpenRouter's provider spec marks `input_modalities` / `output_modalities`
@@ -2871,7 +2872,7 @@ mod tests {
             inference_url: None,
             hugging_face_id: None,
             quantization: None,
-            max_output_length: None,
+            max_output_length: Some(1024),
             supported_sampling_parameters: vec![],
             supported_features: vec![],
             datacenters: None,
@@ -2920,6 +2921,28 @@ mod tests {
             vec!["text".to_string(), "image".to_string()]
         );
         assert_eq!(architecture.output_modalities, vec!["text".to_string()]);
+    }
+
+    #[test]
+    fn model_without_cache_read_pricing_omits_input_cache_read() {
+        let info = model_with_pricing_to_info(make_model_with_pricing(None, None));
+        let json = serde_json::to_value(&info).unwrap();
+
+        assert!(
+            json["pricing"].get("input_cache_read").is_none(),
+            "zero cache-read pricing is an internal unknown/disabled sentinel and must be omitted"
+        );
+    }
+
+    #[test]
+    fn model_with_cache_read_pricing_emits_positive_input_cache_read() {
+        let mut model = make_model_with_pricing(None, None);
+        model.cache_read_cost_per_token = 50_000;
+
+        let info = model_with_pricing_to_info(model);
+        let json = serde_json::to_value(&info).unwrap();
+
+        assert_eq!(json["pricing"]["input_cache_read"], "0.00005");
     }
 
     #[test]

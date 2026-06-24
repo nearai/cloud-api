@@ -20,6 +20,7 @@ async fn create_zero_price_model(server: &axum_test::TestServer, model_name: &st
                 "modelDisplayName": "Zero Price Test Model",
                 "modelDescription": "A model for pricing gate tests",
                 "contextLength": 4096,
+                "maxOutputLength": 1024,
                 "isActive": false
             }
         }))
@@ -114,6 +115,7 @@ async fn test_activation_gate_passes_with_nonzero_pricing() {
                 "modelDisplayName": "Priced Model",
                 "modelDescription": "A model with real pricing",
                 "contextLength": 4096,
+                "maxOutputLength": 1024,
                 "isActive": true
             }
         }))
@@ -175,7 +177,8 @@ async fn test_activation_gate_rejects_new_model_with_default_active() {
                 "outputCostPerToken": {"amount": 0, "currency": "USD"},
                 "modelDisplayName": "Default Active Zero Price",
                 "modelDescription": "Gate should fire due to DB default is_active=true",
-                "contextLength": 4096
+                "contextLength": 4096,
+                "maxOutputLength": 1024
                 // isActive omitted — DB inserts default to true
             }
         }))
@@ -215,6 +218,7 @@ async fn test_activation_gate_allows_nonzero_image_cost() {
                 "modelDisplayName": "Image Only Priced Model",
                 "modelDescription": "Has costPerImage; token costs are zero",
                 "contextLength": 4096,
+                "maxOutputLength": 1024,
                 "isActive": true
             }
         }))
@@ -246,6 +250,7 @@ async fn test_activation_gate_allows_nonzero_cache_read_cost() {
                 "modelDisplayName": "Cache Read Priced Model",
                 "modelDescription": "Has cacheReadCostPerToken; other costs are zero",
                 "contextLength": 4096,
+                "maxOutputLength": 1024,
                 "isActive": true
             }
         }))
@@ -278,6 +283,7 @@ async fn test_history_includes_allow_free_flag() {
                 "modelDisplayName": "Free Model With History",
                 "modelDescription": "Testing allow_free in history",
                 "contextLength": 4096,
+                "maxOutputLength": 1024,
                 "isActive": true,
                 "allowFree": true
             }

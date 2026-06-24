@@ -24,6 +24,7 @@ async fn setup_deprecated_alias(server: &axum_test::TestServer) -> String {
             "modelDisplayName":   "Alias Transparency Test Model",
             "modelDescription":   "Synthetic model deprecated onto Qwen for e2e",
             "contextLength":      4096,
+            "maxOutputLength": 1024,
             "verifiable":         false,
             "isActive":           true,
         }))
@@ -224,6 +225,7 @@ async fn test_alias_to_external_model_with_upstream_name_override_warns() {
             "modelDisplayName":   "External Override Test Model",
             "modelDescription":   "External model with upstream name override",
             "contextLength":      128000,
+            "maxOutputLength": 1024,
             "verifiable":         false,
             "isActive":           true,
             "providerType":       "external",
@@ -244,6 +246,7 @@ async fn test_alias_to_external_model_with_upstream_name_override_warns() {
             "modelDisplayName":   "External Override Old Model",
             "modelDescription":   "Synthetic model deprecated onto the external model",
             "contextLength":      4096,
+            "maxOutputLength": 1024,
             "verifiable":         false,
             "isActive":           true,
         }))
@@ -335,6 +338,7 @@ async fn test_alias_equal_to_upstream_override_still_warns() {
             "modelDisplayName":   "Bare-Alias Override Test Model",
             "modelDescription":   "External model whose alias equals its upstream name",
             "contextLength":      128000,
+            "maxOutputLength": 1024,
             "verifiable":         false,
             "isActive":           true,
             "providerType":       "external",

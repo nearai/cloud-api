@@ -1,4 +1,7 @@
-use crate::models::{OrganizationBalance, OrganizationUsageLog, RecordUsageRequest, StopReason};
+use crate::models::{
+    OrganizationBalance, OrganizationUsageLog, RecordUsageRequest, ServedProviderTier,
+    ServedProviderType, StopReason,
+};
 use crate::pool::DbPool;
 use crate::repositories::utils::map_db_error;
 use crate::retry_db;
@@ -72,6 +75,10 @@ impl OrganizationUsageRepository {
             // the INSERT is skipped (no row returned) and we fetch the existing record.
             let stop_reason_str = request.stop_reason.as_ref().map(|r| r.as_str());
             let response_id_uuid = request.response_id.as_ref().map(|r| r.as_uuid());
+            let served_provider_tier = request.served_provider_tier.map(|tier| tier.as_str());
+            let served_provider_type = request
+                .served_provider_type
+                .map(|provider| provider.as_str());
             let maybe_row = transaction
                 .query_opt(
                     r#"
@@ -80,8 +87,9 @@ impl OrganizationUsageRepository {
                         model_id, model_name, input_tokens, output_tokens, cache_read_tokens, total_tokens,
                         input_cost, output_cost, total_cost,
                         inference_type, created_at, ttft_ms, avg_itl_ms, inference_id,
-                        provider_request_id, stop_reason, response_id, image_count
-                    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22)
+                        provider_request_id, stop_reason, response_id, image_count,
+                        served_provider_tier, served_provider_type, served_via_fallback
+                    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25)
                     ON CONFLICT (organization_id, inference_id) WHERE inference_id IS NOT NULL DO NOTHING
                     RETURNING *
                     "#,
@@ -108,6 +116,9 @@ impl OrganizationUsageRepository {
                         &stop_reason_str,
                         &response_id_uuid,
                         &request.image_count,
+                        &served_provider_tier,
+                        &served_provider_type,
+                        &request.served_via_fallback,
                     ],
                 )
                 .await
@@ -259,7 +270,8 @@ impl OrganizationUsageRepository {
                         model_id, model_name, input_tokens, output_tokens, cache_read_tokens, total_tokens,
                         input_cost, output_cost, total_cost,
                         inference_type, created_at, ttft_ms, avg_itl_ms, inference_id,
-                        provider_request_id, stop_reason, response_id, image_count
+                        provider_request_id, stop_reason, response_id, image_count,
+                        served_provider_tier, served_provider_type, served_via_fallback
                     FROM organization_usage_log
                     WHERE organization_id = $1
                     ORDER BY created_at DESC
@@ -328,7 +340,8 @@ impl OrganizationUsageRepository {
                         model_id, model_name, input_tokens, output_tokens, cache_read_tokens, total_tokens,
                         input_cost, output_cost, total_cost,
                         inference_type, created_at, ttft_ms, avg_itl_ms, inference_id,
-                        provider_request_id, stop_reason, response_id, image_count
+                        provider_request_id, stop_reason, response_id, image_count,
+                        served_provider_tier, served_provider_type, served_via_fallback
                     FROM organization_usage_log
                     WHERE api_key_id = $1
                     ORDER BY created_at DESC
@@ -442,6 +455,8 @@ impl OrganizationUsageRepository {
         // Convert response_id from UUID to ResponseId
         let response_id_uuid: Option<Uuid> = row.get("response_id");
         let response_id = response_id_uuid.map(ResponseId::from);
+        let served_provider_tier = parse_served_provider_tier(row.get("served_provider_tier"))?;
+        let served_provider_type = parse_served_provider_type(row.get("served_provider_type"))?;
 
         Ok(OrganizationUsageLog {
             id: row.get("id"),
@@ -466,6 +481,9 @@ impl OrganizationUsageRepository {
             stop_reason,
             response_id,
             image_count: row.get("image_count"),
+            served_provider_tier,
+            served_provider_type,
+            served_via_fallback: row.get("served_via_fallback"),
             was_inserted,
         })
     }
@@ -611,4 +629,20 @@ pub struct UsageByModel {
     pub total_tokens: i64,
     pub total_cost: i64,
     pub request_count: i64,
+}
+
+fn parse_served_provider_tier(value: Option<String>) -> Result<Option<ServedProviderTier>> {
+    value
+        .as_deref()
+        .map(str::parse)
+        .transpose()
+        .map_err(|message| anyhow::anyhow!("Invalid served_provider_tier in usage log: {message}"))
+}
+
+fn parse_served_provider_type(value: Option<String>) -> Result<Option<ServedProviderType>> {
+    value
+        .as_deref()
+        .map(str::parse)
+        .transpose()
+        .map_err(|message| anyhow::anyhow!("Invalid served_provider_type in usage log: {message}"))
 }

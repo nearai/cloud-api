@@ -68,6 +68,9 @@ impl PrefixRouter {
         }
     }
 
+    // Bucket count is internal to the router now that the Fleet reduces the
+    // routed bucket id modulo the live backend count; kept for tests + clarity.
+    #[allow(dead_code)]
     pub fn num_buckets(&self) -> usize {
         self.num_buckets
     }

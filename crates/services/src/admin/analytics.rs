@@ -126,8 +126,49 @@ pub struct PlatformMetrics {
     pub provider_error_or_timeout_rate: f64,
     /// 95th percentile time-to-first-token across the platform (ms)
     pub p95_ttft_ms: Option<f64>,
+    pub provider_usage: PlatformProviderUsage,
     pub top_models: Vec<TopModelMetrics>,
     pub top_organizations: Vec<TopOrganizationMetrics>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct PlatformProviderUsage {
+    pub fallback: ProviderUsageTotals,
+    pub non_fallback: ProviderUsageTotals,
+    pub by_provider_type: Vec<ProviderTypeUsage>,
+    pub by_provider_tier: Vec<ProviderTierUsage>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
+pub struct ProviderUsageTotals {
+    pub requests: i64,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub total_tokens: i64,
+    pub cache_read_tokens: i64,
+    pub consumed_cost_usd: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ProviderTypeUsage {
+    pub provider_type: Option<String>,
+    pub requests: i64,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub total_tokens: i64,
+    pub cache_read_tokens: i64,
+    pub consumed_cost_usd: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ProviderTierUsage {
+    pub provider_tier: Option<String>,
+    pub requests: i64,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub total_tokens: i64,
+    pub cache_read_tokens: i64,
+    pub consumed_cost_usd: f64,
 }
 
 /// One bucket of platform-wide time-series data
@@ -203,6 +244,19 @@ pub struct ModelRevenueEntry {
     pub provider_type: Option<String>,
     pub avg_ttft_ms: Option<f64>,
     pub p95_ttft_ms: Option<f64>,
+    pub served_provider_breakdown: Vec<ModelProviderRevenueBreakdown>,
+    pub fallback_requests: i64,
+    pub fallback_consumed_cost_usd: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ModelProviderRevenueBreakdown {
+    pub provider_type: Option<String>,
+    pub provider_tier: Option<String>,
+    pub served_via_fallback: bool,
+    pub requests: i64,
+    pub tokens: i64,
+    pub consumed_cost_usd: f64,
 }
 
 /// Paginated per-model consumption ranking for a period
@@ -277,7 +331,7 @@ pub struct ModelRevenueQuery {
     pub start: DateTime<Utc>,
     pub end: DateTime<Utc>,
     pub verifiable: Option<bool>,
-    /// Allowlisted provider type ("vllm" | "external"); validated in the handler.
+    /// Allowlisted provider type ("vllm" | "external" | "chutes"); validated in the handler.
     pub provider_type: Option<String>,
     /// Case-insensitive substring match on model name.
     pub model_search: Option<String>,
@@ -469,7 +523,7 @@ pub struct RevenueDensityReport {
 pub struct RevenueDensityQuery {
     pub start: DateTime<Utc>,
     pub end: DateTime<Utc>,
-    /// Optional provider_type filter (e.g. "nearai", "external").
+    /// Optional provider_type filter (e.g. "vllm", "external", "chutes").
     pub provider_type: Option<String>,
 }
 

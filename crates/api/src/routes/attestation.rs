@@ -4,6 +4,7 @@ use axum::{
     http::StatusCode,
     response::Json as ResponseJson,
 };
+use inference_providers::ProviderTier;
 use serde::{Deserialize, Serialize};
 use services::attestation::{AttestationError, SignatureLookupResult};
 use utoipa::{IntoParams, ToSchema};
@@ -116,6 +117,10 @@ pub struct AttestationQuery {
     /// Include TLS certificate fingerprint in the report data.
     /// Defaults to false; when true, report_data[..32] = SHA256(signing_address || cert_fingerprint).
     pub include_tls_fingerprint: Option<bool>,
+    /// Restrict the report to a specific serving tier.
+    /// Accepted values: `near` (NEAR AI's own TEE fleet) or `chutes` (attested Chutes fallback).
+    /// When omitted, the first successfully responding provider is used.
+    pub provider: Option<String>,
 }
 
 /// Evidence item in NVIDIA payload
@@ -288,6 +293,28 @@ pub async fn get_attestation_report(
         }
     }
 
+    // Parse ?provider= into a ProviderTier filter.
+    // Accepted values: "near" → Near, "chutes" → Attested3p.
+    // Unknown values are rejected with 400 so callers notice typos immediately.
+    let provider_filter = match params
+        .provider
+        .as_deref()
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        None => None,
+        Some("near") => Some(ProviderTier::Near),
+        Some("chutes") => Some(ProviderTier::Attested3p),
+        Some(unknown) => {
+            return Err(error_response(
+                StatusCode::BAD_REQUEST,
+                format!("Unknown provider '{unknown}'. Accepted values: 'near', 'chutes'."),
+                "invalid_request_error",
+                Some("provider"),
+            ));
+        }
+    };
+
     let report = app_state
         .attestation_service
         .get_attestation_report(
@@ -296,6 +323,7 @@ pub async fn get_attestation_report(
             params.nonce,
             params.signing_address,
             params.include_tls_fingerprint.unwrap_or(false),
+            provider_filter,
         )
         .await
         .map_err(attestation_report_error_response)?;

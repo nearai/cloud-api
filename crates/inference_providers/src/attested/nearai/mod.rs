@@ -203,7 +203,7 @@ impl Config {
 pub struct Provider {
     /// All NEAR-AI model-proxy state and behavior: config + clients, the TLS
     /// fingerprint pin state, the backend verifier, and the routing state
-    /// (prefix buckets, rotation addressing, signature pins). Provider is
+    /// (prefix affinity, rotation-index addressing, signature pins). Provider is
     /// becoming a thin trait adapter over this; methods currently still on the
     /// provider read their state via `self.fleet.*` until they move too.
     fleet: Arc<Fleet>,
@@ -247,10 +247,10 @@ impl Fleet {
         }
     }
 
-    /// Clear a bucket's client so it is re-verified on next use (called on a
+    /// Clear an index's client so it is re-verified on next use (called on a
     /// connection error — a stale H2 connection must not be reused unverified).
-    pub(super) fn clear_bucket(&self, bucket_id: usize) {
-        *self.bucket_clients[bucket_id]
+    pub(super) fn clear_index(&self, index: usize) {
+        *self.index_clients[index]
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = None;
     }
@@ -270,26 +270,13 @@ impl Fleet {
         Ok(headers)
     }
 
-    /// Build a one-shot client for a single rotation-SNI attempt. Pooling is
-    /// disabled so attempt N+1 can't reuse attempt N's connection; shares the
-    /// per-provider fingerprint state so the pinned SPKI set is enforced.
-    pub(super) fn build_rotation_client(&self) -> Result<Client, CompletionError> {
-        Client::builder()
-            .use_preconfigured_tls(self.tls_roots.build_config(self.fingerprint_state.clone()))
-            .pool_max_idle_per_host(0)
-            .http2_adaptive_window(true)
-            .connect_timeout(Duration::from_secs(5))
-            .read_timeout(self.config.completion_timeout())
-            .build()
-            .map_err(|e| CompletionError::CompletionError(format!("rotation_client_build: {e}")))
-    }
-
-    /// Maximum inline-verification retries when creating a verified bucket client.
+    /// Maximum inline-verification retries when creating a verified index client.
     const INLINE_VERIFY_RETRIES: usize = 2;
 
-    /// Spawn background tasks to pre-warm all bucket clients. No-op without a
-    /// verifier or before any fingerprint is pinned (Bootstrap/Blocked) — every
-    /// task would otherwise fail the security guard and log noise.
+    /// Spawn background tasks to pre-warm the per-index clients for the live
+    /// backend indices (`0..rotation_count()`). No-op without a verifier or
+    /// before any fingerprint is pinned (Bootstrap/Blocked) — every task would
+    /// otherwise fail the security guard and log noise.
     pub(super) fn pre_warm(self: Arc<Self>) {
         if self.backend_verifier.is_none() {
             return;
@@ -300,33 +287,52 @@ impl Fleet {
             );
             return;
         }
-        let num_buckets = self.bucket_clients.len();
-        tracing::info!(num_buckets = num_buckets, "Pre-warming bucket clients");
-        for bucket_id in 0..num_buckets {
+        let count = self.rotation_count();
+        if count == 0 {
+            tracing::debug!("Pre-warm skipped: rotation count is 0 (no backend count yet)");
+            return;
+        }
+        tracing::info!(num_indices = count, "Pre-warming per-index clients");
+        for index in 0..count {
             let fleet = self.clone();
             tokio::spawn(async move {
-                match fleet.get_or_verify_bucket_client(bucket_id).await {
-                    Ok(_) => tracing::debug!(bucket = bucket_id, "Bucket pre-warm complete"),
+                match fleet.get_or_verify_index_client(index).await {
+                    Ok(_) => tracing::debug!(index, "Index pre-warm complete"),
                     Err(e) => tracing::warn!(
-                        bucket = bucket_id,
+                        index,
                         error = %e,
-                        "Bucket pre-warm failed; will retry inline on first use"
+                        "Index pre-warm failed; will retry inline on first use"
                     ),
                 }
             });
         }
     }
 
-    /// Get the client for a bucket, creating + verifying it inline if needed.
-    /// Bounded by `verification_semaphore`; on exhausted retries falls back to
-    /// `fallback_client` only once a fingerprint is pinned (else fails closed).
-    pub(super) async fn get_or_verify_bucket_client(
+    /// Get the client for a backend index, creating + verifying it inline if
+    /// needed. Verification targets the index's rotation SNI
+    /// (`<canonical>-i<index>.<base>`) so the pinned H2 connection lands on
+    /// backend `index`. Bounded by `verification_semaphore`; on exhausted
+    /// retries falls back to `fallback_client` only once a fingerprint is
+    /// pinned (else fails closed).
+    pub(super) async fn get_or_verify_index_client(
         &self,
-        bucket_id: usize,
+        index: usize,
     ) -> Result<Client, CompletionError> {
-        // Fast path: bucket already has a verified client.
+        // Defensive bound. By construction every caller derives `index` from
+        // `select_index`/`fallback_indices` (both bounded by `rotation_count()`
+        // ≤ `MAX_FANOUT` = `index_clients.len()`) or from a `signature_rotation`
+        // pin that was recorded under the same bound — so this never trips
+        // today. Guard anyway rather than index-panic: this is attestation
+        // hot-path code and a future caller mustn't be able to crash the worker.
+        if index >= self.index_clients.len() {
+            return Err(CompletionError::CompletionError(format!(
+                "backend index {index} out of range (max {})",
+                self.index_clients.len()
+            )));
+        }
+        // Fast path: index already has a verified client.
         {
-            let guard = self.bucket_clients[bucket_id]
+            let guard = self.index_clients[index]
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
             if let Some(ref client) = *guard {
@@ -339,14 +345,14 @@ impl Fleet {
             Some(v) => v,
             None => {
                 return Err(CompletionError::CompletionError(
-                    "No backend verifier configured for lazy bucket creation".to_string(),
+                    "No backend verifier configured for lazy index creation".to_string(),
                 ));
             }
         };
 
         // Bound concurrent inline verifications (thundering-herd guard). The
         // permit is held for the whole retry loop; the first success fills the
-        // bucket and subsequent waiters take the fast path after re-checking.
+        // index slot and subsequent waiters take the fast path after re-checking.
         let _permit = self
             .verification_semaphore
             .acquire()
@@ -355,7 +361,7 @@ impl Fleet {
 
         // Re-check after acquiring the permit.
         {
-            let guard = self.bucket_clients[bucket_id]
+            let guard = self.index_clients[index]
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
             if let Some(ref client) = *guard {
@@ -363,11 +369,28 @@ impl Fleet {
             }
         }
 
+        // Verify against the index's rotation SNI so the pinned connection lands
+        // on backend `index`. If rotation parts are missing (non-rotation URL),
+        // fall back to the canonical base_url — but in that mode callers reach
+        // the canonical path and don't request index clients on the hot path.
+        //
+        // Trim the trailing slash: `rotation_url(index, "")` yields
+        // `https://<canonical>-i<index>.<base>/`, and `create_verified_client`
+        // appends the probe path as `{base_url}/v1/...`. Without the trim that
+        // becomes `//v1/models`, which model-proxy's nginx sidecar does not
+        // match — every index client would fail verification in production
+        // (localhost tests can't catch this, as they disable rotation). The
+        // canonical base_url has no trailing slash by convention.
+        let verify_url = match self.rotation_url(index as u64, "") {
+            Some(u) => u.trim_end_matches('/').to_string(),
+            None => self.config.base_url.clone(),
+        };
+
         let mut last_err = None;
         for _attempt in 0..=Self::INLINE_VERIFY_RETRIES {
-            match verifier.create_verified_client(&self.config.base_url).await {
+            match verifier.create_verified_client(&verify_url).await {
                 Ok(client) => {
-                    let mut guard = self.bucket_clients[bucket_id]
+                    let mut guard = self.index_clients[index]
                         .lock()
                         .unwrap_or_else(|e| e.into_inner());
                     if let Some(ref existing) = *guard {
@@ -377,14 +400,14 @@ impl Fleet {
                     return Ok(client);
                 }
                 Err(e) => {
-                    let guard = self.bucket_clients[bucket_id]
+                    let guard = self.index_clients[index]
                         .lock()
                         .unwrap_or_else(|e| e.into_inner());
                     if let Some(ref existing) = *guard {
                         return Ok(existing.clone());
                     }
                     drop(guard);
-                    tracing::warn!(bucket = bucket_id, error = %e, "Inline backend verification failed, retrying");
+                    tracing::warn!(index, error = %e, "Inline backend verification failed, retrying");
                     last_err = Some(e);
                 }
             }
@@ -399,11 +422,11 @@ impl Fleet {
             last_err.unwrap_or_default()
         );
         if self.pinned_fingerprint_count() > 0 {
-            tracing::warn!(bucket = bucket_id, error = %err_msg, "Inline backend verification exhausted retries; serving with fallback client");
+            tracing::warn!(index, error = %err_msg, "Inline backend verification exhausted retries; serving with fallback client");
             Ok(self.fallback_client.clone())
         } else {
             tracing::warn!(
-                bucket = bucket_id,
+                index,
                 error = %err_msg,
                 "Inline backend verification exhausted retries in Bootstrap state; \
                  refusing fallback to prevent unauthenticated connections"
@@ -415,7 +438,7 @@ impl Fleet {
 
 impl Provider {
     /// Create a new vLLM provider with the given configuration.
-    /// Without a `BackendVerifier`, bucket clients are pre-created eagerly
+    /// Without a `BackendVerifier`, per-index clients are pre-created eagerly
     /// (legacy behavior for tests and non-TEE environments).
     pub fn new(config: Config) -> Self {
         let fingerprint_state = Arc::new(std::sync::RwLock::new(FingerprintState::Bootstrap));
@@ -423,7 +446,7 @@ impl Provider {
     }
 
     /// Create a new vLLM provider sharing an existing fingerprint state.
-    /// Without a `BackendVerifier`, bucket clients are pre-created eagerly.
+    /// Without a `BackendVerifier`, per-index clients are pre-created eagerly.
     pub fn new_with_fingerprint_state(
         config: Config,
         fingerprint_state: Arc<std::sync::RwLock<FingerprintState>>,
@@ -437,9 +460,9 @@ impl Provider {
     }
 
     /// Create a new vLLM provider with inline backend verification.
-    /// Bucket clients are created lazily: on first use, the verifier connects to
-    /// a backend, verifies attestation, pins the fingerprint, and returns a client
-    /// whose H2 connection is pinned to that verified backend.
+    /// Per-index clients are created lazily: on first use, the verifier connects
+    /// to the index's backend, verifies attestation, pins the fingerprint, and
+    /// returns a client whose H2 connection is pinned to that verified backend.
     pub fn new_with_verifier(
         config: Config,
         fingerprint_state: Arc<std::sync::RwLock<FingerprintState>>,
@@ -519,16 +542,17 @@ impl Provider {
         let verification_semaphore = Arc::new(Semaphore::new(inline_verify_concurrency));
 
         let prefix_router = Arc::new(PrefixRouter::new());
-        let num_buckets = prefix_router.num_buckets();
 
-        // Bucket clients: lazily filled when a verifier is available (each bucket
-        // gets a verified client on first use), or eagerly pre-created (legacy).
-        let bucket_clients: Vec<std::sync::Mutex<Option<Client>>> = if backend_verifier.is_some() {
-            (0..num_buckets)
+        // Per-index clients: one slot per rotation index, sized to the hard
+        // fan-out cap. Lazily filled when a verifier is available (each index
+        // gets a verified client pinned to backend `i` on first use), or
+        // eagerly pre-created (legacy / non-TEE mode).
+        let index_clients: Vec<std::sync::Mutex<Option<Client>>> = if backend_verifier.is_some() {
+            (0..crate::rotation::MAX_FANOUT)
                 .map(|_| std::sync::Mutex::new(None))
                 .collect()
         } else {
-            (0..num_buckets)
+            (0..crate::rotation::MAX_FANOUT)
                 .map(|_| {
                     let builder = Client::builder()
                         .use_preconfigured_tls(tls_roots.build_config(fingerprint_state.clone()))
@@ -536,12 +560,12 @@ impl Provider {
                         .http2_adaptive_window(true)
                         .connect_timeout(Duration::from_secs(5))
                         .read_timeout(completion_timeout);
-                    // Bucket clients need the H2 connection to stay sticky to a
+                    // Index clients need the H2 connection to stay sticky to a
                     // single backend across long idle gaps; see
                     // `crate::bucket_keepalive`.
                     let c = crate::bucket_keepalive::apply(builder)
                         .build()
-                        .expect("Failed to create bucket HTTP client");
+                        .expect("Failed to create index HTTP client");
                     std::sync::Mutex::new(Some(c))
                 })
                 .collect()
@@ -560,14 +584,13 @@ impl Provider {
             fleet: Arc::new(Fleet::new(
                 rotation_parts,
                 prefix_router,
-                bucket_clients,
+                index_clients,
                 config,
                 client,
                 fallback_client,
                 verification_semaphore,
                 fingerprint_state,
                 backend_verifier,
-                tls_roots,
             )),
         }
     }
@@ -603,8 +626,8 @@ impl Provider {
         self.fleet.pinned_fingerprint_count()
     }
 
-    /// Spawn background tasks to pre-warm all bucket clients (delegates to
-    /// [`Fleet::pre_warm`]; no-op without a verifier or before any
+    /// Spawn background tasks to pre-warm the live per-index clients (delegates
+    /// to [`Fleet::pre_warm`]; no-op without a verifier or before any
     /// fingerprint is pinned).
     pub fn pre_warm(self: Arc<Self>) {
         self.fleet.clone().pre_warm();
@@ -779,45 +802,46 @@ impl Fleet {
         status_code == 408 || status_code == 429 || (500..=599).contains(&status_code)
     }
 
-    /// Iterate every healthy backend by index until one returns a 2xx (or
-    /// every backend has been exhausted). Called by `chat_completion` after
-    /// the sticky bucket's canonical-SNI attempt returns 5xx/429: with H2
-    /// pooling disabled on each per-index client, every attempt lands on a
-    /// distinct backend, so a single overloaded SGLang can't poison the
-    /// whole request.
+    /// Walk the fallback indices (ordered fastest-EMA first) until one returns
+    /// a 2xx (or every backend has been exhausted). Called by `chat_completion`
+    /// after the sticky index's attempt returns 5xx/429. Each index uses its
+    /// pooled, attestation-verified client (`get_or_verify_index_client`), so a
+    /// served completion is always from a verified backend, and the served
+    /// index is recorded in `signature_rotation` so the signature fetch reuses
+    /// the same warm connection.
     ///
     /// `canonical_err` is the error that triggered the fallback; if all
-    /// rotation indices return retryable failures it surfaces as the final
-    /// error to preserve the original `status_code` for `map_provider_error`.
-    async fn try_chat_completion_rotation(
+    /// indices return retryable failures it surfaces as the final error to
+    /// preserve the original `status_code` for `map_provider_error`.
+    async fn try_chat_completion_fallback_indices(
         &self,
+        indices: &[usize],
         params: &ChatCompletionParams,
         headers: &reqwest::header::HeaderMap,
         timeout: Duration,
         canonical_err: CompletionError,
     ) -> Result<ChatCompletionResponseWithBytes, CompletionError> {
-        let count = self.rotation_count();
         // `last_error` tracks only HttpError-shaped failures so the pool's
         // `classify_retry_decision` sees a typed `retryable_http_5xx` (or
-        // 429) at the end. Transport-level failures from the rotation loop
+        // 429) at the end. Transport-level failures from the fallback loop
         // (Timeout, generic CompletionError) are logged but never overwrite
-        // `last_error`: if every rotation index produced only transport
+        // `last_error`: if every index produced only transport
         // errors, we fall back to `canonical_err` (always an HttpError 5xx/
         // 429 by call-site construction) instead of returning a misleading
         // `CompletionError(...)` that would classify as
         // `retryable_connection_keyword`.
         let mut last_error = canonical_err;
-        for index in 0..count as u64 {
-            let url = match self.rotation_url(index, "/v1/chat/completions") {
+        for &index in indices {
+            let url = match self.rotation_url(index as u64, "/v1/chat/completions") {
                 Some(u) => u,
                 None => continue,
             };
-            let client = match self.build_rotation_client() {
+            let client = match self.get_or_verify_index_client(index).await {
                 Ok(c) => c,
                 Err(e) => {
                     tracing::debug!(
                         index, error = %e,
-                        "Rotation-SNI chat_completion client build failed, trying next backend"
+                        "Fallback index client unavailable, trying next backend"
                     );
                     continue;
                 }
@@ -842,7 +866,7 @@ impl Fleet {
                         index, error = %format_error_chain(&e),
                         is_timeout = e.is_timeout(),
                         is_connect = e.is_connect(),
-                        "Rotation-SNI chat_completion attempt errored, trying next backend"
+                        "Fallback index chat_completion attempt errored, trying next backend"
                     );
                     continue;
                 }
@@ -862,14 +886,14 @@ impl Fleet {
                     tracing::debug!(
                         index,
                         status_code,
-                        "Rotation-SNI chat_completion backend still 5xx/429/408, trying next"
+                        "Fallback index chat_completion backend still 5xx/429/408, trying next"
                     );
                     last_error = err;
                     continue;
                 }
                 // 4xx (other than 408/429) means the request itself is bad —
                 // surface immediately rather than burn the rest of the
-                // rotation set on the same client error.
+                // fallback set on the same client error.
                 return Err(err);
             }
 
@@ -887,64 +911,70 @@ impl Fleet {
             self.signature_rotation
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .insert(chat_id, index);
+                .insert(chat_id, index as u64);
             tracing::info!(
                 index,
-                "Rotation-SNI chat_completion served by alternative backend"
+                "Fallback index chat_completion served by alternative backend"
             );
             return Ok(ChatCompletionResponseWithBytes {
                 response: chat_completion_response,
                 raw_bytes,
+                serving_tier: crate::ProviderTier::Near,
             });
         }
         Err(last_error)
     }
 
-    /// Streaming sibling of `try_chat_completion_rotation`. Two failure modes
-    /// land here:
-    ///   - The canonical send returned HTTP 5xx/429 outright (e.g. nginx 502
-    ///     when the inference-proxy container is restarting).
-    ///   - The canonical send returned HTTP 200 but the first SSE chunk was
+    /// Streaming sibling of `try_chat_completion_fallback_indices`. Two failure
+    /// modes land here:
+    ///   - The sticky index's send returned HTTP 5xx/429 outright (e.g. nginx
+    ///     502 when the inference-proxy container is restarting).
+    ///   - The sticky index's send returned HTTP 200 but the first SSE chunk was
     ///     a `{"error":{"code":...}}` frame, which the parser now surfaces as
     ///     a typed `HttpError` (the SGLang queue-full path that inference-
     ///     proxy's SseTransformer forwards verbatim).
     ///
-    /// We iterate every backend by rotation index until one returns a 200
-    /// whose first SSE chunk is a real content event. Bytes already sent to
-    /// the client are zero (peek happens before any chunk forwarding), so
-    /// retrying the whole stream is safe.
-    async fn try_chat_completion_stream_rotation(
+    /// We walk `indices` (ordered fastest-EMA first by the caller) until one
+    /// returns a 200 whose first SSE chunk is a real content event. Each index
+    /// uses its pooled, attestation-verified client, so a served stream is
+    /// always from a verified backend; the served index is recorded in
+    /// `pending_rotation` and the returned stream is wrapped in a TTFT probe.
+    /// Bytes already sent to the client are zero (peek happens before any chunk
+    /// forwarding), so retrying the whole stream is safe.
+    async fn try_stream_fallback_indices(
         &self,
+        indices: &[usize],
         params: &ChatCompletionParams,
         headers: &reqwest::header::HeaderMap,
         request_hash: &str,
         canonical_err: CompletionError,
     ) -> Result<StreamingResult, CompletionError> {
-        let count = self.rotation_count();
         // See the non-streaming sibling for the design: `last_error` only
-        // tracks HttpError-shaped failures from rotation indices, so the
+        // tracks HttpError-shaped failures from fallback indices, so the
         // pool's `classify_retry_decision` sees the right `retryable_http_*`
         // label at the end. Transport-level failures (Timeout, generic
         // CompletionError) are logged but never overwrite `last_error`;
-        // if rotation produces only transport errors, we fall back to
+        // if the fallback produces only transport errors, we fall back to
         // `canonical_err` (always HttpError 5xx/429 by call-site
         // construction).
         let mut last_error = canonical_err;
-        for index in 0..count as u64 {
-            let url = match self.rotation_url(index, "/v1/chat/completions") {
+        for &index in indices {
+            let url = match self.rotation_url(index as u64, "/v1/chat/completions") {
                 Some(u) => u,
                 None => continue,
             };
-            let client = match self.build_rotation_client() {
+            let client = match self.get_or_verify_index_client(index).await {
                 Ok(c) => c,
                 Err(e) => {
                     tracing::debug!(
                         index, error = %e,
-                        "Rotation-SNI stream client build failed, trying next backend"
+                        "Fallback index stream client unavailable, trying next backend"
                     );
                     continue;
                 }
             };
+            // Capture the send instant for the per-backend TTFT measurement.
+            let started = std::time::Instant::now();
             let response = match self
                 .send_streaming_request(&url, headers.clone(), params, Some(&client))
                 .await
@@ -961,11 +991,11 @@ impl Fleet {
                         return Err(e);
                     }
                     // Retryable HttpError (5xx/429/408) — update last_error
-                    // so the trace label stays accurate at end-of-rotation.
+                    // so the trace label stays accurate at end-of-fallback.
                     CompletionError::HttpError { .. } => {
                         tracing::debug!(
                             index, error = %e,
-                            "Rotation-SNI stream attempt returned 5xx/429/408, trying next backend"
+                            "Fallback index stream attempt returned 5xx/429/408, trying next backend"
                         );
                         last_error = e;
                         continue;
@@ -980,7 +1010,7 @@ impl Fleet {
                         tracing::debug!(
                             index,
                             error = %e,
-                            "Rotation-SNI stream attempt failed transport, trying next backend"
+                            "Fallback index stream attempt failed transport, trying next backend"
                         );
                         continue;
                     }
@@ -993,7 +1023,7 @@ impl Fleet {
                 tracing::debug!(
                     index,
                     status_code,
-                    "Rotation-SNI stream attempt: first chunk was an error, trying next backend"
+                    "Fallback index stream attempt: first chunk was an error, trying next backend"
                 );
                 last_error = CompletionError::HttpError {
                     status_code,
@@ -1006,12 +1036,18 @@ impl Fleet {
             self.pending_rotation
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .insert(request_hash.to_string(), index);
+                .insert(request_hash.to_string(), index as u64);
             tracing::info!(
                 index,
-                "Rotation-SNI chat_completion_stream served by alternative backend"
+                "Fallback index chat_completion_stream served by alternative backend"
             );
-            return Ok(stream);
+            let probed: StreamingResult = Box::pin(TtftProbe::new(
+                stream,
+                self.backend_stats.clone(),
+                index,
+                started,
+            ));
+            return Ok(probed);
         }
         Err(last_error)
     }
@@ -1064,6 +1100,68 @@ impl Fleet {
     }
 }
 
+/// Stream adapter that measures time-to-first-content-token for a backend
+/// index and folds it into the per-index TTFT EMA.
+///
+/// It holds only a clone of the `backend_stats` Arc (not `&Fleet`), so the
+/// measurement happens lazily as the client consumes the stream — after the
+/// originating Fleet method has returned. The probe records exactly once, on
+/// the first SSE event that carries parsed content (`event.chunk.is_some()`),
+/// then becomes a transparent pass-through. No request/response content is
+/// touched or logged — only a latency number bound to an index.
+struct TtftProbe<S> {
+    inner: S,
+    stats: Arc<std::sync::Mutex<Vec<fleet::BackendStat>>>,
+    index: usize,
+    /// Send instant; `None` once the first content TTFT has been recorded.
+    start: Option<std::time::Instant>,
+}
+
+impl<S> TtftProbe<S> {
+    fn new(
+        inner: S,
+        stats: Arc<std::sync::Mutex<Vec<fleet::BackendStat>>>,
+        index: usize,
+        start: std::time::Instant,
+    ) -> Self {
+        Self {
+            inner,
+            stats,
+            index,
+            start: Some(start),
+        }
+    }
+}
+
+impl<S> futures_util::Stream for TtftProbe<S>
+where
+    S: futures_util::Stream<Item = Result<SSEEvent, CompletionError>> + Unpin,
+{
+    type Item = Result<SSEEvent, CompletionError>;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        let polled = std::pin::Pin::new(&mut self.inner).poll_next(cx);
+        if let std::task::Poll::Ready(Some(Ok(ref event))) = polled {
+            // Only a content-bearing chunk counts as the first token; leading
+            // control events (keepalives, blank separators) don't.
+            if event.chunk.is_some() {
+                if let Some(start) = self.start.take() {
+                    let ttft_ms = start.elapsed().as_millis() as f64;
+                    let index = self.index;
+                    let mut stats = self.stats.lock().unwrap_or_else(|e| e.into_inner());
+                    if let Some(s) = stats.get_mut(index) {
+                        fleet::update_ema(s, ttft_ms);
+                    }
+                }
+            }
+        }
+        polled
+    }
+}
+
 #[async_trait]
 impl InferenceProvider for Fleet {
     /// NEAR's own attested fleet. `Provider` (which wraps `Fleet`) is what the pool
@@ -1071,6 +1169,10 @@ impl InferenceProvider for Fleet {
     /// never misclassify a `Fleet` as plaintext if one is ever pooled directly.
     fn tier(&self) -> crate::ProviderTier {
         crate::ProviderTier::Near
+    }
+
+    fn provider_source(&self) -> crate::ProviderSource {
+        crate::ProviderSource::Vllm
     }
 
     async fn get_signature(
@@ -1086,46 +1188,42 @@ impl InferenceProvider for Fleet {
             .map_err(CompletionError::CompletionError)?;
         let timeout = self.config.control_timeout();
 
-        // Resolve the rotation-SNI target once; it's stable across retries.
-        // If this chat_id was served by a rotation-SNI fallback (sticky bucket
-        // returned 5xx, so we walked backends by index until one took the
-        // request), the signature lives on that *specific* backend — neither
-        // the bucket-pinned client nor the general LB client can find it — so
-        // we try this client FIRST on every attempt.
+        // Resolve the backend-index target once; it's stable across retries.
+        // Every index-routed completion records `signature_rotation[chat_id] =
+        // index`, so the signature lives on that *specific* backend. We reuse
+        // the warm, pooled, attestation-verified index client — the same
+        // connection that served the completion — to fetch it. Only chats with
+        // no pin (the count==0 canonical path) fall back to the general LB
+        // client.
         let rotation_index = self
             .signature_rotation
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .get(chat_id)
             .copied();
-        let rotation_target = rotation_index.and_then(|index| {
-            let base = self.rotation_url(index, "")?;
-            let url = format!("{}{}", base.trim_end_matches('/'), path_and_query);
-            let client = self.build_rotation_client().ok()?;
-            Some((index, url, client))
-        });
+        let rotation_target = if let Some(index) = rotation_index {
+            match self.rotation_url(index, "") {
+                Some(base) => {
+                    let url = format!("{}{}", base.trim_end_matches('/'), path_and_query);
+                    // Reuse the pooled, verified index client (same warm
+                    // connection as the completion). Lazy-create + verify it if
+                    // it was cleared (e.g. a count change reset the slot).
+                    match self.get_or_verify_index_client(index as usize).await {
+                        Ok(client) => Some((index, url, client)),
+                        Err(e) => {
+                            tracing::debug!(index, error = %e, "Signature index client unavailable");
+                            None
+                        }
+                    }
+                }
+                None => None,
+            }
+        } else {
+            None
+        };
 
-        // Bucket client hits the same backend under HTTP/2 (ALPN-negotiated)
-        // multiplexing. Under HTTP/1.1 fallback with concurrency it may have
-        // opened a second connection to a different backend, so on 404 we fall
-        // back to the general-purpose LB client.
-        let bucket_id = self
-            .signature_buckets
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(chat_id)
-            .copied();
-        let bucket_client = bucket_id.and_then(|id| {
-            self.bucket_clients[id]
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .clone()
-        });
-        let mut clients_to_try: Vec<&Client> = Vec::new();
-        if let Some(ref bc) = bucket_client {
-            clients_to_try.push(bc);
-        }
-        clients_to_try.push(&self.client);
+        // No pin → walk the general-purpose LB client (count==0 canonical path).
+        let clients_to_try: Vec<&Client> = vec![&self.client];
 
         // The backend signs in a background task that finalizes *after* the
         // final stream chunk, then caches the signature. cloud-api fetches in
@@ -1133,8 +1231,8 @@ impl InferenceProvider for Fleet {
         // backend is usually a signing race (the signature lands a few ms
         // later), not a permanent miss. Retry the whole fetch with a short,
         // bounded backoff. Only a 404 is retried: a non-404 status is
-        // definitive, and a transport error is definitive on the rotation
-        // backend or once it reaches the last bucket/general client.
+        // definitive, and a transport error is definitive on the pinned index
+        // backend or once it reaches the general client.
         //
         // Latency bound: the backoffs add at most their sum (~350ms), but each
         // request also keeps its own `control_timeout`, so a slow (not fast-404)
@@ -1143,16 +1241,16 @@ impl InferenceProvider for Fleet {
         // cancels the whole store if it runs long.
         let mut last_error = None;
         for attempt in 0..=SIGNATURE_FETCH_BACKOFFS_MS.len() {
-            // For a rotation-pinned chat the signature was produced on that
+            // For an index-pinned chat the signature was produced on that
             // *specific* backend, so its response is the ONLY authoritative one:
-            // the bucket/general clients can't have the signature, and probing
-            // them risks a non-authoritative 5xx/transport error suppressing a
-            // retryable rotation 404 (the signature would then be lost). So when
-            // a rotation pin exists we talk only to it — a 404 is the
-            // signing-race signal (retry), and any non-404 status or transport
-            // error (e.g. a TLS SPKI/attestation mismatch) is definitive and
-            // fails fast. Without a pin we walk bucket → general and treat an
-            // all-404 sweep as the race signal.
+            // the general client can't have the signature, and probing it risks
+            // a non-authoritative 5xx/transport error suppressing a retryable
+            // index 404 (the signature would then be lost). So when an index pin
+            // exists we talk only to it — a 404 is the signing-race signal
+            // (retry), and any non-404 status or transport error (e.g. a TLS
+            // SPKI/attestation mismatch) is definitive and fails fast. Without a
+            // pin we walk the general client and treat an all-404 sweep as the
+            // race signal.
             let retryable;
             if let Some((index, rotation_url, client)) = &rotation_target {
                 let index = *index;
@@ -1397,8 +1495,6 @@ impl InferenceProvider for Fleet {
         params: ChatCompletionParams,
         request_hash: String,
     ) -> Result<StreamingResult, CompletionError> {
-        let url = format!("{}/v1/chat/completions", self.config.base_url);
-
         // Ensure streaming and token usage are enabled
         let mut streaming_params = params;
         // #666: self-hosted vLLM serves a verbatim copy of `ChatMessage.content`,
@@ -1425,28 +1521,55 @@ impl InferenceProvider for Fleet {
         // Prepare encryption headers
         self.prepare_encryption_headers(&mut headers, &mut streaming_params.extra);
 
-        // Route to a bucket client based on prompt prefix.
-        // The bucket client maintains a persistent H2 connection to a verified backend
-        // via L4 passthrough → prefix cache hits. Buckets are lazily filled: on first
-        // use, inline verification connects to a backend, verifies attestation, and
-        // pins the client.
-        let bucket_id = self.route(&streaming_params.messages);
-        let bucket_client = self.get_or_verify_bucket_client(bucket_id).await?;
-        let canonical_send = match self
+        // Select the backend rotation index: prefix affinity → same backend →
+        // prefix cache hit, with latency steering off a pathologically slow
+        // backend. `None` means rotation is unavailable (cold-start before
+        // discovery's first count, or a non-rotation URL like `localhost`) —
+        // serve via the canonical fallback path (no index, no per-backend
+        // measurement) so those paths keep working unchanged.
+        let index = match self.select_index(&streaming_params.messages) {
+            None => {
+                let url = format!("{}/v1/chat/completions", self.config.base_url);
+                let response = self
+                    .send_streaming_request(
+                        &url,
+                        headers.clone(),
+                        &streaming_params,
+                        Some(&self.fallback_client),
+                    )
+                    .await?;
+                let sse_stream = new_sse_parser(response.bytes_stream(), true);
+                return Ok(Box::pin(sse_stream));
+            }
+            Some(i) => i,
+        };
+
+        // The index client maintains a persistent H2 connection to a verified
+        // backend (`<canonical>-i<index>.<base>`) via L4 passthrough → prefix
+        // cache hits. Index clients are lazily filled: on first use, inline
+        // verification connects to the index's backend, verifies attestation,
+        // and pins the client.
+        let url = self
+            .rotation_url(index as u64, "/v1/chat/completions")
+            .unwrap_or_else(|| format!("{}/v1/chat/completions", self.config.base_url));
+        let index_client = self.get_or_verify_index_client(index).await?;
+        // Capture the send instant for the per-backend TTFT measurement.
+        let started = std::time::Instant::now();
+        let primary_send = match self
             .send_streaming_request(
                 &url,
                 headers.clone(),
                 &streaming_params,
-                Some(&bucket_client),
+                Some(&index_client),
             )
             .await
         {
             Ok(r) => Ok(r),
             Err(ref e) if Fleet::is_connection_error(e) => {
                 // Connection dropped or fingerprint mismatch on reconnect —
-                // clear bucket and re-verify with a fresh attestation.
-                self.clear_bucket(bucket_id);
-                let fresh = self.get_or_verify_bucket_client(bucket_id).await?;
+                // clear the index client and re-verify with a fresh attestation.
+                self.clear_index(index);
+                let fresh = self.get_or_verify_index_client(index).await?;
                 self.send_streaming_request(&url, headers.clone(), &streaming_params, Some(&fresh))
                     .await
             }
@@ -1454,49 +1577,42 @@ impl InferenceProvider for Fleet {
         };
 
         // Decision tree before exposing the stream:
-        //   - HTTP-level 5xx/429 (status arrived in response headers): try
-        //     rotation-SNI backends in order.
+        //   - HTTP-level 5xx/429 (status arrived in response headers): walk the
+        //     other backend indices ordered by EMA.
         //   - HTTP 200 + first SSE chunk is `{"error":{"code":N,...}}`
         //     (SGLang queue-full path, which inference-proxy's SseTransformer
         //     forwards verbatim): peek catches it via the parser's typed
-        //     `HttpError` and we route to the same rotation fallback.
-        //   - Otherwise: pin bucket, return peekable as the live stream.
+        //     `HttpError` and we route to the same fallback.
+        //   - Otherwise: record the index, wrap the stream in a TTFT probe, and
+        //     return it as the live stream.
         //
-        // We only peek when rotation is actually possible
-        // (`rotation_count() > 0`): the peek blocks until the first SSE
-        // chunk arrives, so on the happy path it adds first-byte latency
-        // to every streaming request. When rotation can't help (cold-start
-        // before discovery's first cycle, or non-rotation URLs like
-        // `localhost`), skip the peek so a first-chunk error still surfaces
-        // through the route layer's `sse_error_frame` path (PR #629) and
-        // happy-path streams return HTTP 200 as soon as the headers arrive.
-        match canonical_send {
-            Ok(response) if self.rotation_count() == 0 => {
-                self.pending_buckets
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .insert(request_hash, bucket_id);
-                let sse_stream = new_sse_parser(response.bytes_stream(), true);
-                Ok(Box::pin(sse_stream))
-            }
+        // Rotation is always possible on this path (we have an index), so we
+        // always peek: the peek blocks until the first SSE chunk arrives, so on
+        // the happy path it adds first-byte latency to the streaming request —
+        // the cost of being able to reroute off a first-chunk error frame.
+        match primary_send {
             Ok(response) => {
                 let parser = new_sse_parser(response.bytes_stream(), true);
                 let stream: StreamingResult = Box::pin(parser);
                 let (first_chunk_status, stream) = Self::peek_first_payload_status(stream).await;
                 match first_chunk_status {
                     None => {
-                        self.pending_buckets
+                        self.pending_rotation
                             .lock()
                             .unwrap_or_else(|e| e.into_inner())
-                            .insert(request_hash, bucket_id);
-                        Ok(stream)
+                            .insert(request_hash, index as u64);
+                        let probed: StreamingResult = Box::pin(TtftProbe::new(
+                            stream,
+                            self.backend_stats.clone(),
+                            index,
+                            started,
+                        ));
+                        Ok(probed)
                     }
                     Some(status_code) => {
-                        // rotation_count() > 0 is guaranteed by the arm
-                        // guard above, so the fallback will actually iterate
-                        // at least one alternative backend.
                         drop(stream);
-                        self.try_chat_completion_stream_rotation(
+                        self.try_stream_fallback_indices(
+                            &self.fallback_indices(index),
                             &streaming_params,
                             &headers,
                             &request_hash,
@@ -1512,10 +1628,10 @@ impl InferenceProvider for Fleet {
             }
             Err(canonical_err) => match &canonical_err {
                 CompletionError::HttpError { status_code, .. }
-                    if Fleet::is_rotation_retryable_status(*status_code)
-                        && self.rotation_count() > 0 =>
+                    if Fleet::is_rotation_retryable_status(*status_code) =>
                 {
-                    self.try_chat_completion_stream_rotation(
+                    self.try_stream_fallback_indices(
+                        &self.fallback_indices(index),
                         &streaming_params,
                         &headers,
                         &request_hash,
@@ -1534,8 +1650,6 @@ impl InferenceProvider for Fleet {
         params: ChatCompletionParams,
         request_hash: String,
     ) -> Result<ChatCompletionResponseWithBytes, CompletionError> {
-        let url = format!("{}/v1/chat/completions", self.config.base_url);
-
         let mut non_streaming_params = params;
         // #666: drop Anthropic prompt-caching breakpoints before forwarding to
         // self-hosted vLLM (see the streaming path for the rationale).
@@ -1553,25 +1667,13 @@ impl InferenceProvider for Fleet {
         // Prepare encryption headers
         self.prepare_encryption_headers(&mut headers, &mut non_streaming_params.extra);
 
-        // Route to a verified bucket client based on prompt prefix.
-        let bucket_id = self.route(&non_streaming_params.messages);
-        let bucket_client = self.get_or_verify_bucket_client(bucket_id).await?;
         let timeout_secs = self.config.completion_timeout_seconds.max(0) as u64;
         let timeout = Duration::from_secs(timeout_secs);
-
-        let send = |client: &Client, hdrs: reqwest::header::HeaderMap| {
-            client
-                .post(&url)
-                .headers(hdrs)
-                .json(&non_streaming_params)
-                .timeout(timeout)
-                .send()
-        };
 
         // Distinguish timeout from other transport errors so the pool can refuse
         // to retry timeouts (a re-send hits the same model with the same prompt).
         // Connect-level timeouts are excluded: those usually indicate transient
-        // network blips and are worth retrying via the bucket-clear path below.
+        // network blips and are worth retrying via the index-clear path below.
         let map_send_err = |e: reqwest::Error| -> CompletionError {
             if e.is_timeout() && !e.is_connect() {
                 CompletionError::Timeout {
@@ -1583,10 +1685,68 @@ impl InferenceProvider for Fleet {
             }
         };
 
-        let response = match send(&bucket_client, headers.clone()).await {
+        // Select the backend rotation index (prefix affinity + latency
+        // steering). `None` → canonical fallback path (cold-start / non-rotation
+        // URL): one shot via the non-pinned fallback client, no index recorded.
+        let index = match self.select_index(&non_streaming_params.messages) {
+            None => {
+                let url = format!("{}/v1/chat/completions", self.config.base_url);
+                let response = self
+                    .fallback_client
+                    .post(&url)
+                    .headers(headers.clone())
+                    .json(&non_streaming_params)
+                    .timeout(timeout)
+                    .send()
+                    .await
+                    .map_err(map_send_err)?;
+                if !response.status().is_success() {
+                    let status_code = response.status().as_u16();
+                    let error_text = response
+                        .text()
+                        .await
+                        .unwrap_or_else(|e| format!("Failed to read error response body: {e}"));
+                    return Err(CompletionError::HttpError {
+                        status_code,
+                        message: crate::extract_error_message(&error_text),
+                        is_external: false,
+                    });
+                }
+                let raw_bytes = response.bytes().await.map_err(map_send_err)?.to_vec();
+                let chat_completion_response: ChatCompletionResponse =
+                    serde_json::from_slice(&raw_bytes).map_err(|e| {
+                        CompletionError::CompletionError(format!("Failed to parse response: {e}"))
+                    })?;
+                return Ok(ChatCompletionResponseWithBytes {
+                    response: chat_completion_response,
+                    raw_bytes,
+                    serving_tier: crate::ProviderTier::Near,
+                });
+            }
+            Some(i) => i,
+        };
+
+        // Route to the index's verified client, posting at the index's rotation
+        // SNI so completion + signature land on the same backend.
+        let url = self
+            .rotation_url(index as u64, "/v1/chat/completions")
+            .unwrap_or_else(|| format!("{}/v1/chat/completions", self.config.base_url));
+        let index_client = self.get_or_verify_index_client(index).await?;
+
+        let send = |client: &Client, hdrs: reqwest::header::HeaderMap| {
+            client
+                .post(&url)
+                .headers(hdrs)
+                .json(&non_streaming_params)
+                .timeout(timeout)
+                .send()
+        };
+
+        let response = match send(&index_client, headers.clone()).await {
             Ok(r) => r,
             // Connection dropped or fingerprint mismatch on reconnect — clear
-            // bucket and re-verify with a fresh attestation. Two subtleties:
+            // the index client and re-verify with a fresh attestation. Two
+            // subtleties:
             // - Read/request timeouts must NOT enter this branch: in reqwest
             //   0.12 a per-request timeout stringifies as "error sending
             //   request for url (...): operation timed out", which matches the
@@ -1601,8 +1761,8 @@ impl InferenceProvider for Fleet {
                             .contains("does not match any attested fingerprint")
                         || e.to_string().contains("error sending request")) =>
             {
-                self.clear_bucket(bucket_id);
-                let fresh = self.get_or_verify_bucket_client(bucket_id).await?;
+                self.clear_index(index);
+                let fresh = self.get_or_verify_index_client(index).await?;
                 send(&fresh, headers.clone()).await.map_err(map_send_err)?
             }
             Err(e) => return Err(map_send_err(e)),
@@ -1620,15 +1780,15 @@ impl InferenceProvider for Fleet {
                 message: crate::extract_error_message(&error_text),
                 is_external: false,
             };
-            // The sticky bucket landed on a backend whose queue is full (or
-            // is otherwise reporting 5xx/429). Walk each backend by index via
-            // model-proxy's rotation SNI before surfacing the error: with H2
-            // pooling disabled on the rotation client, every attempt lands
-            // on a distinct backend. If one is healthy, the request succeeds
-            // and we record the index for signature retrieval.
-            if Fleet::is_rotation_retryable_status(status_code) && self.rotation_count() > 0 {
+            // The sticky index landed on a backend whose queue is full (or is
+            // otherwise reporting 5xx/429). Walk the other backends ordered by
+            // EMA via their pooled, verified index clients. If one is healthy,
+            // the request succeeds and we record the index for signature
+            // retrieval.
+            if Fleet::is_rotation_retryable_status(status_code) {
                 return self
-                    .try_chat_completion_rotation(
+                    .try_chat_completion_fallback_indices(
+                        &self.fallback_indices(index),
                         &non_streaming_params,
                         &headers,
                         timeout,
@@ -1648,17 +1808,18 @@ impl InferenceProvider for Fleet {
             CompletionError::CompletionError(format!("Failed to parse response: {e}"))
         })?;
 
-        // Store the effective bucket ID for signature fetching.
+        // Store the effective backend index for signature fetching.
         // For non-streaming, we know the chat_id immediately.
         let chat_id = chat_completion_response.id.clone();
-        self.signature_buckets
+        self.signature_rotation
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .insert(chat_id, bucket_id);
+            .insert(chat_id, index as u64);
 
         Ok(ChatCompletionResponseWithBytes {
             response: chat_completion_response,
             raw_bytes,
+            serving_tier: crate::ProviderTier::Near,
         })
     }
 
@@ -2113,6 +2274,10 @@ impl InferenceProvider for Provider {
     /// serves; an attested third party (Chutes) sits behind it as fallback.
     fn tier(&self) -> crate::ProviderTier {
         crate::ProviderTier::Near
+    }
+
+    fn provider_source(&self) -> crate::ProviderSource {
+        crate::ProviderSource::Vllm
     }
 
     async fn models(&self) -> Result<ModelsResponse, ListModelsError> {
@@ -2887,26 +3052,31 @@ mod tests {
     }
 
     #[test]
-    fn test_bucket_count_matches_prefix_router() {
+    fn test_index_client_count_is_max_fanout() {
+        // Per-index clients are sized to the hard fan-out cap (one slot per
+        // possible rotation index), independent of the prefix bucket count.
         let provider = create_test_provider();
         assert_eq!(
-            provider.fleet.bucket_clients.len(),
-            provider.fleet.prefix_router.num_buckets()
+            provider.fleet.index_clients.len(),
+            crate::rotation::MAX_FANOUT
         );
     }
 
     #[test]
-    fn test_legacy_provider_eagerly_creates_buckets() {
-        // Without a verifier, buckets are eagerly pre-created (legacy path)
+    fn test_legacy_provider_eagerly_creates_index_clients() {
+        // Without a verifier, index clients are eagerly pre-created (legacy path)
         let provider = create_test_provider();
-        let guard = provider.fleet.bucket_clients[0]
+        let guard = provider.fleet.index_clients[0]
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        assert!(guard.is_some(), "Legacy provider should pre-create buckets");
+        assert!(
+            guard.is_some(),
+            "Legacy provider should pre-create index clients"
+        );
     }
 
     #[test]
-    fn test_lazy_buckets_start_empty_with_verifier() {
+    fn test_lazy_index_clients_start_empty_with_verifier() {
         use std::sync::Arc;
         struct NoopVerifier;
         #[async_trait::async_trait]
@@ -2931,17 +3101,17 @@ mod tests {
             )),
             Arc::new(NoopVerifier),
         );
-        let guard = provider.fleet.bucket_clients[0]
+        let guard = provider.fleet.index_clients[0]
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         assert!(
             guard.is_none(),
-            "Verifier-backed provider should start with empty buckets"
+            "Verifier-backed provider should start with empty index clients"
         );
     }
 
     #[tokio::test]
-    async fn test_get_or_verify_fills_bucket() {
+    async fn test_get_or_verify_fills_index_client() {
         use std::sync::Arc;
         struct NoopVerifier;
         #[async_trait::async_trait]
@@ -2968,28 +3138,28 @@ mod tests {
         );
 
         // Bucket starts empty
-        assert!(provider.fleet.bucket_clients[0].lock().unwrap().is_none());
+        assert!(provider.fleet.index_clients[0].lock().unwrap().is_none());
 
         // get_or_verify fills it
-        let result = provider.fleet.get_or_verify_bucket_client(0).await;
+        let result = provider.fleet.get_or_verify_index_client(0).await;
         assert!(result.is_ok());
-        assert!(provider.fleet.bucket_clients[0].lock().unwrap().is_some());
+        assert!(provider.fleet.index_clients[0].lock().unwrap().is_some());
 
         // Second call returns cached client (fast path)
-        let result2 = provider.fleet.get_or_verify_bucket_client(0).await;
+        let result2 = provider.fleet.get_or_verify_index_client(0).await;
         assert!(result2.is_ok());
     }
 
     #[test]
-    fn test_clear_bucket() {
+    fn test_clear_index() {
         let provider = create_test_provider();
-        assert!(provider.fleet.bucket_clients[0].lock().unwrap().is_some());
-        provider.fleet.clear_bucket(0);
-        assert!(provider.fleet.bucket_clients[0].lock().unwrap().is_none());
+        assert!(provider.fleet.index_clients[0].lock().unwrap().is_some());
+        provider.fleet.clear_index(0);
+        assert!(provider.fleet.index_clients[0].lock().unwrap().is_none());
     }
 
     /// Fix 2 + security guard: when a verifier always fails AND no fingerprints
-    /// have been pinned yet (Bootstrap state), get_or_verify_bucket_client must
+    /// have been pinned yet (Bootstrap state), get_or_verify_index_client must
     /// return Err — using the fallback_client in Bootstrap state would accept any
     /// WebPKI cert and silently bypass SPKI attestation in a TEE environment.
     #[tokio::test]
@@ -3020,18 +3190,18 @@ mod tests {
         );
 
         // Bucket starts empty and no fingerprints are pinned.
-        assert!(provider.fleet.bucket_clients[0].lock().unwrap().is_none());
+        assert!(provider.fleet.index_clients[0].lock().unwrap().is_none());
         assert_eq!(provider.pinned_fingerprint_count(), 0);
 
         // All attempts fail in Bootstrap state → must return Err (not fallback).
-        let result = provider.fleet.get_or_verify_bucket_client(0).await;
+        let result = provider.fleet.get_or_verify_index_client(0).await;
         assert!(
             result.is_err(),
             "expected Err in Bootstrap state, got: {result:?}"
         );
 
         // Bucket remains empty.
-        assert!(provider.fleet.bucket_clients[0].lock().unwrap().is_none());
+        assert!(provider.fleet.index_clients[0].lock().unwrap().is_none());
     }
 
     /// Fix 2: when a verifier always fails but at least one fingerprint has already
@@ -3070,15 +3240,15 @@ mod tests {
         assert_eq!(provider.pinned_fingerprint_count(), 1);
 
         // Bucket starts empty.
-        assert!(provider.fleet.bucket_clients[0].lock().unwrap().is_none());
+        assert!(provider.fleet.index_clients[0].lock().unwrap().is_none());
 
         // All attempts fail but fingerprints are pinned → fallback client returned.
-        let result = provider.fleet.get_or_verify_bucket_client(0).await;
+        let result = provider.fleet.get_or_verify_index_client(0).await;
         assert!(result.is_ok(), "expected fallback Ok, got: {result:?}");
 
         // Bucket remains empty — fallback is not stored as a verified bucket client.
         assert!(
-            provider.fleet.bucket_clients[0].lock().unwrap().is_none(),
+            provider.fleet.index_clients[0].lock().unwrap().is_none(),
             "fallback should not be stored in bucket"
         );
     }
@@ -3118,10 +3288,10 @@ mod tests {
         assert_eq!(provider.pinned_fingerprint_count(), 0);
 
         // Bucket starts empty.
-        assert!(provider.fleet.bucket_clients[0].lock().unwrap().is_none());
+        assert!(provider.fleet.index_clients[0].lock().unwrap().is_none());
 
         // Blocked state has pinned_count == 0 → same safe path as Bootstrap → Err.
-        let result = provider.fleet.get_or_verify_bucket_client(0).await;
+        let result = provider.fleet.get_or_verify_index_client(0).await;
         assert!(
             result.is_err(),
             "expected Err in Blocked state, got: {result:?}"
@@ -3182,7 +3352,7 @@ mod tests {
         for _ in 0..8 {
             let p = provider.clone();
             handles.push(tokio::spawn(async move {
-                p.fleet.get_or_verify_bucket_client(0).await
+                p.fleet.get_or_verify_index_client(0).await
             }));
         }
         for h in handles {
@@ -3328,13 +3498,14 @@ mod tests {
         acceptor.abort();
     }
 
-    /// pre_warm: spawns a background task per bucket that calls
-    /// get_or_verify_bucket_client. After awaiting all tasks, every bucket
-    /// should be filled and the verifier should have been called exactly once
-    /// per bucket (the semaphore double-check prevents duplicate calls for
-    /// the same bucket, but each bucket still needs its own client).
+    /// pre_warm: spawns a background task per live backend index
+    /// (`0..rotation_count()`) that calls get_or_verify_index_client. After
+    /// awaiting all tasks, exactly those index slots should be filled and the
+    /// verifier should have been called exactly once per index (the semaphore
+    /// double-check prevents duplicate calls for the same index, but each index
+    /// still needs its own client).
     #[tokio::test]
-    async fn test_pre_warm_fills_all_buckets() {
+    async fn test_pre_warm_fills_live_index_clients() {
         use std::sync::{
             atomic::{AtomicUsize, Ordering},
             Arc,
@@ -3359,7 +3530,8 @@ mod tests {
 
         let provider = Arc::new(Provider::new_with_verifier_and_concurrency(
             Config {
-                base_url: "http://localhost".to_string(),
+                // Rotation-capable URL so pre_warm can derive live indices.
+                base_url: "https://glm-5-1.completions.near.ai".to_string(),
                 api_key: None,
                 completion_timeout_seconds: 30,
                 control_timeout_seconds: 30,
@@ -3374,46 +3546,54 @@ mod tests {
             Arc::new(CountingVerifier {
                 count: call_count_clone,
             }),
-            4, // production-default semaphore concurrency — exercises throttling with 64 tasks
+            4, // production-default semaphore concurrency — exercises throttling
         ));
 
-        let num_buckets = provider.fleet.bucket_clients.len();
+        // Discovery reports a live backend count; pre_warm warms 0..count.
+        use crate::InferenceProvider;
+        let live_count = 5usize;
+        provider.set_backend_count(live_count);
+        assert_eq!(provider.fleet.rotation_count(), live_count);
 
-        // All buckets start empty.
+        // All index slots start empty.
         assert!(provider
             .fleet
-            .bucket_clients
+            .index_clients
             .iter()
             .all(|b| b.lock().unwrap().is_none()));
 
-        // pre_warm fires background tasks — wait for them all to finish.
+        // pre_warm fires background tasks — wait for the live indices to fill.
         provider.clone().pre_warm();
-        // Yield repeatedly until every bucket is filled or a generous
-        // timeout is exceeded.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
-            let filled = provider
-                .fleet
-                .bucket_clients
+            let filled = provider.fleet.index_clients[..live_count]
                 .iter()
                 .filter(|b| b.lock().unwrap().is_some())
                 .count();
-            if filled == num_buckets {
+            if filled == live_count {
                 break;
             }
             assert!(
                 std::time::Instant::now() < deadline,
-                "pre_warm did not fill all {num_buckets} buckets within timeout; filled={filled}"
+                "pre_warm did not fill all {live_count} live index clients within timeout; filled={filled}"
             );
             tokio::task::yield_now().await;
         }
 
-        // Every bucket should be filled and the verifier called exactly once
-        // per bucket.
+        // Exactly the live indices should be filled, and only the live indices —
+        // slots past the live count must remain empty.
+        assert!(
+            provider.fleet.index_clients[live_count..]
+                .iter()
+                .all(|b| b.lock().unwrap().is_none()),
+            "pre_warm must not warm index slots beyond the live count"
+        );
+
+        // The verifier should have been called exactly once per live index.
         assert_eq!(
             call_count.load(Ordering::SeqCst),
-            num_buckets,
-            "expected one verification call per bucket"
+            live_count,
+            "expected one verification call per live index"
         );
     }
 
@@ -3427,25 +3607,25 @@ mod tests {
             control_timeout_seconds: 30,
         }));
 
-        // In legacy mode buckets are eagerly pre-filled at construction.
+        // In legacy mode index clients are eagerly pre-filled at construction.
         assert!(provider
             .fleet
-            .bucket_clients
+            .index_clients
             .iter()
             .all(|b| b.lock().unwrap().is_some()));
 
-        // pre_warm should not panic and should not clear the pre-filled buckets.
+        // pre_warm should not panic and should not clear the pre-filled clients.
         provider.clone().pre_warm();
         assert!(provider
             .fleet
-            .bucket_clients
+            .index_clients
             .iter()
             .all(|b| b.lock().unwrap().is_some()));
     }
 
     /// pre_warm is a no-op when no fingerprints are pinned (Bootstrap or Blocked state).
     /// Without this guard, pre_warm would spawn 64 tasks that each fail the security
-    /// check in get_or_verify_bucket_client and log spurious warnings.
+    /// check in get_or_verify_index_client and log spurious warnings.
     #[tokio::test]
     async fn test_pre_warm_skips_without_pinned_fingerprints() {
         use std::sync::{
@@ -3474,7 +3654,9 @@ mod tests {
             let call_count = Arc::new(AtomicUsize::new(0));
             let provider = Arc::new(Provider::new_with_verifier_and_concurrency(
                 Config {
-                    base_url: "http://localhost".to_string(),
+                    // Rotation-capable URL + a live count, so the only thing
+                    // stopping pre_warm is the fingerprint guard (not count==0).
+                    base_url: "https://glm-5-1.completions.near.ai".to_string(),
                     api_key: None,
                     completion_timeout_seconds: 30,
                     control_timeout_seconds: 30,
@@ -3485,6 +3667,8 @@ mod tests {
                 }),
                 4,
             ));
+            use crate::InferenceProvider;
+            provider.set_backend_count(5);
 
             // pre_warm must not spawn any tasks when no fingerprints are pinned.
             provider.clone().pre_warm();
@@ -3499,14 +3683,14 @@ mod tests {
                 0,
                 "pre_warm should not call the verifier in Bootstrap/Blocked state"
             );
-            // All buckets must remain empty (no tasks ran).
+            // All index slots must remain empty (no tasks ran).
             assert!(
                 provider
                     .fleet
-                    .bucket_clients
+                    .index_clients
                     .iter()
                     .all(|b| b.lock().unwrap().is_none()),
-                "pre_warm should not fill any buckets in Bootstrap/Blocked state"
+                "pre_warm should not fill any index clients in Bootstrap/Blocked state"
             );
         }
     }
@@ -3609,6 +3793,262 @@ mod tests {
         assert_eq!(provider.fleet.rotation_count(), 0);
     }
 
+    // --- Index-addressed routing: selection, EMA, count-change reset. ---
+
+    /// A rotation-capable provider (no verifier → legacy eager clients) with a
+    /// live backend count set, so `select_index` / `rotation_count` are active.
+    fn rotation_provider(count: usize) -> Provider {
+        use crate::InferenceProvider;
+        let provider = Provider::new(Config {
+            base_url: "https://glm-5-1.completions.near.ai".to_string(),
+            api_key: None,
+            completion_timeout_seconds: 30,
+            control_timeout_seconds: 30,
+        });
+        provider.set_backend_count(count);
+        provider
+    }
+
+    fn user_msg(content: &str) -> crate::ChatMessage {
+        crate::ChatMessage {
+            role: crate::MessageRole::User,
+            content: Some(serde_json::Value::String(content.to_string())),
+            name: None,
+            tool_call_id: None,
+            tool_calls: None,
+        }
+    }
+
+    #[test]
+    fn select_index_returns_none_when_rotation_disabled() {
+        // localhost → no rotation parts → rotation_count()==0 → canonical
+        // fallback path. Many tests (and cold-start) depend on this.
+        let provider = create_test_provider();
+        let msgs = vec![user_msg("hello")];
+        assert_eq!(provider.fleet.select_index(&msgs), None);
+    }
+
+    #[test]
+    fn select_index_is_prefix_hash_mod_count_with_no_stats() {
+        // With no TTFT samples recorded, selection is pure prefix affinity:
+        // `prefix_router.route(messages) % count`.
+        let provider = rotation_provider(8);
+        let msgs = vec![user_msg("a stable system prompt")];
+        let expected = provider.fleet.prefix_router.route(&msgs) % 8;
+        let got = provider.fleet.select_index(&msgs).expect("rotation active");
+        assert_eq!(got, expected);
+        // Deterministic / stable across calls (same prefix → same backend).
+        assert_eq!(provider.fleet.select_index(&msgs), Some(expected));
+    }
+
+    #[test]
+    fn select_index_steers_off_pathologically_slow_preferred_backend() {
+        let provider = rotation_provider(4);
+        let msgs = vec![user_msg("route me")];
+        let preferred = provider.fleet.prefix_router.route(&msgs) % 4;
+
+        // Warm the preferred backend as pathologically slow (>floor and >2× the
+        // fastest), and a different backend as fast. Pick the fast index to be
+        // distinct from `preferred`.
+        let fast = (preferred + 1) % 4;
+        for _ in 0..super::fleet::TTFT_WARMUP_SAMPLES {
+            provider.fleet.record_ttft(preferred, 2000.0);
+            provider.fleet.record_ttft(fast, 100.0);
+        }
+
+        let got = provider.fleet.select_index(&msgs).expect("rotation active");
+        assert_eq!(
+            got, fast,
+            "should steer from the slow preferred backend to the fastest warmed one"
+        );
+
+        // Below the slow ratio (only ~1.5× the fast peer) → keep affinity.
+        let provider2 = rotation_provider(4);
+        let preferred2 = provider2.fleet.prefix_router.route(&msgs) % 4;
+        let other2 = (preferred2 + 1) % 4;
+        for _ in 0..super::fleet::TTFT_WARMUP_SAMPLES {
+            provider2.fleet.record_ttft(preferred2, 900.0);
+            provider2.fleet.record_ttft(other2, 600.0);
+        }
+        assert_eq!(
+            provider2.fleet.select_index(&msgs),
+            Some(preferred2),
+            "below the 2x slow ratio, prefix affinity wins"
+        );
+    }
+
+    #[test]
+    fn record_ttft_ema_warmup_then_stable() {
+        let provider = rotation_provider(4);
+        // First sample seeds the EMA exactly.
+        provider.fleet.record_ttft(0, 100.0);
+        {
+            let stats = provider.fleet.backend_stats.lock().unwrap();
+            assert_eq!(stats[0].ttft_ewma_ms, 100.0);
+            assert_eq!(stats[0].samples, 1);
+        }
+        // Warmup alpha = 0.5: 0.5*200 + 0.5*100 = 150.
+        provider.fleet.record_ttft(0, 200.0);
+        {
+            let stats = provider.fleet.backend_stats.lock().unwrap();
+            assert!((stats[0].ttft_ewma_ms - 150.0).abs() < 1e-9);
+            assert_eq!(stats[0].samples, 2);
+        }
+        // Drive past the warmup threshold so the stable alpha (0.1) applies.
+        for _ in 0..super::fleet::TTFT_WARMUP_SAMPLES {
+            provider.fleet.record_ttft(0, 150.0);
+        }
+        let before = provider.fleet.backend_stats.lock().unwrap()[0].ttft_ewma_ms;
+        // Stable alpha = 0.1: a big spike moves the EMA only ~10% toward it.
+        provider.fleet.record_ttft(0, 1150.0);
+        let after = provider.fleet.backend_stats.lock().unwrap()[0].ttft_ewma_ms;
+        let expected = 0.1 * 1150.0 + 0.9 * before;
+        assert!(
+            (after - expected).abs() < 1e-6,
+            "stable EMA step mismatch: after={after}, expected={expected}"
+        );
+        // Non-positive samples are ignored.
+        let s = provider.fleet.backend_stats.lock().unwrap()[0].samples;
+        provider.fleet.record_ttft(0, 0.0);
+        provider.fleet.record_ttft(0, -5.0);
+        assert_eq!(provider.fleet.backend_stats.lock().unwrap()[0].samples, s);
+    }
+
+    #[test]
+    fn store_backend_count_change_clears_clients_and_resets_stats() {
+        use crate::InferenceProvider;
+        use std::sync::Arc;
+        // Verifier mode (the production path): a count CHANGE must drop the
+        // pinned index clients — the index↔backend binding is only stable while
+        // the count is — so each `None` slot is lazily re-verified against the
+        // new mapping. It also resets the per-index EMA. Seed a count, pin a
+        // client + EMA on index 0, then observe the clear/reset on the change.
+        struct NoopVerifier;
+        #[async_trait::async_trait]
+        impl crate::BackendVerifier for NoopVerifier {
+            async fn create_verified_client(
+                &self,
+                _base_url: &str,
+            ) -> Result<reqwest::Client, String> {
+                Ok(reqwest::Client::new())
+            }
+        }
+        let provider = Provider::new_with_verifier(
+            Config {
+                base_url: "https://glm-5-1.completions.near.ai".to_string(),
+                api_key: None,
+                completion_timeout_seconds: 30,
+                control_timeout_seconds: 30,
+            },
+            Arc::new(std::sync::RwLock::new(
+                crate::spki_verifier::FingerprintState::Bootstrap,
+            )),
+            Arc::new(NoopVerifier),
+        );
+        provider.set_backend_count(4);
+        *provider.fleet.index_clients[0].lock().unwrap() = Some(reqwest::Client::new());
+        for _ in 0..super::fleet::TTFT_WARMUP_SAMPLES {
+            provider.fleet.record_ttft(0, 123.0);
+        }
+
+        // Same count → no reset (clients + stats preserved).
+        provider.set_backend_count(4);
+        assert!(provider.fleet.index_clients[0].lock().unwrap().is_some());
+        assert!(provider.fleet.backend_stats.lock().unwrap()[0].samples > 0);
+
+        // Changed count → clients cleared + stats reset.
+        provider.set_backend_count(6);
+        assert!(
+            provider.fleet.index_clients[0].lock().unwrap().is_none(),
+            "count change must clear pinned index clients in verifier mode"
+        );
+        let stats = provider.fleet.backend_stats.lock().unwrap();
+        assert!(
+            stats
+                .iter()
+                .all(|s| s.samples == 0 && s.ttft_ewma_ms == 0.0),
+            "count change must reset all backend stats"
+        );
+    }
+
+    #[test]
+    fn store_backend_count_change_keeps_legacy_clients_but_resets_stats() {
+        use crate::InferenceProvider;
+        // Legacy/no-verifier mode: index clients are eagerly pre-created and
+        // there is no verifier to lazily re-create them, so a count change must
+        // NOT clear them (clearing would wedge the provider with "no backend
+        // verifier configured"). Stats are still reset.
+        let provider = rotation_provider(4); // Provider::new → no verifier
+        for _ in 0..super::fleet::TTFT_WARMUP_SAMPLES {
+            provider.fleet.record_ttft(0, 123.0);
+        }
+        assert!(provider.fleet.index_clients[0].lock().unwrap().is_some());
+
+        provider.set_backend_count(6);
+        assert!(
+            provider.fleet.index_clients[0].lock().unwrap().is_some(),
+            "legacy eager clients must survive a count change (no verifier to rebuild them)"
+        );
+        let stats = provider.fleet.backend_stats.lock().unwrap();
+        assert!(
+            stats
+                .iter()
+                .all(|s| s.samples == 0 && s.ttft_ewma_ms == 0.0),
+            "count change must still reset all backend stats in legacy mode"
+        );
+    }
+
+    #[test]
+    fn fallback_indices_orders_warmed_fastest_first_and_skips_tried() {
+        let provider = rotation_provider(4);
+        // Warm indices 1 (slow) and 3 (fast); leave 0 and 2 unwarmed.
+        for _ in 0..super::fleet::TTFT_WARMUP_SAMPLES {
+            provider.fleet.record_ttft(1, 800.0);
+            provider.fleet.record_ttft(3, 120.0);
+        }
+        let order = provider.fleet.fallback_indices(0);
+        assert!(!order.contains(&0), "tried index must be skipped");
+        // Warmed fastest first (3 before 1), then unwarmed (just 2 here).
+        assert_eq!(order, vec![3, 1, 2]);
+    }
+
+    #[tokio::test]
+    async fn ttft_probe_records_on_first_content_chunk_only() {
+        use std::sync::{Arc, Mutex};
+        use tokio_stream::StreamExt;
+
+        let stats = Arc::new(Mutex::new(vec![
+            super::fleet::BackendStat::default();
+            crate::rotation::MAX_FANOUT
+        ]));
+        // Leading control event (no chunk) → must NOT record; first data chunk
+        // → records exactly one sample; subsequent data chunk → no new sample.
+        let items: Vec<Result<SSEEvent, CompletionError>> = vec![
+            Ok(control_event(": keepalive\n")),
+            Ok(data_event()),
+            Ok(data_event()),
+        ];
+        let inner: StreamingResult = Box::pin(futures_util::stream::iter(items));
+        let index = 2usize;
+        // Start a few ms in the past so the measured TTFT is strictly positive
+        // (a 0ms reading is dropped by the EMA guard) — deterministic regardless
+        // of how fast the test polls.
+        let start = std::time::Instant::now() - std::time::Duration::from_millis(5);
+        let probe = TtftProbe::new(inner, stats.clone(), index, start);
+        tokio::pin!(probe);
+        let mut count = 0;
+        while let Some(_ev) = probe.next().await {
+            count += 1;
+        }
+        assert_eq!(count, 3, "all events must pass through unchanged");
+        let s = stats.lock().unwrap()[index];
+        assert_eq!(
+            s.samples, 1,
+            "exactly one TTFT sample recorded on the first content chunk"
+        );
+        assert!(s.ttft_ewma_ms >= 0.0);
+    }
+
     #[test]
     fn pin_chat_connection_promotes_pending_rotation_to_signature_rotation() {
         // The streaming fallback stores `request_hash → index` in
@@ -3668,81 +4108,6 @@ mod tests {
             .insert("chat-1".to_string(), 4);
         provider.unpin_chat_connection("chat-1");
         assert!(provider.fleet.signature_rotation.lock().unwrap().is_empty());
-    }
-
-    // --- Characterization tests for the bucket side of pin/unpin (the H2
-    // sticky-prefix routing state). These pin down current behavior so the
-    // Fleet extraction can be proven behavior-identical. ---
-
-    #[test]
-    fn pin_chat_connection_promotes_pending_bucket_to_signature_bucket() {
-        // The streaming path stores `request_hash → bucket_id` in
-        // `pending_buckets` before the chat_id is known; `pin_chat_connection`
-        // must promote it into `signature_buckets` so the signature fetch
-        // reuses the same bucket's pinned H2 connection.
-        let provider = create_test_provider();
-        provider
-            .fleet
-            .pending_buckets
-            .lock()
-            .unwrap()
-            .insert("req-hash-abc".to_string(), 3);
-        provider.pin_chat_connection("req-hash-abc", "chatcmpl-xyz");
-        assert_eq!(
-            provider
-                .fleet
-                .signature_buckets
-                .lock()
-                .unwrap()
-                .get("chatcmpl-xyz")
-                .copied(),
-            Some(3)
-        );
-        // Pending entry drained so a future request_hash reuse can't surface
-        // a stale bucket.
-        assert!(provider.fleet.pending_buckets.lock().unwrap().is_empty());
-    }
-
-    #[test]
-    fn unpin_chat_connection_clears_signature_bucket() {
-        let provider = create_test_provider();
-        provider
-            .fleet
-            .signature_buckets
-            .lock()
-            .unwrap()
-            .insert("chat-1".to_string(), 2);
-        provider.unpin_chat_connection("chat-1");
-        assert!(provider.fleet.signature_buckets.lock().unwrap().is_empty());
-    }
-
-    #[test]
-    fn pin_chat_connection_empty_chat_id_still_writes_signature_bucket() {
-        // Asymmetry to preserve: with an empty chat_id, the ROTATION side skips
-        // writing signature_rotation (see the empty-chat_id test above), but the
-        // BUCKET side still drains pending_buckets into signature_buckets[""].
-        // This characterizes existing behavior — the extraction must keep it
-        // (changing it is a separate, deliberate decision, not a refactor).
-        let provider = create_test_provider();
-        provider
-            .fleet
-            .pending_buckets
-            .lock()
-            .unwrap()
-            .insert("req-hash-orphan".to_string(), 5);
-        provider.pin_chat_connection("req-hash-orphan", "");
-        assert!(provider.fleet.pending_buckets.lock().unwrap().is_empty());
-        assert_eq!(
-            provider
-                .fleet
-                .signature_buckets
-                .lock()
-                .unwrap()
-                .get("")
-                .copied(),
-            Some(5),
-            "bucket side currently writes signature_buckets[\"\"] even for empty chat_id"
-        );
     }
 
     // --- Characterization tests for get_signature's fetch/retry behavior over

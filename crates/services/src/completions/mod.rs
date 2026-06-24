@@ -17,6 +17,7 @@ use futures_util::{Future, Stream};
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
+use tracing::Instrument;
 
 const FINALIZE_TIMEOUT_SECS: u64 = 5;
 const DEEPSEEK_V4_FLASH_MODEL: &str = "deepseek-ai/DeepSeek-V4-Flash";
@@ -37,6 +38,21 @@ pub fn hash_inference_id_to_uuid(full_id: &str) -> Uuid {
 
 /// Get input bucket tag based on token count for metrics breakdown
 /// Buckets: 0-1k, 1-4k, 4-16k, 16-32k, 32-64k, 64-128k, 128k+
+/// Per-request prefix-cache hit rate as a percentage (cache-read / prompt
+/// tokens). `None` when there are no prompt tokens (avoids div-by-zero and keeps
+/// empty-prompt requests out of the distribution). `cached` is already clamped to
+/// `[0, prompt]` by `TokenUsage::cached_tokens()`, so the result is in `[0, 100]`.
+fn cache_hit_rate_percent(cached_tokens: i32, prompt_tokens: i32) -> Option<f64> {
+    if prompt_tokens <= 0 {
+        return None;
+    }
+    // Clamp to [0, prompt] so the result is provably within [0, 100], even if a
+    // provider ever reports cached > prompt. `TokenUsage::cached_tokens()` already
+    // clamps to this range, so this is belt-and-suspenders.
+    let cached = cached_tokens.clamp(0, prompt_tokens);
+    Some((cached as f64 / prompt_tokens as f64) * 100.0)
+}
+
 fn get_input_bucket(token_count: i32) -> &'static str {
     match token_count {
         0..=1000 => "0-1k",
@@ -100,6 +116,10 @@ where
     attestation_supported: bool,
     /// Whether to fetch/store provider chat signatures before ending the stream.
     store_provider_chat_signature: bool,
+    provider_attribution: crate::usage::ProviderAttribution,
+    /// Callback to report observed TTFT back to the provider pool for latency-aware
+    /// routing. Called once with the backend TTFT (ms) from record_usage_and_metrics.
+    latency_reporter: Option<super::inference_provider_pool::ProviderLatencyReporter>,
 }
 
 impl<S> InterceptStream<S>
@@ -248,9 +268,16 @@ where
         let usage_service = self.usage_service.clone();
         let metrics_service = self.metrics_service.clone();
         let ttft_ms = self.ttft_ms;
+
+        // Feed TTFT back to the provider pool for latency-aware routing.
+        if let (Some(ttft), Some(reporter)) = (self.ttft_ms, &self.latency_reporter) {
+            reporter(ttft);
+        }
+
         let e2e_duration = self.service_start_time.elapsed();
         let first_token_time = self.first_token_time;
         let stream_completed = self.stream_completed;
+        let provider_attribution = self.provider_attribution;
 
         let avg_itl_ms = if self.token_count > 0 {
             Some(self.total_itl_ms / self.token_count as f64)
@@ -262,81 +289,108 @@ where
         let mut metric_tags = self.metric_tags.clone();
         metric_tags.push(format!("{TAG_INPUT_BUCKET}:{input_bucket}"));
 
-        // Spawn critical billing operations on blocking thread pool with timeout
+        // Spawn critical billing operations on blocking thread pool with timeout.
         // The tokio runtime waits for blocking tasks during graceful shutdown,
-        // which helps prevent data loss compared to regular spawn
+        // which helps prevent data loss compared to regular spawn.
         let handle_clone = handle.clone();
         handle.spawn_blocking(move || {
-            let _span_guard = span.enter();
-            handle_clone.block_on(async move {
-                let result = tokio::time::timeout(Duration::from_secs(2), async move {
-                    let stop_reason = if let Some(ref err) = last_error {
-                        Some(crate::usage::StopReason::from_completion_error(err))
-                    } else if !stream_completed {
-                        Some(crate::usage::StopReason::ClientDisconnect)
-                    } else if let Some(ref finish_reason) = last_finish_reason {
-                        Some(crate::usage::StopReason::from_provider_finish_reason(
-                            finish_reason,
-                        ))
-                    } else {
-                        Some(crate::usage::StopReason::Completed)
-                    };
+            handle_clone.block_on(
+                async move {
+                    let result = tokio::time::timeout(Duration::from_secs(2), async move {
+                        let stop_reason = if let Some(ref err) = last_error {
+                            Some(crate::usage::StopReason::from_completion_error(err))
+                        } else if !stream_completed {
+                            Some(crate::usage::StopReason::ClientDisconnect)
+                        } else if let Some(ref finish_reason) = last_finish_reason {
+                            Some(crate::usage::StopReason::from_provider_finish_reason(
+                                finish_reason,
+                            ))
+                        } else {
+                            Some(crate::usage::StopReason::Completed)
+                        };
 
-                    if usage_service
-                        .record_usage(RecordUsageServiceRequest {
-                            organization_id,
-                            workspace_id,
-                            api_key_id,
-                            model_id,
-                            input_tokens,
-                            output_tokens,
-                            cache_read_tokens,
-                            inference_type,
-                            ttft_ms,
-                            avg_itl_ms,
-                            inference_id: Some(inference_id),
-                            provider_request_id: Some(chat_id),
-                            stop_reason,
-                            response_id,
-                            image_count: None,
-                        })
-                        .await
-                        .is_err()
-                    {
-                        tracing::error!("Failed to record usage");
-                    }
+                        if usage_service
+                            .record_usage(RecordUsageServiceRequest {
+                                organization_id,
+                                workspace_id,
+                                api_key_id,
+                                model_id,
+                                input_tokens,
+                                output_tokens,
+                                cache_read_tokens,
+                                inference_type,
+                                ttft_ms,
+                                avg_itl_ms,
+                                inference_id: Some(inference_id),
+                                provider_request_id: Some(chat_id),
+                                stop_reason,
+                                response_id,
+                                image_count: None,
+                                provider_attribution,
+                            })
+                            .await
+                            .is_err()
+                        {
+                            tracing::error!("Failed to record usage");
+                        }
 
-                    // Record metrics
-                    let tags: Vec<&str> = metric_tags.iter().map(|s| s.as_str()).collect();
-                    metrics_service.record_latency(METRIC_LATENCY_TOTAL, e2e_duration, &tags);
+                        // Record metrics
+                        let tags: Vec<&str> = metric_tags.iter().map(|s| s.as_str()).collect();
+                        metrics_service.record_latency(METRIC_LATENCY_TOTAL, e2e_duration, &tags);
 
-                    if let Some(first_token_instant) = first_token_time {
-                        let decoding_duration = first_token_instant.elapsed();
-                        metrics_service.record_latency(
-                            METRIC_LATENCY_DECODING_TIME,
-                            decoding_duration,
+                        if let Some(first_token_instant) = first_token_time {
+                            let decoding_duration = first_token_instant.elapsed();
+                            metrics_service.record_latency(
+                                METRIC_LATENCY_DECODING_TIME,
+                                decoding_duration,
+                                &tags,
+                            );
+
+                            let decode_secs = decoding_duration.as_secs_f64();
+                            if decode_secs > 0.0 {
+                                let tps = output_tokens as f64 / decode_secs;
+                                metrics_service.record_histogram(
+                                    METRIC_TOKENS_PER_SECOND,
+                                    tps,
+                                    &tags,
+                                );
+                            }
+                        }
+
+                        metrics_service.record_count(
+                            METRIC_TOKENS_INPUT,
+                            input_tokens as i64,
                             &tags,
                         );
-
-                        let decode_secs = decoding_duration.as_secs_f64();
-                        if decode_secs > 0.0 {
-                            let tps = output_tokens as f64 / decode_secs;
-                            metrics_service.record_histogram(METRIC_TOKENS_PER_SECOND, tps, &tags);
+                        metrics_service.record_count(
+                            METRIC_TOKENS_OUTPUT,
+                            output_tokens as i64,
+                            &tags,
+                        );
+                        // Prefix-cache-hit observability: cache-read token count
+                        // (token-weighted hit rate = cached/input) + per-request
+                        // hit-rate distribution.
+                        metrics_service.record_count(
+                            METRIC_TOKENS_CACHED,
+                            cache_read_tokens as i64,
+                            &tags,
+                        );
+                        if let Some(rate) = cache_hit_rate_percent(cache_read_tokens, input_tokens)
+                        {
+                            metrics_service.record_histogram(METRIC_CACHE_HIT_RATE, rate, &tags);
                         }
+                    })
+                    .await;
+
+                    if result.is_err() {
+                        tracing::error!(
+                            "Timeout recording usage and metrics (2s exceeded), inference_id={}",
+                            inference_id
+                        );
                     }
-
-                    metrics_service.record_count(METRIC_TOKENS_INPUT, input_tokens as i64, &tags);
-                    metrics_service.record_count(METRIC_TOKENS_OUTPUT, output_tokens as i64, &tags);
-                })
-                .await;
-
-                if result.is_err() {
-                    tracing::error!(
-                        "Timeout recording usage and metrics (2s exceeded), inference_id={}",
-                        inference_id
-                    );
                 }
-            })
+                .instrument(span),
+            )
         });
     }
 }
@@ -505,6 +559,51 @@ const ORG_LIMIT_CACHE_TTL_SECS: u64 = 300;
 /// Trade-off: if legitimate long-running requests are still in-flight when the TTL fires,
 /// the limit can be temporarily exceeded until those old requests complete.
 const CONCURRENT_COUNT_TTL_SECS: u64 = 600;
+
+/// Compute a prefix hash from the first PREFIX_HASH_MESSAGES messages for cache-hit routing.
+/// We only hash text content (not image URLs) since only text lands in the KV cache.
+fn compute_prefix_hash(messages: &[inference_providers::ChatMessage]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    for msg in messages
+        .iter()
+        .take(super::inference_provider_pool::PREFIX_HASH_MESSAGES)
+    {
+        // Hash role as its debug string since MessageRole doesn't implement Hash.
+        format!("{:?}", msg.role).hash(&mut hasher);
+        match &msg.content {
+            Some(serde_json::Value::String(s)) => s.hash(&mut hasher),
+            Some(serde_json::Value::Array(parts)) => {
+                for part in parts {
+                    if let Some("text") = part.get("type").and_then(|t| t.as_str()) {
+                        if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
+                            text.hash(&mut hasher);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    hasher.finish()
+}
+
+/// Rough token count estimate for context-length routing (4 chars ≈ 1 token).
+fn estimate_input_tokens(messages: &[inference_providers::ChatMessage]) -> u32 {
+    let chars: usize = messages
+        .iter()
+        .map(|m| match &m.content {
+            Some(serde_json::Value::String(s)) => s.len(),
+            Some(serde_json::Value::Array(parts)) => parts
+                .iter()
+                .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
+                .map(|s| s.len())
+                .sum(),
+            _ => 0,
+        })
+        .sum();
+    (chars / 4).max(1) as u32
+}
 
 impl CompletionServiceImpl {
     /// Inject tracing correlation IDs into the `extra` map that is forwarded
@@ -1172,6 +1271,7 @@ impl CompletionServiceImpl {
         }
     }
 
+    // CLIPPY-ALLOW: InterceptStream construction needs the full tracing, billing, timing, and concurrency context at one ownership boundary.
     #[allow(clippy::too_many_arguments)]
     async fn handle_stream_with_context(
         &self,
@@ -1189,6 +1289,8 @@ impl CompletionServiceImpl {
         response_id: Option<ResponseId>,
         attestation_supported: bool,
         store_provider_chat_signature: bool,
+        provider_attribution: crate::usage::ProviderAttribution,
+        latency_reporter: Option<super::inference_provider_pool::ProviderLatencyReporter>,
     ) -> StreamingResult {
         // Create low-cardinality metric tags (no org/workspace/key - those go to database)
         let metric_tags = Self::create_metric_tags(&model_name);
@@ -1232,6 +1334,8 @@ impl CompletionServiceImpl {
             state: StreamState::Streaming,
             attestation_supported,
             store_provider_chat_signature,
+            provider_attribution,
+            latency_reporter,
         };
         Box::pin(intercepted_stream)
     }
@@ -1359,13 +1463,23 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
 
         let provider_start_time = Instant::now();
 
+        // Compute routing hints from the request messages for adaptive load balancing.
+        let routing_hints = super::inference_provider_pool::ChatRoutingHints {
+            prefix_hash: Some(compute_prefix_hash(&chat_params.messages)),
+            estimated_tokens: Some(estimate_input_tokens(&chat_params.messages)),
+        };
+
         // Get the LLM stream
-        let llm_stream = match self
+        let attributed_stream = match self
             .inference_provider_pool
-            .chat_completion_stream(chat_params, request.body_hash.clone())
+            .chat_completion_stream_with_attribution(
+                chat_params,
+                request.body_hash.clone(),
+                routing_hints,
+            )
             .await
         {
-            Ok(stream) => stream,
+            Ok(pair) => pair,
             Err(e) => {
                 // Guard will decrement counter on drop
                 let err = Self::map_provider_error(
@@ -1378,6 +1492,9 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
                 return Err(err);
             }
         };
+        let llm_stream = attributed_stream.stream;
+        let provider_attribution = attributed_stream.provider_attribution;
+        let latency_reporter = attributed_stream.latency_reporter;
 
         // Transfer counter ownership to InterceptStream (which decrements on drop)
         let counter = guard.disarm();
@@ -1406,6 +1523,8 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
                 request.response_id,
                 model.attestation_supported,
                 !request.skip_provider_chat_signature,
+                provider_attribution,
+                Some(latency_reporter),
             )
             .await;
 
@@ -1530,10 +1649,10 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         let provider_start_time = Instant::now();
         let result = self
             .inference_provider_pool
-            .chat_completion(chat_params, request.body_hash.clone())
+            .chat_completion_with_attribution(chat_params, request.body_hash.clone())
             .await;
 
-        let response_with_bytes = match result {
+        let attributed_response = match result {
             Ok(response) => response,
             Err(e) => {
                 let err = Self::map_provider_error(
@@ -1546,6 +1665,8 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
                 return Err(err);
             }
         };
+        let response_with_bytes = attributed_response.response;
+        let provider_attribution = attributed_response.provider_attribution;
 
         let e2e_latency = service_start_time.elapsed();
         let backend_latency = provider_start_time.elapsed();
@@ -1572,6 +1693,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         let metrics_service = self.metrics_service.clone();
         let input_tokens = response_with_bytes.response.usage.prompt_tokens;
         let output_tokens = response_with_bytes.response.usage.completion_tokens;
+        let cache_read_tokens = response_with_bytes.response.usage.cached_tokens();
         let model_name = model.model_name.clone();
 
         tokio::spawn(async move {
@@ -1593,6 +1715,11 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
 
             metrics_service.record_count(METRIC_TOKENS_INPUT, input_tokens as i64, &tags_str);
             metrics_service.record_count(METRIC_TOKENS_OUTPUT, output_tokens as i64, &tags_str);
+            // Prefix-cache-hit observability (mirrors the streaming path).
+            metrics_service.record_count(METRIC_TOKENS_CACHED, cache_read_tokens as i64, &tags_str);
+            if let Some(rate) = cache_hit_rate_percent(cache_read_tokens, input_tokens) {
+                metrics_service.record_histogram(METRIC_CACHE_HIT_RATE, rate, &tags_str);
+            }
         });
 
         // Record usage with model UUID
@@ -1635,6 +1762,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
                     stop_reason: Some(stop_reason),
                     response_id,
                     image_count: None,
+                    provider_attribution,
                 })
                 .await
                 .is_err()
@@ -1944,6 +2072,9 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
 pub use ports::*;
 
 #[cfg(test)]
+mod provider_attribution_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::metrics::capturing::{CapturingMetricsService, MetricValue};
@@ -2046,6 +2177,8 @@ mod tests {
             state: StreamState::Streaming,
             attestation_supported: true,
             store_provider_chat_signature: true,
+            provider_attribution: crate::usage::ProviderAttribution::default(),
+            latency_reporter: None,
         };
 
         // Consume the stream
@@ -2091,6 +2224,110 @@ mod tests {
             assert!(val > 0.0);
         } else {
             panic!("TPS should be a histogram");
+        }
+    }
+
+    #[test]
+    fn cache_hit_rate_percent_computes_and_guards_zero_prompt() {
+        // No prompt tokens -> excluded from the distribution (no div-by-zero).
+        assert_eq!(cache_hit_rate_percent(0, 0), None);
+        assert_eq!(cache_hit_rate_percent(5, 0), None);
+        // cached/prompt as a percentage.
+        assert_eq!(cache_hit_rate_percent(0, 100), Some(0.0));
+        assert_eq!(cache_hit_rate_percent(50, 100), Some(50.0));
+        assert_eq!(cache_hit_rate_percent(100, 100), Some(100.0));
+        // Defensive: a negative cached count clamps to 0 (cached_tokens() never
+        // returns negative, but the helper must not emit a negative rate).
+        assert_eq!(cache_hit_rate_percent(-5, 100), Some(0.0));
+        // Defensive: cached > prompt clamps to prompt -> capped at 100%.
+        assert_eq!(cache_hit_rate_percent(150, 100), Some(100.0));
+    }
+
+    #[tokio::test]
+    async fn test_intercept_stream_emits_cache_hit_metrics() {
+        let metrics_service = Arc::new(CapturingMetricsService::new());
+        let now = Instant::now();
+        // prompt=10, of which 7 were prefix-cache hits -> 70% hit rate.
+        let usage_chunk = SSEEvent {
+            raw_bytes: Bytes::from("data: ..."),
+            raw_passthrough: true,
+            chunk: Some(StreamChunk::Chat(ChatCompletionChunk {
+                id: "chat-1".to_string(),
+                object: "chat.completion.chunk".to_string(),
+                created: 1234567890,
+                model: "test-model".to_string(),
+                choices: vec![ChatChoice {
+                    index: 0,
+                    delta: None,
+                    logprobs: None,
+                    finish_reason: Some(FinishReason::Stop),
+                    token_ids: None,
+                }],
+                usage: Some(TokenUsage {
+                    prompt_tokens: 10,
+                    completion_tokens: 20,
+                    total_tokens: 30,
+                    prompt_tokens_details: Some(serde_json::json!({"cached_tokens": 7})),
+                }),
+                prompt_token_ids: None,
+                system_fingerprint: None,
+                modality: None,
+                extra: Default::default(),
+            })),
+        };
+        let stream = stream::iter(vec![Ok(usage_chunk)]);
+        let intercept_stream = InterceptStream {
+            inner: stream,
+            attestation_service: Arc::new(MockAttestationService),
+            usage_service: Arc::new(MockUsageService),
+            metrics_service: metrics_service.clone(),
+            request_id: Uuid::new_v4(),
+            organization_id: Uuid::new_v4(),
+            workspace_id: Uuid::new_v4(),
+            api_key_id: Uuid::new_v4(),
+            model_id: Uuid::new_v4(),
+            model_name: "test-model".to_string(),
+            inference_type: crate::usage::ports::InferenceType::ChatCompletionStream,
+            service_start_time: now,
+            provider_start_time: now,
+            first_token_received: false,
+            first_token_time: None,
+            ttft_ms: None,
+            token_count: 0,
+            last_token_time: None,
+            total_itl_ms: 0.0,
+            metric_tags: CompletionServiceImpl::create_metric_tags("test-model"),
+            concurrent_counter: None,
+            last_usage_stats: None,
+            last_chat_id: None,
+            stream_completed: false,
+            response_id: None,
+            last_finish_reason: None,
+            last_error: None,
+            state: StreamState::Streaming,
+            attestation_supported: true,
+            store_provider_chat_signature: true,
+            provider_attribution: crate::usage::ProviderAttribution::default(),
+            latency_reporter: None,
+        };
+        let _ = intercept_stream.collect::<Vec<_>>().await;
+        // Wait for the fire-and-forget usage/metrics task spawned in Drop to finish.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let metrics = metrics_service.get_metrics();
+
+        let cached = metrics
+            .iter()
+            .find(|m| m.name == METRIC_TOKENS_CACHED)
+            .expect("tokens.cached metric missing");
+        assert!(matches!(cached.value, MetricValue::Count(7)));
+
+        let rate = metrics
+            .iter()
+            .find(|m| m.name == METRIC_CACHE_HIT_RATE)
+            .expect("cache.hit_rate metric missing");
+        match rate.value {
+            MetricValue::Histogram(v) => assert!((v - 70.0).abs() < 1e-9, "hit rate = {v}"),
+            _ => panic!("cache.hit_rate should be a histogram"),
         }
     }
 
@@ -2210,6 +2447,8 @@ mod tests {
             state: StreamState::Streaming,
             attestation_supported: true,
             store_provider_chat_signature: true,
+            provider_attribution: crate::usage::ProviderAttribution::default(),
+            latency_reporter: None,
         };
 
         // Consume the stream
@@ -2331,6 +2570,8 @@ mod tests {
             state: StreamState::Streaming,
             attestation_supported: true,
             store_provider_chat_signature: true,
+            provider_attribution: crate::usage::ProviderAttribution::default(),
+            latency_reporter: None,
         };
 
         let _ = intercept_stream.collect::<Vec<_>>().await;
@@ -2536,6 +2777,8 @@ mod tests {
                 state: StreamState::Streaming,
                 attestation_supported: true,
                 store_provider_chat_signature: true,
+                provider_attribution: crate::usage::ProviderAttribution::default(),
+                latency_reporter: None,
             };
             // InterceptStream goes out of scope here and Drop is called
         }

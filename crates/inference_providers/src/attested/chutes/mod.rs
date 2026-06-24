@@ -1415,6 +1415,7 @@ impl InferenceProvider for Provider {
         Ok(ChatCompletionResponseWithBytes {
             response,
             raw_bytes,
+            serving_tier: crate::ProviderTier::Attested3p,
         })
     }
 
@@ -1671,6 +1672,10 @@ impl InferenceProvider for Provider {
     /// a Chutes-only model has no NEAR tier so this provider is primary.
     fn tier(&self) -> crate::ProviderTier {
         crate::ProviderTier::Attested3p
+    }
+
+    fn provider_source(&self) -> crate::ProviderSource {
+        crate::ProviderSource::Chutes
     }
 
     /// Chutes only serves an attested STREAM when streaming is explicitly enabled

@@ -1,3 +1,4 @@
+use super::provider_attribution::ProviderAttribution;
 use crate::responses::models::ResponseId;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -400,6 +401,8 @@ pub enum RecordUsageApiRequest {
         /// Duplicate calls with the same id within the same org
         /// return the existing record without double-charging.
         id: String,
+        #[serde(flatten)]
+        provider_attribution: ProviderAttribution,
     },
     /// Image generation or editing
     ImageGeneration {
@@ -413,6 +416,8 @@ pub enum RecordUsageApiRequest {
         /// Duplicate calls with the same id within the same org
         /// return the existing record without double-charging.
         id: String,
+        #[serde(flatten)]
+        provider_attribution: ProviderAttribution,
     },
     /// Input-token-billed, output-less inference. Bills
     /// `input_tokens × input_cost_per_token` on the named model (no output
@@ -428,24 +433,32 @@ pub enum RecordUsageApiRequest {
         input_tokens: i32,
         /// External idempotency key (see [`Self::ChatCompletion`]'s `id`)
         id: String,
+        #[serde(flatten)]
+        provider_attribution: ProviderAttribution,
     },
     /// Document reranking (billed like [`Self::Embedding`])
     Rerank {
         model: String,
         input_tokens: i32,
         id: String,
+        #[serde(flatten)]
+        provider_attribution: ProviderAttribution,
     },
     /// Text similarity scoring (billed like [`Self::Embedding`])
     Score {
         model: String,
         input_tokens: i32,
         id: String,
+        #[serde(flatten)]
+        provider_attribution: ProviderAttribution,
     },
     /// Privacy/PII classification (billed like [`Self::Embedding`])
     PrivacyClassify {
         model: String,
         input_tokens: i32,
         id: String,
+        #[serde(flatten)]
+        provider_attribution: ProviderAttribution,
     },
 }
 
@@ -475,6 +488,7 @@ pub struct RecordUsageServiceRequest {
     pub response_id: Option<ResponseId>,
     /// Number of images generated (for image generation requests)
     pub image_count: Option<i32>,
+    pub provider_attribution: ProviderAttribution,
 }
 
 /// Request to record usage (database layer)
@@ -507,6 +521,7 @@ pub struct RecordUsageDbRequest {
     pub response_id: Option<ResponseId>,
     /// Number of images generated (for image generation requests)
     pub image_count: Option<i32>,
+    pub provider_attribution: ProviderAttribution,
 }
 
 /// Model pricing information
@@ -618,6 +633,7 @@ pub struct UsageLogEntry {
     /// The database balance is correctly updated only for new inserts,
     /// and this flag ensures metrics tracking follows the same pattern.
     pub was_inserted: bool,
+    pub provider_attribution: ProviderAttribution,
 }
 
 // ============================================

@@ -1,54 +1,175 @@
 name: Tests
 
+# NOTE: deliberately NO top-level `paths:` filter. "Test Suite" is a required
+# status check (branch ruleset), and a path-filtered workflow that is skipped
+# leaves that check perpetually "Expected", which blocks every PR that does not
+# touch Rust files (CI, build scripts, docs) until an admin bypasses it. Instead
+# the workflow always runs and the `changes` job below decides whether the
+# expensive Rust jobs actually execute — so "Test Suite" always reports a result.
 on:
   push:
     branches: [ main, develop ]
-    paths:
-      - '**/*.rs'
-      - '**/Cargo.toml'
-      - '**/Cargo.lock'
-      - 'crates/database/src/migrations/**'
-      - '.github/workflows/test.yml'
   pull_request:
     branches: [ main, develop ]
-    paths:
-      - '**/*.rs'
-      - '**/Cargo.toml'
-      - '**/Cargo.lock'
-      - 'crates/database/src/migrations/**'
-      - '.github/workflows/test.yml'
 
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
   CARGO_INCREMENTAL: 0  # Faster CI builds
+  # Use sccache to cache compiled artifacts across runs. Complements
+  # swatinem/rust-cache (which caches target/) by caching at the object-file
+  # granularity, so dependency recompiles after a Cargo.lock bump or a
+  # feature-flag change are served from cache. On a self-hosted runner the
+  # default cache dir (~/.cache/sccache) persists across runs on disk, so
+  # no actions/cache step is needed.
+  RUSTC_WRAPPER: sccache
+  # Use the mold linker on Linux for much faster linking of the large test
+  # binaries (5-crate workspace, ~400 deps). We pass -fuse-ld=mold through
+  # the default cc driver rather than setting mold as the linker directly,
+  # because mold is a linker, not a driver, and does not understand gcc
+  # driver flags like -m64.
+  #
+  # NOTE: Setting RUSTFLAGS here replaces the target.cfg.rustflags from
+  # .cargo/config.toml (cargo treats these as mutually exclusive sources).
+  # That is intentional for CI: the dropped flags (--remap-path-prefix,
+  # --build-id=none, --hash-style=gnu, --no-undefined) are reproducibility-
+  # only and irrelevant for tests. We keep -C debuginfo=0 for faster test
+  # compiles. The Docker reproducible build does not set RUSTFLAGS, so it
+  # keeps using the full .cargo/config.toml rustflags with ld.
+  RUSTFLAGS: "-C debuginfo=0 -C link-arg=-fuse-ld=mold"
 
 jobs:
+  # Decide whether the Rust test jobs need to run. Covers the same path set the
+  # old `on:` filter used, plus rust-toolchain.toml and .cargo/config.toml (which
+  # affect the build but the old filter omitted). Fails safe: anything we can't
+  # classify (new branch, detection error) is treated as "run the tests".
+  changes:
+    name: Detect changes
+    runs-on: [self-hosted, infra]
+    permissions:
+      contents: read
+    outputs:
+      rust: ${{ steps.detect.outputs.rust }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0  # need history to diff the PR / push range
+
+      - name: Detect Rust-relevant changes
+        id: detect
+        run: |
+          EVENT="${{ github.event_name }}"
+          CHANGED=""
+          if [ "$EVENT" = "pull_request" ]; then
+            CHANGED=$(git diff --name-only \
+              "${{ github.event.pull_request.base.sha }}...${{ github.event.pull_request.head.sha }}" 2>/dev/null)
+          elif [ "$EVENT" = "push" ] && \
+               [ "${{ github.event.before }}" != "0000000000000000000000000000000000000000" ]; then
+            CHANGED=$(git diff --name-only "${{ github.event.before }}" "${{ github.sha }}" 2>/dev/null)
+          fi
+          echo "Changed files:"
+          echo "$CHANGED"
+          # Default to running tests; only skip when we have a concrete file list
+          # and none of it is Rust-relevant.
+          RUST=true
+          if [ -n "$CHANGED" ] && ! echo "$CHANGED" | grep -qE \
+            '(\.rs$|(^|/)Cargo\.(toml|lock)$|^crates/database/src/migrations/|^\.github/workflows/test\.yml$|^\.github/actions/setup-rust-ci/|^\.config/nextest\.toml$|^rust-toolchain\.toml$|^\.cargo/config\.toml$)'; then
+            RUST=false
+          fi
+          echo "rust=$RUST" >> "$GITHUB_OUTPUT"
+          echo "Decision: run Rust test jobs = $RUST"
+
   lint:
     name: Lint
+    needs: changes
+    if: ${{ needs.changes.outputs.rust == 'true' }}
     runs-on: [self-hosted, infra]
 
     steps:
-    - uses: actions/checkout@v6
+    - uses: actions/checkout@v7
 
-    - name: Install Rust
-      uses: actions-rust-lang/setup-rust-toolchain@v1
+    - name: Setup Rust CI
+      uses: ./.github/actions/setup-rust-ci
       with:
+        cache-key: lint
         components: rustfmt, clippy
-
-    - name: Cache Rust dependencies
-      uses: swatinem/rust-cache@v2
-      with:
-        cache-on-failure: true
 
     - name: Run cargo fmt
       run: cargo fmt --all -- --check
 
+    # Clippy reuses the same target/ dir as tests, so this also warms the
+    # sccache + rust-cache for the parallel test jobs.
     - name: Run cargo clippy
       run: cargo clippy --all-targets --all-features -- -D warnings
 
-  test:
-    name: Test Suite
+  # Unit tests (library + binary tests) run without PostgreSQL: the in-crate
+  # #[test] functions use mocks and do not establish real DB connections.
+  unit-test:
+    name: Unit tests
+    needs: changes
+    if: ${{ needs.changes.outputs.rust == 'true' }}
+    runs-on: [self-hosted, infra]
+
+    steps:
+    - uses: actions/checkout@v7
+
+    - name: Setup Rust CI
+      uses: ./.github/actions/setup-rust-ci
+      with:
+        cache-key: unit
+
+    - name: Run unit tests
+      run: cargo nextest run --lib --bins
+      env:
+        POSTGRES_PRIMARY_APP_ID: ${{ secrets.POSTGRES_PRIMARY_APP_ID }}
+        DATABASE_HOST: localhost
+        DATABASE_PORT: 5432
+        DATABASE_NAME: platform_api
+        DATABASE_USERNAME: postgres
+        DATABASE_PASSWORD: postgres
+        DATABASE_MAX_CONNECTIONS: 5
+        DATABASE_TLS_ENABLED: "false"
+        MODEL_DISCOVERY_SERVER_URL: ${{ secrets.MODEL_DISCOVERY_SERVER_URL }}
+        MODEL_DISCOVERY_API_KEY: ${{ secrets.MODEL_DISCOVERY_API_KEY }}
+        AUTH_ADMIN_DOMAINS: ${{ secrets.AUTH_ADMIN_DOMAINS }}
+        AUTH_ENCODING_KEY: ${{ secrets.AUTH_ENCODING_KEY }}
+        BRAVE_SEARCH_PRO_API_KEY: ${{ secrets.BRAVE_SEARCH_PRO_API_KEY }}
+        DEV: "true"
+
+  # vLLM provider integration tests. Uses MockProvider by default
+  # (USE_REAL_VLLM is not set), so these run without external dependencies
+  # and without PostgreSQL. Kept as a separate job so a flake here doesn't
+  # block the e2e suite.
+  integration-test:
+    name: Integration tests
+    needs: changes
+    if: ${{ needs.changes.outputs.rust == 'true' }}
+    runs-on: [self-hosted, infra]
+
+    steps:
+    - uses: actions/checkout@v7
+
+    - name: Setup Rust CI
+      uses: ./.github/actions/setup-rust-ci
+      with:
+        cache-key: integration
+
+    - name: Run integration tests
+      run: cargo nextest run --test integration_tests
+      env:
+        VLLM_BASE_URL: ${{ secrets.VLLM_BASE_URL }}
+        VLLM_API_KEY: ${{ secrets.VLLM_API_KEY }}
+
+  # End-to-end tests. All e2e tests are compiled into a single binary
+  # (tests/e2e_all/) for faster linking. Isolation comes from UUID-scoped
+  # orgs/workspaces/keys on a shared database, not separate databases.
+  # nextest concurrency is capped by .config/nextest.toml (e2e-db group
+  # max-threads = 16; 16 * 4 pool conns = 64 < PG default max_connections
+  # = 100), so no ALTER SYSTEM / restart step is needed.
+  e2e-test:
+    name: E2E tests
+    needs: changes
+    if: ${{ needs.changes.outputs.rust == 'true' }}
     runs-on: [self-hosted, infra]
     environment: Cloud API test env
 
@@ -69,55 +190,14 @@ jobs:
           - 5432:5432
 
     steps:
-    - uses: actions/checkout@v6
+    - uses: actions/checkout@v7
 
-    - name: Increase PostgreSQL max connections
-      run: |
-        # 16 parallel tests * 4 pool connections = 64, but allow headroom for spikes.
-        docker exec ${{ job.services.postgres.id }} \
-          psql -U postgres -c "ALTER SYSTEM SET max_connections = 150;"
-        docker restart ${{ job.services.postgres.id }}
-        for i in $(seq 1 30); do
-          docker exec ${{ job.services.postgres.id }} pg_isready -U postgres && break
-          sleep 1
-        done
-        if ! docker exec ${{ job.services.postgres.id }} pg_isready -U postgres; then
-          echo "PostgreSQL did not become ready after restart within 30 seconds" >&2
-          exit 1
-        fi
-
-    - name: Install Rust
-      uses: actions-rust-lang/setup-rust-toolchain@v1
-
-    - name: Cache Rust dependencies
-      uses: swatinem/rust-cache@v2
+    - name: Setup Rust CI
+      uses: ./.github/actions/setup-rust-ci
       with:
-        cache-on-failure: true
+        cache-key: e2e
 
-    - name: Install cargo-nextest
-      uses: taiki-e/install-action@nextest
-
-    - name: Run unit tests
-      run: cargo nextest run --lib --bins
-      env:
-        POSTGRES_PRIMARY_APP_ID: ${{ secrets.POSTGRES_PRIMARY_APP_ID }}
-        DATABASE_HOST: localhost
-        DATABASE_PORT: 5432
-        DATABASE_NAME: platform_api
-        DATABASE_USERNAME: postgres
-        DATABASE_PASSWORD: postgres
-        DATABASE_MAX_CONNECTIONS: 5
-        DATABASE_TLS_ENABLED: "false"
-        MODEL_DISCOVERY_SERVER_URL: ${{ secrets.MODEL_DISCOVERY_SERVER_URL }}
-        MODEL_DISCOVERY_API_KEY: ${{ secrets.MODEL_DISCOVERY_API_KEY }}
-        AUTH_ADMIN_DOMAINS: ${{ secrets.AUTH_ADMIN_DOMAINS }}
-        AUTH_ENCODING_KEY: ${{ secrets.AUTH_ENCODING_KEY }}
-        BRAVE_SEARCH_PRO_API_KEY: ${{ secrets.BRAVE_SEARCH_PRO_API_KEY }}
-        DEV: "true"
-
-    # All e2e tests are compiled into a single binary (tests/e2e_all/) for faster linking.
-    # Isolation comes from UUID-scoped orgs/workspaces/keys, not separate databases.
-    - name: Run integration tests
+    - name: Run e2e tests
       run: cargo nextest run --test e2e_all
       env:
         POSTGRES_PRIMARY_APP_ID: ${{ secrets.POSTGRES_PRIMARY_APP_ID }}
@@ -137,22 +217,67 @@ jobs:
         RUST_LOG: debug
         DEV: "true"
 
-    - name: Run vLLM integration tests
-      run: cargo test --test integration_tests -- --nocapture
-      env:
-        VLLM_BASE_URL: ${{ secrets.VLLM_BASE_URL }}
-        VLLM_API_KEY: ${{ secrets.VLLM_API_KEY }}
+  # Aggregates all test jobs into a single required status check. The branch
+  # ruleset requires "Test Suite", so this job MUST always run and always report
+  # a result (note `if: always()` plus no `paths:` filter on the workflow) —
+  # otherwise the required check stays "Expected" forever and blocks the PR.
+  # When there are no Rust-relevant changes the test jobs are skipped and this
+  # gate passes; otherwise every test job must have succeeded.
+  test-suite:
+    name: Test Suite
+    runs-on: [self-hosted, infra]
+    needs: [changes, lint, unit-test, integration-test, e2e-test]
+    if: always()
+    steps:
+      - name: Check all tests passed
+        run: |
+          # Fail closed if change detection itself failed — we can't safely
+          # conclude tests were unnecessary.
+          if [[ "${{ needs.changes.result }}" != "success" ]]; then
+            echo "Change-detection job did not succeed (${{ needs.changes.result }}); failing closed."
+            exit 1
+          fi
 
-    # Only build release on main branch, not on PRs
+          if [[ "${{ needs.changes.outputs.rust }}" != "true" ]]; then
+            echo "No Rust-relevant changes — test jobs were skipped. Nothing to verify."
+            exit 0
+          fi
+
+          failed=0
+          for jr in "Lint=${{ needs.lint.result }}" \
+                    "Unit tests=${{ needs.unit-test.result }}" \
+                    "Integration tests=${{ needs.integration-test.result }}" \
+                    "E2E tests=${{ needs.e2e-test.result }}"; do
+            name="${jr%%=*}"; res="${jr#*=}"
+            if [[ "$res" != "success" ]]; then
+              echo "FAIL  ${name}: ${res}"
+              failed=1
+            else
+              echo "OK    ${name}: success"
+            fi
+          done
+          if [[ "$failed" -ne 0 ]]; then
+            echo "One or more test jobs did not succeed"
+            exit 1
+          fi
+          echo "All test jobs passed"
+
+  # Release build, only on main pushes. Split into its own job so it does
+  # not block the test jobs and does not pull in PostgreSQL or test env vars
+  # (there is no build.rs; cargo build --release needs none of them).
+  build-release:
+    name: Build release
+    needs: changes
+    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.changes.outputs.rust == 'true' }}
+    runs-on: [self-hosted, infra]
+
+    steps:
+    - uses: actions/checkout@v7
+
+    - name: Setup Rust CI
+      uses: ./.github/actions/setup-rust-ci
+      with:
+        cache-key: release
+
     - name: Build release
-      if: github.event_name == 'push' && github.ref == 'refs/heads/main'
       run: cargo build --release
-      env:
-        POSTGRES_PRIMARY_APP_ID: ${{ secrets.POSTGRES_PRIMARY_APP_ID }}
-        DATABASE_HOST: localhost
-        DATABASE_PORT: 5432
-        DATABASE_NAME: platform_api
-        DATABASE_USERNAME: postgres
-        DATABASE_PASSWORD: postgres
-        MODEL_DISCOVERY_SERVER_URL: ${{ secrets.MODEL_DISCOVERY_SERVER_URL }}
-        AUTH_ENCODING_KEY: ${{ secrets.AUTH_ENCODING_KEY }}

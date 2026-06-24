@@ -138,6 +138,30 @@ pub enum ProviderTier {
     NonAttested,
 }
 
+/// Concrete inference-engine implementation backing a provider.
+///
+/// Used for usage attribution and analytics so requests can be grouped by the
+/// serving implementation even when multiple implementations share a trust tier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ProviderSource {
+    /// NEAR AI's own attested vLLM/SGLang fleet (`attested::nearai`).
+    Vllm,
+    /// A plaintext, non-attested third party (`non_attested::external`).
+    External,
+    /// A Chutes-attested third party (`attested::chutes`).
+    Chutes,
+}
+
+impl ProviderSource {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            ProviderSource::Vllm => "vllm",
+            ProviderSource::External => "external",
+            ProviderSource::Chutes => "chutes",
+        }
+    }
+}
+
 impl ProviderTier {
     /// Whether this tier carries a verifiable TEE attestation we gate a
     /// "verified" badge on. True for [`Near`](ProviderTier::Near) and
@@ -344,6 +368,12 @@ pub trait InferenceProvider {
     /// returns [`ProviderTier::Attested3p`].
     fn tier(&self) -> ProviderTier {
         ProviderTier::NonAttested
+    }
+
+    /// Concrete provider implementation backing this instance. Defaults to
+    /// [`ProviderSource::External`]; NEAR and Chutes providers override it.
+    fn provider_source(&self) -> ProviderSource {
+        ProviderSource::External
     }
 
     /// Whether this provider can serve **streaming** completions. Default `true`.

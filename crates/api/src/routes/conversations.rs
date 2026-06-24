@@ -59,7 +59,11 @@ pub async fn create_conversation(
     Json(request): Json<CreateConversationRequest>,
 ) -> Result<(StatusCode, ResponseJson<ConversationObject>), (StatusCode, ResponseJson<ErrorResponse>)>
 {
-    debug!("Create conversation request from key: {:?}", api_key);
+    debug!(
+        workspace_id = %api_key.workspace_id.0,
+        api_key_present = true,
+        "Create conversation request from API key"
+    );
 
     // Validate the request
     if let Err(error) = request.validate() {

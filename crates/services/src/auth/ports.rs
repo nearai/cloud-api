@@ -530,14 +530,14 @@ impl AuthServiceTrait for MockAuthService {
         match self.validate_session_access_token(access_token.clone(), encoding_key) {
             Ok(Some(claims)) => {
                 let user = Self::create_mock_user_with_id(claims.sub);
-                tracing::debug!("MockAuthService returning mock user: {}", user.email);
+                tracing::debug!(user_id = %user.id.0, "MockAuthService returning mock user");
                 Ok(user)
             }
             Ok(None) => {
                 // JWT decoding failed - try to extract user ID from rt_ token format
                 let user_id = Self::extract_user_id_from_token(&access_token);
                 let user = Self::create_mock_user_with_id(user_id);
-                tracing::debug!("MockAuthService returning mock user: {}", user.email);
+                tracing::debug!(user_id = %user.id.0, "MockAuthService returning mock user");
                 Ok(user)
             }
             Err(_) => Err(AuthError::SessionNotFound),
@@ -566,17 +566,19 @@ impl AuthServiceTrait for MockAuthService {
         session_token: SessionToken,
         user_agent: &str,
     ) -> Result<(Session, User), AuthError> {
+        let session_token_present = !session_token.0.is_empty();
+        let user_agent_present = !user_agent.is_empty();
         tracing::debug!(
-            "MockAuthService::validate_session called with token: {}, user_agent: {}",
-            session_token,
-            user_agent
+            session_token_present,
+            user_agent_present,
+            "MockAuthService::validate_session called"
         );
         // Accept any token that starts with "rt_"
         if session_token.0.starts_with("rt_") && user_agent == MOCK_USER_AGENT {
             let user_id = Self::extract_user_id_from_token(&session_token.0);
             let user = Self::create_mock_user_with_id(user_id);
             let (_, session, _) = self.create_mock_session(user.id.clone());
-            tracing::debug!("MockAuthService returning mock user: {}", user.email);
+            tracing::debug!(user_id = %user.id.0, "MockAuthService returning mock user");
             Ok((session, user))
         } else {
             Err(AuthError::SessionNotFound)

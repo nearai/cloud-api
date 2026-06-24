@@ -1,5 +1,5 @@
 use crate::{
-    middleware::{auth::AuthenticatedApiKey, RequestBodyHash},
+    middleware::{auth::AuthenticatedApiKey, RequestBodyHash, RequestCorrelation},
     models::{ErrorResponse, ResponseInputItemList},
     routes::common::{HEADER_SHOULD_RETRY, SHOULD_RETRY_FALSE},
     routes::extractors::OpenAiJson,
@@ -242,6 +242,7 @@ pub async fn create_response(
     State(state): State<ResponseRouteState>,
     Extension(api_key): Extension<AuthenticatedApiKey>,
     Extension(body_hash): Extension<RequestBodyHash>,
+    Extension(correlation): Extension<RequestCorrelation>,
     headers: HeaderMap,
     OpenAiJson(mut request): OpenAiJson<CreateResponseRequest>,
 ) -> axum::response::Response {
@@ -313,6 +314,7 @@ pub async fn create_response(
                 request,
                 services::UserId(api_key.api_key.created_by_user_id.0),
                 api_key.api_key.id.0.clone(),
+                correlation.request_id,
                 api_key.organization.id.0,
                 api_key.workspace.id.0,
                 body_hash.hash.clone(),
@@ -436,6 +438,7 @@ pub async fn create_response(
                 request.clone(),
                 services::UserId(api_key.api_key.created_by_user_id.0),
                 api_key.api_key.id.0.clone(),
+                correlation.request_id,
                 api_key.organization.id.0,
                 api_key.workspace.id.0,
                 body_hash.hash.clone(),
@@ -466,13 +469,17 @@ pub async fn create_response(
                 let mut delta_count = 0;
                 while let Some(event) = stream.next().await {
                     event_count += 1;
+                    let event_type = event.event_type.as_str();
+                    let delta_len = event.delta.as_ref().map_or(0, String::len);
+                    let has_delta = event.delta.is_some();
                     tracing::debug!(
-                        "Non-streaming collection: received event #{} type={} delta={:?}",
                         event_count,
-                        event.event_type,
-                        event.delta
+                        event_type,
+                        has_delta,
+                        delta_len,
+                        "Non-streaming collection received event"
                     );
-                    match event.event_type.as_str() {
+                    match event_type {
                         "response.created" => {
                             // Extract response ID from response object
                             if let Some(response) = &event.response {
@@ -488,10 +495,9 @@ pub async fn create_response(
                             if let Some(delta) = &event.delta {
                                 delta_count += 1;
                                 tracing::debug!(
-                                    "Non-streaming: delta #{} len={} content='{}'",
+                                    "Non-streaming: delta #{} len={}",
                                     delta_count,
-                                    delta.len(),
-                                    delta
+                                    delta.len()
                                 );
                                 content.push_str(delta);
                             }
@@ -531,8 +537,8 @@ pub async fn create_response(
                                                 } = content_part
                                                 {
                                                     tracing::debug!(
-                                                        "Non-streaming: final_response output[{}].content[{}] text_len={} text='{}'",
-                                                        idx, cidx, text.len(), text
+                                                        "Non-streaming: final_response output[{}].content[{}] text_len={}",
+                                                        idx, cidx, text.len()
                                                     );
                                                 }
                                             }

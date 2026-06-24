@@ -1,24 +1,16 @@
 name: Tests
 
+# NOTE: deliberately NO top-level `paths:` filter. "Test Suite" is a required
+# status check (branch ruleset), and a path-filtered workflow that is skipped
+# leaves that check perpetually "Expected", which blocks every PR that does not
+# touch Rust files (CI, build scripts, docs) until an admin bypasses it. Instead
+# the workflow always runs and the `changes` job below decides whether the
+# expensive Rust jobs actually execute — so "Test Suite" always reports a result.
 on:
   push:
     branches: [ main, develop ]
-    paths:
-      - '**/*.rs'
-      - '**/Cargo.toml'
-      - '**/Cargo.lock'
-      - 'crates/database/src/migrations/**'
-      - '.github/workflows/test.yml'
-      - '.config/nextest.toml'
   pull_request:
     branches: [ main, develop ]
-    paths:
-      - '**/*.rs'
-      - '**/Cargo.toml'
-      - '**/Cargo.lock'
-      - 'crates/database/src/migrations/**'
-      - '.github/workflows/test.yml'
-      - '.config/nextest.toml'
 
 env:
   CARGO_TERM_COLOR: always
@@ -47,12 +39,54 @@ env:
   RUSTFLAGS: "-C debuginfo=0 -C link-arg=-fuse-ld=mold"
 
 jobs:
+  # Decide whether the Rust test jobs need to run. Covers the same path set the
+  # old `on:` filter used, plus rust-toolchain.toml and .cargo/config.toml (which
+  # affect the build but the old filter omitted). Fails safe: anything we can't
+  # classify (new branch, detection error) is treated as "run the tests".
+  changes:
+    name: Detect changes
+    runs-on: [self-hosted, infra]
+    permissions:
+      contents: read
+    outputs:
+      rust: ${{ steps.detect.outputs.rust }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0  # need history to diff the PR / push range
+
+      - name: Detect Rust-relevant changes
+        id: detect
+        run: |
+          EVENT="${{ github.event_name }}"
+          CHANGED=""
+          if [ "$EVENT" = "pull_request" ]; then
+            CHANGED=$(git diff --name-only \
+              "${{ github.event.pull_request.base.sha }}...${{ github.event.pull_request.head.sha }}" 2>/dev/null)
+          elif [ "$EVENT" = "push" ] && \
+               [ "${{ github.event.before }}" != "0000000000000000000000000000000000000000" ]; then
+            CHANGED=$(git diff --name-only "${{ github.event.before }}" "${{ github.sha }}" 2>/dev/null)
+          fi
+          echo "Changed files:"
+          echo "$CHANGED"
+          # Default to running tests; only skip when we have a concrete file list
+          # and none of it is Rust-relevant.
+          RUST=true
+          if [ -n "$CHANGED" ] && ! echo "$CHANGED" | grep -qE \
+            '(\.rs$|(^|/)Cargo\.(toml|lock)$|^crates/database/src/migrations/|^\.github/workflows/test\.yml$|^\.github/actions/setup-rust-ci/|^\.config/nextest\.toml$|^rust-toolchain\.toml$|^\.cargo/config\.toml$)'; then
+            RUST=false
+          fi
+          echo "rust=$RUST" >> "$GITHUB_OUTPUT"
+          echo "Decision: run Rust test jobs = $RUST"
+
   lint:
     name: Lint
+    needs: changes
+    if: ${{ needs.changes.outputs.rust == 'true' }}
     runs-on: [self-hosted, infra]
 
     steps:
-    - uses: actions/checkout@v6
+    - uses: actions/checkout@v7
 
     - name: Setup Rust CI
       uses: ./.github/actions/setup-rust-ci
@@ -72,10 +106,12 @@ jobs:
   # #[test] functions use mocks and do not establish real DB connections.
   unit-test:
     name: Unit tests
+    needs: changes
+    if: ${{ needs.changes.outputs.rust == 'true' }}
     runs-on: [self-hosted, infra]
 
     steps:
-    - uses: actions/checkout@v6
+    - uses: actions/checkout@v7
 
     - name: Setup Rust CI
       uses: ./.github/actions/setup-rust-ci
@@ -106,10 +142,12 @@ jobs:
   # block the e2e suite.
   integration-test:
     name: Integration tests
+    needs: changes
+    if: ${{ needs.changes.outputs.rust == 'true' }}
     runs-on: [self-hosted, infra]
 
     steps:
-    - uses: actions/checkout@v6
+    - uses: actions/checkout@v7
 
     - name: Setup Rust CI
       uses: ./.github/actions/setup-rust-ci
@@ -130,6 +168,8 @@ jobs:
   # = 100), so no ALTER SYSTEM / restart step is needed.
   e2e-test:
     name: E2E tests
+    needs: changes
+    if: ${{ needs.changes.outputs.rust == 'true' }}
     runs-on: [self-hosted, infra]
     environment: Cloud API test env
 
@@ -150,7 +190,7 @@ jobs:
           - 5432:5432
 
     steps:
-    - uses: actions/checkout@v6
+    - uses: actions/checkout@v7
 
     - name: Setup Rust CI
       uses: ./.github/actions/setup-rust-ci
@@ -177,22 +217,47 @@ jobs:
         RUST_LOG: debug
         DEV: "true"
 
-  # Aggregates all test jobs into a single required status check. Branch
-  # protection requires "Test Suite"; this job satisfies that requirement
-  # without running any extra work.
+  # Aggregates all test jobs into a single required status check. The branch
+  # ruleset requires "Test Suite", so this job MUST always run and always report
+  # a result (note `if: always()` plus no `paths:` filter on the workflow) —
+  # otherwise the required check stays "Expected" forever and blocks the PR.
+  # When there are no Rust-relevant changes the test jobs are skipped and this
+  # gate passes; otherwise every test job must have succeeded.
   test-suite:
     name: Test Suite
     runs-on: [self-hosted, infra]
-    needs: [lint, unit-test, integration-test, e2e-test]
+    needs: [changes, lint, unit-test, integration-test, e2e-test]
     if: always()
     steps:
       - name: Check all tests passed
         run: |
-          if [[ "${{ needs.lint.result }}" != "success" || \
-                "${{ needs.unit-test.result }}" != "success" || \
-                "${{ needs.integration-test.result }}" != "success" || \
-                "${{ needs.e2e-test.result }}" != "success" ]]; then
-            echo "One or more test jobs failed"
+          # Fail closed if change detection itself failed — we can't safely
+          # conclude tests were unnecessary.
+          if [[ "${{ needs.changes.result }}" != "success" ]]; then
+            echo "Change-detection job did not succeed (${{ needs.changes.result }}); failing closed."
+            exit 1
+          fi
+
+          if [[ "${{ needs.changes.outputs.rust }}" != "true" ]]; then
+            echo "No Rust-relevant changes — test jobs were skipped. Nothing to verify."
+            exit 0
+          fi
+
+          failed=0
+          for jr in "Lint=${{ needs.lint.result }}" \
+                    "Unit tests=${{ needs.unit-test.result }}" \
+                    "Integration tests=${{ needs.integration-test.result }}" \
+                    "E2E tests=${{ needs.e2e-test.result }}"; do
+            name="${jr%%=*}"; res="${jr#*=}"
+            if [[ "$res" != "success" ]]; then
+              echo "FAIL  ${name}: ${res}"
+              failed=1
+            else
+              echo "OK    ${name}: success"
+            fi
+          done
+          if [[ "$failed" -ne 0 ]]; then
+            echo "One or more test jobs did not succeed"
             exit 1
           fi
           echo "All test jobs passed"
@@ -202,11 +267,12 @@ jobs:
   # (there is no build.rs; cargo build --release needs none of them).
   build-release:
     name: Build release
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: changes
+    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.changes.outputs.rust == 'true' }}
     runs-on: [self-hosted, infra]
 
     steps:
-    - uses: actions/checkout@v6
+    - uses: actions/checkout@v7
 
     - name: Setup Rust CI
       uses: ./.github/actions/setup-rust-ci

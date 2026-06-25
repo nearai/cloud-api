@@ -281,11 +281,24 @@ impl ApiKeyRepository {
                     ak.is_active,
                     ak.deleted_at,
                     ak.spend_limit,
-                    COALESCE(SUM(usg.total_cost), 0)::BIGINT as usage
+                    (
+                        COALESCE(inference_usage.total_cost, 0)
+                        + COALESCE(service_usage.total_cost, 0)
+                    )::BIGINT as usage
                 FROM api_keys ak
-                LEFT JOIN organization_usage_log usg ON ak.id = usg.api_key_id
+                LEFT JOIN (
+                    SELECT api_key_id, COALESCE(SUM(total_cost), 0)::BIGINT AS total_cost
+                    FROM organization_usage_log
+                    WHERE workspace_id = $1
+                    GROUP BY api_key_id
+                ) inference_usage ON ak.id = inference_usage.api_key_id
+                LEFT JOIN (
+                    SELECT api_key_id, COALESCE(SUM(total_cost), 0)::BIGINT AS total_cost
+                    FROM organization_service_usage_log
+                    WHERE workspace_id = $1
+                    GROUP BY api_key_id
+                ) service_usage ON ak.id = service_usage.api_key_id
                 WHERE ak.workspace_id = $1 AND ak.deleted_at IS NULL
-                GROUP BY ak.id
                 ORDER BY {order_by_column} {order_dir}{tie_breaker}
                 LIMIT $2 OFFSET $3
                 "#

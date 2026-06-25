@@ -567,8 +567,9 @@ mod tests {
         UpdateOrganizationMemberRequest, UpdateOrganizationRequest,
     };
     use crate::workspace::{
-        ApiKey, ApiKeyId, ApiKeyRepository, CreateApiKeyRequest, Workspace, WorkspaceId,
-        WorkspaceOrderBy, WorkspaceOrderDirection, WorkspaceRepository,
+        ApiKey, ApiKeyId, ApiKeyOrderBy, ApiKeyOrderDirection, ApiKeyRepository,
+        CreateApiKeyRequest, Workspace, WorkspaceId, WorkspaceOrderBy, WorkspaceOrderDirection,
+        WorkspaceRepository,
     };
     use bloomfilter::Bloom;
     use chrono::Utc;
@@ -735,6 +736,8 @@ mod tests {
             _: WorkspaceId,
             _: i64,
             _: i64,
+            _: Option<ApiKeyOrderBy>,
+            _: Option<ApiKeyOrderDirection>,
         ) -> Result<Vec<ApiKey>, RepositoryError> {
             unimplemented!()
         }

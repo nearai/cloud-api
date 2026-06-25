@@ -95,20 +95,29 @@ async fn test_list_workspace_api_keys_orders_by_usage() {
     let workspaces = list_workspaces(&server, org.id.clone()).await;
     let workspace = workspaces.first().unwrap();
     let model_name = setup_qwen_model(&server).await;
+    let service = get_or_create_web_search_service(&server).await;
 
     let unused_key =
         create_api_key_in_workspace(&server, workspace.id.clone(), "Unused Key".to_string()).await;
-    let low_spend_key =
-        create_api_key_in_workspace(&server, workspace.id.clone(), "Low Spend Key".to_string())
-            .await;
-    let high_spend_key =
-        create_api_key_in_workspace(&server, workspace.id.clone(), "High Spend Key".to_string())
-            .await;
+    let inference_spend_key = create_api_key_in_workspace(
+        &server,
+        workspace.id.clone(),
+        "Inference Spend Key".to_string(),
+    )
+    .await;
+    let service_spend_key = create_api_key_in_workspace(
+        &server,
+        workspace.id.clone(),
+        "Service Spend Key".to_string(),
+    )
+    .await;
 
     let organization_id = uuid::Uuid::parse_str(&org.id).unwrap();
     let workspace_id = uuid::Uuid::parse_str(&workspace.id).unwrap();
-    let low_spend_key_id = uuid::Uuid::parse_str(&low_spend_key.id).unwrap();
-    let high_spend_key_id = uuid::Uuid::parse_str(&high_spend_key.id).unwrap();
+    let unused_key_id = uuid::Uuid::parse_str(&unused_key.id).unwrap();
+    let inference_spend_key_id = uuid::Uuid::parse_str(&inference_spend_key.id).unwrap();
+    let service_spend_key_id = uuid::Uuid::parse_str(&service_spend_key.id).unwrap();
+    let service_id = service.id;
     let client = database.pool().get().await.unwrap();
     let model_id: uuid::Uuid = client
         .query_one(
@@ -120,8 +129,8 @@ async fn test_list_workspace_api_keys_orders_by_usage() {
         .get(0);
 
     for (api_key_id, total_cost) in [
-        (low_spend_key_id, 100_000_000_i64),
-        (high_spend_key_id, 300_000_000_i64),
+        (service_spend_key_id, 100_000_000_i64),
+        (inference_spend_key_id, 300_000_000_i64),
     ] {
         client
             .execute(
@@ -148,6 +157,57 @@ async fn test_list_workspace_api_keys_orders_by_usage() {
             .unwrap();
     }
 
+    client
+        .execute(
+            r#"
+            INSERT INTO organization_service_usage_log (
+                id, organization_id, workspace_id, api_key_id,
+                service_id, quantity, total_cost, inference_id, created_at
+            ) VALUES ($1, $2, $3, $4, $5, 1, 400000000, NULL, NOW())
+            "#,
+            &[
+                &uuid::Uuid::new_v4(),
+                &organization_id,
+                &workspace_id,
+                &service_spend_key_id,
+                &service_id,
+            ],
+        )
+        .await
+        .unwrap();
+
+    client
+        .execute(
+            "UPDATE api_keys SET created_at = NOW() + INTERVAL '3 hours' WHERE id = $1",
+            &[&service_spend_key_id],
+        )
+        .await
+        .unwrap();
+    client
+        .execute(
+            "UPDATE api_keys SET created_at = NOW() + INTERVAL '2 hours' WHERE id = $1",
+            &[&inference_spend_key_id],
+        )
+        .await
+        .unwrap();
+    client
+        .execute(
+            "UPDATE api_keys SET created_at = NOW() + INTERVAL '1 hour' WHERE id = $1",
+            &[&unused_key_id],
+        )
+        .await
+        .unwrap();
+
+    let default_response = server
+        .get(format!("/v1/workspaces/{}/api-keys?limit=3", workspace.id).as_str())
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .await;
+    assert_eq!(default_response.status_code(), 200);
+    let default_list = default_response.json::<api::models::ListApiKeysResponse>();
+    assert_eq!(default_list.api_keys[0].id, service_spend_key.id);
+    assert_eq!(default_list.api_keys[1].id, inference_spend_key.id);
+    assert_eq!(default_list.api_keys[2].id, unused_key.id);
+
     let desc_response = server
         .get(
             format!(
@@ -160,8 +220,8 @@ async fn test_list_workspace_api_keys_orders_by_usage() {
         .await;
     assert_eq!(desc_response.status_code(), 200);
     let desc_list = desc_response.json::<api::models::ListApiKeysResponse>();
-    assert_eq!(desc_list.api_keys[0].id, high_spend_key.id);
-    assert_eq!(desc_list.api_keys[1].id, low_spend_key.id);
+    assert_eq!(desc_list.api_keys[0].id, service_spend_key.id);
+    assert_eq!(desc_list.api_keys[1].id, inference_spend_key.id);
 
     let asc_response = server
         .get(
@@ -176,7 +236,7 @@ async fn test_list_workspace_api_keys_orders_by_usage() {
     assert_eq!(asc_response.status_code(), 200);
     let asc_list = asc_response.json::<api::models::ListApiKeysResponse>();
     assert_eq!(asc_list.api_keys[0].id, unused_key.id);
-    assert_eq!(asc_list.api_keys[1].id, low_spend_key.id);
+    assert_eq!(asc_list.api_keys[1].id, inference_spend_key.id);
 }
 
 #[tokio::test]

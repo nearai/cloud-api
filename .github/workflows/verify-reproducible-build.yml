@@ -291,3 +291,34 @@ jobs:
               echo "Build digests do not match across environments or verification failed."
             fi
           } >> "$GITHUB_STEP_SUMMARY"
+
+  # Post a Slack alert to #cvm-alerts when any build/verify job fails.
+  # No-ops gracefully if SLACK_BOT_TOKEN is not configured on the repo.
+  notify-slack:
+    name: Notify Slack on failure
+    needs: [build, sequential-builds, verify]
+    if: always() && contains(needs.*.result, 'failure')
+    runs-on: [self-hosted, infra]
+    steps:
+      - name: Send Slack notification
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+        run: |
+          if [ -z "${SLACK_BOT_TOKEN}" ]; then
+            echo "SLACK_BOT_TOKEN not set; skipping Slack notification"
+            exit 0
+          fi
+
+          command -v jq >/dev/null 2>&1 || { sudo apt-get update || true; sudo apt-get install -y jq; }
+
+          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          MSG=":red_circle: *Reproducible build verification failed* on \`${{ github.repository }}\`
+          Branch: \`${{ github.ref_name }}\` · Commit: \`${GITHUB_SHA:0:7}\`
+          Jobs — build: \`${{ needs.build.result }}\` · sequential-builds: \`${{ needs.sequential-builds.result }}\` · verify: \`${{ needs.verify.result }}\`
+
+          <${RUN_URL}|GitHub Actions run>"
+
+          curl -s -X POST https://slack.com/api/chat.postMessage \
+            -H "Authorization: Bearer ${SLACK_BOT_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -d "$(jq -n --arg channel "C09EQ848HHC" --arg text "$MSG" '{channel: $channel, text: $text, unfurl_links: false}')"

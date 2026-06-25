@@ -42,6 +42,12 @@ pub mod ports;
 const GATEWAY_KEY_PATH_ED25519: &str = "/signing-key/ed25519";
 const GATEWAY_KEY_PATH_ECDSA: &str = "/signing-key/ecdsa";
 
+/// Default TTL (seconds) for the no-nonce attestation-report cache. Reports for
+/// nonce-less requests are short-lived snapshots; ~10s collapses the bursty
+/// monitoring herd (bursts arrive within seconds) while keeping reports fresh.
+/// Override with `ATTESTATION_REPORT_CACHE_TTL_SECS`; `0` disables the cache.
+const DEFAULT_ATTESTATION_REPORT_CACHE_TTL_SECS: u64 = 10;
+
 pub struct AttestationService {
     pub repository: Arc<dyn AttestationRepository + Send + Sync>,
     pub inference_provider_pool: Arc<InferenceProviderPool>,
@@ -55,6 +61,15 @@ pub struct AttestationService {
     ed25519_verifying_key: Arc<VerifyingKey>,
     ecdsa_signing_key: Arc<EcdsaSigningKey>,
     ecdsa_verifying_key: Arc<EcdsaVerifyingKey>,
+    /// Short-TTL cache for attestation reports of **nonce-less** requests only.
+    /// Keyed on (model, algo, tls_fp, provider_filter, signing_address) — never
+    /// on a nonce. moka's `try_get_with` also single-flights concurrent misses,
+    /// so a burst of identical no-nonce probes triggers ONE backend build.
+    /// `None` when disabled (TTL=0). Nonce-bearing requests bypass it entirely
+    /// because the nonce is cryptographically bound into the TDX report_data and
+    /// the GPU evidence — serving a cached report for a different nonce would
+    /// defeat the freshness/replay guarantee.
+    report_cache: Option<moka::future::Cache<String, Arc<AttestationReport>>>,
 }
 
 impl AttestationService {
@@ -135,6 +150,29 @@ impl AttestationService {
                 }
             };
 
+        // Build the no-nonce attestation-report cache from env (TTL=0 disables it).
+        let cache_ttl_secs = std::env::var("ATTESTATION_REPORT_CACHE_TTL_SECS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(DEFAULT_ATTESTATION_REPORT_CACHE_TTL_SECS);
+        let report_cache = if cache_ttl_secs == 0 {
+            tracing::info!("Attestation-report cache disabled (TTL=0)");
+            None
+        } else {
+            tracing::info!(
+                ttl_secs = cache_ttl_secs,
+                "Attestation-report cache enabled"
+            );
+            Some(
+                moka::future::Cache::builder()
+                    // One entry per (model, algo, tls_fp, provider, signing_addr)
+                    // combination; the live model catalog is well under this.
+                    .max_capacity(1024)
+                    .time_to_live(std::time::Duration::from_secs(cache_ttl_secs))
+                    .build(),
+            )
+        };
+
         Ok(Self {
             repository,
             inference_provider_pool,
@@ -148,6 +186,7 @@ impl AttestationService {
             ed25519_verifying_key: Arc::new(ed25519_verifying_key),
             ecdsa_signing_key: Arc::new(ecdsa_signing_key),
             ecdsa_verifying_key: Arc::new(ecdsa_verifying_key),
+            report_cache,
         })
     }
 
@@ -569,6 +608,32 @@ pub fn load_vpc_shared_secret() -> Option<String> {
     }
 }
 
+/// Build the cache key for the no-nonce attestation-report cache.
+///
+/// SAFETY-CRITICAL: the nonce is deliberately NOT an input — this cache is only
+/// ever consulted for nonce-less requests (the caller checks `nonce.is_none()`
+/// before using the returned key). Every other parameter that changes the report
+/// contents IS part of the key, so a request can never receive a report built
+/// for a different model / algo / tls-fingerprint / provider tier / signing
+/// address. `signing_algo` is lowercased and defaulted to match the service's
+/// own algo normalization.
+fn report_cache_key(
+    model: Option<&str>,
+    signing_algo: Option<&str>,
+    include_tls_fingerprint: bool,
+    provider_filter: Option<inference_providers::ProviderTier>,
+    signing_address: Option<&str>,
+) -> String {
+    format!(
+        "m={}|a={}|tls={}|pf={}|sa={}",
+        model.unwrap_or("*"),
+        signing_algo.unwrap_or("ed25519").to_ascii_lowercase(),
+        include_tls_fingerprint,
+        provider_filter.map(|t| t.as_str()).unwrap_or("-"),
+        signing_address.unwrap_or("-"),
+    )
+}
+
 #[async_trait]
 impl ports::AttestationServiceTrait for AttestationService {
     async fn get_chat_signature(
@@ -747,254 +812,244 @@ impl ports::AttestationServiceTrait for AttestationService {
         nonce: Option<String>,
         signing_address: Option<String>,
         include_tls_fingerprint: bool,
+        provider_filter: Option<inference_providers::ProviderTier>,
     ) -> Result<AttestationReport, AttestationError> {
-        // Resolve model name (could be an alias) and get model details
-        let mut model_attestations = vec![];
-        // Create a nonce if none was provided
-        let nonce = nonce.unwrap_or_else(|| {
-            let mut nonce_bytes = [0u8; 32];
-            OsRng.fill_bytes(&mut nonce_bytes);
-            let generated_nonce = nonce_bytes
-                .into_iter()
-                .map(|byte| format!("{byte:02x}"))
-                .collect::<String>();
-            tracing::debug!(
-                "No nonce provided for attestation report, generated nonce: {}",
-                generated_nonce
-            );
-            generated_nonce
-        });
+        let env_tag = format!("{TAG_ENVIRONMENT}:{}", get_environment());
 
-        // Parse nonce: handle hex string or generate if needed
-        let nonce_bytes = hex::decode(&nonce).map_err(|e| {
-            tracing::error!("Failed to decode nonce hex string: {}", e);
-            AttestationError::InvalidParameter(format!("Invalid nonce format: {e}"))
-        })?;
+        // Precompute the no-nonce cache key BEFORE the params are moved into the
+        // build closure below.
+        let cache_key = report_cache_key(
+            model.as_deref(),
+            signing_algo.as_deref(),
+            include_tls_fingerprint,
+            provider_filter,
+            signing_address.as_deref(),
+        );
 
-        if nonce_bytes.len() != 32 {
-            return Err(AttestationError::InvalidParameter(format!(
-                "Nonce must be exactly 32 bytes, got {} bytes",
-                nonce_bytes.len()
-            )));
-        }
+        // The full (expensive) report build. `nonce` is the closure parameter so
+        // the body below is unchanged. Called exactly once per request: the
+        // bypass arm diverges via `return`, the cache arm via `try_get_with`.
+        let build = |nonce: Option<String>| async move {
+            // Track whether the caller supplied a nonce. Only caller-supplied nonces are
+            // forwarded to inference-proxy: when None, inference-proxy can serve its
+            // 5-minute cached report (skipping a fresh GPU-evidence NVIDIA NRAS round-trip
+            // that serializes behind a per-backend Mutex and costs ~700 ms per call).
+            let user_provided_nonce = nonce.clone();
 
-        // Determine which signing algorithm to use for report_data (default to ed25519)
-        let algo = signing_algo
-            .as_ref()
-            .map(|s| s.to_lowercase())
-            .unwrap_or_else(|| "ed25519".to_string());
+            // Produce (gateway_nonce: String, nonce_bytes: Vec<u8>) in one pass:
+            // – caller-supplied nonce: validate hex, decode once.
+            // – auto-generated nonce: fill random bytes, hex-encode once (no round-trip).
+            let (gateway_nonce, nonce_bytes) = match nonce {
+                Some(n) => {
+                    let bytes = hex::decode(&n).map_err(|e| {
+                        tracing::error!("Failed to decode nonce hex string: {}", e);
+                        AttestationError::InvalidParameter(format!("Invalid nonce format: {e}"))
+                    })?;
+                    if bytes.len() != 32 {
+                        return Err(AttestationError::InvalidParameter(format!(
+                            "Nonce must be exactly 32 bytes, got {} bytes",
+                            bytes.len()
+                        )));
+                    }
+                    (n, bytes)
+                }
+                None => {
+                    let mut bytes = vec![0u8; 32];
+                    OsRng.fill_bytes(&mut bytes);
+                    let hex = hex::encode(&bytes);
+                    tracing::debug!(
+                        "No nonce provided for attestation report, generated nonce: {hex}"
+                    );
+                    (hex, bytes)
+                }
+            };
 
-        if algo != "ecdsa" && algo != "ed25519" {
-            return Err(AttestationError::InvalidParameter(format!(
-                "Invalid signing algorithm: {algo}, must be 'ecdsa' or 'ed25519'"
-            )));
-        }
+            // Determine which signing algorithm to use for report_data (default to ed25519)
+            let algo = signing_algo
+                .as_ref()
+                .map(|s| s.to_lowercase())
+                .unwrap_or_else(|| "ed25519".to_string());
 
-        if let Some(model) = model {
-            let resolved_model = self
-                .models_repository
-                .resolve_and_get_model(&model)
-                .await
-                .map_err(|e| {
-                    AttestationError::ProviderError(format!("Failed to resolve model: {e}"))
-                })?
-                .ok_or_else(|| {
-                    AttestationError::ProviderError(format!(
-                        "Model '{model}' not found. It's not a valid model name or alias."
-                    ))
-                })?;
-
-            let canonical_name = &resolved_model.model_name;
-
-            // Log if we resolved an alias
-            if canonical_name != &model {
-                tracing::debug!(
-                    requested_model = %model,
-                    canonical_model = %canonical_name,
-                    "Resolved alias to canonical model name for attestation report"
-                );
+            if algo != "ecdsa" && algo != "ed25519" {
+                return Err(AttestationError::InvalidParameter(format!(
+                    "Invalid signing algorithm: {algo}, must be 'ecdsa' or 'ed25519'"
+                )));
             }
 
-            model_attestations = self
-                .inference_provider_pool
-                .get_attestation_report(
-                    canonical_name.clone(),
-                    signing_algo.clone(),
-                    Some(nonce.clone()),
-                    signing_address,
-                    include_tls_fingerprint,
-                )
-                .await
-                .map_err(|e| AttestationError::ProviderError(e.to_string()))?;
-        }
+            // Resolve model alias synchronously (fast DB lookup ~10 ms) before spawning
+            // the parallel futures below.
+            let resolved_canonical = if let Some(ref m) = model {
+                let resolved_model = self
+                    .models_repository
+                    .resolve_and_get_model(m)
+                    .await
+                    .map_err(|e| {
+                        AttestationError::ProviderError(format!("Failed to resolve model: {e}"))
+                    })?
+                    .ok_or_else(|| {
+                        AttestationError::ProviderError(format!(
+                            "Model '{m}' not found. It's not a valid model name or alias."
+                        ))
+                    })?;
+                let canonical = resolved_model.model_name.clone();
+                if &canonical != m {
+                    tracing::debug!(
+                        requested_model = %m,
+                        canonical_model = %canonical,
+                        "Resolved alias to canonical model name for attestation report"
+                    );
+                }
+                Some(canonical)
+            } else {
+                None
+            };
 
-        // Use VPC info loaded at initialization
-        let vpc = self.vpc_info.clone();
+            // Prepare gateway-quote inputs synchronously (no await needed).
+            let vpc = self.vpc_info.clone();
+            let signing_address_to_use = self.get_signing_address_hex(&algo)?;
+            let signing_address_clean = signing_address_to_use
+                .strip_prefix("0x")
+                .unwrap_or(&signing_address_to_use);
+            let signing_address_bytes = hex::decode(signing_address_clean).map_err(|e| {
+                tracing::error!("Failed to decode signing address hex string: {}", e);
+                AttestationError::InvalidParameter(format!("Invalid signing address format: {e}"))
+            })?;
+            let signing_address_for_report = if signing_address_bytes.len() > 32 {
+                signing_address_bytes[..32].to_vec()
+            } else {
+                signing_address_bytes
+            };
 
-        // Get signing address (public key) for report_data
-        // Store in owned String to avoid lifetime issues
-        let signing_address_to_use = self.get_signing_address_hex(&algo)?;
-
-        // Parse signing address from hex (remove 0x prefix if present)
-        let signing_address_clean = signing_address_to_use
-            .strip_prefix("0x")
-            .unwrap_or(&signing_address_to_use);
-        let signing_address_bytes = hex::decode(signing_address_clean).map_err(|e| {
-            tracing::error!("Failed to decode signing address hex string: {}", e);
-            AttestationError::InvalidParameter(format!("Invalid signing address format: {e}"))
-        })?;
-
-        // For report_data, we need exactly 32 bytes for the signing address
-        // ECDSA returns Ethereum address (20 bytes), ed25519 returns public key (32 bytes)
-        // We'll pad to 32 bytes if needed (left-justified with zeros)
-        let signing_address_for_report = if signing_address_bytes.len() > 32 {
-            // Take first 32 bytes if longer (shouldn't happen with current implementation)
-            signing_address_bytes[..32].to_vec()
-        } else {
-            signing_address_bytes
-        };
-
-        // Resolve TLS cert fingerprint if requested
-        let tls_fingerprint = if include_tls_fingerprint {
-            Some(self.tls_cert_fingerprint.clone().ok_or_else(|| {
+            let tls_fingerprint = if include_tls_fingerprint {
+                Some(self.tls_cert_fingerprint.clone().ok_or_else(|| {
                 AttestationError::InternalError(
                     "include_tls_fingerprint=true but TLS_CERT_PATH is not set or fingerprint could not be computed".to_string(),
                 )
             })?)
-        } else {
-            None
-        };
-
-        // Read TLS certificate PEM if fingerprint is requested (for the response body)
-        let tls_certificate = if include_tls_fingerprint {
-            if let Ok(path) = std::env::var("TLS_CERT_PATH") {
-                tokio::fs::read_to_string(&path).await.ok()
             } else {
                 None
-            }
-        } else {
-            None
-        };
+            };
 
-        // Build report_data: [first_32_bytes || nonce (32 bytes)]
-        // When include_tls_fingerprint=true: first_32 = SHA256(signing_address_bytes || cert_fingerprint_bytes)
-        // Otherwise: first_32 = signing_address (right-padded with zeros)
-        let mut report_data = vec![0u8; 64];
-        if let Some(ref fp_hex) = tls_fingerprint {
-            use sha2::Digest;
-            let fp_bytes = hex::decode(fp_hex).map_err(|e| {
-                AttestationError::InternalError(format!("bad cert fingerprint hex: {e}"))
-            })?;
-            let mut hasher = sha2::Sha256::new();
-            hasher.update(&signing_address_for_report);
-            hasher.update(&fp_bytes);
-            let hash = hasher.finalize();
-            report_data[..32].copy_from_slice(&hash);
-        } else {
-            report_data[..signing_address_for_report.len()]
-                .copy_from_slice(&signing_address_for_report);
-        }
-        report_data[32..64].copy_from_slice(&nonce_bytes);
-
-        // Fake attestation data is only available in debug builds with DEV set.
-        // In release builds, real dstack attestation is always required.
-        // Both the fake data branch and real dstack branch are gated with #[cfg] so
-        // fake attestation strings are physically absent from release binaries.
-        let gateway_attestation;
-        #[cfg(debug_assertions)]
-        {
-            if std::env::var("DEV").is_ok() {
-                gateway_attestation = DstackCpuQuote {
-                    signing_address: signing_address_to_use,
-                    signing_algo: algo,
-                    intel_quote: "0x1234567890abcdef".to_string(),
-                    event_log: "0x1234567890abcdef".to_string(),
-                    report_data: hex::encode(&report_data),
-                    request_nonce: nonce.clone(),
-                    info: serde_json::json!({
-                        "app_id": "dev-app-id",
-                        "instance_id": "dev-instance-id",
-                        "app_cert": "dev-app-cert",
-                        "tcb_info": {},
-                        "app_name": "dev-app-name",
-                        "device_id": "dev-device-id",
-                        "mr_aggregated": "dev-mr-aggregated",
-                        "os_image_hash": "dev-os-image-id",
-                        "key_provider_info": "dev-key-provider-info",
-                        "compose_hash": "dev-compose-hash",
-                        "vm_config": {},
-                    }),
-                    vpc,
-                    tls_cert_fingerprint: tls_fingerprint.clone(),
-                };
+            // Build report_data: [first_32_bytes || nonce (32 bytes)]
+            // When include_tls_fingerprint=true: first_32 = SHA256(signing_address_bytes || cert_fingerprint_bytes)
+            // Otherwise: first_32 = signing_address (right-padded with zeros)
+            let mut report_data = vec![0u8; 64];
+            if let Some(ref fp_hex) = tls_fingerprint {
+                use sha2::Digest;
+                let fp_bytes = hex::decode(fp_hex).map_err(|e| {
+                    AttestationError::InternalError(format!("bad cert fingerprint hex: {e}"))
+                })?;
+                let mut hasher = sha2::Sha256::new();
+                hasher.update(&signing_address_for_report);
+                hasher.update(&fp_bytes);
+                let hash = hasher.finalize();
+                report_data[..32].copy_from_slice(&hash);
             } else {
-                let client = dstack_client::DstackClient::new(None);
-
-                let info = client.info().await.map_err(|e| {
-                    tracing::error!(
-                        "Failed to get cloud API attestation info, are you running in a CVM?: {e:?}"
-                    );
-                    AttestationError::InternalError(
-                        "failed to get cloud API attestation info".to_string(),
-                    )
-                })?;
-
-                let cpu_quote = client.get_quote(report_data).await.map_err(|e| {
-                    tracing::error!(
-                        "Failed to get cloud API attestation, are you running in a CVM?: {:?}",
-                        e
-                    );
-                    AttestationError::InternalError(
-                        "failed to get cloud API attestation".to_string(),
-                    )
-                })?;
-                gateway_attestation = DstackCpuQuote::from_quote_and_nonce(
-                    signing_address_to_use,
-                    algo,
-                    vpc,
-                    info,
-                    cpu_quote,
-                    nonce,
-                    tls_fingerprint.clone(),
-                );
+                report_data[..signing_address_for_report.len()]
+                    .copy_from_slice(&signing_address_for_report);
             }
-        }
-        #[cfg(not(debug_assertions))]
-        {
-            let client = dstack_client::DstackClient::new(None);
+            report_data[32..64].copy_from_slice(&nonce_bytes);
 
-            let info = client.info().await.map_err(|e| {
-                tracing::error!(
-                    "Failed to get cloud API attestation info, are you running in a CVM?: {e:?}"
-                );
-                AttestationError::InternalError(
-                    "failed to get cloud API attestation info".to_string(),
-                )
-            })?;
+            // Read TLS certificate PEM if fingerprint is requested (for the response body).
+            let tls_certificate = if include_tls_fingerprint {
+                if let Ok(path) = std::env::var("TLS_CERT_PATH") {
+                    tokio::fs::read_to_string(&path).await.ok()
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
 
-            let cpu_quote = client.get_quote(report_data).await.map_err(|e| {
-                tracing::error!(
-                    "Failed to get cloud API attestation, are you running in a CVM?: {:?}",
-                    e
-                );
-                AttestationError::InternalError("failed to get cloud API attestation".to_string())
-            })?;
-            gateway_attestation = DstackCpuQuote::from_quote_and_nonce(
+            // Run model-attestation fetch and gateway TDX-quote generation concurrently.
+            // These are independent: the model fetch is an outbound HTTP call to the
+            // inference backend; the gateway quote is a local dstack Unix-socket call.
+            let model_fut = {
+                let pool = &self.inference_provider_pool;
+                async move {
+                    if let Some(canonical) = resolved_canonical {
+                        pool.get_attestation_report(
+                            canonical,
+                            signing_algo,
+                            // Key fix: only forward the nonce when the caller supplied one.
+                            // When None, inference-proxy serves its 5-min cached report
+                            // instead of forcing a fresh GPU-evidence collection (~700 ms).
+                            user_provided_nonce,
+                            signing_address,
+                            include_tls_fingerprint,
+                            provider_filter,
+                        )
+                        .await
+                        .map_err(|e| AttestationError::ProviderError(e.to_string()))
+                    } else {
+                        Ok(vec![])
+                    }
+                }
+            };
+
+            let gateway_fut = build_gateway_quote(
                 signing_address_to_use,
                 algo,
                 vpc,
-                info,
-                cpu_quote,
-                nonce,
+                report_data,
+                gateway_nonce,
                 tls_fingerprint,
             );
-        }
 
-        Ok(AttestationReport {
-            gateway_attestation,
-            model_attestations,
-            tls_certificate,
-        })
+            let (model_attestations, gateway_attestation) =
+                tokio::try_join!(model_fut, gateway_fut)?;
+
+            Ok(AttestationReport {
+                gateway_attestation,
+                model_attestations,
+                tls_certificate,
+            })
+        }; // end `build` closure
+
+        // Nonce-bearing requests (and the disabled-cache case) bypass the cache:
+        // the nonce is cryptographically bound into the TDX report_data and the
+        // GPU evidence, so serving a cached report for a different nonce would
+        // defeat the freshness / replay guarantee. Only nonce-LESS requests —
+        // which already opt out of freshness (the gateway auto-generates a random
+        // nonce and inference-proxy serves its own cached report) — are cached.
+        let cache = match &self.report_cache {
+            Some(c) if nonce.is_none() => c.clone(),
+            _ => {
+                self.metrics_service.record_count(
+                    METRIC_ATTESTATION_REPORT_CACHE,
+                    1,
+                    &[&format!("{TAG_RESULT}:bypass"), &env_tag],
+                );
+                return build(nonce).await;
+            }
+        };
+
+        // No-nonce path: short-TTL cache + single-flight. `try_get_with` coalesces
+        // concurrent misses on the same key, so a burst of identical no-nonce
+        // probes triggers ONE backend build instead of N (collapsing the
+        // monitoring thundering-herd that sheds 503s at the inference backend).
+        let computed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = computed.clone();
+        let res = cache
+            .try_get_with(cache_key, async move {
+                flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                build(None).await.map(Arc::new)
+            })
+            .await;
+        let result = if computed.load(std::sync::atomic::Ordering::Relaxed) {
+            "miss"
+        } else {
+            "hit"
+        };
+        self.metrics_service.record_count(
+            METRIC_ATTESTATION_REPORT_CACHE,
+            1,
+            &[&format!("{TAG_RESULT}:{result}"), &env_tag],
+        );
+        // Clone the report out of the shared `Arc`; map the coalesced
+        // `Arc<AttestationError>` back to an owned error so the route still maps
+        // it to the correct HTTP status.
+        res.map(|arc| (*arc).clone()).map_err(|e| (*e).clone())
     }
 
     async fn verify_vpc_signature(
@@ -1039,5 +1094,164 @@ impl ports::AttestationServiceTrait for AttestationService {
                 Ok(false)
             }
         }
+    }
+}
+
+/// Generate the gateway CVM's TDX quote for an attestation report.
+///
+/// Fake attestation strings are only available in debug builds with `DEV` set —
+/// they are physically absent from release binaries (the early-return block is
+/// gated with `#[cfg(debug_assertions)]`).
+async fn build_gateway_quote(
+    signing_address: String,
+    algo: String,
+    vpc: Option<VpcInfo>,
+    report_data: Vec<u8>,
+    nonce: String,
+    tls_fingerprint: Option<String>,
+) -> Result<DstackCpuQuote, AttestationError> {
+    #[cfg(debug_assertions)]
+    if std::env::var("DEV").is_ok() {
+        return Ok(DstackCpuQuote {
+            signing_address,
+            signing_algo: algo,
+            intel_quote: "0x1234567890abcdef".to_string(),
+            event_log: "0x1234567890abcdef".to_string(),
+            report_data: hex::encode(&report_data),
+            request_nonce: nonce,
+            info: serde_json::json!({
+                "app_id": "dev-app-id",
+                "instance_id": "dev-instance-id",
+                "app_cert": "dev-app-cert",
+                "tcb_info": {},
+                "app_name": "dev-app-name",
+                "device_id": "dev-device-id",
+                "mr_aggregated": "dev-mr-aggregated",
+                "os_image_hash": "dev-os-image-id",
+                "key_provider_info": "dev-key-provider-info",
+                "compose_hash": "dev-compose-hash",
+                "vm_config": {},
+            }),
+            vpc,
+            tls_cert_fingerprint: tls_fingerprint,
+        });
+    }
+
+    let client = dstack_client::DstackClient::new(None);
+
+    let info = client.info().await.map_err(|e| {
+        tracing::error!(
+            "Failed to get cloud API attestation info, are you running in a CVM?: {e:?}"
+        );
+        AttestationError::InternalError("failed to get cloud API attestation info".to_string())
+    })?;
+
+    let cpu_quote = client.get_quote(report_data).await.map_err(|e| {
+        tracing::error!(
+            "Failed to get cloud API attestation, are you running in a CVM?: {:?}",
+            e
+        );
+        AttestationError::InternalError("failed to get cloud API attestation".to_string())
+    })?;
+
+    Ok(DstackCpuQuote::from_quote_and_nonce(
+        signing_address,
+        algo,
+        vpc,
+        info,
+        cpu_quote,
+        nonce,
+        tls_fingerprint,
+    ))
+}
+
+#[cfg(test)]
+mod cache_key_tests {
+    use super::report_cache_key;
+    use inference_providers::ProviderTier;
+
+    #[test]
+    fn key_is_independent_of_nonce_by_construction() {
+        // The function has no nonce parameter — this test documents that the
+        // safety-critical invariant (a cached no-nonce report is never keyed on,
+        // nor served for, a specific nonce) holds at the type level: two requests
+        // with identical params map to one key regardless of any nonce the caller
+        // did or didn't send.
+        let a = report_cache_key(Some("gpt-oss-120b"), Some("ecdsa"), false, None, None);
+        let b = report_cache_key(Some("gpt-oss-120b"), Some("ecdsa"), false, None, None);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn algo_defaults_and_lowercases() {
+        // None defaults to ed25519; case is normalized so ECDSA and ecdsa collide.
+        assert_eq!(
+            report_cache_key(Some("m"), None, false, None, None),
+            report_cache_key(Some("m"), Some("ed25519"), false, None, None),
+        );
+        assert_eq!(
+            report_cache_key(Some("m"), Some("ECDSA"), false, None, None),
+            report_cache_key(Some("m"), Some("ecdsa"), false, None, None),
+        );
+    }
+
+    #[test]
+    fn distinct_params_produce_distinct_keys() {
+        let base = report_cache_key(Some("m"), Some("ecdsa"), false, None, None);
+        // Each differing dimension must yield a different key (no cross-serving).
+        assert_ne!(
+            base,
+            report_cache_key(Some("m2"), Some("ecdsa"), false, None, None)
+        );
+        assert_ne!(
+            base,
+            report_cache_key(Some("m"), Some("ed25519"), false, None, None)
+        );
+        assert_ne!(
+            base,
+            report_cache_key(Some("m"), Some("ecdsa"), true, None, None)
+        );
+        assert_ne!(
+            base,
+            report_cache_key(
+                Some("m"),
+                Some("ecdsa"),
+                false,
+                Some(ProviderTier::Near),
+                None
+            )
+        );
+        assert_ne!(
+            base,
+            report_cache_key(Some("m"), Some("ecdsa"), false, None, Some("0xabc"))
+        );
+        // Near vs Attested3p must not collide.
+        assert_ne!(
+            report_cache_key(
+                Some("m"),
+                Some("ecdsa"),
+                false,
+                Some(ProviderTier::Near),
+                None
+            ),
+            report_cache_key(
+                Some("m"),
+                Some("ecdsa"),
+                false,
+                Some(ProviderTier::Attested3p),
+                None
+            ),
+        );
+    }
+
+    #[test]
+    fn none_model_is_distinct_from_wildcard_literal() {
+        // A request for all models (None) keys on "*"; a model literally named
+        // "*" is not a realistic catalog entry, so this is acceptable and just
+        // documents the sentinel.
+        assert_eq!(
+            report_cache_key(None, Some("ecdsa"), false, None, None),
+            report_cache_key(Some("*"), Some("ecdsa"), false, None, None),
+        );
     }
 }

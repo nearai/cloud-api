@@ -37,6 +37,7 @@ async fn admin_patch_with_provider_type_keeps_pinned_provider() {
             "modelDisplayName":   "Chutes Pin Test",
             "modelDescription":   "Synthetic pinned model for the admin-PATCH regression",
             "contextLength":      4096,
+            "maxOutputLength": 1024,
             "providerType":       "chutes",
             "isActive":           true,
         }))
@@ -86,6 +87,7 @@ async fn seed_model_if_absent_does_not_clobber_existing() {
             is_active: Some(true),
             input_cost_per_token: Some(1_234),
             output_cost_per_token: Some(5_678),
+            max_output_length: Some(1024),
             ..Default::default()
         },
     )

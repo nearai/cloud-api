@@ -25,13 +25,13 @@ jobs:
       packages: write
       attestations: write
       id-token: write
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, infra]
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Log in to Docker registry
-        uses: docker/login-action@946f94de75ea52995b6aa1e54fd3e0aeed6cc573
+        uses: docker/login-action@3864d6aed8ff134b2ed894ce00c87695c709c870
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ vars.DOCKER_REGISTRY_USER }}

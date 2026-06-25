@@ -470,3 +470,79 @@ fn copy_response_headers(response: &reqwest::Response, bhttp_msg: &mut bhttp::Me
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    use futures_util::io::Cursor as FuturesCursor;
+
+    async fn varint_bytes(v: u64) -> Vec<u8> {
+        let mut buf = FuturesCursor::new(Vec::new());
+        bhttp_write_varint(&mut buf, v).await.unwrap();
+        buf.into_inner()
+    }
+
+    #[tokio::test]
+    async fn varint_encoding_matches_quic_lengths() {
+        // 1-byte form: 0..=63
+        assert_eq!(varint_bytes(0).await, vec![0x00]);
+        assert_eq!(varint_bytes(63).await, vec![0x3f]);
+        // 2-byte form: 64..=16383
+        assert_eq!(varint_bytes(64).await, vec![0x40, 0x40]);
+        assert_eq!(varint_bytes(16383).await, vec![0x7f, 0xff]);
+        // 4-byte form: 16384..=1073741823
+        assert_eq!(varint_bytes(16384).await, vec![0x80, 0x00, 0x40, 0x00]);
+        // 8-byte form: large value
+        let big = varint_bytes(0x3fff_ffff_ffff_ffff).await;
+        assert_eq!(big.len(), 8);
+        assert_eq!(big[0], 0xff);
+    }
+
+    #[tokio::test]
+    async fn varint_roundtrips_through_bhttp_reader() {
+        let mut buf = FuturesCursor::new(Vec::new());
+        write_indeterminate_response_header(
+            &mut buf,
+            200,
+            &[
+                (b"content-type".to_vec(), b"application/json".to_vec()),
+                (b"x-test".to_vec(), b"hello".to_vec()),
+            ],
+        )
+        .await
+        .unwrap();
+        bhttp_write_vec(&mut buf, b"{\"a\":").await.unwrap();
+        bhttp_write_vec(&mut buf, b"1}").await.unwrap();
+        bhttp_write_varint(&mut buf, 0).await.unwrap(); // body terminator
+        bhttp_write_varint(&mut buf, 0).await.unwrap(); // trailer terminator
+
+        let bytes = buf.into_inner();
+        assert_eq!(bytes[0], 3); // framing indicator: response indeterminate
+
+        let msg = bhttp::Message::read_bhttp(&mut Cursor::new(&bytes[..])).unwrap();
+        assert_eq!(msg.control().status().unwrap().code(), 200);
+        assert_eq!(msg.content(), b"{\"a\":1}");
+        assert_eq!(
+            msg.header().get(b"content-type"),
+            Some(b"application/json".as_ref())
+        );
+        assert_eq!(msg.header().get(b"x-test"), Some(b"hello".as_ref()));
+    }
+
+    #[tokio::test]
+    async fn empty_body_roundtrips() {
+        let mut buf = FuturesCursor::new(Vec::new());
+        write_indeterminate_response_header(&mut buf, 204, &[])
+            .await
+            .unwrap();
+        bhttp_write_varint(&mut buf, 0).await.unwrap(); // body terminator
+        bhttp_write_varint(&mut buf, 0).await.unwrap(); // trailer terminator
+
+        let bytes = buf.into_inner();
+        let msg = bhttp::Message::read_bhttp(&mut Cursor::new(&bytes[..])).unwrap();
+        assert_eq!(msg.control().status().unwrap().code(), 204);
+        assert!(msg.content().is_empty());
+    }
+}

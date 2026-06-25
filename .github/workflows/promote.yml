@@ -39,23 +39,23 @@ jobs:
     if: >-
       github.event_name == 'schedule' ||
       (github.event_name == 'workflow_dispatch' && inputs.target == 'prod')
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, infra]
     environment: production
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Log in to Docker registry
-        uses: docker/login-action@946f94de75ea52995b6aa1e54fd3e0aeed6cc573
+        uses: docker/login-action@3864d6aed8ff134b2ed894ce00c87695c709c870
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ vars.DOCKER_REGISTRY_USER }}
           password: ${{ secrets.DOCKER_REGISTRY_TOKEN }}
 
-      - name: Install skopeo and jq
+      - name: Install skopeo, jq, and gh
         run: |
           sudo apt-get update
-          sudo apt-get install -y skopeo jq
+          sudo apt-get install -y skopeo jq gh
 
       # Resolve the source digest BEFORE copying to :prod. This avoids the
       # inspect-after-write race where reading back :prod could in theory hit a
@@ -66,6 +66,10 @@ jobs:
         run: |
           set -euo pipefail
           DIGEST_INPUT="${{ inputs.digest }}"
+          if [ -n "$DIGEST_INPUT" ] && ! echo "$DIGEST_INPUT" | grep -qE '^sha256:[a-f0-9]{64}$'; then
+            echo "::error::digest input must be 'sha256:<64 hex chars>', got: '${DIGEST_INPUT}'"
+            exit 1
+          fi
           if [ -n "$DIGEST_INPUT" ]; then
             echo "Promoting by digest: ${DIGEST_INPUT}"
             SOURCE="${{ env.IMAGE }}@${DIGEST_INPUT}"

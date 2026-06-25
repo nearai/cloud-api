@@ -126,8 +126,49 @@ pub struct PlatformMetrics {
     pub provider_error_or_timeout_rate: f64,
     /// 95th percentile time-to-first-token across the platform (ms)
     pub p95_ttft_ms: Option<f64>,
+    pub provider_usage: PlatformProviderUsage,
     pub top_models: Vec<TopModelMetrics>,
     pub top_organizations: Vec<TopOrganizationMetrics>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct PlatformProviderUsage {
+    pub fallback: ProviderUsageTotals,
+    pub non_fallback: ProviderUsageTotals,
+    pub by_provider_type: Vec<ProviderTypeUsage>,
+    pub by_provider_tier: Vec<ProviderTierUsage>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
+pub struct ProviderUsageTotals {
+    pub requests: i64,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub total_tokens: i64,
+    pub cache_read_tokens: i64,
+    pub consumed_cost_usd: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ProviderTypeUsage {
+    pub provider_type: Option<String>,
+    pub requests: i64,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub total_tokens: i64,
+    pub cache_read_tokens: i64,
+    pub consumed_cost_usd: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ProviderTierUsage {
+    pub provider_tier: Option<String>,
+    pub requests: i64,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub total_tokens: i64,
+    pub cache_read_tokens: i64,
+    pub consumed_cost_usd: f64,
 }
 
 /// One bucket of platform-wide time-series data
@@ -203,6 +244,19 @@ pub struct ModelRevenueEntry {
     pub provider_type: Option<String>,
     pub avg_ttft_ms: Option<f64>,
     pub p95_ttft_ms: Option<f64>,
+    pub served_provider_breakdown: Vec<ModelProviderRevenueBreakdown>,
+    pub fallback_requests: i64,
+    pub fallback_consumed_cost_usd: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ModelProviderRevenueBreakdown {
+    pub provider_type: Option<String>,
+    pub provider_tier: Option<String>,
+    pub served_via_fallback: bool,
+    pub requests: i64,
+    pub tokens: i64,
+    pub consumed_cost_usd: f64,
 }
 
 /// Paginated per-model consumption ranking for a period
@@ -277,7 +331,7 @@ pub struct ModelRevenueQuery {
     pub start: DateTime<Utc>,
     pub end: DateTime<Utc>,
     pub verifiable: Option<bool>,
-    /// Allowlisted provider type ("vllm" | "external"); validated in the handler.
+    /// Allowlisted provider type ("vllm" | "external" | "chutes"); validated in the handler.
     pub provider_type: Option<String>,
     /// Case-insensitive substring match on model name.
     pub model_search: Option<String>,
@@ -422,23 +476,23 @@ pub struct PerformanceTimeseries {
 
 /// Per-model revenue density row.
 ///
-/// All rate fields are in USD/second, derived from 1-minute buckets.
+/// All rate fields are in USD/minute, derived from 1-minute buckets.
 /// Percentiles are computed over **active minutes only** (buckets with >0 revenue)
 /// to reflect the rate during actual serving windows, not idle time.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct RevenueDensityModelRow {
     pub model_name: String,
-    /// P50 revenue rate during active minutes, USD/s
-    pub p50_usd_per_sec: f64,
-    /// P95 revenue rate during active minutes, USD/s
-    pub p95_usd_per_sec: f64,
-    /// P99 revenue rate during active minutes, USD/s
-    pub p99_usd_per_sec: f64,
-    /// Maximum observed revenue rate, USD/s
-    pub peak_usd_per_sec: f64,
-    /// Annualized revenue if p99 rate were constant: p99 × 86400 × 365, USD
+    /// P50 revenue rate during active minutes, USD/min
+    pub p50_usd_per_min: f64,
+    /// P95 revenue rate during active minutes, USD/min
+    pub p95_usd_per_min: f64,
+    /// P99 revenue rate during active minutes, USD/min
+    pub p99_usd_per_min: f64,
+    /// Maximum observed revenue rate, USD/min
+    pub peak_usd_per_min: f64,
+    /// Annualized revenue if p99 rate were constant: p99 × 60 × 24 × 365, USD
     pub p99_annualized_usd: f64,
-    /// Annualized revenue if peak rate were constant: peak × 86400 × 365, USD
+    /// Annualized revenue if peak rate were constant: peak × 60 × 24 × 365, USD
     pub peak_annualized_usd: f64,
     /// Number of 1-minute buckets with revenue > 0 in the period
     pub active_minutes: i64,
@@ -454,10 +508,10 @@ pub struct RevenueDensityReport {
     /// Buckets with any revenue > 0
     pub active_minutes: i64,
     // Platform-wide percentiles (over active minutes, all models combined)
-    pub p50_usd_per_sec: f64,
-    pub p95_usd_per_sec: f64,
-    pub p99_usd_per_sec: f64,
-    pub peak_usd_per_sec: f64,
+    pub p50_usd_per_min: f64,
+    pub p95_usd_per_min: f64,
+    pub p99_usd_per_min: f64,
+    pub peak_usd_per_min: f64,
     pub p99_annualized_usd: f64,
     pub peak_annualized_usd: f64,
     /// Per-model breakdown, sorted by total consumed cost DESC
@@ -469,6 +523,8 @@ pub struct RevenueDensityReport {
 pub struct RevenueDensityQuery {
     pub start: DateTime<Utc>,
     pub end: DateTime<Utc>,
+    /// Optional provider_type filter (e.g. "vllm", "external", "chutes").
+    pub provider_type: Option<String>,
 }
 
 /// Query params for the performance timeseries endpoint.

@@ -1335,16 +1335,24 @@ impl InferenceProvider for Provider {
                 id: self.canonical_id.clone(),
                 object: "model".to_string(),
                 owned_by: "chutes".to_string(),
+                context_length: None,
+                max_model_len: None,
+                top_provider: None,
             }],
         })
     }
 
     async fn chat_completion(
         &self,
-        params: ChatCompletionParams,
+        mut params: ChatCompletionParams,
         _request_hash: String,
     ) -> Result<ChatCompletionResponseWithBytes, CompletionError> {
         reject_client_e2ee(&params)?;
+        // #666: Chutes serializes `ChatMessage.content` verbatim into the (E2EE)
+        // request body, so drop Anthropic prompt-caching breakpoints before
+        // `request_body` — the upstream may 400 on an unknown `cache_control`
+        // content-part field (it only matters on the Anthropic upstream).
+        crate::strip_cache_control(&mut params.messages);
         let body = request_body(&self.model_name, &params, false)
             .map_err(CompletionError::CompletionError)?;
         let prep = self.verify_and_prepare(&body).await?;
@@ -1410,12 +1418,13 @@ impl InferenceProvider for Provider {
         Ok(ChatCompletionResponseWithBytes {
             response,
             raw_bytes,
+            serving_tier: crate::ProviderTier::Attested3p,
         })
     }
 
     async fn chat_completion_stream(
         &self,
-        params: ChatCompletionParams,
+        mut params: ChatCompletionParams,
         _request_hash: String,
     ) -> Result<StreamingResult, CompletionError> {
         // Streaming is off by default: Chutes' stream protocol has no
@@ -1433,6 +1442,9 @@ impl InferenceProvider for Provider {
             ));
         }
         reject_client_e2ee(&params)?;
+        // #666: drop Anthropic prompt-caching breakpoints before serialization
+        // (see the non-streaming path for the rationale).
+        crate::strip_cache_control(&mut params.messages);
         // Capture the CLIENT's usage intent before `request_body` force-sets
         // `include_usage: true` upstream (we always request usage so billing sees
         // it; #781 L1 gates what the client receives). A client opts in via
@@ -1663,6 +1675,10 @@ impl InferenceProvider for Provider {
     /// a Chutes-only model has no NEAR tier so this provider is primary.
     fn tier(&self) -> crate::ProviderTier {
         crate::ProviderTier::Attested3p
+    }
+
+    fn provider_source(&self) -> crate::ProviderSource {
+        crate::ProviderSource::Chutes
     }
 
     /// Chutes only serves an attested STREAM when streaming is explicitly enabled

@@ -126,6 +126,7 @@ pub trait ResponseServiceTrait: Send + Sync {
         request: models::CreateResponseRequest,
         user_id: UserId,
         api_key_id: String,
+        request_id: uuid::Uuid,
         organization_id: uuid::Uuid,
         workspace_id: uuid::Uuid,
         body_hash: String,

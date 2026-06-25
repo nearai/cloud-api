@@ -389,6 +389,7 @@ pub async fn batch_upsert_models(
                     context_length: request.context_length,
                     verifiable: request.verifiable,
                     is_active: request.is_active,
+                    allow_free: request.allow_free,
                     aliases: request.aliases.clone(),
                     owned_by: request.owned_by.clone(),
                     provider_type: request.provider_type.clone(),
@@ -495,16 +496,19 @@ pub async fn batch_upsert_models(
 
     // Register inference_url models (our own vLLM/SGLang backends)
     // Only for active, non-external models with an inference_url set
-    let inference_url_models: Vec<(String, String)> = batch_request
+    let inference_url_models: Vec<(String, String, Option<u32>)> = batch_request
         .iter()
         .filter_map(|(model_name, request)| {
             let is_active = request.is_active != Some(false);
             let is_external = request.provider_type.as_deref() == Some("external");
             if is_active && !is_external {
-                request
-                    .inference_url
-                    .clone()
-                    .map(|url| (model_name.clone(), url))
+                request.inference_url.clone().map(|url| {
+                    (
+                        model_name.clone(),
+                        url,
+                        request.context_length.map(|c| c as u32),
+                    )
+                })
             } else {
                 None
             }
@@ -518,7 +522,7 @@ pub async fn batch_upsert_models(
         );
         app_state
             .inference_provider_pool
-            .load_inference_url_models(inference_url_models)
+            .load_inference_url_models(inference_url_models, true)
             .await;
     }
 
@@ -894,6 +898,7 @@ pub async fn get_model_history(
             is_ready: h.is_ready,
             deprecation_date: h.deprecation_date.as_ref().map(format_deprecation_date),
             openrouter_slug: h.openrouter_slug,
+            allow_free: h.allow_free,
         })
         .collect();
 
@@ -2661,9 +2666,13 @@ pub async fn create_admin_access_token(
         .and_then(|h| h.to_str().ok())
         .map(|s| s.to_string());
 
+    let expires_in_hours = request_body.expires_in_hours;
+    let user_agent_present = user_agent.is_some();
     debug!(
-        "Creating admin access token for user: {} with {} hours expiration; (User-Agent: {:?})",
-        admin_user.0.email, request_body.expires_in_hours, user_agent
+        admin_user_id = %admin_user.0.id,
+        expires_in_hours,
+        user_agent_present,
+        "Creating admin access token"
     );
 
     // Validate expiration time (must be positive)
@@ -2693,8 +2702,9 @@ pub async fn create_admin_access_token(
     {
         Ok((admin_token, access_token)) => {
             debug!(
-                "Admin access token created successfully for user: {}",
-                admin_user.0.email
+                admin_user_id = %admin_user.0.id,
+                token_id = %admin_token.id,
+                "Admin access token created successfully"
             );
 
             let response = AdminAccessTokenResponse {
@@ -2751,8 +2761,10 @@ pub async fn list_admin_access_tokens(
     crate::routes::common::validate_limit_offset(params.limit, params.offset)?;
 
     debug!(
-        "List admin access tokens request with limit={}, offset={} by admin: {}",
-        params.limit, params.offset, admin_user.0.email
+        admin_user_id = %admin_user.0.id,
+        limit = params.limit,
+        offset = params.offset,
+        "List admin access tokens request"
     );
 
     match app_state
@@ -2818,8 +2830,9 @@ pub async fn delete_admin_access_token(
     Json(request): Json<DeleteAdminAccessTokenRequest>,
 ) -> Result<ResponseJson<serde_json::Value>, (StatusCode, ResponseJson<ErrorResponse>)> {
     debug!(
-        "Delete admin access token request for token_id: {} by admin: {}",
-        token_id, admin_user.0.email
+        admin_user_id = %admin_user.0.id,
+        token_id = %token_id,
+        "Delete admin access token request"
     );
 
     // Parse token ID
@@ -2841,8 +2854,9 @@ pub async fn delete_admin_access_token(
     {
         Ok(true) => {
             debug!(
-                "Admin access token {} revoked successfully by admin: {}",
-                token_id, admin_user.0.email
+                admin_user_id = %admin_user.0.id,
+                token_id = %token_id,
+                "Admin access token revoked successfully"
             );
 
             let response = serde_json::json!({
@@ -3231,7 +3245,7 @@ pub struct ModelRevenueQueryParams {
     pub offset: i64,
     /// Filter by verifiable (TEE) models only / non-verifiable only.
     pub verifiable: Option<bool>,
-    /// Filter by provider type ("vllm" or "external").
+    /// Filter by provider type ("vllm", "external", or "chutes").
     pub provider_type: Option<String>,
     /// Case-insensitive substring match on model name.
     pub model_search: Option<String>,
@@ -3253,7 +3267,7 @@ pub struct ModelRevenueQueryParams {
         ("limit" = Option<i64>, Query, description = "Page size (1-1000, default 100)"),
         ("offset" = Option<i64>, Query, description = "Page offset (default 0)"),
         ("verifiable" = Option<bool>, Query, description = "Filter to verifiable (true) or non-verifiable (false) models"),
-        ("provider_type" = Option<String>, Query, description = "Filter by provider type (e.g. vllm, external)"),
+        ("provider_type" = Option<String>, Query, description = "Filter by provider type (e.g. vllm, external, chutes)"),
         ("sort" = Option<String>, Query, description = "Sort: revenue (default), requests, tokens")
     ),
     responses(
@@ -3288,9 +3302,9 @@ pub async fn get_model_revenue(
     let sort = services::admin::RevenueSort::from_query(params.sort.as_deref())
         .map_err(|m| bad_request(m, "invalid_parameter"))?;
     if let Some(pt) = params.provider_type.as_deref() {
-        if pt != "vllm" && pt != "external" {
+        if !matches!(pt, "vllm" | "external" | "chutes") {
             return Err(bad_request(
-                format!("invalid provider_type '{pt}'; expected 'vllm' or 'external'"),
+                format!("invalid provider_type '{pt}'; expected one of: vllm, external, chutes"),
                 "invalid_parameter",
             ));
         }
@@ -3628,6 +3642,8 @@ pub async fn get_performance_timeseries(
 pub struct RevenueDensityParams {
     pub start: Option<String>,
     pub end: Option<String>,
+    /// Optional provider type filter (e.g. "vllm", "external", "chutes").
+    pub provider_type: Option<String>,
 }
 
 /// Get revenue density percentiles (Admin only)
@@ -3654,7 +3670,11 @@ pub async fn get_revenue_density(
 
     let result = app_state
         .analytics_service
-        .get_revenue_density(services::admin::RevenueDensityQuery { start, end })
+        .get_revenue_density(services::admin::RevenueDensityQuery {
+            start,
+            end,
+            provider_type: params.provider_type,
+        })
         .await
         .map_err(|e| {
             error!("Failed to get revenue density: {:?}", e);

@@ -5,12 +5,17 @@
 #[path = "../common/mod.rs"]
 mod common;
 
+mod admin_activation_pricing_gate;
 mod admin_analytics;
 mod admin_deprecate_model;
 mod admin_invitation_email_deliveries;
 mod admin_list_models;
 mod admin_organization_members;
 mod admin_pricing_changes;
+mod admin_provider_attribution_model_revenue;
+mod admin_provider_attribution_platform;
+mod admin_provider_attribution_support;
+mod admin_schema_compatibility;
 mod admin_services;
 mod api_keys;
 mod audio_image;
@@ -53,11 +58,14 @@ mod privacy_redact;
 mod provider_errors;
 mod reasoning;
 mod repositories;
+mod request_id_contract;
 mod rerank;
 mod response_signature_verification;
 mod score;
+mod serving_provider;
 mod signature_verification;
 mod usage_chat_completions;
+mod usage_provider_attribution;
 mod usage_recording;
 mod usage_responses;
 mod vpc_login;

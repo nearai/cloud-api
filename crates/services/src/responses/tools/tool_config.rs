@@ -557,12 +557,11 @@ pub fn convert_tool_calls(
                         available_tools = ?available_tool_names,
                         "Tool call has no name and multiple tools available, cannot infer"
                     );
-                    // Log args at debug level for staging troubleshooting (not in prod)
                     tracing::debug!(
                         model = model,
                         index = idx,
-                        args = args_str,
-                        "Tool call missing name - arguments for debugging"
+                        arguments_len = args_str.len(),
+                        "Tool call missing name"
                     );
                     let id = resolve_tool_call_id(id_opt, ERROR_TOOL_TYPE);
                     tool_calls_detected.push(ToolCallInfo {
@@ -604,13 +603,12 @@ pub fn convert_tool_calls(
                     index = idx,
                     "Failed to parse tool call arguments"
                 );
-                // Log args at debug level for staging troubleshooting (not in prod)
                 tracing::debug!(
                     model = model,
                     tool_name = name,
                     index = idx,
-                    args = args_str,
-                    "Failed to parse tool call - arguments for debugging"
+                    arguments_len = args_str.len(),
+                    "Failed to parse tool call"
                 );
                 tool_calls_detected.push(create_invalid_json_error(
                     &name,

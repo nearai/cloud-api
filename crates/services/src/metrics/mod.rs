@@ -95,12 +95,21 @@ impl MetricsServiceTrait for OtlpMetricsService {
                 consts::METRIC_PROVIDER_REQUESTS => {
                     "Served requests by provider tier + fallback (Chutes-served traffic, NEAR->fallback rate)"
                 }
+                consts::METRIC_PROVIDER_ATTEMPTS => {
+                    "Provider attempts by bounded provider tier, source, fallback, operation, result, retry decision, retry round, and attempt index"
+                }
                 consts::METRIC_TOKENS_INPUT => "Input tokens consumed",
                 consts::METRIC_TOKENS_OUTPUT => "Output tokens generated",
+                consts::METRIC_TOKENS_CACHED => {
+                    "Cache-read (prefix-cache hit) input tokens; hit rate = tokens.cached / tokens.input"
+                }
                 consts::METRIC_VERIFICATION_SUCCESS => "Successful verification operations",
                 consts::METRIC_VERIFICATION_FAILURE => "Failed verification operations",
                 consts::METRIC_SIGNATURE_CREATION_SUCCESS => {
                     "Successful gateway signature creation operations"
+                }
+                consts::METRIC_ATTESTATION_REPORT_CACHE => {
+                    "Attestation-report cache outcomes by result (hit|miss|bypass)"
                 }
                 consts::METRIC_HTTP_REQUESTS => {
                     "Total HTTP requests by endpoint, method, and status"
@@ -149,6 +158,10 @@ impl MetricsServiceTrait for OtlpMetricsService {
         let histogram = histograms.entry(name.to_string()).or_insert_with(|| {
             let (description, unit) = match name {
                 consts::METRIC_TOKENS_PER_SECOND => ("Token generation throughput", "tokens/sec"),
+                consts::METRIC_CACHE_HIT_RATE => (
+                    "Per-request prefix-cache hit rate (cache-read / prompt tokens)",
+                    "percent",
+                ),
                 _ => ("Value distribution", ""),
             };
 

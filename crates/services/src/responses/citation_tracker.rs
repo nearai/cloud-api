@@ -324,7 +324,13 @@ impl CitationTracker {
                         // Citation is closing - finalize it immediately with correct indices
                         if let Some(active) = self.active_citation.take() {
                             if active.source_id == source_id {
-                                tracing::debug!("CitationTracker: Citation tag closed [/s:{}] - indices=[{}, {}], text='{}'", source_id, active.start_index, self.clean_position, active.accumulated_content);
+                                tracing::debug!(
+                                    "CitationTracker: Citation tag closed [/s:{}] - indices=[{}, {}], cited_text_len={}",
+                                    source_id,
+                                    active.start_index,
+                                    self.clean_position,
+                                    active.accumulated_content.len()
+                                );
                                 let citation = Citation {
                                     start_index: active.start_index,
                                     end_index: self.clean_position,
@@ -395,8 +401,8 @@ impl CitationTracker {
         // If there's pending token_buffer (incomplete tag at end), treat as literal
         if !self.token_buffer.is_empty() {
             tracing::debug!(
-                "CitationTracker: Flushing incomplete token_buffer at finalize: '{}'",
-                self.token_buffer
+                "CitationTracker: Flushing incomplete token_buffer at finalize: token_buffer_len={}",
+                self.token_buffer.len()
             );
             let buffer_content = self.token_buffer.clone();
             let _ = self.do_flush_to_clean_text(&buffer_content);

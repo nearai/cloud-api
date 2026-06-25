@@ -554,6 +554,48 @@ impl services::workspace::ports::WorkspaceRepository for WorkspaceRepository {
     ) -> Result<i64, RepositoryError> {
         self.count_by_organization(organization_id.0).await
     }
+
+    async fn list_by_user(
+        &self,
+        user_id: services::auth::ports::UserId,
+        limit: i64,
+    ) -> Result<Vec<services::workspace::Workspace>, RepositoryError> {
+        let rows = retry_db!("list_workspaces_by_user_across_orgs", {
+            let client = self
+                .pool
+                .get()
+                .await
+                .context("Failed to get database connection")
+                .map_err(RepositoryError::PoolError)?;
+
+            // Single query: join workspaces → organizations → organization_members
+            // to fetch all workspaces the user can access across all their orgs.
+            client
+                .query(
+                    r#"
+                    SELECT w.*
+                    FROM workspaces w
+                    INNER JOIN organization_members om
+                        ON w.organization_id = om.organization_id
+                    WHERE om.user_id = $1
+                      AND w.is_active = true
+                    ORDER BY w.created_at ASC
+                    LIMIT $2
+                    "#,
+                    &[&user_id.0, &limit],
+                )
+                .await
+                .map_err(map_db_error)
+        })?;
+
+        rows.into_iter()
+            .map(|row| {
+                self.row_to_workspace(row)
+                    .map(db_workspace_to_workspace_service)
+                    .map_err(RepositoryError::DataConversionError)
+            })
+            .collect()
+    }
 }
 
 // Conversion function for workspace service

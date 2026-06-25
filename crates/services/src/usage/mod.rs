@@ -1,4 +1,5 @@
 pub mod ports;
+pub mod provider_attribution;
 
 use crate::metrics::{
     consts::{
@@ -9,6 +10,7 @@ use crate::metrics::{
     MetricsServiceTrait,
 };
 pub use ports::*;
+pub use provider_attribution::*;
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -282,6 +284,7 @@ impl UsageServiceTrait for UsageServiceImpl {
             stop_reason: request.stop_reason,
             response_id: request.response_id,
             image_count: request.image_count,
+            provider_attribution: request.provider_attribution,
         };
 
         // Record in database
@@ -359,6 +362,7 @@ impl UsageServiceTrait for UsageServiceImpl {
             image_count,
             inference_type,
             external_id,
+            provider_attribution,
         ) = match &request {
             RecordUsageApiRequest::ChatCompletion {
                 model,
@@ -366,6 +370,7 @@ impl UsageServiceTrait for UsageServiceImpl {
                 output_tokens,
                 cache_read_tokens,
                 id,
+                provider_attribution,
             } => {
                 if id.trim().is_empty() {
                     return Err(UsageError::ValidationError(
@@ -398,12 +403,14 @@ impl UsageServiceTrait for UsageServiceImpl {
                     None,
                     InferenceType::ChatCompletion,
                     id.clone(),
+                    *provider_attribution,
                 )
             }
             RecordUsageApiRequest::ImageGeneration {
                 model,
                 image_count,
                 id,
+                provider_attribution,
             } => {
                 if id.trim().is_empty() {
                     return Err(UsageError::ValidationError(
@@ -423,12 +430,14 @@ impl UsageServiceTrait for UsageServiceImpl {
                     Some(*image_count),
                     InferenceType::ImageGeneration,
                     id.clone(),
+                    *provider_attribution,
                 )
             }
             RecordUsageApiRequest::Embedding {
                 model,
                 input_tokens,
                 id,
+                provider_attribution,
             } => {
                 validate_input_only_usage(id, *input_tokens)?;
                 (
@@ -439,12 +448,14 @@ impl UsageServiceTrait for UsageServiceImpl {
                     None,
                     InferenceType::Embedding,
                     id.clone(),
+                    *provider_attribution,
                 )
             }
             RecordUsageApiRequest::Rerank {
                 model,
                 input_tokens,
                 id,
+                provider_attribution,
             } => {
                 validate_input_only_usage(id, *input_tokens)?;
                 (
@@ -455,12 +466,14 @@ impl UsageServiceTrait for UsageServiceImpl {
                     None,
                     InferenceType::Rerank,
                     id.clone(),
+                    *provider_attribution,
                 )
             }
             RecordUsageApiRequest::Score {
                 model,
                 input_tokens,
                 id,
+                provider_attribution,
             } => {
                 validate_input_only_usage(id, *input_tokens)?;
                 (
@@ -471,12 +484,14 @@ impl UsageServiceTrait for UsageServiceImpl {
                     None,
                     InferenceType::Score,
                     id.clone(),
+                    *provider_attribution,
                 )
             }
             RecordUsageApiRequest::PrivacyClassify {
                 model,
                 input_tokens,
                 id,
+                provider_attribution,
             } => {
                 validate_input_only_usage(id, *input_tokens)?;
                 (
@@ -487,6 +502,7 @@ impl UsageServiceTrait for UsageServiceImpl {
                     None,
                     InferenceType::PrivacyClassify,
                     id.clone(),
+                    *provider_attribution,
                 )
             }
         };
@@ -533,6 +549,7 @@ impl UsageServiceTrait for UsageServiceImpl {
             stop_reason: None,
             response_id: None,
             image_count,
+            provider_attribution,
         };
 
         self.record_usage(service_request).await

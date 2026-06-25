@@ -4,12 +4,13 @@ pub mod ports;
 pub use analytics::{
     AnalyticsRepository, AnalyticsService, ApiKeyMetrics, BillingSourceBreakdown, BillingSummary,
     MetricsSummary, ModelConsumptionPoint, ModelConsumptionTimeseries,
-    ModelConsumptionTimeseriesQuery, ModelMetrics, ModelRevenueEntry, ModelRevenueQuery,
-    ModelRevenueReport, OrgRevenueEntry, OrgRevenueQuery, OrgRevenueReport, OrganizationMetrics,
-    PerformancePoint, PerformanceTimeseries, PerformanceTimeseriesQuery, PlatformMetrics,
-    PlatformTimeSeriesMetrics, PlatformTimeSeriesPoint, RevenueDensityModelRow,
-    RevenueDensityQuery, RevenueDensityReport, RevenueSort, TimeSeriesMetrics, TimeSeriesPoint,
-    TopModelMetrics, TopOrganizationMetrics, WorkspaceMetrics,
+    ModelConsumptionTimeseriesQuery, ModelMetrics, ModelProviderRevenueBreakdown,
+    ModelRevenueEntry, ModelRevenueQuery, ModelRevenueReport, OrgRevenueEntry, OrgRevenueQuery,
+    OrgRevenueReport, OrganizationMetrics, PerformancePoint, PerformanceTimeseries,
+    PerformanceTimeseriesQuery, PlatformMetrics, PlatformProviderUsage, PlatformTimeSeriesMetrics,
+    PlatformTimeSeriesPoint, ProviderTierUsage, ProviderTypeUsage, ProviderUsageTotals,
+    RevenueDensityModelRow, RevenueDensityQuery, RevenueDensityReport, RevenueSort,
+    TimeSeriesMetrics, TimeSeriesPoint, TopModelMetrics, TopOrganizationMetrics, WorkspaceMetrics,
 };
 pub mod infra;
 pub mod pricing_scheduler;
@@ -616,6 +617,7 @@ impl AdminService for AdminServiceImpl {
             context_length: None,
             verifiable: None,
             is_active: None,
+            allow_free: None,
             aliases: None,
             owned_by: None,
             provider_type: None,
@@ -1241,7 +1243,7 @@ impl AdminServiceImpl {
     async fn validate_model_request(
         model_name: &str,
         request: &UpdateModelAdminRequest,
-        _repository: Arc<dyn AdminRepository>,
+        repository: Arc<dyn AdminRepository>,
     ) -> Result<(), AdminError> {
         // All costs use fixed scale 9 (nano-dollars) and USD - no scale/currency validation needed
 
@@ -1267,6 +1269,62 @@ impl AdminServiceImpl {
                 return Err(AdminError::InvalidPricing(
                     "Model description cannot be empty".to_string(),
                 ));
+            }
+        }
+
+        // Activation pricing gate: reject requests that would result in an
+        // active model with all-zero pricing unless allow_free is set.
+        //
+        // The gate fires when:
+        //   - is_active is explicitly Some(true), OR
+        //   - is_active is None AND the model does not exist yet (new model
+        //     inserts default is_active to true, so omitting it on create is
+        //     equivalent to passing is_active=true).
+        //
+        // The free-check covers all four cost fields: input, output, image,
+        // and cache_read.  A model with non-zero cost on any field is treated
+        // as priced and is not blocked.
+        let existing = repository
+            .get_model_costs(model_name)
+            .await
+            .map_err(|e| AdminError::InternalError(e.to_string()))?;
+
+        let is_new_model = existing.is_none();
+
+        // Evaluate whether this request will result in an active model.
+        let (
+            existing_input,
+            existing_output,
+            existing_image,
+            existing_cache_read,
+            existing_allow_free,
+        ) = existing.unwrap_or((0, 0, 0, 0, false));
+
+        let effective_is_active = request.is_active.unwrap_or(is_new_model);
+
+        if effective_is_active {
+            let effective_input = request.input_cost_per_token.unwrap_or(existing_input);
+            let effective_output = request.output_cost_per_token.unwrap_or(existing_output);
+            let effective_image = request.cost_per_image.unwrap_or(existing_image);
+            let effective_cache_read = request
+                .cache_read_cost_per_token
+                .unwrap_or(existing_cache_read);
+            let effective_allow_free = request.allow_free.unwrap_or(existing_allow_free);
+
+            if effective_input == 0
+                && effective_output == 0
+                && effective_image == 0
+                && effective_cache_read == 0
+                && !effective_allow_free
+            {
+                return Err(AdminError::InvalidPricing(format!(
+                    "Cannot activate model '{}' with zero pricing. \
+                     Set allowFree=true to explicitly allow free serving, \
+                     or set a non-zero cost on at least one of: \
+                     inputCostPerToken, outputCostPerToken, costPerImage, \
+                     cacheReadCostPerToken.",
+                    model_name
+                )));
             }
         }
 

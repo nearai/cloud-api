@@ -627,6 +627,7 @@ pub struct MockProvider {
     /// `NonAttested`. Set via [`MockProvider::with_tier`] to exercise tiered
     /// provider selection (e.g. a `Near` primary with an `Attested3p` fallback).
     tier: crate::ProviderTier,
+    provider_source: crate::ProviderSource,
     /// Value reported by [`InferenceProvider::supports_streaming`]; defaults to
     /// `true`. Set via [`MockProvider::with_streaming_support`] to exercise the
     /// streaming-capability filter (e.g. a Chutes-like fallback with streaming off).
@@ -645,6 +646,9 @@ impl MockProvider {
             object: "model".to_string(),
             created: 1762544256,
             owned_by: "vllm".to_string(),
+            context_length: None,
+            max_model_len: None,
+            top_provider: None,
         }];
         Self {
             models,
@@ -660,6 +664,7 @@ impl MockProvider {
             last_chat_params: Arc::new(Mutex::new(None)),
             fail_attestation: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tier: crate::ProviderTier::NonAttested,
+            provider_source: crate::ProviderSource::External,
             supports_streaming: true,
             supports_client_e2ee: true,
         }
@@ -683,6 +688,7 @@ impl MockProvider {
             last_chat_params: Arc::new(Mutex::new(None)),
             fail_attestation: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tier: crate::ProviderTier::NonAttested,
+            provider_source: crate::ProviderSource::External,
             supports_streaming: true,
             supports_client_e2ee: true,
         }
@@ -704,6 +710,7 @@ impl MockProvider {
             last_chat_params: Arc::new(Mutex::new(None)),
             fail_attestation: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tier: crate::ProviderTier::NonAttested,
+            provider_source: crate::ProviderSource::External,
             supports_streaming: true,
             supports_client_e2ee: true,
         }
@@ -714,6 +721,11 @@ impl MockProvider {
     /// and the verifiable-never-falls-back-to-plaintext rule).
     pub fn with_tier(mut self, tier: crate::ProviderTier) -> Self {
         self.tier = tier;
+        self
+    }
+
+    pub fn with_provider_source(mut self, provider_source: crate::ProviderSource) -> Self {
+        self.provider_source = provider_source;
         self
     }
 
@@ -924,6 +936,10 @@ impl crate::InferenceProvider for MockProvider {
         self.tier
     }
 
+    fn provider_source(&self) -> crate::ProviderSource {
+        self.provider_source
+    }
+
     fn supports_streaming(&self) -> bool {
         self.supports_streaming
     }
@@ -1118,6 +1134,7 @@ impl crate::InferenceProvider for MockProvider {
         Ok(ChatCompletionResponseWithBytes {
             response,
             raw_bytes,
+            serving_tier: self.tier(),
         })
     }
 

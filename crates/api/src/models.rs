@@ -71,12 +71,27 @@ pub enum MessageContent {
 #[serde(tag = "type")]
 pub enum MessageContentPart {
     #[serde(rename = "text")]
-    Text { text: String },
+    Text {
+        text: String,
+        /// Anthropic prompt-caching breakpoint (`{"type":"ephemeral"}`), forwarded
+        /// verbatim (#666). Without this field serde drops the breakpoint at
+        /// deserialization, so it never survives the re-serialize in
+        /// `From<Message> for ChatMessage` to reach the Anthropic converter.
+        /// Stripped before any non-Anthropic upstream sees it (see
+        /// `inference_providers::strip_cache_control`). Omitted on the wire when
+        /// absent so the common (uncached) request is byte-identical to before.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cache_control: Option<serde_json::Value>,
+    },
     #[serde(rename = "image_url")]
     ImageUrl {
         image_url: MessageImageUrl,
         #[serde(skip_serializing_if = "Option::is_none")]
         detail: Option<String>,
+        /// Prompt-caching breakpoint on an image content part (#666). Same
+        /// verbatim forwarding and same non-Anthropic stripping as `Text`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cache_control: Option<serde_json::Value>,
     },
     // OpenAI format: input_audio with data + format
     #[serde(rename = "input_audio")]
@@ -1037,8 +1052,10 @@ pub struct ModelPricing {
     pub image: String,
     /// OpenRouter: USD per request, as a string ("0" when not applicable).
     pub request: String,
-    /// OpenRouter: USD per cached input token, as a string ("0" when not applicable).
-    pub input_cache_read: String,
+    /// OpenRouter: USD per cached input token, as a string. Omitted when cache-read
+    /// pricing is disabled or unknown.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_cache_read: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
@@ -2357,7 +2374,7 @@ impl CreateResponseRequest {
         }
 
         if let Some(max_tokens) = self.max_output_tokens {
-            if max_tokens == 0 {
+            if max_tokens < 1 {
                 return Err("max_output_tokens must be greater than 0".to_string());
             }
         }
@@ -3476,6 +3493,10 @@ pub struct UpdateModelApiRequest {
     pub verifiable: Option<bool>,
     #[serde(rename = "isActive")]
     pub is_active: Option<bool>,
+    /// If true, this model may be activated even when both cost fields are 0.
+    /// Required to be set explicitly when activating a zero-price model.
+    #[serde(rename = "allowFree", skip_serializing_if = "Option::is_none")]
+    pub allow_free: Option<bool>,
     pub aliases: Option<Vec<String>>,
     #[serde(rename = "ownedBy")]
     pub owned_by: Option<String>,
@@ -3904,6 +3925,9 @@ pub struct ModelHistoryEntry {
     /// OpenRouter `openrouter.slug` override the model carried at this point.
     #[serde(rename = "openrouterSlug", skip_serializing_if = "Option::is_none")]
     pub openrouter_slug: Option<String>,
+    /// If true, this model was allowed to serve without pricing at this point in time.
+    #[serde(rename = "allowFree")]
+    pub allow_free: bool,
 }
 
 /// Model history response - complete history of model changes
@@ -4208,6 +4232,34 @@ mod tests {
     }
 
     #[test]
+    fn test_create_response_request_rejects_non_positive_max_output_tokens() {
+        for max_output_tokens in [-1, 0] {
+            let request: CreateResponseRequest = serde_json::from_value(json!({
+                "model": "gpt-4.1",
+                "input": "Hello!",
+                "max_output_tokens": max_output_tokens
+            }))
+            .unwrap();
+
+            assert_eq!(
+                request.validate().unwrap_err(),
+                "max_output_tokens must be greater than 0"
+            );
+        }
+
+        for max_output_tokens in [None, Some(1), Some(1000)] {
+            let request: CreateResponseRequest = serde_json::from_value(json!({
+                "model": "gpt-4.1",
+                "input": "Hello!",
+                "max_output_tokens": max_output_tokens
+            }))
+            .unwrap();
+
+            assert!(request.validate().is_ok());
+        }
+    }
+
+    #[test]
     fn test_create_response_request_array_input_with_multipart_content() {
         let json = r#"{
             "model": "gpt-4.1",
@@ -4351,9 +4403,11 @@ mod tests {
                 content: Some(MessageContent::Parts(vec![
                     MessageContentPart::Text {
                         text: "Hello".to_string(),
+                        cache_control: None,
                     },
                     MessageContentPart::Text {
                         text: "World".to_string(),
+                        cache_control: None,
                     },
                 ])),
                 name: None,
@@ -4531,12 +4585,14 @@ mod tests {
                 content: Some(MessageContent::Parts(vec![
                     MessageContentPart::Text {
                         text: "What's in this image?".to_string(),
+                        cache_control: None,
                     },
                     MessageContentPart::ImageUrl {
                         image_url: MessageImageUrl::String(
                             "data:image/jpeg;base64,/9j/4AAQSkZJRg==".to_string(),
                         ),
                         detail: Some("low".to_string()),
+                        cache_control: None,
                     },
                 ])),
                 name: None,

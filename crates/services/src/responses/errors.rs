@@ -160,7 +160,7 @@ fn completion_http_status_code(error: &crate::completions::CompletionError) -> u
         | crate::completions::CompletionError::InvalidParams(_) => 400,
         crate::completions::CompletionError::RateLimitExceeded(_) => 429,
         crate::completions::CompletionError::ProviderError { status_code, .. } => *status_code,
-        crate::completions::CompletionError::ServiceOverloaded(_) => 529,
+        crate::completions::CompletionError::ServiceOverloaded(_) => 429,
         crate::completions::CompletionError::InternalError(_) => 500,
     }
 }
@@ -218,5 +218,42 @@ fn response_error(
         type_: error_type.to_string(),
         param: None,
         code: code.map(str::to_string),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::completions::CompletionError;
+
+    #[test]
+    fn test_responses_api_service_overloaded_returns_429() {
+        let completion_err = CompletionError::ServiceOverloaded("all backends busy".to_string());
+        let response_err = ResponseError::Completion(completion_err);
+        assert_eq!(
+            response_err.http_status_code(),
+            429,
+            "ServiceOverloaded should map to HTTP 429 in the Responses API"
+        );
+    }
+
+    #[test]
+    fn test_responses_api_service_overloaded_error_type() {
+        let completion_err = CompletionError::ServiceOverloaded("all backends busy".to_string());
+        let response_err = ResponseError::Completion(completion_err);
+        let error_body = response_err.response_error();
+        assert_eq!(
+            error_body.type_,
+            "service_overloaded",
+            "ServiceOverloaded should carry type=service_overloaded in the Responses API error body"
+        );
+    }
+
+    #[test]
+    fn test_responses_api_rate_limit_returns_429() {
+        let completion_err = CompletionError::RateLimitExceeded("quota exceeded".to_string());
+        let response_err = ResponseError::Completion(completion_err);
+        assert_eq!(response_err.http_status_code(), 429);
+        assert_eq!(response_err.response_error().type_, "rate_limit_exceeded");
     }
 }

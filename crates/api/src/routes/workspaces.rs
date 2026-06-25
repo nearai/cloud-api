@@ -154,6 +154,48 @@ impl From<WorkspaceOrderDirection> for services::workspace::WorkspaceOrderDirect
     }
 }
 
+#[derive(Debug, Deserialize)]
+pub struct ListApiKeysParams {
+    #[serde(default = "crate::routes::common::default_limit")]
+    pub limit: i64,
+    #[serde(default)]
+    pub offset: i64,
+    pub order_by: Option<ApiKeyOrderBy>,
+    pub order_direction: Option<ApiKeyOrderDirection>,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ApiKeyOrderBy {
+    CreatedAt,
+    Usage,
+}
+
+impl From<ApiKeyOrderBy> for services::workspace::ApiKeyOrderBy {
+    fn from(value: ApiKeyOrderBy) -> Self {
+        match value {
+            ApiKeyOrderBy::CreatedAt => Self::CreatedAt,
+            ApiKeyOrderBy::Usage => Self::Usage,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ApiKeyOrderDirection {
+    Asc,
+    Desc,
+}
+
+impl From<ApiKeyOrderDirection> for services::workspace::ApiKeyOrderDirection {
+    fn from(value: ApiKeyOrderDirection) -> Self {
+        match value {
+            ApiKeyOrderDirection::Asc => Self::Asc,
+            ApiKeyOrderDirection::Desc => Self::Desc,
+        }
+    }
+}
+
 // ============================================
 // Workspace Management Routes
 // ============================================
@@ -772,7 +814,9 @@ pub async fn create_workspace_api_key(
     params(
         ("workspace_id" = Uuid, Path, description = "Workspace ID"),
         ("limit" = Option<i64>, Query, description = "Maximum number of results (default: 20)"),
-        ("offset" = Option<i64>, Query, description = "Number of results to skip (default: 0)")
+        ("offset" = Option<i64>, Query, description = "Number of results to skip (default: 0)"),
+        ("order_by" = Option<ApiKeyOrderBy>, Query, description = "Field to order by: created_at or usage"),
+        ("order_direction" = Option<ApiKeyOrderDirection>, Query, description = "Sort direction: asc or desc")
     ),
     responses(
         (status = 200, description = "Paginated list of workspace API keys", body = ListApiKeysResponse),
@@ -789,7 +833,7 @@ pub async fn list_workspace_api_keys(
     State(app_state): State<AppState>,
     Extension(user): Extension<AuthenticatedUser>,
     Path(workspace_id): Path<Uuid>,
-    Query(params): Query<ListParams>,
+    Query(params): Query<ListApiKeysParams>,
 ) -> Result<Json<ListApiKeysResponse>, (StatusCode, Json<ErrorResponse>)> {
     debug!(
         "Listing API keys for workspace: {} by user: {} (limit: {}, offset: {})",
@@ -837,9 +881,18 @@ pub async fn list_workspace_api_keys(
     };
 
     // Use workspace service to list workspace API keys with pagination and usage data
+    let order_by = params.order_by.map(Into::into);
+    let order_direction = params.order_direction.map(Into::into);
     match app_state
         .workspace_service
-        .list_api_keys_paginated(workspace_id_typed, user_id, params.limit, params.offset)
+        .list_api_keys_paginated(
+            workspace_id_typed,
+            user_id,
+            params.limit,
+            params.offset,
+            order_by,
+            order_direction,
+        )
         .await
     {
         Ok(api_keys) => {

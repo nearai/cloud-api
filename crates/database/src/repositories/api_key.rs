@@ -6,7 +6,7 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use services::common::{extract_api_key_prefix, generate_api_key, hash_api_key, RepositoryError};
-use services::workspace::ports::CreateApiKeyRequest;
+use services::workspace::ports::{ApiKeyOrderBy, ApiKeyOrderDirection, CreateApiKeyRequest};
 use tracing::debug;
 use uuid::Uuid;
 
@@ -237,7 +237,25 @@ impl ApiKeyRepository {
         workspace_id: Uuid,
         limit: i64,
         offset: i64,
+        order_by: Option<ApiKeyOrderBy>,
+        order_direction: Option<ApiKeyOrderDirection>,
     ) -> Result<Vec<ApiKey>, RepositoryError> {
+        let order_by = order_by.unwrap_or(ApiKeyOrderBy::CreatedAt);
+        let order_direction = order_direction.unwrap_or(ApiKeyOrderDirection::Desc);
+
+        let order_by_column = match order_by {
+            ApiKeyOrderBy::CreatedAt => "ak.created_at",
+            ApiKeyOrderBy::Usage => "usage",
+        };
+        let order_dir = match order_direction {
+            ApiKeyOrderDirection::Asc => "ASC",
+            ApiKeyOrderDirection::Desc => "DESC",
+        };
+        let tie_breaker = match order_by {
+            ApiKeyOrderBy::CreatedAt => ", ak.id ASC",
+            ApiKeyOrderBy::Usage => ", ak.created_at DESC, ak.id ASC",
+        };
+
         let rows = retry_db!("list_api_keys_by_workspace_paginated", {
             let client = self
                 .pool
@@ -248,7 +266,8 @@ impl ApiKeyRepository {
 
             client
                 .query(
-                    r#"
+                    &format!(
+                        r#"
                 SELECT 
                     ak.id,
                     ak.key_hash,
@@ -267,9 +286,10 @@ impl ApiKeyRepository {
                 LEFT JOIN organization_usage_log usg ON ak.id = usg.api_key_id
                 WHERE ak.workspace_id = $1 AND ak.deleted_at IS NULL
                 GROUP BY ak.id
-                ORDER BY ak.created_at DESC
+                ORDER BY {order_by_column} {order_dir}{tie_breaker}
                 LIMIT $2 OFFSET $3
-                "#,
+                "#
+                    ),
                     &[&workspace_id, &limit, &offset],
                 )
                 .await
@@ -620,9 +640,11 @@ impl services::workspace::ports::ApiKeyRepository for ApiKeyRepository {
         workspace_id: services::workspace::WorkspaceId,
         limit: i64,
         offset: i64,
+        order_by: Option<services::workspace::ApiKeyOrderBy>,
+        order_direction: Option<services::workspace::ApiKeyOrderDirection>,
     ) -> Result<Vec<services::workspace::ApiKey>, RepositoryError> {
         let api_keys = self
-            .list_by_workspace_paginated(workspace_id.0, limit, offset)
+            .list_by_workspace_paginated(workspace_id.0, limit, offset, order_by, order_direction)
             .await?;
         Ok(api_keys
             .into_iter()

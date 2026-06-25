@@ -106,6 +106,20 @@ pub enum WorkspaceOrderDirection {
     Desc,
 }
 
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApiKeyOrderBy {
+    CreatedAt,
+    Usage,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApiKeyOrderDirection {
+    Asc,
+    Desc,
+}
+
 // Repository trait for workspace data access
 #[async_trait]
 pub trait WorkspaceRepository: Send + Sync {
@@ -182,6 +196,8 @@ pub trait ApiKeyRepository: Send + Sync {
         workspace_id: WorkspaceId,
         limit: i64,
         offset: i64,
+        order_by: Option<ApiKeyOrderBy>,
+        order_direction: Option<ApiKeyOrderDirection>,
     ) -> Result<Vec<ApiKey>, RepositoryError>;
 
     async fn delete(&self, id: ApiKeyId) -> Result<bool, RepositoryError>;
@@ -281,6 +297,8 @@ pub trait WorkspaceServiceTrait: Send + Sync {
         requester_id: UserId,
         limit: i64,
         offset: i64,
+        order_by: Option<ApiKeyOrderBy>,
+        order_direction: Option<ApiKeyOrderDirection>,
     ) -> Result<Vec<ApiKey>, WorkspaceError>;
 
     /// Get a specific API key by ID with permission checking

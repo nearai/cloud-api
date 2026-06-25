@@ -89,6 +89,97 @@ async fn test_list_workspace_api_keys() {
 }
 
 #[tokio::test]
+async fn test_list_workspace_api_keys_orders_by_usage() {
+    let (server, database) = setup_test_server_with_database().await;
+    let org = create_org(&server).await;
+    let workspaces = list_workspaces(&server, org.id.clone()).await;
+    let workspace = workspaces.first().unwrap();
+    let model_name = setup_qwen_model(&server).await;
+
+    let unused_key =
+        create_api_key_in_workspace(&server, workspace.id.clone(), "Unused Key".to_string()).await;
+    let low_spend_key =
+        create_api_key_in_workspace(&server, workspace.id.clone(), "Low Spend Key".to_string())
+            .await;
+    let high_spend_key =
+        create_api_key_in_workspace(&server, workspace.id.clone(), "High Spend Key".to_string())
+            .await;
+
+    let organization_id = uuid::Uuid::parse_str(&org.id).unwrap();
+    let workspace_id = uuid::Uuid::parse_str(&workspace.id).unwrap();
+    let low_spend_key_id = uuid::Uuid::parse_str(&low_spend_key.id).unwrap();
+    let high_spend_key_id = uuid::Uuid::parse_str(&high_spend_key.id).unwrap();
+    let client = database.pool().get().await.unwrap();
+    let model_id: uuid::Uuid = client
+        .query_one(
+            "SELECT id FROM models WHERE model_name = $1",
+            &[&model_name],
+        )
+        .await
+        .unwrap()
+        .get(0);
+
+    for (api_key_id, total_cost) in [
+        (low_spend_key_id, 100_000_000_i64),
+        (high_spend_key_id, 300_000_000_i64),
+    ] {
+        client
+            .execute(
+                r#"
+                INSERT INTO organization_usage_log (
+                    id, organization_id, workspace_id, api_key_id,
+                    model_id, model_name, input_tokens, output_tokens,
+                    total_tokens, input_cost, output_cost, total_cost,
+                    inference_type, created_at
+                ) VALUES ($1, $2, $3, $4, $5, $6, 10, 10, 20, 1, 1, $7,
+                          'chat_completion', NOW())
+                "#,
+                &[
+                    &uuid::Uuid::new_v4(),
+                    &organization_id,
+                    &workspace_id,
+                    &api_key_id,
+                    &model_id,
+                    &model_name,
+                    &total_cost,
+                ],
+            )
+            .await
+            .unwrap();
+    }
+
+    let desc_response = server
+        .get(
+            format!(
+                "/v1/workspaces/{}/api-keys?limit=2&order_by=usage&order_direction=desc",
+                workspace.id
+            )
+            .as_str(),
+        )
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .await;
+    assert_eq!(desc_response.status_code(), 200);
+    let desc_list = desc_response.json::<api::models::ListApiKeysResponse>();
+    assert_eq!(desc_list.api_keys[0].id, high_spend_key.id);
+    assert_eq!(desc_list.api_keys[1].id, low_spend_key.id);
+
+    let asc_response = server
+        .get(
+            format!(
+                "/v1/workspaces/{}/api-keys?limit=2&order_by=usage&order_direction=asc",
+                workspace.id
+            )
+            .as_str(),
+        )
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .await;
+    assert_eq!(asc_response.status_code(), 200);
+    let asc_list = asc_response.json::<api::models::ListApiKeysResponse>();
+    assert_eq!(asc_list.api_keys[0].id, unused_key.id);
+    assert_eq!(asc_list.api_keys[1].id, low_spend_key.id);
+}
+
+#[tokio::test]
 async fn test_api_key_prevents_duplicate_names_in_workspace() {
     let server = setup_test_server().await;
     let org = create_org(&server).await;

@@ -139,6 +139,19 @@ pub trait ModelsServiceTrait: Send + Sync {
         identifier: &str,
     ) -> Result<ModelWithPricing, ModelsError>;
 
+    /// Resolve a model identifier for public model-detail reads.
+    ///
+    /// Production implementations should use the cached active public model
+    /// list, preferring exact canonical model-name matches before alias matches.
+    /// The default keeps existing test doubles source-compatible; concrete
+    /// public catalog services should override it.
+    async fn resolve_public_model(
+        &self,
+        identifier: &str,
+    ) -> Result<ModelWithPricing, ModelsError> {
+        self.resolve_and_get_model(identifier).await
+    }
+
     /// Resolve `identifier` against the cached active-models alias map.
     /// Returns `Some(canonical_name)` when `identifier` is a registered
     /// alias of an active model, `None` when it is a canonical name,

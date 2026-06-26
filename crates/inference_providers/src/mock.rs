@@ -648,6 +648,7 @@ impl MockProvider {
             owned_by: "vllm".to_string(),
             context_length: None,
             max_model_len: None,
+            max_output_length: None,
             top_provider: None,
         }];
         Self {

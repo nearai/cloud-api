@@ -23,6 +23,7 @@ mod audio_transcriptions;
 mod auth_tokens;
 mod auto_redact;
 mod auto_redact_adversarial;
+mod backend_output_limits;
 mod billing_and_models;
 mod chat_encryption;
 mod check_api_key;

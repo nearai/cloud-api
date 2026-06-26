@@ -31,6 +31,36 @@ pub use provider_attribution::{
 
 type InferenceProviderTrait = dyn InferenceProvider + Send + Sync;
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BackendModelMetadata {
+    pub context_length: Option<i32>,
+    pub max_output_length: Option<i32>,
+}
+
+impl BackendModelMetadata {
+    fn from_provider_model(model: &inference_providers::ModelInfo) -> Self {
+        Self {
+            context_length: model.advertised_context_length(),
+            max_output_length: model.advertised_max_output_length(),
+        }
+    }
+
+    fn has_metadata(self) -> bool {
+        self.context_length.is_some() || self.max_output_length.is_some()
+    }
+
+    fn merge_max(&mut self, other: Self) {
+        merge_positive_max(&mut self.context_length, other.context_length);
+        merge_positive_max(&mut self.max_output_length, other.max_output_length);
+    }
+}
+
+fn merge_positive_max(stored: &mut Option<i32>, candidate: Option<i32>) {
+    if let Some(candidate) = candidate.filter(|value| *value > 0) {
+        *stored = Some(stored.map_or(candidate, |stored| stored.max(candidate)));
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ProviderAttemptResult {
     Success,
@@ -3592,7 +3622,30 @@ impl InferenceProviderPool {
         mappings.model_to_providers.keys().cloned().collect()
     }
 
-    pub async fn max_context_lengths_by_model(&self) -> HashMap<String, i32> {
+    fn metadata_for_registered_model(
+        model_name: &str,
+        response: &inference_providers::models::ModelsResponse,
+    ) -> BackendModelMetadata {
+        let mut exact_metadata = BackendModelMetadata::default();
+        for model in response.data.iter().filter(|model| model.id == model_name) {
+            exact_metadata.merge_max(BackendModelMetadata::from_provider_model(model));
+        }
+        if exact_metadata.has_metadata() {
+            return exact_metadata;
+        }
+
+        if response.data.len() == 1 {
+            return response
+                .data
+                .first()
+                .map(BackendModelMetadata::from_provider_model)
+                .unwrap_or_default();
+        }
+
+        BackendModelMetadata::default()
+    }
+
+    pub async fn max_model_metadata_by_model(&self) -> HashMap<String, BackendModelMetadata> {
         let model_providers: Vec<(String, Vec<Arc<InferenceProviderTrait>>)> = {
             let mappings = self.provider_mappings.read().await;
             mappings
@@ -3615,29 +3668,16 @@ impl InferenceProviderPool {
             })
             .collect();
 
-        let mut max_lengths: HashMap<String, i32> = HashMap::new();
+        let mut max_metadata: HashMap<String, BackendModelMetadata> = HashMap::new();
         for (model_name, result) in futures::future::join_all(tasks).await {
             match result {
                 Ok(response) => {
-                    let exact = response
-                        .data
-                        .iter()
-                        .filter(|model| model.id == model_name)
-                        .filter_map(|model| model.advertised_context_length())
-                        .max();
-                    let single = if response.data.len() == 1 {
-                        response
-                            .data
-                            .first()
-                            .and_then(|model| model.advertised_context_length())
-                    } else {
-                        None
-                    };
-                    if let Some(context_length) = exact.or(single).filter(|value| *value > 0) {
-                        max_lengths
+                    let metadata = Self::metadata_for_registered_model(&model_name, &response);
+                    if metadata.has_metadata() {
+                        max_metadata
                             .entry(model_name)
-                            .and_modify(|stored| *stored = (*stored).max(context_length))
-                            .or_insert(context_length);
+                            .and_modify(|stored| stored.merge_max(metadata))
+                            .or_insert(metadata);
                     }
                 }
                 Err(error) => {
@@ -3650,7 +3690,19 @@ impl InferenceProviderPool {
             }
         }
 
-        max_lengths
+        max_metadata
+    }
+
+    pub async fn max_context_lengths_by_model(&self) -> HashMap<String, i32> {
+        self.max_model_metadata_by_model()
+            .await
+            .into_iter()
+            .filter_map(|(model_name, metadata)| {
+                metadata
+                    .context_length
+                    .map(|context_length| (model_name, context_length))
+            })
+            .collect()
     }
 
     /// Sync external providers — just re-loads them into provider_mappings.
@@ -4728,26 +4780,244 @@ mod tests {
             .collect()
     }
 
+    fn provider_model(
+        model_id: &str,
+        context_length: Option<i32>,
+        max_output_length: Option<i32>,
+    ) -> inference_providers::ModelInfo {
+        inference_providers::ModelInfo {
+            id: model_id.to_string(),
+            object: "model".to_string(),
+            created: 0,
+            owned_by: "test".to_string(),
+            context_length,
+            max_model_len: None,
+            max_output_length,
+            top_provider: None,
+        }
+    }
+
+    struct FailingModelsProvider;
+
+    #[async_trait::async_trait]
+    impl inference_providers::InferenceProvider for FailingModelsProvider {
+        async fn models(
+            &self,
+        ) -> Result<
+            inference_providers::models::ModelsResponse,
+            inference_providers::models::ListModelsError,
+        > {
+            Err(inference_providers::models::ListModelsError::FetchError(
+                "test metadata failure".to_string(),
+            ))
+        }
+
+        async fn chat_completion_stream(
+            &self,
+            _params: ChatCompletionParams,
+            _request_hash: String,
+        ) -> Result<StreamingResult, CompletionError> {
+            panic!("FailingModelsProvider only supports models() in tests")
+        }
+
+        async fn chat_completion(
+            &self,
+            _params: ChatCompletionParams,
+            _request_hash: String,
+        ) -> Result<inference_providers::ChatCompletionResponseWithBytes, CompletionError> {
+            panic!("FailingModelsProvider only supports models() in tests")
+        }
+
+        async fn text_completion_stream(
+            &self,
+            _params: inference_providers::CompletionParams,
+        ) -> Result<StreamingResult, CompletionError> {
+            panic!("FailingModelsProvider only supports models() in tests")
+        }
+
+        async fn image_generation(
+            &self,
+            _params: ImageGenerationParams,
+            _request_hash: String,
+        ) -> Result<ImageGenerationResponseWithBytes, ImageGenerationError> {
+            panic!("FailingModelsProvider only supports models() in tests")
+        }
+
+        async fn image_edit(
+            &self,
+            _params: Arc<ImageEditParams>,
+            _request_hash: String,
+        ) -> Result<ImageEditResponseWithBytes, ImageEditError> {
+            panic!("FailingModelsProvider only supports models() in tests")
+        }
+
+        async fn score(
+            &self,
+            _params: inference_providers::ScoreParams,
+            _request_hash: String,
+        ) -> Result<inference_providers::ScoreResponse, inference_providers::ScoreError> {
+            panic!("FailingModelsProvider only supports models() in tests")
+        }
+
+        async fn rerank(&self, _params: RerankParams) -> Result<RerankResponse, RerankError> {
+            panic!("FailingModelsProvider only supports models() in tests")
+        }
+
+        async fn embeddings_raw(
+            &self,
+            _body: bytes::Bytes,
+            _extra: std::collections::HashMap<String, serde_json::Value>,
+        ) -> Result<bytes::Bytes, inference_providers::EmbeddingError> {
+            panic!("FailingModelsProvider only supports models() in tests")
+        }
+
+        async fn privacy_classify_raw(
+            &self,
+            _body: bytes::Bytes,
+            _extra: std::collections::HashMap<String, serde_json::Value>,
+        ) -> Result<bytes::Bytes, inference_providers::PrivacyClassifyError> {
+            panic!("FailingModelsProvider only supports models() in tests")
+        }
+
+        async fn get_signature(
+            &self,
+            _chat_id: &str,
+            _signing_algo: Option<String>,
+        ) -> Result<inference_providers::ChatSignature, CompletionError> {
+            panic!("FailingModelsProvider only supports models() in tests")
+        }
+
+        async fn get_attestation_report(
+            &self,
+            _model: String,
+            _signing_algo: Option<String>,
+            _nonce: Option<String>,
+            _signing_address: Option<String>,
+            _include_tls_fingerprint: bool,
+        ) -> Result<serde_json::Map<String, serde_json::Value>, AttestationError> {
+            panic!("FailingModelsProvider only supports models() in tests")
+        }
+
+        async fn audio_transcription(
+            &self,
+            _params: AudioTranscriptionParams,
+            _request_hash: String,
+        ) -> Result<AudioTranscriptionResponse, AudioTranscriptionError> {
+            panic!("FailingModelsProvider only supports models() in tests")
+        }
+    }
+
     #[tokio::test]
-    async fn max_context_lengths_by_model_reads_backend_metadata() {
+    async fn max_model_metadata_by_model_prefers_exact_backend_model_id_match() {
         let model_id = "test/model".to_string();
         let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
         let provider = Arc::new(inference_providers::mock::MockProvider::with_models(vec![
-            inference_providers::ModelInfo {
-                id: model_id.clone(),
-                object: "model".to_string(),
-                created: 0,
-                owned_by: "test".to_string(),
-                context_length: Some(32_768),
-                max_model_len: None,
-                top_provider: None,
-            },
+            provider_model("test/other", Some(131_072), Some(16_384)),
+            provider_model(&model_id, Some(32_768), Some(4_096)),
         ]));
 
         pool.register_provider(model_id.clone(), provider).await;
-        let context_lengths = pool.max_context_lengths_by_model().await;
+        let metadata = pool.max_model_metadata_by_model().await;
 
-        assert_eq!(context_lengths.get(&model_id), Some(&32_768));
+        assert_eq!(
+            metadata.get(&model_id),
+            Some(&BackendModelMetadata {
+                context_length: Some(32_768),
+                max_output_length: Some(4_096),
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn max_model_metadata_by_model_uses_single_model_fallback() {
+        let model_id = "test/canonical".to_string();
+        let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
+        let provider = Arc::new(inference_providers::mock::MockProvider::with_models(vec![
+            provider_model("backend/internal", Some(65_536), Some(8_192)),
+        ]));
+
+        pool.register_provider(model_id.clone(), provider).await;
+        let metadata = pool.max_model_metadata_by_model().await;
+
+        assert_eq!(
+            metadata.get(&model_id),
+            Some(&BackendModelMetadata {
+                context_length: Some(65_536),
+                max_output_length: Some(8_192),
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn max_model_metadata_by_model_uses_max_across_two_providers() {
+        let model_id = "test/model".to_string();
+        let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
+        pool.register_provider(
+            model_id.clone(),
+            Arc::new(inference_providers::mock::MockProvider::with_models(vec![
+                provider_model(&model_id, Some(32_768), Some(8_192)),
+            ])),
+        )
+        .await;
+        pool.register_pinned_secondary_provider(
+            model_id.clone(),
+            Arc::new(inference_providers::mock::MockProvider::with_models(vec![
+                provider_model(&model_id, Some(65_536), Some(4_096)),
+            ])),
+        )
+        .await;
+
+        let metadata = pool.max_model_metadata_by_model().await;
+
+        assert_eq!(
+            metadata.get(&model_id),
+            Some(&BackendModelMetadata {
+                context_length: Some(65_536),
+                max_output_length: Some(8_192),
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn max_model_metadata_by_model_ignores_zero_and_negative_values() {
+        let model_id = "test/model".to_string();
+        let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
+        pool.register_provider(
+            model_id.clone(),
+            Arc::new(inference_providers::mock::MockProvider::with_models(vec![
+                provider_model(&model_id, Some(0), Some(-1)),
+            ])),
+        )
+        .await;
+
+        let metadata = pool.max_model_metadata_by_model().await;
+
+        assert!(!metadata.contains_key(&model_id));
+    }
+
+    #[tokio::test]
+    async fn max_model_metadata_by_model_provider_errors_do_not_prevent_other_providers() {
+        let model_id = "test/model".to_string();
+        let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
+        pool.register_provider(
+            model_id.clone(),
+            Arc::new(inference_providers::mock::MockProvider::with_models(vec![
+                provider_model(&model_id, Some(32_768), Some(4_096)),
+            ])),
+        )
+        .await;
+        pool.register_pinned_secondary_provider(model_id.clone(), Arc::new(FailingModelsProvider))
+            .await;
+
+        let metadata = pool.max_model_metadata_by_model().await;
+
+        assert_eq!(
+            metadata.get(&model_id),
+            Some(&BackendModelMetadata {
+                context_length: Some(32_768),
+                max_output_length: Some(4_096),
+            })
+        );
     }
 
     #[test]

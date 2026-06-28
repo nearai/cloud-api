@@ -253,6 +253,12 @@ pub trait UsageServiceTrait: Send + Sync {
         organization_id: Uuid,
     ) -> Result<Option<OrganizationLimit>, UsageError>;
 
+    /// Get active credit limit rows that contribute to the unified limit.
+    async fn get_credit_limits(
+        &self,
+        organization_id: Uuid,
+    ) -> Result<Vec<OrganizationCreditLimit>, UsageError>;
+
     /// Get usage history for a specific API key
     /// Returns a tuple of (entries, total_count)
     async fn get_usage_history_by_api_key(
@@ -373,6 +379,12 @@ pub trait OrganizationLimitsRepository: Send + Sync {
         &self,
         organization_id: Uuid,
     ) -> anyhow::Result<Option<OrganizationLimit>>;
+
+    /// Get current limit rows for an organization.
+    async fn get_current_limit_breakdown(
+        &self,
+        organization_id: Uuid,
+    ) -> anyhow::Result<Vec<OrganizationCreditLimit>>;
 }
 
 // ============================================
@@ -541,6 +553,16 @@ pub struct ModelPricing {
 #[derive(Debug, Clone)]
 pub struct OrganizationLimit {
     pub spend_limit: i64,
+}
+
+/// One active credit source contributing to an organization's spending limit.
+/// All amounts use fixed scale of 9 (nano-dollars) and USD currency.
+#[derive(Debug, Clone)]
+pub struct OrganizationCreditLimit {
+    pub credit_type: String,
+    pub source: Option<String>,
+    pub amount: i64,
+    pub currency: String,
 }
 
 /// Cost breakdown for a request

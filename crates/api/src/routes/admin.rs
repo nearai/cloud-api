@@ -162,6 +162,7 @@ pub struct AdminAppState {
         Arc<dyn services::organization::OrganizationServiceTrait + Send + Sync>,
     pub auth_service: Arc<dyn AuthServiceTrait>,
     pub usage_service: Arc<dyn UsageServiceTrait + Send + Sync>,
+    pub staking_farm_service: Arc<services::staking_farm::StakingFarmService>,
     pub config: Arc<ApiConfig>,
     pub admin_access_token_repository: Arc<database::repositories::AdminAccessTokenRepository>,
     pub inference_provider_pool: Arc<services::inference_provider_pool::InferenceProviderPool>,
@@ -1012,6 +1013,7 @@ pub async fn update_organization_limits(
     let credit_type_enum = match updated_limits.credit_type.to_lowercase().as_str() {
         "grant" => CreditType::Grant,
         "payment" => CreditType::Payment,
+        "staking_farm" => CreditType::StakingFarm,
         _ => CreditType::Payment, // Default fallback (should not happen)
     };
 
@@ -1115,6 +1117,7 @@ pub async fn get_organization_limits_history(
             let credit_type_enum = match h.credit_type.to_lowercase().as_str() {
                 "grant" => CreditType::Grant,
                 "payment" => CreditType::Payment,
+                "staking_farm" => CreditType::StakingFarm,
                 _ => CreditType::Payment,
             };
             OrgLimitsHistoryEntry {

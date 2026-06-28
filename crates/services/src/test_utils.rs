@@ -6,9 +6,9 @@ use crate::{
         AttestationError,
     },
     usage::{
-        CostBreakdown, InferenceType, OrganizationBalanceInfo, OrganizationLimit,
-        ProviderAttribution, RecordUsageApiRequest, RecordUsageServiceRequest, UsageCheckResult,
-        UsageError, UsageLogEntry, UsageServiceTrait,
+        CostBreakdown, InferenceType, OrganizationBalanceInfo, OrganizationCreditLimit,
+        OrganizationLimit, ProviderAttribution, RecordUsageApiRequest, RecordUsageServiceRequest,
+        UsageCheckResult, UsageError, UsageLogEntry, UsageServiceTrait,
     },
 };
 use async_trait::async_trait;
@@ -264,6 +264,13 @@ impl UsageServiceTrait for MockUsageService {
         Ok(None)
     }
 
+    async fn get_credit_limits(
+        &self,
+        _organization_id: Uuid,
+    ) -> Result<Vec<OrganizationCreditLimit>, UsageError> {
+        Ok(vec![])
+    }
+
     async fn get_usage_history_by_api_key(
         &self,
         _api_key_id: Uuid,
@@ -503,6 +510,13 @@ impl UsageServiceTrait for CapturingUsageService {
         _organization_id: Uuid,
     ) -> Result<Option<OrganizationLimit>, UsageError> {
         Ok(None)
+    }
+
+    async fn get_credit_limits(
+        &self,
+        _organization_id: Uuid,
+    ) -> Result<Vec<OrganizationCreditLimit>, UsageError> {
+        Ok(vec![])
     }
 
     async fn get_usage_history_by_api_key(

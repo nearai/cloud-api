@@ -3948,6 +3948,7 @@ pub struct ModelHistoryResponse {
 /// Credit type for organization limits
 /// - grant: Free credits provided by the platform
 /// - payment: Credits purchased by the organization
+/// - staking_farm: House of Stake farm reward units converted into credits
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, ToSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum CreditType {
@@ -3955,6 +3956,8 @@ pub enum CreditType {
     Grant,
     #[serde(alias = "PAYMENT")]
     Payment,
+    #[serde(rename = "staking_farm", alias = "STAKING_FARM")]
+    StakingFarm,
 }
 
 impl std::fmt::Display for CreditType {
@@ -3962,6 +3965,7 @@ impl std::fmt::Display for CreditType {
         match self {
             CreditType::Grant => write!(f, "grant"),
             CreditType::Payment => write!(f, "payment"),
+            CreditType::StakingFarm => write!(f, "staking_farm"),
         }
     }
 }
@@ -3972,6 +3976,7 @@ impl CreditType {
         match self {
             CreditType::Grant => "grant",
             CreditType::Payment => "payment",
+            CreditType::StakingFarm => "staking_farm",
         }
     }
 }

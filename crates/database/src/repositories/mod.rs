@@ -17,6 +17,7 @@ pub mod organization_invitation;
 pub mod organization_limits;
 pub mod organization_limits_repository_impl;
 pub mod organization_service_usage;
+pub mod organization_staking_farm_sources;
 pub mod organization_usage;
 pub mod response;
 pub mod response_item;
@@ -51,6 +52,7 @@ pub use organization_limits::OrganizationLimitsRepository;
 pub use organization_service_usage::{
     OrganizationServiceUsageRepository, RecordServiceUsageRequest,
 };
+pub use organization_staking_farm_sources::OrganizationStakingFarmSourcesRepository;
 pub use organization_usage::{OrganizationUsageRepository, UsageStats};
 pub use response::PgResponseRepository;
 pub use response_item::PgResponseItemsRepository;

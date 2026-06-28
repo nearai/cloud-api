@@ -664,6 +664,16 @@ impl UsageServiceTrait for UsageServiceImpl {
         Ok(limit)
     }
 
+    async fn get_credit_limits(
+        &self,
+        organization_id: Uuid,
+    ) -> Result<Vec<OrganizationCreditLimit>, UsageError> {
+        self.limits_repository
+            .get_current_limit_breakdown(organization_id)
+            .await
+            .map_err(|e| UsageError::InternalError(format!("Failed to get limits: {e}")))
+    }
+
     /// Get usage history for a specific API key
     async fn get_usage_history_by_api_key(
         &self,

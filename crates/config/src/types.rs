@@ -23,11 +23,13 @@ pub struct ApiConfig {
     pub external_providers: ExternalProvidersConfig,
     pub github_dispatch: GitHubDispatchConfig,
     pub infra: InfraConfig,
+    pub staking_farm: StakingFarmConfig,
 }
 
 impl ApiConfig {
     /// Load configuration from environment variables
     pub fn from_env() -> Result<Self, String> {
+        let auth = AuthConfig::from_env()?;
         Ok(Self {
             server: ServerConfig::from_env()?,
             inference_api_key: env::var("INFERENCE_API_KEY")
@@ -42,7 +44,8 @@ impl ApiConfig {
                 .filter(|s| !s.is_empty()),
             logging: LoggingConfig::from_env()?,
             dstack_client: DstackClientConfig::from_env()?,
-            auth: AuthConfig::from_env()?,
+            staking_farm: StakingFarmConfig::from_env(&auth.near),
+            auth,
             database: DatabaseConfig::from_env()?,
             s3: S3Config::from_env()?,
             invitation_email: InvitationEmailConfig::from_env()?,
@@ -52,6 +55,65 @@ impl ApiConfig {
             github_dispatch: GitHubDispatchConfig::from_env()?,
             infra: InfraConfig::from_env(),
         })
+    }
+}
+
+/// Global House of Stake farm configuration used to convert reward units into
+/// NEAR AI Cloud credits. The feature is disabled until contract/product IDs are
+/// supplied by the deployment environment.
+#[derive(Debug, Clone)]
+pub struct StakingFarmConfig {
+    pub enabled: bool,
+    pub network_id: String,
+    pub contract_id: String,
+    pub farm_product_id: String,
+    pub farm_price_id: Option<String>,
+    pub credit_nano_usd_per_reward_unit: i64,
+    pub sync_staleness_seconds: i64,
+}
+
+impl Default for StakingFarmConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            network_id: NEAR_DEFAULT_NETWORK_ID.to_string(),
+            contract_id: String::new(),
+            farm_product_id: String::new(),
+            farm_price_id: None,
+            credit_nano_usd_per_reward_unit: 1_000_000_000,
+            sync_staleness_seconds: 300,
+        }
+    }
+}
+
+impl StakingFarmConfig {
+    pub fn from_env(near: &NearConfig) -> Self {
+        let mut config = Self {
+            enabled: env::var("STAKING_FARM_ENABLED")
+                .ok()
+                .and_then(|value| value.parse::<bool>().ok())
+                .unwrap_or(false),
+            network_id: near.network_id.clone(),
+            contract_id: env::var("STAKING_FARM_CONTRACT_ID").unwrap_or_default(),
+            farm_product_id: env::var("STAKING_FARM_PRODUCT_ID").unwrap_or_default(),
+            farm_price_id: env::var("STAKING_FARM_PRICE_ID")
+                .ok()
+                .filter(|value| !value.is_empty()),
+            credit_nano_usd_per_reward_unit: env::var(
+                "STAKING_FARM_CREDIT_NANO_USD_PER_REWARD_UNIT",
+            )
+            .ok()
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(1_000_000_000),
+            sync_staleness_seconds: env::var("STAKING_FARM_SYNC_STALENESS_SECONDS")
+                .ok()
+                .and_then(|value| value.parse::<i64>().ok())
+                .unwrap_or(300),
+        };
+
+        config.enabled =
+            config.enabled && !config.contract_id.is_empty() && !config.farm_product_id.is_empty();
+        config
     }
 }
 
@@ -450,9 +512,11 @@ pub struct GoogleOAuthConfig {
 #[derive(Debug, Clone)]
 pub struct NearConfig {
     pub rpc_url: String,
+    pub network_id: String,
     pub expected_recipient: String,
 }
 
+const NEAR_DEFAULT_NETWORK_ID: &str = "mainnet";
 const NEAR_DEFAULT_RECIPIENT: &str = "cloud.near.ai";
 const NEAR_DEFAULT_RPC_URL: &str = "https://free.rpc.fastnear.com";
 
@@ -460,6 +524,7 @@ impl Default for NearConfig {
     fn default() -> Self {
         Self {
             rpc_url: NEAR_DEFAULT_RPC_URL.to_string(),
+            network_id: NEAR_DEFAULT_NETWORK_ID.to_string(),
             expected_recipient: NEAR_DEFAULT_RECIPIENT.to_string(),
         }
     }
@@ -469,6 +534,8 @@ impl NearConfig {
     pub fn from_env() -> Self {
         Self {
             rpc_url: env::var("NEAR_RPC_URL").unwrap_or_else(|_| NEAR_DEFAULT_RPC_URL.to_string()),
+            network_id: env::var("NEAR_NETWORK_ID")
+                .unwrap_or_else(|_| NEAR_DEFAULT_NETWORK_ID.to_string()),
             expected_recipient: env::var("NEAR_EXPECTED_RECIPIENT")
                 .unwrap_or_else(|_| NEAR_DEFAULT_RECIPIENT.to_string()),
         }
@@ -697,6 +764,21 @@ mod tests {
         }
     }
 
+    fn clear_staking_farm_env() {
+        for key in [
+            "STAKING_FARM_ENABLED",
+            "STAKING_FARM_CONTRACT_ID",
+            "STAKING_FARM_PRODUCT_ID",
+            "STAKING_FARM_PRICE_ID",
+            "STAKING_FARM_CREDIT_NANO_USD_PER_REWARD_UNIT",
+            "STAKING_FARM_SYNC_STALENESS_SECONDS",
+            "STAKING_FARM_NETWORK_ID",
+            "STAKING_FARM_RPC_URL",
+        ] {
+            std::env::remove_var(key);
+        }
+    }
+
     #[test]
     #[serial]
     fn github_dispatch_disabled_by_default() {
@@ -717,6 +799,30 @@ mod tests {
             GitHubDispatchConfig::default().event_type,
             DEFAULT_GITHUB_DISPATCH_EVENT_TYPE
         );
+    }
+
+    #[test]
+    #[serial]
+    fn staking_farm_config_uses_shared_near_network() {
+        clear_staking_farm_env();
+        std::env::set_var("STAKING_FARM_ENABLED", "true");
+        std::env::set_var("STAKING_FARM_CONTRACT_ID", "stake.testnet");
+        std::env::set_var("STAKING_FARM_PRODUCT_ID", "cloud-credits");
+        std::env::set_var("STAKING_FARM_NETWORK_ID", "ignored-mainnet");
+
+        let near = NearConfig {
+            rpc_url: "https://rpc.testnet.near.org".to_string(),
+            network_id: "testnet".to_string(),
+            expected_recipient: "cloud.near.ai".to_string(),
+        };
+        let config = StakingFarmConfig::from_env(&near);
+
+        assert!(config.enabled);
+        assert_eq!(config.network_id, "testnet");
+        assert_eq!(config.contract_id, "stake.testnet");
+        assert_eq!(config.farm_product_id, "cloud-credits");
+
+        clear_staking_farm_env();
     }
 
     #[test]

@@ -2,7 +2,7 @@ use crate::middleware::{auth_middleware, AuthState};
 use crate::ohttp_gateway::{OhttpAttestation, OhttpGateway};
 use axum::{
     middleware::from_fn_with_state,
-    routing::{delete, get, put},
+    routing::{delete, get, post, put},
     Router,
 };
 use services::{
@@ -31,6 +31,7 @@ pub struct AppState {
     pub inference_provider_pool: Arc<services::inference_provider_pool::InferenceProviderPool>,
     pub metrics_service: Arc<dyn services::metrics::MetricsServiceTrait>,
     pub analytics_service: Arc<services::admin::AnalyticsService>,
+    pub staking_farm_service: Arc<services::staking_farm::StakingFarmService>,
     pub config: Arc<config::ApiConfig>,
     /// OHTTP gateway for RFC 9458 decapsulation/encapsulation. `None` when OHTTP_ENABLED is unset.
     pub ohttp_gateway: Option<Arc<OhttpGateway>>,
@@ -129,6 +130,14 @@ pub fn build_management_router(app_state: AppState, auth_state: AuthState) -> Ro
             get(crate::routes::usage::get_organization_usage_history),
         )
         .route(
+            "/{id}/staking/farm",
+            get(crate::routes::staking_farm::get_organization_staking_farm),
+        )
+        .route(
+            "/{id}/staking/farm/sync",
+            post(crate::routes::staking_farm::sync_organization_staking_farm),
+        )
+        .route(
             "/{id}/usage/by-model",
             get(crate::routes::usage::get_organization_usage_by_model),
         )
@@ -179,6 +188,10 @@ pub fn build_management_router(app_state: AppState, auth_state: AuthState) -> Ro
 
     // Combine all routes with appropriate auth middleware
     Router::new()
+        .route(
+            "/staking/farm/config",
+            get(crate::routes::staking_farm::get_staking_farm_config),
+        )
         .nest("/organizations", org_routes)
         .nest("/users", user_routes)
         .with_state(app_state)

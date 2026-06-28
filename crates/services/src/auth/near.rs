@@ -98,7 +98,7 @@ impl NearAuthService {
                 config.rpc_url
             )
         });
-        let network_config = NetworkConfig::from_rpc_url("near", rpc_url);
+        let network_config = NetworkConfig::from_rpc_url(&config.network_id, rpc_url);
         Self {
             auth_service,
             nonce_repository,

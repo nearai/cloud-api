@@ -19,6 +19,7 @@ pub mod organization_members;
 pub mod organizations;
 pub mod responses;
 pub mod services;
+pub mod staking_farm;
 pub mod unsupported;
 pub mod usage;
 pub mod users;

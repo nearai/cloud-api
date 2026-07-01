@@ -1,8 +1,5 @@
 use serde::{Deserialize, Serialize};
 /// Error types for attestation operations
-// `Clone` so a cached/coalesced attestation-report build (moka `try_get_with`,
-// which yields `Arc<AttestationError>`) can return an owned error that preserves
-// the variant for correct HTTP status mapping. All variants hold only `String`.
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum AttestationError {
     #[error("Signature not found: {0}")]
@@ -22,6 +19,21 @@ pub enum AttestationError {
 
     #[error("Internal error: {0}")]
     InternalError(String),
+
+    #[error("ITA attestation is unavailable: {reason}")]
+    ItaUnavailable { reason: String },
+
+    #[error("ITA rate limited")]
+    ItaRateLimited { retry_after: Option<String> },
+
+    #[error("ITA request timed out")]
+    ItaTimeout,
+
+    #[error("ITA upstream error: {reason}")]
+    ItaBadUpstream { reason: String },
+
+    #[error("ITA evidence is invalid: {reason}")]
+    ItaInvalidEvidence { reason: String },
 }
 
 /// Result of looking up a signature that includes fallback cases
@@ -107,9 +119,6 @@ impl DstackCpuQuote {
     }
 }
 
-// `Clone` so the no-nonce report cache can store an `Arc<AttestationReport>` and
-// hand owned copies back to the trait method (which returns by value).
-#[derive(Clone)]
 pub struct AttestationReport {
     pub gateway_attestation: DstackCpuQuote,
     pub model_attestations: Vec<serde_json::Map<String, serde_json::Value>>,

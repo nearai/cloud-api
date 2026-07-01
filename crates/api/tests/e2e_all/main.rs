@@ -42,6 +42,7 @@ mod function_tools;
 mod general;
 mod health;
 mod invitations;
+mod ita_attestation;
 mod mcp;
 mod mcp_server;
 mod message_metadata;

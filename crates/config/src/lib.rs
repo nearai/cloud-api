@@ -10,9 +10,11 @@
 
 use thiserror::Error;
 
+pub mod ita;
 pub mod types;
 
 // Re-export all configuration types
+pub use ita::*;
 pub use types::*;
 
 #[derive(Error, Debug)]

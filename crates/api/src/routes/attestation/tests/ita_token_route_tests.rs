@@ -30,7 +30,7 @@ async fn ita_token_route_accepts_valid_public_query_without_auth() {
         .add_query_param("signing_algo", "ed25519")
         .add_query_param("signing_address", "near1signer")
         .add_query_param("include_tls_fingerprint", "true")
-        .add_query_param("policy_ids", &format!("{POLICY_A},{POLICY_B}"))
+        .add_query_param("policy_ids", format!("{POLICY_A},{POLICY_B}"))
         .add_query_param("policy_must_match", "true")
         .add_query_param("token_signing_alg", "RS256")
         .await;

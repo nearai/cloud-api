@@ -1,0 +1,42 @@
+# Local dev stack: real engine + isolated Postgres. Everything binds to
+# 127.0.0.1 on ports chosen not to clash with the e2e test-postgres (5432).
+services:
+  postgres:
+    image: postgres:16
+    container_name: local-stack-postgres
+    environment:
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: platform_api
+    ports:
+      - "127.0.0.1:15432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  # Real inference engine on CPU: llama.cpp's OpenAI-compatible server with a
+  # tiny instruct model, auto-downloaded from HF on first start and cached in
+  # ./cache. Engine-agnostic seam: the tier shims speak OpenAI upstream, so a
+  # vLLM CPU image can be swapped in here later.
+  llama:
+    image: ghcr.io/ggml-org/llama.cpp:server
+    container_name: local-stack-llama
+    command: >
+      -hf Qwen/Qwen2.5-0.5B-Instruct-GGUF:Q4_K_M
+      --alias local
+      --host 0.0.0.0 --port 8090
+      --ctx-size 8192
+      --parallel 2
+    environment:
+      LLAMA_CACHE: /cache
+    volumes:
+      - ./cache:/cache
+    ports:
+      - "127.0.0.1:18090:8090"
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://127.0.0.1:8090/health"]
+      interval: 5s
+      timeout: 5s
+      retries: 120
+      start_period: 30s

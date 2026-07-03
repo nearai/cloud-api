@@ -1445,6 +1445,10 @@ impl ModelRepository {
 
     /// Get all active models with inference_url set.
     /// Returns (model_name, inference_url, context_length) triples for direct routing.
+    /// A row whose `provider_config` declares a `long_context` tier expands into
+    /// TWO entries under the same model name (base fleet + long-context URL, each
+    /// with its own declared capacity) — see
+    /// `services::inference_provider_pool::expand_inference_endpoints`.
     pub async fn get_inference_url_models(&self) -> Result<Vec<(String, String, Option<u32>)>> {
         let rows = retry_db!("get_inference_url_models", {
             let client = self
@@ -1457,7 +1461,7 @@ impl ModelRepository {
             client
                 .query(
                     r#"
-                    SELECT model_name, inference_url, context_length
+                    SELECT model_name, inference_url, context_length, provider_config
                     FROM models
                     WHERE is_active = true
                       AND inference_url IS NOT NULL
@@ -1471,11 +1475,17 @@ impl ModelRepository {
 
         let models = rows
             .into_iter()
-            .map(|row| {
+            .flat_map(|row| {
                 let model_name: String = row.get("model_name");
                 let inference_url: String = row.get("inference_url");
                 let context_length: i32 = row.get("context_length");
-                (model_name, inference_url, Some(context_length as u32))
+                let provider_config: Option<serde_json::Value> = row.get("provider_config");
+                services::inference_provider_pool::expand_inference_endpoints(
+                    &model_name,
+                    &inference_url,
+                    Some(context_length as u32),
+                    provider_config.as_ref(),
+                )
             })
             .collect();
         Ok(models)

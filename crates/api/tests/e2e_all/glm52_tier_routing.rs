@@ -80,8 +80,7 @@ async fn mount_models_and_tokenize(server: &MockServer, model: &str, tokenize_co
     Mock::given(method("POST"))
         .and(path("/v1/tokenize"))
         .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_json(serde_json::json!({"count": tokenize_count})),
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({"count": tokenize_count})),
         )
         .mount(server)
         .await;
@@ -303,7 +302,11 @@ async fn e2e_context_length_400_falls_through_to_long_tier() {
         "context-400 must fall through to the bigger tier, body: {}",
         resp.text()
     );
-    assert!(resp.text().contains("served-by-long"), "got: {}", resp.text());
+    assert!(
+        resp.text().contains("served-by-long"),
+        "got: {}",
+        resp.text()
+    );
     assert_eq!(completions_hits(&base).await, 1, "base tried once");
 }
 
@@ -369,8 +372,7 @@ async fn e2e_streaming_oversize_request_served_by_long_tier() {
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
         .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_raw(sse_body(&model, "long"), "text/event-stream"),
+            ResponseTemplate::new(200).set_body_raw(sse_body(&model, "long"), "text/event-stream"),
         )
         .mount(&long)
         .await;
@@ -412,7 +414,9 @@ async fn e2e_catalog_shows_single_entry_with_full_context() {
         "the two-tier model must appear exactly once in the public catalog"
     );
     assert_eq!(
-        entries[0]["context_length"].as_i64().or(entries[0]["contextLength"].as_i64()),
+        entries[0]["context_length"]
+            .as_i64()
+            .or(entries[0]["contextLength"].as_i64()),
         Some(10_000),
         "catalog must advertise the full long-tier window, entry: {}",
         entries[0]

@@ -22,6 +22,7 @@ async fn admin_patch_with_provider_type_keeps_pinned_provider() {
     pool.register_pinned_secondary_provider(
         model.clone(),
         Arc::new(inference_providers::mock::MockProvider::new()),
+        None,
     )
     .await;
     assert!(pool.has_provider(&model).await);

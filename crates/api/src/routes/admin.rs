@@ -495,24 +495,43 @@ pub async fn batch_upsert_models(
     }
 
     // Register inference_url models (our own vLLM/SGLang backends)
-    // Only for active, non-external models with an inference_url set
+    // Only for active, non-external models with an inference_url set.
+    // A `provider_config.long_context` block expands into a second endpoint
+    // under the same canonical id (long-context tier).
+    //
+    // Built from `updated_models` — the MERGED post-upsert rows — not from
+    // the PATCH request: a partial PATCH (say pricing + inference_url,
+    // without provider_config) must not re-register the model with its
+    // long-context tier or declared capacities missing; the DB row is the
+    // source of truth the periodic refresh would converge to anyway.
     let inference_url_models: Vec<(String, String, Option<u32>)> = batch_request
         .iter()
         .filter_map(|(model_name, request)| {
-            let is_active = request.is_active != Some(false);
-            let is_external = request.provider_type.as_deref() == Some("external");
-            if is_active && !is_external {
-                request.inference_url.clone().map(|url| {
-                    (
-                        model_name.clone(),
-                        url,
-                        request.context_length.map(|c| c as u32),
+            let merged = updated_models.get(model_name)?;
+            let is_active = merged.is_active;
+            let is_external = merged.provider_type == "external";
+            // Only re-register when the PATCH touched something
+            // registration-relevant, mirroring the unregister trigger above
+            // (plus provider_config, which now carries routing tiers).
+            let touches_registration = request.provider_type.is_some()
+                || request.inference_url.is_some()
+                || request.provider_config.is_some()
+                || request.is_active.is_some()
+                || request.context_length.is_some();
+            if is_active && !is_external && touches_registration {
+                merged.inference_url.clone().map(|url| {
+                    services::inference_provider_pool::expand_inference_endpoints(
+                        model_name,
+                        &url,
+                        u32::try_from(merged.context_length).ok(),
+                        merged.provider_config.as_ref(),
                     )
                 })
             } else {
                 None
             }
         })
+        .flatten()
         .collect();
 
     if !inference_url_models.is_empty() {

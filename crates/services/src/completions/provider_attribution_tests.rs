@@ -179,7 +179,7 @@ async fn completion_service_with_mock_providers(
     }
 
     pool.register_provider(model_name.to_string(), near).await;
-    pool.register_pinned_secondary_provider(model_name.to_string(), chutes)
+    pool.register_pinned_secondary_provider(model_name.to_string(), chutes, None)
         .await;
 
     let usage_service = Arc::new(CapturingUsageService::new());

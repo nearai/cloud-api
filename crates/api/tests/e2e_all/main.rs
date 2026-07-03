@@ -27,6 +27,7 @@ mod billing_and_models;
 mod chat_encryption;
 mod check_api_key;
 mod chutes_catalog;
+mod glm52_tier_routing;
 mod client_disconnect;
 mod concurrent_limit;
 mod conversations;

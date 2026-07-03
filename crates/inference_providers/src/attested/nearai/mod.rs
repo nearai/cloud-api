@@ -1614,7 +1614,11 @@ impl InferenceProvider for Fleet {
     /// verified backend. Nothing about the text (or the response body, which
     /// may echo token ids) is logged.
     async fn count_tokens(&self, model: &str, text: String) -> Option<u64> {
-        const TOKENIZE_TIMEOUT: Duration = Duration::from_secs(5);
+        // Tight on purpose: this sits on the request's critical path and is a
+        // best-effort precision upgrade — a slow backend should fail-open to
+        // the caller's heuristic, not add seconds of latency. (Tokenizing
+        // ~1MB of text takes SGLang well under a second when healthy.)
+        const TOKENIZE_TIMEOUT: Duration = Duration::from_secs(2);
 
         let url = format!("{}/v1/tokenize", self.config.base_url);
         let headers = self.build_headers().ok()?;

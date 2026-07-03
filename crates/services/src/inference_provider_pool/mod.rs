@@ -2627,6 +2627,7 @@ impl InferenceProviderPool {
                         // as other providers may have capacity or better connectivity.
                         // NOTE: Don't increment the failure counter for non-retryable 4xx —
                         // these indicate invalid requests, not unhealthy providers.
+                        let mut context_400_fell_through = false;
                         if let CompletionError::HttpError {
                             status_code,
                             message,
@@ -2663,15 +2664,14 @@ impl InferenceProviderPool {
                                         .values()
                                         .any(|c| c.is_some_and(|other| other > mine))
                                 });
+                            let ctx_400_falls_through = larger_ctx_sibling_exists
+                                && Self::is_context_length_exceeded_error(*status_code, message);
+                            context_400_fell_through = ctx_400_falls_through;
                             if (400..=499).contains(status_code)
                                 && *status_code != 429
                                 && *status_code != 408
                                 && !Self::is_model_not_found_error(*status_code, message)
-                                && !(larger_ctx_sibling_exists
-                                    && Self::is_context_length_exceeded_error(
-                                        *status_code,
-                                        message,
-                                    ))
+                                && !ctx_400_falls_through
                             {
                                 tracing::warn!(
                                     model_id = %model_id,
@@ -2794,8 +2794,23 @@ impl InferenceProviderPool {
                         // Sanitize and preserve the last error with its structure intact.
                         // Carry the raw-error retry decision so downstream gates and the
                         // terminal log don't re-classify the sanitized form.
-                        last_error = Some(Self::sanitize_completion_error(e, model_id));
-                        last_retry_decision = Some(retry_decision);
+                        //
+                        // Exception: a context-length 400 that fell through from a
+                        // smaller-window provider is an EXPECTED rejection on the way
+                        // to a bigger sibling — it must not clobber an earlier
+                        // retryable error from a provider that actually fits. E.g. a
+                        // long request whose 1M tier 503s (queue full) and whose base
+                        // fleet then 400s: keeping the 503 lets the outer round retry
+                        // the saturated capable tier and, if it stays saturated,
+                        // surfaces a retryable 503 to the client instead of a
+                        // misleading "maximum context length" 400 for a request that
+                        // is genuinely servable.
+                        let keep_prior_retryable = context_400_fell_through
+                            && last_retry_decision.is_some_and(|d| d.starts_with("retryable_"));
+                        if !keep_prior_retryable {
+                            last_error = Some(Self::sanitize_completion_error(e, model_id));
+                            last_retry_decision = Some(retry_decision);
+                        }
                     }
                 }
             }
@@ -3059,13 +3074,22 @@ impl InferenceProviderPool {
 
         let estimate = context_routing::estimate_input(params);
         let pre_factor = estimate.countable_tokens + estimate.uncounted_tokens;
+        let output_reserve = params
+            .max_completion_tokens
+            .or(params.max_tokens)
+            .unwrap_or(0)
+            .max(0) as u64;
 
         // Exact count only when the heuristic is close enough to a capacity
-        // boundary that its error could flip the tier decision.
+        // boundary that its error could flip the tier decision. The band is
+        // checked against input + output reserve: a large max_tokens shrinks
+        // the input room to `cap - reserve`, so a mid-size prompt can sit at
+        // the boundary even when the input alone looks comfortably below it.
         let (band_low, band_high) = context_routing::tokenize_band();
+        let boundary_demand = (pre_factor + output_reserve) as f64;
         let near_boundary = distinct.iter().any(|cap| {
             let cap = *cap as f64;
-            (pre_factor as f64) >= band_low * cap && (pre_factor as f64) <= band_high * cap
+            boundary_demand >= band_low * cap && boundary_demand <= band_high * cap
         });
 
         let mut exact_count: Option<u64> = None;
@@ -3094,11 +3118,6 @@ impl InferenceProviderPool {
             }
         }
 
-        let output_reserve = params
-            .max_completion_tokens
-            .or(params.max_tokens)
-            .unwrap_or(0)
-            .max(0) as u64;
         // The exact count replaces only the COUNTABLE text; media and
         // template overhead are invisible to the tokenizer and re-added.
         let required = match exact_count {
@@ -3108,7 +3127,7 @@ impl InferenceProviderPool {
             }
         } + estimate.uncounted_tokens
             + output_reserve;
-        let required = u32::try_from(required).unwrap_or(u32::MAX);
+        let required = required.min(u32::MAX as u64) as u32;
         hints.estimated_tokens = Some(required);
 
         // Numbers only — never content (see CLAUDE.md logging rules).
@@ -8059,6 +8078,82 @@ mod tests {
             chutes.last_chat_params().await.is_none(),
             "no fall-through without a strictly larger declared window"
         );
+    }
+
+    /// A context-length 400 falling through from the (too-small) base fleet
+    /// must not clobber an earlier RETRYABLE error from the capable tier: a
+    /// long request whose 1M tier 503s (queue full) and whose base fleet then
+    /// 400s must terminate with the retryable 503 — the request is genuinely
+    /// servable once the long tier drains — not a misleading "maximum context
+    /// length" client error that would stop the caller from retrying.
+    #[tokio::test]
+    async fn context_400_fall_through_does_not_clobber_retryable_error() {
+        use inference_providers::mock::MockProvider;
+        use inference_providers::{CompletionError, ProviderTier};
+
+        let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
+        let model_id = "z-ai/glm-5.2".to_string();
+
+        let long = Arc::new(MockProvider::new_accept_all().with_tier(ProviderTier::Near));
+        long.set_error_override(Some(CompletionError::HttpError {
+            status_code: 503,
+            message: "queue full".to_string(),
+            is_external: true,
+        }))
+        .await;
+        let base = Arc::new(MockProvider::new_accept_all().with_tier(ProviderTier::Near));
+        base.set_error_override(Some(CompletionError::HttpError {
+            status_code: 400,
+            message: "This model's maximum context length is 262144 tokens.".to_string(),
+            is_external: true,
+        }))
+        .await;
+
+        {
+            let mut m = pool.provider_mappings.write().await;
+            m.model_to_providers.insert(
+                model_id.clone(),
+                vec![
+                    base.clone() as Arc<InferenceProviderTrait>,
+                    long.clone() as Arc<InferenceProviderTrait>,
+                ],
+            );
+        }
+        {
+            let mut states = pool
+                .provider_load_state
+                .write()
+                .unwrap_or_else(|e| e.into_inner());
+            states
+                .entry(Arc::as_ptr(&base) as *const () as usize)
+                .or_default()
+                .max_context_tokens = Some(262_144);
+            states
+                .entry(Arc::as_ptr(&long) as *const () as usize)
+                .or_default()
+                .max_context_tokens = Some(1_048_576);
+        }
+
+        // ~1.2MB of text → the internally-computed requirement (~360k) puts
+        // the request in the long tier: order [long(503), base(400)].
+        let mut params = fallback_params(&model_id);
+        params.messages[0].content = Some(serde_json::Value::String("a".repeat(1_200_000)));
+
+        let err = pool
+            .chat_completion(params, "test-hash".to_string())
+            .await
+            .expect_err("both providers fail");
+        assert!(
+            base.last_chat_params().await.is_some(),
+            "base must have been tried via the fall-through"
+        );
+        match err {
+            CompletionError::HttpError { status_code, .. } => assert_eq!(
+                status_code, 503,
+                "the capable tier's retryable 503 must be the terminal error, not the base 400"
+            ),
+            other => panic!("expected the long tier's HttpError(503), got: {other}"),
+        }
     }
 
     /// Best-fit capacity ordering: for a model with two NEAR tiers (262k fleet

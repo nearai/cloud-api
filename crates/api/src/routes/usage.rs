@@ -116,11 +116,14 @@ pub async fn compute_organization_balance_response(
         usage_service.get_credit_limits(organization_id)
     )
     .map_err(|e| {
-        tracing::error!("Failed to get organization balance or limit: {:?}", e);
+        tracing::error!(
+            "Failed to get organization balance, limit, or credit limits: {:?}",
+            e
+        );
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             ResponseJson(ErrorResponse::new(
-                "Failed to retrieve balance or limit".to_string(),
+                "Failed to retrieve balance, limit, or credit limits".to_string(),
                 "internal_server_error".to_string(),
             )),
         )

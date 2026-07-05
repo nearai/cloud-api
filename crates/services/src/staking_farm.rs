@@ -5,7 +5,7 @@ use near_api::{Contract, Data, NetworkConfig};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashSet,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, MutexGuard},
 };
 use uuid::Uuid;
 
@@ -274,10 +274,13 @@ impl StakingFarmService {
             }
         };
 
-        let computed_credit_result = reward_units_24_to_nano_usd(
-            &farm_account.total_earned_reward_units,
-            source.credit_nano_usd_per_reward_unit,
-        );
+        let computed_credit_result =
+            validate_farm_account_reward_units(&farm_account).and_then(|_| {
+                reward_units_24_to_nano_usd(
+                    &farm_account.total_earned_reward_units,
+                    source.credit_nano_usd_per_reward_unit,
+                )
+            });
         let computed_credit = match computed_credit_result {
             Ok(credit) => credit,
             Err(error) => {
@@ -377,7 +380,7 @@ impl StakingFarmService {
     }
 
     fn try_start_sync(&self, organization_id: Uuid) -> Option<ActiveSyncGuard> {
-        let mut active_syncs = self.active_syncs.lock().unwrap();
+        let mut active_syncs = lock_active_syncs(&self.active_syncs);
         if !active_syncs.insert(organization_id) {
             return None;
         }
@@ -395,11 +398,33 @@ struct ActiveSyncGuard {
 
 impl Drop for ActiveSyncGuard {
     fn drop(&mut self) {
-        self.active_syncs
-            .lock()
-            .unwrap()
-            .remove(&self.organization_id);
+        lock_active_syncs(&self.active_syncs).remove(&self.organization_id);
     }
+}
+
+fn lock_active_syncs(active_syncs: &Mutex<HashSet<Uuid>>) -> MutexGuard<'_, HashSet<Uuid>> {
+    active_syncs
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn validate_farm_account_reward_units(farm_account: &FarmAccount) -> anyhow::Result<()> {
+    validate_reward_units_24_format(
+        "accumulated_reward_units",
+        &farm_account.accumulated_reward_units,
+    )?;
+    validate_reward_units_24_format("pending_reward_units", &farm_account.pending_reward_units)?;
+    validate_reward_units_24_format(
+        "total_earned_reward_units",
+        &farm_account.total_earned_reward_units,
+    )
+}
+
+fn validate_reward_units_24_format(field: &str, value: &str) -> anyhow::Result<()> {
+    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        anyhow::bail!("{field} must be an unsigned integer string");
+    }
+    Ok(())
 }
 
 pub fn reward_units_24_to_nano_usd(
@@ -753,6 +778,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn invalid_farm_account_reward_units_fail_before_limit_update() {
+        let organization_id = Uuid::new_v4();
+        let source = source_fixture(organization_id);
+        let repo = Arc::new(MockStakingFarmRepository::default());
+        *repo.source.lock().unwrap() = Some(source.clone());
+        let mut account = farm_account("3000000000000000000000000");
+        account.accumulated_reward_units = "not-a-number".to_string();
+        let client = Arc::new(MockStakingFarmContractClient::returning(account));
+        let service = StakingFarmService::new(repo.clone(), client, enabled_config());
+
+        let synced = service.sync_for_source(source, None).await.unwrap();
+
+        assert_eq!(synced.sync_status, StakingSyncStatus::Failed.as_str());
+        assert!(synced
+            .last_sync_error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("accumulated_reward_units"));
+        assert!(repo.limit_updates.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn stale_source_is_synced_automatically() {
         let organization_id = Uuid::new_v4();
         let source = source_fixture(organization_id);
@@ -795,6 +842,29 @@ mod tests {
         assert!(second.unwrap().is_some());
         assert_eq!(client.calls.lock().unwrap().len(), 1);
         assert_eq!(repo.limit_updates.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn active_sync_guard_recovers_poisoned_mutex() {
+        let service = StakingFarmService::new(
+            Arc::new(MockStakingFarmRepository::default()),
+            Arc::new(MockStakingFarmContractClient::returning(farm_account("0"))),
+            enabled_config(),
+        );
+        let organization_id = Uuid::new_v4();
+        let active_syncs = service.active_syncs.clone();
+
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = active_syncs.lock().unwrap();
+            panic!("poison active sync lock");
+        }));
+
+        let guard = service
+            .try_start_sync(organization_id)
+            .expect("poisoned mutex should be recovered");
+        assert!(service.try_start_sync(organization_id).is_none());
+        drop(guard);
+        assert!(service.try_start_sync(organization_id).is_some());
     }
 
     #[tokio::test]

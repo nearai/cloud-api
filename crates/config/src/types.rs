@@ -94,7 +94,7 @@ impl StakingFarmConfig {
                 .and_then(|value| value.parse::<bool>().ok())
                 .unwrap_or(false),
             network_id: near.network_id.clone(),
-            contract_id: env::var("STAKING_FARM_CONTRACT_ID").unwrap_or_default(),
+            contract_id: env::var("NEAR_STAKING_CONTRACT_ID").unwrap_or_default(),
             farm_product_id: env::var("STAKING_FARM_PRODUCT_ID").unwrap_or_default(),
             farm_price_id: env::var("STAKING_FARM_PRICE_ID")
                 .ok()
@@ -767,13 +767,13 @@ mod tests {
     fn clear_staking_farm_env() {
         for key in [
             "STAKING_FARM_ENABLED",
-            "STAKING_FARM_CONTRACT_ID",
+            "NEAR_STAKING_CONTRACT_ID",
             "STAKING_FARM_PRODUCT_ID",
             "STAKING_FARM_PRICE_ID",
             "STAKING_FARM_CREDIT_NANO_USD_PER_REWARD_UNIT",
             "STAKING_FARM_SYNC_STALENESS_SECONDS",
-            "STAKING_FARM_NETWORK_ID",
-            "STAKING_FARM_RPC_URL",
+            "NEAR_NETWORK_ID",
+            "NEAR_RPC_URL",
         ] {
             std::env::remove_var(key);
         }
@@ -806,19 +806,17 @@ mod tests {
     fn staking_farm_config_uses_shared_near_network() {
         clear_staking_farm_env();
         std::env::set_var("STAKING_FARM_ENABLED", "true");
-        std::env::set_var("STAKING_FARM_CONTRACT_ID", "stake.testnet");
+        std::env::set_var("NEAR_STAKING_CONTRACT_ID", "stake.testnet");
         std::env::set_var("STAKING_FARM_PRODUCT_ID", "cloud-credits");
-        std::env::set_var("STAKING_FARM_NETWORK_ID", "ignored-mainnet");
+        std::env::set_var("NEAR_NETWORK_ID", "testnet");
+        std::env::set_var("NEAR_RPC_URL", "https://rpc.testnet.near.org");
 
-        let near = NearConfig {
-            rpc_url: "https://rpc.testnet.near.org".to_string(),
-            network_id: "testnet".to_string(),
-            expected_recipient: "cloud.near.ai".to_string(),
-        };
+        let near = NearConfig::from_env();
         let config = StakingFarmConfig::from_env(&near);
 
         assert!(config.enabled);
         assert_eq!(config.network_id, "testnet");
+        assert_eq!(near.rpc_url, "https://rpc.testnet.near.org");
         assert_eq!(config.contract_id, "stake.testnet");
         assert_eq!(config.farm_product_id, "cloud-credits");
 

@@ -184,9 +184,9 @@ impl StakingFarmRepository for OrganizationStakingFarmSourcesRepository {
                     SET sync_status = $1,
                         last_sync_error = $2,
                         last_synced_at = CASE WHEN $1 = 'synced' THEN now() ELSE last_synced_at END,
-                        last_synced_accumulated_reward_units_24 = $3::numeric,
-                        last_synced_pending_reward_units_24 = $4::numeric,
-                        last_synced_reward_units_24 = $5::numeric,
+                        last_synced_accumulated_reward_units_24 = $3::text::numeric,
+                        last_synced_pending_reward_units_24 = $4::text::numeric,
+                        last_synced_reward_units_24 = $5::text::numeric,
                         last_synced_credit_nano_usd = $6,
                         active_positions = $7,
                         updated_at = now()

@@ -2265,6 +2265,7 @@ mod tests {
             display_name: Some(requester_role.to_string()),
             avatar_url: None,
             auth_provider: "test".to_string(),
+            provider_user_id: requester_role.to_string(),
             role: UserRole::User,
             is_active: true,
             last_login: None,

@@ -177,21 +177,20 @@ impl StakingFarmRepository for OrganizationStakingFarmSourcesRepository {
                 .context("Failed to get database connection")
                 .map_err(RepositoryError::PoolError)?;
 
-            let now = Utc::now();
             client
                 .query_one(
                     r#"
                     UPDATE organization_staking_farm_sources
                     SET sync_status = $1,
                         last_sync_error = $2,
-                        last_synced_at = CASE WHEN $1 = 'synced' THEN $3 ELSE last_synced_at END,
-                        last_synced_accumulated_reward_units_24 = $4::numeric,
-                        last_synced_pending_reward_units_24 = $5::numeric,
-                        last_synced_reward_units_24 = $6::numeric,
-                        last_synced_credit_nano_usd = $7,
-                        active_positions = $8,
-                        updated_at = $3
-                    WHERE id = $9
+                        last_synced_at = CASE WHEN $1 = 'synced' THEN now() ELSE last_synced_at END,
+                        last_synced_accumulated_reward_units_24 = $3::numeric,
+                        last_synced_pending_reward_units_24 = $4::numeric,
+                        last_synced_reward_units_24 = $5::numeric,
+                        last_synced_credit_nano_usd = $6,
+                        active_positions = $7,
+                        updated_at = now()
+                    WHERE id = $8
                     RETURNING id, organization_id, near_account_id, network_id, contract_id,
                               farm_product_id, farm_price_id, credit_nano_usd_per_reward_unit,
                               status, sync_status, last_sync_error, created_by_user_id,
@@ -204,7 +203,6 @@ impl StakingFarmRepository for OrganizationStakingFarmSourcesRepository {
                     &[
                         &update.sync_status.as_str(),
                         &update.last_sync_error,
-                        &now,
                         &update.last_synced_accumulated_reward_units_24,
                         &update.last_synced_pending_reward_units_24,
                         &update.last_synced_reward_units_24,

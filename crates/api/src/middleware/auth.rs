@@ -692,8 +692,8 @@ fn convert_user_to_db_user(user: services::auth::User) -> DbUser {
         updated_at: user.updated_at,
         last_login_at: user.last_login,
         is_active: user.is_active,
-        auth_provider: "oauth".to_string(), // Default for now
-        provider_user_id: user.id.0.to_string(),
+        auth_provider: user.auth_provider,
+        provider_user_id: user.provider_user_id,
         tokens_revoked_at: user.tokens_revoked_at,
     }
 }

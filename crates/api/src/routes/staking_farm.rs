@@ -49,6 +49,23 @@ pub struct StakingFarmStateResponse {
     pub active_positions: serde_json::Value,
 }
 
+/// Get staking farm configuration
+///
+/// Returns the active House of Stake farm configuration used to convert
+/// on-chain staking reward units into NEAR AI Cloud credits.
+#[utoipa::path(
+    get,
+    path = "/v1/staking/farm/config",
+    tag = "Staking Farm",
+    responses(
+        (status = 200, description = "Staking farm configuration", body = StakingFarmConfigResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    ),
+    security(
+        ("session_token" = [])
+    )
+)]
 pub async fn get_staking_farm_config(
     State(app_state): State<AppState>,
 ) -> RouteResult<StakingFarmConfigResponse> {
@@ -64,6 +81,30 @@ pub async fn get_staking_farm_config(
     }))
 }
 
+/// Get organization staking farm state
+///
+/// Returns the staking farm source and last synced farm-credit state for an
+/// organization. The organization must be the NEAR-authenticated user's default
+/// organization.
+#[utoipa::path(
+    get,
+    path = "/v1/organizations/{org_id}/staking/farm",
+    tag = "Staking Farm",
+    params(
+        ("org_id" = String, Path, description = "Organization ID")
+    ),
+    responses(
+        (status = 200, description = "Organization staking farm state", body = StakingFarmStateResponse),
+        (status = 400, description = "Invalid organization ID", body = ErrorResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 403, description = "Forbidden", body = ErrorResponse),
+        (status = 404, description = "No staking farm source found", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    ),
+    security(
+        ("session_token" = [])
+    )
+)]
 pub async fn get_organization_staking_farm(
     State(app_state): State<AppState>,
     Extension(user): Extension<AuthenticatedUser>,
@@ -81,6 +122,29 @@ pub async fn get_organization_staking_farm(
     Ok(ResponseJson(source_to_response(source)))
 }
 
+/// Sync organization staking farm credits
+///
+/// Links or refreshes the NEAR-authenticated user's staking farm source for the
+/// organization, then syncs reward units from the configured staking contract.
+#[utoipa::path(
+    post,
+    path = "/v1/organizations/{org_id}/staking/farm/sync",
+    tag = "Staking Farm",
+    params(
+        ("org_id" = String, Path, description = "Organization ID")
+    ),
+    responses(
+        (status = 200, description = "Synced organization staking farm state", body = StakingFarmStateResponse),
+        (status = 400, description = "Invalid organization ID", body = ErrorResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 403, description = "Forbidden", body = ErrorResponse),
+        (status = 409, description = "NEAR account is already linked to another organization", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    ),
+    security(
+        ("session_token" = [])
+    )
+)]
 pub async fn sync_organization_staking_farm(
     State(app_state): State<AppState>,
     Extension(user): Extension<AuthenticatedUser>,
@@ -98,6 +162,29 @@ pub async fn sync_organization_staking_farm(
     Ok(ResponseJson(source_to_response(source)))
 }
 
+/// Get admin organization staking farm state
+///
+/// Returns the staking farm source and last synced farm-credit state for any
+/// organization. Requires platform admin access.
+#[utoipa::path(
+    get,
+    path = "/v1/admin/organizations/{org_id}/staking/farm",
+    tag = "Admin",
+    params(
+        ("org_id" = String, Path, description = "Organization ID")
+    ),
+    responses(
+        (status = 200, description = "Organization staking farm state", body = StakingFarmStateResponse),
+        (status = 400, description = "Invalid organization ID", body = ErrorResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 403, description = "Forbidden", body = ErrorResponse),
+        (status = 404, description = "No staking farm source found", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    ),
+    security(
+        ("session_token" = [])
+    )
+)]
 pub async fn get_admin_organization_staking_farm(
     State(app_state): State<AdminAppState>,
     Extension(_admin_user): Extension<AdminUser>,
@@ -114,6 +201,29 @@ pub async fn get_admin_organization_staking_farm(
     Ok(ResponseJson(source_to_response(source)))
 }
 
+/// Sync admin organization staking farm credits
+///
+/// Refreshes staking farm reward units and derived credits for any linked
+/// organization. Requires platform admin access.
+#[utoipa::path(
+    post,
+    path = "/v1/admin/organizations/{org_id}/staking/farm/sync",
+    tag = "Admin",
+    params(
+        ("org_id" = String, Path, description = "Organization ID")
+    ),
+    responses(
+        (status = 200, description = "Synced organization staking farm state", body = StakingFarmStateResponse),
+        (status = 400, description = "Invalid organization ID", body = ErrorResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 403, description = "Forbidden", body = ErrorResponse),
+        (status = 404, description = "No staking farm source found", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    ),
+    security(
+        ("session_token" = [])
+    )
+)]
 pub async fn sync_admin_organization_staking_farm(
     State(app_state): State<AdminAppState>,
     Extension(admin_user): Extension<AdminUser>,

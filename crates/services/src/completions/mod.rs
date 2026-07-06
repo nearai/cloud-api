@@ -79,7 +79,6 @@ where
     workspace_id: Uuid,
     api_key_id: Uuid,
     model_id: Uuid,
-    #[allow(dead_code)] // Kept for potential debugging/logging use
     model_name: String,
     inference_type: crate::usage::ports::InferenceType,
     service_start_time: Instant,
@@ -206,20 +205,32 @@ where
                 // Distinguish client disconnect / provider error from truly unexpected cases.
                 // Client disconnects and provider errors are expected — usage is only sent
                 // in the final chunk, so an interrupted stream will never have it.
-                if !self.stream_completed {
-                    tracing::warn!(%organization_id, %model_id, stream_error = self.last_error.is_some(),
+                //
+                // `last_error` must be checked in addition to `stream_completed`: the
+                // route converts an in-stream provider Err into an SSE error frame and
+                // keeps polling, so the stream still ends "normally"
+                // (stream_completed == true) after e.g. a backend queue abort before
+                // the first token. That is a provider error, not a mystery.
+                if !self.stream_completed || self.last_error.is_some() {
+                    tracing::warn!(%organization_id, %model_id, model = %self.model_name,
+                        stream_completed = self.stream_completed,
+                        stream_error = self.last_error.is_some(),
                         "Stream interrupted before usage stats or chat_id received (client disconnect or provider error)");
                 } else {
-                    tracing::error!(%organization_id, %model_id, "Stream completed but no usage stats and no chat_id available");
+                    tracing::error!(%organization_id, %model_id, model = %self.model_name,
+                        "Stream completed but no usage stats and no chat_id available");
                 }
                 return;
             }
             (None, Some(chat_id)) => {
-                if !self.stream_completed {
-                    tracing::warn!(%chat_id, %organization_id, %model_id, stream_error = self.last_error.is_some(),
+                if !self.stream_completed || self.last_error.is_some() {
+                    tracing::warn!(%chat_id, %organization_id, %model_id, model = %self.model_name,
+                        stream_completed = self.stream_completed,
+                        stream_error = self.last_error.is_some(),
                         "Stream interrupted before usage stats received (client disconnect or provider error)");
                 } else {
-                    tracing::error!(%chat_id, %organization_id, %model_id, "Stream completed but no usage stats available");
+                    tracing::error!(%chat_id, %organization_id, %model_id, model = %self.model_name,
+                        "Stream completed but no usage stats available");
                 }
                 return;
             }
@@ -229,6 +240,7 @@ where
                     completion_tokens = usage.completion_tokens,
                     %organization_id,
                     %model_id,
+                    model = %self.model_name,
                     "Stream ended but no chat_id available"
                 );
                 return;
@@ -1676,15 +1688,24 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         if model.attestation_supported {
             let attestation_service = self.attestation_service.clone();
             let chat_id = response_with_bytes.response.id.clone();
+            let model_name = model.model_name.clone();
             tokio::spawn(async move {
-                if attestation_service
+                match attestation_service
                     .store_chat_signature_from_provider(chat_id.as_str())
                     .await
-                    .is_err()
                 {
-                    tracing::error!("Failed to store chat signature");
-                } else {
-                    tracing::debug!("Stored signature for chat_id: {}", chat_id);
+                    Err(e) => {
+                        tracing::error!(
+                            %chat_id,
+                            %organization_id,
+                            model = %model_name,
+                            error = %e,
+                            "Failed to store chat signature"
+                        );
+                    }
+                    Ok(()) => {
+                        tracing::debug!("Stored signature for chat_id: {}", chat_id);
+                    }
                 }
             });
         }

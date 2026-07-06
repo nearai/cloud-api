@@ -236,7 +236,20 @@ impl ports::ResponseServiceTrait for ResponseServiceImpl {
             if let Err(e) =
                 Self::process_response_stream(tx.clone(), context, usage_tracker.clone()).await
             {
-                tracing::error!("Error processing response stream: {:?}", e);
+                let status_code = e.http_status_code();
+                if (400..500).contains(&status_code) {
+                    // Client-caused (invalid params, model chat-template rejection,
+                    // bad tool call, ...). The client gets a structured 4xx /
+                    // response.failed event — not an infra failure, so keep the
+                    // ERROR stream clean for real incidents.
+                    tracing::warn!(
+                        status_code,
+                        "Client error processing response stream: {:?}",
+                        e
+                    );
+                } else {
+                    tracing::error!(status_code, "Error processing response stream: {:?}", e);
+                }
 
                 // Attach accumulated usage so downstream (e.g. non-streaming
                 // route fallback, billing) can bill for partial work done

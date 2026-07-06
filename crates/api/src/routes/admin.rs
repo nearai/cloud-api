@@ -999,31 +999,43 @@ pub async fn update_organization_limits(
         .admin_service
         .update_organization_limits(organization_id, service_request)
         .await
-        .map_err(|e| {
-            error!("Failed to update organization limits");
-            match e {
-                services::admin::AdminError::OrganizationNotFound(msg) => (
+        .map_err(|e| match e {
+            services::admin::AdminError::OrganizationNotFound(msg) => {
+                warn!(%organization_id, "Organization not found for limits update");
+                (
                     StatusCode::NOT_FOUND,
                     ResponseJson(ErrorResponse::new(
                         msg,
                         "organization_not_found".to_string(),
                     )),
-                ),
-                services::admin::AdminError::InvalidLimits(msg) => (
+                )
+            }
+            services::admin::AdminError::InvalidLimits(msg) => {
+                warn!(%organization_id, "Invalid limits update rejected");
+                (
                     StatusCode::BAD_REQUEST,
                     ResponseJson(ErrorResponse::new(msg, "invalid_limits".to_string())),
-                ),
-                services::admin::AdminError::Unauthorized(msg) => (
+                )
+            }
+            services::admin::AdminError::Unauthorized(msg) => {
+                warn!(%organization_id, "Unauthorized limits update");
+                (
                     StatusCode::UNAUTHORIZED,
                     ResponseJson(ErrorResponse::new(msg, "unauthorized".to_string())),
-                ),
-                _ => (
+                )
+            }
+            // AdminError display strings carry only IDs/categories — without
+            // this field the log cannot distinguish a DB failure from e.g. the
+            // concurrent-update unique-violation race.
+            other => {
+                error!(%organization_id, error = %other, "Failed to update organization limits");
+                (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     ResponseJson(ErrorResponse::new(
                         "Failed to update organization limits".to_string(),
                         "internal_server_error".to_string(),
                     )),
-                ),
+                )
             }
         })?;
 
@@ -1104,27 +1116,36 @@ pub async fn get_organization_limits_history(
         .admin_service
         .get_organization_limits_history(organization_uuid, params.limit, params.offset)
         .await
-        .map_err(|e| {
-            error!("Failed to retrieve organization limits history");
-            match e {
-                services::admin::AdminError::OrganizationNotFound(msg) => (
+        .map_err(|e| match e {
+            services::admin::AdminError::OrganizationNotFound(msg) => {
+                // Fires for every org that has no limits-history rows yet (the
+                // service maps empty history to OrganizationNotFound) — routine
+                // dashboard traffic, not an operational error.
+                debug!(%organization_uuid, "Limits history: organization not found or no history");
+                (
                     StatusCode::NOT_FOUND,
                     ResponseJson(ErrorResponse::new(
                         msg,
                         "organization_not_found".to_string(),
                     )),
-                ),
-                services::admin::AdminError::Unauthorized(msg) => (
+                )
+            }
+            services::admin::AdminError::Unauthorized(msg) => {
+                warn!(%organization_uuid, "Unauthorized limits history request");
+                (
                     StatusCode::UNAUTHORIZED,
                     ResponseJson(ErrorResponse::new(msg, "unauthorized".to_string())),
-                ),
-                _ => (
+                )
+            }
+            other => {
+                error!(%organization_uuid, error = %other, "Failed to retrieve organization limits history");
+                (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     ResponseJson(ErrorResponse::new(
                         "Failed to retrieve limits history".to_string(),
                         "internal_server_error".to_string(),
                     )),
-                ),
+                )
             }
         })?;
 

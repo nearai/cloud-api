@@ -237,7 +237,7 @@ impl ports::ResponseServiceTrait for ResponseServiceImpl {
                 Self::process_response_stream(tx.clone(), context, usage_tracker.clone()).await
             {
                 let status_code = e.http_status_code();
-                if (400..500).contains(&status_code) {
+                if e.is_client_caused() {
                     // Client-caused (invalid params, model chat-template rejection,
                     // bad tool call, ...). The client gets a structured 4xx /
                     // response.failed event — not an infra failure, so keep the

@@ -1689,25 +1689,28 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
             let attestation_service = self.attestation_service.clone();
             let chat_id = response_with_bytes.response.id.clone();
             let model_name = model.model_name.clone();
-            tokio::spawn(async move {
-                match attestation_service
-                    .store_chat_signature_from_provider(chat_id.as_str())
-                    .await
-                {
-                    Err(e) => {
-                        tracing::error!(
-                            %chat_id,
-                            %organization_id,
-                            model = %model_name,
-                            error = %e,
-                            "Failed to store chat signature"
-                        );
-                    }
-                    Ok(()) => {
-                        tracing::debug!("Stored signature for chat_id: {}", chat_id);
+            tokio::spawn(
+                async move {
+                    match attestation_service
+                        .store_chat_signature_from_provider(chat_id.as_str())
+                        .await
+                    {
+                        Err(e) => {
+                            tracing::error!(
+                                %chat_id,
+                                %organization_id,
+                                model = %model_name,
+                                error = %e,
+                                "Failed to store chat signature"
+                            );
+                        }
+                        Ok(()) => {
+                            tracing::debug!("Stored signature for chat_id: {}", chat_id);
+                        }
                     }
                 }
-            });
+                .instrument(tracing::Span::current()),
+            );
         }
 
         // Record metrics with low-cardinality tags only

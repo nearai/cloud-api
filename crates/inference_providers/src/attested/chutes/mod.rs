@@ -25,6 +25,7 @@
 //! unattested path. Turning Chutes on is gated behind an enable flag in the pool.
 
 pub mod attestation;
+mod availability;
 pub mod client;
 pub mod e2ee;
 pub mod e2ee_stream;
@@ -380,6 +381,11 @@ impl Provider {
     fn map_client_error(ctx: &str, e: client::ChutesClientError) -> CompletionError {
         let msg = format!("{ctx}: {e}");
         match e {
+            client::ChutesClientError::Status { status: 400, body }
+                if availability::stale_invoke_target(ctx, &body) =>
+            {
+                availability::retryable_provider_unavailable(ctx, "stale Chutes E2E target")
+            }
             // Retryable / correctly-masked upstream statuses: preserve so the
             // pool classifier can act on them. The message is the STAGE + STATUS
             // only — NOT the raw upstream body (#778 follow-up): a 5xx body could
@@ -396,13 +402,15 @@ impl Provider {
                 message: format!("{ctx}: Chutes returned HTTP {status}"),
                 is_external: true,
             },
+            client::ChutesClientError::Http(_) => {
+                availability::retryable_provider_unavailable(ctx, "Chutes HTTP transport error")
+            }
             // Any other upstream status (400/413/422/…) on an internally-built
             // request, plus all non-status client errors (transport / oversized
             // body / model-not-found / missing-chute-id / decode), mask as the
             // prior generic 502. Listed explicitly (no `_`) so a new
             // `ChutesClientError` variant forces this mapping to be revisited.
             client::ChutesClientError::Status { .. }
-            | client::ChutesClientError::Http(_)
             | client::ChutesClientError::BodyTooLarge { .. }
             | client::ChutesClientError::ModelNotFound(_)
             | client::ChutesClientError::MissingChuteId(_)
@@ -438,8 +446,9 @@ impl Provider {
             .filter(|i| !i.e2e_pubkey.is_empty() && !i.nonces.is_empty())
             .collect();
         if candidates.is_empty() {
-            return Err(CompletionError::CompletionError(
-                "no E2E-capable Chutes instance with an available nonce token".to_string(),
+            return Err(availability::retryable_provider_unavailable(
+                "discover instances",
+                "no E2E-capable instance with an available nonce token",
             ));
         }
 
@@ -468,12 +477,14 @@ impl Provider {
             INSTANCE_RR.fetch_add(1, Ordering::Relaxed) % n
         };
         let mut last_err = String::from("no candidate instances");
+        let mut last_err_retryable = false;
         for off in 0..n {
             let inst = candidates[(start + off) % n];
             let evidence = match evidence_resp.instance(&inst.instance_id) {
                 Some(e) => e,
                 None => {
                     last_err = format!("instance {} not present in /evidence", inst.instance_id);
+                    last_err_retryable = true;
                     continue;
                 }
             };
@@ -489,6 +500,7 @@ impl Provider {
                 Ok(info) => info,
                 Err(e) => {
                     last_err = format!("instance {} attestation failed: {e}", inst.instance_id);
+                    last_err_retryable = false;
                     continue;
                 }
             };
@@ -496,6 +508,7 @@ impl Provider {
                 Ok(pk) => pk,
                 Err(e) => {
                     last_err = format!("instance {} e2e_pubkey base64: {e}", inst.instance_id);
+                    last_err_retryable = false;
                     continue;
                 }
             };
@@ -503,6 +516,7 @@ impl Provider {
                 Ok(p) => p,
                 Err(e) => {
                     last_err = format!("instance {} E2EE build: {e}", inst.instance_id);
+                    last_err_retryable = false;
                     continue;
                 }
             };
@@ -517,6 +531,7 @@ impl Provider {
                 Some(n) => n,
                 None => {
                     last_err = format!("instance {} nonce pool drained", inst.instance_id);
+                    last_err_retryable = true;
                     continue;
                 }
             };
@@ -535,6 +550,12 @@ impl Provider {
                 blob,
                 session,
             });
+        }
+        if last_err_retryable {
+            return Err(availability::retryable_provider_unavailable(
+                "verify Chutes instance",
+                &last_err,
+            ));
         }
         Err(CompletionError::CompletionError(format!(
             "all candidate Chutes instances failed (refusing to send inference); last: {last_err}"
@@ -1801,14 +1822,42 @@ mod tests {
                 "Chutes /e2e/invoke",
                 ChutesClientError::Status {
                     status,
-                    // A nonce/token error body that must never reach the client.
-                    body: "consumed nonce token: secret-internal-detail".into(),
+                    body: "malformed encrypted request payload: secret-internal-detail".into(),
                 },
             );
             match mapped {
                 CompletionError::CompletionError(_) => {}
                 other => panic!("internal {status} must mask to CompletionError, got {other:?}"),
             }
+        }
+    }
+
+    #[test]
+    fn map_client_error_retries_stale_invoke_400() {
+        use client::ChutesClientError;
+
+        let mapped = Provider::map_client_error(
+            "Chutes /e2e/invoke",
+            ChutesClientError::Status {
+                status: 400,
+                body: "nonce token expired for selected instance".into(),
+            },
+        );
+
+        match mapped {
+            CompletionError::HttpError {
+                status_code,
+                message,
+                is_external,
+            } => {
+                assert_eq!(status_code, 503);
+                assert!(is_external, "Chutes is an external upstream");
+                assert!(
+                    message.contains("Chutes /e2e/invoke") && message.contains("stale"),
+                    "message should identify the retryable stale-target case: {message}"
+                );
+            }
+            other => panic!("stale invoke 400 must map to retryable HttpError, got {other:?}"),
         }
     }
 

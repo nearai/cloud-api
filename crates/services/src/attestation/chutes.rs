@@ -231,10 +231,24 @@ impl ChutesInstanceVerifier for ChutesBackendVerifier {
 ///   published row byte-for-byte (2026-06-11).
 /// - `8xb200 / 8xb200-xeon6 / 8xb300 v1.3.1-rc1` — **GLM-5.2-TEE**, 3 distinct
 ///   Blackwell register sets matched the published `1.3.1-rc1` rows byte-for-byte
-///   (MRTD + RTMR0 + RTMR1 + RTMR2 + runtime RTMR3), 2026-06-24. GLM-5.2's live
-///   fleet runs the `-rc1` firmware; the final `v1.3.1` rows are pinned too so the
-///   model keeps attesting once Chutes promotes the chute off the release
-///   candidate (the `-rc1` and final identities differ on RTMR1/2/3).
+///   (MRTD + RTMR0 + RTMR1 + RTMR2 + runtime RTMR3), 2026-06-24. GLM-5.2's fleet
+///   ran the `-rc1` firmware at the time; Chutes has since promoted it to the
+///   final `v1.3.1` (the `-rc1` and final identities differ on RTMR1/2/3).
+/// - `8xb200 [10.2.1] v1.3.1` — **GLM-5.2-TEE**, observed live on prod fallback
+///   attempts (2026-07-06): the full register set matches the published final
+///   v1.3.1 identity byte-for-byte; only this RTMR0 row was missing from the
+///   previous snapshot, so every instance failed closed.
+/// - `8xh200 [10.1.0-flat] v1.3.1` — **GLM-5.1-TEE**, observed live the same way
+///   (2026-07-06).
+///
+/// ⚠️ Chutes re-measures and re-publishes hardware rows *within* a release as
+/// they roll out platform updates — the bracketed suffixes (`[10.2.1]`,
+/// `[10.1.0-flat]`, `[10.1.0, XEON6, SNC3]`, …) are such revisions. A published
+/// row missing from this snapshot fails closed and silently kills the Chutes
+/// path for any model scheduled on that hardware until the next resync
+/// (2026-07-02 and 2026-07-06 incidents: GLM-5.2 / GLM-5.1 fallback dead during
+/// a NEAR-fleet outage). When resyncing, take the **full published family**, not
+/// just the row observed failing.
 ///
 /// The remaining rows in each family are taken from the same published release
 /// and carry the identical software identity; they are accepted so a model
@@ -272,6 +286,7 @@ pub fn vetted_golden_measurements() -> ChutesMeasurementPolicy {
             rtmr3: "bfac8bbe97148d00c0bc5dea273ccd926e2415511f08f5dedaa96d3c19e824d2bf01fae86e8987ff509fd3ad31374a60",
             hardware_rows: &[
                 ("8xh200", "2864b11878e8129095d62a5dd7c3e3aae178d3a077606a825617324768f189ad05aed08376947df92d6c75865d915cbf"),
+                ("8xh200-r2", "c0466500b034f7b51be7ea0fcc477e60b54833d927db96e4826ac37c60ec02dc28703a16af551f46be17035157b474da"),
                 ("8xRTX_PRO_6000", "5064826bfd530ca9f823ceecb74899d7dbd014b60897a77317a14200c8706f2368ecbbc0a04cec8ceef90474b8c955e1"),
                 ("8xb200", "734628b9a715ec492c2b14b409907f32d91847f439ba8bac2fa985b41c01245536348fefb2e021ed574c290c8c50347a"),
                 ("8xb200-eth", "724c1d0d20c11a479d2874fa543b0f1b920be32f2a5b9707fa5bcf6176fff31aeac9436e541e1125f78a0b61f7c2e165"),
@@ -292,10 +307,17 @@ pub fn vetted_golden_measurements() -> ChutesMeasurementPolicy {
                 ("8xb300", "43204fcb166114bee9ea562d88fef18d618f591499f8b73ac87be07962f2b228569b680d2ede4ed719d4a3514f90feda"),
             ],
         },
-        // Final v1.3.1 software identity — pinned so GLM-5.2 keeps attesting once
-        // Chutes promotes the chute off the release candidate. Same MRTD as -rc1,
-        // distinct RTMR1/2/3. Published + app-measured; not yet live cross-checked
-        // (no instance observed on the final release yet).
+        // Final v1.3.1 software identity — GLM-5.2-TEE's fleet since Chutes
+        // promoted it off the release candidate. Same MRTD as -rc1, distinct
+        // RTMR1/2/3. Full published hardware family (resynced 2026-07-06);
+        // `8xb200 [10.2.1]` (GLM-5.2-TEE) and `8xh200 [10.1.0-flat]`
+        // (GLM-5.1-TEE) are live cross-checked against signature-verified,
+        // nonce-bound prod quotes (2026-07-06). The previous snapshot's plain
+        // `8xb200` / `8xb200-xeon6` / `8xb300` rows were -rc1 hardware values
+        // carried over on the assumption they'd persist into the final release;
+        // Chutes instead re-measured b200/b300 and renamed the xeon6 row, so the
+        // stale carry-overs are dropped — Chutes never published them for the
+        // final v1.3.1.
         Family {
             version: "1.3.1",
             mrtd: "261ce538b435e2d0e85fc97e254bc99154c507b7a8e13d59b69f8532384f1d0bfaadfddf3fccc6e0a411203840bbee8d",
@@ -304,11 +326,16 @@ pub fn vetted_golden_measurements() -> ChutesMeasurementPolicy {
             rtmr3: "51204be641a2af357f5f4e6a121d348d6cb1cbe53c4c35d9dcc3364196b4d41a6e1de75025bb2e76f3b00cc7192f9433",
             hardware_rows: &[
                 ("8xh200 [10.2.1]", "212d8284fe29a52a033cd662763e452915d2002bcc3c3e73aa660b100087bd3cce8aef414c3d7012f6a857f392c1919b"),
+                ("8xh200 [10.2.1, NVSW0]", "c90a27d633d97e2f785a0a65c4a7ee2258872655e3bada2cad0e719e313db542fd35c6889897d9ae6369f82e39877861"),
                 ("8xh200 [10.1.0]", "7e76988fae31dda82f0043b331d908f0716e9da24fed80b6ea6cec9b6615ff84f24321056a8befbea3fff67bd1e59205"),
+                ("8xh200 [10.1.0, NVSW0]", "cdf7169a9f90c4d2fd29f89579f4ad7b90c272d607bc7ba2365e91560a248b9eafe01940f3c1e9d6bd6987573080b6c1"),
+                ("8xh200 [10.1.0-flat]", "ed373dfcc4e3b9cc57282773784c88445699f95705ec0995959c4aa95f9dec454c76da891fa56f820f547b02db8c1f2f"),
                 ("8xRTX_PRO_6000", "0917443cc41e9a5afebc8e87e69a63f32208c47d4b4b4fd410fbc1a705e1880c1383a4ad51903a5ed20cb4090420185a"),
-                ("8xb200", "7c028a01902475caaa81c245151184d08fcb847cfcbac4ced3c6812d2abe101680d5c015e7cfdb1c98ae54ae7ff0d524"),
-                ("8xb200-xeon6", "2b22fa53ace208d4f046ae90b7ad28d71a7f4ef0573897d40f6c82b4036217e3170c856f91e54bc19c20c9958c5d1e36"),
-                ("8xb300", "43204fcb166114bee9ea562d88fef18d618f591499f8b73ac87be07962f2b228569b680d2ede4ed719d4a3514f90feda"),
+                ("8xb200 [10.2.1]", "35038cbb04f872ac6d2784b05c912c438007583e58960dc66fb02d1b04462dd5994f94536da37b5877ccd3dd27d8d54d"),
+                ("8xb200 [10.2.1, IB4]", "555fc635cd49723dc33d53a9d53be82fd161be351174e5449a465bbeffbcbd01f36d89dcd25fad61bf4c9e65c570f5d6"),
+                ("8xb200 [10.2.1, XEON6]", "65fd972e40ac4d8a933d10ebfc31f07336cf1e45a3864523427b454df5d3b9dd0043f10e975da39677b62d45860c13e3"),
+                ("8xb200 [10.1.0, XEON6, SNC3]", "2b22fa53ace208d4f046ae90b7ad28d71a7f4ef0573897d40f6c82b4036217e3170c856f91e54bc19c20c9958c5d1e36"),
+                ("8xb300", "91adf9667ba4c65bec5345a8c9b98010708d903847bf838c4526c3ebbc35561719e2127e48a3f6f77f651d71d2cbc8d4"),
             ],
         },
     ];
@@ -411,6 +438,7 @@ mod tests {
         const RTMR3: &str = "bfac8bbe97148d00c0bc5dea273ccd926e2415511f08f5dedaa96d3c19e824d2bf01fae86e8987ff509fd3ad31374a60";
         // Per-hardware RTMR0 (the only register that differs within v1.3.0).
         const RTMR0_H200: &str = "2864b11878e8129095d62a5dd7c3e3aae178d3a077606a825617324768f189ad05aed08376947df92d6c75865d915cbf";
+        const RTMR0_H200_R2: &str = "c0466500b034f7b51be7ea0fcc477e60b54833d927db96e4826ac37c60ec02dc28703a16af551f46be17035157b474da";
         const RTMR0_RTX_PRO_6000: &str = "5064826bfd530ca9f823ceecb74899d7dbd014b60897a77317a14200c8706f2368ecbbc0a04cec8ceef90474b8c955e1";
         const RTMR0_B200: &str = "734628b9a715ec492c2b14b409907f32d91847f439ba8bac2fa985b41c01245536348fefb2e021ed574c290c8c50347a";
         const RTMR0_B200_ETH: &str = "724c1d0d20c11a479d2874fa543b0f1b920be32f2a5b9707fa5bcf6176fff31aeac9436e541e1125f78a0b61f7c2e165";
@@ -447,11 +475,12 @@ mod tests {
 
         #[test]
         fn covers_the_full_v130_hardware_family() {
-            // All five published v1.3.0 hardware platforms are accepted — by name,
+            // All six published v1.3.0 hardware platforms are accepted — by name,
             // so swapping a row for a different config (count unchanged) still fails.
-            // Total = 5 (v1.3.0) + 3 (v1.3.1-rc1 Blackwell) + 6 (v1.3.1 final).
-            assert_eq!(vetted_golden_measurements().len(), 14);
+            // Total = 6 (v1.3.0) + 3 (v1.3.1-rc1 Blackwell) + 11 (v1.3.1 final).
+            assert_eq!(vetted_golden_measurements().len(), 20);
             accepts(RTMR0_H200, "8xh200");
+            accepts(RTMR0_H200_R2, "8xh200-r2");
             accepts(RTMR0_RTX_PRO_6000, "8xRTX_PRO_6000");
             accepts(RTMR0_B200, "8xb200");
             accepts(RTMR0_B200_ETH, "8xb200-eth");
@@ -473,6 +502,10 @@ mod tests {
         const FINAL_RTMR2: &str = "8471360414fe80b4343fb17dd59e442bdc55b5955df0adf610b1de15ad7b454e98fb8e9d38cc188b82369f4f620b6968";
         const FINAL_RTMR3: &str = "51204be641a2af357f5f4e6a121d348d6cb1cbe53c4c35d9dcc3364196b4d41a6e1de75025bb2e76f3b00cc7192f9433";
         const FINAL_RTMR0_H200_1021: &str = "212d8284fe29a52a033cd662763e452915d2002bcc3c3e73aa660b100087bd3cce8aef414c3d7012f6a857f392c1919b";
+        // Live-observed rows from the 2026-07-06 incident (genuine, DCAP-signature-
+        // verified, nonce-bound prod quotes logged by the fail-closed reject path).
+        const FINAL_RTMR0_B200_1021: &str = "35038cbb04f872ac6d2784b05c912c438007583e58960dc66fb02d1b04462dd5994f94536da37b5877ccd3dd27d8d54d";
+        const FINAL_RTMR0_H200_1010_FLAT: &str = "ed373dfcc4e3b9cc57282773784c88445699f95705ec0995959c4aa95f9dec454c76da891fa56f820f547b02db8c1f2f";
 
         fn accepts_family(
             rtmr0: &str,
@@ -545,6 +578,53 @@ mod tests {
                 "8xh200 [10.2.1]",
                 "1.3.1",
             );
+        }
+
+        #[test]
+        fn accepts_the_live_observed_final_v131_rows() {
+            // Regression guard for the 2026-07-06 incident: GLM-5.2-TEE (promoted
+            // to final v1.3.1 on `8xb200 [10.2.1]`) and GLM-5.1-TEE (on
+            // `8xh200 [10.1.0-flat]`) were rejected with "observed measurements
+            // match no accepted Chutes config" during a NEAR-fleet outage — the
+            // fallback existed but was unusable. These are the live-observed
+            // register sets from those signature-verified quotes; they must verify.
+            accepts_family(
+                FINAL_RTMR0_B200_1021,
+                MRTD_V131,
+                FINAL_RTMR1,
+                FINAL_RTMR2,
+                FINAL_RTMR3,
+                "8xb200 [10.2.1]",
+                "1.3.1",
+            );
+            accepts_family(
+                FINAL_RTMR0_H200_1010_FLAT,
+                MRTD_V131,
+                FINAL_RTMR1,
+                FINAL_RTMR2,
+                FINAL_RTMR3,
+                "8xh200 [10.1.0-flat]",
+                "1.3.1",
+            );
+        }
+
+        #[test]
+        fn rejects_stale_rc1_hardware_carried_onto_final_software() {
+            // The previous snapshot carried the -rc1 Blackwell RTMR0s into the
+            // final v1.3.1 family on the assumption they'd persist; Chutes instead
+            // re-measured them, and never published `8xb200`@7c028a01… for the
+            // final release. The stale combination must no longer verify.
+            let policy = vetted_golden_measurements();
+            let err = policy
+                .verify(
+                    &reg(MRTD_V131),
+                    &reg(RC1_RTMR0_B200),
+                    &reg(FINAL_RTMR1),
+                    &reg(FINAL_RTMR2),
+                    &reg(FINAL_RTMR3),
+                )
+                .unwrap_err();
+            assert!(matches!(err, MeasurementError::NoMatch { .. }));
         }
 
         #[test]

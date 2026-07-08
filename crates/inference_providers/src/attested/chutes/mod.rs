@@ -680,12 +680,18 @@ fn strip_internal_response_fields(obj: &mut serde_json::Map<String, Value>) {
 /// - a chunk with an empty `choices` array is the FINAL usage-only chunk → its
 ///   `usage` is kept iff `include_usage` was requested, else stripped.
 ///
+/// Returns `true` when the chunk was the FINAL usage-only chunk and the client did
+/// NOT request usage: OpenAI emits no final usage chunk at all in that case, so the
+/// caller must suppress the whole chunk from the client stream rather than forward
+/// a gutted `choices: []` husk (strict SDK parsers reject it, and cost-tracking
+/// clients read it as zero usage) — see [`rewrite_sse_event_model`].
+///
 /// NOTE: this gates only `raw_bytes` (the bytes the passthrough route forwards to the
 /// client). The parsed `chunk.usage` is left intact so `InterceptStream` can still
 /// read it for billing/limits — see [`rewrite_sse_event_model`].
-fn gate_stream_usage(obj: &mut serde_json::Map<String, Value>, include_usage: bool) {
+fn gate_stream_usage(obj: &mut serde_json::Map<String, Value>, include_usage: bool) -> bool {
     if !obj.contains_key("usage") {
-        return;
+        return false;
     }
     let is_final = obj
         .get("choices")
@@ -694,6 +700,7 @@ fn gate_stream_usage(obj: &mut serde_json::Map<String, Value>, include_usage: bo
     if !is_final || !include_usage {
         obj.remove("usage");
     }
+    is_final && !include_usage
 }
 
 /// Rewrite the `model` field of a decrypted OpenAI SSE event to the canonical id
@@ -758,8 +765,21 @@ fn rewrite_sse_event_model(
 
     // Client-facing `raw_bytes`: apply the streamed-usage gate (#781 L1). The parsed
     // chunk above is untouched by this gate, so billing still sees `usage`.
+    let mut suppress_client_chunk = false;
     if let Some(obj) = v.as_object_mut() {
-        gate_stream_usage(obj, include_usage);
+        suppress_client_chunk = gate_stream_usage(obj, include_usage);
+    }
+    if suppress_client_chunk {
+        // The FINAL usage-only chunk, with the client NOT having requested usage:
+        // OpenAI sends no such chunk at all, so emit nothing to the client instead
+        // of a gutted `choices: []` husk (strict SDK parsers choke on it, and
+        // cost-tracking clients read the stream as zero usage). The parsed chunk
+        // is kept so `InterceptStream` still sees `usage` for billing/limits.
+        return SSEEvent {
+            raw_bytes: bytes::Bytes::new(),
+            chunk: ev.chunk,
+            raw_passthrough: ev.raw_passthrough,
+        };
     }
     let Ok(json) = serde_json::to_string(&v) else {
         return ev;
@@ -2461,15 +2481,26 @@ mod tests {
 
     #[test]
     fn stream_usage_gate_final_chunk_honors_include_usage() {
-        // The FINAL usage-only chunk has an empty `choices` array. Its `usage` is kept
-        // only when the client requested include_usage; otherwise it is dropped.
+        // The FINAL usage-only chunk has an empty `choices` array. When the client
+        // requested include_usage it is forwarded with `usage` intact; otherwise the
+        // WHOLE chunk is suppressed from the client stream — OpenAI emits no final
+        // usage chunk at all in that case, and forwarding a gutted `choices: []`
+        // husk breaks strict SDK parsers and reads as zero usage to cost-tracking
+        // clients (BeeZi production feedback).
+        use crate::StreamChunk;
         let final_chunk = r#"{"id":"c","object":"chat.completion.chunk","created":0,"model":"m","choices":[],"usage":{"prompt_tokens":3,"completion_tokens":5,"total_tokens":8}}"#;
 
-        // include_usage unset → no usage reaches the client.
-        let v = rewrite_raw(final_chunk, false);
+        // include_usage unset → the chunk is suppressed entirely (no husk).
+        let chunk = StreamChunk::Chat(serde_json::from_str(final_chunk).expect("parse chunk"));
+        let ev = SSEEvent {
+            raw_bytes: bytes::Bytes::from(format!("data: {final_chunk}\n\n")),
+            chunk: Some(chunk),
+            raw_passthrough: true,
+        };
+        let out = rewrite_sse_event_model(ev, None, /* include_usage */ false);
         assert!(
-            v.get("usage").is_none(),
-            "final chunk usage dropped when include_usage unset"
+            out.raw_bytes.is_empty(),
+            "final usage chunk suppressed from client when include_usage unset"
         );
 
         // include_usage set → usage survives on the final chunk only.
@@ -2495,10 +2526,12 @@ mod tests {
         };
         let out = rewrite_sse_event_model(ev, None, /* include_usage */ false);
 
-        // Client-facing raw_bytes: usage stripped.
-        let s = std::str::from_utf8(&out.raw_bytes).unwrap();
-        let v: Value = serde_json::from_str(s.strip_prefix("data: ").unwrap().trim_end()).unwrap();
-        assert!(v.get("usage").is_none(), "client raw_bytes usage gated out");
+        // Client-facing raw_bytes: the whole final usage chunk is suppressed (OpenAI
+        // sends no final chunk when include_usage wasn't requested — no husk).
+        assert!(
+            out.raw_bytes.is_empty(),
+            "client raw_bytes suppressed for the gated final usage chunk"
+        );
 
         // Parsed chunk: usage preserved for InterceptStream billing.
         let Some(StreamChunk::Chat(c)) = &out.chunk else {

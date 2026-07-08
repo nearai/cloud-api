@@ -117,6 +117,7 @@ use utoipa::{Modify, OpenApi};
         crate::routes::users::list_user_invitations,
         crate::routes::users::accept_invitation,
         crate::routes::users::decline_invitation,
+        crate::routes::kyt::get_current_user_near_kyt,
         // Invitation endpoints (token-based)
         crate::routes::users::get_invitation_by_token,
         crate::routes::users::accept_invitation_by_token,
@@ -289,6 +290,10 @@ use utoipa::{Modify, OpenApi};
             // Staking farm models
             crate::routes::staking_farm::StakingFarmConfigResponse,
             crate::routes::staking_farm::StakingFarmStateResponse,
+            services::kyt::KytCheckResponse,
+            services::kyt::KytRisk,
+            services::kyt::KytRiskLevel,
+            services::kyt::KytRiskStatus,
             // Feature request models
             crate::routes::feature_requests::FeatureRequestKind,
             crate::routes::feature_requests::SubmitFeatureRequest,

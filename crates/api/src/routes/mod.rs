@@ -12,6 +12,7 @@ pub mod feature_requests;
 pub mod files;
 pub mod gateway;
 pub mod health;
+pub mod kyt;
 pub mod mcp_server;
 pub mod models;
 pub mod ohttp;

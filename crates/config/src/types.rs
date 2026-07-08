@@ -24,6 +24,7 @@ pub struct ApiConfig {
     pub github_dispatch: GitHubDispatchConfig,
     pub infra: InfraConfig,
     pub staking_farm: StakingFarmConfig,
+    pub kyt: KytConfig,
 }
 
 impl ApiConfig {
@@ -54,7 +55,77 @@ impl ApiConfig {
             external_providers: ExternalProvidersConfig::from_env(),
             github_dispatch: GitHubDispatchConfig::from_env()?,
             infra: InfraConfig::from_env(),
+            kyt: KytConfig::from_env()?,
         })
+    }
+}
+
+/// KYT/AML provider configuration for server-side wallet risk checks.
+#[derive(Debug, Clone)]
+pub struct KytConfig {
+    pub enabled: bool,
+    pub provider: String,
+    pub lukka_base_url: String,
+    pub lukka_bearer_token: Option<String>,
+    pub timeout_seconds: u64,
+    pub retries: u32,
+    pub cache_ttl_seconds: i64,
+}
+
+impl Default for KytConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            provider: "lukka".to_string(),
+            lukka_base_url: "https://api.blockchain-analytics.lukka.tech".to_string(),
+            lukka_bearer_token: None,
+            timeout_seconds: 10,
+            retries: 1,
+            cache_ttl_seconds: 3600,
+        }
+    }
+}
+
+impl KytConfig {
+    pub fn from_env() -> Result<Self, String> {
+        let mut config = Self {
+            enabled: env::var("KYT_ENABLED")
+                .ok()
+                .and_then(|value| value.parse::<bool>().ok())
+                .unwrap_or(false),
+            provider: env::var("KYT_PROVIDER").unwrap_or_else(|_| "lukka".to_string()),
+            lukka_base_url: env::var("LUKKA_BASE_URL")
+                .unwrap_or_else(|_| "https://api.blockchain-analytics.lukka.tech".to_string()),
+            lukka_bearer_token: if env::var("KYT_ENABLED")
+                .ok()
+                .and_then(|value| value.parse::<bool>().ok())
+                .unwrap_or(false)
+            {
+                read_optional_secret_env("LUKKA_BEARER_TOKEN_FILE", "LUKKA_BEARER_TOKEN")?
+            } else {
+                None
+            },
+            timeout_seconds: env::var("KYT_TIMEOUT_SECONDS")
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(10),
+            retries: env::var("KYT_RETRIES")
+                .ok()
+                .and_then(|value| value.parse::<u32>().ok())
+                .unwrap_or(1),
+            cache_ttl_seconds: env::var("KYT_CACHE_TTL_SECONDS")
+                .ok()
+                .and_then(|value| value.parse::<i64>().ok())
+                .unwrap_or(3600),
+        };
+
+        config.provider = config.provider.to_ascii_lowercase();
+        config.enabled = config.enabled
+            && config.provider == "lukka"
+            && config.lukka_bearer_token.is_some()
+            && config.cache_ttl_seconds > 0;
+
+        Ok(config)
     }
 }
 
@@ -779,6 +850,21 @@ mod tests {
         }
     }
 
+    fn clear_kyt_env() {
+        for key in [
+            "KYT_ENABLED",
+            "KYT_PROVIDER",
+            "LUKKA_BASE_URL",
+            "LUKKA_BEARER_TOKEN",
+            "LUKKA_BEARER_TOKEN_FILE",
+            "KYT_TIMEOUT_SECONDS",
+            "KYT_RETRIES",
+            "KYT_CACHE_TTL_SECONDS",
+        ] {
+            std::env::remove_var(key);
+        }
+    }
+
     #[test]
     #[serial]
     fn github_dispatch_disabled_by_default() {
@@ -821,6 +907,59 @@ mod tests {
         assert_eq!(config.farm_product_id, "cloud-credits");
 
         clear_staking_farm_env();
+    }
+
+    #[test]
+    #[serial]
+    fn kyt_disabled_by_default() {
+        clear_kyt_env();
+        let config = KytConfig::from_env().unwrap();
+        assert!(!config.enabled);
+        assert_eq!(config.provider, "lukka");
+        assert!(config.lukka_bearer_token.is_none());
+    }
+
+    #[test]
+    #[serial]
+    fn kyt_disabled_ignores_unreadable_token_file() {
+        clear_kyt_env();
+        std::env::set_var("KYT_ENABLED", "false");
+        std::env::set_var("LUKKA_BEARER_TOKEN_FILE", "/missing/lukka-token");
+
+        let config = KytConfig::from_env().unwrap();
+
+        assert!(!config.enabled);
+        assert!(config.lukka_bearer_token.is_none());
+        clear_kyt_env();
+    }
+
+    #[test]
+    #[serial]
+    fn kyt_enabled_requires_token_to_be_effectively_enabled() {
+        clear_kyt_env();
+        std::env::set_var("KYT_ENABLED", "true");
+
+        let config = KytConfig::from_env().unwrap();
+
+        assert!(!config.enabled);
+        assert!(config.lukka_bearer_token.is_none());
+        clear_kyt_env();
+    }
+
+    #[test]
+    #[serial]
+    fn kyt_enabled_reads_inline_token() {
+        clear_kyt_env();
+        std::env::set_var("KYT_ENABLED", "true");
+        std::env::set_var("LUKKA_BEARER_TOKEN", "lukka-secret");
+        std::env::set_var("KYT_CACHE_TTL_SECONDS", "600");
+
+        let config = KytConfig::from_env().unwrap();
+
+        assert!(config.enabled);
+        assert_eq!(config.lukka_bearer_token.as_deref(), Some("lukka-secret"));
+        assert_eq!(config.cache_ttl_seconds, 600);
+        clear_kyt_env();
     }
 
     #[test]

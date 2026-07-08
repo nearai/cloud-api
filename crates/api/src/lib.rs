@@ -104,6 +104,7 @@ pub struct DomainServices {
     pub files_service: Arc<dyn services::files::FileServiceTrait + Send + Sync>,
     pub metrics_service: Arc<dyn services::metrics::MetricsServiceTrait>,
     pub staking_farm_service: Arc<services::staking_farm::StakingFarmService>,
+    pub kyt_service: Arc<services::kyt::KytService>,
     pub web_search_provider: Arc<dyn services::responses::tools::WebSearchProviderTrait>,
     pub service_usage_service:
         Arc<dyn services::service_usage::ServiceUsageServiceTrait + Send + Sync>,
@@ -502,6 +503,10 @@ pub async fn init_domain_services_with_pool(
         staking_farm_contract_client,
         config.staking_farm.clone(),
     ));
+    let kyt_service = Arc::new(
+        services::kyt::KytService::with_lukka_provider(config.kyt.clone())
+            .expect("Failed to initialize KYT service"),
+    );
 
     DomainServices {
         conversation_service,
@@ -518,6 +523,7 @@ pub async fn init_domain_services_with_pool(
         files_service,
         metrics_service,
         staking_farm_service,
+        kyt_service,
         web_search_provider,
         service_usage_service,
     }
@@ -1143,6 +1149,7 @@ pub fn build_app_with_config(
         metrics_service: domain_services.metrics_service.clone(),
         analytics_service: analytics_service.clone(),
         staking_farm_service: domain_services.staking_farm_service.clone(),
+        kyt_service: domain_services.kyt_service.clone(),
         config: config.clone(),
         ohttp_gateway,
         ohttp_attestation,
@@ -2380,6 +2387,7 @@ mod tests {
             github_dispatch: config::GitHubDispatchConfig::default(),
             infra: config::InfraConfig::default(),
             staking_farm: config::StakingFarmConfig::default(),
+            kyt: config::KytConfig::default(),
         };
 
         // Initialize services
@@ -2485,6 +2493,7 @@ mod tests {
             github_dispatch: config::GitHubDispatchConfig::default(),
             infra: config::InfraConfig::default(),
             staking_farm: config::StakingFarmConfig::default(),
+            kyt: config::KytConfig::default(),
         };
 
         let auth_components = init_auth_services(database.clone(), &config);

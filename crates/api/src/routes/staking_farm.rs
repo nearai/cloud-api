@@ -10,6 +10,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use services::auth::UserId;
+use services::kyt::KytCheckResponse;
 use services::organization::OrganizationId;
 use services::staking_farm::{OrganizationStakingFarmSource, StakingFarmSourceConflict};
 use utoipa::ToSchema;
@@ -47,6 +48,7 @@ pub struct StakingFarmStateResponse {
     pub sync_status: String,
     pub last_sync_error: Option<String>,
     pub active_positions: serde_json::Value,
+    pub kyt: Option<KytCheckResponse>,
 }
 
 /// Get staking farm configuration
@@ -118,8 +120,12 @@ pub async fn get_organization_staking_farm(
         .await
         .map_err(internal_error)?
         .ok_or_else(|| not_found("No staking farm source found"))?;
+    let kyt = app_state
+        .kyt_service
+        .check_near_account(&source.network_id, &user.0.provider_user_id)
+        .await;
 
-    Ok(ResponseJson(source_to_response(source)))
+    Ok(ResponseJson(source_to_response(source, Some(kyt))))
 }
 
 /// Sync organization staking farm credits
@@ -153,13 +159,17 @@ pub async fn sync_organization_staking_farm(
     let organization_id = parse_uuid(&org_id, "Invalid organization ID")?;
     require_near_default_org(&app_state, &user, organization_id).await?;
     let near_account_id = user.0.provider_user_id.clone();
+    let kyt = app_state
+        .kyt_service
+        .check_near_account(&app_state.config.auth.near.network_id, &near_account_id)
+        .await;
     let source = app_state
         .staking_farm_service
         .sync_for_near_account(organization_id, near_account_id, user.0.id)
         .await
         .map_err(staking_farm_error)?;
 
-    Ok(ResponseJson(source_to_response(source)))
+    Ok(ResponseJson(source_to_response(source, Some(kyt))))
 }
 
 /// Get admin organization staking farm state
@@ -198,7 +208,7 @@ pub async fn get_admin_organization_staking_farm(
         .map_err(internal_error)?
         .ok_or_else(|| not_found("No staking farm source found"))?;
 
-    Ok(ResponseJson(source_to_response(source)))
+    Ok(ResponseJson(source_to_response(source, None)))
 }
 
 /// Sync admin organization staking farm credits
@@ -242,7 +252,7 @@ pub async fn sync_admin_organization_staking_farm(
         .await
         .map_err(internal_error)?;
 
-    Ok(ResponseJson(source_to_response(source)))
+    Ok(ResponseJson(source_to_response(source, None)))
 }
 
 async fn require_near_default_org(
@@ -283,7 +293,10 @@ async fn require_near_default_org(
     Ok(())
 }
 
-fn source_to_response(source: OrganizationStakingFarmSource) -> StakingFarmStateResponse {
+fn source_to_response(
+    source: OrganizationStakingFarmSource,
+    kyt: Option<KytCheckResponse>,
+) -> StakingFarmStateResponse {
     StakingFarmStateResponse {
         organization_id: source.organization_id.to_string(),
         near_account_id: source.near_account_id,
@@ -302,6 +315,7 @@ fn source_to_response(source: OrganizationStakingFarmSource) -> StakingFarmState
         sync_status: source.sync_status,
         last_sync_error: source.last_sync_error,
         active_positions: source.active_positions,
+        kyt,
     }
 }
 

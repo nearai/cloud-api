@@ -4702,7 +4702,7 @@ pub async fn audio_transcriptions(
                 }
                 services::completions::ports::CompletionError::ProviderError {
                     status_code,
-                    ..
+                    message,
                 } => {
                     let http_status = StatusCode::from_u16(status_code)
                         .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
@@ -4726,6 +4726,7 @@ pub async fn audio_transcriptions(
                             status_code,
                             %organization_id,
                             workspace_id = %api_key.workspace.id.0,
+                            detail = %message,
                             "Audio transcription rejected by provider (client input)"
                         );
                         (
@@ -4741,6 +4742,7 @@ pub async fn audio_transcriptions(
                             status_code,
                             %organization_id,
                             workspace_id = %api_key.workspace.id.0,
+                            detail = %message,
                             "Audio transcription provider error"
                         );
                         (
@@ -5528,9 +5530,14 @@ pub async fn rerank(
                 }
                 services::completions::ports::CompletionError::ProviderError {
                     status_code,
-                    ..
+                    message,
                 } => {
-                    tracing::error!("Rerank provider error");
+                    tracing::error!(
+                        model = %request.model,
+                        upstream_status = status_code,
+                        detail = %message,
+                        "Rerank provider error"
+                    );
                     let http_status = StatusCode::from_u16(status_code)
                         .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
                     (
@@ -5872,14 +5879,25 @@ pub async fn embeddings(
                     status_code,
                     message,
                 } => {
-                    let classified = classify_provider_error(status_code, message);
+                    // `message` carries the provider-level detail (including the
+                    // upstream URL on connection failures, where `status_code` is
+                    // synthetic) — without it the log can't distinguish a backend
+                    // 5xx from an unreachable SNI.
+                    let classified = classify_provider_error(status_code, message.clone());
                     if classified.0.is_client_error() {
                         tracing::warn!(
+                            model = %model_name,
                             upstream_status = status_code,
+                            detail = %message,
                             "Embeddings rejected by upstream with client error"
                         );
                     } else {
-                        tracing::error!(upstream_status = status_code, "Embeddings provider error");
+                        tracing::error!(
+                            model = %model_name,
+                            upstream_status = status_code,
+                            detail = %message,
+                            "Embeddings provider error"
+                        );
                     }
                     classified
                 }
@@ -6189,9 +6207,13 @@ pub async fn privacy_classify(
                 }
                 services::completions::ports::CompletionError::ProviderError {
                     status_code,
-                    ..
+                    message,
                 } => {
-                    tracing::error!("Privacy classify provider error");
+                    tracing::error!(
+                        upstream_status = status_code,
+                        detail = %message,
+                        "Privacy classify provider error"
+                    );
                     let http_status = StatusCode::from_u16(status_code)
                         .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
                     (
@@ -6487,9 +6509,13 @@ pub async fn privacy_redact(
                 }
                 services::completions::ports::CompletionError::ProviderError {
                     status_code,
-                    ..
+                    message,
                 } => {
-                    tracing::error!("Privacy redact provider error");
+                    tracing::error!(
+                        upstream_status = status_code,
+                        detail = %message,
+                        "Privacy redact provider error"
+                    );
                     let http_status = StatusCode::from_u16(status_code)
                         .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
                     (
@@ -6980,9 +7006,14 @@ pub async fn score(
                 }
                 services::completions::ports::CompletionError::ProviderError {
                     status_code,
-                    ..
+                    message,
                 } => {
-                    tracing::error!("Score provider error");
+                    tracing::error!(
+                        model = %request.model,
+                        upstream_status = status_code,
+                        detail = %message,
+                        "Score provider error"
+                    );
                     let http_status = StatusCode::from_u16(status_code)
                         .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
                     (

@@ -239,7 +239,12 @@ pub async fn batch_upsert_models(
         validate_price(&request.input_cost_per_token, "inputCostPerToken")?;
         validate_price(&request.output_cost_per_token, "outputCostPerToken")?;
         validate_price(&request.cost_per_image, "costPerImage")?;
-        validate_price(&request.cache_read_cost_per_token, "cacheReadCostPerToken")?;
+        // Tri-state field: only a concrete price needs validation; an omitted
+        // field (unchanged) and an explicit null (disable) are both fine.
+        validate_price(
+            &request.cache_read_cost_per_token.clone().flatten(),
+            "cacheReadCostPerToken",
+        )?;
 
         // OpenRouter vocabulary checks. The provider spec at
         // https://openrouter.ai/docs/guides/community/for-providers enumerates
@@ -379,10 +384,12 @@ pub async fn batch_upsert_models(
                     input_cost_per_token: request.input_cost_per_token.as_ref().map(|p| p.amount),
                     output_cost_per_token: request.output_cost_per_token.as_ref().map(|p| p.amount),
                     cost_per_image: request.cost_per_image.as_ref().map(|p| p.amount),
+                    // Tri-state passes through: outer None = leave unchanged,
+                    // Some(None) = disable cache pricing, Some(Some(p)) = set.
                     cache_read_cost_per_token: request
                         .cache_read_cost_per_token
                         .as_ref()
-                        .map(|p| p.amount),
+                        .map(|inner| inner.as_ref().map(|p| p.amount)),
                     model_display_name: request.model_display_name.clone(),
                     model_description: request.model_description.clone(),
                     model_icon: request.model_icon.clone(),
@@ -636,11 +643,7 @@ pub async fn batch_upsert_models(
                 scale: 9,
                 currency: "USD".to_string(),
             },
-            cache_read_cost_per_token: DecimalPrice {
-                amount: updated_model.cache_read_cost_per_token,
-                scale: 9,
-                currency: "USD".to_string(),
-            },
+            cache_read_cost_per_token: updated_model.cache_read_cost_per_token.map(usd_price),
             metadata: ModelMetadata {
                 verifiable: updated_model.verifiable,
                 context_length: updated_model.context_length,
@@ -746,11 +749,7 @@ pub async fn list_models(
                 scale: 9,
                 currency: "USD".to_string(),
             },
-            cache_read_cost_per_token: DecimalPrice {
-                amount: model.cache_read_cost_per_token,
-                scale: 9,
-                currency: "USD".to_string(),
-            },
+            cache_read_cost_per_token: model.cache_read_cost_per_token.map(usd_price),
             metadata: ModelMetadata {
                 verifiable: model.verifiable,
                 context_length: model.context_length,
@@ -886,11 +885,7 @@ pub async fn get_model_history(
                 scale: 9,
                 currency: "USD".to_string(),
             },
-            cache_read_cost_per_token: DecimalPrice {
-                amount: h.cache_read_cost_per_token,
-                scale: 9,
-                currency: "USD".to_string(),
-            },
+            cache_read_cost_per_token: h.cache_read_cost_per_token.map(usd_price),
             context_length: h.context_length,
             model_name: h.model_name,
             model_display_name: h.model_display_name,
@@ -1444,11 +1439,7 @@ pub async fn deprecate_model(
             scale: 9,
             currency: "USD".to_string(),
         },
-        cache_read_cost_per_token: DecimalPrice {
-            amount: m.cache_read_cost_per_token,
-            scale: 9,
-            currency: "USD".to_string(),
-        },
+        cache_read_cost_per_token: m.cache_read_cost_per_token.map(usd_price),
         metadata: ModelMetadata {
             verifiable: m.verifiable,
             context_length: m.context_length,
@@ -1673,7 +1664,7 @@ fn scheduled_pricing_change_to_dto(
         old_pricing: PricingFields {
             input_cost_per_token: usd_price(change.old_input_cost_per_token),
             output_cost_per_token: usd_price(change.old_output_cost_per_token),
-            cache_read_cost_per_token: usd_price(change.old_cache_read_cost_per_token),
+            cache_read_cost_per_token: change.old_cache_read_cost_per_token.map(usd_price),
             cost_per_image: usd_price(change.old_cost_per_image),
         },
         new_pricing: PricingFieldUpdates {
@@ -1736,7 +1727,7 @@ pub async fn preview_model_pricing_changes(
                 old_pricing: PricingFields {
                     input_cost_per_token: usd_price(m.old_input_cost_per_token),
                     output_cost_per_token: usd_price(m.old_output_cost_per_token),
-                    cache_read_cost_per_token: usd_price(m.old_cache_read_cost_per_token),
+                    cache_read_cost_per_token: m.old_cache_read_cost_per_token.map(usd_price),
                     cost_per_image: usd_price(m.old_cost_per_image),
                 },
                 new_pricing: PricingFieldUpdates {

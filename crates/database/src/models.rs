@@ -432,8 +432,10 @@ pub struct Model {
     pub input_cost_per_token: i64,
     pub output_cost_per_token: i64,
     pub cost_per_image: i64,
-    /// Cost per cached input token (0 = no cache pricing; when set, cached tokens billed at this rate)
-    pub cache_read_cost_per_token: i64,
+    /// Cost per cached input token. `None` = cache pricing disabled (cached
+    /// tokens billed at `input_cost_per_token`); `Some(x)` (x >= 0) = cached
+    /// tokens billed at `x` (`Some(0)` = genuinely free).
+    pub cache_read_cost_per_token: Option<i64>,
 
     // Model metadata
     pub context_length: i32,
@@ -500,7 +502,10 @@ pub struct UpdateModelPricingRequest {
     pub input_cost_per_token: Option<i64>,
     pub output_cost_per_token: Option<i64>,
     pub cost_per_image: Option<i64>,
-    pub cache_read_cost_per_token: Option<i64>,
+    /// Tri-state: `None` = leave unchanged, `Some(None)` = disable cache
+    /// pricing (set column to NULL), `Some(Some(v))` = set to `v`
+    /// (`Some(Some(0))` = genuinely free cache reads).
+    pub cache_read_cost_per_token: Option<Option<i64>>,
     pub model_display_name: Option<String>,
     pub model_description: Option<String>,
     pub model_icon: Option<String>,
@@ -555,7 +560,9 @@ pub struct ModelHistory {
     pub input_cost_per_token: i64,
     pub output_cost_per_token: i64,
     pub cost_per_image: i64,
-    pub cache_read_cost_per_token: i64,
+    /// `None` = cache pricing disabled at this point in time; `Some(x)` =
+    /// cached tokens billed at `x` (`Some(0)` = genuinely free).
+    pub cache_read_cost_per_token: Option<i64>,
 
     // Model metadata snapshot
     pub context_length: i32,

@@ -1,3 +1,4 @@
+use crate::ita::ItaAttestationConfig;
 use std::{collections::HashMap, env};
 
 #[derive(Debug, Clone)]
@@ -24,6 +25,7 @@ pub struct ApiConfig {
     pub github_dispatch: GitHubDispatchConfig,
     pub infra: InfraConfig,
     pub staking_farm: StakingFarmConfig,
+    pub ita: ItaAttestationConfig,
 }
 
 impl ApiConfig {
@@ -54,6 +56,7 @@ impl ApiConfig {
             external_providers: ExternalProvidersConfig::from_env(),
             github_dispatch: GitHubDispatchConfig::from_env()?,
             infra: InfraConfig::from_env(),
+            ita: ItaAttestationConfig::from_env()?,
         })
     }
 }
@@ -141,6 +144,39 @@ impl InfraConfig {
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(0.0),
         }
+    }
+}
+
+pub(crate) fn parse_bool_env(key: &str, default: bool) -> Result<bool, String> {
+    match env::var(key) {
+        Ok(raw) => match raw.trim() {
+            "1" => Ok(true),
+            "0" => Ok(false),
+            value if value.eq_ignore_ascii_case("true") => Ok(true),
+            value if value.eq_ignore_ascii_case("false") => Ok(false),
+            _ => Err(format!("{key} must be true or false")),
+        },
+        Err(_) => Ok(default),
+    }
+}
+
+pub(crate) fn parse_u64_env(key: &str, default: u64) -> Result<u64, String> {
+    match env::var(key) {
+        Ok(raw) => raw
+            .trim()
+            .parse::<u64>()
+            .map_err(|_| format!("{key} must be an unsigned integer")),
+        Err(_) => Ok(default),
+    }
+}
+
+pub(crate) fn parse_u32_env(key: &str, default: u32) -> Result<u32, String> {
+    match env::var(key) {
+        Ok(raw) => raw
+            .trim()
+            .parse::<u32>()
+            .map_err(|_| format!("{key} must be an unsigned integer")),
+        Err(_) => Ok(default),
     }
 }
 
@@ -687,7 +723,7 @@ impl InvitationEmailConfig {
     }
 }
 
-fn non_empty_env(key: &str) -> Option<String> {
+pub(crate) fn non_empty_env(key: &str) -> Option<String> {
     env::var(key)
         .ok()
         .map(|value| value.trim().to_string())
@@ -704,6 +740,21 @@ fn read_optional_secret_env(file_key: &str, value_key: &str) -> Result<Option<St
             return Err(format!("{file_key} cannot be empty"));
         }
         return Ok(Some(value));
+    }
+
+    Ok(non_empty_env(value_key))
+}
+
+pub(crate) fn read_optional_secret_env_absent_empty(
+    file_key: &str,
+    value_key: &str,
+) -> Result<Option<String>, String> {
+    if let Some(path) = non_empty_env(file_key) {
+        let value = std::fs::read_to_string(&path)
+            .map_err(|e| format!("Failed to read {file_key}: {e}"))?
+            .trim()
+            .to_string();
+        return Ok((!value.is_empty()).then_some(value));
     }
 
     Ok(non_empty_env(value_key))

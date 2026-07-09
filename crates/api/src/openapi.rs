@@ -180,8 +180,9 @@ use utoipa::{Modify, OpenApi};
         // Health check endpoint
         crate::routes::health::health_check,
         // Attestation endpoints
-        crate::routes::attestation::get_signature,
-        crate::routes::attestation::get_attestation_report,
+        crate::routes::attestation::signature::get_signature,
+        crate::routes::attestation::report::get_attestation_report,
+        crate::routes::attestation::ita_token::get_ita_token,
     ),
     components(
         schemas(
@@ -243,6 +244,10 @@ use utoipa::{Modify, OpenApi};
             // Attestation models
             crate::routes::attestation::SignatureResponse,
             crate::routes::attestation::AttestationResponse,
+            crate::routes::attestation::ItaTokenItem,
+            crate::routes::attestation::ItaModelTokenItem,
+            crate::routes::attestation::ItaModelAliasResolved,
+            crate::routes::attestation::ItaTokenResponse,
             crate::routes::attestation::VerifyRequest,
             crate::routes::attestation::Evidence,
             crate::routes::attestation::NvidiaPayload,

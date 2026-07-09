@@ -2680,6 +2680,12 @@ pub async fn models(
 
     let response = ModelsResponse {
         object: "list".to_string(),
+        // Every active model is listed, including non-generative ones such as
+        // the `openai/privacy-filter` token-classification model. Clients tell
+        // model kinds apart from the per-model `output_modalities` /
+        // `architecture.outputModalities` fields — a classification model
+        // reports `["classification"]`, an image model `["image"]` — rather
+        // than by absence from the catalog (issue #615).
         data: models.into_iter().map(model_with_pricing_to_info).collect(),
     };
     Ok(ResponseJson(response))

@@ -66,7 +66,12 @@ impl AttestationService {
                     .get_signature(chat_id, Some(algo.to_string()))
                     .await
                     .map_err(|e| {
+                        // The error string embeds the backend URL on connection
+                        // failures — without it (and chat_id) these events are
+                        // impossible to attribute to a model/backend.
                         tracing::error!(
+                            %chat_id,
+                            error = %e,
                             "Failed to get chat signature from provider for algorithm: {}",
                             algo
                         );
@@ -95,6 +100,8 @@ impl AttestationService {
                     .await
                     .map_err(|e| {
                         tracing::error!(
+                            %chat_id,
+                            error = %e,
                             "Failed to store chat signature in repository for algorithm: {}",
                             algo
                         );

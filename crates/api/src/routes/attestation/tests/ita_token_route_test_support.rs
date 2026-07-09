@@ -235,7 +235,7 @@ fn model_with_name(model_name: &str) -> ModelWithPricing {
         input_cost_per_token: 0,
         output_cost_per_token: 0,
         cost_per_image: 0,
-        cache_read_cost_per_token: 0,
+        cache_read_cost_per_token: None,
         context_length: 0,
         verifiable: true,
         aliases: Vec::new(),

@@ -14,7 +14,9 @@ pub(in crate::attestation) fn generate_nonce_hex() -> String {
 
 pub(in crate::attestation) fn decode_nonce_hex(nonce: &str) -> Result<Vec<u8>, AttestationError> {
     let nonce_bytes = hex::decode(nonce).map_err(|e| {
-        tracing::error!("Failed to decode nonce hex string: {}", e);
+        // Malformed caller-supplied nonce → clean 400 below; a
+        // client input error, not a server fault.
+        tracing::warn!("Failed to decode nonce hex string: {}", e);
         AttestationError::InvalidParameter(format!("Invalid nonce format: {e}"))
     })?;
 

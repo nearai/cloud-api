@@ -1055,14 +1055,50 @@ mod tests {
                 ChutesModelEntry {
                     canonical_id: "zai-org/GLM-5.1-FP8".to_string(),
                     chute_slug: "zai-org/GLM-5.1-TEE".to_string(),
+                    max_context_tokens: None,
                 },
                 // Bare entry: canonical == slug.
                 ChutesModelEntry {
                     canonical_id: "moonshotai/Kimi-K2.6-TEE".to_string(),
                     chute_slug: "moonshotai/Kimi-K2.6-TEE".to_string(),
+                    max_context_tokens: None,
                 },
             ],
             "pairs split on '='; bare => canonical==slug; empty/half-empty tokens dropped"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn chutes_models_parses_optional_max_context_suffix() {
+        std::env::set_var(
+            "CHUTES_MODELS",
+            "z-ai/glm-5.2=zai-org/GLM-5.2-TEE@1048576, bare/model@131072, weird/slug@notanumber",
+        );
+        let cfg = ExternalProvidersConfig::from_env();
+        std::env::remove_var("CHUTES_MODELS");
+
+        assert_eq!(
+            cfg.chutes_models,
+            vec![
+                ChutesModelEntry {
+                    canonical_id: "z-ai/glm-5.2".to_string(),
+                    chute_slug: "zai-org/GLM-5.2-TEE".to_string(),
+                    max_context_tokens: Some(1_048_576),
+                },
+                // Bare entry: suffix stripped BEFORE canonical == slug.
+                ChutesModelEntry {
+                    canonical_id: "bare/model".to_string(),
+                    chute_slug: "bare/model".to_string(),
+                    max_context_tokens: Some(131_072),
+                },
+                // Unparseable suffix stays part of the slug (fail-open).
+                ChutesModelEntry {
+                    canonical_id: "weird/slug@notanumber".to_string(),
+                    chute_slug: "weird/slug@notanumber".to_string(),
+                    max_context_tokens: None,
+                },
+            ],
         );
     }
 
@@ -1092,10 +1128,12 @@ mod tests {
                 ChutesModelEntry {
                     canonical_id: "zai-org/GLM-5.1-FP8".to_string(),
                     chute_slug: "zai-org/GLM-5.1-TEE".to_string(),
+                    max_context_tokens: None,
                 },
                 ChutesModelEntry {
                     canonical_id: "other/model".to_string(),
                     chute_slug: "other/model".to_string(),
+                    max_context_tokens: None,
                 },
             ],
             "duplicate canonical id dropped (first wins); the second slug is ignored"
@@ -1111,12 +1149,20 @@ mod tests {
 /// and route under (the NEAR-served id when NEAR also serves the model, else the
 /// OpenRouter id) — never the raw `-TEE` chute slug; the **chute slug** is the
 /// internal upstream identity we send to Chutes and resolve to a `chute_id`.
+///
+/// The slug side takes an optional `@<max_context_tokens>` suffix (e.g.
+/// `z-ai/glm-5.2=zai-org/GLM-5.2-TEE@1048576`) declaring the chute's context
+/// window, so the pool's context-length routing knows whether Chutes can take
+/// a long request. Unset means "no declared limit" (today's behavior: Chutes
+/// is never filtered by size).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChutesModelEntry {
     /// User-facing / catalog model id (e.g. `zai-org/GLM-5.1-FP8`).
     pub canonical_id: String,
     /// Chutes chute slug sent upstream (e.g. `zai-org/GLM-5.1-TEE`).
     pub chute_slug: String,
+    /// Declared context window of the chute (`@<n>` suffix), if any.
+    pub max_context_tokens: Option<u32>,
 }
 
 /// External providers configuration for third-party AI providers
@@ -1225,15 +1271,35 @@ impl ExternalProvidersConfig {
             let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
             let mut entries: Vec<ChutesModelEntry> = Vec::new();
             for tok in raw.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
+                // Optional `@<max_context_tokens>` suffix on the slug side. A
+                // suffix that doesn't parse as a number is treated as part of
+                // the slug (fail-open: no declared limit) rather than dropped.
+                let split_ctx = |slug: &str| -> (String, Option<u32>) {
+                    match slug.rsplit_once('@') {
+                        Some((base, ctx)) => match ctx.trim().parse::<u32>() {
+                            Ok(n) if !base.trim().is_empty() => (base.trim().to_string(), Some(n)),
+                            _ => (slug.to_string(), None),
+                        },
+                        None => (slug.to_string(), None),
+                    }
+                };
                 let entry = match tok.split_once('=') {
-                    Some((canonical, slug)) => ChutesModelEntry {
-                        canonical_id: canonical.trim().to_string(),
-                        chute_slug: slug.trim().to_string(),
-                    },
-                    None => ChutesModelEntry {
-                        canonical_id: tok.to_string(),
-                        chute_slug: tok.to_string(),
-                    },
+                    Some((canonical, slug)) => {
+                        let (chute_slug, max_context_tokens) = split_ctx(slug.trim());
+                        ChutesModelEntry {
+                            canonical_id: canonical.trim().to_string(),
+                            chute_slug,
+                            max_context_tokens,
+                        }
+                    }
+                    None => {
+                        let (chute_slug, max_context_tokens) = split_ctx(tok);
+                        ChutesModelEntry {
+                            canonical_id: chute_slug.clone(),
+                            chute_slug,
+                            max_context_tokens,
+                        }
+                    }
                 };
                 if entry.canonical_id.is_empty() || entry.chute_slug.is_empty() {
                     continue;

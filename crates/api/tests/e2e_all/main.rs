@@ -40,6 +40,7 @@ mod feature_requests;
 mod files;
 mod function_tools;
 mod general;
+mod glm52_tier_routing;
 mod health;
 mod invitations;
 mod ita_attestation;

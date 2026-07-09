@@ -55,7 +55,7 @@ fn test_model(model_name: &str) -> ModelWithPricing {
         input_cost_per_token: 1,
         output_cost_per_token: 1,
         cost_per_image: 0,
-        cache_read_cost_per_token: 0,
+        cache_read_cost_per_token: None,
         context_length: 4096,
         verifiable: true,
         aliases: Vec::new(),
@@ -179,7 +179,7 @@ async fn completion_service_with_mock_providers(
     }
 
     pool.register_provider(model_name.to_string(), near).await;
-    pool.register_pinned_secondary_provider(model_name.to_string(), chutes)
+    pool.register_pinned_secondary_provider(model_name.to_string(), chutes, None)
         .await;
 
     let usage_service = Arc::new(CapturingUsageService::new());

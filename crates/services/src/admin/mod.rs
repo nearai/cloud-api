@@ -1298,7 +1298,7 @@ impl AdminServiceImpl {
             existing_image,
             existing_cache_read,
             existing_allow_free,
-        ) = existing.unwrap_or((0, 0, 0, 0, false));
+        ) = existing.unwrap_or((0, 0, 0, None, false));
 
         let effective_is_active = request.is_active.unwrap_or(is_new_model);
 
@@ -1306,6 +1306,10 @@ impl AdminServiceImpl {
             let effective_input = request.input_cost_per_token.unwrap_or(existing_input);
             let effective_output = request.output_cost_per_token.unwrap_or(existing_output);
             let effective_image = request.cost_per_image.unwrap_or(existing_image);
+            // Tri-state: absent = keep existing, explicit null = disabled (None),
+            // value = that value. Disabled (None) and an explicit free price
+            // (Some(0)) both contribute no revenue, so neither counts as
+            // "priced" for the activation gate.
             let effective_cache_read = request
                 .cache_read_cost_per_token
                 .unwrap_or(existing_cache_read);
@@ -1314,7 +1318,7 @@ impl AdminServiceImpl {
             if effective_input == 0
                 && effective_output == 0
                 && effective_image == 0
-                && effective_cache_read == 0
+                && effective_cache_read.unwrap_or(0) == 0
                 && !effective_allow_free
             {
                 return Err(AdminError::InvalidPricing(format!(

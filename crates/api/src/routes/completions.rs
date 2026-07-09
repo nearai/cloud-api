@@ -2724,8 +2724,11 @@ fn model_with_pricing_to_info(model: services::models::ModelWithPricing) -> Mode
         completion: nano_dollars_to_per_token_string(model.output_cost_per_token),
         image: nano_dollars_to_per_token_string(model.cost_per_image),
         request: "0".to_string(),
-        input_cache_read: (model.cache_read_cost_per_token > 0)
-            .then(|| nano_dollars_to_per_token_string(model.cache_read_cost_per_token)),
+        // None = cache pricing disabled -> omit the field entirely.
+        // Some(0) is a real (genuinely free) price and renders as "0".
+        input_cache_read: model
+            .cache_read_cost_per_token
+            .map(nano_dollars_to_per_token_string),
     };
 
     // OpenRouter's provider spec marks `input_modalities` / `output_modalities`
@@ -2859,7 +2862,7 @@ mod tests {
             input_cost_per_token: 0,
             output_cost_per_token: 0,
             cost_per_image: 0,
-            cache_read_cost_per_token: 0,
+            cache_read_cost_per_token: None,
             context_length: 4096,
             verifiable: false,
             aliases: vec![],
@@ -2930,19 +2933,32 @@ mod tests {
 
         assert!(
             json["pricing"].get("input_cache_read").is_none(),
-            "zero cache-read pricing is an internal unknown/disabled sentinel and must be omitted"
+            "None means cache pricing is disabled and input_cache_read must be omitted"
         );
     }
 
     #[test]
     fn model_with_cache_read_pricing_emits_positive_input_cache_read() {
         let mut model = make_model_with_pricing(None, None);
-        model.cache_read_cost_per_token = 50_000;
+        model.cache_read_cost_per_token = Some(50_000);
 
         let info = model_with_pricing_to_info(model);
         let json = serde_json::to_value(&info).unwrap();
 
         assert_eq!(json["pricing"]["input_cache_read"], "0.00005");
+    }
+
+    #[test]
+    fn model_with_free_cache_read_pricing_emits_zero_input_cache_read() {
+        // Some(0) is a genuinely free cache-read price — unlike None
+        // (disabled), it must render as the string "0", not be omitted.
+        let mut model = make_model_with_pricing(None, None);
+        model.cache_read_cost_per_token = Some(0);
+
+        let info = model_with_pricing_to_info(model);
+        let json = serde_json::to_value(&info).unwrap();
+
+        assert_eq!(json["pricing"]["input_cache_read"], "0");
     }
 
     #[test]

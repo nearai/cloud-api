@@ -29,6 +29,8 @@ pub struct ModelDeprecationEmail {
 
 /// One model's entry in a consolidated pricing change email.
 /// Amounts are nano-dollars (scale 9); `new_*` is `None` when unchanged.
+/// `old_cache_read_cost_per_token` is `None` when cache pricing was disabled
+/// at confirm time.
 #[derive(Debug, Clone)]
 pub struct PricingChangeEmailModel {
     pub model_id: String,
@@ -38,7 +40,7 @@ pub struct PricingChangeEmailModel {
     pub new_input_cost_per_token: Option<i64>,
     pub old_output_cost_per_token: i64,
     pub new_output_cost_per_token: Option<i64>,
-    pub old_cache_read_cost_per_token: i64,
+    pub old_cache_read_cost_per_token: Option<i64>,
     pub new_cache_read_cost_per_token: Option<i64>,
     pub old_cost_per_image: i64,
     pub new_cost_per_image: Option<i64>,
@@ -466,11 +468,18 @@ fn pricing_change_lines(model: &PricingChangeEmailModel) -> Vec<String> {
         model.old_output_cost_per_token,
         model.new_output_cost_per_token,
     );
-    per_million(
-        "Cache reads",
-        model.old_cache_read_cost_per_token,
-        model.new_cache_read_cost_per_token,
-    );
+    // Cache-read pricing may have been disabled (None) before this change;
+    // render that as "not set" rather than a fabricated $0 price.
+    if let Some(new) = model.new_cache_read_cost_per_token {
+        lines.push(format!(
+            "Cache reads: {} → {} per 1M tokens",
+            model
+                .old_cache_read_cost_per_token
+                .map(format_usd_per_million_tokens)
+                .unwrap_or_else(|| "not set".to_string()),
+            format_usd_per_million_tokens(new),
+        ));
+    }
     if let Some(new) = model.new_cost_per_image {
         lines.push(format!(
             "Images: {} → {} per image",
@@ -697,7 +706,7 @@ mod tests {
                     new_input_cost_per_token: Some(280),
                     old_output_cost_per_token: 850,
                     new_output_cost_per_token: None,
-                    old_cache_read_cost_per_token: 25,
+                    old_cache_read_cost_per_token: Some(25),
                     new_cache_read_cost_per_token: None,
                     old_cost_per_image: 0,
                     new_cost_per_image: None,
@@ -710,7 +719,7 @@ mod tests {
                     new_input_cost_per_token: None,
                     old_output_cost_per_token: 15_000,
                     new_output_cost_per_token: Some(12_000),
-                    old_cache_read_cost_per_token: 0,
+                    old_cache_read_cost_per_token: None,
                     new_cache_read_cost_per_token: None,
                     old_cost_per_image: 2_000_000_000,
                     new_cost_per_image: Some(2_500_000_000),

@@ -9,6 +9,12 @@ use super::{
     InferenceProviderPool, MetricsServiceTrait, ModelsRepository, UsageRepository,
 };
 
+/// Default TTL (seconds) for the no-nonce attestation-report cache. Reports for
+/// nonce-less requests are short-lived snapshots; ~10s collapses the bursty
+/// monitoring herd (bursts arrive within seconds) while keeping reports fresh.
+/// Override with `ATTESTATION_REPORT_CACHE_TTL_SECS`; `0` disables the cache.
+const DEFAULT_ATTESTATION_REPORT_CACHE_TTL_SECS: u64 = 10;
+
 impl AttestationService {
     pub async fn init(
         repository: Arc<dyn AttestationRepository + Send + Sync>,
@@ -95,6 +101,29 @@ impl AttestationService {
             inference_provider_pool.clone(),
         ));
 
+        // Build the no-nonce attestation-report cache from env (TTL=0 disables it).
+        let cache_ttl_secs = std::env::var("ATTESTATION_REPORT_CACHE_TTL_SECS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(DEFAULT_ATTESTATION_REPORT_CACHE_TTL_SECS);
+        let report_cache = if cache_ttl_secs == 0 {
+            tracing::info!("Attestation-report cache disabled (TTL=0)");
+            None
+        } else {
+            tracing::info!(
+                ttl_secs = cache_ttl_secs,
+                "Attestation-report cache enabled"
+            );
+            Some(
+                moka::future::Cache::builder()
+                    // One entry per (model, algo, tls_fp, provider, signing_addr)
+                    // combination; the live model catalog is well under this.
+                    .max_capacity(1024)
+                    .time_to_live(std::time::Duration::from_secs(cache_ttl_secs))
+                    .build(),
+            )
+        };
+
         Ok(Self {
             repository,
             inference_provider_pool,
@@ -112,6 +141,7 @@ impl AttestationService {
             ita_client,
             gateway_quote_collector: Arc::new(DstackGatewayQuoteCollector),
             model_attestation_collector,
+            report_cache,
         })
     }
 }

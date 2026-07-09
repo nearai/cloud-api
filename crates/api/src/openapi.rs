@@ -88,6 +88,7 @@ use utoipa::{Modify, OpenApi};
         crate::routes::organization_members::list_organization_members,
         crate::routes::organization_members::list_organization_invitations,
         crate::routes::organization_members::cancel_organization_invitation,
+        crate::routes::organization_members::cancel_invitation,
         // Workspace endpoints
         crate::routes::workspaces::create_workspace,
         crate::routes::workspaces::list_organization_workspaces,
@@ -301,6 +302,10 @@ use utoipa::{Modify, OpenApi};
             FileUploadResponse, ExpiresAfter, FileListResponse, FileDeleteResponse,
             // Platform Stats analytics models
             services::admin::PlatformMetrics,
+            services::admin::PlatformProviderUsage,
+            services::admin::ProviderUsageTotals,
+            services::admin::ProviderTypeUsage,
+            services::admin::ProviderTierUsage,
             services::admin::TopModelMetrics,
             services::admin::TopOrganizationMetrics,
             services::admin::PlatformTimeSeriesMetrics,
@@ -309,6 +314,7 @@ use utoipa::{Modify, OpenApi};
             services::admin::BillingSourceBreakdown,
             services::admin::ModelRevenueReport,
             services::admin::ModelRevenueEntry,
+            services::admin::ModelProviderRevenueBreakdown,
             services::admin::OrgRevenueReport,
             services::admin::OrgRevenueEntry,
             services::admin::InfraSummary,

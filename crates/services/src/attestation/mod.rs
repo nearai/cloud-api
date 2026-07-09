@@ -56,4 +56,13 @@ pub struct AttestationService {
     ita_client: Option<ItaClient>,
     gateway_quote_collector: Arc<dyn GatewayQuoteCollector>,
     model_attestation_collector: Arc<dyn ModelAttestationCollector>,
+    /// Short-TTL cache for attestation reports of **nonce-less** requests only.
+    /// Keyed on (model, algo, tls_fp, provider_filter, signing_address) — never
+    /// on a nonce. moka's `try_get_with` also single-flights concurrent misses,
+    /// so a burst of identical no-nonce probes triggers ONE backend build.
+    /// `None` when disabled (TTL=0). Nonce-bearing requests bypass it entirely
+    /// because the nonce is cryptographically bound into the TDX report_data and
+    /// the GPU evidence — serving a cached report for a different nonce would
+    /// defeat the freshness/replay guarantee.
+    report_cache: Option<moka::future::Cache<String, Arc<models::AttestationReport>>>,
 }

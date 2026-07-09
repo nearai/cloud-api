@@ -93,6 +93,7 @@ fn service_with_collectors(
         ita_client,
         gateway_quote_collector: Arc::new(gateway_collector),
         model_attestation_collector: Arc::new(model_collector),
+        report_cache: None,
     }
 }
 

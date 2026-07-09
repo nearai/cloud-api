@@ -119,6 +119,9 @@ impl DstackCpuQuote {
     }
 }
 
+// `Clone` so the no-nonce report cache can store an `Arc<AttestationReport>` and
+// hand owned copies back to the trait method (which returns by value).
+#[derive(Clone)]
 pub struct AttestationReport {
     pub gateway_attestation: DstackCpuQuote,
     pub model_attestations: Vec<serde_json::Map<String, serde_json::Value>>,

@@ -55,6 +55,7 @@ impl AttestationService {
         provider_filter: Option<ProviderTier>,
     ) -> Result<AttestationReport, AttestationError> {
         let mut model_attestations = vec![];
+        let user_provided_nonce = nonce.clone();
         let nonce = nonce.unwrap_or_else(|| {
             tracing::debug!("No nonce provided for attestation report, generated nonce internally");
             generate_nonce_hex()
@@ -89,7 +90,10 @@ impl AttestationService {
                 .get_attestation_report(
                     canonical_name.clone(),
                     signing_algo.clone(),
-                    Some(nonce.clone()),
+                    // Key fix: only forward the nonce when the caller supplied one.
+                    // When None, inference-proxy serves its 5-min cached report
+                    // instead of forcing a fresh GPU-evidence collection (~700 ms).
+                    user_provided_nonce,
                     signing_address,
                     include_tls_fingerprint,
                     provider_filter,

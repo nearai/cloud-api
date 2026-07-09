@@ -151,7 +151,7 @@ async fn client_does_not_retry_non_transient_statuses() -> TestResult {
 
 #[tokio::test]
 async fn client_retries_transient_statuses_up_to_cap() -> TestResult {
-    for status in [429, 502, 503, 504] {
+    for status in [502, 503, 504] {
         // Given: a transient ITA status twice, then a valid nonce.
         let server = FakeIta::start(vec![
             FakeStep::json(status, r#"{}"#),
@@ -258,8 +258,8 @@ fn retry_classifier_matches_connection_reset_only() {
 }
 
 #[tokio::test]
-async fn retry_after_is_preserved_when_rate_limit_retry_is_exhausted() -> TestResult {
-    // Given: ITA keeps returning 429 with Retry-After.
+async fn rate_limit_is_surfaced_immediately_with_retry_after() -> TestResult {
+    // Given: ITA returns 429 with Retry-After.
     let server = FakeIta::start(vec![
         FakeStep::json(429, r#"{}"#).with_header("Retry-After", "2"),
         FakeStep::json(429, r#"{}"#).with_header("Retry-After", "2"),
@@ -267,15 +267,17 @@ async fn retry_after_is_preserved_when_rate_limit_retry_is_exhausted() -> TestRe
     .await?;
     let client = client_for(&server, 1, 25)?;
 
-    // When: the retry cap is exhausted.
+    // When: the rate-limited endpoint is called.
     let error = client.get_nonce("request-rate-limit").await.unwrap_err();
 
-    // Then: the typed error retains Retry-After for API-layer propagation.
+    // Then: no retry is attempted before the advertised window (the fixed
+    // backoff would undercut Retry-After and burn quota), and the typed error
+    // retains Retry-After for API-layer propagation.
     assert!(matches!(
         error,
         ItaClientError::RateLimited { retry_after: Some(value) } if value == "2"
     ));
-    assert_eq!(server.requests().len(), 2);
+    assert_eq!(server.requests().len(), 1);
     Ok(())
 }
 

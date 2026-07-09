@@ -42,8 +42,13 @@ pub enum ItaClientError {
 impl ItaClientError {
     pub(super) fn is_retryable(&self) -> bool {
         match self {
-            Self::Timeout | Self::RateLimited { .. } | Self::TransientStatus { .. } => true,
+            Self::Timeout | Self::TransientStatus { .. } => true,
             Self::Transport { retryable, .. } => *retryable,
+            // 429 is deliberately NOT retried: the fixed backoff is far shorter
+            // than any realistic Retry-After window, so retrying just burns ITA
+            // quota while the caller waits. Surface it immediately — Retry-After
+            // is preserved on the typed error for API-layer propagation.
+            Self::RateLimited { .. } => false,
             Self::MissingCredentials
             | Self::InvalidConfig { .. }
             | Self::InvalidRequestId

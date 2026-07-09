@@ -152,7 +152,8 @@ fn parse_optional_bool(
     param: &'static str,
 ) -> Result<Option<bool>, (StatusCode, ResponseJson<ErrorResponse>)> {
     match raw.map(str::trim) {
-        None => Ok(None),
+        // An explicitly empty value (`?param=`) is treated as absent.
+        None | Some("") => Ok(None),
         Some("true") | Some("1") => Ok(Some(true)),
         Some("false") | Some("0") => Ok(Some(false)),
         Some(_) => Err(error_response(

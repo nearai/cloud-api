@@ -122,6 +122,7 @@ pub fn test_config() -> ApiConfig {
         external_providers: config::ExternalProvidersConfig::default(),
         github_dispatch: config::GitHubDispatchConfig::default(),
         infra: config::InfraConfig::default(),
+        staking_farm: config::StakingFarmConfig::default(),
         ita: config::ItaAttestationConfig::default(),
     }
 }

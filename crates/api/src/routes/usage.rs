@@ -93,26 +93,51 @@ pub struct OrganizationBalanceResponse {
     pub total_requests: i64,
     pub total_tokens: i64,
     pub updated_at: String,
+    pub credit_limits: Vec<CreditLimitBreakdownResponse>,
+}
+
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct CreditLimitBreakdownResponse {
+    #[serde(rename = "type")]
+    pub credit_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    pub amount: i64,
+    pub currency: String,
 }
 
 pub async fn compute_organization_balance_response(
     usage_service: &(dyn UsageServiceTrait + Send + Sync),
     organization_id: Uuid,
 ) -> Result<OrganizationBalanceResponse, UsageError> {
-    let (balance, limit) = tokio::try_join!(
+    let (balance, limit, credit_limits) = tokio::try_join!(
         usage_service.get_balance(organization_id),
-        usage_service.get_limit(organization_id)
+        usage_service.get_limit(organization_id),
+        usage_service.get_credit_limits(organization_id)
     )
     .map_err(|e| {
-        tracing::error!("Failed to get organization balance or limit: {:?}", e);
+        tracing::error!(
+            "Failed to get organization balance, limit, or credit limits: {:?}",
+            e
+        );
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             ResponseJson(ErrorResponse::new(
-                "Failed to retrieve balance or limit".to_string(),
+                "Failed to retrieve balance, limit, or credit limits".to_string(),
                 "internal_server_error".to_string(),
             )),
         )
     })?;
+
+    let credit_limits: Vec<CreditLimitBreakdownResponse> = credit_limits
+        .into_iter()
+        .map(|limit| CreditLimitBreakdownResponse {
+            credit_type: limit.credit_type,
+            source: limit.source,
+            amount: limit.amount,
+            currency: limit.currency,
+        })
+        .collect();
 
     match balance {
         Some(balance) => {
@@ -141,6 +166,7 @@ pub async fn compute_organization_balance_response(
                 total_requests: balance.total_requests,
                 total_tokens: balance.total_tokens,
                 updated_at: balance.updated_at.to_rfc3339(),
+                credit_limits,
             })
         }
         None => {
@@ -157,6 +183,7 @@ pub async fn compute_organization_balance_response(
                     total_requests: 0,
                     total_tokens: 0,
                     updated_at: Utc::now().to_rfc3339(),
+                    credit_limits,
                 })
             } else {
                 Err((

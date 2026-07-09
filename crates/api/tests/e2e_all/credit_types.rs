@@ -1,6 +1,6 @@
 //! End-to-end tests for organization credit type tracking feature.
 //!
-//! Tests the ability to track different types of credits (grant vs payment)
+//! Tests the ability to track different types of credits
 //! with optional source tracking and multi-currency support.
 
 use crate::common::*;
@@ -43,6 +43,13 @@ async fn test_add_credits_variations() {
     let test_cases = [
         ("grant", Some("nearai"), 10_000_000_000i64, "USD", "USD"),
         ("payment", Some("stripe"), 50_000_000_000i64, "USD", "USD"),
+        (
+            "staking_farm",
+            Some("house-of-stake"),
+            20_000_000_000i64,
+            "USD",
+            "USD",
+        ),
         (
             "payment",
             Some("hot-pay"),
@@ -112,6 +119,122 @@ async fn test_credits_accumulate_across_types() {
         .collect();
     assert!(types.contains(&"grant"));
     assert!(types.contains(&"payment"));
+}
+
+/// Test that staking farm credits are distinct from purchased payment credits.
+#[tokio::test]
+async fn test_staking_farm_does_not_overwrite_payment_credits() {
+    let server = setup_test_server().await;
+    let org = create_org(&server).await;
+
+    add_credits_with_type(
+        &server,
+        &org.id,
+        "payment",
+        Some("stripe+hot-pay"),
+        50_000_000_000,
+        "USD",
+        &get_session_id(),
+    )
+    .await;
+    add_credits_with_type(
+        &server,
+        &org.id,
+        "staking_farm",
+        Some("house-of-stake"),
+        20_000_000_000,
+        "USD",
+        &get_session_id(),
+    )
+    .await;
+    add_credits_with_type(
+        &server,
+        &org.id,
+        "staking_farm",
+        Some("house-of-stake"),
+        30_000_000_000,
+        "USD",
+        &get_session_id(),
+    )
+    .await;
+
+    let history = get_limits_history(&server, &org.id).await;
+    let active: Vec<_> = history
+        .history
+        .iter()
+        .filter(|h| h.effective_until.is_none())
+        .collect();
+    assert_eq!(active.len(), 2);
+
+    let payment = active
+        .iter()
+        .find(|h| h.credit_type.as_str() == "payment")
+        .unwrap();
+    let staking_farm = active
+        .iter()
+        .find(|h| h.credit_type.as_str() == "staking_farm")
+        .unwrap();
+    assert_eq!(payment.spend_limit.amount, 50_000_000_000);
+    assert_eq!(staking_farm.spend_limit.amount, 30_000_000_000);
+}
+
+/// Test balance response includes active credit source/type breakdown.
+#[tokio::test]
+async fn test_balance_response_includes_credit_limit_breakdown() {
+    let server = setup_test_server().await;
+    let org = create_org(&server).await;
+
+    add_credits_with_type(
+        &server,
+        &org.id,
+        "grant",
+        Some("nearai"),
+        10_000_000_000,
+        "USD",
+        &get_session_id(),
+    )
+    .await;
+    add_credits_with_type(
+        &server,
+        &org.id,
+        "payment",
+        Some("stripe+hot-pay"),
+        50_000_000_000,
+        "USD",
+        &get_session_id(),
+    )
+    .await;
+    add_credits_with_type(
+        &server,
+        &org.id,
+        "staking_farm",
+        Some("house-of-stake"),
+        20_000_000_000,
+        "USD",
+        &get_session_id(),
+    )
+    .await;
+
+    let response = server
+        .get(format!("/v1/organizations/{}/usage/balance", org.id).as_str())
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .add_header("User-Agent", MOCK_USER_AGENT)
+        .await;
+    assert_eq!(response.status_code(), 200);
+    let balance = response.json::<api::routes::usage::OrganizationBalanceResponse>();
+
+    assert_eq!(balance.spend_limit, Some(80_000_000_000));
+    assert_eq!(balance.credit_limits.len(), 3);
+    assert!(balance.credit_limits.iter().any(|limit| {
+        limit.credit_type == "payment"
+            && limit.source.as_deref() == Some("stripe+hot-pay")
+            && limit.amount == 50_000_000_000
+    }));
+    assert!(balance.credit_limits.iter().any(|limit| {
+        limit.credit_type == "staking_farm"
+            && limit.source.as_deref() == Some("house-of-stake")
+            && limit.amount == 20_000_000_000
+    }));
 }
 
 /// Test that updating the same credit type replaces the previous one

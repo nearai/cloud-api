@@ -586,6 +586,7 @@ mod tests {
             display_name: Some("Test User".to_string()),
             avatar_url: None,
             auth_provider: provider.to_string(),
+            provider_user_id: email.to_string(),
             role: UserRole::User,
             is_active: true,
             last_login: None,

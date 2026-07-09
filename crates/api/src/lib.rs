@@ -103,6 +103,7 @@ pub struct DomainServices {
     pub user_service: Arc<dyn services::user::UserServiceTrait + Send + Sync>,
     pub files_service: Arc<dyn services::files::FileServiceTrait + Send + Sync>,
     pub metrics_service: Arc<dyn services::metrics::MetricsServiceTrait>,
+    pub staking_farm_service: Arc<services::staking_farm::StakingFarmService>,
     pub web_search_provider: Arc<dyn services::responses::tools::WebSearchProviderTrait>,
     pub service_usage_service:
         Arc<dyn services::service_usage::ServiceUsageServiceTrait + Send + Sync>,
@@ -484,6 +485,25 @@ pub async fn init_domain_services_with_pool(
         service_usage_repo,
     ));
 
+    let staking_farm_repository = Arc::new(
+        database::repositories::OrganizationStakingFarmSourcesRepository::new(
+            database.pool().clone(),
+        ),
+    ) as Arc<dyn services::staking_farm::StakingFarmRepository>;
+    let staking_farm_contract_client = Arc::new(
+        services::staking_farm::NearRpcStakingFarmClient::new(
+            config.auth.near.rpc_url.clone(),
+            config.auth.near.network_id.clone(),
+        )
+        .expect("Failed to initialize staking farm NEAR RPC client"),
+    )
+        as Arc<dyn services::staking_farm::StakingFarmContractClient>;
+    let staking_farm_service = Arc::new(services::staking_farm::StakingFarmService::new(
+        staking_farm_repository,
+        staking_farm_contract_client,
+        config.staking_farm.clone(),
+    ));
+
     DomainServices {
         conversation_service,
         response_service,
@@ -498,6 +518,7 @@ pub async fn init_domain_services_with_pool(
         user_service,
         files_service,
         metrics_service,
+        staking_farm_service,
         web_search_provider,
         service_usage_service,
     }
@@ -1123,6 +1144,7 @@ pub fn build_app_with_config(
         inference_provider_pool: domain_services.inference_provider_pool.clone(),
         metrics_service: domain_services.metrics_service.clone(),
         analytics_service: analytics_service.clone(),
+        staking_farm_service: domain_services.staking_farm_service.clone(),
         config: config.clone(),
         ohttp_gateway,
         ohttp_attestation,
@@ -1139,6 +1161,7 @@ pub fn build_app_with_config(
 
     let usage_state = middleware::UsageState {
         usage_service: domain_services.usage_service.clone(),
+        staking_farm_service: domain_services.staking_farm_service.clone(),
         usage_repository,
         api_key_repository,
     };
@@ -1215,6 +1238,7 @@ pub fn build_app_with_config(
         AdminRouteServices {
             inference_provider_pool: app_state.inference_provider_pool.clone(),
             analytics_service,
+            staking_farm_service: app_state.staking_farm_service.clone(),
             models_service: domain_services.models_service.clone(),
             completion_service: domain_services.completion_service.clone(),
             organization_service: domain_services.organization_service.clone(),
@@ -1887,6 +1911,7 @@ fn cache_control_layer(value: &'static str) -> CacheControlLayer {
 pub struct AdminRouteServices {
     pub inference_provider_pool: Arc<services::inference_provider_pool::InferenceProviderPool>,
     pub analytics_service: Arc<services::admin::AnalyticsService>,
+    pub staking_farm_service: Arc<services::staking_farm::StakingFarmService>,
     pub models_service: Arc<services::models::ModelsServiceImpl>,
     pub completion_service: Arc<services::CompletionServiceImpl>,
     pub organization_service:
@@ -1915,6 +1940,9 @@ pub fn build_admin_routes(
         list_organizations, list_users, preview_model_deprecation, preview_model_pricing_changes,
         resend_invitation_email, update_organization_concurrent_limit, update_organization_limits,
         update_service, AdminAppState,
+    };
+    use crate::routes::staking_farm::{
+        get_admin_organization_staking_farm, sync_admin_organization_staking_farm,
     };
     use database::repositories::{AdminAccessTokenRepository, AdminCompositeRepository};
     use services::admin::AdminServiceImpl;
@@ -1957,6 +1985,7 @@ pub fn build_admin_routes(
         organization_service: services.organization_service,
         auth_service: auth_state_middleware.auth_service.clone(),
         usage_service: services.usage_service,
+        staking_farm_service: services.staking_farm_service,
         config,
         admin_access_token_repository,
         inference_provider_pool: services.inference_provider_pool,
@@ -2018,6 +2047,14 @@ pub fn build_admin_routes(
         .route(
             "/admin/organizations/{org_id}/usage/balance",
             axum::routing::get(get_admin_organization_balance),
+        )
+        .route(
+            "/admin/organizations/{org_id}/staking/farm",
+            axum::routing::get(get_admin_organization_staking_farm),
+        )
+        .route(
+            "/admin/organizations/{org_id}/staking/farm/sync",
+            axum::routing::post(sync_admin_organization_staking_farm),
         )
         .route(
             "/admin/organizations/{org_id}/concurrent-limit",
@@ -2363,6 +2400,7 @@ mod tests {
             external_providers: config::ExternalProvidersConfig::default(),
             github_dispatch: config::GitHubDispatchConfig::default(),
             infra: config::InfraConfig::default(),
+            staking_farm: config::StakingFarmConfig::default(),
             ita: config::ItaAttestationConfig::default(),
         };
 
@@ -2468,6 +2506,7 @@ mod tests {
             external_providers: config::ExternalProvidersConfig::default(),
             github_dispatch: config::GitHubDispatchConfig::default(),
             infra: config::InfraConfig::default(),
+            staking_farm: config::StakingFarmConfig::default(),
             ita: config::ItaAttestationConfig::default(),
         };
 

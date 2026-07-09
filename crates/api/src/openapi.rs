@@ -35,6 +35,7 @@ use utoipa::{Modify, OpenApi};
         (name = "Invitations", description = "Token-based invitation handling"),
         (name = "Usage", description = "Usage tracking and billing information"),
         (name = "Billing", description = "Billing costs endpoint (HuggingFace integration)"),
+        (name = "Staking Farm", description = "House of Stake farm credit configuration and synchronization"),
         (name = "Health", description = "Health check endpoints"),
         (name = "Attestation", description = "Attestation and verification endpoints"),
         (name = "Gateway", description = "Model gateway integration endpoints"),
@@ -126,6 +127,10 @@ use utoipa::{Modify, OpenApi};
         crate::routes::usage::get_api_key_usage_history,
         crate::routes::usage::get_user_organization_metrics,
         crate::routes::usage::get_user_organization_timeseries,
+        // Staking farm endpoints
+        crate::routes::staking_farm::get_staking_farm_config,
+        crate::routes::staking_farm::get_organization_staking_farm,
+        crate::routes::staking_farm::sync_organization_staking_farm,
         // Feature request endpoints
         crate::routes::feature_requests::submit_feature_request,
         crate::routes::feature_requests::list_admin_feature_requests,
@@ -148,6 +153,8 @@ use utoipa::{Modify, OpenApi};
         crate::routes::admin::get_admin_organization_balance,
         crate::routes::admin::update_organization_limits,
         crate::routes::admin::get_organization_limits_history,
+        crate::routes::staking_farm::get_admin_organization_staking_farm,
+        crate::routes::staking_farm::sync_admin_organization_staking_farm,
         crate::routes::admin::update_organization_concurrent_limit,
         crate::routes::admin::get_organization_concurrent_limit,
         crate::routes::admin::get_organization_metrics,
@@ -284,6 +291,9 @@ use utoipa::{Modify, OpenApi};
             crate::routes::usage::UserWorkspaceMetrics,
             crate::routes::usage::UserTimeSeriesMetrics,
             crate::routes::usage::UserTimeSeriesPoint,
+            // Staking farm models
+            crate::routes::staking_farm::StakingFarmConfigResponse,
+            crate::routes::staking_farm::StakingFarmStateResponse,
             // Feature request models
             crate::routes::feature_requests::FeatureRequestKind,
             crate::routes::feature_requests::SubmitFeatureRequest,

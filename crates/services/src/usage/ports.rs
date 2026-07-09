@@ -202,9 +202,9 @@ pub trait UsageServiceTrait: Send + Sync {
     ///   where `cache_read` is the effective cached token count (see below).
     /// - **Capping**: The provided `cached_tokens` (or `cache_read_tokens`) is treated as
     ///   `min(cached_tokens, input_tokens).max(0)`; i.e. cached count is never negative and never exceeds input.
-    /// - **Cache pricing disabled**: When the model’s `cache_read_cost_per_token == 0`, cache pricing is
+    /// - **Cache pricing disabled**: When the model’s `cache_read_cost_per_token` is `None`, cache pricing is
     ///   disabled and all input tokens (including cached) are billed at `input_cost_per_token` (cached tokens
-    ///   are not free).
+    ///   are not free). `Some(0)` means cached tokens are genuinely free; `Some(x)` bills them at `x`.
     async fn calculate_cost(
         &self,
         model_id: &str,
@@ -545,7 +545,10 @@ pub struct ModelPricing {
     pub input_cost_per_token: i64,
     pub output_cost_per_token: i64,
     pub cost_per_image: i64,
-    pub cache_read_cost_per_token: i64,
+    /// Cost per cached input token. `None` = cache pricing disabled (cached
+    /// tokens billed at `input_cost_per_token`); `Some(x)` (x >= 0) = cached
+    /// tokens billed at `x` (`Some(0)` = genuinely free).
+    pub cache_read_cost_per_token: Option<i64>,
 }
 
 /// Organization spending limit

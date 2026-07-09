@@ -79,6 +79,41 @@ impl ResponseError {
         }
     }
 
+    /// Whether this failure was caused by the client's request (bad params,
+    /// unknown tool, the org's own rate limit, provider-rejected params mapped
+    /// to `InvalidParams` upstream) rather than by our infrastructure.
+    ///
+    /// Deliberately variant-based, not "status is 4xx":
+    /// `CompletionError::ProviderError` passes the raw upstream status
+    /// through, where 401/403/407 mean OUR backend credentials are broken and
+    /// 408 is an upstream timeout — those must keep logging at ERROR.
+    pub fn is_client_caused(&self) -> bool {
+        match self {
+            ResponseError::InvalidParams(_)
+            | ResponseError::UnknownTool(_)
+            | ResponseError::EmptyToolName
+            | ResponseError::McpServerLimitExceeded { .. }
+            | ResponseError::McpToolLimitExceeded { .. }
+            | ResponseError::McpInsecureUrl
+            | ResponseError::McpPrivateIpBlocked
+            | ResponseError::McpApprovalRequired { .. }
+            | ResponseError::McpApprovalRequestNotFound(_)
+            | ResponseError::FunctionCallRequired { .. }
+            | ResponseError::FunctionCallNotFound(_) => true,
+            ResponseError::Completion(error) => matches!(
+                error,
+                crate::completions::CompletionError::InvalidModel(_)
+                    | crate::completions::CompletionError::InvalidParams(_)
+                    | crate::completions::CompletionError::RateLimitExceeded(_)
+            ),
+            ResponseError::InternalError(_)
+            | ResponseError::StreamInterrupted
+            | ResponseError::McpConnectionFailed(_)
+            | ResponseError::McpToolDiscoveryFailed(_)
+            | ResponseError::McpToolExecutionFailed(_) => false,
+        }
+    }
+
     pub fn response_error(&self) -> crate::responses::models::ResponseError {
         match self {
             ResponseError::InvalidParams(msg) => response_error(msg, "invalid_request_error", None),

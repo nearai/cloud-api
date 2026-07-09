@@ -718,7 +718,12 @@ impl ports::AttestationServiceTrait for AttestationService {
                     .get_signature(chat_id, Some(algo.to_string()))
                     .await
                     .map_err(|e| {
+                        // The error string embeds the backend URL on connection
+                        // failures — without it (and chat_id) these events are
+                        // impossible to attribute to a model/backend.
                         tracing::error!(
+                            %chat_id,
+                            error = %e,
                             "Failed to get chat signature from provider for algorithm: {}",
                             algo
                         );
@@ -749,6 +754,8 @@ impl ports::AttestationServiceTrait for AttestationService {
                     .await
                     .map_err(|e| {
                         tracing::error!(
+                            %chat_id,
+                            error = %e,
                             "Failed to store chat signature in repository for algorithm: {}",
                             algo
                         );
@@ -842,7 +849,9 @@ impl ports::AttestationServiceTrait for AttestationService {
             let (gateway_nonce, nonce_bytes) = match nonce {
                 Some(n) => {
                     let bytes = hex::decode(&n).map_err(|e| {
-                        tracing::error!("Failed to decode nonce hex string: {}", e);
+                        // Malformed caller-supplied nonce → clean 400 below; a
+                        // client input error, not a server fault.
+                        tracing::warn!("Failed to decode nonce hex string: {}", e);
                         AttestationError::InvalidParameter(format!("Invalid nonce format: {e}"))
                     })?;
                     if bytes.len() != 32 {

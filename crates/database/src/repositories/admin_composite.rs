@@ -196,7 +196,7 @@ impl AdminRepository for AdminCompositeRepository {
     async fn get_model_costs(
         &self,
         model_name: &str,
-    ) -> Result<Option<(i64, i64, i64, i64, bool)>> {
+    ) -> Result<Option<(i64, i64, i64, Option<i64>, bool)>> {
         let model = self.model_repo.get_by_internal_name(model_name).await?;
         Ok(model.map(|m| {
             (
@@ -430,7 +430,7 @@ impl AdminRepository for AdminCompositeRepository {
                 &deprecated_row_after.get::<_, i64>("input_cost_per_token"),
                 &deprecated_row_after.get::<_, i64>("output_cost_per_token"),
                 &deprecated_row_after.get::<_, i64>("cost_per_image"),
-                &deprecated_row_after.get::<_, i64>("cache_read_cost_per_token"),
+                &deprecated_row_after.get::<_, Option<i64>>("cache_read_cost_per_token"),
                 &deprecated_row_after.get::<_, i32>("context_length"),
                 &deprecated_row_after.get::<_, String>("model_name"),
                 &deprecated_row_after.get::<_, String>("model_display_name"),

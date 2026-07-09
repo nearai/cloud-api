@@ -40,11 +40,13 @@ const EXTERNAL_USAGE_ID_NAMESPACE: Uuid = Uuid::from_u128(0x1966acaf_9f95_5dab_b
 /// - `total = input_cost + output_cost`
 ///
 /// **Important semantic**:
-/// - When `pricing.cache_read_cost_per_token == 0`, cache pricing is treated as **disabled** and
+/// - When `pricing.cache_read_cost_per_token` is `None`, cache pricing is **disabled** and
 ///   all input tokens (including cached ones) are billed at `input_cost_per_token`.
 ///   This preserves legacy behavior for existing models even if providers start reporting
-///   `cached_tokens > 0`. Admins must explicitly set a non-zero `cache_read_cost_per_token`
-///   on a model to enable discounted cache billing.
+///   `cached_tokens > 0`. Admins must explicitly set a `cache_read_cost_per_token`
+///   on a model to enable cache billing.
+/// - `Some(0)` means cached tokens are genuinely **free**; `Some(x)` bills them at the
+///   (typically discounted) rate `x`.
 ///
 /// All costs are in nano-dollars (scale 9). Uses checked arithmetic for overflow safety.
 pub fn compute_token_cost(
@@ -63,13 +65,11 @@ pub fn compute_token_cost(
 
     let cache_read = cache_read_tokens.min(input_tokens).max(0) as i64;
     let non_cached_input = (input_tokens as i64) - cache_read;
-    // If cache_read_cost_per_token is 0, treat cache pricing as disabled and bill cached tokens
-    // at the normal input rate. This avoids making cached tokens free for existing models.
-    let effective_cache_rate = if pricing.cache_read_cost_per_token == 0 {
-        pricing.input_cost_per_token
-    } else {
-        pricing.cache_read_cost_per_token
-    };
+    // If cache_read_cost_per_token is None, cache pricing is disabled: bill cached tokens
+    // at the normal input rate. Some(0) is a genuinely free cache-read price.
+    let effective_cache_rate = pricing
+        .cache_read_cost_per_token
+        .unwrap_or(pricing.input_cost_per_token);
     let input_cost = non_cached_input
         .checked_mul(pricing.input_cost_per_token)
         .and_then(|c| {
@@ -154,8 +154,9 @@ impl UsageServiceTrait for UsageServiceImpl {
     /// Uses the same semantics as `record_usage` / `compute_token_cost`:
     /// - For token-based chat-style models, applies cache-aware pricing:
     ///   `(input - cache_read) * input_rate + cache_read * cache_read_rate + output * output_rate`.
-    /// - When `cache_read_cost_per_token == 0`, cache pricing is treated as **disabled** and
-    ///   all input tokens (including cached ones) are billed at `input_cost_per_token` (no free cache).
+    /// - When `cache_read_cost_per_token` is `None`, cache pricing is **disabled** and
+    ///   all input tokens (including cached ones) are billed at `input_cost_per_token`.
+    ///   `Some(0)` means cached tokens are genuinely free; `Some(x)` bills them at `x`.
     /// - Non-token billing types (image, audio duration, rerank, etc.) have dedicated paths in
     ///   `record_usage` and do not use this helper.
     ///
@@ -789,7 +790,7 @@ mod tests {
     fn make_pricing(
         input_cost_per_token: i64,
         output_cost_per_token: i64,
-        cache_read_cost_per_token: i64,
+        cache_read_cost_per_token: Option<i64>,
     ) -> ModelPricing {
         ModelPricing {
             id: Uuid::nil(),
@@ -807,7 +808,7 @@ mod tests {
 
     #[test]
     fn test_compute_token_cost_no_cache() {
-        let pricing = make_pricing(10, 20, 5);
+        let pricing = make_pricing(10, 20, Some(5));
         let cost = unwrap_cost(compute_token_cost(100, 50, 0, &pricing));
 
         assert_eq!(cost.input_cost, 100 * 10);
@@ -817,7 +818,8 @@ mod tests {
 
     #[test]
     fn test_compute_token_cost_partial_cache() {
-        let pricing = make_pricing(10, 20, 5);
+        // Some(x): cached tokens are billed at the configured rate x.
+        let pricing = make_pricing(10, 20, Some(5));
         let cost = unwrap_cost(compute_token_cost(100, 50, 40, &pricing));
 
         // 60 non-cached * 10 + 40 cached * 5 = 600 + 200
@@ -828,7 +830,7 @@ mod tests {
 
     #[test]
     fn test_compute_token_cost_cache_capped_to_input() {
-        let pricing = make_pricing(10, 20, 5);
+        let pricing = make_pricing(10, 20, Some(5));
         // cache_read_tokens > input_tokens, should be capped to input_tokens (30)
         let cost = unwrap_cost(compute_token_cost(30, 0, 100, &pricing));
 
@@ -839,14 +841,28 @@ mod tests {
     }
 
     #[test]
-    fn test_compute_token_cost_cache_disabled_when_zero() {
-        // cache_read_cost_per_token == 0 means "cache pricing disabled": all input tokens
-        // (including cached) are billed at input_cost_per_token. No free cached tokens.
-        let pricing = make_pricing(10, 20, 0);
+    fn test_compute_token_cost_cache_disabled_when_none() {
+        // cache_read_cost_per_token == None means "cache pricing disabled": all input
+        // tokens (including cached) are billed at input_cost_per_token. No free cached
+        // tokens.
+        let pricing = make_pricing(10, 20, None);
         let cost = unwrap_cost(compute_token_cost(100, 50, 40, &pricing));
 
         // All 100 input tokens at input rate (cached 40 are not discounted)
         assert_eq!(cost.input_cost, 100 * 10);
+        assert_eq!(cost.output_cost, 50 * 20);
+        assert_eq!(cost.total_cost, cost.input_cost + cost.output_cost);
+    }
+
+    #[test]
+    fn test_compute_token_cost_cache_genuinely_free_when_some_zero() {
+        // Some(0) is a real price: cached tokens cost exactly 0 (unlike None,
+        // which bills them at the full input rate).
+        let pricing = make_pricing(10, 20, Some(0));
+        let cost = unwrap_cost(compute_token_cost(100, 50, 40, &pricing));
+
+        // 60 non-cached * 10 + 40 cached * 0 = 600
+        assert_eq!(cost.input_cost, 60 * 10);
         assert_eq!(cost.output_cost, 50 * 20);
         assert_eq!(cost.total_cost, cost.input_cost + cost.output_cost);
     }

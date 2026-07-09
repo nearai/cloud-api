@@ -144,7 +144,7 @@ impl ModelPricingScheduler {
                     .is_none_or(|v| v == current.output_cost_per_token)
                 && change
                     .new_cache_read_cost_per_token
-                    .is_none_or(|v| v == current.cache_read_cost_per_token)
+                    .is_none_or(|v| Some(v) == current.cache_read_cost_per_token)
                 && change
                     .new_cost_per_image
                     .is_none_or(|v| v == current.cost_per_image);
@@ -179,7 +179,11 @@ impl ModelPricingScheduler {
             input_cost_per_token: change.new_input_cost_per_token,
             output_cost_per_token: change.new_output_cost_per_token,
             cost_per_image: change.new_cost_per_image,
-            cache_read_cost_per_token: change.new_cache_read_cost_per_token,
+            // Scheduled changes carry `None` = "field unchanged" and can only
+            // SET a cache-read price, never disable it (that would need the
+            // update-request's explicit-null `Some(None)` state; disabling is
+            // done via PATCH /v1/admin/models instead).
+            cache_read_cost_per_token: change.new_cache_read_cost_per_token.map(Some),
             model_display_name: None,
             model_description: None,
             model_icon: None,

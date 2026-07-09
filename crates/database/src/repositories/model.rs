@@ -414,6 +414,9 @@ impl ModelRepository {
         let openrouter_slug_value: Option<String> =
             update_request.openrouter_slug.clone().flatten();
         let openrouter_slug_clear: bool = matches!(update_request.openrouter_slug, Some(None));
+        // Tri-state as well: explicit `null` disables cache pricing (NULL column).
+        let cache_read_value: Option<i64> = update_request.cache_read_cost_per_token.flatten();
+        let cache_read_clear: bool = matches!(update_request.cache_read_cost_per_token, Some(None));
 
         let row = retry_db!("upsert_model_pricing", {
             let client = self
@@ -432,7 +435,7 @@ impl ModelRepository {
                             input_cost_per_token = COALESCE($2, input_cost_per_token),
                             output_cost_per_token = COALESCE($3, output_cost_per_token),
                             cost_per_image = COALESCE($4, cost_per_image),
-                            cache_read_cost_per_token = COALESCE($5, cache_read_cost_per_token),
+                            cache_read_cost_per_token = CASE WHEN $32 THEN NULL ELSE COALESCE($5, cache_read_cost_per_token) END,
                             model_display_name = COALESCE($6, model_display_name),
                             model_description = COALESCE($7, model_description),
                             model_icon = COALESCE($8, model_icon),
@@ -469,7 +472,7 @@ impl ModelRepository {
                             &update_request.input_cost_per_token,
                             &update_request.output_cost_per_token,
                             &update_request.cost_per_image,
-                            &update_request.cache_read_cost_per_token,
+                            &cache_read_value,
                             &update_request.model_display_name,
                             &update_request.model_description,
                             &update_request.model_icon,
@@ -496,6 +499,7 @@ impl ModelRepository {
                             &openrouter_slug_value,
                             &openrouter_slug_clear,
                             &update_request.allow_free,
+                            &cache_read_clear,
                         ],
                     )
                     .await
@@ -589,7 +593,10 @@ impl ModelRepository {
                             &update_request.input_cost_per_token.unwrap_or(0),
                             &update_request.output_cost_per_token.unwrap_or(0),
                             &update_request.cost_per_image.unwrap_or(0),
-                            &update_request.cache_read_cost_per_token.unwrap_or(0),
+                            // Absent and explicit-null both insert NULL = cache
+                            // pricing disabled (the old code inserted the
+                            // equally-disabled 0 default here).
+                            &cache_read_value,
                             &display_name.as_ref().unwrap(),
                             &description.as_ref().unwrap(),
                             &update_request.model_icon,
@@ -680,6 +687,8 @@ impl ModelRepository {
         let is_ready_value: Option<bool> = req.is_ready.flatten();
         let deprecation_date_value: Option<DateTime<Utc>> = req.deprecation_date.flatten();
         let openrouter_slug_value: Option<String> = req.openrouter_slug.clone().flatten();
+        // Absent and explicit-null both insert NULL = cache pricing disabled.
+        let cache_read_value: Option<i64> = req.cache_read_cost_per_token.flatten();
 
         let row = retry_db!("seed_model_if_absent", {
             let client = self
@@ -727,7 +736,7 @@ impl ModelRepository {
                         &req.input_cost_per_token.unwrap_or(0),
                         &req.output_cost_per_token.unwrap_or(0),
                         &req.cost_per_image.unwrap_or(0),
-                        &req.cache_read_cost_per_token.unwrap_or(0),
+                        &cache_read_value,
                         &display_name,
                         &description,
                         &req.model_icon,
@@ -1149,7 +1158,7 @@ impl ModelRepository {
                     &model_row.get::<_, i64>("input_cost_per_token"),
                     &model_row.get::<_, i64>("output_cost_per_token"),
                     &model_row.get::<_, i64>("cost_per_image"),
-                    &model_row.get::<_, i64>("cache_read_cost_per_token"),
+                    &model_row.get::<_, Option<i64>>("cache_read_cost_per_token"),
                     &model_row.get::<_, i32>("context_length"),
                     &model_row.get::<_, String>("model_name"),
                     &model_row.get::<_, String>("model_display_name"),
@@ -1445,6 +1454,10 @@ impl ModelRepository {
 
     /// Get all active models with inference_url set.
     /// Returns (model_name, inference_url, context_length) triples for direct routing.
+    /// A row whose `provider_config` declares a `long_context` tier expands into
+    /// TWO entries under the same model name (base fleet + long-context URL, each
+    /// with its own declared capacity) — see
+    /// `services::inference_provider_pool::expand_inference_endpoints`.
     pub async fn get_inference_url_models(&self) -> Result<Vec<(String, String, Option<u32>)>> {
         let rows = retry_db!("get_inference_url_models", {
             let client = self
@@ -1457,7 +1470,7 @@ impl ModelRepository {
             client
                 .query(
                     r#"
-                    SELECT model_name, inference_url, context_length
+                    SELECT model_name, inference_url, context_length, provider_config
                     FROM models
                     WHERE is_active = true
                       AND inference_url IS NOT NULL
@@ -1471,11 +1484,17 @@ impl ModelRepository {
 
         let models = rows
             .into_iter()
-            .map(|row| {
+            .flat_map(|row| {
                 let model_name: String = row.get("model_name");
                 let inference_url: String = row.get("inference_url");
                 let context_length: i32 = row.get("context_length");
-                (model_name, inference_url, Some(context_length as u32))
+                let provider_config: Option<serde_json::Value> = row.get("provider_config");
+                services::inference_provider_pool::expand_inference_endpoints(
+                    &model_name,
+                    &inference_url,
+                    Some(context_length as u32),
+                    provider_config.as_ref(),
+                )
             })
             .collect();
         Ok(models)

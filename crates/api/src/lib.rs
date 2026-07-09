@@ -956,6 +956,7 @@ pub async fn init_inference_providers(
                             pool.register_pinned_secondary_provider(
                                 entry.canonical_id.clone(),
                                 Arc::new(provider),
+                                entry.max_context_tokens,
                             )
                             .await;
                             tracing::info!(

@@ -8,7 +8,12 @@ pub struct UpdateModelAdminRequest {
     pub input_cost_per_token: Option<i64>,
     pub output_cost_per_token: Option<i64>,
     pub cost_per_image: Option<i64>,
-    pub cache_read_cost_per_token: Option<i64>,
+    /// Cost per cached input token.
+    ///
+    /// Tri-state: `None` = leave unchanged, `Some(None)` = disable cache
+    /// pricing (cached tokens billed at the full input rate), `Some(Some(v))`
+    /// = set to `v` (`Some(Some(0))` = genuinely free cache reads).
+    pub cache_read_cost_per_token: Option<Option<i64>>,
     pub model_display_name: Option<String>,
     pub model_description: Option<String>,
     pub model_icon: Option<String>,
@@ -74,7 +79,9 @@ pub struct ModelPricing {
     pub input_cost_per_token: i64,
     pub output_cost_per_token: i64,
     pub cost_per_image: i64,
-    pub cache_read_cost_per_token: i64,
+    /// `None` = cache pricing disabled; `Some(x)` = cached tokens billed at
+    /// `x` (`Some(0)` = genuinely free).
+    pub cache_read_cost_per_token: Option<i64>,
     pub context_length: i32,
     pub verifiable: bool,
     pub is_active: bool,
@@ -115,7 +122,8 @@ pub struct ModelHistoryEntry {
     pub input_cost_per_token: i64,
     pub output_cost_per_token: i64,
     pub cost_per_image: i64,
-    pub cache_read_cost_per_token: i64,
+    /// `None` = cache pricing disabled at this point in time.
+    pub cache_read_cost_per_token: Option<i64>,
     pub context_length: i32,
     pub model_name: String,
     pub model_display_name: String,
@@ -233,7 +241,9 @@ pub struct AdminModelInfo {
     pub input_cost_per_token: i64,
     pub output_cost_per_token: i64,
     pub cost_per_image: i64,
-    pub cache_read_cost_per_token: i64,
+    /// `None` = cache pricing disabled; `Some(x)` = cached tokens billed at
+    /// `x` (`Some(0)` = genuinely free).
+    pub cache_read_cost_per_token: Option<i64>,
     pub context_length: i32,
     pub verifiable: bool,
     pub is_active: bool,
@@ -393,7 +403,8 @@ pub struct ModelPricingSnapshot {
     pub model_display_name: String,
     pub input_cost_per_token: i64,
     pub output_cost_per_token: i64,
-    pub cache_read_cost_per_token: i64,
+    /// `None` = cache pricing disabled at confirm time.
+    pub cache_read_cost_per_token: Option<i64>,
     pub cost_per_image: i64,
 }
 
@@ -409,7 +420,8 @@ pub struct ScheduledPricingChangeInsert {
     pub new_cost_per_image: Option<i64>,
     pub old_input_cost_per_token: i64,
     pub old_output_cost_per_token: i64,
-    pub old_cache_read_cost_per_token: i64,
+    /// `None` = cache pricing was disabled at confirm time.
+    pub old_cache_read_cost_per_token: Option<i64>,
     pub old_cost_per_image: i64,
     pub effective_at: chrono::DateTime<chrono::Utc>,
 }
@@ -428,7 +440,8 @@ pub struct ScheduledPricingChange {
     pub new_cost_per_image: Option<i64>,
     pub old_input_cost_per_token: i64,
     pub old_output_cost_per_token: i64,
-    pub old_cache_read_cost_per_token: i64,
+    /// `None` = cache pricing was disabled at confirm time.
+    pub old_cache_read_cost_per_token: Option<i64>,
     pub old_cost_per_image: i64,
     pub effective_at: chrono::DateTime<chrono::Utc>,
     pub status: ScheduledPricingChangeStatus,
@@ -464,7 +477,8 @@ pub struct PricingChangeModelPreview {
     pub organization_count: i64,
     pub old_input_cost_per_token: i64,
     pub old_output_cost_per_token: i64,
-    pub old_cache_read_cost_per_token: i64,
+    /// `None` = cache pricing currently disabled.
+    pub old_cache_read_cost_per_token: Option<i64>,
     pub old_cost_per_image: i64,
     pub new_input_cost_per_token: Option<i64>,
     pub new_output_cost_per_token: Option<i64>,
@@ -599,11 +613,12 @@ pub trait AdminRepository: Send + Sync {
 
     /// Fetch the current pricing costs and allow_free flag for a model by name.
     /// Returns `None` if the model does not exist (new model).
-    /// Returns `Some((input_cost, output_cost, cost_per_image, cache_read_cost_per_token, allow_free))`.
+    /// Returns `Some((input_cost, output_cost, cost_per_image, cache_read_cost_per_token, allow_free))`,
+    /// where `cache_read_cost_per_token` is `None` when cache pricing is disabled.
     async fn get_model_costs(
         &self,
         model_name: &str,
-    ) -> Result<Option<(i64, i64, i64, i64, bool)>, anyhow::Error>;
+    ) -> Result<Option<(i64, i64, i64, Option<i64>, bool)>, anyhow::Error>;
 
     /// Get complete history for a model with pagination (includes pricing and other attributes)
     async fn get_model_history(

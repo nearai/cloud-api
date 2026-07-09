@@ -40,8 +40,8 @@ pub const MOCK_USER_ID: &str = "11111111-1111-1111-1111-111111111111";
 pub const E2E_QWEN_MODEL_NAME: &str = "Qwen/Qwen3-30B-A3B-Instruct-2507";
 pub const E2E_QWEN_INPUT_COST_PER_TOKEN: i64 = 1_000_000;
 pub const E2E_QWEN_OUTPUT_COST_PER_TOKEN: i64 = 2_000_000;
-/// Cache-read cost when setup_qwen_model is used (no cache pricing in API).
-pub const E2E_QWEN_CACHE_READ_COST_NO_CACHE: i64 = 0;
+/// Cache-read cost when setup_qwen_model is used (cache pricing disabled).
+pub const E2E_QWEN_CACHE_READ_COST_NO_CACHE: Option<i64> = None;
 /// Cache-read cost when setup_qwen_model_with_cache_pricing is used.
 pub const E2E_QWEN_CACHE_READ_COST_WITH_CACHE: i64 = 500_000;
 
@@ -834,7 +834,12 @@ pub async fn setup_qwen_model_with_cache_pricing(server: &axum_test::TestServer)
         "Output cost per token should match E2E_QWEN_OUTPUT_COST_PER_TOKEN"
     );
     assert_eq!(
-        updated[0].cache_read_cost_per_token.amount, E2E_QWEN_CACHE_READ_COST_WITH_CACHE,
+        updated[0]
+            .cache_read_cost_per_token
+            .as_ref()
+            .expect("cache-read pricing must be present when configured")
+            .amount,
+        E2E_QWEN_CACHE_READ_COST_WITH_CACHE,
         "Cache-read cost per token should match E2E_QWEN_CACHE_READ_COST_WITH_CACHE"
     );
     // Ensure mock provider registers model before test proceeds
@@ -862,7 +867,7 @@ pub fn e2e_qwen_model_pricing_with_cache() -> ModelPricing {
         input_cost_per_token: E2E_QWEN_INPUT_COST_PER_TOKEN,
         output_cost_per_token: E2E_QWEN_OUTPUT_COST_PER_TOKEN,
         cost_per_image: 0,
-        cache_read_cost_per_token: E2E_QWEN_CACHE_READ_COST_WITH_CACHE,
+        cache_read_cost_per_token: Some(E2E_QWEN_CACHE_READ_COST_WITH_CACHE),
     }
 }
 

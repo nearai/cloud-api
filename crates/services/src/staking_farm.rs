@@ -12,7 +12,7 @@ use uuid::Uuid;
 pub const CREDIT_TYPE_STAKING_FARM: &str = "staking_farm";
 pub const CREDIT_SOURCE_HOUSE_OF_STAKE: &str = "house-of-stake";
 const REWARD_UNIT_SCALE_24: u128 = 1_000_000_000_000_000_000_000_000;
-const STAKING_FARM_RPC_TIMEOUT_SECS: u64 = 5;
+const NEAR_RPC_TIMEOUT_SECS: u64 = 10;
 
 #[derive(Debug, thiserror::Error)]
 #[error("NEAR account is already linked to another organization")]
@@ -168,7 +168,7 @@ impl StakingFarmContractClient for NearRpcStakingFarmClient {
     ) -> anyhow::Result<FarmAccount> {
         let contract = Contract(contract_id.parse()?);
         let account: Data<FarmAccount> = tokio::time::timeout(
-            std::time::Duration::from_secs(STAKING_FARM_RPC_TIMEOUT_SECS),
+            std::time::Duration::from_secs(NEAR_RPC_TIMEOUT_SECS),
             contract
                 .call_function(
                     "get_farm_account",

@@ -14,7 +14,7 @@ use crate::{
     openapi::ApiDoc,
     routes::{
         api::{build_management_router, AppState},
-        attestation::{get_attestation_report, get_signature},
+        attestation::{self, get_signature},
         auth::{
             current_user, github_login, google_login, login_page, logout, oauth_callback,
             StateStore,
@@ -349,6 +349,7 @@ pub async fn init_domain_services_with_pool(
             models_repo.clone(),
             metrics_service.clone(),
             usage_repository_for_attestation,
+            config.ita.clone(),
         )
         .await
         .unwrap(),
@@ -1641,17 +1642,16 @@ pub fn build_conversation_routes(
 
 /// Build attestation routes with auth
 pub fn build_attestation_routes(app_state: AppState, auth_state_middleware: &AuthState) -> Router {
+    let attestation_route_state = attestation::AttestationRouteState::from(app_state);
     let authenticated_routes = Router::new()
         .route("/signature/{chat_id}", get(get_signature))
-        .with_state(app_state.clone())
+        .with_state(attestation_route_state.clone())
         .layer(from_fn_with_state(
             auth_state_middleware.clone(),
             auth_middleware_with_api_key,
         ));
 
-    let public_routes = Router::new()
-        .route("/attestation/report", get(get_attestation_report))
-        .with_state(app_state);
+    let public_routes = attestation::build_public_attestation_routes(attestation_route_state);
 
     Router::new()
         .merge(authenticated_routes)
@@ -2258,6 +2258,26 @@ mod tests {
     }
 
     #[test]
+    fn test_openapi_ita_token_endpoint_is_public() {
+        let spec = match serde_json::to_value(ApiDoc::openapi()) {
+            Ok(spec) => spec,
+            Err(error) => {
+                panic!("OpenAPI spec must serialize: {error}");
+            }
+        };
+        let ita_get = &spec["paths"]["/v1/attestation/ita-token"]["get"];
+
+        assert_eq!(
+            ita_get["security"],
+            serde_json::json!([{}]),
+            "/v1/attestation/ita-token must explicitly override global OpenAPI security"
+        );
+        assert!(spec["components"]["schemas"]
+            .as_object()
+            .is_some_and(|schemas| schemas.contains_key("ItaTokenResponse")));
+    }
+
+    #[test]
     fn test_openapi_conversation_action_paths_use_v1_prefix() {
         let spec = serde_json::to_value(ApiDoc::openapi()).unwrap();
         let paths = spec["paths"].as_object().unwrap();
@@ -2343,6 +2363,7 @@ mod tests {
             external_providers: config::ExternalProvidersConfig::default(),
             github_dispatch: config::GitHubDispatchConfig::default(),
             infra: config::InfraConfig::default(),
+            ita: config::ItaAttestationConfig::default(),
         };
 
         // Initialize services
@@ -2447,6 +2468,7 @@ mod tests {
             external_providers: config::ExternalProvidersConfig::default(),
             github_dispatch: config::GitHubDispatchConfig::default(),
             infra: config::InfraConfig::default(),
+            ita: config::ItaAttestationConfig::default(),
         };
 
         let auth_components = init_auth_services(database.clone(), &config);

@@ -43,6 +43,7 @@ mod general;
 mod glm52_tier_routing;
 mod health;
 mod invitations;
+mod ita_attestation;
 mod mcp;
 mod mcp_server;
 mod message_metadata;

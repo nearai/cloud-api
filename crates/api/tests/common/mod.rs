@@ -6,6 +6,12 @@
 //! orgs/workspaces/keys, not separate databases.
 
 pub mod db_setup;
+pub mod fake_ita;
+pub mod ita_evidence;
+pub mod ita_server;
+
+pub use ita_evidence::setup_test_server_with_config_and_ita_model_evidence;
+pub use ita_server::{setup_ita_server, setup_ita_server_with_env_policy, ItaServerMode};
 
 use api::{
     build_app_with_config, init_auth_services,
@@ -116,6 +122,7 @@ pub fn test_config() -> ApiConfig {
         external_providers: config::ExternalProvidersConfig::default(),
         github_dispatch: config::GitHubDispatchConfig::default(),
         infra: config::InfraConfig::default(),
+        ita: config::ItaAttestationConfig::default(),
     }
 }
 

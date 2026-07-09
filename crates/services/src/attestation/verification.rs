@@ -267,10 +267,12 @@ impl AttestationVerifier {
         // only (NEAR's historical behavior).
         let tcb_status = &verified_report.status;
         if self.policy.require_tcb_up_to_date() && tcb_status != "UpToDate" {
-            return Err(AttestationVerificationError::TdxVerificationFailed(format!(
-                "TCB status is '{tcb_status}' but REQUIRE_TCB_UP_TO_DATE is set (advisory_ids: {:?})",
-                verified_report.advisory_ids
-            )));
+            return Err(AttestationVerificationError::TdxVerificationFailed(
+                format!(
+                    "TCB status is '{tcb_status}' but REQUIRE_TCB_UP_TO_DATE is set (advisory_ids: {:?})",
+                    verified_report.advisory_ids
+                ),
+            ));
         }
         if tcb_status != "UpToDate" {
             tracing::warn!(

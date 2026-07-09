@@ -1,6 +1,7 @@
 // Test utilities for services crate
 use crate::{
     attestation::{
+        ita::{ItaTokenQuery, ItaTokenResponse},
         models::{AttestationReport, SignatureLookupResult},
         ports::AttestationServiceTrait,
         AttestationError,
@@ -63,6 +64,15 @@ impl AttestationServiceTrait for MockAttestationService {
         _include_tls_fingerprint: bool,
         _provider_filter: Option<ProviderTier>,
     ) -> Result<AttestationReport, AttestationError> {
+        Err(AttestationError::InternalError(
+            "Not implemented".to_string(),
+        ))
+    }
+
+    async fn get_ita_attestation_token(
+        &self,
+        _query: ItaTokenQuery,
+    ) -> Result<ItaTokenResponse, AttestationError> {
         Err(AttestationError::InternalError(
             "Not implemented".to_string(),
         ))

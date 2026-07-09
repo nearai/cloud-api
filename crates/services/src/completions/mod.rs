@@ -1768,40 +1768,40 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
             .map(|reason| crate::usage::StopReason::from_finish_reason(reason))
             .unwrap_or(crate::usage::StopReason::Completed);
 
-        tokio::spawn(async move {
-            if usage_service
-                .record_usage(RecordUsageServiceRequest {
-                    organization_id,
-                    workspace_id,
-                    api_key_id,
-                    model_id,
-                    input_tokens,
-                    output_tokens,
-                    cache_read_tokens,
-                    inference_type: crate::usage::ports::InferenceType::ChatCompletion,
-                    ttft_ms: None,    // N/A for non-streaming
-                    avg_itl_ms: None, // N/A for non-streaming
-                    inference_id: Some(inference_id),
-                    provider_request_id: Some(provider_request_id),
-                    stop_reason: Some(stop_reason),
-                    response_id,
-                    image_count: None,
-                    provider_attribution,
-                })
-                .await
-                .is_err()
-            {
-                tracing::error!("Failed to record usage in completion service");
-            } else {
-                tracing::debug!(
-                    "Recorded usage for org {}: {} input, {} output tokens (api_key: {})",
-                    organization_id,
-                    input_tokens,
-                    output_tokens,
-                    api_key_id
-                );
-            }
-        });
+        usage_service
+            .record_usage(RecordUsageServiceRequest {
+                organization_id,
+                workspace_id,
+                api_key_id,
+                model_id,
+                input_tokens,
+                output_tokens,
+                cache_read_tokens,
+                inference_type: crate::usage::ports::InferenceType::ChatCompletion,
+                ttft_ms: None,    // N/A for non-streaming
+                avg_itl_ms: None, // N/A for non-streaming
+                inference_id: Some(inference_id),
+                provider_request_id: Some(provider_request_id),
+                stop_reason: Some(stop_reason),
+                response_id,
+                image_count: None,
+                provider_attribution,
+            })
+            .await
+            .map_err(|e| {
+                let err =
+                    ports::CompletionError::InternalError(format!("Failed to record usage: {e}"));
+                self.record_error(&err, Some(&model.model_name));
+                err
+            })?;
+
+        tracing::debug!(
+            "Recorded usage for org {}: {} input, {} output tokens (api_key: {})",
+            organization_id,
+            input_tokens,
+            output_tokens,
+            api_key_id
+        );
 
         Ok(response_with_bytes)
     }

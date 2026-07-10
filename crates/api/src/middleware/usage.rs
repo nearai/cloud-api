@@ -240,7 +240,8 @@ pub async fn usage_check_middleware(
 mod tests {
     use super::*;
     use services::usage::{
-        CostBreakdown, InferenceCost, OrganizationBalanceInfo, OrganizationCreditLimit,
+        CostBreakdown, InferenceCost, InferenceUsageHistoryQuery, InferenceUsageReportQuery,
+        InferenceUsageReportRow, OrganizationBalanceInfo, OrganizationCreditLimit,
         OrganizationLimit, RecordUsageApiRequest, RecordUsageServiceRequest, UsageByModelEntry,
         UsageError, UsageLogEntry,
     };
@@ -388,6 +389,20 @@ mod tests {
             _start_date: chrono::DateTime<chrono::Utc>,
         ) -> Result<Vec<UsageByModelEntry>, UsageError> {
             unimplemented!()
+        }
+
+        async fn list_inference_usage_report(
+            &self,
+            _query: InferenceUsageReportQuery,
+        ) -> Result<Vec<InferenceUsageReportRow>, UsageError> {
+            Ok(vec![])
+        }
+
+        async fn list_inference_usage_history(
+            &self,
+            _query: InferenceUsageHistoryQuery,
+        ) -> Result<(Vec<InferenceUsageReportRow>, i64), UsageError> {
+            Ok((vec![], 0))
         }
     }
 

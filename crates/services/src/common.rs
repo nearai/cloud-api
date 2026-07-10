@@ -3,6 +3,8 @@ use uuid::Uuid;
 
 pub const API_KEY_PREFIX: &str = "sk-";
 pub const API_KEY_LENGTH: usize = 35;
+pub const REPORTING_TOKEN_PREFIX: &str = "rpt-";
+pub const REPORTING_TOKEN_LENGTH: usize = 36;
 
 /// Maximum serialized size for metadata blobs (e.g. conversation metadata, response metadata)
 pub const MAX_METADATA_SIZE_BYTES: usize = 16 * 1024;
@@ -44,6 +46,26 @@ pub fn extract_api_key_prefix(key: &str) -> String {
 
 pub fn is_valid_api_key_format(key: &str) -> bool {
     key.starts_with(API_KEY_PREFIX) && key.len() == API_KEY_LENGTH
+}
+
+pub fn generate_reporting_token() -> String {
+    format!(
+        "{}{}",
+        REPORTING_TOKEN_PREFIX,
+        Uuid::new_v4().to_string().replace("-", "")
+    )
+}
+
+pub fn hash_reporting_token(token: &str) -> String {
+    hash_api_key(token)
+}
+
+pub fn extract_reporting_token_prefix(token: &str) -> String {
+    token[..12.min(token.len())].to_string()
+}
+
+pub fn is_valid_reporting_token_format(token: &str) -> bool {
+    token.starts_with(REPORTING_TOKEN_PREFIX) && token.len() == REPORTING_TOKEN_LENGTH
 }
 
 /// Shared error types for repository operations across all domains.

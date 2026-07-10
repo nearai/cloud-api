@@ -2,7 +2,8 @@ pub mod ports;
 
 pub use ports::ServiceUsageServiceTrait;
 use ports::{
-    RecordServiceUsageParams, RecordServiceUsageWithPricingParams, ServiceUsageRepositoryTrait,
+    RecordServiceUsageParams, RecordServiceUsageWithPricingParams, ServiceUsageReportEntry,
+    ServiceUsageReportFilters, ServiceUsageRepositoryTrait,
 };
 use std::sync::Arc;
 use uuid::Uuid;
@@ -74,6 +75,16 @@ impl ServiceUsageServiceTrait for ServiceUsageService {
     ) -> Result<(Vec<ports::ServiceUsageLogEntry>, i64), ServiceUsageError> {
         self.repo
             .list_usage_logs(organization_id, service_name, limit, offset)
+            .await
+            .map_err(|e| ServiceUsageError::InternalError(e.to_string()))
+    }
+
+    async fn get_usage_report(
+        &self,
+        filters: &ServiceUsageReportFilters,
+    ) -> Result<Vec<ServiceUsageReportEntry>, ServiceUsageError> {
+        self.repo
+            .list_usage_report(filters)
             .await
             .map_err(|e| ServiceUsageError::InternalError(e.to_string()))
     }

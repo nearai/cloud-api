@@ -59,6 +59,7 @@ mod privacy_classify;
 mod privacy_redact;
 mod provider_errors;
 mod reasoning;
+mod reporting_usage;
 mod repositories;
 mod request_id_contract;
 mod rerank;

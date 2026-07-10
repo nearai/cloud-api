@@ -1,5 +1,6 @@
 pub mod ports;
 pub mod provider_attribution;
+pub mod reporting;
 
 use crate::metrics::{
     consts::{
@@ -11,6 +12,7 @@ use crate::metrics::{
 };
 pub use ports::*;
 pub use provider_attribution::*;
+pub use reporting::*;
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -779,6 +781,30 @@ impl UsageServiceTrait for UsageServiceImpl {
             .get_usage_by_model(organization_id, start_date)
             .await
             .map_err(|e| UsageError::InternalError(format!("Failed to get usage by model: {e}")))
+    }
+
+    async fn list_inference_usage_report(
+        &self,
+        query: InferenceUsageReportQuery,
+    ) -> Result<Vec<InferenceUsageReportRow>, UsageError> {
+        self.usage_repository
+            .list_inference_usage_report(query)
+            .await
+            .map_err(|e| {
+                UsageError::InternalError(format!("Failed to list inference usage report: {e}"))
+            })
+    }
+
+    async fn list_inference_usage_history(
+        &self,
+        query: InferenceUsageHistoryQuery,
+    ) -> Result<(Vec<InferenceUsageReportRow>, i64), UsageError> {
+        self.usage_repository
+            .list_inference_usage_history(query)
+            .await
+            .map_err(|e| {
+                UsageError::InternalError(format!("Failed to list inference usage history: {e}"))
+            })
     }
 }
 

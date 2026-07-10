@@ -17,6 +17,8 @@ pub mod models;
 pub mod ohttp;
 pub mod organization_members;
 pub mod organizations;
+pub mod reporting_tokens;
+pub mod reporting_usage;
 pub mod responses;
 pub mod services;
 pub mod staking_farm;

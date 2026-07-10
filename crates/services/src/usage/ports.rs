@@ -1,5 +1,9 @@
 use super::provider_attribution::ProviderAttribution;
 use crate::responses::models::ResponseId;
+pub use crate::usage::reporting::{
+    InferenceUsageHistoryQuery, InferenceUsageReportCursor, InferenceUsageReportQuery,
+    InferenceUsageReportRow,
+};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -295,6 +299,16 @@ pub trait UsageServiceTrait: Send + Sync {
         organization_id: Uuid,
         start_date: DateTime<Utc>,
     ) -> Result<Vec<UsageByModelEntry>, UsageError>;
+
+    async fn list_inference_usage_report(
+        &self,
+        query: InferenceUsageReportQuery,
+    ) -> Result<Vec<InferenceUsageReportRow>, UsageError>;
+
+    async fn list_inference_usage_history(
+        &self,
+        query: InferenceUsageHistoryQuery,
+    ) -> Result<(Vec<InferenceUsageReportRow>, i64), UsageError>;
 }
 
 // ============================================
@@ -361,6 +375,16 @@ pub trait UsageRepository: Send + Sync {
         organization_id: Uuid,
         start_date: DateTime<Utc>,
     ) -> anyhow::Result<Vec<UsageByModelEntry>>;
+
+    async fn list_inference_usage_report(
+        &self,
+        query: InferenceUsageReportQuery,
+    ) -> anyhow::Result<Vec<InferenceUsageReportRow>>;
+
+    async fn list_inference_usage_history(
+        &self,
+        query: InferenceUsageHistoryQuery,
+    ) -> anyhow::Result<(Vec<InferenceUsageReportRow>, i64)>;
 }
 
 #[async_trait::async_trait]

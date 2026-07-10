@@ -15,7 +15,7 @@ use uuid::Uuid;
 
 #[derive(Debug, Clone)]
 pub struct OrganizationUsageRepository {
-    pool: DbPool,
+    pub(crate) pool: DbPool,
 }
 
 impl OrganizationUsageRepository {

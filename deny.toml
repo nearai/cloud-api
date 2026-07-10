@@ -1,0 +1,15 @@
+[graph]
+all-features = true
+
+[advisories]
+db-urls = ["https://github.com/RustSec/advisory-db"]
+yanked = "warn"
+unmaintained = "workspace"
+unsound = "workspace"
+unused-ignored-advisory = "warn"
+ignore = [
+    { id = "RUSTSEC-2023-0071", reason = "rsa Marvin timing side channel does not affect cloud-api JWT handling because cloud-api uses HS256/HMAC rather than RSA algorithms." },
+    { id = "RUSTSEC-2024-0436", reason = "paste is an unmaintained transitive dependency from dstack-sdk/alloy; informational only and tracked for upstream migration." },
+    { id = "RUSTSEC-2024-0388", reason = "derivative is an unmaintained transitive dependency from dstack-sdk/alloy/ruint/ark-ff; informational only and tracked for upstream migration." },
+    { id = "RUSTSEC-2026-0173", reason = "proc-macro-error2 is a build-time transitive dependency from dstack-sdk/alloy-sol-macro; informational only and tracked for upstream migration." },
+]

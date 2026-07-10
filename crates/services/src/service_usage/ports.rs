@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 use uuid::Uuid;
@@ -69,6 +70,53 @@ pub struct ServiceUsageLogEntry {
     pub created_at: chrono::DateTime<chrono::Utc>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ServiceUsageReportCursor {
+    pub created_at: DateTime<Utc>,
+    pub id: Uuid,
+}
+
+#[derive(Debug, Clone)]
+pub struct ServiceUsageReportFilters {
+    pub organization_id: Uuid,
+    pub service_name: Option<String>,
+    pub workspace_id: Option<Uuid>,
+    pub api_key_id: Option<Uuid>,
+    pub start_time: Option<DateTime<Utc>>,
+    pub end_time: Option<DateTime<Utc>>,
+    pub cursor: Option<ServiceUsageReportCursor>,
+    pub limit: i64,
+}
+
+impl Default for ServiceUsageReportFilters {
+    fn default() -> Self {
+        Self {
+            organization_id: Uuid::default(),
+            service_name: None,
+            workspace_id: None,
+            api_key_id: None,
+            start_time: None,
+            end_time: None,
+            cursor: None,
+            limit: 100,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ServiceUsageReportEntry {
+    pub id: Uuid,
+    pub organization_id: Uuid,
+    pub workspace_id: Uuid,
+    pub api_key_id: Uuid,
+    pub service_id: Uuid,
+    pub service_name: String,
+    pub quantity: i32,
+    pub total_cost: i64,
+    pub inference_id: Option<Uuid>,
+    pub created_at: DateTime<Utc>,
+}
+
 /// Port for the service usage service. Implemented by ServiceUsageService.
 #[async_trait]
 pub trait ServiceUsageServiceTrait: Send + Sync {
@@ -93,6 +141,11 @@ pub trait ServiceUsageServiceTrait: Send + Sync {
         limit: i64,
         offset: i64,
     ) -> Result<(Vec<ServiceUsageLogEntry>, i64), super::ServiceUsageError>;
+
+    async fn get_usage_report(
+        &self,
+        filters: &ServiceUsageReportFilters,
+    ) -> Result<Vec<ServiceUsageReportEntry>, super::ServiceUsageError>;
 }
 
 /// Port for recording platform service usage (e.g. web_search).
@@ -116,4 +169,9 @@ pub trait ServiceUsageRepositoryTrait: Send + Sync {
         limit: i64,
         offset: i64,
     ) -> anyhow::Result<(Vec<ServiceUsageLogEntry>, i64)>;
+
+    async fn list_usage_report(
+        &self,
+        filters: &ServiceUsageReportFilters,
+    ) -> anyhow::Result<Vec<ServiceUsageReportEntry>>;
 }

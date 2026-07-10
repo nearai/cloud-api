@@ -57,7 +57,7 @@ pub async fn create_reporting_token(
 
     let user_id = authenticated_user_to_user_id(user).0;
     let created = app_state
-        .reporting_token_repository
+        .reporting_token_service
         .create(CreateOrganizationReportingTokenRequest {
             organization_id: org_id,
             name: request.name.trim().to_string(),
@@ -114,7 +114,7 @@ pub async fn list_reporting_tokens(
     require_reporting_token_manager(&app_state, user, org_id).await?;
 
     let tokens = app_state
-        .reporting_token_repository
+        .reporting_token_service
         .list_active_by_organization(org_id)
         .await
         .map_err(map_repository_error)?;
@@ -159,7 +159,7 @@ pub async fn revoke_reporting_token(
     require_reporting_token_manager(&app_state, user.clone(), org_id).await?;
 
     let token = app_state
-        .reporting_token_repository
+        .reporting_token_service
         .get_by_id(token_id)
         .await
         .map_err(map_repository_error)?
@@ -172,7 +172,7 @@ pub async fn revoke_reporting_token(
 
     let user_id = authenticated_user_to_user_id(user).0;
     match app_state
-        .reporting_token_repository
+        .reporting_token_service
         .revoke(token_id, user_id)
         .await
         .map_err(map_repository_error)?

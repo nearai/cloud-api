@@ -311,6 +311,7 @@ use utoipa::{Modify, OpenApi};
             crate::routes::reporting_usage::ReportingUsageRowSource,
             crate::routes::reporting_usage::ReportingUsageExportResponse,
             crate::routes::reporting_usage::ReportingUsageExportRow,
+            crate::routes::reporting_usage::ReportingUsageDetails,
             crate::routes::reporting_usage::ReportingInferenceUsage,
             crate::routes::reporting_usage::ReportingServiceUsage,
             crate::routes::reporting_usage::ReportingUsageSummaryResponse,

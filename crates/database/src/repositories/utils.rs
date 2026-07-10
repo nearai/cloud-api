@@ -39,6 +39,8 @@ pub fn map_db_error(err: tokio_postgres::Error) -> RepositoryError {
                 RepositoryError::ConnectionFailed(message.to_string())
             }
 
+            &SqlState::QUERY_CANCELED => RepositoryError::QueryTimeout,
+
             // Default case - wrap in generic database error
             _ => RepositoryError::DatabaseError(anyhow::anyhow!(
                 "Database error ({}): {}",

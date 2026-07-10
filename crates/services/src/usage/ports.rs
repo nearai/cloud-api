@@ -698,6 +698,7 @@ pub enum UsageError {
     NotFound(String),
     CostCalculationOverflow(String),
     ValidationError(String),
+    ReportingTimeout,
 }
 
 impl std::fmt::Display for UsageError {
@@ -712,6 +713,7 @@ impl std::fmt::Display for UsageError {
                 write!(f, "Cost calculation overflow: {msg}")
             }
             UsageError::ValidationError(msg) => write!(f, "Validation error: {msg}"),
+            UsageError::ReportingTimeout => write!(f, "Usage reporting query timed out"),
         }
     }
 }

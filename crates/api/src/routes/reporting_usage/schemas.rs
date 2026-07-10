@@ -14,7 +14,6 @@ pub struct ReportingUsageExportResponse {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct ReportingUsageExportRow {
-    pub source: ReportingUsageRowSource,
     pub id: Uuid,
     pub created_at: DateTime<Utc>,
     pub workspace_id: Uuid,
@@ -22,10 +21,24 @@ pub struct ReportingUsageExportRow {
     pub total_cost_nano_usd: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub total_cost_usd: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub inference: Option<ReportingInferenceUsage>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub service: Option<ReportingServiceUsage>,
+    #[serde(flatten)]
+    pub usage: ReportingUsageDetails,
+}
+
+impl ReportingUsageExportRow {
+    pub const fn source(&self) -> ReportingUsageRowSource {
+        match &self.usage {
+            ReportingUsageDetails::Inference { .. } => ReportingUsageRowSource::Inference,
+            ReportingUsageDetails::Service { .. } => ReportingUsageRowSource::Service,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(tag = "source", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ReportingUsageDetails {
+    Inference { inference: ReportingInferenceUsage },
+    Service { service: ReportingServiceUsage },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]

@@ -1,4 +1,4 @@
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+use super::cursor::{ReportingUsageCursor, ReportingUsageCursorFilters};
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use services::usage::InferenceType;
@@ -10,7 +10,6 @@ use uuid::Uuid;
 const DEFAULT_REPORTING_USAGE_LIMIT: u16 = 100;
 const MAX_REPORTING_USAGE_LIMIT: u16 = 1000;
 const MAX_REPORTING_USAGE_RANGE_DAYS: i64 = 366;
-const REPORTING_USAGE_CURSOR_VERSION: u8 = 1;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
@@ -129,105 +128,65 @@ impl TryFrom<ReportingUsageQueryParams> for ReportingUsageQuery {
     type Error = ReportingUsageQueryError;
 
     fn try_from(params: ReportingUsageQueryParams) -> Result<Self, Self::Error> {
-        let (start_time, end_time) = normalize_time_range(
-            parse_optional_time(params.start_time.as_deref())?,
-            parse_optional_time(params.end_time.as_deref())?,
-        )?;
+        let requested_start_time = parse_optional_time(params.start_time.as_deref())?;
+        let requested_end_time = parse_optional_time(params.end_time.as_deref())?;
+        let requested_source = params
+            .source
+            .as_deref()
+            .map(ReportingUsageSource::from_str)
+            .transpose()?;
+        let requested_inference_type = params
+            .inference_type
+            .as_deref()
+            .map(InferenceType::from_str)
+            .transpose()
+            .map_err(ReportingUsageQueryError::InvalidInferenceType)?;
+        let cursor = params
+            .cursor
+            .as_deref()
+            .map(ReportingUsageCursor::decode)
+            .transpose()?;
+        let context = match cursor.as_ref() {
+            Some(cursor) => cursor.restore_context(
+                &params,
+                requested_start_time,
+                requested_end_time,
+                requested_source,
+                requested_inference_type,
+            )?,
+            None => {
+                let (start_time, end_time) =
+                    normalize_time_range(requested_start_time, requested_end_time)?;
+                ReportingUsageCursorFilters {
+                    start_time,
+                    end_time,
+                    source: requested_source.unwrap_or_default(),
+                    workspace_id: params.workspace_id,
+                    api_key_id: params.api_key_id,
+                    model: params.model,
+                    inference_type: requested_inference_type,
+                    service_name: params.service_name,
+                }
+            }
+        };
 
         Ok(Self {
-            start_time: Some(start_time),
-            end_time: Some(end_time),
-            source: params
-                .source
-                .as_deref()
-                .map(ReportingUsageSource::from_str)
-                .transpose()?
-                .unwrap_or_default(),
-            workspace_id: params.workspace_id,
-            api_key_id: params.api_key_id,
-            model: params.model,
-            inference_type: params
-                .inference_type
-                .as_deref()
-                .map(InferenceType::from_str)
-                .transpose()
-                .map_err(ReportingUsageQueryError::InvalidInferenceType)?,
-            service_name: params.service_name,
+            start_time: Some(context.start_time),
+            end_time: Some(context.end_time),
+            source: context.source,
+            workspace_id: context.workspace_id,
+            api_key_id: context.api_key_id,
+            model: context.model,
+            inference_type: context.inference_type,
+            service_name: context.service_name,
             limit: params
                 .limit
                 .map(ReportingUsageLimit::new)
                 .transpose()?
                 .unwrap_or_default(),
-            cursor: params
-                .cursor
-                .as_deref()
-                .map(ReportingUsageCursor::decode)
-                .transpose()?,
+            cursor,
         })
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ReportingUsageCursor {
-    pub created_at: DateTime<Utc>,
-    pub source: ReportingUsageRowSource,
-    pub id: Uuid,
-}
-
-impl ReportingUsageCursor {
-    pub const fn new(created_at: DateTime<Utc>, source: ReportingUsageRowSource, id: Uuid) -> Self {
-        Self {
-            created_at,
-            source,
-            id,
-        }
-    }
-
-    pub fn encode(&self) -> Result<String, ReportingUsageQueryError> {
-        let payload = ReportingUsageCursorPayload {
-            version: REPORTING_USAGE_CURSOR_VERSION,
-            created_at: self.created_at,
-            source: self.source,
-            id: self.id,
-        };
-        let bytes =
-            serde_json::to_vec(&payload).map_err(|_| ReportingUsageQueryError::InvalidCursor)?;
-        Ok(URL_SAFE_NO_PAD.encode(bytes))
-    }
-
-    pub fn decode(value: &str) -> Result<Self, ReportingUsageQueryError> {
-        let bytes = URL_SAFE_NO_PAD
-            .decode(value)
-            .map_err(|_| ReportingUsageQueryError::InvalidCursor)?;
-        let payload: ReportingUsageCursorPayload =
-            serde_json::from_slice(&bytes).map_err(|_| ReportingUsageQueryError::InvalidCursor)?;
-        if payload.version != REPORTING_USAGE_CURSOR_VERSION {
-            return Err(ReportingUsageQueryError::InvalidCursor);
-        }
-        Ok(Self {
-            created_at: payload.created_at,
-            source: payload.source,
-            id: payload.id,
-        })
-    }
-
-    #[cfg(test)]
-    pub fn encode_raw_for_tests(
-        value: &serde_json::Value,
-    ) -> Result<String, ReportingUsageQueryError> {
-        let bytes =
-            serde_json::to_vec(value).map_err(|_| ReportingUsageQueryError::InvalidCursor)?;
-        Ok(URL_SAFE_NO_PAD.encode(bytes))
-    }
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct ReportingUsageCursorPayload {
-    #[serde(rename = "v")]
-    version: u8,
-    created_at: DateTime<Utc>,
-    source: ReportingUsageRowSource,
-    id: Uuid,
 }
 
 fn parse_optional_time(
@@ -242,7 +201,7 @@ fn parse_optional_time(
         .transpose()
 }
 
-fn validate_time_range(
+pub(super) fn validate_time_range(
     start_time: DateTime<Utc>,
     end_time: DateTime<Utc>,
 ) -> Result<(), ReportingUsageQueryError> {

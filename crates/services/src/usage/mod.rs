@@ -790,8 +790,14 @@ impl UsageServiceTrait for UsageServiceImpl {
         self.usage_repository
             .list_inference_usage_report(query)
             .await
-            .map_err(|e| {
-                UsageError::InternalError(format!("Failed to list inference usage report: {e}"))
+            .map_err(|error| {
+                if crate::common::is_query_timeout(&error) {
+                    UsageError::ReportingTimeout
+                } else {
+                    UsageError::InternalError(format!(
+                        "Failed to list inference usage report: {error}"
+                    ))
+                }
             })
     }
 

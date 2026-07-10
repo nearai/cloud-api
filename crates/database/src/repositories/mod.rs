@@ -24,6 +24,8 @@ pub mod organization_staking_farm_sources;
 pub mod organization_usage;
 mod organization_usage_reporting;
 mod organization_usage_reporting_summary;
+mod reporting_query;
+pub mod reporting_usage_summary;
 pub mod response;
 pub mod response_item;
 pub mod retry;
@@ -60,6 +62,7 @@ pub use organization_service_usage::{
 };
 pub use organization_staking_farm_sources::OrganizationStakingFarmSourcesRepository;
 pub use organization_usage::{OrganizationUsageRepository, UsageStats};
+pub use reporting_usage_summary::PostgresReportingUsageSummaryRepository;
 pub use response::PgResponseRepository;
 pub use response_item::PgResponseItemsRepository;
 pub use service::ServiceRepository;

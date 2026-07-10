@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::time::Instant;
 use utoipa::ToSchema;
 use uuid::Uuid;
 
@@ -86,6 +87,7 @@ pub struct ServiceUsageReportFilters {
     pub end_time: Option<DateTime<Utc>>,
     pub cursor: Option<ServiceUsageReportCursor>,
     pub limit: i64,
+    pub deadline: Option<Instant>,
 }
 
 impl Default for ServiceUsageReportFilters {
@@ -99,6 +101,7 @@ impl Default for ServiceUsageReportFilters {
             end_time: None,
             cursor: None,
             limit: 100,
+            deadline: None,
         }
     }
 }

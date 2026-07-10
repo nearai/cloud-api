@@ -123,6 +123,10 @@ pub fn test_config() -> ApiConfig {
         github_dispatch: config::GitHubDispatchConfig::default(),
         infra: config::InfraConfig::default(),
         staking_farm: config::StakingFarmConfig::default(),
+        usage_reporting: config::UsageReportingConfig {
+            enabled: true,
+            ..config::UsageReportingConfig::default()
+        },
         ita: config::ItaAttestationConfig::default(),
     }
 }
@@ -410,6 +414,19 @@ where
     let (server, _pool, _mock) =
         build_test_server_components(infra.database.clone(), infra.config).await;
     server
+}
+
+pub async fn setup_test_server_with_config_and_database<F>(
+    mutate: F,
+) -> (axum_test::TestServer, Arc<Database>)
+where
+    F: FnOnce(&mut config::ApiConfig),
+{
+    let mut infra = setup_test_infrastructure().await;
+    mutate(&mut infra.config);
+    let database = infra.database.clone();
+    let (server, _pool, _mock) = build_test_server_components(database.clone(), infra.config).await;
+    (server, database)
 }
 
 pub async fn setup_test_server_with_database() -> (axum_test::TestServer, Arc<Database>) {

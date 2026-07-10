@@ -112,10 +112,10 @@ async fn insert_inference_usage(
                     id, organization_id, workspace_id, api_key_id, model_id, model_name,
                     input_tokens, output_tokens, cache_read_tokens, total_tokens,
                     input_cost, output_cost, total_cost, request_type, inference_type,
-                    created_at, inference_id, stop_reason
+                    created_at, inference_id, provider_request_id, stop_reason
                 )
                 VALUES ($1, $2, $3, $4, $5, $6, $7, 3, 1, $8, $9, 300, $10,
-                    NULL, 'chat_completion', $11, $12, 'completed')
+                    NULL, 'chat_completion', $11, $12, $13, 'completed')
                 "#,
                 &[
                     &Uuid::new_v4(),
@@ -130,6 +130,7 @@ async fn insert_inference_usage(
                     &total_cost,
                     &created_at,
                     &Some(Uuid::new_v4()),
+                    &Some(format!("private-provider-request-{total_cost}")),
                 ],
             )
             .await

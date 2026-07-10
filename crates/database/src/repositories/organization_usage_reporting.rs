@@ -18,23 +18,39 @@ impl OrganizationUsageRepository {
         let cursor_created_at = cursor.map(|value| value.created_at);
         let cursor_id = cursor.map(|value| value.id);
         let limit = i64::from(query.limit);
+        let deadline = crate::repositories::reporting_query::reporting_deadline(
+            self.reporting_statement_timeout,
+            query.deadline,
+        )?;
 
         let rows = retry_db!("list_inference_usage_report", {
-            let client = self
+            let mut client = self
                 .pool
                 .get()
                 .await
                 .context("Failed to get database connection")
                 .map_err(RepositoryError::PoolError)?;
 
-            client
+            let transaction = client
+                .build_transaction()
+                .read_only(true)
+                .start()
+                .await
+                .map_err(map_db_error)?;
+            crate::repositories::reporting_query::configure_reporting_transaction(
+                &transaction,
+                crate::repositories::reporting_query::remaining_statement_timeout(deadline)?,
+            )
+            .await?;
+            let rows = transaction
                 .query(
                     r#"
                     SELECT
                         id, organization_id, workspace_id, api_key_id, created_at,
                         model_name, inference_type, input_tokens, output_tokens,
                         cache_read_tokens, total_tokens, input_cost, output_cost,
-                        total_cost, response_id, inference_id, stop_reason, image_count
+                        total_cost, response_id, provider_request_id, inference_id,
+                        stop_reason, image_count
                     FROM organization_usage_log
                     WHERE organization_id = $1
                       AND ($2::TIMESTAMPTZ IS NULL OR created_at >= $2)
@@ -65,7 +81,9 @@ impl OrganizationUsageRepository {
                     ],
                 )
                 .await
-                .map_err(map_db_error)
+                .map_err(map_db_error)?;
+            transaction.commit().await.map_err(map_db_error)?;
+            Ok::<_, RepositoryError>(rows)
         })?;
 
         Ok(rows.iter().map(row_to_report).collect())
@@ -92,7 +110,8 @@ impl OrganizationUsageRepository {
                         id, organization_id, workspace_id, api_key_id, created_at,
                         model_name, inference_type, input_tokens, output_tokens,
                         cache_read_tokens, total_tokens, input_cost, output_cost,
-                        total_cost, response_id, inference_id, stop_reason, image_count
+                        total_cost, response_id, provider_request_id, inference_id,
+                        stop_reason, image_count
                     FROM organization_usage_log
                     WHERE organization_id = $1
                       AND ($2::TIMESTAMPTZ IS NULL OR created_at >= $2)
@@ -197,6 +216,7 @@ fn row_to_report(row: &Row) -> InferenceUsageReportRow {
         cache_read_cost_nano_usd: None,
         total_cost_nano_usd: row.get("total_cost"),
         response_id: row.get("response_id"),
+        provider_request_id: row.get("provider_request_id"),
         inference_id: row.get("inference_id"),
         stop_reason: row.get("stop_reason"),
         image_count: row.get("image_count"),

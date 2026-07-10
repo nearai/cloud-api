@@ -7,6 +7,7 @@ pub mod patroni_discovery;
 pub mod pool;
 pub mod repositories;
 pub mod shutdown_coordinator;
+mod usage_reporting_indexes;
 
 pub use constants::*;
 pub use models::*;
@@ -15,9 +16,11 @@ pub use repositories::{
     ApiKeyRepository, McpConnectorRepository, OAuthStateRepository,
     OrganizationReportingTokenRepository, PgAttestationRepository, PgConversationRepository,
     PgOrganizationInvitationRepository, PgOrganizationRepository, PgResponseItemsRepository,
-    PgResponseRepository, PostgresNearNonceRepository, SessionRepository, UserRepository,
+    PgResponseRepository, PostgresNearNonceRepository, PostgresReportingUsageSummaryRepository,
+    SessionRepository, UserRepository,
 };
 pub use shutdown_coordinator::{ShutdownCoordinator, ShutdownStage, ShutdownStageResult};
+pub use usage_reporting_indexes::ensure_usage_reporting_indexes;
 
 use anyhow::Result;
 use cluster_manager::{ClusterManager, DatabaseConfig as ClusterDbConfig, ReadPreference};

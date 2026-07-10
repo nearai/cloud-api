@@ -23,6 +23,7 @@ pub struct ReportingTokenResponse {
     pub created_by_user_id: Uuid,
     pub created_at: DateTime<Utc>,
     pub expires_at: Option<DateTime<Utc>>,
+    /// Approximate last-authentication timestamp, refreshed at most once every 15 minutes.
     pub last_used_at: Option<DateTime<Utc>>,
     pub scope: ReportingTokenScope,
 }
@@ -39,6 +40,7 @@ pub struct CreateReportingTokenResponse {
     pub created_by_user_id: Uuid,
     pub created_at: DateTime<Utc>,
     pub expires_at: Option<DateTime<Utc>>,
+    /// Approximate last-authentication timestamp, refreshed at most once every 15 minutes.
     pub last_used_at: Option<DateTime<Utc>>,
     pub scope: ReportingTokenScope,
 }
@@ -55,7 +57,7 @@ impl CreateReportingTokenRequest {
         if name.is_empty() {
             return Err("name is required".to_string());
         }
-        if name.len() > 255 {
+        if name.chars().count() > 255 {
             return Err("name must be at most 255 characters".to_string());
         }
         if let Some(expires_at) = self.expires_at {
@@ -64,5 +66,28 @@ impl CreateReportingTokenRequest {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reporting_token_name_limit_counts_characters_not_utf8_bytes() {
+        let valid = CreateReportingTokenRequest {
+            name: "é".repeat(255),
+            expires_at: None,
+        };
+        let invalid = CreateReportingTokenRequest {
+            name: "é".repeat(256),
+            expires_at: None,
+        };
+
+        assert!(valid.validate().is_ok());
+        assert_eq!(
+            invalid.validate(),
+            Err("name must be at most 255 characters".to_string())
+        );
     }
 }

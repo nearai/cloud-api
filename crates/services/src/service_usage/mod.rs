@@ -16,6 +16,8 @@ pub enum ServiceUsageError {
     CostOverflow,
     #[error("Internal error: {0}")]
     InternalError(String),
+    #[error("Usage reporting query timed out")]
+    ReportingTimeout,
 }
 
 /// Records platform-level service usage (e.g. web_search) and updates org balance.
@@ -83,9 +85,12 @@ impl ServiceUsageServiceTrait for ServiceUsageService {
         &self,
         filters: &ServiceUsageReportFilters,
     ) -> Result<Vec<ServiceUsageReportEntry>, ServiceUsageError> {
-        self.repo
-            .list_usage_report(filters)
-            .await
-            .map_err(|e| ServiceUsageError::InternalError(e.to_string()))
+        self.repo.list_usage_report(filters).await.map_err(|error| {
+            if crate::common::is_query_timeout(&error) {
+                ServiceUsageError::ReportingTimeout
+            } else {
+                ServiceUsageError::InternalError(error.to_string())
+            }
+        })
     }
 }

@@ -187,7 +187,7 @@ pub async fn auth_middleware(
             Err((
                 StatusCode::UNAUTHORIZED,
                 axum::Json(crate::models::ErrorResponse::new(
-                    "Invalid authorization header format".to_string(),
+                    "Authorization header does not start with 'Bearer '".to_string(),
                     "unauthorized".to_string(),
                 )),
             ))
@@ -671,9 +671,9 @@ async fn authenticate_reporting_token(
     state: &AuthState,
     token: &str,
 ) -> Result<AuthenticatedReportingToken, (StatusCode, axum::Json<crate::models::ErrorResponse>)> {
-    debug!("Calling reporting token repository to validate token");
+    debug!("Calling reporting token service to validate token");
 
-    match state.reporting_token_repository.validate(token).await {
+    match state.reporting_token_service.validate(token).await {
         Ok(Some(validated)) => Ok(reporting_token_extension(validated)),
         Ok(None) => {
             debug!("Invalid or expired reporting token");
@@ -771,8 +771,8 @@ pub struct AuthState {
     pub oauth_manager: Arc<OAuthManager>,
     pub auth_service: Arc<dyn AuthServiceTrait>,
     pub workspace_repository: Arc<dyn services::workspace::WorkspaceRepository>,
-    pub reporting_token_repository:
-        Arc<dyn services::reporting_tokens::OrganizationReportingTokenRepository>,
+    pub reporting_token_service:
+        Arc<dyn services::reporting_tokens::OrganizationReportingTokenService>,
     pub admin_access_token_repository: Arc<database::repositories::AdminAccessTokenRepository>,
     pub admin_domains: Vec<String>,
     pub encoding_key: String,
@@ -783,8 +783,8 @@ impl AuthState {
         oauth_manager: Arc<OAuthManager>,
         auth_service: Arc<dyn AuthServiceTrait>,
         workspace_repository: Arc<dyn services::workspace::WorkspaceRepository>,
-        reporting_token_repository: Arc<
-            dyn services::reporting_tokens::OrganizationReportingTokenRepository,
+        reporting_token_service: Arc<
+            dyn services::reporting_tokens::OrganizationReportingTokenService,
         >,
         admin_access_token_repository: Arc<database::repositories::AdminAccessTokenRepository>,
         admin_domains: Vec<String>,
@@ -794,7 +794,7 @@ impl AuthState {
             oauth_manager,
             auth_service,
             workspace_repository,
-            reporting_token_repository,
+            reporting_token_service,
             admin_access_token_repository,
             admin_domains,
             encoding_key,

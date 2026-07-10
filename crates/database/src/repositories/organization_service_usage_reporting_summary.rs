@@ -1,224 +1,149 @@
-use crate::repositories::{utils::map_db_error, OrganizationServiceUsageRepository};
-use crate::retry_db;
-use anyhow::{Context, Result};
+use crate::repositories::utils::map_db_error;
 use services::{
     common::RepositoryError,
     reporting_usage::{
         ReportingUsageSummaryFilters, ServiceApiKeySummary, ServiceDaySummary, ServiceNameSummary,
-        ServiceUsageSummary, ServiceUsageSummaryRepository, ServiceUsageTotals,
-        ServiceWorkspaceSummary,
+        ServiceUsageSummary, ServiceUsageTotals, ServiceWorkspaceSummary,
     },
 };
-use tokio_postgres::Row;
+use tokio_postgres::{GenericClient, Row};
+use uuid::Uuid;
 
-impl OrganizationServiceUsageRepository {
-    pub async fn summarize_service_usage_report(
-        &self,
-        filters: &ReportingUsageSummaryFilters,
-    ) -> Result<ServiceUsageSummary> {
-        let summary = retry_db!("summarize_service_usage_report", {
-            let client = self
-                .pool
-                .get()
-                .await
-                .context("Failed to get database connection")
-                .map_err(RepositoryError::PoolError)?;
+pub(super) async fn summarize_service_usage<C>(
+    client: &C,
+    filters: &ReportingUsageSummaryFilters,
+) -> Result<ServiceUsageSummary, RepositoryError>
+where
+    C: GenericClient + Sync,
+{
+    let rows = client
+        .query(
+            r#"
+            WITH filtered AS MATERIALIZED (
+                SELECT usage_log.workspace_id, usage_log.api_key_id,
+                       services.service_name,
+                       DATE_TRUNC('day', usage_log.created_at) AS day,
+                       usage_log.quantity, usage_log.total_cost
+                FROM organization_service_usage_log AS usage_log
+                INNER JOIN services ON services.id = usage_log.service_id
+                WHERE usage_log.organization_id = $1
+                  AND ($2::TIMESTAMPTZ IS NULL OR usage_log.created_at >= $2)
+                  AND ($3::TIMESTAMPTZ IS NULL OR usage_log.created_at <= $3)
+                  AND ($4::UUID IS NULL OR usage_log.workspace_id = $4)
+                  AND ($5::UUID IS NULL OR usage_log.api_key_id = $5)
+                  AND ($6::TEXT IS NULL OR services.service_name = $6)
+            )
+            SELECT
+                CASE
+                    WHEN GROUPING(workspace_id) = 0 THEN 'workspace'
+                    WHEN GROUPING(api_key_id) = 0 THEN 'api_key'
+                    WHEN GROUPING(service_name) = 0 THEN 'service'
+                    WHEN GROUPING(day) = 0 THEN 'day'
+                    ELSE 'totals'
+                END AS dimension,
+                workspace_id,
+                api_key_id,
+                service_name,
+                TO_CHAR(day, 'YYYY-MM-DD') AS day,
+                COUNT(*)::BIGINT AS usage_count,
+                COALESCE(SUM(quantity), 0)::BIGINT AS quantity,
+                COALESCE(SUM(total_cost), 0)::BIGINT AS total_cost
+            FROM filtered
+            GROUP BY GROUPING SETS (
+                (), (workspace_id), (api_key_id), (service_name), (day)
+            )
+            "#,
+            &[
+                &filters.organization_id,
+                &filters.start_time,
+                &filters.end_time,
+                &filters.workspace_id,
+                &filters.api_key_id,
+                &filters.service_name,
+            ],
+        )
+        .await
+        .map_err(map_db_error)?;
 
-            let totals = client
-                .query_one(
-                    r#"
-                    SELECT COUNT(*)::bigint,
-                           COALESCE(SUM(usage_log.total_cost), 0)::bigint
-                    FROM organization_service_usage_log AS usage_log
-                    INNER JOIN services ON services.id = usage_log.service_id
-                    WHERE usage_log.organization_id = $1
-                      AND ($2::TIMESTAMPTZ IS NULL OR usage_log.created_at >= $2)
-                      AND ($3::TIMESTAMPTZ IS NULL OR usage_log.created_at <= $3)
-                      AND ($4::UUID IS NULL OR usage_log.workspace_id = $4)
-                      AND ($5::UUID IS NULL OR usage_log.api_key_id = $5)
-                      AND ($6::TEXT IS NULL OR services.service_name = $6)
-                    "#,
-                    &[
-                        &filters.organization_id,
-                        &filters.start_time,
-                        &filters.end_time,
-                        &filters.workspace_id,
-                        &filters.api_key_id,
-                        &filters.service_name,
-                    ],
-                )
-                .await
-                .map_err(map_db_error)?;
-
-            let by_workspace = client
-                .query(
-                    r#"
-                    SELECT usage_log.workspace_id, COUNT(*)::bigint,
-                           COALESCE(SUM(usage_log.total_cost), 0)::bigint
-                    FROM organization_service_usage_log AS usage_log
-                    INNER JOIN services ON services.id = usage_log.service_id
-                    WHERE usage_log.organization_id = $1
-                      AND ($2::TIMESTAMPTZ IS NULL OR usage_log.created_at >= $2)
-                      AND ($3::TIMESTAMPTZ IS NULL OR usage_log.created_at <= $3)
-                      AND ($4::UUID IS NULL OR usage_log.workspace_id = $4)
-                      AND ($5::UUID IS NULL OR usage_log.api_key_id = $5)
-                      AND ($6::TEXT IS NULL OR services.service_name = $6)
-                    GROUP BY usage_log.workspace_id
-                    ORDER BY 3 DESC, usage_log.workspace_id ASC
-                    "#,
-                    &[
-                        &filters.organization_id,
-                        &filters.start_time,
-                        &filters.end_time,
-                        &filters.workspace_id,
-                        &filters.api_key_id,
-                        &filters.service_name,
-                    ],
-                )
-                .await
-                .map_err(map_db_error)?;
-
-            let by_api_key = client
-                .query(
-                    r#"
-                    SELECT usage_log.api_key_id, COUNT(*)::bigint,
-                           COALESCE(SUM(usage_log.total_cost), 0)::bigint
-                    FROM organization_service_usage_log AS usage_log
-                    INNER JOIN services ON services.id = usage_log.service_id
-                    WHERE usage_log.organization_id = $1
-                      AND ($2::TIMESTAMPTZ IS NULL OR usage_log.created_at >= $2)
-                      AND ($3::TIMESTAMPTZ IS NULL OR usage_log.created_at <= $3)
-                      AND ($4::UUID IS NULL OR usage_log.workspace_id = $4)
-                      AND ($5::UUID IS NULL OR usage_log.api_key_id = $5)
-                      AND ($6::TEXT IS NULL OR services.service_name = $6)
-                    GROUP BY usage_log.api_key_id
-                    ORDER BY 3 DESC, usage_log.api_key_id ASC
-                    "#,
-                    &[
-                        &filters.organization_id,
-                        &filters.start_time,
-                        &filters.end_time,
-                        &filters.workspace_id,
-                        &filters.api_key_id,
-                        &filters.service_name,
-                    ],
-                )
-                .await
-                .map_err(map_db_error)?;
-
-            let by_service = client
-                .query(
-                    r#"
-                    SELECT services.service_name, COUNT(*)::bigint,
-                           COALESCE(SUM(usage_log.quantity), 0)::bigint,
-                           COALESCE(SUM(usage_log.total_cost), 0)::bigint
-                    FROM organization_service_usage_log AS usage_log
-                    INNER JOIN services ON services.id = usage_log.service_id
-                    WHERE usage_log.organization_id = $1
-                      AND ($2::TIMESTAMPTZ IS NULL OR usage_log.created_at >= $2)
-                      AND ($3::TIMESTAMPTZ IS NULL OR usage_log.created_at <= $3)
-                      AND ($4::UUID IS NULL OR usage_log.workspace_id = $4)
-                      AND ($5::UUID IS NULL OR usage_log.api_key_id = $5)
-                      AND ($6::TEXT IS NULL OR services.service_name = $6)
-                    GROUP BY services.service_name
-                    ORDER BY 4 DESC, services.service_name ASC
-                    "#,
-                    &[
-                        &filters.organization_id,
-                        &filters.start_time,
-                        &filters.end_time,
-                        &filters.workspace_id,
-                        &filters.api_key_id,
-                        &filters.service_name,
-                    ],
-                )
-                .await
-                .map_err(map_db_error)?;
-
-            let by_day = client
-                .query(
-                    r#"
-                    SELECT TO_CHAR(DATE_TRUNC('day', usage_log.created_at), 'YYYY-MM-DD'),
-                           COUNT(*)::bigint,
-                           COALESCE(SUM(usage_log.total_cost), 0)::bigint
-                    FROM organization_service_usage_log AS usage_log
-                    INNER JOIN services ON services.id = usage_log.service_id
-                    WHERE usage_log.organization_id = $1
-                      AND ($2::TIMESTAMPTZ IS NULL OR usage_log.created_at >= $2)
-                      AND ($3::TIMESTAMPTZ IS NULL OR usage_log.created_at <= $3)
-                      AND ($4::UUID IS NULL OR usage_log.workspace_id = $4)
-                      AND ($5::UUID IS NULL OR usage_log.api_key_id = $5)
-                      AND ($6::TEXT IS NULL OR services.service_name = $6)
-                    GROUP BY DATE_TRUNC('day', usage_log.created_at)
-                    ORDER BY 1 ASC
-                    "#,
-                    &[
-                        &filters.organization_id,
-                        &filters.start_time,
-                        &filters.end_time,
-                        &filters.workspace_id,
-                        &filters.api_key_id,
-                        &filters.service_name,
-                    ],
-                )
-                .await
-                .map_err(map_db_error)?;
-
-            Ok::<_, RepositoryError>(ServiceUsageSummary {
-                totals: ServiceUsageTotals {
-                    usage_count: totals.get(0),
-                    total_cost_nano_usd: totals.get(1),
-                },
-                by_workspace: by_workspace.iter().map(workspace_from_row).collect(),
-                by_api_key: by_api_key.iter().map(api_key_from_row).collect(),
-                by_service: by_service.iter().map(service_from_row).collect(),
-                by_day: by_day.iter().map(day_from_row).collect(),
-            })
-        })?;
-
-        Ok(summary)
+    let mut summary = ServiceUsageSummary::default();
+    for row in &rows {
+        let dimension: String = value(row, "dimension")?;
+        let usage_count = value(row, "usage_count")?;
+        let total_cost_nano_usd = value(row, "total_cost")?;
+        match dimension.as_str() {
+            "totals" => {
+                summary.totals = ServiceUsageTotals {
+                    usage_count,
+                    total_cost_nano_usd,
+                };
+            }
+            "workspace" => summary.by_workspace.push(ServiceWorkspaceSummary {
+                workspace_id: required_uuid(row, "workspace_id")?,
+                usage_count,
+                total_cost_nano_usd,
+            }),
+            "api_key" => summary.by_api_key.push(ServiceApiKeySummary {
+                api_key_id: required_uuid(row, "api_key_id")?,
+                usage_count,
+                total_cost_nano_usd,
+            }),
+            "service" => summary.by_service.push(ServiceNameSummary {
+                service_name: required_string(row, "service_name")?,
+                usage_count,
+                quantity: value(row, "quantity")?,
+                total_cost_nano_usd,
+            }),
+            "day" => summary.by_day.push(ServiceDaySummary {
+                day: required_string(row, "day")?,
+                usage_count,
+                total_cost_nano_usd,
+            }),
+            other => {
+                return Err(RepositoryError::DataConversionError(anyhow::anyhow!(
+                    "unknown service summary dimension: {other}"
+                )));
+            }
+        }
     }
+
+    summary.by_workspace.sort_by(|left, right| {
+        right
+            .total_cost_nano_usd
+            .cmp(&left.total_cost_nano_usd)
+            .then_with(|| left.workspace_id.cmp(&right.workspace_id))
+    });
+    summary.by_api_key.sort_by(|left, right| {
+        right
+            .total_cost_nano_usd
+            .cmp(&left.total_cost_nano_usd)
+            .then_with(|| left.api_key_id.cmp(&right.api_key_id))
+    });
+    summary.by_service.sort_by(|left, right| {
+        right
+            .total_cost_nano_usd
+            .cmp(&left.total_cost_nano_usd)
+            .then_with(|| left.service_name.cmp(&right.service_name))
+    });
+    summary
+        .by_day
+        .sort_by(|left, right| left.day.cmp(&right.day));
+    Ok(summary)
 }
 
-#[async_trait::async_trait]
-impl ServiceUsageSummaryRepository for OrganizationServiceUsageRepository {
-    async fn summarize_service_usage(
-        &self,
-        filters: &ReportingUsageSummaryFilters,
-    ) -> Result<ServiceUsageSummary> {
-        self.summarize_service_usage_report(filters).await
-    }
+fn value<T>(row: &Row, column: &str) -> Result<T, RepositoryError>
+where
+    T: tokio_postgres::types::FromSqlOwned,
+{
+    row.try_get(column)
+        .map_err(|error| RepositoryError::DataConversionError(error.into()))
 }
 
-fn workspace_from_row(row: &Row) -> ServiceWorkspaceSummary {
-    ServiceWorkspaceSummary {
-        workspace_id: row.get(0),
-        usage_count: row.get(1),
-        total_cost_nano_usd: row.get(2),
-    }
+fn required_uuid(row: &Row, column: &str) -> Result<Uuid, RepositoryError> {
+    value::<Option<Uuid>>(row, column)?
+        .ok_or_else(|| RepositoryError::DataConversionError(anyhow::anyhow!("missing {column}")))
 }
 
-fn api_key_from_row(row: &Row) -> ServiceApiKeySummary {
-    ServiceApiKeySummary {
-        api_key_id: row.get(0),
-        usage_count: row.get(1),
-        total_cost_nano_usd: row.get(2),
-    }
-}
-
-fn service_from_row(row: &Row) -> ServiceNameSummary {
-    ServiceNameSummary {
-        service_name: row.get(0),
-        usage_count: row.get(1),
-        quantity: row.get(2),
-        total_cost_nano_usd: row.get(3),
-    }
-}
-
-fn day_from_row(row: &Row) -> ServiceDaySummary {
-    ServiceDaySummary {
-        day: row.get(0),
-        usage_count: row.get(1),
-        total_cost_nano_usd: row.get(2),
-    }
+fn required_string(row: &Row, column: &str) -> Result<String, RepositoryError> {
+    value::<Option<String>>(row, column)?
+        .ok_or_else(|| RepositoryError::DataConversionError(anyhow::anyhow!("missing {column}")))
 }

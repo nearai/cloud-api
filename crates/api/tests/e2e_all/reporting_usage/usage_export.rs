@@ -2,7 +2,9 @@ use super::usage_export_fixture::{
     assert_no_private_export_fields, redacted_export, seed_export_fixture, url_ts, ExportFixture,
 };
 use super::{bearer, setup_reporting_usage_server};
-use crate::common::{create_org, get_session_id, MOCK_USER_AGENT};
+use crate::common::{
+    create_org, get_session_id, setup_test_server_with_config_and_database, MOCK_USER_AGENT,
+};
 use serde_json::Value;
 
 #[tokio::test]
@@ -96,6 +98,143 @@ async fn usage_export() {
 }
 
 #[tokio::test]
+async fn usage_export_cursor_restores_filters_and_excludes_consumed_tied_service_rows() {
+    // Given: a mixed export whose third row is inference usage tied with a service row.
+    let (server, database) = setup_reporting_usage_server().await;
+    let fixture = seed_export_fixture(&server, &database).await;
+    let first_url = format!(
+        "/v1/organizations/{}/usage/export?start_time={}&end_time={}&source=all&workspace_id={}&api_key_id={}&limit=3",
+        fixture.org_id,
+        url_ts(2026, 7, 1),
+        url_ts(2026, 7, 4),
+        fixture.workspace_id,
+        fixture.api_key_id
+    );
+    let first = get_export(&server, &fixture, first_url).await;
+    let first_rows = first["data"].as_array().expect("data should be an array");
+    assert_eq!(first_rows.len(), 3);
+    assert_eq!(first_rows[1]["source"], "service");
+    assert_eq!(first_rows[2]["source"], "inference");
+    assert_eq!(first_rows[1]["created_at"], first_rows[2]["created_at"]);
+    let cursor = first["next_cursor"]
+        .as_str()
+        .expect("first page should include next_cursor");
+
+    // When: page two supplies only the cursor, omitting the original window and filters.
+    let second = get_export(
+        &server,
+        &fixture,
+        format!(
+            "/v1/organizations/{}/usage/export?cursor={cursor}",
+            fixture.org_id
+        ),
+    )
+    .await;
+
+    // Then: context is restored and the already-consumed tied service row is not duplicated.
+    let second_rows = second["data"].as_array().expect("data should be an array");
+    assert_eq!(second_rows.len(), 1, "{second}");
+    assert_eq!(second_rows[0]["source"], "inference");
+    assert_eq!(second_rows[0]["created_at"], "2026-07-01T00:00:00Z");
+    assert!(second.get("next_cursor").is_none());
+}
+
+#[tokio::test]
+async fn usage_export_rejects_cursor_from_another_organization() {
+    let (server, database) = setup_reporting_usage_server().await;
+    let first_org = seed_export_fixture(&server, &database).await;
+    let second_org = seed_export_fixture(&server, &database).await;
+
+    let first_page = server
+        .get(
+            format!(
+                "/v1/organizations/{}/usage/export?start_time={}&end_time={}&limit=1",
+                first_org.org_id,
+                url_ts(2026, 7, 1),
+                url_ts(2026, 7, 4)
+            )
+            .as_str(),
+        )
+        .add_header("Authorization", bearer(&first_org.token))
+        .add_header("User-Agent", MOCK_USER_AGENT)
+        .await;
+    assert_eq!(first_page.status_code(), 200, "{}", first_page.text());
+    let cursor = first_page
+        .json::<Value>()
+        .get("next_cursor")
+        .and_then(Value::as_str)
+        .expect("first organization should return a continuation cursor")
+        .to_string();
+
+    let replay = server
+        .get(
+            format!(
+                "/v1/organizations/{}/usage/export?cursor={cursor}",
+                second_org.org_id
+            )
+            .as_str(),
+        )
+        .add_header("Authorization", bearer(&second_org.token))
+        .add_header("User-Agent", MOCK_USER_AGENT)
+        .await;
+
+    assert_eq!(replay.status_code(), 400, "{}", replay.text());
+    assert_eq!(
+        replay.json::<Value>()["error"]["type"],
+        "invalid_reporting_usage_query"
+    );
+}
+
+#[tokio::test]
+async fn usage_export_database_timeout_returns_504_and_stops_query() {
+    let (server, database) = setup_test_server_with_config_and_database(|config| {
+        config.usage_reporting.request_timeout_seconds = 1;
+    })
+    .await;
+    let org = create_org(&server).await;
+    let token = super::create_reporting_token(&server, &org.id).await;
+    let mut blocker = database
+        .pool()
+        .get()
+        .await
+        .expect("blocking database connection");
+    let transaction = blocker.transaction().await.expect("blocking transaction");
+    transaction
+        .batch_execute("LOCK TABLE organization_usage_log IN ACCESS EXCLUSIVE MODE")
+        .await
+        .expect("exclusive test lock");
+
+    let response = server
+        .get(format!("/v1/organizations/{}/usage/export?source=inference", org.id).as_str())
+        .add_header("Authorization", bearer(&token))
+        .add_header("User-Agent", MOCK_USER_AGENT)
+        .await;
+
+    assert_eq!(response.status_code(), 504, "{}", response.text());
+    assert_eq!(
+        response.json::<Value>()["error"]["type"],
+        "reporting_request_timeout"
+    );
+    let active_query_count: i64 = transaction
+        .query_one(
+            r#"
+            SELECT COUNT(*)::BIGINT
+            FROM pg_stat_activity
+            WHERE datname = current_database()
+              AND pid <> pg_backend_pid()
+              AND state = 'active'
+              AND query LIKE '%FROM organization_usage_log%'
+            "#,
+            &[],
+        )
+        .await
+        .expect("active query check")
+        .get(0);
+    assert_eq!(active_query_count, 0, "timed-out export query must stop");
+    transaction.rollback().await.expect("release test lock");
+}
+
+#[tokio::test]
 async fn usage_export_omits_cache_read_cost_when_not_separately_persisted() {
     // Given: persisted inference usage includes cached tokens but no separate cache-read cost column.
     let (server, database) = setup_reporting_usage_server().await;
@@ -168,6 +307,39 @@ async fn usage_export_rejects_bad_input_and_bad_auth_scope() {
         400,
         "{}",
         invalid_cursor.text()
+    );
+
+    let first_page = server
+        .get(
+            format!(
+                "/v1/organizations/{}/usage/export?start_time={}&end_time={}&source=all&limit=1",
+                fixture.org_id,
+                url_ts(2026, 7, 1),
+                url_ts(2026, 7, 4)
+            )
+            .as_str(),
+        )
+        .add_header("Authorization", bearer(&fixture.token))
+        .await
+        .json::<Value>();
+    let bound_cursor = first_page["next_cursor"]
+        .as_str()
+        .expect("first page should include next_cursor");
+    let conflicting_filter = server
+        .get(
+            format!(
+                "/v1/organizations/{}/usage/export?cursor={bound_cursor}&source=service",
+                fixture.org_id
+            )
+            .as_str(),
+        )
+        .add_header("Authorization", bearer(&fixture.token))
+        .await;
+    assert_eq!(
+        conflicting_filter.status_code(),
+        400,
+        "{}",
+        conflicting_filter.text()
     );
 
     // When: a token from one org calls another org export.

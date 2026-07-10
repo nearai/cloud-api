@@ -6,6 +6,7 @@ use anyhow::{Context, Result};
 use chrono::Utc;
 use services::common::RepositoryError;
 use services::service_usage::ports::{ServiceUsageReportEntry, ServiceUsageReportFilters};
+use std::time::Duration;
 use tokio_postgres::Row;
 use uuid::Uuid;
 
@@ -23,11 +24,23 @@ pub struct RecordServiceUsageRequest {
 #[derive(Debug, Clone)]
 pub struct OrganizationServiceUsageRepository {
     pub(crate) pool: DbPool,
+    reporting_statement_timeout: Duration,
 }
 
 impl OrganizationServiceUsageRepository {
     pub fn new(pool: DbPool) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            reporting_statement_timeout:
+                crate::repositories::reporting_query::DEFAULT_REPORTING_STATEMENT_TIMEOUT,
+        }
+    }
+
+    pub fn with_reporting_statement_timeout(pool: DbPool, statement_timeout: Duration) -> Self {
+        Self {
+            pool,
+            reporting_statement_timeout: statement_timeout,
+        }
     }
 
     /// List service usage rows for an organization, optionally filtered by service_id.
@@ -102,15 +115,30 @@ impl OrganizationServiceUsageRepository {
 
         let cursor_created_at = filters.cursor.map(|cursor| cursor.created_at);
         let cursor_id = filters.cursor.map(|cursor| cursor.id);
+        let deadline = crate::repositories::reporting_query::reporting_deadline(
+            self.reporting_statement_timeout,
+            filters.deadline,
+        )?;
         let rows = retry_db!("list_service_usage_report", {
-            let client = self
+            let mut client = self
                 .pool
                 .get()
                 .await
                 .context("Failed to get database connection")
                 .map_err(RepositoryError::PoolError)?;
 
-            client
+            let transaction = client
+                .build_transaction()
+                .read_only(true)
+                .start()
+                .await
+                .map_err(map_db_error)?;
+            crate::repositories::reporting_query::configure_reporting_transaction(
+                &transaction,
+                crate::repositories::reporting_query::remaining_statement_timeout(deadline)?,
+            )
+            .await?;
+            let rows = transaction
                 .query(
                     r#"
                     SELECT
@@ -144,7 +172,9 @@ impl OrganizationServiceUsageRepository {
                     ],
                 )
                 .await
-                .map_err(map_db_error)
+                .map_err(map_db_error)?;
+            transaction.commit().await.map_err(map_db_error)?;
+            Ok::<_, RepositoryError>(rows)
         })?;
 
         Ok(rows.iter().map(Self::row_to_report_entry).collect())

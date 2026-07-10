@@ -194,3 +194,124 @@ async fn organization_reporting_token_rejects_malformed_inputs_and_empty_name() 
 
     Ok(())
 }
+
+#[tokio::test]
+async fn organization_reporting_token_validation_preserves_recent_last_used_at(
+) -> anyhow::Result<()> {
+    // Given: an active token whose audit timestamp was refreshed less than 15 minutes ago.
+    let pool = test_pool().await?;
+    let repository =
+        database::repositories::OrganizationReportingTokenRepository::new(pool.clone());
+    let (organization_id, user_id) = insert_org_and_user(&pool).await?;
+    let created = repository
+        .create(CreateOrganizationReportingTokenRequest {
+            organization_id,
+            name: "recent sync".to_string(),
+            created_by_user_id: user_id,
+            expires_at: None,
+        })
+        .await?;
+    let client = pool.get().await?;
+    client
+        .execute(
+            r#"
+            UPDATE organization_reporting_tokens
+            SET last_used_at = NOW() - INTERVAL '5 minutes'
+            WHERE id = $1
+            "#,
+            &[&created.token.id],
+        )
+        .await?;
+    let row_before = client
+        .query_one(
+            r#"
+            SELECT last_used_at, xmin::text::bigint AS row_version
+            FROM organization_reporting_tokens
+            WHERE id = $1
+            "#,
+            &[&created.token.id],
+        )
+        .await?;
+    let persisted_before: chrono::DateTime<Utc> = row_before.get("last_used_at");
+    let row_version_before: i64 = row_before.get("row_version");
+
+    // When: the token is validated again inside the debounce interval.
+    let validated = repository
+        .validate(&created.raw_token)
+        .await?
+        .expect("active token should validate");
+
+    // Then: validation returns the token without issuing another audit-timestamp write.
+    let row_after = client
+        .query_one(
+            r#"
+            SELECT last_used_at, xmin::text::bigint AS row_version
+            FROM organization_reporting_tokens
+            WHERE id = $1
+            "#,
+            &[&created.token.id],
+        )
+        .await?;
+    let persisted_after: chrono::DateTime<Utc> = row_after.get("last_used_at");
+    let row_version_after: i64 = row_after.get("row_version");
+    assert_eq!(validated.last_used_at, Some(persisted_before));
+    assert_eq!(persisted_after, persisted_before);
+    assert_eq!(row_version_after, row_version_before);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn organization_reporting_token_validation_refreshes_stale_last_used_at() -> anyhow::Result<()>
+{
+    // Given: an active token whose audit timestamp is older than 15 minutes.
+    let pool = test_pool().await?;
+    let repository =
+        database::repositories::OrganizationReportingTokenRepository::new(pool.clone());
+    let (organization_id, user_id) = insert_org_and_user(&pool).await?;
+    let created = repository
+        .create(CreateOrganizationReportingTokenRequest {
+            organization_id,
+            name: "stale sync".to_string(),
+            created_by_user_id: user_id,
+            expires_at: None,
+        })
+        .await?;
+    let client = pool.get().await?;
+    client
+        .execute(
+            r#"
+            UPDATE organization_reporting_tokens
+            SET last_used_at = NOW() - INTERVAL '16 minutes'
+            WHERE id = $1
+            "#,
+            &[&created.token.id],
+        )
+        .await?;
+    let persisted_before: chrono::DateTime<Utc> = client
+        .query_one(
+            "SELECT last_used_at FROM organization_reporting_tokens WHERE id = $1",
+            &[&created.token.id],
+        )
+        .await?
+        .get("last_used_at");
+
+    // When: the stale token is validated.
+    let validated = repository
+        .validate(&created.raw_token)
+        .await?
+        .expect("active token should validate");
+
+    // Then: its audit timestamp is refreshed and returned.
+    let persisted_after: chrono::DateTime<Utc> = client
+        .query_one(
+            "SELECT last_used_at FROM organization_reporting_tokens WHERE id = $1",
+            &[&created.token.id],
+        )
+        .await?
+        .get("last_used_at");
+    assert_eq!(validated.last_used_at, Some(persisted_after));
+    assert!(persisted_after > persisted_before);
+
+    Ok(())
+}

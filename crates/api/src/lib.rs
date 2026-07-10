@@ -226,10 +226,12 @@ pub fn init_auth_services(database: Arc<Database>, config: &ApiConfig) -> AuthCo
         auth_service.clone(),
         workspace_repository.clone(),
         Arc::new(
-            database::repositories::OrganizationReportingTokenRepository::new(
-                database.pool().clone(),
-            ),
-        ) as Arc<dyn services::reporting_tokens::OrganizationReportingTokenRepository>,
+            services::reporting_tokens::OrganizationReportingTokenServiceImpl::new(Arc::new(
+                database::repositories::OrganizationReportingTokenRepository::new(
+                    database.pool().clone(),
+                ),
+            )),
+        ) as Arc<dyn services::reporting_tokens::OrganizationReportingTokenService>,
         admin_access_token_repository,
         config.auth.admin_domains.clone(),
         config.auth.encoding_key.clone(),
@@ -316,6 +318,7 @@ pub async fn init_domain_services_with_pool(
     // fallback counter (cloud_api.provider.requests) from the one layer that
     // knows which trust tier served each request.
     inference_provider_pool.set_metrics_service(metrics_service.clone());
+    let reporting_statement_timeout = config.usage_reporting.database_statement_timeout();
 
     // Create shared repositories
     let conversation_repo = Arc::new(database::PgConversationRepository::new(
@@ -371,9 +374,12 @@ pub async fn init_domain_services_with_pool(
     ));
 
     // Prepare repositories for usage service (will be created after workspace service)
-    let usage_repository = Arc::new(database::repositories::OrganizationUsageRepository::new(
-        database.pool().clone(),
-    ));
+    let usage_repository = Arc::new(
+        database::repositories::OrganizationUsageRepository::with_reporting_statement_timeout(
+            database.pool().clone(),
+            reporting_statement_timeout,
+        ),
+    );
     let limits_repository_for_usage = Arc::new(
         database::repositories::OrganizationLimitsRepository::new(database.pool().clone()),
     );
@@ -482,7 +488,10 @@ pub async fn init_domain_services_with_pool(
         database.pool().clone(),
     ));
     let org_service_usage_repo = Arc::new(
-        database::repositories::OrganizationServiceUsageRepository::new(database.pool().clone()),
+        database::repositories::OrganizationServiceUsageRepository::with_reporting_statement_timeout(
+            database.pool().clone(),
+            reporting_statement_timeout,
+        ),
     );
     let service_usage_repo = Arc::new(database::repositories::ServiceUsageRepositoryImpl::new(
         service_repo,
@@ -1147,12 +1156,14 @@ pub fn build_app_with_config(
         attestation_service: domain_services.attestation_service.clone(),
         usage_service: domain_services.usage_service.clone(),
         service_usage_service: domain_services.service_usage_service.clone(),
-        reporting_token_repository: Arc::new(
-            database::repositories::OrganizationReportingTokenRepository::new(
-                database.pool().clone(),
-            ),
+        reporting_token_service: Arc::new(
+            services::reporting_tokens::OrganizationReportingTokenServiceImpl::new(Arc::new(
+                database::repositories::OrganizationReportingTokenRepository::new(
+                    database.pool().clone(),
+                ),
+            )),
         )
-            as Arc<dyn services::reporting_tokens::OrganizationReportingTokenRepository>,
+            as Arc<dyn services::reporting_tokens::OrganizationReportingTokenService>,
         user_service: domain_services.user_service.clone(),
         files_service: domain_services.files_service.clone(),
         inference_provider_pool: domain_services.inference_provider_pool.clone(),
@@ -1277,19 +1288,28 @@ pub fn build_app_with_config(
         domain_services.usage_service.clone(),
         &auth_components.auth_state_middleware,
     );
-    let reporting_usage_routes = build_reporting_usage_routes(
-        domain_services.usage_service.clone(),
-        domain_services.service_usage_service.clone(),
-        Arc::new(database::repositories::OrganizationUsageRepository::new(
-            database.pool().clone(),
-        )),
-        Arc::new(
-            database::repositories::OrganizationServiceUsageRepository::new(
+    let reporting_usage_routes = if config.usage_reporting.enabled {
+        let summary_repository = Arc::new(
+            database::repositories::PostgresReportingUsageSummaryRepository::with_statement_timeout(
                 database.pool().clone(),
+                config.usage_reporting.database_statement_timeout(),
             ),
-        ),
-        &auth_components.auth_state_middleware,
-    );
+        )
+            as Arc<dyn services::reporting_usage::ReportingUsageSummaryRepository>;
+        let summary_service = Arc::new(services::reporting_usage::ReportingUsageService::new(
+            summary_repository,
+        ));
+        build_reporting_usage_routes(
+            domain_services.usage_service.clone(),
+            domain_services.service_usage_service.clone(),
+            summary_service,
+            middleware::ReportingGuardState::from_config(&config.usage_reporting),
+            &auth_components.auth_state_middleware,
+        )
+    } else {
+        tracing::info!("Programmatic usage reporting routes are disabled");
+        Router::new()
+    };
 
     // Build OpenAPI and documentation routes
     let openapi_routes = build_openapi_routes();
@@ -1815,18 +1835,16 @@ pub fn build_billing_routes(
 pub fn build_reporting_usage_routes(
     usage_service: Arc<dyn services::usage::UsageServiceTrait + Send + Sync>,
     service_usage_service: Arc<dyn services::service_usage::ServiceUsageServiceTrait + Send + Sync>,
-    inference_summary_repo: Arc<dyn services::reporting_usage::InferenceUsageSummaryRepository>,
-    service_summary_repo: Arc<dyn services::reporting_usage::ServiceUsageSummaryRepository>,
+    summary_service: Arc<services::reporting_usage::ReportingUsageService>,
+    guard_state: middleware::ReportingGuardState,
     auth_state_middleware: &AuthState,
 ) -> Router {
     let export_state = crate::routes::reporting_usage::ReportingUsageExportState::new(
         usage_service,
         service_usage_service,
     );
-    let summary_state = crate::routes::reporting_usage::ReportingUsageSummaryState::new(
-        inference_summary_repo,
-        service_summary_repo,
-    );
+    let summary_state =
+        crate::routes::reporting_usage::ReportingUsageSummaryState::new(summary_service);
     let export_router = Router::new()
         .route(
             "/organizations/{org_id}/usage/export",
@@ -1842,25 +1860,24 @@ pub fn build_reporting_usage_routes(
     let router = Router::new().merge(export_router).merge(summary_router);
 
     #[cfg(debug_assertions)]
-    {
-        router
-            .route(
-                "/organizations/{org_id}/usage/reporting-token-auth-probe",
-                get(crate::routes::reporting_usage::reporting_token_auth_probe),
-            )
-            .layer(from_fn_with_state(
-                auth_state_middleware.clone(),
-                auth_middleware_with_reporting_token,
-            ))
-    }
+    let router = router.route(
+        "/organizations/{org_id}/usage/reporting-token-auth-probe",
+        get(crate::routes::reporting_usage::reporting_token_auth_probe),
+    );
 
-    #[cfg(not(debug_assertions))]
-    {
-        router.layer(from_fn_with_state(
+    router
+        .layer(from_fn_with_state(
+            guard_state.clone(),
+            middleware::reporting_token_guard_middleware,
+        ))
+        .layer(from_fn_with_state(
             auth_state_middleware.clone(),
             auth_middleware_with_reporting_token,
         ))
-    }
+        .layer(from_fn_with_state(
+            guard_state,
+            middleware::reporting_global_guard_middleware,
+        ))
 }
 
 /// Build gateway routes for external model gateways to validate API keys.
@@ -2542,6 +2559,7 @@ mod tests {
             github_dispatch: config::GitHubDispatchConfig::default(),
             infra: config::InfraConfig::default(),
             staking_farm: config::StakingFarmConfig::default(),
+            usage_reporting: config::UsageReportingConfig::default(),
             ita: config::ItaAttestationConfig::default(),
         };
 
@@ -2648,6 +2666,7 @@ mod tests {
             github_dispatch: config::GitHubDispatchConfig::default(),
             infra: config::InfraConfig::default(),
             staking_farm: config::StakingFarmConfig::default(),
+            usage_reporting: config::UsageReportingConfig::default(),
             ita: config::ItaAttestationConfig::default(),
         };
 

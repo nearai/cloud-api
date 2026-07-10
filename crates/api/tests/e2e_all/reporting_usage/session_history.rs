@@ -2,6 +2,7 @@ use crate::common::{
     create_api_key_in_workspace, create_org, list_workspaces, setup_qwen_model,
 };
 use chrono::{DateTime, TimeZone};
+use utoipa::OpenApi;
 use uuid::Uuid;
 
 #[tokio::test]
@@ -36,7 +37,10 @@ async fn session_usage_history_filters() {
     assert_eq!(row.created_at, ts(2026, 7, 2).to_rfc3339());
     assert_eq!(row.total_cost, 700);
     assert_eq!(row.stop_reason.as_deref(), Some("completed"));
-    assert_eq!(row.provider_request_id, None);
+    assert_eq!(
+        row.provider_request_id.as_deref(),
+        Some("provider-request-700")
+    );
 
     let manual = serde_json::json!({
         "status": 200,
@@ -47,6 +51,69 @@ async fn session_usage_history_filters() {
     });
     assert_no_private_session_history_fields(&manual);
     println!("manual GET /usage/history filtered session 200 {manual}");
+}
+
+#[tokio::test]
+async fn session_usage_history_workspace_and_api_key_filters_remain_unbounded() {
+    // Given: matching usage older than the reporting API's 366-day default window.
+    let (server, database) = setup_reporting_usage_server().await;
+    let fixture = seed_session_history_fixture(&server, &database).await;
+
+    // When: only workspace and API-key filters are supplied to the legacy history route.
+    let response = server
+        .get(
+            format!(
+                "/v1/organizations/{}/usage/history?workspace_id={}&api_key_id={}&limit=10&offset=0",
+                fixture.org_id, fixture.workspace_id, fixture.api_key_id
+            )
+            .as_str(),
+        )
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .add_header("User-Agent", MOCK_USER_AGENT)
+        .await;
+
+    // Then: all matching history is returned, including the old row.
+    assert_eq!(response.status_code(), 200, "{}", response.text());
+    let body = response.json::<api::routes::usage::UsageHistoryResponse>();
+    assert_eq!(body.total, 3);
+    assert_eq!(body.data.len(), 3);
+    assert!(body
+        .data
+        .iter()
+        .any(|row| row.created_at == ts(2024, 1, 1).to_rfc3339()));
+    assert!(body
+        .data
+        .iter()
+        .all(|row| row.provider_request_id.is_some()));
+}
+
+#[test]
+fn session_usage_history_openapi_lists_supported_filters() {
+    // Given: the generated public OpenAPI document.
+    let spec = serde_json::to_value(api::openapi::ApiDoc::openapi())
+        .expect("OpenAPI spec should serialize");
+
+    // When: the legacy organization history operation is inspected.
+    let parameters = spec["paths"]["/v1/organizations/{org_id}/usage/history"]["get"]
+        ["parameters"]
+        .as_array()
+        .expect("history parameters should be an array");
+    let names: Vec<&str> = parameters
+        .iter()
+        .filter_map(|parameter| parameter["name"].as_str())
+        .collect();
+
+    // Then: every accepted date/time and ownership filter is documented.
+    for name in [
+        "start_date",
+        "end_date",
+        "start_time",
+        "end_time",
+        "workspace_id",
+        "api_key_id",
+    ] {
+        assert!(names.contains(&name), "missing OpenAPI parameter {name}");
+    }
 }
 
 #[tokio::test]
@@ -114,8 +181,11 @@ async fn seed_session_history_fixture(
         &workspace_id,
         &api_key.id,
         &model,
-        ts(2026, 7, 1),
-        500,
+        SessionUsageRow {
+            created_at: ts(2026, 7, 1),
+            total_cost: 500,
+            provider_request_id: "provider-request-500",
+        },
     )
     .await;
     insert_inference_usage_row(
@@ -124,8 +194,11 @@ async fn seed_session_history_fixture(
         &workspace_id,
         &api_key.id,
         &model,
-        ts(2026, 7, 2),
-        700,
+        SessionUsageRow {
+            created_at: ts(2026, 7, 2),
+            total_cost: 700,
+            provider_request_id: "provider-request-700",
+        },
     )
     .await;
     insert_inference_usage_row(
@@ -134,8 +207,24 @@ async fn seed_session_history_fixture(
         &other_workspace,
         &other_api_key.id,
         &model,
-        ts(2026, 7, 2),
-        900,
+        SessionUsageRow {
+            created_at: ts(2026, 7, 2),
+            total_cost: 900,
+            provider_request_id: "provider-request-900",
+        },
+    )
+    .await;
+    insert_inference_usage_row(
+        database,
+        &org.id,
+        &workspace_id,
+        &api_key.id,
+        &model,
+        SessionUsageRow {
+            created_at: ts(2024, 1, 1),
+            total_cost: 300,
+            provider_request_id: "provider-request-300",
+        },
     )
     .await;
 
@@ -163,14 +252,19 @@ async fn create_workspace(server: &axum_test::TestServer, org_id: &str) -> Strin
         .id
 }
 
+struct SessionUsageRow {
+    created_at: DateTime<Utc>,
+    total_cost: i64,
+    provider_request_id: &'static str,
+}
+
 async fn insert_inference_usage_row(
     database: &Arc<Database>,
     org_id: &str,
     workspace_id: &str,
     api_key_id: &str,
     model: &str,
-    created_at: DateTime<Utc>,
-    total_cost: i64,
+    row: SessionUsageRow,
 ) {
     let client = database.pool().get().await.expect("db connection");
     let model_id: Uuid = client
@@ -186,10 +280,10 @@ async fn insert_inference_usage_row(
                 id, organization_id, workspace_id, api_key_id, model_id, model_name,
                 input_tokens, output_tokens, cache_read_tokens, total_tokens,
                 input_cost, output_cost, total_cost, request_type, inference_type,
-                created_at, inference_id, stop_reason
+                created_at, inference_id, provider_request_id, stop_reason
             )
             VALUES ($1, $2, $3, $4, $5, $6, 4, 3, 1, 8, $7, 300, $8,
-                NULL, 'chat_completion', $9, $10, 'completed')
+                NULL, 'chat_completion', $9, $10, $11, 'completed')
             "#,
             &[
                 &Uuid::new_v4(),
@@ -198,10 +292,11 @@ async fn insert_inference_usage_row(
                 &Uuid::parse_str(api_key_id).expect("api key uuid"),
                 &model_id,
                 &model,
-                &(total_cost - 300),
-                &total_cost,
-                &created_at,
+                &(row.total_cost - 300),
+                &row.total_cost,
+                &row.created_at,
                 &Some(Uuid::new_v4()),
+                &Some(row.provider_request_id),
             ],
         )
         .await

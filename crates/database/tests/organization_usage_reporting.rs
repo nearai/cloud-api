@@ -115,6 +115,7 @@ async fn organization_usage_reporting_filters_and_cursor() -> anyhow::Result<()>
             inference_type: Some("chat_completion".to_string()),
             limit: 1,
             cursor: None,
+            deadline: None,
         })
         .await?;
 
@@ -148,6 +149,7 @@ async fn organization_usage_reporting_filters_and_cursor() -> anyhow::Result<()>
                 created_at: first_page[0].created_at,
                 id: first_page[0].id,
             }),
+            deadline: None,
         })
         .await?;
 

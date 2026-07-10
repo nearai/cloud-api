@@ -91,10 +91,19 @@ pub enum RepositoryError {
     ConnectionFailed(String),
     #[error("Database authentication failed")]
     AuthenticationFailed,
+    #[error("Database query timed out")]
+    QueryTimeout,
     #[error("Database connection pool error: {0}")]
     PoolError(#[source] anyhow::Error),
     #[error("Database operation error: {0}")]
     DatabaseError(#[source] anyhow::Error),
     #[error("Data conversion error: {0}")]
     DataConversionError(#[source] anyhow::Error),
+}
+
+pub fn is_query_timeout(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .filter_map(|cause| cause.downcast_ref::<RepositoryError>())
+        .any(|error| matches!(error, RepositoryError::QueryTimeout))
 }

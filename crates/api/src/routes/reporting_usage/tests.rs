@@ -1,11 +1,12 @@
 use super::{
-    ReportingInferenceUsage, ReportingUsageCursor, ReportingUsageExportResponse,
-    ReportingUsageExportRow, ReportingUsageQuery, ReportingUsageQueryError,
-    ReportingUsageQueryParams, ReportingUsageRowSource, ReportingUsageSource,
-    ReportingUsageSummaryResponse, ReportingUsageTotals,
+    ReportingInferenceUsage, ReportingUsageCursor, ReportingUsageDetails,
+    ReportingUsageExportResponse, ReportingUsageExportRow, ReportingUsageQuery,
+    ReportingUsageQueryError, ReportingUsageQueryParams, ReportingUsageRowSource,
+    ReportingUsageSource, ReportingUsageSummaryResponse, ReportingUsageTotals,
 };
 use chrono::{DateTime, Duration, Utc};
 use serde_json::json;
+use utoipa::OpenApi as _;
 use uuid::Uuid;
 
 fn ts(value: &str) -> DateTime<Utc> {
@@ -14,16 +15,27 @@ fn ts(value: &str) -> DateTime<Utc> {
         .with_timezone(&Utc)
 }
 
+fn organization_id() -> Uuid {
+    Uuid::parse_str("018f7e4c-1111-7abc-9234-123456789abc").unwrap()
+}
+
 #[test]
 fn reporting_usage_query_defaults_and_cursor_roundtrip() {
     // Given: no optional filters and a stable inference cursor tuple.
     let params = ReportingUsageQueryParams::default();
     let created_at = ts("2026-07-01T12:34:56Z");
     let id = Uuid::parse_str("018f7e4c-1234-7abc-9234-123456789abc").unwrap();
-    let cursor = ReportingUsageCursor::new(created_at, ReportingUsageRowSource::Inference, id);
 
     // When: the boundary DTO is parsed and the cursor is encoded/decoded.
     let query = ReportingUsageQuery::try_from(params).unwrap();
+    let cursor = ReportingUsageCursor::for_query(
+        organization_id(),
+        created_at,
+        ReportingUsageRowSource::Inference,
+        id,
+        &query,
+    )
+    .unwrap();
     let encoded = cursor.encode().unwrap();
     let decoded = ReportingUsageCursor::decode(&encoded).unwrap();
 
@@ -33,10 +45,85 @@ fn reporting_usage_query_defaults_and_cursor_roundtrip() {
     assert!(query.start_time.is_some());
     assert!(query.end_time.is_some());
     assert_eq!(decoded, cursor);
+    assert!(decoded.validate_organization(organization_id()).is_ok());
+    assert_eq!(
+        decoded.validate_organization(Uuid::new_v4()),
+        Err(ReportingUsageQueryError::InvalidCursor)
+    );
     assert_eq!(cursor.encode().unwrap(), encoded);
     assert!(!encoded.contains('+'));
     assert!(!encoded.contains('/'));
     assert!(!encoded.contains('='));
+}
+
+#[test]
+fn reporting_usage_cursor_restores_omitted_context_and_rejects_conflicts() {
+    // Given: a first-page query with an explicit window and every supported filter.
+    let workspace_id = Uuid::parse_str("018f7e4c-2222-7abc-9234-123456789abc").unwrap();
+    let api_key_id = Uuid::parse_str("018f7e4c-3333-7abc-9234-123456789abc").unwrap();
+    let first_page = ReportingUsageQuery::try_from(ReportingUsageQueryParams {
+        start_time: Some("2026-07-01T00:00:00Z".to_string()),
+        end_time: Some("2026-07-02T00:00:00Z".to_string()),
+        source: Some("inference".to_string()),
+        workspace_id: Some(workspace_id),
+        api_key_id: Some(api_key_id),
+        model: Some("test-model".to_string()),
+        inference_type: Some("chat_completion".to_string()),
+        service_name: Some("web_search".to_string()),
+        limit: Some(1),
+        cursor: None,
+    })
+    .unwrap();
+    let cursor = ReportingUsageCursor::for_query(
+        organization_id(),
+        ts("2026-07-01T12:34:56Z"),
+        ReportingUsageRowSource::Inference,
+        Uuid::parse_str("018f7e4c-1234-7abc-9234-123456789abc").unwrap(),
+        &first_page,
+    )
+    .unwrap()
+    .encode()
+    .unwrap();
+
+    // When: page two supplies only the opaque cursor.
+    let continuation = ReportingUsageQuery::try_from(ReportingUsageQueryParams {
+        cursor: Some(cursor.clone()),
+        ..ReportingUsageQueryParams::default()
+    })
+    .unwrap();
+
+    // Then: the cursor restores the exact effective window and filter context.
+    assert_eq!(continuation.start_time, first_page.start_time);
+    assert_eq!(continuation.end_time, first_page.end_time);
+    assert_eq!(continuation.source, first_page.source);
+    assert_eq!(continuation.workspace_id, first_page.workspace_id);
+    assert_eq!(continuation.api_key_id, first_page.api_key_id);
+    assert_eq!(continuation.model, first_page.model);
+    assert_eq!(continuation.inference_type, first_page.inference_type);
+    assert_eq!(continuation.service_name, first_page.service_name);
+
+    // When/Then: explicitly changing any bound context invalidates the cursor.
+    let conflicting_source = ReportingUsageQueryParams {
+        source: Some("service".to_string()),
+        cursor: Some(cursor.clone()),
+        ..ReportingUsageQueryParams::default()
+    };
+    let conflicting_start = ReportingUsageQueryParams {
+        start_time: Some("2026-07-01T00:00:01Z".to_string()),
+        cursor: Some(cursor.clone()),
+        ..ReportingUsageQueryParams::default()
+    };
+    let conflicting_workspace = ReportingUsageQueryParams {
+        workspace_id: Some(Uuid::new_v4()),
+        cursor: Some(cursor),
+        ..ReportingUsageQueryParams::default()
+    };
+    for params in [conflicting_source, conflicting_start, conflicting_workspace] {
+        assert!(matches!(
+            ReportingUsageQuery::try_from(params),
+            Err(ReportingUsageQueryError::InvalidCursor)
+        ));
+    }
 }
 
 #[test]
@@ -154,7 +241,6 @@ fn reporting_usage_query_manual_codec_serializes_response_and_cursor() {
     let row_id = Uuid::parse_str("018f7e4c-1234-7abc-9234-123456789abc").unwrap();
     let workspace_id = Uuid::parse_str("018f7e4c-2222-7abc-9234-123456789abc").unwrap();
     let api_key_id = Uuid::parse_str("018f7e4c-3333-7abc-9234-123456789abc").unwrap();
-    let cursor = ReportingUsageCursor::new(created_at, ReportingUsageRowSource::Inference, row_id);
     let query = ReportingUsageQuery::try_from(ReportingUsageQueryParams {
         start_time: Some("2026-07-01T00:00:00Z".to_string()),
         end_time: Some("2026-07-02T00:00:00Z".to_string()),
@@ -163,32 +249,40 @@ fn reporting_usage_query_manual_codec_serializes_response_and_cursor() {
         ..ReportingUsageQueryParams::default()
     })
     .unwrap();
+    let cursor = ReportingUsageCursor::for_query(
+        organization_id(),
+        created_at,
+        ReportingUsageRowSource::Inference,
+        row_id,
+        &query,
+    )
+    .unwrap();
 
     let export = ReportingUsageExportResponse {
         data: vec![ReportingUsageExportRow {
-            source: ReportingUsageRowSource::Inference,
             id: row_id,
             created_at,
             workspace_id,
             api_key_id,
             total_cost_nano_usd: 42,
             total_cost_usd: Some("$0.000000042".to_string()),
-            inference: Some(ReportingInferenceUsage {
-                model: "test-model".to_string(),
-                inference_type: "chat_completion".to_string(),
-                input_tokens: 10,
-                output_tokens: 20,
-                cache_read_tokens: 3,
-                total_tokens: 33,
-                input_cost_nano_usd: 10,
-                output_cost_nano_usd: 29,
-                cache_read_cost_nano_usd: None,
-                total_cost_nano_usd: 42,
-                response_id: None,
-                inference_id: Some(row_id),
-                image_count: None,
-            }),
-            service: None,
+            usage: ReportingUsageDetails::Inference {
+                inference: ReportingInferenceUsage {
+                    model: "test-model".to_string(),
+                    inference_type: "chat_completion".to_string(),
+                    input_tokens: 10,
+                    output_tokens: 20,
+                    cache_read_tokens: 3,
+                    total_tokens: 33,
+                    input_cost_nano_usd: 10,
+                    output_cost_nano_usd: 29,
+                    cache_read_cost_nano_usd: None,
+                    total_cost_nano_usd: 42,
+                    response_id: None,
+                    inference_id: Some(row_id),
+                    image_count: None,
+                },
+            },
         }],
         next_cursor: Some(cursor.encode().unwrap()),
     };
@@ -229,6 +323,12 @@ fn reporting_usage_query_manual_codec_serializes_response_and_cursor() {
     assert!(export_json.contains("\"cache_read_tokens\":3"));
     assert!(!export_json.contains("cache_read_cost_nano_usd"));
     assert!(summary_json.contains("\"inference_cost_nano_usd\":42"));
+    let mut invalid_row = serde_json::to_value(&export.data[0]).unwrap();
+    invalid_row
+        .as_object_mut()
+        .unwrap()
+        .insert("service".to_string(), json!({}));
+    assert!(serde_json::from_value::<ReportingUsageExportRow>(invalid_row).is_err());
     println!("cursor={encoded}");
     println!(
         "cursor_tuple={}|{}|{}",
@@ -238,4 +338,12 @@ fn reporting_usage_query_manual_codec_serializes_response_and_cursor() {
     );
     println!("export_json={export_json}");
     println!("summary_json={summary_json}");
+}
+
+#[test]
+fn reporting_usage_export_details_schema_requires_exactly_one_variant() {
+    let spec = serde_json::to_value(crate::openapi::ApiDoc::openapi()).unwrap();
+    let details = &spec["components"]["schemas"]["ReportingUsageDetails"];
+
+    assert_eq!(details["oneOf"].as_array().map(Vec::len), Some(2));
 }

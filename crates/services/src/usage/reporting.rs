@@ -1,5 +1,6 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::time::Instant;
 use uuid::Uuid;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -19,6 +20,7 @@ pub struct InferenceUsageReportQuery {
     pub inference_type: Option<String>,
     pub limit: u16,
     pub cursor: Option<InferenceUsageReportCursor>,
+    pub deadline: Option<Instant>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -44,6 +46,7 @@ impl InferenceUsageReportQuery {
             inference_type: None,
             limit: 100,
             cursor: None,
+            deadline: None,
         }
     }
 }
@@ -66,6 +69,8 @@ pub struct InferenceUsageReportRow {
     pub cache_read_cost_nano_usd: Option<i64>,
     pub total_cost_nano_usd: i64,
     pub response_id: Option<Uuid>,
+    #[serde(skip)]
+    pub provider_request_id: Option<String>,
     pub inference_id: Option<Uuid>,
     pub stop_reason: Option<String>,
     pub image_count: Option<i32>,

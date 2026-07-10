@@ -25,6 +25,7 @@ pub struct ApiConfig {
     pub github_dispatch: GitHubDispatchConfig,
     pub infra: InfraConfig,
     pub staking_farm: StakingFarmConfig,
+    pub usage_reporting: UsageReportingConfig,
     pub ita: ItaAttestationConfig,
 }
 
@@ -57,7 +58,89 @@ impl ApiConfig {
             github_dispatch: GitHubDispatchConfig::from_env()?,
             infra: InfraConfig::from_env(),
             ita: ItaAttestationConfig::from_env()?,
+            usage_reporting: UsageReportingConfig::from_env()?,
         })
+    }
+}
+
+/// Operational limits for the programmatic usage-reporting API.
+///
+/// Reporting is disabled by default because its production indexes are built
+/// concurrently outside refinery. Operators enable it only after completing
+/// the rollout checklist in `docs/usage-reporting-rollout.md`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UsageReportingConfig {
+    pub enabled: bool,
+    pub global_requests_per_minute: u32,
+    pub token_requests_per_minute: u32,
+    pub max_concurrent_requests: usize,
+    pub token_max_concurrent_requests: usize,
+    pub request_timeout_seconds: u64,
+}
+
+impl Default for UsageReportingConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            global_requests_per_minute: 600,
+            token_requests_per_minute: 60,
+            max_concurrent_requests: 4,
+            token_max_concurrent_requests: 2,
+            request_timeout_seconds: 15,
+        }
+    }
+}
+
+impl UsageReportingConfig {
+    pub fn database_statement_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(self.request_timeout_seconds.saturating_mul(800).max(1))
+    }
+
+    pub fn from_env() -> Result<Self, String> {
+        let defaults = Self::default();
+        let config = Self {
+            enabled: parse_bool_env("USAGE_REPORTING_ENABLED", defaults.enabled)?,
+            global_requests_per_minute: parse_u32_env(
+                "USAGE_REPORTING_GLOBAL_REQUESTS_PER_MINUTE",
+                defaults.global_requests_per_minute,
+            )?,
+            token_requests_per_minute: parse_u32_env(
+                "USAGE_REPORTING_TOKEN_REQUESTS_PER_MINUTE",
+                defaults.token_requests_per_minute,
+            )?,
+            max_concurrent_requests: usize::try_from(parse_u32_env(
+                "USAGE_REPORTING_MAX_CONCURRENT_REQUESTS",
+                u32::try_from(defaults.max_concurrent_requests)
+                    .map_err(|_| "default reporting concurrency exceeds u32".to_string())?,
+            )?)
+            .map_err(|_| "USAGE_REPORTING_MAX_CONCURRENT_REQUESTS is too large".to_string())?,
+            token_max_concurrent_requests: usize::try_from(parse_u32_env(
+                "USAGE_REPORTING_TOKEN_MAX_CONCURRENT_REQUESTS",
+                u32::try_from(defaults.token_max_concurrent_requests)
+                    .map_err(|_| "default token reporting concurrency exceeds u32".to_string())?,
+            )?)
+            .map_err(|_| {
+                "USAGE_REPORTING_TOKEN_MAX_CONCURRENT_REQUESTS is too large".to_string()
+            })?,
+            request_timeout_seconds: parse_u64_env(
+                "USAGE_REPORTING_REQUEST_TIMEOUT_SECONDS",
+                defaults.request_timeout_seconds,
+            )?,
+        };
+
+        if config.global_requests_per_minute == 0
+            || config.token_requests_per_minute == 0
+            || config.max_concurrent_requests == 0
+            || config.token_max_concurrent_requests == 0
+            || config.request_timeout_seconds == 0
+        {
+            return Err("usage reporting limits must be greater than zero".to_string());
+        }
+        if config.request_timeout_seconds > 3_600 {
+            return Err("USAGE_REPORTING_REQUEST_TIMEOUT_SECONDS must not exceed 3600".to_string());
+        }
+
+        Ok(config)
     }
 }
 
@@ -764,6 +847,23 @@ pub(crate) fn read_optional_secret_env_absent_empty(
 mod tests {
     use super::*;
     use serial_test::serial;
+
+    #[test]
+    fn reporting_database_timeout_leaves_headroom_for_http_response() {
+        let config = UsageReportingConfig {
+            request_timeout_seconds: 15,
+            ..UsageReportingConfig::default()
+        };
+
+        assert_eq!(
+            config.database_statement_timeout(),
+            std::time::Duration::from_secs(12)
+        );
+        assert!(
+            config.database_statement_timeout()
+                < std::time::Duration::from_secs(config.request_timeout_seconds)
+        );
+    }
 
     #[test]
     fn test_is_admin_email() {

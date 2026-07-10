@@ -26,8 +26,8 @@ pub struct AppState {
     pub usage_service: Arc<dyn services::usage::UsageServiceTrait + Send + Sync>,
     pub service_usage_service:
         Arc<dyn services::service_usage::ServiceUsageServiceTrait + Send + Sync>,
-    pub reporting_token_repository:
-        Arc<dyn services::reporting_tokens::OrganizationReportingTokenRepository>,
+    pub reporting_token_service:
+        Arc<dyn services::reporting_tokens::OrganizationReportingTokenService>,
     pub user_service: Arc<dyn services::user::UserServiceTrait + Send + Sync>,
     pub files_service: Arc<dyn FileServiceTrait + Send + Sync>,
     pub inference_provider_pool: Arc<services::inference_provider_pool::InferenceProviderPool>,

@@ -87,6 +87,18 @@ impl OrganizationReportingTokenRepository {
             return Ok(None);
         }
 
+        const SELECT_VALID_TOKEN: &str = r#"
+            SELECT *,
+                   COALESCE(
+                       last_used_at >= NOW() - INTERVAL '15 minutes',
+                       FALSE
+                   ) AS last_used_at_is_fresh
+            FROM organization_reporting_tokens
+            WHERE token_hash = $1
+              AND revoked_at IS NULL
+              AND (expires_at IS NULL OR expires_at > NOW())
+        "#;
+
         let token_hash = hash_reporting_token(raw_token);
         let row = retry_db!("validate_organization_reporting_token", {
             let client = self
@@ -96,20 +108,40 @@ impl OrganizationReportingTokenRepository {
                 .context("Failed to get database connection")
                 .map_err(RepositoryError::PoolError)?;
 
-            client
-                .query_opt(
-                    r#"
+            let selected = client
+                .query_opt(SELECT_VALID_TOKEN, &[&token_hash])
+                .await
+                .map_err(map_db_error)?;
+
+            match selected {
+                Some(row) if row.get("last_used_at_is_fresh") => Ok(Some(row)),
+                Some(_) => match client
+                    .query_opt(
+                        r#"
                     UPDATE organization_reporting_tokens
                     SET last_used_at = NOW()
                     WHERE token_hash = $1
                       AND revoked_at IS NULL
                       AND (expires_at IS NULL OR expires_at > NOW())
+                      AND (
+                          last_used_at IS NULL
+                          OR last_used_at < NOW() - INTERVAL '15 minutes'
+                      )
                     RETURNING *
                     "#,
-                    &[&token_hash],
-                )
-                .await
-                .map_err(map_db_error)
+                        &[&token_hash],
+                    )
+                    .await
+                    .map_err(map_db_error)?
+                {
+                    Some(row) => Ok(Some(row)),
+                    None => client
+                        .query_opt(SELECT_VALID_TOKEN, &[&token_hash])
+                        .await
+                        .map_err(map_db_error),
+                },
+                None => Ok(None),
+            }
         })?;
 
         match row {

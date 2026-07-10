@@ -271,6 +271,13 @@ impl UsageHistoryQuery {
             || self.workspace_id.is_some()
             || self.api_key_id.is_some()
     }
+
+    const fn has_time_filters(&self) -> bool {
+        self.start_date.is_some()
+            || self.end_date.is_some()
+            || self.start_time.is_some()
+            || self.end_time.is_some()
+    }
 }
 
 /// Service usage history entry (platform services like web_search).
@@ -360,7 +367,13 @@ pub async fn get_organization_balance(
     params(
         ("org_id" = String, Path, description = "Organization ID"),
         ("limit" = Option<i64>, Query, description = "Number of records to return (default: 100)"),
-        ("offset" = Option<i64>, Query, description = "Offset for pagination (default: 0)")
+        ("offset" = Option<i64>, Query, description = "Offset for pagination (default: 0)"),
+        ("start_date" = Option<String>, Query, description = "Inclusive UTC start date in YYYY-MM-DD or RFC3339 format."),
+        ("end_date" = Option<String>, Query, description = "Inclusive UTC end date in YYYY-MM-DD or RFC3339 format."),
+        ("start_time" = Option<String>, Query, description = "Inclusive RFC3339 start timestamp. Takes precedence over start_date."),
+        ("end_time" = Option<String>, Query, description = "Inclusive RFC3339 end timestamp. Takes precedence over end_date."),
+        ("workspace_id" = Option<Uuid>, Query, description = "Filter by workspace ID."),
+        ("api_key_id" = Option<Uuid>, Query, description = "Filter by API key ID.")
     ),
     responses(
         (status = 200, description = "Usage history", body = UsageHistoryResponse),
@@ -472,6 +485,18 @@ fn usage_history_report_query(
     organization_id: Uuid,
     query: &UsageHistoryQuery,
 ) -> Result<InferenceUsageHistoryQuery, UsageError> {
+    if !query.has_time_filters() {
+        return Ok(InferenceUsageHistoryQuery {
+            organization_id,
+            start_time: None,
+            end_time: None,
+            workspace_id: query.workspace_id,
+            api_key_id: query.api_key_id,
+            limit: query.limit,
+            offset: query.offset,
+        });
+    }
+
     let params = crate::routes::reporting_usage::ReportingUsageQueryParams {
         start_time: usage_history_start_time(query)?,
         end_time: usage_history_end_time(query)?,
@@ -570,7 +595,7 @@ fn usage_report_row_response(
         created_at: row.created_at.to_rfc3339(),
         stop_reason: row.stop_reason,
         response_id: row.response_id.map(|id| id.to_string()),
-        provider_request_id: None,
+        provider_request_id: row.provider_request_id,
         inference_id: row.inference_id.map(|id| id.to_string()),
         image_count: row.image_count,
     })

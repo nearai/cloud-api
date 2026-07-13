@@ -203,6 +203,11 @@ async fn usage_export_database_timeout_returns_504_and_stops_query() {
         .batch_execute("LOCK TABLE organization_usage_log IN ACCESS EXCLUSIVE MODE")
         .await
         .expect("exclusive test lock");
+    let application_name: String = transaction
+        .query_one("SHOW application_name", &[])
+        .await
+        .expect("test pool application name")
+        .get(0);
 
     let response = server
         .get(format!("/v1/organizations/{}/usage/export?source=inference", org.id).as_str())
@@ -222,10 +227,11 @@ async fn usage_export_database_timeout_returns_504_and_stops_query() {
             FROM pg_stat_activity
             WHERE datname = current_database()
               AND pid <> pg_backend_pid()
+              AND application_name = $1
               AND state = 'active'
               AND query LIKE '%FROM organization_usage_log%'
             "#,
-            &[],
+            &[&application_name],
         )
         .await
         .expect("active query check")

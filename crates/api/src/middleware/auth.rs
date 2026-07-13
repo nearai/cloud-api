@@ -6,6 +6,8 @@ use axum::{
 };
 use database::User as DbUser;
 use services::auth::{AuthError, AuthServiceTrait, OAuthManager, SessionToken};
+use services::common::REPORTING_TOKEN_PREFIX;
+use services::reporting_tokens::{ReportingTokenScope, ValidatedOrganizationReportingToken};
 use std::sync::Arc;
 use tracing::{debug, error};
 
@@ -48,6 +50,14 @@ pub struct AuthenticatedApiKey {
     pub organization: services::organization::Organization,
 }
 
+#[derive(Clone, Debug)]
+pub struct AuthenticatedReportingToken {
+    pub id: uuid::Uuid,
+    pub organization_id: uuid::Uuid,
+    pub token_prefix: String,
+    pub scope: ReportingTokenScope,
+}
+
 pub async fn auth_middleware_with_api_key(
     State(state): State<AuthState>,
     request: Request,
@@ -68,7 +78,7 @@ pub async fn auth_middleware_with_api_key(
         if let Some(token) = auth_value.strip_prefix("Bearer ") {
             authenticate_api_key(&state, token).await
         } else {
-            debug!("Authorization header does not start with 'Bearer '");
+            debug!("Authorization header uses unsupported scheme");
             Err((
                 StatusCode::UNAUTHORIZED,
                 axum::Json(crate::models::ErrorResponse::new(
@@ -120,7 +130,7 @@ pub async fn auth_middleware_with_workspace_context(
         if let Some(token) = auth_value.strip_prefix("Bearer ") {
             authenticate_api_key_with_context(&state, token).await
         } else {
-            debug!("Authorization header does not start with 'Bearer '");
+            debug!("Authorization header uses unsupported scheme");
             Err((
                 StatusCode::UNAUTHORIZED,
                 axum::Json(crate::models::ErrorResponse::new(
@@ -173,7 +183,7 @@ pub async fn auth_middleware(
             debug!("Extracted Bearer token");
             authenticate_session_access(&state, token.to_string()).await
         } else {
-            debug!("Authorization header does not start with 'Bearer '");
+            debug!("Authorization header uses unsupported scheme");
             Err((
                 StatusCode::UNAUTHORIZED,
                 axum::Json(crate::models::ErrorResponse::new(
@@ -200,6 +210,55 @@ pub async fn auth_middleware(
             Ok(next.run(request).await)
         }
         Err(status) => Err(status),
+    }
+}
+
+pub async fn auth_middleware_with_reporting_token(
+    State(state): State<AuthState>,
+    request: Request,
+    next: Next,
+) -> Result<Response, (StatusCode, axum::Json<crate::models::ErrorResponse>)> {
+    let auth_header = request
+        .headers()
+        .get("authorization")
+        .and_then(|h| h.to_str().ok());
+
+    tracing::debug!(
+        has_authorization = auth_header.is_some(),
+        "Auth reporting token middleware"
+    );
+
+    let auth_result = if let Some(auth_value) = auth_header {
+        debug!("Found Authorization header");
+        if let Some(token) = auth_value.strip_prefix("Bearer ") {
+            authenticate_reporting_token(&state, token).await
+        } else {
+            debug!("Authorization header uses unsupported scheme");
+            Err((
+                StatusCode::UNAUTHORIZED,
+                axum::Json(crate::models::ErrorResponse::new(
+                    "Invalid authorization header format".to_string(),
+                    "invalid_auth_header".to_string(),
+                )),
+            ))
+        }
+    } else {
+        Err((
+            StatusCode::UNAUTHORIZED,
+            axum::Json(crate::models::ErrorResponse::new(
+                "Missing authorization header".to_string(),
+                "missing_auth_header".to_string(),
+            )),
+        ))
+    };
+
+    match auth_result {
+        Ok(reporting_token) => {
+            let mut request = request;
+            request.extensions_mut().insert(reporting_token);
+            Ok(next.run(request).await)
+        }
+        Err(error) => Err(error),
     }
 }
 
@@ -294,11 +353,11 @@ pub async fn admin_middleware(
                 authenticate_session_access(&state, token.to_string()).await
             }
         } else {
-            debug!("Authorization header does not start with 'Bearer '");
+            debug!("Authorization header uses unsupported scheme");
             Err((
                 StatusCode::UNAUTHORIZED,
                 axum::Json(crate::models::ErrorResponse::new(
-                    "Authorization header does not start with 'Bearer '".to_string(),
+                    "Invalid authorization header format".to_string(),
                     "unauthorized".to_string(),
                 )),
             ))
@@ -411,6 +470,17 @@ async fn authenticate_session_access(
     state: &AuthState,
     token: String, // jwt
 ) -> Result<DbUser, (StatusCode, axum::Json<crate::models::ErrorResponse>)> {
+    if token.starts_with(REPORTING_TOKEN_PREFIX) {
+        debug!("Reporting token rejected by session middleware");
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            axum::Json(crate::models::ErrorResponse::new(
+                "Invalid or expired access token".to_string(),
+                "unauthorized".to_string(),
+            )),
+        ));
+    }
+
     debug!("Authenticating session access token");
     // Use auth service
 
@@ -480,6 +550,10 @@ pub async fn refresh_middleware(
         debug!("Found Authorization header");
         if let Some(token) = auth_value.strip_prefix("Bearer ") {
             debug!("Extracted Bearer token");
+            if token.starts_with(REPORTING_TOKEN_PREFIX) {
+                debug!("Reporting token rejected by refresh middleware");
+                return Err(StatusCode::UNAUTHORIZED);
+            }
             if let Some(user_agent_value) = user_agent {
                 authenticate_session_refresh(
                     &state,
@@ -492,7 +566,7 @@ pub async fn refresh_middleware(
                 Err(StatusCode::UNAUTHORIZED)
             }
         } else {
-            debug!("Authorization header does not start with 'Bearer '");
+            debug!("Authorization header uses unsupported scheme");
             Err(StatusCode::UNAUTHORIZED)
         }
     } else {
@@ -593,6 +667,48 @@ async fn authenticate_api_key(
     }
 }
 
+async fn authenticate_reporting_token(
+    state: &AuthState,
+    token: &str,
+) -> Result<AuthenticatedReportingToken, (StatusCode, axum::Json<crate::models::ErrorResponse>)> {
+    debug!("Calling reporting token service to validate token");
+
+    match state.reporting_token_service.validate(token).await {
+        Ok(Some(validated)) => Ok(reporting_token_extension(validated)),
+        Ok(None) => {
+            debug!("Invalid or expired reporting token");
+            Err((
+                StatusCode::UNAUTHORIZED,
+                axum::Json(crate::models::ErrorResponse::new(
+                    "Invalid or expired reporting token".to_string(),
+                    "invalid_reporting_token".to_string(),
+                )),
+            ))
+        }
+        Err(_) => {
+            error!("Failed to validate reporting token");
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                axum::Json(crate::models::ErrorResponse::new(
+                    "Failed to validate reporting token".to_string(),
+                    "internal_server_error".to_string(),
+                )),
+            ))
+        }
+    }
+}
+
+fn reporting_token_extension(
+    validated: ValidatedOrganizationReportingToken,
+) -> AuthenticatedReportingToken {
+    AuthenticatedReportingToken {
+        id: validated.id,
+        organization_id: validated.organization_id,
+        token_prefix: validated.token_prefix,
+        scope: validated.scope,
+    }
+}
+
 /// Authenticate using API key and resolve workspace/organization context
 async fn authenticate_api_key_with_context(
     state: &AuthState,
@@ -655,6 +771,8 @@ pub struct AuthState {
     pub oauth_manager: Arc<OAuthManager>,
     pub auth_service: Arc<dyn AuthServiceTrait>,
     pub workspace_repository: Arc<dyn services::workspace::WorkspaceRepository>,
+    pub reporting_token_service:
+        Arc<dyn services::reporting_tokens::OrganizationReportingTokenService>,
     pub admin_access_token_repository: Arc<database::repositories::AdminAccessTokenRepository>,
     pub admin_domains: Vec<String>,
     pub encoding_key: String,
@@ -665,6 +783,9 @@ impl AuthState {
         oauth_manager: Arc<OAuthManager>,
         auth_service: Arc<dyn AuthServiceTrait>,
         workspace_repository: Arc<dyn services::workspace::WorkspaceRepository>,
+        reporting_token_service: Arc<
+            dyn services::reporting_tokens::OrganizationReportingTokenService,
+        >,
         admin_access_token_repository: Arc<database::repositories::AdminAccessTokenRepository>,
         admin_domains: Vec<String>,
         encoding_key: String,
@@ -673,6 +794,7 @@ impl AuthState {
             oauth_manager,
             auth_service,
             workspace_repository,
+            reporting_token_service,
             admin_access_token_repository,
             admin_domains,
             encoding_key,

@@ -4,7 +4,8 @@ use crate::repositories::{
 };
 use async_trait::async_trait;
 use services::service_usage::ports::{
-    RecordServiceUsageParams, ServiceUsageLogEntry, ServiceUsageRepositoryTrait,
+    RecordServiceUsageParams, ServiceUsageLogEntry, ServiceUsageReportEntry,
+    ServiceUsageReportFilters, ServiceUsageRepositoryTrait,
 };
 use std::sync::Arc;
 use uuid::Uuid;
@@ -93,5 +94,12 @@ impl ServiceUsageRepositoryTrait for ServiceUsageRepositoryImpl {
             .collect();
 
         Ok((entries, total))
+    }
+
+    async fn list_usage_report(
+        &self,
+        filters: &ServiceUsageReportFilters,
+    ) -> anyhow::Result<Vec<ServiceUsageReportEntry>> {
+        self.usage_repo.list_reporting_usage(filters).await
     }
 }

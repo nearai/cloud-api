@@ -9,9 +9,12 @@ use axum::{
     response::Json as ResponseJson,
     Extension,
 };
-use chrono::{Duration, Utc};
+use chrono::{DateTime, Duration, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
-use services::{organization::OrganizationError, usage::UsageServiceTrait};
+use services::{
+    organization::OrganizationError,
+    usage::{InferenceUsageHistoryQuery, InferenceUsageReportRow, UsageServiceTrait},
+};
 use subtle::ConstantTimeEq;
 use utoipa::ToSchema;
 use uuid::Uuid;
@@ -251,6 +254,30 @@ pub struct UsageHistoryQuery {
     pub limit: i64,
     #[serde(default)]
     pub offset: i64,
+    pub start_date: Option<String>,
+    pub end_date: Option<String>,
+    pub start_time: Option<String>,
+    pub end_time: Option<String>,
+    pub workspace_id: Option<Uuid>,
+    pub api_key_id: Option<Uuid>,
+}
+
+impl UsageHistoryQuery {
+    const fn has_filters(&self) -> bool {
+        self.start_date.is_some()
+            || self.end_date.is_some()
+            || self.start_time.is_some()
+            || self.end_time.is_some()
+            || self.workspace_id.is_some()
+            || self.api_key_id.is_some()
+    }
+
+    const fn has_time_filters(&self) -> bool {
+        self.start_date.is_some()
+            || self.end_date.is_some()
+            || self.start_time.is_some()
+            || self.end_time.is_some()
+    }
 }
 
 /// Service usage history entry (platform services like web_search).
@@ -340,7 +367,13 @@ pub async fn get_organization_balance(
     params(
         ("org_id" = String, Path, description = "Organization ID"),
         ("limit" = Option<i64>, Query, description = "Number of records to return (default: 100)"),
-        ("offset" = Option<i64>, Query, description = "Offset for pagination (default: 0)")
+        ("offset" = Option<i64>, Query, description = "Offset for pagination (default: 0)"),
+        ("start_date" = Option<String>, Query, description = "Inclusive UTC start date in YYYY-MM-DD or RFC3339 format."),
+        ("end_date" = Option<String>, Query, description = "Inclusive UTC end date in YYYY-MM-DD or RFC3339 format."),
+        ("start_time" = Option<String>, Query, description = "Inclusive RFC3339 start timestamp. Takes precedence over start_date."),
+        ("end_time" = Option<String>, Query, description = "Inclusive RFC3339 end timestamp. Takes precedence over end_date."),
+        ("workspace_id" = Option<Uuid>, Query, description = "Filter by workspace ID."),
+        ("api_key_id" = Option<Uuid>, Query, description = "Filter by API key ID.")
     ),
     responses(
         (status = 200, description = "Usage history", body = UsageHistoryResponse),
@@ -370,6 +403,10 @@ pub async fn get_organization_usage_history(
     crate::routes::common::validate_limit_offset(query.limit, query.offset)?;
 
     let organization_id = check_org_membership(&app_state, user, &org_id).await?;
+
+    if query.has_filters() {
+        return get_filtered_organization_usage_history(&app_state, organization_id, &query).await;
+    }
 
     let (history, total) = app_state
         .usage_service
@@ -415,6 +452,191 @@ pub async fn get_organization_usage_history(
         limit: query.limit,
         offset: query.offset,
     }))
+}
+
+async fn get_filtered_organization_usage_history(
+    app_state: &AppState,
+    organization_id: Uuid,
+    query: &UsageHistoryQuery,
+) -> Result<ResponseJson<UsageHistoryResponse>, UsageError> {
+    let report_query = usage_history_report_query(organization_id, query)?;
+    let (history, total) = app_state
+        .usage_service
+        .list_inference_usage_history(report_query)
+        .await
+        .map_err(|_| internal_usage_history_error("Failed to retrieve usage history"))?;
+
+    let data = history
+        .into_iter()
+        .map(usage_report_row_response)
+        .collect::<Result<Vec<_>, _>>()?;
+    let total = usize::try_from(total)
+        .map_err(|_| internal_usage_history_error("Invalid usage history total"))?;
+
+    Ok(ResponseJson(UsageHistoryResponse {
+        data,
+        total,
+        limit: query.limit,
+        offset: query.offset,
+    }))
+}
+
+fn usage_history_report_query(
+    organization_id: Uuid,
+    query: &UsageHistoryQuery,
+) -> Result<InferenceUsageHistoryQuery, UsageError> {
+    if !query.has_time_filters() {
+        return Ok(InferenceUsageHistoryQuery {
+            organization_id,
+            start_time: None,
+            end_time: None,
+            workspace_id: query.workspace_id,
+            api_key_id: query.api_key_id,
+            limit: query.limit,
+            offset: query.offset,
+        });
+    }
+
+    let params = crate::routes::reporting_usage::ReportingUsageQueryParams {
+        start_time: usage_history_start_time(query)?,
+        end_time: usage_history_end_time(query)?,
+        source: Some("inference".to_string()),
+        workspace_id: query.workspace_id,
+        api_key_id: query.api_key_id,
+        model: None,
+        inference_type: None,
+        service_name: None,
+        limit: Some(
+            u16::try_from(query.limit)
+                .map_err(|_| usage_history_query_bad_request("Limit cannot exceed 1000"))?,
+        ),
+        cursor: None,
+    };
+    let parsed = crate::routes::reporting_usage::ReportingUsageQuery::try_from(params)
+        .map_err(usage_history_query_error)?;
+
+    Ok(InferenceUsageHistoryQuery {
+        organization_id,
+        start_time: parsed.start_time,
+        end_time: parsed.end_time,
+        workspace_id: parsed.workspace_id,
+        api_key_id: parsed.api_key_id,
+        limit: query.limit,
+        offset: query.offset,
+    })
+}
+
+fn usage_history_start_time(query: &UsageHistoryQuery) -> Result<Option<String>, UsageError> {
+    match query.start_time.as_ref() {
+        Some(value) => Ok(Some(value.clone())),
+        None => normalize_usage_history_date(query.start_date.as_deref(), DateBoundary::Start),
+    }
+}
+
+fn usage_history_end_time(query: &UsageHistoryQuery) -> Result<Option<String>, UsageError> {
+    match query.end_time.as_ref() {
+        Some(value) => Ok(Some(value.clone())),
+        None => normalize_usage_history_date(query.end_date.as_deref(), DateBoundary::End),
+    }
+}
+
+#[derive(Clone, Copy)]
+enum DateBoundary {
+    Start,
+    End,
+}
+
+fn normalize_usage_history_date(
+    value: Option<&str>,
+    boundary: DateBoundary,
+) -> Result<Option<String>, UsageError> {
+    let Some(raw) = value else {
+        return Ok(None);
+    };
+    if DateTime::parse_from_rfc3339(raw).is_ok() {
+        return Ok(Some(raw.to_string()));
+    }
+
+    let date = NaiveDate::parse_from_str(raw, "%Y-%m-%d").map_err(|_| {
+        usage_history_query_error(
+            crate::routes::reporting_usage::ReportingUsageQueryError::InvalidTimestamp,
+        )
+    })?;
+    let time = match boundary {
+        DateBoundary::Start => date.and_hms_nano_opt(0, 0, 0, 0),
+        DateBoundary::End => date.and_hms_nano_opt(23, 59, 59, 999_999_999),
+    }
+    .ok_or_else(|| {
+        usage_history_query_error(
+            crate::routes::reporting_usage::ReportingUsageQueryError::InvalidTimestamp,
+        )
+    })?;
+
+    Ok(Some(
+        DateTime::<Utc>::from_naive_utc_and_offset(time, Utc).to_rfc3339(),
+    ))
+}
+
+fn usage_report_row_response(
+    row: InferenceUsageReportRow,
+) -> Result<UsageHistoryEntryResponse, UsageError> {
+    Ok(UsageHistoryEntryResponse {
+        id: row.id.to_string(),
+        workspace_id: row.workspace_id.to_string(),
+        api_key_id: row.api_key_id.to_string(),
+        model: row.model,
+        input_tokens: checked_usage_history_i32(row.input_tokens, "input_tokens")?,
+        output_tokens: checked_usage_history_i32(row.output_tokens, "output_tokens")?,
+        cache_read_tokens: checked_usage_history_i32(row.cache_read_tokens, "cache_read_tokens")?,
+        total_tokens: checked_usage_history_i32(row.total_tokens, "total_tokens")?,
+        total_cost: row.total_cost_nano_usd,
+        total_cost_display: format_amount(row.total_cost_nano_usd),
+        inference_type: row.inference_type,
+        created_at: row.created_at.to_rfc3339(),
+        stop_reason: row.stop_reason,
+        response_id: row.response_id.map(|id| id.to_string()),
+        provider_request_id: row.provider_request_id,
+        inference_id: row.inference_id.map(|id| id.to_string()),
+        image_count: row.image_count,
+    })
+}
+
+fn checked_usage_history_i32(value: i64, field: &str) -> Result<i32, UsageError> {
+    i32::try_from(value)
+        .map_err(|_| internal_usage_history_error(&format!("Invalid usage history {field}")))
+}
+
+fn usage_history_query_error(
+    error: crate::routes::reporting_usage::ReportingUsageQueryError,
+) -> UsageError {
+    (
+        StatusCode::BAD_REQUEST,
+        ResponseJson(ErrorResponse::new(
+            error.to_string(),
+            "invalid_reporting_usage_query".to_string(),
+        )),
+    )
+}
+
+fn usage_history_query_bad_request(message: &str) -> UsageError {
+    (
+        StatusCode::BAD_REQUEST,
+        ResponseJson(ErrorResponse::new(
+            message.to_string(),
+            "invalid_parameter".to_string(),
+        )),
+    )
+}
+
+fn internal_usage_history_error(message: &str) -> UsageError {
+    tracing::error!("{message}");
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        ResponseJson(ErrorResponse::new(
+            message.to_string(),
+            "internal_server_error".to_string(),
+        )),
+    )
 }
 
 /// Get service usage history for an organization

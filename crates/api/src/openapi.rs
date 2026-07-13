@@ -7,7 +7,7 @@ use utoipa::{Modify, OpenApi};
 #[openapi(
     info(
         title = "NEAR AI Cloud API",
-        description = "A comprehensive cloud API for AI model inference, conversation management, and organization administration.\n\n## Authentication\n\nThis API supports three authentication methods:\n\n1. **Access Token (JWT)**: Use `Authorization: Bearer <jwt_token>` with a short-lived JWT access token for most API endpoints. Obtain this by calling POST /users/me/access_tokens with a refresh token.\n2. **Refresh Token**: Use `Authorization: Bearer <refresh_token>` (prefix: `rt_`) only with POST /users/me/access_tokens to create new JWT access tokens. Obtained from OAuth login.\n3. **API Key (Programmatic Access)**: Use `Authorization: Bearer sk-<api_key>` with an API key (prefix: `sk-`)\n\nClick the **Authorize** button above to configure authentication.",
+        description = "A comprehensive cloud API for AI model inference, conversation management, and organization administration.\n\n## Authentication\n\nThis API supports four authentication methods:\n\n1. **Access Token (JWT)**: Use `Authorization: Bearer <jwt_token>` with a short-lived JWT access token for most API endpoints. Obtain this by calling POST /users/me/access_tokens with a refresh token.\n2. **Refresh Token**: Use `Authorization: Bearer <refresh_token>` (prefix: `rt_`) only with POST /users/me/access_tokens to create new JWT access tokens. Obtained from OAuth login.\n3. **API Key (Programmatic Access)**: Use `Authorization: Bearer sk-<api_key>` with an API key (prefix: `sk-`).\n4. **Reporting Token (Read-only Usage Reporting)**: Use `Authorization: Bearer rpt-<reporting_token>` only with usage reporting endpoints.\n\nClick the **Authorize** button above to configure authentication.",
         version = "1.0.0",
         contact(
             name = "NEAR AI Team",
@@ -34,6 +34,7 @@ use utoipa::{Modify, OpenApi};
         (name = "Users", description = "User profile and token management"),
         (name = "Invitations", description = "Token-based invitation handling"),
         (name = "Usage", description = "Usage tracking and billing information"),
+        (name = "Reporting", description = "Read-only customer usage reporting"),
         (name = "Billing", description = "Billing costs endpoint (HuggingFace integration)"),
         (name = "Staking Farm", description = "House of Stake farm credit configuration and synchronization"),
         (name = "Health", description = "Health check endpoints"),
@@ -131,6 +132,12 @@ use utoipa::{Modify, OpenApi};
         crate::routes::staking_farm::get_staking_farm_config,
         crate::routes::staking_farm::get_organization_staking_farm,
         crate::routes::staking_farm::sync_organization_staking_farm,
+        // Customer reporting endpoints
+        crate::routes::reporting_tokens::create_reporting_token,
+        crate::routes::reporting_tokens::list_reporting_tokens,
+        crate::routes::reporting_tokens::revoke_reporting_token,
+        crate::routes::reporting_usage::export::export_usage,
+        crate::routes::reporting_usage::summary::summary_usage,
         // Feature request endpoints
         crate::routes::feature_requests::submit_feature_request,
         crate::routes::feature_requests::list_admin_feature_requests,
@@ -294,6 +301,26 @@ use utoipa::{Modify, OpenApi};
             // Staking farm models
             crate::routes::staking_farm::StakingFarmConfigResponse,
             crate::routes::staking_farm::StakingFarmStateResponse,
+            // Customer reporting models
+            services::reporting_tokens::ReportingTokenScope,
+            crate::routes::reporting_tokens::CreateReportingTokenRequest,
+            crate::routes::reporting_tokens::CreateReportingTokenResponse,
+            crate::routes::reporting_tokens::ReportingTokenResponse,
+            crate::routes::reporting_tokens::ListReportingTokensResponse,
+            crate::routes::reporting_usage::ReportingUsageSource,
+            crate::routes::reporting_usage::ReportingUsageRowSource,
+            crate::routes::reporting_usage::ReportingUsageExportResponse,
+            crate::routes::reporting_usage::ReportingUsageExportRow,
+            crate::routes::reporting_usage::ReportingUsageDetails,
+            crate::routes::reporting_usage::ReportingInferenceUsage,
+            crate::routes::reporting_usage::ReportingServiceUsage,
+            crate::routes::reporting_usage::ReportingUsageSummaryResponse,
+            crate::routes::reporting_usage::ReportingUsageTotals,
+            crate::routes::reporting_usage::ReportingWorkspaceSummary,
+            crate::routes::reporting_usage::ReportingApiKeySummary,
+            crate::routes::reporting_usage::ReportingModelSummary,
+            crate::routes::reporting_usage::ReportingServiceSummary,
+            crate::routes::reporting_usage::ReportingDaySummary,
             // Feature request models
             crate::routes::feature_requests::FeatureRequestKind,
             crate::routes::feature_requests::SubmitFeatureRequest,
@@ -373,6 +400,16 @@ impl Modify for SecurityAddon {
                         .description(Some(
                             "API key for programmatic access (Authorization: Bearer sk-<api_key>)",
                         ))
+                        .build(),
+                ),
+            );
+            components.add_security_scheme(
+                "reporting_token",
+                SecurityScheme::Http(
+                    HttpBuilder::new()
+                        .scheme(HttpAuthScheme::Bearer)
+                        .bearer_format("reporting_token")
+                        .description(Some("Read-only reporting token for usage reporting endpoints (Authorization: Bearer rpt-<reporting_token>)"))
                         .build(),
                 ),
             );

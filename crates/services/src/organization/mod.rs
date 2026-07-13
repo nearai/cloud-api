@@ -87,6 +87,9 @@ impl OrganizationServiceImpl {
             RepositoryError::AuthenticationFailed => {
                 OrganizationError::InternalError("Database authentication failed".to_string())
             }
+            RepositoryError::QueryTimeout => {
+                OrganizationError::InternalError("Database query timed out".to_string())
+            }
             RepositoryError::PoolError(err) => {
                 OrganizationError::InternalError(format!("Database connection pool error: {err}"))
             }

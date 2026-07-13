@@ -10,7 +10,10 @@ use crate::ohttp_gateway::{OhttpAttestation, OhttpGateway};
 use crate::routes::mcp_server::{handle_mcp_request, McpRouteState};
 use crate::routes::ohttp::{ohttp_config, ohttp_relay};
 use crate::{
-    middleware::{auth::auth_middleware_with_api_key, auth_middleware, AuthState},
+    middleware::{
+        auth::{auth_middleware_with_api_key, auth_middleware_with_reporting_token},
+        auth_middleware, AuthState,
+    },
     openapi::ApiDoc,
     routes::{
         api::{build_management_router, AppState},
@@ -222,6 +225,13 @@ pub fn init_auth_services(database: Arc<Database>, config: &ApiConfig) -> AuthCo
         oauth_manager_arc.clone(),
         auth_service.clone(),
         workspace_repository.clone(),
+        Arc::new(
+            services::reporting_tokens::OrganizationReportingTokenServiceImpl::new(Arc::new(
+                database::repositories::OrganizationReportingTokenRepository::new(
+                    database.pool().clone(),
+                ),
+            )),
+        ) as Arc<dyn services::reporting_tokens::OrganizationReportingTokenService>,
         admin_access_token_repository,
         config.auth.admin_domains.clone(),
         config.auth.encoding_key.clone(),
@@ -308,6 +318,7 @@ pub async fn init_domain_services_with_pool(
     // fallback counter (cloud_api.provider.requests) from the one layer that
     // knows which trust tier served each request.
     inference_provider_pool.set_metrics_service(metrics_service.clone());
+    let reporting_statement_timeout = config.usage_reporting.database_statement_timeout();
 
     // Create shared repositories
     let conversation_repo = Arc::new(database::PgConversationRepository::new(
@@ -363,9 +374,12 @@ pub async fn init_domain_services_with_pool(
     ));
 
     // Prepare repositories for usage service (will be created after workspace service)
-    let usage_repository = Arc::new(database::repositories::OrganizationUsageRepository::new(
-        database.pool().clone(),
-    ));
+    let usage_repository = Arc::new(
+        database::repositories::OrganizationUsageRepository::with_reporting_statement_timeout(
+            database.pool().clone(),
+            reporting_statement_timeout,
+        ),
+    );
     let limits_repository_for_usage = Arc::new(
         database::repositories::OrganizationLimitsRepository::new(database.pool().clone()),
     );
@@ -474,7 +488,10 @@ pub async fn init_domain_services_with_pool(
         database.pool().clone(),
     ));
     let org_service_usage_repo = Arc::new(
-        database::repositories::OrganizationServiceUsageRepository::new(database.pool().clone()),
+        database::repositories::OrganizationServiceUsageRepository::with_reporting_statement_timeout(
+            database.pool().clone(),
+            reporting_statement_timeout,
+        ),
     );
     let service_usage_repo = Arc::new(database::repositories::ServiceUsageRepositoryImpl::new(
         service_repo,
@@ -1139,6 +1156,14 @@ pub fn build_app_with_config(
         attestation_service: domain_services.attestation_service.clone(),
         usage_service: domain_services.usage_service.clone(),
         service_usage_service: domain_services.service_usage_service.clone(),
+        reporting_token_service: Arc::new(
+            services::reporting_tokens::OrganizationReportingTokenServiceImpl::new(Arc::new(
+                database::repositories::OrganizationReportingTokenRepository::new(
+                    database.pool().clone(),
+                ),
+            )),
+        )
+            as Arc<dyn services::reporting_tokens::OrganizationReportingTokenService>,
         user_service: domain_services.user_service.clone(),
         files_service: domain_services.files_service.clone(),
         inference_provider_pool: domain_services.inference_provider_pool.clone(),
@@ -1263,6 +1288,28 @@ pub fn build_app_with_config(
         domain_services.usage_service.clone(),
         &auth_components.auth_state_middleware,
     );
+    let reporting_usage_routes = if config.usage_reporting.enabled {
+        let summary_repository = Arc::new(
+            database::repositories::PostgresReportingUsageSummaryRepository::with_statement_timeout(
+                database.pool().clone(),
+                config.usage_reporting.database_statement_timeout(),
+            ),
+        )
+            as Arc<dyn services::reporting_usage::ReportingUsageSummaryRepository>;
+        let summary_service = Arc::new(services::reporting_usage::ReportingUsageService::new(
+            summary_repository,
+        ));
+        build_reporting_usage_routes(
+            domain_services.usage_service.clone(),
+            domain_services.service_usage_service.clone(),
+            summary_service,
+            middleware::ReportingGuardState::from_config(&config.usage_reporting),
+            &auth_components.auth_state_middleware,
+        )
+    } else {
+        tracing::info!("Programmatic usage reporting routes are disabled");
+        Router::new()
+    };
 
     // Build OpenAPI and documentation routes
     let openapi_routes = build_openapi_routes();
@@ -1326,6 +1373,7 @@ pub fn build_app_with_config(
                 .merge(files_routes)
                 .merge(feature_request_routes)
                 .merge(billing_routes)
+                .merge(reporting_usage_routes)
                 .merge(gateway_routes)
                 .merge(internal_routes)
                 .merge(health_routes)
@@ -1781,6 +1829,54 @@ pub fn build_billing_routes(
         .layer(from_fn_with_state(
             auth_state_middleware.clone(),
             middleware::auth::auth_middleware_with_workspace_context,
+        ))
+}
+
+pub fn build_reporting_usage_routes(
+    usage_service: Arc<dyn services::usage::UsageServiceTrait + Send + Sync>,
+    service_usage_service: Arc<dyn services::service_usage::ServiceUsageServiceTrait + Send + Sync>,
+    summary_service: Arc<services::reporting_usage::ReportingUsageService>,
+    guard_state: middleware::ReportingGuardState,
+    auth_state_middleware: &AuthState,
+) -> Router {
+    let export_state = crate::routes::reporting_usage::ReportingUsageExportState::new(
+        usage_service,
+        service_usage_service,
+    );
+    let summary_state =
+        crate::routes::reporting_usage::ReportingUsageSummaryState::new(summary_service);
+    let export_router = Router::new()
+        .route(
+            "/organizations/{org_id}/usage/export",
+            get(crate::routes::reporting_usage::export_usage),
+        )
+        .with_state(export_state);
+    let summary_router = Router::new()
+        .route(
+            "/organizations/{org_id}/usage/summary",
+            get(crate::routes::reporting_usage::summary_usage),
+        )
+        .with_state(summary_state);
+    let router = Router::new().merge(export_router).merge(summary_router);
+
+    #[cfg(debug_assertions)]
+    let router = router.route(
+        "/organizations/{org_id}/usage/reporting-token-auth-probe",
+        get(crate::routes::reporting_usage::reporting_token_auth_probe),
+    );
+
+    router
+        .layer(from_fn_with_state(
+            guard_state.clone(),
+            middleware::reporting_token_guard_middleware,
+        ))
+        .layer(from_fn_with_state(
+            auth_state_middleware.clone(),
+            auth_middleware_with_reporting_token,
+        ))
+        .layer(from_fn_with_state(
+            guard_state,
+            middleware::reporting_global_guard_middleware,
         ))
 }
 
@@ -2277,9 +2373,71 @@ mod tests {
         assert!(components.security_schemes.contains_key("session_token"));
         assert!(components.security_schemes.contains_key("refresh_token"));
         assert!(components.security_schemes.contains_key("api_key"));
+        assert!(components.security_schemes.contains_key("reporting_token"));
+
+        let spec_json = serde_json::to_value(&spec).unwrap();
+        assert_reporting_path_security(
+            &spec_json,
+            "/v1/organizations/{org_id}/reporting-tokens",
+            "post",
+            "session_token",
+        );
+        assert_reporting_path_security(
+            &spec_json,
+            "/v1/organizations/{org_id}/reporting-tokens",
+            "get",
+            "session_token",
+        );
+        assert_reporting_path_security(
+            &spec_json,
+            "/v1/organizations/{org_id}/reporting-tokens/{token_id}",
+            "delete",
+            "session_token",
+        );
+        assert_reporting_path_security(
+            &spec_json,
+            "/v1/organizations/{org_id}/usage/export",
+            "get",
+            "reporting_token",
+        );
+        assert_reporting_path_security(
+            &spec_json,
+            "/v1/organizations/{org_id}/usage/summary",
+            "get",
+            "reporting_token",
+        );
+        println!(
+            "OPENAPI_REPORTING_CONTRACT={}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "reporting_tokens": spec_json["paths"]["/v1/organizations/{org_id}/reporting-tokens"],
+                "reporting_token_revoke": spec_json["paths"]["/v1/organizations/{org_id}/reporting-tokens/{token_id}"],
+                "usage_export": spec_json["paths"]["/v1/organizations/{org_id}/usage/export"],
+                "usage_summary": spec_json["paths"]["/v1/organizations/{org_id}/usage/summary"],
+                "reporting_token_scheme": spec_json["components"]["securitySchemes"]["reporting_token"],
+            }))
+            .unwrap()
+        );
 
         // Verify servers are not hardcoded (will be set dynamically on client)
         assert!(spec.servers.is_none() || spec.servers.as_ref().unwrap().is_empty());
+    }
+
+    fn assert_reporting_path_security(
+        spec: &serde_json::Value,
+        path: &str,
+        method: &str,
+        scheme: &str,
+    ) {
+        let operation = &spec["paths"][path][method];
+        assert!(
+            operation.is_object(),
+            "missing OpenAPI operation: {method} {path}"
+        );
+        assert_eq!(
+            operation["security"],
+            serde_json::json!([{ scheme: [] }]),
+            "{method} {path} must use only {scheme} security"
+        );
     }
 
     #[test]
@@ -2401,6 +2559,7 @@ mod tests {
             github_dispatch: config::GitHubDispatchConfig::default(),
             infra: config::InfraConfig::default(),
             staking_farm: config::StakingFarmConfig::default(),
+            usage_reporting: config::UsageReportingConfig::default(),
             ita: config::ItaAttestationConfig::default(),
         };
 
@@ -2507,6 +2666,7 @@ mod tests {
             github_dispatch: config::GitHubDispatchConfig::default(),
             infra: config::InfraConfig::default(),
             staking_farm: config::StakingFarmConfig::default(),
+            usage_reporting: config::UsageReportingConfig::default(),
             ita: config::ItaAttestationConfig::default(),
         };
 

@@ -5,6 +5,8 @@ use crate::retry_db;
 use anyhow::{Context, Result};
 use chrono::Utc;
 use services::common::RepositoryError;
+use services::service_usage::ports::{ServiceUsageReportEntry, ServiceUsageReportFilters};
+use std::time::Duration;
 use tokio_postgres::Row;
 use uuid::Uuid;
 
@@ -21,12 +23,24 @@ pub struct RecordServiceUsageRequest {
 
 #[derive(Debug, Clone)]
 pub struct OrganizationServiceUsageRepository {
-    pool: DbPool,
+    pub(crate) pool: DbPool,
+    reporting_statement_timeout: Duration,
 }
 
 impl OrganizationServiceUsageRepository {
     pub fn new(pool: DbPool) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            reporting_statement_timeout:
+                crate::repositories::reporting_query::DEFAULT_REPORTING_STATEMENT_TIMEOUT,
+        }
+    }
+
+    pub fn with_reporting_statement_timeout(pool: DbPool, statement_timeout: Duration) -> Self {
+        Self {
+            pool,
+            reporting_statement_timeout: statement_timeout,
+        }
     }
 
     /// List service usage rows for an organization, optionally filtered by service_id.
@@ -89,6 +103,81 @@ impl OrganizationServiceUsageRepository {
 
         let logs = rows.iter().map(|row| self.row_to_log(row)).collect();
         Ok((logs, total))
+    }
+
+    pub async fn list_reporting_usage(
+        &self,
+        filters: &ServiceUsageReportFilters,
+    ) -> Result<Vec<ServiceUsageReportEntry>> {
+        if let (Some(start_time), Some(end_time)) = (filters.start_time, filters.end_time) {
+            anyhow::ensure!(end_time >= start_time, "invalid reporting date range");
+        }
+
+        let cursor_created_at = filters.cursor.map(|cursor| cursor.created_at);
+        let cursor_id = filters.cursor.map(|cursor| cursor.id);
+        let deadline = crate::repositories::reporting_query::reporting_deadline(
+            self.reporting_statement_timeout,
+            filters.deadline,
+        )?;
+        let rows = retry_db!("list_service_usage_report", {
+            let mut client = self
+                .pool
+                .get()
+                .await
+                .context("Failed to get database connection")
+                .map_err(RepositoryError::PoolError)?;
+
+            let transaction = client
+                .build_transaction()
+                .read_only(true)
+                .start()
+                .await
+                .map_err(map_db_error)?;
+            crate::repositories::reporting_query::configure_reporting_transaction(
+                &transaction,
+                crate::repositories::reporting_query::remaining_statement_timeout(deadline)?,
+            )
+            .await?;
+            let rows = transaction
+                .query(
+                    r#"
+                    SELECT
+                        usage_log.id, usage_log.organization_id, usage_log.workspace_id,
+                        usage_log.api_key_id, usage_log.service_id, services.service_name,
+                        usage_log.quantity, usage_log.total_cost, usage_log.inference_id,
+                        usage_log.created_at
+                    FROM organization_service_usage_log AS usage_log
+                    INNER JOIN services ON services.id = usage_log.service_id
+                    WHERE usage_log.organization_id = $1
+                      AND ($2::TEXT IS NULL OR services.service_name = $2)
+                      AND ($3::UUID IS NULL OR usage_log.workspace_id = $3)
+                      AND ($4::UUID IS NULL OR usage_log.api_key_id = $4)
+                      AND ($5::TIMESTAMPTZ IS NULL OR usage_log.created_at >= $5)
+                      AND ($6::TIMESTAMPTZ IS NULL OR usage_log.created_at <= $6)
+                      AND ($7::TIMESTAMPTZ IS NULL OR $8::UUID IS NULL
+                           OR (usage_log.created_at, usage_log.id) < ($7, $8))
+                    ORDER BY usage_log.created_at DESC, usage_log.id DESC
+                    LIMIT $9
+                    "#,
+                    &[
+                        &filters.organization_id,
+                        &filters.service_name,
+                        &filters.workspace_id,
+                        &filters.api_key_id,
+                        &filters.start_time,
+                        &filters.end_time,
+                        &cursor_created_at,
+                        &cursor_id,
+                        &filters.limit,
+                    ],
+                )
+                .await
+                .map_err(map_db_error)?;
+            transaction.commit().await.map_err(map_db_error)?;
+            Ok::<_, RepositoryError>(rows)
+        })?;
+
+        Ok(rows.iter().map(Self::row_to_report_entry).collect())
     }
 
     /// Record service usage and update organization_balance. Idempotent when inference_id is set:
@@ -198,6 +287,21 @@ impl OrganizationServiceUsageRepository {
             workspace_id: row.get("workspace_id"),
             api_key_id: row.get("api_key_id"),
             service_id: row.get("service_id"),
+            quantity: row.get("quantity"),
+            total_cost: row.get("total_cost"),
+            inference_id: row.get("inference_id"),
+            created_at: row.get("created_at"),
+        }
+    }
+
+    fn row_to_report_entry(row: &Row) -> ServiceUsageReportEntry {
+        ServiceUsageReportEntry {
+            id: row.get("id"),
+            organization_id: row.get("organization_id"),
+            workspace_id: row.get("workspace_id"),
+            api_key_id: row.get("api_key_id"),
+            service_id: row.get("service_id"),
+            service_name: row.get("service_name"),
             quantity: row.get("quantity"),
             total_cost: row.get("total_cost"),
             inference_id: row.get("inference_id"),

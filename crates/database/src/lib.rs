@@ -7,17 +7,20 @@ pub mod patroni_discovery;
 pub mod pool;
 pub mod repositories;
 pub mod shutdown_coordinator;
+mod usage_reporting_indexes;
 
 pub use constants::*;
 pub use models::*;
 pub use pool::DbPool;
 pub use repositories::{
-    ApiKeyRepository, McpConnectorRepository, OAuthStateRepository, PgAttestationRepository,
-    PgConversationRepository, PgOrganizationInvitationRepository, PgOrganizationRepository,
-    PgResponseItemsRepository, PgResponseRepository, PostgresNearNonceRepository,
+    ApiKeyRepository, McpConnectorRepository, OAuthStateRepository,
+    OrganizationReportingTokenRepository, PgAttestationRepository, PgConversationRepository,
+    PgOrganizationInvitationRepository, PgOrganizationRepository, PgResponseItemsRepository,
+    PgResponseRepository, PostgresNearNonceRepository, PostgresReportingUsageSummaryRepository,
     SessionRepository, UserRepository,
 };
 pub use shutdown_coordinator::{ShutdownCoordinator, ShutdownStage, ShutdownStageResult};
+pub use usage_reporting_indexes::ensure_usage_reporting_indexes;
 
 use anyhow::Result;
 use cluster_manager::{ClusterManager, DatabaseConfig as ClusterDbConfig, ReadPreference};
@@ -35,6 +38,7 @@ pub struct Database {
     pub organizations: PgOrganizationRepository,
     pub users: UserRepository,
     pub api_keys: ApiKeyRepository,
+    pub organization_reporting_tokens: OrganizationReportingTokenRepository,
     pub sessions: SessionRepository,
     pub mcp_connectors: McpConnectorRepository,
     pub conversations: PgConversationRepository,
@@ -52,6 +56,7 @@ impl Database {
             organizations: PgOrganizationRepository::new(pool.clone()),
             users: UserRepository::new(pool.clone()),
             api_keys: ApiKeyRepository::new(pool.clone()),
+            organization_reporting_tokens: OrganizationReportingTokenRepository::new(pool.clone()),
             sessions: SessionRepository::new(pool.clone()),
             mcp_connectors: McpConnectorRepository::new(pool.clone()),
             conversations: PgConversationRepository::new(pool.clone()),

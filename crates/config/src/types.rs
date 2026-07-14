@@ -1,3 +1,4 @@
+use crate::ita::ItaAttestationConfig;
 use std::{collections::HashMap, env};
 
 #[derive(Debug, Clone)]
@@ -23,11 +24,15 @@ pub struct ApiConfig {
     pub external_providers: ExternalProvidersConfig,
     pub github_dispatch: GitHubDispatchConfig,
     pub infra: InfraConfig,
+    pub staking_farm: StakingFarmConfig,
+    pub usage_reporting: UsageReportingConfig,
+    pub ita: ItaAttestationConfig,
 }
 
 impl ApiConfig {
     /// Load configuration from environment variables
     pub fn from_env() -> Result<Self, String> {
+        let auth = AuthConfig::from_env()?;
         Ok(Self {
             server: ServerConfig::from_env()?,
             inference_api_key: env::var("INFERENCE_API_KEY")
@@ -42,7 +47,8 @@ impl ApiConfig {
                 .filter(|s| !s.is_empty()),
             logging: LoggingConfig::from_env()?,
             dstack_client: DstackClientConfig::from_env()?,
-            auth: AuthConfig::from_env()?,
+            staking_farm: StakingFarmConfig::from_env(&auth.near),
+            auth,
             database: DatabaseConfig::from_env()?,
             s3: S3Config::from_env()?,
             invitation_email: InvitationEmailConfig::from_env()?,
@@ -51,7 +57,149 @@ impl ApiConfig {
             external_providers: ExternalProvidersConfig::from_env(),
             github_dispatch: GitHubDispatchConfig::from_env()?,
             infra: InfraConfig::from_env(),
+            ita: ItaAttestationConfig::from_env()?,
+            usage_reporting: UsageReportingConfig::from_env()?,
         })
+    }
+}
+
+/// Operational limits for the programmatic usage-reporting API.
+///
+/// Reporting is disabled by default because its production indexes are built
+/// concurrently outside refinery. Operators enable it only after completing
+/// the rollout checklist in `docs/usage-reporting-rollout.md`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UsageReportingConfig {
+    pub enabled: bool,
+    pub global_requests_per_minute: u32,
+    pub token_requests_per_minute: u32,
+    pub max_concurrent_requests: usize,
+    pub token_max_concurrent_requests: usize,
+    pub request_timeout_seconds: u64,
+}
+
+impl Default for UsageReportingConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            global_requests_per_minute: 600,
+            token_requests_per_minute: 60,
+            max_concurrent_requests: 4,
+            token_max_concurrent_requests: 2,
+            request_timeout_seconds: 15,
+        }
+    }
+}
+
+impl UsageReportingConfig {
+    pub fn database_statement_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(self.request_timeout_seconds.saturating_mul(800).max(1))
+    }
+
+    pub fn from_env() -> Result<Self, String> {
+        let defaults = Self::default();
+        let config = Self {
+            enabled: parse_bool_env("USAGE_REPORTING_ENABLED", defaults.enabled)?,
+            global_requests_per_minute: parse_u32_env(
+                "USAGE_REPORTING_GLOBAL_REQUESTS_PER_MINUTE",
+                defaults.global_requests_per_minute,
+            )?,
+            token_requests_per_minute: parse_u32_env(
+                "USAGE_REPORTING_TOKEN_REQUESTS_PER_MINUTE",
+                defaults.token_requests_per_minute,
+            )?,
+            max_concurrent_requests: usize::try_from(parse_u32_env(
+                "USAGE_REPORTING_MAX_CONCURRENT_REQUESTS",
+                u32::try_from(defaults.max_concurrent_requests)
+                    .map_err(|_| "default reporting concurrency exceeds u32".to_string())?,
+            )?)
+            .map_err(|_| "USAGE_REPORTING_MAX_CONCURRENT_REQUESTS is too large".to_string())?,
+            token_max_concurrent_requests: usize::try_from(parse_u32_env(
+                "USAGE_REPORTING_TOKEN_MAX_CONCURRENT_REQUESTS",
+                u32::try_from(defaults.token_max_concurrent_requests)
+                    .map_err(|_| "default token reporting concurrency exceeds u32".to_string())?,
+            )?)
+            .map_err(|_| {
+                "USAGE_REPORTING_TOKEN_MAX_CONCURRENT_REQUESTS is too large".to_string()
+            })?,
+            request_timeout_seconds: parse_u64_env(
+                "USAGE_REPORTING_REQUEST_TIMEOUT_SECONDS",
+                defaults.request_timeout_seconds,
+            )?,
+        };
+
+        if config.global_requests_per_minute == 0
+            || config.token_requests_per_minute == 0
+            || config.max_concurrent_requests == 0
+            || config.token_max_concurrent_requests == 0
+            || config.request_timeout_seconds == 0
+        {
+            return Err("usage reporting limits must be greater than zero".to_string());
+        }
+        if config.request_timeout_seconds > 3_600 {
+            return Err("USAGE_REPORTING_REQUEST_TIMEOUT_SECONDS must not exceed 3600".to_string());
+        }
+
+        Ok(config)
+    }
+}
+
+/// Global House of Stake farm configuration used to convert reward units into
+/// NEAR AI Cloud credits. The feature is disabled until contract/product IDs are
+/// supplied by the deployment environment.
+#[derive(Debug, Clone)]
+pub struct StakingFarmConfig {
+    pub enabled: bool,
+    pub network_id: String,
+    pub contract_id: String,
+    pub farm_product_id: String,
+    pub farm_price_id: Option<String>,
+    pub credit_nano_usd_per_reward_unit: i64,
+    pub sync_staleness_seconds: i64,
+}
+
+impl Default for StakingFarmConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            network_id: NEAR_DEFAULT_NETWORK_ID.to_string(),
+            contract_id: String::new(),
+            farm_product_id: String::new(),
+            farm_price_id: None,
+            credit_nano_usd_per_reward_unit: 1_000_000_000,
+            sync_staleness_seconds: 300,
+        }
+    }
+}
+
+impl StakingFarmConfig {
+    pub fn from_env(near: &NearConfig) -> Self {
+        let mut config = Self {
+            enabled: env::var("STAKING_FARM_ENABLED")
+                .ok()
+                .and_then(|value| value.parse::<bool>().ok())
+                .unwrap_or(false),
+            network_id: near.network_id.clone(),
+            contract_id: env::var("NEAR_STAKING_CONTRACT_ID").unwrap_or_default(),
+            farm_product_id: env::var("STAKING_FARM_PRODUCT_ID").unwrap_or_default(),
+            farm_price_id: env::var("STAKING_FARM_PRICE_ID")
+                .ok()
+                .filter(|value| !value.is_empty()),
+            credit_nano_usd_per_reward_unit: env::var(
+                "STAKING_FARM_CREDIT_NANO_USD_PER_REWARD_UNIT",
+            )
+            .ok()
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(1_000_000_000),
+            sync_staleness_seconds: env::var("STAKING_FARM_SYNC_STALENESS_SECONDS")
+                .ok()
+                .and_then(|value| value.parse::<i64>().ok())
+                .unwrap_or(300),
+        };
+
+        config.enabled =
+            config.enabled && !config.contract_id.is_empty() && !config.farm_product_id.is_empty();
+        config
     }
 }
 
@@ -79,6 +227,39 @@ impl InfraConfig {
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(0.0),
         }
+    }
+}
+
+pub(crate) fn parse_bool_env(key: &str, default: bool) -> Result<bool, String> {
+    match env::var(key) {
+        Ok(raw) => match raw.trim() {
+            "1" => Ok(true),
+            "0" => Ok(false),
+            value if value.eq_ignore_ascii_case("true") => Ok(true),
+            value if value.eq_ignore_ascii_case("false") => Ok(false),
+            _ => Err(format!("{key} must be true or false")),
+        },
+        Err(_) => Ok(default),
+    }
+}
+
+pub(crate) fn parse_u64_env(key: &str, default: u64) -> Result<u64, String> {
+    match env::var(key) {
+        Ok(raw) => raw
+            .trim()
+            .parse::<u64>()
+            .map_err(|_| format!("{key} must be an unsigned integer")),
+        Err(_) => Ok(default),
+    }
+}
+
+pub(crate) fn parse_u32_env(key: &str, default: u32) -> Result<u32, String> {
+    match env::var(key) {
+        Ok(raw) => raw
+            .trim()
+            .parse::<u32>()
+            .map_err(|_| format!("{key} must be an unsigned integer")),
+        Err(_) => Ok(default),
     }
 }
 
@@ -450,9 +631,11 @@ pub struct GoogleOAuthConfig {
 #[derive(Debug, Clone)]
 pub struct NearConfig {
     pub rpc_url: String,
+    pub network_id: String,
     pub expected_recipient: String,
 }
 
+const NEAR_DEFAULT_NETWORK_ID: &str = "mainnet";
 const NEAR_DEFAULT_RECIPIENT: &str = "cloud.near.ai";
 const NEAR_DEFAULT_RPC_URL: &str = "https://free.rpc.fastnear.com";
 
@@ -460,6 +643,7 @@ impl Default for NearConfig {
     fn default() -> Self {
         Self {
             rpc_url: NEAR_DEFAULT_RPC_URL.to_string(),
+            network_id: NEAR_DEFAULT_NETWORK_ID.to_string(),
             expected_recipient: NEAR_DEFAULT_RECIPIENT.to_string(),
         }
     }
@@ -469,6 +653,8 @@ impl NearConfig {
     pub fn from_env() -> Self {
         Self {
             rpc_url: env::var("NEAR_RPC_URL").unwrap_or_else(|_| NEAR_DEFAULT_RPC_URL.to_string()),
+            network_id: env::var("NEAR_NETWORK_ID")
+                .unwrap_or_else(|_| NEAR_DEFAULT_NETWORK_ID.to_string()),
             expected_recipient: env::var("NEAR_EXPECTED_RECIPIENT")
                 .unwrap_or_else(|_| NEAR_DEFAULT_RECIPIENT.to_string()),
         }
@@ -620,7 +806,7 @@ impl InvitationEmailConfig {
     }
 }
 
-fn non_empty_env(key: &str) -> Option<String> {
+pub(crate) fn non_empty_env(key: &str) -> Option<String> {
     env::var(key)
         .ok()
         .map(|value| value.trim().to_string())
@@ -642,10 +828,42 @@ fn read_optional_secret_env(file_key: &str, value_key: &str) -> Result<Option<St
     Ok(non_empty_env(value_key))
 }
 
+pub(crate) fn read_optional_secret_env_absent_empty(
+    file_key: &str,
+    value_key: &str,
+) -> Result<Option<String>, String> {
+    if let Some(path) = non_empty_env(file_key) {
+        let value = std::fs::read_to_string(&path)
+            .map_err(|e| format!("Failed to read {file_key}: {e}"))?
+            .trim()
+            .to_string();
+        return Ok((!value.is_empty()).then_some(value));
+    }
+
+    Ok(non_empty_env(value_key))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serial_test::serial;
+
+    #[test]
+    fn reporting_database_timeout_leaves_headroom_for_http_response() {
+        let config = UsageReportingConfig {
+            request_timeout_seconds: 15,
+            ..UsageReportingConfig::default()
+        };
+
+        assert_eq!(
+            config.database_statement_timeout(),
+            std::time::Duration::from_secs(12)
+        );
+        assert!(
+            config.database_statement_timeout()
+                < std::time::Duration::from_secs(config.request_timeout_seconds)
+        );
+    }
 
     #[test]
     fn test_is_admin_email() {
@@ -697,6 +915,21 @@ mod tests {
         }
     }
 
+    fn clear_staking_farm_env() {
+        for key in [
+            "STAKING_FARM_ENABLED",
+            "NEAR_STAKING_CONTRACT_ID",
+            "STAKING_FARM_PRODUCT_ID",
+            "STAKING_FARM_PRICE_ID",
+            "STAKING_FARM_CREDIT_NANO_USD_PER_REWARD_UNIT",
+            "STAKING_FARM_SYNC_STALENESS_SECONDS",
+            "NEAR_NETWORK_ID",
+            "NEAR_RPC_URL",
+        ] {
+            std::env::remove_var(key);
+        }
+    }
+
     #[test]
     #[serial]
     fn github_dispatch_disabled_by_default() {
@@ -717,6 +950,28 @@ mod tests {
             GitHubDispatchConfig::default().event_type,
             DEFAULT_GITHUB_DISPATCH_EVENT_TYPE
         );
+    }
+
+    #[test]
+    #[serial]
+    fn staking_farm_config_uses_shared_near_network() {
+        clear_staking_farm_env();
+        std::env::set_var("STAKING_FARM_ENABLED", "true");
+        std::env::set_var("NEAR_STAKING_CONTRACT_ID", "stake.testnet");
+        std::env::set_var("STAKING_FARM_PRODUCT_ID", "cloud-credits");
+        std::env::set_var("NEAR_NETWORK_ID", "testnet");
+        std::env::set_var("NEAR_RPC_URL", "https://rpc.testnet.near.org");
+
+        let near = NearConfig::from_env();
+        let config = StakingFarmConfig::from_env(&near);
+
+        assert!(config.enabled);
+        assert_eq!(config.network_id, "testnet");
+        assert_eq!(near.rpc_url, "https://rpc.testnet.near.org");
+        assert_eq!(config.contract_id, "stake.testnet");
+        assert_eq!(config.farm_product_id, "cloud-credits");
+
+        clear_staking_farm_env();
     }
 
     #[test]

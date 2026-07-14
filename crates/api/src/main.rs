@@ -20,6 +20,11 @@ async fn main() {
 
     // Initialize core services
     let database = init_database(&config.database).await;
+    if config.usage_reporting.enabled {
+        database::ensure_usage_reporting_indexes(database.pool())
+            .await
+            .expect("Usage reporting index prerequisites are not satisfied");
+    }
     let auth_components = init_auth_services(database.clone(), &config);
 
     // Initialize OpenTelemetry pipeline

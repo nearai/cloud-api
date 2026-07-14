@@ -5,17 +5,52 @@ use axum::{
     response::Response,
 };
 use services::usage::{UsageCheckResult, UsageServiceTrait};
-use std::sync::Arc;
+use std::{future::Future, pin::Pin, sync::Arc};
 use tracing::{debug, warn};
 
 use super::auth::AuthenticatedApiKey;
 use crate::models::ErrorResponse;
 use crate::routes::common::format_amount;
 
+pub trait StakingFarmPreflightSync: Send + Sync {
+    fn sync_organization_if_stale(
+        &self,
+        organization_id: uuid::Uuid,
+    ) -> Pin<
+        Box<
+            dyn Future<
+                    Output = anyhow::Result<
+                        Option<services::staking_farm::OrganizationStakingFarmSource>,
+                    >,
+                > + Send
+                + '_,
+        >,
+    >;
+}
+
+impl StakingFarmPreflightSync for services::staking_farm::StakingFarmService {
+    fn sync_organization_if_stale(
+        &self,
+        organization_id: uuid::Uuid,
+    ) -> Pin<
+        Box<
+            dyn Future<
+                    Output = anyhow::Result<
+                        Option<services::staking_farm::OrganizationStakingFarmSource>,
+                    >,
+                > + Send
+                + '_,
+        >,
+    > {
+        Box::pin(self.sync_organization_if_stale(organization_id))
+    }
+}
+
 /// State for usage middleware
 #[derive(Clone)]
 pub struct UsageState {
     pub usage_service: Arc<dyn UsageServiceTrait + Send + Sync>,
+    pub staking_farm_service: Arc<services::staking_farm::StakingFarmService>,
     pub usage_repository: Arc<database::repositories::OrganizationUsageRepository>,
     pub api_key_repository: Arc<database::repositories::ApiKeyRepository>,
 }
@@ -88,9 +123,32 @@ pub async fn check_usage_for_api_key(
         );
     }
 
+    check_organization_usage_after_staking_preflight(
+        state.staking_farm_service.as_ref(),
+        state.usage_service.as_ref(),
+        organization_id,
+    )
+    .await
+}
+
+async fn check_organization_usage_after_staking_preflight(
+    staking_farm_service: &(dyn StakingFarmPreflightSync + Send + Sync),
+    usage_service: &(dyn UsageServiceTrait + Send + Sync),
+    organization_id: uuid::Uuid,
+) -> Result<(), (StatusCode, axum::Json<ErrorResponse>)> {
+    if let Err(error) = staking_farm_service
+        .sync_organization_if_stale(organization_id)
+        .await
+    {
+        warn!(
+            organization_id = %organization_id,
+            error = %error,
+            "Staking farm preflight sync failed; continuing with last synced credits"
+        );
+    }
+
     // Check if organization can make request
-    let check_result = state
-        .usage_service
+    let check_result = usage_service
         .check_can_use(organization_id)
         .await
         .map_err(|_| {
@@ -176,4 +234,227 @@ pub async fn usage_check_middleware(
 
     check_usage_for_api_key(&state, api_key).await?;
     Ok(next.run(request).await)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use services::usage::{
+        CostBreakdown, InferenceCost, InferenceUsageHistoryQuery, InferenceUsageReportQuery,
+        InferenceUsageReportRow, OrganizationBalanceInfo, OrganizationCreditLimit,
+        OrganizationLimit, RecordUsageApiRequest, RecordUsageServiceRequest, UsageByModelEntry,
+        UsageError, UsageLogEntry,
+    };
+    use std::sync::Mutex;
+    use uuid::Uuid;
+
+    #[derive(Default)]
+    struct MockStakingFarmPreflight {
+        calls: Mutex<Vec<Uuid>>,
+        should_fail: bool,
+        events: Arc<Mutex<Vec<&'static str>>>,
+    }
+
+    impl StakingFarmPreflightSync for MockStakingFarmPreflight {
+        fn sync_organization_if_stale(
+            &self,
+            organization_id: Uuid,
+        ) -> Pin<
+            Box<
+                dyn Future<
+                        Output = anyhow::Result<
+                            Option<services::staking_farm::OrganizationStakingFarmSource>,
+                        >,
+                    > + Send
+                    + '_,
+            >,
+        > {
+            self.calls.lock().unwrap().push(organization_id);
+            self.events.lock().unwrap().push("staking");
+            let should_fail = self.should_fail;
+            Box::pin(async move {
+                if should_fail {
+                    anyhow::bail!("staking sync failed");
+                }
+                Ok(None)
+            })
+        }
+    }
+
+    struct MockUsageService {
+        result: UsageCheckResult,
+        calls: Mutex<Vec<Uuid>>,
+        events: Arc<Mutex<Vec<&'static str>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl UsageServiceTrait for MockUsageService {
+        async fn calculate_cost(
+            &self,
+            _model_id: &str,
+            _input_tokens: i32,
+            _output_tokens: i32,
+            _cache_read_tokens: i32,
+        ) -> Result<CostBreakdown, UsageError> {
+            unimplemented!()
+        }
+
+        async fn record_usage(
+            &self,
+            _request: RecordUsageServiceRequest,
+        ) -> Result<UsageLogEntry, UsageError> {
+            unimplemented!()
+        }
+
+        async fn record_usage_from_api(
+            &self,
+            _organization_id: Uuid,
+            _workspace_id: Uuid,
+            _api_key_id: Uuid,
+            _request: RecordUsageApiRequest,
+        ) -> Result<UsageLogEntry, UsageError> {
+            unimplemented!()
+        }
+
+        async fn check_can_use(
+            &self,
+            organization_id: Uuid,
+        ) -> Result<UsageCheckResult, UsageError> {
+            self.calls.lock().unwrap().push(organization_id);
+            self.events.lock().unwrap().push("usage");
+            Ok(self.result.clone())
+        }
+
+        async fn get_balance(
+            &self,
+            _organization_id: Uuid,
+        ) -> Result<Option<OrganizationBalanceInfo>, UsageError> {
+            unimplemented!()
+        }
+
+        async fn get_usage_history(
+            &self,
+            _organization_id: Uuid,
+            _limit: Option<i64>,
+            _offset: Option<i64>,
+        ) -> Result<(Vec<UsageLogEntry>, i64), UsageError> {
+            unimplemented!()
+        }
+
+        async fn get_limit(
+            &self,
+            _organization_id: Uuid,
+        ) -> Result<Option<OrganizationLimit>, UsageError> {
+            unimplemented!()
+        }
+
+        async fn get_credit_limits(
+            &self,
+            _organization_id: Uuid,
+        ) -> Result<Vec<OrganizationCreditLimit>, UsageError> {
+            unimplemented!()
+        }
+
+        async fn get_usage_history_by_api_key(
+            &self,
+            _api_key_id: Uuid,
+            _limit: Option<i64>,
+            _offset: Option<i64>,
+        ) -> Result<(Vec<UsageLogEntry>, i64), UsageError> {
+            unimplemented!()
+        }
+
+        async fn get_api_key_usage_history_with_permissions(
+            &self,
+            _workspace_id: Uuid,
+            _api_key_id: Uuid,
+            _user_id: Uuid,
+            _limit: Option<i64>,
+            _offset: Option<i64>,
+        ) -> Result<(Vec<UsageLogEntry>, i64), UsageError> {
+            unimplemented!()
+        }
+
+        async fn get_costs_by_inference_ids(
+            &self,
+            _organization_id: Uuid,
+            _inference_ids: Vec<Uuid>,
+        ) -> Result<Vec<InferenceCost>, UsageError> {
+            unimplemented!()
+        }
+
+        async fn get_usage_by_model(
+            &self,
+            _organization_id: Uuid,
+            _start_date: chrono::DateTime<chrono::Utc>,
+        ) -> Result<Vec<UsageByModelEntry>, UsageError> {
+            unimplemented!()
+        }
+
+        async fn list_inference_usage_report(
+            &self,
+            _query: InferenceUsageReportQuery,
+        ) -> Result<Vec<InferenceUsageReportRow>, UsageError> {
+            Ok(vec![])
+        }
+
+        async fn list_inference_usage_history(
+            &self,
+            _query: InferenceUsageHistoryQuery,
+        ) -> Result<(Vec<InferenceUsageReportRow>, i64), UsageError> {
+            Ok((vec![], 0))
+        }
+    }
+
+    #[tokio::test]
+    async fn staking_farm_preflight_runs_before_usage_check() {
+        let organization_id = Uuid::new_v4();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let staking = MockStakingFarmPreflight {
+            calls: Mutex::new(Vec::new()),
+            should_fail: false,
+            events: events.clone(),
+        };
+        let usage = MockUsageService {
+            result: UsageCheckResult::Allowed {
+                remaining: 1_000_000_000,
+            },
+            calls: Mutex::new(Vec::new()),
+            events: events.clone(),
+        };
+
+        check_organization_usage_after_staking_preflight(&staking, &usage, organization_id)
+            .await
+            .unwrap();
+
+        assert_eq!(staking.calls.lock().unwrap().as_slice(), &[organization_id]);
+        assert_eq!(usage.calls.lock().unwrap().as_slice(), &[organization_id]);
+        assert_eq!(events.lock().unwrap().as_slice(), &["staking", "usage"]);
+    }
+
+    #[tokio::test]
+    async fn staking_farm_preflight_failure_still_checks_usage() {
+        let organization_id = Uuid::new_v4();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let staking = MockStakingFarmPreflight {
+            calls: Mutex::new(Vec::new()),
+            should_fail: true,
+            events: events.clone(),
+        };
+        let usage = MockUsageService {
+            result: UsageCheckResult::Allowed {
+                remaining: 1_000_000_000,
+            },
+            calls: Mutex::new(Vec::new()),
+            events: events.clone(),
+        };
+
+        check_organization_usage_after_staking_preflight(&staking, &usage, organization_id)
+            .await
+            .unwrap();
+
+        assert_eq!(staking.calls.lock().unwrap().as_slice(), &[organization_id]);
+        assert_eq!(usage.calls.lock().unwrap().as_slice(), &[organization_id]);
+        assert_eq!(events.lock().unwrap().as_slice(), &["staking", "usage"]);
+    }
 }

@@ -10,11 +10,14 @@ use crate::ohttp_gateway::{OhttpAttestation, OhttpGateway};
 use crate::routes::mcp_server::{handle_mcp_request, McpRouteState};
 use crate::routes::ohttp::{ohttp_config, ohttp_relay};
 use crate::{
-    middleware::{auth::auth_middleware_with_api_key, auth_middleware, AuthState},
+    middleware::{
+        auth::{auth_middleware_with_api_key, auth_middleware_with_reporting_token},
+        auth_middleware, AuthState,
+    },
     openapi::ApiDoc,
     routes::{
         api::{build_management_router, AppState},
-        attestation::{get_attestation_report, get_signature},
+        attestation::{self, get_signature},
         auth::{
             current_user, github_login, google_login, login_page, logout, oauth_callback,
             StateStore,
@@ -103,6 +106,7 @@ pub struct DomainServices {
     pub user_service: Arc<dyn services::user::UserServiceTrait + Send + Sync>,
     pub files_service: Arc<dyn services::files::FileServiceTrait + Send + Sync>,
     pub metrics_service: Arc<dyn services::metrics::MetricsServiceTrait>,
+    pub staking_farm_service: Arc<services::staking_farm::StakingFarmService>,
     pub web_search_provider: Arc<dyn services::responses::tools::WebSearchProviderTrait>,
     pub service_usage_service:
         Arc<dyn services::service_usage::ServiceUsageServiceTrait + Send + Sync>,
@@ -221,6 +225,13 @@ pub fn init_auth_services(database: Arc<Database>, config: &ApiConfig) -> AuthCo
         oauth_manager_arc.clone(),
         auth_service.clone(),
         workspace_repository.clone(),
+        Arc::new(
+            services::reporting_tokens::OrganizationReportingTokenServiceImpl::new(Arc::new(
+                database::repositories::OrganizationReportingTokenRepository::new(
+                    database.pool().clone(),
+                ),
+            )),
+        ) as Arc<dyn services::reporting_tokens::OrganizationReportingTokenService>,
         admin_access_token_repository,
         config.auth.admin_domains.clone(),
         config.auth.encoding_key.clone(),
@@ -307,6 +318,7 @@ pub async fn init_domain_services_with_pool(
     // fallback counter (cloud_api.provider.requests) from the one layer that
     // knows which trust tier served each request.
     inference_provider_pool.set_metrics_service(metrics_service.clone());
+    let reporting_statement_timeout = config.usage_reporting.database_statement_timeout();
 
     // Create shared repositories
     let conversation_repo = Arc::new(database::PgConversationRepository::new(
@@ -349,6 +361,7 @@ pub async fn init_domain_services_with_pool(
             models_repo.clone(),
             metrics_service.clone(),
             usage_repository_for_attestation,
+            config.ita.clone(),
         )
         .await
         .unwrap(),
@@ -361,9 +374,12 @@ pub async fn init_domain_services_with_pool(
     ));
 
     // Prepare repositories for usage service (will be created after workspace service)
-    let usage_repository = Arc::new(database::repositories::OrganizationUsageRepository::new(
-        database.pool().clone(),
-    ));
+    let usage_repository = Arc::new(
+        database::repositories::OrganizationUsageRepository::with_reporting_statement_timeout(
+            database.pool().clone(),
+            reporting_statement_timeout,
+        ),
+    );
     let limits_repository_for_usage = Arc::new(
         database::repositories::OrganizationLimitsRepository::new(database.pool().clone()),
     );
@@ -472,7 +488,10 @@ pub async fn init_domain_services_with_pool(
         database.pool().clone(),
     ));
     let org_service_usage_repo = Arc::new(
-        database::repositories::OrganizationServiceUsageRepository::new(database.pool().clone()),
+        database::repositories::OrganizationServiceUsageRepository::with_reporting_statement_timeout(
+            database.pool().clone(),
+            reporting_statement_timeout,
+        ),
     );
     let service_usage_repo = Arc::new(database::repositories::ServiceUsageRepositoryImpl::new(
         service_repo,
@@ -481,6 +500,25 @@ pub async fn init_domain_services_with_pool(
         as Arc<dyn services::service_usage::ports::ServiceUsageRepositoryTrait>;
     let service_usage_service = Arc::new(services::service_usage::ServiceUsageService::new(
         service_usage_repo,
+    ));
+
+    let staking_farm_repository = Arc::new(
+        database::repositories::OrganizationStakingFarmSourcesRepository::new(
+            database.pool().clone(),
+        ),
+    ) as Arc<dyn services::staking_farm::StakingFarmRepository>;
+    let staking_farm_contract_client = Arc::new(
+        services::staking_farm::NearRpcStakingFarmClient::new(
+            config.auth.near.rpc_url.clone(),
+            config.auth.near.network_id.clone(),
+        )
+        .expect("Failed to initialize staking farm NEAR RPC client"),
+    )
+        as Arc<dyn services::staking_farm::StakingFarmContractClient>;
+    let staking_farm_service = Arc::new(services::staking_farm::StakingFarmService::new(
+        staking_farm_repository,
+        staking_farm_contract_client,
+        config.staking_farm.clone(),
     ));
 
     DomainServices {
@@ -497,6 +535,7 @@ pub async fn init_domain_services_with_pool(
         user_service,
         files_service,
         metrics_service,
+        staking_farm_service,
         web_search_provider,
         service_usage_service,
     }
@@ -1117,11 +1156,20 @@ pub fn build_app_with_config(
         attestation_service: domain_services.attestation_service.clone(),
         usage_service: domain_services.usage_service.clone(),
         service_usage_service: domain_services.service_usage_service.clone(),
+        reporting_token_service: Arc::new(
+            services::reporting_tokens::OrganizationReportingTokenServiceImpl::new(Arc::new(
+                database::repositories::OrganizationReportingTokenRepository::new(
+                    database.pool().clone(),
+                ),
+            )),
+        )
+            as Arc<dyn services::reporting_tokens::OrganizationReportingTokenService>,
         user_service: domain_services.user_service.clone(),
         files_service: domain_services.files_service.clone(),
         inference_provider_pool: domain_services.inference_provider_pool.clone(),
         metrics_service: domain_services.metrics_service.clone(),
         analytics_service: analytics_service.clone(),
+        staking_farm_service: domain_services.staking_farm_service.clone(),
         config: config.clone(),
         ohttp_gateway,
         ohttp_attestation,
@@ -1138,6 +1186,7 @@ pub fn build_app_with_config(
 
     let usage_state = middleware::UsageState {
         usage_service: domain_services.usage_service.clone(),
+        staking_farm_service: domain_services.staking_farm_service.clone(),
         usage_repository,
         api_key_repository,
     };
@@ -1214,6 +1263,7 @@ pub fn build_app_with_config(
         AdminRouteServices {
             inference_provider_pool: app_state.inference_provider_pool.clone(),
             analytics_service,
+            staking_farm_service: app_state.staking_farm_service.clone(),
             models_service: domain_services.models_service.clone(),
             completion_service: domain_services.completion_service.clone(),
             organization_service: domain_services.organization_service.clone(),
@@ -1238,6 +1288,28 @@ pub fn build_app_with_config(
         domain_services.usage_service.clone(),
         &auth_components.auth_state_middleware,
     );
+    let reporting_usage_routes = if config.usage_reporting.enabled {
+        let summary_repository = Arc::new(
+            database::repositories::PostgresReportingUsageSummaryRepository::with_statement_timeout(
+                database.pool().clone(),
+                config.usage_reporting.database_statement_timeout(),
+            ),
+        )
+            as Arc<dyn services::reporting_usage::ReportingUsageSummaryRepository>;
+        let summary_service = Arc::new(services::reporting_usage::ReportingUsageService::new(
+            summary_repository,
+        ));
+        build_reporting_usage_routes(
+            domain_services.usage_service.clone(),
+            domain_services.service_usage_service.clone(),
+            summary_service,
+            middleware::ReportingGuardState::from_config(&config.usage_reporting),
+            &auth_components.auth_state_middleware,
+        )
+    } else {
+        tracing::info!("Programmatic usage reporting routes are disabled");
+        Router::new()
+    };
 
     // Build OpenAPI and documentation routes
     let openapi_routes = build_openapi_routes();
@@ -1301,6 +1373,7 @@ pub fn build_app_with_config(
                 .merge(files_routes)
                 .merge(feature_request_routes)
                 .merge(billing_routes)
+                .merge(reporting_usage_routes)
                 .merge(gateway_routes)
                 .merge(internal_routes)
                 .merge(health_routes)
@@ -1641,17 +1714,16 @@ pub fn build_conversation_routes(
 
 /// Build attestation routes with auth
 pub fn build_attestation_routes(app_state: AppState, auth_state_middleware: &AuthState) -> Router {
+    let attestation_route_state = attestation::AttestationRouteState::from(app_state);
     let authenticated_routes = Router::new()
         .route("/signature/{chat_id}", get(get_signature))
-        .with_state(app_state.clone())
+        .with_state(attestation_route_state.clone())
         .layer(from_fn_with_state(
             auth_state_middleware.clone(),
             auth_middleware_with_api_key,
         ));
 
-    let public_routes = Router::new()
-        .route("/attestation/report", get(get_attestation_report))
-        .with_state(app_state);
+    let public_routes = attestation::build_public_attestation_routes(attestation_route_state);
 
     Router::new()
         .merge(authenticated_routes)
@@ -1757,6 +1829,54 @@ pub fn build_billing_routes(
         .layer(from_fn_with_state(
             auth_state_middleware.clone(),
             middleware::auth::auth_middleware_with_workspace_context,
+        ))
+}
+
+pub fn build_reporting_usage_routes(
+    usage_service: Arc<dyn services::usage::UsageServiceTrait + Send + Sync>,
+    service_usage_service: Arc<dyn services::service_usage::ServiceUsageServiceTrait + Send + Sync>,
+    summary_service: Arc<services::reporting_usage::ReportingUsageService>,
+    guard_state: middleware::ReportingGuardState,
+    auth_state_middleware: &AuthState,
+) -> Router {
+    let export_state = crate::routes::reporting_usage::ReportingUsageExportState::new(
+        usage_service,
+        service_usage_service,
+    );
+    let summary_state =
+        crate::routes::reporting_usage::ReportingUsageSummaryState::new(summary_service);
+    let export_router = Router::new()
+        .route(
+            "/organizations/{org_id}/usage/export",
+            get(crate::routes::reporting_usage::export_usage),
+        )
+        .with_state(export_state);
+    let summary_router = Router::new()
+        .route(
+            "/organizations/{org_id}/usage/summary",
+            get(crate::routes::reporting_usage::summary_usage),
+        )
+        .with_state(summary_state);
+    let router = Router::new().merge(export_router).merge(summary_router);
+
+    #[cfg(debug_assertions)]
+    let router = router.route(
+        "/organizations/{org_id}/usage/reporting-token-auth-probe",
+        get(crate::routes::reporting_usage::reporting_token_auth_probe),
+    );
+
+    router
+        .layer(from_fn_with_state(
+            guard_state.clone(),
+            middleware::reporting_token_guard_middleware,
+        ))
+        .layer(from_fn_with_state(
+            auth_state_middleware.clone(),
+            auth_middleware_with_reporting_token,
+        ))
+        .layer(from_fn_with_state(
+            guard_state,
+            middleware::reporting_global_guard_middleware,
         ))
 }
 
@@ -1887,6 +2007,7 @@ fn cache_control_layer(value: &'static str) -> CacheControlLayer {
 pub struct AdminRouteServices {
     pub inference_provider_pool: Arc<services::inference_provider_pool::InferenceProviderPool>,
     pub analytics_service: Arc<services::admin::AnalyticsService>,
+    pub staking_farm_service: Arc<services::staking_farm::StakingFarmService>,
     pub models_service: Arc<services::models::ModelsServiceImpl>,
     pub completion_service: Arc<services::CompletionServiceImpl>,
     pub organization_service:
@@ -1915,6 +2036,9 @@ pub fn build_admin_routes(
         list_organizations, list_users, preview_model_deprecation, preview_model_pricing_changes,
         resend_invitation_email, update_organization_concurrent_limit, update_organization_limits,
         update_service, AdminAppState,
+    };
+    use crate::routes::staking_farm::{
+        get_admin_organization_staking_farm, sync_admin_organization_staking_farm,
     };
     use database::repositories::{AdminAccessTokenRepository, AdminCompositeRepository};
     use services::admin::AdminServiceImpl;
@@ -1957,6 +2081,7 @@ pub fn build_admin_routes(
         organization_service: services.organization_service,
         auth_service: auth_state_middleware.auth_service.clone(),
         usage_service: services.usage_service,
+        staking_farm_service: services.staking_farm_service,
         config,
         admin_access_token_repository,
         inference_provider_pool: services.inference_provider_pool,
@@ -2018,6 +2143,14 @@ pub fn build_admin_routes(
         .route(
             "/admin/organizations/{org_id}/usage/balance",
             axum::routing::get(get_admin_organization_balance),
+        )
+        .route(
+            "/admin/organizations/{org_id}/staking/farm",
+            axum::routing::get(get_admin_organization_staking_farm),
+        )
+        .route(
+            "/admin/organizations/{org_id}/staking/farm/sync",
+            axum::routing::post(sync_admin_organization_staking_farm),
         )
         .route(
             "/admin/organizations/{org_id}/concurrent-limit",
@@ -2240,9 +2373,71 @@ mod tests {
         assert!(components.security_schemes.contains_key("session_token"));
         assert!(components.security_schemes.contains_key("refresh_token"));
         assert!(components.security_schemes.contains_key("api_key"));
+        assert!(components.security_schemes.contains_key("reporting_token"));
+
+        let spec_json = serde_json::to_value(&spec).unwrap();
+        assert_reporting_path_security(
+            &spec_json,
+            "/v1/organizations/{org_id}/reporting-tokens",
+            "post",
+            "session_token",
+        );
+        assert_reporting_path_security(
+            &spec_json,
+            "/v1/organizations/{org_id}/reporting-tokens",
+            "get",
+            "session_token",
+        );
+        assert_reporting_path_security(
+            &spec_json,
+            "/v1/organizations/{org_id}/reporting-tokens/{token_id}",
+            "delete",
+            "session_token",
+        );
+        assert_reporting_path_security(
+            &spec_json,
+            "/v1/organizations/{org_id}/usage/export",
+            "get",
+            "reporting_token",
+        );
+        assert_reporting_path_security(
+            &spec_json,
+            "/v1/organizations/{org_id}/usage/summary",
+            "get",
+            "reporting_token",
+        );
+        println!(
+            "OPENAPI_REPORTING_CONTRACT={}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "reporting_tokens": spec_json["paths"]["/v1/organizations/{org_id}/reporting-tokens"],
+                "reporting_token_revoke": spec_json["paths"]["/v1/organizations/{org_id}/reporting-tokens/{token_id}"],
+                "usage_export": spec_json["paths"]["/v1/organizations/{org_id}/usage/export"],
+                "usage_summary": spec_json["paths"]["/v1/organizations/{org_id}/usage/summary"],
+                "reporting_token_scheme": spec_json["components"]["securitySchemes"]["reporting_token"],
+            }))
+            .unwrap()
+        );
 
         // Verify servers are not hardcoded (will be set dynamically on client)
         assert!(spec.servers.is_none() || spec.servers.as_ref().unwrap().is_empty());
+    }
+
+    fn assert_reporting_path_security(
+        spec: &serde_json::Value,
+        path: &str,
+        method: &str,
+        scheme: &str,
+    ) {
+        let operation = &spec["paths"][path][method];
+        assert!(
+            operation.is_object(),
+            "missing OpenAPI operation: {method} {path}"
+        );
+        assert_eq!(
+            operation["security"],
+            serde_json::json!([{ scheme: [] }]),
+            "{method} {path} must use only {scheme} security"
+        );
     }
 
     #[test]
@@ -2255,6 +2450,26 @@ mod tests {
             serde_json::json!([{}]),
             "/v1/models must explicitly override global OpenAPI security"
         );
+    }
+
+    #[test]
+    fn test_openapi_ita_token_endpoint_is_public() {
+        let spec = match serde_json::to_value(ApiDoc::openapi()) {
+            Ok(spec) => spec,
+            Err(error) => {
+                panic!("OpenAPI spec must serialize: {error}");
+            }
+        };
+        let ita_get = &spec["paths"]["/v1/attestation/ita-token"]["get"];
+
+        assert_eq!(
+            ita_get["security"],
+            serde_json::json!([{}]),
+            "/v1/attestation/ita-token must explicitly override global OpenAPI security"
+        );
+        assert!(spec["components"]["schemas"]
+            .as_object()
+            .is_some_and(|schemas| schemas.contains_key("ItaTokenResponse")));
     }
 
     #[test]
@@ -2343,6 +2558,9 @@ mod tests {
             external_providers: config::ExternalProvidersConfig::default(),
             github_dispatch: config::GitHubDispatchConfig::default(),
             infra: config::InfraConfig::default(),
+            staking_farm: config::StakingFarmConfig::default(),
+            usage_reporting: config::UsageReportingConfig::default(),
+            ita: config::ItaAttestationConfig::default(),
         };
 
         // Initialize services
@@ -2447,6 +2665,9 @@ mod tests {
             external_providers: config::ExternalProvidersConfig::default(),
             github_dispatch: config::GitHubDispatchConfig::default(),
             infra: config::InfraConfig::default(),
+            staking_farm: config::StakingFarmConfig::default(),
+            usage_reporting: config::UsageReportingConfig::default(),
+            ita: config::ItaAttestationConfig::default(),
         };
 
         let auth_components = init_auth_services(database.clone(), &config);

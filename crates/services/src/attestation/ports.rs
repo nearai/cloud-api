@@ -1,3 +1,4 @@
+use crate::attestation::ita::{ItaTokenQuery, ItaTokenResponse};
 use crate::attestation::models::{
     AttestationError, AttestationReport, ChatSignature, SignatureLookupResult,
 };
@@ -55,6 +56,11 @@ pub trait AttestationServiceTrait: Send + Sync {
         include_tls_fingerprint: bool,
         provider_filter: Option<ProviderTier>,
     ) -> Result<AttestationReport, AttestationError>;
+
+    async fn get_ita_attestation_token(
+        &self,
+        query: ItaTokenQuery,
+    ) -> Result<ItaTokenResponse, AttestationError>;
 
     /// Verify a VPC shared secret signature
     async fn verify_vpc_signature(

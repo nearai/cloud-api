@@ -1,5 +1,6 @@
 pub mod ports;
 pub mod provider_attribution;
+pub mod reporting;
 
 use crate::metrics::{
     consts::{
@@ -11,6 +12,7 @@ use crate::metrics::{
 };
 pub use ports::*;
 pub use provider_attribution::*;
+pub use reporting::*;
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -665,6 +667,16 @@ impl UsageServiceTrait for UsageServiceImpl {
         Ok(limit)
     }
 
+    async fn get_credit_limits(
+        &self,
+        organization_id: Uuid,
+    ) -> Result<Vec<OrganizationCreditLimit>, UsageError> {
+        self.limits_repository
+            .get_current_limit_breakdown(organization_id)
+            .await
+            .map_err(|e| UsageError::InternalError(format!("Failed to get limits: {e}")))
+    }
+
     /// Get usage history for a specific API key
     async fn get_usage_history_by_api_key(
         &self,
@@ -769,6 +781,36 @@ impl UsageServiceTrait for UsageServiceImpl {
             .get_usage_by_model(organization_id, start_date)
             .await
             .map_err(|e| UsageError::InternalError(format!("Failed to get usage by model: {e}")))
+    }
+
+    async fn list_inference_usage_report(
+        &self,
+        query: InferenceUsageReportQuery,
+    ) -> Result<Vec<InferenceUsageReportRow>, UsageError> {
+        self.usage_repository
+            .list_inference_usage_report(query)
+            .await
+            .map_err(|error| {
+                if crate::common::is_query_timeout(&error) {
+                    UsageError::ReportingTimeout
+                } else {
+                    UsageError::InternalError(format!(
+                        "Failed to list inference usage report: {error}"
+                    ))
+                }
+            })
+    }
+
+    async fn list_inference_usage_history(
+        &self,
+        query: InferenceUsageHistoryQuery,
+    ) -> Result<(Vec<InferenceUsageReportRow>, i64), UsageError> {
+        self.usage_repository
+            .list_inference_usage_history(query)
+            .await
+            .map_err(|e| {
+                UsageError::InternalError(format!("Failed to list inference usage history: {e}"))
+            })
     }
 }
 

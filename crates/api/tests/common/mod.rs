@@ -6,6 +6,12 @@
 //! orgs/workspaces/keys, not separate databases.
 
 pub mod db_setup;
+pub mod fake_ita;
+pub mod ita_evidence;
+pub mod ita_server;
+
+pub use ita_evidence::setup_test_server_with_config_and_ita_model_evidence;
+pub use ita_server::{setup_ita_server, setup_ita_server_with_env_policy, ItaServerMode};
 
 use api::{
     build_app_with_config, init_auth_services,
@@ -116,6 +122,12 @@ pub fn test_config() -> ApiConfig {
         external_providers: config::ExternalProvidersConfig::default(),
         github_dispatch: config::GitHubDispatchConfig::default(),
         infra: config::InfraConfig::default(),
+        staking_farm: config::StakingFarmConfig::default(),
+        usage_reporting: config::UsageReportingConfig {
+            enabled: true,
+            ..config::UsageReportingConfig::default()
+        },
+        ita: config::ItaAttestationConfig::default(),
     }
 }
 
@@ -402,6 +414,19 @@ where
     let (server, _pool, _mock) =
         build_test_server_components(infra.database.clone(), infra.config).await;
     server
+}
+
+pub async fn setup_test_server_with_config_and_database<F>(
+    mutate: F,
+) -> (axum_test::TestServer, Arc<Database>)
+where
+    F: FnOnce(&mut config::ApiConfig),
+{
+    let mut infra = setup_test_infrastructure().await;
+    mutate(&mut infra.config);
+    let database = infra.database.clone();
+    let (server, _pool, _mock) = build_test_server_components(database.clone(), infra.config).await;
+    (server, database)
 }
 
 pub async fn setup_test_server_with_database() -> (axum_test::TestServer, Arc<Database>) {

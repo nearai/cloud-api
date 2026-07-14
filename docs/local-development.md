@@ -275,6 +275,7 @@ Provider refresh runs every 300s by default
 | `POST /v1/responses`                        | API key  | Platform-specific event-streamed responses                  |
 | `POST /v1/conversations`                    | API key  | Conversation lifecycle                                      |
 | `GET  /v1/attestation/report`               | API key  | TEE attestation (503 outside a CVM unless `DEV=true` in debug builds) |
+| `GET  /v1/attestation/ita-token`            | public   | Intel Trust Authority JWT wrapper (requires ITA env vars)   |
 | `GET  /v1/signature/{chat_id}`              | API key  | Per-completion signature lookup                             |
 
 The Scalar UI at `http://localhost:3000/docs` lets you fire each of these
@@ -310,6 +311,52 @@ in the TEE. For schema-level testing, debug builds (i.e. anything but
 `cargo build --release`) honor `DEV=true`, which short-circuits the
 dstack call and returns canned attestation data so the endpoint
 returns 200.
+
+**`/v1/attestation/ita-token` returns 503**
+The Intel Trust Authority endpoint is public, but it is disabled by
+default. Enable it only with local fake credentials or real deployment
+secrets supplied through the environment:
+
+```env
+ENABLE_ITA_ATTESTATION=true
+ITA_API_BASE_URL=http://127.0.0.1:9009
+ITA_PORTAL_BASE_URL=https://portal.trustauthority.intel.com
+ITA_API_KEY=test-local-only
+# alternatively:
+# ITA_API_KEY_FILE=/path/to/local/ita-api-key
+ITA_TIMEOUT_SECONDS=10
+ITA_MAX_RETRIES=2
+ITA_RETRY_BACKOFF_MS=250
+ITA_POLICY_IDS=11111111-1111-4111-8111-111111111111,22222222-2222-4222-8222-222222222222
+ITA_POLICY_MUST_MATCH=false
+ITA_TOKEN_SIGNING_ALG=PS384
+```
+
+For local testing, point `ITA_API_BASE_URL` at a fake ITA upstream that
+serves `GET /appraisal/v2/nonce` and `POST /appraisal/v2/attest`. The
+e2e test harness uses this pattern, so no Intel credentials or customer
+evidence are needed:
+
+```bash
+DEV=true ENABLE_ITA_ATTESTATION=true \
+ITA_API_BASE_URL=http://127.0.0.1:9009 ITA_API_KEY=test-local-only \
+cargo test -p api --test e2e_all ita_attestation -- --nocapture
+```
+
+Sample public request:
+
+```bash
+curl -i \
+  'http://localhost:3000/v1/attestation/ita-token?nonce=0000000000000000000000000000000000000000000000000000000000000001&policy_ids=11111111-1111-4111-8111-111111111111&policy_must_match=true'
+```
+
+Successful responses include `gateway.token` and a `jwks_url` such as
+`https://portal.trustauthority.intel.com/certs`; verifiers should use
+that JWKS/certs URL to verify the ITA-signed JWT. `policy_ids` must be
+Intel Trust Authority policy UUIDs, and requests can specify at most 10.
+Do not paste raw ITA JWTs, nonce values, quotes, GPU evidence, certs, API
+keys, request bodies, or response bodies into logs, tickets, docs, or
+evidence files.
 
 **Postgres seed fails with `duplicate key value … users_email_key`**
 Another user already owns `admin@test.com`. Run:

@@ -48,6 +48,10 @@ pub struct ClusterManager {
     /// pool was successfully built and verified against that member, so a
     /// failed rebuild leaves it unchanged and the next reconcile tick retries.
     write_pool_target: Arc<RwLock<Option<String>>>,
+    /// Serializes reconciliation so concurrent callers cannot interleave
+    /// verify/install sequences and roll the write pool back to an older
+    /// leader (last-writer-wins).
+    reconcile_lock: Mutex<()>,
     read_pools: Arc<RwLock<HashMap<String, Pool>>>,
     database_config: DatabaseConfig,
     read_preference: ReadPreference,
@@ -78,6 +82,7 @@ impl ClusterManager {
             discovery,
             write_pool: DbPool::uninitialized(),
             write_pool_target: Arc::new(RwLock::new(None)),
+            reconcile_lock: Mutex::new(()),
             read_pools: Arc::new(RwLock::new(HashMap::new())),
             database_config,
             read_preference,
@@ -159,8 +164,20 @@ impl ClusterManager {
                 )
             })??;
 
-        self.write_pool.replace(pool);
+        // Discovery may have advanced while this candidate was being verified
+        // (up to WRITE_POOL_VERIFY_TIMEOUT). Installing a stale leader would
+        // repoint every repository to a demoted node until the next reconcile
+        // tick, so confirm the candidate is still the current leader.
         let target = Self::member_target(leader);
+        let current = self.discovery.get_leader().await;
+        if current.as_ref().map(Self::member_target).as_deref() != Some(target.as_str()) {
+            return Err(anyhow!(
+                "Cluster leader changed to {:?} while verifying {target}; discarding this pool",
+                current.map(|m| Self::member_target(&m))
+            ));
+        }
+
+        self.write_pool.replace(pool);
         *self.write_pool_target.write().await = Some(target.clone());
 
         info!("Write pool now targets leader {} ({})", leader.name, target);
@@ -325,6 +342,10 @@ impl ClusterManager {
     /// accepting connections yet) is retried on the next tick instead of being
     /// dropped.
     pub async fn reconcile(&self) {
+        // One reconciliation at a time: interleaved verify/install sequences
+        // could install pools out of order and roll back to an older leader.
+        let _guard = self.reconcile_lock.lock().await;
+
         if self.discovery.is_state_stale().await {
             let age = self
                 .discovery

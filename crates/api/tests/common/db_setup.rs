@@ -142,4 +142,5 @@ pub async fn create_test_pool() -> database::pool::DbPool {
             tokio_postgres::NoTls,
         )
         .expect("Failed to create test connection pool")
+        .into()
 }

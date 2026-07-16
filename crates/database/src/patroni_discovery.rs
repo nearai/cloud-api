@@ -277,6 +277,23 @@ impl PatroniDiscovery {
         *task_handle = Some(handle);
     }
 
+    /// Test-only: inject a cluster state directly, bypassing HTTP discovery.
+    /// Not part of the public API; exposed so integration/e2e tests can drive
+    /// failover scenarios without a real Patroni endpoint.
+    #[doc(hidden)]
+    pub async fn set_cluster_state_for_test(
+        &self,
+        leader: Option<ClusterMember>,
+        replicas: Vec<ClusterMember>,
+    ) {
+        let mut state = self.cluster_state.write().await;
+        *state = Some(ClusterState {
+            leader,
+            replicas,
+            last_updated: std::time::Instant::now(),
+        });
+    }
+
     /// Get cluster state age in seconds
     pub async fn get_state_age_secs(&self) -> Option<u64> {
         let state = self.cluster_state.read().await;

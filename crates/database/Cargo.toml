@@ -62,3 +62,8 @@ reqwest = { version = "0.12", features = ["json"] }
 # For TLS connections to PostgreSQL
 postgres-native-tls = "0.5"
 native-tls = "0.2"
+
+[features]
+# Exposes test-only helpers (e.g. Patroni cluster-state injection) to
+# dependent crates' test suites. Never enable in production builds.
+test-support = []

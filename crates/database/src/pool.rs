@@ -126,8 +126,9 @@ impl DbPool {
     }
 
     /// Install `pool` as the active pool for this handle and every clone of it.
-    /// The previous pool (if any) is dropped once its checked-out connections
-    /// are returned.
+    /// Connections already checked out of the previous pool are not
+    /// interrupted; the old pool is torn down once those connections are
+    /// returned and its last reference is gone.
     pub fn replace(&self, pool: Pool) {
         let mut guard = self.inner.write().unwrap_or_else(|e| e.into_inner());
         *guard = Some(pool);

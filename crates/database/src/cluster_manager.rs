@@ -139,11 +139,8 @@ impl ClusterManager {
             // as leader while Postgres is still completing promotion;
             // installing it would pin every write to a read-only node with no
             // retry, so fail and let the next reconcile tick try again.
-            let rows = conn.query("SELECT pg_is_in_recovery()", &[]).await?;
-            let is_replica: bool = rows
-                .first()
-                .ok_or_else(|| anyhow!("Empty response to pg_is_in_recovery()"))?
-                .try_get(0)?;
+            let row = conn.query_one("SELECT pg_is_in_recovery()", &[]).await?;
+            let is_replica: bool = row.try_get(0)?;
             if is_replica {
                 return Err(anyhow!(
                     "Node {} claims to be leader but is still in recovery",
@@ -329,10 +326,13 @@ impl ClusterManager {
     /// dropped.
     pub async fn reconcile(&self) {
         if self.discovery.is_state_stale().await {
-            warn!(
-                "Patroni cluster state is stale (age: {:?}s); leader changes may go undetected",
-                self.discovery.get_state_age_secs().await
-            );
+            let age = self
+                .discovery
+                .get_state_age_secs()
+                .await
+                .map(|secs| format!("{secs}s"))
+                .unwrap_or_else(|| "never loaded".to_string());
+            warn!("Patroni cluster state is stale (age: {age}); leader changes may go undetected");
         }
 
         match self.discovery.get_leader().await {

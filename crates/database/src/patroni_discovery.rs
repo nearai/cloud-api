@@ -278,9 +278,10 @@ impl PatroniDiscovery {
     }
 
     /// Test-only: inject a cluster state directly, bypassing HTTP discovery.
-    /// Not part of the public API; exposed so integration/e2e tests can drive
-    /// failover scenarios without a real Patroni endpoint.
-    #[doc(hidden)]
+    /// Compiled only for this crate's tests and for dependents that enable the
+    /// `test-support` feature (the e2e suite), so it does not ship in release
+    /// builds.
+    #[cfg(any(test, feature = "test-support"))]
     pub async fn set_cluster_state_for_test(
         &self,
         leader: Option<ClusterMember>,

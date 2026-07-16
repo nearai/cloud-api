@@ -72,6 +72,36 @@ fn omits_empty_policy_ids_but_keeps_effective_policy_controls() -> TestResult {
 }
 
 #[test]
+fn trims_event_log_before_base64_encoding() -> TestResult {
+    let runtime_data = runtime_data();
+    let mut gateway = gateway_quote(&runtime_data);
+    gateway.event_log = format!(" \n{DSTACK_EVENT_LOG}\t");
+
+    let value = serde_json::to_value(gateway_request(&gateway)?)?;
+
+    assert_eq!(
+        value["tdx"]["event_log"],
+        "W3siaW1yIjozLCJldmVudF90eXBlIjoxLCJkaWdlc3QiOiIwMCJ9XQ=="
+    );
+    Ok(())
+}
+
+#[test]
+fn omits_empty_event_log_placeholders() -> TestResult {
+    let runtime_data = runtime_data();
+
+    for event_log in ["", " \n\t", "0x", " 0x \n"] {
+        let mut gateway = gateway_quote(&runtime_data);
+        gateway.event_log = event_log.to_string();
+
+        let value = serde_json::to_value(gateway_request(&gateway)?)?;
+
+        assert_eq!(value["tdx"].get("event_log"), None, "{event_log:?}");
+    }
+    Ok(())
+}
+
+#[test]
 fn report_data_uses_decoded_nonce_bytes_not_base64_text() -> TestResult {
     // Given: gateway report_data was produced with decoded Val || Iat bytes.
     let runtime_data = runtime_data();

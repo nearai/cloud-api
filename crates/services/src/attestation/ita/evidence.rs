@@ -114,11 +114,12 @@ fn build_tdx_evidence(
     let quote = decode_required_hex("tdx.quote", &gateway.intel_quote)?;
     let runtime_data = runtime_data_bytes(gateway)?;
     verify_report_data(gateway, verifier_nonce, &runtime_data)?;
-    let event_log = decode_optional_hex("tdx.event_log", &gateway.event_log)?;
+    let event_log = (!gateway.event_log.trim().is_empty())
+        .then(|| STANDARD.encode(gateway.event_log.as_bytes()));
     Ok(ItaTdxEvidence {
         quote: STANDARD.encode(quote),
         runtime_data: STANDARD.encode(runtime_data),
-        event_log: event_log.map(|bytes| STANDARD.encode(bytes)),
+        event_log,
         verifier_nonce: verifier_nonce.clone(),
     })
 }
@@ -192,20 +193,6 @@ fn decode_required_hex(field: &'static str, raw: &str) -> Result<Vec<u8>, ItaEvi
         return Err(ItaEvidenceError::MissingField(field));
     }
     hex::decode(hex_value).map_err(|source| ItaEvidenceError::InvalidHex { field, source })
-}
-
-fn decode_optional_hex(
-    field: &'static str,
-    raw: &str,
-) -> Result<Option<Vec<u8>>, ItaEvidenceError> {
-    let trimmed = raw.trim();
-    let hex_value = trimmed.strip_prefix("0x").unwrap_or(trimmed);
-    if hex_value.is_empty() {
-        return Ok(None);
-    }
-    hex::decode(hex_value)
-        .map(Some)
-        .map_err(|source| ItaEvidenceError::InvalidHex { field, source })
 }
 
 #[cfg(test)]

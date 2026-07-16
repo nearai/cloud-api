@@ -4,7 +4,7 @@ use serde_json::{json, Value};
 
 use super::evidence_test_support::{
     effective_policy, gateway_quote, gateway_request, runtime_data, verifier_nonce, TestResult,
-    POLICY_A, POLICY_B,
+    DSTACK_EVENT_LOG, POLICY_A, POLICY_B,
 };
 use super::*;
 
@@ -12,7 +12,7 @@ pub(super) fn expected_tdx_json() -> Value {
     json!({
         "quote": "AQIDBA==",
         "runtime_data": STANDARD.encode(runtime_data()),
-        "event_log": "Cgs=",
+        "event_log": STANDARD.encode(DSTACK_EVENT_LOG.as_bytes()),
         "verifier_nonce": {
             "val": "dmVyaWZpZXItdmFsdWU=",
             "iat": "aWF0LWJ5dGVz",

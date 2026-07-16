@@ -10,6 +10,7 @@ pub(super) type TestResult = Result<(), Box<dyn std::error::Error>>;
 
 pub(super) const POLICY_A: &str = "11111111-1111-4111-8111-111111111111";
 pub(super) const POLICY_B: &str = "22222222-2222-4222-8222-222222222222";
+pub(super) const DSTACK_EVENT_LOG: &str = r#"[{"imr":3,"event_type":1,"digest":"00"}]"#;
 
 pub(super) fn verifier_nonce() -> ItaVerifierNonce {
     ItaVerifierNonce {
@@ -56,7 +57,7 @@ pub(super) fn gateway_quote(runtime_data: &[u8]) -> DstackCpuQuote {
         signing_address: "0xabc123".to_string(),
         signing_algo: "ed25519".to_string(),
         intel_quote: "0x01020304".to_string(),
-        event_log: "0x0a0b".to_string(),
+        event_log: DSTACK_EVENT_LOG.to_string(),
         report_data: report_data(runtime_data),
         request_nonce: "00".repeat(32),
         info: json!({}),

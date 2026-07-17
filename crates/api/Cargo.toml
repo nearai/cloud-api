@@ -61,7 +61,9 @@ tokio-util = { version = "0.7", features = ["compat", "io"] }
 reqwest = { version = "0.12", features = ["json", "stream"] }
 
 [dev-dependencies]
+database = { path = "../database", features = ["test-support"] }
 axum-test = "20"
+wiremock = "0.6"
 serde_json = "1.0"
 url = "2.5"
 tokio-test = "0.4"

@@ -234,6 +234,16 @@ impl PatroniDiscovery {
         state.as_ref()?.leader.clone()
     }
 
+    /// Run `f` with the current leader while holding the cluster-state read
+    /// lock. Topology publication (`update_cluster_state`) takes the write
+    /// lock, so it is excluded for the duration — letting callers make a
+    /// leader comparison and a pool install atomic relative to discovery
+    /// updates. `f` must be synchronous and quick; it runs under the lock.
+    pub async fn with_current_leader<R>(&self, f: impl FnOnce(Option<&ClusterMember>) -> R) -> R {
+        let state = self.cluster_state.read().await;
+        f(state.as_ref().and_then(|s| s.leader.as_ref()))
+    }
+
     /// Get all replica information
     pub async fn get_replicas(&self) -> Vec<ClusterMember> {
         let state = self.cluster_state.read().await;
@@ -275,6 +285,24 @@ impl PatroniDiscovery {
 
         let mut task_handle = self.refresh_task_handle.lock().await;
         *task_handle = Some(handle);
+    }
+
+    /// Test-only: inject a cluster state directly, bypassing HTTP discovery.
+    /// Compiled only for this crate's tests and for dependents that enable the
+    /// `test-support` feature (the e2e suite), so it does not ship in release
+    /// builds.
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn set_cluster_state_for_test(
+        &self,
+        leader: Option<ClusterMember>,
+        replicas: Vec<ClusterMember>,
+    ) {
+        let mut state = self.cluster_state.write().await;
+        *state = Some(ClusterState {
+            leader,
+            replicas,
+            last_updated: std::time::Instant::now(),
+        });
     }
 
     /// Get cluster state age in seconds

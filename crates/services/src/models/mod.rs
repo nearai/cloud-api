@@ -273,7 +273,7 @@ mod tests {
             input_cost_per_token: 1,
             output_cost_per_token: 1,
             cost_per_image: 0,
-            cache_read_cost_per_token: 0,
+            cache_read_cost_per_token: None,
             context_length: 4096,
             verifiable: true,
             aliases: Vec::new(),

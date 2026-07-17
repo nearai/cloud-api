@@ -2724,8 +2724,11 @@ fn model_with_pricing_to_info(model: services::models::ModelWithPricing) -> Mode
         completion: nano_dollars_to_per_token_string(model.output_cost_per_token),
         image: nano_dollars_to_per_token_string(model.cost_per_image),
         request: "0".to_string(),
-        input_cache_read: (model.cache_read_cost_per_token > 0)
-            .then(|| nano_dollars_to_per_token_string(model.cache_read_cost_per_token)),
+        // None = cache pricing disabled -> omit the field entirely.
+        // Some(0) is a real (genuinely free) price and renders as "0".
+        input_cache_read: model
+            .cache_read_cost_per_token
+            .map(nano_dollars_to_per_token_string),
     };
 
     // OpenRouter's provider spec marks `input_modalities` / `output_modalities`
@@ -2859,7 +2862,7 @@ mod tests {
             input_cost_per_token: 0,
             output_cost_per_token: 0,
             cost_per_image: 0,
-            cache_read_cost_per_token: 0,
+            cache_read_cost_per_token: None,
             context_length: 4096,
             verifiable: false,
             aliases: vec![],
@@ -2957,19 +2960,32 @@ mod tests {
 
         assert!(
             json["pricing"].get("input_cache_read").is_none(),
-            "zero cache-read pricing is an internal unknown/disabled sentinel and must be omitted"
+            "None means cache pricing is disabled and input_cache_read must be omitted"
         );
     }
 
     #[test]
     fn model_with_cache_read_pricing_emits_positive_input_cache_read() {
         let mut model = make_model_with_pricing(None, None);
-        model.cache_read_cost_per_token = 50_000;
+        model.cache_read_cost_per_token = Some(50_000);
 
         let info = model_with_pricing_to_info(model);
         let json = serde_json::to_value(&info).unwrap();
 
         assert_eq!(json["pricing"]["input_cache_read"], "0.00005");
+    }
+
+    #[test]
+    fn model_with_free_cache_read_pricing_emits_zero_input_cache_read() {
+        // Some(0) is a genuinely free cache-read price — unlike None
+        // (disabled), it must render as the string "0", not be omitted.
+        let mut model = make_model_with_pricing(None, None);
+        model.cache_read_cost_per_token = Some(0);
+
+        let info = model_with_pricing_to_info(model);
+        let json = serde_json::to_value(&info).unwrap();
+
+        assert_eq!(json["pricing"]["input_cache_read"], "0");
     }
 
     #[test]
@@ -4729,7 +4745,7 @@ pub async fn audio_transcriptions(
                 }
                 services::completions::ports::CompletionError::ProviderError {
                     status_code,
-                    ..
+                    message,
                 } => {
                     let http_status = StatusCode::from_u16(status_code)
                         .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
@@ -4753,6 +4769,7 @@ pub async fn audio_transcriptions(
                             status_code,
                             %organization_id,
                             workspace_id = %api_key.workspace.id.0,
+                            detail = %message,
                             "Audio transcription rejected by provider (client input)"
                         );
                         (
@@ -4768,6 +4785,7 @@ pub async fn audio_transcriptions(
                             status_code,
                             %organization_id,
                             workspace_id = %api_key.workspace.id.0,
+                            detail = %message,
                             "Audio transcription provider error"
                         );
                         (
@@ -5555,9 +5573,14 @@ pub async fn rerank(
                 }
                 services::completions::ports::CompletionError::ProviderError {
                     status_code,
-                    ..
+                    message,
                 } => {
-                    tracing::error!("Rerank provider error");
+                    tracing::error!(
+                        model = %request.model,
+                        upstream_status = status_code,
+                        detail = %message,
+                        "Rerank provider error"
+                    );
                     let http_status = StatusCode::from_u16(status_code)
                         .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
                     (
@@ -5899,14 +5922,25 @@ pub async fn embeddings(
                     status_code,
                     message,
                 } => {
-                    let classified = classify_provider_error(status_code, message);
+                    // `message` carries the provider-level detail (including the
+                    // upstream URL on connection failures, where `status_code` is
+                    // synthetic) — without it the log can't distinguish a backend
+                    // 5xx from an unreachable SNI.
+                    let classified = classify_provider_error(status_code, message.clone());
                     if classified.0.is_client_error() {
                         tracing::warn!(
+                            model = %model_name,
                             upstream_status = status_code,
+                            detail = %message,
                             "Embeddings rejected by upstream with client error"
                         );
                     } else {
-                        tracing::error!(upstream_status = status_code, "Embeddings provider error");
+                        tracing::error!(
+                            model = %model_name,
+                            upstream_status = status_code,
+                            detail = %message,
+                            "Embeddings provider error"
+                        );
                     }
                     classified
                 }
@@ -6216,9 +6250,13 @@ pub async fn privacy_classify(
                 }
                 services::completions::ports::CompletionError::ProviderError {
                     status_code,
-                    ..
+                    message,
                 } => {
-                    tracing::error!("Privacy classify provider error");
+                    tracing::error!(
+                        upstream_status = status_code,
+                        detail = %message,
+                        "Privacy classify provider error"
+                    );
                     let http_status = StatusCode::from_u16(status_code)
                         .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
                     (
@@ -6514,9 +6552,13 @@ pub async fn privacy_redact(
                 }
                 services::completions::ports::CompletionError::ProviderError {
                     status_code,
-                    ..
+                    message,
                 } => {
-                    tracing::error!("Privacy redact provider error");
+                    tracing::error!(
+                        upstream_status = status_code,
+                        detail = %message,
+                        "Privacy redact provider error"
+                    );
                     let http_status = StatusCode::from_u16(status_code)
                         .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
                     (
@@ -7007,9 +7049,14 @@ pub async fn score(
                 }
                 services::completions::ports::CompletionError::ProviderError {
                     status_code,
-                    ..
+                    message,
                 } => {
-                    tracing::error!("Score provider error");
+                    tracing::error!(
+                        model = %request.model,
+                        upstream_status = status_code,
+                        detail = %message,
+                        "Score provider error"
+                    );
                     let http_status = StatusCode::from_u16(status_code)
                         .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
                     (

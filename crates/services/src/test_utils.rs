@@ -1,14 +1,16 @@
 // Test utilities for services crate
 use crate::{
     attestation::{
+        ita::{ItaTokenQuery, ItaTokenResponse},
         models::{AttestationReport, SignatureLookupResult},
         ports::AttestationServiceTrait,
         AttestationError,
     },
     usage::{
-        CostBreakdown, InferenceType, OrganizationBalanceInfo, OrganizationLimit,
-        ProviderAttribution, RecordUsageApiRequest, RecordUsageServiceRequest, UsageCheckResult,
-        UsageError, UsageLogEntry, UsageServiceTrait,
+        CostBreakdown, InferenceType, InferenceUsageHistoryQuery, InferenceUsageReportQuery,
+        InferenceUsageReportRow, OrganizationBalanceInfo, OrganizationCreditLimit,
+        OrganizationLimit, ProviderAttribution, RecordUsageApiRequest, RecordUsageServiceRequest,
+        UsageCheckResult, UsageError, UsageLogEntry, UsageServiceTrait,
     },
 };
 use async_trait::async_trait;
@@ -63,6 +65,15 @@ impl AttestationServiceTrait for MockAttestationService {
         _include_tls_fingerprint: bool,
         _provider_filter: Option<ProviderTier>,
     ) -> Result<AttestationReport, AttestationError> {
+        Err(AttestationError::InternalError(
+            "Not implemented".to_string(),
+        ))
+    }
+
+    async fn get_ita_attestation_token(
+        &self,
+        _query: ItaTokenQuery,
+    ) -> Result<ItaTokenResponse, AttestationError> {
         Err(AttestationError::InternalError(
             "Not implemented".to_string(),
         ))
@@ -264,6 +275,13 @@ impl UsageServiceTrait for MockUsageService {
         Ok(None)
     }
 
+    async fn get_credit_limits(
+        &self,
+        _organization_id: Uuid,
+    ) -> Result<Vec<OrganizationCreditLimit>, UsageError> {
+        Ok(vec![])
+    }
+
     async fn get_usage_history_by_api_key(
         &self,
         _api_key_id: Uuid,
@@ -298,6 +316,20 @@ impl UsageServiceTrait for MockUsageService {
         _start_date: chrono::DateTime<chrono::Utc>,
     ) -> Result<Vec<crate::usage::UsageByModelEntry>, UsageError> {
         Ok(vec![])
+    }
+
+    async fn list_inference_usage_report(
+        &self,
+        _query: InferenceUsageReportQuery,
+    ) -> Result<Vec<InferenceUsageReportRow>, UsageError> {
+        Ok(vec![])
+    }
+
+    async fn list_inference_usage_history(
+        &self,
+        _query: InferenceUsageHistoryQuery,
+    ) -> Result<(Vec<InferenceUsageReportRow>, i64), UsageError> {
+        Ok((vec![], 0))
     }
 }
 
@@ -505,6 +537,13 @@ impl UsageServiceTrait for CapturingUsageService {
         Ok(None)
     }
 
+    async fn get_credit_limits(
+        &self,
+        _organization_id: Uuid,
+    ) -> Result<Vec<OrganizationCreditLimit>, UsageError> {
+        Ok(vec![])
+    }
+
     async fn get_usage_history_by_api_key(
         &self,
         _api_key_id: Uuid,
@@ -539,5 +578,19 @@ impl UsageServiceTrait for CapturingUsageService {
         _start_date: chrono::DateTime<chrono::Utc>,
     ) -> Result<Vec<crate::usage::UsageByModelEntry>, UsageError> {
         Ok(vec![])
+    }
+
+    async fn list_inference_usage_report(
+        &self,
+        _query: InferenceUsageReportQuery,
+    ) -> Result<Vec<InferenceUsageReportRow>, UsageError> {
+        Ok(vec![])
+    }
+
+    async fn list_inference_usage_history(
+        &self,
+        _query: InferenceUsageHistoryQuery,
+    ) -> Result<(Vec<InferenceUsageReportRow>, i64), UsageError> {
+        Ok((vec![], 0))
     }
 }

@@ -1053,7 +1053,7 @@ pub struct ModelPricing {
     /// OpenRouter: USD per request, as a string ("0" when not applicable).
     pub request: String,
     /// OpenRouter: USD per cached input token, as a string. Omitted when cache-read
-    /// pricing is disabled or unknown.
+    /// pricing is disabled; `"0"` means cached input tokens are genuinely free.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub input_cache_read: Option<String>,
 }
@@ -3300,8 +3300,13 @@ pub struct AdminModelWithPricing {
     pub output_cost_per_token: DecimalPrice,
     #[serde(rename = "costPerImage")]
     pub cost_per_image: DecimalPrice,
-    #[serde(rename = "cacheReadCostPerToken")]
-    pub cache_read_cost_per_token: DecimalPrice,
+    /// Cost per cached input token. Omitted when cache pricing is disabled;
+    /// an amount of 0 means cached tokens are genuinely free.
+    #[serde(
+        rename = "cacheReadCostPerToken",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub cache_read_cost_per_token: Option<DecimalPrice>,
     pub metadata: ModelMetadata,
     #[serde(rename = "isActive")]
     pub is_active: bool,
@@ -3322,8 +3327,13 @@ pub struct ModelWithPricing {
     pub output_cost_per_token: DecimalPrice,
     #[serde(rename = "costPerImage")]
     pub cost_per_image: DecimalPrice,
-    #[serde(rename = "cacheReadCostPerToken")]
-    pub cache_read_cost_per_token: DecimalPrice,
+    /// Cost per cached input token. Omitted when cache pricing is disabled;
+    /// an amount of 0 means cached tokens are genuinely free.
+    #[serde(
+        rename = "cacheReadCostPerToken",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub cache_read_cost_per_token: Option<DecimalPrice>,
     pub metadata: ModelMetadata,
 }
 
@@ -3477,11 +3487,22 @@ pub struct UpdateModelApiRequest {
     pub output_cost_per_token: Option<DecimalPriceRequest>,
     #[serde(rename = "costPerImage")]
     pub cost_per_image: Option<DecimalPriceRequest>,
+    /// Cost per cached input token.
+    ///
+    /// Tri-state PATCH semantics:
+    /// - omitted → leave unchanged
+    /// - `null` → disable cache pricing (cached tokens billed at the full
+    ///   input rate; `cacheReadCostPerToken` / `input_cache_read` omitted from
+    ///   catalog responses)
+    /// - a price → set verbatim (an amount of 0 = genuinely free cache reads)
     #[serde(
         rename = "cacheReadCostPerToken",
+        default,
+        deserialize_with = "deserialize_nullable",
         skip_serializing_if = "Option::is_none"
     )]
-    pub cache_read_cost_per_token: Option<DecimalPriceRequest>,
+    #[schema(value_type = Option<DecimalPriceRequest>)]
+    pub cache_read_cost_per_token: Nullable<DecimalPriceRequest>,
     #[serde(rename = "modelDisplayName")]
     pub model_display_name: Option<String>,
     #[serde(rename = "modelDescription")]
@@ -3735,15 +3756,19 @@ pub struct PricingChangeBatchRequest {
     pub change_reason: Option<String>,
 }
 
-/// Full pricing snapshot (all four fields).
+/// Full pricing snapshot. `cacheReadCostPerToken` is omitted when cache
+/// pricing was disabled at snapshot time.
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct PricingFields {
     #[serde(rename = "inputCostPerToken")]
     pub input_cost_per_token: DecimalPrice,
     #[serde(rename = "outputCostPerToken")]
     pub output_cost_per_token: DecimalPrice,
-    #[serde(rename = "cacheReadCostPerToken")]
-    pub cache_read_cost_per_token: DecimalPrice,
+    #[serde(
+        rename = "cacheReadCostPerToken",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub cache_read_cost_per_token: Option<DecimalPrice>,
     #[serde(rename = "costPerImage")]
     pub cost_per_image: DecimalPrice,
 }
@@ -3858,8 +3883,12 @@ pub struct ModelHistoryEntry {
     pub output_cost_per_token: DecimalPrice,
     #[serde(rename = "costPerImage")]
     pub cost_per_image: DecimalPrice,
-    #[serde(rename = "cacheReadCostPerToken")]
-    pub cache_read_cost_per_token: DecimalPrice,
+    /// Omitted when cache pricing was disabled at this point in time.
+    #[serde(
+        rename = "cacheReadCostPerToken",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub cache_read_cost_per_token: Option<DecimalPrice>,
     #[serde(rename = "contextLength")]
     pub context_length: i32,
     #[serde(rename = "modelName")]
@@ -3948,6 +3977,7 @@ pub struct ModelHistoryResponse {
 /// Credit type for organization limits
 /// - grant: Free credits provided by the platform
 /// - payment: Credits purchased by the organization
+/// - staking_farm: House of Stake farm reward units converted into credits
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, ToSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum CreditType {
@@ -3955,6 +3985,8 @@ pub enum CreditType {
     Grant,
     #[serde(alias = "PAYMENT")]
     Payment,
+    #[serde(rename = "staking_farm", alias = "STAKING_FARM")]
+    StakingFarm,
 }
 
 impl std::fmt::Display for CreditType {
@@ -3962,6 +3994,7 @@ impl std::fmt::Display for CreditType {
         match self {
             CreditType::Grant => write!(f, "grant"),
             CreditType::Payment => write!(f, "payment"),
+            CreditType::StakingFarm => write!(f, "staking_farm"),
         }
     }
 }
@@ -3972,6 +4005,7 @@ impl CreditType {
         match self {
             CreditType::Grant => "grant",
             CreditType::Payment => "payment",
+            CreditType::StakingFarm => "staking_farm",
         }
     }
 }

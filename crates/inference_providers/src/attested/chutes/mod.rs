@@ -25,6 +25,7 @@
 //! unattested path. Turning Chutes on is gated behind an enable flag in the pool.
 
 pub mod attestation;
+mod availability;
 pub mod client;
 pub mod e2ee;
 pub mod e2ee_stream;
@@ -380,6 +381,11 @@ impl Provider {
     fn map_client_error(ctx: &str, e: client::ChutesClientError) -> CompletionError {
         let msg = format!("{ctx}: {e}");
         match e {
+            client::ChutesClientError::Status { status: 400, body }
+                if availability::stale_invoke_target(ctx, &body) =>
+            {
+                availability::retryable_provider_unavailable(ctx, "stale Chutes E2E target")
+            }
             // Retryable / correctly-masked upstream statuses: preserve so the
             // pool classifier can act on them. The message is the STAGE + STATUS
             // only — NOT the raw upstream body (#778 follow-up): a 5xx body could
@@ -396,13 +402,15 @@ impl Provider {
                 message: format!("{ctx}: Chutes returned HTTP {status}"),
                 is_external: true,
             },
+            client::ChutesClientError::Http(_) => {
+                availability::retryable_provider_unavailable(ctx, "Chutes HTTP transport error")
+            }
             // Any other upstream status (400/413/422/…) on an internally-built
             // request, plus all non-status client errors (transport / oversized
             // body / model-not-found / missing-chute-id / decode), mask as the
             // prior generic 502. Listed explicitly (no `_`) so a new
             // `ChutesClientError` variant forces this mapping to be revisited.
             client::ChutesClientError::Status { .. }
-            | client::ChutesClientError::Http(_)
             | client::ChutesClientError::BodyTooLarge { .. }
             | client::ChutesClientError::ModelNotFound(_)
             | client::ChutesClientError::MissingChuteId(_)
@@ -438,8 +446,9 @@ impl Provider {
             .filter(|i| !i.e2e_pubkey.is_empty() && !i.nonces.is_empty())
             .collect();
         if candidates.is_empty() {
-            return Err(CompletionError::CompletionError(
-                "no E2E-capable Chutes instance with an available nonce token".to_string(),
+            return Err(availability::retryable_provider_unavailable(
+                "discover instances",
+                "no E2E-capable instance with an available nonce token",
             ));
         }
 
@@ -468,12 +477,14 @@ impl Provider {
             INSTANCE_RR.fetch_add(1, Ordering::Relaxed) % n
         };
         let mut last_err = String::from("no candidate instances");
+        let mut last_err_retryable = false;
         for off in 0..n {
             let inst = candidates[(start + off) % n];
             let evidence = match evidence_resp.instance(&inst.instance_id) {
                 Some(e) => e,
                 None => {
                     last_err = format!("instance {} not present in /evidence", inst.instance_id);
+                    last_err_retryable = true;
                     continue;
                 }
             };
@@ -489,6 +500,7 @@ impl Provider {
                 Ok(info) => info,
                 Err(e) => {
                     last_err = format!("instance {} attestation failed: {e}", inst.instance_id);
+                    last_err_retryable = false;
                     continue;
                 }
             };
@@ -496,6 +508,7 @@ impl Provider {
                 Ok(pk) => pk,
                 Err(e) => {
                     last_err = format!("instance {} e2e_pubkey base64: {e}", inst.instance_id);
+                    last_err_retryable = false;
                     continue;
                 }
             };
@@ -503,6 +516,7 @@ impl Provider {
                 Ok(p) => p,
                 Err(e) => {
                     last_err = format!("instance {} E2EE build: {e}", inst.instance_id);
+                    last_err_retryable = false;
                     continue;
                 }
             };
@@ -517,6 +531,7 @@ impl Provider {
                 Some(n) => n,
                 None => {
                     last_err = format!("instance {} nonce pool drained", inst.instance_id);
+                    last_err_retryable = true;
                     continue;
                 }
             };
@@ -535,6 +550,12 @@ impl Provider {
                 blob,
                 session,
             });
+        }
+        if last_err_retryable {
+            return Err(availability::retryable_provider_unavailable(
+                "verify Chutes instance",
+                &last_err,
+            ));
         }
         Err(CompletionError::CompletionError(format!(
             "all candidate Chutes instances failed (refusing to send inference); last: {last_err}"
@@ -659,12 +680,18 @@ fn strip_internal_response_fields(obj: &mut serde_json::Map<String, Value>) {
 /// - a chunk with an empty `choices` array is the FINAL usage-only chunk → its
 ///   `usage` is kept iff `include_usage` was requested, else stripped.
 ///
+/// Returns `true` when the chunk was the FINAL usage-only chunk and the client did
+/// NOT request usage: OpenAI emits no final usage chunk at all in that case, so the
+/// caller must suppress the whole chunk from the client stream rather than forward
+/// a gutted `choices: []` husk (strict SDK parsers reject it, and cost-tracking
+/// clients read it as zero usage) — see [`rewrite_sse_event_model`].
+///
 /// NOTE: this gates only `raw_bytes` (the bytes the passthrough route forwards to the
 /// client). The parsed `chunk.usage` is left intact so `InterceptStream` can still
 /// read it for billing/limits — see [`rewrite_sse_event_model`].
-fn gate_stream_usage(obj: &mut serde_json::Map<String, Value>, include_usage: bool) {
+fn gate_stream_usage(obj: &mut serde_json::Map<String, Value>, include_usage: bool) -> bool {
     if !obj.contains_key("usage") {
-        return;
+        return false;
     }
     let is_final = obj
         .get("choices")
@@ -673,6 +700,7 @@ fn gate_stream_usage(obj: &mut serde_json::Map<String, Value>, include_usage: bo
     if !is_final || !include_usage {
         obj.remove("usage");
     }
+    is_final && !include_usage
 }
 
 /// Rewrite the `model` field of a decrypted OpenAI SSE event to the canonical id
@@ -737,8 +765,21 @@ fn rewrite_sse_event_model(
 
     // Client-facing `raw_bytes`: apply the streamed-usage gate (#781 L1). The parsed
     // chunk above is untouched by this gate, so billing still sees `usage`.
+    let mut suppress_client_chunk = false;
     if let Some(obj) = v.as_object_mut() {
-        gate_stream_usage(obj, include_usage);
+        suppress_client_chunk = gate_stream_usage(obj, include_usage);
+    }
+    if suppress_client_chunk {
+        // The FINAL usage-only chunk, with the client NOT having requested usage:
+        // OpenAI sends no such chunk at all, so emit nothing to the client instead
+        // of a gutted `choices: []` husk (strict SDK parsers choke on it, and
+        // cost-tracking clients read the stream as zero usage). The parsed chunk
+        // is kept so `InterceptStream` still sees `usage` for billing/limits.
+        return SSEEvent {
+            raw_bytes: bytes::Bytes::new(),
+            chunk: ev.chunk,
+            raw_passthrough: ev.raw_passthrough,
+        };
     }
     let Ok(json) = serde_json::to_string(&v) else {
         return ev;
@@ -1802,14 +1843,42 @@ mod tests {
                 "Chutes /e2e/invoke",
                 ChutesClientError::Status {
                     status,
-                    // A nonce/token error body that must never reach the client.
-                    body: "consumed nonce token: secret-internal-detail".into(),
+                    body: "malformed encrypted request payload: secret-internal-detail".into(),
                 },
             );
             match mapped {
                 CompletionError::CompletionError(_) => {}
                 other => panic!("internal {status} must mask to CompletionError, got {other:?}"),
             }
+        }
+    }
+
+    #[test]
+    fn map_client_error_retries_stale_invoke_400() {
+        use client::ChutesClientError;
+
+        let mapped = Provider::map_client_error(
+            "Chutes /e2e/invoke",
+            ChutesClientError::Status {
+                status: 400,
+                body: "nonce token expired for selected instance".into(),
+            },
+        );
+
+        match mapped {
+            CompletionError::HttpError {
+                status_code,
+                message,
+                is_external,
+            } => {
+                assert_eq!(status_code, 503);
+                assert!(is_external, "Chutes is an external upstream");
+                assert!(
+                    message.contains("Chutes /e2e/invoke") && message.contains("stale"),
+                    "message should identify the retryable stale-target case: {message}"
+                );
+            }
+            other => panic!("stale invoke 400 must map to retryable HttpError, got {other:?}"),
         }
     }
 
@@ -2413,15 +2482,26 @@ mod tests {
 
     #[test]
     fn stream_usage_gate_final_chunk_honors_include_usage() {
-        // The FINAL usage-only chunk has an empty `choices` array. Its `usage` is kept
-        // only when the client requested include_usage; otherwise it is dropped.
+        // The FINAL usage-only chunk has an empty `choices` array. When the client
+        // requested include_usage it is forwarded with `usage` intact; otherwise the
+        // WHOLE chunk is suppressed from the client stream — OpenAI emits no final
+        // usage chunk at all in that case, and forwarding a gutted `choices: []`
+        // husk breaks strict SDK parsers and reads as zero usage to cost-tracking
+        // clients (BeeZi production feedback).
+        use crate::StreamChunk;
         let final_chunk = r#"{"id":"c","object":"chat.completion.chunk","created":0,"model":"m","choices":[],"usage":{"prompt_tokens":3,"completion_tokens":5,"total_tokens":8}}"#;
 
-        // include_usage unset → no usage reaches the client.
-        let v = rewrite_raw(final_chunk, false);
+        // include_usage unset → the chunk is suppressed entirely (no husk).
+        let chunk = StreamChunk::Chat(serde_json::from_str(final_chunk).expect("parse chunk"));
+        let ev = SSEEvent {
+            raw_bytes: bytes::Bytes::from(format!("data: {final_chunk}\n\n")),
+            chunk: Some(chunk),
+            raw_passthrough: true,
+        };
+        let out = rewrite_sse_event_model(ev, None, /* include_usage */ false);
         assert!(
-            v.get("usage").is_none(),
-            "final chunk usage dropped when include_usage unset"
+            out.raw_bytes.is_empty(),
+            "final usage chunk suppressed from client when include_usage unset"
         );
 
         // include_usage set → usage survives on the final chunk only.
@@ -2447,10 +2527,12 @@ mod tests {
         };
         let out = rewrite_sse_event_model(ev, None, /* include_usage */ false);
 
-        // Client-facing raw_bytes: usage stripped.
-        let s = std::str::from_utf8(&out.raw_bytes).unwrap();
-        let v: Value = serde_json::from_str(s.strip_prefix("data: ").unwrap().trim_end()).unwrap();
-        assert!(v.get("usage").is_none(), "client raw_bytes usage gated out");
+        // Client-facing raw_bytes: the whole final usage chunk is suppressed (OpenAI
+        // sends no final chunk when include_usage wasn't requested — no husk).
+        assert!(
+            out.raw_bytes.is_empty(),
+            "client raw_bytes suppressed for the gated final usage chunk"
+        );
 
         // Parsed chunk: usage preserved for InterceptStream billing.
         let Some(StreamChunk::Chat(c)) = &out.chunk else {

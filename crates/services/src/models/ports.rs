@@ -30,7 +30,11 @@ pub struct ModelWithPricing {
     pub input_cost_per_token: i64,
     pub output_cost_per_token: i64,
     pub cost_per_image: i64,
-    pub cache_read_cost_per_token: i64,
+    /// Cost per cached input token. `None` = cache pricing disabled (cached
+    /// tokens billed at `input_cost_per_token`, `input_cache_read` omitted
+    /// from the public catalog); `Some(x)` = cached tokens billed at `x`
+    /// (`Some(0)` = genuinely free, rendered as `"0"`).
+    pub cache_read_cost_per_token: Option<i64>,
 
     // Model metadata
     pub context_length: i32,

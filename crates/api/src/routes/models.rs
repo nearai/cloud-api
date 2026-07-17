@@ -10,7 +10,7 @@ use axum::{
 use serde::Deserialize;
 use services::models::ModelsServiceTrait;
 use std::sync::Arc;
-use tracing::{debug, error};
+use tracing::{debug, error, warn};
 use utoipa::IntoParams;
 
 #[derive(Clone)]
@@ -126,11 +126,11 @@ pub async fn list_models(
                 scale: 9,
                 currency: "USD".to_string(),
             },
-            cache_read_cost_per_token: DecimalPrice {
-                amount: model.cache_read_cost_per_token,
+            cache_read_cost_per_token: model.cache_read_cost_per_token.map(|amount| DecimalPrice {
+                amount,
                 scale: 9,
                 currency: "USD".to_string(),
-            },
+            }),
             metadata: ModelMetadata {
                 verifiable: model.verifiable,
                 context_length: model.context_length,
@@ -203,7 +203,9 @@ pub async fn get_model_by_name(
         .await
         .map_err(|e| match e {
             services::models::ModelsError::NotFound(_) => {
-                error!("Model not found: '{}' (URL-decoded query)", model_name);
+                // Routine 404 on a public, unauthenticated endpoint fed by arbitrary
+                // client input (scanners probe slug permutations) — not operational.
+                warn!("Model not found: '{}' (URL-decoded query)", model_name);
                 (
                     StatusCode::NOT_FOUND,
                     ResponseJson(ErrorResponse::new(
@@ -212,8 +214,8 @@ pub async fn get_model_by_name(
                     )),
                 )
             }
-            _ => {
-                error!("Failed to get model '{}'", model_name);
+            other => {
+                error!(error = %other, "Failed to get model '{}'", model_name);
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     ResponseJson(ErrorResponse::new(
@@ -242,11 +244,11 @@ pub async fn get_model_by_name(
             scale: 9,
             currency: "USD".to_string(),
         },
-        cache_read_cost_per_token: DecimalPrice {
-            amount: model.cache_read_cost_per_token,
+        cache_read_cost_per_token: model.cache_read_cost_per_token.map(|amount| DecimalPrice {
+            amount,
             scale: 9,
             currency: "USD".to_string(),
-        },
+        }),
         metadata: ModelMetadata {
             verifiable: model.verifiable,
             context_length: model.context_length,

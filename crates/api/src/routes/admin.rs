@@ -162,6 +162,7 @@ pub struct AdminAppState {
         Arc<dyn services::organization::OrganizationServiceTrait + Send + Sync>,
     pub auth_service: Arc<dyn AuthServiceTrait>,
     pub usage_service: Arc<dyn UsageServiceTrait + Send + Sync>,
+    pub staking_farm_service: Arc<services::staking_farm::StakingFarmService>,
     pub config: Arc<ApiConfig>,
     pub admin_access_token_repository: Arc<database::repositories::AdminAccessTokenRepository>,
     pub inference_provider_pool: Arc<services::inference_provider_pool::InferenceProviderPool>,
@@ -239,7 +240,12 @@ pub async fn batch_upsert_models(
         validate_price(&request.input_cost_per_token, "inputCostPerToken")?;
         validate_price(&request.output_cost_per_token, "outputCostPerToken")?;
         validate_price(&request.cost_per_image, "costPerImage")?;
-        validate_price(&request.cache_read_cost_per_token, "cacheReadCostPerToken")?;
+        // Tri-state field: only a concrete price needs validation; an omitted
+        // field (unchanged) and an explicit null (disable) are both fine.
+        validate_price(
+            &request.cache_read_cost_per_token.clone().flatten(),
+            "cacheReadCostPerToken",
+        )?;
 
         // OpenRouter vocabulary checks. The provider spec at
         // https://openrouter.ai/docs/guides/community/for-providers enumerates
@@ -379,10 +385,12 @@ pub async fn batch_upsert_models(
                     input_cost_per_token: request.input_cost_per_token.as_ref().map(|p| p.amount),
                     output_cost_per_token: request.output_cost_per_token.as_ref().map(|p| p.amount),
                     cost_per_image: request.cost_per_image.as_ref().map(|p| p.amount),
+                    // Tri-state passes through: outer None = leave unchanged,
+                    // Some(None) = disable cache pricing, Some(Some(p)) = set.
                     cache_read_cost_per_token: request
                         .cache_read_cost_per_token
                         .as_ref()
-                        .map(|p| p.amount),
+                        .map(|inner| inner.as_ref().map(|p| p.amount)),
                     model_display_name: request.model_display_name.clone(),
                     model_description: request.model_description.clone(),
                     model_icon: request.model_icon.clone(),
@@ -495,24 +503,43 @@ pub async fn batch_upsert_models(
     }
 
     // Register inference_url models (our own vLLM/SGLang backends)
-    // Only for active, non-external models with an inference_url set
+    // Only for active, non-external models with an inference_url set.
+    // A `provider_config.long_context` block expands into a second endpoint
+    // under the same canonical id (long-context tier).
+    //
+    // Built from `updated_models` — the MERGED post-upsert rows — not from
+    // the PATCH request: a partial PATCH (say pricing + inference_url,
+    // without provider_config) must not re-register the model with its
+    // long-context tier or declared capacities missing; the DB row is the
+    // source of truth the periodic refresh would converge to anyway.
     let inference_url_models: Vec<(String, String, Option<u32>)> = batch_request
         .iter()
         .filter_map(|(model_name, request)| {
-            let is_active = request.is_active != Some(false);
-            let is_external = request.provider_type.as_deref() == Some("external");
-            if is_active && !is_external {
-                request.inference_url.clone().map(|url| {
-                    (
-                        model_name.clone(),
-                        url,
-                        request.context_length.map(|c| c as u32),
+            let merged = updated_models.get(model_name)?;
+            let is_active = merged.is_active;
+            let is_external = merged.provider_type == "external";
+            // Only re-register when the PATCH touched something
+            // registration-relevant, mirroring the unregister trigger above
+            // (plus provider_config, which now carries routing tiers).
+            let touches_registration = request.provider_type.is_some()
+                || request.inference_url.is_some()
+                || request.provider_config.is_some()
+                || request.is_active.is_some()
+                || request.context_length.is_some();
+            if is_active && !is_external && touches_registration {
+                merged.inference_url.clone().map(|url| {
+                    services::inference_provider_pool::expand_inference_endpoints(
+                        model_name,
+                        &url,
+                        u32::try_from(merged.context_length).ok(),
+                        merged.provider_config.as_ref(),
                     )
                 })
             } else {
                 None
             }
         })
+        .flatten()
         .collect();
 
     if !inference_url_models.is_empty() {
@@ -617,11 +644,7 @@ pub async fn batch_upsert_models(
                 scale: 9,
                 currency: "USD".to_string(),
             },
-            cache_read_cost_per_token: DecimalPrice {
-                amount: updated_model.cache_read_cost_per_token,
-                scale: 9,
-                currency: "USD".to_string(),
-            },
+            cache_read_cost_per_token: updated_model.cache_read_cost_per_token.map(usd_price),
             metadata: ModelMetadata {
                 verifiable: updated_model.verifiable,
                 context_length: updated_model.context_length,
@@ -727,11 +750,7 @@ pub async fn list_models(
                 scale: 9,
                 currency: "USD".to_string(),
             },
-            cache_read_cost_per_token: DecimalPrice {
-                amount: model.cache_read_cost_per_token,
-                scale: 9,
-                currency: "USD".to_string(),
-            },
+            cache_read_cost_per_token: model.cache_read_cost_per_token.map(usd_price),
             metadata: ModelMetadata {
                 verifiable: model.verifiable,
                 context_length: model.context_length,
@@ -867,11 +886,7 @@ pub async fn get_model_history(
                 scale: 9,
                 currency: "USD".to_string(),
             },
-            cache_read_cost_per_token: DecimalPrice {
-                amount: h.cache_read_cost_per_token,
-                scale: 9,
-                currency: "USD".to_string(),
-            },
+            cache_read_cost_per_token: h.cache_read_cost_per_token.map(usd_price),
             context_length: h.context_length,
             model_name: h.model_name,
             model_display_name: h.model_display_name,
@@ -980,31 +995,43 @@ pub async fn update_organization_limits(
         .admin_service
         .update_organization_limits(organization_id, service_request)
         .await
-        .map_err(|e| {
-            error!("Failed to update organization limits");
-            match e {
-                services::admin::AdminError::OrganizationNotFound(msg) => (
+        .map_err(|e| match e {
+            services::admin::AdminError::OrganizationNotFound(msg) => {
+                warn!(%organization_id, "Organization not found for limits update");
+                (
                     StatusCode::NOT_FOUND,
                     ResponseJson(ErrorResponse::new(
                         msg,
                         "organization_not_found".to_string(),
                     )),
-                ),
-                services::admin::AdminError::InvalidLimits(msg) => (
+                )
+            }
+            services::admin::AdminError::InvalidLimits(msg) => {
+                warn!(%organization_id, "Invalid limits update rejected");
+                (
                     StatusCode::BAD_REQUEST,
                     ResponseJson(ErrorResponse::new(msg, "invalid_limits".to_string())),
-                ),
-                services::admin::AdminError::Unauthorized(msg) => (
+                )
+            }
+            services::admin::AdminError::Unauthorized(msg) => {
+                warn!(%organization_id, "Unauthorized limits update");
+                (
                     StatusCode::UNAUTHORIZED,
                     ResponseJson(ErrorResponse::new(msg, "unauthorized".to_string())),
-                ),
-                _ => (
+                )
+            }
+            // AdminError display strings carry only IDs/categories — without
+            // this field the log cannot distinguish a DB failure from e.g. the
+            // concurrent-update unique-violation race.
+            other => {
+                error!(%organization_id, error = %other, "Failed to update organization limits");
+                (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     ResponseJson(ErrorResponse::new(
                         "Failed to update organization limits".to_string(),
                         "internal_server_error".to_string(),
                     )),
-                ),
+                )
             }
         })?;
 
@@ -1012,6 +1039,7 @@ pub async fn update_organization_limits(
     let credit_type_enum = match updated_limits.credit_type.to_lowercase().as_str() {
         "grant" => CreditType::Grant,
         "payment" => CreditType::Payment,
+        "staking_farm" => CreditType::StakingFarm,
         _ => CreditType::Payment, // Default fallback (should not happen)
     };
 
@@ -1085,27 +1113,36 @@ pub async fn get_organization_limits_history(
         .admin_service
         .get_organization_limits_history(organization_uuid, params.limit, params.offset)
         .await
-        .map_err(|e| {
-            error!("Failed to retrieve organization limits history");
-            match e {
-                services::admin::AdminError::OrganizationNotFound(msg) => (
+        .map_err(|e| match e {
+            services::admin::AdminError::OrganizationNotFound(msg) => {
+                // Fires for every org that has no limits-history rows yet (the
+                // service maps empty history to OrganizationNotFound) — routine
+                // dashboard traffic, not an operational error.
+                debug!(%organization_uuid, "Limits history: organization not found or no history");
+                (
                     StatusCode::NOT_FOUND,
                     ResponseJson(ErrorResponse::new(
                         msg,
                         "organization_not_found".to_string(),
                     )),
-                ),
-                services::admin::AdminError::Unauthorized(msg) => (
+                )
+            }
+            services::admin::AdminError::Unauthorized(msg) => {
+                warn!(%organization_uuid, "Unauthorized limits history request");
+                (
                     StatusCode::UNAUTHORIZED,
                     ResponseJson(ErrorResponse::new(msg, "unauthorized".to_string())),
-                ),
-                _ => (
+                )
+            }
+            other => {
+                error!(%organization_uuid, error = %other, "Failed to retrieve organization limits history");
+                (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     ResponseJson(ErrorResponse::new(
                         "Failed to retrieve limits history".to_string(),
                         "internal_server_error".to_string(),
                     )),
-                ),
+                )
             }
         })?;
 
@@ -1115,6 +1152,7 @@ pub async fn get_organization_limits_history(
             let credit_type_enum = match h.credit_type.to_lowercase().as_str() {
                 "grant" => CreditType::Grant,
                 "payment" => CreditType::Payment,
+                "staking_farm" => CreditType::StakingFarm,
                 _ => CreditType::Payment,
             };
             OrgLimitsHistoryEntry {
@@ -1404,11 +1442,7 @@ pub async fn deprecate_model(
             scale: 9,
             currency: "USD".to_string(),
         },
-        cache_read_cost_per_token: DecimalPrice {
-            amount: m.cache_read_cost_per_token,
-            scale: 9,
-            currency: "USD".to_string(),
-        },
+        cache_read_cost_per_token: m.cache_read_cost_per_token.map(usd_price),
         metadata: ModelMetadata {
             verifiable: m.verifiable,
             context_length: m.context_length,
@@ -1633,7 +1667,7 @@ fn scheduled_pricing_change_to_dto(
         old_pricing: PricingFields {
             input_cost_per_token: usd_price(change.old_input_cost_per_token),
             output_cost_per_token: usd_price(change.old_output_cost_per_token),
-            cache_read_cost_per_token: usd_price(change.old_cache_read_cost_per_token),
+            cache_read_cost_per_token: change.old_cache_read_cost_per_token.map(usd_price),
             cost_per_image: usd_price(change.old_cost_per_image),
         },
         new_pricing: PricingFieldUpdates {
@@ -1696,7 +1730,7 @@ pub async fn preview_model_pricing_changes(
                 old_pricing: PricingFields {
                     input_cost_per_token: usd_price(m.old_input_cost_per_token),
                     output_cost_per_token: usd_price(m.old_output_cost_per_token),
-                    cache_read_cost_per_token: usd_price(m.old_cache_read_cost_per_token),
+                    cache_read_cost_per_token: m.old_cache_read_cost_per_token.map(usd_price),
                     cost_per_image: usd_price(m.old_cost_per_image),
                 },
                 new_pricing: PricingFieldUpdates {

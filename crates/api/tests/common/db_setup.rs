@@ -129,6 +129,7 @@ pub async fn create_test_pool() -> database::pool::DbPool {
     pg_config.dbname = Some(get_test_db_name());
     pg_config.user = Some(db_user());
     pg_config.password = Some(db_password());
+    pg_config.application_name = Some(format!("cloud-api-e2e-{}", uuid::Uuid::new_v4().simple()));
 
     pg_config.pool = Some(deadpool_postgres::PoolConfig {
         max_size: 4,
@@ -141,4 +142,5 @@ pub async fn create_test_pool() -> database::pool::DbPool {
             tokio_postgres::NoTls,
         )
         .expect("Failed to create test connection pool")
+        .into()
 }

@@ -6,6 +6,12 @@
 //! orgs/workspaces/keys, not separate databases.
 
 pub mod db_setup;
+pub mod fake_ita;
+pub mod ita_evidence;
+pub mod ita_server;
+
+pub use ita_evidence::setup_test_server_with_config_and_ita_model_evidence;
+pub use ita_server::{setup_ita_server, setup_ita_server_with_env_policy, ItaServerMode};
 
 use api::{
     build_app_with_config, init_auth_services,
@@ -40,8 +46,8 @@ pub const MOCK_USER_ID: &str = "11111111-1111-1111-1111-111111111111";
 pub const E2E_QWEN_MODEL_NAME: &str = "Qwen/Qwen3-30B-A3B-Instruct-2507";
 pub const E2E_QWEN_INPUT_COST_PER_TOKEN: i64 = 1_000_000;
 pub const E2E_QWEN_OUTPUT_COST_PER_TOKEN: i64 = 2_000_000;
-/// Cache-read cost when setup_qwen_model is used (no cache pricing in API).
-pub const E2E_QWEN_CACHE_READ_COST_NO_CACHE: i64 = 0;
+/// Cache-read cost when setup_qwen_model is used (cache pricing disabled).
+pub const E2E_QWEN_CACHE_READ_COST_NO_CACHE: Option<i64> = None;
 /// Cache-read cost when setup_qwen_model_with_cache_pricing is used.
 pub const E2E_QWEN_CACHE_READ_COST_WITH_CACHE: i64 = 500_000;
 
@@ -116,6 +122,12 @@ pub fn test_config() -> ApiConfig {
         external_providers: config::ExternalProvidersConfig::default(),
         github_dispatch: config::GitHubDispatchConfig::default(),
         infra: config::InfraConfig::default(),
+        staking_farm: config::StakingFarmConfig::default(),
+        usage_reporting: config::UsageReportingConfig {
+            enabled: true,
+            ..config::UsageReportingConfig::default()
+        },
+        ita: config::ItaAttestationConfig::default(),
     }
 }
 
@@ -402,6 +414,19 @@ where
     let (server, _pool, _mock) =
         build_test_server_components(infra.database.clone(), infra.config).await;
     server
+}
+
+pub async fn setup_test_server_with_config_and_database<F>(
+    mutate: F,
+) -> (axum_test::TestServer, Arc<Database>)
+where
+    F: FnOnce(&mut config::ApiConfig),
+{
+    let mut infra = setup_test_infrastructure().await;
+    mutate(&mut infra.config);
+    let database = infra.database.clone();
+    let (server, _pool, _mock) = build_test_server_components(database.clone(), infra.config).await;
+    (server, database)
 }
 
 pub async fn setup_test_server_with_database() -> (axum_test::TestServer, Arc<Database>) {
@@ -833,7 +858,12 @@ pub async fn setup_qwen_model_with_cache_pricing(server: &axum_test::TestServer)
         "Output cost per token should match E2E_QWEN_OUTPUT_COST_PER_TOKEN"
     );
     assert_eq!(
-        updated[0].cache_read_cost_per_token.amount, E2E_QWEN_CACHE_READ_COST_WITH_CACHE,
+        updated[0]
+            .cache_read_cost_per_token
+            .as_ref()
+            .expect("cache-read pricing must be present when configured")
+            .amount,
+        E2E_QWEN_CACHE_READ_COST_WITH_CACHE,
         "Cache-read cost per token should match E2E_QWEN_CACHE_READ_COST_WITH_CACHE"
     );
     // Ensure mock provider registers model before test proceeds
@@ -861,7 +891,7 @@ pub fn e2e_qwen_model_pricing_with_cache() -> ModelPricing {
         input_cost_per_token: E2E_QWEN_INPUT_COST_PER_TOKEN,
         output_cost_per_token: E2E_QWEN_OUTPUT_COST_PER_TOKEN,
         cost_per_image: 0,
-        cache_read_cost_per_token: E2E_QWEN_CACHE_READ_COST_WITH_CACHE,
+        cache_read_cost_per_token: Some(E2E_QWEN_CACHE_READ_COST_WITH_CACHE),
     }
 }
 

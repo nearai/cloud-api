@@ -22,6 +22,9 @@ use std::{
 use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, info, warn};
 
+mod context_routing;
+pub use context_routing::expand_inference_endpoints;
+
 mod provider_attribution;
 use provider_attribution::{served_provider_attribution, ServedProviderResult};
 pub use provider_attribution::{
@@ -183,8 +186,13 @@ pub struct ChatRoutingHints {
     /// When set, provider selection within the leading tier uses this hash instead of
     /// pure round-robin, so requests with the same prefix tend to land on the same backend.
     pub prefix_hash: Option<u64>,
-    /// Rough token count estimate (total chars / 4). Providers whose
-    /// max_context_tokens < this value are sorted after capable providers.
+    /// Estimated context requirement in tokens. Callers set a rough input
+    /// estimate (bytes / 4 over the countable request text); for models whose
+    /// providers declare multiple context capacities the pool refines it into
+    /// `ceil(input_tokens × factor) + max_tokens reserve`, using an exact
+    /// `/v1/tokenize` count near tier boundaries (see
+    /// `refine_context_requirement`). Providers whose max_context_tokens <
+    /// this value are sorted after capable providers.
     pub estimated_tokens: Option<u32>,
 }
 
@@ -948,8 +956,19 @@ impl InferenceProviderPool {
         &self,
         model_id: String,
         provider: Arc<InferenceProviderTrait>,
+        max_context_tokens: Option<u32>,
     ) {
         let ptr = Arc::as_ptr(&provider) as *const () as usize;
+        // Declared context window (e.g. the `@<n>` suffix in CHUTES_MODELS) so
+        // context-length routing knows whether this fallback can take a long
+        // request. `None` = no declared limit (never filtered by size).
+        if let Some(ctx) = max_context_tokens {
+            let mut states = self
+                .provider_load_state
+                .write()
+                .unwrap_or_else(|e| e.into_inner());
+            states.entry(ptr).or_default().max_context_tokens = Some(ctx);
+        }
         self.pinned_models
             .write()
             .unwrap_or_else(|e| e.into_inner())
@@ -1780,9 +1799,20 @@ impl InferenceProviderPool {
                 .map(|s| s.ttft_ewma_ms)
                 .fold(f64::MAX, f64::min);
 
-            // Sort key: (context_overflow, hard_demoted, latency_demoted, tier_rank)
-            // Lower = preferred.
-            let key_of = |p: &Arc<InferenceProviderTrait>| -> (u8, u8, u8, u8) {
+            // Sort key: (context_overflow, hard_demoted, latency_demoted, tier_rank,
+            // capacity_rank). Lower = preferred. The trailing capacity rank makes
+            // ordering BEST-FIT within an otherwise-equal group: for a model with
+            // two NEAR tiers (e.g. glm-5.2's 262k fleet + single-host 1M tier),
+            // short requests prefer the smaller/plentiful fleet instead of
+            // round-robining onto the long-context host, which stays their
+            // retryable-5xx failover and the primary home for oversized requests
+            // (whose context_overflow flag sorts the small fleet last). Inside the
+            // OVERFLOW group the rank inverts to biggest-capacity-first: when the
+            // (over-)estimate exceeds every declared window, the provider closest
+            // to fitting — which may well serve the real, smaller request — must
+            // be tried before a guaranteed-400 small fleet. Models whose providers
+            // all share one capacity (or declare none) order exactly as before.
+            let key_of = |p: &Arc<InferenceProviderTrait>| -> (u8, u8, u8, u8, u32) {
                 let ptr = Arc::as_ptr(p) as *const () as usize;
                 let failures = counts.get(&ptr).copied().unwrap_or(0);
                 let (ttft_ewma_ms, ttft_samples, max_context_tokens) = states
@@ -1805,7 +1835,21 @@ impl InferenceProviderPool {
                         && min_ttft_ms.is_finite()
                         && ttft_ewma_ms > TTFT_SLOW_RATIO * min_ttft_ms,
                 );
-                (context_overflow, demoted, latency_demoted, tier_rank(p))
+                let capacity = max_context_tokens.unwrap_or(u32::MAX);
+                let capacity_rank = if context_overflow == 1 {
+                    // Nothing fits (per the estimate): closest-to-fitting first.
+                    u32::MAX - capacity
+                } else {
+                    // Fitting providers: smallest sufficient window first.
+                    capacity
+                };
+                (
+                    context_overflow,
+                    demoted,
+                    latency_demoted,
+                    tier_rank(p),
+                    capacity_rank,
+                )
             };
             let mut ordered = providers;
             ordered.sort_by_key(&key_of); // stable sort
@@ -2036,6 +2080,26 @@ impl InferenceProviderPool {
         let m = message.to_ascii_lowercase();
         m.contains("model_not_found")
             || (m.contains("model") && (m.contains("does not exist") || m.contains("not found")))
+    }
+
+    /// A 400 whose body says the input exceeds THIS backend's context window
+    /// (vLLM/SGLang phrasings: "maximum context length", "longer than the
+    /// model's context length", "input length ... exceeds"). With tiered
+    /// context routing, a sibling provider may have a bigger window — so,
+    /// like [`Self::is_model_not_found_error`], this escapes the 4xx
+    /// fast-return and falls through to the next provider. It stays
+    /// non-retryable (same provider is never re-tried, failure counter
+    /// untouched — the backend is healthy, the request just doesn't fit).
+    /// These bodies carry token counts, never message content. A wording
+    /// miss simply restores the old fast-return behavior.
+    fn is_context_length_exceeded_error(status_code: u16, message: &str) -> bool {
+        if status_code != 400 {
+            return false;
+        }
+        let m = message.to_ascii_lowercase();
+        m.contains("maximum context length")
+            || (m.contains("context length") && (m.contains("exceed") || m.contains("longer than")))
+            || (m.contains("input length") && m.contains("exceed"))
     }
 
     /// Single source of truth for the retry decision: the inner retry loop
@@ -2415,6 +2479,30 @@ impl InferenceProviderPool {
             .iter()
             .any(|provider| provider.tier() == inference_providers::ProviderTier::Near);
 
+        // Declared context capacities of the candidates, for the context-tier
+        // metric tags on the success counter below. `context_tier:long` means
+        // the request's estimated context requirement exceeded at least one
+        // candidate's window — i.e. tiered context routing constrained the
+        // choice (glm-5.2 >262k traffic shows up here).
+        let ctx_caps: HashMap<usize, Option<u32>> = {
+            let states = self
+                .provider_load_state
+                .read()
+                .unwrap_or_else(|e| e.into_inner());
+            providers
+                .iter()
+                .map(|p| {
+                    let ptr = Arc::as_ptr(p) as *const () as usize;
+                    (ptr, states.get(&ptr).and_then(|s| s.max_context_tokens))
+                })
+                .collect()
+        };
+        let context_tier_long = hints.estimated_tokens.is_some_and(|req| {
+            ctx_caps
+                .values()
+                .any(|cap| cap.is_some_and(|cap| req > cap))
+        });
+
         tracing::info!(
             model_id = %model_id,
             providers_count = providers.len(),
@@ -2522,6 +2610,12 @@ impl InferenceProviderPool {
                         // NEAR→fallback rate per model. Recorded here — the only point
                         // that knows the serving provider's tier and the attempt index.
                         if let Some(metrics) = self.metrics_service.get() {
+                            let provider_ctx = ctx_caps
+                                .get(&(Arc::as_ptr(provider) as *const () as usize))
+                                .copied()
+                                .flatten()
+                                .map(|cap| cap.to_string())
+                                .unwrap_or_else(|| "unbounded".to_string());
                             metrics.record_count(
                                 crate::metrics::consts::METRIC_PROVIDER_REQUESTS,
                                 1,
@@ -2530,6 +2624,14 @@ impl InferenceProviderPool {
                                     &format!("provider_tier:{}", tier.as_str()),
                                     &format!("fallback:{is_fallback}"),
                                     &format!("operation:{operation_name}"),
+                                    // Which capacity tier served, and whether the
+                                    // request was context-constrained (dashboards:
+                                    // long-tier share + who serves >262k traffic).
+                                    &format!("provider_ctx:{provider_ctx}"),
+                                    &format!(
+                                        "context_tier:{}",
+                                        if context_tier_long { "long" } else { "default" }
+                                    ),
                                 ],
                             );
                         }
@@ -2555,6 +2657,7 @@ impl InferenceProviderPool {
                         // as other providers may have capacity or better connectivity.
                         // NOTE: Don't increment the failure counter for non-retryable 4xx —
                         // these indicate invalid requests, not unhealthy providers.
+                        let mut context_400_fell_through = false;
                         if let CompletionError::HttpError {
                             status_code,
                             message,
@@ -2570,10 +2673,35 @@ impl InferenceProviderPool {
                             // provider and the failure counter isn't bumped; if no
                             // other provider serves it, the error still propagates
                             // after the loop.
+                            // A context-length 400 gets the same treatment — but
+                            // ONLY when a sibling with a strictly larger DECLARED
+                            // window exists (glm-5.2 262k fleet → 1M tier): an
+                            // under-estimated request then self-heals, the
+                            // incapable backend having rejected before prefill.
+                            // Without such a sibling (single-capacity model, or a
+                            // fallback with no/equal declared window) the request
+                            // can't fit anywhere else either, so keep today's
+                            // fast-return: the engine's actionable "maximum
+                            // context length is N" error surfaces immediately
+                            // instead of being replaced by a fallback's after a
+                            // wasted full-payload re-upload.
+                            let larger_ctx_sibling_exists = ctx_caps
+                                .get(&(Arc::as_ptr(provider) as *const () as usize))
+                                .copied()
+                                .flatten()
+                                .is_some_and(|mine| {
+                                    ctx_caps
+                                        .values()
+                                        .any(|c| c.is_some_and(|other| other > mine))
+                                });
+                            let ctx_400_falls_through = larger_ctx_sibling_exists
+                                && Self::is_context_length_exceeded_error(*status_code, message);
+                            context_400_fell_through = ctx_400_falls_through;
                             if (400..=499).contains(status_code)
                                 && *status_code != 429
                                 && *status_code != 408
                                 && !Self::is_model_not_found_error(*status_code, message)
+                                && !ctx_400_falls_through
                             {
                                 tracing::warn!(
                                     model_id = %model_id,
@@ -2696,8 +2824,23 @@ impl InferenceProviderPool {
                         // Sanitize and preserve the last error with its structure intact.
                         // Carry the raw-error retry decision so downstream gates and the
                         // terminal log don't re-classify the sanitized form.
-                        last_error = Some(Self::sanitize_completion_error(e, model_id));
-                        last_retry_decision = Some(retry_decision);
+                        //
+                        // Exception: a context-length 400 that fell through from a
+                        // smaller-window provider is an EXPECTED rejection on the way
+                        // to a bigger sibling — it must not clobber an earlier
+                        // retryable error from a provider that actually fits. E.g. a
+                        // long request whose 1M tier 503s (queue full) and whose base
+                        // fleet then 400s: keeping the 503 lets the outer round retry
+                        // the saturated capable tier and, if it stays saturated,
+                        // surfaces a retryable 503 to the client instead of a
+                        // misleading "maximum context length" 400 for a request that
+                        // is genuinely servable.
+                        let keep_prior_retryable = context_400_fell_through
+                            && last_retry_decision.is_some_and(|d| d.starts_with("retryable_"));
+                        if !keep_prior_retryable {
+                            last_error = Some(Self::sanitize_completion_error(e, model_id));
+                            last_retry_decision = Some(retry_decision);
+                        }
                     }
                 }
             }
@@ -2896,6 +3039,150 @@ impl InferenceProviderPool {
             .unwrap_or_else(|| AttestationError::ProviderNotFound(model)))
     }
 
+    /// Bound on concurrent `/v1/tokenize` refinement calls. Requests that
+    /// can't get a permit fall back to the byte heuristic immediately — the
+    /// exact count is an accuracy optimization, never worth queueing for,
+    /// and the cap keeps a burst of boundary-sized prompts from doubling
+    /// ingress bandwidth against the backend.
+    const TOKENIZE_CONCURRENCY: usize = 4;
+
+    /// Set `hints.estimated_tokens` to the CONTEXT REQUIREMENT the routing
+    /// sort compares against provider capacities:
+    /// `ceil(countable_input × factor) + media/template overhead + max_tokens reserve`.
+    ///
+    /// Runs ONLY for models whose providers declare ≥2 distinct context
+    /// capacities (e.g. glm-5.2's 262k fleet + 1M tier) — for every other
+    /// model this is a no-op and the hint keeps its original (PR #838)
+    /// semantics, so their routing is unchanged. The estimate is computed
+    /// here, from the full request (text + tools + media + template
+    /// overhead), NOT taken from the service-side hint — keeping the richer
+    /// accounting scoped to multi-tier models only. When it lands inside the
+    /// tokenize band around a declared capacity (where the ±25% byte
+    /// heuristic could flip the tier decision), asks a NEAR provider for an
+    /// exact count via its attested `/v1/tokenize` passthrough — best-effort
+    /// and concurrency-capped, falling back to the heuristic with the wider
+    /// safety factor. Skipped for encrypted payloads (`skip_exact_count`):
+    /// tokenizing ciphertext is meaningless, and the byte heuristic still
+    /// approximates plaintext size.
+    async fn refine_context_requirement(
+        &self,
+        model_id: &str,
+        params: &ChatCompletionParams,
+        hints: &mut ChatRoutingHints,
+        skip_exact_count: bool,
+    ) {
+        let providers = {
+            let mappings = self.provider_mappings.read().await;
+            match mappings.model_to_providers.get(model_id) {
+                Some(p) => p.clone(),
+                None => return,
+            }
+        };
+
+        let caps: Vec<(Arc<InferenceProviderTrait>, Option<u32>)> = {
+            let states = self
+                .provider_load_state
+                .read()
+                .unwrap_or_else(|e| e.into_inner());
+            providers
+                .into_iter()
+                .map(|p| {
+                    let ptr = Arc::as_ptr(&p) as *const () as usize;
+                    let cap = states.get(&ptr).and_then(|s| s.max_context_tokens);
+                    (p, cap)
+                })
+                .collect()
+        };
+
+        let distinct: std::collections::BTreeSet<u32> =
+            caps.iter().filter_map(|(_, c)| *c).collect();
+        if distinct.len() < 2 {
+            // Single-capacity (or undeclared) model: no tier decision to make;
+            // leave the hint untouched so existing routing is unchanged.
+            return;
+        }
+
+        let estimate = context_routing::estimate_input(params);
+        let pre_factor = estimate.countable_tokens + estimate.uncounted_tokens;
+        let output_reserve = params
+            .max_completion_tokens
+            .or(params.max_tokens)
+            .unwrap_or(0)
+            .max(0) as u64;
+
+        // Exact count only when the heuristic is close enough to a capacity
+        // boundary that its error could flip the tier decision. The band is
+        // checked against input + output reserve: a large max_tokens shrinks
+        // the input room to `cap - reserve`, so a mid-size prompt can sit at
+        // the boundary even when the input alone looks comfortably below it.
+        let (band_low, band_high) = context_routing::tokenize_band();
+        let boundary_demand = (pre_factor + output_reserve) as f64;
+        let near_boundary = distinct.iter().any(|cap| {
+            let cap = *cap as f64;
+            boundary_demand >= band_low * cap && boundary_demand <= band_high * cap
+        });
+
+        let mut exact_count: Option<u64> = None;
+        if near_boundary && !skip_exact_count {
+            static TOKENIZE_PERMITS: tokio::sync::Semaphore =
+                tokio::sync::Semaphore::const_new(InferenceProviderPool::TOKENIZE_CONCURRENCY);
+            if let Ok(_permit) = TOKENIZE_PERMITS.try_acquire() {
+                // Count on the base fleet (smallest declared capacity — the
+                // plentiful tier) so the long-context host doesn't pay the
+                // tokenize traffic too. Same model ⇒ same tokenizer everywhere.
+                let smallest = distinct.iter().next().copied();
+                let tokenizer_provider = caps
+                    .iter()
+                    .find(|(p, c)| {
+                        *c == smallest && p.tier() == inference_providers::ProviderTier::Near
+                    })
+                    .or_else(|| {
+                        caps.iter()
+                            .find(|(p, _)| p.tier() == inference_providers::ProviderTier::Near)
+                    })
+                    .map(|(p, _)| p.clone());
+                if let Some(provider) = tokenizer_provider {
+                    let text = context_routing::concat_prompt_text(params);
+                    exact_count = provider.count_tokens(model_id, text).await;
+                }
+            }
+        }
+
+        // The exact count replaces only the COUNTABLE text; media and
+        // template overhead are invisible to the tokenizer and re-added.
+        let required = match exact_count {
+            Some(n) => (n as f64 * context_routing::exact_factor()).ceil() as u64,
+            None => {
+                (estimate.countable_tokens as f64 * context_routing::safety_factor()).ceil() as u64
+            }
+        } + estimate.uncounted_tokens
+            + output_reserve;
+        let required = required.min(u32::MAX as u64) as u32;
+        hints.estimated_tokens = Some(required);
+
+        // Numbers only — never content (see CLAUDE.md logging rules).
+        let smallest_cap = distinct.iter().next().copied().unwrap_or(u32::MAX);
+        if required > smallest_cap {
+            tracing::info!(
+                model_id = %model_id,
+                input_estimate = pre_factor,
+                required_tokens = required,
+                output_reserve,
+                exact_count_used = exact_count.is_some(),
+                "Request exceeds the base tier's context window; routing to a longer-context provider"
+            );
+        } else {
+            tracing::debug!(
+                model_id = %model_id,
+                input_estimate = pre_factor,
+                required_tokens = required,
+                output_reserve,
+                exact_count_used = exact_count.is_some(),
+                "Refined context requirement for tier routing"
+            );
+        }
+    }
+
     pub async fn chat_completion_stream(
         &self,
         params: ChatCompletionParams,
@@ -2912,7 +3199,7 @@ impl InferenceProviderPool {
         &self,
         mut params: ChatCompletionParams,
         request_hash: String,
-        hints: ChatRoutingHints,
+        mut hints: ChatRoutingHints,
     ) -> Result<AttributedChatCompletionStream, CompletionError> {
         let model_id = params.model.clone();
 
@@ -2928,6 +3215,16 @@ impl InferenceProviderPool {
         let needs_client_e2ee = params
             .extra
             .contains_key(encryption_headers::CLIENT_PUB_KEY);
+
+        // Turn the rough input estimate into a context requirement (exact
+        // tokenize near tier boundaries). No-op for single-capacity models.
+        self.refine_context_requirement(
+            &model_id,
+            &params,
+            &mut hints,
+            model_pub_key.is_some() || needs_client_e2ee,
+        )
+        .await;
 
         let params_for_provider = params.clone();
 
@@ -3052,6 +3349,11 @@ impl InferenceProviderPool {
         request_hash: String,
     ) -> Result<AttributedChatCompletion, CompletionError> {
         let model_id = params.model.clone();
+        // Non-streaming requests carry no service-side routing hints (that
+        // path predates PR #838's estimator and stays byte-identical for
+        // single-capacity models); multi-tier models still get context
+        // routing because the refinement below computes its own estimate.
+        let mut hints = ChatRoutingHints::default();
 
         // Extract model_pub_key from params.extra for routing before any cloning.
         // This ensures the key is removed from params.extra so it won't be passed to the provider,
@@ -3068,6 +3370,16 @@ impl InferenceProviderPool {
             .extra
             .contains_key(encryption_headers::CLIENT_PUB_KEY);
 
+        // Turn the rough input estimate into a context requirement (exact
+        // tokenize near tier boundaries). No-op for single-capacity models.
+        self.refine_context_requirement(
+            &model_id,
+            &params,
+            &mut hints,
+            model_pub_key.is_some() || needs_client_e2ee,
+        )
+        .await;
+
         tracing::debug!(
             model = %model_id,
             "Starting chat completion request"
@@ -3082,7 +3394,7 @@ impl InferenceProviderPool {
                 "chat_completion",
                 model_pub_key,
                 needs_client_e2ee,
-                &ChatRoutingHints::default(),
+                &hints,
                 |provider| {
                     let params = params_for_provider.clone();
                     let request_hash = request_hash.clone();
@@ -3760,6 +4072,14 @@ impl InferenceProviderPool {
 
         for (model_name, url, context_length) in &models {
             if let Some(existing) = existing_cache.get(url) {
+                // Keep the declared capacity fresh on reuse too — an admin
+                // PATCH that only changes context numbers (same URLs) must
+                // take effect without provider recreation.
+                if let Some(ctx) = context_length {
+                    let ptr = Arc::as_ptr(existing) as *const () as usize;
+                    let mut states = pool_load_state.write().unwrap_or_else(|e| e.into_inner());
+                    states.entry(ptr).or_default().max_context_tokens = Some(*ctx);
+                }
                 reused.push((model_name.clone(), url.clone(), existing.clone()));
             } else {
                 needs_creation.push((model_name.clone(), url.clone(), *context_length));
@@ -5981,6 +6301,7 @@ mod tests {
         pool.register_pinned_secondary_provider(
             "chutes-model".to_string(),
             Arc::new(MockProvider::new()),
+            None,
         )
         .await;
 
@@ -6013,7 +6334,7 @@ mod tests {
         let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
 
         let pinned: Arc<InferenceProviderTrait> = Arc::new(MockProvider::new());
-        pool.register_pinned_secondary_provider("chutes-model".to_string(), pinned.clone())
+        pool.register_pinned_secondary_provider("chutes-model".to_string(), pinned.clone(), None)
             .await;
 
         // A DB-discovered external model with the SAME id must NOT replace the
@@ -6048,6 +6369,7 @@ mod tests {
         pool.register_pinned_secondary_provider(
             "chutes-model".to_string(),
             Arc::new(MockProvider::new()),
+            None,
         )
         .await;
         pool.register_provider("db-model".to_string(), Arc::new(MockProvider::new()))
@@ -6094,16 +6416,19 @@ mod tests {
         pool.register_pinned_secondary_provider(
             model.clone(),
             Arc::new(MockProvider::new().with_tier(ProviderTier::NonAttested)),
+            None,
         )
         .await;
         pool.register_pinned_secondary_provider(
             model.clone(),
             Arc::new(MockProvider::new().with_tier(ProviderTier::Attested3p)),
+            None,
         )
         .await;
         pool.register_pinned_secondary_provider(
             model.clone(),
             Arc::new(MockProvider::new().with_tier(ProviderTier::Near)),
+            None,
         )
         .await;
 
@@ -6131,6 +6456,7 @@ mod tests {
         pool.register_pinned_secondary_provider(
             model.clone(),
             Arc::new(MockProvider::new().with_tier(ProviderTier::Attested3p)),
+            None,
         )
         .await;
 
@@ -6186,6 +6512,7 @@ mod tests {
         pool.register_pinned_secondary_provider(
             model.clone(),
             Arc::new(MockProvider::new().with_tier(ProviderTier::Attested3p)),
+            None,
         )
         .await;
 
@@ -6348,6 +6675,7 @@ mod tests {
         pool.register_pinned_secondary_provider(
             model.clone(),
             Arc::new(MockProvider::new().with_tier(ProviderTier::Attested3p)),
+            None,
         )
         .await;
 
@@ -6452,6 +6780,7 @@ mod tests {
         pool.register_pinned_secondary_provider(
             real_pinned.clone(),
             Arc::new(MockProvider::new().with_tier(ProviderTier::Attested3p)),
+            None,
         )
         .await;
 
@@ -7861,6 +8190,461 @@ mod tests {
         }
     }
 
+    #[test]
+    fn context_length_exceeded_matcher_covers_engine_phrasings_only() {
+        for (status, msg, expect) in [
+            // vLLM/OpenAI-compatible phrasing.
+            (400u16, "This model's maximum context length is 262144 tokens.", true),
+            // SGLang phrasings.
+            (400, "the input (300000 tokens) is longer than the model's context length (262144 tokens)", true),
+            (400, "Requested input length 300000 exceeds the maximum allowed", true),
+            (400, "max_tokens exceeds the model's context length", true),
+            // Same wording on a non-400 must not match (5xx has its own path).
+            (503, "maximum context length", false),
+            // Unrelated 400s must not match.
+            (400, "Invalid value for 'temperature': must be between 0 and 2", false),
+            (400, "The model `x` does not exist.", false),
+        ] {
+            assert_eq!(
+                InferenceProviderPool::is_context_length_exceeded_error(status, msg),
+                expect,
+                "status={status} msg={msg}"
+            );
+        }
+    }
+
+    /// Tiered context routing: a 400 whose body says the input exceeds THIS
+    /// backend's context window must fall through to the next provider (a
+    /// bigger-window sibling or the Chutes fallback) instead of fast-returning
+    /// — an under-estimated long request self-heals. Covers both the vLLM and
+    /// SGLang phrasings.
+    #[tokio::test]
+    async fn near_context_length_400_falls_through_to_bigger_provider() {
+        use inference_providers::mock::{MockProvider, RequestMatcher, ResponseTemplate};
+        use inference_providers::{CompletionError, ProviderTier};
+
+        for message in [
+            "This model's maximum context length is 262144 tokens. However, you requested 300000 tokens. Please reduce the length of the messages or completion.",
+            "the input (300000 tokens) is longer than the model's context length (262144 tokens)",
+            "Requested input length 300000 exceeds the maximum allowed",
+        ] {
+            let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
+            let model_id = "z-ai/glm-5.2".to_string();
+
+            let base = Arc::new(MockProvider::new_accept_all().with_tier(ProviderTier::Near));
+            base.set_error_override(Some(CompletionError::HttpError {
+                status_code: 400,
+                message: message.to_string(),
+                is_external: true,
+            }))
+            .await;
+
+            let long = Arc::new(MockProvider::new_accept_all().with_tier(ProviderTier::Near));
+            long.when(RequestMatcher::Any)
+                .respond_with(ResponseTemplate::new("served-by-long-tier"))
+                .await;
+
+            {
+                let mut m = pool.provider_mappings.write().await;
+                m.model_to_providers.insert(
+                    model_id.clone(),
+                    vec![
+                        base.clone() as Arc<InferenceProviderTrait>,
+                        long.clone() as Arc<InferenceProviderTrait>,
+                    ],
+                );
+            }
+            // The fall-through requires a sibling with a strictly larger
+            // DECLARED window — declare the two tiers' capacities.
+            {
+                let mut states = pool
+                    .provider_load_state
+                    .write()
+                    .unwrap_or_else(|e| e.into_inner());
+                states
+                    .entry(Arc::as_ptr(&base) as *const () as usize)
+                    .or_default()
+                    .max_context_tokens = Some(262_144);
+                states
+                    .entry(Arc::as_ptr(&long) as *const () as usize)
+                    .or_default()
+                    .max_context_tokens = Some(1_048_576);
+            }
+
+            let resp = pool
+                .chat_completion(fallback_params(&model_id), "test-hash".to_string())
+                .await
+                .unwrap_or_else(|e| {
+                    panic!("context-length 400 must fall through to the bigger provider, got: {e} (message: {message})")
+                });
+            let body = String::from_utf8_lossy(&resp.raw_bytes);
+            assert!(
+                body.contains("served-by-long-tier"),
+                "response must come from the bigger-window sibling, got: {body}"
+            );
+            // Not a health signal: the base fleet's failure counter must not move.
+            let counts = pool
+                .provider_failure_counts
+                .read()
+                .unwrap_or_else(|e| e.into_inner());
+            let base_ptr = Arc::as_ptr(&base) as *const () as usize;
+            assert_eq!(
+                counts.get(&base_ptr).copied().unwrap_or(0),
+                0,
+                "context-length 400 must not bump the failure counter"
+            );
+        }
+    }
+
+    /// Guard for existing models (e.g. GLM-5.1 + a Chutes fallback with no
+    /// declared window): a context-length 400 with NO strictly-larger
+    /// declared sibling must keep today's fast-return — no full-payload
+    /// re-upload to a fallback that can't fit the request either, and the
+    /// engine's actionable error stays the terminal one.
+    #[tokio::test]
+    async fn context_length_400_without_bigger_sibling_fast_returns() {
+        use inference_providers::mock::MockProvider;
+        use inference_providers::{CompletionError, ProviderTier};
+
+        let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
+        let model_id = "zai-org/GLM-5.1-FP8".to_string();
+
+        let near = Arc::new(MockProvider::new_accept_all().with_tier(ProviderTier::Near));
+        near.set_error_override(Some(CompletionError::HttpError {
+            status_code: 400,
+            message: "This model's maximum context length is 202752 tokens.".to_string(),
+            is_external: true,
+        }))
+        .await;
+        let chutes = Arc::new(MockProvider::new_accept_all().with_tier(ProviderTier::Attested3p));
+
+        {
+            let mut m = pool.provider_mappings.write().await;
+            m.model_to_providers.insert(
+                model_id.clone(),
+                vec![
+                    near.clone() as Arc<InferenceProviderTrait>,
+                    chutes.clone() as Arc<InferenceProviderTrait>,
+                ],
+            );
+        }
+        // NEAR declares its window; Chutes declares none (unknown ≠ larger).
+        {
+            let mut states = pool
+                .provider_load_state
+                .write()
+                .unwrap_or_else(|e| e.into_inner());
+            states
+                .entry(Arc::as_ptr(&near) as *const () as usize)
+                .or_default()
+                .max_context_tokens = Some(202_752);
+        }
+
+        let result = pool
+            .chat_completion(fallback_params(&model_id), "test-hash".to_string())
+            .await;
+        assert!(result.is_err(), "context-length 400 must propagate");
+        assert!(
+            chutes.last_chat_params().await.is_none(),
+            "no fall-through without a strictly larger declared window"
+        );
+    }
+
+    /// A context-length 400 falling through from the (too-small) base fleet
+    /// must not clobber an earlier RETRYABLE error from the capable tier: a
+    /// long request whose 1M tier 503s (queue full) and whose base fleet then
+    /// 400s must terminate with the retryable 503 — the request is genuinely
+    /// servable once the long tier drains — not a misleading "maximum context
+    /// length" client error that would stop the caller from retrying.
+    #[tokio::test]
+    async fn context_400_fall_through_does_not_clobber_retryable_error() {
+        use inference_providers::mock::MockProvider;
+        use inference_providers::{CompletionError, ProviderTier};
+
+        let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
+        let model_id = "z-ai/glm-5.2".to_string();
+
+        let long = Arc::new(MockProvider::new_accept_all().with_tier(ProviderTier::Near));
+        long.set_error_override(Some(CompletionError::HttpError {
+            status_code: 503,
+            message: "queue full".to_string(),
+            is_external: true,
+        }))
+        .await;
+        let base = Arc::new(MockProvider::new_accept_all().with_tier(ProviderTier::Near));
+        base.set_error_override(Some(CompletionError::HttpError {
+            status_code: 400,
+            message: "This model's maximum context length is 262144 tokens.".to_string(),
+            is_external: true,
+        }))
+        .await;
+
+        {
+            let mut m = pool.provider_mappings.write().await;
+            m.model_to_providers.insert(
+                model_id.clone(),
+                vec![
+                    base.clone() as Arc<InferenceProviderTrait>,
+                    long.clone() as Arc<InferenceProviderTrait>,
+                ],
+            );
+        }
+        {
+            let mut states = pool
+                .provider_load_state
+                .write()
+                .unwrap_or_else(|e| e.into_inner());
+            states
+                .entry(Arc::as_ptr(&base) as *const () as usize)
+                .or_default()
+                .max_context_tokens = Some(262_144);
+            states
+                .entry(Arc::as_ptr(&long) as *const () as usize)
+                .or_default()
+                .max_context_tokens = Some(1_048_576);
+        }
+
+        // ~1.2MB of text → the internally-computed requirement (~360k) puts
+        // the request in the long tier: order [long(503), base(400)].
+        let mut params = fallback_params(&model_id);
+        params.messages[0].content = Some(serde_json::Value::String("a".repeat(1_200_000)));
+
+        let err = pool
+            .chat_completion(params, "test-hash".to_string())
+            .await
+            .expect_err("both providers fail");
+        assert!(
+            base.last_chat_params().await.is_some(),
+            "base must have been tried via the fall-through"
+        );
+        match err {
+            CompletionError::HttpError { status_code, .. } => assert_eq!(
+                status_code, 503,
+                "the capable tier's retryable 503 must be the terminal error, not the base 400"
+            ),
+            other => panic!("expected the long tier's HttpError(503), got: {other}"),
+        }
+    }
+
+    /// Best-fit capacity ordering: for a model with two NEAR tiers (262k fleet
+    /// + 1M host) and a Chutes fallback, short requests must prefer the small
+    /// fleet (the 1M host stays failover), and requests that don't fit 262k
+    /// must sort the small fleet last while keeping NEAR-before-Chutes for the
+    /// capable tiers.
+    #[tokio::test]
+    async fn context_capacity_orders_best_fit_within_tier() {
+        use inference_providers::mock::MockProvider;
+        use inference_providers::ProviderTier;
+
+        let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
+        let model = "z-ai/glm-5.2".to_string();
+
+        let base: Arc<InferenceProviderTrait> =
+            Arc::new(MockProvider::new().with_tier(ProviderTier::Near));
+        let long: Arc<InferenceProviderTrait> =
+            Arc::new(MockProvider::new().with_tier(ProviderTier::Near));
+        let chutes: Arc<InferenceProviderTrait> =
+            Arc::new(MockProvider::new().with_tier(ProviderTier::Attested3p));
+
+        {
+            let mut m = pool.provider_mappings.write().await;
+            m.model_to_providers.insert(
+                model.clone(),
+                vec![long.clone(), chutes.clone(), base.clone()],
+            );
+        }
+        {
+            let mut states = pool
+                .provider_load_state
+                .write()
+                .unwrap_or_else(|e| e.into_inner());
+            states
+                .entry(Arc::as_ptr(&base) as *const () as usize)
+                .or_default()
+                .max_context_tokens = Some(262_144);
+            states
+                .entry(Arc::as_ptr(&long) as *const () as usize)
+                .or_default()
+                .max_context_tokens = Some(1_048_576);
+            states
+                .entry(Arc::as_ptr(&chutes) as *const () as usize)
+                .or_default()
+                .max_context_tokens = Some(1_048_576);
+        }
+
+        let ptr = |p: &Arc<InferenceProviderTrait>| Arc::as_ptr(p) as *const () as usize;
+
+        // Short request: base fleet first, long tier as failover, Chutes last.
+        let short = pool
+            .get_providers_with_fallback(
+                &model,
+                None,
+                &ChatRoutingHints {
+                    prefix_hash: None,
+                    estimated_tokens: Some(10_000),
+                },
+            )
+            .await
+            .expect("providers");
+        assert_eq!(
+            short.iter().map(&ptr).collect::<Vec<_>>(),
+            vec![ptr(&base), ptr(&long), ptr(&chutes)],
+            "short requests: best-fit NEAR first, long tier failover, Chutes last"
+        );
+
+        // Long request (doesn't fit 262k): long tier first, Chutes next, base last.
+        let long_req = pool
+            .get_providers_with_fallback(
+                &model,
+                None,
+                &ChatRoutingHints {
+                    prefix_hash: None,
+                    estimated_tokens: Some(300_000),
+                },
+            )
+            .await
+            .expect("providers");
+        assert_eq!(
+            long_req.iter().map(&ptr).collect::<Vec<_>>(),
+            vec![ptr(&long), ptr(&chutes), ptr(&base)],
+            "long requests: 1M NEAR tier first, capable Chutes fallback, overflowing fleet last"
+        );
+
+        // No estimate: pure tier/capacity order, no overflow flags.
+        let no_hint = pool
+            .get_providers_with_fallback(&model, None, &ChatRoutingHints::default())
+            .await
+            .expect("providers");
+        assert_eq!(
+            no_hint.iter().map(&ptr).collect::<Vec<_>>(),
+            vec![ptr(&base), ptr(&long), ptr(&chutes)],
+            "without an estimate the smaller fleet still leads within the NEAR tier"
+        );
+
+        // Over-estimate exceeding EVERY window (e.g. inflated heuristic on a
+        // ~950k-token request): closest-to-fitting NEAR provider first — the
+        // real request may well fit its 1M window — never the guaranteed-400
+        // small fleet.
+        let oversize = pool
+            .get_providers_with_fallback(
+                &model,
+                None,
+                &ChatRoutingHints {
+                    prefix_hash: None,
+                    estimated_tokens: Some(2_000_000),
+                },
+            )
+            .await
+            .expect("providers");
+        assert_eq!(
+            oversize.iter().map(&ptr).collect::<Vec<_>>(),
+            vec![ptr(&long), ptr(&base), ptr(&chutes)],
+            "all-overflow: biggest window first within the NEAR tier"
+        );
+    }
+
+    /// The requirement refinement only activates for models whose providers
+    /// declare ≥2 distinct capacities — for every other model the hint is
+    /// left exactly as the caller set it (byte-identical routing). For
+    /// multi-tier models the hint becomes
+    /// ceil(countable × safety_factor) + overhead + max_tokens reserve,
+    /// computed from the request itself (whatever the incoming hint was).
+    #[tokio::test]
+    async fn refine_context_requirement_gates_on_multi_capacity() {
+        use inference_providers::mock::MockProvider;
+        use inference_providers::ProviderTier;
+
+        let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
+        let model = "z-ai/glm-5.2".to_string();
+
+        let base: Arc<InferenceProviderTrait> =
+            Arc::new(MockProvider::new().with_tier(ProviderTier::Near));
+        let long: Arc<InferenceProviderTrait> =
+            Arc::new(MockProvider::new().with_tier(ProviderTier::Near));
+        {
+            let mut m = pool.provider_mappings.write().await;
+            m.model_to_providers
+                .insert(model.clone(), vec![base.clone(), long.clone()]);
+        }
+
+        // 400k bytes of text → countable = 100_000 tokens; 1 message → 4
+        // tokens overhead; max_tokens reserve 8_000.
+        let mut params = fallback_params(&model);
+        params.messages[0].content = Some(serde_json::Value::String("a".repeat(400_000)));
+        params.max_tokens = Some(8_000);
+
+        // Homogeneous capacities: refinement must leave the hint untouched
+        // (both the None non-streaming form and a caller-set estimate).
+        {
+            let mut states = pool
+                .provider_load_state
+                .write()
+                .unwrap_or_else(|e| e.into_inner());
+            for p in [&base, &long] {
+                states
+                    .entry(Arc::as_ptr(p) as *const () as usize)
+                    .or_default()
+                    .max_context_tokens = Some(262_144);
+            }
+        }
+        let mut hints = ChatRoutingHints::default();
+        pool.refine_context_requirement(&model, &params, &mut hints, false)
+            .await;
+        assert_eq!(
+            hints.estimated_tokens, None,
+            "single-capacity model: hint must stay untouched"
+        );
+
+        // Heterogeneous capacities: requirement computed from the request.
+        // (MockProvider's count_tokens is the trait default None, and 100k is
+        // outside the [0.7, 1.3] tokenize band of both caps → heuristic path.)
+        {
+            let mut states = pool
+                .provider_load_state
+                .write()
+                .unwrap_or_else(|e| e.into_inner());
+            states
+                .entry(Arc::as_ptr(&long) as *const () as usize)
+                .or_default()
+                .max_context_tokens = Some(1_048_576);
+        }
+        let mut hints = ChatRoutingHints::default();
+        pool.refine_context_requirement(&model, &params, &mut hints, false)
+            .await;
+        assert_eq!(
+            hints.estimated_tokens,
+            Some((100_000f64 * context_routing::safety_factor()).ceil() as u32 + 4 + 8_000),
+            "multi-capacity model: requirement = ceil(countable × factor) + overhead + max_tokens"
+        );
+    }
+
+    /// `register_pinned_secondary_provider` records the declared context
+    /// window (CHUTES_MODELS `@<n>` suffix) so capacity ordering sees it.
+    #[tokio::test]
+    async fn pinned_secondary_provider_records_declared_capacity() {
+        use inference_providers::mock::MockProvider;
+        use inference_providers::ProviderTier;
+
+        let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
+        let chutes: Arc<InferenceProviderTrait> =
+            Arc::new(MockProvider::new().with_tier(ProviderTier::Attested3p));
+        pool.register_pinned_secondary_provider(
+            "z-ai/glm-5.2".to_string(),
+            chutes.clone(),
+            Some(1_048_576),
+        )
+        .await;
+
+        let states = pool
+            .provider_load_state
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
+        let cap = states
+            .get(&(Arc::as_ptr(&chutes) as *const () as usize))
+            .and_then(|s| s.max_context_tokens);
+        assert_eq!(cap, Some(1_048_576));
+    }
+
     /// Guard against over-reaching the #797 fix: a GENUINE client 4xx (bad
     /// params, not model-not-found) must still fast-return without trying the
     /// fallback — retrying an invalid request on Chutes would only waste it.
@@ -7872,10 +8656,13 @@ mod tests {
         let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
         let model_id = "z-ai/glm-5.1".to_string();
 
+        // NOTE: deliberately NOT a context-length message — those now fall
+        // through to a bigger-window sibling (see
+        // `near_context_length_400_falls_through_to_bigger_provider`).
         let near = Arc::new(MockProvider::new_accept_all().with_tier(ProviderTier::Near));
         near.set_error_override(Some(CompletionError::HttpError {
             status_code: 400,
-            message: "max_tokens exceeds the model's context length".to_string(),
+            message: "Invalid value for 'temperature': must be between 0 and 2".to_string(),
             is_external: true,
         }))
         .await;
@@ -7973,6 +8760,9 @@ mod tests {
                 "provider_tier:attested_3p".to_string(),
                 "fallback:true".to_string(),
                 "operation:chat_completion".to_string(),
+                // No declared capacities and no size constraint in this setup.
+                "provider_ctx:unbounded".to_string(),
+                "context_tier:default".to_string(),
             ]
         );
 
@@ -7985,6 +8775,8 @@ mod tests {
                 "provider_tier:near".to_string(),
                 "fallback:false".to_string(),
                 "operation:chat_completion".to_string(),
+                "provider_ctx:unbounded".to_string(),
+                "context_tier:default".to_string(),
             ]
         );
     }
@@ -8543,7 +9335,7 @@ mod tests {
             .await;
 
         pool.register_provider(model_id.clone(), near).await;
-        pool.register_pinned_secondary_provider(model_id.clone(), chutes)
+        pool.register_pinned_secondary_provider(model_id.clone(), chutes, None)
             .await;
         pool.prune_stale_pinned(&HashSet::new()).await;
 
@@ -8589,7 +9381,7 @@ mod tests {
             .respond_with(ResponseTemplate::new("served-by-primary-chutes"))
             .await;
 
-        pool.register_pinned_secondary_provider(model_id.clone(), chutes)
+        pool.register_pinned_secondary_provider(model_id.clone(), chutes, None)
             .await;
 
         let served = pool

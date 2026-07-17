@@ -1,5 +1,9 @@
 use super::provider_attribution::ProviderAttribution;
 use crate::responses::models::ResponseId;
+pub use crate::usage::reporting::{
+    InferenceUsageHistoryQuery, InferenceUsageReportCursor, InferenceUsageReportQuery,
+    InferenceUsageReportRow,
+};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -202,9 +206,9 @@ pub trait UsageServiceTrait: Send + Sync {
     ///   where `cache_read` is the effective cached token count (see below).
     /// - **Capping**: The provided `cached_tokens` (or `cache_read_tokens`) is treated as
     ///   `min(cached_tokens, input_tokens).max(0)`; i.e. cached count is never negative and never exceeds input.
-    /// - **Cache pricing disabled**: When the model’s `cache_read_cost_per_token == 0`, cache pricing is
+    /// - **Cache pricing disabled**: When the model’s `cache_read_cost_per_token` is `None`, cache pricing is
     ///   disabled and all input tokens (including cached) are billed at `input_cost_per_token` (cached tokens
-    ///   are not free).
+    ///   are not free). `Some(0)` means cached tokens are genuinely free; `Some(x)` bills them at `x`.
     async fn calculate_cost(
         &self,
         model_id: &str,
@@ -253,6 +257,12 @@ pub trait UsageServiceTrait: Send + Sync {
         organization_id: Uuid,
     ) -> Result<Option<OrganizationLimit>, UsageError>;
 
+    /// Get active credit limit rows that contribute to the unified limit.
+    async fn get_credit_limits(
+        &self,
+        organization_id: Uuid,
+    ) -> Result<Vec<OrganizationCreditLimit>, UsageError>;
+
     /// Get usage history for a specific API key
     /// Returns a tuple of (entries, total_count)
     async fn get_usage_history_by_api_key(
@@ -289,6 +299,16 @@ pub trait UsageServiceTrait: Send + Sync {
         organization_id: Uuid,
         start_date: DateTime<Utc>,
     ) -> Result<Vec<UsageByModelEntry>, UsageError>;
+
+    async fn list_inference_usage_report(
+        &self,
+        query: InferenceUsageReportQuery,
+    ) -> Result<Vec<InferenceUsageReportRow>, UsageError>;
+
+    async fn list_inference_usage_history(
+        &self,
+        query: InferenceUsageHistoryQuery,
+    ) -> Result<(Vec<InferenceUsageReportRow>, i64), UsageError>;
 }
 
 // ============================================
@@ -355,6 +375,16 @@ pub trait UsageRepository: Send + Sync {
         organization_id: Uuid,
         start_date: DateTime<Utc>,
     ) -> anyhow::Result<Vec<UsageByModelEntry>>;
+
+    async fn list_inference_usage_report(
+        &self,
+        query: InferenceUsageReportQuery,
+    ) -> anyhow::Result<Vec<InferenceUsageReportRow>>;
+
+    async fn list_inference_usage_history(
+        &self,
+        query: InferenceUsageHistoryQuery,
+    ) -> anyhow::Result<(Vec<InferenceUsageReportRow>, i64)>;
 }
 
 #[async_trait::async_trait]
@@ -373,6 +403,12 @@ pub trait OrganizationLimitsRepository: Send + Sync {
         &self,
         organization_id: Uuid,
     ) -> anyhow::Result<Option<OrganizationLimit>>;
+
+    /// Get current limit rows for an organization.
+    async fn get_current_limit_breakdown(
+        &self,
+        organization_id: Uuid,
+    ) -> anyhow::Result<Vec<OrganizationCreditLimit>>;
 }
 
 // ============================================
@@ -533,7 +569,10 @@ pub struct ModelPricing {
     pub input_cost_per_token: i64,
     pub output_cost_per_token: i64,
     pub cost_per_image: i64,
-    pub cache_read_cost_per_token: i64,
+    /// Cost per cached input token. `None` = cache pricing disabled (cached
+    /// tokens billed at `input_cost_per_token`); `Some(x)` (x >= 0) = cached
+    /// tokens billed at `x` (`Some(0)` = genuinely free).
+    pub cache_read_cost_per_token: Option<i64>,
 }
 
 /// Organization spending limit
@@ -541,6 +580,16 @@ pub struct ModelPricing {
 #[derive(Debug, Clone)]
 pub struct OrganizationLimit {
     pub spend_limit: i64,
+}
+
+/// One active credit source contributing to an organization's spending limit.
+/// All amounts use fixed scale of 9 (nano-dollars) and USD currency.
+#[derive(Debug, Clone)]
+pub struct OrganizationCreditLimit {
+    pub credit_type: String,
+    pub source: Option<String>,
+    pub amount: i64,
+    pub currency: String,
 }
 
 /// Cost breakdown for a request
@@ -649,6 +698,7 @@ pub enum UsageError {
     NotFound(String),
     CostCalculationOverflow(String),
     ValidationError(String),
+    ReportingTimeout,
 }
 
 impl std::fmt::Display for UsageError {
@@ -663,6 +713,7 @@ impl std::fmt::Display for UsageError {
                 write!(f, "Cost calculation overflow: {msg}")
             }
             UsageError::ValidationError(msg) => write!(f, "Validation error: {msg}"),
+            UsageError::ReportingTimeout => write!(f, "Usage reporting query timed out"),
         }
     }
 }

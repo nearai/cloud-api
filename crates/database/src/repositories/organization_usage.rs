@@ -10,17 +10,30 @@ use chrono::Utc;
 use services::common::RepositoryError;
 use services::responses::models::ResponseId;
 use std::collections::HashMap;
+use std::time::Duration;
 use tokio_postgres::Row;
 use uuid::Uuid;
 
 #[derive(Debug, Clone)]
 pub struct OrganizationUsageRepository {
-    pool: DbPool,
+    pub(crate) pool: DbPool,
+    pub(crate) reporting_statement_timeout: Duration,
 }
 
 impl OrganizationUsageRepository {
     pub fn new(pool: DbPool) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            reporting_statement_timeout:
+                crate::repositories::reporting_query::DEFAULT_REPORTING_STATEMENT_TIMEOUT,
+        }
+    }
+
+    pub fn with_reporting_statement_timeout(pool: DbPool, statement_timeout: Duration) -> Self {
+        Self {
+            pool,
+            reporting_statement_timeout: statement_timeout,
+        }
     }
 
     /// Get total spend for a specific API key

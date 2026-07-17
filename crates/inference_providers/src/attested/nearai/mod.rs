@@ -1618,6 +1618,59 @@ impl InferenceProvider for Fleet {
         Ok(merge_model_responses(responses))
     }
 
+    /// Exact token count via the backend's `POST /v1/tokenize` passthrough
+    /// (inference-proxy forwards it to the engine's native tokenize endpoint).
+    ///
+    /// Best-effort by design: any transport/HTTP/parse failure returns `None`
+    /// and the caller falls back to its byte-based heuristic — this must never
+    /// fail a request. Goes over `self.client`, whose TLS config enforces the
+    /// pinned attested fingerprints, so the prompt text only ever reaches a
+    /// verified backend. Nothing about the text (or the response body, which
+    /// may echo token ids) is logged.
+    async fn count_tokens(&self, model: &str, text: String) -> Option<u64> {
+        // Tight on purpose: this sits on the request's critical path and is a
+        // best-effort precision upgrade — a slow backend should fail-open to
+        // the caller's heuristic, not add seconds of latency. (Tokenizing
+        // ~1MB of text takes SGLang well under a second when healthy.)
+        const TOKENIZE_TIMEOUT: Duration = Duration::from_secs(2);
+
+        let url = format!("{}/v1/tokenize", self.config.base_url);
+        let headers = self.build_headers().ok()?;
+        let body = serde_json::json!({ "model": model, "prompt": text });
+
+        let response = self
+            .client
+            .post(&url)
+            .headers(headers)
+            .timeout(TOKENIZE_TIMEOUT)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| {
+                tracing::debug!(error = %e, "Tokenize request failed; falling back to heuristic");
+            })
+            .ok()?;
+
+        if !response.status().is_success() {
+            tracing::debug!(
+                status = %response.status(),
+                "Tokenize request returned non-2xx; falling back to heuristic"
+            );
+            return None;
+        }
+
+        let parsed: serde_json::Value = response.json().await.ok()?;
+        // Engines differ slightly: vLLM/SGLang return `count` (int); fall back
+        // to the length of a flat `tokens` array. Anything else → None.
+        if let Some(count) = parsed.get("count").and_then(|c| c.as_u64()) {
+            return Some(count);
+        }
+        parsed
+            .get("tokens")
+            .and_then(|t| t.as_array())
+            .map(|arr| arr.len() as u64)
+    }
+
     /// Performs a streaming chat completion request
     async fn chat_completion_stream(
         &self,
@@ -2487,6 +2540,9 @@ impl InferenceProvider for Provider {
     }
     fn set_backend_count(&self, count: usize) {
         self.fleet.set_backend_count(count)
+    }
+    async fn count_tokens(&self, model: &str, text: String) -> Option<u64> {
+        self.fleet.count_tokens(model, text).await
     }
     async fn get_attestation_report(
         &self,

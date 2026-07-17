@@ -56,6 +56,9 @@ impl WorkspaceServiceImpl {
             RepositoryError::AuthenticationFailed => {
                 WorkspaceError::InternalError("Database authentication failed".to_string())
             }
+            RepositoryError::QueryTimeout => {
+                WorkspaceError::InternalError("Database query timed out".to_string())
+            }
             RepositoryError::PoolError(err) => {
                 WorkspaceError::InternalError(format!("Database connection pool error: {err}"))
             }

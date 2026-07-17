@@ -134,13 +134,16 @@ pub async fn init_database(db_config: &config::DatabaseConfig) -> Arc<Database> 
         use std::time::Duration;
         loop {
             tokio::time::sleep(Duration::from_secs(60)).await;
-            tracing::info!(
-                pool = "database",
-                size = pool.status().size,
-                available = pool.status().available,
-                waiting = pool.status().waiting,
-                "Pool status"
-            );
+            match pool.status() {
+                Some(status) => tracing::info!(
+                    pool = "database",
+                    size = status.size,
+                    available = status.available,
+                    waiting = status.waiting,
+                    "Pool status"
+                ),
+                None => tracing::warn!(pool = "database", "Pool status: no pool installed"),
+            }
         }
     });
 

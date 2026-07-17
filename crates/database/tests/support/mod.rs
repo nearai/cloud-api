@@ -46,7 +46,7 @@ pub fn ts(year: i32, month: u32, day: u32, hour: u32) -> DateTime<Utc> {
 }
 
 pub async fn test_pool() -> anyhow::Result<DbPool> {
-    let pool = pool_config().create_pool(Some(Runtime::Tokio1), NoTls)?;
+    let pool = DbPool::new(pool_config().create_pool(Some(Runtime::Tokio1), NoTls)?);
     MIGRATED
         .get_or_try_init(|| async { migrations::run(&pool).await })
         .await?;

@@ -1,3 +1,4 @@
+use crate::pool::DbPool;
 use crate::Database;
 use anyhow::Result;
 use std::env;
@@ -27,7 +28,7 @@ pub async fn create_mock_database() -> Result<Database> {
             deadpool_postgres::Manager::from_config(config, tokio_postgres::NoTls, mgr_config);
         let pool = deadpool_postgres::Pool::builder(mgr).max_size(1).build()?;
 
-        return Ok(Database::new(pool));
+        return Ok(Database::new(DbPool::new(pool)));
     }
 
     // Otherwise, create a dummy pool that will fail if actually used
@@ -49,5 +50,5 @@ pub async fn create_mock_database() -> Result<Database> {
     // Create a pool with max_size of 0 so it doesn't try to connect immediately
     let pool = deadpool_postgres::Pool::builder(mgr).max_size(1).build()?;
 
-    Ok(Database::new(pool))
+    Ok(Database::new(DbPool::new(pool)))
 }

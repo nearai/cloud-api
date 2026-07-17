@@ -55,6 +55,7 @@ mod oauth_frontend_callback;
 mod openrouter_params;
 mod org_system_prompt;
 mod pagination_validation;
+mod patroni_failover;
 mod privacy_classify;
 mod privacy_redact;
 mod provider_errors;

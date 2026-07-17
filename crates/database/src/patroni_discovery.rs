@@ -234,6 +234,16 @@ impl PatroniDiscovery {
         state.as_ref()?.leader.clone()
     }
 
+    /// Run `f` with the current leader while holding the cluster-state read
+    /// lock. Topology publication (`update_cluster_state`) takes the write
+    /// lock, so it is excluded for the duration — letting callers make a
+    /// leader comparison and a pool install atomic relative to discovery
+    /// updates. `f` must be synchronous and quick; it runs under the lock.
+    pub async fn with_current_leader<R>(&self, f: impl FnOnce(Option<&ClusterMember>) -> R) -> R {
+        let state = self.cluster_state.read().await;
+        f(state.as_ref().and_then(|s| s.leader.as_ref()))
+    }
+
     /// Get all replica information
     pub async fn get_replicas(&self) -> Vec<ClusterMember> {
         let state = self.cluster_state.read().await;

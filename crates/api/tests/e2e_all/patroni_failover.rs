@@ -178,7 +178,7 @@ async fn stale_candidate_is_discarded_when_leader_changes_during_verification() 
     let upstream = postgres_upstream();
     // Candidate A delays every connection, holding reconcile inside
     // verification long enough to flip the leader underneath it.
-    let leader_a = TcpProxy::start(upstream.clone(), Duration::from_millis(750)).await;
+    let leader_a = TcpProxy::start(upstream.clone(), Duration::from_secs(2)).await;
     let leader_b = TcpProxy::start(upstream, Duration::ZERO).await;
 
     let discovery = test_discovery();
@@ -198,8 +198,17 @@ async fn stale_candidate_is_discarded_when_leader_changes_during_verification() 
         let manager = manager.clone();
         async move { manager.reconcile().await }
     });
-    // Wait until reconcile is inside A's delayed verification, then fail over.
-    tokio::time::sleep(Duration::from_millis(250)).await;
+    // Wait until reconcile has snapshotted A and is inside its delayed
+    // verification — observable as A's proxy accepting the first connection —
+    // then fail over. The 2s pre-connect delay keeps verification pending far
+    // longer than the flip takes.
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while leader_a.connections.load(Ordering::SeqCst) == 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("reconcile must attempt a connection to leader A");
     discovery
         .set_cluster_state_for_test(Some(leader_b.target()), vec![])
         .await;

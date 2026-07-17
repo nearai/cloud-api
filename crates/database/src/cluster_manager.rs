@@ -47,7 +47,10 @@ pub struct ClusterManager {
     /// `host:port` the write pool currently targets. Recorded only after a
     /// pool was successfully built and verified against that member, so a
     /// failed rebuild leaves it unchanged and the next reconcile tick retries.
-    write_pool_target: Arc<RwLock<Option<String>>>,
+    /// A std lock (never held across an await) so the compare-and-install in
+    /// `create_write_pool` can run synchronously under the discovery state
+    /// lock.
+    write_pool_target: Arc<std::sync::RwLock<Option<String>>>,
     /// Serializes reconciliation so concurrent callers cannot interleave
     /// verify/install sequences and roll the write pool back to an older
     /// leader (last-writer-wins).
@@ -81,7 +84,7 @@ impl ClusterManager {
         Self {
             discovery,
             write_pool: DbPool::uninitialized(),
-            write_pool_target: Arc::new(RwLock::new(None)),
+            write_pool_target: Arc::new(std::sync::RwLock::new(None)),
             reconcile_lock: Mutex::new(()),
             read_pools: Arc::new(RwLock::new(HashMap::new())),
             database_config,
@@ -167,18 +170,31 @@ impl ClusterManager {
         // Discovery may have advanced while this candidate was being verified
         // (up to WRITE_POOL_VERIFY_TIMEOUT). Installing a stale leader would
         // repoint every repository to a demoted node until the next reconcile
-        // tick, so confirm the candidate is still the current leader.
+        // tick, so compare-and-install under the discovery state lock:
+        // topology publication is excluded while the closure runs, so a
+        // leader change cannot slip in between the check and the install.
         let target = Self::member_target(leader);
-        let current = self.discovery.get_leader().await;
-        if current.as_ref().map(Self::member_target).as_deref() != Some(target.as_str()) {
+        let install_result = self
+            .discovery
+            .with_current_leader(|current| {
+                let current_target = current.map(Self::member_target);
+                if current_target.as_deref() == Some(target.as_str()) {
+                    self.write_pool.replace(pool);
+                    *self
+                        .write_pool_target
+                        .write()
+                        .unwrap_or_else(|e| e.into_inner()) = Some(target.clone());
+                    Ok(())
+                } else {
+                    Err(current_target)
+                }
+            })
+            .await;
+        if let Err(current) = install_result {
             return Err(anyhow!(
-                "Cluster leader changed to {:?} while verifying {target}; discarding this pool",
-                current.map(|m| Self::member_target(&m))
+                "Cluster leader changed to {current:?} while verifying {target}; discarding this pool"
             ));
         }
-
-        self.write_pool.replace(pool);
-        *self.write_pool_target.write().await = Some(target.clone());
 
         info!("Write pool now targets leader {} ({})", leader.name, target);
         Ok(())
@@ -359,7 +375,11 @@ impl ClusterManager {
         match self.discovery.get_leader().await {
             Some(leader) => {
                 let target = Self::member_target(&leader);
-                let installed = self.write_pool_target.read().await.clone();
+                let installed = self
+                    .write_pool_target
+                    .read()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone();
                 if installed.as_deref() != Some(target.as_str()) {
                     warn!(
                         "Write pool targets {installed:?} but cluster leader is {target}; rebuilding write pool"
@@ -532,7 +552,7 @@ mod tests {
         let first_attempts = attempts.load(Ordering::SeqCst);
         assert!(first_attempts >= 1, "reconcile must attempt a connection");
         assert!(
-            manager.write_pool_target.read().await.is_none(),
+            manager.write_pool_target.read().unwrap().is_none(),
             "a failed rebuild must not record the leader as installed"
         );
 

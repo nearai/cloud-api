@@ -114,13 +114,11 @@ fn build_tdx_evidence(
     let quote = decode_required_hex("tdx.quote", &gateway.intel_quote)?;
     let runtime_data = runtime_data_bytes(gateway)?;
     verify_report_data(gateway, verifier_nonce, &runtime_data)?;
-    let event_log = gateway.event_log.trim();
-    let event_log =
-        (!event_log.is_empty() && event_log != "0x").then(|| STANDARD.encode(event_log.as_bytes()));
     Ok(ItaTdxEvidence {
         quote: STANDARD.encode(quote),
         runtime_data: STANDARD.encode(runtime_data),
-        event_log,
+        // Dstack's JSON event log is not the raw CCEL/NEL format accepted by ITA.
+        event_log: None,
         verifier_nonce: verifier_nonce.clone(),
     })
 }

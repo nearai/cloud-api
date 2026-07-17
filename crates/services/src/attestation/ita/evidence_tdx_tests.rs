@@ -4,7 +4,7 @@ use serde_json::{json, Value};
 
 use super::evidence_test_support::{
     effective_policy, gateway_quote, gateway_request, runtime_data, verifier_nonce, TestResult,
-    DSTACK_EVENT_LOG, POLICY_A, POLICY_B,
+    POLICY_A, POLICY_B,
 };
 use super::*;
 
@@ -12,7 +12,6 @@ pub(super) fn expected_tdx_json() -> Value {
     json!({
         "quote": "AQIDBA==",
         "runtime_data": STANDARD.encode(runtime_data()),
-        "event_log": STANDARD.encode(DSTACK_EVENT_LOG.as_bytes()),
         "verifier_nonce": {
             "val": "dmVyaWZpZXItdmFsdWU=",
             "iat": "aWF0LWJ5dGVz",
@@ -72,32 +71,17 @@ fn omits_empty_policy_ids_but_keeps_effective_policy_controls() -> TestResult {
 }
 
 #[test]
-fn trims_event_log_before_base64_encoding() -> TestResult {
+fn omits_unsupported_dstack_event_log() -> TestResult {
+    // Given: dstack supplies a non-empty JSON event log rather than raw CCEL/NEL bytes.
     let runtime_data = runtime_data();
-    let mut gateway = gateway_quote(&runtime_data);
-    gateway.event_log = format!(" \n{DSTACK_EVENT_LOG}\t");
+    let gateway = gateway_quote(&runtime_data);
+    assert!(!gateway.event_log.is_empty());
 
+    // When: the gateway evidence is mapped to the ITA wire request.
     let value = serde_json::to_value(gateway_request(&gateway)?)?;
 
-    assert_eq!(
-        value["tdx"]["event_log"],
-        "W3siaW1yIjozLCJldmVudF90eXBlIjoxLCJkaWdlc3QiOiIwMCJ9XQ=="
-    );
-    Ok(())
-}
-
-#[test]
-fn omits_empty_event_log_placeholders() -> TestResult {
-    let runtime_data = runtime_data();
-
-    for event_log in ["", " \n\t", "0x", " 0x \n"] {
-        let mut gateway = gateway_quote(&runtime_data);
-        gateway.event_log = event_log.to_string();
-
-        let value = serde_json::to_value(gateway_request(&gateway)?)?;
-
-        assert_eq!(value["tdx"].get("event_log"), None, "{event_log:?}");
-    }
+    // Then: the optional event_log field is omitted.
+    assert_eq!(value["tdx"].get("event_log"), None);
     Ok(())
 }
 

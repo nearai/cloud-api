@@ -37,7 +37,7 @@ url = "2.5"
 # floated minor could change the KEM wire encoding and silently break interop.
 ml-kem = { version = "=0.3.2", features = ["getrandom"] }
 hkdf = "0.13"
-chacha20poly1305 = "0.10"
+chacha20poly1305 = "0.11"
 flate2 = "1"
 getrandom = "0.4"
 async-stream = "0.3"

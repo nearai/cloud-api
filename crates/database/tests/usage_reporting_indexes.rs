@@ -21,7 +21,7 @@ fn pool_config() -> Config {
 }
 
 fn create_pool(config: &Config) -> anyhow::Result<DbPool> {
-    Ok(config.create_pool(Some(Runtime::Tokio1), NoTls)?)
+    Ok(config.create_pool(Some(Runtime::Tokio1), NoTls)?.into())
 }
 
 #[tokio::test]

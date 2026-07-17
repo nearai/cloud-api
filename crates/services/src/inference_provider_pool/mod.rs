@@ -5284,6 +5284,7 @@ mod tests {
             Arc::new(inference_providers::mock::MockProvider::with_models(vec![
                 provider_model(&model_id, Some(65_536), Some(4_096)),
             ])),
+            None,
         )
         .await;
 
@@ -5326,8 +5327,12 @@ mod tests {
             ])),
         )
         .await;
-        pool.register_pinned_secondary_provider(model_id.clone(), Arc::new(FailingModelsProvider))
-            .await;
+        pool.register_pinned_secondary_provider(
+            model_id.clone(),
+            Arc::new(FailingModelsProvider),
+            None,
+        )
+        .await;
 
         let metadata = pool.max_model_metadata_by_model().await;
 

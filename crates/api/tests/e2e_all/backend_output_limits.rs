@@ -141,8 +141,6 @@ async fn get_json(server: &axum_test::TestServer, path: &str) -> serde_json::Val
 
 #[tokio::test]
 async fn backend_output_limits_six_model_regression() {
-    std::env::set_var("DEV", "1");
-    std::env::set_var("BRAVE_SEARCH_PRO_API_KEY", "test_brave_key");
     let (server, pool, _, _) = setup_test_server_with_pool().await;
     let suffix = uuid::Uuid::new_v4();
     let alias = format!("backend-output-limits-alias-{suffix}");

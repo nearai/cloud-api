@@ -10,7 +10,8 @@ pub(super) type TestResult = Result<(), Box<dyn std::error::Error>>;
 
 pub(super) const POLICY_A: &str = "11111111-1111-4111-8111-111111111111";
 pub(super) const POLICY_B: &str = "22222222-2222-4222-8222-222222222222";
-pub(super) const DSTACK_EVENT_LOG: &str = r#"[{"imr":3,"event_type":1,"digest":"00"}]"#;
+pub(super) const DSTACK_EVENT_LOG: &str =
+    r#"[{"imr":3,"event_type":1,"digest":"00","event":"test","event_payload":"00"}]"#;
 
 pub(super) fn verifier_nonce() -> ItaVerifierNonce {
     ItaVerifierNonce {

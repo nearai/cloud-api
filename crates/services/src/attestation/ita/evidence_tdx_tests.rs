@@ -76,6 +76,9 @@ fn omits_unsupported_dstack_event_log() -> TestResult {
     let runtime_data = runtime_data();
     let gateway = gateway_quote(&runtime_data);
     assert!(!gateway.event_log.is_empty());
+    let parsed_event_log: Vec<dstack_sdk_types::dstack::EventLog> =
+        serde_json::from_str(&gateway.event_log)?;
+    assert_eq!(parsed_event_log.len(), 1);
 
     // When: the gateway evidence is mapped to the ITA wire request.
     let value = serde_json::to_value(gateway_request(&gateway)?)?;

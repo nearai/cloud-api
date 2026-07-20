@@ -64,13 +64,12 @@ mod tests {
         let response =
             retry_after_middleware(response_with_status(StatusCode::TOO_MANY_REQUESTS)).await;
 
-        assert_eq!(
-            response
-                .headers()
-                .get(RETRY_AFTER)
-                .and_then(|v| v.to_str().ok()),
-            Some(DEFAULT_RETRY_AFTER_SECS.to_string().as_str())
-        );
+        let retry_after = response
+            .headers()
+            .get(RETRY_AFTER)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<u64>().ok());
+        assert_eq!(retry_after, Some(DEFAULT_RETRY_AFTER_SECS));
     }
 
     #[tokio::test]

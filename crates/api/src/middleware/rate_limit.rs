@@ -176,12 +176,11 @@ mod tests {
         assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
         // SDK backoff honors Retry-After; the value must match the fixed
         // window advertised in the error message ("Try again in 60 seconds").
-        assert_eq!(
-            response
-                .headers()
-                .get(RETRY_AFTER)
-                .and_then(|v| v.to_str().ok()),
-            Some(RATE_LIMIT_WINDOW_SECS.to_string().as_str())
-        );
+        let retry_after = response
+            .headers()
+            .get(RETRY_AFTER)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<u64>().ok());
+        assert_eq!(retry_after, Some(RATE_LIMIT_WINDOW_SECS));
     }
 }

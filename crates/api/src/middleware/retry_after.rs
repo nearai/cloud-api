@@ -31,7 +31,7 @@ use axum::{
 /// value. A short seed: the error body already tells clients to back off
 /// exponentially, and the conditions behind these 429s (concurrency caps,
 /// transient overload) usually clear quickly.
-pub const DEFAULT_RETRY_AFTER_SECS: u64 = 2;
+const DEFAULT_RETRY_AFTER_SECS: u64 = 2;
 
 /// `map_response` layer: add a default `Retry-After` header to any 429 that
 /// does not already carry one. Never overrides a value set closer to the

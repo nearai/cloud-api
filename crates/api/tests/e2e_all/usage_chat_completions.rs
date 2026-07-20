@@ -131,8 +131,9 @@ async fn test_chat_completions_records_usage_and_history() {
 }
 
 /// Call chat/completions with the default stream mode, consume the stream, then verify usage was
-/// still recorded in org usage history (limit=1). The public response may stay on raw passthrough
-/// for attested models to preserve provider signatures; billing capture must remain independent.
+/// still recorded in org usage history (limit=1). The attested model's public stream has usage
+/// stripped by the route-level rewrite; billing capture must remain independent (InterceptStream
+/// reads the parsed chunks in the service layer, upstream of the rewrite).
 #[tokio::test]
 async fn test_chat_completions_stream_records_usage_in_history() {
     ensure_usage_chat_completions_env();
@@ -215,8 +216,8 @@ async fn test_chat_completions_stream_records_usage_in_history() {
 }
 
 /// Register a non-attested (external) chat model in both the provider pool and the DB.
-/// For attested models, usage in intermediate chunks is preserved byte-exactly for TEE
-/// signature verification. Only non-attested models have usage stripped to `null`.
+/// Both attested and non-attested models have usage stripped to `null` when the client
+/// did not request `include_usage`; non-attested streams are simply not gateway-signed.
 async fn setup_non_attested_model(
     server: &axum_test::TestServer,
     pool: &std::sync::Arc<services::inference_provider_pool::InferenceProviderPool>,
@@ -256,8 +257,7 @@ async fn setup_non_attested_model(
 async fn test_chat_completions_stream_default_emits_usage_null_in_all_chunks() {
     // Default streaming (no stream_options): per OpenAI spec, `usage` must be
     // `null` in every chunk and no final usage-only chunk is emitted.
-    // Only verified for non-attested models; attested model streams are forwarded
-    // byte-exactly for TEE signature verification.
+    // Non-attested variant; see the *_attested_* tests below for the self-hosted path.
     let (server, pool, mock_provider, _db) = setup_test_server_with_pool().await;
     let model_name = setup_non_attested_model(&server, &pool, &mock_provider).await;
 
@@ -306,8 +306,7 @@ async fn test_chat_completions_stream_default_emits_usage_null_in_all_chunks() {
 async fn test_chat_completions_stream_include_usage_false_emits_usage_null_in_all_chunks() {
     // Explicit include_usage:false: same as default — all chunks must carry
     // `usage: null` and no final usage-only chunk is emitted.
-    // Only verified for non-attested models; attested model streams are forwarded
-    // byte-exactly for TEE signature verification.
+    // Non-attested variant; see the *_attested_* tests below for the self-hosted path.
     let (server, pool, mock_provider, _db) = setup_test_server_with_pool().await;
     let model_name = setup_non_attested_model(&server, &pool, &mock_provider).await;
 
@@ -353,8 +352,122 @@ async fn test_chat_completions_stream_include_usage_false_emits_usage_null_in_al
     assert!(saw_chunk, "stream should contain at least one chunk");
 }
 
+/// Assert the OpenAI streaming contract for a stream where `include_usage` was NOT
+/// requested: every chunk carries `usage: null`, no trailing usage-only
+/// (`choices: []`) chunk is emitted, and the stream ends with `[DONE]`.
+fn assert_stream_has_no_usage(response_text: &str, context: &str) {
+    let mut saw_chunk = false;
+    let mut saw_done = false;
+    for line in response_text.lines() {
+        let Some(data) = line.strip_prefix("data: ") else {
+            continue;
+        };
+        if data.trim() == "[DONE]" {
+            saw_done = true;
+            break;
+        }
+
+        saw_chunk = true;
+        let value: serde_json::Value =
+            serde_json::from_str(data).expect("stream data should be JSON");
+        assert!(
+            value.get("usage").is_some_and(serde_json::Value::is_null),
+            "{context}: all chunks must carry usage:null (got {value})"
+        );
+        // The upstream's trailing usage-only chunk (`choices: []`) must be
+        // suppressed entirely — forwarding it (with or without usage) breaks
+        // strict SDK parsers.
+        let choices_empty = value
+            .get("choices")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(Vec::is_empty);
+        assert!(
+            !choices_empty,
+            "{context}: no usage-only/empty-choices chunk may be forwarded (got {value})"
+        );
+    }
+    assert!(
+        saw_chunk,
+        "{context}: stream should contain at least one chunk"
+    );
+    assert!(saw_done, "{context}: stream should end with [DONE]");
+}
+
+#[tokio::test]
+async fn test_chat_completions_stream_default_attested_strips_usage_and_final_chunk() {
+    // Default streaming (no stream_options) on an ATTESTED (self-hosted) model.
+    // The upstream always emits per-chunk usage plus a trailing usage-only chunk
+    // (the nearai provider forces include_usage + continuous_usage_stats for
+    // billing; the mock provider mirrors that shape). Live-verified on prod
+    // 2026-07-20: 200 of 202 chunks carried populated usage and the stream ended
+    // with a `choices: []` usage husk. Per OpenAI spec, none of that may reach a
+    // client that did not request include_usage.
+    ensure_usage_chat_completions_env();
+    let server = setup_test_server().await;
+
+    let model_name = setup_qwen_model(&server).await;
+    let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
+    let api_key = get_api_key_for_org(&server, org.id.clone()).await;
+
+    let stream_resp = server
+        .post("/v1/chat/completions")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .json(&json!({
+            "model": model_name,
+            "messages": [{ "role": "user", "content": "hello" }],
+            "stream": true
+        }))
+        .await;
+
+    assert_eq!(
+        stream_resp.status_code(),
+        200,
+        "streaming chat/completions should succeed: {}",
+        stream_resp.text()
+    );
+
+    assert_stream_has_no_usage(&stream_resp.text(), "attested default streaming");
+}
+
+#[tokio::test]
+async fn test_chat_completions_stream_include_usage_false_attested_strips_usage_and_final_chunk() {
+    // Explicit include_usage:false on an ATTESTED model: same contract as the
+    // default case — usage:null everywhere, no trailing usage-only chunk.
+    ensure_usage_chat_completions_env();
+    let server = setup_test_server().await;
+
+    let model_name = setup_qwen_model(&server).await;
+    let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
+    let api_key = get_api_key_for_org(&server, org.id.clone()).await;
+
+    let stream_resp = server
+        .post("/v1/chat/completions")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .json(&json!({
+            "model": model_name,
+            "messages": [{ "role": "user", "content": "hello" }],
+            "stream": true,
+            "stream_options": { "include_usage": false }
+        }))
+        .await;
+
+    assert_eq!(
+        stream_resp.status_code(),
+        200,
+        "streaming chat/completions should succeed: {}",
+        stream_resp.text()
+    );
+
+    assert_stream_has_no_usage(
+        &stream_resp.text(),
+        "attested include_usage:false streaming",
+    );
+}
+
 #[tokio::test]
 async fn test_chat_completions_stream_include_usage_true_emits_final_usage_only() {
+    // include_usage:true on the (attested) qwen model: intermediate chunks carry
+    // usage:null and exactly one final usage chunk is emitted (rewrite path).
     ensure_usage_chat_completions_env();
     let server = setup_test_server().await;
 

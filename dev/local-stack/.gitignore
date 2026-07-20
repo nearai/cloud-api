@@ -1,0 +1,6 @@
+cache/
+run/
+*.log
+*.pid
+.api-key
+SATURATE-*

@@ -310,7 +310,7 @@ mod tests {
             input_cost_per_token: 0,
             output_cost_per_token: 0,
             cost_per_image: 0,
-            cache_read_cost_per_token: 0,
+            cache_read_cost_per_token: None,
             context_length: 16_384,
             verifiable: false,
             aliases: vec!["public-alias".to_string()],

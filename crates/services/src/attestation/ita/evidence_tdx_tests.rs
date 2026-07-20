@@ -12,7 +12,6 @@ pub(super) fn expected_tdx_json() -> Value {
     json!({
         "quote": "AQIDBA==",
         "runtime_data": STANDARD.encode(runtime_data()),
-        "event_log": "Cgs=",
         "verifier_nonce": {
             "val": "dmVyaWZpZXItdmFsdWU=",
             "iat": "aWF0LWJ5dGVz",
@@ -68,6 +67,24 @@ fn omits_empty_policy_ids_but_keeps_effective_policy_controls() -> TestResult {
     assert_eq!(value.get("policy_ids"), None);
     assert_eq!(value["token_signing_alg"], "PS384");
     assert_eq!(value["policy_must_match"], false);
+    Ok(())
+}
+
+#[test]
+fn omits_unsupported_dstack_event_log() -> TestResult {
+    // Given: dstack supplies a non-empty JSON event log rather than raw CCEL/NEL bytes.
+    let runtime_data = runtime_data();
+    let gateway = gateway_quote(&runtime_data);
+    assert!(!gateway.event_log.is_empty());
+    let parsed_event_log: Vec<dstack_sdk_types::dstack::EventLog> =
+        serde_json::from_str(&gateway.event_log)?;
+    assert_eq!(parsed_event_log.len(), 1);
+
+    // When: the gateway evidence is mapped to the ITA wire request.
+    let value = serde_json::to_value(gateway_request(&gateway)?)?;
+
+    // Then: the optional event_log field is omitted.
+    assert_eq!(value["tdx"].get("event_log"), None);
     Ok(())
 }
 

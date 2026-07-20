@@ -144,7 +144,7 @@ impl GatewayQuoteCollector for RecordingGatewayQuoteCollector {
             signing_address: input.signing_address,
             signing_algo: input.signing_algo,
             intel_quote: "0x01020304".to_string(),
-            event_log: "0x0a0b".to_string(),
+            event_log: "[]".to_string(),
             report_data: hex::encode(input.report_data),
             request_nonce: input.request_nonce,
             info: json!({}),

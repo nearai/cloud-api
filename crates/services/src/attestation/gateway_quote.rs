@@ -36,7 +36,7 @@ impl GatewayQuoteCollector for DstackGatewayQuoteCollector {
                     signing_address: input.signing_address,
                     signing_algo: input.signing_algo,
                     intel_quote: "0x1234567890abcdef".to_string(),
-                    event_log: "0x1234567890abcdef".to_string(),
+                    event_log: "[]".to_string(),
                     report_data: hex::encode(input.report_data),
                     request_nonce: input.request_nonce,
                     info: serde_json::json!({

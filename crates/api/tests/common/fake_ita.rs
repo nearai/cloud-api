@@ -103,7 +103,9 @@ async fn fake_attest(State(state): State<Arc<FakeItaState>>, body: Bytes) -> Res
         FakeItaMode::Success => Json(json!({"token": "gateway.jwt"})).into_response(),
         FakeItaMode::RateLimited => (
             StatusCode::TOO_MANY_REQUESTS,
-            [(RETRY_AFTER, "2")],
+            // Deliberately distinct from the router's default Retry-After (2) so
+            // e2e tests prove the upstream value is preserved, not re-inserted.
+            [(RETRY_AFTER, "7")],
             Json(json!({})),
         )
             .into_response(),

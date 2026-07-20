@@ -83,20 +83,21 @@ async fn ita_token_disabled_returns_service_unavailable_without_auth() {
 
 #[tokio::test]
 async fn ita_token_rate_limit_preserves_retry_after_header() {
-    // Given: ITA rate-limits appraisal and asks the caller to retry after two seconds.
+    // Given: ITA rate-limits appraisal and asks the caller to retry after seven seconds
+    // (a value distinct from the router's default of 2, so preservation is provable).
     let fake_ita = FakeIta::start(FakeItaMode::RateLimited).await;
     let server = setup_ita_server(&fake_ita, ItaServerMode::Enabled { max_retries: 0 }).await;
 
     // When: a caller requests an ITA token through the HTTP surface.
     let response = server.get(&format!("{ITA_TOKEN_PATH}?nonce={NONCE}")).await;
 
-    // Then: the endpoint returns 429 and preserves Retry-After.
+    // Then: the endpoint returns 429 and preserves the upstream Retry-After.
     assert_eq!(response.status_code(), 429, "{}", response.text());
     let retry_after = response
         .headers()
         .get(RETRY_AFTER)
         .and_then(|value| value.to_str().ok());
-    assert_eq!(retry_after, Some("2"));
+    assert_eq!(retry_after, Some("7"));
 }
 
 #[tokio::test]
@@ -188,7 +189,7 @@ async fn ita_token_manual_qa_curl_style_success_and_rate_limit() {
         .headers()
         .get(RETRY_AFTER)
         .and_then(|value| value.to_str().ok());
-    assert_eq!(retry_after, Some("2"));
+    assert_eq!(retry_after, Some("7"));
 }
 
 fn print_curl_style_response(path: &str, response: &axum_test::TestResponse) {

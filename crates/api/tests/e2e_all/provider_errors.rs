@@ -3,6 +3,23 @@
 use crate::common::*;
 
 use api::models::BatchUpdateModelApiRequest;
+use axum::http::header::RETRY_AFTER;
+
+/// Assert a 429 response carries a machine-readable `Retry-After` header with
+/// a positive integer value — the signal SDK backoff (OpenAI/Anthropic
+/// clients) actually honors, unlike the prose in the error body.
+fn assert_retry_after_present(response: &axum_test::TestResponse) {
+    let retry_after = response
+        .headers()
+        .get(RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok());
+    assert!(
+        retry_after.is_some_and(|secs| secs > 0),
+        "429 must carry a positive integer Retry-After header, got {:?}",
+        response.headers().get(RETRY_AFTER)
+    );
+}
 
 /// Helper to create a standard chat completion request body
 fn chat_request(model: &str, stream: bool) -> serde_json::Value {
@@ -74,6 +91,7 @@ async fn test_provider_error_503_propagated() {
         "Error message should indicate overloaded status. Got: {}",
         err.error.message
     );
+    assert_retry_after_present(&response);
 }
 
 /// Test that a 429 error from the provider is propagated as rate_limit_exceeded
@@ -108,6 +126,7 @@ async fn test_provider_error_429_propagated() {
 
     let err = response.json::<api::models::ErrorResponse>();
     assert_eq!(err.error.r#type, "rate_limit_exceeded");
+    assert_retry_after_present(&response);
 }
 
 /// Test that the non-streaming Responses API propagates provider 429s as HTTP 429
@@ -269,6 +288,7 @@ async fn test_responses_service_overloaded_returns_429() {
         "Responses API: overloaded error should carry type=service_overloaded, got {}",
         err.error.r#type
     );
+    assert_retry_after_present(&response);
 }
 
 /// Test that initial inference failures in non-streaming Responses API surface

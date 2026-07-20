@@ -289,7 +289,10 @@ pub async fn handle_mcp_request(
             }),
         )),
         "tools/call" => {
-            if let Err((status, error)) =
+            // The Retry-After header from the limiter is dropped here on
+            // purpose: MCP errors travel inside the JSON-RPC body of a 200
+            // response, so there is no client-facing 429 to attach it to.
+            if let Err((status, _retry_after, error)) =
                 check_rate_limit_for_api_key(&state.rate_limit_state, &api_key).await
             {
                 return Ok(map_http_error_to_mcp_error(request_id, status, error.0));

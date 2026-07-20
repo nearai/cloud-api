@@ -1,6 +1,6 @@
 use axum::{
     extract::{Request, State},
-    http::StatusCode,
+    http::{header::RETRY_AFTER, HeaderName, HeaderValue, StatusCode},
     middleware::Next,
     response::Response,
 };
@@ -74,10 +74,32 @@ impl RateLimitState {
     }
 }
 
+/// 429 rejection from the per-key limiter: status, `Retry-After` header, body.
+/// The header value matches the fixed rate-limit window (and the "Try again in
+/// N seconds" prose in the message) so SDK backoff waits out the window.
+pub type RateLimitedResponse = (
+    StatusCode,
+    [(HeaderName, HeaderValue); 1],
+    axum::Json<ErrorResponse>,
+);
+
+fn rate_limited_response(count: u32, limit: u32) -> RateLimitedResponse {
+    (
+        StatusCode::TOO_MANY_REQUESTS,
+        [(RETRY_AFTER, HeaderValue::from(RATE_LIMIT_WINDOW_SECS))],
+        axum::Json(ErrorResponse::new(
+            format!(
+                "API rate limit exceeded ({count}/{limit} requests/min). Try again in {RATE_LIMIT_WINDOW_SECS} seconds."
+            ),
+            "rate_limit_exceeded".to_string(),
+        )),
+    )
+}
+
 pub async fn check_rate_limit_for_api_key(
     state: &RateLimitState,
     auth_key: &AuthenticatedApiKey,
-) -> Result<(), (StatusCode, axum::Json<ErrorResponse>)> {
+) -> Result<(), RateLimitedResponse> {
     let api_key_id = &auth_key.api_key.id.0;
     let (allowed, count, limit) = state.check_limit(api_key_id).await;
 
@@ -86,15 +108,7 @@ pub async fn check_rate_limit_for_api_key(
             "API key rate limit exceeded for key {}: {}/{} requests/min (org_id: {})",
             api_key_id, count, limit, auth_key.organization.id.0
         );
-        return Err((
-            StatusCode::TOO_MANY_REQUESTS,
-            axum::Json(ErrorResponse::new(
-                format!(
-                    "API rate limit exceeded ({count}/{limit} requests/min). Try again in {RATE_LIMIT_WINDOW_SECS} seconds."
-                ),
-                "rate_limit_exceeded".to_string(),
-            )),
-        ));
+        return Err(rate_limited_response(count, limit));
     }
 
     debug!(
@@ -108,7 +122,7 @@ pub async fn api_key_rate_limit_middleware(
     State(state): State<RateLimitState>,
     request: Request,
     next: Next,
-) -> Result<Response, (StatusCode, axum::Json<ErrorResponse>)> {
+) -> Result<Response, RateLimitedResponse> {
     let auth_key = match request.extensions().get::<AuthenticatedApiKey>() {
         Some(key) => key.clone(),
         None => return Ok(next.run(request).await),
@@ -151,5 +165,23 @@ mod tests {
         assert!(allowed2);
         assert_eq!(count1, 1);
         assert_eq!(count2, 1);
+    }
+
+    #[test]
+    fn test_rate_limited_response_carries_retry_after() {
+        use axum::response::IntoResponse;
+
+        let response = rate_limited_response(1001, 1000).into_response();
+
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        // SDK backoff honors Retry-After; the value must match the fixed
+        // window advertised in the error message ("Try again in 60 seconds").
+        assert_eq!(
+            response
+                .headers()
+                .get(RETRY_AFTER)
+                .and_then(|v| v.to_str().ok()),
+            Some(RATE_LIMIT_WINDOW_SECS.to_string().as_str())
+        );
     }
 }

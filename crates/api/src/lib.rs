@@ -41,7 +41,7 @@ use axum::http::{header::CACHE_CONTROL, HeaderValue};
 use axum::response::Response;
 use axum::{
     extract::DefaultBodyLimit,
-    middleware::{from_fn, from_fn_with_state, Next},
+    middleware::{from_fn, from_fn_with_state, map_response, Next},
     response::Html,
     routing::{get, post},
     Router,
@@ -1403,6 +1403,11 @@ pub fn build_app_with_config(
         // so compression is safe for them as well.
         .layer(CompressionLayer::new())
         .layer(from_fn(middleware::request_correlation_middleware))
+        // Outermost response pass: every client-facing 429 gets a
+        // machine-readable Retry-After header (SDK backoff honors it).
+        // Sites that set their own value (per-key limiter window, upstream
+        // ITA propagation) are left untouched.
+        .layer(map_response(middleware::retry_after_middleware))
 }
 
 /// Build VPC authentication routes

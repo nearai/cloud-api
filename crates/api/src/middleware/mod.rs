@@ -9,6 +9,7 @@ pub mod metrics;
 pub mod rate_limit;
 pub mod reporting_guard;
 pub mod request_correlation;
+pub mod retry_after;
 pub mod usage;
 
 // Re-export commonly used items
@@ -24,4 +25,5 @@ pub use reporting_guard::{
     ReportingRequestDeadline,
 };
 pub use request_correlation::{request_correlation_middleware, RequestCorrelation};
+pub use retry_after::retry_after_middleware;
 pub use usage::{usage_check_middleware, UsageState};

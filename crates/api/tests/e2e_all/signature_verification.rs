@@ -322,3 +322,102 @@ async fn test_streaming_chat_include_usage_signature_hashes_client_bytes() {
         "stored response hash must match the exact include_usage SSE body returned to the client"
     );
 }
+
+#[tokio::test]
+async fn test_streaming_chat_default_stream_signature_stored_before_stream_completes() {
+    // Default streaming (no stream_options) on an attested model takes the
+    // usage-strip gateway-signature path. The route must store the gateway
+    // signature BEFORE emitting [DONE]/ending the stream (the [DONE] marker is
+    // held back and appended by the end-of-stream tail after the store), so a
+    // client that fetches the signature as soon as the stream completes must
+    // never race the store. Deliberately no sleep before the signature query.
+    let server = setup_test_server().await;
+    setup_qwen_model(&server).await;
+    let org = setup_org_with_credits(&server, 10000000000i64).await;
+    let api_key = get_api_key_for_org(&server, org.id).await;
+    let model_name = "Qwen/Qwen3-30B-A3B-Instruct-2507";
+
+    let request_body = serde_json::json!({
+        "messages": [
+            {
+                "role": "user",
+                "content": "Respond with only two words."
+            }
+        ],
+        "stream": true,
+        "model": model_name,
+        "nonce": 44
+    });
+
+    let request_json = serde_json::to_string(&request_body).expect("Failed to serialize request");
+    let expected_request_hash = compute_sha256(&request_json);
+
+    let response = server
+        .post("/v1/chat/completions")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .json(&request_body)
+        .await;
+    assert_eq!(
+        response.status_code(),
+        200,
+        "Streaming request should succeed: {}",
+        response.text()
+    );
+
+    let response_text = response.text();
+    let expected_response_hash = compute_sha256(&response_text);
+    let mut chat_id = None::<String>;
+    let mut saw_done = false;
+
+    for line in response_text.lines() {
+        let Some(data) = line.strip_prefix("data: ") else {
+            continue;
+        };
+        if data.trim() == "[DONE]" {
+            saw_done = true;
+            break;
+        }
+        if let Ok(StreamChunk::Chat(chat_chunk)) = serde_json::from_str::<StreamChunk>(data) {
+            if chat_id.is_none() {
+                chat_id = Some(chat_chunk.id.clone());
+            }
+            assert!(
+                chat_chunk.usage.is_none(),
+                "default stream must not forward populated usage: {data}"
+            );
+        }
+    }
+
+    let chat_id = chat_id.expect("Should have extracted chat_id from stream");
+    assert!(saw_done, "stream should end with [DONE]: {response_text}");
+
+    // No sleep: the signature must already be stored by the time the stream has
+    // ended, because the tail only emits the final [DONE] frame after the store.
+    let signature_response = server
+        .get(format!("/v1/signature/{chat_id}?model={model_name}&signing_algo=ecdsa").as_str())
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .await;
+    assert_eq!(
+        signature_response.status_code(),
+        200,
+        "Signature must be retrievable immediately after the stream ends: {}",
+        signature_response.text()
+    );
+
+    let signature_json = signature_response.json::<serde_json::Value>();
+    let signature_text = signature_json
+        .get("text")
+        .and_then(|v| v.as_str())
+        .expect("Signature response should have 'text' field");
+    let hash_parts: Vec<&str> = signature_text.split(':').collect();
+    assert_eq!(
+        hash_parts.len(),
+        2,
+        "Signature text should contain two hashes separated by ':'"
+    );
+    assert_eq!(hash_parts[0], expected_request_hash);
+    assert_eq!(
+        hash_parts[1], expected_response_hash,
+        "stored response hash must match the exact stripped SSE body returned to the client"
+    );
+}

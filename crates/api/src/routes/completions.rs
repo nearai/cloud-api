@@ -1656,12 +1656,19 @@ async fn chat_completions_inner(
                                     // Anthropic) need normalization to OpenAI format.
                                     // Control lines carry no parsed payload; forward
                                     // them raw so keepalives/comments are preserved.
-                                    // Hold [DONE] back for rewritten streams so the
-                                    // tail can emit final usage, append [DONE], and
-                                    // store any gateway signature before completion.
+                                    // Hold [DONE] back for rewritten streams
+                                    // (redacted, usage-rewritten, or usage-stripped)
+                                    // so the tail can emit final usage, store any
+                                    // gateway signature, and only then append
+                                    // [DONE] — a client that fetches the signature
+                                    // the moment it sees [DONE] must not race the
+                                    // store.
                                     let Some(mut chunk) = event.chunk else {
                                         if event.is_done_marker() {
-                                            if auto_redact_enabled || rewrite_public_stream_usage {
+                                            if auto_redact_enabled
+                                                || rewrite_public_stream_usage
+                                                || strip_intermediate_usage
+                                            {
                                                 return None;
                                             }
                                             upstream_done.store(
@@ -1970,10 +1977,12 @@ async fn chat_completions_inner(
                                     // post-fetch unpin never runs. Drop the
                                     // signature-fetch routing pin here so the
                                     // provider's chat_id → backend map does not
-                                    // grow unboundedly.
-                                    if let Some(chat_id) =
-                                        public_signature_chat_id_for_chain.lock().await.clone()
-                                    {
+                                    // grow unboundedly. Clone the chat_id in its
+                                    // own statement so the mutex guard is not held
+                                    // across the pool lookup await.
+                                    let chat_id =
+                                        public_signature_chat_id_for_chain.lock().await.clone();
+                                    if let Some(chat_id) = chat_id {
                                         if let Some(provider) = provider_pool_for_chain
                                             .get_provider_by_chat_id(&chat_id)
                                             .await

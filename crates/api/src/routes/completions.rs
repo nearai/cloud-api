@@ -2887,6 +2887,33 @@ mod tests {
     }
 
     #[test]
+    fn model_with_pricing_to_info_emits_effective_output_limits_in_public_json() {
+        let mut model = make_model_with_pricing(None, None);
+        model.max_output_length = Some(2_048);
+
+        let info = model_with_pricing_to_info(model);
+        let json = serde_json::to_value(&info).unwrap();
+
+        assert_eq!(json["max_output_length"], 2_048);
+        assert_eq!(json["top_provider"]["max_completion_tokens"], 2_048);
+    }
+
+    #[test]
+    fn model_with_pricing_to_info_omits_output_limit_keys_when_none() {
+        let mut model = make_model_with_pricing(None, None);
+        model.max_output_length = None;
+
+        let info = model_with_pricing_to_info(model);
+        let json = serde_json::to_value(&info).unwrap();
+
+        assert!(json.get("max_output_length").is_none());
+        assert!(
+            json["top_provider"].get("max_completion_tokens").is_none(),
+            "serialized top_provider must omit max_completion_tokens when no effective output limit exists"
+        );
+    }
+
+    #[test]
     fn model_without_architecture_defaults_to_text_modalities() {
         // OpenRouter requires input_modalities / output_modalities. Models whose
         // architecture column was never backfilled (NULL modalities) must still

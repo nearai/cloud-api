@@ -769,6 +769,8 @@ pub struct ModelInfo {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_model_len: Option<i32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_output_length: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub top_provider: Option<TopProviderInfo>,
 }
 
@@ -786,12 +788,27 @@ impl ModelInfo {
         .filter(|value| *value > 0)
         .max()
     }
+
+    pub fn advertised_max_output_length(&self) -> Option<i32> {
+        [
+            self.max_output_length,
+            self.top_provider
+                .as_ref()
+                .and_then(|provider| provider.max_completion_tokens),
+        ]
+        .into_iter()
+        .flatten()
+        .filter(|value| *value > 0)
+        .max()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TopProviderInfo {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_length: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_completion_tokens: Option<i32>,
 }
 
 /// vLLM returns OpenAI-compatible models response
@@ -1237,12 +1254,140 @@ mod tests {
             owned_by: "vllm".to_string(),
             context_length: Some(16_384),
             max_model_len: Some(32_768),
+            max_output_length: None,
             top_provider: Some(TopProviderInfo {
                 context_length: Some(65_536),
+                max_completion_tokens: None,
             }),
         };
 
         assert_eq!(model.advertised_context_length(), Some(65_536));
+    }
+
+    #[test]
+    fn model_info_advertised_max_output_length_uses_provider_metadata() {
+        let cases = [
+            (
+                "top-level only",
+                serde_json::json!({
+                    "id": "test/top-level",
+                    "object": "model",
+                    "created": 0,
+                    "owned_by": "vllm",
+                    "max_output_length": 4_096
+                }),
+                Some(4_096),
+            ),
+            (
+                "nested only",
+                serde_json::json!({
+                    "id": "test/nested",
+                    "object": "model",
+                    "created": 0,
+                    "owned_by": "vllm",
+                    "top_provider": {
+                        "max_completion_tokens": 8_192
+                    }
+                }),
+                Some(8_192),
+            ),
+            (
+                "both use maximum",
+                serde_json::json!({
+                    "id": "test/both",
+                    "object": "model",
+                    "created": 0,
+                    "owned_by": "vllm",
+                    "max_output_length": 4_096,
+                    "top_provider": {
+                        "max_completion_tokens": 16_384
+                    }
+                }),
+                Some(16_384),
+            ),
+            (
+                "root max_completion_tokens ignored",
+                serde_json::json!({
+                    "id": "test/root-only",
+                    "object": "model",
+                    "created": 0,
+                    "owned_by": "vllm",
+                    "max_completion_tokens": 32_768
+                }),
+                None,
+            ),
+            (
+                "zero ignored",
+                serde_json::json!({
+                    "id": "test/zero",
+                    "object": "model",
+                    "created": 0,
+                    "owned_by": "vllm",
+                    "max_output_length": 0,
+                    "top_provider": {
+                        "max_completion_tokens": 0
+                    }
+                }),
+                None,
+            ),
+            (
+                "negative ignored",
+                serde_json::json!({
+                    "id": "test/negative",
+                    "object": "model",
+                    "created": 0,
+                    "owned_by": "vllm",
+                    "max_output_length": -1,
+                    "top_provider": {
+                        "max_completion_tokens": -2
+                    }
+                }),
+                None,
+            ),
+            (
+                "missing",
+                serde_json::json!({
+                    "id": "test/missing",
+                    "object": "model",
+                    "created": 0,
+                    "owned_by": "vllm"
+                }),
+                None,
+            ),
+        ];
+
+        for (case, value, expected) in cases {
+            let model: ModelInfo =
+                serde_json::from_value(value).expect("provider model metadata should parse");
+
+            assert_eq!(model.advertised_max_output_length(), expected, "{case}");
+        }
+    }
+
+    #[test]
+    fn model_info_advertised_max_output_length_rejects_malformed_values() {
+        let malformed_values = [
+            serde_json::json!({
+                "id": "test/string",
+                "object": "model",
+                "created": 0,
+                "owned_by": "vllm",
+                "max_output_length": "4096"
+            }),
+            serde_json::json!({
+                "id": "test/out-of-range",
+                "object": "model",
+                "created": 0,
+                "owned_by": "vllm",
+                "top_provider": {
+                    "max_completion_tokens": 2_147_483_648_i64
+                }
+            }),
+        ];
+
+        for value in malformed_values {
+            assert!(serde_json::from_value::<ModelInfo>(value).is_err());
+        }
     }
 
     /// #666 NO-LEAK: `strip_cache_control` removes the breakpoint from each

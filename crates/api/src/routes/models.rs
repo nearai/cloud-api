@@ -197,10 +197,9 @@ pub async fn get_model_by_name(
 ) -> Result<ResponseJson<ModelWithPricing>, (StatusCode, ResponseJson<ErrorResponse>)> {
     debug!("Get model request for: {}", model_name);
 
-    // Get the model from the service
     let model = app_state
         .models_service
-        .resolve_and_get_model(&model_name)
+        .resolve_public_model(&model_name)
         .await
         .map_err(|e| match e {
             services::models::ModelsError::NotFound(_) => {
@@ -282,4 +281,124 @@ pub async fn get_model_by_name(
     };
 
     Ok(ResponseJson(api_model))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use async_trait::async_trait;
+    use services::models::{ModelInfo as ServiceModelInfo, ModelsError};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use uuid::Uuid;
+
+    #[derive(Default)]
+    struct PublicResolverService {
+        public_calls: AtomicUsize,
+        db_calls: AtomicUsize,
+    }
+
+    fn service_model(
+        model_name: &str,
+        max_output_length: Option<i32>,
+    ) -> services::models::ModelWithPricing {
+        services::models::ModelWithPricing {
+            id: Uuid::new_v4(),
+            model_name: model_name.to_string(),
+            model_display_name: "Public Detail Model".to_string(),
+            model_description: "route test model".to_string(),
+            model_icon: None,
+            input_cost_per_token: 0,
+            output_cost_per_token: 0,
+            cost_per_image: 0,
+            cache_read_cost_per_token: None,
+            context_length: 16_384,
+            verifiable: false,
+            aliases: vec!["public-alias".to_string()],
+            owned_by: "test".to_string(),
+            provider_type: "vllm".to_string(),
+            provider_config: None,
+            attestation_supported: false,
+            input_modalities: Some(vec!["text".to_string()]),
+            output_modalities: Some(vec!["text".to_string()]),
+            inference_url: Some("https://internal.example.test".to_string()),
+            hugging_face_id: None,
+            quantization: None,
+            max_output_length,
+            supported_sampling_parameters: vec![],
+            supported_features: vec![],
+            datacenters: None,
+            is_ready: Some(true),
+            deprecation_date: None,
+            openrouter_slug: None,
+            created_at: chrono::Utc::now(),
+        }
+    }
+
+    #[async_trait]
+    impl ModelsServiceTrait for PublicResolverService {
+        async fn get_models(&self) -> Result<Vec<ServiceModelInfo>, ModelsError> {
+            Ok(Vec::new())
+        }
+
+        async fn get_models_with_pricing(
+            &self,
+        ) -> Result<Vec<services::models::ModelWithPricing>, ModelsError> {
+            Ok(Vec::new())
+        }
+
+        async fn get_model_by_name(
+            &self,
+            model_name: &str,
+        ) -> Result<services::models::ModelWithPricing, ModelsError> {
+            Err(ModelsError::NotFound(format!(
+                "Model '{model_name}' not found"
+            )))
+        }
+
+        async fn resolve_and_get_model(
+            &self,
+            _identifier: &str,
+        ) -> Result<services::models::ModelWithPricing, ModelsError> {
+            self.db_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(service_model("db-backed/detail", Some(512)))
+        }
+
+        async fn resolve_public_model(
+            &self,
+            identifier: &str,
+        ) -> Result<services::models::ModelWithPricing, ModelsError> {
+            self.public_calls.fetch_add(1, Ordering::SeqCst);
+            assert_eq!(identifier, "public-alias");
+            Ok(service_model("public/enriched-detail", Some(4_096)))
+        }
+
+        async fn resolve_alias_cached(&self, _identifier: &str) -> Option<String> {
+            None
+        }
+
+        async fn get_configured_model_names(&self) -> Result<Vec<String>, ModelsError> {
+            Ok(Vec::new())
+        }
+
+        async fn invalidate_models_cache(&self) {}
+    }
+
+    #[tokio::test]
+    async fn get_model_by_name_uses_public_resolver_for_public_detail() {
+        let service = Arc::new(PublicResolverService::default());
+        let app_state = ModelsAppState {
+            models_service: service.clone(),
+        };
+
+        let ResponseJson(model) =
+            get_model_by_name(State(app_state), Path("public-alias".to_string()))
+                .await
+                .unwrap();
+
+        assert_eq!(model.model_id, "public/enriched-detail");
+        assert_eq!(model.metadata.max_output_length, Some(4_096));
+        assert!(model.metadata.inference_url.is_none());
+        assert_eq!(service.public_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(service.db_calls.load(Ordering::SeqCst), 0);
+    }
 }

@@ -216,7 +216,7 @@ fn merge_model_responses(responses: Vec<ModelsResponse>) -> ModelsResponse {
     for response in responses {
         for model in response.data {
             if let Some(index) = by_id.get(&model.id).copied() {
-                merge_model_context_length(&mut merged.data[index], &model);
+                merge_model_metadata(&mut merged.data[index], &model);
             } else {
                 by_id.insert(model.id.clone(), merged.data.len());
                 merged.data.push(model);
@@ -227,7 +227,7 @@ fn merge_model_responses(responses: Vec<ModelsResponse>) -> ModelsResponse {
     merged
 }
 
-fn merge_model_context_length(existing: &mut ModelInfo, candidate: &ModelInfo) {
+fn merge_model_metadata(existing: &mut ModelInfo, candidate: &ModelInfo) {
     if let Some(context_length) = [
         existing.advertised_context_length(),
         candidate.advertised_context_length(),
@@ -239,6 +239,20 @@ fn merge_model_context_length(existing: &mut ModelInfo, candidate: &ModelInfo) {
         existing.context_length = Some(context_length);
         if let Some(provider) = existing.top_provider.as_mut() {
             provider.context_length = Some(context_length);
+        }
+    }
+
+    if let Some(max_output_length) = [
+        existing.advertised_max_output_length(),
+        candidate.advertised_max_output_length(),
+    ]
+    .into_iter()
+    .flatten()
+    .max()
+    {
+        existing.max_output_length = Some(max_output_length);
+        if let Some(provider) = existing.top_provider.as_mut() {
+            provider.max_completion_tokens = Some(max_output_length);
         }
     }
 }
@@ -3889,36 +3903,88 @@ mod tests {
     }
 
     #[test]
-    fn merge_model_responses_uses_max_context_length_across_backends() {
+    fn merge_model_responses_uses_max_metadata_across_backends() {
         let merged = merge_model_responses(vec![
             ModelsResponse {
                 object: "list".to_string(),
-                data: vec![ModelInfo {
-                    id: "test/model".to_string(),
-                    object: "model".to_string(),
-                    created: 1,
-                    owned_by: "vllm".to_string(),
-                    context_length: Some(8_192),
-                    max_model_len: None,
-                    top_provider: None,
-                }],
+                data: vec![
+                    ModelInfo {
+                        id: "test/model".to_string(),
+                        object: "model".to_string(),
+                        created: 1,
+                        owned_by: "vllm".to_string(),
+                        context_length: Some(8_192),
+                        max_model_len: None,
+                        max_output_length: Some(0),
+                        top_provider: Some(TopProviderInfo {
+                            context_length: Some(16_384),
+                            max_completion_tokens: Some(-1),
+                        }),
+                    },
+                    ModelInfo {
+                        id: "nested-only/model".to_string(),
+                        object: "model".to_string(),
+                        created: 1,
+                        owned_by: "vllm".to_string(),
+                        context_length: None,
+                        max_model_len: None,
+                        max_output_length: Some(-2),
+                        top_provider: None,
+                    },
+                ],
             },
             ModelsResponse {
                 object: "list".to_string(),
-                data: vec![ModelInfo {
-                    id: "test/model".to_string(),
-                    object: "model".to_string(),
-                    created: 1,
-                    owned_by: "vllm".to_string(),
-                    context_length: Some(32_768),
-                    max_model_len: None,
-                    top_provider: None,
-                }],
+                data: vec![
+                    ModelInfo {
+                        id: "test/model".to_string(),
+                        object: "model".to_string(),
+                        created: 1,
+                        owned_by: "vllm".to_string(),
+                        context_length: Some(32_768),
+                        max_model_len: None,
+                        max_output_length: Some(1_024),
+                        top_provider: Some(TopProviderInfo {
+                            context_length: Some(65_536),
+                            max_completion_tokens: Some(4_096),
+                        }),
+                    },
+                    ModelInfo {
+                        id: "nested-only/model".to_string(),
+                        object: "model".to_string(),
+                        created: 1,
+                        owned_by: "vllm".to_string(),
+                        context_length: None,
+                        max_model_len: None,
+                        max_output_length: None,
+                        top_provider: Some(TopProviderInfo {
+                            context_length: None,
+                            max_completion_tokens: Some(2_048),
+                        }),
+                    },
+                ],
             },
         ]);
 
-        assert_eq!(merged.data.len(), 1);
-        assert_eq!(merged.data[0].context_length, Some(32_768));
+        assert_eq!(merged.data.len(), 2);
+        assert_eq!(merged.data[0].context_length, Some(65_536));
+        assert_eq!(merged.data[0].max_output_length, Some(4_096));
+        assert_eq!(
+            merged.data[0]
+                .top_provider
+                .as_ref()
+                .and_then(|provider| provider.context_length),
+            Some(65_536)
+        );
+        assert_eq!(
+            merged.data[0]
+                .top_provider
+                .as_ref()
+                .and_then(|provider| provider.max_completion_tokens),
+            Some(4_096)
+        );
+        assert_eq!(merged.data[1].max_output_length, Some(2_048));
+        assert!(merged.data[1].top_provider.is_none());
     }
 
     #[test]

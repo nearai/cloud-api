@@ -1378,6 +1378,7 @@ impl InferenceProvider for Provider {
                 owned_by: "chutes".to_string(),
                 context_length: None,
                 max_model_len: None,
+                max_output_length: None,
                 top_provider: None,
             }],
         })

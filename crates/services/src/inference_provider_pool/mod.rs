@@ -1655,8 +1655,10 @@ impl InferenceProviderPool {
         mappings.model_to_providers.get(model_id).cloned()
     }
 
-    /// Store a mapping of chat_id to provider
-    async fn store_chat_id_mapping(
+    /// Store a mapping of chat_id to provider.
+    /// `pub(crate)` (not `pub`) so attestation lifecycle unit tests can seed a
+    /// chat_id → provider pin; production writes stay inside this module.
+    pub(crate) async fn store_chat_id_mapping(
         &self,
         chat_id: String,
         provider: Arc<dyn InferenceProvider + Send + Sync>,

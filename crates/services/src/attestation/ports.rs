@@ -33,6 +33,32 @@ pub trait AttestationServiceTrait: Send + Sync {
         response_hash: String,
     ) -> Result<(), AttestationError>;
 
+    /// Store a gateway chat signature and then release the provider-pool
+    /// signature-fetch routing pin for `chat_id`, mirroring the lifecycle
+    /// ownership of [`Self::store_chat_signature_from_provider`]: the pin is
+    /// released whether the store succeeds, fails, or times out, so the
+    /// provider's chat_id → backend map cannot grow unboundedly on
+    /// gateway-signed streams (where the provider signature fetch — and its
+    /// post-fetch unpin — is skipped).
+    async fn store_chat_signature_and_unpin(
+        &self,
+        chat_id: &str,
+        request_hash: String,
+        response_hash: String,
+    ) -> Result<(), AttestationError> {
+        let result = self
+            .store_chat_signature(chat_id, request_hash, response_hash)
+            .await;
+        self.release_chat_signature_pin(chat_id).await;
+        result
+    }
+
+    /// Release the provider-pool signature-fetch routing pin for `chat_id`
+    /// without storing a signature — the errored-stream path, where there is
+    /// nothing to sign but the pin still has to be dropped. Default no-op for
+    /// implementations without a provider pool (mocks).
+    async fn release_chat_signature_pin(&self, _chat_id: &str) {}
+
     /// Store a response signature directly (for response streams)
     /// Creates a signature with text format "request_hash:response_hash"
     /// Stores both ECDSA and ED25519 signatures

@@ -46,6 +46,47 @@ pub enum SignatureLookupResult {
     Unavailable { error_code: String, message: String },
 }
 
+/// Which key produced a stored chat signature.
+///
+/// The two kinds sign different payloads:
+/// - [`SignatureKind::ProviderTee`]: signed inside the model-serving TEE over
+///   `"{model_id}:{request_hash}:{response_hash}"` (the provider's canonical
+///   text), covering the exact bytes the model backend emitted.
+/// - [`SignatureKind::Gateway`]: signed by the cloud-api gateway TEE over
+///   `"{request_hash}:{response_hash}"`, covering the exact bytes the client
+///   received. Used when the gateway rewrites the stream (usage accounting or
+///   stripping, redaction), so the provider's byte-exact signature can no
+///   longer match, and for attested providers without per-response signatures.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SignatureKind {
+    /// Signed by the model-serving TEE (provider signature, stored verbatim).
+    ProviderTee,
+    /// Signed by the cloud-api gateway TEE over the client-visible bytes.
+    Gateway,
+}
+
+impl SignatureKind {
+    /// Database string representation (matches the serde snake_case form).
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            SignatureKind::ProviderTee => "provider_tee",
+            SignatureKind::Gateway => "gateway",
+        }
+    }
+
+    /// Parse the database string representation. Returns `None` for unknown
+    /// values so an unexpected row degrades to "kind unknown" instead of
+    /// failing the whole signature lookup.
+    pub fn from_db_str(s: &str) -> Option<Self> {
+        match s {
+            "provider_tee" => Some(SignatureKind::ProviderTee),
+            "gateway" => Some(SignatureKind::Gateway),
+            _ => None,
+        }
+    }
+}
+
 /// Chat signature for cryptographic verification
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatSignature {
@@ -57,6 +98,12 @@ pub struct ChatSignature {
     pub signing_address: String,
     /// The signing algorithm used (e.g., "ecdsa")
     pub signing_algo: String,
+    /// Which key produced this signature. `None` for rows stored before the
+    /// kind was recorded (their provenance is unknown — both provider-TEE and
+    /// gateway writes predate the column), so it is surfaced as absent rather
+    /// than guessed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature_kind: Option<SignatureKind>,
 }
 
 /// VPC (Virtual Private Cloud) metadata included in attestation reports

@@ -34,6 +34,20 @@ impl ports::AttestationServiceTrait for AttestationService {
             .await
     }
 
+    async fn store_chat_signature_and_unpin(
+        &self,
+        chat_id: &str,
+        request_hash: String,
+        response_hash: String,
+    ) -> Result<(), AttestationError> {
+        self.store_chat_signature_and_unpin_impl(chat_id, request_hash, response_hash)
+            .await
+    }
+
+    async fn release_chat_signature_pin(&self, chat_id: &str) {
+        self.release_chat_signature_pin_impl(chat_id).await
+    }
+
     async fn store_response_signature(
         &self,
         response_id: &str,

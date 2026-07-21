@@ -2,7 +2,7 @@ use ed25519_dalek::Signer;
 use k256::ecdsa::{RecoveryId, Signature as EcdsaSignature};
 use sha3::{Digest, Keccak256};
 
-use super::{AttestationError, AttestationService, ChatSignature};
+use super::{AttestationError, AttestationService, ChatSignature, SignatureKind};
 use crate::metrics::consts::*;
 
 impl AttestationService {
@@ -35,6 +35,7 @@ impl AttestationService {
                         signature: signature_hex,
                         signing_address,
                         signing_algo: algo.to_string(),
+                        signature_kind: Some(SignatureKind::Gateway),
                     },
                 )
                 .await

@@ -636,6 +636,10 @@ pub struct MockProvider {
     /// `true`. Set via [`MockProvider::with_client_e2ee_support`] to exercise the
     /// client-E2EE-capability filter (e.g. a Chutes-like fallback that rejects it).
     supports_client_e2ee: bool,
+    /// Chat ids passed to [`InferenceProvider::unpin_chat_connection`], in call
+    /// order. Lets lifecycle tests assert the signature-fetch routing pin was
+    /// released. `std::sync::Mutex` because the trait method is synchronous.
+    unpinned_chat_ids: Arc<std::sync::Mutex<Vec<String>>>,
 }
 
 impl MockProvider {
@@ -668,6 +672,7 @@ impl MockProvider {
             provider_source: crate::ProviderSource::External,
             supports_streaming: true,
             supports_client_e2ee: true,
+            unpinned_chat_ids: Arc::new(std::sync::Mutex::new(Vec::new())),
         }
     }
 
@@ -692,6 +697,7 @@ impl MockProvider {
             provider_source: crate::ProviderSource::External,
             supports_streaming: true,
             supports_client_e2ee: true,
+            unpinned_chat_ids: Arc::new(std::sync::Mutex::new(Vec::new())),
         }
     }
 
@@ -714,6 +720,7 @@ impl MockProvider {
             provider_source: crate::ProviderSource::External,
             supports_streaming: true,
             supports_client_e2ee: true,
+            unpinned_chat_ids: Arc::new(std::sync::Mutex::new(Vec::new())),
         }
     }
 
@@ -753,6 +760,16 @@ impl MockProvider {
     /// Get the last chat completion params received by the mock provider
     pub async fn last_chat_params(&self) -> Option<ChatCompletionParams> {
         self.last_chat_params.lock().await.clone()
+    }
+
+    /// Chat ids for which [`crate::InferenceProvider::unpin_chat_connection`]
+    /// was called, in call order. Used by lifecycle tests to assert the
+    /// signature-fetch routing pin was released.
+    pub fn unpinned_chat_ids(&self) -> Vec<String> {
+        self.unpinned_chat_ids
+            .lock()
+            .map(|ids| ids.clone())
+            .unwrap_or_default()
     }
 
     /// Register request and response hashes for a chat_id
@@ -947,6 +964,12 @@ impl crate::InferenceProvider for MockProvider {
 
     fn supports_client_e2ee(&self) -> bool {
         self.supports_client_e2ee
+    }
+
+    fn unpin_chat_connection(&self, chat_id: &str) {
+        if let Ok(mut ids) = self.unpinned_chat_ids.lock() {
+            ids.push(chat_id.to_string());
+        }
     }
 
     async fn models(&self) -> Result<ModelsResponse, ListModelsError> {

@@ -1,5 +1,7 @@
 use async_trait::async_trait;
-use services::attestation::{ports::AttestationRepository, AttestationError, ChatSignature};
+use services::attestation::{
+    ports::AttestationRepository, AttestationError, ChatSignature, SignatureKind,
+};
 
 use crate::DbPool;
 
@@ -28,11 +30,20 @@ impl PgAttestationRepository {
         let signing_algo: String = row
             .try_get("signing_algo")
             .map_err(|e| AttestationError::RepositoryError(e.to_string()))?;
+        // NULL (legacy rows) and unrecognized values both surface as `None`:
+        // the kind is unknown, not guessed.
+        let signature_kind: Option<String> = row
+            .try_get("signature_kind")
+            .map_err(|e| AttestationError::RepositoryError(e.to_string()))?;
+        let signature_kind = signature_kind
+            .as_deref()
+            .and_then(SignatureKind::from_db_str);
         Ok(ChatSignature {
             text,
             signature,
             signing_address,
             signing_algo,
+            signature_kind,
         })
     }
 }
@@ -49,10 +60,11 @@ impl AttestationRepository for PgAttestationRepository {
             .get()
             .await
             .map_err(|e| AttestationError::RepositoryError(e.to_string()))?;
+        let signature_kind = signature.signature_kind.map(|kind| kind.as_str());
         client
             .execute(
-                "INSERT INTO chat_signatures (chat_id, text, signature, signing_address, signing_algo) VALUES ($1, $2, $3, $4, $5) ON CONFLICT (chat_id, signing_algo) DO UPDATE SET text = EXCLUDED.text, signature = EXCLUDED.signature, signing_address = EXCLUDED.signing_address, updated_at = NOW()",
-                &[&chat_id, &signature.text, &signature.signature, &signature.signing_address, &signature.signing_algo],
+                "INSERT INTO chat_signatures (chat_id, text, signature, signing_address, signing_algo, signature_kind) VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (chat_id, signing_algo) DO UPDATE SET text = EXCLUDED.text, signature = EXCLUDED.signature, signing_address = EXCLUDED.signing_address, signature_kind = EXCLUDED.signature_kind, updated_at = NOW()",
+                &[&chat_id, &signature.text, &signature.signature, &signature.signing_address, &signature.signing_algo, &signature_kind],
             )
             .await
             .map_err(|e| AttestationError::RepositoryError(e.to_string()))?;

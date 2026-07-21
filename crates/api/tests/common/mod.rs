@@ -168,6 +168,7 @@ async fn build_test_server_components(
     axum_test::TestServer,
     Arc<services::inference_provider_pool::InferenceProviderPool>,
     Arc<inference_providers::mock::MockProvider>,
+    axum::Router,
 ) {
     // Create mock user in database for foreign key constraints
     assert_mock_user_in_db(&database).await;
@@ -193,9 +194,9 @@ async fn build_test_server_components(
         domain_services,
         Arc::new(config),
     );
-    let server = axum_test::TestServer::new(app);
+    let server = axum_test::TestServer::new(app.clone());
 
-    (server, inference_provider_pool, mock_provider)
+    (server, inference_provider_pool, mock_provider, app)
 }
 
 async fn build_test_server_components_with_real_providers(
@@ -411,7 +412,7 @@ where
 {
     let mut infra = setup_test_infrastructure().await;
     mutate(&mut infra.config);
-    let (server, _pool, _mock) =
+    let (server, _pool, _mock, _router) =
         build_test_server_components(infra.database.clone(), infra.config).await;
     server
 }
@@ -425,7 +426,8 @@ where
     let mut infra = setup_test_infrastructure().await;
     mutate(&mut infra.config);
     let database = infra.database.clone();
-    let (server, _pool, _mock) = build_test_server_components(database.clone(), infra.config).await;
+    let (server, _pool, _mock, _router) =
+        build_test_server_components(database.clone(), infra.config).await;
     (server, database)
 }
 
@@ -442,7 +444,7 @@ pub async fn setup_test_server_with_pool() -> (
 ) {
     let infra = setup_test_infrastructure().await;
 
-    let (server, inference_provider_pool, mock_provider) =
+    let (server, inference_provider_pool, mock_provider, _router) =
         build_test_server_components(infra.database.clone(), infra.config).await;
 
     (
@@ -451,6 +453,20 @@ pub async fn setup_test_server_with_pool() -> (
         mock_provider,
         infra.database,
     )
+}
+
+/// Like `setup_test_server`, but also returns the underlying `axum::Router`,
+/// so a test can drive it in-process (`tower::ServiceExt::oneshot`) and poll
+/// the response body frame-by-frame. `axum_test` buffers whole response
+/// bodies, which cannot observe mid-body ordering (e.g. "the signature is
+/// stored before `[DONE]` is emitted"). Both handles share the same
+/// state/database, so setup done through the `TestServer` is visible to
+/// requests driven through the `Router`.
+pub async fn setup_test_server_and_router() -> (axum_test::TestServer, axum::Router) {
+    let infra = setup_test_infrastructure().await;
+    let (server, _pool, _mock, router) =
+        build_test_server_components(infra.database.clone(), infra.config).await;
+    (server, router)
 }
 
 pub async fn setup_test_server_real_providers() -> (

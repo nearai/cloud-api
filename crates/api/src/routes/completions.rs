@@ -42,7 +42,6 @@ const USAGE_RECORDING_TIMEOUT_SECS: u64 = 5;
 // unbounded. Past the cap we proceed without an Inference-Id header and let
 // the remaining stream (including the buffered control events) flow through.
 const MAX_LEADING_CONTROL_EVENTS: usize = 32;
-const STREAM_SIGNATURE_STORE_TIMEOUT_SECS: u64 = 5;
 
 /// Insert validated E2EE headers into a provider `extra` HashMap.
 fn insert_encryption_headers(
@@ -1598,7 +1597,6 @@ async fn chat_completions_inner(
                 let public_signature_hasher_for_chain = public_signature_hasher.clone();
                 let public_signature_chat_id_for_chain = public_signature_chat_id.clone();
                 let attestation_service_for_chain = app_state.attestation_service.clone();
-                let provider_pool_for_chain = app_state.inference_provider_pool.clone();
 
                 // Re-attach any stashed leading control events, then convert
                 // to a raw bytes stream.
@@ -1921,31 +1919,38 @@ async fn chat_completions_inner(
                                     combined.extend_from_slice(b"data: [DONE]\n\n");
                                 }
 
-                                if gateway_signature_enabled && error_count_final == 0 {
-                                    let response_hash = {
-                                        let mut hasher =
-                                            public_signature_hasher_for_chain.lock().await;
-                                        hasher.update(&combined);
-                                        hex::encode(hasher.clone().finalize())
-                                    };
+                                if gateway_signature_enabled {
+                                    // The provider-signature fetch is skipped for
+                                    // gateway-signed streams
+                                    // (skip_provider_chat_signature), so its
+                                    // post-fetch unpin never runs. The attestation
+                                    // service owns the store+unpin lifecycle
+                                    // (mirroring store_chat_signature_from_provider):
+                                    // it releases the signature-fetch routing pin
+                                    // whether the store succeeds, fails, or times
+                                    // out, so the provider's chat_id → backend map
+                                    // does not grow unboundedly. Clone the chat_id
+                                    // in its own statement so the mutex guard is
+                                    // not held across the service awaits.
+                                    let chat_id =
+                                        public_signature_chat_id_for_chain.lock().await.clone();
+                                    if error_count_final == 0 {
+                                        let response_hash = {
+                                            let mut hasher =
+                                                public_signature_hasher_for_chain.lock().await;
+                                            hasher.update(&combined);
+                                            hex::encode(hasher.clone().finalize())
+                                        };
 
-                                    if let Some(chat_id) =
-                                        public_signature_chat_id_for_chain.lock().await.clone()
-                                    {
-                                        match tokio::time::timeout(
-                                            Duration::from_secs(
-                                                STREAM_SIGNATURE_STORE_TIMEOUT_SECS,
-                                            ),
-                                            attestation_service_for_chain.store_chat_signature(
-                                                &chat_id,
-                                                request_hash,
-                                                response_hash,
-                                            ),
-                                        )
-                                        .await
-                                        {
-                                            Ok(Ok(())) => {}
-                                            Ok(Err(e)) => {
+                                        if let Some(chat_id) = chat_id {
+                                            if let Err(e) = attestation_service_for_chain
+                                                .store_chat_signature_and_unpin(
+                                                    &chat_id,
+                                                    request_hash,
+                                                    response_hash,
+                                                )
+                                                .await
+                                            {
                                                 tracing::error!(
                                                     %organization_id,
                                                     model = %model_name,
@@ -1953,42 +1958,20 @@ async fn chat_completions_inner(
                                                     "Failed to store public stream chat signature"
                                                 );
                                             }
-                                            Err(_) => {
-                                                tracing::error!(
-                                                    %organization_id,
-                                                    model = %model_name,
-                                                    "Timeout storing public stream chat signature"
-                                                );
-                                            }
+                                        } else {
+                                            tracing::warn!(
+                                                %organization_id,
+                                                model = %model_name,
+                                                "Cannot store public stream chat signature: no chat_id observed"
+                                            );
                                         }
-                                    } else {
-                                        tracing::warn!(
-                                            %organization_id,
-                                            model = %model_name,
-                                            "Cannot store public stream chat signature: no chat_id observed"
-                                        );
-                                    }
-                                }
-
-                                if gateway_signature_enabled {
-                                    // The provider-signature fetch is skipped for
-                                    // gateway-signed streams
-                                    // (skip_provider_chat_signature), so its
-                                    // post-fetch unpin never runs. Drop the
-                                    // signature-fetch routing pin here so the
-                                    // provider's chat_id → backend map does not
-                                    // grow unboundedly. Clone the chat_id in its
-                                    // own statement so the mutex guard is not held
-                                    // across the pool lookup await.
-                                    let chat_id =
-                                        public_signature_chat_id_for_chain.lock().await.clone();
-                                    if let Some(chat_id) = chat_id {
-                                        if let Some(provider) = provider_pool_for_chain
-                                            .get_provider_by_chat_id(&chat_id)
-                                            .await
-                                        {
-                                            provider.unpin_chat_connection(&chat_id);
-                                        }
+                                    } else if let Some(chat_id) = chat_id {
+                                        // Errored stream: nothing to sign, but the
+                                        // signature-fetch routing pin still has to
+                                        // be dropped.
+                                        attestation_service_for_chain
+                                            .release_chat_signature_pin(&chat_id)
+                                            .await;
                                     }
                                 }
 

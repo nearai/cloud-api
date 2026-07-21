@@ -19,10 +19,24 @@ pub struct SignatureQuery {
 /// Response for signature endpoint
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct SignatureResponse {
+    /// The signed payload. Its format depends on `signature_kind`:
+    /// - `provider_tee`: `"{model_id}:{request_hash}:{response_hash}"` —
+    ///   signed inside the model-serving TEE over the bytes the model backend
+    ///   emitted.
+    /// - `gateway`: `"{request_hash}:{response_hash}"` — signed by the
+    ///   cloud-api gateway TEE over the exact bytes the client received.
     pub text: String,
     pub signature: String,
     pub signing_address: String,
     pub signing_algo: String,
+    /// Which key produced this signature: `"provider_tee"` (model-serving TEE)
+    /// or `"gateway"` (cloud-api gateway TEE, used when the gateway rewrites
+    /// the stream bytes — usage accounting/stripping, redaction — and for
+    /// attested fallback providers without per-response signatures). Omitted
+    /// for signatures stored before the kind was recorded, whose provenance is
+    /// unknown.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub signature_kind: Option<String>,
 }
 
 impl From<services::attestation::ChatSignature> for SignatureResponse {
@@ -32,6 +46,7 @@ impl From<services::attestation::ChatSignature> for SignatureResponse {
             signature: sig.signature,
             signing_address: sig.signing_address,
             signing_algo: sig.signing_algo,
+            signature_kind: sig.signature_kind.map(|kind| kind.as_str().to_string()),
         }
     }
 }

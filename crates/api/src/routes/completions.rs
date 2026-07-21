@@ -42,7 +42,6 @@ const USAGE_RECORDING_TIMEOUT_SECS: u64 = 5;
 // unbounded. Past the cap we proceed without an Inference-Id header and let
 // the remaining stream (including the buffered control events) flow through.
 const MAX_LEADING_CONTROL_EVENTS: usize = 32;
-const STREAM_SIGNATURE_STORE_TIMEOUT_SECS: u64 = 5;
 
 /// Insert validated E2EE headers into a provider `extra` HashMap.
 fn insert_encryption_headers(
@@ -417,24 +416,31 @@ fn chat_stream_usage_mode(
         && !chat_stream_has_non_text_modalities(request);
 
     // For default streaming (no include_usage or include_usage:false), strip populated
-    // usage from all chunks so intermediate ones carry `usage: null` per OpenAI spec.
+    // usage from all chunks so intermediate ones carry `usage: null` per OpenAI spec,
+    // and drop the upstream's trailing usage-only chunk entirely (OpenAI emits no
+    // final usage chunk when include_usage wasn't requested; forwarding it breaks
+    // strict SDK parsers — the same defect class as the Chutes husk fix, #870).
     //
-    // Only applied for non-attested (external) models. Attested models (e.g. nearai,
-    // chutes) sign the raw upstream bytes; stripping usage before forwarding to the
-    // client would break byte-exact TEE signature verification because the client
-    // would hash different bytes than what the inference proxy signed. For those
-    // models the provider-signed stream MUST be forwarded verbatim (the
-    // `rewrite_public_stream_usage` path handles `include_usage:true` via the
-    // separately-computed gateway signature).
+    // Applied for BOTH non-attested and attested models. Self-hosted upstreams
+    // always emit per-chunk usage because the nearai provider forces
+    // `stream_options: {include_usage: true, continuous_usage_stats: true}` for
+    // billing capture, so without this gate every chunk of an attested stream
+    // carries a populated `usage` object the client never asked for, plus a
+    // trailing `choices: []` usage-only chunk. Stripping re-serializes the chunks,
+    // so byte-exact provider-signature verification no longer applies; for attested
+    // models the gateway signature covers the rewritten client-facing bytes instead
+    // (`gateway_signature_enabled` below), exactly like the
+    // `rewrite_public_stream_usage` path does for `include_usage: true`. Internal
+    // usage capture is unaffected: InterceptStream records usage from the parsed
+    // chunks in the service layer, upstream of this route-level rewrite.
     //
-    // Also skipped when: the client requested continuous stats (explicit per-chunk
-    // usage), E2EE is active (chunks are opaque), non-text modalities are in use,
-    // `rewrite_public_stream_usage` already handles usage shaping, or the client
-    // explicitly requested `include_usage:true` (fall back to byte-exact passthrough
-    // so the client receives the usage it asked for even if model metadata is
-    // temporarily unavailable).
+    // Skipped when: model metadata is unavailable (`None` — fall back to byte-exact
+    // passthrough rather than guessing), the client requested continuous stats
+    // (explicit per-chunk usage), E2EE is active (chunks are opaque), non-text
+    // modalities are in use, `rewrite_public_stream_usage` already handles usage
+    // shaping, or the client explicitly requested `include_usage:true`.
     let strip_intermediate_usage = request.stream == Some(true)
-        && model_attestation_supported == Some(false)
+        && model_attestation_supported.is_some()
         && !rewrite_public_stream_usage
         && !chat_stream_include_usage_requested(request)
         && !chat_stream_continuous_usage_requested(request)
@@ -443,7 +449,11 @@ fn chat_stream_usage_mode(
 
     ChatStreamUsageMode {
         rewrite_public_stream_usage,
-        gateway_signature_enabled: rewrite_public_stream_usage
+        // Both rewrite modes re-serialize the client-facing bytes, so for attested
+        // models the provider's byte-exact signature can no longer match what the
+        // client received. Skip the provider signature fetch and sign the rewritten
+        // stream at the gateway instead.
+        gateway_signature_enabled: (rewrite_public_stream_usage || strip_intermediate_usage)
             && model_attestation_supported.unwrap_or(false),
         strip_intermediate_usage,
     }
@@ -1644,12 +1654,19 @@ async fn chat_completions_inner(
                                     // Anthropic) need normalization to OpenAI format.
                                     // Control lines carry no parsed payload; forward
                                     // them raw so keepalives/comments are preserved.
-                                    // Hold [DONE] back for rewritten streams so the
-                                    // tail can emit final usage, append [DONE], and
-                                    // store any gateway signature before completion.
+                                    // Hold [DONE] back for rewritten streams
+                                    // (redacted, usage-rewritten, or usage-stripped)
+                                    // so the tail can emit final usage, store any
+                                    // gateway signature, and only then append
+                                    // [DONE] — a client that fetches the signature
+                                    // the moment it sees [DONE] must not race the
+                                    // store.
                                     let Some(mut chunk) = event.chunk else {
                                         if event.is_done_marker() {
-                                            if auto_redact_enabled || rewrite_public_stream_usage {
+                                            if auto_redact_enabled
+                                                || rewrite_public_stream_usage
+                                                || strip_intermediate_usage
+                                            {
                                                 return None;
                                             }
                                             upstream_done.store(
@@ -1902,31 +1919,38 @@ async fn chat_completions_inner(
                                     combined.extend_from_slice(b"data: [DONE]\n\n");
                                 }
 
-                                if gateway_signature_enabled && error_count_final == 0 {
-                                    let response_hash = {
-                                        let mut hasher =
-                                            public_signature_hasher_for_chain.lock().await;
-                                        hasher.update(&combined);
-                                        hex::encode(hasher.clone().finalize())
-                                    };
+                                if gateway_signature_enabled {
+                                    // The provider-signature fetch is skipped for
+                                    // gateway-signed streams
+                                    // (skip_provider_chat_signature), so its
+                                    // post-fetch unpin never runs. The attestation
+                                    // service owns the store+unpin lifecycle
+                                    // (mirroring store_chat_signature_from_provider):
+                                    // it releases the signature-fetch routing pin
+                                    // whether the store succeeds, fails, or times
+                                    // out, so the provider's chat_id → backend map
+                                    // does not grow unboundedly. Clone the chat_id
+                                    // in its own statement so the mutex guard is
+                                    // not held across the service awaits.
+                                    let chat_id =
+                                        public_signature_chat_id_for_chain.lock().await.clone();
+                                    if error_count_final == 0 {
+                                        let response_hash = {
+                                            let mut hasher =
+                                                public_signature_hasher_for_chain.lock().await;
+                                            hasher.update(&combined);
+                                            hex::encode(hasher.clone().finalize())
+                                        };
 
-                                    if let Some(chat_id) =
-                                        public_signature_chat_id_for_chain.lock().await.clone()
-                                    {
-                                        match tokio::time::timeout(
-                                            Duration::from_secs(
-                                                STREAM_SIGNATURE_STORE_TIMEOUT_SECS,
-                                            ),
-                                            attestation_service_for_chain.store_chat_signature(
-                                                &chat_id,
-                                                request_hash,
-                                                response_hash,
-                                            ),
-                                        )
-                                        .await
-                                        {
-                                            Ok(Ok(())) => {}
-                                            Ok(Err(e)) => {
+                                        if let Some(chat_id) = chat_id {
+                                            if let Err(e) = attestation_service_for_chain
+                                                .store_chat_signature_and_unpin(
+                                                    &chat_id,
+                                                    request_hash,
+                                                    response_hash,
+                                                )
+                                                .await
+                                            {
                                                 tracing::error!(
                                                     %organization_id,
                                                     model = %model_name,
@@ -1934,20 +1958,20 @@ async fn chat_completions_inner(
                                                     "Failed to store public stream chat signature"
                                                 );
                                             }
-                                            Err(_) => {
-                                                tracing::error!(
-                                                    %organization_id,
-                                                    model = %model_name,
-                                                    "Timeout storing public stream chat signature"
-                                                );
-                                            }
+                                        } else {
+                                            tracing::warn!(
+                                                %organization_id,
+                                                model = %model_name,
+                                                "Cannot store public stream chat signature: no chat_id observed"
+                                            );
                                         }
-                                    } else {
-                                        tracing::warn!(
-                                            %organization_id,
-                                            model = %model_name,
-                                            "Cannot store public stream chat signature: no chat_id observed"
-                                        );
+                                    } else if let Some(chat_id) = chat_id {
+                                        // Errored stream: nothing to sign, but the
+                                        // signature-fetch routing pin still has to
+                                        // be dropped.
+                                        attestation_service_for_chain
+                                            .release_chat_signature_pin(&chat_id)
+                                            .await;
                                     }
                                 }
 
@@ -3155,32 +3179,40 @@ mod tests {
     }
 
     #[test]
-    fn default_attested_stream_preserves_passthrough_for_tee_verification() {
-        // Default streaming for ATTESTED models: byte-exact passthrough is preserved
-        // so the client can verify the inference TEE's provider signature.
-        // Stripping usage would change the bytes the client sees vs what the provider
-        // signed, breaking TEE signature verification.
+    fn default_attested_stream_strips_usage_and_signs_at_gateway() {
+        // Default streaming for ATTESTED models: the self-hosted upstream always
+        // emits per-chunk usage plus a trailing usage-only chunk (the nearai
+        // provider forces include_usage + continuous_usage_stats for billing), so
+        // the route must strip usage and drop the trailing chunk per OpenAI spec.
+        // Re-serializing breaks byte-exact provider-signature verification, so the
+        // gateway signature covers the rewritten client-facing bytes instead —
+        // same mechanism as the include_usage:true rewrite path.
         let request = chat_request_with_include_usage(None);
         let mode = chat_stream_usage_mode(&request, Some(true), false);
 
         assert!(!mode.rewrite_public_stream_usage);
-        assert!(!mode.gateway_signature_enabled);
         assert!(
-            !mode.strip_intermediate_usage,
-            "attested streams must preserve raw passthrough for TEE verification"
+            mode.strip_intermediate_usage,
+            "attested default streams must strip usage per OpenAI spec"
+        );
+        assert!(
+            mode.gateway_signature_enabled,
+            "stripped attested streams must be gateway-signed so the stored \
+             signature matches the bytes the client received"
         );
     }
 
     #[test]
-    fn include_usage_false_attested_stream_preserves_passthrough_for_tee_verification() {
-        // Explicit include_usage:false for ATTESTED model: same as default,
-        // preserve passthrough for TEE signature verification.
+    fn include_usage_false_attested_stream_strips_usage_and_signs_at_gateway() {
+        // Explicit include_usage:false for ATTESTED model: same as default —
+        // strip usage, drop the trailing usage-only chunk, gateway-sign the
+        // rewritten bytes.
         let request = chat_request_with_include_usage(Some(false));
         let mode = chat_stream_usage_mode(&request, Some(true), false);
 
         assert!(!mode.rewrite_public_stream_usage);
-        assert!(!mode.gateway_signature_enabled);
-        assert!(!mode.strip_intermediate_usage);
+        assert!(mode.strip_intermediate_usage);
+        assert!(mode.gateway_signature_enabled);
     }
 
     #[test]
@@ -3240,6 +3272,25 @@ mod tests {
         assert!(
             !mode.strip_intermediate_usage,
             "explicit include_usage:true must never strip usage, even on metadata lookup failure"
+        );
+    }
+
+    #[test]
+    fn default_stream_with_metadata_lookup_failure_preserves_passthrough() {
+        // Default streaming with model metadata unavailable
+        // (model_attestation_supported == None): fall back to byte-exact
+        // passthrough. Without metadata we cannot know whether the stream needs
+        // a gateway signature, so rewriting would either break provider-signature
+        // verification (attested) or be applied blindly; passthrough is the safe
+        // fallback, matching the include_usage:true metadata-failure behaviour.
+        let request = chat_request_with_include_usage(None);
+        let mode = chat_stream_usage_mode(&request, None, false);
+
+        assert!(!mode.rewrite_public_stream_usage);
+        assert!(!mode.gateway_signature_enabled);
+        assert!(
+            !mode.strip_intermediate_usage,
+            "metadata lookup failure must preserve raw passthrough"
         );
     }
 

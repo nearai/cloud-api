@@ -1,3 +1,5 @@
+#[cfg(test)]
+mod chat_signature_lifecycle_tests;
 mod chat_signatures;
 pub mod chutes;
 mod environment;
@@ -26,7 +28,7 @@ pub use environment::{
 pub use gateway_quote::{DstackGatewayQuoteCollector, GatewayQuoteCollector, GatewayQuoteInput};
 pub use ita::{ModelAttestationCollector, ModelAttestationInput};
 pub use measurement::MeasurementPolicy;
-pub use models::{AttestationError, ChatSignature, SignatureLookupResult};
+pub use models::{AttestationError, ChatSignature, SignatureKind, SignatureLookupResult};
 pub(in crate::attestation) use report::{decode_nonce_hex, generate_nonce_hex};
 pub use report_data::{ReportDataVerifier, StrictBoundReportDataVerifier};
 pub use verification::{AttestationVerificationError, AttestationVerifier, VerifiedAttestation};

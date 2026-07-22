@@ -1,3 +1,15 @@
+//! Attestation route handlers.
+//!
+//! Route classification (nearai/infra#193). Every attestation route must be
+//! listed here with an explicit auth decision; wiring lives in
+//! `build_attestation_routes` (crate root):
+//!
+//! | Route                           | Auth    | Rationale |
+//! |---------------------------------|---------|-----------|
+//! | `GET /v1/attestation/report`    | API key | Data-plane endpoint, documented as key-protected. Key validation only — retrieval is not billed and never creates usage records. |
+//! | `GET /v1/signature/{chat_id}`   | API key | Returns per-completion signatures; completions are key-scoped, so lookups are too. |
+//! | `GET /v1/attestation/ita-token` | Public  | Deliberate exception — see `build_public_attestation_routes`. |
+
 use crate::{ohttp_gateway::OhttpAttestation, routes::api::AppState};
 use axum::{routing::get, Router};
 use services::models::ModelsServiceTrait;
@@ -39,9 +51,26 @@ impl From<AppState> for AttestationRouteState {
     }
 }
 
+/// Attestation routes that are served WITHOUT authentication.
+///
+/// Only `GET /v1/attestation/ita-token` is public, and keeping it public is an
+/// explicit, documented decision (nearai/infra#193):
+///
+/// - The response contains exclusively TEE attestation evidence signed by
+///   Intel Trust Authority (gateway and model provider JWTs) — no customer
+///   data, no per-request data, nothing key-scoped.
+/// - It exists so third parties can verify the platform's TEE claims without
+///   first creating an account, mirroring the public verifiability of the
+///   per-model `*.completions.near.ai` attestation endpoints.
+/// - Abuse is bounded upstream: Intel Trust Authority rate limits are
+///   propagated to callers as 429 responses.
+///
+/// Any route added here must be justified the same way and reflected in the
+/// classification table in the module docs above. `GET /v1/attestation/report`
+/// deliberately does NOT belong here: it is an API-key-protected data-plane
+/// endpoint (see `build_attestation_routes` in the crate root).
 pub fn build_public_attestation_routes(state: AttestationRouteState) -> Router {
     Router::new()
-        .route("/attestation/report", get(get_attestation_report))
         .route("/attestation/ita-token", get(get_ita_token))
         .with_state(state)
 }

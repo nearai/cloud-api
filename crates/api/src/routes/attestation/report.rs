@@ -127,7 +127,9 @@ impl From<services::attestation::models::AttestationReport> for AttestationRespo
 
 /// Get attestation report
 ///
-/// Get hardware attestation report for TEE verification. Public endpoint.
+/// Get hardware attestation report for TEE verification. Requires an API key
+/// (nearai/infra#193); report retrieval is non-billable — no usage or billing
+/// records are created.
 #[utoipa::path(
     get,
     path = "/v1/attestation/report",
@@ -137,7 +139,11 @@ impl From<services::attestation::models::AttestationReport> for AttestationRespo
     responses(
         (status = 200, description = "Attestation report retrieved", body = AttestationResponse),
         (status = 400, description = "Invalid nonce format", body = ErrorResponse),
+        (status = 401, description = "Missing or invalid API key", body = ErrorResponse),
         (status = 503, description = "Service unavailable", body = ErrorResponse)
+    ),
+    security(
+        ("api_key" = [])
     ),
     tag = "Attestation"
 )]

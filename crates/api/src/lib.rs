@@ -17,7 +17,7 @@ use crate::{
     openapi::ApiDoc,
     routes::{
         api::{build_management_router, AppState},
-        attestation::{self, get_signature},
+        attestation::{self, get_attestation_report, get_signature},
         auth::{
             current_user, github_login, google_login, login_page, logout, oauth_callback,
             StateStore,
@@ -1736,10 +1736,21 @@ pub fn build_conversation_routes(
         ))
 }
 
-/// Build attestation routes with auth
+/// Build attestation routes with auth.
+///
+/// Route classification (nearai/infra#193) — see `routes/attestation.rs` for
+/// the full table:
+/// - `GET /v1/attestation/report` and `GET /v1/signature/{chat_id}` require an
+///   API key (`auth_middleware_with_api_key`). The middleware only validates
+///   the key (rejecting missing/invalid/expired/revoked keys with 401); like
+///   the signature route, report retrieval is non-billable — no usage or
+///   billing records are created.
+/// - `GET /v1/attestation/ita-token` is deliberately public; the rationale is
+///   documented on `build_public_attestation_routes`.
 pub fn build_attestation_routes(app_state: AppState, auth_state_middleware: &AuthState) -> Router {
     let attestation_route_state = attestation::AttestationRouteState::from(app_state);
     let authenticated_routes = Router::new()
+        .route("/attestation/report", get(get_attestation_report))
         .route("/signature/{chat_id}", get(get_signature))
         .with_state(attestation_route_state.clone())
         .layer(from_fn_with_state(
@@ -2478,6 +2489,9 @@ mod tests {
 
     #[test]
     fn test_openapi_ita_token_endpoint_is_public() {
+        // /v1/attestation/ita-token is the ONLY public attestation route — an
+        // explicit, documented decision (nearai/infra#193); see
+        // `build_public_attestation_routes` in routes/attestation.rs.
         let spec = match serde_json::to_value(ApiDoc::openapi()) {
             Ok(spec) => spec,
             Err(error) => {
@@ -2494,6 +2508,42 @@ mod tests {
         assert!(spec["components"]["schemas"]
             .as_object()
             .is_some_and(|schemas| schemas.contains_key("ItaTokenResponse")));
+    }
+
+    #[test]
+    fn test_openapi_attestation_report_requires_api_key() {
+        // nearai/infra#193: /v1/attestation/report is an API-key-protected
+        // data-plane endpoint. The OpenAPI contract must match the runtime
+        // auth middleware.
+        let spec = serde_json::to_value(ApiDoc::openapi()).unwrap();
+        let report_get = &spec["paths"]["/v1/attestation/report"]["get"];
+
+        assert!(
+            report_get.is_object(),
+            "missing OpenAPI operation: GET /v1/attestation/report"
+        );
+        assert_eq!(
+            report_get["security"],
+            serde_json::json!([{ "api_key": [] }]),
+            "/v1/attestation/report must require api_key security"
+        );
+    }
+
+    #[test]
+    fn test_openapi_signature_requires_api_key() {
+        // nearai/infra#193: /v1/signature/{chat_id} stays API-key-protected.
+        let spec = serde_json::to_value(ApiDoc::openapi()).unwrap();
+        let signature_get = &spec["paths"]["/v1/signature/{chat_id}"]["get"];
+
+        assert!(
+            signature_get.is_object(),
+            "missing OpenAPI operation: GET /v1/signature/{{chat_id}}"
+        );
+        assert_eq!(
+            signature_get["security"],
+            serde_json::json!([{ "api_key": [] }]),
+            "/v1/signature/{{chat_id}} must require api_key security"
+        );
     }
 
     #[test]

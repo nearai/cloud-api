@@ -172,6 +172,38 @@ impl ResponseRepositoryTrait for PgResponseRepository {
             None
         };
 
+        // Defense in depth: never attach a response to a conversation that does
+        // not belong to the caller's workspace, even if a service-level check
+        // was bypassed. Unknown and foreign conversations fail identically.
+        if let Some(conv_uuid) = conversation_uuid {
+            let conversation_row = retry_db!("verify_conversation_ownership", {
+                let client = self
+                    .pool
+                    .get()
+                    .await
+                    .context("Failed to get database connection")
+                    .map_err(RepositoryError::PoolError)?;
+
+                client
+                    .query_opt(
+                        r#"
+                        SELECT 1
+                        FROM conversations
+                        WHERE id = $1 AND workspace_id = $2 AND deleted_at IS NULL
+                        "#,
+                        &[&conv_uuid, &workspace_id.0],
+                    )
+                    .await
+                    .map_err(map_db_error)
+            })?;
+
+            if conversation_row.is_none() {
+                return Err(anyhow::Error::new(RepositoryError::NotFound(
+                    "conversation".to_string(),
+                )));
+            }
+        }
+
         // Extract previous_response_id if present (this is the parent response)
         // If not provided but conversation is provided, find the latest "real" response
         // in the conversation to link to it. If there is no such response yet, we
@@ -182,40 +214,47 @@ impl ResponseRepositoryTrait for PgResponseRepository {
                 .unwrap_or(prev_id);
             let prev_uuid = Uuid::parse_str(uuid_str).context("Invalid previous response ID")?;
 
+            // Fetch the previous response, scoped to the caller's workspace.
+            // Defense in depth: a previous response that does not exist in this
+            // workspace must never be linked as a parent edge (unknown and
+            // foreign IDs fail identically).
+            let prev_response = retry_db!("fetch_previous_response_conversation", {
+                let client = self
+                    .pool
+                    .get()
+                    .await
+                    .context("Failed to get database connection")
+                    .map_err(RepositoryError::PoolError)?;
+
+                client
+                    .query_opt(
+                        r#"
+                        SELECT conversation_id
+                        FROM responses
+                        WHERE id = $1 AND workspace_id = $2
+                        "#,
+                        &[&prev_uuid, &workspace_id.0],
+                    )
+                    .await
+                    .map_err(map_db_error)
+            })?;
+
+            let Some(row) = prev_response else {
+                return Err(anyhow::Error::new(RepositoryError::NotFound(
+                    "previous response".to_string(),
+                )));
+            };
+
             // If conversation_uuid is not explicitly set, inherit it from the previous response
             if conversation_uuid.is_none() {
-                // Fetch the previous response to get its conversation_id
-                let prev_response = retry_db!("fetch_previous_response_conversation", {
-                    let client = self
-                        .pool
-                        .get()
-                        .await
-                        .context("Failed to get database connection")
-                        .map_err(RepositoryError::PoolError)?;
+                let prev_conversation_id: Option<Uuid> = row.get("conversation_id");
+                conversation_uuid = prev_conversation_id;
 
-                    client
-                        .query_opt(
-                            r#"
-                            SELECT conversation_id
-                            FROM responses
-                            WHERE id = $1 AND workspace_id = $2
-                            "#,
-                            &[&prev_uuid, &workspace_id.0],
-                        )
-                        .await
-                        .map_err(map_db_error)
-                })?;
-
-                if let Some(row) = prev_response {
-                    let prev_conversation_id: Option<Uuid> = row.get("conversation_id");
-                    conversation_uuid = prev_conversation_id;
-
-                    if conversation_uuid.is_some() {
-                        tracing::debug!(
-                            "Inherited conversation_id from previous response {}",
-                            prev_id
-                        );
-                    }
+                if conversation_uuid.is_some() {
+                    tracing::debug!(
+                        "Inherited conversation_id from previous response {}",
+                        prev_id
+                    );
                 }
             }
 

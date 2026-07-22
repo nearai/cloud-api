@@ -737,6 +737,7 @@ pub async fn setup_mcp(
     request: &models::CreateResponseRequest,
     client_factory: Option<&Arc<dyn McpClientFactory>>,
     response_items_repository: &Arc<dyn ResponseItemRepositoryTrait>,
+    workspace_id: crate::workspace::WorkspaceId,
     ctx: &mut ResponseStreamContext,
     emitter: &mut EventEmitter,
 ) -> Result<Option<McpSetupResult>, ResponseError> {
@@ -769,9 +770,10 @@ pub async fn setup_mcp(
 
     let executor = Arc::new(mcp_executor);
 
-    // Process any approval responses
+    // Process any approval responses (workspace-scoped lookup)
     let approval_messages =
-        process_approval_responses(&executor, request, response_items_repository).await?;
+        process_approval_responses(&executor, request, response_items_repository, workspace_id)
+            .await?;
 
     Ok(Some(McpSetupResult {
         executor,
@@ -854,7 +856,8 @@ pub async fn initialize_mcp_executor(
 /// Process MCP approval responses from the request input.
 ///
 /// For each approval response:
-/// - Fetches the approval request directly by ID from the database
+/// - Fetches the approval request by ID, constrained to the caller's workspace
+///   (unknown and foreign IDs surface as the same not-found error)
 /// - If approved: executes the tool and adds result to messages
 /// - If rejected: adds rejection message for LLM context
 ///
@@ -863,6 +866,7 @@ pub async fn process_approval_responses(
     mcp_executor: &McpToolExecutor,
     request: &models::CreateResponseRequest,
     response_items_repository: &Arc<dyn ResponseItemRepositoryTrait>,
+    workspace_id: crate::workspace::WorkspaceId,
 ) -> Result<Vec<crate::completions::ports::CompletionMessage>, ResponseError> {
     let mut messages = Vec::new();
 
@@ -891,9 +895,9 @@ pub async fn process_approval_responses(
         })?;
         let item_id = models::ResponseItemId(item_uuid);
 
-        // Fetch the approval request directly by ID
+        // Fetch the approval request by ID, scoped to the caller's workspace
         let item = response_items_repository
-            .get_by_id(item_id)
+            .get_by_id(item_id, workspace_id.clone())
             .await
             .map_err(|e| {
                 ResponseError::InternalError(format!("Failed to fetch approval request: {e}"))

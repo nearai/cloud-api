@@ -92,9 +92,14 @@ pub trait ResponseItemRepositoryTrait: Send + Sync {
         conversation_id: Option<ConversationId>,
         item: models::ResponseOutputItem,
     ) -> anyhow::Result<models::ResponseOutputItem>;
+    /// Get a response item by ID, constrained to the given workspace.
+    ///
+    /// Returns `None` for unknown items and for items owned by another
+    /// workspace so the two cases are indistinguishable to callers.
     async fn get_by_id(
         &self,
         id: models::ResponseItemId,
+        workspace_id: WorkspaceId,
     ) -> anyhow::Result<Option<models::ResponseOutputItem>>;
     async fn update(
         &self,
@@ -110,9 +115,16 @@ pub trait ResponseItemRepositoryTrait: Send + Sync {
         &self,
         api_key_id: uuid::Uuid,
     ) -> anyhow::Result<Vec<models::ResponseOutputItem>>;
+    /// List items for a conversation, constrained to the given workspace.
+    ///
+    /// Callers must additionally verify conversation ownership before calling;
+    /// the workspace constraint here is defense in depth. An `after` cursor
+    /// that does not belong to this conversation and workspace is rejected
+    /// with a `RepositoryError::NotFound`-based error.
     async fn list_by_conversation(
         &self,
         conversation_id: ConversationId,
+        workspace_id: WorkspaceId,
         after: Option<String>,
         limit: i64,
     ) -> anyhow::Result<Vec<models::ResponseOutputItem>>;

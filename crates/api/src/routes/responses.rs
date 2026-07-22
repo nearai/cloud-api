@@ -102,6 +102,8 @@ fn map_response_error_to_status(error: &ServiceResponseError) -> StatusCode {
         ServiceResponseError::UnknownTool(_) => StatusCode::BAD_REQUEST,
         ServiceResponseError::EmptyToolName => StatusCode::BAD_REQUEST,
         ServiceResponseError::StreamInterrupted => StatusCode::INTERNAL_SERVER_ERROR,
+        ServiceResponseError::ConversationNotFound => StatusCode::NOT_FOUND,
+        ServiceResponseError::PreviousResponseNotFound => StatusCode::NOT_FOUND,
         ServiceResponseError::McpConnectionFailed(_) => StatusCode::BAD_GATEWAY,
         ServiceResponseError::McpToolDiscoveryFailed(_) => StatusCode::BAD_GATEWAY,
         ServiceResponseError::McpToolExecutionFailed(_) => StatusCode::BAD_GATEWAY,
@@ -160,6 +162,14 @@ impl From<ServiceResponseError> for ErrorResponse {
             ServiceResponseError::StreamInterrupted => {
                 ErrorResponse::new("Stream interrupted".to_string(), "stream_error".to_string())
             }
+            ServiceResponseError::ConversationNotFound => ErrorResponse::new(
+                "Conversation not found".to_string(),
+                "not_found_error".to_string(),
+            ),
+            ServiceResponseError::PreviousResponseNotFound => ErrorResponse::new(
+                "Previous response not found".to_string(),
+                "not_found_error".to_string(),
+            ),
             ServiceResponseError::McpConnectionFailed(msg) => ErrorResponse::new(
                 format!("MCP connection failed: {msg}"),
                 "mcp_error".to_string(),

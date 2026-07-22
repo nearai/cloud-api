@@ -32,6 +32,7 @@ fn map_conversation_error_to_status(error: &ConversationError) -> StatusCode {
     match error {
         ConversationError::InvalidParams(_) => StatusCode::BAD_REQUEST,
         ConversationError::InternalError(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        ConversationError::NotFound => StatusCode::NOT_FOUND,
     }
 }
 
@@ -1471,6 +1472,12 @@ impl From<ConversationError> for ErrorResponse {
             ConversationError::InternalError(msg) => ErrorResponse::new(
                 format!("Internal server error: {msg}"),
                 "internal_server_error".to_string(),
+            ),
+            // Identical body to the handler-level 404s so unknown and foreign
+            // conversation IDs cannot be told apart.
+            ConversationError::NotFound => ErrorResponse::new(
+                "Conversation not found".to_string(),
+                "not_found_error".to_string(),
             ),
         }
     }

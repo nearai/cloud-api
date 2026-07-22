@@ -32,6 +32,7 @@ mod client_disconnect;
 mod concurrent_limit;
 mod conversations;
 mod credit_types;
+mod cross_workspace;
 mod deser_error_envelope;
 mod duplicate_names;
 mod embeddings;

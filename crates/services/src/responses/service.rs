@@ -942,6 +942,46 @@ impl ResponseServiceImpl {
         )
         .await?;
 
+        // Verify previous_response_id ownership before loading any history or
+        // creating the response. Unknown and foreign response IDs get the same
+        // non-enumerating 404-style error; without this check a foreign ID
+        // would be persisted as this response's parent edge.
+        if let Some(prev_response_id) = &context.request.previous_response_id {
+            let uuid_str = prev_response_id
+                .strip_prefix(crate::id_prefixes::PREFIX_RESP)
+                .unwrap_or(prev_response_id);
+            let prev_uuid = Uuid::parse_str(uuid_str).map_err(|e| {
+                errors::ResponseError::InvalidParams(format!("invalid previous_response_id: {e}"))
+            })?;
+
+            let prev_response = context
+                .response_repository
+                .get_by_id(models::ResponseId(prev_uuid), workspace_id_domain.clone())
+                .await
+                .map_err(|e| {
+                    errors::ResponseError::InternalError(format!(
+                        "Failed to verify previous response ownership: {e}"
+                    ))
+                })?;
+
+            if prev_response.is_none() {
+                return Err(errors::ResponseError::PreviousResponseNotFound);
+            }
+        }
+
+        // Validate MCP approval-request references before creating the
+        // response row. setup_mcp() re-resolves them later (workspace-scoped),
+        // but that runs after the response has been persisted and
+        // response.created has been emitted — failing only there would leave
+        // an orphaned in-progress response. Unknown and foreign IDs produce
+        // the same not-found error here as in the approval processing itself.
+        Self::validate_mcp_approval_references(
+            &context.request,
+            &context.response_items_repository,
+            workspace_id_domain.clone(),
+        )
+        .await?;
+
         let mut messages = Self::load_conversation_context(
             &context.request,
             &context.conversation_service,
@@ -1045,6 +1085,7 @@ impl ResponseServiceImpl {
             &context.request,
             context.mcp_client_factory.as_ref(),
             &context.response_items_repository,
+            workspace_id_domain.clone(),
             &mut ctx,
             &mut emitter,
         )
@@ -1808,6 +1849,76 @@ impl ResponseServiceImpl {
         Ok(tools::ToolExecutionResult::Success)
     }
 
+    /// Validate MCP approval-response references from the request input.
+    ///
+    /// Runs before the response row is created so an invalid, unknown, or
+    /// foreign `approval_request_id` fails fast without persisting anything.
+    /// Mirrors the checks in `tools::mcp::process_approval_responses` (which
+    /// still runs later as defense in depth): workspace-scoped lookup, same
+    /// non-enumerating not-found for unknown and foreign IDs, and a type
+    /// check that the referenced item is an approval request.
+    ///
+    /// Only active when the request configures MCP tools, matching when
+    /// approval responses are actually processed.
+    async fn validate_mcp_approval_references(
+        request: &models::CreateResponseRequest,
+        response_items_repository: &Arc<dyn ports::ResponseItemRepositoryTrait>,
+        workspace_id: crate::workspace::WorkspaceId,
+    ) -> Result<(), errors::ResponseError> {
+        let has_mcp_tools = request.tools.as_ref().is_some_and(|tools| {
+            tools
+                .iter()
+                .any(|t| matches!(t, models::ResponseTool::Mcp { .. }))
+        });
+        if !has_mcp_tools {
+            return Ok(());
+        }
+
+        let approval_ids: Vec<&str> = match &request.input {
+            Some(models::ResponseInput::Items(items)) => items
+                .iter()
+                .filter_map(|item| item.as_mcp_approval())
+                .map(|(approval_request_id, _approve)| approval_request_id)
+                .collect(),
+            _ => return Ok(()),
+        };
+
+        for approval_request_id in approval_ids {
+            let uuid_str = approval_request_id
+                .strip_prefix(crate::id_prefixes::PREFIX_MCPR)
+                .unwrap_or(approval_request_id);
+            let item_uuid = Uuid::parse_str(uuid_str).map_err(|e| {
+                errors::ResponseError::InvalidParams(format!("Invalid approval_request_id: {e}"))
+            })?;
+
+            let item = response_items_repository
+                .get_by_id(models::ResponseItemId(item_uuid), workspace_id.clone())
+                .await
+                .map_err(|e| {
+                    errors::ResponseError::InternalError(format!(
+                        "Failed to fetch approval request: {e}"
+                    ))
+                })?;
+
+            match item {
+                None => {
+                    return Err(errors::ResponseError::McpApprovalRequestNotFound(
+                        approval_request_id.to_string(),
+                    ));
+                }
+                Some(models::ResponseOutputItem::McpApprovalRequest { .. }) => {}
+                Some(_) => {
+                    return Err(errors::ResponseError::InvalidParams(format!(
+                        "Item {} is not an MCP approval request",
+                        approval_request_id
+                    )));
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     /// Process function call outputs from the request input.
     ///
     /// When resuming a response after function calls, the client provides
@@ -2202,18 +2313,27 @@ impl ResponseServiceImpl {
                     })?,
             };
 
-            // Load conversation metadata to verify it exists
-            let _conversation = conversation_service
+            // Verify the conversation exists AND belongs to the caller's
+            // workspace before reading any history. A missing or foreign
+            // conversation is rejected with the same non-enumerating error so
+            // another workspace's history can never be imported into a
+            // completion context.
+            let conversation = conversation_service
                 .get_conversation(conversation_id, workspace_id.clone())
                 .await
                 .map_err(|e| {
                     errors::ResponseError::InternalError(format!("Failed to get conversation: {e}"))
                 })?;
 
+            if conversation.is_none() {
+                return Err(errors::ResponseError::ConversationNotFound);
+            }
+
             // Load all response items from the conversation
-            // Use high limit (1000) and no 'after' cursor for context loading
+            // Use high limit (1000) and no 'after' cursor for context loading.
+            // The repository constrains the query by workspace as defense in depth.
             let conversation_items = response_items_repository
-                .list_by_conversation(conversation_id, None, 1000)
+                .list_by_conversation(conversation_id, workspace_id.clone(), None, 1000)
                 .await
                 .map_err(|e| {
                     errors::ResponseError::InternalError(format!(

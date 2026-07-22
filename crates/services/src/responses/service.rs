@@ -969,6 +969,19 @@ impl ResponseServiceImpl {
             }
         }
 
+        // Validate MCP approval-request references before creating the
+        // response row. setup_mcp() re-resolves them later (workspace-scoped),
+        // but that runs after the response has been persisted and
+        // response.created has been emitted — failing only there would leave
+        // an orphaned in-progress response. Unknown and foreign IDs produce
+        // the same not-found error here as in the approval processing itself.
+        Self::validate_mcp_approval_references(
+            &context.request,
+            &context.response_items_repository,
+            workspace_id_domain.clone(),
+        )
+        .await?;
+
         let mut messages = Self::load_conversation_context(
             &context.request,
             &context.conversation_service,
@@ -1834,6 +1847,76 @@ impl ResponseServiceImpl {
         }
 
         Ok(tools::ToolExecutionResult::Success)
+    }
+
+    /// Validate MCP approval-response references from the request input.
+    ///
+    /// Runs before the response row is created so an invalid, unknown, or
+    /// foreign `approval_request_id` fails fast without persisting anything.
+    /// Mirrors the checks in `tools::mcp::process_approval_responses` (which
+    /// still runs later as defense in depth): workspace-scoped lookup, same
+    /// non-enumerating not-found for unknown and foreign IDs, and a type
+    /// check that the referenced item is an approval request.
+    ///
+    /// Only active when the request configures MCP tools, matching when
+    /// approval responses are actually processed.
+    async fn validate_mcp_approval_references(
+        request: &models::CreateResponseRequest,
+        response_items_repository: &Arc<dyn ports::ResponseItemRepositoryTrait>,
+        workspace_id: crate::workspace::WorkspaceId,
+    ) -> Result<(), errors::ResponseError> {
+        let has_mcp_tools = request.tools.as_ref().is_some_and(|tools| {
+            tools
+                .iter()
+                .any(|t| matches!(t, models::ResponseTool::Mcp { .. }))
+        });
+        if !has_mcp_tools {
+            return Ok(());
+        }
+
+        let approval_ids: Vec<&str> = match &request.input {
+            Some(models::ResponseInput::Items(items)) => items
+                .iter()
+                .filter_map(|item| item.as_mcp_approval())
+                .map(|(approval_request_id, _approve)| approval_request_id)
+                .collect(),
+            _ => return Ok(()),
+        };
+
+        for approval_request_id in approval_ids {
+            let uuid_str = approval_request_id
+                .strip_prefix(crate::id_prefixes::PREFIX_MCPR)
+                .unwrap_or(approval_request_id);
+            let item_uuid = Uuid::parse_str(uuid_str).map_err(|e| {
+                errors::ResponseError::InvalidParams(format!("Invalid approval_request_id: {e}"))
+            })?;
+
+            let item = response_items_repository
+                .get_by_id(models::ResponseItemId(item_uuid), workspace_id.clone())
+                .await
+                .map_err(|e| {
+                    errors::ResponseError::InternalError(format!(
+                        "Failed to fetch approval request: {e}"
+                    ))
+                })?;
+
+            match item {
+                None => {
+                    return Err(errors::ResponseError::McpApprovalRequestNotFound(
+                        approval_request_id.to_string(),
+                    ));
+                }
+                Some(models::ResponseOutputItem::McpApprovalRequest { .. }) => {}
+                Some(_) => {
+                    return Err(errors::ResponseError::InvalidParams(format!(
+                        "Item {} is not an MCP approval request",
+                        approval_request_id
+                    )));
+                }
+            }
+        }
+
+        Ok(())
     }
 
     /// Process function call outputs from the request input.

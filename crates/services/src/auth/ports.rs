@@ -30,6 +30,12 @@ pub struct AccessTokenClaims {
     pub sub: UserId,
     pub exp: i64,
     pub iat: i64,
+    /// Id of the refresh-token session this access token was minted from.
+    /// Validation rejects tokens whose session has been revoked (logout), so
+    /// revoking a session invalidates both credentials at once. `None` only
+    /// on legacy tokens issued before session binding was introduced.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sid: Option<SessionId>,
 }
 
 impl From<Uuid> for UserId {
@@ -268,9 +274,13 @@ pub trait AuthServiceTrait: Send + Sync {
         refresh_expires_in_hours: i64,
     ) -> Result<(String, Session, String), AuthError>;
 
+    /// Mint a session access token (JWT). `session_id` binds the token to a
+    /// refresh-token session via the `sid` claim; pass `None` only where no
+    /// server-side session exists (mock/test flows).
     fn create_session_access_token(
         &self,
         user_id: UserId,
+        session_id: Option<SessionId>,
         encoding_key: String,
         expires_in_hours: i64,
     ) -> Result<String, AuthError>;
@@ -347,6 +357,9 @@ pub struct AuthService {
     pub api_key_cache: ApiKeyCache,
     pub api_key_bloom_filter: ApiKeyBloomFilter,
     pub bloom_filter_ready: BloomFilterReady,
+    /// Reject access tokens without a `sid` claim (legacy tokens issued
+    /// before session binding). See `AuthConfig::require_session_bound_access_tokens`.
+    pub require_session_bound_access_tokens: bool,
 }
 
 pub struct UserService {
@@ -425,11 +438,13 @@ impl MockAuthService {
         refresh_expires_in_hours: i64,
     ) -> (String, Session, String) {
         let expiration = chrono::Utc::now() + chrono::Duration::hours(expires_in_hours);
+        let session_id = SessionId(uuid::Uuid::new_v4());
 
         let claims = AccessTokenClaims {
             sub: user_id.clone(),
             exp: expiration.timestamp(),
             iat: chrono::Utc::now().timestamp(),
+            sid: Some(session_id.clone()),
         };
 
         let access_token = jsonwebtoken::encode(
@@ -438,8 +453,6 @@ impl MockAuthService {
             &jsonwebtoken::EncodingKey::from_secret(encoding_key.as_bytes()),
         )
         .unwrap();
-
-        let session_id = SessionId(uuid::Uuid::new_v4());
         // Generate token with same format as real session repository
         let session_token = format!("rt_{}", uuid::Uuid::new_v4().to_string().replace("-", ""));
         let expires_at = chrono::Utc::now() + chrono::Duration::hours(refresh_expires_in_hours);
@@ -482,6 +495,7 @@ impl AuthServiceTrait for MockAuthService {
     fn create_session_access_token(
         &self,
         user_id: UserId,
+        session_id: Option<SessionId>,
         encoding_key: String,
         expires_in_hours: i64,
     ) -> Result<String, AuthError> {
@@ -491,6 +505,7 @@ impl AuthServiceTrait for MockAuthService {
             sub: user_id,
             exp: expiration.timestamp(),
             iat: chrono::Utc::now().timestamp(),
+            sid: session_id,
         };
 
         jsonwebtoken::encode(

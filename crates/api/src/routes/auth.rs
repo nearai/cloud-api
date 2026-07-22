@@ -1,7 +1,7 @@
 use crate::middleware::AuthenticatedUser;
 use axum::{
     extract::{Query, Request, State},
-    http::{header::SET_COOKIE, HeaderMap, StatusCode},
+    http::{HeaderMap, StatusCode},
     response::{Html, IntoResponse, Redirect, Response},
     Extension, Json,
 };
@@ -547,21 +547,49 @@ pub async fn current_user(Extension(user): Extension<AuthenticatedUser>) -> Json
 }
 
 /// Logout endpoint
-pub async fn logout(Extension(user): Extension<AuthenticatedUser>) -> Response {
-    debug!("Logging out user_id={}", user.0.id);
+///
+/// Authenticated with the session's refresh token (via `refresh_middleware`,
+/// like token refresh). Revokes exactly the current server-side refresh-token
+/// session, which immediately invalidates that refresh token and every access
+/// token bound to it through its `sid` claim. Other sessions (devices) of the
+/// same user are not touched.
+///
+/// Idempotent from the caller's perspective: revoking a session that was
+/// already deleted between authentication and revocation still returns 200.
+/// A repeated call with the already-revoked refresh token fails middleware
+/// authentication with 401 and changes nothing.
+pub async fn logout(
+    State((_oauth, _state_store, auth_service, _config)): State<AuthState>,
+    Extension((session, user)): Extension<(services::auth::Session, AuthenticatedUser)>,
+) -> Response {
+    debug!(
+        "Logging out user_id={} session_id={}",
+        user.0.id, session.id
+    );
 
-    // This would need the session_id from cookie in real implementation
-    // For now, just clear the cookie
-    let cookie = "session_id=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0";
-
-    (
-        StatusCode::OK,
-        [(SET_COOKIE, cookie)],
-        Json(serde_json::json!({
-            "message": "Logged out successfully"
-        })),
-    )
-        .into_response()
+    match auth_service.logout(session.id).await {
+        Ok(revoked) => {
+            debug!(revoked, user_id = %user.0.id, "Logout completed");
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "message": "Logged out successfully"
+                })),
+            )
+                .into_response()
+        }
+        Err(e) => {
+            error!(error = %e, user_id = %user.0.id, "Failed to revoke session on logout");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": "internal_server_error",
+                    "error_description": "Failed to revoke session"
+                })),
+            )
+                .into_response()
+        }
+    }
 }
 
 /// NEAR wallet login endpoint

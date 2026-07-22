@@ -34,6 +34,15 @@ pub fn parse_uuid_from_prefixed(id: &str, prefix: &str) -> Result<Uuid, errors::
     })
 }
 
+/// Returns true when a repository error indicates the pagination cursor was
+/// rejected (it does not exist, or belongs to another conversation/workspace).
+fn is_invalid_cursor_error(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .filter_map(|cause| cause.downcast_ref::<crate::common::RepositoryError>())
+        .any(|e| matches!(e, crate::common::RepositoryError::NotFound(_)))
+}
+
 /// Conversation service for managing conversations
 pub struct ConversationServiceImpl {
     pub conv_repo: Arc<dyn ports::ConversationRepository>,
@@ -418,25 +427,51 @@ impl ports::ConversationServiceTrait for ConversationServiceImpl {
     async fn list_conversation_items(
         &self,
         conversation_id: models::ConversationId,
-        _workspace_id: WorkspaceId,
+        workspace_id: WorkspaceId,
         after: Option<String>,
         limit: i64,
     ) -> Result<Vec<crate::responses::models::ResponseOutputItem>, errors::ConversationError> {
         tracing::debug!(
-            "Listing conversation items for conversation_id={}, after={:?}, limit={}",
+            "Listing conversation items for conversation_id={}, workspace_id={}, after={:?}, limit={}",
             conversation_id,
+            workspace_id.0,
             after,
             limit
         );
 
-        // Get items from response_items repository
-        self.response_items_repo
-            .list_by_conversation(conversation_id, after, limit)
+        // Enforce workspace ownership before touching any items. Unknown and
+        // foreign conversation IDs both surface as the same NotFound so callers
+        // cannot enumerate other workspaces' conversation IDs.
+        let conversation = self
+            .conv_repo
+            .get_by_id(conversation_id, workspace_id.clone())
             .await
             .map_err(|e| {
                 errors::ConversationError::InternalError(format!(
-                    "Failed to list conversation items: {e}"
+                    "Failed to verify conversation: {e}"
                 ))
+            })?;
+
+        if conversation.is_none() {
+            return Err(errors::ConversationError::NotFound);
+        }
+
+        // Get items from response_items repository. The repository additionally
+        // constrains the query by workspace (defense in depth) and rejects
+        // pagination cursors that do not belong to this conversation.
+        self.response_items_repo
+            .list_by_conversation(conversation_id, workspace_id, after, limit)
+            .await
+            .map_err(|e| {
+                if is_invalid_cursor_error(&e) {
+                    errors::ConversationError::InvalidParams(
+                        "Invalid 'after' cursor for this conversation".to_string(),
+                    )
+                } else {
+                    errors::ConversationError::InternalError(format!(
+                        "Failed to list conversation items: {e}"
+                    ))
+                }
             })
     }
 
@@ -467,9 +502,8 @@ impl ports::ConversationServiceTrait for ConversationServiceImpl {
             })?;
 
         if conversation.is_none() {
-            return Err(errors::ConversationError::InvalidParams(format!(
-                "Conversation not found: {conversation_id}"
-            )));
+            // Same non-enumerating response for unknown and foreign conversations.
+            return Err(errors::ConversationError::NotFound);
         }
 
         // Create a minimal response for backfilled items
@@ -713,5 +747,399 @@ mod tests {
         let empty_ids: Vec<models::ConversationId> = Vec::new();
         assert_eq!(empty_ids.len(), 0, "Empty vector should have length 0");
         assert!(empty_ids.is_empty(), "Empty vector should report as empty");
+    }
+
+    // ============================================
+    // Workspace ownership enforcement (issue nearai/infra#190)
+    // ============================================
+
+    use crate::conversations::ports::ConversationServiceTrait;
+    use crate::responses::models as resp_models;
+    use std::sync::Mutex;
+
+    fn test_conversation(
+        id: models::ConversationId,
+        workspace_id: WorkspaceId,
+    ) -> models::Conversation {
+        let now = chrono::Utc::now();
+        models::Conversation {
+            id,
+            workspace_id,
+            api_key_id: Uuid::new_v4(),
+            pinned_at: None,
+            archived_at: None,
+            deleted_at: None,
+            cloned_from_id: None,
+            root_response_id: None,
+            metadata: serde_json::json!({}),
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    /// Conversation repository that owns exactly one conversation in one
+    /// workspace. `get_by_id` behaves like the real repository: it only
+    /// returns the conversation when both the ID and the workspace match.
+    struct MockConversationRepo {
+        conversation: models::Conversation,
+    }
+
+    #[async_trait]
+    impl ports::ConversationRepository for MockConversationRepo {
+        async fn create(
+            &self,
+            _workspace_id: WorkspaceId,
+            _api_key_id: Uuid,
+            _metadata: serde_json::Value,
+        ) -> Result<models::Conversation> {
+            panic!("create must not be called");
+        }
+
+        async fn get_by_id(
+            &self,
+            id: models::ConversationId,
+            workspace_id: WorkspaceId,
+        ) -> Result<Option<models::Conversation>> {
+            if id.0 == self.conversation.id.0 && workspace_id == self.conversation.workspace_id {
+                Ok(Some(self.conversation.clone()))
+            } else {
+                Ok(None)
+            }
+        }
+
+        async fn update(
+            &self,
+            _id: models::ConversationId,
+            _workspace_id: WorkspaceId,
+            _metadata: serde_json::Value,
+        ) -> Result<Option<models::Conversation>> {
+            panic!("update must not be called");
+        }
+
+        async fn set_pinned(
+            &self,
+            _id: models::ConversationId,
+            _workspace_id: WorkspaceId,
+            _is_pinned: bool,
+        ) -> Result<Option<models::Conversation>> {
+            panic!("set_pinned must not be called");
+        }
+
+        async fn set_archived(
+            &self,
+            _id: models::ConversationId,
+            _workspace_id: WorkspaceId,
+            _is_archived: bool,
+        ) -> Result<Option<models::Conversation>> {
+            panic!("set_archived must not be called");
+        }
+
+        async fn clone_conversation(
+            &self,
+            _id: models::ConversationId,
+            _workspace_id: WorkspaceId,
+            _api_key_id: Uuid,
+        ) -> Result<Option<models::Conversation>> {
+            panic!("clone_conversation must not be called");
+        }
+
+        async fn delete(
+            &self,
+            _id: models::ConversationId,
+            _workspace_id: WorkspaceId,
+        ) -> Result<bool> {
+            panic!("delete must not be called");
+        }
+
+        async fn batch_get_by_ids(
+            &self,
+            _ids: Vec<models::ConversationId>,
+            _workspace_id: WorkspaceId,
+        ) -> Result<Vec<models::Conversation>> {
+            panic!("batch_get_by_ids must not be called");
+        }
+    }
+
+    /// Response repository that panics on any write: the ownership check must
+    /// reject foreign conversations before any response row is created.
+    struct RejectingResponseRepo;
+
+    #[async_trait]
+    impl ResponseRepositoryTrait for RejectingResponseRepo {
+        async fn create(
+            &self,
+            _workspace_id: WorkspaceId,
+            _api_key_id: Uuid,
+            _request: resp_models::CreateResponseRequest,
+        ) -> anyhow::Result<resp_models::ResponseObject> {
+            panic!("response create must not be called for a foreign conversation");
+        }
+
+        async fn get_by_id(
+            &self,
+            _id: resp_models::ResponseId,
+            _workspace_id: WorkspaceId,
+        ) -> anyhow::Result<Option<resp_models::ResponseObject>> {
+            Ok(None)
+        }
+
+        async fn update(
+            &self,
+            _id: resp_models::ResponseId,
+            _workspace_id: WorkspaceId,
+            _output_message: Option<String>,
+            _status: resp_models::ResponseStatus,
+            _usage: Option<serde_json::Value>,
+        ) -> anyhow::Result<Option<resp_models::ResponseObject>> {
+            panic!("response update must not be called for a foreign conversation");
+        }
+
+        async fn delete(
+            &self,
+            _id: resp_models::ResponseId,
+            _workspace_id: WorkspaceId,
+        ) -> anyhow::Result<bool> {
+            panic!("response delete must not be called");
+        }
+
+        async fn cancel(
+            &self,
+            _id: resp_models::ResponseId,
+            _workspace_id: WorkspaceId,
+        ) -> anyhow::Result<Option<resp_models::ResponseObject>> {
+            panic!("response cancel must not be called");
+        }
+
+        async fn list_by_workspace(
+            &self,
+            _workspace_id: WorkspaceId,
+            _limit: i64,
+            _offset: i64,
+        ) -> anyhow::Result<Vec<resp_models::ResponseObject>> {
+            panic!("list_by_workspace must not be called");
+        }
+
+        async fn list_by_conversation(
+            &self,
+            _conversation_id: models::ConversationId,
+            _workspace_id: WorkspaceId,
+            _limit: i64,
+        ) -> anyhow::Result<Vec<resp_models::ResponseObject>> {
+            panic!("list_by_conversation must not be called");
+        }
+
+        async fn get_previous(
+            &self,
+            _response_id: resp_models::ResponseId,
+            _workspace_id: WorkspaceId,
+        ) -> anyhow::Result<Option<resp_models::ResponseObject>> {
+            panic!("get_previous must not be called");
+        }
+
+        async fn get_latest_in_conversation(
+            &self,
+            _conversation_id: models::ConversationId,
+            _workspace_id: WorkspaceId,
+        ) -> anyhow::Result<Option<resp_models::ResponseObject>> {
+            panic!("get_latest_in_conversation must not be called");
+        }
+
+        async fn get_or_create_root_response(
+            &self,
+            _conversation_id: models::ConversationId,
+            _workspace_id: WorkspaceId,
+            _api_key_id: Uuid,
+        ) -> anyhow::Result<String> {
+            panic!("get_or_create_root_response must not be called");
+        }
+    }
+
+    /// Response-item repository that records list calls and panics on writes.
+    #[derive(Default)]
+    struct RecordingItemsRepo {
+        list_calls: Mutex<Vec<(Uuid, Uuid, Option<String>)>>,
+    }
+
+    #[async_trait]
+    impl ResponseItemRepositoryTrait for RecordingItemsRepo {
+        async fn create(
+            &self,
+            _response_id: resp_models::ResponseId,
+            _api_key_id: Uuid,
+            _conversation_id: Option<models::ConversationId>,
+            _item: resp_models::ResponseOutputItem,
+        ) -> anyhow::Result<resp_models::ResponseOutputItem> {
+            panic!("item create must not be called for a foreign conversation");
+        }
+
+        async fn get_by_id(
+            &self,
+            _id: resp_models::ResponseItemId,
+            _workspace_id: WorkspaceId,
+        ) -> anyhow::Result<Option<resp_models::ResponseOutputItem>> {
+            Ok(None)
+        }
+
+        async fn update(
+            &self,
+            _id: resp_models::ResponseItemId,
+            _item: resp_models::ResponseOutputItem,
+        ) -> anyhow::Result<resp_models::ResponseOutputItem> {
+            panic!("item update must not be called");
+        }
+
+        async fn delete(&self, _id: resp_models::ResponseItemId) -> anyhow::Result<bool> {
+            panic!("item delete must not be called");
+        }
+
+        async fn list_by_response(
+            &self,
+            _response_id: resp_models::ResponseId,
+        ) -> anyhow::Result<Vec<resp_models::ResponseOutputItem>> {
+            panic!("list_by_response must not be called");
+        }
+
+        async fn list_by_api_key(
+            &self,
+            _api_key_id: Uuid,
+        ) -> anyhow::Result<Vec<resp_models::ResponseOutputItem>> {
+            panic!("list_by_api_key must not be called");
+        }
+
+        async fn list_by_conversation(
+            &self,
+            conversation_id: models::ConversationId,
+            workspace_id: WorkspaceId,
+            after: Option<String>,
+            _limit: i64,
+        ) -> anyhow::Result<Vec<resp_models::ResponseOutputItem>> {
+            self.list_calls
+                .lock()
+                .unwrap()
+                .push((conversation_id.0, workspace_id.0, after));
+            Ok(vec![])
+        }
+    }
+
+    fn service_with_owned_conversation(
+        conversation_id: models::ConversationId,
+        owner_workspace: WorkspaceId,
+    ) -> (ConversationServiceImpl, Arc<RecordingItemsRepo>) {
+        let items_repo = Arc::new(RecordingItemsRepo::default());
+        let service = ConversationServiceImpl::new(
+            Arc::new(MockConversationRepo {
+                conversation: test_conversation(conversation_id, owner_workspace),
+            }),
+            Arc::new(RejectingResponseRepo),
+            items_repo.clone(),
+        );
+        (service, items_repo)
+    }
+
+    #[tokio::test]
+    async fn test_list_conversation_items_foreign_workspace_not_found() {
+        let conversation_id = models::ConversationId(Uuid::new_v4());
+        let owner_workspace = WorkspaceId(Uuid::new_v4());
+        let foreign_workspace = WorkspaceId(Uuid::new_v4());
+
+        let (service, items_repo) =
+            service_with_owned_conversation(conversation_id, owner_workspace);
+
+        let result = service
+            .list_conversation_items(conversation_id, foreign_workspace, None, 10)
+            .await;
+
+        assert!(
+            matches!(result, Err(errors::ConversationError::NotFound)),
+            "foreign-workspace lookup must return NotFound, got: {result:?}"
+        );
+        assert!(
+            items_repo.list_calls.lock().unwrap().is_empty(),
+            "item repository must not be queried for a foreign conversation"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_list_conversation_items_unknown_conversation_not_found() {
+        let owner_workspace = WorkspaceId(Uuid::new_v4());
+        let (service, items_repo) = service_with_owned_conversation(
+            models::ConversationId(Uuid::new_v4()),
+            owner_workspace.clone(),
+        );
+
+        // Same workspace, unknown conversation ID: identical NotFound outcome
+        // as the foreign-workspace case (non-enumerating behavior).
+        let result = service
+            .list_conversation_items(
+                models::ConversationId(Uuid::new_v4()),
+                owner_workspace,
+                None,
+                10,
+            )
+            .await;
+
+        assert!(matches!(result, Err(errors::ConversationError::NotFound)));
+        assert!(items_repo.list_calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_list_conversation_items_same_workspace_passes_workspace_to_repo() {
+        let conversation_id = models::ConversationId(Uuid::new_v4());
+        let owner_workspace = WorkspaceId(Uuid::new_v4());
+
+        let (service, items_repo) =
+            service_with_owned_conversation(conversation_id, owner_workspace.clone());
+
+        let result = service
+            .list_conversation_items(conversation_id, owner_workspace.clone(), None, 10)
+            .await;
+
+        assert!(result.is_ok(), "owner lookup must succeed: {result:?}");
+        let calls = items_repo.list_calls.lock().unwrap();
+        assert_eq!(calls.len(), 1, "item repository queried exactly once");
+        assert_eq!(calls[0].0, conversation_id.0);
+        assert_eq!(
+            calls[0].1, owner_workspace.0,
+            "workspace must be threaded through to the repository query"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_create_conversation_items_foreign_workspace_not_found() {
+        let conversation_id = models::ConversationId(Uuid::new_v4());
+        let owner_workspace = WorkspaceId(Uuid::new_v4());
+        let foreign_workspace = WorkspaceId(Uuid::new_v4());
+
+        let (service, _items_repo) =
+            service_with_owned_conversation(conversation_id, owner_workspace);
+
+        let item = resp_models::ResponseOutputItem::Message {
+            id: format!("msg_{}", Uuid::new_v4().simple()),
+            response_id: String::new(),
+            previous_response_id: None,
+            next_response_ids: vec![],
+            created_at: 0,
+            status: resp_models::ResponseItemStatus::Completed,
+            role: "user".to_string(),
+            content: vec![],
+            model: String::new(),
+            metadata: None,
+        };
+
+        // The mock response/item repositories panic on create, so this also
+        // proves no response or response item is created on the foreign path.
+        let result = service
+            .create_conversation_items(
+                conversation_id,
+                foreign_workspace,
+                Uuid::new_v4(),
+                vec![item],
+            )
+            .await;
+
+        assert!(
+            matches!(result, Err(errors::ConversationError::NotFound)),
+            "foreign-workspace item creation must return NotFound, got: {result:?}"
+        );
     }
 }

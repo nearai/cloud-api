@@ -1051,13 +1051,11 @@ async fn test_create_conversation_items_nonexistent_conversation() {
         }))
         .await;
 
-    assert_eq!(create_items_response.status_code(), 400);
+    // Unknown conversations return the same non-enumerating 404 as
+    // conversations owned by another workspace (see issue nearai/infra#190).
+    assert_eq!(create_items_response.status_code(), 404);
     let error_response = create_items_response.json::<api::models::ErrorResponse>();
-    assert!(
-        error_response.error.message.contains("not found")
-            || error_response.error.message.contains("Conversation"),
-        "Error message should indicate conversation not found"
-    );
+    assert_eq!(error_response.error.message, "Conversation not found");
 
     println!("✅ Non-existent conversation validation test passed");
 }

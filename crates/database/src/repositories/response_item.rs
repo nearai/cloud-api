@@ -27,8 +27,9 @@
 //! };
 //! repo.create(response_id, user_id, Some(conversation_id), item).await?;
 //!
-//! // Get all items for a conversation (useful for context building)
-//! let items = repo.list_by_conversation(conversation_id).await?;
+//! // Get all items for a conversation (useful for context building).
+//! // Queries are always constrained to the owning workspace.
+//! let items = repo.list_by_conversation(conversation_id, workspace_id, None, 100).await?;
 //!
 //! // Get all items for a specific response
 //! let items = repo.list_by_response(response_id).await?;
@@ -302,8 +303,15 @@ impl ResponseItemRepositoryTrait for PgResponseItemsRepository {
         self.row_to_item(row)
     }
 
-    /// Get a response item by its ID
-    async fn get_by_id(&self, id: ResponseItemId) -> Result<Option<ResponseOutputItem>> {
+    /// Get a response item by its ID, constrained to the owning workspace.
+    ///
+    /// The workspace constraint goes through the owning response so a caller
+    /// can never read another workspace's item, even with a known item ID.
+    async fn get_by_id(
+        &self,
+        id: ResponseItemId,
+        workspace_id: services::workspace::WorkspaceId,
+    ) -> Result<Option<ResponseOutputItem>> {
         let row = retry_db!("get_response_item_by_id", {
             let client = self
                 .pool
@@ -313,7 +321,21 @@ impl ResponseItemRepositoryTrait for PgResponseItemsRepository {
                 .map_err(RepositoryError::PoolError)?;
 
             client
-                .query_opt("SELECT * FROM response_items WHERE id = $1", &[&id.0])
+                .query_opt(
+                    r#"
+                    SELECT
+                        ri.*,
+                        r.previous_response_id,
+                        r.next_response_ids,
+                        r.created_at as response_created_at,
+                        r.model
+                    FROM response_items ri
+                    JOIN responses r ON ri.response_id = r.id
+                    WHERE ri.id = $1
+                      AND r.workspace_id = $2
+                    "#,
+                    &[&id.0, &workspace_id.0],
+                )
                 .await
                 .map_err(map_db_error)
         })?;
@@ -457,14 +479,62 @@ impl ResponseItemRepositoryTrait for PgResponseItemsRepository {
 
     /// List all items for a specific conversation (useful for building context)
     /// Supports cursor-based pagination using the `after` parameter
+    ///
+    /// Every query is constrained to the owning workspace through the joined
+    /// response row (defense in depth on top of the service-level ownership
+    /// check), and an `after` cursor is only accepted when it references an
+    /// item of this exact conversation and workspace.
     async fn list_by_conversation(
         &self,
         conversation_id: ConversationId,
+        workspace_id: services::workspace::WorkspaceId,
         after: Option<String>,
         limit: i64,
     ) -> Result<Vec<ResponseOutputItem>> {
         // Extract UUID from the after item ID if provided
         let after_uuid = after.as_ref().map(|id| Self::extract_uuid_from_item_id(id));
+
+        // Validate the pagination cursor before using it: it must reference an
+        // item that belongs to this conversation and this workspace. Unknown
+        // and foreign cursors are rejected identically so they cannot be used
+        // to probe other conversations or workspaces.
+        let after_position = if let Some(after_uuid) = after_uuid {
+            let cursor_row = retry_db!("validate_conversation_item_cursor", {
+                let client = self
+                    .pool
+                    .get()
+                    .await
+                    .context("Failed to get database connection")
+                    .map_err(RepositoryError::PoolError)?;
+
+                client
+                    .query_opt(
+                        r#"
+                        SELECT ri.created_at, ri.id
+                        FROM response_items ri
+                        JOIN responses r ON ri.response_id = r.id
+                        WHERE ri.id = $1
+                          AND ri.conversation_id = $2
+                          AND r.workspace_id = $3
+                        "#,
+                        &[&after_uuid, &conversation_id.0, &workspace_id.0],
+                    )
+                    .await
+                    .map_err(map_db_error)
+            })?;
+
+            let Some(cursor_row) = cursor_row else {
+                return Err(anyhow::Error::new(RepositoryError::NotFound(
+                    "pagination cursor".to_string(),
+                )));
+            };
+
+            let cursor_created_at: chrono::DateTime<Utc> = cursor_row.try_get("created_at")?;
+            let cursor_id: Uuid = cursor_row.try_get("id")?;
+            Some((cursor_created_at, cursor_id))
+        } else {
+            None
+        };
 
         let rows = retry_db!("list_response_items_by_conversation", {
             let client = self
@@ -474,7 +544,7 @@ impl ResponseItemRepositoryTrait for PgResponseItemsRepository {
                 .context("Failed to get database connection")
                 .map_err(RepositoryError::PoolError)?;
 
-            if let Some(after_uuid) = after_uuid {
+            if let Some((cursor_created_at, cursor_id)) = after_position {
                 // Query items after the reference item using composite (created_at, id) comparison
                 // This handles cases where multiple items have the same created_at timestamp
                 // We fetch limit + 1 to determine if there are more items
@@ -490,13 +560,18 @@ impl ResponseItemRepositoryTrait for PgResponseItemsRepository {
                         FROM response_items ri
                         JOIN responses r ON ri.response_id = r.id
                         WHERE ri.conversation_id = $1
-                          AND (ri.created_at, ri.id) > (
-                              SELECT created_at, id FROM response_items WHERE id = $2
-                          )
+                          AND r.workspace_id = $2
+                          AND (ri.created_at, ri.id) > ($3, $4)
                         ORDER BY ri.created_at ASC, ri.id ASC
-                        LIMIT $3
+                        LIMIT $5
                         "#,
-                        &[&conversation_id.0, &after_uuid, &limit],
+                        &[
+                            &conversation_id.0,
+                            &workspace_id.0,
+                            &cursor_created_at,
+                            &cursor_id,
+                            &limit,
+                        ],
                     )
                     .await
                     .map_err(map_db_error)
@@ -514,10 +589,11 @@ impl ResponseItemRepositoryTrait for PgResponseItemsRepository {
                         FROM response_items ri
                         JOIN responses r ON ri.response_id = r.id
                         WHERE ri.conversation_id = $1
+                          AND r.workspace_id = $2
                         ORDER BY ri.created_at ASC, ri.id ASC
-                        LIMIT $2
+                        LIMIT $3
                         "#,
-                        &[&conversation_id.0, &limit],
+                        &[&conversation_id.0, &workspace_id.0, &limit],
                     )
                     .await
                     .map_err(map_db_error)

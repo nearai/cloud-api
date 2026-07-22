@@ -47,14 +47,26 @@ impl AuthServiceTrait for AuthService {
             return Err(AuthError::UserAgentTooLong(MAX_USER_AGENT_LEN));
         }
 
-        let access_token =
-            self.create_session_access_token(user_id.clone(), encoding_key, expires_in_hours)?;
-
+        // Create the refresh-token session first so the access token can be
+        // bound to it via the `sid` claim: revoking the session on logout then
+        // invalidates both credentials at once.
         let (refresh_session, refresh_token) = self
             .session_repository
-            .create(user_id, ip_address, user_agent, refresh_expires_in_hours)
+            .create(
+                user_id.clone(),
+                ip_address,
+                user_agent,
+                refresh_expires_in_hours,
+            )
             .await
             .map_err(|e| AuthError::InternalError(format!("Failed to create session: {e}")))?;
+
+        let access_token = self.create_session_access_token(
+            user_id,
+            Some(refresh_session.id.clone()),
+            encoding_key,
+            expires_in_hours,
+        )?;
 
         Ok((access_token, refresh_session, refresh_token))
     }
@@ -62,6 +74,7 @@ impl AuthServiceTrait for AuthService {
     fn create_session_access_token(
         &self,
         user_id: UserId,
+        session_id: Option<SessionId>,
         encoding_key: String,
         expires_in_hours: i64,
     ) -> Result<String, AuthError> {
@@ -71,6 +84,7 @@ impl AuthServiceTrait for AuthService {
             sub: user_id,
             exp: expiration.timestamp(),
             iat: chrono::Utc::now().timestamp(),
+            sid: session_id,
         };
 
         jsonwebtoken::encode(
@@ -114,7 +128,7 @@ impl AuthServiceTrait for AuthService {
         // Get the user
         let user = self
             .user_repository
-            .get_by_id(claims.sub)
+            .get_by_id(claims.sub.clone())
             .await
             .map_err(|e| AuthError::InternalError(format!("Failed to get user: {e}")))?
             .ok_or(AuthError::UserNotFound)?;
@@ -130,6 +144,37 @@ impl AuthServiceTrait for AuthService {
                     token_issued_at, revoked_at
                 );
                 return Err(AuthError::SessionNotFound);
+            }
+        }
+
+        // Bind the access token to its originating refresh-token session: a
+        // revoked (logged-out) or expired session invalidates the token
+        // immediately. This is a single primary-key lookup per request; it is
+        // deliberately uncached because any cache TTL would re-open the exact
+        // revocation window this check closes.
+        match claims.sid {
+            Some(session_id) => {
+                let session = self
+                    .session_repository
+                    .get_by_id(session_id)
+                    .await
+                    .map_err(|e| AuthError::InternalError(format!("Failed to get session: {e}")))?
+                    .ok_or(AuthError::SessionNotFound)?;
+
+                if session.user_id != claims.sub || session.expires_at < Utc::now() {
+                    debug!("Access token session is expired or bound to another user");
+                    return Err(AuthError::SessionNotFound);
+                }
+            }
+            None => {
+                // Legacy access token issued before session binding. During
+                // the compatibility window (flag off) these keep validating
+                // and age out naturally; once the flag is on, any token that
+                // cannot be tied to a live session is rejected.
+                if self.require_session_bound_access_tokens {
+                    debug!("Rejecting legacy access token without sid claim");
+                    return Err(AuthError::SessionNotFound);
+                }
             }
         }
 
@@ -206,14 +251,9 @@ impl AuthServiceTrait for AuthService {
         access_token_expires_in_hours: i64,
         refresh_token_expires_in_hours: i64,
     ) -> Result<(String, Session, String), AuthError> {
-        // Create a new access token
-        let access_token = self.create_session_access_token(
-            user_id.clone(),
-            encoding_key,
-            access_token_expires_in_hours,
-        )?;
-
-        // Rotate the refresh token
+        // Rotate the refresh token first; only mint an access token for a
+        // session that is confirmed live. Rotation keeps the session id, so
+        // the new access token stays bound to the same session.
         let (rotated_session, new_refresh_token) = self
             .session_repository
             .rotate(session_id, old_token_hash, refresh_token_expires_in_hours)
@@ -227,6 +267,14 @@ impl AuthServiceTrait for AuthService {
                     AuthError::InternalError(format!("Failed to rotate session: {e}"))
                 }
             })?;
+
+        // Create a new access token bound to the rotated session
+        let access_token = self.create_session_access_token(
+            user_id,
+            Some(rotated_session.id.clone()),
+            encoding_key,
+            access_token_expires_in_hours,
+        )?;
 
         Ok((access_token, rotated_session, new_refresh_token))
     }
@@ -428,6 +476,7 @@ impl AuthService {
         organization_repository: Arc<dyn OrganizationRepository>,
         workspace_repository: Arc<dyn WorkspaceRepository>,
         organization_service: Arc<dyn crate::organization::OrganizationServiceTrait>,
+        require_session_bound_access_tokens: bool,
     ) -> Self {
         let api_key_cache: ApiKeyCache = Cache::builder()
             .max_capacity(API_KEY_CACHE_MAX_CAPACITY)
@@ -455,6 +504,7 @@ impl AuthService {
             api_key_cache,
             api_key_bloom_filter,
             bloom_filter_ready,
+            require_session_bound_access_tokens,
         }
     }
 
@@ -636,8 +686,9 @@ mod tests {
         ) -> anyhow::Result<User> {
             unimplemented!()
         }
-        async fn get_by_id(&self, _: UserId) -> anyhow::Result<Option<User>> {
-            unimplemented!()
+        async fn get_by_id(&self, id: UserId) -> anyhow::Result<Option<User>> {
+            let user = self.user.lock().unwrap();
+            Ok(user.as_ref().filter(|u| u.id == id).cloned())
         }
         async fn get_by_email(&self, _: &str) -> anyhow::Result<Option<User>> {
             unimplemented!()
@@ -711,6 +762,87 @@ mod tests {
         }
         async fn revoke(&self, _: SessionId) -> anyhow::Result<bool> {
             unimplemented!()
+        }
+        async fn revoke_all_for_user(&self, _: UserId) -> anyhow::Result<usize> {
+            unimplemented!()
+        }
+        async fn cleanup_expired(&self) -> anyhow::Result<usize> {
+            unimplemented!()
+        }
+    }
+
+    /// In-memory session repository for exercising session binding/revocation.
+    struct InMemorySessionRepo {
+        sessions: Mutex<std::collections::HashMap<Uuid, Session>>,
+    }
+
+    impl InMemorySessionRepo {
+        fn new() -> Self {
+            Self {
+                sessions: Mutex::new(std::collections::HashMap::new()),
+            }
+        }
+
+        fn insert_session(&self, user_id: UserId, expires_at: chrono::DateTime<Utc>) -> Session {
+            let session = Session {
+                id: SessionId(Uuid::new_v4()),
+                user_id,
+                token_hash: "test_token_hash".to_string(),
+                created_at: Utc::now(),
+                expires_at,
+                ip_address: None,
+                user_agent: "Test Agent".to_string(),
+            };
+            self.sessions
+                .lock()
+                .unwrap()
+                .insert(session.id.0, session.clone());
+            session
+        }
+
+        fn contains(&self, session_id: &SessionId) -> bool {
+            self.sessions.lock().unwrap().contains_key(&session_id.0)
+        }
+    }
+
+    #[async_trait]
+    impl SessionRepository for InMemorySessionRepo {
+        async fn create(
+            &self,
+            user_id: UserId,
+            _: Option<String>,
+            _: String,
+            expires_in_hours: i64,
+        ) -> anyhow::Result<(Session, String)> {
+            let session = self.insert_session(
+                user_id,
+                Utc::now() + chrono::Duration::hours(expires_in_hours),
+            );
+            let token = format!("rt_{}", session.id.0.simple());
+            Ok((session, token))
+        }
+        async fn validate(&self, _: SessionToken, _: &str) -> anyhow::Result<Option<Session>> {
+            unimplemented!()
+        }
+        async fn get_by_id(&self, session_id: SessionId) -> anyhow::Result<Option<Session>> {
+            Ok(self.sessions.lock().unwrap().get(&session_id.0).cloned())
+        }
+        async fn list_by_user(&self, _: UserId) -> anyhow::Result<Vec<Session>> {
+            unimplemented!()
+        }
+        async fn extend(&self, _: SessionId, _: i64) -> anyhow::Result<bool> {
+            unimplemented!()
+        }
+        async fn rotate(&self, _: SessionId, _: &str, _: i64) -> anyhow::Result<(Session, String)> {
+            unimplemented!()
+        }
+        async fn revoke(&self, session_id: SessionId) -> anyhow::Result<bool> {
+            Ok(self
+                .sessions
+                .lock()
+                .unwrap()
+                .remove(&session_id.0)
+                .is_some())
         }
         async fn revoke_all_for_user(&self, _: UserId) -> anyhow::Result<usize> {
             unimplemented!()
@@ -1180,10 +1312,18 @@ mod tests {
     }
 
     fn build_auth_service(user_repo: Arc<MockUserRepo>) -> AuthService {
+        build_auth_service_with_sessions(user_repo, Arc::new(StubSessionRepo), false)
+    }
+
+    fn build_auth_service_with_sessions(
+        user_repo: Arc<MockUserRepo>,
+        session_repo: Arc<dyn SessionRepository>,
+        require_session_bound_access_tokens: bool,
+    ) -> AuthService {
         let bloom = Bloom::new_for_fp_rate(100, 0.01).expect("bloom filter creation failed");
         AuthService {
             user_repository: user_repo,
-            session_repository: Arc::new(StubSessionRepo),
+            session_repository: session_repo,
             api_key_repository: Arc::new(StubApiKeyRepo),
             organization_repository: Arc::new(StubOrgRepo),
             workspace_repository: Arc::new(StubWorkspaceRepo),
@@ -1191,6 +1331,7 @@ mod tests {
             api_key_cache: moka::future::Cache::builder().build(),
             api_key_bloom_filter: Arc::new(RwLock::new(bloom)),
             bloom_filter_ready: Arc::new(AtomicBool::new(false)),
+            require_session_bound_access_tokens,
         }
     }
 
@@ -1241,5 +1382,205 @@ mod tests {
             *repo.email_updated.lock().unwrap(),
             Some("new@example.com".to_string())
         );
+    }
+
+    const TEST_ENCODING_KEY: &str = "test_encoding_key";
+
+    #[tokio::test]
+    async fn test_create_session_binds_access_token_to_session() {
+        let user = make_user("alice@example.com", "google");
+        let user_repo = Arc::new(MockUserRepo::with_user(user.clone()));
+        let session_repo = Arc::new(InMemorySessionRepo::new());
+        let service = build_auth_service_with_sessions(user_repo, session_repo.clone(), false);
+
+        let (access_token, session, refresh_token) = service
+            .create_session(
+                user.id.clone(),
+                None,
+                "Test Agent".to_string(),
+                TEST_ENCODING_KEY.to_string(),
+                1,
+                24,
+            )
+            .await
+            .unwrap();
+        assert!(refresh_token.starts_with("rt_"));
+
+        // The access token carries the sid claim of the session it was minted from.
+        let claims = service
+            .validate_session_access_token(access_token.clone(), TEST_ENCODING_KEY.to_string())
+            .unwrap()
+            .unwrap();
+        assert_eq!(claims.sid.as_ref().map(|s| s.0), Some(session.id.0));
+
+        // And it validates while the session is live.
+        let validated = service
+            .validate_session_access(access_token, TEST_ENCODING_KEY.to_string())
+            .await
+            .unwrap();
+        assert_eq!(validated.id, user.id);
+    }
+
+    #[tokio::test]
+    async fn test_logout_revokes_session_and_invalidates_access_token() {
+        let user = make_user("alice@example.com", "google");
+        let user_repo = Arc::new(MockUserRepo::with_user(user.clone()));
+        let session_repo = Arc::new(InMemorySessionRepo::new());
+        let service = build_auth_service_with_sessions(user_repo, session_repo.clone(), false);
+
+        let (access_token, session, _refresh_token) = service
+            .create_session(
+                user.id.clone(),
+                None,
+                "Test Agent".to_string(),
+                TEST_ENCODING_KEY.to_string(),
+                1,
+                24,
+            )
+            .await
+            .unwrap();
+
+        assert!(service.logout(session.id.clone()).await.unwrap());
+        assert!(!session_repo.contains(&session.id));
+
+        // The still-unexpired access token is rejected once its session is gone.
+        let result = service
+            .validate_session_access(access_token, TEST_ENCODING_KEY.to_string())
+            .await;
+        assert!(matches!(result, Err(AuthError::SessionNotFound)));
+
+        // Repeated logout is safe: reports nothing revoked, restores nothing.
+        assert!(!service.logout(session.id.clone()).await.unwrap());
+        assert!(!session_repo.contains(&session.id));
+    }
+
+    #[tokio::test]
+    async fn test_logout_revokes_only_target_session() {
+        let user = make_user("alice@example.com", "google");
+        let user_repo = Arc::new(MockUserRepo::with_user(user.clone()));
+        let session_repo = Arc::new(InMemorySessionRepo::new());
+        let service = build_auth_service_with_sessions(user_repo, session_repo.clone(), false);
+
+        let (token_a, session_a, _) = service
+            .create_session(
+                user.id.clone(),
+                None,
+                "Test Agent".to_string(),
+                TEST_ENCODING_KEY.to_string(),
+                1,
+                24,
+            )
+            .await
+            .unwrap();
+        let (token_b, session_b, _) = service
+            .create_session(
+                user.id.clone(),
+                None,
+                "Test Agent".to_string(),
+                TEST_ENCODING_KEY.to_string(),
+                1,
+                24,
+            )
+            .await
+            .unwrap();
+
+        assert!(service.logout(session_a.id.clone()).await.unwrap());
+
+        // Session A's access token dies immediately; session B is untouched.
+        assert!(matches!(
+            service
+                .validate_session_access(token_a, TEST_ENCODING_KEY.to_string())
+                .await,
+            Err(AuthError::SessionNotFound)
+        ));
+        assert!(session_repo.contains(&session_b.id));
+        assert!(service
+            .validate_session_access(token_b, TEST_ENCODING_KEY.to_string())
+            .await
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_access_token_rejected_when_session_expired() {
+        let user = make_user("alice@example.com", "google");
+        let user_repo = Arc::new(MockUserRepo::with_user(user.clone()));
+        let session_repo = Arc::new(InMemorySessionRepo::new());
+        let service = build_auth_service_with_sessions(user_repo, session_repo.clone(), false);
+
+        // Session row exists but is already expired.
+        let expired_session =
+            session_repo.insert_session(user.id.clone(), Utc::now() - chrono::Duration::hours(1));
+        let access_token = service
+            .create_session_access_token(
+                user.id.clone(),
+                Some(expired_session.id),
+                TEST_ENCODING_KEY.to_string(),
+                1,
+            )
+            .unwrap();
+
+        let result = service
+            .validate_session_access(access_token, TEST_ENCODING_KEY.to_string())
+            .await;
+        assert!(matches!(result, Err(AuthError::SessionNotFound)));
+    }
+
+    #[tokio::test]
+    async fn test_legacy_access_token_without_sid_follows_compat_flag() {
+        let user = make_user("alice@example.com", "google");
+
+        // Flag off (default): legacy tokens keep validating during the cutover window.
+        let service = build_auth_service_with_sessions(
+            Arc::new(MockUserRepo::with_user(user.clone())),
+            Arc::new(InMemorySessionRepo::new()),
+            false,
+        );
+        let legacy_token = service
+            .create_session_access_token(user.id.clone(), None, TEST_ENCODING_KEY.to_string(), 1)
+            .unwrap();
+        assert!(service
+            .validate_session_access(legacy_token.clone(), TEST_ENCODING_KEY.to_string())
+            .await
+            .is_ok());
+
+        // Flag on: tokens that cannot be tied to a live session are rejected.
+        let strict_service = build_auth_service_with_sessions(
+            Arc::new(MockUserRepo::with_user(user.clone())),
+            Arc::new(InMemorySessionRepo::new()),
+            true,
+        );
+        assert!(matches!(
+            strict_service
+                .validate_session_access(legacy_token, TEST_ENCODING_KEY.to_string())
+                .await,
+            Err(AuthError::SessionNotFound)
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_access_token_rejected_when_sid_belongs_to_other_user() {
+        let user = make_user("alice@example.com", "google");
+        let user_repo = Arc::new(MockUserRepo::with_user(user.clone()));
+        let session_repo = Arc::new(InMemorySessionRepo::new());
+        let service = build_auth_service_with_sessions(user_repo, session_repo.clone(), false);
+
+        // Session belongs to a different user than the token subject.
+        let other_session = session_repo.insert_session(
+            UserId(Uuid::new_v4()),
+            Utc::now() + chrono::Duration::hours(24),
+        );
+        let access_token = service
+            .create_session_access_token(
+                user.id.clone(),
+                Some(other_session.id),
+                TEST_ENCODING_KEY.to_string(),
+                1,
+            )
+            .unwrap();
+
+        let result = service
+            .validate_session_access(access_token, TEST_ENCODING_KEY.to_string())
+            .await;
+        assert!(matches!(result, Err(AuthError::SessionNotFound)));
     }
 }

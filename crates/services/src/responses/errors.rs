@@ -13,6 +13,18 @@ pub enum ResponseError {
     #[error("Stream interrupted")]
     StreamInterrupted,
 
+    /// The referenced conversation does not exist in the caller's workspace.
+    /// Unknown and foreign conversation IDs are deliberately indistinguishable
+    /// (non-enumerating 404).
+    #[error("Conversation not found")]
+    ConversationNotFound,
+
+    /// The referenced previous response does not exist in the caller's
+    /// workspace. Unknown and foreign response IDs are deliberately
+    /// indistinguishable (non-enumerating 404).
+    #[error("Previous response not found")]
+    PreviousResponseNotFound,
+
     // ============================================
     // MCP (Model Context Protocol) Errors
     // ============================================
@@ -70,7 +82,9 @@ impl ResponseError {
             | ResponseError::McpApprovalRequired { .. }
             | ResponseError::FunctionCallRequired { .. } => 400,
             ResponseError::McpApprovalRequestNotFound(_)
-            | ResponseError::FunctionCallNotFound(_) => 404,
+            | ResponseError::FunctionCallNotFound(_)
+            | ResponseError::ConversationNotFound
+            | ResponseError::PreviousResponseNotFound => 404,
             ResponseError::McpConnectionFailed(_)
             | ResponseError::McpToolDiscoveryFailed(_)
             | ResponseError::McpToolExecutionFailed(_) => 502,
@@ -99,7 +113,9 @@ impl ResponseError {
             | ResponseError::McpApprovalRequired { .. }
             | ResponseError::McpApprovalRequestNotFound(_)
             | ResponseError::FunctionCallRequired { .. }
-            | ResponseError::FunctionCallNotFound(_) => true,
+            | ResponseError::FunctionCallNotFound(_)
+            | ResponseError::ConversationNotFound
+            | ResponseError::PreviousResponseNotFound => true,
             ResponseError::Completion(error) => matches!(
                 error,
                 crate::completions::CompletionError::InvalidModel(_)
@@ -135,6 +151,12 @@ impl ResponseError {
             ),
             ResponseError::StreamInterrupted => {
                 response_error("Stream interrupted", "stream_error", None)
+            }
+            ResponseError::ConversationNotFound => {
+                response_error("Conversation not found", "not_found", None)
+            }
+            ResponseError::PreviousResponseNotFound => {
+                response_error("Previous response not found", "not_found", None)
             }
             ResponseError::McpConnectionFailed(msg) => {
                 response_error(&format!("MCP connection failed: {msg}"), "mcp_error", None)

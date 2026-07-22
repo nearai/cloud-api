@@ -86,6 +86,7 @@ pub fn test_config() -> ApiConfig {
             google: None,
             near: config::NearConfig::default(),
             admin_domains: vec!["test.com".to_string()],
+            require_session_bound_access_tokens: false,
         },
         database: config::DatabaseConfig {
             primary_app_id: "postgres-test".to_string(),

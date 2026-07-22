@@ -536,6 +536,18 @@ pub struct AuthConfig {
     /// Email domains that are granted platform admin access
     /// Users with emails from these domains will have admin privileges
     pub admin_domains: Vec<String>,
+    /// Reject session access tokens that carry no `sid` (session id) claim.
+    ///
+    /// Access tokens minted since session binding was introduced are tied to
+    /// their refresh-token session and die with it on logout. Tokens issued
+    /// before that carry no `sid` and cannot be tied to a live session.
+    ///
+    /// Default `false`: legacy tokens keep validating during the cutover
+    /// window (they age out naturally — access tokens live at most a few
+    /// hours). Set `AUTH_REQUIRE_SESSION_BOUND_ACCESS_TOKENS=true` once all
+    /// outstanding legacy tokens have expired to reject any token that cannot
+    /// be tied to a live session.
+    pub require_session_bound_access_tokens: bool,
 }
 
 impl AuthConfig {
@@ -593,6 +605,10 @@ impl AuthConfig {
             google,
             near,
             admin_domains,
+            require_session_bound_access_tokens: parse_bool_env(
+                "AUTH_REQUIRE_SESSION_BOUND_ACCESS_TOKENS",
+                false,
+            )?,
         })
     }
 
@@ -874,6 +890,7 @@ mod tests {
             google: None,
             near: NearConfig::default(),
             admin_domains: vec!["near.ai".to_string(), "near.org".to_string()],
+            require_session_bound_access_tokens: false,
         };
 
         // Test admin domains
@@ -897,6 +914,7 @@ mod tests {
             google: None,
             near: NearConfig::default(),
             admin_domains: vec![],
+            require_session_bound_access_tokens: false,
         };
 
         // Should return false when no admin domains configured

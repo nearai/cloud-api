@@ -26,6 +26,44 @@ pub fn openai_compat_routes() -> Router {
         .route("/models/{*model_id}", any(openai_endpoint_not_implemented))
 }
 
+/// Global router fallback for requests that match no route.
+///
+/// Returns a stable generic OpenAI-style error envelope instead of Axum's
+/// default empty-body 404, so unmapped paths never surface framework or
+/// infrastructure detail (nearai/infra#192). The body is intentionally
+/// static: no method/path echo, no version, no implementation hints.
+pub async fn unknown_route() -> (
+    StatusCode,
+    [(&'static str, &'static str); 1],
+    Json<ErrorResponse>,
+) {
+    (
+        StatusCode::NOT_FOUND,
+        [(HEADER_SHOULD_RETRY, SHOULD_RETRY_FALSE)],
+        Json(ErrorResponse::new(
+            "Not found".to_string(),
+            "invalid_request_error".to_string(),
+        )),
+    )
+}
+
+/// Fallback for requests that match a route path but not the HTTP method:
+/// the same stable generic envelope as [`unknown_route`], with 405.
+pub async fn method_not_allowed() -> (
+    StatusCode,
+    [(&'static str, &'static str); 1],
+    Json<ErrorResponse>,
+) {
+    (
+        StatusCode::METHOD_NOT_ALLOWED,
+        [(HEADER_SHOULD_RETRY, SHOULD_RETRY_FALSE)],
+        Json(ErrorResponse::new(
+            "Method not allowed".to_string(),
+            "invalid_request_error".to_string(),
+        )),
+    )
+}
+
 pub async fn openai_endpoint_not_implemented(
     method: Method,
     OriginalUri(uri): OriginalUri,
@@ -125,6 +163,101 @@ mod tests {
                 "message should mention {method} {path}, got {message:?}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn unknown_route_fallback_returns_generic_json_envelope() {
+        async fn ok() -> &'static str {
+            "ok"
+        }
+
+        for (method, path) in [
+            (Method::GET, "/nonexistent"),
+            (Method::GET, "/test.html"),
+            (Method::POST, "/v1/nonexistent"),
+            (Method::DELETE, "/.env"),
+        ] {
+            let app: Router = Router::new()
+                .route("/v1/health", get(ok))
+                .fallback(unknown_route);
+            let response = app
+                .oneshot(
+                    HttpRequest::builder()
+                        .method(method.clone())
+                        .uri(path)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{method} {path}");
+            assert_eq!(
+                response
+                    .headers()
+                    .get(CONTENT_TYPE)
+                    .map(|value| value.to_str().unwrap()),
+                Some("application/json"),
+                "{method} {path}"
+            );
+            assert_eq!(
+                response
+                    .headers()
+                    .get(HEADER_SHOULD_RETRY)
+                    .map(|value| value.to_str().unwrap()),
+                Some(SHOULD_RETRY_FALSE),
+                "{method} {path}"
+            );
+
+            let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+            // The body must stay static and generic: no path echo, no
+            // implementation detail.
+            assert_eq!(body["error"]["message"], "Not found", "{method} {path}");
+            assert_eq!(
+                body["error"]["type"], "invalid_request_error",
+                "{method} {path}"
+            );
+            assert_eq!(body["error"]["param"], serde_json::Value::Null);
+            assert_eq!(body["error"]["code"], serde_json::Value::Null);
+        }
+    }
+
+    #[tokio::test]
+    async fn method_not_allowed_fallback_returns_generic_json_envelope() {
+        async fn ok() -> &'static str {
+            "ok"
+        }
+
+        let app: Router = Router::new()
+            .route("/only-get", get(ok))
+            .fallback(unknown_route)
+            .method_not_allowed_fallback(method_not_allowed);
+        let response = app
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::POST)
+                    .uri("/only-get")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+        assert_eq!(
+            response
+                .headers()
+                .get(CONTENT_TYPE)
+                .map(|value| value.to_str().unwrap()),
+            Some("application/json")
+        );
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"]["message"], "Method not allowed");
+        assert_eq!(body["error"]["type"], "invalid_request_error");
     }
 
     #[test]

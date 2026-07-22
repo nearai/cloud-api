@@ -18,6 +18,7 @@ mod admin_provider_attribution_support;
 mod admin_schema_compatibility;
 mod admin_services;
 mod api_keys;
+mod attestation_auth;
 mod audio_image;
 mod audio_transcriptions;
 mod auth_tokens;

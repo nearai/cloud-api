@@ -17,7 +17,12 @@ use services::attestation::ita::{
 /// Get Intel Trust Authority attestation token
 ///
 /// Get Intel Trust Authority signed attestation JWTs for the gateway and, when
-/// requested, compatible model provider evidence. Public endpoint.
+/// requested, compatible model provider evidence. Public endpoint — this is an
+/// explicit, documented decision (nearai/infra#193): the response carries only
+/// ITA-signed TEE evidence (no customer or key-scoped data), public access lets
+/// third parties verify the platform without an account, and upstream ITA rate
+/// limits bound abuse (propagated as 429). See
+/// `build_public_attestation_routes` in `routes/attestation.rs`.
 #[utoipa::path(
     get,
     path = "/v1/attestation/ita-token",

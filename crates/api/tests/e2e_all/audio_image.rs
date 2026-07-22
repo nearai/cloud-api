@@ -988,9 +988,11 @@ async fn test_has_audio_content_detection() {
 /// Mock ECDSA public key for testing
 const MOCK_ECDSA_PUB_KEY: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
-/// Helper function to fetch the model public key from the attestation report endpoint
+/// Helper function to fetch the model public key from the attestation report endpoint.
+/// The endpoint requires an API key (nearai/infra#193).
 async fn get_model_public_key(
     server: &axum_test::TestServer,
+    api_key: &str,
     model: &str,
     signing_algo: Option<&str>,
 ) -> Option<String> {
@@ -1002,7 +1004,10 @@ async fn get_model_public_key(
         url.push_str(&format!("&signing_algo={}", encoded_algo));
     }
 
-    let response = server.get(&url).await;
+    let response = server
+        .get(&url)
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .await;
 
     if response.status_code() != 200 {
         return None;
@@ -1050,7 +1055,7 @@ async fn test_audio_output_with_encryption_headers() {
     let model = "Qwen/Qwen3-Omni-30B-A3B-Instruct";
 
     // Get the model public key from attestation endpoint
-    let model_pub_key = get_model_public_key(&server, model, Some("ecdsa"))
+    let model_pub_key = get_model_public_key(&server, &api_key, model, Some("ecdsa"))
         .await
         .unwrap_or_else(|| MOCK_ECDSA_PUB_KEY.to_string());
 
@@ -1127,11 +1132,14 @@ async fn test_audio_output_attestation_report() {
 
     let model = "Qwen/Qwen3-Omni-30B-A3B-Instruct";
 
-    // Test attestation report endpoint for the audio model
+    // Test attestation report endpoint for the audio model (requires API key)
     let encoded_model = url::form_urlencoded::byte_serialize(model.as_bytes()).collect::<String>();
     let url = format!("/v1/attestation/report?model={}", encoded_model);
 
-    let response = server.get(&url).await;
+    let response = server
+        .get(&url)
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .await;
     println!(
         "Attestation report response status: {}",
         response.status_code()

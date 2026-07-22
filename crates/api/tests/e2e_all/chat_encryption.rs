@@ -15,9 +15,11 @@ use inference_providers::StreamChunk;
 // These tests use the deepseek-ai/DeepSeek-V3.1 model which has encryption support enabled.
 // The tests run in CI and require a running vllm-proxy instance with encryption support.
 
-/// Helper function to fetch the model public key from the attestation report endpoint
+/// Helper function to fetch the model public key from the attestation report endpoint.
+/// The endpoint requires an API key (nearai/infra#193).
 async fn get_model_public_key(
     server: &TestServer,
+    api_key: &str,
     model: &str,
     signing_algo: Option<&str>,
 ) -> Option<String> {
@@ -29,7 +31,10 @@ async fn get_model_public_key(
         url.push_str(&format!("&signing_algo={}", encoded_algo));
     }
 
-    let response = server.get(&url).await;
+    let response = server
+        .get(&url)
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .await;
 
     if response.status_code() != 200 {
         return None;
@@ -86,12 +91,13 @@ impl EncryptionTestHarness {
         let api_key = get_api_key_for_org(&server, org.id).await;
 
         let model = TEST_MODEL.to_string();
-        let model_pub_key_ecdsa = get_model_public_key(&server, &model, Some("ecdsa"))
+        let model_pub_key_ecdsa = get_model_public_key(&server, &api_key, &model, Some("ecdsa"))
             .await
             .expect("Failed to fetch ECDSA model public key from attestation report");
-        let model_pub_key_ed25519 = get_model_public_key(&server, &model, Some("ed25519"))
-            .await
-            .expect("Failed to fetch Ed25519 model public key from attestation report");
+        let model_pub_key_ed25519 =
+            get_model_public_key(&server, &api_key, &model, Some("ed25519"))
+                .await
+                .expect("Failed to fetch Ed25519 model public key from attestation report");
 
         Self {
             server,
@@ -134,12 +140,13 @@ impl EncryptionTestHarnessWithPool {
         let api_key = get_api_key_for_org(&server, org.id).await;
 
         let model = TEST_MODEL.to_string();
-        let model_pub_key_ecdsa = get_model_public_key(&server, &model, Some("ecdsa"))
+        let model_pub_key_ecdsa = get_model_public_key(&server, &api_key, &model, Some("ecdsa"))
             .await
             .expect("Failed to fetch ECDSA model public key from attestation report");
-        let model_pub_key_ed25519 = get_model_public_key(&server, &model, Some("ed25519"))
-            .await
-            .expect("Failed to fetch Ed25519 model public key from attestation report");
+        let model_pub_key_ed25519 =
+            get_model_public_key(&server, &api_key, &model, Some("ed25519"))
+                .await
+                .expect("Failed to fetch Ed25519 model public key from attestation report");
 
         Self {
             server,

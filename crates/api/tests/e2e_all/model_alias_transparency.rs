@@ -504,10 +504,13 @@ async fn test_legacy_completions_alias_contract() {
 async fn test_attestation_report_announces_alias() {
     let server = setup_test_server().await;
     let alias = setup_deprecated_alias(&server).await;
+    let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
+    let api_key = get_api_key_for_org(&server, org.id).await;
 
     let encoded = url::form_urlencoded::byte_serialize(alias.as_bytes()).collect::<String>();
     let response = server
         .get(&format!("/v1/attestation/report?model={encoded}"))
+        .add_header("Authorization", format!("Bearer {api_key}"))
         .await;
     // The mock attestation path may or may not produce a full report, but
     // whenever the request is served the alias header must be present.
@@ -527,10 +530,13 @@ async fn test_attestation_report_announces_alias() {
 async fn test_attestation_report_no_aliasing_rejects() {
     let server = setup_test_server().await;
     let alias = setup_deprecated_alias(&server).await;
+    let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
+    let api_key = get_api_key_for_org(&server, org.id).await;
 
     let encoded = url::form_urlencoded::byte_serialize(alias.as_bytes()).collect::<String>();
     let response = server
         .get(&format!("/v1/attestation/report?model={encoded}"))
+        .add_header("Authorization", format!("Bearer {api_key}"))
         .add_header("x-no-aliasing", "true")
         .await;
     assert_eq!(

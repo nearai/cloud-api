@@ -201,6 +201,7 @@ pub fn init_auth_services(database: Arc<Database>, config: &ApiConfig) -> AuthCo
             organization_repo as Arc<dyn services::organization::ports::OrganizationRepository>,
             workspace_repository_for_auth,
             organization_service.clone(),
+            config.auth.require_session_bound_access_tokens,
         ))
     };
 
@@ -1476,7 +1477,17 @@ pub fn build_auth_routes(
                 auth_middleware,
             )),
         )
-        .route("/logout", post(logout))
+        // Logout authenticates with the refresh token (same middleware as
+        // token refresh) so the handler can revoke that exact server-side
+        // session, invalidating the refresh token and all access tokens
+        // bound to it.
+        .route(
+            "/logout",
+            post(logout).layer(from_fn_with_state(
+                auth_state_middleware.clone(),
+                crate::middleware::auth::refresh_middleware,
+            )),
+        )
         .merge(near_router)
         .with_state(auth_state)
 }
@@ -2535,6 +2546,7 @@ mod tests {
                 google: None,
                 near: config::NearConfig::default(),
                 admin_domains: vec![],
+                require_session_bound_access_tokens: false,
             },
             database: config::DatabaseConfig {
                 primary_app_id: "postgres-patroni-1".to_string(),
@@ -2642,6 +2654,7 @@ mod tests {
                 google: None,
                 near: config::NearConfig::default(),
                 admin_domains: vec![],
+                require_session_bound_access_tokens: false,
             },
             database: config::DatabaseConfig {
                 primary_app_id: "postgres-patroni-1".to_string(),

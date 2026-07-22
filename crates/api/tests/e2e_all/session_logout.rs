@@ -14,9 +14,6 @@ use std::sync::Arc;
 /// numbers, so any consistent value works.
 const TEST_UA: &str = "Mozilla/5.0 (X11; Linux x86_64) TestBrowser/1.0";
 
-/// Matches the encoding key in `test_config()`.
-const TEST_ENCODING_KEY: &str = "mock_encoding_key";
-
 async fn real_auth_server() -> (axum_test::TestServer, Arc<database::Database>) {
     setup_test_server_with_config_and_database(|c| c.auth.mock = false).await
 }
@@ -105,6 +102,21 @@ async fn session_row_exists(database: &Arc<database::Database>, session_id: uuid
         .is_some()
 }
 
+/// Delete a test user (sessions cascade) so repeated runs don't accumulate
+/// rows in the shared e2e database. Deletes by id, so it cannot interfere
+/// with users created by concurrently running tests.
+async fn cleanup_user(database: &Arc<database::Database>, user_id: uuid::Uuid) {
+    let client = database
+        .pool()
+        .get()
+        .await
+        .expect("Failed to get database connection");
+    client
+        .execute("DELETE FROM users WHERE id = $1", &[&user_id])
+        .await
+        .expect("Failed to clean up test user");
+}
+
 #[tokio::test]
 async fn test_logout_invalidates_access_and_refresh_tokens() {
     let (server, database) = real_auth_server().await;
@@ -145,6 +157,8 @@ async fn test_logout_invalidates_access_and_refresh_tokens() {
         !session_row_exists(&database, session_id).await,
         "refresh-token session row must be gone after logout"
     );
+
+    cleanup_user(&database, user_id).await;
 }
 
 #[tokio::test]
@@ -170,6 +184,8 @@ async fn test_logout_revokes_only_the_current_session() {
     assert!(session_row_exists(&database, session_b_id).await);
     let rotated_b = mint_tokens(&server, &tokens_b.refresh_token).await;
     assert_eq!(me_status(&server, &rotated_b.access_token).await, 200);
+
+    cleanup_user(&database, user_id).await;
 }
 
 #[tokio::test]
@@ -194,6 +210,8 @@ async fn test_repeated_logout_is_safe() {
         remaining.is_empty(),
         "repeated logout must not create or restore sessions"
     );
+
+    cleanup_user(&database, user_id).await;
 }
 
 #[tokio::test]
@@ -216,6 +234,8 @@ async fn test_fresh_login_after_logout_creates_independent_session() {
     assert_eq!(logout_status(&server, &new_tokens.refresh_token).await, 200);
     assert_eq!(me_status(&server, &new_tokens.access_token).await, 401);
     assert!(!session_row_exists(&database, new_session_id).await);
+
+    cleanup_user(&database, user_id).await;
 }
 
 #[tokio::test]
@@ -231,8 +251,10 @@ async fn test_legacy_access_token_without_sid_follows_compat_flag() {
             database.pool().clone(),
         )),
     };
+    // Sign with the same key the test servers use.
+    let encoding_key = test_config().auth.encoding_key;
     let legacy_token = minter
-        .create_session_access_token(UserId(user_id), None, TEST_ENCODING_KEY.to_string(), 1)
+        .create_session_access_token(UserId(user_id), None, encoding_key, 1)
         .expect("Failed to mint legacy token");
 
     // Default (compat window): legacy tokens still validate.
@@ -255,6 +277,9 @@ async fn test_legacy_access_token_without_sid_follows_compat_flag() {
         me_status(&strict_server, &strict_tokens.access_token).await,
         200
     );
+
+    cleanup_user(&database, user_id).await;
+    cleanup_user(&strict_database, strict_user_id).await;
 }
 
 #[tokio::test]

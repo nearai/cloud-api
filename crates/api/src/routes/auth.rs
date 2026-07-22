@@ -578,8 +578,8 @@ pub async fn logout(
             )
                 .into_response()
         }
-        Err(_) => {
-            error!("Failed to revoke session on logout");
+        Err(e) => {
+            error!(error = %e, user_id = %user.0.id, "Failed to revoke session on logout");
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({

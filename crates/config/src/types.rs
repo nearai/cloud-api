@@ -605,12 +605,10 @@ impl AuthConfig {
             google,
             near,
             admin_domains,
-            require_session_bound_access_tokens: env::var(
+            require_session_bound_access_tokens: parse_bool_env(
                 "AUTH_REQUIRE_SESSION_BOUND_ACCESS_TOKENS",
-            )
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(false),
+                false,
+            )?,
         })
     }
 

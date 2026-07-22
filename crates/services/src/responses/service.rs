@@ -942,6 +942,33 @@ impl ResponseServiceImpl {
         )
         .await?;
 
+        // Verify previous_response_id ownership before loading any history or
+        // creating the response. Unknown and foreign response IDs get the same
+        // non-enumerating 404-style error; without this check a foreign ID
+        // would be persisted as this response's parent edge.
+        if let Some(prev_response_id) = &context.request.previous_response_id {
+            let uuid_str = prev_response_id
+                .strip_prefix(crate::id_prefixes::PREFIX_RESP)
+                .unwrap_or(prev_response_id);
+            let prev_uuid = Uuid::parse_str(uuid_str).map_err(|e| {
+                errors::ResponseError::InvalidParams(format!("invalid previous_response_id: {e}"))
+            })?;
+
+            let prev_response = context
+                .response_repository
+                .get_by_id(models::ResponseId(prev_uuid), workspace_id_domain.clone())
+                .await
+                .map_err(|e| {
+                    errors::ResponseError::InternalError(format!(
+                        "Failed to verify previous response ownership: {e}"
+                    ))
+                })?;
+
+            if prev_response.is_none() {
+                return Err(errors::ResponseError::PreviousResponseNotFound);
+            }
+        }
+
         let mut messages = Self::load_conversation_context(
             &context.request,
             &context.conversation_service,
@@ -1045,6 +1072,7 @@ impl ResponseServiceImpl {
             &context.request,
             context.mcp_client_factory.as_ref(),
             &context.response_items_repository,
+            workspace_id_domain.clone(),
             &mut ctx,
             &mut emitter,
         )
@@ -2202,18 +2230,27 @@ impl ResponseServiceImpl {
                     })?,
             };
 
-            // Load conversation metadata to verify it exists
-            let _conversation = conversation_service
+            // Verify the conversation exists AND belongs to the caller's
+            // workspace before reading any history. A missing or foreign
+            // conversation is rejected with the same non-enumerating error so
+            // another workspace's history can never be imported into a
+            // completion context.
+            let conversation = conversation_service
                 .get_conversation(conversation_id, workspace_id.clone())
                 .await
                 .map_err(|e| {
                     errors::ResponseError::InternalError(format!("Failed to get conversation: {e}"))
                 })?;
 
+            if conversation.is_none() {
+                return Err(errors::ResponseError::ConversationNotFound);
+            }
+
             // Load all response items from the conversation
-            // Use high limit (1000) and no 'after' cursor for context loading
+            // Use high limit (1000) and no 'after' cursor for context loading.
+            // The repository constrains the query by workspace as defense in depth.
             let conversation_items = response_items_repository
-                .list_by_conversation(conversation_id, None, 1000)
+                .list_by_conversation(conversation_id, workspace_id.clone(), None, 1000)
                 .await
                 .map_err(|e| {
                     errors::ResponseError::InternalError(format!(

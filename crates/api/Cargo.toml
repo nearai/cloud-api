@@ -55,14 +55,14 @@ moka = { version = "0.12.15", features = ["future"] }
 urlencoding = "2.1"
 # OHTTP gateway (RFC 9458) — HPKE-based request encapsulation/decapsulation
 ohttp = { version = "0.7", features = ["server", "stream", "rust-hpke"] }
-bhttp = "0.7"
+bhttp = "0.8"
 futures-util = "0.3"
 tokio-util = { version = "0.7", features = ["compat", "io"] }
 reqwest = { version = "0.12", features = ["json", "stream"] }
 
 [dev-dependencies]
 database = { path = "../database", features = ["test-support"] }
-axum-test = "20"
+axum-test = "21"
 wiremock = "0.6"
 serde_json = "1.0"
 url = "2.5"
@@ -75,7 +75,7 @@ sha3 = "0.12"
 hmac = "0.13"
 tokio-postgres = "0.7.18"
 deadpool-postgres = { version = "0.14", features = ["rt_tokio_1"] }
-ed25519-dalek = { version = "2.1", features = ["rand_core"] }
+ed25519-dalek = { version = "3.0", features = ["rand_core"] }
 rand = "0.10"
 services = { path = "../services", features = ["test-mocks"] }
 async-trait = "0.1"

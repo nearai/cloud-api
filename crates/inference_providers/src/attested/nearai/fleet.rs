@@ -79,10 +79,9 @@ pub(super) struct Fleet {
     /// that don't fit the rotation scheme (one-label host, IP literal, …) — then
     /// rotation is a no-op and the canonical-SNI path is used.
     rotation_parts: Option<rotation::UrlParts>,
-    /// Message-prefix trie mapping a conversation prefix to a bucket id, so
-    /// requests sharing a prefix stick to the same backend (prefix-cache hit).
-    /// The bucket id is reduced modulo the live backend count to a rotation
-    /// index by `select_index`.
+    /// Stateless first-message router. Its stable key is reduced modulo the
+    /// live backend count by `select_index`, so every Cloud API process sends a
+    /// reusable prefix to the same indexed backend.
     pub(super) prefix_router: Arc<PrefixRouter>,
     /// Lazily-filled (or eagerly pre-created in legacy mode) per-backend-index
     /// clients, each pinning a persistent H2 connection to one verified
@@ -163,18 +162,15 @@ impl Fleet {
     /// is logged, the completion still streams). This matches the pre-existing
     /// rotation-fallback behavior; it is not introduced by index-addressing.
     ///
-    /// Reachability: `prefix_router.route()` returns a bucket id in
-    /// `0..NUM_PREFIX_BUCKETS` (default 64), reduced mod `count`. When `count >
-    /// NUM_PREFIX_BUCKETS` (more than 64 live backends for one model — far above
-    /// any current deployment) the high indices are unreachable as the
-    /// *preferred* pick, though latency steering / fallback can still reach
-    /// them. Raise `NUM_PREFIX_BUCKETS` if a model ever exceeds 64 backends.
+    /// Reachability: `prefix_router.route()` returns a deterministic `u64`
+    /// derived from the first message. Reducing it modulo `count` makes every
+    /// live backend index reachable without process-local routing state.
     pub(super) fn select_index(&self, messages: &[crate::ChatMessage]) -> Option<usize> {
         let count = self.rotation_count();
         if count == 0 {
             return None;
         }
-        let preferred = self.prefix_router.route(messages) % count;
+        let preferred = (self.prefix_router.route(messages) % count as u64) as usize;
         let stats = lock(&self.backend_stats);
         // Warmed EMA for index `i`, or None if out of range / not yet warmed.
         // `.get()` keeps this panic-free regardless of how `count` relates to

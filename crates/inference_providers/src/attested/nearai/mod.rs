@@ -4104,7 +4104,7 @@ mod tests {
         // `prefix_router.route(messages) % count`.
         let provider = rotation_provider(8);
         let msgs = vec![user_msg("a stable system prompt")];
-        let expected = provider.fleet.prefix_router.route(&msgs) % 8;
+        let expected = (provider.fleet.prefix_router.route(&msgs) % 8) as usize;
         let got = provider.fleet.select_index(&msgs).expect("rotation active");
         assert_eq!(got, expected);
         // Deterministic / stable across calls (same prefix → same backend).
@@ -4112,10 +4112,29 @@ mod tests {
     }
 
     #[test]
+    fn select_index_is_stable_across_provider_histories() {
+        let provider_a = rotation_provider(3);
+        let provider_b = rotation_provider(3);
+
+        for index in 0..100 {
+            let message_a = vec![user_msg(&format!("provider-a-prefix-{index}"))];
+            let message_b = vec![user_msg(&format!("provider-b-prefix-{}", 100 - index))];
+            provider_a.fleet.select_index(&message_a);
+            provider_b.fleet.select_index(&message_b);
+        }
+
+        let shared = vec![user_msg("shared prefix across Cloud API processes")];
+        assert_eq!(
+            provider_a.fleet.select_index(&shared),
+            provider_b.fleet.select_index(&shared)
+        );
+    }
+
+    #[test]
     fn select_index_steers_off_pathologically_slow_preferred_backend() {
         let provider = rotation_provider(4);
         let msgs = vec![user_msg("route me")];
-        let preferred = provider.fleet.prefix_router.route(&msgs) % 4;
+        let preferred = (provider.fleet.prefix_router.route(&msgs) % 4) as usize;
 
         // Warm the preferred backend as pathologically slow (>floor and >2× the
         // fastest), and a different backend as fast. Pick the fast index to be
@@ -4134,7 +4153,7 @@ mod tests {
 
         // Below the slow ratio (only ~1.5× the fast peer) → keep affinity.
         let provider2 = rotation_provider(4);
-        let preferred2 = provider2.fleet.prefix_router.route(&msgs) % 4;
+        let preferred2 = (provider2.fleet.prefix_router.route(&msgs) % 4) as usize;
         let other2 = (preferred2 + 1) % 4;
         for _ in 0..super::fleet::TTFT_WARMUP_SAMPLES {
             provider2.fleet.record_ttft(preferred2, 900.0);

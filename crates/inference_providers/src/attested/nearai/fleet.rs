@@ -32,6 +32,12 @@ pub(super) const TTFT_WARMUP_SAMPLES: u32 = 8;
 /// fastest peer's EMA AND the absolute floor below.
 const TTFT_SLOW_RATIO: f64 = 2.0;
 const TTFT_SLOW_FLOOR_MS: f64 = 500.0;
+/// Keep a small burst for a reusable prefix on its deterministic primary
+/// before spilling overlapping requests to the next backend. This preserves a
+/// single cache copy for ordinary traffic while preventing one hot prefix from
+/// monopolizing a replica. The counter is process-local and tracks only live
+/// requests; it never stores message content.
+const PREFIX_AFFINITY_BURST: u32 = 4;
 
 #[derive(Default, Clone, Copy)]
 pub(super) struct BackendStat {
@@ -65,6 +71,43 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+type PrefixLoads = HashMap<u64, Vec<u32>>;
+
+/// Reservation for one live prefix-routed request. Releasing is RAII-based so
+/// cancellation, errors, and dropped streams cannot leak routing load.
+pub(super) struct RouteLease {
+    route_key: u64,
+    index: usize,
+    prefix_loads: Arc<Mutex<PrefixLoads>>,
+}
+
+impl RouteLease {
+    pub(super) fn index(&self) -> usize {
+        self.index
+    }
+
+    pub(super) fn route_key(&self) -> u64 {
+        self.route_key
+    }
+}
+
+impl Drop for RouteLease {
+    fn drop(&mut self) {
+        let mut loads = lock(&self.prefix_loads);
+        let remove = if let Some(counts) = loads.get_mut(&self.route_key) {
+            if let Some(count) = counts.get_mut(self.index) {
+                *count = count.saturating_sub(1);
+            }
+            counts.iter().all(|count| *count == 0)
+        } else {
+            false
+        };
+        if remove {
+            loads.remove(&self.route_key);
+        }
+    }
+}
+
 pub(super) struct Fleet {
     /// request_hash → rotation index during streaming (before the chat_id is
     /// known). Universal completion→signature index map for the streaming path.
@@ -80,8 +123,8 @@ pub(super) struct Fleet {
     /// rotation is a no-op and the canonical-SNI path is used.
     rotation_parts: Option<rotation::UrlParts>,
     /// Stateless first-message router. Its stable key is reduced modulo the
-    /// live backend count by `select_index`, so every Cloud API process sends a
-    /// reusable prefix to the same indexed backend.
+    /// live backend count, so every Cloud API process gives a reusable prefix
+    /// the same primary backend; only overlapping hot-prefix bursts may spill.
     pub(super) prefix_router: Arc<PrefixRouter>,
     /// Lazily-filled (or eagerly pre-created in legacy mode) per-backend-index
     /// clients, each pinning a persistent H2 connection to one verified
@@ -93,6 +136,9 @@ pub(super) struct Fleet {
     /// index. Arc so the stream-measurement wrapper can update it after the
     /// Fleet method returns. Sized to MAX_FANOUT.
     pub(super) backend_stats: Arc<Mutex<Vec<BackendStat>>>,
+    /// Live request counts by routing key and backend index. Entries exist only
+    /// while a request is in flight and contain no prompt or response content.
+    prefix_loads: Arc<Mutex<PrefixLoads>>,
     /// Provider config (base_url, api_key, timeouts).
     pub(super) config: Config,
     /// General-purpose client for non-completion requests (attestation, models).
@@ -134,6 +180,7 @@ impl Fleet {
                 BackendStat::default();
                 rotation::MAX_FANOUT
             ])),
+            prefix_loads: Arc::new(Mutex::new(HashMap::new())),
             config,
             client,
             fallback_client,
@@ -143,11 +190,12 @@ impl Fleet {
         }
     }
 
-    /// Select the backend rotation index for a request: prefix-affinity
-    /// (same prefix → same backend → KV-cache hit) with preemptive latency
-    /// steering away from a backend whose TTFT EMA is pathological. Returns
-    /// `None` when rotation is unavailable (count==0 / no rotation parts) →
-    /// caller uses the canonical fallback path.
+    /// Select the idle preferred backend for a request: deterministic
+    /// prefix-affinity with preemptive latency steering away from a backend
+    /// whose TTFT EMA is pathological. The live request path uses
+    /// `acquire_index`, which starts here and adds bounded hot-prefix spillover.
+    /// Returns `None` when rotation is unavailable (count==0 / no rotation
+    /// parts), so the caller uses the canonical fallback path.
     ///
     /// Index↔backend stability: `<canonical>-iN` routes to backend `N % count`
     /// at model-proxy by SNI (independent of which TCP connection we use), so a
@@ -164,13 +212,80 @@ impl Fleet {
     ///
     /// Reachability: `prefix_router.route()` returns a deterministic `u64`
     /// derived from the first message. Reducing it modulo `count` makes every
-    /// live backend index reachable without process-local routing state.
+    /// live backend index reachable as the stateless primary. Process-local
+    /// state affects only temporary spillover while requests overlap.
+    #[cfg(test)]
     pub(super) fn select_index(&self, messages: &[crate::ChatMessage]) -> Option<usize> {
         let count = self.rotation_count();
         if count == 0 {
             return None;
         }
-        let preferred = (self.prefix_router.route(messages) % count as u64) as usize;
+        let route_key = self.prefix_router.route(messages);
+        self.candidate_indices(route_key, count).into_iter().next()
+    }
+
+    /// Reserve a backend for this request. A reusable prefix stays on its
+    /// deterministic primary for a small burst, then overlapping requests
+    /// spill across the remaining healthy indices in deterministic order.
+    pub(super) fn acquire_index(&self, messages: &[crate::ChatMessage]) -> Option<RouteLease> {
+        let count = self.rotation_count();
+        if count == 0 {
+            return None;
+        }
+        let route_key = self.prefix_router.route(messages);
+        if messages.is_empty() {
+            return Some(self.reserve_index(route_key, 0));
+        }
+        let candidates = self.candidate_indices(route_key, count);
+        let mut loads = lock(&self.prefix_loads);
+        let counts = loads.entry(route_key).or_insert_with(|| vec![0; count]);
+        if counts.len() < count {
+            counts.resize(count, 0);
+        }
+        let index = candidates
+            .iter()
+            .copied()
+            .find(|index| counts[*index] < PREFIX_AFFINITY_BURST)
+            .unwrap_or_else(|| {
+                candidates
+                    .iter()
+                    .enumerate()
+                    .min_by_key(|(rank, index)| (counts[**index], *rank))
+                    .map(|(_, index)| *index)
+                    .expect("rotation count is non-zero")
+            });
+        counts[index] = counts[index].saturating_add(1);
+        drop(loads);
+        Some(RouteLease {
+            route_key,
+            index,
+            prefix_loads: self.prefix_loads.clone(),
+        })
+    }
+
+    /// Reserve an explicit fallback index for the same prefix key.
+    pub(super) fn reserve_index(&self, route_key: u64, index: usize) -> RouteLease {
+        let mut loads = lock(&self.prefix_loads);
+        let counts = loads.entry(route_key).or_default();
+        if counts.len() <= index {
+            counts.resize(index + 1, 0);
+        }
+        counts[index] = counts[index].saturating_add(1);
+        drop(loads);
+        RouteLease {
+            route_key,
+            index,
+            prefix_loads: self.prefix_loads.clone(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn active_prefix_loads(&self) -> usize {
+        lock(&self.prefix_loads).len()
+    }
+
+    fn candidate_indices(&self, route_key: u64, count: usize) -> Vec<usize> {
+        let preferred = (route_key % count as u64) as usize;
         let stats = lock(&self.backend_stats);
         // Warmed EMA for index `i`, or None if out of range / not yet warmed.
         // `.get()` keeps this panic-free regardless of how `count` relates to
@@ -182,26 +297,33 @@ impl Fleet {
                 .map(|s| s.ttft_ewma_ms)
         };
         let min_warm = (0..count).filter_map(ema).fold(f64::MAX, f64::min);
-        if let Some(pref_ema) = ema(preferred) {
-            if pref_ema > TTFT_SLOW_FLOOR_MS
-                && min_warm.is_finite()
-                && pref_ema > TTFT_SLOW_RATIO * min_warm
-            {
-                // Steer to the fastest warmed backend; ties/unwarmed keep preferred.
-                let mut best = preferred;
-                let mut best_ms = pref_ema;
-                for i in 0..count {
-                    if let Some(e) = ema(i) {
-                        if e < best_ms {
-                            best = i;
-                            best_ms = e;
-                        }
-                    }
-                }
-                return Some(best);
+        let is_slow = |index: usize| {
+            ema(index).is_some_and(|value| {
+                value > TTFT_SLOW_FLOOR_MS
+                    && min_warm.is_finite()
+                    && value > TTFT_SLOW_RATIO * min_warm
+            })
+        };
+        let mut candidates: Vec<usize> = (0..count)
+            .map(|offset| (preferred + offset) % count)
+            .filter(|index| !is_slow(*index))
+            .collect();
+        if candidates.is_empty() {
+            candidates.push(preferred);
+        } else if is_slow(preferred) {
+            // Preserve the existing behavior: when the deterministic primary
+            // is pathological, lead with the fastest warmed healthy backend.
+            if let Some(fastest) = candidates.iter().copied().min_by(|a, b| {
+                ema(*a)
+                    .unwrap_or(f64::MAX)
+                    .partial_cmp(&ema(*b).unwrap_or(f64::MAX))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            }) {
+                candidates.retain(|index| *index != fastest);
+                candidates.insert(0, fastest);
             }
         }
-        Some(preferred)
+        candidates
     }
 
     /// Record an observed TTFT (ms) for a backend index into its EMA.

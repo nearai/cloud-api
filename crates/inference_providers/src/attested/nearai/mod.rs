@@ -910,6 +910,7 @@ impl Fleet {
     async fn try_chat_completion_fallback_indices(
         &self,
         indices: &[usize],
+        route_key: u64,
         params: &ChatCompletionParams,
         headers: &reqwest::header::HeaderMap,
         timeout: Duration,
@@ -930,6 +931,7 @@ impl Fleet {
                 Some(u) => u,
                 None => continue,
             };
+            let _route_lease = self.reserve_index(route_key, index);
             let client = match self.get_or_verify_index_client(index).await {
                 Ok(c) => c,
                 Err(e) => {
@@ -1038,6 +1040,7 @@ impl Fleet {
     async fn try_stream_fallback_indices(
         &self,
         indices: &[usize],
+        route_key: u64,
         params: &ChatCompletionParams,
         headers: &reqwest::header::HeaderMap,
         request_hash: &str,
@@ -1057,6 +1060,7 @@ impl Fleet {
                 Some(u) => u,
                 None => continue,
             };
+            let route_lease = self.reserve_index(route_key, index);
             let client = match self.get_or_verify_index_client(index).await {
                 Ok(c) => c,
                 Err(e) => {
@@ -1140,6 +1144,7 @@ impl Fleet {
                 self.backend_stats.clone(),
                 index,
                 started,
+                Some(route_lease),
             ));
             return Ok(probed);
         }
@@ -1209,6 +1214,9 @@ struct TtftProbe<S> {
     index: usize,
     /// Send instant; `None` once the first content TTFT has been recorded.
     start: Option<std::time::Instant>,
+    /// Keeps this backend counted as live until the stream completes or the
+    /// caller drops it. `None` is used only by focused unit tests.
+    _route_lease: Option<fleet::RouteLease>,
 }
 
 impl<S> TtftProbe<S> {
@@ -1217,12 +1225,14 @@ impl<S> TtftProbe<S> {
         stats: Arc<std::sync::Mutex<Vec<fleet::BackendStat>>>,
         index: usize,
         start: std::time::Instant,
+        route_lease: Option<fleet::RouteLease>,
     ) -> Self {
         Self {
             inner,
             stats,
             index,
             start: Some(start),
+            _route_lease: route_lease,
         }
     }
 }
@@ -1251,6 +1261,8 @@ where
                     }
                 }
             }
+        } else if matches!(polled, std::task::Poll::Ready(None)) {
+            self._route_lease.take();
         }
         polled
     }
@@ -1703,13 +1715,14 @@ impl InferenceProvider for Fleet {
         // Prepare encryption headers
         self.prepare_encryption_headers(&mut headers, &mut streaming_params.extra);
 
-        // Select the backend rotation index: prefix affinity → same backend →
-        // prefix cache hit, with latency steering off a pathologically slow
-        // backend. `None` means rotation is unavailable (cold-start before
-        // discovery's first count, or a non-rotation URL like `localhost`) —
-        // serve via the canonical fallback path (no index, no per-backend
-        // measurement) so those paths keep working unchanged.
-        let index = match self.select_index(&streaming_params.messages) {
+        // Reserve a backend rotation index: deterministic prefix affinity keeps
+        // the normal path cache-hot, a small per-prefix burst may spill across
+        // healthy replicas, and TTFT steering excludes pathological backends.
+        // `None` means rotation is unavailable (cold-start before discovery's
+        // first count, or a non-rotation URL like `localhost`) — serve via the
+        // canonical fallback path (no index, no per-backend measurement) so
+        // those paths keep working unchanged.
+        let route_lease = match self.acquire_index(&streaming_params.messages) {
             None => {
                 let url = format!("{}/v1/chat/completions", self.config.base_url);
                 let response = self
@@ -1723,8 +1736,10 @@ impl InferenceProvider for Fleet {
                 let sse_stream = new_sse_parser(response.bytes_stream(), true);
                 return Ok(Box::pin(sse_stream));
             }
-            Some(i) => i,
+            Some(lease) => lease,
         };
+        let index = route_lease.index();
+        let route_key = route_lease.route_key();
 
         // The index client maintains a persistent H2 connection to a verified
         // backend (`<canonical>-i<index>.<base>`) via L4 passthrough → prefix
@@ -1788,13 +1803,16 @@ impl InferenceProvider for Fleet {
                             self.backend_stats.clone(),
                             index,
                             started,
+                            Some(route_lease),
                         ));
                         Ok(probed)
                     }
                     Some(status_code) => {
                         drop(stream);
+                        drop(route_lease);
                         self.try_stream_fallback_indices(
                             &self.fallback_indices(index),
+                            route_key,
                             &streaming_params,
                             &headers,
                             &request_hash,
@@ -1812,8 +1830,10 @@ impl InferenceProvider for Fleet {
                 CompletionError::HttpError { status_code, .. }
                     if Fleet::is_rotation_retryable_status(*status_code) =>
                 {
+                    drop(route_lease);
                     self.try_stream_fallback_indices(
                         &self.fallback_indices(index),
+                        route_key,
                         &streaming_params,
                         &headers,
                         &request_hash,
@@ -1867,10 +1887,11 @@ impl InferenceProvider for Fleet {
             }
         };
 
-        // Select the backend rotation index (prefix affinity + latency
-        // steering). `None` → canonical fallback path (cold-start / non-rotation
-        // URL): one shot via the non-pinned fallback client, no index recorded.
-        let index = match self.select_index(&non_streaming_params.messages) {
+        // Reserve the backend rotation index (deterministic prefix affinity,
+        // bounded hot-prefix spillover, and latency steering). `None` →
+        // canonical fallback path (cold-start / non-rotation URL): one shot via
+        // the non-pinned fallback client, no index recorded.
+        let route_lease = match self.acquire_index(&non_streaming_params.messages) {
             None => {
                 let url = format!("{}/v1/chat/completions", self.config.base_url);
                 let response = self
@@ -1905,8 +1926,10 @@ impl InferenceProvider for Fleet {
                     serving_tier: crate::ProviderTier::Near,
                 });
             }
-            Some(i) => i,
+            Some(lease) => lease,
         };
+        let index = route_lease.index();
+        let route_key = route_lease.route_key();
 
         // Route to the index's verified client, posting at the index's rotation
         // SNI so completion + signature land on the same backend.
@@ -1968,9 +1991,11 @@ impl InferenceProvider for Fleet {
             // the request succeeds and we record the index for signature
             // retrieval.
             if Fleet::is_rotation_retryable_status(status_code) {
+                drop(route_lease);
                 return self
                     .try_chat_completion_fallback_indices(
                         &self.fallback_indices(index),
+                        route_key,
                         &non_streaming_params,
                         &headers,
                         timeout,
@@ -4131,6 +4156,222 @@ mod tests {
     }
 
     #[test]
+    fn acquire_index_keeps_a_small_burst_then_spills_deterministically() {
+        let provider = rotation_provider(3);
+        let messages = vec![user_msg("shared hot prefix")];
+        let primary = provider
+            .fleet
+            .select_index(&messages)
+            .expect("rotation active");
+        let second = (primary + 1) % 3;
+        let third = (primary + 2) % 3;
+
+        let leases: Vec<_> = (0..9)
+            .map(|_| {
+                provider
+                    .fleet
+                    .acquire_index(&messages)
+                    .expect("rotation active")
+            })
+            .collect();
+        let indices: Vec<_> = leases.iter().map(|lease| lease.index()).collect();
+        assert_eq!(&indices[..4], &[primary; 4]);
+        assert_eq!(&indices[4..8], &[second; 4]);
+        assert_eq!(indices[8], third);
+        assert_eq!(provider.fleet.active_prefix_loads(), 1);
+
+        drop(leases);
+        assert_eq!(provider.fleet.active_prefix_loads(), 0);
+        let after_release = provider
+            .fleet
+            .acquire_index(&messages)
+            .expect("rotation active");
+        assert_eq!(after_release.index(), primary);
+    }
+
+    #[test]
+    fn acquire_index_scopes_live_load_to_each_prefix() {
+        let provider = rotation_provider(3);
+        let first = vec![user_msg("first prefix")];
+        let second = vec![user_msg("unrelated prefix")];
+        let second_primary = provider
+            .fleet
+            .select_index(&second)
+            .expect("rotation active");
+
+        let held: Vec<_> = (0..8)
+            .map(|_| {
+                provider
+                    .fleet
+                    .acquire_index(&first)
+                    .expect("rotation active")
+            })
+            .collect();
+        let unrelated = provider
+            .fleet
+            .acquire_index(&second)
+            .expect("rotation active");
+
+        assert_eq!(unrelated.index(), second_primary);
+        drop(unrelated);
+        drop(held);
+        assert_eq!(provider.fleet.active_prefix_loads(), 0);
+    }
+
+    #[test]
+    fn acquire_index_is_deterministic_across_independent_fleets() {
+        let provider_a = rotation_provider(3);
+        let provider_b = rotation_provider(3);
+        let messages = vec![user_msg("shared prefix across processes")];
+
+        let leases_a: Vec<_> = (0..12)
+            .map(|_| {
+                provider_a
+                    .fleet
+                    .acquire_index(&messages)
+                    .expect("rotation active")
+            })
+            .collect();
+        let leases_b: Vec<_> = (0..12)
+            .map(|_| {
+                provider_b
+                    .fleet
+                    .acquire_index(&messages)
+                    .expect("rotation active")
+            })
+            .collect();
+
+        assert_eq!(
+            leases_a
+                .iter()
+                .map(|lease| lease.index())
+                .collect::<Vec<_>>(),
+            leases_b
+                .iter()
+                .map(|lease| lease.index())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn acquire_index_respects_backend_counts_one_through_four() {
+        let messages = vec![user_msg("backend count coverage")];
+        for count in 1..=4 {
+            let provider = rotation_provider(count);
+            let leases: Vec<_> = (0..20)
+                .map(|_| {
+                    provider
+                        .fleet
+                        .acquire_index(&messages)
+                        .expect("rotation active")
+                })
+                .collect();
+            assert!(leases.iter().all(|lease| lease.index() < count));
+            if count > 1 {
+                assert!(
+                    leases
+                        .iter()
+                        .map(|lease| lease.index())
+                        .collect::<std::collections::HashSet<_>>()
+                        .len()
+                        > 1
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn acquire_index_tolerates_backend_count_changes_with_live_leases() {
+        let provider = rotation_provider(3);
+        let messages = vec![user_msg("topology change prefix")];
+        let held: Vec<_> = (0..9)
+            .map(|_| {
+                provider
+                    .fleet
+                    .acquire_index(&messages)
+                    .expect("rotation active")
+            })
+            .collect();
+
+        provider.set_backend_count(2);
+        let after_shrink: Vec<_> = (0..8)
+            .map(|_| {
+                provider
+                    .fleet
+                    .acquire_index(&messages)
+                    .expect("rotation active")
+            })
+            .collect();
+        assert!(after_shrink.iter().all(|lease| lease.index() < 2));
+
+        provider.set_backend_count(4);
+        let after_growth: Vec<_> = (0..16)
+            .map(|_| {
+                provider
+                    .fleet
+                    .acquire_index(&messages)
+                    .expect("rotation active")
+            })
+            .collect();
+        assert!(after_growth.iter().all(|lease| lease.index() < 4));
+
+        drop(after_growth);
+        drop(after_shrink);
+        drop(held);
+        assert_eq!(provider.fleet.active_prefix_loads(), 0);
+    }
+
+    #[test]
+    fn acquire_index_is_thread_safe_and_balances_a_sustained_hot_prefix() {
+        use std::sync::{Arc, Barrier};
+
+        let provider = rotation_provider(3);
+        let fleet = provider.fleet.clone();
+        let messages = Arc::new(vec![user_msg("concurrent hot prefix")]);
+        let acquired = Arc::new(Barrier::new(13));
+        let release = Arc::new(Barrier::new(13));
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let workers: Vec<_> = (0..12)
+            .map(|_| {
+                let fleet = fleet.clone();
+                let messages = messages.clone();
+                let acquired = acquired.clone();
+                let release = release.clone();
+                let sender = sender.clone();
+                std::thread::spawn(move || {
+                    let lease = fleet.acquire_index(&messages).expect("rotation active");
+                    sender.send(lease.index()).expect("send selected index");
+                    acquired.wait();
+                    release.wait();
+                    drop(lease);
+                })
+            })
+            .collect();
+        drop(sender);
+
+        acquired.wait();
+        let mut counts = [0usize; 3];
+        for index in receiver.iter().take(12) {
+            counts[index] += 1;
+        }
+        assert_eq!(counts, [4, 4, 4]);
+        release.wait();
+        for worker in workers {
+            worker.join().expect("routing worker should not panic");
+        }
+        assert_eq!(fleet.active_prefix_loads(), 0);
+    }
+
+    #[test]
+    fn acquire_index_keeps_empty_messages_on_zero() {
+        let provider = rotation_provider(4);
+        let leases: Vec<_> = (0..20)
+            .map(|_| provider.fleet.acquire_index(&[]).expect("rotation active"))
+            .collect();
+        assert!(leases.iter().all(|lease| lease.index() == 0));
+    }
+
+    #[test]
     fn select_index_steers_off_pathologically_slow_preferred_backend() {
         let provider = rotation_provider(4);
         let msgs = vec![user_msg("route me")];
@@ -4164,6 +4405,17 @@ mod tests {
             Some(preferred2),
             "below the 2x slow ratio, prefix affinity wins"
         );
+
+        // Load spillover must not reintroduce the pathological backend.
+        let leases: Vec<_> = (0..32)
+            .map(|_| {
+                provider
+                    .fleet
+                    .acquire_index(&msgs)
+                    .expect("rotation active")
+            })
+            .collect();
+        assert!(leases.iter().all(|lease| lease.index() != preferred));
     }
 
     #[test]
@@ -4323,7 +4575,7 @@ mod tests {
         // (a 0ms reading is dropped by the EMA guard) — deterministic regardless
         // of how fast the test polls.
         let start = std::time::Instant::now() - std::time::Duration::from_millis(5);
-        let probe = TtftProbe::new(inner, stats.clone(), index, start);
+        let probe = TtftProbe::new(inner, stats.clone(), index, start, None);
         tokio::pin!(probe);
         let mut count = 0;
         while let Some(_ev) = probe.next().await {
@@ -4336,6 +4588,31 @@ mod tests {
             "exactly one TTFT sample recorded on the first content chunk"
         );
         assert!(s.ttft_ewma_ms >= 0.0);
+    }
+
+    #[tokio::test]
+    async fn ttft_probe_releases_route_lease_at_end_of_stream() {
+        use tokio_stream::StreamExt;
+
+        let provider = rotation_provider(3);
+        let messages = vec![user_msg("streamed prefix")];
+        let lease = provider
+            .fleet
+            .acquire_index(&messages)
+            .expect("rotation active");
+        assert_eq!(provider.fleet.active_prefix_loads(), 1);
+        let inner: StreamingResult = Box::pin(futures_util::stream::empty());
+        let probe = TtftProbe::new(
+            inner,
+            provider.fleet.backend_stats.clone(),
+            lease.index(),
+            std::time::Instant::now(),
+            Some(lease),
+        );
+        tokio::pin!(probe);
+
+        assert!(probe.next().await.is_none());
+        assert_eq!(provider.fleet.active_prefix_loads(), 0);
     }
 
     #[test]

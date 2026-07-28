@@ -21,9 +21,22 @@ where
 {
     let status = response.status();
     if !status.is_success() {
-        let retry_after = response_header(response.headers(), RETRY_AFTER.as_str());
-        let detail = read_error_detail(response).await;
-        return Err(status_error(status, retry_after, detail));
+        // Classify by status line before touching the body: transient and
+        // rate-limit responses discard diagnostic detail, and awaiting a
+        // slow error body here would burn the read timeout once per retry
+        // attempt before with_retry can fire the next one.
+        return Err(match status {
+            StatusCode::TOO_MANY_REQUESTS => ItaClientError::RateLimited {
+                retry_after: response_header(response.headers(), RETRY_AFTER.as_str()),
+            },
+            StatusCode::BAD_GATEWAY
+            | StatusCode::SERVICE_UNAVAILABLE
+            | StatusCode::GATEWAY_TIMEOUT => ItaClientError::TransientStatus { status },
+            _ => ItaClientError::NonRetryableStatus {
+                status,
+                detail: read_error_detail(response).await,
+            },
+        });
     }
 
     let body = read_limited_body(response, body_limit).await?;
@@ -86,27 +99,23 @@ async fn read_limited_body(
     Ok(Bytes::from(body))
 }
 
-fn status_error(
-    status: StatusCode,
-    retry_after: Option<String>,
-    detail: Option<String>,
-) -> ItaClientError {
-    match status {
-        StatusCode::TOO_MANY_REQUESTS => ItaClientError::RateLimited { retry_after },
-        StatusCode::BAD_GATEWAY | StatusCode::SERVICE_UNAVAILABLE | StatusCode::GATEWAY_TIMEOUT => {
-            ItaClientError::TransientStatus { status }
-        }
-        _ => ItaClientError::NonRetryableStatus { status, detail },
-    }
-}
-
 /// Best-effort extraction of ITA's error body for diagnostics. ITA error
 /// bodies describe attestation infrastructure failures (never customer
 /// data); the text is bounded and control characters are stripped.
-async fn read_error_detail(response: reqwest::Response) -> Option<String> {
-    let body = read_limited_body(response, ERROR_DETAIL_BODY_LIMIT)
-        .await
-        .ok()?;
+/// Oversized bodies are truncated rather than discarded — long appraisal
+/// failures are exactly where the detail matters — and a mid-read
+/// transport error keeps whatever arrived.
+async fn read_error_detail(mut response: reqwest::Response) -> Option<String> {
+    let mut body = Vec::new();
+    while body.len() < ERROR_DETAIL_BODY_LIMIT {
+        match response.chunk().await {
+            Ok(Some(chunk)) => {
+                let take = (ERROR_DETAIL_BODY_LIMIT - body.len()).min(chunk.len());
+                body.extend_from_slice(&chunk[..take]);
+            }
+            Ok(None) | Err(_) => break,
+        }
+    }
     extract_error_detail(&body)
 }
 

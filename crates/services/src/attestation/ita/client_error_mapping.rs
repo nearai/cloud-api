@@ -19,9 +19,18 @@ pub(in crate::attestation::ita) fn map_ita_client_error(error: ItaClientError) -
                 ),
             }
         }
-        ItaClientError::NonRetryableStatus { status, detail } => AttestationError::ItaBadUpstream {
-            reason: append_detail(format!("ITA returned status {status}"), detail),
-        },
+        ItaClientError::NonRetryableStatus { status, detail } => {
+            // 400 detail describes the caller's evidence and belongs in the
+            // response; for auth/infra statuses the body is ITA account text
+            // (request ids, tenant hints) — log it for operators, keep the
+            // client-facing reason to the bare status.
+            if let Some(detail) = &detail {
+                tracing::warn!(status = %status, detail = %detail, "ITA returned non-retryable status");
+            }
+            AttestationError::ItaBadUpstream {
+                reason: format!("ITA returned status {status}"),
+            }
+        }
         ItaClientError::TransientStatus { status } => AttestationError::ItaBadUpstream {
             reason: format!("ITA transient status {status} remained after retries"),
         },
@@ -41,6 +50,10 @@ fn append_detail(base: String, detail: Option<String>) -> String {
         None => base,
     }
 }
+
+#[cfg(test)]
+#[path = "client_error_mapping_tests.rs"]
+mod tests;
 
 pub(in crate::attestation) fn ita_client_error_class(error: &ItaClientError) -> &'static str {
     match error {

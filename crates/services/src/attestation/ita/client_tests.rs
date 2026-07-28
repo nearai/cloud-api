@@ -138,11 +138,13 @@ async fn client_does_not_retry_non_transient_statuses() -> TestResult {
         // When: the nonce endpoint observes that status.
         let error = client.get_nonce("request-non-transient").await.unwrap_err();
 
-        // Then: the status is surfaced without retrying.
+        // Then: the status is surfaced without retrying, and the body detail
+        // is captured for every non-retryable status (401/403 detail feeds
+        // the operator warn log, not just the 400 client-facing reason).
         assert!(matches!(
             error,
-            ItaClientError::NonRetryableStatus { status: observed, .. }
-                if observed.as_u16() == status
+            ItaClientError::NonRetryableStatus { status: observed, detail: Some(detail) }
+                if observed.as_u16() == status && detail == "rejected"
         ));
         assert_eq!(server.requests().len(), 1);
     }
@@ -182,8 +184,8 @@ async fn non_retryable_status_detail_handles_non_json_and_oversized_bodies() -> 
             FakeStep::body(400, "plain-text rejection".to_string()),
             Some("plain-text rejection".to_string()),
         ),
-        // Oversized bodies are dropped rather than buffered without bound.
-        (FakeStep::body(400, "x".repeat(5000)), None),
+        // Oversized bodies are truncated (bounded read), not dropped.
+        (FakeStep::body(400, "x".repeat(5000)), Some("x".repeat(256))),
     ];
 
     for (step, expected_detail) in scenarios {
@@ -336,6 +338,33 @@ async fn rate_limit_is_surfaced_immediately_with_retry_after() -> TestResult {
         ItaClientError::RateLimited { retry_after: Some(value) } if value == "2"
     ));
     assert_eq!(server.requests().len(), 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn rate_limit_classification_does_not_wait_for_slow_error_body() -> TestResult {
+    // Given: ITA sends 429 headers promptly but stalls before sending the body.
+    let server = FakeIta::start(vec![
+        FakeStep::headers_then_stall(429).with_header("Retry-After", "2")
+    ])
+    .await?;
+    let client = client_for(&server, 0, 400)?;
+
+    // When: the rate limit is observed.
+    let started = std::time::Instant::now();
+    let error = client.get_nonce("request-stalled-429").await.unwrap_err();
+
+    // Then: classification uses the status line alone — detail extraction is
+    // reserved for non-retryable statuses, so the stalled body is never awaited.
+    assert!(matches!(
+        error,
+        ItaClientError::RateLimited { retry_after: Some(value) } if value == "2"
+    ));
+    assert!(
+        started.elapsed() < Duration::from_millis(200),
+        "429 must be surfaced without waiting on the error body (took {:?})",
+        started.elapsed()
+    );
     Ok(())
 }
 

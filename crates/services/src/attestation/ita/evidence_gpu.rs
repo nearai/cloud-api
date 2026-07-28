@@ -130,7 +130,7 @@ fn normalize_certificate_chain(
         .map_err(|source| ItaEvidenceError::InvalidBase64 { field, source })?;
     let text = String::from_utf8_lossy(&decoded);
     let mut canonical = String::new();
-    let mut certificates = 0_usize;
+    let mut found_certificate = false;
     let mut rest: &str = &text;
     while let Some(begin) = rest.find(PEM_CERTIFICATE_BEGIN) {
         let after_begin = &rest[begin + PEM_CERTIFICATE_BEGIN.len()..];
@@ -159,10 +159,10 @@ fn normalize_certificate_chain(
         }
         canonical.push_str(PEM_CERTIFICATE_END);
         canonical.push('\n');
-        certificates += 1;
+        found_certificate = true;
         rest = &after_begin[end + PEM_CERTIFICATE_END.len()..];
     }
-    if certificates == 0 {
+    if !found_certificate {
         return Err(ItaEvidenceError::InvalidPemChain { field });
     }
     Ok(STANDARD.encode(canonical.as_bytes()))

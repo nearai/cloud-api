@@ -72,6 +72,12 @@ pub(crate) enum FakeStep {
         headers: Vec<(String, String)>,
         body: String,
     },
+    /// Send the status line and headers promptly, then stall without ever
+    /// sending the advertised body.
+    HeadersThenStall {
+        status: u16,
+        headers: Vec<(String, String)>,
+    },
     Hang,
     CloseBeforeResponse,
     ResetConnection,
@@ -94,6 +100,13 @@ impl FakeStep {
         }
     }
 
+    pub(crate) fn headers_then_stall(status: u16) -> Self {
+        Self::HeadersThenStall {
+            status,
+            headers: Vec::new(),
+        }
+    }
+
     pub(crate) fn with_header(self, name: &str, value: &str) -> Self {
         match self {
             Self::Response {
@@ -107,6 +120,13 @@ impl FakeStep {
                     headers,
                     body,
                 }
+            }
+            Self::HeadersThenStall {
+                status,
+                mut headers,
+            } => {
+                headers.push((name.to_string(), value.to_string()));
+                Self::HeadersThenStall { status, headers }
             }
             Self::Hang => Self::Hang,
             Self::CloseBeforeResponse => Self::CloseBeforeResponse,
@@ -204,6 +224,17 @@ async fn respond(stream: &mut tokio::net::TcpStream, step: FakeStep) -> io::Resu
             response.push_str("\r\n");
             response.push_str(&body);
             let _ = stream.write_all(response.as_bytes()).await;
+            Ok(())
+        }
+        FakeStep::HeadersThenStall { status, headers } => {
+            let mut response =
+                format!("HTTP/1.1 {status} ERR\r\nContent-Length: 4096\r\nConnection: close\r\n");
+            for (name, value) in headers {
+                response.push_str(&format!("{name}: {value}\r\n"));
+            }
+            response.push_str("\r\n");
+            let _ = stream.write_all(response.as_bytes()).await;
+            tokio::time::sleep(Duration::from_millis(300)).await;
             Ok(())
         }
         FakeStep::Hang => {

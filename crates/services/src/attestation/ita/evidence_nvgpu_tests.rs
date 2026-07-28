@@ -232,6 +232,33 @@ fn rewraps_crlf_and_wide_lines_to_canonical_pem() -> TestResult {
 }
 
 #[test]
+fn pins_canonical_pem_output_to_a_literal_expectation() -> TestResult {
+    // Given: a dirty chain around a fixed DER whose canonical form is written
+    // out literally, independent of the test helper that mirrors the
+    // implementation's wrapping loop.
+    let runtime_data = runtime_data();
+    let gateway = gateway_quote(&runtime_data);
+    let dirty_pem = "-----BEGIN CERTIFICATE-----\r\ncGlubmVkLWRlci1wYXlsb2FkLTAxMjM0NTY3ODktYWJjZGVmZ2hpamtsbW5vcHFy\r\ncw==\r\n-----END CERTIFICATE-----\r\n\x00\x00";
+    let evidence = vec![model_evidence_with_certificate(
+        "HOPPER",
+        &gpu_nonce(),
+        &STANDARD.encode(dirty_pem),
+    )];
+
+    // When: the model request is built.
+    let request = model_request(&gateway, &evidence)?;
+
+    // Then: the canonical output matches the literal 64-column LF form.
+    let expected_pem = "-----BEGIN CERTIFICATE-----\ncGlubmVkLWRlci1wYXlsb2FkLTAxMjM0NTY3ODktYWJjZGVmZ2hpamtsbW5vcHFy\ncw==\n-----END CERTIFICATE-----\n";
+    let value = serde_json::to_value(request)?;
+    assert_eq!(
+        value["nvgpu"]["evidence_list"][0]["certificate"],
+        STANDARD.encode(expected_pem)
+    );
+    Ok(())
+}
+
+#[test]
 fn fails_closed_on_cert_chain_without_pem_blocks() {
     // Given: a base64 certificate value that decodes to no PEM block at all.
     let runtime_data = runtime_data();

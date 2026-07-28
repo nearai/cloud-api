@@ -1,9 +1,9 @@
 //! Prefix-aware routing for inference cache hit optimization.
 //!
 //! Requests sharing the same first message (typically the system prompt) receive
-//! the same deterministic routing key in every Cloud API process. The fleet
-//! reduces that key modulo the current backend count, keeping the request on the
-//! same indexed backend and its KV cache while the backend membership is stable.
+//! the same deterministic first-turn routing key in every Cloud API process.
+//! Established conversations use their stable first two messages instead, so
+//! growing history remains on one indexed backend after the first follow-up.
 
 use crate::models::{ChatMessage, MessageRole};
 use sha2::{Digest, Sha256};
@@ -28,37 +28,65 @@ impl PrefixRouter {
         };
 
         let mut hasher = Sha256::new();
-        // Fixed-width role and content-kind tags make the outer fields
-        // unambiguous; every variable-width text value is length-prefixed.
-        hasher.update([role_tag(&message.role)]);
+        hash_message(&mut hasher, message);
+        key_from(hasher)
+    }
 
-        match message.content.as_ref() {
-            None => hasher.update([0]),
-            Some(serde_json::Value::String(text)) => {
-                hasher.update([1]);
-                hash_text(&mut hasher, text);
-            }
-            Some(serde_json::Value::Array(parts)) => {
-                hasher.update([2]);
-                for part in parts {
-                    if let Some(text) = part.get("text").and_then(|value| value.as_str()) {
-                        hash_text(&mut hasher, text);
-                    }
-                }
-            }
-            Some(other) => {
-                hasher.update([3]);
-                hash_text(&mut hasher, &other.to_string());
-            }
+    /// Return a deterministic routing key for an established conversation.
+    ///
+    /// The first two messages remain stable as later assistant, tool, and user
+    /// turns are appended. Hashing only that pair therefore gives
+    /// follow-up requests a process-independent home without making the first
+    /// turn give up shared-system-prefix affinity.
+    pub fn route_conversation(&self, messages: &[ChatMessage]) -> u64 {
+        if messages.is_empty() {
+            return 0;
         }
 
-        let digest = hasher.finalize();
-        u64::from_be_bytes(
-            digest[..8]
-                .try_into()
-                .expect("SHA-256 digest always contains eight bytes"),
-        )
+        let count = messages.len().min(2);
+        let mut hasher = Sha256::new();
+        hasher.update(b"nearai-conversation-route-v1");
+        hasher.update((count as u64).to_be_bytes());
+        for message in messages.iter().take(count) {
+            hash_message(&mut hasher, message);
+        }
+        key_from(hasher)
     }
+}
+
+fn hash_message(hasher: &mut Sha256, message: &ChatMessage) {
+    // Fixed-width role and content-kind tags make the outer fields
+    // unambiguous; every variable-width text value is length-prefixed.
+    hasher.update([role_tag(&message.role)]);
+
+    match message.content.as_ref() {
+        None => hasher.update([0]),
+        Some(serde_json::Value::String(text)) => {
+            hasher.update([1]);
+            hash_text(hasher, text);
+        }
+        Some(serde_json::Value::Array(parts)) => {
+            hasher.update([2]);
+            for part in parts {
+                if let Some(text) = part.get("text").and_then(|value| value.as_str()) {
+                    hash_text(hasher, text);
+                }
+            }
+        }
+        Some(other) => {
+            hasher.update([3]);
+            hash_text(hasher, &other.to_string());
+        }
+    }
+}
+
+fn key_from(hasher: Sha256) -> u64 {
+    let digest = hasher.finalize();
+    u64::from_be_bytes(
+        digest[..8]
+            .try_into()
+            .expect("SHA-256 digest always contains eight bytes"),
+    )
 }
 
 fn role_tag(role: &MessageRole) -> u8 {
@@ -109,6 +137,71 @@ mod tests {
         ];
 
         assert_eq!(router.route(&messages_a), router.route(&messages_b));
+    }
+
+    #[test]
+    fn conversation_key_uses_first_two_messages_and_ignores_later_history() {
+        let router = PrefixRouter::new();
+        let initial = vec![
+            text_message(MessageRole::System, "You are a helpful assistant."),
+            text_message(MessageRole::User, "Start a synthetic task."),
+        ];
+        let follow_up = vec![
+            initial[0].clone(),
+            initial[1].clone(),
+            text_message(MessageRole::Assistant, "Synthetic answer."),
+            text_message(MessageRole::User, "Continue the synthetic task."),
+        ];
+
+        assert_eq!(
+            router.route_conversation(&initial),
+            router.route_conversation(&follow_up)
+        );
+    }
+
+    #[test]
+    fn conversation_key_changes_with_the_initial_user_turn() {
+        let router = PrefixRouter::new();
+        let first = vec![
+            text_message(MessageRole::System, "shared system prefix"),
+            text_message(MessageRole::User, "conversation one"),
+        ];
+        let second = vec![
+            text_message(MessageRole::System, "shared system prefix"),
+            text_message(MessageRole::User, "conversation two"),
+        ];
+
+        assert_ne!(
+            router.route_conversation(&first),
+            router.route_conversation(&second)
+        );
+    }
+
+    #[test]
+    fn conversation_routing_key_has_stable_test_vector() {
+        let messages = vec![
+            text_message(MessageRole::System, "shared prefix"),
+            text_message(MessageRole::User, "initial turn"),
+        ];
+
+        assert_eq!(
+            PrefixRouter::new().route_conversation(&messages),
+            11_280_323_719_959_491_568
+        );
+    }
+
+    #[test]
+    fn independent_routers_return_the_same_conversation_key() {
+        let messages = vec![
+            text_message(MessageRole::System, "shared system prefix"),
+            text_message(MessageRole::User, "stable initial turn"),
+            text_message(MessageRole::Assistant, "later history"),
+        ];
+
+        assert_eq!(
+            PrefixRouter::new().route_conversation(&messages),
+            PrefixRouter::new().route_conversation(&messages)
+        );
     }
 
     #[test]
@@ -239,7 +332,9 @@ mod tests {
 
     #[test]
     fn empty_messages_route_to_zero() {
-        assert_eq!(PrefixRouter::new().route(&[]), 0);
+        let router = PrefixRouter::new();
+        assert_eq!(router.route(&[]), 0);
+        assert_eq!(router.route_conversation(&[]), 0);
     }
 
     #[test]

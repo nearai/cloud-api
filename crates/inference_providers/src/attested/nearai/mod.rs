@@ -1716,8 +1716,8 @@ impl InferenceProvider for Fleet {
         self.prepare_encryption_headers(&mut headers, &mut streaming_params.extra);
 
         // Reserve a backend rotation index: deterministic prefix affinity keeps
-        // the normal path cache-hot, a small per-prefix burst may spill across
-        // healthy replicas, and TTFT steering excludes pathological backends.
+        // initial requests cache-hot, established conversations stay on a
+        // stable home, and TTFT steering excludes pathological backends.
         // `None` means rotation is unavailable (cold-start before discovery's
         // first count, or a non-rotation URL like `localhost`) — serve via the
         // canonical fallback path (no index, no per-backend measurement) so
@@ -1887,10 +1887,10 @@ impl InferenceProvider for Fleet {
             }
         };
 
-        // Reserve the backend rotation index (deterministic prefix affinity,
-        // bounded hot-prefix spillover, and latency steering). `None` →
-        // canonical fallback path (cold-start / non-rotation URL): one shot via
-        // the non-pinned fallback client, no index recorded.
+        // Reserve the backend rotation index (deterministic first-turn prefix
+        // affinity, stable conversation homes, and latency steering). `None`
+        // → canonical fallback path (cold-start / non-rotation URL): one shot
+        // via the non-pinned fallback client, no index recorded.
         let route_lease = match self.acquire_index(&non_streaming_params.messages) {
             None => {
                 let url = format!("{}/v1/chat/completions", self.config.base_url);
@@ -4105,8 +4105,12 @@ mod tests {
     }
 
     fn user_msg(content: &str) -> crate::ChatMessage {
+        role_msg(crate::MessageRole::User, content)
+    }
+
+    fn role_msg(role: crate::MessageRole, content: &str) -> crate::ChatMessage {
         crate::ChatMessage {
-            role: crate::MessageRole::User,
+            role,
             content: Some(serde_json::Value::String(content.to_string())),
             name: None,
             tool_call_id: None,
@@ -4163,8 +4167,6 @@ mod tests {
             .fleet
             .select_index(&messages)
             .expect("rotation active");
-        let second = (primary + 1) % 3;
-        let third = (primary + 2) % 3;
 
         let leases: Vec<_> = (0..9)
             .map(|_| {
@@ -4176,8 +4178,10 @@ mod tests {
             .collect();
         let indices: Vec<_> = leases.iter().map(|lease| lease.index()).collect();
         assert_eq!(&indices[..4], &[primary; 4]);
-        assert_eq!(&indices[4..8], &[second; 4]);
-        assert_eq!(indices[8], third);
+        assert!(indices[4..8].iter().all(|index| *index == indices[4]));
+        assert_ne!(indices[4], primary);
+        assert_ne!(indices[8], primary);
+        assert_ne!(indices[8], indices[4]);
         assert_eq!(provider.fleet.active_prefix_loads(), 1);
 
         drop(leases);
@@ -4187,6 +4191,35 @@ mod tests {
             .acquire_index(&messages)
             .expect("rotation active");
         assert_eq!(after_release.index(), primary);
+    }
+
+    #[test]
+    fn colliding_prefixes_have_key_dependent_spill_orders() {
+        let provider = rotation_provider(3);
+        let mut by_primary: std::collections::HashMap<usize, (u64, Vec<usize>)> =
+            std::collections::HashMap::new();
+        let mut collision = None;
+
+        for index in 0..1_000 {
+            let messages = vec![user_msg(&format!("collision-prefix-{index}"))];
+            let route_key = provider.fleet.prefix_router.route(&messages);
+            let candidates = provider.fleet.candidate_indices(route_key, 3);
+            let primary = candidates[0];
+            if let Some((other_key, other_candidates)) = by_primary.get(&primary) {
+                if candidates[1..] != other_candidates[1..] {
+                    collision = Some((*other_key, other_candidates.clone(), route_key, candidates));
+                    break;
+                }
+            } else {
+                by_primary.insert(primary, (route_key, candidates));
+            }
+        }
+
+        let (first_key, first, second_key, second) =
+            collision.expect("find same-primary keys with different spill orders");
+        assert_eq!(first_key % 3, second_key % 3);
+        assert_eq!(first[0], second[0]);
+        assert_ne!(first[1..], second[1..]);
     }
 
     #[test]
@@ -4251,6 +4284,94 @@ mod tests {
                 .map(|lease| lease.index())
                 .collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn follow_up_conversation_is_sticky_across_later_history_and_fleets() {
+        let provider_a = rotation_provider(3);
+        let provider_b = rotation_provider(3);
+        let initial = [
+            role_msg(crate::MessageRole::System, "shared system prefix"),
+            user_msg("synthetic conversation one"),
+        ];
+        let turn_two = vec![
+            initial[0].clone(),
+            initial[1].clone(),
+            role_msg(crate::MessageRole::Assistant, "synthetic answer one"),
+            user_msg("synthetic follow-up two"),
+        ];
+        let turn_three = vec![
+            turn_two[0].clone(),
+            turn_two[1].clone(),
+            turn_two[2].clone(),
+            turn_two[3].clone(),
+            role_msg(crate::MessageRole::Assistant, "synthetic answer two"),
+            user_msg("synthetic follow-up three"),
+        ];
+
+        let turn_two_a = provider_a
+            .fleet
+            .acquire_index(&turn_two)
+            .expect("rotation active");
+        let turn_three_a = provider_a
+            .fleet
+            .acquire_index(&turn_three)
+            .expect("rotation active");
+        let turn_three_b = provider_b
+            .fleet
+            .acquire_index(&turn_three)
+            .expect("rotation active");
+
+        assert_eq!(turn_two_a.index(), turn_three_a.index());
+        assert_eq!(turn_two_a.index(), turn_three_b.index());
+    }
+
+    #[test]
+    fn follow_up_conversation_does_not_spill_while_requests_overlap() {
+        let provider = rotation_provider(3);
+        let messages = vec![
+            role_msg(crate::MessageRole::System, "shared system prefix"),
+            user_msg("synthetic initial turn"),
+            role_msg(crate::MessageRole::Assistant, "synthetic answer"),
+            user_msg("synthetic follow-up"),
+        ];
+
+        let leases: Vec<_> = (0..12)
+            .map(|_| {
+                provider
+                    .fleet
+                    .acquire_index(&messages)
+                    .expect("rotation active")
+            })
+            .collect();
+
+        assert!(leases
+            .iter()
+            .all(|lease| lease.index() == leases[0].index()));
+    }
+
+    #[test]
+    fn distinct_conversations_with_one_prefix_can_reach_all_backends() {
+        let provider = rotation_provider(3);
+        let mut seen = [false; 3];
+
+        for index in 0..1_000 {
+            let messages = vec![
+                role_msg(crate::MessageRole::System, "shared system prefix"),
+                user_msg(&format!("synthetic conversation {index}")),
+                role_msg(crate::MessageRole::Assistant, "synthetic answer"),
+            ];
+            let lease = provider
+                .fleet
+                .acquire_index(&messages)
+                .expect("rotation active");
+            seen[lease.index()] = true;
+            if seen.iter().all(|value| *value) {
+                break;
+            }
+        }
+
+        assert!(seen.into_iter().all(|value| value));
     }
 
     #[test]

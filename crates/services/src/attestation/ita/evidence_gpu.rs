@@ -100,13 +100,72 @@ fn ita_nvgpu_item(
 ) -> Result<ItaNvgpuEvidenceItem, ItaEvidenceError> {
     let certificate = required_trimmed(item.certificate, "nvgpu.evidence_list.certificate")?;
     let evidence = required_trimmed(item.evidence, "nvgpu.evidence_list.evidence")?;
-    validate_base64("nvgpu.evidence_list.certificate", &certificate)?;
+    let certificate = normalize_certificate_chain("nvgpu.evidence_list.certificate", &certificate)?;
     validate_base64("nvgpu.evidence_list.evidence", &evidence)?;
     Ok(ItaNvgpuEvidenceItem {
         certificate,
         evidence,
         firmware_version: item.firmware_version,
     })
+}
+
+const PEM_CERTIFICATE_BEGIN: &str = "-----BEGIN CERTIFICATE-----";
+const PEM_CERTIFICATE_END: &str = "-----END CERTIFICATE-----";
+const PEM_LINE_WIDTH: usize = 64;
+
+/// Re-encode the provider's GPU certificate chain as canonical PEM.
+///
+/// Providers read the chain out of NVML's fixed-size buffer, so the wire
+/// value can carry trailing NUL padding after the last certificate. NVIDIA's
+/// NRAS accepts that chain, but Intel Trust Authority rejects the whole
+/// attest request with a bare 400 ("Failed to verify GPU evidence"). Intel's
+/// own client re-encodes every certificate before submission, so mirror
+/// that: keep each CERTIFICATE block's payload and drop everything else.
+fn normalize_certificate_chain(
+    field: &'static str,
+    value: &str,
+) -> Result<String, ItaEvidenceError> {
+    let decoded = STANDARD
+        .decode(value)
+        .map_err(|source| ItaEvidenceError::InvalidBase64 { field, source })?;
+    let text = String::from_utf8_lossy(&decoded);
+    let mut canonical = String::new();
+    let mut certificates = 0_usize;
+    let mut rest: &str = &text;
+    while let Some(begin) = rest.find(PEM_CERTIFICATE_BEGIN) {
+        let after_begin = &rest[begin + PEM_CERTIFICATE_BEGIN.len()..];
+        let Some(end) = after_begin.find(PEM_CERTIFICATE_END) else {
+            return Err(ItaEvidenceError::InvalidPemChain { field });
+        };
+        let payload: String = after_begin[..end]
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        let der = STANDARD
+            .decode(&payload)
+            .map_err(|source| ItaEvidenceError::InvalidBase64 { field, source })?;
+        if der.is_empty() {
+            return Err(ItaEvidenceError::InvalidPemChain { field });
+        }
+        canonical.push_str(PEM_CERTIFICATE_BEGIN);
+        canonical.push('\n');
+        let encoded = STANDARD.encode(der);
+        let mut offset = 0;
+        while offset < encoded.len() {
+            let line_end = (offset + PEM_LINE_WIDTH).min(encoded.len());
+            canonical.push_str(&encoded[offset..line_end]);
+            canonical.push('\n');
+            offset = line_end;
+        }
+        canonical.push_str(PEM_CERTIFICATE_END);
+        canonical.push('\n');
+        certificates += 1;
+        rest = &after_begin[end + PEM_CERTIFICATE_END.len()..];
+    }
+    if certificates == 0 {
+        return Err(ItaEvidenceError::InvalidPemChain { field });
+    }
+    Ok(STANDARD.encode(canonical.as_bytes()))
 }
 
 fn required_trimmed(

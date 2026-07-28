@@ -1,3 +1,4 @@
+use base64::{engine::general_purpose::STANDARD, Engine as _};
 use config::{ItaEffectivePolicy, ItaPolicyIds, ItaTokenSigningAlg};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256, Sha512};
@@ -73,11 +74,40 @@ pub(super) fn gpu_nonce() -> String {
     hex::encode(hasher.finalize())
 }
 
+pub(super) const TEST_CERT_DER: &[u8] = b"test-der-certificate-bytes";
+
+/// Canonical PEM chain, base64-encoded — the exact format
+/// `normalize_certificate_chain` emits (64-column base64 lines, LF endings).
+pub(super) fn canonical_pem_chain_b64(certs: &[&[u8]]) -> String {
+    let mut pem = String::new();
+    for der in certs {
+        pem.push_str("-----BEGIN CERTIFICATE-----\n");
+        let encoded = STANDARD.encode(der);
+        let mut offset = 0;
+        while offset < encoded.len() {
+            let line_end = (offset + 64).min(encoded.len());
+            pem.push_str(&encoded[offset..line_end]);
+            pem.push('\n');
+            offset = line_end;
+        }
+        pem.push_str("-----END CERTIFICATE-----\n");
+    }
+    STANDARD.encode(pem)
+}
+
 pub(super) fn model_evidence(arch: &str, gpu_nonce: &str) -> Map<String, Value> {
+    model_evidence_with_certificate(arch, gpu_nonce, &canonical_pem_chain_b64(&[TEST_CERT_DER]))
+}
+
+pub(super) fn model_evidence_with_certificate(
+    arch: &str,
+    gpu_nonce: &str,
+    certificate: &str,
+) -> Map<String, Value> {
     let payload = json!({
         "gpu_nonce": gpu_nonce,
         "arch": arch,
-        "evidence_list": [{ "certificate": "Y2VydA==", "evidence": "ZXZpZGVuY2U=" }]
+        "evidence_list": [{ "certificate": certificate, "evidence": "ZXZpZGVuY2U=" }]
     });
     let mut evidence = Map::new();
     evidence.insert(

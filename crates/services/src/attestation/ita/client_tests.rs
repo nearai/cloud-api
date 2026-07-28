@@ -141,10 +141,68 @@ async fn client_does_not_retry_non_transient_statuses() -> TestResult {
         // Then: the status is surfaced without retrying.
         assert!(matches!(
             error,
-            ItaClientError::NonRetryableStatus { status: observed }
+            ItaClientError::NonRetryableStatus { status: observed, .. }
                 if observed.as_u16() == status
         ));
         assert_eq!(server.requests().len(), 1);
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn non_retryable_status_captures_error_detail_from_json_body() -> TestResult {
+    // Given: ITA rejects evidence with its production-style error body.
+    let server = FakeIta::start(vec![FakeStep::json(
+        400,
+        r#"{"error":"Received error from Appraisal request :Failed to verify GPU evidence"}"#,
+    )])
+    .await?;
+    let client = client_for(&server, 0, 100)?;
+
+    // When: the attest endpoint observes the rejection.
+    let error = client
+        .attest("request-detail", &sample_attest_request())
+        .await
+        .unwrap_err();
+
+    // Then: the upstream reason survives into the typed error for diagnosis.
+    assert!(matches!(
+        error,
+        ItaClientError::NonRetryableStatus { status, detail: Some(detail) }
+            if status.as_u16() == 400
+                && detail == "Received error from Appraisal request :Failed to verify GPU evidence"
+    ));
+    Ok(())
+}
+
+#[tokio::test]
+async fn non_retryable_status_detail_handles_non_json_and_oversized_bodies() -> TestResult {
+    let scenarios = [
+        (
+            FakeStep::body(400, "plain-text rejection".to_string()),
+            Some("plain-text rejection".to_string()),
+        ),
+        // Oversized bodies are dropped rather than buffered without bound.
+        (FakeStep::body(400, "x".repeat(5000)), None),
+    ];
+
+    for (step, expected_detail) in scenarios {
+        // Given: ITA returns a 400 with a non-JSON or oversized body.
+        let server = FakeIta::start(vec![step]).await?;
+        let client = client_for(&server, 0, 100)?;
+
+        // When: the attest endpoint observes the rejection.
+        let error = client
+            .attest("request-detail-fallback", &sample_attest_request())
+            .await
+            .unwrap_err();
+
+        // Then: detail is best-effort text, bounded, or absent — never a failure.
+        assert!(matches!(
+            error,
+            ItaClientError::NonRetryableStatus { status, detail }
+                if status.as_u16() == 400 && detail == expected_detail
+        ));
     }
     Ok(())
 }

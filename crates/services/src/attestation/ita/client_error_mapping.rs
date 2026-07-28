@@ -11,13 +11,16 @@ pub(in crate::attestation::ita) fn map_ita_client_error(error: ItaClientError) -
             AttestationError::ItaRateLimited { retry_after }
         }
         ItaClientError::Timeout => AttestationError::ItaTimeout,
-        ItaClientError::NonRetryableStatus { status } if status.as_u16() == 400 => {
+        ItaClientError::NonRetryableStatus { status, detail } if status.as_u16() == 400 => {
             AttestationError::ItaInvalidEvidence {
-                reason: format!("ITA rejected evidence with status {status}"),
+                reason: append_detail(
+                    format!("ITA rejected evidence with status {status}"),
+                    detail,
+                ),
             }
         }
-        ItaClientError::NonRetryableStatus { status } => AttestationError::ItaBadUpstream {
-            reason: format!("ITA returned status {status}"),
+        ItaClientError::NonRetryableStatus { status, detail } => AttestationError::ItaBadUpstream {
+            reason: append_detail(format!("ITA returned status {status}"), detail),
         },
         ItaClientError::TransientStatus { status } => AttestationError::ItaBadUpstream {
             reason: format!("ITA transient status {status} remained after retries"),
@@ -29,6 +32,13 @@ pub(in crate::attestation::ita) fn map_ita_client_error(error: ItaClientError) -
         | ItaClientError::InvalidVerifierNonce { .. } => AttestationError::ItaBadUpstream {
             reason: error.to_string(),
         },
+    }
+}
+
+fn append_detail(base: String, detail: Option<String>) -> String {
+    match detail {
+        Some(detail) => format!("{base}: {detail}"),
+        None => base,
     }
 }
 

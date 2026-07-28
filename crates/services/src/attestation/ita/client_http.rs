@@ -9,6 +9,9 @@ use serde::de::DeserializeOwned;
 
 use super::ItaClientError;
 
+const ERROR_DETAIL_BODY_LIMIT: usize = 4 * 1024;
+const ERROR_DETAIL_MAX_CHARS: usize = 256;
+
 pub(super) async fn parse_json_response<T>(
     response: reqwest::Response,
     body_limit: usize,
@@ -18,7 +21,9 @@ where
 {
     let status = response.status();
     if !status.is_success() {
-        return Err(status_error(status, response.headers()));
+        let retry_after = response_header(response.headers(), RETRY_AFTER.as_str());
+        let detail = read_error_detail(response).await;
+        return Err(status_error(status, retry_after, detail));
     }
 
     let body = read_limited_body(response, body_limit).await?;
@@ -81,16 +86,51 @@ async fn read_limited_body(
     Ok(Bytes::from(body))
 }
 
-fn status_error(status: StatusCode, headers: &HeaderMap) -> ItaClientError {
+fn status_error(
+    status: StatusCode,
+    retry_after: Option<String>,
+    detail: Option<String>,
+) -> ItaClientError {
     match status {
-        StatusCode::TOO_MANY_REQUESTS => ItaClientError::RateLimited {
-            retry_after: response_header(headers, RETRY_AFTER.as_str()),
-        },
+        StatusCode::TOO_MANY_REQUESTS => ItaClientError::RateLimited { retry_after },
         StatusCode::BAD_GATEWAY | StatusCode::SERVICE_UNAVAILABLE | StatusCode::GATEWAY_TIMEOUT => {
             ItaClientError::TransientStatus { status }
         }
-        _ => ItaClientError::NonRetryableStatus { status },
+        _ => ItaClientError::NonRetryableStatus { status, detail },
     }
+}
+
+/// Best-effort extraction of ITA's error body for diagnostics. ITA error
+/// bodies describe attestation infrastructure failures (never customer
+/// data); the text is bounded and control characters are stripped.
+async fn read_error_detail(response: reqwest::Response) -> Option<String> {
+    let body = read_limited_body(response, ERROR_DETAIL_BODY_LIMIT)
+        .await
+        .ok()?;
+    extract_error_detail(&body)
+}
+
+fn extract_error_detail(body: &[u8]) -> Option<String> {
+    let text = match serde_json::from_slice::<serde_json::Value>(body) {
+        Ok(value) => {
+            let mut json_detail = None;
+            for key in ["error", "message", "detail"] {
+                if let Some(text) = value.get(key).and_then(serde_json::Value::as_str) {
+                    json_detail = Some(text.to_string());
+                    break;
+                }
+            }
+            json_detail.unwrap_or_else(|| String::from_utf8_lossy(body).into_owned())
+        }
+        Err(_) => String::from_utf8_lossy(body).into_owned(),
+    };
+    let sanitized: String = text
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .take(ERROR_DETAIL_MAX_CHARS)
+        .collect();
+    let trimmed = sanitized.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
 fn is_retryable_transport_error(error: &reqwest::Error) -> bool {

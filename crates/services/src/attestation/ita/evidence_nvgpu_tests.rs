@@ -1,8 +1,10 @@
+use base64::{engine::general_purpose::STANDARD, Engine as _};
 use serde_json::{json, Map, Value};
 
 use super::evidence_test_support::{
-    effective_policy, gateway_quote, gpu_nonce, model_evidence, model_request, runtime_data,
-    verifier_nonce, TestResult, POLICY_A,
+    canonical_pem_chain_b64, effective_policy, gateway_quote, gpu_nonce, model_evidence,
+    model_evidence_with_certificate, model_request, runtime_data, verifier_nonce, TestResult,
+    POLICY_A, TEST_CERT_DER,
 };
 use super::tdx_tests::expected_tdx_json;
 use super::*;
@@ -38,7 +40,10 @@ fn maps_tdx_and_matching_nvgpu_to_exact_ita_json() -> TestResult {
                 },
                 "gpu_nonce": gpu_nonce(),
                 "arch": "HOPPER",
-                "evidence_list": [{ "certificate": "Y2VydA==", "evidence": "ZXZpZGVuY2U=" }]
+                "evidence_list": [{
+                    "certificate": canonical_pem_chain_b64(&[TEST_CERT_DER]),
+                    "evidence": "ZXZpZGVuY2U="
+                }]
             }
         })
     );
@@ -162,5 +167,131 @@ fn fails_closed_on_unsupported_provider_evidence() {
     assert!(matches!(
         error,
         ItaEvidenceError::UnsupportedProviderEvidence
+    ));
+}
+
+#[test]
+fn normalizes_cert_chain_with_trailing_nul_padding() -> TestResult {
+    // Given: a cert chain carrying NVML fixed-size-buffer NUL padding, as prod
+    // providers emit. NRAS accepts that chain; ITA rejects the whole attest
+    // request with a bare 400, so the mapper must canonicalize it.
+    let runtime_data = runtime_data();
+    let gateway = gateway_quote(&runtime_data);
+    let canonical = canonical_pem_chain_b64(&[TEST_CERT_DER]);
+    let mut dirty = STANDARD.decode(&canonical)?;
+    dirty.extend_from_slice(b"\n\x00\x00\x00\x00\x00");
+    let evidence = vec![model_evidence_with_certificate(
+        "HOPPER",
+        &gpu_nonce(),
+        &STANDARD.encode(dirty),
+    )];
+
+    // When: the model request is built.
+    let request = model_request(&gateway, &evidence)?;
+
+    // Then: the padding is dropped and the chain is byte-identical to canonical PEM.
+    let value = serde_json::to_value(request)?;
+    assert_eq!(value["nvgpu"]["evidence_list"][0]["certificate"], canonical);
+    Ok(())
+}
+
+#[test]
+fn rewraps_crlf_and_wide_lines_to_canonical_pem() -> TestResult {
+    // Given: two certificates PEM-encoded with CRLF endings and 76-column wrapping.
+    let der_one = [0x41_u8; 100];
+    let der_two = [0x42_u8; 10];
+    let mut pem = String::new();
+    for der in [&der_one[..], &der_two[..]] {
+        pem.push_str("-----BEGIN CERTIFICATE-----\r\n");
+        let encoded = STANDARD.encode(der);
+        for chunk_start in (0..encoded.len()).step_by(76) {
+            let chunk_end = (chunk_start + 76).min(encoded.len());
+            pem.push_str(&encoded[chunk_start..chunk_end]);
+            pem.push_str("\r\n");
+        }
+        pem.push_str("-----END CERTIFICATE-----\r\n");
+    }
+    let runtime_data = runtime_data();
+    let gateway = gateway_quote(&runtime_data);
+    let evidence = vec![model_evidence_with_certificate(
+        "HOPPER",
+        &gpu_nonce(),
+        &STANDARD.encode(pem),
+    )];
+
+    // When: the model request is built.
+    let request = model_request(&gateway, &evidence)?;
+
+    // Then: both certificates survive, in order, re-wrapped at 64 columns with LF.
+    let value = serde_json::to_value(request)?;
+    assert_eq!(
+        value["nvgpu"]["evidence_list"][0]["certificate"],
+        canonical_pem_chain_b64(&[&der_one, &der_two])
+    );
+    Ok(())
+}
+
+#[test]
+fn fails_closed_on_cert_chain_without_pem_blocks() {
+    // Given: a base64 certificate value that decodes to no PEM block at all.
+    let runtime_data = runtime_data();
+    let gateway = gateway_quote(&runtime_data);
+    let evidence = vec![model_evidence_with_certificate(
+        "HOPPER",
+        &gpu_nonce(),
+        "Y2VydA==",
+    )];
+
+    // When: the model mapper normalizes the certificate chain.
+    let error = model_request(&gateway, &evidence).expect_err("non-PEM chain must fail");
+
+    // Then: the request fails closed instead of forwarding unverifiable bytes to ITA.
+    assert!(matches!(
+        error,
+        ItaEvidenceError::InvalidPemChain {
+            field: "nvgpu.evidence_list.certificate"
+        }
+    ));
+}
+
+#[test]
+fn fails_closed_on_unterminated_pem_block() {
+    // Given: a chain whose BEGIN marker has no matching END marker.
+    let runtime_data = runtime_data();
+    let gateway = gateway_quote(&runtime_data);
+    let evidence = vec![model_evidence_with_certificate(
+        "HOPPER",
+        &gpu_nonce(),
+        &STANDARD.encode("-----BEGIN CERTIFICATE-----\nAAAA\n"),
+    )];
+
+    // When: the model mapper normalizes the certificate chain.
+    let error = model_request(&gateway, &evidence).expect_err("unterminated block must fail");
+
+    // Then: the truncated chain is rejected.
+    assert!(matches!(error, ItaEvidenceError::InvalidPemChain { .. }));
+}
+
+#[test]
+fn fails_closed_on_invalid_base64_inside_pem_block() {
+    // Given: a PEM block whose payload is not valid base64.
+    let runtime_data = runtime_data();
+    let gateway = gateway_quote(&runtime_data);
+    let evidence = vec![model_evidence_with_certificate(
+        "HOPPER",
+        &gpu_nonce(),
+        &STANDARD.encode("-----BEGIN CERTIFICATE-----\n!!!!\n-----END CERTIFICATE-----\n"),
+    )];
+
+    // When: the model mapper normalizes the certificate chain.
+    let error = model_request(&gateway, &evidence).expect_err("bad payload must fail");
+
+    // Then: the invalid payload is reported against the certificate field.
+    assert!(matches!(
+        error,
+        ItaEvidenceError::InvalidBase64 {
+            field: "nvgpu.evidence_list.certificate",
+            ..
+        }
     ));
 }

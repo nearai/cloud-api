@@ -5,6 +5,7 @@ use std::{
 };
 
 use async_trait::async_trait;
+use base64::{engine::general_purpose::STANDARD, Engine as _};
 use config::{ExternalProvidersConfig, ItaAttestationConfig, ItaBaseUrl, ItaPolicyIds};
 use serde_json::{json, Map, Value};
 use uuid::Uuid;
@@ -215,10 +216,14 @@ impl RecordingModelCollector {
 }
 
 fn model_evidence(gpu_nonce: &str) -> Map<String, Value> {
+    let pem = format!(
+        "-----BEGIN CERTIFICATE-----\n{}\n-----END CERTIFICATE-----\n",
+        STANDARD.encode(b"test-der-certificate-bytes")
+    );
     let payload = json!({
         "gpu_nonce": gpu_nonce,
         "arch": "HOPPER",
-        "evidence_list": [{ "certificate": "Y2VydA==", "evidence": "ZXZpZGVuY2U=" }]
+        "evidence_list": [{ "certificate": STANDARD.encode(pem), "evidence": "ZXZpZGVuY2U=" }]
     });
     let mut evidence = Map::new();
     evidence.insert(

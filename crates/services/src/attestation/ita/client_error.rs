@@ -27,7 +27,13 @@ pub enum ItaClientError {
     #[error("ITA rate limited")]
     RateLimited { retry_after: Option<String> },
     #[error("ITA returned non-retryable status {status}")]
-    NonRetryableStatus { status: StatusCode },
+    NonRetryableStatus {
+        status: StatusCode,
+        /// Bounded, sanitized error text from ITA's response body (e.g.
+        /// "Failed to verify GPU evidence") — the status alone is useless
+        /// for diagnosing rejected evidence.
+        detail: Option<String>,
+    },
     #[error("ITA transient status {status} remained after retries")]
     TransientStatus { status: StatusCode },
     #[error("ITA upstream response is invalid: {reason}")]

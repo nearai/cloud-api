@@ -50,6 +50,8 @@ pub enum ItaEvidenceError {
         #[source]
         source: base64::DecodeError,
     },
+    #[error("ITA evidence field '{field}' is not a valid PEM certificate chain")]
+    InvalidPemChain { field: &'static str },
     #[error("gateway TDX report_data does not match ITA nonce-bound runtime data")]
     ReportDataMismatch,
     #[error("provider evidence is not ITA-compatible")]

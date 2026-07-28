@@ -217,7 +217,10 @@ impl inference_providers::InferenceProvider for ItaCompatibleModelEvidenceProvid
                     "gpu_nonce": gpu_nonce,
                     "arch": "H100",
                     "evidence_list": [{
-                        "certificate": base64::engine::general_purpose::STANDARD.encode(b"test-gpu-cert"),
+                        "certificate": base64::engine::general_purpose::STANDARD.encode(format!(
+                            "-----BEGIN CERTIFICATE-----\n{}\n-----END CERTIFICATE-----\n",
+                            base64::engine::general_purpose::STANDARD.encode(b"test-gpu-cert")
+                        )),
                         "evidence": base64::engine::general_purpose::STANDARD.encode(b"test-gpu-evidence"),
                         "firmware_version": "test-fw"
                     }]

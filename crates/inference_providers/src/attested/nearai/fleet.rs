@@ -18,6 +18,8 @@ use crate::rotation;
 use crate::spki_verifier::FingerprintState;
 use crate::BackendVerifier;
 use reqwest::Client;
+use sha2::{Digest, Sha256};
+use std::cmp::Reverse;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock};
@@ -32,6 +34,12 @@ pub(super) const TTFT_WARMUP_SAMPLES: u32 = 8;
 /// fastest peer's EMA AND the absolute floor below.
 const TTFT_SLOW_RATIO: f64 = 2.0;
 const TTFT_SLOW_FLOOR_MS: f64 = 500.0;
+/// Keep a small first-turn burst for a reusable prefix on its deterministic
+/// primary before spilling overlapping requests to another backend. This
+/// preserves a single cache copy for ordinary traffic while preventing one hot
+/// prefix from monopolizing a replica. The counter is process-local and tracks
+/// only live requests; it never stores message content.
+const PREFIX_AFFINITY_BURST: u32 = 4;
 
 #[derive(Default, Clone, Copy)]
 pub(super) struct BackendStat {
@@ -65,6 +73,43 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+type PrefixLoads = HashMap<u64, Vec<u32>>;
+
+/// Reservation for one live affinity-routed request. Releasing is RAII-based
+/// so cancellation, errors, and dropped streams cannot leak routing load.
+pub(super) struct RouteLease {
+    route_key: u64,
+    index: usize,
+    prefix_loads: Arc<Mutex<PrefixLoads>>,
+}
+
+impl RouteLease {
+    pub(super) fn index(&self) -> usize {
+        self.index
+    }
+
+    pub(super) fn route_key(&self) -> u64 {
+        self.route_key
+    }
+}
+
+impl Drop for RouteLease {
+    fn drop(&mut self) {
+        let mut loads = lock(&self.prefix_loads);
+        let remove = if let Some(counts) = loads.get_mut(&self.route_key) {
+            if let Some(count) = counts.get_mut(self.index) {
+                *count = count.saturating_sub(1);
+            }
+            counts.iter().all(|count| *count == 0)
+        } else {
+            false
+        };
+        if remove {
+            loads.remove(&self.route_key);
+        }
+    }
+}
+
 pub(super) struct Fleet {
     /// request_hash → rotation index during streaming (before the chat_id is
     /// known). Universal completion→signature index map for the streaming path.
@@ -79,10 +124,9 @@ pub(super) struct Fleet {
     /// that don't fit the rotation scheme (one-label host, IP literal, …) — then
     /// rotation is a no-op and the canonical-SNI path is used.
     rotation_parts: Option<rotation::UrlParts>,
-    /// Message-prefix trie mapping a conversation prefix to a bucket id, so
-    /// requests sharing a prefix stick to the same backend (prefix-cache hit).
-    /// The bucket id is reduced modulo the live backend count to a rotation
-    /// index by `select_index`.
+    /// Stateless prefix/conversation router. Stable keys are reduced modulo the
+    /// live backend count, so every Cloud API process agrees on first-turn
+    /// prefix primaries and established-conversation homes.
     pub(super) prefix_router: Arc<PrefixRouter>,
     /// Lazily-filled (or eagerly pre-created in legacy mode) per-backend-index
     /// clients, each pinning a persistent H2 connection to one verified
@@ -94,6 +138,9 @@ pub(super) struct Fleet {
     /// index. Arc so the stream-measurement wrapper can update it after the
     /// Fleet method returns. Sized to MAX_FANOUT.
     pub(super) backend_stats: Arc<Mutex<Vec<BackendStat>>>,
+    /// Live request counts by routing key and backend index. Entries exist only
+    /// while a request is in flight and contain no prompt or response content.
+    prefix_loads: Arc<Mutex<PrefixLoads>>,
     /// Provider config (base_url, api_key, timeouts).
     pub(super) config: Config,
     /// General-purpose client for non-completion requests (attestation, models).
@@ -135,6 +182,7 @@ impl Fleet {
                 BackendStat::default();
                 rotation::MAX_FANOUT
             ])),
+            prefix_loads: Arc::new(Mutex::new(HashMap::new())),
             config,
             client,
             fallback_client,
@@ -144,11 +192,12 @@ impl Fleet {
         }
     }
 
-    /// Select the backend rotation index for a request: prefix-affinity
-    /// (same prefix → same backend → KV-cache hit) with preemptive latency
-    /// steering away from a backend whose TTFT EMA is pathological. Returns
-    /// `None` when rotation is unavailable (count==0 / no rotation parts) →
-    /// caller uses the canonical fallback path.
+    /// Select the idle preferred backend for a request: deterministic
+    /// prefix-affinity with preemptive latency steering away from a backend
+    /// whose TTFT EMA is pathological. The live request path uses
+    /// `acquire_index`, which starts here and adds bounded hot-prefix spillover.
+    /// Returns `None` when rotation is unavailable (count==0 / no rotation
+    /// parts), so the caller uses the canonical fallback path.
     ///
     /// Index↔backend stability: `<canonical>-iN` routes to backend `N % count`
     /// at model-proxy by SNI (independent of which TCP connection we use), so a
@@ -163,18 +212,98 @@ impl Fleet {
     /// is logged, the completion still streams). This matches the pre-existing
     /// rotation-fallback behavior; it is not introduced by index-addressing.
     ///
-    /// Reachability: `prefix_router.route()` returns a bucket id in
-    /// `0..NUM_PREFIX_BUCKETS` (default 64), reduced mod `count`. When `count >
-    /// NUM_PREFIX_BUCKETS` (more than 64 live backends for one model — far above
-    /// any current deployment) the high indices are unreachable as the
-    /// *preferred* pick, though latency steering / fallback can still reach
-    /// them. Raise `NUM_PREFIX_BUCKETS` if a model ever exceeds 64 backends.
+    /// Reachability: the prefix or conversation router returns a deterministic
+    /// `u64`. Reducing it modulo `count` makes every live backend index
+    /// reachable as the stateless primary. Process-local state affects only
+    /// temporary first-turn spillover while requests overlap.
+    #[cfg(test)]
     pub(super) fn select_index(&self, messages: &[crate::ChatMessage]) -> Option<usize> {
         let count = self.rotation_count();
         if count == 0 {
             return None;
         }
-        let preferred = self.prefix_router.route(messages) % count;
+        let route_key = self.route_key(messages);
+        self.candidate_indices(route_key, count).into_iter().next()
+    }
+
+    /// Reserve a backend for this request.
+    ///
+    /// Initial requests keep reusable-prefix affinity with bounded,
+    /// key-decorrelated spillover. Once assistant or tool history is present,
+    /// the stable first two messages select a conversation home instead. That
+    /// allows at most one deterministic handoff after the first turn and keeps
+    /// all later growing-history requests on the same backend.
+    pub(super) fn acquire_index(&self, messages: &[crate::ChatMessage]) -> Option<RouteLease> {
+        let count = self.rotation_count();
+        if count == 0 {
+            return None;
+        }
+        let has_history = has_conversation_history(messages);
+        let route_key = self.route_key(messages);
+        if messages.is_empty() {
+            return Some(self.reserve_index(route_key, 0));
+        }
+        let candidates = self.candidate_indices(route_key, count);
+        if has_history {
+            return Some(self.reserve_index(route_key, candidates[0]));
+        }
+        let mut loads = lock(&self.prefix_loads);
+        let counts = loads.entry(route_key).or_insert_with(|| vec![0; count]);
+        if counts.len() < count {
+            counts.resize(count, 0);
+        }
+        let index = candidates
+            .iter()
+            .copied()
+            .find(|index| counts[*index] < PREFIX_AFFINITY_BURST)
+            .unwrap_or_else(|| {
+                candidates
+                    .iter()
+                    .enumerate()
+                    .min_by_key(|(rank, index)| (counts[**index], *rank))
+                    .map(|(_, index)| *index)
+                    .expect("rotation count is non-zero")
+            });
+        counts[index] = counts[index].saturating_add(1);
+        drop(loads);
+        Some(RouteLease {
+            route_key,
+            index,
+            prefix_loads: self.prefix_loads.clone(),
+        })
+    }
+
+    /// Reserve an explicit fallback index for the same prefix key.
+    pub(super) fn reserve_index(&self, route_key: u64, index: usize) -> RouteLease {
+        let mut loads = lock(&self.prefix_loads);
+        let counts = loads.entry(route_key).or_default();
+        if counts.len() <= index {
+            counts.resize(index + 1, 0);
+        }
+        counts[index] = counts[index].saturating_add(1);
+        drop(loads);
+        RouteLease {
+            route_key,
+            index,
+            prefix_loads: self.prefix_loads.clone(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn active_prefix_loads(&self) -> usize {
+        lock(&self.prefix_loads).len()
+    }
+
+    fn route_key(&self, messages: &[crate::ChatMessage]) -> u64 {
+        if has_conversation_history(messages) {
+            self.prefix_router.route_conversation(messages)
+        } else {
+            self.prefix_router.route(messages)
+        }
+    }
+
+    pub(super) fn candidate_indices(&self, route_key: u64, count: usize) -> Vec<usize> {
+        let preferred = (route_key % count as u64) as usize;
         let stats = lock(&self.backend_stats);
         // Warmed EMA for index `i`, or None if out of range / not yet warmed.
         // `.get()` keeps this panic-free regardless of how `count` relates to
@@ -186,26 +315,40 @@ impl Fleet {
                 .map(|s| s.ttft_ewma_ms)
         };
         let min_warm = (0..count).filter_map(ema).fold(f64::MAX, f64::min);
-        if let Some(pref_ema) = ema(preferred) {
-            if pref_ema > TTFT_SLOW_FLOOR_MS
-                && min_warm.is_finite()
-                && pref_ema > TTFT_SLOW_RATIO * min_warm
-            {
-                // Steer to the fastest warmed backend; ties/unwarmed keep preferred.
-                let mut best = preferred;
-                let mut best_ms = pref_ema;
-                for i in 0..count {
-                    if let Some(e) = ema(i) {
-                        if e < best_ms {
-                            best = i;
-                            best_ms = e;
-                        }
-                    }
-                }
-                return Some(best);
+        let is_slow = |index: usize| {
+            ema(index).is_some_and(|value| {
+                value > TTFT_SLOW_FLOOR_MS
+                    && min_warm.is_finite()
+                    && value > TTFT_SLOW_RATIO * min_warm
+            })
+        };
+        let mut candidates: Vec<usize> = (0..count).filter(|index| !is_slow(*index)).collect();
+        // Preserve the modulo primary, but give each colliding routing key a
+        // different deterministic spill order. A simple ring makes all keys
+        // with the same primary pile onto the same secondary under pressure.
+        candidates.sort_by_key(|index| {
+            (
+                *index != preferred,
+                Reverse(route_index_score(route_key, *index)),
+                *index,
+            )
+        });
+        if candidates.is_empty() {
+            candidates.push(preferred);
+        } else if is_slow(preferred) {
+            // Preserve the existing behavior: when the deterministic primary
+            // is pathological, lead with the fastest warmed healthy backend.
+            if let Some(fastest) = candidates.iter().copied().min_by(|a, b| {
+                ema(*a)
+                    .unwrap_or(f64::MAX)
+                    .partial_cmp(&ema(*b).unwrap_or(f64::MAX))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            }) {
+                candidates.retain(|index| *index != fastest);
+                candidates.insert(0, fastest);
             }
         }
-        Some(preferred)
+        candidates
     }
 
     /// Record an observed TTFT (ms) for a backend index into its EMA.
@@ -319,4 +462,25 @@ impl Fleet {
     pub(super) fn backend_count(&self) -> usize {
         self.last_backend_count.load(Ordering::Relaxed)
     }
+}
+
+fn has_conversation_history(messages: &[crate::ChatMessage]) -> bool {
+    messages.iter().skip(1).any(|message| {
+        matches!(
+            message.role,
+            crate::MessageRole::Assistant | crate::MessageRole::Tool
+        )
+    })
+}
+
+fn route_index_score(route_key: u64, index: usize) -> u64 {
+    let mut hasher = Sha256::new();
+    hasher.update(route_key.to_be_bytes());
+    hasher.update((index as u64).to_be_bytes());
+    let digest = hasher.finalize();
+    u64::from_be_bytes(
+        digest[..8]
+            .try_into()
+            .expect("SHA-256 digest always contains eight bytes"),
+    )
 }

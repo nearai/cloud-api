@@ -199,10 +199,18 @@ impl OrganizationServiceImpl {
             ));
         }
 
-        self.repository
-            .delete(id.0)
+        match self
+            .repository
+            .delete_if_no_staking_farm_source(id.0)
             .await
-            .map_err(Self::map_repository_error)
+            .map_err(Self::map_repository_error)?
+        {
+            DeleteOrganizationResult::Deleted => Ok(true),
+            DeleteOrganizationResult::NotFound => Ok(false),
+            DeleteOrganizationResult::StakingWalletBound => {
+                Err(OrganizationError::StakingWalletBound)
+            }
+        }
     }
 
     /// List organizations accessible to a user (where they are a member, private helper)
@@ -1838,6 +1846,8 @@ mod tests {
     struct StubOrgRepo {
         org: Organization,
         member: Option<OrganizationMember>,
+        delete_result: DeleteOrganizationResult,
+        delete_if_no_staking_farm_source_calls: Mutex<usize>,
     }
 
     #[async_trait]
@@ -1880,8 +1890,12 @@ mod tests {
             unimplemented!()
         }
 
-        async fn delete(&self, _: Uuid) -> Result<bool, RepositoryError> {
-            unimplemented!()
+        async fn delete_if_no_staking_farm_source(
+            &self,
+            _: Uuid,
+        ) -> Result<DeleteOrganizationResult, RepositoryError> {
+            *self.delete_if_no_staking_farm_source_calls.lock().unwrap() += 1;
+            Ok(self.delete_result)
         }
 
         async fn add_member(
@@ -2288,7 +2302,12 @@ mod tests {
             get_by_id_calls: Mutex::new(0),
         });
         let service = OrganizationServiceImpl::new_with_email_sender(
-            Arc::new(StubOrgRepo { org, member }) as Arc<dyn OrganizationRepository>,
+            Arc::new(StubOrgRepo {
+                org,
+                member,
+                delete_result: DeleteOrganizationResult::Deleted,
+                delete_if_no_staking_farm_source_calls: Mutex::new(0),
+            }) as Arc<dyn OrganizationRepository>,
             user_repo.clone() as Arc<dyn UserRepository>,
             invitation_repo.clone() as Arc<dyn OrganizationInvitationRepository>,
             email_sender.clone() as Arc<dyn EmailSender>,
@@ -2296,6 +2315,67 @@ mod tests {
         );
 
         (service, invitation_repo, email_sender, user_repo)
+    }
+
+    #[tokio::test]
+    async fn delete_organization_blocks_staking_wallet_bound_org_without_deleting() {
+        let owner_id = UserId(Uuid::new_v4());
+        let org_id = OrganizationId(Uuid::new_v4());
+        let org_repo = Arc::new(StubOrgRepo {
+            org: Organization {
+                id: org_id.clone(),
+                name: "Staking Bound Org".to_string(),
+                description: None,
+                owner_id: owner_id.clone(),
+                settings: serde_json::json!({}),
+                is_active: true,
+                created_at: chrono::Utc::now(),
+                updated_at: chrono::Utc::now(),
+            },
+            member: None,
+            delete_result: DeleteOrganizationResult::StakingWalletBound,
+            delete_if_no_staking_farm_source_calls: Mutex::new(0),
+        });
+        let user_repo = Arc::new(StubUserRepo {
+            inviter: User {
+                id: owner_id.clone(),
+                email: "owner@example.com".to_string(),
+                username: "owner".to_string(),
+                display_name: Some("Owner".to_string()),
+                avatar_url: None,
+                auth_provider: "test".to_string(),
+                provider_user_id: "owner".to_string(),
+                role: UserRole::User,
+                is_active: true,
+                last_login: None,
+                created_at: chrono::Utc::now(),
+                updated_at: chrono::Utc::now(),
+                tokens_revoked_at: None,
+            },
+            get_by_id_calls: Mutex::new(0),
+        });
+        let invitation_repo = Arc::new(StubInvitationRepo {
+            records: Mutex::new(Vec::new()),
+        });
+        let service = OrganizationServiceImpl::new(
+            org_repo.clone() as Arc<dyn OrganizationRepository>,
+            user_repo as Arc<dyn UserRepository>,
+            invitation_repo as Arc<dyn OrganizationInvitationRepository>,
+        );
+
+        let error = service
+            .delete_organization(org_id, owner_id)
+            .await
+            .expect_err("staking-bound organization deletion should be rejected");
+
+        assert!(matches!(error, OrganizationError::StakingWalletBound));
+        assert_eq!(
+            *org_repo
+                .delete_if_no_staking_farm_source_calls
+                .lock()
+                .unwrap(),
+            1
+        );
     }
 
     #[tokio::test]

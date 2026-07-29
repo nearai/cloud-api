@@ -113,6 +113,9 @@ pub enum OrganizationError {
     #[error("Organization already exists")]
     AlreadyExists,
 
+    #[error("Organization is bound to a NEAR staking wallet")]
+    StakingWalletBound,
+
     #[error("Internal error: {0}")]
     InternalError(String),
 
@@ -143,6 +146,13 @@ pub struct AddOrganizationMemberRequest {
 #[derive(Debug, Clone)]
 pub struct UpdateOrganizationMemberRequest {
     pub role: MemberRole,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeleteOrganizationResult {
+    Deleted,
+    NotFound,
+    StakingWalletBound,
 }
 
 /// Organization member with full user information
@@ -301,7 +311,16 @@ pub trait OrganizationRepository: Send + Sync {
         request: UpdateOrganizationRequest,
     ) -> Result<Organization, RepositoryError>;
 
-    async fn delete(&self, id: Uuid) -> Result<bool, RepositoryError>;
+    /// Soft-deletes an active organization only if it has no staking farm source.
+    ///
+    /// The staking-source check is deliberately status-agnostic: the org-to-wallet
+    /// binding is permanent, and unbinding is not an API operation. Scoping this to
+    /// active rows would break that invariant. Implementations must serialize this
+    /// check with staking farm source creation for the same organization.
+    async fn delete_if_no_staking_farm_source(
+        &self,
+        id: Uuid,
+    ) -> Result<DeleteOrganizationResult, RepositoryError>;
 
     async fn add_member(
         &self,

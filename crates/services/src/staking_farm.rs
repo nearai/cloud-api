@@ -18,6 +18,10 @@ const NEAR_RPC_TIMEOUT_SECS: u64 = 10;
 #[error("NEAR account is already linked to another organization")]
 pub struct StakingFarmSourceConflict;
 
+#[derive(Debug, thiserror::Error)]
+#[error("organization is inactive and cannot be linked to a NEAR staking wallet")]
+pub struct StakingFarmOrganizationInactive;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum StakingFarmSourceStatus {

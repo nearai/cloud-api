@@ -609,12 +609,13 @@ mod tests {
     use crate::common::RepositoryError;
     use crate::organization::{
         AddOrganizationMemberRequest, BatchInvitationResponse, CreateOrganizationRequest,
-        InvitationEmailDeliveryFilters, InvitationEmailResendResult, InvitationStatus, MemberRole,
-        Organization, OrganizationError, OrganizationId, OrganizationInvitation,
-        OrganizationInvitationEmailDelivery, OrganizationInvitationWithDetails, OrganizationMember,
-        OrganizationMemberWithUser, OrganizationOrderBy, OrganizationOrderDirection,
-        OrganizationRepository, OrganizationServiceTrait, OrganizationWithRole,
-        UpdateOrganizationMemberRequest, UpdateOrganizationRequest,
+        DeleteOrganizationResult, InvitationEmailDeliveryFilters, InvitationEmailResendResult,
+        InvitationStatus, MemberRole, Organization, OrganizationError, OrganizationId,
+        OrganizationInvitation, OrganizationInvitationEmailDelivery,
+        OrganizationInvitationWithDetails, OrganizationMember, OrganizationMemberWithUser,
+        OrganizationOrderBy, OrganizationOrderDirection, OrganizationRepository,
+        OrganizationServiceTrait, OrganizationWithRole, UpdateOrganizationMemberRequest,
+        UpdateOrganizationRequest,
     };
     use crate::workspace::{
         ApiKey, ApiKeyId, ApiKeyOrderBy, ApiKeyOrderDirection, ApiKeyRepository,
@@ -951,7 +952,10 @@ mod tests {
         ) -> Result<Organization, RepositoryError> {
             unimplemented!()
         }
-        async fn delete(&self, _: Uuid) -> Result<bool, RepositoryError> {
+        async fn delete_if_no_staking_farm_source(
+            &self,
+            _: Uuid,
+        ) -> Result<DeleteOrganizationResult, RepositoryError> {
             unimplemented!()
         }
         async fn add_member(

@@ -199,6 +199,8 @@ impl OrganizationServiceImpl {
             ));
         }
 
+        // Any NEAR staking wallet binding blocks organization deletion, even if
+        // a future flow marks the staking source disconnected.
         if self
             .repository
             .has_staking_farm_source(id.0)

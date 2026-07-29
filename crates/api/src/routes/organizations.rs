@@ -5,14 +5,28 @@ use crate::models::{
 };
 use crate::{middleware::AuthenticatedUser, routes::api::AppState};
 use axum::{
-    extract::{Extension, Json, Path, Query, State},
+    extract::{Extension, FromRef, Json, Path, Query, State},
     http::StatusCode,
 };
 use serde::Deserialize;
-use services::organization::{OrganizationError, OrganizationId};
+use services::organization::{OrganizationError, OrganizationId, OrganizationServiceTrait};
+use std::sync::Arc;
 use tracing::{debug, error};
 use utoipa;
 use utoipa::ToSchema;
+
+#[derive(Clone)]
+pub struct OrganizationDeleteState {
+    pub organization_service: Arc<dyn OrganizationServiceTrait + Send + Sync>,
+}
+
+impl FromRef<AppState> for OrganizationDeleteState {
+    fn from_ref(app_state: &AppState) -> Self {
+        Self {
+            organization_service: app_state.organization_service.clone(),
+        }
+    }
+}
 
 /// List organizations
 ///
@@ -271,7 +285,6 @@ pub async fn create_organization(
         (status = 401, description = "Unauthorized", body = ErrorResponse),
         (status = 403, description = "Forbidden", body = ErrorResponse),
         (status = 404, description = "Organization not found", body = ErrorResponse),
-        (status = 409, description = "Organization is bound to a NEAR staking wallet", body = ErrorResponse),
         (status = 500, description = "Internal server error", body = ErrorResponse)
     ),
     security(
@@ -596,6 +609,7 @@ pub async fn update_organization(
         (status = 401, description = "Unauthorized", body = ErrorResponse),
         (status = 403, description = "Forbidden", body = ErrorResponse),
         (status = 404, description = "Organization not found", body = ErrorResponse),
+        (status = 409, description = "Organization is bound to a NEAR staking wallet", body = ErrorResponse),
         (status = 500, description = "Internal server error", body = ErrorResponse)
     ),
     security(
@@ -603,7 +617,7 @@ pub async fn update_organization(
     )
 )]
 pub async fn delete_organization(
-    State(app_state): State<AppState>,
+    State(state): State<OrganizationDeleteState>,
     Extension(user): Extension<AuthenticatedUser>,
     Path(organization_id): Path<OrganizationId>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
@@ -614,7 +628,7 @@ pub async fn delete_organization(
 
     let user_id = crate::conversions::authenticated_user_to_user_id(user);
 
-    match app_state
+    match state
         .organization_service
         .delete_organization(organization_id.clone(), user_id)
         .await
@@ -628,25 +642,13 @@ pub async fn delete_organization(
         }
         Ok(false) | Err(OrganizationError::NotFound) => {
             tracing::warn!("Organization not found {}", organization_id.0);
-            Err((
-                StatusCode::NOT_FOUND,
-                Json(ErrorResponse::new(
-                    "Organization not found".to_string(),
-                    "not_found".to_string(),
-                )),
-            ))
+            Err(map_delete_organization_error(OrganizationError::NotFound))
         }
-        Err(OrganizationError::Unauthorized(msg)) => Err((
-            StatusCode::FORBIDDEN,
-            Json(ErrorResponse::new(msg, "forbidden".to_string())),
+        Err(OrganizationError::Unauthorized(msg)) => Err(map_delete_organization_error(
+            OrganizationError::Unauthorized(msg),
         )),
-        Err(OrganizationError::StakingWalletBound) => Err((
-            StatusCode::CONFLICT,
-            Json(ErrorResponse::new(
-                "Organization cannot be deleted because it is bound to a NEAR staking wallet"
-                    .to_string(),
-                "staking_wallet_bound".to_string(),
-            )),
+        Err(OrganizationError::StakingWalletBound) => Err(map_delete_organization_error(
+            OrganizationError::StakingWalletBound,
         )),
         Err(_) => {
             error!("Failed to delete organization");
@@ -658,5 +660,351 @@ pub async fn delete_organization(
                 )),
             ))
         }
+    }
+}
+
+fn map_delete_organization_error(error: OrganizationError) -> (StatusCode, Json<ErrorResponse>) {
+    let (status, body) = crate::routes::common::map_organization_error(error);
+    (status, Json(body.0))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use async_trait::async_trait;
+    use chrono::Utc;
+    use services::auth::UserId;
+    use services::organization::{
+        BatchInvitationResponse, InvitationEmailDeliveryFilters, InvitationEmailResendResult,
+        InvitationStatus, MemberRole, Organization, OrganizationInvitation,
+        OrganizationInvitationEmailDelivery, OrganizationInvitationWithDetails, OrganizationMember,
+        OrganizationMemberWithUser, OrganizationOrderBy, OrganizationOrderDirection,
+        OrganizationWithRole,
+    };
+    use tower::ServiceExt;
+    use uuid::Uuid;
+
+    struct StakingWalletBoundDeleteService;
+
+    #[async_trait]
+    impl OrganizationServiceTrait for StakingWalletBoundDeleteService {
+        async fn create_organization(
+            &self,
+            _: String,
+            _: Option<String>,
+            _: UserId,
+        ) -> Result<Organization, OrganizationError> {
+            unimplemented!()
+        }
+
+        async fn get_organization(
+            &self,
+            _: OrganizationId,
+        ) -> Result<Organization, OrganizationError> {
+            unimplemented!()
+        }
+
+        async fn update_organization(
+            &self,
+            _: OrganizationId,
+            _: UserId,
+            _: Option<String>,
+            _: Option<String>,
+            _: Option<i32>,
+            _: Option<serde_json::Value>,
+        ) -> Result<Organization, OrganizationError> {
+            unimplemented!()
+        }
+
+        async fn delete_organization(
+            &self,
+            _: OrganizationId,
+            _: UserId,
+        ) -> Result<bool, OrganizationError> {
+            Err(OrganizationError::StakingWalletBound)
+        }
+
+        async fn list_organizations_for_user(
+            &self,
+            _: UserId,
+            _: i64,
+            _: i64,
+            _: Option<OrganizationOrderBy>,
+            _: Option<OrganizationOrderDirection>,
+        ) -> Result<Vec<Organization>, OrganizationError> {
+            unimplemented!()
+        }
+
+        async fn list_organizations_with_roles_for_user(
+            &self,
+            _: UserId,
+            _: i64,
+            _: i64,
+            _: Option<OrganizationOrderBy>,
+            _: Option<OrganizationOrderDirection>,
+        ) -> Result<Vec<OrganizationWithRole>, OrganizationError> {
+            unimplemented!()
+        }
+
+        async fn count_organizations_for_user(&self, _: UserId) -> Result<i64, OrganizationError> {
+            unimplemented!()
+        }
+
+        async fn add_member(
+            &self,
+            _: OrganizationId,
+            _: UserId,
+            _: UserId,
+            _: MemberRole,
+        ) -> Result<OrganizationMember, OrganizationError> {
+            unimplemented!()
+        }
+
+        async fn remove_member(
+            &self,
+            _: OrganizationId,
+            _: UserId,
+            _: UserId,
+        ) -> Result<bool, OrganizationError> {
+            unimplemented!()
+        }
+
+        async fn update_member_role(
+            &self,
+            _: OrganizationId,
+            _: UserId,
+            _: UserId,
+            _: MemberRole,
+        ) -> Result<OrganizationMember, OrganizationError> {
+            unimplemented!()
+        }
+
+        async fn is_member(&self, _: OrganizationId, _: UserId) -> Result<bool, OrganizationError> {
+            unimplemented!()
+        }
+
+        async fn get_user_role(
+            &self,
+            _: OrganizationId,
+            _: UserId,
+        ) -> Result<Option<MemberRole>, OrganizationError> {
+            unimplemented!()
+        }
+
+        async fn get_member_count(
+            &self,
+            _: OrganizationId,
+            _: UserId,
+        ) -> Result<i64, OrganizationError> {
+            unimplemented!()
+        }
+
+        async fn get_organization_by_name(
+            &self,
+            _: &str,
+        ) -> Result<Option<Organization>, OrganizationError> {
+            unimplemented!()
+        }
+
+        async fn get_members_with_users_paginated(
+            &self,
+            _: OrganizationId,
+            _: UserId,
+            _: i64,
+            _: i64,
+        ) -> Result<Vec<OrganizationMemberWithUser>, OrganizationError> {
+            unimplemented!()
+        }
+
+        async fn invite_members_by_email(
+            &self,
+            _: OrganizationId,
+            _: UserId,
+            _: Vec<(String, MemberRole)>,
+        ) -> Result<BatchInvitationResponse, OrganizationError> {
+            unimplemented!()
+        }
+
+        async fn add_member_validated(
+            &self,
+            _: OrganizationId,
+            _: UserId,
+            _: UserId,
+            _: MemberRole,
+        ) -> Result<OrganizationMember, OrganizationError> {
+            unimplemented!()
+        }
+
+        async fn update_member_role_validated(
+            &self,
+            _: OrganizationId,
+            _: UserId,
+            _: UserId,
+            _: MemberRole,
+        ) -> Result<OrganizationMember, OrganizationError> {
+            unimplemented!()
+        }
+
+        async fn remove_member_validated(
+            &self,
+            _: OrganizationId,
+            _: UserId,
+            _: UserId,
+        ) -> Result<bool, OrganizationError> {
+            unimplemented!()
+        }
+
+        async fn create_invitations(
+            &self,
+            _: OrganizationId,
+            _: UserId,
+            _: Vec<(String, MemberRole)>,
+            _: i64,
+        ) -> Result<BatchInvitationResponse, OrganizationError> {
+            unimplemented!()
+        }
+
+        async fn list_user_invitations(
+            &self,
+            _: &str,
+        ) -> Result<Vec<OrganizationInvitationWithDetails>, OrganizationError> {
+            unimplemented!()
+        }
+
+        async fn get_invitation_by_token(
+            &self,
+            _: &str,
+        ) -> Result<OrganizationInvitation, OrganizationError> {
+            unimplemented!()
+        }
+
+        async fn accept_invitation_by_token(
+            &self,
+            _: &str,
+            _: UserId,
+            _: &str,
+        ) -> Result<OrganizationMember, OrganizationError> {
+            unimplemented!()
+        }
+
+        async fn accept_invitation(
+            &self,
+            _: Uuid,
+            _: UserId,
+            _: &str,
+        ) -> Result<OrganizationMember, OrganizationError> {
+            unimplemented!()
+        }
+
+        async fn decline_invitation(&self, _: Uuid, _: &str) -> Result<(), OrganizationError> {
+            unimplemented!()
+        }
+
+        async fn cancel_organization_invitation(
+            &self,
+            _: OrganizationId,
+            _: UserId,
+            _: Uuid,
+        ) -> Result<(), OrganizationError> {
+            unimplemented!()
+        }
+
+        async fn list_organization_invitations(
+            &self,
+            _: OrganizationId,
+            _: UserId,
+            _: Option<InvitationStatus>,
+        ) -> Result<Vec<OrganizationInvitation>, OrganizationError> {
+            unimplemented!()
+        }
+
+        async fn list_invitation_email_deliveries(
+            &self,
+            _: InvitationEmailDeliveryFilters,
+            _: i64,
+            _: i64,
+        ) -> Result<(Vec<OrganizationInvitationEmailDelivery>, i64), OrganizationError> {
+            unimplemented!()
+        }
+
+        async fn resend_invitation_email(
+            &self,
+            _: Uuid,
+        ) -> Result<InvitationEmailResendResult, OrganizationError> {
+            unimplemented!()
+        }
+
+        async fn get_system_prompt(
+            &self,
+            _: OrganizationId,
+            _: UserId,
+        ) -> Result<Option<String>, OrganizationError> {
+            unimplemented!()
+        }
+
+        async fn update_system_prompt(
+            &self,
+            _: OrganizationId,
+            _: UserId,
+            _: Option<String>,
+        ) -> Result<Option<String>, OrganizationError> {
+            unimplemented!()
+        }
+    }
+
+    fn authenticated_user(id: Uuid) -> AuthenticatedUser {
+        let now = Utc::now();
+        AuthenticatedUser(database::User {
+            id,
+            email: "owner@example.com".to_string(),
+            username: "owner".to_string(),
+            display_name: Some("Owner".to_string()),
+            avatar_url: None,
+            created_at: now,
+            updated_at: now,
+            last_login_at: None,
+            is_active: true,
+            auth_provider: "test".to_string(),
+            provider_user_id: id.to_string(),
+            tokens_revoked_at: None,
+        })
+    }
+
+    #[tokio::test]
+    async fn delete_organization_returns_staking_wallet_bound_conflict() {
+        let org_id = OrganizationId(Uuid::new_v4());
+        let user_id = Uuid::new_v4();
+        let state = OrganizationDeleteState {
+            organization_service: Arc::new(StakingWalletBoundDeleteService),
+        };
+
+        let app = axum::Router::new()
+            .route(
+                "/v1/organizations/{org_id}",
+                axum::routing::delete(delete_organization),
+            )
+            .layer(Extension(authenticated_user(user_id)))
+            .with_state(state);
+
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method(axum::http::Method::DELETE)
+                    .uri(format!("/v1/organizations/{}", org_id.0))
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: ErrorResponse = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(body.error.r#type, "staking_wallet_bound");
+        assert!(body.error.message.contains("NEAR staking wallet"));
     }
 }

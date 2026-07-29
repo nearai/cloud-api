@@ -679,14 +679,14 @@ impl OrganizationRepository for PgOrganizationRepository {
 
             client
                 .query_one(
-                    "SELECT EXISTS (SELECT 1 FROM organization_staking_farm_sources WHERE organization_id = $1) AS exists",
+                    "SELECT EXISTS (SELECT 1 FROM organization_staking_farm_sources WHERE organization_id = $1) AS has_source",
                     &[&id],
                 )
                 .await
                 .map_err(map_db_error)
         })?;
 
-        Ok(row.get("exists"))
+        Ok(row.get("has_source"))
     }
 
     async fn add_member(

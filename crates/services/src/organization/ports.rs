@@ -306,6 +306,10 @@ pub trait OrganizationRepository: Send + Sync {
 
     async fn delete(&self, id: Uuid) -> Result<bool, RepositoryError>;
 
+    /// Returns true if the org has any staking farm source row, regardless of status.
+    /// This is deliberately status-agnostic: the org-to-wallet binding is permanent,
+    /// and unbinding is not an API operation. Scoping this to active rows would break
+    /// that invariant.
     async fn has_staking_farm_source(&self, id: Uuid) -> Result<bool, RepositoryError>;
 
     async fn add_member(

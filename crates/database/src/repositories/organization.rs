@@ -679,6 +679,8 @@ impl OrganizationRepository for PgOrganizationRepository {
 
             client
                 .query_one(
+                    // Keep this status-agnostic: any staking source row means
+                    // the org is permanently bound to the NEAR wallet.
                     "SELECT EXISTS (SELECT 1 FROM organization_staking_farm_sources WHERE organization_id = $1) AS has_source",
                     &[&id],
                 )

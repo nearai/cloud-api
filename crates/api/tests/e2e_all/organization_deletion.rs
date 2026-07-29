@@ -8,32 +8,34 @@ async fn test_delete_organization_bound_to_staking_wallet_returns_409() {
     let user_id = uuid::Uuid::parse_str(MOCK_USER_ID).expect("mock user id should be a UUID");
     let near_account_id = format!("staking-{}.near", uuid::Uuid::new_v4());
 
-    let client = database
-        .pool()
-        .get()
-        .await
-        .expect("failed to get database connection");
-    client
-        .execute(
-            r#"
-            INSERT INTO organization_staking_farm_sources (
-                organization_id,
-                near_account_id,
-                network_id,
-                contract_id,
-                farm_product_id,
-                farm_price_id,
-                credit_nano_usd_per_reward_unit,
-                status,
-                sync_status,
-                created_by_user_id
+    {
+        let client = database
+            .pool()
+            .get()
+            .await
+            .expect("failed to get database connection");
+        client
+            .execute(
+                r#"
+                INSERT INTO organization_staking_farm_sources (
+                    organization_id,
+                    near_account_id,
+                    network_id,
+                    contract_id,
+                    farm_product_id,
+                    farm_price_id,
+                    credit_nano_usd_per_reward_unit,
+                    status,
+                    sync_status,
+                    created_by_user_id
+                )
+                VALUES ($1, $2, 'testnet', 'stake.testnet', 'cloud-credits', 'price-test', 1000000000, 'active', 'never_synced', $3)
+                "#,
+                &[&org_id, &near_account_id, &user_id],
             )
-            VALUES ($1, $2, 'testnet', 'stake.testnet', 'cloud-credits', 'price-test', 1000000000, 'active', 'never_synced', $3)
-            "#,
-            &[&org_id, &near_account_id, &user_id],
-        )
-        .await
-        .expect("failed to insert staking farm source");
+            .await
+            .expect("failed to insert staking farm source");
+    }
 
     let response = server
         .delete(format!("/v1/organizations/{}", org.id).as_str())
@@ -46,6 +48,11 @@ async fn test_delete_organization_bound_to_staking_wallet_returns_409() {
     assert_eq!(error.error.r#type, "staking_wallet_bound");
     assert!(error.error.message.contains("NEAR staking wallet"));
 
+    let client = database
+        .pool()
+        .get()
+        .await
+        .expect("failed to get database connection");
     let row = client
         .query_one(
             r#"

@@ -30,6 +30,7 @@ utoipa = { version = "5.3", features = ["chrono", "uuid"] }
 oauth2 = { version = "5", features = ["reqwest"] }
 reqwest = { version = "0.12", features = ["json", "stream"] }
 url = "2.5"
+urlencoding = "2.1"
 bytes = "1.11"
 tokio-stream = "0.1"
 # MCP protocol

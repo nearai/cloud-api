@@ -1,4 +1,5 @@
 pub mod admin;
+pub mod aml;
 pub mod attestation;
 pub mod auth;
 pub mod auto_redact;

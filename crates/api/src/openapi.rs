@@ -110,6 +110,7 @@ use utoipa::{Modify, OpenApi};
         crate::routes::files::get_file_content,
         // Users endpoints
         crate::routes::users::get_current_user,
+        crate::routes::users::get_user_status,
         crate::routes::users::update_current_user_profile,
         crate::routes::users::get_user_refresh_tokens,
         crate::routes::users::revoke_user_refresh_token,
@@ -243,6 +244,7 @@ use utoipa::{Modify, OpenApi};
             PublicUserResponse,
             AdminUserResponse,
             crate::routes::users::UpdateUserProfileRequest,
+            crate::routes::users::UserStatusResponse,
             // Conversation models
             CreateConversationRequest, ConversationObject,
             UpdateConversationRequest, ConversationDeleteResult, ConversationItemList,

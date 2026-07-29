@@ -25,6 +25,7 @@ pub struct ApiConfig {
     pub github_dispatch: GitHubDispatchConfig,
     pub infra: InfraConfig,
     pub staking_farm: StakingFarmConfig,
+    pub aml: AmlConfig,
     pub usage_reporting: UsageReportingConfig,
     pub ita: ItaAttestationConfig,
 }
@@ -57,9 +58,76 @@ impl ApiConfig {
             external_providers: ExternalProvidersConfig::from_env(),
             github_dispatch: GitHubDispatchConfig::from_env()?,
             infra: InfraConfig::from_env(),
+            aml: AmlConfig::from_env()?,
             ita: ItaAttestationConfig::from_env()?,
             usage_reporting: UsageReportingConfig::from_env()?,
         })
+    }
+}
+
+/// Server-side AML/KYT policy for NEAR wallet-gated House-of-Stake flows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AmlConfig {
+    pub enabled: bool,
+    pub lukka_base_url: String,
+    pub lukka_bearer_token: Option<String>,
+    pub refresh_window_days: i64,
+    pub memory_cache_ttl_seconds: u64,
+    pub request_timeout_seconds: u64,
+}
+
+impl Default for AmlConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            lukka_base_url: "https://api.blockchain-analytics.lukka.tech".to_string(),
+            lukka_bearer_token: None,
+            refresh_window_days: 30,
+            memory_cache_ttl_seconds: 300,
+            request_timeout_seconds: 10,
+        }
+    }
+}
+
+impl AmlConfig {
+    pub fn from_env() -> Result<Self, String> {
+        let defaults = Self::default();
+        let token = env::var("LUKKA_AML_BEARER_TOKEN")
+            .ok()
+            .filter(|value| !value.is_empty());
+        let requested_enabled = parse_bool_env("AML_ENABLED", defaults.enabled)?;
+        let config = Self {
+            enabled: requested_enabled && token.is_some(),
+            lukka_base_url: env::var("LUKKA_AML_BASE_URL")
+                .ok()
+                .filter(|value| !value.is_empty())
+                .unwrap_or(defaults.lukka_base_url),
+            lukka_bearer_token: token,
+            refresh_window_days: parse_i64_env(
+                "AML_REFRESH_WINDOW_DAYS",
+                defaults.refresh_window_days,
+            )?,
+            memory_cache_ttl_seconds: parse_u64_env(
+                "AML_MEMORY_CACHE_TTL_SECONDS",
+                defaults.memory_cache_ttl_seconds,
+            )?,
+            request_timeout_seconds: parse_u64_env(
+                "AML_REQUEST_TIMEOUT_SECONDS",
+                defaults.request_timeout_seconds,
+            )?,
+        };
+
+        if config.refresh_window_days <= 0 {
+            return Err("AML_REFRESH_WINDOW_DAYS must be greater than zero".to_string());
+        }
+        if config.memory_cache_ttl_seconds == 0 {
+            return Err("AML_MEMORY_CACHE_TTL_SECONDS must be greater than zero".to_string());
+        }
+        if config.request_timeout_seconds == 0 || config.request_timeout_seconds > 300 {
+            return Err("AML_REQUEST_TIMEOUT_SECONDS must be between 1 and 300".to_string());
+        }
+
+        Ok(config)
     }
 }
 
@@ -249,6 +317,16 @@ pub(crate) fn parse_u64_env(key: &str, default: u64) -> Result<u64, String> {
             .trim()
             .parse::<u64>()
             .map_err(|_| format!("{key} must be an unsigned integer")),
+        Err(_) => Ok(default),
+    }
+}
+
+pub(crate) fn parse_i64_env(key: &str, default: i64) -> Result<i64, String> {
+    match env::var(key) {
+        Ok(raw) => raw
+            .trim()
+            .parse::<i64>()
+            .map_err(|_| format!("{key} must be an integer")),
         Err(_) => Ok(default),
     }
 }

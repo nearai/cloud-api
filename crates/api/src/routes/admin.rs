@@ -163,6 +163,7 @@ pub struct AdminAppState {
     pub auth_service: Arc<dyn AuthServiceTrait>,
     pub usage_service: Arc<dyn UsageServiceTrait + Send + Sync>,
     pub staking_farm_service: Arc<services::staking_farm::StakingFarmService>,
+    pub aml_service: Arc<services::aml::AmlService>,
     pub config: Arc<ApiConfig>,
     pub admin_access_token_repository: Arc<database::repositories::AdminAccessTokenRepository>,
     pub inference_provider_pool: Arc<services::inference_provider_pool::InferenceProviderPool>,

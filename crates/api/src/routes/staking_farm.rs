@@ -9,6 +9,7 @@ use axum::{
     Extension,
 };
 use serde::{Deserialize, Serialize};
+use services::aml::{AmlError, AmlFlow};
 use services::auth::UserId;
 use services::organization::OrganizationId;
 use services::staking_farm::{
@@ -154,6 +155,7 @@ pub async fn sync_organization_staking_farm(
 ) -> RouteResult<StakingFarmStateResponse> {
     let organization_id = parse_uuid(&org_id, "Invalid organization ID")?;
     require_near_default_org(&app_state, &user, organization_id).await?;
+    enforce_near_account_status(&app_state, &user, AmlFlow::StakingFarmSync).await?;
     let near_account_id = user.0.provider_user_id.clone();
     let source = app_state
         .staking_farm_service
@@ -162,6 +164,33 @@ pub async fn sync_organization_staking_farm(
         .map_err(staking_farm_error)?;
 
     Ok(ResponseJson(source_to_response(source)))
+}
+
+async fn enforce_near_account_status(
+    app_state: &AppState,
+    user: &AuthenticatedUser,
+    flow: AmlFlow,
+) -> Result<(), (StatusCode, ResponseJson<ErrorResponse>)> {
+    match app_state
+        .aml_service
+        .check_authenticated_near_user(
+            user.0.id,
+            &user.0.auth_provider,
+            &user.0.provider_user_id,
+            flow,
+        )
+        .await
+    {
+        Ok(_) => Ok(()),
+        Err(AmlError::AccountBlocked) => Err((
+            StatusCode::FORBIDDEN,
+            ResponseJson(ErrorResponse::new(
+                "Account error".to_string(),
+                "account_error".to_string(),
+            )),
+        )),
+        Err(error) => Err(internal_error(error)),
+    }
 }
 
 /// Get admin organization staking farm state

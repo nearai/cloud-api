@@ -124,6 +124,7 @@ pub fn test_config() -> ApiConfig {
         github_dispatch: config::GitHubDispatchConfig::default(),
         infra: config::InfraConfig::default(),
         staking_farm: config::StakingFarmConfig::default(),
+        aml: config::AmlConfig::default(),
         usage_reporting: config::UsageReportingConfig {
             enabled: true,
             ..config::UsageReportingConfig::default()

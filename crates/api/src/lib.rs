@@ -2652,6 +2652,7 @@ mod tests {
             github_dispatch: config::GitHubDispatchConfig::default(),
             infra: config::InfraConfig::default(),
             staking_farm: config::StakingFarmConfig::default(),
+            aml: config::AmlConfig::default(),
             usage_reporting: config::UsageReportingConfig::default(),
             ita: config::ItaAttestationConfig::default(),
         };
@@ -2760,6 +2761,7 @@ mod tests {
             github_dispatch: config::GitHubDispatchConfig::default(),
             infra: config::InfraConfig::default(),
             staking_farm: config::StakingFarmConfig::default(),
+            aml: config::AmlConfig::default(),
             usage_reporting: config::UsageReportingConfig::default(),
             ita: config::ItaAttestationConfig::default(),
         };

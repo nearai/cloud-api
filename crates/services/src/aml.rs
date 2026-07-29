@@ -308,6 +308,7 @@ fn normalize_lukka_report(
             .as_ref()
             .and_then(|section| section.risk_level.as_deref()),
     );
+    let active = risk_level != AmlRiskLevel::Unknown;
     NewAmlReport {
         user_id,
         flow,
@@ -323,7 +324,7 @@ fn normalize_lukka_report(
         reason: info.and_then(|info| info.description.clone()),
         provider_report_time: info.and_then(|info| info.report_time),
         result_json: value,
-        active: true,
+        active,
     }
 }
 
@@ -424,6 +425,12 @@ impl AmlService {
             return self.decision_from_report(&report);
         }
 
+        let stale_active_report = self
+            .repository
+            .latest_active_report(&account_id, AML_ADDRESS_TYPE_NEAR, AML_PROVIDER_LUKKA)
+            .await
+            .map_err(|error| AmlError::RepositoryFailure(error.to_string()))?;
+
         let provider_result = self
             .provider
             .score_near_account(&account_id, user_id, flow)
@@ -435,18 +442,13 @@ impl AmlService {
             .map_err(|error| AmlError::RepositoryFailure(error.to_string()))?;
 
         if report.risk_level == AmlRiskLevel::Unknown {
-            if let Some(stale_report) = self
-                .repository
-                .latest_active_report(&account_id, AML_ADDRESS_TYPE_NEAR, AML_PROVIDER_LUKKA)
-                .await
-                .map_err(|error| AmlError::RepositoryFailure(error.to_string()))?
-            {
+            if let Some(stale_report) = stale_active_report {
                 if stale_report.risk_level == AmlRiskLevel::High {
                     return Err(AmlError::AccountBlocked);
                 }
             }
             tracing::warn!(
-                account_id,
+                user_id = ?user_id,
                 flow = flow.as_str(),
                 "AML provider result was UNKNOWN; failing open"
             );
@@ -533,9 +535,28 @@ mod tests {
         assert!(!report.active);
     }
 
+    #[test]
+    fn lukka_missing_risk_level_maps_to_inactive_unknown() {
+        let report = normalize_lukka_report(
+            None,
+            AmlFlow::UserStatus,
+            "alice.near",
+            serde_json::json!({
+                "report_info_section": {
+                    "address": "alice.near",
+                    "address_type": "NEAR"
+                }
+            }),
+        );
+
+        assert_eq!(report.risk_level, AmlRiskLevel::Unknown);
+        assert!(!report.active);
+    }
+
     #[derive(Default)]
     struct MockAmlRepository {
-        latest: Mutex<Option<AmlReport>>,
+        latest_active: Mutex<Option<AmlReport>>,
+        latest_fresh_active: Mutex<Option<AmlReport>>,
         allowlisted: Mutex<bool>,
         created: Mutex<Vec<NewAmlReport>>,
     }
@@ -548,7 +569,7 @@ mod tests {
             _address_type: &str,
             _provider: &str,
         ) -> anyhow::Result<Option<AmlReport>> {
-            Ok(self.latest.lock().unwrap().clone())
+            Ok(self.latest_active.lock().unwrap().clone())
         }
 
         async fn latest_fresh_active_report(
@@ -558,7 +579,7 @@ mod tests {
             _provider: &str,
             _fresh_after: DateTime<Utc>,
         ) -> anyhow::Result<Option<AmlReport>> {
-            Ok(self.latest.lock().unwrap().clone())
+            Ok(self.latest_fresh_active.lock().unwrap().clone())
         }
 
         async fn create_report(&self, report: NewAmlReport) -> anyhow::Result<AmlReport> {
@@ -620,6 +641,26 @@ mod tests {
         assert!(matches!(result, Ok(AmlDecision::Allowed)));
     }
 
+    #[tokio::test]
+    async fn unknown_provider_result_keeps_stale_high_blocked() {
+        let repo = Arc::new(MockAmlRepository::default());
+        *repo.latest_active.lock().unwrap() =
+            Some(report_to_stored(new_report(AmlRiskLevel::High)));
+        let provider = Arc::new(StaticProvider(new_report(AmlRiskLevel::Unknown)));
+        let service = AmlService::new(repo.clone(), provider, enabled_config());
+
+        let first = service
+            .check_near_account(None, "alice.near", AmlFlow::UserStatus)
+            .await;
+        assert!(matches!(first, Err(AmlError::AccountBlocked)));
+
+        let second = service
+            .check_near_account(None, "alice.near", AmlFlow::UserStatus)
+            .await;
+        assert!(matches!(second, Err(AmlError::AccountBlocked)));
+        assert_eq!(repo.created.lock().unwrap().len(), 2);
+    }
+
     fn enabled_config() -> AmlConfig {
         AmlConfig {
             enabled: true,
@@ -630,6 +671,7 @@ mod tests {
     }
 
     fn new_report(risk_level: AmlRiskLevel) -> NewAmlReport {
+        let active = risk_level != AmlRiskLevel::Unknown;
         NewAmlReport {
             user_id: None,
             flow: AmlFlow::UserStatus,
@@ -642,7 +684,7 @@ mod tests {
             reason: None,
             provider_report_time: None,
             result_json: serde_json::json!({}),
-            active: true,
+            active,
         }
     }
 

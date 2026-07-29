@@ -117,8 +117,8 @@ impl AmlConfig {
             )?,
         };
 
-        if config.refresh_window_days <= 0 {
-            return Err("AML_REFRESH_WINDOW_DAYS must be greater than zero".to_string());
+        if config.refresh_window_days <= 0 || config.refresh_window_days > 365 {
+            return Err("AML_REFRESH_WINDOW_DAYS must be between 1 and 365".to_string());
         }
         if config.memory_cache_ttl_seconds == 0 {
             return Err("AML_MEMORY_CACHE_TTL_SECONDS must be greater than zero".to_string());
@@ -1024,6 +1024,33 @@ mod tests {
         ] {
             std::env::remove_var(key);
         }
+    }
+
+    fn clear_aml_env() {
+        for key in [
+            "AML_ENABLED",
+            "LUKKA_AML_BEARER_TOKEN",
+            "LUKKA_AML_BASE_URL",
+            "AML_REFRESH_WINDOW_DAYS",
+            "AML_MEMORY_CACHE_TTL_SECONDS",
+            "AML_REQUEST_TIMEOUT_SECONDS",
+        ] {
+            std::env::remove_var(key);
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn aml_refresh_window_rejects_out_of_range_values() {
+        clear_aml_env();
+        std::env::set_var("AML_REFRESH_WINDOW_DAYS", "366");
+        let error = AmlConfig::from_env().unwrap_err();
+        assert!(error.contains("between 1 and 365"));
+
+        std::env::set_var("AML_REFRESH_WINDOW_DAYS", "0");
+        let error = AmlConfig::from_env().unwrap_err();
+        assert!(error.contains("between 1 and 365"));
+        clear_aml_env();
     }
 
     #[test]

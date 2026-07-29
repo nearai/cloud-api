@@ -954,6 +954,9 @@ mod tests {
         async fn delete(&self, _: Uuid) -> Result<bool, RepositoryError> {
             unimplemented!()
         }
+        async fn has_staking_farm_source(&self, _: Uuid) -> Result<bool, RepositoryError> {
+            unimplemented!()
+        }
         async fn add_member(
             &self,
             _: Uuid,

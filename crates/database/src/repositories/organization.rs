@@ -668,6 +668,27 @@ impl OrganizationRepository for PgOrganizationRepository {
         Ok(rows_affected > 0)
     }
 
+    async fn has_staking_farm_source(&self, id: Uuid) -> Result<bool, RepositoryError> {
+        let row = retry_db!("organization_has_staking_farm_source", {
+            let client = self
+                .pool
+                .get()
+                .await
+                .context("Failed to get database connection")
+                .map_err(RepositoryError::PoolError)?;
+
+            client
+                .query_one(
+                    "SELECT EXISTS (SELECT 1 FROM organization_staking_farm_sources WHERE organization_id = $1) AS exists",
+                    &[&id],
+                )
+                .await
+                .map_err(map_db_error)
+        })?;
+
+        Ok(row.get("exists"))
+    }
+
     async fn add_member(
         &self,
         org_id: Uuid,

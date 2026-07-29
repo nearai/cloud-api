@@ -271,6 +271,7 @@ pub async fn create_organization(
         (status = 401, description = "Unauthorized", body = ErrorResponse),
         (status = 403, description = "Forbidden", body = ErrorResponse),
         (status = 404, description = "Organization not found", body = ErrorResponse),
+        (status = 409, description = "Organization is bound to a NEAR staking wallet", body = ErrorResponse),
         (status = 500, description = "Internal server error", body = ErrorResponse)
     ),
     security(
@@ -638,6 +639,14 @@ pub async fn delete_organization(
         Err(OrganizationError::Unauthorized(msg)) => Err((
             StatusCode::FORBIDDEN,
             Json(ErrorResponse::new(msg, "forbidden".to_string())),
+        )),
+        Err(OrganizationError::StakingWalletBound) => Err((
+            StatusCode::CONFLICT,
+            Json(ErrorResponse::new(
+                "Organization cannot be deleted because it is bound to a NEAR staking wallet"
+                    .to_string(),
+                "staking_wallet_bound".to_string(),
+            )),
         )),
         Err(_) => {
             error!("Failed to delete organization");

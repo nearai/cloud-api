@@ -560,6 +560,14 @@ pub fn map_organization_error(
                 "conflict".to_string(),
             )),
         ),
+        OrganizationError::StakingWalletBound => (
+            StatusCode::CONFLICT,
+            ResponseJson(ErrorResponse::new(
+                "Organization cannot be deleted because it is bound to a NEAR staking wallet"
+                    .to_string(),
+                "staking_wallet_bound".to_string(),
+            )),
+        ),
         OrganizationError::AlreadyMember => (
             StatusCode::CONFLICT,
             ResponseJson(ErrorResponse::new(

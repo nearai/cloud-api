@@ -113,6 +113,9 @@ pub enum OrganizationError {
     #[error("Organization already exists")]
     AlreadyExists,
 
+    #[error("Organization is bound to a NEAR staking wallet")]
+    StakingWalletBound,
+
     #[error("Internal error: {0}")]
     InternalError(String),
 
@@ -302,6 +305,8 @@ pub trait OrganizationRepository: Send + Sync {
     ) -> Result<Organization, RepositoryError>;
 
     async fn delete(&self, id: Uuid) -> Result<bool, RepositoryError>;
+
+    async fn has_staking_farm_source(&self, id: Uuid) -> Result<bool, RepositoryError>;
 
     async fn add_member(
         &self,

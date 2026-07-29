@@ -593,6 +593,15 @@ mod tests {
     use super::*;
 
     #[test]
+    fn map_organization_error_staking_wallet_bound_returns_conflict() {
+        let (status, body) = map_organization_error(OrganizationError::StakingWalletBound);
+
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body.0.error.r#type, "staking_wallet_bound");
+        assert!(body.0.error.message.contains("NEAR staking wallet"));
+    }
+
+    #[test]
     fn test_parse_legacy_file_reference_valid_with_prefix() {
         let result =
             parse_legacy_file_reference("[File: file-32af7670-f5b9-47a0-a952-20d5d3831e67]");

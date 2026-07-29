@@ -6,9 +6,10 @@ use async_trait::async_trait;
 use chrono::Utc;
 use services::common::RepositoryError;
 use services::staking_farm::{
-    OrganizationStakingFarmSource, StakingFarmRepository, StakingFarmSourceConflict,
-    StakingFarmSourceStatus, StakingFarmSourceSyncUpdate, StakingSyncStatus,
-    UpsertStakingFarmSourceRequest, CREDIT_SOURCE_HOUSE_OF_STAKE, CREDIT_TYPE_STAKING_FARM,
+    OrganizationStakingFarmSource, StakingFarmOrganizationInactive, StakingFarmRepository,
+    StakingFarmSourceConflict, StakingFarmSourceStatus, StakingFarmSourceSyncUpdate,
+    StakingSyncStatus, UpsertStakingFarmSourceRequest, CREDIT_SOURCE_HOUSE_OF_STAKE,
+    CREDIT_TYPE_STAKING_FARM,
 };
 use tokio_postgres::Row;
 use uuid::Uuid;
@@ -57,70 +58,94 @@ impl StakingFarmRepository for OrganizationStakingFarmSourcesRepository {
         request: UpsertStakingFarmSourceRequest,
     ) -> Result<OrganizationStakingFarmSource> {
         let row = retry_db!("upsert_organization_staking_farm_source", {
-            let client = self
+            let mut client = self
                 .pool
                 .get()
                 .await
                 .context("Failed to get database connection")
                 .map_err(RepositoryError::PoolError)?;
 
-            client
+            let transaction = client.transaction().await.map_err(map_db_error)?;
+
+            let organization = transaction
                 .query_opt(
-                    r#"
-                    INSERT INTO organization_staking_farm_sources (
-                        id,
-                        organization_id,
-                        near_account_id,
-                        network_id,
-                        contract_id,
-                        farm_product_id,
-                        farm_price_id,
-                        credit_nano_usd_per_reward_unit,
-                        status,
-                        sync_status,
-                        created_by_user_id,
-                        created_at,
-                        updated_at
-                    )
-                    VALUES (
-                        uuid_generate_v4(), $1, $2, $3, $4, $5, $6, $7,
-                        'active', 'never_synced', $8, now(), now()
-                    )
-                    ON CONFLICT (near_account_id, network_id, contract_id)
-                    DO UPDATE SET
-                        organization_id = CASE
-                            WHEN organization_staking_farm_sources.organization_id = EXCLUDED.organization_id
-                            THEN EXCLUDED.organization_id
-                            ELSE organization_staking_farm_sources.organization_id
-                        END,
-                        farm_product_id = EXCLUDED.farm_product_id,
-                        farm_price_id = EXCLUDED.farm_price_id,
-                        credit_nano_usd_per_reward_unit = EXCLUDED.credit_nano_usd_per_reward_unit,
-                        status = 'active',
-                        updated_at = now()
-                    WHERE organization_staking_farm_sources.organization_id = EXCLUDED.organization_id
-                    RETURNING id, organization_id, near_account_id, network_id, contract_id,
-                              farm_product_id, farm_price_id, credit_nano_usd_per_reward_unit,
-                              status, sync_status, last_sync_error, created_by_user_id,
-                              created_at, updated_at, last_synced_at,
-                              last_synced_accumulated_reward_units_24::text AS last_synced_accumulated_reward_units_24,
-                              last_synced_pending_reward_units_24::text AS last_synced_pending_reward_units_24,
-                              last_synced_reward_units_24::text AS last_synced_reward_units_24,
-                              last_synced_credit_nano_usd, active_positions
-                    "#,
-                    &[
-                        &request.organization_id,
-                        &request.near_account_id,
-                        &request.network_id,
-                        &request.contract_id,
-                        &request.farm_product_id,
-                        &request.farm_price_id,
-                        &request.credit_nano_usd_per_reward_unit,
-                        &request.created_by_user_id,
-                    ],
+                    // Lock the organization row before creating a staking source so
+                    // concurrent source creation and deletion serialize on the same row.
+                    "SELECT id FROM organizations WHERE id = $1 AND is_active = true FOR UPDATE",
+                    &[&request.organization_id],
                 )
                 .await
-                .map_err(map_db_error)
+                .map_err(map_db_error)?;
+
+            let row = if organization.is_none() {
+                transaction.rollback().await.map_err(map_db_error)?;
+                Err(RepositoryError::DatabaseError(anyhow::anyhow!(
+                    StakingFarmOrganizationInactive
+                )))
+            } else {
+                let row = transaction
+                    .query_opt(
+                        r#"
+                        INSERT INTO organization_staking_farm_sources (
+                            id,
+                            organization_id,
+                            near_account_id,
+                            network_id,
+                            contract_id,
+                            farm_product_id,
+                            farm_price_id,
+                            credit_nano_usd_per_reward_unit,
+                            status,
+                            sync_status,
+                            created_by_user_id,
+                            created_at,
+                            updated_at
+                        )
+                        VALUES (
+                            uuid_generate_v4(), $1, $2, $3, $4, $5, $6, $7,
+                            'active', 'never_synced', $8, now(), now()
+                        )
+                        ON CONFLICT (near_account_id, network_id, contract_id)
+                        DO UPDATE SET
+                            organization_id = CASE
+                                WHEN organization_staking_farm_sources.organization_id = EXCLUDED.organization_id
+                                THEN EXCLUDED.organization_id
+                                ELSE organization_staking_farm_sources.organization_id
+                            END,
+                            farm_product_id = EXCLUDED.farm_product_id,
+                            farm_price_id = EXCLUDED.farm_price_id,
+                            credit_nano_usd_per_reward_unit = EXCLUDED.credit_nano_usd_per_reward_unit,
+                            status = 'active',
+                            updated_at = now()
+                        WHERE organization_staking_farm_sources.organization_id = EXCLUDED.organization_id
+                        RETURNING id, organization_id, near_account_id, network_id, contract_id,
+                                  farm_product_id, farm_price_id, credit_nano_usd_per_reward_unit,
+                                  status, sync_status, last_sync_error, created_by_user_id,
+                                  created_at, updated_at, last_synced_at,
+                                  last_synced_accumulated_reward_units_24::text AS last_synced_accumulated_reward_units_24,
+                                  last_synced_pending_reward_units_24::text AS last_synced_pending_reward_units_24,
+                                  last_synced_reward_units_24::text AS last_synced_reward_units_24,
+                                  last_synced_credit_nano_usd, active_positions
+                        "#,
+                        &[
+                            &request.organization_id,
+                            &request.near_account_id,
+                            &request.network_id,
+                            &request.contract_id,
+                            &request.farm_product_id,
+                            &request.farm_price_id,
+                            &request.credit_nano_usd_per_reward_unit,
+                            &request.created_by_user_id,
+                        ],
+                    )
+                    .await
+                    .map_err(map_db_error)?;
+
+                transaction.commit().await.map_err(map_db_error)?;
+                Ok(row)
+            }?;
+
+            Ok(row)
         })?;
 
         let row = row.ok_or_else(|| anyhow::anyhow!(StakingFarmSourceConflict))?;

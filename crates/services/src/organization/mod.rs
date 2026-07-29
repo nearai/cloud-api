@@ -199,21 +199,18 @@ impl OrganizationServiceImpl {
             ));
         }
 
-        // Any NEAR staking wallet binding blocks organization deletion, even if
-        // a future flow marks the staking source disconnected.
-        if self
+        match self
             .repository
-            .has_staking_farm_source(id.0)
+            .delete_if_no_staking_farm_source(id.0)
             .await
             .map_err(Self::map_repository_error)?
         {
-            return Err(OrganizationError::StakingWalletBound);
+            DeleteOrganizationResult::Deleted => Ok(true),
+            DeleteOrganizationResult::NotFound => Ok(false),
+            DeleteOrganizationResult::StakingWalletBound => {
+                Err(OrganizationError::StakingWalletBound)
+            }
         }
-
-        self.repository
-            .delete(id.0)
-            .await
-            .map_err(Self::map_repository_error)
     }
 
     /// List organizations accessible to a user (where they are a member, private helper)
@@ -1849,8 +1846,8 @@ mod tests {
     struct StubOrgRepo {
         org: Organization,
         member: Option<OrganizationMember>,
-        has_staking_farm_source: bool,
-        delete_calls: Mutex<usize>,
+        delete_result: DeleteOrganizationResult,
+        delete_if_no_staking_farm_source_calls: Mutex<usize>,
     }
 
     #[async_trait]
@@ -1893,13 +1890,12 @@ mod tests {
             unimplemented!()
         }
 
-        async fn delete(&self, _: Uuid) -> Result<bool, RepositoryError> {
-            *self.delete_calls.lock().unwrap() += 1;
-            Ok(true)
-        }
-
-        async fn has_staking_farm_source(&self, _: Uuid) -> Result<bool, RepositoryError> {
-            Ok(self.has_staking_farm_source)
+        async fn delete_if_no_staking_farm_source(
+            &self,
+            _: Uuid,
+        ) -> Result<DeleteOrganizationResult, RepositoryError> {
+            *self.delete_if_no_staking_farm_source_calls.lock().unwrap() += 1;
+            Ok(self.delete_result)
         }
 
         async fn add_member(
@@ -2309,8 +2305,8 @@ mod tests {
             Arc::new(StubOrgRepo {
                 org,
                 member,
-                has_staking_farm_source: false,
-                delete_calls: Mutex::new(0),
+                delete_result: DeleteOrganizationResult::Deleted,
+                delete_if_no_staking_farm_source_calls: Mutex::new(0),
             }) as Arc<dyn OrganizationRepository>,
             user_repo.clone() as Arc<dyn UserRepository>,
             invitation_repo.clone() as Arc<dyn OrganizationInvitationRepository>,
@@ -2337,8 +2333,8 @@ mod tests {
                 updated_at: chrono::Utc::now(),
             },
             member: None,
-            has_staking_farm_source: true,
-            delete_calls: Mutex::new(0),
+            delete_result: DeleteOrganizationResult::StakingWalletBound,
+            delete_if_no_staking_farm_source_calls: Mutex::new(0),
         });
         let user_repo = Arc::new(StubUserRepo {
             inviter: User {
@@ -2373,7 +2369,13 @@ mod tests {
             .expect_err("staking-bound organization deletion should be rejected");
 
         assert!(matches!(error, OrganizationError::StakingWalletBound));
-        assert_eq!(*org_repo.delete_calls.lock().unwrap(), 0);
+        assert_eq!(
+            *org_repo
+                .delete_if_no_staking_farm_source_calls
+                .lock()
+                .unwrap(),
+            1
+        );
     }
 
     #[tokio::test]

@@ -647,48 +647,68 @@ impl OrganizationRepository for PgOrganizationRepository {
             .map_err(RepositoryError::DataConversionError)
     }
 
-    async fn delete(&self, id: Uuid) -> Result<bool, RepositoryError> {
-        let rows_affected = retry_db!("delete organization", {
-            let client = self
+    async fn delete_if_no_staking_farm_source(
+        &self,
+        id: Uuid,
+    ) -> Result<DeleteOrganizationResult, RepositoryError> {
+        retry_db!("delete_organization_if_no_staking_farm_source", {
+            let mut client = self
                 .pool
                 .get()
                 .await
                 .context("Failed to get database connection")
                 .map_err(RepositoryError::PoolError)?;
 
-            client
-                .execute(
-                    "UPDATE organizations SET is_active = false WHERE id = $1 AND is_active = true",
+            let transaction = client.transaction().await.map_err(map_db_error)?;
+
+            let organization = transaction
+                .query_opt(
+                    // Lock the organization row before checking staking sources so
+                    // concurrent source creation and deletion serialize on the same row.
+                    "SELECT id FROM organizations WHERE id = $1 AND is_active = true FOR UPDATE",
                     &[&id],
                 )
                 .await
-                .map_err(map_db_error)
-        })?;
+                .map_err(map_db_error)?;
 
-        Ok(rows_affected > 0)
-    }
+            let outcome = if organization.is_none() {
+                transaction.rollback().await.map_err(map_db_error)?;
+                DeleteOrganizationResult::NotFound
+            } else {
+                let row = transaction
+                    .query_one(
+                        // Keep this status-agnostic: any staking source row means
+                        // the org is permanently bound to the NEAR wallet.
+                        "SELECT EXISTS (SELECT 1 FROM organization_staking_farm_sources WHERE organization_id = $1) AS has_source",
+                        &[&id],
+                    )
+                    .await
+                    .map_err(map_db_error)?;
 
-    async fn has_staking_farm_source(&self, id: Uuid) -> Result<bool, RepositoryError> {
-        let row = retry_db!("organization_has_staking_farm_source", {
-            let client = self
-                .pool
-                .get()
-                .await
-                .context("Failed to get database connection")
-                .map_err(RepositoryError::PoolError)?;
+                if row.get::<_, bool>("has_source") {
+                    transaction.rollback().await.map_err(map_db_error)?;
+                    DeleteOrganizationResult::StakingWalletBound
+                } else {
+                    let rows_affected = transaction
+                        .execute(
+                            "UPDATE organizations SET is_active = false WHERE id = $1 AND is_active = true",
+                            &[&id],
+                        )
+                        .await
+                        .map_err(map_db_error)?;
 
-            client
-                .query_one(
-                    // Keep this status-agnostic: any staking source row means
-                    // the org is permanently bound to the NEAR wallet.
-                    "SELECT EXISTS (SELECT 1 FROM organization_staking_farm_sources WHERE organization_id = $1) AS has_source",
-                    &[&id],
-                )
-                .await
-                .map_err(map_db_error)
-        })?;
+                    transaction.commit().await.map_err(map_db_error)?;
 
-        Ok(row.get("has_source"))
+                    if rows_affected > 0 {
+                        DeleteOrganizationResult::Deleted
+                    } else {
+                        DeleteOrganizationResult::NotFound
+                    }
+                }
+            };
+
+            Ok(outcome)
+        })
     }
 
     async fn add_member(

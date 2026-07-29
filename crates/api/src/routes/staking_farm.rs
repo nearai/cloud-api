@@ -11,7 +11,9 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use services::auth::UserId;
 use services::organization::OrganizationId;
-use services::staking_farm::{OrganizationStakingFarmSource, StakingFarmSourceConflict};
+use services::staking_farm::{
+    OrganizationStakingFarmSource, StakingFarmOrganizationInactive, StakingFarmSourceConflict,
+};
 use utoipa::ToSchema;
 use uuid::Uuid;
 
@@ -138,7 +140,7 @@ pub async fn get_organization_staking_farm(
         (status = 400, description = "Invalid organization ID", body = ErrorResponse),
         (status = 401, description = "Unauthorized", body = ErrorResponse),
         (status = 403, description = "Forbidden", body = ErrorResponse),
-        (status = 409, description = "NEAR account is already linked to another organization", body = ErrorResponse),
+        (status = 409, description = "NEAR account conflict or organization inactive", body = ErrorResponse),
         (status = 500, description = "Internal server error", body = ErrorResponse)
     ),
     security(
@@ -333,12 +335,30 @@ fn not_found(message: &str) -> (StatusCode, ResponseJson<ErrorResponse>) {
 }
 
 fn staking_farm_error(error: anyhow::Error) -> (StatusCode, ResponseJson<ErrorResponse>) {
-    if error.downcast_ref::<StakingFarmSourceConflict>().is_some() {
+    if error
+        .chain()
+        .any(|cause| cause.downcast_ref::<StakingFarmSourceConflict>().is_some())
+    {
         return (
             StatusCode::CONFLICT,
             ResponseJson(ErrorResponse::new(
                 "NEAR account is already linked to another organization".to_string(),
                 "staking_farm_source_conflict".to_string(),
+            )),
+        );
+    }
+
+    if error.chain().any(|cause| {
+        cause
+            .downcast_ref::<StakingFarmOrganizationInactive>()
+            .is_some()
+    }) {
+        return (
+            StatusCode::CONFLICT,
+            ResponseJson(ErrorResponse::new(
+                "Organization is inactive and cannot be linked to a NEAR staking wallet"
+                    .to_string(),
+                "organization_inactive".to_string(),
             )),
         );
     }
@@ -355,4 +375,18 @@ fn internal_error(error: impl std::fmt::Display) -> (StatusCode, ResponseJson<Er
             "internal_server_error".to_string(),
         )),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn staking_farm_error_organization_inactive_returns_conflict() {
+        let (status, body) = staking_farm_error(anyhow::anyhow!(StakingFarmOrganizationInactive));
+
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body.0.error.r#type, "organization_inactive");
+        assert!(body.0.error.message.contains("inactive"));
+    }
 }

@@ -66,7 +66,7 @@ impl ApiConfig {
 }
 
 /// Server-side AML/KYT policy for NEAR wallet-gated House-of-Stake flows.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct AmlConfig {
     pub enabled: bool,
     pub lukka_base_url: String,
@@ -74,6 +74,22 @@ pub struct AmlConfig {
     pub refresh_window_days: i64,
     pub memory_cache_ttl_seconds: u64,
     pub request_timeout_seconds: u64,
+}
+
+impl std::fmt::Debug for AmlConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AmlConfig")
+            .field("enabled", &self.enabled)
+            .field("lukka_base_url", &self.lukka_base_url)
+            .field(
+                "lukka_bearer_token",
+                &self.lukka_bearer_token.as_ref().map(|_| "<redacted>"),
+            )
+            .field("refresh_window_days", &self.refresh_window_days)
+            .field("memory_cache_ttl_seconds", &self.memory_cache_ttl_seconds)
+            .field("request_timeout_seconds", &self.request_timeout_seconds)
+            .finish()
+    }
 }
 
 impl Default for AmlConfig {
@@ -94,10 +110,14 @@ impl AmlConfig {
         let defaults = Self::default();
         let token = env::var("LUKKA_AML_BEARER_TOKEN")
             .ok()
+            .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty());
         let requested_enabled = parse_bool_env("AML_ENABLED", defaults.enabled)?;
+        if requested_enabled && token.is_none() {
+            return Err("LUKKA_AML_BEARER_TOKEN must be set when AML_ENABLED=true".to_string());
+        }
         let config = Self {
-            enabled: requested_enabled && token.is_some(),
+            enabled: requested_enabled,
             lukka_base_url: env::var("LUKKA_AML_BASE_URL")
                 .ok()
                 .filter(|value| !value.is_empty())
@@ -1051,6 +1071,42 @@ mod tests {
         let error = AmlConfig::from_env().unwrap_err();
         assert!(error.contains("between 1 and 365"));
         clear_aml_env();
+    }
+
+    #[test]
+    fn aml_config_debug_redacts_lukka_bearer_token() {
+        let config = AmlConfig {
+            enabled: true,
+            lukka_bearer_token: Some("lukka-secret-token".to_string()),
+            ..AmlConfig::default()
+        };
+
+        let debug = format!("{config:?}");
+        assert!(debug.contains("<redacted>"));
+        assert!(!debug.contains("lukka-secret-token"));
+    }
+
+    #[test]
+    #[serial]
+    fn aml_enabled_requires_non_empty_lukka_bearer_token() {
+        clear_aml_env();
+        std::env::set_var("AML_ENABLED", "true");
+        let error = AmlConfig::from_env().unwrap_err();
+        assert!(error.contains("LUKKA_AML_BEARER_TOKEN"));
+
+        std::env::set_var("LUKKA_AML_BEARER_TOKEN", "   ");
+        let error = AmlConfig::from_env().unwrap_err();
+        assert!(error.contains("LUKKA_AML_BEARER_TOKEN"));
+        clear_aml_env();
+    }
+
+    #[test]
+    #[serial]
+    fn aml_disabled_allows_missing_lukka_bearer_token() {
+        clear_aml_env();
+        let config = AmlConfig::from_env().unwrap();
+        assert!(!config.enabled);
+        assert!(config.lukka_bearer_token.is_none());
     }
 
     #[test]

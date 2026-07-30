@@ -425,12 +425,6 @@ impl AmlService {
             return self.decision_from_report(&report);
         }
 
-        let stale_active_report = self
-            .repository
-            .latest_active_report(&account_id, AML_ADDRESS_TYPE_NEAR, AML_PROVIDER_LUKKA)
-            .await
-            .map_err(|error| AmlError::RepositoryFailure(error.to_string()))?;
-
         let provider_result = self
             .provider
             .score_near_account(&account_id, user_id, flow)
@@ -442,7 +436,12 @@ impl AmlService {
             .map_err(|error| AmlError::RepositoryFailure(error.to_string()))?;
 
         if report.risk_level == AmlRiskLevel::Unknown {
-            if let Some(stale_report) = stale_active_report {
+            if let Some(stale_report) = self
+                .repository
+                .latest_active_report(&account_id, AML_ADDRESS_TYPE_NEAR, AML_PROVIDER_LUKKA)
+                .await
+                .map_err(|error| AmlError::RepositoryFailure(error.to_string()))?
+            {
                 if stale_report.risk_level == AmlRiskLevel::High {
                     return Err(AmlError::AccountBlocked);
                 }
@@ -584,7 +583,11 @@ mod tests {
 
         async fn create_report(&self, report: NewAmlReport) -> anyhow::Result<AmlReport> {
             self.created.lock().unwrap().push(report.clone());
-            Ok(report_to_stored(report))
+            let stored = report_to_stored(report);
+            if stored.active {
+                *self.latest_active.lock().unwrap() = Some(stored.clone());
+            }
+            Ok(stored)
         }
 
         async fn is_allowlisted(
@@ -607,6 +610,36 @@ mod tests {
             _flow: AmlFlow,
         ) -> Result<NewAmlReport, AmlError> {
             Ok(self.0.clone())
+        }
+    }
+
+    struct ConcurrentHighThenUnknownProvider {
+        barrier: tokio::sync::Barrier,
+        calls: Mutex<usize>,
+    }
+
+    #[async_trait]
+    impl AmlProviderClient for ConcurrentHighThenUnknownProvider {
+        async fn score_near_account(
+            &self,
+            _account_id: &str,
+            _user_id: Option<Uuid>,
+            _flow: AmlFlow,
+        ) -> Result<NewAmlReport, AmlError> {
+            let call_index = {
+                let mut calls = self.calls.lock().unwrap();
+                let call_index = *calls;
+                *calls += 1;
+                call_index
+            };
+
+            self.barrier.wait().await;
+            if call_index == 0 {
+                return Ok(new_report(AmlRiskLevel::High));
+            }
+
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            Ok(new_report(AmlRiskLevel::Unknown))
         }
     }
 
@@ -657,6 +690,25 @@ mod tests {
         let second = service
             .check_near_account(None, "alice.near", AmlFlow::UserStatus)
             .await;
+        assert!(matches!(second, Err(AmlError::AccountBlocked)));
+        assert_eq!(repo.created.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn concurrent_unknown_result_rechecks_latest_active_high() {
+        let repo = Arc::new(MockAmlRepository::default());
+        let provider = Arc::new(ConcurrentHighThenUnknownProvider {
+            barrier: tokio::sync::Barrier::new(2),
+            calls: Mutex::new(0),
+        });
+        let service = AmlService::new(repo.clone(), provider, enabled_config());
+
+        let (first, second) = tokio::join!(
+            service.check_near_account(None, "alice.near", AmlFlow::UserStatus),
+            service.check_near_account(None, "alice.near", AmlFlow::UserStatus)
+        );
+
+        assert!(matches!(first, Err(AmlError::AccountBlocked)));
         assert!(matches!(second, Err(AmlError::AccountBlocked)));
         assert_eq!(repo.created.lock().unwrap().len(), 2);
     }

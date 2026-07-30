@@ -507,6 +507,18 @@ pub async fn init_domain_services_with_pool(
         service_usage_repo,
     ));
 
+    let aml_repository = Arc::new(database::repositories::PostgresAmlRepository::new(
+        database.pool().clone(),
+    )) as Arc<dyn services::aml::AmlRepository>;
+    let aml_provider = Arc::new(
+        services::aml::LukkaAmlClient::new(&config.aml)
+            .expect("Failed to initialize Lukka AML client"),
+    ) as Arc<dyn services::aml::AmlProviderClient>;
+    let aml_service = Arc::new(services::aml::AmlService::new(
+        aml_repository,
+        aml_provider,
+        config.aml.clone(),
+    ));
     let staking_farm_repository = Arc::new(
         database::repositories::OrganizationStakingFarmSourcesRepository::new(
             database.pool().clone(),
@@ -523,19 +535,8 @@ pub async fn init_domain_services_with_pool(
     let staking_farm_service = Arc::new(services::staking_farm::StakingFarmService::new(
         staking_farm_repository,
         staking_farm_contract_client,
+        Some(aml_service.clone()),
         config.staking_farm.clone(),
-    ));
-    let aml_repository = Arc::new(database::repositories::PostgresAmlRepository::new(
-        database.pool().clone(),
-    )) as Arc<dyn services::aml::AmlRepository>;
-    let aml_provider = Arc::new(
-        services::aml::LukkaAmlClient::new(&config.aml)
-            .expect("Failed to initialize Lukka AML client"),
-    ) as Arc<dyn services::aml::AmlProviderClient>;
-    let aml_service = Arc::new(services::aml::AmlService::new(
-        aml_repository,
-        aml_provider,
-        config.aml.clone(),
     ));
 
     DomainServices {

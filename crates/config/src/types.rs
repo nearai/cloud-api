@@ -253,7 +253,7 @@ fn parse_aml_blocked_risk_levels(key: &str, default: &[String]) -> Result<Vec<St
     {
         let level = value.to_ascii_uppercase();
         match level.as_str() {
-            "LOW" | "MEDIUM" | "HIGH" | "UNKNOWN" => {
+            "LOW" | "MEDIUM" | "HIGH" => {
                 if !levels.contains(&level) {
                     levels.push(level);
                 }
@@ -1285,6 +1285,11 @@ mod tests {
     fn aml_risk_policy_rejects_invalid_values() {
         clear_aml_env();
         std::env::set_var("LUKKA_AML_BLOCKED_RISK_LEVELS", "SEVERE");
+        let error = AmlConfig::from_env().unwrap_err();
+        assert!(error.contains("LUKKA_AML_BLOCKED_RISK_LEVELS"));
+
+        clear_aml_env();
+        std::env::set_var("LUKKA_AML_BLOCKED_RISK_LEVELS", "UNKNOWN");
         let error = AmlConfig::from_env().unwrap_err();
         assert!(error.contains("LUKKA_AML_BLOCKED_RISK_LEVELS"));
 

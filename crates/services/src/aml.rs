@@ -529,6 +529,9 @@ impl AmlService {
         }
 
         if let Some(report) = self.unknown_cache.get(&account_id).await {
+            if self.should_block_report(&report) {
+                return Err(AmlError::AccountBlocked);
+            }
             return self
                 .decision_from_unknown_report(&account_id, &report, user_id, flow, false)
                 .await;
@@ -546,6 +549,12 @@ impl AmlService {
 
         if report.risk_level != AmlRiskLevel::Unknown {
             self.cache.insert(account_id.clone(), report.clone()).await;
+        }
+
+        if report.risk_level == AmlRiskLevel::Unknown {
+            self.unknown_cache
+                .insert(account_id.clone(), report.clone())
+                .await;
         }
 
         if self.should_block_report(&report) {
@@ -586,15 +595,13 @@ impl AmlService {
     }
 
     fn should_block_report(&self, report: &AmlReport) -> bool {
-        self.config
-            .blocked_risk_levels
-            .iter()
-            .any(|level| level == report.risk_level.as_str())
-            || self
-                .config
-                .score_block_threshold
-                .zip(report.score)
-                .is_some_and(|(threshold, score)| score >= threshold)
+        self.config.blocked_risk_levels.iter().any(|level| {
+            report.risk_level != AmlRiskLevel::Unknown && level == report.risk_level.as_str()
+        }) || self
+            .config
+            .score_block_threshold
+            .zip(report.score)
+            .is_some_and(|(threshold, score)| score >= threshold)
     }
 
     async fn decision_from_unknown_report(
@@ -1078,17 +1085,22 @@ mod tests {
             score_block_threshold: Some(75),
             ..enabled_config()
         };
-        let service = AmlService::new(repo, provider, config);
+        let service = AmlService::new(repo.clone(), provider, config);
 
-        let result = service
+        let first = service
             .check_near_account(None, "alice.near", AmlFlow::UserStatus)
             .await;
+        assert!(matches!(first, Err(AmlError::AccountBlocked)));
 
-        assert!(matches!(result, Err(AmlError::AccountBlocked)));
+        let second = service
+            .check_near_account(None, "alice.near", AmlFlow::UserStatus)
+            .await;
+        assert!(matches!(second, Err(AmlError::AccountBlocked)));
+        assert_eq!(repo.created.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]
-    async fn configured_unknown_risk_level_blocks_provider_result() {
+    async fn unknown_risk_level_fails_open_even_if_policy_contains_unknown() {
         let repo = Arc::new(MockAmlRepository::default());
         let provider = Arc::new(StaticProvider(NewAmlReport {
             risk_level: AmlRiskLevel::Unknown,
@@ -1108,7 +1120,7 @@ mod tests {
             .check_near_account(None, "alice.near", AmlFlow::UserStatus)
             .await;
 
-        assert!(matches!(result, Err(AmlError::AccountBlocked)));
+        assert!(matches!(result, Ok(AmlDecision::Allowed)));
     }
 
     #[tokio::test]

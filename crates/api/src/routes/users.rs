@@ -187,7 +187,7 @@ pub async fn get_current_user(
 /// provider details are never exposed in this public response.
 #[utoipa::path(
     get,
-    path = "/v1/users/status",
+    path = "/v1/users/me/status",
     tag = "Users",
     responses(
         (status = 200, description = "Current account is eligible", body = UserStatusResponse),

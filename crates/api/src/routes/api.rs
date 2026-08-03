@@ -169,7 +169,7 @@ pub fn build_management_router(app_state: AppState, auth_state: AuthState) -> Ro
     // User routes (require access token authentication)
     let user_routes = Router::new()
         .route("/me", get(get_current_user))
-        .route("/status", get(get_user_status))
+        .route("/me/status", get(get_user_status))
         .route("/me/profile", put(update_current_user_profile))
         .route("/me/invitations", get(list_user_invitations))
         .route(

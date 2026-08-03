@@ -74,6 +74,8 @@ pub struct AmlConfig {
     pub refresh_window_days: i64,
     pub memory_cache_ttl_seconds: u64,
     pub request_timeout_seconds: u64,
+    pub blocked_risk_levels: Vec<String>,
+    pub score_block_threshold: Option<i32>,
 }
 
 impl std::fmt::Debug for AmlConfig {
@@ -88,6 +90,8 @@ impl std::fmt::Debug for AmlConfig {
             .field("refresh_window_days", &self.refresh_window_days)
             .field("memory_cache_ttl_seconds", &self.memory_cache_ttl_seconds)
             .field("request_timeout_seconds", &self.request_timeout_seconds)
+            .field("blocked_risk_levels", &self.blocked_risk_levels)
+            .field("score_block_threshold", &self.score_block_threshold)
             .finish()
     }
 }
@@ -101,6 +105,8 @@ impl Default for AmlConfig {
             refresh_window_days: 30,
             memory_cache_ttl_seconds: 300,
             request_timeout_seconds: 10,
+            blocked_risk_levels: vec!["HIGH".to_string()],
+            score_block_threshold: Some(75),
         }
     }
 }
@@ -135,6 +141,14 @@ impl AmlConfig {
                 "AML_REQUEST_TIMEOUT_SECONDS",
                 defaults.request_timeout_seconds,
             )?,
+            blocked_risk_levels: parse_aml_blocked_risk_levels(
+                "AML_BLOCKED_RISK_LEVELS",
+                &defaults.blocked_risk_levels,
+            )?,
+            score_block_threshold: parse_optional_i32_env(
+                "AML_SCORE_BLOCK_THRESHOLD",
+                defaults.score_block_threshold,
+            )?,
         };
 
         if config.refresh_window_days <= 0 || config.refresh_window_days > 365 {
@@ -146,8 +160,64 @@ impl AmlConfig {
         if config.request_timeout_seconds == 0 || config.request_timeout_seconds > 300 {
             return Err("AML_REQUEST_TIMEOUT_SECONDS must be between 1 and 300".to_string());
         }
+        if config.blocked_risk_levels.is_empty() && config.score_block_threshold.is_none() {
+            return Err(
+                "At least one AML risk policy must be configured via AML_BLOCKED_RISK_LEVELS or AML_SCORE_BLOCK_THRESHOLD"
+                    .to_string(),
+            );
+        }
+        if config
+            .score_block_threshold
+            .is_some_and(|threshold| !(0..=100).contains(&threshold))
+        {
+            return Err("AML_SCORE_BLOCK_THRESHOLD must be between 0 and 100".to_string());
+        }
 
         Ok(config)
+    }
+}
+
+fn parse_aml_blocked_risk_levels(key: &str, default: &[String]) -> Result<Vec<String>, String> {
+    let raw = match env::var(key) {
+        Ok(raw) => raw,
+        Err(_) => return Ok(default.to_vec()),
+    };
+
+    let mut levels = Vec::new();
+    for value in raw
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        let level = value.to_ascii_uppercase();
+        match level.as_str() {
+            "LOW" | "MEDIUM" | "HIGH" | "UNKNOWN" => {
+                if !levels.contains(&level) {
+                    levels.push(level);
+                }
+            }
+            _ => return Err(format!("{key} contains unsupported risk level '{value}'")),
+        }
+    }
+    Ok(levels)
+}
+
+fn parse_optional_i32_env(key: &str, default: Option<i32>) -> Result<Option<i32>, String> {
+    match env::var(key) {
+        Ok(raw) => {
+            let value = raw.trim();
+            if value.is_empty()
+                || value.eq_ignore_ascii_case("none")
+                || value.eq_ignore_ascii_case("disabled")
+            {
+                return Ok(None);
+            }
+            value
+                .parse::<i32>()
+                .map(Some)
+                .map_err(|_| format!("{key} must be an integer, 'none', or 'disabled'"))
+        }
+        Err(_) => Ok(default),
     }
 }
 
@@ -1054,6 +1124,8 @@ mod tests {
             "AML_REFRESH_WINDOW_DAYS",
             "AML_MEMORY_CACHE_TTL_SECONDS",
             "AML_REQUEST_TIMEOUT_SECONDS",
+            "AML_BLOCKED_RISK_LEVELS",
+            "AML_SCORE_BLOCK_THRESHOLD",
         ] {
             std::env::remove_var(key);
         }
@@ -1107,6 +1179,44 @@ mod tests {
         let config = AmlConfig::from_env().unwrap();
         assert!(!config.enabled);
         assert!(config.lukka_bearer_token.is_none());
+    }
+
+    #[test]
+    #[serial]
+    fn aml_risk_policy_env_overrides_defaults() {
+        clear_aml_env();
+        std::env::set_var("AML_BLOCKED_RISK_LEVELS", "medium, high, medium");
+        std::env::set_var("AML_SCORE_BLOCK_THRESHOLD", "82");
+
+        let config = AmlConfig::from_env().unwrap();
+
+        assert_eq!(
+            config.blocked_risk_levels,
+            vec!["MEDIUM".to_string(), "HIGH".to_string()]
+        );
+        assert_eq!(config.score_block_threshold, Some(82));
+        clear_aml_env();
+    }
+
+    #[test]
+    #[serial]
+    fn aml_risk_policy_rejects_invalid_values() {
+        clear_aml_env();
+        std::env::set_var("AML_BLOCKED_RISK_LEVELS", "SEVERE");
+        let error = AmlConfig::from_env().unwrap_err();
+        assert!(error.contains("AML_BLOCKED_RISK_LEVELS"));
+
+        clear_aml_env();
+        std::env::set_var("AML_SCORE_BLOCK_THRESHOLD", "101");
+        let error = AmlConfig::from_env().unwrap_err();
+        assert!(error.contains("AML_SCORE_BLOCK_THRESHOLD"));
+
+        clear_aml_env();
+        std::env::set_var("AML_BLOCKED_RISK_LEVELS", "");
+        std::env::set_var("AML_SCORE_BLOCK_THRESHOLD", "disabled");
+        let error = AmlConfig::from_env().unwrap_err();
+        assert!(error.contains("At least one AML risk policy"));
+        clear_aml_env();
     }
 
     #[test]

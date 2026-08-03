@@ -78,6 +78,7 @@ pub struct AmlConfig {
     pub score_block_threshold: Option<i32>,
     pub high_risk_slack_webhook_url: Option<String>,
     pub high_risk_slack_timeout_ms: u64,
+    pub high_risk_slack_dedupe_seconds: u64,
 }
 
 impl std::fmt::Debug for AmlConfig {
@@ -105,6 +106,10 @@ impl std::fmt::Debug for AmlConfig {
                 "high_risk_slack_timeout_ms",
                 &self.high_risk_slack_timeout_ms,
             )
+            .field(
+                "high_risk_slack_dedupe_seconds",
+                &self.high_risk_slack_dedupe_seconds,
+            )
             .finish()
     }
 }
@@ -122,6 +127,7 @@ impl Default for AmlConfig {
             score_block_threshold: Some(75),
             high_risk_slack_webhook_url: None,
             high_risk_slack_timeout_ms: 3_000,
+            high_risk_slack_dedupe_seconds: 300,
         }
     }
 }
@@ -174,6 +180,10 @@ impl AmlConfig {
                 "LUKKA_AML_HIGH_RISK_SLACK_TIMEOUT_MS",
                 defaults.high_risk_slack_timeout_ms,
             )?,
+            high_risk_slack_dedupe_seconds: parse_u64_env(
+                "LUKKA_AML_HIGH_RISK_SLACK_DEDUPE_SECONDS",
+                defaults.high_risk_slack_dedupe_seconds,
+            )?,
         };
 
         if config.refresh_window_days <= 0 || config.refresh_window_days > 365 {
@@ -193,13 +203,23 @@ impl AmlConfig {
         }
         if config
             .score_block_threshold
-            .is_some_and(|threshold| !(0..=100).contains(&threshold))
+            .is_some_and(|threshold| !(1..=100).contains(&threshold))
         {
-            return Err("LUKKA_AML_SCORE_BLOCK_THRESHOLD must be between 0 and 100".to_string());
+            return Err(
+                "LUKKA_AML_SCORE_BLOCK_THRESHOLD must be between 1 and 100, or disabled"
+                    .to_string(),
+            );
         }
         if config.high_risk_slack_timeout_ms == 0 || config.high_risk_slack_timeout_ms > 30_000 {
             return Err(
                 "LUKKA_AML_HIGH_RISK_SLACK_TIMEOUT_MS must be between 1 and 30000".to_string(),
+            );
+        }
+        if config.high_risk_slack_dedupe_seconds == 0
+            || config.high_risk_slack_dedupe_seconds > 86_400
+        {
+            return Err(
+                "LUKKA_AML_HIGH_RISK_SLACK_DEDUPE_SECONDS must be between 1 and 86400".to_string(),
             );
         }
 
@@ -1158,6 +1178,7 @@ mod tests {
             "LUKKA_AML_SCORE_BLOCK_THRESHOLD",
             "LUKKA_AML_HIGH_RISK_SLACK_WEBHOOK_URL",
             "LUKKA_AML_HIGH_RISK_SLACK_TIMEOUT_MS",
+            "LUKKA_AML_HIGH_RISK_SLACK_DEDUPE_SECONDS",
         ] {
             std::env::remove_var(key);
         }
@@ -1226,6 +1247,7 @@ mod tests {
             " https://hooks.slack.test/token ",
         );
         std::env::set_var("LUKKA_AML_HIGH_RISK_SLACK_TIMEOUT_MS", "2500");
+        std::env::set_var("LUKKA_AML_HIGH_RISK_SLACK_DEDUPE_SECONDS", "120");
 
         let config = AmlConfig::from_env().unwrap();
 
@@ -1239,6 +1261,7 @@ mod tests {
             Some("https://hooks.slack.test/token")
         );
         assert_eq!(config.high_risk_slack_timeout_ms, 2500);
+        assert_eq!(config.high_risk_slack_dedupe_seconds, 120);
         clear_aml_env();
     }
 
@@ -1256,6 +1279,11 @@ mod tests {
         assert!(error.contains("LUKKA_AML_SCORE_BLOCK_THRESHOLD"));
 
         clear_aml_env();
+        std::env::set_var("LUKKA_AML_SCORE_BLOCK_THRESHOLD", "0");
+        let error = AmlConfig::from_env().unwrap_err();
+        assert!(error.contains("LUKKA_AML_SCORE_BLOCK_THRESHOLD"));
+
+        clear_aml_env();
         std::env::set_var("LUKKA_AML_BLOCKED_RISK_LEVELS", "");
         std::env::set_var("LUKKA_AML_SCORE_BLOCK_THRESHOLD", "disabled");
         let error = AmlConfig::from_env().unwrap_err();
@@ -1265,6 +1293,11 @@ mod tests {
         std::env::set_var("LUKKA_AML_HIGH_RISK_SLACK_TIMEOUT_MS", "30001");
         let error = AmlConfig::from_env().unwrap_err();
         assert!(error.contains("LUKKA_AML_HIGH_RISK_SLACK_TIMEOUT_MS"));
+
+        clear_aml_env();
+        std::env::set_var("LUKKA_AML_HIGH_RISK_SLACK_DEDUPE_SECONDS", "86401");
+        let error = AmlConfig::from_env().unwrap_err();
+        assert!(error.contains("LUKKA_AML_HIGH_RISK_SLACK_DEDUPE_SECONDS"));
         clear_aml_env();
     }
 

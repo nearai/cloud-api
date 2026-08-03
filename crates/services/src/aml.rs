@@ -433,6 +433,7 @@ pub struct AmlService {
     provider: Arc<dyn AmlProviderClient>,
     config: AmlConfig,
     cache: Cache<String, AmlReport>,
+    alert_dedupe_cache: Cache<String, ()>,
     slack_client: reqwest::Client,
 }
 
@@ -444,6 +445,12 @@ impl AmlService {
     ) -> Self {
         let cache = Cache::builder()
             .time_to_live(StdDuration::from_secs(config.memory_cache_ttl_seconds))
+            .max_capacity(10_000)
+            .build();
+        let alert_dedupe_cache = Cache::builder()
+            .time_to_live(StdDuration::from_secs(
+                config.high_risk_slack_dedupe_seconds,
+            ))
             .max_capacity(10_000)
             .build();
         let slack_client = reqwest::Client::builder()
@@ -461,6 +468,7 @@ impl AmlService {
             provider,
             config,
             cache,
+            alert_dedupe_cache,
             slack_client,
         }
     }
@@ -524,6 +532,16 @@ impl AmlService {
             .await
             .map_err(|error| AmlError::RepositoryFailure(error.to_string()))?;
 
+        if report.risk_level != AmlRiskLevel::Unknown {
+            self.cache.insert(account_id.clone(), report.clone()).await;
+        }
+
+        if self.should_block_report(&report) {
+            self.enqueue_high_risk_slack_alert(&report, user_id, flow, "provider_report")
+                .await;
+            return Err(AmlError::AccountBlocked);
+        }
+
         if report.risk_level == AmlRiskLevel::Unknown {
             if let Some(stale_report) = self
                 .repository
@@ -537,7 +555,8 @@ impl AmlService {
                         user_id,
                         flow,
                         "stale_report_fallback",
-                    );
+                    )
+                    .await;
                     return Err(AmlError::AccountBlocked);
                 }
             }
@@ -549,10 +568,6 @@ impl AmlService {
             return Ok(AmlDecision::Allowed);
         }
 
-        self.cache.insert(account_id, report.clone()).await;
-        if self.should_block_report(&report) {
-            self.enqueue_high_risk_slack_alert(&report, user_id, flow, "provider_report");
-        }
         self.decision_from_report(&report)
     }
 
@@ -590,14 +605,14 @@ impl AmlService {
                 .is_some_and(|(threshold, score)| score >= threshold)
     }
 
-    fn enqueue_high_risk_slack_alert(
+    async fn enqueue_high_risk_slack_alert(
         &self,
         report: &AmlReport,
         user_id: Option<Uuid>,
         flow: AmlFlow,
         action: &'static str,
     ) {
-        let Some(webhook_url) = self.config.high_risk_slack_webhook_url.clone() else {
+        let Some(webhook_url) = self.reserve_high_risk_slack_alert(report, action).await else {
             return;
         };
         let payload = high_risk_slack_payload(report, user_id, flow, action);
@@ -619,6 +634,20 @@ impl AmlService {
                 }
             }
         });
+    }
+
+    async fn reserve_high_risk_slack_alert(
+        &self,
+        report: &AmlReport,
+        action: &'static str,
+    ) -> Option<String> {
+        let webhook_url = self.config.high_risk_slack_webhook_url.clone()?;
+        let dedupe_key = format!("{}:{action}:{}", report.provider, report.account_id);
+        if self.alert_dedupe_cache.get(&dedupe_key).await.is_some() {
+            return None;
+        }
+        self.alert_dedupe_cache.insert(dedupe_key, ()).await;
+        Some(webhook_url)
     }
 }
 
@@ -744,6 +773,30 @@ mod tests {
         );
 
         assert_eq!(report.risk_level, AmlRiskLevel::Unknown);
+        assert!(!report.active);
+    }
+
+    #[test]
+    fn lukka_missing_risk_level_preserves_score_for_policy() {
+        let report = normalize_lukka_report(
+            None,
+            AmlFlow::UserStatus,
+            "alice.near",
+            serde_json::json!({
+                "report_info_section": {
+                    "address": "alice.near",
+                    "address_type": "NEAR"
+                },
+                "cscore_section": {
+                    "cscore": 99
+                }
+            }),
+            Some(75),
+        );
+
+        assert_eq!(report.risk_level, AmlRiskLevel::Unknown);
+        assert_eq!(report.score, Some(99));
+        assert_eq!(report.reason.as_deref(), Some("missing_risk_level"));
         assert!(!report.active);
     }
 
@@ -979,6 +1032,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn configured_score_threshold_blocks_unknown_report_with_matching_score() {
+        let repo = Arc::new(MockAmlRepository::default());
+        let provider = Arc::new(StaticProvider(NewAmlReport {
+            risk_level: AmlRiskLevel::Unknown,
+            score: Some(80),
+            active: false,
+            reason: Some("missing_risk_level".to_string()),
+            ..new_report(AmlRiskLevel::Unknown)
+        }));
+        let config = AmlConfig {
+            blocked_risk_levels: vec![],
+            score_block_threshold: Some(75),
+            ..enabled_config()
+        };
+        let service = AmlService::new(repo, provider, config);
+
+        let result = service
+            .check_near_account(None, "alice.near", AmlFlow::UserStatus)
+            .await;
+
+        assert!(matches!(result, Err(AmlError::AccountBlocked)));
+    }
+
+    #[tokio::test]
+    async fn configured_unknown_risk_level_blocks_provider_result() {
+        let repo = Arc::new(MockAmlRepository::default());
+        let provider = Arc::new(StaticProvider(NewAmlReport {
+            risk_level: AmlRiskLevel::Unknown,
+            score: None,
+            active: false,
+            reason: Some("missing_risk_level".to_string()),
+            ..new_report(AmlRiskLevel::Unknown)
+        }));
+        let config = AmlConfig {
+            blocked_risk_levels: vec!["UNKNOWN".to_string()],
+            score_block_threshold: None,
+            ..enabled_config()
+        };
+        let service = AmlService::new(repo, provider, config);
+
+        let result = service
+            .check_near_account(None, "alice.near", AmlFlow::UserStatus)
+            .await;
+
+        assert!(matches!(result, Err(AmlError::AccountBlocked)));
+    }
+
+    #[tokio::test]
     async fn high_level_is_allowed_when_policy_excludes_it_and_score_disabled() {
         let repo = Arc::new(MockAmlRepository::default());
         let provider = Arc::new(StaticProvider(new_report(AmlRiskLevel::High)));
@@ -1032,7 +1133,13 @@ mod tests {
     #[tokio::test]
     async fn unknown_provider_result_fails_open_without_stale_high() {
         let repo = Arc::new(MockAmlRepository::default());
-        let provider = Arc::new(StaticProvider(new_report(AmlRiskLevel::Unknown)));
+        let provider = Arc::new(StaticProvider(NewAmlReport {
+            risk_level: AmlRiskLevel::Unknown,
+            score: None,
+            active: false,
+            reason: Some("timeout".to_string()),
+            ..new_report(AmlRiskLevel::Unknown)
+        }));
         let service = AmlService::new(repo, provider, enabled_config());
 
         let result = service
@@ -1060,6 +1167,36 @@ mod tests {
             .await;
         assert!(matches!(second, Err(AmlError::AccountBlocked)));
         assert_eq!(repo.created.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn stale_report_fallback_slack_alert_is_deduped() {
+        let repo = Arc::new(MockAmlRepository::default());
+        let provider = Arc::new(StaticProvider(new_report(AmlRiskLevel::High)));
+        let config = AmlConfig {
+            high_risk_slack_webhook_url: Some("https://hooks.slack.test/token".to_string()),
+            high_risk_slack_dedupe_seconds: 60,
+            ..enabled_config()
+        };
+        let service = AmlService::new(repo, provider, config);
+        let report = report_to_stored(new_report(AmlRiskLevel::High));
+
+        let first = service
+            .reserve_high_risk_slack_alert(&report, "stale_report_fallback")
+            .await;
+        let second = service
+            .reserve_high_risk_slack_alert(&report, "stale_report_fallback")
+            .await;
+        let different_action = service
+            .reserve_high_risk_slack_alert(&report, "provider_report")
+            .await;
+
+        assert_eq!(first.as_deref(), Some("https://hooks.slack.test/token"));
+        assert!(second.is_none());
+        assert_eq!(
+            different_action.as_deref(),
+            Some("https://hooks.slack.test/token")
+        );
     }
 
     #[tokio::test]

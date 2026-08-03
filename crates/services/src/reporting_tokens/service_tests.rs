@@ -6,7 +6,7 @@ use super::{
 };
 use crate::common::RepositoryError;
 use async_trait::async_trait;
-use chrono::{TimeZone as _, Utc};
+use chrono::{Duration, TimeZone as _, Utc};
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -104,10 +104,7 @@ fn service() -> OrganizationReportingTokenServiceImpl {
 async fn create_forwards_request_to_repository() {
     // Given: a reporting-token service backed by a repository adapter.
     let service = service();
-    let expires_at = Utc
-        .with_ymd_and_hms(2026, 8, 1, 0, 0, 0)
-        .single()
-        .expect("valid fixture timestamp");
+    let expires_at = Utc::now() + Duration::days(30);
 
     // When: a reporting token is created.
     let created = service

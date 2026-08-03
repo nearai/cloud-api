@@ -73,6 +73,7 @@ pub struct AmlConfig {
     pub lukka_bearer_token: Option<String>,
     pub refresh_window_days: i64,
     pub memory_cache_ttl_seconds: u64,
+    pub unknown_cache_ttl_seconds: u64,
     pub request_timeout_seconds: u64,
     pub blocked_risk_levels: Vec<String>,
     pub score_block_threshold: Option<i32>,
@@ -92,6 +93,7 @@ impl std::fmt::Debug for AmlConfig {
             )
             .field("refresh_window_days", &self.refresh_window_days)
             .field("memory_cache_ttl_seconds", &self.memory_cache_ttl_seconds)
+            .field("unknown_cache_ttl_seconds", &self.unknown_cache_ttl_seconds)
             .field("request_timeout_seconds", &self.request_timeout_seconds)
             .field("blocked_risk_levels", &self.blocked_risk_levels)
             .field("score_block_threshold", &self.score_block_threshold)
@@ -122,6 +124,7 @@ impl Default for AmlConfig {
             lukka_bearer_token: None,
             refresh_window_days: 30,
             memory_cache_ttl_seconds: 300,
+            unknown_cache_ttl_seconds: 60,
             request_timeout_seconds: 10,
             blocked_risk_levels: vec!["HIGH".to_string()],
             score_block_threshold: Some(75),
@@ -160,6 +163,10 @@ impl AmlConfig {
                 "LUKKA_AML_MEMORY_CACHE_TTL_SECONDS",
                 defaults.memory_cache_ttl_seconds,
             )?,
+            unknown_cache_ttl_seconds: parse_u64_env(
+                "LUKKA_AML_UNKNOWN_CACHE_TTL_SECONDS",
+                defaults.unknown_cache_ttl_seconds,
+            )?,
             request_timeout_seconds: parse_u64_env(
                 "LUKKA_AML_REQUEST_TIMEOUT_SECONDS",
                 defaults.request_timeout_seconds,
@@ -191,6 +198,11 @@ impl AmlConfig {
         }
         if config.memory_cache_ttl_seconds == 0 {
             return Err("LUKKA_AML_MEMORY_CACHE_TTL_SECONDS must be greater than zero".to_string());
+        }
+        if config.unknown_cache_ttl_seconds == 0 || config.unknown_cache_ttl_seconds > 86_400 {
+            return Err(
+                "LUKKA_AML_UNKNOWN_CACHE_TTL_SECONDS must be between 1 and 86400".to_string(),
+            );
         }
         if config.request_timeout_seconds == 0 || config.request_timeout_seconds > 300 {
             return Err("LUKKA_AML_REQUEST_TIMEOUT_SECONDS must be between 1 and 300".to_string());
@@ -1173,6 +1185,7 @@ mod tests {
             "LUKKA_AML_BASE_URL",
             "LUKKA_AML_REPORT_REFRESH_DAYS",
             "LUKKA_AML_MEMORY_CACHE_TTL_SECONDS",
+            "LUKKA_AML_UNKNOWN_CACHE_TTL_SECONDS",
             "LUKKA_AML_REQUEST_TIMEOUT_SECONDS",
             "LUKKA_AML_BLOCKED_RISK_LEVELS",
             "LUKKA_AML_SCORE_BLOCK_THRESHOLD",
@@ -1248,6 +1261,7 @@ mod tests {
         );
         std::env::set_var("LUKKA_AML_HIGH_RISK_SLACK_TIMEOUT_MS", "2500");
         std::env::set_var("LUKKA_AML_HIGH_RISK_SLACK_DEDUPE_SECONDS", "120");
+        std::env::set_var("LUKKA_AML_UNKNOWN_CACHE_TTL_SECONDS", "45");
 
         let config = AmlConfig::from_env().unwrap();
 
@@ -1262,6 +1276,7 @@ mod tests {
         );
         assert_eq!(config.high_risk_slack_timeout_ms, 2500);
         assert_eq!(config.high_risk_slack_dedupe_seconds, 120);
+        assert_eq!(config.unknown_cache_ttl_seconds, 45);
         clear_aml_env();
     }
 
@@ -1288,6 +1303,11 @@ mod tests {
         std::env::set_var("LUKKA_AML_SCORE_BLOCK_THRESHOLD", "disabled");
         let error = AmlConfig::from_env().unwrap_err();
         assert!(error.contains("At least one AML risk policy"));
+
+        clear_aml_env();
+        std::env::set_var("LUKKA_AML_UNKNOWN_CACHE_TTL_SECONDS", "86401");
+        let error = AmlConfig::from_env().unwrap_err();
+        assert!(error.contains("LUKKA_AML_UNKNOWN_CACHE_TTL_SECONDS"));
 
         clear_aml_env();
         std::env::set_var("LUKKA_AML_HIGH_RISK_SLACK_TIMEOUT_MS", "30001");

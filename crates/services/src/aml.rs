@@ -433,6 +433,7 @@ pub struct AmlService {
     provider: Arc<dyn AmlProviderClient>,
     config: AmlConfig,
     cache: Cache<String, AmlReport>,
+    unknown_cache: Cache<String, AmlReport>,
     alert_dedupe_cache: Cache<String, ()>,
     slack_client: reqwest::Client,
 }
@@ -445,6 +446,10 @@ impl AmlService {
     ) -> Self {
         let cache = Cache::builder()
             .time_to_live(StdDuration::from_secs(config.memory_cache_ttl_seconds))
+            .max_capacity(10_000)
+            .build();
+        let unknown_cache = Cache::builder()
+            .time_to_live(StdDuration::from_secs(config.unknown_cache_ttl_seconds))
             .max_capacity(10_000)
             .build();
         let alert_dedupe_cache = Cache::builder()
@@ -468,6 +473,7 @@ impl AmlService {
             provider,
             config,
             cache,
+            unknown_cache,
             alert_dedupe_cache,
             slack_client,
         }
@@ -522,6 +528,12 @@ impl AmlService {
             return self.decision_from_report(&report);
         }
 
+        if let Some(report) = self.unknown_cache.get(&account_id).await {
+            return self
+                .decision_from_unknown_report(&account_id, &report, user_id, flow, false)
+                .await;
+        }
+
         let provider_result = self
             .provider
             .score_near_account(&account_id, user_id, flow)
@@ -543,29 +555,9 @@ impl AmlService {
         }
 
         if report.risk_level == AmlRiskLevel::Unknown {
-            if let Some(stale_report) = self
-                .repository
-                .latest_active_report(&account_id, AML_ADDRESS_TYPE_NEAR, AML_PROVIDER_LUKKA)
-                .await
-                .map_err(|error| AmlError::RepositoryFailure(error.to_string()))?
-            {
-                if self.should_block_report(&stale_report) {
-                    self.enqueue_high_risk_slack_alert(
-                        &stale_report,
-                        user_id,
-                        flow,
-                        "stale_report_fallback",
-                    )
-                    .await;
-                    return Err(AmlError::AccountBlocked);
-                }
-            }
-            tracing::warn!(
-                user_id = ?user_id,
-                flow = flow.as_str(),
-                "AML provider result was UNKNOWN; failing open"
-            );
-            return Ok(AmlDecision::Allowed);
+            return self
+                .decision_from_unknown_report(&account_id, &report, user_id, flow, true)
+                .await;
         }
 
         self.decision_from_report(&report)
@@ -603,6 +595,46 @@ impl AmlService {
                 .score_block_threshold
                 .zip(report.score)
                 .is_some_and(|(threshold, score)| score >= threshold)
+    }
+
+    async fn decision_from_unknown_report(
+        &self,
+        account_id: &str,
+        report: &AmlReport,
+        user_id: Option<Uuid>,
+        flow: AmlFlow,
+        cache_unknown: bool,
+    ) -> Result<AmlDecision, AmlError> {
+        if cache_unknown {
+            self.unknown_cache
+                .insert(account_id.to_string(), report.clone())
+                .await;
+        }
+
+        if let Some(stale_report) = self
+            .repository
+            .latest_active_report(account_id, AML_ADDRESS_TYPE_NEAR, AML_PROVIDER_LUKKA)
+            .await
+            .map_err(|error| AmlError::RepositoryFailure(error.to_string()))?
+        {
+            if self.should_block_report(&stale_report) {
+                self.enqueue_high_risk_slack_alert(
+                    &stale_report,
+                    user_id,
+                    flow,
+                    "stale_report_fallback",
+                )
+                .await;
+                return Err(AmlError::AccountBlocked);
+            }
+        }
+
+        tracing::warn!(
+            user_id = ?user_id,
+            flow = flow.as_str(),
+            "AML provider result was UNKNOWN; failing open"
+        );
+        Ok(AmlDecision::Allowed)
     }
 
     async fn enqueue_high_risk_slack_alert(
@@ -1150,11 +1182,41 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unknown_provider_result_keeps_stale_high_blocked() {
+    async fn unknown_provider_result_is_short_cached_after_fail_open() {
+        let repo = Arc::new(MockAmlRepository::default());
+        let provider = Arc::new(StaticProvider(NewAmlReport {
+            risk_level: AmlRiskLevel::Unknown,
+            score: None,
+            active: false,
+            reason: Some("lukka_http_404".to_string()),
+            ..new_report(AmlRiskLevel::Unknown)
+        }));
+        let service = AmlService::new(repo.clone(), provider, enabled_config());
+
+        let first = service
+            .check_near_account(None, "alice.near", AmlFlow::UserStatus)
+            .await;
+        assert!(matches!(first, Ok(AmlDecision::Allowed)));
+
+        let second = service
+            .check_near_account(None, "alice.near", AmlFlow::UserStatus)
+            .await;
+        assert!(matches!(second, Ok(AmlDecision::Allowed)));
+        assert_eq!(repo.created.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn cached_unknown_result_keeps_stale_high_blocked() {
         let repo = Arc::new(MockAmlRepository::default());
         *repo.latest_active.lock().unwrap() =
             Some(report_to_stored(new_report(AmlRiskLevel::High)));
-        let provider = Arc::new(StaticProvider(new_report(AmlRiskLevel::Unknown)));
+        let provider = Arc::new(StaticProvider(NewAmlReport {
+            risk_level: AmlRiskLevel::Unknown,
+            score: None,
+            active: false,
+            reason: Some("timeout".to_string()),
+            ..new_report(AmlRiskLevel::Unknown)
+        }));
         let service = AmlService::new(repo.clone(), provider, enabled_config());
 
         let first = service
@@ -1166,7 +1228,7 @@ mod tests {
             .check_near_account(None, "alice.near", AmlFlow::UserStatus)
             .await;
         assert!(matches!(second, Err(AmlError::AccountBlocked)));
-        assert_eq!(repo.created.lock().unwrap().len(), 2);
+        assert_eq!(repo.created.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]

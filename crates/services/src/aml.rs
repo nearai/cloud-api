@@ -433,6 +433,7 @@ pub struct AmlService {
     provider: Arc<dyn AmlProviderClient>,
     config: AmlConfig,
     cache: Cache<String, AmlReport>,
+    slack_client: reqwest::Client,
 }
 
 impl AmlService {
@@ -445,11 +446,22 @@ impl AmlService {
             .time_to_live(StdDuration::from_secs(config.memory_cache_ttl_seconds))
             .max_capacity(10_000)
             .build();
+        let slack_client = reqwest::Client::builder()
+            .timeout(StdDuration::from_millis(config.high_risk_slack_timeout_ms))
+            .build()
+            .unwrap_or_else(|error| {
+                tracing::warn!(
+                    error = %error,
+                    "failed to initialize AML Slack alert client; using default client"
+                );
+                reqwest::Client::new()
+            });
         Self {
             repository,
             provider,
             config,
             cache,
+            slack_client,
         }
     }
 
@@ -519,7 +531,13 @@ impl AmlService {
                 .await
                 .map_err(|error| AmlError::RepositoryFailure(error.to_string()))?
             {
-                if stale_report.risk_level == AmlRiskLevel::High {
+                if self.should_block_report(&stale_report) {
+                    self.enqueue_high_risk_slack_alert(
+                        &stale_report,
+                        user_id,
+                        flow,
+                        "stale_report_fallback",
+                    );
                     return Err(AmlError::AccountBlocked);
                 }
             }
@@ -532,6 +550,9 @@ impl AmlService {
         }
 
         self.cache.insert(account_id, report.clone()).await;
+        if self.should_block_report(&report) {
+            self.enqueue_high_risk_slack_alert(&report, user_id, flow, "provider_report");
+        }
         self.decision_from_report(&report)
     }
 
@@ -550,8 +571,15 @@ impl AmlService {
     }
 
     fn decision_from_report(&self, report: &AmlReport) -> Result<AmlDecision, AmlError> {
-        if self
-            .config
+        if self.should_block_report(report) {
+            Err(AmlError::AccountBlocked)
+        } else {
+            Ok(AmlDecision::Allowed)
+        }
+    }
+
+    fn should_block_report(&self, report: &AmlReport) -> bool {
+        self.config
             .blocked_risk_levels
             .iter()
             .any(|level| level == report.risk_level.as_str())
@@ -560,12 +588,85 @@ impl AmlService {
                 .score_block_threshold
                 .zip(report.score)
                 .is_some_and(|(threshold, score)| score >= threshold)
-        {
-            Err(AmlError::AccountBlocked)
-        } else {
-            Ok(AmlDecision::Allowed)
-        }
     }
+
+    fn enqueue_high_risk_slack_alert(
+        &self,
+        report: &AmlReport,
+        user_id: Option<Uuid>,
+        flow: AmlFlow,
+        action: &'static str,
+    ) {
+        let Some(webhook_url) = self.config.high_risk_slack_webhook_url.clone() else {
+            return;
+        };
+        let payload = high_risk_slack_payload(report, user_id, flow, action);
+        let client = self.slack_client.clone();
+        tokio::spawn(async move {
+            match client.post(webhook_url).json(&payload).send().await {
+                Ok(response) if response.status().is_success() => {}
+                Ok(response) => {
+                    tracing::warn!(
+                        status = response.status().as_u16(),
+                        "AML high-risk Slack alert returned non-success status"
+                    );
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        error = %error,
+                        "failed to send AML high-risk Slack alert"
+                    );
+                }
+            }
+        });
+    }
+}
+
+fn high_risk_slack_payload(
+    report: &AmlReport,
+    user_id: Option<Uuid>,
+    flow: AmlFlow,
+    action: &str,
+) -> serde_json::Value {
+    let user_id = user_id
+        .map(|id| id.to_string())
+        .unwrap_or_else(|| "-".to_string());
+    let score = report
+        .score
+        .map(|score| score.to_string())
+        .unwrap_or_else(|| "-".to_string());
+    let report_id = report.report_id.as_deref().unwrap_or("-");
+    let reason = report.reason.as_deref().unwrap_or("-");
+    let provider_report_time = report
+        .provider_report_time
+        .map(|time| time.to_rfc3339())
+        .unwrap_or_else(|| "-".to_string());
+
+    serde_json::json!({
+        "text": format!(
+            "High-risk Lukka AML account detected: {} ({})",
+            report.account_id,
+            report.risk_level.as_str()
+        ),
+        "attachments": [
+            {
+                "color": "danger",
+                "fields": [
+                    { "title": "Account", "value": report.account_id, "short": true },
+                    { "title": "User ID", "value": user_id, "short": true },
+                    { "title": "Flow", "value": flow.as_str(), "short": true },
+                    { "title": "Action", "value": action, "short": true },
+                    { "title": "Provider", "value": report.provider, "short": true },
+                    { "title": "Address Type", "value": report.address_type, "short": true },
+                    { "title": "Risk Level", "value": report.risk_level.as_str(), "short": true },
+                    { "title": "Score", "value": score, "short": true },
+                    { "title": "Report ID", "value": report_id, "short": false },
+                    { "title": "Reason", "value": reason, "short": false },
+                    { "title": "Provider Report Time", "value": provider_report_time, "short": false }
+                ]
+            }
+        ]
+    })
 }
 
 #[cfg(test)]
@@ -893,6 +994,39 @@ mod tests {
             .await;
 
         assert!(matches!(result, Ok(AmlDecision::Allowed)));
+    }
+
+    #[test]
+    fn high_risk_slack_payload_includes_audit_context() {
+        let user_id = Uuid::new_v4();
+        let report = report_to_stored(NewAmlReport {
+            user_id: Some(user_id),
+            flow: AmlFlow::StakingFarmSync,
+            risk_level: AmlRiskLevel::High,
+            score: Some(91),
+            reason: Some("risk policy matched".to_string()),
+            ..new_report(AmlRiskLevel::High)
+        });
+
+        let payload =
+            high_risk_slack_payload(&report, Some(user_id), AmlFlow::StakingFarmSync, "test");
+
+        assert_eq!(
+            payload["text"].as_str(),
+            Some("High-risk Lukka AML account detected: gregoshes.near (HIGH)")
+        );
+        let fields = payload["attachments"][0]["fields"]
+            .as_array()
+            .expect("Slack attachment should include fields");
+        assert!(fields
+            .iter()
+            .any(|field| { field["title"] == "User ID" && field["value"] == user_id.to_string() }));
+        assert!(fields
+            .iter()
+            .any(|field| field["title"] == "Score" && field["value"] == "91"));
+        assert!(fields
+            .iter()
+            .any(|field| field["title"] == "Action" && field["value"] == "test"));
     }
 
     #[tokio::test]

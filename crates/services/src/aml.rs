@@ -2,12 +2,13 @@ use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
 use config::AmlConfig;
 use moka::future::Cache;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::{sync::Arc, time::Duration as StdDuration};
 use uuid::Uuid;
 
 pub const AML_PROVIDER_LUKKA: &str = "lukka";
 pub const AML_ADDRESS_TYPE_NEAR: &str = "NEAR";
+const HIGH_CSCORE_THRESHOLD: i32 = 75;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
@@ -25,20 +26,6 @@ impl AmlRiskLevel {
             Self::Medium => "MEDIUM",
             Self::High => "HIGH",
             Self::Unknown => "UNKNOWN",
-        }
-    }
-
-    fn from_provider(value: Option<&str>) -> Self {
-        match value
-            .unwrap_or_default()
-            .trim()
-            .to_ascii_uppercase()
-            .as_str()
-        {
-            "LOW" => Self::Low,
-            "MEDIUM" => Self::Medium,
-            "HIGH" => Self::High,
-            _ => Self::Unknown,
         }
     }
 }
@@ -97,7 +84,6 @@ pub struct NewAmlReport {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AmlDecision {
     Allowed,
-    Blocked,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -169,10 +155,15 @@ struct LukkaReport {
 
 #[derive(Debug, Deserialize, Serialize)]
 struct LukkaReportInfo {
+    #[serde(default, deserialize_with = "lenient_opt")]
     address: Option<String>,
+    #[serde(default, deserialize_with = "lenient_opt")]
     address_type: Option<String>,
+    #[serde(default, deserialize_with = "lenient_opt")]
     report_id: Option<String>,
+    #[serde(default, deserialize_with = "lenient_opt")]
     report_time: Option<DateTime<Utc>>,
+    #[serde(default, deserialize_with = "lenient_opt")]
     description: Option<String>,
     #[serde(flatten)]
     extra: serde_json::Map<String, serde_json::Value>,
@@ -180,10 +171,40 @@ struct LukkaReportInfo {
 
 #[derive(Debug, Deserialize, Serialize)]
 struct LukkaCscore {
+    #[serde(default, deserialize_with = "lenient_opt_i32")]
     cscore: Option<i32>,
+    #[serde(default, deserialize_with = "lenient_opt")]
     risk_level: Option<String>,
     #[serde(flatten)]
     extra: serde_json::Map<String, serde_json::Value>,
+}
+
+fn lenient_opt<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: serde::de::DeserializeOwned,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(value.and_then(|value| serde_json::from_value(value).ok()))
+}
+
+fn lenient_opt_i32<'de, D>(deserializer: D) -> Result<Option<i32>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    if let Some(number) = value.as_i64() {
+        return Ok(i32::try_from(number).ok());
+    }
+    if let Some(number) = value.as_f64() {
+        if number.is_finite() && number >= i32::MIN as f64 && number <= i32::MAX as f64 {
+            return Ok(Some(number.round() as i32));
+        }
+    }
+    Ok(serde_json::from_value(value).ok())
 }
 
 #[async_trait]
@@ -281,11 +302,12 @@ fn normalize_lukka_report(
         .filter(|address| address == requested_account_id)
         .is_none()
     {
-        return provider_failure_report(
+        return provider_failure_report_with_result(
             user_id,
             flow,
             requested_account_id.to_string(),
             "address_mismatch".to_string(),
+            value,
         );
     }
 
@@ -294,20 +316,24 @@ fn normalize_lukka_report(
         .filter(|address_type| address_type.eq_ignore_ascii_case(AML_ADDRESS_TYPE_NEAR))
         .is_none()
     {
-        return provider_failure_report(
+        return provider_failure_report_with_result(
             user_id,
             flow,
             requested_account_id.to_string(),
             "address_type_mismatch".to_string(),
+            value,
         );
     }
 
-    let risk_level = AmlRiskLevel::from_provider(
-        report
-            .cscore_section
-            .as_ref()
-            .and_then(|section| section.risk_level.as_deref()),
-    );
+    let score = report
+        .cscore_section
+        .as_ref()
+        .and_then(|section| section.cscore);
+    let provider_risk_level = report
+        .cscore_section
+        .as_ref()
+        .and_then(|section| section.risk_level.as_deref());
+    let (risk_level, risk_reason) = normalize_provider_risk_level(provider_risk_level, score);
     let active = risk_level != AmlRiskLevel::Unknown;
     NewAmlReport {
         user_id,
@@ -316,15 +342,37 @@ fn normalize_lukka_report(
         account_id: requested_account_id.to_string(),
         address_type: AML_ADDRESS_TYPE_NEAR.to_string(),
         risk_level,
-        score: report
-            .cscore_section
-            .as_ref()
-            .and_then(|section| section.cscore),
+        score,
         report_id: info.and_then(|info| info.report_id.clone()),
-        reason: info.and_then(|info| info.description.clone()),
+        reason: risk_reason.or_else(|| info.and_then(|info| info.description.clone())),
         provider_report_time: info.and_then(|info| info.report_time),
         result_json: value,
         active,
+    }
+}
+
+fn normalize_provider_risk_level(
+    value: Option<&str>,
+    score: Option<i32>,
+) -> (AmlRiskLevel, Option<String>) {
+    let value = value.map(str::trim).filter(|value| !value.is_empty());
+    match value.map(|value| value.to_ascii_uppercase()) {
+        Some(value) if value == "LOW" => (AmlRiskLevel::Low, None),
+        Some(value) if value == "MEDIUM" => (AmlRiskLevel::Medium, None),
+        Some(value) if value == "HIGH" => (AmlRiskLevel::High, None),
+        Some(_) => {
+            let raw_value = value.unwrap_or_default();
+            let reason = Some(format!("unrecognized_risk_level:{raw_value}"));
+            if score.is_some_and(|score| score >= HIGH_CSCORE_THRESHOLD) {
+                (AmlRiskLevel::High, reason)
+            } else {
+                (AmlRiskLevel::Unknown, reason)
+            }
+        }
+        None => (
+            AmlRiskLevel::Unknown,
+            Some("missing_risk_level".to_string()),
+        ),
     }
 }
 
@@ -333,6 +381,22 @@ fn provider_failure_report(
     flow: AmlFlow,
     account_id: String,
     reason: String,
+) -> NewAmlReport {
+    provider_failure_report_with_result(
+        user_id,
+        flow,
+        account_id,
+        reason.clone(),
+        serde_json::json!({ "error": reason }),
+    )
+}
+
+fn provider_failure_report_with_result(
+    user_id: Option<Uuid>,
+    flow: AmlFlow,
+    account_id: String,
+    reason: String,
+    result_json: serde_json::Value,
 ) -> NewAmlReport {
     NewAmlReport {
         user_id,
@@ -345,7 +409,7 @@ fn provider_failure_report(
         report_id: None,
         reason: Some(reason.clone()),
         provider_report_time: None,
-        result_json: serde_json::json!({ "error": reason }),
+        result_json,
         active: false,
     }
 }
@@ -531,6 +595,10 @@ mod tests {
 
         assert_eq!(report.risk_level, AmlRiskLevel::Unknown);
         assert_eq!(report.reason.as_deref(), Some("address_mismatch"));
+        assert_eq!(
+            report.result_json["report_info_section"]["address"].as_str(),
+            Some("bob.near")
+        );
         assert!(!report.active);
     }
 
@@ -549,6 +617,85 @@ mod tests {
         );
 
         assert_eq!(report.risk_level, AmlRiskLevel::Unknown);
+        assert!(!report.active);
+    }
+
+    #[test]
+    fn lukka_metadata_type_drift_does_not_discard_high_risk() {
+        let report = normalize_lukka_report(
+            None,
+            AmlFlow::UserStatus,
+            "alice.near",
+            serde_json::json!({
+                "report_info_section": {
+                    "address": "alice.near",
+                    "address_type": "NEAR",
+                    "report_id": 12345,
+                    "report_time": "not-rfc3339"
+                },
+                "cscore_section": {
+                    "cscore": 99.5,
+                    "risk_level": "HIGH"
+                }
+            }),
+        );
+
+        assert_eq!(report.risk_level, AmlRiskLevel::High);
+        assert_eq!(report.score, Some(100));
+        assert!(report.report_id.is_none());
+        assert!(report.provider_report_time.is_none());
+        assert!(report.active);
+    }
+
+    #[test]
+    fn lukka_unrecognized_risk_level_uses_high_score_fallback() {
+        let report = normalize_lukka_report(
+            None,
+            AmlFlow::UserStatus,
+            "alice.near",
+            serde_json::json!({
+                "report_info_section": {
+                    "address": "alice.near",
+                    "address_type": "NEAR"
+                },
+                "cscore_section": {
+                    "cscore": 99,
+                    "risk_level": "SEVERE"
+                }
+            }),
+        );
+
+        assert_eq!(report.risk_level, AmlRiskLevel::High);
+        assert_eq!(
+            report.reason.as_deref(),
+            Some("unrecognized_risk_level:SEVERE")
+        );
+        assert!(report.active);
+    }
+
+    #[test]
+    fn lukka_unrecognized_risk_level_with_low_score_stays_inactive_unknown() {
+        let report = normalize_lukka_report(
+            None,
+            AmlFlow::UserStatus,
+            "alice.near",
+            serde_json::json!({
+                "report_info_section": {
+                    "address": "alice.near",
+                    "address_type": "NEAR"
+                },
+                "cscore_section": {
+                    "cscore": 10,
+                    "risk_level": "NEW_LOW_TIER"
+                }
+            }),
+        );
+
+        assert_eq!(report.risk_level, AmlRiskLevel::Unknown);
+        assert_eq!(
+            report.reason.as_deref(),
+            Some("unrecognized_risk_level:NEW_LOW_TIER")
+        );
         assert!(!report.active);
     }
 

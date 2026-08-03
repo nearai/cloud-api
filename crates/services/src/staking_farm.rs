@@ -9,7 +9,7 @@ use std::{
 };
 use uuid::Uuid;
 
-use crate::aml::{AmlDecision, AmlError, AmlFlow};
+use crate::aml::{AmlError, AmlFlow};
 
 pub const CREDIT_TYPE_STAKING_FARM: &str = "staking_farm";
 pub const CREDIT_SOURCE_HOUSE_OF_STAKE: &str = "house-of-stake";
@@ -158,7 +158,7 @@ pub trait StakingFarmAmlGate: Send + Sync {
         user_id: Option<Uuid>,
         account_id: &str,
         flow: AmlFlow,
-    ) -> Result<AmlDecision, AmlError>;
+    ) -> Result<(), AmlError>;
 }
 
 #[async_trait]
@@ -168,8 +168,10 @@ impl StakingFarmAmlGate for crate::aml::AmlService {
         user_id: Option<Uuid>,
         account_id: &str,
         flow: AmlFlow,
-    ) -> Result<AmlDecision, AmlError> {
-        crate::aml::AmlService::check_near_account(self, user_id, account_id, flow).await
+    ) -> Result<(), AmlError> {
+        crate::aml::AmlService::check_near_account(self, user_id, account_id, flow)
+            .await
+            .map(|_| ())
     }
 }
 
@@ -434,8 +436,7 @@ impl StakingFarmService {
             )
             .await
         {
-            Ok(AmlDecision::Allowed) => Ok(()),
-            Ok(AmlDecision::Blocked) => Err(anyhow::Error::new(AmlError::AccountBlocked)),
+            Ok(()) => Ok(()),
             Err(error) => Err(anyhow::Error::new(error)),
         }
     }
@@ -692,7 +693,7 @@ mod tests {
             user_id: Option<Uuid>,
             account_id: &str,
             flow: AmlFlow,
-        ) -> Result<AmlDecision, AmlError> {
+        ) -> Result<(), AmlError> {
             self.calls
                 .lock()
                 .unwrap()
@@ -700,7 +701,7 @@ mod tests {
             if self.blocked {
                 Err(AmlError::AccountBlocked)
             } else {
-                Ok(AmlDecision::Allowed)
+                Ok(())
             }
         }
     }

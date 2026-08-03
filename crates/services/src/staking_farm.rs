@@ -9,6 +9,8 @@ use std::{
 };
 use uuid::Uuid;
 
+use crate::aml::{AmlError, AmlFlow};
+
 pub const CREDIT_TYPE_STAKING_FARM: &str = "staking_farm";
 pub const CREDIT_SOURCE_HOUSE_OF_STAKE: &str = "house-of-stake";
 const REWARD_UNIT_SCALE_24: u128 = 1_000_000_000_000_000_000_000_000;
@@ -149,6 +151,30 @@ pub trait StakingFarmContractClient: Send + Sync {
     ) -> anyhow::Result<FarmAccount>;
 }
 
+#[async_trait]
+pub trait StakingFarmAmlGate: Send + Sync {
+    async fn check_near_account(
+        &self,
+        user_id: Option<Uuid>,
+        account_id: &str,
+        flow: AmlFlow,
+    ) -> Result<(), AmlError>;
+}
+
+#[async_trait]
+impl StakingFarmAmlGate for crate::aml::AmlService {
+    async fn check_near_account(
+        &self,
+        user_id: Option<Uuid>,
+        account_id: &str,
+        flow: AmlFlow,
+    ) -> Result<(), AmlError> {
+        crate::aml::AmlService::check_near_account(self, user_id, account_id, flow)
+            .await
+            .map(|_| ())
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct NearRpcStakingFarmClient {
     network_config: NetworkConfig,
@@ -191,6 +217,7 @@ impl StakingFarmContractClient for NearRpcStakingFarmClient {
 pub struct StakingFarmService {
     repository: Arc<dyn StakingFarmRepository>,
     contract_client: Arc<dyn StakingFarmContractClient>,
+    aml_gate: Option<Arc<dyn StakingFarmAmlGate>>,
     config: StakingFarmConfig,
     active_syncs: Arc<Mutex<HashSet<Uuid>>>,
 }
@@ -199,11 +226,13 @@ impl StakingFarmService {
     pub fn new(
         repository: Arc<dyn StakingFarmRepository>,
         contract_client: Arc<dyn StakingFarmContractClient>,
+        aml_gate: Option<Arc<dyn StakingFarmAmlGate>>,
         config: StakingFarmConfig,
     ) -> Self {
         Self {
             repository,
             contract_client,
+            aml_gate,
             config,
             active_syncs: Arc::new(Mutex::new(HashSet::new())),
         }
@@ -253,6 +282,8 @@ impl StakingFarmService {
         changed_by_user_id: Option<Uuid>,
     ) -> anyhow::Result<OrganizationStakingFarmSource> {
         ensure_configured(&self.config)?;
+        self.enforce_aml_for_source(&source, changed_by_user_id)
+            .await?;
 
         let sync_result = self
             .contract_client
@@ -385,6 +416,28 @@ impl StakingFarmService {
             self.sync_for_source(source, None).await.map(Some)
         } else {
             Ok(Some(source))
+        }
+    }
+
+    async fn enforce_aml_for_source(
+        &self,
+        source: &OrganizationStakingFarmSource,
+        changed_by_user_id: Option<Uuid>,
+    ) -> anyhow::Result<()> {
+        let Some(aml_gate) = &self.aml_gate else {
+            return Ok(());
+        };
+
+        match aml_gate
+            .check_near_account(
+                changed_by_user_id,
+                &source.near_account_id,
+                AmlFlow::StakingFarmSync,
+            )
+            .await
+        {
+            Ok(()) => Ok(()),
+            Err(error) => Err(anyhow::Error::new(error)),
         }
     }
 
@@ -619,6 +672,40 @@ mod tests {
         }
     }
 
+    struct MockStakingFarmAmlGate {
+        blocked: bool,
+        calls: Mutex<Vec<(Option<Uuid>, String, AmlFlow)>>,
+    }
+
+    impl MockStakingFarmAmlGate {
+        fn blocking() -> Self {
+            Self {
+                blocked: true,
+                calls: Mutex::new(vec![]),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl StakingFarmAmlGate for MockStakingFarmAmlGate {
+        async fn check_near_account(
+            &self,
+            user_id: Option<Uuid>,
+            account_id: &str,
+            flow: AmlFlow,
+        ) -> Result<(), AmlError> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((user_id, account_id.to_string(), flow));
+            if self.blocked {
+                Err(AmlError::AccountBlocked)
+            } else {
+                Ok(())
+            }
+        }
+    }
+
     fn enabled_config() -> StakingFarmConfig {
         StakingFarmConfig {
             enabled: true,
@@ -706,7 +793,7 @@ mod tests {
         let user_id = Uuid::new_v4();
         let repo = Arc::new(MockStakingFarmRepository::default());
         let client = Arc::new(MockStakingFarmContractClient::returning(farm_account("0")));
-        let service = StakingFarmService::new(repo.clone(), client, enabled_config());
+        let service = StakingFarmService::new(repo.clone(), client, None, enabled_config());
 
         let source = service
             .ensure_source_for_near_account(
@@ -735,7 +822,7 @@ mod tests {
         let client = Arc::new(MockStakingFarmContractClient::returning(farm_account(
             "1000000000000000000000000",
         )));
-        let service = StakingFarmService::new(repo.clone(), client, enabled_config());
+        let service = StakingFarmService::new(repo.clone(), client, None, enabled_config());
 
         let synced = service
             .sync_for_source(source, Some(Uuid::new_v4()))
@@ -754,7 +841,7 @@ mod tests {
         let repo = Arc::new(MockStakingFarmRepository::default());
         *repo.source.lock().unwrap() = Some(source.clone());
         let client = Arc::new(MockStakingFarmContractClient::failing("rpc unavailable"));
-        let service = StakingFarmService::new(repo.clone(), client, enabled_config());
+        let service = StakingFarmService::new(repo.clone(), client, None, enabled_config());
 
         let synced = service.sync_for_source(source, None).await.unwrap();
 
@@ -773,7 +860,7 @@ mod tests {
         let client = Arc::new(MockStakingFarmContractClient::returning(farm_account(
             &u128::MAX.to_string(),
         )));
-        let service = StakingFarmService::new(repo.clone(), client, enabled_config());
+        let service = StakingFarmService::new(repo.clone(), client, None, enabled_config());
 
         let synced = service.sync_for_source(source, None).await.unwrap();
 
@@ -795,7 +882,7 @@ mod tests {
         let mut account = farm_account("3000000000000000000000000");
         account.accumulated_reward_units = "not-a-number".to_string();
         let client = Arc::new(MockStakingFarmContractClient::returning(account));
-        let service = StakingFarmService::new(repo.clone(), client, enabled_config());
+        let service = StakingFarmService::new(repo.clone(), client, None, enabled_config());
 
         let synced = service.sync_for_source(source, None).await.unwrap();
 
@@ -809,6 +896,117 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sync_for_source_blocks_aml_rejected_source_before_contract_call() {
+        let organization_id = Uuid::new_v4();
+        let user_id = Uuid::new_v4();
+        let source = source_fixture(organization_id);
+        let repo = Arc::new(MockStakingFarmRepository::default());
+        *repo.source.lock().unwrap() = Some(source.clone());
+        let client = Arc::new(MockStakingFarmContractClient::returning(farm_account(
+            "3000000000000000000000000",
+        )));
+        let aml_gate = Arc::new(MockStakingFarmAmlGate::blocking());
+        let service = StakingFarmService::new(
+            repo.clone(),
+            client.clone(),
+            Some(aml_gate.clone()),
+            enabled_config(),
+        );
+
+        let error = service
+            .sync_for_source(source, Some(user_id))
+            .await
+            .expect_err("AML-rejected source should block sync");
+
+        assert!(error.chain().any(|cause| matches!(
+            cause.downcast_ref::<AmlError>(),
+            Some(AmlError::AccountBlocked)
+        )));
+        assert!(client.calls.lock().unwrap().is_empty());
+        assert!(repo.limit_updates.lock().unwrap().is_empty());
+        assert_eq!(
+            aml_gate.calls.lock().unwrap().as_slice(),
+            &[(
+                Some(user_id),
+                "alice.near".to_string(),
+                AmlFlow::StakingFarmSync
+            )]
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_preflight_blocks_aml_rejected_source_before_contract_call() {
+        let organization_id = Uuid::new_v4();
+        let source = source_fixture(organization_id);
+        let repo = Arc::new(MockStakingFarmRepository::default());
+        *repo.source.lock().unwrap() = Some(source);
+        let client = Arc::new(MockStakingFarmContractClient::returning(farm_account(
+            "3000000000000000000000000",
+        )));
+        let aml_gate = Arc::new(MockStakingFarmAmlGate::blocking());
+        let service = StakingFarmService::new(
+            repo.clone(),
+            client.clone(),
+            Some(aml_gate.clone()),
+            enabled_config(),
+        );
+
+        let error = service
+            .sync_organization_if_stale(organization_id)
+            .await
+            .expect_err("AML-rejected stale source should block preflight sync");
+
+        assert!(error.chain().any(|cause| matches!(
+            cause.downcast_ref::<AmlError>(),
+            Some(AmlError::AccountBlocked)
+        )));
+        assert!(client.calls.lock().unwrap().is_empty());
+        assert!(repo.limit_updates.lock().unwrap().is_empty());
+        assert_eq!(
+            aml_gate.calls.lock().unwrap().as_slice(),
+            &[(None, "alice.near".to_string(), AmlFlow::StakingFarmSync)]
+        );
+    }
+
+    #[tokio::test]
+    async fn sync_for_near_account_blocks_aml_rejected_source_before_contract_call() {
+        let organization_id = Uuid::new_v4();
+        let user_id = Uuid::new_v4();
+        let repo = Arc::new(MockStakingFarmRepository::default());
+        let client = Arc::new(MockStakingFarmContractClient::returning(farm_account(
+            "3000000000000000000000000",
+        )));
+        let aml_gate = Arc::new(MockStakingFarmAmlGate::blocking());
+        let service = StakingFarmService::new(
+            repo.clone(),
+            client.clone(),
+            Some(aml_gate.clone()),
+            enabled_config(),
+        );
+
+        let error = service
+            .sync_for_near_account(organization_id, "alice.near".to_string(), user_id)
+            .await
+            .expect_err("AML-rejected user source should block sync");
+
+        assert!(error.chain().any(|cause| matches!(
+            cause.downcast_ref::<AmlError>(),
+            Some(AmlError::AccountBlocked)
+        )));
+        assert_eq!(repo.upserts.lock().unwrap().len(), 1);
+        assert!(client.calls.lock().unwrap().is_empty());
+        assert!(repo.limit_updates.lock().unwrap().is_empty());
+        assert_eq!(
+            aml_gate.calls.lock().unwrap().as_slice(),
+            &[(
+                Some(user_id),
+                "alice.near".to_string(),
+                AmlFlow::StakingFarmSync
+            )]
+        );
+    }
+
+    #[tokio::test]
     async fn stale_source_is_synced_automatically() {
         let organization_id = Uuid::new_v4();
         let source = source_fixture(organization_id);
@@ -817,7 +1015,7 @@ mod tests {
         let client = Arc::new(MockStakingFarmContractClient::returning(farm_account(
             "3000000000000000000000000",
         )));
-        let service = StakingFarmService::new(repo.clone(), client.clone(), enabled_config());
+        let service = StakingFarmService::new(repo.clone(), client.clone(), None, enabled_config());
 
         let synced = service
             .sync_organization_if_stale(organization_id)
@@ -840,7 +1038,7 @@ mod tests {
             MockStakingFarmContractClient::returning(farm_account("3000000000000000000000000"))
                 .with_delay(50),
         );
-        let service = StakingFarmService::new(repo.clone(), client.clone(), enabled_config());
+        let service = StakingFarmService::new(repo.clone(), client.clone(), None, enabled_config());
 
         let (first, second) = tokio::join!(
             service.sync_organization_if_stale(organization_id),
@@ -858,6 +1056,7 @@ mod tests {
         let service = StakingFarmService::new(
             Arc::new(MockStakingFarmRepository::default()),
             Arc::new(MockStakingFarmContractClient::returning(farm_account("0"))),
+            None,
             enabled_config(),
         );
         let organization_id = Uuid::new_v4();
@@ -887,7 +1086,7 @@ mod tests {
         let client = Arc::new(MockStakingFarmContractClient::returning(farm_account(
             "3000000000000000000000000",
         )));
-        let service = StakingFarmService::new(repo.clone(), client.clone(), enabled_config());
+        let service = StakingFarmService::new(repo.clone(), client.clone(), None, enabled_config());
 
         let result = service
             .sync_organization_if_stale(organization_id)

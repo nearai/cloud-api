@@ -9,6 +9,7 @@ use axum::{
     Extension,
 };
 use serde::{Deserialize, Serialize};
+use services::aml::AmlError;
 use services::auth::UserId;
 use services::organization::OrganizationId;
 use services::staking_farm::{
@@ -242,7 +243,7 @@ pub async fn sync_admin_organization_staking_farm(
         .staking_farm_service
         .sync_for_source(source, Some(admin_user.0.id))
         .await
-        .map_err(internal_error)?;
+        .map_err(staking_farm_error)?;
 
     Ok(ResponseJson(source_to_response(source)))
 }
@@ -359,6 +360,21 @@ fn staking_farm_error(error: anyhow::Error) -> (StatusCode, ResponseJson<ErrorRe
                 "Organization is inactive and cannot be linked to a NEAR staking wallet"
                     .to_string(),
                 "organization_inactive".to_string(),
+            )),
+        );
+    }
+
+    if error.chain().any(|cause| {
+        matches!(
+            cause.downcast_ref::<AmlError>(),
+            Some(AmlError::AccountBlocked)
+        )
+    }) {
+        return (
+            StatusCode::FORBIDDEN,
+            ResponseJson(ErrorResponse::new(
+                "Account error".to_string(),
+                "account_error".to_string(),
             )),
         );
     }

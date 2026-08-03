@@ -107,6 +107,7 @@ pub struct DomainServices {
     pub files_service: Arc<dyn services::files::FileServiceTrait + Send + Sync>,
     pub metrics_service: Arc<dyn services::metrics::MetricsServiceTrait>,
     pub staking_farm_service: Arc<services::staking_farm::StakingFarmService>,
+    pub aml_service: Arc<services::aml::AmlService>,
     pub web_search_provider: Arc<dyn services::responses::tools::WebSearchProviderTrait>,
     pub service_usage_service:
         Arc<dyn services::service_usage::ServiceUsageServiceTrait + Send + Sync>,
@@ -506,6 +507,18 @@ pub async fn init_domain_services_with_pool(
         service_usage_repo,
     ));
 
+    let aml_repository = Arc::new(database::repositories::PostgresAmlRepository::new(
+        database.pool().clone(),
+    )) as Arc<dyn services::aml::AmlRepository>;
+    let aml_provider = Arc::new(
+        services::aml::LukkaAmlClient::new(&config.aml)
+            .expect("Failed to initialize Lukka AML client"),
+    ) as Arc<dyn services::aml::AmlProviderClient>;
+    let aml_service = Arc::new(services::aml::AmlService::new(
+        aml_repository,
+        aml_provider,
+        config.aml.clone(),
+    ));
     let staking_farm_repository = Arc::new(
         database::repositories::OrganizationStakingFarmSourcesRepository::new(
             database.pool().clone(),
@@ -522,6 +535,7 @@ pub async fn init_domain_services_with_pool(
     let staking_farm_service = Arc::new(services::staking_farm::StakingFarmService::new(
         staking_farm_repository,
         staking_farm_contract_client,
+        Some(aml_service.clone()),
         config.staking_farm.clone(),
     ));
 
@@ -540,6 +554,7 @@ pub async fn init_domain_services_with_pool(
         files_service,
         metrics_service,
         staking_farm_service,
+        aml_service,
         web_search_provider,
         service_usage_service,
     }
@@ -1174,6 +1189,7 @@ pub fn build_app_with_config(
         metrics_service: domain_services.metrics_service.clone(),
         analytics_service: analytics_service.clone(),
         staking_farm_service: domain_services.staking_farm_service.clone(),
+        aml_service: domain_services.aml_service.clone(),
         config: config.clone(),
         ohttp_gateway,
         ohttp_attestation,
@@ -1268,6 +1284,7 @@ pub fn build_app_with_config(
             inference_provider_pool: app_state.inference_provider_pool.clone(),
             analytics_service,
             staking_farm_service: app_state.staking_farm_service.clone(),
+            aml_service: app_state.aml_service.clone(),
             models_service: domain_services.models_service.clone(),
             completion_service: domain_services.completion_service.clone(),
             organization_service: domain_services.organization_service.clone(),
@@ -2043,6 +2060,7 @@ pub struct AdminRouteServices {
     pub inference_provider_pool: Arc<services::inference_provider_pool::InferenceProviderPool>,
     pub analytics_service: Arc<services::admin::AnalyticsService>,
     pub staking_farm_service: Arc<services::staking_farm::StakingFarmService>,
+    pub aml_service: Arc<services::aml::AmlService>,
     pub models_service: Arc<services::models::ModelsServiceImpl>,
     pub completion_service: Arc<services::CompletionServiceImpl>,
     pub organization_service:
@@ -2117,6 +2135,7 @@ pub fn build_admin_routes(
         auth_service: auth_state_middleware.auth_service.clone(),
         usage_service: services.usage_service,
         staking_farm_service: services.staking_farm_service,
+        aml_service: services.aml_service,
         config,
         admin_access_token_repository,
         inference_provider_pool: services.inference_provider_pool,
@@ -2634,6 +2653,7 @@ mod tests {
             github_dispatch: config::GitHubDispatchConfig::default(),
             infra: config::InfraConfig::default(),
             staking_farm: config::StakingFarmConfig::default(),
+            aml: config::AmlConfig::default(),
             usage_reporting: config::UsageReportingConfig::default(),
             ita: config::ItaAttestationConfig::default(),
         };
@@ -2742,6 +2762,7 @@ mod tests {
             github_dispatch: config::GitHubDispatchConfig::default(),
             infra: config::InfraConfig::default(),
             staking_farm: config::StakingFarmConfig::default(),
+            aml: config::AmlConfig::default(),
             usage_reporting: config::UsageReportingConfig::default(),
             ita: config::ItaAttestationConfig::default(),
         };

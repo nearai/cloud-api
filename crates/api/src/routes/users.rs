@@ -13,8 +13,13 @@ use axum::{
     http::StatusCode,
 };
 use serde::Deserialize;
+use serde::Serialize;
 use services::{
-    auth::AuthError, auth::UserId, organization::OrganizationError, user::UserServiceError,
+    aml::{AmlError, AmlFlow},
+    auth::AuthError,
+    auth::UserId,
+    organization::OrganizationError,
+    user::UserServiceError,
 };
 use tracing::{debug, error};
 use utoipa::ToSchema;
@@ -39,6 +44,11 @@ fn services_session_to_api_refresh_token(
 pub struct UpdateUserProfileRequest {
     pub display_name: Option<String>,
     pub avatar_url: Option<String>,
+}
+
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+pub struct UserStatusResponse {
+    pub status: String,
 }
 
 impl UpdateUserProfileRequest {
@@ -169,6 +179,61 @@ pub async fn get_current_user(
     );
 
     Ok(Json(response))
+}
+
+/// Get current user's account eligibility status
+///
+/// Returns a minimal eligibility response for frontend preflight checks. AML/KYT
+/// provider details are never exposed in this public response.
+#[utoipa::path(
+    get,
+    path = "/v1/users/me/status",
+    tag = "Users",
+    responses(
+        (status = 200, description = "Current account is eligible", body = UserStatusResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 403, description = "Current account is not eligible", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    ),
+    security(
+        ("session_token" = [])
+    )
+)]
+pub async fn get_user_status(
+    State(app_state): State<AppState>,
+    Extension(user): Extension<AuthenticatedUser>,
+) -> Result<Json<UserStatusResponse>, (StatusCode, Json<ErrorResponse>)> {
+    match app_state
+        .aml_service
+        .check_authenticated_near_user(
+            user.0.id,
+            &user.0.auth_provider,
+            &user.0.provider_user_id,
+            AmlFlow::UserStatus,
+        )
+        .await
+    {
+        Ok(_) => Ok(Json(UserStatusResponse {
+            status: "ok".to_string(),
+        })),
+        Err(AmlError::AccountBlocked) => Err((
+            StatusCode::FORBIDDEN,
+            Json(ErrorResponse::new(
+                "Account error".to_string(),
+                "account_error".to_string(),
+            )),
+        )),
+        Err(error) => {
+            error!(error = %error, "Failed to get user account status");
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse::new(
+                    "Failed to check account status".to_string(),
+                    "internal_server_error".to_string(),
+                )),
+            ))
+        }
+    }
 }
 
 /// Update current user's profile

@@ -686,12 +686,12 @@ async fn auto_redact_bills_classify_pass() {
 
     // Exactly one privacy_classify row should be billed for the inline
     // classify pass, carrying the mock's 10 input tokens and no output.
-    // Billing runs on a spawned background task, so poll (bounded) until the
-    // row lands rather than querying once.
+    // Billing runs on a spawned background task with a 10s route-side timeout,
+    // so poll slightly longer than that rather than querying once.
     let org_uuid = uuid::Uuid::parse_str(&org.id).expect("org id is a uuid");
     let pool = db.pool();
     let mut rows = Vec::new();
-    for _ in 0..40 {
+    for _ in 0..220 {
         let client = pool.get().await.expect("db connection");
         rows = client
             .query(

@@ -34,6 +34,7 @@ pub struct AppState {
     pub metrics_service: Arc<dyn services::metrics::MetricsServiceTrait>,
     pub analytics_service: Arc<services::admin::AnalyticsService>,
     pub staking_farm_service: Arc<services::staking_farm::StakingFarmService>,
+    pub aml_service: Arc<services::aml::AmlService>,
     pub config: Arc<config::ApiConfig>,
     /// OHTTP gateway for RFC 9458 decapsulation/encapsulation. `None` when OHTTP_ENABLED is unset.
     pub ohttp_gateway: Option<Arc<OhttpGateway>>,
@@ -49,7 +50,7 @@ use crate::routes::{
     organizations::*,
     users::{
         accept_invitation, create_access_token, decline_invitation, get_current_user,
-        get_user_refresh_tokens, list_user_invitations, revoke_all_user_tokens,
+        get_user_refresh_tokens, get_user_status, list_user_invitations, revoke_all_user_tokens,
         revoke_user_refresh_token, update_current_user_profile,
     },
 };
@@ -168,6 +169,7 @@ pub fn build_management_router(app_state: AppState, auth_state: AuthState) -> Ro
     // User routes (require access token authentication)
     let user_routes = Router::new()
         .route("/me", get(get_current_user))
+        .route("/me/status", get(get_user_status))
         .route("/me/profile", put(update_current_user_profile))
         .route("/me/invitations", get(list_user_invitations))
         .route(

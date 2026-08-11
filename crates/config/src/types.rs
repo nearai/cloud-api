@@ -1060,18 +1060,7 @@ pub(crate) fn non_empty_env(key: &str) -> Option<String> {
 }
 
 fn read_optional_secret_env(file_key: &str, value_key: &str) -> Result<Option<String>, String> {
-    if let Some(path) = non_empty_env(file_key) {
-        let value = std::fs::read_to_string(&path)
-            .map_err(|e| format!("Failed to read {file_key}: {e}"))?
-            .trim()
-            .to_string();
-        if value.is_empty() {
-            return Err(format!("{file_key} cannot be empty"));
-        }
-        return Ok(Some(value));
-    }
-
-    Ok(non_empty_env(value_key))
+    read_optional_non_empty_file_env(file_key, Some(value_key))
 }
 
 pub(crate) fn read_optional_secret_env_absent_empty(
@@ -1079,20 +1068,92 @@ pub(crate) fn read_optional_secret_env_absent_empty(
     value_key: &str,
 ) -> Result<Option<String>, String> {
     if let Some(path) = non_empty_env(file_key) {
-        let value = std::fs::read_to_string(&path)
-            .map_err(|e| format!("Failed to read {file_key}: {e}"))?
-            .trim()
-            .to_string();
+        let value = read_trimmed_file(file_key, &path)?;
         return Ok((!value.is_empty()).then_some(value));
     }
 
     Ok(non_empty_env(value_key))
 }
 
+fn read_trimmed_file(file_key: &str, path: &str) -> Result<String, String> {
+    std::fs::read_to_string(path)
+        .map_err(|e| format!("Failed to read {file_key}: {e}"))
+        .map(|value| value.trim().to_string())
+}
+
+fn read_optional_non_empty_file_env(
+    file_key: &str,
+    fallback_key: Option<&str>,
+) -> Result<Option<String>, String> {
+    if let Some(path) = non_empty_env(file_key) {
+        let value = read_trimmed_file(file_key, &path)?;
+        if value.is_empty() {
+            return Err(format!("{file_key} cannot be empty"));
+        }
+        return Ok(Some(value));
+    }
+
+    Ok(fallback_key.and_then(non_empty_env))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serial_test::serial;
+
+    #[test]
+    #[serial]
+    fn otlp_config_without_instance_file_preserves_existing_defaults() {
+        std::env::remove_var("TELEMETRY_SERVICE_INSTANCE_ID_FILE");
+        std::env::remove_var("TELEMETRY_OTLP_ENDPOINT");
+        std::env::remove_var("TELEMETRY_OTLP_PROTOCOL");
+
+        let config = OtlpConfig::from_env().unwrap();
+
+        assert_eq!(config.endpoint, "http://localhost:4317");
+        assert_eq!(config.protocol, "grpc");
+        assert_eq!(config.instance_id, None);
+    }
+
+    #[test]
+    #[serial]
+    fn otlp_config_reads_and_trims_configured_instance_file() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), " vmm-instance-123 \n").unwrap();
+        std::env::set_var("TELEMETRY_SERVICE_INSTANCE_ID_FILE", file.path());
+
+        let config = OtlpConfig::from_env().unwrap();
+
+        assert_eq!(config.instance_id.as_deref(), Some("vmm-instance-123"));
+        std::env::remove_var("TELEMETRY_SERVICE_INSTANCE_ID_FILE");
+    }
+
+    #[test]
+    #[serial]
+    fn otlp_config_rejects_missing_configured_instance_file() {
+        std::env::set_var(
+            "TELEMETRY_SERVICE_INSTANCE_ID_FILE",
+            "/tmp/cloud-api-telemetry-instance-id-missing",
+        );
+
+        let error = OtlpConfig::from_env().unwrap_err();
+
+        assert!(error.contains("TELEMETRY_SERVICE_INSTANCE_ID_FILE"));
+        std::env::remove_var("TELEMETRY_SERVICE_INSTANCE_ID_FILE");
+    }
+
+    #[test]
+    #[serial]
+    fn otlp_config_rejects_empty_configured_instance_file() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::env::set_var("TELEMETRY_SERVICE_INSTANCE_ID_FILE", file.path());
+
+        let error = OtlpConfig::from_env().unwrap_err();
+
+        assert!(error.contains("TELEMETRY_SERVICE_INSTANCE_ID_FILE"));
+        assert!(error.contains("cannot be empty"));
+        std::env::remove_var("TELEMETRY_SERVICE_INSTANCE_ID_FILE");
+    }
 
     #[test]
     fn reporting_database_timeout_leaves_headroom_for_http_response() {
@@ -1956,11 +2017,18 @@ impl ExternalProvidersConfig {
 pub struct OtlpConfig {
     pub endpoint: String,
     pub protocol: String,
+    pub instance_id: Option<String>,
 }
 
 impl OtlpConfig {
     pub fn from_env() -> Result<Self, String> {
-        Ok(Self::default())
+        let instance_id =
+            read_optional_non_empty_file_env("TELEMETRY_SERVICE_INSTANCE_ID_FILE", None)?;
+
+        Ok(Self {
+            instance_id,
+            ..Self::default()
+        })
     }
 }
 
@@ -1970,6 +2038,7 @@ impl Default for OtlpConfig {
             endpoint: env::var("TELEMETRY_OTLP_ENDPOINT")
                 .unwrap_or_else(|_| "http://localhost:4317".to_string()),
             protocol: env::var("TELEMETRY_OTLP_PROTOCOL").unwrap_or_else(|_| "grpc".to_string()),
+            instance_id: None,
         }
     }
 }

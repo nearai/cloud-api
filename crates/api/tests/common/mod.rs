@@ -118,6 +118,7 @@ pub fn test_config() -> ApiConfig {
             endpoint: std::env::var("TELEMETRY_OTLP_ENDPOINT")
                 .unwrap_or_else(|_| "http://localhost:4317".to_string()),
             protocol: std::env::var("TELEMETRY_OTLP_PROTOCOL").unwrap_or("grpc".to_string()),
+            instance_id: None,
         },
         cors: config::CorsConfig::default(),
         external_providers: config::ExternalProvidersConfig::default(),

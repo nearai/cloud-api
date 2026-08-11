@@ -1413,7 +1413,9 @@ pub fn build_app_with_config(
         .fallback(routes::unsupported::unknown_route)
         .method_not_allowed_fallback(routes::unsupported::method_not_allowed)
         .layer(cors)
-        // Add HTTP metrics middleware to track all requests
+        // Keep metrics on Router::layer: MatchedPath is populated inside Axum's
+        // router, and moving this middleware outside would label every route
+        // as /unmatched.
         .layer(from_fn_with_state(
             metrics_state,
             middleware::http_metrics_middleware,

@@ -257,6 +257,12 @@ impl ChutesInstanceVerifier for ChutesBackendVerifier {
 /// transparency endpoint — these rows merely enumerate which genuine software
 /// identities we accept.
 ///
+/// Resync #3 (after #849 and #865) fetched the published measurements from
+/// `GET https://api.chutes.ai/servers/tee/measurements` on 2026-08-12. It is
+/// purely additive for newly provisioned hardware: the new rows retain the same
+/// v1.3.1 MRTD/RTMR1/RTMR2/runtime-RTMR3 software identity and differ only in
+/// per-hardware RTMR0.
+///
 /// NOT included (fail-closed): the v1.0.0–v1.2.0 rows publish RTMR3 = all-zeros
 /// (a boot template, never matchable against a live extended RTMR3 — the running
 /// app is unmeasured). Both v1.3.1 and v1.3.1-rc1 publish a non-zero runtime
@@ -309,7 +315,8 @@ pub fn vetted_golden_measurements() -> ChutesMeasurementPolicy {
         },
         // Final v1.3.1 software identity — GLM-5.2-TEE's fleet since Chutes
         // promoted it off the release candidate. Same MRTD as -rc1, distinct
-        // RTMR1/2/3. Full published hardware family (resynced 2026-07-06);
+        // RTMR1/2/3. Full published hardware family (resynced 2026-07-06, then
+        // purely additively on 2026-08-12 for new hardware provisioning);
         // `8xb200 [10.2.1]` (GLM-5.2-TEE) and `8xh200 [10.1.0-flat]`
         // (GLM-5.1-TEE) are live cross-checked against signature-verified,
         // nonce-bound prod quotes (2026-07-06). The previous snapshot's plain
@@ -336,6 +343,15 @@ pub fn vetted_golden_measurements() -> ChutesMeasurementPolicy {
                 ("8xb200 [10.2.1, XEON6]", "65fd972e40ac4d8a933d10ebfc31f07336cf1e45a3864523427b454df5d3b9dd0043f10e975da39677b62d45860c13e3"),
                 ("8xb200 [10.1.0, XEON6, SNC3]", "2b22fa53ace208d4f046ae90b7ad28d71a7f4ef0573897d40f6c82b4036217e3170c856f91e54bc19c20c9958c5d1e36"),
                 ("8xb300", "91adf9667ba4c65bec5345a8c9b98010708d903847bf838c4526c3ebbc35561719e2127e48a3f6f77f651d71d2cbc8d4"),
+                ("8xh200 [10.2.1, FLAT]", "b237753a1c8a05042209947fc0f98c8459783db7f3411860c38249c5abd4efd8c6fb7820036ff19b5099138aaf9e0bd1"),
+                ("8xRTX_PRO_6000 [10.1.0]", "0917443cc41e9a5afebc8e87e69a63f32208c47d4b4b4fd410fbc1a705e1880c1383a4ad51903a5ed20cb4090420185a"),
+                ("8xRTX_PRO_6000 [10.2.1, NUMA2-4/4]", "5fc09d108ef74d5505b876690de5ab5da02af463ba84bb33299efd1c02144b5d7a6ba579b3ff31ef9118350468e9faf2"),
+                ("8xRTX_PRO_6000 [10.2.1, NUMA2-3/5]", "1de32a41a8116e042f33e9cb813f1f6edfef1452c8b2cf54df5451a848ef8931e97f40927191acabfd111c8b8d66796a"),
+                ("8xRTX_PRO_6000 [10.2.1, FLAT]", "e9f0b31ce30e4917767d22ad26ad0a8f4edc095b8d9f4bbb36c9cc24fe274aa2dfe16ce3c961dac2d8cef3e6ae2e901d"),
+                ("8xRTX_PRO_6000 [10.2.1, FLAT, MSI-GNR]", "872d965083f0bab7d080bd7d40155ba1b2b911d883f391ab7d6b9d810abeefd058e04129d72c088cf4fd05c099a57704"),
+                ("8xb200 [10.2.1, XEON6, 272CPU]", "9673907ceb0c9ca79337437bb91695e7a3d19e82df1e41de1b0d2db8081fccb5d82f26d479a5016553cb20964d5948b9"),
+                ("8xb200 [10.2.1, XEON6, SNC3]", "ccef43242ef633a542405dbfe55d04d823a50586b0a07510d058ea88ad8d1f8281f227f00c664435d92b23431c4d1c3c"),
+                ("8xb200 [10.2.1, ubuntu3]", "ff42d0f7b03cbe84f9e252d8f912b465852c8ee92584c5c047de134a46c8f1e1545683e713bbdd64e2af7d10e8bafaae"),
             ],
         },
     ];
@@ -477,8 +493,8 @@ mod tests {
         fn covers_the_full_v130_hardware_family() {
             // All six published v1.3.0 hardware platforms are accepted — by name,
             // so swapping a row for a different config (count unchanged) still fails.
-            // Total = 6 (v1.3.0) + 3 (v1.3.1-rc1 Blackwell) + 11 (v1.3.1 final).
-            assert_eq!(vetted_golden_measurements().len(), 20);
+            // Total = 6 (v1.3.0) + 3 (v1.3.1-rc1 Blackwell) + 20 (v1.3.1 final).
+            assert_eq!(vetted_golden_measurements().len(), 29);
             accepts(RTMR0_H200, "8xh200");
             accepts(RTMR0_H200_R2, "8xh200-r2");
             accepts(RTMR0_RTX_PRO_6000, "8xRTX_PRO_6000");
@@ -606,6 +622,34 @@ mod tests {
                 "8xh200 [10.1.0-flat]",
                 "1.3.1",
             );
+        }
+
+        #[test]
+        fn accepts_the_2026_08_12_observed_new_v131_hardware_rows() {
+            // Chutes' 2026-08-12 transparency-log snapshot added these hardware
+            // configurations without changing the final v1.3.1 software identity.
+            // Every new RTMR0 must verify with the family's shared MRTD/RTMR1/2/3.
+            for (matched_name, rtmr0) in [
+                ("8xh200 [10.2.1, FLAT]", "b237753a1c8a05042209947fc0f98c8459783db7f3411860c38249c5abd4efd8c6fb7820036ff19b5099138aaf9e0bd1"),
+                ("8xRTX_PRO_6000", "0917443cc41e9a5afebc8e87e69a63f32208c47d4b4b4fd410fbc1a705e1880c1383a4ad51903a5ed20cb4090420185a"),
+                ("8xRTX_PRO_6000 [10.2.1, NUMA2-4/4]", "5fc09d108ef74d5505b876690de5ab5da02af463ba84bb33299efd1c02144b5d7a6ba579b3ff31ef9118350468e9faf2"),
+                ("8xRTX_PRO_6000 [10.2.1, NUMA2-3/5]", "1de32a41a8116e042f33e9cb813f1f6edfef1452c8b2cf54df5451a848ef8931e97f40927191acabfd111c8b8d66796a"),
+                ("8xRTX_PRO_6000 [10.2.1, FLAT]", "e9f0b31ce30e4917767d22ad26ad0a8f4edc095b8d9f4bbb36c9cc24fe274aa2dfe16ce3c961dac2d8cef3e6ae2e901d"),
+                ("8xRTX_PRO_6000 [10.2.1, FLAT, MSI-GNR]", "872d965083f0bab7d080bd7d40155ba1b2b911d883f391ab7d6b9d810abeefd058e04129d72c088cf4fd05c099a57704"),
+                ("8xb200 [10.2.1, XEON6, 272CPU]", "9673907ceb0c9ca79337437bb91695e7a3d19e82df1e41de1b0d2db8081fccb5d82f26d479a5016553cb20964d5948b9"),
+                ("8xb200 [10.2.1, XEON6, SNC3]", "ccef43242ef633a542405dbfe55d04d823a50586b0a07510d058ea88ad8d1f8281f227f00c664435d92b23431c4d1c3c"),
+                ("8xb200 [10.2.1, ubuntu3]", "ff42d0f7b03cbe84f9e252d8f912b465852c8ee92584c5c047de134a46c8f1e1545683e713bbdd64e2af7d10e8bafaae"),
+            ] {
+                accepts_family(
+                    rtmr0,
+                    MRTD_V131,
+                    FINAL_RTMR1,
+                    FINAL_RTMR2,
+                    FINAL_RTMR3,
+                    matched_name,
+                    "1.3.1",
+                );
+            }
         }
 
         #[test]

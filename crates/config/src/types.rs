@@ -1100,10 +1100,41 @@ fn read_optional_non_empty_file_env(
 mod tests {
     use super::*;
     use serial_test::serial;
+    use std::ffi::OsString;
+
+    struct TelemetryEnvGuard {
+        values: [(&'static str, Option<OsString>); 3],
+    }
+
+    impl TelemetryEnvGuard {
+        fn new() -> Self {
+            const KEYS: [&str; 3] = [
+                "TELEMETRY_SERVICE_INSTANCE_ID_FILE",
+                "TELEMETRY_OTLP_ENDPOINT",
+                "TELEMETRY_OTLP_PROTOCOL",
+            ];
+
+            Self {
+                values: KEYS.map(|key| (key, std::env::var_os(key))),
+            }
+        }
+    }
+
+    impl Drop for TelemetryEnvGuard {
+        fn drop(&mut self) {
+            for (key, value) in &mut self.values {
+                match value.take() {
+                    Some(value) => std::env::set_var(*key, value),
+                    None => std::env::remove_var(*key),
+                }
+            }
+        }
+    }
 
     #[test]
     #[serial]
     fn otlp_config_without_instance_file_preserves_existing_defaults() {
+        let _env = TelemetryEnvGuard::new();
         std::env::remove_var("TELEMETRY_SERVICE_INSTANCE_ID_FILE");
         std::env::remove_var("TELEMETRY_OTLP_ENDPOINT");
         std::env::remove_var("TELEMETRY_OTLP_PROTOCOL");
@@ -1118,6 +1149,7 @@ mod tests {
     #[test]
     #[serial]
     fn otlp_config_reads_and_trims_configured_instance_file() {
+        let _env = TelemetryEnvGuard::new();
         let file = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(file.path(), " vmm-instance-123 \n").unwrap();
         std::env::set_var("TELEMETRY_SERVICE_INSTANCE_ID_FILE", file.path());
@@ -1125,34 +1157,59 @@ mod tests {
         let config = OtlpConfig::from_env().unwrap();
 
         assert_eq!(config.instance_id.as_deref(), Some("vmm-instance-123"));
-        std::env::remove_var("TELEMETRY_SERVICE_INSTANCE_ID_FILE");
     }
 
     #[test]
     #[serial]
     fn otlp_config_rejects_missing_configured_instance_file() {
-        std::env::set_var(
-            "TELEMETRY_SERVICE_INSTANCE_ID_FILE",
-            "/tmp/cloud-api-telemetry-instance-id-missing",
-        );
+        let _env = TelemetryEnvGuard::new();
+        let dir = tempfile::tempdir().unwrap();
+        let missing_path = dir.path().join("missing");
+        assert!(!missing_path.exists());
+        std::env::set_var("TELEMETRY_SERVICE_INSTANCE_ID_FILE", &missing_path);
 
         let error = OtlpConfig::from_env().unwrap_err();
 
         assert!(error.contains("TELEMETRY_SERVICE_INSTANCE_ID_FILE"));
-        std::env::remove_var("TELEMETRY_SERVICE_INSTANCE_ID_FILE");
     }
 
     #[test]
     #[serial]
-    fn otlp_config_rejects_empty_configured_instance_file() {
+    fn otlp_config_rejects_whitespace_only_configured_instance_file() {
+        let _env = TelemetryEnvGuard::new();
         let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), "   \n\t").unwrap();
         std::env::set_var("TELEMETRY_SERVICE_INSTANCE_ID_FILE", file.path());
 
         let error = OtlpConfig::from_env().unwrap_err();
 
         assert!(error.contains("TELEMETRY_SERVICE_INSTANCE_ID_FILE"));
         assert!(error.contains("cannot be empty"));
-        std::env::remove_var("TELEMETRY_SERVICE_INSTANCE_ID_FILE");
+    }
+
+    #[test]
+    #[serial]
+    fn otlp_config_env_guard_restores_values_after_panic() {
+        let original = [
+            std::env::var_os("TELEMETRY_SERVICE_INSTANCE_ID_FILE"),
+            std::env::var_os("TELEMETRY_OTLP_ENDPOINT"),
+            std::env::var_os("TELEMETRY_OTLP_PROTOCOL"),
+        ];
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _env = TelemetryEnvGuard::new();
+            std::env::set_var("TELEMETRY_SERVICE_INSTANCE_ID_FILE", "temporary");
+            std::env::set_var("TELEMETRY_OTLP_ENDPOINT", "temporary-endpoint");
+            std::env::set_var("TELEMETRY_OTLP_PROTOCOL", "temporary-protocol");
+            panic!("simulate a test panic");
+        }));
+
+        assert!(result.is_err());
+        assert_eq!(
+            std::env::var_os("TELEMETRY_SERVICE_INSTANCE_ID_FILE"),
+            original[0]
+        );
+        assert_eq!(std::env::var_os("TELEMETRY_OTLP_ENDPOINT"), original[1]);
+        assert_eq!(std::env::var_os("TELEMETRY_OTLP_PROTOCOL"), original[2]);
     }
 
     #[test]

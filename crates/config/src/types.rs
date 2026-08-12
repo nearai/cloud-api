@@ -28,6 +28,63 @@ pub struct ApiConfig {
     pub aml: AmlConfig,
     pub usage_reporting: UsageReportingConfig,
     pub ita: ItaAttestationConfig,
+    pub fleet_concurrency: FleetConcurrencyConfig,
+}
+
+/// How concurrent-request limits are enforced across replicas.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FleetConcurrencyMode {
+    /// Each replica counts only its own in-flight requests.
+    #[default]
+    Off,
+    /// Admission is decided by the fleet-wide lease count.
+    Enforce,
+}
+
+#[derive(Debug, Clone)]
+pub struct FleetConcurrencyConfig {
+    pub mode: FleetConcurrencyMode,
+    pub lease_ttl_seconds: u64,
+    pub instance_id: String,
+}
+
+impl Default for FleetConcurrencyConfig {
+    fn default() -> Self {
+        Self {
+            mode: FleetConcurrencyMode::Off,
+            lease_ttl_seconds: 30,
+            instance_id: String::new(),
+        }
+    }
+}
+
+impl FleetConcurrencyConfig {
+    pub fn from_env() -> Self {
+        let mode = match env::var("FLEET_CONCURRENCY_MODE")
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "enforce" => FleetConcurrencyMode::Enforce,
+            _ => FleetConcurrencyMode::Off,
+        };
+
+        Self {
+            mode,
+            lease_ttl_seconds: env::var("FLEET_CONCURRENCY_LEASE_TTL_SECONDS")
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .filter(|seconds| *seconds > 0)
+                .unwrap_or(30),
+            instance_id: env::var("FLEET_CONCURRENCY_INSTANCE_ID")
+                .ok()
+                .filter(|value| !value.is_empty())
+                .unwrap_or_else(|| {
+                    let host = env::var("HOSTNAME").unwrap_or_else(|_| "unknown".to_string());
+                    format!("{host}-{}", std::process::id())
+                }),
+        }
+    }
 }
 
 impl ApiConfig {
@@ -60,6 +117,7 @@ impl ApiConfig {
             infra: InfraConfig::from_env(),
             aml: AmlConfig::from_env()?,
             ita: ItaAttestationConfig::from_env()?,
+            fleet_concurrency: FleetConcurrencyConfig::from_env(),
             usage_reporting: UsageReportingConfig::from_env()?,
         })
     }

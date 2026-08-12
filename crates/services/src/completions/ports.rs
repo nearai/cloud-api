@@ -3,6 +3,7 @@ use crate::UserId;
 use async_trait::async_trait;
 use inference_providers::StreamingResult;
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
 use uuid::Uuid;
 
 /// Default concurrent request limit per organization per model
@@ -127,6 +128,30 @@ pub trait OrganizationConcurrentLimitRepository: Send + Sync {
     /// Get the concurrent request limit for an organization
     /// Returns None if no custom limit is set (use default)
     async fn get_concurrent_limit(&self, org_id: Uuid) -> Result<Option<u32>, anyhow::Error>;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LeaseOutcome {
+    Admitted,
+    AtLimit { limit: u32, in_flight: i64 },
+}
+
+/// Repository trait for fleet-wide concurrency leases
+/// Used by CompletionService so replicas admit against one shared count
+#[async_trait]
+pub trait ConcurrencyLeaseRepository: Send + Sync {
+    /// Record a lease if the organization is below its limit for the model
+    async fn try_acquire(
+        &self,
+        lease_id: Uuid,
+        organization_id: Uuid,
+        model_id: Uuid,
+        instance_id: &str,
+        default_limit: u32,
+        ttl: Duration,
+    ) -> Result<LeaseOutcome, anyhow::Error>;
+
+    async fn release(&self, lease_ids: &[Uuid]) -> Result<(), anyhow::Error>;
 }
 
 #[async_trait]

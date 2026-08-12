@@ -130,6 +130,7 @@ pub fn test_config() -> ApiConfig {
             ..config::UsageReportingConfig::default()
         },
         ita: config::ItaAttestationConfig::default(),
+        fleet_concurrency: config::FleetConcurrencyConfig::default(),
     }
 }
 
@@ -431,6 +432,37 @@ where
     let (server, _pool, _mock, _router) =
         build_test_server_components(database.clone(), infra.config).await;
     (server, database)
+}
+
+/// Build several independent servers that share one database, standing in for
+/// the replicas of a deployed fleet. Each gets its own services and provider
+/// pool, so anything they agree on has to travel through the database.
+pub async fn setup_test_fleet<F>(
+    instances: usize,
+    mutate: F,
+) -> (
+    Vec<axum_test::TestServer>,
+    Vec<Arc<inference_providers::mock::MockProvider>>,
+    Arc<Database>,
+)
+where
+    F: Fn(&mut config::ApiConfig),
+{
+    let infra = setup_test_infrastructure().await;
+    let database = infra.database.clone();
+
+    let mut servers = Vec::with_capacity(instances);
+    let mut mocks = Vec::with_capacity(instances);
+    for _ in 0..instances {
+        let mut config = infra.config.clone();
+        mutate(&mut config);
+        let (server, _pool, mock, _router) =
+            build_test_server_components(database.clone(), config).await;
+        servers.push(server);
+        mocks.push(mock);
+    }
+
+    (servers, mocks, database)
 }
 
 pub async fn setup_test_server_with_database() -> (axum_test::TestServer, Arc<Database>) {

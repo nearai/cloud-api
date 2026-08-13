@@ -136,6 +136,13 @@ pub enum LeaseOutcome {
     AtLimit { limit: u32, in_flight: i64 },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HeldLease {
+    pub id: Uuid,
+    pub organization_id: Uuid,
+    pub model_id: Uuid,
+}
+
 /// Repository trait for fleet-wide concurrency leases
 /// Used by CompletionService so replicas admit against one shared count
 #[async_trait]
@@ -152,6 +159,23 @@ pub trait ConcurrencyLeaseRepository: Send + Sync {
     ) -> Result<LeaseOutcome, anyhow::Error>;
 
     async fn release(&self, lease_ids: &[Uuid]) -> Result<(), anyhow::Error>;
+
+    /// Extend leases the store already has. Updating in place means a lease
+    /// released while this call was in flight stays deleted instead of being
+    /// recreated with no holder.
+    async fn renew(&self, lease_ids: &[Uuid], ttl: Duration) -> Result<(), anyhow::Error>;
+
+    /// Write leases the store does not have yet, which happens when a request
+    /// was admitted while it was unreachable. Returns the leases now stored.
+    async fn persist(
+        &self,
+        leases: &[HeldLease],
+        instance_id: &str,
+        ttl: Duration,
+    ) -> Result<(), anyhow::Error>;
+
+    /// Remove leases whose holder stopped renewing them.
+    async fn sweep_expired(&self) -> Result<u64, anyhow::Error>;
 }
 
 #[async_trait]

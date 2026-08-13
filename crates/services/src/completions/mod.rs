@@ -7,6 +7,7 @@ use crate::responses::models::ResponseId;
 use crate::usage::{RecordUsageServiceRequest, UsageServiceTrait};
 use inference_providers::{ChatMessage, MessageRole, SSEEvent, StreamChunk, StreamingResult};
 use moka::future::Cache;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -522,6 +523,9 @@ pub(crate) enum ConcurrentSlot {
     Local(Arc<AtomicU32>),
     Lease {
         id: Uuid,
+        organization_id: Uuid,
+        model_id: Uuid,
+        held: Arc<HeldLeases>,
         release: mpsc::UnboundedSender<Uuid>,
     },
 }
@@ -532,8 +536,21 @@ impl ConcurrentSlot {
             Self::Local(counter) => {
                 counter.fetch_sub(1, Ordering::Release);
             }
-            Self::Lease { id, release } => {
-                let _ = release.send(*id);
+            Self::Lease {
+                id,
+                organization_id,
+                model_id,
+                held,
+                release,
+            } => {
+                held.remove(*organization_id, *model_id, *id);
+                if release.send(*id).is_err() {
+                    tracing::error!(
+                        lease_id = %id,
+                        "Concurrency lease release channel is closed; the lease will \
+                         hold capacity until it expires"
+                    );
+                }
             }
         }
     }
@@ -577,6 +594,7 @@ pub struct CompletionServiceImpl {
     concurrent_limit: u32,
     /// Cache for per-organization concurrent limits (5-minute TTL)
     org_concurrent_limits: Cache<Uuid, u32>,
+    last_known_limits: Cache<Uuid, u32>,
     /// Repository for fetching organization concurrent limits
     organization_limit_repository: Arc<dyn ports::OrganizationConcurrentLimitRepository>,
     fleet_concurrency: Option<FleetConcurrency>,
@@ -589,15 +607,142 @@ enum LeaseAdmission {
     Unavailable(anyhow::Error),
 }
 
+/// Leases this replica currently holds. Renewal reads it to keep them alive,
+/// release removes from it, and admission counts it when the lease store is
+/// unreachable, so the degraded path can never admit on top of live leases.
+#[derive(Default)]
+pub(crate) struct HeldLeases {
+    by_model: std::sync::Mutex<HashMap<(Uuid, Uuid), HashMap<Uuid, LeaseState>>>,
+}
+
+/// Whether a held lease already has a row in the lease store. Renewal updates
+/// stored leases and inserts pending ones, so an update can never recreate a
+/// row that a release deleted while the round trip was outstanding.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LeaseState {
+    Stored,
+    PendingWrite,
+}
+
+impl HeldLeases {
+    fn insert(&self, organization_id: Uuid, model_id: Uuid, lease_id: Uuid, state: LeaseState) {
+        let mut guard = self.by_model.lock().unwrap_or_else(|e| e.into_inner());
+        guard
+            .entry((organization_id, model_id))
+            .or_default()
+            .insert(lease_id, state);
+    }
+
+    /// Ids no longer held are skipped, so a lease released mid-write is not
+    /// resurrected in the registry either.
+    fn mark_stored(&self, leases: &[ports::HeldLease]) {
+        let mut guard = self.by_model.lock().unwrap_or_else(|e| e.into_inner());
+        for lease in leases {
+            if let Some(ids) = guard.get_mut(&(lease.organization_id, lease.model_id)) {
+                if let Some(state) = ids.get_mut(&lease.id) {
+                    *state = LeaseState::Stored;
+                }
+            }
+        }
+    }
+
+    fn remove(&self, organization_id: Uuid, model_id: Uuid, lease_id: Uuid) {
+        let mut guard = self.by_model.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(ids) = guard.get_mut(&(organization_id, model_id)) {
+            ids.remove(&lease_id);
+            if ids.is_empty() {
+                guard.remove(&(organization_id, model_id));
+            }
+        }
+    }
+
+    fn count(&self, organization_id: Uuid, model_id: Uuid) -> usize {
+        let guard = self.by_model.lock().unwrap_or_else(|e| e.into_inner());
+        guard
+            .get(&(organization_id, model_id))
+            .map_or(0, |ids| ids.len())
+    }
+
+    /// Record a lease only if the model is below `limit`, deciding and
+    /// inserting under one lock so concurrent degraded admissions cannot both
+    /// observe the same count and both proceed.
+    fn insert_below(
+        &self,
+        organization_id: Uuid,
+        model_id: Uuid,
+        lease_id: Uuid,
+        limit: usize,
+    ) -> Result<(), usize> {
+        let mut guard = self.by_model.lock().unwrap_or_else(|e| e.into_inner());
+        let ids = guard.entry((organization_id, model_id)).or_default();
+        if ids.len() >= limit {
+            return Err(ids.len());
+        }
+        ids.insert(lease_id, LeaseState::PendingWrite);
+        Ok(())
+    }
+
+    /// Held leases split by whether the store already has them.
+    fn snapshot(&self) -> (Vec<ports::HeldLease>, Vec<ports::HeldLease>) {
+        let guard = self.by_model.lock().unwrap_or_else(|e| e.into_inner());
+        let mut stored = Vec::new();
+        let mut pending = Vec::new();
+        for ((organization_id, model_id), ids) in guard.iter() {
+            for (id, state) in ids {
+                let lease = ports::HeldLease {
+                    id: *id,
+                    organization_id: *organization_id,
+                    model_id: *model_id,
+                };
+                match state {
+                    LeaseState::Stored => stored.push(lease),
+                    LeaseState::PendingWrite => pending.push(lease),
+                }
+            }
+        }
+        (stored, pending)
+    }
+
+    fn held_ids(&self) -> HashSet<Uuid> {
+        let guard = self.by_model.lock().unwrap_or_else(|e| e.into_inner());
+        guard.values().flat_map(|ids| ids.keys()).copied().collect()
+    }
+}
+
 struct FleetConcurrency {
     repository: Arc<dyn ports::ConcurrencyLeaseRepository>,
+    held: Arc<HeldLeases>,
     release: mpsc::UnboundedSender<Uuid>,
     instance_id: String,
     ttl: Duration,
 }
 
+/// Renewals attempted within one lease TTL. Three gives two spare attempts
+/// before a live request's lease could lapse.
+const LEASE_RENEWALS_PER_TTL: u32 = 3;
+
+/// Each of these loops silently stops enforcing something if it exits, so a
+/// death is reported rather than discarded.
+fn supervise(task: &'static str, handle: tokio::task::JoinHandle<()>) {
+    tokio::spawn(async move {
+        match handle.await {
+            Ok(()) => {
+                tracing::warn!(task = task, "Fleet concurrency task stopped")
+            }
+            Err(error) => tracing::error!(
+                task = task,
+                error = %error,
+                "Fleet concurrency task died; limits are no longer maintained"
+            ),
+        }
+    });
+}
+
 /// TTL for organization concurrent limit cache (5 minutes)
 const ORG_LIMIT_CACHE_TTL_SECS: u64 = 300;
+
+/// How long a limit that was actually read stays usable as a fallback (24h).
+const LAST_KNOWN_LIMIT_TTL_SECS: u64 = 86_400;
 
 /// TTL for concurrent count cache entries (10 minutes).
 /// Safety net: if a counter gets stuck (e.g., due to a panic or proxy not propagating
@@ -708,6 +853,10 @@ impl CompletionServiceImpl {
             concurrent_counts,
             concurrent_limit: DEFAULT_CONCURRENT_LIMIT,
             org_concurrent_limits,
+            last_known_limits: Cache::builder()
+                .time_to_live(Duration::from_secs(LAST_KNOWN_LIMIT_TTL_SECS))
+                .max_capacity(10_000)
+                .build(),
             organization_limit_repository,
             fleet_concurrency: None,
         }
@@ -724,7 +873,7 @@ impl CompletionServiceImpl {
         let (release, mut released) = mpsc::unbounded_channel::<Uuid>();
         let releaser = repository.clone();
 
-        tokio::spawn(async move {
+        let drain = tokio::spawn(async move {
             let mut batch = Vec::new();
             while released.recv_many(&mut batch, 128).await > 0 {
                 if let Err(error) = releaser.release(&batch).await {
@@ -738,8 +887,90 @@ impl CompletionServiceImpl {
             }
         });
 
+        supervise("release", drain);
+
+        let held = Arc::new(HeldLeases::default());
+
+        let renewer = repository.clone();
+        let renewing = held.clone();
+        let renew_instance = instance_id.clone();
+        let renew_every = ttl / LEASE_RENEWALS_PER_TTL;
+        let renew_task = tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(renew_every);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                ticker.tick().await;
+                let (stored, pending) = renewing.snapshot();
+
+                let stored_ids: Vec<Uuid> = stored.iter().map(|lease| lease.id).collect();
+                if let Err(error) = renewer.renew(&stored_ids, ttl).await {
+                    tracing::warn!(
+                        leases = stored_ids.len(),
+                        error = %error,
+                        "Failed to renew concurrency leases; in-flight requests continue"
+                    );
+                }
+
+                if pending.is_empty() {
+                    continue;
+                }
+                if let Err(error) = renewer.persist(&pending, &renew_instance, ttl).await {
+                    tracing::warn!(
+                        leases = pending.len(),
+                        error = %error,
+                        "Failed to store leases admitted while the lease store was down"
+                    );
+                    continue;
+                }
+                renewing.mark_stored(&pending);
+
+                // A pending lease released during the insert is written with no
+                // holder, so nothing would renew or release it again.
+                let held = renewing.held_ids();
+                let orphaned: Vec<Uuid> = pending
+                    .iter()
+                    .map(|lease| lease.id)
+                    .filter(|id| !held.contains(id))
+                    .collect();
+                if !orphaned.is_empty() {
+                    if let Err(error) = renewer.release(&orphaned).await {
+                        tracing::warn!(
+                            leases = orphaned.len(),
+                            error = %error,
+                            "Failed to drop leases released while being stored; they will expire"
+                        );
+                    }
+                }
+            }
+        });
+
+        supervise("renew", renew_task);
+
+        let sweeper = repository.clone();
+        let sweep_task = tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(ttl);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                ticker.tick().await;
+                match sweeper.sweep_expired().await {
+                    Ok(0) => {}
+                    Ok(removed) => tracing::info!(
+                        removed = removed,
+                        "Reclaimed concurrency leases whose holder stopped renewing"
+                    ),
+                    Err(error) => tracing::warn!(
+                        error = %error,
+                        "Failed to sweep expired concurrency leases"
+                    ),
+                }
+            }
+        });
+
+        supervise("sweep", sweep_task);
+
         self.fleet_concurrency = Some(FleetConcurrency {
             repository,
+            held,
             release,
             instance_id,
             ttl,
@@ -904,22 +1135,43 @@ impl CompletionServiceImpl {
         let default_limit = self.concurrent_limit;
         let repo = self.organization_limit_repository.clone();
 
-        self.org_concurrent_limits
-            .get_with(organization_id, async move {
+        // optionally_get_with does not cache a None, so a failed lookup falls back
+        // for this request only instead of pinning the default for the whole TTL.
+        let limit = self
+            .org_concurrent_limits
+            .optionally_get_with(organization_id, async move {
                 match repo.get_concurrent_limit(organization_id).await {
-                    Ok(Some(limit)) if limit > 0 => limit,
-                    Ok(_) => default_limit, // Use default if NULL or 0
+                    Ok(Some(limit)) if limit > 0 => Some(limit),
+                    Ok(_) => Some(default_limit), // Use default if NULL or 0
                     Err(e) => {
                         tracing::warn!(
                             organization_id = %organization_id,
                             error = %e,
                             "Failed to fetch org concurrent limit, using default"
                         );
-                        default_limit
+                        None
                     }
                 }
             })
-            .await
+            .await;
+
+        match limit {
+            Some(limit) => {
+                self.last_known_limits.insert(organization_id, limit).await;
+                limit
+            }
+            None => self
+                .last_known_org_concurrent_limit(organization_id)
+                .await
+                .unwrap_or(default_limit),
+        }
+    }
+
+    /// Last limit actually read for this organization. Outliving the lookup
+    /// cache matters because an outage longer than that TTL would otherwise
+    /// leave the degraded path widening the cap to the global default.
+    async fn last_known_org_concurrent_limit(&self, organization_id: Uuid) -> Option<u32> {
+        self.last_known_limits.get(&organization_id).await
     }
 
     /// Create low-cardinality metric tags for a request
@@ -1307,6 +1559,55 @@ impl CompletionServiceImpl {
             .collect()
     }
 
+    /// Admission while the lease store is unreachable. Counting this replica's
+    /// own leases degrades to the per-process behaviour that shipped before
+    /// fleet limits existed, and never admits on top of leases already live.
+    /// The lease is recorded locally only; the next renewal writes it back.
+    async fn admit_from_held_leases(
+        &self,
+        fleet: &FleetConcurrency,
+        organization_id: Uuid,
+        model_id: Uuid,
+        model_name: &str,
+    ) -> Result<ConcurrentSlot, ports::CompletionError> {
+        let limit = self
+            .last_known_org_concurrent_limit(organization_id)
+            .await
+            .unwrap_or(self.concurrent_limit);
+        let lease_id = Uuid::new_v4();
+
+        match fleet
+            .held
+            .insert_below(organization_id, model_id, lease_id, limit as usize)
+        {
+            Ok(()) => Ok(ConcurrentSlot::Lease {
+                id: lease_id,
+                organization_id,
+                model_id,
+                held: fleet.held.clone(),
+                release: fleet.release.clone(),
+            }),
+            Err(in_flight) => {
+                tracing::warn!(
+                    organization_id = %organization_id,
+                    model_id = %model_id,
+                    model_name = %model_name,
+                    current_count = in_flight,
+                    limit = limit,
+                    "Organization concurrent request limit exceeded for model on this replica"
+                );
+                let message = format!(
+                    "Concurrent request limit exceeded for model {model_name}. Organization limit: {limit} concurrent requests per model."
+                );
+                self.record_error(
+                    &ports::CompletionError::RateLimitExceeded(message.clone()),
+                    Some(model_name),
+                );
+                Err(ports::CompletionError::RateLimitExceeded(message))
+            }
+        }
+    }
+
     async fn try_acquire_lease(
         &self,
         fleet: &FleetConcurrency,
@@ -1329,10 +1630,18 @@ impl CompletionServiceImpl {
             .map_err(LeaseAdmission::Unavailable)?;
 
         match outcome {
-            ports::LeaseOutcome::Admitted => Ok(ConcurrentSlot::Lease {
-                id: lease_id,
-                release: fleet.release.clone(),
-            }),
+            ports::LeaseOutcome::Admitted => {
+                fleet
+                    .held
+                    .insert(organization_id, model_id, lease_id, LeaseState::Stored);
+                Ok(ConcurrentSlot::Lease {
+                    id: lease_id,
+                    organization_id,
+                    model_id,
+                    held: fleet.held.clone(),
+                    release: fleet.release.clone(),
+                })
+            }
             ports::LeaseOutcome::AtLimit { limit, in_flight } => {
                 tracing::warn!(
                     organization_id = %organization_id,
@@ -1374,8 +1683,11 @@ impl CompletionServiceImpl {
                         organization_id = %organization_id,
                         model_id = %model_id,
                         error = %error,
-                        "Fleet concurrency unavailable, falling back to per-process limit"
+                        "Fleet concurrency unavailable, falling back to this replica's leases"
                     );
+                    return self
+                        .admit_from_held_leases(fleet, organization_id, model_id, model_name)
+                        .await;
                 }
             }
         }

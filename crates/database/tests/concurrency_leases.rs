@@ -1,7 +1,7 @@
 mod support;
 
 use database::repositories::concurrency_lease::PostgresConcurrencyLeaseRepository;
-use services::completions::ports::{ConcurrencyLeaseRepository, LeaseOutcome};
+use services::completions::ports::{ConcurrencyLeaseRepository, HeldLease, LeaseOutcome};
 use std::sync::Arc;
 use std::time::Duration;
 use uuid::Uuid;
@@ -155,6 +155,150 @@ async fn released_leases_free_capacity_again() {
         LeaseOutcome::Admitted,
         "releasing a lease must free exactly one slot"
     );
+}
+
+/// Renewal is what lets a request outlive the TTL. Without it a request longer
+/// than the TTL frees its own slot while still running.
+#[tokio::test]
+async fn renewal_keeps_a_lease_past_its_original_ttl() {
+    let pool = support::test_pool().await.expect("test pool");
+    let org = support::insert_org_fixture(&pool)
+        .await
+        .expect("org fixture");
+    let model = support::insert_model(&pool, &format!("lease-{}", Uuid::new_v4()))
+        .await
+        .expect("model fixture");
+
+    pool.get()
+        .await
+        .expect("connection")
+        .execute(
+            "UPDATE organizations SET rate_limit = 1 WHERE id = $1",
+            &[&org.org_id],
+        )
+        .await
+        .expect("rate limit update");
+
+    let repository = PostgresConcurrencyLeaseRepository::new(pool.clone());
+    let lease_id = Uuid::new_v4();
+    let outcome = repository
+        .try_acquire(
+            lease_id,
+            org.org_id,
+            model.id,
+            "instance-a",
+            DEFAULT_LIMIT,
+            Duration::from_secs(1),
+        )
+        .await
+        .expect("acquire");
+    assert_eq!(outcome, LeaseOutcome::Admitted);
+
+    repository.renew(&[lease_id], TTL).await.expect("renew");
+
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+
+    let blocked = repository
+        .try_acquire(
+            Uuid::new_v4(),
+            org.org_id,
+            model.id,
+            "instance-b",
+            DEFAULT_LIMIT,
+            TTL,
+        )
+        .await
+        .expect("acquire");
+    assert!(
+        matches!(blocked, LeaseOutcome::AtLimit { .. }),
+        "a renewed lease must still hold its slot after the original TTL"
+    );
+}
+
+/// Renewal must never recreate a row. A request that finished during the round
+/// trip has already been deleted, and an insert here would strand a slot that
+/// nothing holds, renews or releases.
+#[tokio::test]
+async fn renewal_cannot_recreate_a_released_lease() {
+    let pool = support::test_pool().await.expect("test pool");
+    let org = support::insert_org_fixture(&pool)
+        .await
+        .expect("org fixture");
+    let model = support::insert_model(&pool, &format!("lease-{}", Uuid::new_v4()))
+        .await
+        .expect("model fixture");
+
+    let repository = PostgresConcurrencyLeaseRepository::new(pool.clone());
+    let lease_id = Uuid::new_v4();
+    repository
+        .try_acquire(
+            lease_id,
+            org.org_id,
+            model.id,
+            "instance-a",
+            DEFAULT_LIMIT,
+            TTL,
+        )
+        .await
+        .expect("acquire");
+
+    repository.release(&[lease_id]).await.expect("release");
+    repository.renew(&[lease_id], TTL).await.expect("renew");
+
+    let live: i64 = pool
+        .get()
+        .await
+        .expect("connection")
+        .query_one(
+            "SELECT COUNT(*) FROM concurrency_leases WHERE id = $1",
+            &[&lease_id],
+        )
+        .await
+        .expect("count")
+        .get(0);
+    assert_eq!(
+        live, 0,
+        "renewing a released lease must not bring it back to life"
+    );
+}
+
+/// Leases admitted while the store was unreachable are written back, so they
+/// start counting against the fleet instead of only this replica.
+#[tokio::test]
+async fn pending_leases_are_written_back() {
+    let pool = support::test_pool().await.expect("test pool");
+    let org = support::insert_org_fixture(&pool)
+        .await
+        .expect("org fixture");
+    let model = support::insert_model(&pool, &format!("lease-{}", Uuid::new_v4()))
+        .await
+        .expect("model fixture");
+
+    let repository = PostgresConcurrencyLeaseRepository::new(pool.clone());
+    let lease_id = Uuid::new_v4();
+    let pending = [HeldLease {
+        id: lease_id,
+        organization_id: org.org_id,
+        model_id: model.id,
+    }];
+
+    repository
+        .persist(&pending, "instance-a", TTL)
+        .await
+        .expect("persist");
+
+    let live: i64 = pool
+        .get()
+        .await
+        .expect("connection")
+        .query_one(
+            "SELECT COUNT(*) FROM concurrency_leases WHERE id = $1 AND expires_at > NOW()",
+            &[&lease_id],
+        )
+        .await
+        .expect("count")
+        .get(0);
+    assert_eq!(live, 1, "a degraded-path lease must reach the store");
 }
 
 /// An expired lease must not keep counting, or a replica that died holding

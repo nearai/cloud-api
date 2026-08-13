@@ -16,3 +16,6 @@ oci.tar
 .DS_Store
 secret
 repro_*.sh
+# rustc reads -C incremental= as a directory, so the reproducibility flag in
+# .cargo/config.toml writes incremental artifacts to ./false
+/false/

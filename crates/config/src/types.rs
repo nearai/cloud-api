@@ -52,7 +52,7 @@ impl Default for FleetConcurrencyConfig {
     fn default() -> Self {
         Self {
             mode: FleetConcurrencyMode::Off,
-            lease_ttl_seconds: 30,
+            lease_ttl_seconds: 60,
             instance_id: String::new(),
         }
     }
@@ -75,7 +75,7 @@ impl FleetConcurrencyConfig {
                 .ok()
                 .and_then(|value| value.parse::<u64>().ok())
                 .filter(|seconds| *seconds > 0)
-                .unwrap_or(30),
+                .unwrap_or(60),
             instance_id: env::var("FLEET_CONCURRENCY_INSTANCE_ID")
                 .ok()
                 .filter(|value| !value.is_empty())

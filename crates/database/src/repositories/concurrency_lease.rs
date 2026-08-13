@@ -4,7 +4,7 @@ use crate::retry_db;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use services::common::RepositoryError;
-use services::completions::ports::{ConcurrencyLeaseRepository, LeaseOutcome};
+use services::completions::ports::{ConcurrencyLeaseRepository, HeldLease, LeaseOutcome};
 use std::time::Duration;
 use uuid::Uuid;
 
@@ -110,6 +110,103 @@ impl ConcurrencyLeaseRepository for PostgresConcurrencyLeaseRepository {
         })?;
 
         Ok(outcome)
+    }
+
+    async fn renew(&self, lease_ids: &[Uuid], ttl: Duration) -> Result<()> {
+        if lease_ids.is_empty() {
+            return Ok(());
+        }
+
+        let ttl_seconds = ttl.as_secs() as f64;
+
+        retry_db!("renew_concurrency_leases", {
+            let client = self
+                .pool
+                .get()
+                .await
+                .context("Failed to get database connection")
+                .map_err(RepositoryError::PoolError)?;
+
+            client
+                .execute(
+                    r#"
+                    UPDATE concurrency_leases
+                    SET expires_at = NOW() + make_interval(secs => $2)
+                    WHERE id = ANY($1)
+                    "#,
+                    &[&lease_ids, &ttl_seconds],
+                )
+                .await
+                .map_err(map_db_error)
+        })?;
+
+        Ok(())
+    }
+
+    async fn persist(&self, leases: &[HeldLease], instance_id: &str, ttl: Duration) -> Result<()> {
+        if leases.is_empty() {
+            return Ok(());
+        }
+
+        let ids: Vec<Uuid> = leases.iter().map(|lease| lease.id).collect();
+        let organization_ids: Vec<Uuid> =
+            leases.iter().map(|lease| lease.organization_id).collect();
+        let model_ids: Vec<Uuid> = leases.iter().map(|lease| lease.model_id).collect();
+        let ttl_seconds = ttl.as_secs() as f64;
+
+        retry_db!("persist_concurrency_leases", {
+            let client = self
+                .pool
+                .get()
+                .await
+                .context("Failed to get database connection")
+                .map_err(RepositoryError::PoolError)?;
+
+            client
+                .execute(
+                    r#"
+                    INSERT INTO concurrency_leases
+                        (id, organization_id, model_id, instance_id, expires_at)
+                    SELECT held.id, held.organization_id, held.model_id, $4,
+                           NOW() + make_interval(secs => $5)
+                    FROM UNNEST($1::uuid[], $2::uuid[], $3::uuid[])
+                        AS held(id, organization_id, model_id)
+                    ON CONFLICT (id) DO UPDATE SET expires_at = EXCLUDED.expires_at
+                    "#,
+                    &[
+                        &ids,
+                        &organization_ids,
+                        &model_ids,
+                        &instance_id,
+                        &ttl_seconds,
+                    ],
+                )
+                .await
+                .map_err(map_db_error)
+        })?;
+
+        Ok(())
+    }
+
+    async fn sweep_expired(&self) -> Result<u64> {
+        let removed = retry_db!("sweep_expired_concurrency_leases", {
+            let client = self
+                .pool
+                .get()
+                .await
+                .context("Failed to get database connection")
+                .map_err(RepositoryError::PoolError)?;
+
+            client
+                .execute(
+                    "DELETE FROM concurrency_leases WHERE expires_at < NOW()",
+                    &[],
+                )
+                .await
+                .map_err(map_db_error)
+        })?;
+
+        Ok(removed)
     }
 
     async fn release(&self, lease_ids: &[Uuid]) -> Result<()> {

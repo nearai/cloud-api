@@ -29,16 +29,3 @@ pub const PREFIX_FC: &str = "fc_";
 
 /// Prefix for function call output IDs
 pub const PREFIX_FCO: &str = "fco_";
-
-/// All known ID prefixes (useful for path normalization in metrics)
-pub const ALL_PREFIXES: &[&str] = &[
-    PREFIX_CHATCMPL,
-    PREFIX_RESP,
-    PREFIX_FILE,
-    PREFIX_MSG,
-    PREFIX_CONV,
-    PREFIX_SK,
-    PREFIX_MCPR,
-    PREFIX_FC,
-    PREFIX_FCO,
-];

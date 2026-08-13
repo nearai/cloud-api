@@ -2649,6 +2649,7 @@ mod tests {
             otlp: config::OtlpConfig {
                 endpoint: "http://localhost:4317".to_string(),
                 protocol: "grpc".to_string(),
+                instance_id: None,
             },
             cors: config::CorsConfig::default(),
             external_providers: config::ExternalProvidersConfig::default(),
@@ -2758,6 +2759,7 @@ mod tests {
             otlp: config::OtlpConfig {
                 endpoint: "http://localhost:4317".to_string(),
                 protocol: "grpc".to_string(),
+                instance_id: None,
             },
             cors: config::CorsConfig::default(),
             external_providers: config::ExternalProvidersConfig::default(),

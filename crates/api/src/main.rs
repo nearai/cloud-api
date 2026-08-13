@@ -2,14 +2,16 @@ use api::{build_app_with_config, init_auth_services, init_database, init_domain_
 use config::{ApiConfig, LoggingConfig};
 use database::repositories::AdminCompositeRepository;
 use database::{Database, ShutdownCoordinator, ShutdownStage};
-use opentelemetry::{global, KeyValue};
+use opentelemetry::global;
 use opentelemetry_otlp::{MetricExporter, WithExportConfig};
-use opentelemetry_sdk::{metrics::SdkMeterProvider, Resource};
+use opentelemetry_sdk::metrics::SdkMeterProvider;
 use services::admin::ModelPricingScheduler;
 use services::inference_provider_pool::InferenceProviderPool;
 use services::metrics::{MetricsServiceTrait, OtlpMetricsService};
 use std::sync::Arc;
 use std::time::Duration;
+
+mod telemetry;
 
 #[tokio::main]
 async fn main() {
@@ -37,12 +39,8 @@ async fn main() {
     // Get environment from env var (local, dev, staging, prod)
     let environment = std::env::var("ENVIRONMENT").unwrap_or_else(|_| "local".to_string());
 
-    let resource = Resource::builder()
-        .with_attributes(vec![
-            KeyValue::new("service.name", "cloud-api"),
-            KeyValue::new("environment", environment.clone()),
-        ])
-        .build();
+    let resource =
+        telemetry::build_telemetry_resource(&environment, config.otlp.instance_id.as_deref());
 
     let meter_provider = SdkMeterProvider::builder()
         .with_periodic_exporter(exporter)

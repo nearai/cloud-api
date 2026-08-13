@@ -1413,7 +1413,9 @@ pub fn build_app_with_config(
         .fallback(routes::unsupported::unknown_route)
         .method_not_allowed_fallback(routes::unsupported::method_not_allowed)
         .layer(cors)
-        // Add HTTP metrics middleware to track all requests
+        // Keep metrics on Router::layer: MatchedPath is populated inside Axum's
+        // router, and moving this middleware outside would label every route
+        // as /unmatched.
         .layer(from_fn_with_state(
             metrics_state,
             middleware::http_metrics_middleware,
@@ -2647,6 +2649,7 @@ mod tests {
             otlp: config::OtlpConfig {
                 endpoint: "http://localhost:4317".to_string(),
                 protocol: "grpc".to_string(),
+                instance_id: None,
             },
             cors: config::CorsConfig::default(),
             external_providers: config::ExternalProvidersConfig::default(),
@@ -2756,6 +2759,7 @@ mod tests {
             otlp: config::OtlpConfig {
                 endpoint: "http://localhost:4317".to_string(),
                 protocol: "grpc".to_string(),
+                instance_id: None,
             },
             cors: config::CorsConfig::default(),
             external_providers: config::ExternalProvidersConfig::default(),

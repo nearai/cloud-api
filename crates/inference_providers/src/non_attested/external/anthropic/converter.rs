@@ -50,6 +50,11 @@ pub enum AnthropicContentPart {
         id: String,
         name: String,
         input: serde_json::Value,
+        /// Anthropic prompt-caching breakpoint. Anthropic documents `tool_use`
+        /// as cacheable, and a flattened assistant turn carries the turn's
+        /// breakpoint on its final block.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cache_control: Option<serde_json::Value>,
     },
     #[serde(rename = "tool_result")]
     ToolResult {
@@ -74,14 +79,13 @@ pub enum AnthropicContentPart {
 }
 
 impl AnthropicContentPart {
-    /// Mutable handle on this block's caching breakpoint, or `None` for block
-    /// kinds that cannot carry one (`tool_use`).
-    fn cache_control_mut(&mut self) -> Option<&mut Option<serde_json::Value>> {
+    /// Mutable handle on this block's prompt-caching breakpoint.
+    fn cache_control_mut(&mut self) -> &mut Option<serde_json::Value> {
         match self {
             Self::Text { cache_control, .. }
+            | Self::ToolUse { cache_control, .. }
             | Self::ToolResult { cache_control, .. }
-            | Self::Image { cache_control, .. } => Some(cache_control),
-            Self::ToolUse { .. } => None,
+            | Self::Image { cache_control, .. } => cache_control,
         }
     }
 }
@@ -376,10 +380,11 @@ fn flattened_text_cache_control(content: &serde_json::Value) -> Option<serde_jso
 ///
 /// Order is Anthropic's own prefix order — `system` blocks first, then messages
 /// in order, then blocks within a message. When the caller sends more than four
-/// we keep the FIRST (the system/tools prefix: the largest, most stable cached
-/// segment) and the LAST THREE (the most recent, longest advancing prefixes),
-/// and clear the rest. Dropping a breakpoint only costs a cache write; keeping
-/// it would cost the whole request.
+/// we keep the FIRST to preserve the request's earliest, most-stable cache
+/// segment — the tools/system prefix when a system breakpoint exists, otherwise
+/// simply the oldest surviving prefix — and the LAST THREE as the advancing
+/// anchor. This is a heuristic: dropping a breakpoint costs a cache write,
+/// whereas exceeding the limit costs the whole request.
 fn enforce_breakpoint_limit(
     system: &mut Option<AnthropicSystem>,
     messages: &mut [AnthropicMessage],
@@ -407,10 +412,7 @@ fn enforce_breakpoint_limit(
             continue;
         };
         for (part_index, part) in parts.iter_mut().enumerate() {
-            if part
-                .cache_control_mut()
-                .is_some_and(|cache_control| cache_control.is_some())
-            {
+            if part.cache_control_mut().is_some() {
                 positions.push(BreakpointPosition::Message {
                     message_index,
                     part_index,
@@ -423,6 +425,12 @@ fn enforce_breakpoint_limit(
     if count <= MAX_CACHE_BREAKPOINTS {
         return;
     }
+
+    tracing::debug!(
+        breakpoints_sent = count,
+        breakpoints_kept = MAX_CACHE_BREAKPOINTS,
+        "Clamped Anthropic prompt-caching breakpoints to the provider limit"
+    );
 
     for position in positions
         .into_iter()
@@ -447,7 +455,7 @@ fn enforce_breakpoint_limit(
                     match &mut message.content {
                         AnthropicMessageContent::Blocks(parts) => parts
                             .get_mut(part_index)
-                            .and_then(AnthropicContentPart::cache_control_mut),
+                            .map(AnthropicContentPart::cache_control_mut),
                         AnthropicMessageContent::Text(_) => None,
                     }
                 });
@@ -589,7 +597,7 @@ pub fn convert_messages(
                 // does — Anthropic allows a breakpoint on an assistant content
                 // block, so a cached prefix ending at an assistant turn keeps it
                 // (#666). The assistant text is flattened into a single block, so
-                // we attach the last (prefix-boundary) breakpoint to that block.
+                // the last marker remains the turn's prefix boundary.
                 let text_cache_control =
                     msg.content.as_ref().and_then(flattened_text_cache_control);
 
@@ -604,7 +612,7 @@ pub fn convert_messages(
                             if !text.is_empty() {
                                 blocks.push(AnthropicContentPart::Text {
                                     text,
-                                    cache_control: text_cache_control,
+                                    cache_control: None,
                                 });
                             }
                         }
@@ -620,7 +628,19 @@ pub fn convert_messages(
                                 .and_then(|args| serde_json::from_str(args).ok())
                                 .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
 
-                            blocks.push(AnthropicContentPart::ToolUse { id, name, input });
+                            blocks.push(AnthropicContentPart::ToolUse {
+                                id,
+                                name,
+                                input,
+                                cache_control: None,
+                            });
+                        }
+
+                        // This branch requires non-empty tool_calls, so a final
+                        // tool_use block always exists and carries the whole
+                        // flattened turn's breakpoint.
+                        if let Some(last_block) = blocks.last_mut() {
+                            *last_block.cache_control_mut() = text_cache_control;
                         }
 
                         anthropic_messages.push(AnthropicMessage {
@@ -1436,7 +1456,9 @@ mod tests {
     #[test]
     fn test_cache_control_on_assistant_with_tool_calls_forwards_breakpoint() {
         // Assistant turn with BOTH text (carrying a breakpoint) and tool calls:
-        // the breakpoint must land on the text block, the tool_use blocks follow.
+        // the breakpoint moved to the final tool_use block because Anthropic
+        // caches up to and including the marked block, so the whole turn must
+        // be covered rather than only its leading text.
         let messages = vec![ChatMessage {
             role: MessageRole::Assistant,
             content: Some(serde_json::json!([
@@ -1472,14 +1494,55 @@ mod tests {
                 cache_control,
             } => {
                 assert_eq!(text, "Let me look that up.");
-                assert_eq!(
-                    *cache_control,
-                    Some(serde_json::json!({"type": "ephemeral"}))
+                assert!(
+                    cache_control.is_none(),
+                    "leading text must not end the cached prefix"
                 );
             }
             other => panic!("expected text block first, got {other:?}"),
         }
-        assert!(matches!(blocks[1], AnthropicContentPart::ToolUse { .. }));
+        let serialized_blocks = serde_json::to_value(blocks).unwrap();
+        assert_eq!(serialized_blocks[1]["type"], "tool_use");
+        assert_eq!(
+            serialized_blocks[1]["cache_control"],
+            serde_json::json!({"type": "ephemeral"})
+        );
+    }
+
+    #[test]
+    fn test_cache_control_on_empty_assistant_text_with_tool_calls_reaches_final_tool_use() {
+        let messages = vec![ChatMessage {
+            role: MessageRole::Assistant,
+            content: Some(serde_json::json!([{
+                "type": "text",
+                "text": "",
+                "cache_control": {"type": "ephemeral"}
+            }])),
+            name: None,
+            tool_call_id: None,
+            tool_calls: Some(vec![ToolCall {
+                id: Some("call_empty".to_string()),
+                type_: Some("function".to_string()),
+                function: FunctionCall {
+                    name: Some("search".to_string()),
+                    arguments: Some("{\"q\":\"x\"}".to_string()),
+                },
+                index: None,
+                thought_signature: None,
+            }]),
+        }];
+
+        let (_system, anthropic_messages) = convert_messages(&messages);
+        let AnthropicMessageContent::Blocks(blocks) = &anthropic_messages[0].content else {
+            panic!("expected block form");
+        };
+        assert_eq!(blocks.len(), 1, "empty text must not emit a text block");
+        let serialized_blocks = serde_json::to_value(blocks).unwrap();
+        assert_eq!(serialized_blocks[0]["type"], "tool_use");
+        assert_eq!(
+            serialized_blocks[0]["cache_control"],
+            serde_json::json!({"type": "ephemeral"})
+        );
     }
 
     #[test]

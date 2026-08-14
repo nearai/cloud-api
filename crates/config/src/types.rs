@@ -60,13 +60,20 @@ impl Default for FleetConcurrencyConfig {
 
 impl FleetConcurrencyConfig {
     pub fn from_env() -> Self {
-        let mode = match env::var("FLEET_CONCURRENCY_MODE")
-            .unwrap_or_default()
-            .to_ascii_lowercase()
-            .as_str()
-        {
+        let requested = env::var("FLEET_CONCURRENCY_MODE").unwrap_or_default();
+        let mode = match requested.to_ascii_lowercase().as_str() {
             "enforce" => FleetConcurrencyMode::Enforce,
-            _ => FleetConcurrencyMode::Off,
+            "" | "off" => FleetConcurrencyMode::Off,
+            _ => {
+                // eprintln for the reason given on the CHUTES_MODELS warning
+                // below. Silence here reads as enforcement being on when it is
+                // not.
+                eprintln!(
+                    "WARN: unrecognised FLEET_CONCURRENCY_MODE '{requested}', \
+                     falling back to off"
+                );
+                FleetConcurrencyMode::Off
+            }
         };
 
         Self {

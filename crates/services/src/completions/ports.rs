@@ -130,9 +130,11 @@ pub trait OrganizationConcurrentLimitRepository: Send + Sync {
     async fn get_concurrent_limit(&self, org_id: Uuid) -> Result<Option<u32>, anyhow::Error>;
 }
 
+/// Both variants carry the limit that was applied, so the caller can remember
+/// it for the degraded path without a second lookup.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LeaseOutcome {
-    Admitted,
+    Admitted { limit: u32 },
     AtLimit { limit: u32, in_flight: i64 },
 }
 
@@ -160,13 +162,12 @@ pub trait ConcurrencyLeaseRepository: Send + Sync {
 
     async fn release(&self, lease_ids: &[Uuid]) -> Result<(), anyhow::Error>;
 
-    /// Extend leases the store already has. Updating in place means a lease
-    /// released while this call was in flight stays deleted instead of being
-    /// recreated with no holder.
-    async fn renew(&self, lease_ids: &[Uuid], ttl: Duration) -> Result<(), anyhow::Error>;
+    /// Extend leases the store already has, returning the ids still there.
+    /// Updates in place so a lease released mid-call stays deleted.
+    async fn renew(&self, lease_ids: &[Uuid], ttl: Duration) -> Result<Vec<Uuid>, anyhow::Error>;
 
-    /// Write leases the store does not have yet, which happens when a request
-    /// was admitted while it was unreachable. Returns the leases now stored.
+    /// Write leases the store does not have yet, from requests admitted while
+    /// it was unreachable.
     async fn persist(
         &self,
         leases: &[HeldLease],

@@ -12,6 +12,3 @@ CREATE INDEX idx_concurrency_leases_org_model
 
 CREATE INDEX idx_concurrency_leases_expires_at
     ON concurrency_leases (expires_at);
-
-CREATE INDEX idx_concurrency_leases_instance
-    ON concurrency_leases (instance_id, expires_at);

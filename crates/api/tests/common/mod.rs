@@ -434,9 +434,8 @@ where
     (server, database)
 }
 
-/// Build several independent servers that share one database, standing in for
-/// the replicas of a deployed fleet. Each gets its own services and provider
-/// pool, so anything they agree on has to travel through the database.
+/// Independent servers sharing one database, standing in for fleet replicas.
+/// Each gets its own services, so agreement has to travel through the database.
 pub async fn setup_test_fleet<F>(
     instances: usize,
     mutate: F,

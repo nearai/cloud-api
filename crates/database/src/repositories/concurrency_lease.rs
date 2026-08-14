@@ -18,8 +18,11 @@ impl PostgresConcurrencyLeaseRepository {
         Self { pool }
     }
 
+    /// Zero and negative mean unset, as on the per-process path. Reading zero
+    /// as a real limit would reject every request for the organization.
     fn effective_limit(stored: Option<i32>, default_limit: u32) -> u32 {
         stored
+            .filter(|value| *value > 0)
             .and_then(|value| u32::try_from(value).ok())
             .unwrap_or(default_limit)
     }
@@ -106,20 +109,20 @@ impl ConcurrencyLeaseRepository for PostgresConcurrencyLeaseRepository {
             .map_err(map_db_error)?;
 
             tx.commit().await.map_err(map_db_error)?;
-            Ok(LeaseOutcome::Admitted)
+            Ok(LeaseOutcome::Admitted { limit })
         })?;
 
         Ok(outcome)
     }
 
-    async fn renew(&self, lease_ids: &[Uuid], ttl: Duration) -> Result<()> {
+    async fn renew(&self, lease_ids: &[Uuid], ttl: Duration) -> Result<Vec<Uuid>> {
         if lease_ids.is_empty() {
-            return Ok(());
+            return Ok(Vec::new());
         }
 
         let ttl_seconds = ttl.as_secs() as f64;
 
-        retry_db!("renew_concurrency_leases", {
+        let rows = retry_db!("renew_concurrency_leases", {
             let client = self
                 .pool
                 .get()
@@ -128,11 +131,12 @@ impl ConcurrencyLeaseRepository for PostgresConcurrencyLeaseRepository {
                 .map_err(RepositoryError::PoolError)?;
 
             client
-                .execute(
+                .query(
                     r#"
                     UPDATE concurrency_leases
                     SET expires_at = NOW() + make_interval(secs => $2)
                     WHERE id = ANY($1)
+                    RETURNING id
                     "#,
                     &[&lease_ids, &ttl_seconds],
                 )
@@ -140,7 +144,7 @@ impl ConcurrencyLeaseRepository for PostgresConcurrencyLeaseRepository {
                 .map_err(map_db_error)
         })?;
 
-        Ok(())
+        Ok(rows.iter().map(|row| row.get("id")).collect())
     }
 
     async fn persist(&self, leases: &[HeldLease], instance_id: &str, ttl: Duration) -> Result<()> {
@@ -197,9 +201,18 @@ impl ConcurrencyLeaseRepository for PostgresConcurrencyLeaseRepository {
                 .context("Failed to get database connection")
                 .map_err(RepositoryError::PoolError)?;
 
+            // Bounded so a backlog cannot become one long delete holding row
+            // locks against live admissions; the next tick takes the rest.
             client
                 .execute(
-                    "DELETE FROM concurrency_leases WHERE expires_at < NOW()",
+                    r#"
+                    DELETE FROM concurrency_leases
+                    WHERE id = ANY(
+                        SELECT id FROM concurrency_leases
+                        WHERE expires_at < NOW()
+                        LIMIT 1000
+                    )
+                    "#,
                     &[],
                 )
                 .await

@@ -1,3 +1,5 @@
+// Shared with other test binaries, which use a different subset of it.
+#[allow(dead_code)]
 mod support;
 
 use database::repositories::concurrency_lease::PostgresConcurrencyLeaseRepository;
@@ -60,7 +62,7 @@ async fn concurrent_acquires_never_exceed_the_limit() {
     let mut at_limit = 0usize;
     for attempt in attempts {
         match attempt.await.expect("task").expect("acquire") {
-            LeaseOutcome::Admitted => admitted += 1,
+            LeaseOutcome::Admitted { .. } => admitted += 1,
             LeaseOutcome::AtLimit { .. } => at_limit += 1,
         }
     }
@@ -120,7 +122,7 @@ async fn released_leases_free_capacity_again() {
             )
             .await
             .expect("acquire");
-        assert_eq!(outcome, LeaseOutcome::Admitted);
+        assert!(matches!(outcome, LeaseOutcome::Admitted { .. }));
         held.push(lease_id);
     }
 
@@ -150,9 +152,8 @@ async fn released_leases_free_capacity_again() {
         )
         .await
         .expect("acquire");
-    assert_eq!(
-        readmitted,
-        LeaseOutcome::Admitted,
+    assert!(
+        matches!(readmitted, LeaseOutcome::Admitted { .. }),
         "releasing a lease must free exactly one slot"
     );
 }
@@ -192,7 +193,7 @@ async fn renewal_keeps_a_lease_past_its_original_ttl() {
         )
         .await
         .expect("acquire");
-    assert_eq!(outcome, LeaseOutcome::Admitted);
+    assert!(matches!(outcome, LeaseOutcome::Admitted { .. }));
 
     repository.renew(&[lease_id], TTL).await.expect("renew");
 
@@ -243,7 +244,11 @@ async fn renewal_cannot_recreate_a_released_lease() {
         .expect("acquire");
 
     repository.release(&[lease_id]).await.expect("release");
-    repository.renew(&[lease_id], TTL).await.expect("renew");
+    let renewed = repository.renew(&[lease_id], TTL).await.expect("renew");
+    assert!(
+        renewed.is_empty(),
+        "a released lease must not report as renewed"
+    );
 
     let live: i64 = pool
         .get()
@@ -301,6 +306,115 @@ async fn pending_leases_are_written_back() {
     assert_eq!(live, 1, "a degraded-path lease must reach the store");
 }
 
+/// A zero or negative rate_limit means unset, not a limit of zero. Reading it
+/// literally would reject every request for the organization.
+#[tokio::test]
+async fn a_zero_rate_limit_falls_back_to_the_default() {
+    let pool = support::test_pool().await.expect("test pool");
+    let org = support::insert_org_fixture(&pool)
+        .await
+        .expect("org fixture");
+    let model = support::insert_model(&pool, &format!("lease-{}", Uuid::new_v4()))
+        .await
+        .expect("model fixture");
+
+    let repository = PostgresConcurrencyLeaseRepository::new(pool.clone());
+
+    for stored in [0i32, -1i32] {
+        pool.get()
+            .await
+            .expect("connection")
+            .execute(
+                "UPDATE organizations SET rate_limit = $1 WHERE id = $2",
+                &[&stored, &org.org_id],
+            )
+            .await
+            .expect("rate limit update");
+
+        let outcome = repository
+            .try_acquire(
+                Uuid::new_v4(),
+                org.org_id,
+                model.id,
+                "instance-a",
+                DEFAULT_LIMIT,
+                TTL,
+            )
+            .await
+            .expect("acquire");
+
+        assert!(
+            matches!(outcome, LeaseOutcome::Admitted { limit } if limit == DEFAULT_LIMIT),
+            "rate_limit {stored} must fall back to the default, got {outcome:?}"
+        );
+    }
+}
+
+/// cargo test --test concurrency_leases admission_throughput -- --ignored --nocapture
+#[tokio::test]
+#[ignore]
+async fn admission_throughput() {
+    let concurrency: usize = std::env::var("BENCH_CONCURRENCY")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(16);
+    let rounds: usize = std::env::var("BENCH_ROUNDS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(200);
+
+    let pool = support::test_pool().await.expect("test pool");
+    let org = support::insert_org_fixture(&pool)
+        .await
+        .expect("org fixture");
+    let model = support::insert_model(&pool, &format!("bench-{}", Uuid::new_v4()))
+        .await
+        .expect("model fixture");
+
+    pool.get()
+        .await
+        .expect("connection")
+        .execute(
+            "UPDATE organizations SET rate_limit = 100000 WHERE id = $1",
+            &[&org.org_id],
+        )
+        .await
+        .expect("rate limit update");
+
+    let repository = Arc::new(PostgresConcurrencyLeaseRepository::new(pool.clone()));
+    let started = std::time::Instant::now();
+
+    for _ in 0..rounds {
+        let mut batch = Vec::with_capacity(concurrency);
+        for _ in 0..concurrency {
+            let repository = repository.clone();
+            let org_id = org.org_id;
+            let model_id = model.id;
+            batch.push(tokio::spawn(async move {
+                let lease_id = Uuid::new_v4();
+                repository
+                    .try_acquire(lease_id, org_id, model_id, "bench", DEFAULT_LIMIT, TTL)
+                    .await
+                    .expect("acquire");
+                lease_id
+            }));
+        }
+        let mut ids: Vec<Uuid> = Vec::with_capacity(concurrency);
+        for handle in batch {
+            ids.push(handle.await.expect("task"));
+        }
+        repository.release(&ids).await.expect("release");
+    }
+
+    let elapsed = started.elapsed();
+    let total = rounds * concurrency;
+    println!(
+        "concurrency={concurrency} admissions: {total} in {elapsed:?} => {:.0}/s, {:.2}ms mean",
+        total as f64 / elapsed.as_secs_f64(),
+        elapsed.as_secs_f64() * 1000.0 / total as f64
+    );
+}
+
 /// An expired lease must not keep counting, or a replica that died holding
 /// leases would lock the organization out permanently.
 #[tokio::test]
@@ -335,7 +449,7 @@ async fn expired_leases_stop_counting() {
         )
         .await
         .expect("acquire");
-    assert_eq!(outcome, LeaseOutcome::Admitted);
+    assert!(matches!(outcome, LeaseOutcome::Admitted { .. }));
 
     tokio::time::sleep(Duration::from_millis(1200)).await;
 
@@ -350,9 +464,8 @@ async fn expired_leases_stop_counting() {
         )
         .await
         .expect("acquire");
-    assert_eq!(
-        after_expiry,
-        LeaseOutcome::Admitted,
+    assert!(
+        matches!(after_expiry, LeaseOutcome::Admitted { .. }),
         "a lease past its TTL must not hold capacity"
     );
 }

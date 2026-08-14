@@ -480,6 +480,13 @@ fn build_system(content: &serde_json::Value, caching_enabled: bool) -> Anthropic
         return AnthropicSystem::Text(extract_content(content));
     }
 
+    // Anthropic rejects empty text blocks. Keep an empty system prompt in the
+    // bare-string form even when a later message enables caching.
+    let flattened = extract_content(content);
+    if flattened.is_empty() {
+        return AnthropicSystem::Text(flattened);
+    }
+
     // Array form while caching is enabled: emit one text block per `text` part,
     // attaching its breakpoint. Image parts in a system prompt are dropped
     // (matching the text-only flattening this path already did).
@@ -499,7 +506,11 @@ fn build_system(content: &serde_json::Value, caching_enabled: bool) -> Anthropic
         if obj.get("type").and_then(|t| t.as_str()) != Some("text") {
             continue;
         }
-        let Some(text) = obj.get("text").and_then(|t| t.as_str()) else {
+        let Some(text) = obj
+            .get("text")
+            .and_then(|t| t.as_str())
+            .filter(|text| !text.is_empty())
+        else {
             continue;
         };
         blocks.push(AnthropicSystemBlock {
@@ -562,6 +573,11 @@ pub fn convert_messages(
                     .unwrap_or_default();
 
                 if has_image || caching_enabled {
+                    // Keep text parts separate so a caller's per-part cache
+                    // breakpoint remains attached to the exact prefix boundary it
+                    // selected. This intentionally differs from the uncached
+                    // newline-joined string form; flattening here would make the
+                    // representation stable only by coarsening breakpoint precision.
                     let mut blocks = Vec::with_capacity(parts.len());
                     for (idx, part) in parts.into_iter().enumerate() {
                         let cc = cache_controls.get(idx).cloned().flatten();
@@ -683,7 +699,7 @@ pub fn convert_messages(
                 // moving the breakpoint cannot change its representation. The text
                 // remains flattened into one block. Uncached requests keep the bare
                 // string form and remain byte-identical to before.
-                if caching_enabled {
+                if caching_enabled && !content.is_empty() {
                     anthropic_messages.push(AnthropicMessage {
                         role: "assistant".to_string(),
                         content: AnthropicMessageContent::Blocks(vec![
@@ -1399,6 +1415,79 @@ mod tests {
             .unwrap()
             .remove("cache_control");
         assert_eq!(user_a_n, user_a_n_plus_one);
+
+        // The headline regression: an unmarked single-part message must have
+        // the same block shape when the moving anchor lands on it next turn.
+        let assistant_b_n = serde_json::to_value(&messages_n[1]).unwrap();
+        let assistant_b_n_plus_one = serde_json::to_value(&messages_n_plus_one[1]).unwrap();
+        assert_eq!(assistant_b_n, assistant_b_n_plus_one);
+
+        let user_c_n = serde_json::to_value(&messages_n[2]).unwrap();
+        let mut user_c_n_plus_one = serde_json::to_value(&messages_n_plus_one[2]).unwrap();
+        user_c_n_plus_one["content"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("cache_control");
+        assert_eq!(user_c_n, user_c_n_plus_one);
+    }
+
+    #[test]
+    fn test_empty_system_stays_bare_string_when_caching_is_enabled() {
+        let messages = vec![
+            ChatMessage {
+                role: MessageRole::System,
+                content: Some(serde_json::Value::String(String::new())),
+                name: None,
+                tool_call_id: None,
+                tool_calls: None,
+            },
+            ChatMessage {
+                role: MessageRole::User,
+                content: Some(serde_json::json!([{
+                    "type": "text",
+                    "text": "anchor",
+                    "cache_control": {"type": "ephemeral"}
+                }])),
+                name: None,
+                tool_call_id: None,
+                tool_calls: None,
+            },
+        ];
+
+        let (system, _messages) = convert_messages(&messages);
+        assert!(matches!(system, Some(AnthropicSystem::Text(text)) if text.is_empty()));
+    }
+
+    #[test]
+    fn test_empty_assistant_stays_bare_string_when_caching_is_enabled() {
+        for content in [None, Some(serde_json::Value::String(String::new()))] {
+            let messages = vec![
+                ChatMessage {
+                    role: MessageRole::User,
+                    content: Some(serde_json::json!([{
+                        "type": "text",
+                        "text": "anchor",
+                        "cache_control": {"type": "ephemeral"}
+                    }])),
+                    name: None,
+                    tool_call_id: None,
+                    tool_calls: None,
+                },
+                ChatMessage {
+                    role: MessageRole::Assistant,
+                    content,
+                    name: None,
+                    tool_call_id: None,
+                    tool_calls: Some(Vec::new()),
+                },
+            ];
+
+            let (_system, anthropic_messages) = convert_messages(&messages);
+            assert!(matches!(
+                &anthropic_messages[1].content,
+                AnthropicMessageContent::Text(text) if text.is_empty()
+            ));
+        }
     }
 
     #[test]

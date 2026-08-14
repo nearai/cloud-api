@@ -93,17 +93,22 @@ fn strip_json_code_fence(content: &str) -> String {
 /// SEPARATELY from `input_tokens`, whereas OpenAI's `cached_tokens` is a SUBSET
 /// of `prompt_tokens` (and `TokenUsage::cached_tokens()` caps it to
 /// `[0, prompt_tokens]`). To preserve that invariant AND bill the cache-read
-/// cost, we ADD both cache figures into `prompt_tokens` and report the read
-/// portion as `cached_tokens`. When there is no cache read, `prompt_tokens_details`
-/// stays `None` so an uncached response is byte-identical to before.
+/// cost, we ADD both cache figures into `prompt_tokens` and report the read and
+/// creation portions separately. When there is no cache activity,
+/// `prompt_tokens_details` stays `None` so an uncached response is byte-identical
+/// to before.
 fn map_usage(usage: &AnthropicUsage) -> TokenUsage {
     let prompt_tokens =
         usage.input_tokens + usage.cache_read_input_tokens + usage.cache_creation_input_tokens;
-    let prompt_tokens_details = if usage.cache_read_input_tokens > 0 {
-        Some(serde_json::json!({ "cached_tokens": usage.cache_read_input_tokens }))
-    } else {
-        None
-    };
+    let prompt_tokens_details =
+        if usage.cache_read_input_tokens > 0 || usage.cache_creation_input_tokens > 0 {
+            Some(serde_json::json!({
+                "cached_tokens": usage.cache_read_input_tokens,
+                "cache_creation_tokens": usage.cache_creation_input_tokens,
+            }))
+        } else {
+            None
+        };
     TokenUsage {
         prompt_tokens,
         completion_tokens: usage.output_tokens,
@@ -801,7 +806,22 @@ mod tests {
         // cached_tokens surfaced via prompt_tokens_details, and clamped helper
         // confirms the invariant cached <= prompt.
         assert_eq!(mapped.cached_tokens(), 80);
+        assert_eq!(mapped.cache_creation_tokens(), 5);
         assert!(mapped.cached_tokens() <= mapped.prompt_tokens);
+    }
+
+    #[test]
+    fn test_map_usage_cache_creation_without_read_emits_details() {
+        let mapped = map_usage(&AnthropicUsage {
+            input_tokens: 10,
+            output_tokens: 3,
+            cache_read_input_tokens: 0,
+            cache_creation_input_tokens: 7,
+        });
+
+        assert_eq!(mapped.prompt_tokens, 17);
+        assert_eq!(mapped.cached_tokens(), 0);
+        assert_eq!(mapped.cache_creation_tokens(), 7);
     }
 
     #[test]

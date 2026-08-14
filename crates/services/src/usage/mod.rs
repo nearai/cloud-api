@@ -68,14 +68,16 @@ pub fn compute_token_cost(
 }
 
 /// Anthropic's five-minute prompt-cache write rate is 1.25x the ordinary
-/// input rate. Prices use integer nano-dollars, so reject values that cannot
-/// represent the multiplier exactly instead of rounding a billing rate.
+/// input rate. Prices use integer nano-dollars, so round half-up when the
+/// multiplier lands between representable values.
 pub fn five_minute_cache_write_rate(input_cost_per_token: i64) -> Option<i64> {
     if input_cost_per_token < 0 {
         return None;
     }
-    let scaled = input_cost_per_token.checked_mul(5)?;
-    (scaled % 4 == 0).then_some(scaled / 4)
+    input_cost_per_token
+        .checked_mul(5)?
+        .checked_add(2)?
+        .checked_div(4)
 }
 
 /// Compute token cost with an optional separately-priced cache-write subset.
@@ -112,9 +114,7 @@ pub fn compute_token_cost_with_cache_write(
     let effective_cache_rate = pricing
         .cache_read_cost_per_token
         .unwrap_or(pricing.input_cost_per_token);
-    let cache_write_rate = cache_write
-        .map(|write| write.cost_per_token)
-        .unwrap_or(pricing.input_cost_per_token);
+    let cache_write_rate = cache_write.map_or(0, |write| write.cost_per_token);
     let input_cost = non_cached_input
         .checked_mul(pricing.input_cost_per_token)
         .and_then(|c| {
@@ -881,8 +881,8 @@ impl UsageServiceTrait for UsageServiceImpl {
 #[cfg(test)]
 mod tests {
     use super::{
-        compute_token_cost, compute_token_cost_with_cache_write, CacheWriteBilling, CostBreakdown,
-        ModelPricing, UsageError,
+        compute_token_cost, compute_token_cost_with_cache_write, five_minute_cache_write_rate,
+        CacheWriteBilling, CostBreakdown, ModelPricing, UsageError,
     };
     use uuid::Uuid;
 
@@ -903,6 +903,15 @@ mod tests {
 
     fn unwrap_cost(result: Result<CostBreakdown, UsageError>) -> CostBreakdown {
         result.expect("cost calculation should not overflow in this test")
+    }
+
+    #[test]
+    fn five_minute_cache_write_rate_rounds_half_up() {
+        assert_eq!(five_minute_cache_write_rate(4), Some(5));
+        assert_eq!(five_minute_cache_write_rate(250), Some(313));
+        assert_eq!(five_minute_cache_write_rate(251), Some(314));
+        assert_eq!(five_minute_cache_write_rate(-1), None);
+        assert_eq!(five_minute_cache_write_rate(i64::MAX), None);
     }
 
     #[test]

@@ -421,6 +421,24 @@ impl TokenUsage {
             .unwrap_or(0);
         n.min(self.prompt_tokens).max(0)
     }
+
+    /// Number of prompt tokens used to create an Anthropic prompt-cache entry.
+    /// This provider-specific detail is a non-overlapping subset of
+    /// `prompt_tokens`, after cache-read tokens are accounted for.
+    pub fn cache_creation_tokens(&self) -> i32 {
+        let Some(ref details) = self.prompt_tokens_details else {
+            return 0;
+        };
+        let Some(value) = details.get("cache_creation_tokens") else {
+            return 0;
+        };
+        let tokens = value
+            .as_i64()
+            .and_then(|value| i32::try_from(value).ok())
+            .unwrap_or(0)
+            .max(0);
+        tokens.min(self.prompt_tokens.saturating_sub(self.cached_tokens()))
+    }
 }
 
 /// Audio output data (for Qwen3-Omni and similar models)

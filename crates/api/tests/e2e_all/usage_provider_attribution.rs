@@ -95,6 +95,7 @@ fn attributed_usage_request(
         response_id: None,
         image_count: None,
         cache_read_tokens: 0,
+        cache_write_tokens: 0,
         served_provider_tier: Some(ServedProviderTier::Attested3p),
         served_provider_type: Some(ServedProviderType::Chutes),
         served_via_fallback: true,

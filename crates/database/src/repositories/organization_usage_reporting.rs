@@ -48,7 +48,7 @@ impl OrganizationUsageRepository {
                     SELECT
                         id, organization_id, workspace_id, api_key_id, created_at,
                         model_name, inference_type, input_tokens, output_tokens,
-                        cache_read_tokens, total_tokens, input_cost, output_cost,
+                        cache_read_tokens, cache_write_tokens, total_tokens, input_cost, output_cost,
                         total_cost, response_id, provider_request_id, inference_id,
                         stop_reason, image_count
                     FROM organization_usage_log
@@ -109,7 +109,7 @@ impl OrganizationUsageRepository {
                     SELECT
                         id, organization_id, workspace_id, api_key_id, created_at,
                         model_name, inference_type, input_tokens, output_tokens,
-                        cache_read_tokens, total_tokens, input_cost, output_cost,
+                        cache_read_tokens, cache_write_tokens, total_tokens, input_cost, output_cost,
                         total_cost, response_id, provider_request_id, inference_id,
                         stop_reason, image_count
                     FROM organization_usage_log
@@ -210,6 +210,7 @@ fn row_to_report(row: &Row) -> InferenceUsageReportRow {
         input_tokens: i64::from(row.get::<_, i32>("input_tokens")),
         output_tokens: i64::from(row.get::<_, i32>("output_tokens")),
         cache_read_tokens: i64::from(row.get::<_, i32>("cache_read_tokens")),
+        cache_write_tokens: i64::from(row.get::<_, i32>("cache_write_tokens")),
         total_tokens: i64::from(row.get::<_, i32>("total_tokens")),
         input_cost_nano_usd: row.get("input_cost"),
         output_cost_nano_usd: row.get("output_cost"),

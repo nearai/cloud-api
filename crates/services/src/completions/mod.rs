@@ -4,7 +4,9 @@ use crate::attestation::ports::AttestationServiceTrait;
 use crate::inference_provider_pool::InferenceProviderPool;
 use crate::models::ModelsRepository;
 use crate::responses::models::ResponseId;
-use crate::usage::{RecordUsageServiceRequest, UsageServiceTrait};
+use crate::usage::{
+    five_minute_cache_write_rate, CacheWriteBilling, RecordUsageServiceRequest, UsageServiceTrait,
+};
 use inference_providers::{ChatMessage, MessageRole, SSEEvent, StreamChunk, StreamingResult};
 use moka::future::Cache;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -116,6 +118,8 @@ where
     /// Whether to fetch/store provider chat signatures before ending the stream.
     store_provider_chat_signature: bool,
     provider_attribution: crate::usage::ProviderAttribution,
+    /// Five-minute prompt-cache write price for Anthropic-backed models.
+    cache_write_cost_per_token: Option<i64>,
     /// Callback to report observed TTFT back to the provider pool for latency-aware
     /// routing. Called once with the backend TTFT (ms) from record_usage_and_metrics.
     latency_reporter: Option<super::inference_provider_pool::ProviderLatencyReporter>,
@@ -191,7 +195,7 @@ where
         )
         .entered();
 
-        let (input_tokens, output_tokens, cache_read_tokens, chat_id) = match (
+        let (input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, chat_id) = match (
             &self.last_usage_stats,
             &self.last_chat_id,
         ) {
@@ -199,6 +203,7 @@ where
                 usage.prompt_tokens,
                 usage.completion_tokens,
                 usage.cached_tokens(),
+                usage.cache_creation_tokens(),
                 chat_id.clone(),
             ),
             (None, None) => {
@@ -290,6 +295,13 @@ where
         let first_token_time = self.first_token_time;
         let stream_completed = self.stream_completed;
         let provider_attribution = self.provider_attribution;
+        let cache_write = self
+            .cache_write_cost_per_token
+            .filter(|_| cache_write_tokens > 0)
+            .map(|cost_per_token| CacheWriteBilling {
+                tokens: cache_write_tokens,
+                cost_per_token,
+            });
 
         let avg_itl_ms = if self.token_count > 0 {
             Some(self.total_itl_ms / self.token_count as f64)
@@ -330,6 +342,7 @@ where
                                 input_tokens,
                                 output_tokens,
                                 cache_read_tokens,
+                                cache_write,
                                 inference_type,
                                 ttft_ms,
                                 avg_itl_ms,
@@ -897,6 +910,30 @@ impl CompletionServiceImpl {
         Ok(())
     }
 
+    fn anthropic_cache_write_rate(
+        model: &crate::models::ModelWithPricing,
+    ) -> Result<Option<i64>, ports::CompletionError> {
+        let is_anthropic = model.provider_type == "external"
+            && model
+                .provider_config
+                .as_ref()
+                .and_then(|config| config.get("backend"))
+                .and_then(serde_json::Value::as_str)
+                == Some("anthropic");
+        if !is_anthropic {
+            return Ok(None);
+        }
+
+        five_minute_cache_write_rate(model.input_cost_per_token)
+            .map(Some)
+            .ok_or_else(|| {
+                ports::CompletionError::InternalError(format!(
+                    "Model '{}' has an invalid Anthropic cache-write price",
+                    model.model_name
+                ))
+            })
+    }
+
     /// These tags are used for OTLP/Datadog metrics and should only include
     /// low-cardinality values to minimize costs (~98% savings vs high-cardinality).
     /// High-cardinality data (org/workspace/key) is tracked via database analytics.
@@ -1302,6 +1339,7 @@ impl CompletionServiceImpl {
         attestation_supported: bool,
         store_provider_chat_signature: bool,
         provider_attribution: crate::usage::ProviderAttribution,
+        cache_write_cost_per_token: Option<i64>,
         latency_reporter: Option<super::inference_provider_pool::ProviderLatencyReporter>,
     ) -> StreamingResult {
         // Create low-cardinality metric tags (no org/workspace/key - those go to database)
@@ -1347,6 +1385,7 @@ impl CompletionServiceImpl {
             attestation_supported,
             store_provider_chat_signature,
             provider_attribution,
+            cache_write_cost_per_token,
             latency_reporter,
         };
         Box::pin(intercepted_stream)
@@ -1445,6 +1484,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         };
 
         let canonical_name = &model.model_name;
+        let cache_write_cost_per_token = Self::anthropic_cache_write_rate(&model)?;
 
         // Update params with canonical name if it's different
         if canonical_name != &request.model {
@@ -1536,6 +1576,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
                 model.attestation_supported,
                 !request.skip_provider_chat_signature,
                 provider_attribution,
+                cache_write_cost_per_token,
                 Some(latency_reporter),
             )
             .await;
@@ -1621,6 +1662,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         };
 
         let canonical_name = &model.model_name;
+        let cache_write_cost_per_token = Self::anthropic_cache_write_rate(&model)?;
 
         let api_key_id = match uuid::Uuid::parse_str(&request.api_key_id) {
             Ok(id) => id,
@@ -1718,6 +1760,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         let input_tokens = response_with_bytes.response.usage.prompt_tokens;
         let output_tokens = response_with_bytes.response.usage.completion_tokens;
         let cache_read_tokens = response_with_bytes.response.usage.cached_tokens();
+        let cache_write_tokens = response_with_bytes.response.usage.cache_creation_tokens();
         let model_name = model.model_name.clone();
 
         tokio::spawn(async move {
@@ -1777,6 +1820,12 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
                 input_tokens,
                 output_tokens,
                 cache_read_tokens,
+                cache_write: cache_write_cost_per_token
+                    .filter(|_| cache_write_tokens > 0)
+                    .map(|cost_per_token| CacheWriteBilling {
+                        tokens: cache_write_tokens,
+                        cost_per_token,
+                    }),
                 inference_type: crate::usage::ports::InferenceType::ChatCompletion,
                 ttft_ms: None,    // N/A for non-streaming
                 avg_itl_ms: None, // N/A for non-streaming
@@ -2202,6 +2251,7 @@ mod tests {
             attestation_supported: true,
             store_provider_chat_signature: true,
             provider_attribution: crate::usage::ProviderAttribution::default(),
+            cache_write_cost_per_token: None,
             latency_reporter: None,
         };
 
@@ -2269,7 +2319,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_intercept_stream_emits_cache_hit_metrics() {
+        use crate::test_utils::CapturingUsageService;
+
         let metrics_service = Arc::new(CapturingMetricsService::new());
+        let usage_service = Arc::new(CapturingUsageService::new());
         let now = Instant::now();
         // prompt=10, of which 7 were prefix-cache hits -> 70% hit rate.
         let usage_chunk = SSEEvent {
@@ -2291,7 +2344,10 @@ mod tests {
                     prompt_tokens: 10,
                     completion_tokens: 20,
                     total_tokens: 30,
-                    prompt_tokens_details: Some(serde_json::json!({"cached_tokens": 7})),
+                    prompt_tokens_details: Some(serde_json::json!({
+                        "cached_tokens": 7,
+                        "cache_creation_tokens": 2,
+                    })),
                 }),
                 prompt_token_ids: None,
                 system_fingerprint: None,
@@ -2303,7 +2359,7 @@ mod tests {
         let intercept_stream = InterceptStream {
             inner: stream,
             attestation_service: Arc::new(MockAttestationService),
-            usage_service: Arc::new(MockUsageService),
+            usage_service: usage_service.clone(),
             metrics_service: metrics_service.clone(),
             request_id: Uuid::new_v4(),
             organization_id: Uuid::new_v4(),
@@ -2332,6 +2388,7 @@ mod tests {
             attestation_supported: true,
             store_provider_chat_signature: true,
             provider_attribution: crate::usage::ProviderAttribution::default(),
+            cache_write_cost_per_token: Some(125),
             latency_reporter: None,
         };
         let _ = intercept_stream.collect::<Vec<_>>().await;
@@ -2353,6 +2410,13 @@ mod tests {
             MetricValue::Histogram(v) => assert!((v - 70.0).abs() < 1e-9, "hit rate = {v}"),
             _ => panic!("cache.hit_rate should be a histogram"),
         }
+        let requests = usage_service.get_requests();
+        assert_eq!(requests.len(), 1);
+        let cache_write = requests[0]
+            .cache_write
+            .expect("cache write should be billed");
+        assert_eq!(cache_write.tokens, 2);
+        assert_eq!(cache_write.cost_per_token, 125);
     }
 
     #[tokio::test]
@@ -2472,6 +2536,7 @@ mod tests {
             attestation_supported: true,
             store_provider_chat_signature: true,
             provider_attribution: crate::usage::ProviderAttribution::default(),
+            cache_write_cost_per_token: None,
             latency_reporter: None,
         };
 
@@ -2595,6 +2660,7 @@ mod tests {
             attestation_supported: true,
             store_provider_chat_signature: true,
             provider_attribution: crate::usage::ProviderAttribution::default(),
+            cache_write_cost_per_token: None,
             latency_reporter: None,
         };
 
@@ -2802,6 +2868,7 @@ mod tests {
                 attestation_supported: true,
                 store_provider_chat_signature: true,
                 provider_attribution: crate::usage::ProviderAttribution::default(),
+                cache_write_cost_per_token: None,
                 latency_reporter: None,
             };
             // InterceptStream goes out of scope here and Drop is called

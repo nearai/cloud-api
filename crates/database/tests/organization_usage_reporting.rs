@@ -38,6 +38,7 @@ async fn organization_usage_reporting_filters_and_cursor() -> anyhow::Result<()>
             input_tokens: 10,
             output_tokens: 5,
             cache_read_tokens: 2,
+            cache_write_tokens: 1,
             input_cost: 100,
             output_cost: 200,
             total_cost: 300,
@@ -56,6 +57,7 @@ async fn organization_usage_reporting_filters_and_cursor() -> anyhow::Result<()>
             input_tokens: 11,
             output_tokens: 6,
             cache_read_tokens: 3,
+            cache_write_tokens: 0,
             input_cost: 110,
             output_cost: 220,
             total_cost: 330,
@@ -74,6 +76,7 @@ async fn organization_usage_reporting_filters_and_cursor() -> anyhow::Result<()>
             input_tokens: 9,
             output_tokens: 0,
             cache_read_tokens: 0,
+            cache_write_tokens: 0,
             input_cost: 90,
             output_cost: 0,
             total_cost: 90,
@@ -92,6 +95,7 @@ async fn organization_usage_reporting_filters_and_cursor() -> anyhow::Result<()>
             input_tokens: 99,
             output_tokens: 99,
             cache_read_tokens: 0,
+            cache_write_tokens: 0,
             input_cost: 990,
             output_cost: 990,
             total_cost: 1980,
@@ -126,6 +130,7 @@ async fn organization_usage_reporting_filters_and_cursor() -> anyhow::Result<()>
     assert_eq!(first_page[0].input_tokens, 10);
     assert_eq!(first_page[0].output_tokens, 5);
     assert_eq!(first_page[0].cache_read_tokens, 2);
+    assert_eq!(first_page[0].cache_write_tokens, 1);
     assert_eq!(first_page[0].total_tokens, 15);
     assert_eq!(first_page[0].input_cost_nano_usd, 100);
     assert_eq!(first_page[0].output_cost_nano_usd, 200);
@@ -195,6 +200,7 @@ async fn organization_usage_reporting_excludes_other_orgs() -> anyhow::Result<()
             input_tokens: 1,
             output_tokens: 1,
             cache_read_tokens: 0,
+            cache_write_tokens: 0,
             input_cost: 10,
             output_cost: 20,
             total_cost: 30,
@@ -217,6 +223,7 @@ async fn organization_usage_reporting_excludes_other_orgs() -> anyhow::Result<()
             input_tokens: 2,
             output_tokens: 2,
             cache_read_tokens: 0,
+            cache_write_tokens: 0,
             input_cost: 20,
             output_cost: 40,
             total_cost: 60,

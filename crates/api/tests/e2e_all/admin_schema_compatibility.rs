@@ -171,6 +171,7 @@ fn admin_provider_attribution_preserves_existing_response_fields() {
         input_tokens: 10,
         output_tokens: 20,
         cache_read_tokens: 0,
+        cache_write_tokens: 0,
         total_tokens: 30,
         total_cost: 1000,
         total_cost_display: "$0.000001".to_string(),

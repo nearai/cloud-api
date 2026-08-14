@@ -711,6 +711,8 @@ pub struct OrganizationUsageLog {
     pub image_count: Option<i32>,
     /// Cached prompt tokens (subset of input_tokens) when provider reports cache hits
     pub cache_read_tokens: i32,
+    /// Prompt tokens written to provider cache (subset of input_tokens)
+    pub cache_write_tokens: i32,
     pub served_provider_tier: Option<ServedProviderTier>,
     pub served_provider_type: Option<ServedProviderType>,
     pub served_via_fallback: bool,
@@ -760,6 +762,8 @@ pub struct RecordUsageRequest {
     pub image_count: Option<i32>,
     /// Cached prompt tokens (subset of input_tokens) when provider reports cache hits
     pub cache_read_tokens: i32,
+    /// Prompt tokens written to provider cache (subset of input_tokens)
+    pub cache_write_tokens: i32,
     pub served_provider_tier: Option<ServedProviderTier>,
     pub served_provider_type: Option<ServedProviderType>,
     pub served_via_fallback: bool,

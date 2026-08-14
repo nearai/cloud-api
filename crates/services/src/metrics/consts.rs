@@ -59,6 +59,7 @@ pub const METRIC_BILLED_REQUESTS: &str = "cloud_api.billed.requests";
 pub const METRIC_BILLED_INPUT_TOKENS: &str = "cloud_api.billed.input_tokens";
 pub const METRIC_BILLED_OUTPUT_TOKENS: &str = "cloud_api.billed.output_tokens";
 pub const METRIC_BILLED_CACHE_READ_TOKENS: &str = "cloud_api.billed.cache_read_tokens";
+pub const METRIC_BILLED_CACHE_WRITE_TOKENS: &str = "cloud_api.billed.cache_write_tokens";
 pub const METRIC_BILLED_INPUT_COST_USD: &str = "cloud_api.billed.input_cost_usd";
 pub const METRIC_BILLED_OUTPUT_COST_USD: &str = "cloud_api.billed.output_cost_usd";
 

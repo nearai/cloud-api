@@ -499,6 +499,14 @@ pub enum RecordUsageApiRequest {
 }
 
 /// Request to record usage (service layer)
+#[derive(Debug, Clone, Copy)]
+pub struct CacheWriteBilling {
+    /// Cache-write tokens, included in `input_tokens`.
+    pub tokens: i32,
+    /// Explicit cache-write price in nano-dollars per token.
+    pub cost_per_token: i64,
+}
+
 #[derive(Debug, Clone)]
 pub struct RecordUsageServiceRequest {
     pub organization_id: Uuid,
@@ -509,6 +517,8 @@ pub struct RecordUsageServiceRequest {
     pub output_tokens: i32,
     /// Number of prompt tokens that were cache hits (subset of input_tokens)
     pub cache_read_tokens: i32,
+    /// Optional separately-priced cache writes (also a subset of input_tokens).
+    pub cache_write: Option<CacheWriteBilling>,
     pub inference_type: InferenceType,
     /// Time to first token in milliseconds
     pub ttft_ms: Option<i32>,
@@ -539,6 +549,7 @@ pub struct RecordUsageDbRequest {
     pub input_tokens: i32,
     pub output_tokens: i32,
     pub cache_read_tokens: i32,
+    pub cache_write_tokens: i32,
     pub input_cost: i64,
     pub output_cost: i64,
     pub total_cost: i64,
@@ -656,6 +667,7 @@ pub struct UsageLogEntry {
     pub input_tokens: i32,
     pub output_tokens: i32,
     pub cache_read_tokens: i32,
+    pub cache_write_tokens: i32,
     pub total_tokens: i32,
     pub input_cost: i64,
     pub output_cost: i64,

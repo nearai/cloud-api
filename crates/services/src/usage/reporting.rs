@@ -63,6 +63,7 @@ pub struct InferenceUsageReportRow {
     pub input_tokens: i64,
     pub output_tokens: i64,
     pub cache_read_tokens: i64,
+    pub cache_write_tokens: i64,
     pub total_tokens: i64,
     pub input_cost_nano_usd: i64,
     pub output_cost_nano_usd: i64,

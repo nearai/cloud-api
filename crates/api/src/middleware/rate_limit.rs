@@ -15,11 +15,13 @@ use std::{
 use tracing::{debug, warn};
 
 use super::auth::AuthenticatedApiKey;
+use crate::models::AnthropicErrorResponse;
 use crate::models::ErrorResponse;
 
 const DEFAULT_API_KEY_RATE_LIMIT: u32 = 1000; // requests per minute
 const RATE_LIMIT_WINDOW_SECS: u64 = 60;
 const RATE_LIMIT_CACHE_MAX_CAPACITY: u64 = 50_000;
+const ANTHROPIC_COUNT_TOKENS_SCOPE: &str = "anthropic_count_tokens";
 
 #[derive(Debug)]
 struct Counter(AtomicU32);
@@ -118,6 +120,30 @@ pub async fn check_rate_limit_for_api_key(
     Ok(())
 }
 
+async fn check_rate_limit_for_api_key_in_scope(
+    state: &RateLimitState,
+    auth_key: &AuthenticatedApiKey,
+    scope: &str,
+) -> Result<(), RateLimitedResponse> {
+    let api_key_id = &auth_key.api_key.id.0;
+    let bucket = format!("{scope}:{api_key_id}");
+    let (allowed, count, limit) = state.check_limit(&bucket).await;
+
+    if !allowed {
+        warn!(
+            "Scoped API key rate limit exceeded for key {}: {}/{} requests/min (org_id: {}, scope: {})",
+            api_key_id, count, limit, auth_key.organization.id.0, scope
+        );
+        return Err(rate_limited_response(count, limit));
+    }
+
+    debug!(
+        "Scoped API key rate limit check passed for {}: {}/{} (scope: {})",
+        api_key_id, count, limit, scope
+    );
+    Ok(())
+}
+
 pub async fn api_key_rate_limit_middleware(
     State(state): State<RateLimitState>,
     request: Request,
@@ -129,6 +155,73 @@ pub async fn api_key_rate_limit_middleware(
     };
 
     check_rate_limit_for_api_key(&state, &auth_key).await?;
+    Ok(next.run(request).await)
+}
+
+pub async fn anthropic_api_key_rate_limit_middleware(
+    State(state): State<RateLimitState>,
+    request: Request,
+    next: Next,
+) -> Result<
+    Response,
+    (
+        StatusCode,
+        [(HeaderName, HeaderValue); 1],
+        axum::Json<AnthropicErrorResponse>,
+    ),
+> {
+    let Some(auth_key) = request.extensions().get::<AuthenticatedApiKey>().cloned() else {
+        return Ok(next.run(request).await);
+    };
+
+    if let Err((status, headers, axum::Json(error))) =
+        check_rate_limit_for_api_key(&state, &auth_key).await
+    {
+        return Err((
+            status,
+            headers,
+            axum::Json(AnthropicErrorResponse::new(
+                "rate_limit_error",
+                error.error.message,
+            )),
+        ));
+    }
+
+    Ok(next.run(request).await)
+}
+
+/// Anthropic rate-limits token counting separately from Messages creation.
+/// Keep a distinct per-key bucket so free count requests cannot consume the
+/// request allowance used by billable inference.
+pub async fn anthropic_count_tokens_rate_limit_middleware(
+    State(state): State<RateLimitState>,
+    request: Request,
+    next: Next,
+) -> Result<
+    Response,
+    (
+        StatusCode,
+        [(HeaderName, HeaderValue); 1],
+        axum::Json<AnthropicErrorResponse>,
+    ),
+> {
+    let Some(auth_key) = request.extensions().get::<AuthenticatedApiKey>().cloned() else {
+        return Ok(next.run(request).await);
+    };
+
+    if let Err((status, headers, axum::Json(error))) =
+        check_rate_limit_for_api_key_in_scope(&state, &auth_key, ANTHROPIC_COUNT_TOKENS_SCOPE).await
+    {
+        return Err((
+            status,
+            headers,
+            axum::Json(AnthropicErrorResponse::new(
+                "rate_limit_error",
+                error.error.message,
+            )),
+        ));
+    }
+
     Ok(next.run(request).await)
 }
 
@@ -165,6 +258,18 @@ mod tests {
         assert!(allowed2);
         assert_eq!(count1, 1);
         assert_eq!(count2, 1);
+    }
+
+    #[tokio::test]
+    async fn count_tokens_uses_a_bucket_independent_from_inference() {
+        let state = RateLimitState::new(1);
+        let api_key_id = "test-key-123";
+        let count_tokens_bucket = format!("{ANTHROPIC_COUNT_TOKENS_SCOPE}:{api_key_id}");
+
+        assert!(state.check_limit(api_key_id).await.0);
+        assert!(state.check_limit(&count_tokens_bucket).await.0);
+        assert!(!state.check_limit(api_key_id).await.0);
+        assert!(!state.check_limit(&count_tokens_bucket).await.0);
     }
 
     #[test]

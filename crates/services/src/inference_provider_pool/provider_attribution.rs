@@ -25,6 +25,11 @@ pub struct AttributedImageEdit {
     pub provider_attribution: crate::usage::ProviderAttribution,
 }
 
+pub struct AttributedAnthropicRawResponse {
+    pub response: inference_providers::AnthropicRawResponse,
+    pub provider_attribution: crate::usage::ProviderAttribution,
+}
+
 pub(super) struct ServedProviderResult<T> {
     pub(super) value: T,
     pub(super) provider: Arc<dyn InferenceProvider + Send + Sync>,

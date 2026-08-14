@@ -1857,6 +1857,22 @@ mod tests {
             "duplicate canonical id dropped (first wins); the second slug is ignored"
         );
     }
+
+    #[test]
+    #[serial]
+    fn native_anthropic_messages_flag_is_hard_off_by_default() {
+        let previous = std::env::var_os("ENABLE_ANTHROPIC_MESSAGES");
+        std::env::remove_var("ENABLE_ANTHROPIC_MESSAGES");
+        assert!(!ExternalProvidersConfig::from_env().enable_anthropic_messages);
+
+        std::env::set_var("ENABLE_ANTHROPIC_MESSAGES", "TRUE");
+        assert!(ExternalProvidersConfig::from_env().enable_anthropic_messages);
+
+        match previous {
+            Some(value) => std::env::set_var("ENABLE_ANTHROPIC_MESSAGES", value),
+            None => std::env::remove_var("ENABLE_ANTHROPIC_MESSAGES"),
+        }
+    }
 }
 
 /// One Chutes model to register, parsed from a single `CHUTES_MODELS` token.
@@ -1891,6 +1907,9 @@ pub struct ExternalProvidersConfig {
     pub openai_api_key: Option<String>,
     /// Anthropic API key
     pub anthropic_api_key: Option<String>,
+    /// Expose the native Anthropic Messages routes. Hard-off by default so the
+    /// first rollout can be enabled on staging without changing production.
+    pub enable_anthropic_messages: bool,
     /// Google Gemini API key
     pub gemini_api_key: Option<String>,
     /// Default timeout for external provider requests (seconds)
@@ -1938,6 +1957,10 @@ impl ExternalProvidersConfig {
         } else {
             env::var("ANTHROPIC_API_KEY").ok()
         };
+        let enable_anthropic_messages = env::var("ENABLE_ANTHROPIC_MESSAGES")
+            .ok()
+            .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
 
         // Gemini API key
         let gemini_api_key = if let Ok(path) = env::var("GEMINI_API_KEY_FILE") {
@@ -2048,6 +2071,7 @@ impl ExternalProvidersConfig {
         Self {
             openai_api_key,
             anthropic_api_key,
+            enable_anthropic_messages,
             gemini_api_key,
             timeout_seconds,
             refresh_interval_secs,

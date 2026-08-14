@@ -7,7 +7,8 @@ pub mod converter;
 
 use super::backend::{BackendConfig, ExternalBackend};
 use crate::{
-    BufferedSSEParser, ChatCompletionParams, ChatCompletionResponse, ChatCompletionResponseChoice,
+    AnthropicRawError, AnthropicRawRequest, AnthropicRawResponse, BufferedSSEParser,
+    ChatCompletionParams, ChatCompletionResponse, ChatCompletionResponseChoice,
     ChatCompletionResponseWithBytes, ChatResponseMessage, CompletionError, MessageRole,
     StreamingResult, TokenUsage,
 };
@@ -18,7 +19,7 @@ use converter::{
     map_finish_reason_string, AnthropicEventParser, AnthropicParserState, AnthropicRequest,
     AnthropicResponse, AnthropicUsage,
 };
-use futures_util::Stream;
+use futures_util::{Stream, StreamExt as _};
 use reqwest::{header::HeaderValue, Client};
 
 const DEFAULT_ANTHROPIC_VERSION: &str = "2023-06-01";
@@ -230,6 +231,43 @@ impl AnthropicBackend {
         Ok(headers)
     }
 
+    fn build_raw_headers(
+        &self,
+        config: &BackendConfig,
+        request: &AnthropicRawRequest,
+    ) -> Result<reqwest::header::HeaderMap, AnthropicRawError> {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            reqwest::header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        );
+
+        let api_key = HeaderValue::from_str(&config.api_key).map_err(|error| {
+            AnthropicRawError::Transport(format!("invalid upstream credential: {error}"))
+        })?;
+        headers.insert("x-api-key", api_key);
+
+        let version = request
+            .headers
+            .version
+            .as_deref()
+            .or_else(|| config.extra.get("version").map(String::as_str))
+            .unwrap_or(DEFAULT_ANTHROPIC_VERSION);
+        let version = HeaderValue::from_str(version).map_err(|error| {
+            AnthropicRawError::InvalidRequest(format!("invalid anthropic-version header: {error}"))
+        })?;
+        headers.insert("anthropic-version", version);
+
+        if let Some(beta) = request.headers.beta.as_deref() {
+            let beta = HeaderValue::from_str(beta).map_err(|error| {
+                AnthropicRawError::InvalidRequest(format!("invalid anthropic-beta header: {error}"))
+            })?;
+            headers.insert("anthropic-beta", beta);
+        }
+
+        Ok(headers)
+    }
+
     fn build_request(
         &self,
         model: &str,
@@ -425,11 +463,204 @@ impl ExternalBackend for AnthropicBackend {
             serving_tier: crate::ProviderTier::NonAttested,
         })
     }
+
+    async fn anthropic_raw(
+        &self,
+        config: &BackendConfig,
+        model: &str,
+        mut request: AnthropicRawRequest,
+    ) -> Result<AnthropicRawResponse, AnthropicRawError> {
+        let body = request.body.as_object_mut().ok_or_else(|| {
+            AnthropicRawError::InvalidRequest("request body must be a JSON object".to_string())
+        })?;
+        body.insert(
+            "model".to_string(),
+            serde_json::Value::String(model.to_string()),
+        );
+
+        let mut url =
+            reqwest::Url::parse(&format!("{}/{}", config.base_url, request.endpoint.path()))
+                .map_err(|_| {
+                    AnthropicRawError::Transport("invalid upstream base URL".to_string())
+                })?;
+        url.set_query(request.beta.then_some("beta=true"));
+        let headers = self.build_raw_headers(config, &request)?;
+        let timeout = std::time::Duration::from_secs(config.timeout_seconds as u64);
+
+        let response = self
+            .client
+            .post(url)
+            .headers(headers)
+            .timeout(timeout)
+            .json(&request.body)
+            .send()
+            .await
+            .map_err(|error| AnthropicRawError::Transport(error.without_url().to_string()))?;
+
+        let status = response.status();
+        let headers = response.headers().clone();
+        let body = response.bytes_stream().map(|chunk| {
+            chunk.map_err(|error| AnthropicRawError::Transport(error.without_url().to_string()))
+        });
+
+        Ok(AnthropicRawResponse {
+            status,
+            headers,
+            body: Box::pin(body),
+        })
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{AnthropicRawEndpoint, AnthropicRawHeaders};
+
+    async fn collect_raw_body(mut response: AnthropicRawResponse) -> Vec<u8> {
+        let mut body = Vec::new();
+        while let Some(chunk) = response.body.next().await {
+            body.extend_from_slice(&chunk.expect("raw response body chunk"));
+        }
+        body
+    }
+
+    fn raw_test_config(base_url: String) -> BackendConfig {
+        let mut extra = std::collections::HashMap::new();
+        extra.insert("version".to_string(), "2023-06-01".to_string());
+        BackendConfig {
+            base_url,
+            api_key: "upstream-secret".to_string(),
+            timeout_seconds: 30,
+            extra,
+            extra_request_body: std::collections::HashMap::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn raw_messages_rewrites_only_model_and_preserves_upstream_response() {
+        use wiremock::matchers::{body_json, header, method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/messages"))
+            .and(query_param("beta", "true"))
+            .and(header("x-api-key", "upstream-secret"))
+            .and(header("anthropic-version", "2024-10-22"))
+            .and(header("anthropic-beta", "prompt-caching-2024-07-31"))
+            .and(body_json(serde_json::json!({
+                "model": "claude-remote",
+                "max_tokens": 17,
+                "messages": [{"role": "user", "content": "hello"}],
+                "future_field": {"nested": [1, 2, 3]}
+            })))
+            .respond_with(
+                ResponseTemplate::new(429)
+                    .insert_header("retry-after", "7")
+                    .set_body_raw(
+                        r#"{"type":"error","error":{"type":"rate_limit_error","message":"slow down"}}"#,
+                        "application/json",
+                    ),
+            )
+            .mount(&server)
+            .await;
+
+        let backend = AnthropicBackend::new();
+        let response = backend
+            .anthropic_raw(
+                &raw_test_config(server.uri()),
+                "claude-remote",
+                AnthropicRawRequest {
+                    endpoint: AnthropicRawEndpoint::Messages,
+                    beta: true,
+                    body: serde_json::json!({
+                        "model": "anthropic/claude-cloud",
+                        "max_tokens": 17,
+                        "messages": [{"role": "user", "content": "hello"}],
+                        "future_field": {"nested": [1, 2, 3]}
+                    }),
+                    headers: AnthropicRawHeaders {
+                        version: Some("2024-10-22".to_string()),
+                        beta: Some("prompt-caching-2024-07-31".to_string()),
+                    },
+                },
+            )
+            .await
+            .expect("raw request should return the upstream response");
+
+        assert_eq!(response.status, reqwest::StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(response.headers.get("retry-after").unwrap(), "7");
+        let body = collect_raw_body(response).await;
+        assert_eq!(
+            body,
+            br#"{"type":"error","error":{"type":"rate_limit_error","message":"slow down"}}"#
+        );
+    }
+
+    #[tokio::test]
+    async fn raw_count_tokens_uses_separate_path_and_configured_version() {
+        use wiremock::matchers::{body_json, header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/messages/count_tokens"))
+            .and(header("anthropic-version", "2023-06-01"))
+            .and(body_json(serde_json::json!({
+                "model": "claude-remote",
+                "messages": [{"role": "user", "content": "hello"}]
+            })))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw(r#"{"input_tokens":9}"#, "application/json"),
+            )
+            .mount(&server)
+            .await;
+
+        let backend = AnthropicBackend::new();
+        let response = backend
+            .anthropic_raw(
+                &raw_test_config(server.uri()),
+                "claude-remote",
+                AnthropicRawRequest {
+                    endpoint: AnthropicRawEndpoint::CountTokens,
+                    beta: false,
+                    body: serde_json::json!({
+                        "model": "claude-cloud",
+                        "messages": [{"role": "user", "content": "hello"}]
+                    }),
+                    headers: AnthropicRawHeaders::default(),
+                },
+            )
+            .await
+            .expect("count_tokens passthrough should succeed");
+
+        assert_eq!(response.status, reqwest::StatusCode::OK);
+        assert_eq!(collect_raw_body(response).await, br#"{"input_tokens":9}"#);
+    }
+
+    #[tokio::test]
+    async fn raw_request_rejects_non_object_body_before_network() {
+        let backend = AnthropicBackend::new();
+        let result = backend
+            .anthropic_raw(
+                &raw_test_config("http://127.0.0.1:1".to_string()),
+                "claude-remote",
+                AnthropicRawRequest {
+                    endpoint: AnthropicRawEndpoint::Messages,
+                    beta: false,
+                    body: serde_json::json!(["not", "an", "object"]),
+                    headers: AnthropicRawHeaders::default(),
+                },
+            )
+            .await;
+
+        let Err(error) = result else {
+            panic!("array body must be rejected locally");
+        };
+
+        assert!(matches!(error, AnthropicRawError::InvalidRequest(_)));
+    }
 
     #[test]
     fn test_build_headers_default_version() {

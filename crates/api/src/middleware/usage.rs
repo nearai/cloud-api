@@ -9,7 +9,7 @@ use std::{future::Future, pin::Pin, sync::Arc};
 use tracing::{debug, warn};
 
 use super::auth::AuthenticatedApiKey;
-use crate::models::ErrorResponse;
+use crate::models::{AnthropicErrorResponse, ErrorResponse};
 use crate::routes::common::format_amount;
 
 pub trait StakingFarmPreflightSync: Send + Sync {
@@ -233,6 +233,42 @@ pub async fn usage_check_middleware(
         })?;
 
     check_usage_for_api_key(&state, api_key).await?;
+    Ok(next.run(request).await)
+}
+
+/// Spend-limit middleware for the native Anthropic routes, with the error
+/// envelope Anthropic SDKs expect.
+pub async fn anthropic_usage_check_middleware(
+    State(state): State<UsageState>,
+    request: Request,
+    next: Next,
+) -> Result<Response, (StatusCode, axum::Json<AnthropicErrorResponse>)> {
+    let api_key = request
+        .extensions()
+        .get::<AuthenticatedApiKey>()
+        .ok_or_else(|| {
+            (
+                StatusCode::UNAUTHORIZED,
+                axum::Json(AnthropicErrorResponse::new(
+                    "authentication_error",
+                    "API key authentication required",
+                )),
+            )
+        })?;
+
+    check_usage_for_api_key(&state, api_key)
+        .await
+        .map_err(|(status, axum::Json(error))| {
+            let error_type = if status.is_server_error() {
+                "api_error"
+            } else {
+                "invalid_request_error"
+            };
+            (
+                status,
+                axum::Json(AnthropicErrorResponse::new(error_type, error.error.message)),
+            )
+        })?;
     Ok(next.run(request).await)
 }
 

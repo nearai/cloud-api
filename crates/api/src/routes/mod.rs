@@ -1,4 +1,5 @@
 pub mod admin;
+pub mod anthropic;
 pub mod api;
 pub mod attestation;
 pub mod auth;

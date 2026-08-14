@@ -4,18 +4,22 @@
 //! - `cloud_api.http.requests` - Count of HTTP requests by method, endpoint, status
 //! - `cloud_api.http.duration` - Histogram of request durations by method, endpoint
 //!
-//! Endpoints are normalized to replace UUIDs with `{id}` to reduce cardinality.
+//! Endpoints use Axum's matched route templates. Requests that do not match a
+//! registered route use a single `/unmatched` bucket.
 
-use axum::{body::Body, extract::State, http::Request, middleware::Next, response::Response};
-use services::{
-    id_prefixes::ALL_PREFIXES,
-    metrics::{
-        consts::{
-            get_environment, METRIC_HTTP_DURATION, METRIC_HTTP_REQUESTS, TAG_ENDPOINT,
-            TAG_ENVIRONMENT, TAG_METHOD, TAG_STATUS_CODE,
-        },
-        MetricsServiceTrait,
+use axum::{
+    body::Body,
+    extract::{MatchedPath, State},
+    http::{Method, Request},
+    middleware::Next,
+    response::Response,
+};
+use services::metrics::{
+    consts::{
+        get_environment, METRIC_HTTP_DURATION, METRIC_HTTP_REQUESTS, TAG_ENDPOINT, TAG_ENVIRONMENT,
+        TAG_METHOD, TAG_STATUS_CODE,
     },
+    MetricsServiceTrait,
 };
 use std::sync::Arc;
 use std::time::Instant;
@@ -26,6 +30,21 @@ pub struct MetricsState {
     pub metrics_service: Arc<dyn MetricsServiceTrait>,
 }
 
+fn bounded_method(method: &Method) -> &'static str {
+    match method.as_str() {
+        "GET" => "GET",
+        "POST" => "POST",
+        "PUT" => "PUT",
+        "PATCH" => "PATCH",
+        "DELETE" => "DELETE",
+        "HEAD" => "HEAD",
+        "OPTIONS" => "OPTIONS",
+        "TRACE" => "TRACE",
+        "CONNECT" => "CONNECT",
+        _ => "OTHER",
+    }
+}
+
 /// Middleware that records HTTP request metrics
 pub async fn http_metrics_middleware(
     State(state): State<MetricsState>,
@@ -33,15 +52,18 @@ pub async fn http_metrics_middleware(
     next: Next,
 ) -> Response {
     let start = Instant::now();
-    let method = req.method().to_string();
-    let path = req.uri().path().to_string();
+    let method = bounded_method(req.method());
+    let endpoint = req
+        .extensions()
+        .get::<MatchedPath>()
+        .map(MatchedPath::as_str)
+        .unwrap_or("/unmatched")
+        .to_owned();
 
     let response = next.run(req).await;
     let duration = start.elapsed();
     let status = response.status().as_u16();
 
-    // Normalize path to reduce cardinality (replace UUIDs with {id})
-    let endpoint = normalize_path(&path);
     let environment = get_environment();
 
     let tags = [
@@ -62,93 +84,99 @@ pub async fn http_metrics_middleware(
     response
 }
 
-/// Normalize path by replacing UUIDs and dynamic IDs with `{id}` to reduce cardinality.
-///
-/// Examples:
-/// - `/v1/workspaces/abc12345-1234-5678-9abc-def012345678/api-keys` -> `/v1/workspaces/{id}/api-keys`
-/// - `/v1/responses/resp_abc123` -> `/v1/responses/{id}`
-fn normalize_path(path: &str) -> String {
-    path.split('/')
-        .map(|segment| {
-            if is_uuid(segment) || is_dynamic_id(segment) {
-                "{id}"
-            } else {
-                segment
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("/")
-}
-
-/// Check if a string looks like a UUID (8-4-4-4-12 hex pattern)
-fn is_uuid(s: &str) -> bool {
-    if s.len() != 36 {
-        return false;
-    }
-    let parts: Vec<&str> = s.split('-').collect();
-    if parts.len() != 5 {
-        return false;
-    }
-    let expected_lens = [8, 4, 4, 4, 12];
-    parts
-        .iter()
-        .zip(expected_lens.iter())
-        .all(|(part, &len)| part.len() == len && part.chars().all(|c| c.is_ascii_hexdigit()))
-}
-
-/// Check if a string looks like a dynamic ID (e.g., chatcmpl-xxx, resp_xxx, sk-xxx)
-fn is_dynamic_id(s: &str) -> bool {
-    ALL_PREFIXES.iter().any(|prefix| s.starts_with(prefix))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::{
+        http::{Method, StatusCode},
+        middleware::from_fn_with_state,
+        routing::get,
+        Router,
+    };
+    use services::metrics::capturing::CapturingMetricsService;
+    use tower::ServiceExt;
 
-    #[test]
-    fn test_is_uuid() {
-        assert!(is_uuid("abc12345-1234-5678-9abc-def012345678"));
-        assert!(is_uuid("ABC12345-1234-5678-9ABC-DEF012345678"));
-        assert!(!is_uuid("not-a-uuid"));
-        assert!(!is_uuid("abc12345-1234-5678-9abc")); // too short
-        assert!(!is_uuid("abc12345-1234-5678-9abc-def012345678x")); // too long
+    fn metrics_router(metrics: Arc<CapturingMetricsService>) -> Router {
+        Router::new()
+            .nest(
+                "/v1",
+                Router::new().route("/signature/{chat_id}", get(|| async { StatusCode::OK })),
+            )
+            .fallback(|| async { StatusCode::NOT_FOUND })
+            .layer(from_fn_with_state(
+                MetricsState {
+                    metrics_service: metrics,
+                },
+                http_metrics_middleware,
+            ))
     }
 
-    #[test]
-    fn test_is_dynamic_id() {
-        assert!(is_dynamic_id("chatcmpl-abc123xyz"));
-        assert!(is_dynamic_id("resp_abc123"));
-        assert!(is_dynamic_id("sk-test123"));
-        assert!(!is_dynamic_id("models"));
-        assert!(!is_dynamic_id("health"));
+    async fn recorded_tags(method: Method, uri: &str) -> Vec<String> {
+        let metrics = Arc::new(CapturingMetricsService::new());
+        let response = metrics_router(metrics.clone())
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(uri)
+                    .body(Body::empty())
+                    .expect("test request should be valid"),
+            )
+            .await
+            .expect("test router should return a response");
+
+        assert!(matches!(
+            response.status(),
+            StatusCode::OK | StatusCode::NOT_FOUND
+        ));
+
+        metrics
+            .get_metrics()
+            .into_iter()
+            .find(|metric| metric.name == METRIC_HTTP_REQUESTS)
+            .map(|metric| metric.tags)
+            .expect("request count metric should be recorded")
     }
 
-    #[test]
-    fn test_normalize_path() {
-        // UUID normalization
-        assert_eq!(
-            normalize_path("/v1/workspaces/abc12345-1234-5678-9abc-def012345678/api-keys"),
-            "/v1/workspaces/{id}/api-keys"
-        );
+    fn recorded_tag(tags: &[String], name: &str) -> String {
+        let prefix = format!("{name}:");
+        tags.iter()
+            .find_map(|tag| tag.strip_prefix(&prefix).map(str::to_owned))
+            .expect("request count metric should have the requested tag")
+    }
 
-        // Multiple UUIDs
-        assert_eq!(
-            normalize_path("/v1/workspaces/abc12345-1234-5678-9abc-def012345678/api-keys/def12345-1234-5678-9abc-def012345678"),
-            "/v1/workspaces/{id}/api-keys/{id}"
-        );
+    #[tokio::test]
+    async fn signature_route_uses_matched_template_instead_of_bare_id() {
+        let raw_id = "0123456789abcdef0123456789abcdef";
 
-        // OpenAI-style IDs
-        assert_eq!(
-            normalize_path("/v1/responses/chatcmpl-abc123xyz"),
-            "/v1/responses/{id}"
-        );
-        assert_eq!(
-            normalize_path("/v1/responses/resp_abc123"),
-            "/v1/responses/{id}"
-        );
+        let tags = recorded_tags(Method::GET, &format!("/v1/signature/{raw_id}")).await;
+        let endpoint = recorded_tag(&tags, TAG_ENDPOINT);
 
-        // No IDs to normalize
-        assert_eq!(normalize_path("/v1/models"), "/v1/models");
-        assert_eq!(normalize_path("/health"), "/health");
+        assert_eq!(endpoint, "/v1/signature/{chat_id}");
+        assert!(!endpoint.contains(raw_id));
+        assert_eq!(recorded_tag(&tags, TAG_METHOD), "GET");
+    }
+
+    #[tokio::test]
+    async fn unmatched_scanner_path_uses_single_bounded_bucket() {
+        let scanner_path = "/wp-admin/install.php";
+
+        let tags = recorded_tags(Method::GET, scanner_path).await;
+        let endpoint = recorded_tag(&tags, TAG_ENDPOINT);
+
+        assert_eq!(endpoint, "/unmatched");
+        assert!(!endpoint.contains(scanner_path));
+    }
+
+    #[tokio::test]
+    async fn extension_scanner_method_uses_single_bounded_bucket() {
+        let raw_method = "PROPFIND";
+        let method = Method::from_bytes(raw_method.as_bytes())
+            .expect("extension method should be valid HTTP syntax");
+
+        let tags = recorded_tags(method, "/wp-admin/install.php").await;
+        let recorded_method = recorded_tag(&tags, TAG_METHOD);
+
+        assert_eq!(recorded_method, "OTHER");
+        assert!(!recorded_method.contains(raw_method));
     }
 }

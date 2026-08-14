@@ -36,10 +36,6 @@ impl StreamState {
         self.input_tokens
     }
 
-    pub fn model(&self) -> &str {
-        &self.model
-    }
-
     /// Convert one decoded Anthropic SSE `data:` JSON value into at most one
     /// OpenAI chat-completion chunk.
     pub fn convert_event(&mut self, event: &Value) -> Result<Option<Value>, CompatError> {
@@ -166,7 +162,7 @@ impl StreamState {
                     .and_then(|error| error.get("message"))
                     .and_then(Value::as_str)
                     .unwrap_or("unknown upstream error");
-                Err(CompatError::request(format!(
+                Err(CompatError::upstream(format!(
                     "Anthropic error: {error_type} - {message}"
                 )))
             }
@@ -244,7 +240,7 @@ fn update_count(
         .and_then(|value| i32::try_from(value).ok())
         .filter(|value| *value >= 0)
         .ok_or_else(|| CompatError::at(parameter, format!("{parameter} is out of range")))?;
-    *target = value;
+    *target = (*target).max(value);
     Ok(())
 }
 
@@ -319,5 +315,37 @@ mod tests {
             error.message,
             "Anthropic error: overloaded_error - try again"
         );
+        assert_eq!(error.kind, crate::CompatErrorKind::Upstream);
+    }
+
+    #[test]
+    fn cumulative_usage_does_not_regress_and_unknown_stop_reason_stops() {
+        let mut state = StreamState::new("claude-cloud".to_string(), 123);
+        state
+            .convert_event(&json!({
+                "type":"message_start",
+                "message":{"id":"msg_1","usage":{
+                    "input_tokens":10,"output_tokens":0,
+                    "cache_read_input_tokens":3,"cache_creation_input_tokens":4
+                }}
+            }))
+            .unwrap();
+
+        let finish = state
+            .convert_event(&json!({
+                "type":"message_delta",
+                "delta":{"stop_reason":"future_reason"},
+                "usage":{
+                    "input_tokens":0,"output_tokens":2,
+                    "cache_read_input_tokens":0,"cache_creation_input_tokens":0
+                }
+            }))
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(finish["choices"][0]["finish_reason"], "stop");
+        assert_eq!(finish["usage"]["prompt_tokens"], 17);
+        assert_eq!(finish["usage"]["completion_tokens"], 2);
+        assert_eq!(finish["usage"]["prompt_tokens_details"]["cached_tokens"], 3);
     }
 }

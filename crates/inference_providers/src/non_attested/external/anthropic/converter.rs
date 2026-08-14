@@ -868,11 +868,6 @@ impl AnthropicParserState {
     fn input_tokens(&self) -> i32 {
         self.inner.input_tokens()
     }
-
-    #[cfg(test)]
-    pub(crate) fn model(&self) -> &str {
-        self.inner.model()
-    }
 }
 
 /// Anthropic event parser
@@ -887,13 +882,21 @@ impl SSEEventParser for AnthropicEventParser {
     ) -> Result<Option<StreamChunk>, CompletionError> {
         let event: serde_json::Value = serde_json::from_str(data)
             .map_err(|_| CompletionError::InvalidResponse("Failed to parse event".to_string()))?;
-        let converted = state.inner.convert_event(&event).map_err(|error| {
-            if error.message.starts_with("Anthropic error:") {
-                CompletionError::CompletionError(error.message)
-            } else {
-                CompletionError::InvalidResponse("Failed to convert event".to_string())
-            }
-        })?;
+        let converted = state
+            .inner
+            .convert_event(&event)
+            .map_err(|error| match error.kind {
+                anthropic_compat::CompatErrorKind::Upstream => {
+                    CompletionError::CompletionError(error.message)
+                }
+                anthropic_compat::CompatErrorKind::Conversion => {
+                    tracing::warn!(
+                        parameter = error.parameter.as_deref().unwrap_or("request"),
+                        "failed to convert Anthropic stream event"
+                    );
+                    CompletionError::InvalidResponse("Failed to convert event".to_string())
+                }
+            })?;
         converted
             .map(|chunk| {
                 serde_json::from_value(chunk)

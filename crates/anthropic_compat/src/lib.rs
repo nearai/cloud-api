@@ -44,13 +44,21 @@ pub struct ConvertedRequest {
 #[derive(Debug, thiserror::Error, Clone, PartialEq, Eq)]
 #[error("{message}")]
 pub struct CompatError {
+    pub kind: CompatErrorKind,
     pub parameter: Option<String>,
     pub message: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompatErrorKind {
+    Conversion,
+    Upstream,
 }
 
 impl CompatError {
     fn at(parameter: impl Into<String>, message: impl Into<String>) -> Self {
         Self {
+            kind: CompatErrorKind::Conversion,
             parameter: Some(parameter.into()),
             message: message.into(),
         }
@@ -58,6 +66,15 @@ impl CompatError {
 
     fn request(message: impl Into<String>) -> Self {
         Self {
+            kind: CompatErrorKind::Conversion,
+            parameter: None,
+            message: message.into(),
+        }
+    }
+
+    fn upstream(message: impl Into<String>) -> Self {
+        Self {
+            kind: CompatErrorKind::Upstream,
             parameter: None,
             message: message.into(),
         }
@@ -79,7 +96,8 @@ pub fn convert_openai_request(
         .as_object()
         .ok_or_else(|| CompatError::request("request body must be a JSON object"))?;
 
-    reject_premium_features(request)?;
+    let mut warnings = Vec::new();
+    validate_premium_features(request, &mut warnings)?;
 
     let messages = request
         .get("messages")
@@ -92,9 +110,19 @@ pub fn convert_openai_request(
         ));
     }
 
-    let mut warnings = Vec::new();
     let (mut system, mut messages) = convert_messages(messages, &mut warnings)?;
-    let mut tools = convert_tools(request.get("tools"), &mut warnings)?;
+    if messages.is_empty() {
+        return Err(CompatError::at(
+            "messages",
+            "messages must contain at least one non-empty user or assistant message",
+        ));
+    }
+    let tool_choice_none = request.get("tool_choice").and_then(Value::as_str) == Some("none");
+    let mut tools = if tool_choice_none {
+        None
+    } else {
+        convert_tools(request.get("tools"), &mut warnings)?
+    };
     clamp_cache_breakpoints(
         &mut tools,
         &mut system,
@@ -126,14 +154,14 @@ pub fn convert_openai_request(
     if let Some(tools) = tools {
         output.insert("tools".to_string(), Value::Array(tools));
     }
-    if let Some(tool_choice) = convert_tool_choice(request.get("tool_choice"))? {
+    if let Some(tool_choice) = convert_tool_choice(request.get("tool_choice"), &mut warnings)? {
         output.insert("tool_choice".to_string(), tool_choice);
     }
     if let Some(stop) = convert_stop(request.get("stop"))? {
         output.insert("stop_sequences".to_string(), stop);
     }
 
-    copy_sampling_parameters(request, &options.model, &mut output)?;
+    copy_sampling_parameters(request, &options.model, &mut output, &mut warnings)?;
     copy_anthropic_extensions(request, &mut output)?;
     collect_parameter_warnings(request, &mut warnings);
     deduplicate_warnings(&mut warnings);
@@ -144,7 +172,10 @@ pub fn convert_openai_request(
     })
 }
 
-fn reject_premium_features(request: &Map<String, Value>) -> Result<(), CompatError> {
+fn validate_premium_features(
+    request: &Map<String, Value>,
+    warnings: &mut Vec<ConversionWarning>,
+) -> Result<(), CompatError> {
     if request.get("speed").and_then(Value::as_str) == Some("fast") {
         return Err(CompatError::at(
             "speed",
@@ -153,23 +184,23 @@ fn reject_premium_features(request: &Map<String, Value>) -> Result<(), CompatErr
     }
     if request
         .get("service_tier")
-        .and_then(Value::as_str)
-        .is_some_and(|tier| tier != "standard_only")
+        .filter(|value| !value.is_null())
+        .is_some_and(|value| value.as_str() != Some("standard_only"))
     {
-        return Err(CompatError::at(
-            "service_tier",
-            "only service_tier=standard_only is supported",
-        ));
+        warnings.push(ConversionWarning {
+            parameter: "service_tier".to_string(),
+            reason: "OpenAI service tier is not forwarded to Anthropic",
+        });
     }
     for parameter in ["inference_geo", "mcp_servers", "container"] {
-        if request.contains_key(parameter) {
+        if request.get(parameter).is_some_and(|value| !value.is_null()) {
             return Err(CompatError::at(
                 parameter,
                 format!("{parameter} is not supported through Chat Completions"),
             ));
         }
     }
-    if contains_one_hour_cache_control(&Value::Object(request.clone())) {
+    if request_contains_one_hour_cache_control(request) {
         return Err(CompatError::at(
             "cache_control",
             "one-hour prompt caching is not supported yet",
@@ -178,16 +209,56 @@ fn reject_premium_features(request: &Map<String, Value>) -> Result<(), CompatErr
     Ok(())
 }
 
-fn contains_one_hour_cache_control(value: &Value) -> bool {
-    match value {
-        Value::Object(object) => {
-            object.get("cache_control").is_some_and(|cache_control| {
-                cache_control.get("ttl").and_then(Value::as_str) == Some("1h")
-            }) || object.values().any(contains_one_hour_cache_control)
-        }
-        Value::Array(values) => values.iter().any(contains_one_hour_cache_control),
-        _ => false,
-    }
+fn cache_control_is_one_hour(value: Option<&Value>) -> bool {
+    value
+        .and_then(Value::as_object)
+        .and_then(|cache_control| cache_control.get("ttl"))
+        .and_then(Value::as_str)
+        == Some("1h")
+}
+
+fn object_has_one_hour_cache_control(object: &Map<String, Value>) -> bool {
+    cache_control_is_one_hour(object.get("cache_control"))
+}
+
+fn request_contains_one_hour_cache_control(request: &Map<String, Value>) -> bool {
+    cache_control_is_one_hour(request.get("cache_control"))
+        || request
+            .get("messages")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_object)
+            .any(|message| {
+                object_has_one_hour_cache_control(message)
+                    || message
+                        .get("content")
+                        .and_then(Value::as_array)
+                        .into_iter()
+                        .flatten()
+                        .filter_map(Value::as_object)
+                        .any(object_has_one_hour_cache_control)
+                    || message
+                        .get("tool_calls")
+                        .and_then(Value::as_array)
+                        .into_iter()
+                        .flatten()
+                        .filter_map(Value::as_object)
+                        .any(object_has_one_hour_cache_control)
+            })
+        || request
+            .get("tools")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_object)
+            .any(|tool| {
+                object_has_one_hour_cache_control(tool)
+                    || tool
+                        .get("function")
+                        .and_then(Value::as_object)
+                        .is_some_and(object_has_one_hour_cache_control)
+            })
 }
 
 fn integer_parameter(
@@ -233,20 +304,18 @@ fn convert_messages(
                 let content = object.get("content").unwrap_or(&Value::Null);
                 let mut blocks = convert_content(content, ContentMode::User, &path)?;
                 apply_message_cache_control(object, &mut blocks);
-                if blocks.is_empty() {
-                    blocks.push(text_block("", None));
+                if !blocks.is_empty() {
+                    push_or_merge_turn(&mut turns, "user", blocks);
                 }
-                push_or_merge_turn(&mut turns, "user", blocks);
             }
             "assistant" => {
                 let content = object.get("content").unwrap_or(&Value::Null);
                 let mut blocks = convert_content(content, ContentMode::Assistant, &path)?;
                 blocks.extend(convert_tool_calls(object.get("tool_calls"), &path)?);
                 apply_message_cache_control(object, &mut blocks);
-                if blocks.is_empty() {
-                    blocks.push(text_block("", None));
+                if !blocks.is_empty() {
+                    push_or_merge_turn(&mut turns, "assistant", blocks);
                 }
-                push_or_merge_turn(&mut turns, "assistant", blocks);
             }
             "tool" => {
                 let tool_use_id = object
@@ -308,12 +377,18 @@ fn convert_content(
 ) -> Result<Vec<Value>, CompatError> {
     match content {
         Value::Null => Ok(Vec::new()),
-        Value::String(text) => Ok(vec![text_block(text, None)]),
-        Value::Array(parts) => parts
+        Value::String(text) => Ok((!text.is_empty())
+            .then(|| text_block(text, None))
+            .into_iter()
+            .collect()),
+        Value::Array(parts) => Ok(parts
             .iter()
             .enumerate()
             .map(|(index, part)| convert_content_part(part, mode, message_path, index))
-            .collect(),
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .flatten()
+            .collect()),
         _ => Err(CompatError::at(
             format!("{message_path}.content"),
             "message content must be a string, array, or null",
@@ -326,7 +401,7 @@ fn convert_content_part(
     mode: ContentMode,
     message_path: &str,
     index: usize,
-) -> Result<Value, CompatError> {
+) -> Result<Option<Value>, CompatError> {
     let path = format!("{message_path}.content[{index}]");
     let object = part
         .as_object()
@@ -343,11 +418,12 @@ fn convert_content_part(
                 .get("text")
                 .and_then(Value::as_str)
                 .ok_or_else(|| CompatError::at(format!("{path}.text"), "text must be a string"))?;
-            Ok(text_block(text, cache_control))
+            Ok((!text.is_empty()).then(|| text_block(text, cache_control)))
         }
         "image_url" | "input_image" if matches!(mode, ContentMode::User) => {
-            convert_image_part(object, cache_control, &path)
+            convert_image_part(object, cache_control, &path).map(Some)
         }
+        "image_url" | "input_image" if matches!(mode, ContentMode::ToolResult) => Ok(None),
         "image_url" | "input_image" => Err(CompatError::at(
             format!("{path}.type"),
             "images are supported only in user messages",
@@ -561,7 +637,11 @@ fn convert_tools(
             let mut converted = Map::new();
             converted.insert("name".to_string(), Value::String(name.to_string()));
             converted.insert("input_schema".to_string(), input_schema);
-            if let Some(description) = function.get("description").cloned() {
+            if let Some(description) = function
+                .get("description")
+                .filter(|value| !value.is_null())
+                .cloned()
+            {
                 converted.insert("description".to_string(), description);
             }
             if let Some(cache_control) = object
@@ -585,7 +665,10 @@ fn convert_tools(
     Ok(Some(converted))
 }
 
-fn convert_tool_choice(tool_choice: Option<&Value>) -> Result<Option<Value>, CompatError> {
+fn convert_tool_choice(
+    tool_choice: Option<&Value>,
+    warnings: &mut Vec<ConversionWarning>,
+) -> Result<Option<Value>, CompatError> {
     let Some(choice) = tool_choice.filter(|value| !value.is_null()) else {
         return Ok(None);
     };
@@ -594,10 +677,13 @@ fn convert_tool_choice(tool_choice: Option<&Value>) -> Result<Option<Value>, Com
             "auto" => Ok(Some(json!({"type": "auto"}))),
             "required" => Ok(Some(json!({"type": "any"}))),
             "none" => Ok(None),
-            other => Err(CompatError::at(
-                "tool_choice",
-                format!("unsupported tool_choice: {other}"),
-            )),
+            _ => {
+                warnings.push(ConversionWarning {
+                    parameter: "tool_choice".to_string(),
+                    reason: "unknown tool choice mapped to auto",
+                });
+                Ok(Some(json!({"type": "auto"})))
+            }
         },
         Value::Object(object) => {
             let name = object
@@ -639,11 +725,20 @@ fn copy_sampling_parameters(
     request: &Map<String, Value>,
     model: &str,
     output: &mut Map<String, Value>,
+    warnings: &mut Vec<ConversionWarning>,
 ) -> Result<(), CompatError> {
     if MODELS_REJECTING_SAMPLING
         .iter()
         .any(|fragment| model.contains(fragment))
     {
+        for parameter in ["temperature", "top_p"] {
+            if request.get(parameter).is_some_and(|value| !value.is_null()) {
+                warnings.push(ConversionWarning {
+                    parameter: parameter.to_string(),
+                    reason: "sampling controls are not supported by this Anthropic model",
+                });
+            }
+        }
         return Ok(());
     }
 
@@ -661,6 +756,12 @@ fn copy_sampling_parameters(
             "temperature".to_string(),
             Value::from(value.clamp(0.0, 1.0)),
         );
+        if request.get("top_p").is_some_and(|value| !value.is_null()) {
+            warnings.push(ConversionWarning {
+                parameter: "top_p".to_string(),
+                reason: "not forwarded when temperature is set",
+            });
+        }
     } else if let Some(top_p) = request.get("top_p").filter(|value| !value.is_null()) {
         let value = top_p
             .as_f64()
@@ -861,6 +962,10 @@ mod tests {
         assert!(converted.body.get("top_p").is_none());
         assert_eq!(converted.body["system"].as_array().unwrap().len(), 2);
         assert_eq!(converted.body["messages"][0]["content"][0]["type"], "text");
+        assert!(converted
+            .warnings
+            .iter()
+            .any(|warning| warning.parameter == "top_p"));
     }
 
     #[test]
@@ -981,6 +1086,167 @@ mod tests {
             blocks[1]["source"],
             json!({"type":"base64","media_type":"image/png","data":"AAEC"})
         );
+    }
+
+    #[test]
+    fn filters_empty_text_blocks_and_ignores_images_in_tool_results() {
+        let converted = convert(json!({
+            "model":"m",
+            "messages":[
+                {"role":"user","content":[
+                    {"type":"text","text":""},
+                    {"type":"image_url","image_url":"https://example.test/a.png"}
+                ]},
+                {"role":"assistant","content":""},
+                {"role":"assistant","tool_calls":[{
+                    "id":"toolu_1","type":"function",
+                    "function":{"name":"lookup","arguments":"{}"}
+                }]},
+                {"role":"tool","tool_call_id":"toolu_1","content":[
+                    {"type":"image_url","image_url":"https://example.test/result.png"},
+                    {"type":"text","text":"result"}
+                ]}
+            ]
+        }));
+        let messages = converted.body["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[0]["content"].as_array().unwrap().len(), 1);
+        assert_eq!(messages[0]["content"][0]["type"], "image");
+        assert_eq!(messages[2]["content"][0]["content"], "result");
+        assert!(messages.iter().all(|message| message["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|block| block.get("text").and_then(Value::as_str) != Some(""))));
+
+        let error = convert_openai_request(
+            &json!({"model":"m","messages":[{"role":"user","content":""}]}),
+            &options(),
+        )
+        .unwrap_err();
+        assert_eq!(error.parameter.as_deref(), Some("messages"));
+    }
+
+    #[test]
+    fn tool_choice_none_removes_tools_and_unknown_choice_falls_back_to_auto() {
+        let none = convert(json!({
+            "model":"m",
+            "messages":[{"role":"user","content":"hi"}],
+            "tools":[{"type":"function","function":{
+                "name":"lookup","description":null,
+                "parameters":{"type":"object"}
+            }}],
+            "tool_choice":"none"
+        }));
+        assert!(none.body.get("tools").is_none());
+        assert!(none.body.get("tool_choice").is_none());
+
+        let disabled_server_tool = convert(json!({
+            "model":"m",
+            "messages":[{"role":"user","content":"hi"}],
+            "tools":[{"type":"web_search_20250305","name":"web_search"}],
+            "tool_choice":"none"
+        }));
+        assert!(disabled_server_tool.body.get("tools").is_none());
+
+        let unknown = convert(json!({
+            "model":"m",
+            "messages":[{"role":"user","content":"hi"}],
+            "tools":[{"type":"function","function":{
+                "name":"lookup","description":null,
+                "parameters":{"type":"object"}
+            }}],
+            "tool_choice":"future_choice"
+        }));
+        assert_eq!(unknown.body["tool_choice"]["type"], "auto");
+        assert!(unknown.body["tools"][0].get("description").is_none());
+        assert!(unknown
+            .warnings
+            .iter()
+            .any(|warning| warning.parameter == "tool_choice"));
+    }
+
+    #[test]
+    fn null_premium_fields_are_absent_and_openai_service_tier_is_a_warning() {
+        let converted = convert(json!({
+            "model":"m",
+            "messages":[{"role":"user","content":"hi"}],
+            "service_tier":"auto",
+            "inference_geo":null,
+            "mcp_servers":null,
+            "container":null
+        }));
+        assert!(converted.body.get("service_tier").is_none());
+        assert!(converted
+            .warnings
+            .iter()
+            .any(|warning| warning.parameter == "service_tier"));
+
+        for parameter in ["speed", "inference_geo", "mcp_servers", "container"] {
+            let mut request = json!({
+                "model":"m",
+                "messages":[{"role":"user","content":"hi"}]
+            });
+            request[parameter] = if parameter == "speed" {
+                json!("fast")
+            } else {
+                json!({})
+            };
+            assert_eq!(
+                convert_openai_request(&request, &options())
+                    .unwrap_err()
+                    .parameter
+                    .as_deref(),
+                Some(parameter)
+            );
+        }
+    }
+
+    #[test]
+    fn cache_ttl_scan_ignores_arbitrary_tool_schema_json() {
+        let converted = convert(json!({
+            "model":"m",
+            "messages":[{"role":"user","content":"hi"}],
+            "tools":[{"type":"function","function":{
+                "name":"lookup",
+                "parameters":{
+                    "type":"object",
+                    "properties":{"cache_control":{"default":{"ttl":"1h"}}}
+                }
+            }}]
+        }));
+        assert_eq!(
+            converted.body["tools"][0]["input_schema"]["properties"]["cache_control"]["default"]
+                ["ttl"],
+            "1h"
+        );
+    }
+
+    #[test]
+    fn model_specific_sampling_drops_are_explicit_warnings() {
+        let request = json!({
+            "model":"m",
+            "messages":[{"role":"user","content":"hi"}],
+            "temperature":0.5,
+            "top_p":0.9
+        });
+        let converted = convert_openai_request(
+            &request,
+            &ConvertOptions {
+                model: "claude-opus-4-7".to_string(),
+                stream: false,
+            },
+        )
+        .unwrap();
+        assert!(converted.body.get("temperature").is_none());
+        assert!(converted.body.get("top_p").is_none());
+        let parameters = converted
+            .warnings
+            .iter()
+            .map(|warning| warning.parameter.as_str())
+            .collect::<Vec<_>>();
+        assert!(parameters.contains(&"temperature"));
+        assert!(parameters.contains(&"top_p"));
     }
 
     #[test]

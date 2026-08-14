@@ -176,7 +176,8 @@ pub(crate) fn map_finish_reason(reason: Option<&str>) -> Option<&'static str> {
         Some("max_tokens" | "model_context_window_exceeded") => Some("length"),
         Some("tool_use") => Some("tool_calls"),
         Some("refusal") => Some("content_filter"),
-        Some(_) | None => None,
+        Some(_) => Some("stop"),
+        None => None,
     }
 }
 
@@ -197,6 +198,24 @@ fn strip_json_code_fence(content: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn response(content: Value, usage: Value) -> Value {
+        json!({
+            "id":"msg_1",
+            "model":"claude-upstream-dated",
+            "content":content,
+            "stop_reason":"end_turn",
+            "usage":usage,
+        })
+    }
+
+    fn options(strip_json_fence: bool) -> ResponseOptions {
+        ResponseOptions {
+            model: "claude-cloud".to_string(),
+            created: 123,
+            strip_json_fence,
+        }
+    }
 
     #[test]
     fn converts_text_tools_reasoning_and_cache_usage() {
@@ -238,5 +257,78 @@ mod tests {
             converted["usage"]["prompt_tokens_details"]["cache_creation_tokens"],
             4
         );
+    }
+
+    #[test]
+    fn production_converter_preserves_model_usage_and_json_regressions() {
+        let cases = [
+            ("```json\n{\"city\":\"Paris\"}\n```", "{\"city\":\"Paris\"}"),
+            ("```\n{\"a\":1}\n```", "{\"a\":1}"),
+            ("{\"raw\":true}", "{\"raw\":true}"),
+        ];
+        for (input, expected) in cases {
+            let (converted, _) = convert_anthropic_response(
+                &response(
+                    json!([{"type":"text","text":input}]),
+                    json!({
+                        "input_tokens":10,
+                        "output_tokens":30,
+                        "cache_read_input_tokens":80,
+                        "cache_creation_input_tokens":5,
+                    }),
+                ),
+                &options(true),
+            )
+            .unwrap();
+            assert_eq!(converted["model"], "claude-cloud");
+            assert_eq!(converted["choices"][0]["message"]["content"], expected);
+            assert_eq!(converted["usage"]["prompt_tokens"], 95);
+            assert_eq!(converted["usage"]["completion_tokens"], 30);
+            assert_eq!(converted["usage"]["total_tokens"], 125);
+            assert_eq!(
+                converted["usage"]["prompt_tokens_details"]["cached_tokens"],
+                80
+            );
+            assert_eq!(
+                converted["usage"]["prompt_tokens_details"]["cache_creation_tokens"],
+                5
+            );
+        }
+    }
+
+    #[test]
+    fn cache_creation_only_emits_details_and_no_cache_omits_them() {
+        let (creation, _) = convert_anthropic_response(
+            &response(
+                json!([]),
+                json!({
+                    "input_tokens":10,"output_tokens":3,
+                    "cache_read_input_tokens":0,"cache_creation_input_tokens":7,
+                }),
+            ),
+            &options(false),
+        )
+        .unwrap();
+        assert_eq!(creation["usage"]["prompt_tokens"], 17);
+        assert_eq!(
+            creation["usage"]["prompt_tokens_details"]["cache_creation_tokens"],
+            7
+        );
+
+        let (uncached, _) = convert_anthropic_response(
+            &response(json!([]), json!({"input_tokens":100,"output_tokens":20})),
+            &options(false),
+        )
+        .unwrap();
+        assert_eq!(uncached["usage"]["prompt_tokens"], 100);
+        assert!(uncached["usage"].get("prompt_tokens_details").is_none());
+    }
+
+    #[test]
+    fn unknown_terminal_reason_falls_back_to_stop() {
+        let mut input = response(json!([]), json!({"input_tokens":1,"output_tokens":1}));
+        input["stop_reason"] = json!("future_reason");
+        let (converted, _) = convert_anthropic_response(&input, &options(false)).unwrap();
+        assert_eq!(converted["choices"][0]["finish_reason"], "stop");
     }
 }

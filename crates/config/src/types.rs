@@ -1873,6 +1873,26 @@ mod tests {
             None => std::env::remove_var("ENABLE_ANTHROPIC_MESSAGES"),
         }
     }
+
+    #[test]
+    #[serial]
+    fn native_anthropic_beta_allowlist_is_trimmed_and_deduplicated() {
+        let previous = std::env::var_os("ANTHROPIC_ALLOWED_BETAS");
+        std::env::set_var(
+            "ANTHROPIC_ALLOWED_BETAS",
+            "future-beta-1, future-beta-2, future-beta-1, ",
+        );
+
+        assert_eq!(
+            ExternalProvidersConfig::from_env().anthropic_allowed_betas,
+            vec!["future-beta-1".to_string(), "future-beta-2".to_string()]
+        );
+
+        match previous {
+            Some(value) => std::env::set_var("ANTHROPIC_ALLOWED_BETAS", value),
+            None => std::env::remove_var("ANTHROPIC_ALLOWED_BETAS"),
+        }
+    }
 }
 
 /// One Chutes model to register, parsed from a single `CHUTES_MODELS` token.
@@ -1910,6 +1930,9 @@ pub struct ExternalProvidersConfig {
     /// Expose the native Anthropic Messages routes. Hard-off by default so the
     /// first rollout can be enabled on staging without changing production.
     pub enable_anthropic_messages: bool,
+    /// Additional native Anthropic beta tokens admitted by operations without
+    /// waiting for a Cloud API release.
+    pub anthropic_allowed_betas: Vec<String>,
     /// Google Gemini API key
     pub gemini_api_key: Option<String>,
     /// Default timeout for external provider requests (seconds)
@@ -1961,6 +1984,19 @@ impl ExternalProvidersConfig {
             .ok()
             .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
+        let mut anthropic_allowed_betas = env::var("ANTHROPIC_ALLOWED_BETAS")
+            .ok()
+            .map(|value| {
+                value
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|token| !token.is_empty())
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        anthropic_allowed_betas.sort_unstable();
+        anthropic_allowed_betas.dedup();
 
         // Gemini API key
         let gemini_api_key = if let Ok(path) = env::var("GEMINI_API_KEY_FILE") {
@@ -2072,6 +2108,7 @@ impl ExternalProvidersConfig {
             openai_api_key,
             anthropic_api_key,
             enable_anthropic_messages,
+            anthropic_allowed_betas,
             gemini_api_key,
             timeout_seconds,
             refresh_interval_secs,

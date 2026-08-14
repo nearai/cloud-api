@@ -22,6 +22,7 @@ const DEFAULT_API_KEY_RATE_LIMIT: u32 = 1000; // requests per minute
 const RATE_LIMIT_WINDOW_SECS: u64 = 60;
 const RATE_LIMIT_CACHE_MAX_CAPACITY: u64 = 50_000;
 const ANTHROPIC_COUNT_TOKENS_SCOPE: &str = "anthropic_count_tokens";
+const ANTHROPIC_COUNT_TOKENS_RATE_LIMIT: u32 = 100;
 
 #[derive(Debug)]
 struct Counter(AtomicU32);
@@ -64,15 +65,20 @@ impl RateLimitState {
     }
 
     async fn check_limit(&self, api_key_id: &str) -> (bool, u32, u32) {
+        self.check_limit_with_limit(api_key_id, self.rate_limit)
+            .await
+    }
+
+    async fn check_limit_with_limit(&self, api_key_id: &str, limit: u32) -> (bool, u32, u32) {
         let counter = self
             .key_limits
             .get_with(api_key_id.to_string(), async { Arc::new(Counter::new(0)) })
             .await;
 
         let count = counter.increment();
-        let allowed = count <= self.rate_limit;
+        let allowed = count <= limit;
 
-        (allowed, count, self.rate_limit)
+        (allowed, count, limit)
     }
 }
 
@@ -124,10 +130,11 @@ async fn check_rate_limit_for_api_key_in_scope(
     state: &RateLimitState,
     auth_key: &AuthenticatedApiKey,
     scope: &str,
+    limit: u32,
 ) -> Result<(), RateLimitedResponse> {
     let api_key_id = &auth_key.api_key.id.0;
     let bucket = format!("{scope}:{api_key_id}");
-    let (allowed, count, limit) = state.check_limit(&bucket).await;
+    let (allowed, count, limit) = state.check_limit_with_limit(&bucket, limit).await;
 
     if !allowed {
         warn!(
@@ -209,8 +216,13 @@ pub async fn anthropic_count_tokens_rate_limit_middleware(
         return Ok(next.run(request).await);
     };
 
-    if let Err((status, headers, axum::Json(error))) =
-        check_rate_limit_for_api_key_in_scope(&state, &auth_key, ANTHROPIC_COUNT_TOKENS_SCOPE).await
+    if let Err((status, headers, axum::Json(error))) = check_rate_limit_for_api_key_in_scope(
+        &state,
+        &auth_key,
+        ANTHROPIC_COUNT_TOKENS_SCOPE,
+        ANTHROPIC_COUNT_TOKENS_RATE_LIMIT,
+    )
+    .await
     {
         return Err((
             status,
@@ -267,9 +279,28 @@ mod tests {
         let count_tokens_bucket = format!("{ANTHROPIC_COUNT_TOKENS_SCOPE}:{api_key_id}");
 
         assert!(state.check_limit(api_key_id).await.0);
-        assert!(state.check_limit(&count_tokens_bucket).await.0);
+        let (_, _, limit) = state
+            .check_limit_with_limit(&count_tokens_bucket, ANTHROPIC_COUNT_TOKENS_RATE_LIMIT)
+            .await;
+        assert_eq!(limit, ANTHROPIC_COUNT_TOKENS_RATE_LIMIT);
         assert!(!state.check_limit(api_key_id).await.0);
-        assert!(!state.check_limit(&count_tokens_bucket).await.0);
+        for _ in 1..ANTHROPIC_COUNT_TOKENS_RATE_LIMIT {
+            assert!(
+                state
+                    .check_limit_with_limit(
+                        &count_tokens_bucket,
+                        ANTHROPIC_COUNT_TOKENS_RATE_LIMIT,
+                    )
+                    .await
+                    .0
+            );
+        }
+        assert!(
+            !state
+                .check_limit_with_limit(&count_tokens_bucket, ANTHROPIC_COUNT_TOKENS_RATE_LIMIT,)
+                .await
+                .0
+        );
     }
 
     #[test]

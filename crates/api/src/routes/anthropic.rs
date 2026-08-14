@@ -19,6 +19,7 @@ use inference_providers::{
     anthropic_raw::AnthropicRawBody, AnthropicRawEndpoint, AnthropicRawError, AnthropicRawHeaders,
     AnthropicRawRequest, AnthropicRawResponse,
 };
+use services::completions::ports::{CompletionError, ConcurrentRequestGuard};
 use services::models::{ModelWithPricing, ModelsError, ModelsServiceTrait};
 use services::usage::{
     five_minute_cache_write_rate, CacheWriteBilling, InferenceType, ProviderAttribution,
@@ -27,6 +28,7 @@ use services::usage::{
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
+use std::time::Duration;
 use uuid::Uuid;
 
 const MAX_SSE_USAGE_LINE_BYTES: usize = 256 * 1024;
@@ -92,6 +94,12 @@ struct NativeUsage {
 
 impl NativeUsage {
     fn apply_usage(&mut self, usage: &serde_json::Value) {
+        if let Some(usage) = usage.as_object() {
+            self.apply_usage_object(usage);
+        }
+    }
+
+    fn apply_usage_object(&mut self, usage: &serde_json::Map<String, serde_json::Value>) {
         update_non_negative(&mut self.input_tokens, usage.get("input_tokens"));
         update_non_negative(&mut self.output_tokens, usage.get("output_tokens"));
         update_non_negative(
@@ -237,20 +245,53 @@ struct NativeUsageStream {
     inner: AnthropicRawBody,
     parser: SseUsageParser,
     billing: Option<NativeBillingContext>,
+    concurrent_slot: Option<ConcurrentRequestGuard>,
+    runtime_handle: tokio::runtime::Handle,
 }
 
 impl NativeUsageStream {
     fn finish_billing(&mut self, default_reason: StopReason) {
+        // The upstream request no longer occupies provider capacity after its
+        // stream ends, errors, or is dropped by a disconnected client.
+        self.concurrent_slot.take();
         let Some(context) = self.billing.take() else {
             return;
         };
         let mut usage = self.parser.finish();
         let stop_reason = usage.stop_reason.take().unwrap_or(default_reason);
-        tokio::spawn(async move {
-            if let Err(error) = record_native_usage(context, usage, stop_reason).await {
-                tracing::error!(error = %error, "Failed to record native Anthropic stream usage");
-            }
+        spawn_native_usage_recording(self.runtime_handle.clone(), context, usage, stop_reason);
+    }
+}
+
+fn spawn_native_usage_recording(
+    handle: tokio::runtime::Handle,
+    context: NativeBillingContext,
+    usage: NativeUsage,
+    stop_reason: StopReason,
+) {
+    let task_handle = handle.clone();
+    let spawned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        handle.spawn_blocking(move || {
+            task_handle.block_on(async move {
+                match tokio::time::timeout(
+                    Duration::from_secs(2),
+                    record_native_usage(context, usage, stop_reason),
+                )
+                .await
+                {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => {
+                        tracing::error!(error = %error, "Failed to record native Anthropic stream usage");
+                    }
+                    Err(_) => {
+                        tracing::error!("Timed out recording native Anthropic stream usage");
+                    }
+                }
+            });
         });
+    }));
+    if spawned.is_err() {
+        tracing::error!("Could not schedule native Anthropic usage recording during shutdown");
     }
 }
 
@@ -327,7 +368,13 @@ async fn handle_request(
     body: Bytes,
     endpoint: AnthropicRawEndpoint,
 ) -> Response {
-    let prepared = match prepare_request(&headers, query.as_deref(), &body, endpoint) {
+    let prepared = match prepare_request(
+        &headers,
+        query.as_deref(),
+        &body,
+        endpoint,
+        &app_state.config.external_providers.anthropic_allowed_betas,
+    ) {
         Ok(prepared) => prepared,
         Err(error) => return error.into_response(),
     };
@@ -353,6 +400,29 @@ async fn handle_request(
             tracing::error!(model = %model.model_name, "Invalid native Anthropic billing context");
             return error.into_response();
         }
+    };
+
+    let concurrent_slot = if endpoint == AnthropicRawEndpoint::Messages {
+        match app_state
+            .completion_service
+            .acquire_concurrent_slot(api_key.organization.id.0, model.id, &model.model_name)
+            .await
+        {
+            Ok(slot) => Some(slot),
+            Err(CompletionError::RateLimitExceeded(message)) => {
+                return anthropic_error(StatusCode::TOO_MANY_REQUESTS, "rate_limit_error", message);
+            }
+            Err(error) => {
+                tracing::error!(error = %error, model = %model.model_name, "Failed to acquire native Anthropic concurrency slot");
+                return anthropic_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "api_error",
+                    "Failed to enforce the organization concurrency limit",
+                );
+            }
+        }
+    } else {
+        None
     };
 
     let request = AnthropicRawRequest {
@@ -407,6 +477,7 @@ async fn handle_request(
         endpoint,
         prepared.stream,
         billing,
+        concurrent_slot,
         alias_from,
     )
     .await
@@ -448,6 +519,7 @@ fn prepare_request(
     query: Option<&str>,
     body: &[u8],
     endpoint: AnthropicRawEndpoint,
+    additional_allowed_betas: &[String],
 ) -> RouteResult<PreparedRequest> {
     reject_unsupported_anthropic_headers(headers)?;
     reject_e2ee(headers)?;
@@ -505,7 +577,7 @@ fn prepare_request(
         beta_query: normalize_query(query)?,
         headers: AnthropicRawHeaders {
             version: single_header(headers, "anthropic-version")?,
-            beta: normalized_beta_header(headers)?,
+            beta: normalized_beta_header(headers, additional_allowed_betas)?,
         },
     })
 }
@@ -556,29 +628,53 @@ fn reject_unsupported_features(
         return Err(unsupported_feature("server-side fallbacks"));
     }
     if let Some(tools) = body.get("tools").and_then(serde_json::Value::as_array) {
-        // Client-executed custom tools have name/input_schema and no `type`.
-        // Anthropic's built-in/server tools are typed. Reject every typed tool
-        // so a new billable server product cannot bypass a stale name list.
-        if tools.iter().any(|tool| tool.get("type").is_some()) {
+        // Client-executed tools may omit their type or explicitly use
+        // `type: "custom"`. Other typed tools are Anthropic-hosted products;
+        // reject those so new billable server features cannot bypass policy.
+        if tools.iter().any(|tool| {
+            tool.get("type")
+                .is_some_and(|kind| kind.as_str() != Some("custom"))
+        }) {
             return Err(unsupported_feature("typed Anthropic tools"));
         }
     }
-    if contains_one_hour_cache_control(&serde_json::Value::Object(body.clone())) {
+    if request_contains_one_hour_cache_control(body) {
         return Err(unsupported_feature("one-hour prompt caching"));
     }
     Ok(())
 }
 
-fn contains_one_hour_cache_control(value: &serde_json::Value) -> bool {
+fn value_has_one_hour_cache_control(value: &serde_json::Value) -> bool {
     match value {
         serde_json::Value::Object(object) => {
             object.get("cache_control").is_some_and(|cache_control| {
                 cache_control.get("ttl").and_then(serde_json::Value::as_str) == Some("1h")
-            }) || object.values().any(contains_one_hour_cache_control)
+            })
         }
-        serde_json::Value::Array(values) => values.iter().any(contains_one_hour_cache_control),
+        serde_json::Value::Array(values) => values.iter().any(value_has_one_hour_cache_control),
         _ => false,
     }
+}
+
+fn request_contains_one_hour_cache_control(
+    body: &serde_json::Map<String, serde_json::Value>,
+) -> bool {
+    body.get("system")
+        .is_some_and(value_has_one_hour_cache_control)
+        || body
+            .get("messages")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|messages| {
+                messages.iter().any(|message| {
+                    message
+                        .get("content")
+                        .is_some_and(value_has_one_hour_cache_control)
+                })
+            })
+        || body
+            .get("tools")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|tools| tools.iter().any(value_has_one_hour_cache_control))
 }
 
 fn unsupported_feature(feature: &str) -> AnthropicRouteError {
@@ -645,12 +741,13 @@ fn single_header(headers: &HeaderMap, name: &'static str) -> RouteResult<Option<
         })
 }
 
-fn normalized_beta_header(headers: &HeaderMap) -> RouteResult<Option<String>> {
-    // Beta names change more quickly than Cloud API releases, and Claude Code
-    // routinely sends several dated tokens. Preserve them as transport data;
-    // the body policy above blocks the premium/server-side products we cannot
-    // account for. This keeps the native route a middleman instead of another
-    // schema registry.
+fn normalized_beta_header(
+    headers: &HeaderMap,
+    additional_allowed_betas: &[String],
+) -> RouteResult<Option<String>> {
+    // Keep the default surface narrow, while allowing operators to admit a
+    // newly released token through ANTHROPIC_ALLOWED_BETAS without a code
+    // deployment. Body policy still blocks unsupported server-side products.
     let mut betas = Vec::<String>::new();
     for value in headers.get_all("anthropic-beta") {
         let value = value.to_str().map_err(|_| {
@@ -665,7 +762,11 @@ fn normalized_beta_header(headers: &HeaderMap) -> RouteResult<Option<String>> {
             .map(str::trim)
             .filter(|token| !token.is_empty())
         {
-            if !ALLOWED_ANTHROPIC_BETAS.contains(&token) {
+            if !ALLOWED_ANTHROPIC_BETAS.contains(&token)
+                && !additional_allowed_betas
+                    .iter()
+                    .any(|allowed| allowed == token)
+            {
                 return Err(unsupported_feature(&format!(
                     "anthropic-beta token '{token}'"
                 )));
@@ -752,6 +853,7 @@ async fn build_upstream_response(
     endpoint: AnthropicRawEndpoint,
     stream: bool,
     billing: Option<NativeBillingContext>,
+    concurrent_slot: Option<ConcurrentRequestGuard>,
     alias_from: Option<String>,
 ) -> Response {
     let status = upstream.status;
@@ -797,6 +899,8 @@ async fn build_upstream_response(
             inner: upstream.body,
             parser: SseUsageParser::default(),
             billing,
+            concurrent_slot,
+            runtime_handle: tokio::runtime::Handle::current(),
         })
     } else {
         Body::from_stream(upstream.body)
@@ -835,7 +939,7 @@ fn parse_non_stream_usage(body: &[u8]) -> Result<NativeUsage, &'static str> {
             .map(map_stop_reason),
         ..Default::default()
     };
-    usage.apply_usage(&serde_json::Value::Object(raw_usage.clone()));
+    usage.apply_usage_object(raw_usage);
     Ok(usage)
 }
 
@@ -911,7 +1015,7 @@ fn response_from_body(
     *response.status_mut() = status;
     for (name, value) in headers {
         let Some(name) = name else { continue };
-        if !is_hop_by_hop_or_length(&name) {
+        if is_forwardable_upstream_header(&name) {
             response.headers_mut().append(name, value);
         }
     }
@@ -927,19 +1031,8 @@ fn response_from_body(
     response
 }
 
-fn is_hop_by_hop_or_length(name: &header::HeaderName) -> bool {
-    matches!(
-        name.as_str(),
-        "connection"
-            | "content-length"
-            | "keep-alive"
-            | "proxy-authenticate"
-            | "proxy-authorization"
-            | "te"
-            | "trailer"
-            | "transfer-encoding"
-            | "upgrade"
-    )
+fn is_forwardable_upstream_header(name: &header::HeaderName) -> bool {
+    matches!(name.as_str(), "content-type" | "request-id" | "retry-after")
 }
 
 fn anthropic_error(
@@ -1006,6 +1099,7 @@ mod tests {
             None,
             &serde_json::to_vec(&body).unwrap(),
             AnthropicRawEndpoint::Messages,
+            &[],
         )
         .unwrap();
 
@@ -1026,7 +1120,7 @@ mod tests {
             HeaderValue::from_static("claude-code-20250219"),
         );
         assert_eq!(
-            normalized_beta_header(&headers).unwrap().as_deref(),
+            normalized_beta_header(&headers, &[]).unwrap().as_deref(),
             Some("claude-code-20250219,interleaved-thinking-2025-05-14")
         );
 
@@ -1034,7 +1128,15 @@ mod tests {
             "anthropic-beta",
             HeaderValue::from_static("fast-mode-2026-02-01"),
         );
-        assert!(normalized_beta_header(&headers).is_err());
+        assert!(normalized_beta_header(&headers, &[]).is_err());
+
+        let additional = vec!["fast-mode-2026-02-01".to_string()];
+        assert_eq!(
+            normalized_beta_header(&headers, &additional)
+                .unwrap()
+                .as_deref(),
+            Some("fast-mode-2026-02-01")
+        );
     }
 
     #[test]
@@ -1051,6 +1153,7 @@ mod tests {
             Some("beta=true"),
             &base_body(),
             AnthropicRawEndpoint::Messages,
+            &[],
         )
         .unwrap();
 
@@ -1069,7 +1172,10 @@ mod tests {
         let headers = request_headers();
         let client_tool = serde_json::json!({
             "model": "claude-sonnet-4-6",
-            "tools": [{"name": "lookup", "input_schema": {"type": "object"}}]
+            "tools": [
+                {"name": "lookup", "input_schema": {"type": "object"}},
+                {"type": "custom", "name": "explicit", "input_schema": {"type": "object"}}
+            ]
         });
         assert!(reject_unsupported_features(&headers, client_tool.as_object().unwrap()).is_ok());
 
@@ -1086,6 +1192,22 @@ mod tests {
         ] {
             assert!(reject_unsupported_features(&headers, body.as_object().unwrap()).is_err());
         }
+
+        let tool_input_with_cache_shaped_data = serde_json::json!({
+            "messages": [{
+                "role": "assistant",
+                "content": [{
+                    "type": "tool_use",
+                    "name": "remember",
+                    "input": {"cache_control": {"ttl": "1h"}}
+                }]
+            }]
+        });
+        assert!(reject_unsupported_features(
+            &headers,
+            tool_input_with_cache_shaped_data.as_object().unwrap(),
+        )
+        .is_ok());
     }
 
     #[test]
@@ -1116,9 +1238,9 @@ mod tests {
     }
 
     #[test]
-    fn five_minute_cache_write_rate_requires_an_exact_nano_dollar_price() {
+    fn five_minute_cache_write_rate_rounds_non_divisible_prices() {
         assert_eq!(five_minute_cache_write_rate(3_000), Some(3_750));
-        assert_eq!(five_minute_cache_write_rate(1), None);
+        assert_eq!(five_minute_cache_write_rate(1), Some(1));
         assert_eq!(five_minute_cache_write_rate(-1), None);
         assert_eq!(five_minute_cache_write_rate(i64::MAX), None);
     }
@@ -1175,10 +1297,23 @@ mod tests {
     }
 
     #[test]
-    fn upstream_response_headers_drop_only_transport_headers() {
+    fn upstream_response_headers_use_a_small_safe_allowlist() {
         let mut headers = HeaderMap::new();
         headers.insert(header::CONTENT_LENGTH, HeaderValue::from_static("123"));
+        headers.insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        );
         headers.insert(header::RETRY_AFTER, HeaderValue::from_static("7"));
+        headers.insert("request-id", HeaderValue::from_static("req_synthetic"));
+        headers.insert(
+            "anthropic-organization-id",
+            HeaderValue::from_static("org_synthetic"),
+        );
+        headers.insert(
+            "anthropic-ratelimit-requests-remaining",
+            HeaderValue::from_static("42"),
+        );
         let response = response_from_bytes(
             StatusCode::TOO_MANY_REQUESTS,
             headers,
@@ -1186,6 +1321,22 @@ mod tests {
             None,
         );
         assert!(response.headers().get(header::CONTENT_LENGTH).is_none());
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "application/json"
+        );
         assert_eq!(response.headers().get(header::RETRY_AFTER).unwrap(), "7");
+        assert_eq!(
+            response.headers().get("request-id").unwrap(),
+            "req_synthetic"
+        );
+        assert!(response
+            .headers()
+            .get("anthropic-organization-id")
+            .is_none());
+        assert!(response
+            .headers()
+            .get("anthropic-ratelimit-requests-remaining")
+            .is_none());
     }
 }

@@ -1535,6 +1535,7 @@ pub fn build_completion_routes(
     {
         let messages = Router::new()
             .route("/messages", post(routes::anthropic::messages))
+            .layer(DefaultBodyLimit::max(AUDIO_TRANSCRIPTION_MAX_BODY_SIZE))
             .with_state(app_state.clone())
             .layer(from_fn_with_state(
                 usage_state.clone(),
@@ -1557,6 +1558,7 @@ pub fn build_completion_routes(
                 "/messages/count_tokens",
                 post(routes::anthropic::count_tokens),
             )
+            .layer(DefaultBodyLimit::max(AUDIO_TRANSCRIPTION_MAX_BODY_SIZE))
             .with_state(app_state.clone())
             .layer(from_fn_with_state(
                 rate_limit_state.clone(),
@@ -1572,8 +1574,8 @@ pub fn build_completion_routes(
         Router::new()
     };
 
-    // Text-based inference routes (chat/completions, image generation, audio transcription, rerank, score)
-    // Use default body limit (~2 MB) since they only accept JSON
+    // Text-based inference routes (chat/completions, image generation, audio transcription, rerank, score).
+    // The shared 25 MiB cap accommodates inline multimodal JSON payloads.
     let text_inference_routes = Router::new()
         .route("/chat/completions", post(chat_completions))
         .route("/completions", post(completions))

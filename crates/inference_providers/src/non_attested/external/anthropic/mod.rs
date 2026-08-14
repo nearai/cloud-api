@@ -470,6 +470,12 @@ impl ExternalBackend for AnthropicBackend {
         model: &str,
         mut request: AnthropicRawRequest,
     ) -> Result<AnthropicRawResponse, AnthropicRawError> {
+        let streaming = request.endpoint == crate::AnthropicRawEndpoint::Messages
+            && request
+                .body
+                .get("stream")
+                .and_then(serde_json::Value::as_bool)
+                == Some(true);
         let body = request.body.as_object_mut().ok_or_else(|| {
             AnthropicRawError::InvalidRequest("request body must be a JSON object".to_string())
         })?;
@@ -487,15 +493,23 @@ impl ExternalBackend for AnthropicBackend {
         let headers = self.build_raw_headers(config, &request)?;
         let timeout = std::time::Duration::from_secs(config.timeout_seconds as u64);
 
-        let response = self
-            .client
-            .post(url)
-            .headers(headers)
-            .timeout(timeout)
-            .json(&request.body)
-            .send()
-            .await
-            .map_err(|error| AnthropicRawError::Transport(error.without_url().to_string()))?;
+        let request_builder = self.client.post(url).headers(headers).json(&request.body);
+        let response = if streaming {
+            tokio::time::timeout(timeout, request_builder.send())
+                .await
+                .map_err(|_| {
+                    AnthropicRawError::Transport(
+                        "timed out waiting for Anthropic response headers".to_string(),
+                    )
+                })?
+                .map_err(|error| AnthropicRawError::Transport(error.without_url().to_string()))?
+        } else {
+            request_builder
+                .timeout(timeout)
+                .send()
+                .await
+                .map_err(|error| AnthropicRawError::Transport(error.without_url().to_string()))?
+        };
 
         let status = response.status();
         let headers = response.headers().clone();

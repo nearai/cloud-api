@@ -6,9 +6,11 @@
 //! - Response/event parsing (Anthropic → OpenAI)
 //! - Streaming state management for tool calls
 
+#[cfg(test)]
+use crate::TokenUsage;
 use crate::{
-    chunk_builder::ChunkContext, ChatMessage, CompletionError, FunctionCall, MessageRole,
-    SSEEventParser, StreamChunk, TokenUsage, ToolCall, ToolDefinition,
+    ChatMessage, CompletionError, FunctionCall, MessageRole, SSEEventParser, StreamChunk, ToolCall,
+    ToolDefinition,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -850,78 +852,26 @@ pub fn extract_response_content(
 // Streaming Parser State & Implementation
 // =============================================================================
 
-/// Active tool call being accumulated during streaming
-#[derive(Debug, Clone)]
-struct ActiveToolCall {
-    /// Accumulated JSON arguments
-    json_buffer: String,
-    /// Index in the tool_calls array (for OpenAI format)
-    index: i64,
-}
-
-/// Parser state for Anthropic streaming
+/// Thin inference-provider wrapper around the pure compatibility state machine.
 pub struct AnthropicParserState {
-    pub message_id: Option<String>,
-    pub model: String,
-    pub created: i64,
-    pub input_tokens: i32,
-    pub output_tokens: i32,
-    /// Prompt-cache tokens (read + creation) Anthropic charged us for. Reported
-    /// separately from `input_tokens` by Anthropic; we fold them into
-    /// `prompt_tokens` and surface the read portion as `cached_tokens` so the
-    /// existing OpenAI-shaped billing path bills cache reads (#666).
-    cache_read_tokens: i32,
-    cache_creation_tokens: i32,
-    tool_calls: HashMap<i64, ActiveToolCall>,
-    tool_call_counter: i64,
+    inner: anthropic_compat::StreamState,
 }
 
 impl AnthropicParserState {
     pub fn new(model: String) -> Self {
         Self {
-            message_id: None,
-            model,
-            created: chrono::Utc::now().timestamp(),
-            input_tokens: 0,
-            output_tokens: 0,
-            cache_read_tokens: 0,
-            cache_creation_tokens: 0,
-            tool_calls: HashMap::new(),
-            tool_call_counter: 0,
+            inner: anthropic_compat::StreamState::new(model, chrono::Utc::now().timestamp()),
         }
     }
 
-    /// Build the prompt-token usage for a streaming chunk.
-    ///
-    /// CRITICAL accounting (#666): Anthropic reports cache reads/creation
-    /// SEPARATELY from `input_tokens`, whereas OpenAI's `cached_tokens` is a
-    /// SUBSET of `prompt_tokens` (and `TokenUsage::cached_tokens()` caps it to
-    /// `[0, prompt_tokens]`). To both preserve that OpenAI invariant AND bill
-    /// the cache-read cost, we ADD the cache tokens into `prompt_tokens` and
-    /// report the read portion as `cached_tokens`.
-    fn prompt_tokens(&self) -> i32 {
-        self.input_tokens + self.cache_read_tokens + self.cache_creation_tokens
+    #[cfg(test)]
+    fn input_tokens(&self) -> i32 {
+        self.inner.input_tokens()
     }
 
-    /// `prompt_tokens_details` for a chunk: cache reads and writes when either
-    /// occurred, else `None` (so an uncached stream is byte-identical to before).
-    fn prompt_tokens_details(&self) -> Option<serde_json::Value> {
-        if self.cache_read_tokens > 0 || self.cache_creation_tokens > 0 {
-            Some(serde_json::json!({
-                "cached_tokens": self.cache_read_tokens,
-                "cache_creation_tokens": self.cache_creation_tokens,
-            }))
-        } else {
-            None
-        }
-    }
-
-    fn chunk_context(&self) -> ChunkContext {
-        ChunkContext::new(
-            self.message_id.clone().unwrap_or_default(),
-            self.model.clone(),
-            self.created,
-        )
+    #[cfg(test)]
+    pub(crate) fn model(&self) -> &str {
+        self.inner.model()
     }
 }
 
@@ -935,124 +885,24 @@ impl SSEEventParser for AnthropicEventParser {
         state: &mut Self::State,
         data: &str,
     ) -> Result<Option<StreamChunk>, CompletionError> {
-        let event: AnthropicStreamEvent = serde_json::from_str(data)
+        let event: serde_json::Value = serde_json::from_str(data)
             .map_err(|_| CompletionError::InvalidResponse("Failed to parse event".to_string()))?;
-
-        match event {
-            AnthropicStreamEvent::MessageStart { message } => {
-                state.message_id = Some(message.id);
-                state.input_tokens = message.usage.input_tokens;
-                // Cache-token counts are known up front (message_start), like
-                // input_tokens (#666). Capture them so an interrupted stream is
-                // still billed for the cache reads Anthropic charged us for.
-                state.cache_read_tokens = message.usage.cache_read_input_tokens;
-                state.cache_creation_tokens = message.usage.cache_creation_input_tokens;
-                let ctx = state.chunk_context();
-                // Anthropic reports input tokens up front in `message_start`, but
-                // completion tokens only in the final `message_delta`. Carry the
-                // known input tokens on the first chunk so an interrupted stream is
-                // still billed for the prompt tokens Anthropic charged us for
-                // (completion tokens stay 0 until the final chunk). On a clean
-                // stream the final chunk's full usage overwrites this.
-                let prompt_tokens = state.prompt_tokens();
-                let early_usage = TokenUsage {
-                    prompt_tokens,
-                    completion_tokens: 0,
-                    total_tokens: prompt_tokens,
-                    prompt_tokens_details: state.prompt_tokens_details(),
-                };
-                Ok(Some(StreamChunk::Chat(
-                    ctx.role_chunk_with_usage(Some(early_usage)),
-                )))
+        let converted = state.inner.convert_event(&event).map_err(|error| {
+            if error.message.starts_with("Anthropic error:") {
+                CompletionError::CompletionError(error.message)
+            } else {
+                CompletionError::InvalidResponse("Failed to convert event".to_string())
             }
-
-            AnthropicStreamEvent::ContentBlockStart {
-                index,
-                content_block,
-            } => {
-                if content_block.is_tool_use() {
-                    if let (Some(id), Some(name)) = (content_block.id, content_block.name) {
-                        let tool_index = state.tool_call_counter;
-                        state.tool_call_counter += 1;
-
-                        state.tool_calls.insert(
-                            index,
-                            ActiveToolCall {
-                                json_buffer: String::new(),
-                                index: tool_index,
-                            },
-                        );
-
-                        let ctx = state.chunk_context();
-                        return Ok(Some(StreamChunk::Chat(
-                            ctx.tool_call_start_chunk(tool_index, id, name),
-                        )));
-                    }
-                }
-                Ok(None)
-            }
-
-            AnthropicStreamEvent::ContentBlockDelta { index, delta } => {
-                let ctx = state.chunk_context();
-
-                if delta.is_text_delta() {
-                    if let Some(text) = delta.text {
-                        return Ok(Some(StreamChunk::Chat(ctx.text_chunk(text))));
-                    }
-                } else if delta.is_input_json_delta() {
-                    if let Some(partial_json) = delta.partial_json {
-                        if let Some(tool_call) = state.tool_calls.get_mut(&index) {
-                            tool_call.json_buffer.push_str(&partial_json);
-                            return Ok(Some(StreamChunk::Chat(
-                                ctx.tool_call_args_chunk(tool_call.index, partial_json),
-                            )));
-                        }
-                    }
-                }
-                Ok(None)
-            }
-
-            AnthropicStreamEvent::ContentBlockStop { index } => {
-                state.tool_calls.remove(&index);
-                Ok(None)
-            }
-
-            AnthropicStreamEvent::MessageDelta { delta, usage } => {
-                state.output_tokens = usage.output_tokens;
-                // The final message_delta usage may also restate the cache
-                // counts; prefer non-zero values so the final chunk carries the
-                // authoritative figures even if message_start was missed (#666).
-                if usage.cache_read_input_tokens > 0 {
-                    state.cache_read_tokens = usage.cache_read_input_tokens;
-                }
-                if usage.cache_creation_input_tokens > 0 {
-                    state.cache_creation_tokens = usage.cache_creation_input_tokens;
-                }
-                let ctx = state.chunk_context();
-                let finish_reason = map_finish_reason(delta.stop_reason);
-                let prompt_tokens = state.prompt_tokens();
-                let token_usage = TokenUsage {
-                    prompt_tokens,
-                    completion_tokens: state.output_tokens,
-                    total_tokens: prompt_tokens + state.output_tokens,
-                    prompt_tokens_details: state.prompt_tokens_details(),
-                };
-                Ok(Some(StreamChunk::Chat(
-                    ctx.finish_chunk(finish_reason, token_usage),
-                )))
-            }
-
-            AnthropicStreamEvent::Error { error } => {
-                tracing::warn!(backend = "anthropic", error_type = %error.type_, "Stream error received");
-                Err(CompletionError::CompletionError(format!(
-                    "Anthropic error: {} - {}",
-                    error.type_, error.message
-                )))
-            }
-
-            // Ignore Ping, MessageStop
-            _ => Ok(None),
-        }
+        })?;
+        converted
+            .map(|chunk| {
+                serde_json::from_value(chunk)
+                    .map(StreamChunk::Chat)
+                    .map_err(|_| {
+                        CompletionError::InvalidResponse("Failed to convert event".to_string())
+                    })
+            })
+            .transpose()
     }
 }
 
@@ -1286,7 +1136,7 @@ mod tests {
         assert_eq!(usage.prompt_tokens, 42);
         assert_eq!(usage.completion_tokens, 0);
         assert_eq!(usage.total_tokens, 42);
-        assert_eq!(state.input_tokens, 42);
+        assert_eq!(state.input_tokens(), 42);
     }
 
     // ── #666: prompt-caching cache_control passthrough + cache-stat surfacing ──

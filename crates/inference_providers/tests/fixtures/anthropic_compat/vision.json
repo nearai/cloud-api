@@ -1,0 +1,17 @@
+{
+  "model": "anthropic/claude-sonnet-4-6",
+  "messages": [
+    {
+      "role": "user",
+      "content": [
+        {"type": "text", "text": "Describe this synthetic image."},
+        {
+          "type": "image_url",
+          "image_url": {"url": "data:image/png;base64,iVBORw0KGgo="}
+        }
+      ]
+    }
+  ],
+  "max_tokens": 32,
+  "stream": true
+}

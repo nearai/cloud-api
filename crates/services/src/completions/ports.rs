@@ -99,6 +99,11 @@ pub struct CompletionRequest {
     /// will store a gateway signature over bytes it rewrites before returning.
     pub skip_provider_chat_signature: bool,
 
+    /// Original Chat Completions JSON, retained in memory only for a
+    /// provider-specific wire adapter. It is never logged or persisted.
+    #[serde(default, skip_serializing, skip_deserializing)]
+    pub original_request: Option<serde_json::Value>,
+
     pub extra: std::collections::HashMap<String, serde_json::Value>,
 }
 

@@ -92,7 +92,7 @@ pub trait SSEEventParser: Send + Unpin {
 /// # Type Parameters
 /// - `S`: The underlying byte stream (typically `impl Stream<Item = Result<Bytes, reqwest::Error>>`)
 /// - `P`: The provider-specific event parser implementing `SSEEventParser`
-pub struct BufferedSSEParser<S, P: SSEEventParser> {
+pub struct BufferedSSEParser<S, P: SSEEventParser, E = reqwest::Error> {
     inner: S,
     bytes_buffer: Vec<u8>,
     /// Pending results from previous process_buffer() calls.
@@ -102,12 +102,12 @@ pub struct BufferedSSEParser<S, P: SSEEventParser> {
     /// Prevents infinite error loops when the stream is broken.
     finished: bool,
     state: P::State,
-    _marker: PhantomData<P>,
+    _marker: PhantomData<(P, E)>,
 }
 
-impl<S, P> BufferedSSEParser<S, P>
+impl<S, P, E> BufferedSSEParser<S, P, E>
 where
-    S: Stream<Item = Result<Bytes, reqwest::Error>> + Unpin,
+    S: Stream<Item = Result<Bytes, E>> + Unpin,
     P: SSEEventParser,
 {
     /// Create a new buffered SSE parser with the given state
@@ -203,10 +203,11 @@ where
     }
 }
 
-impl<S, P> Stream for BufferedSSEParser<S, P>
+impl<S, P, E> Stream for BufferedSSEParser<S, P, E>
 where
-    S: Stream<Item = Result<Bytes, reqwest::Error>> + Unpin,
+    S: Stream<Item = Result<Bytes, E>> + Unpin,
     P: SSEEventParser,
+    E: std::fmt::Display + Unpin,
 {
     type Item = Result<SSEEvent, CompletionError>;
 

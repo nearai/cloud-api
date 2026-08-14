@@ -283,6 +283,11 @@ pub struct ChatCompletionParams {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub modalities: Option<Vec<String>>,
 
+    /// Original Chat Completions JSON for protocol-specific adapters. This
+    /// in-memory sidecar is never serialized to an upstream provider.
+    #[serde(default, skip_serializing, skip_deserializing)]
+    pub original_request: Option<serde_json::Value>,
+
     #[serde(flatten)]
     pub extra: std::collections::HashMap<String, serde_json::Value>,
 }

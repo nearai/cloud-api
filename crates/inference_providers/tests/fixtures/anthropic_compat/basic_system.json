@@ -1,0 +1,8 @@
+{
+  "model": "anthropic/claude-sonnet-4-6",
+  "messages": [
+    {"role": "system", "content": "Answer concisely."},
+    {"role": "user", "content": "Hello"}
+  ],
+  "max_completion_tokens": 64
+}

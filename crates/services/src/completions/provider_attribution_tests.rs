@@ -104,6 +104,7 @@ fn completion_request(model: &str) -> ports::CompletionRequest {
         body_hash: "test-body-hash".to_string(),
         response_id: None,
         skip_provider_chat_signature: true,
+        original_request: None,
         extra: std::collections::HashMap::new(),
     }
 }

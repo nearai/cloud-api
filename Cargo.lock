@@ -499,6 +499,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5192cca8006f1fd4f7237516f40fa183bb07f8fbdfedaa0036de5ea9b0b45e78"
 
 [[package]]
+name = "anthropic_compat"
+version = "0.0.0"
+dependencies = [
+ "serde_json",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "anyhow"
 version = "1.0.103"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3869,6 +3877,7 @@ dependencies = [
 name = "inference_providers"
 version = "0.0.0"
 dependencies = [
+ "anthropic_compat",
  "async-stream",
  "async-trait",
  "base64 0.22.1",

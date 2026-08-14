@@ -585,6 +585,9 @@ fn convert_chat_request_to_service(
     body_hash: RequestBodyHash,
     request_id: Uuid,
 ) -> ServiceCompletionRequest {
+    // The body-hash middleware already buffered these exact bytes. Keep one
+    // parsed in-memory copy for protocol adapters; never log or persist it.
+    let original_request = serde_json::from_slice(&body_hash.body_bytes).ok();
     // `presence_penalty` / `frequency_penalty` are typed fields on
     // `ChatCompletionRequest`, so `#[serde(flatten)] extra` never captures them.
     // The service layer hardcodes the typed `ChatCompletionParams` penalty slots
@@ -643,6 +646,7 @@ fn convert_chat_request_to_service(
         body_hash: body_hash.hash.clone(),
         response_id: None, // Direct chat completions API calls don't have a response_id
         skip_provider_chat_signature: false,
+        original_request,
         extra,
     }
 }
@@ -1273,6 +1277,7 @@ fn convert_text_request_to_service(
         body_hash: body_hash.hash.clone(),
         response_id: None, // Direct text completions API calls don't have a response_id
         skip_provider_chat_signature: false,
+        original_request: None,
         extra,
     }
 }
@@ -1487,6 +1492,11 @@ async fn chat_completions_inner(
     // (preserves raw-bytes signing) and the streaming wrap (preserves the
     // existing debug log path).
     let auto_redact_enabled = auto_redact_requested && !redaction_map.is_empty();
+    if auto_redact_enabled {
+        // The typed messages now contain placeholders. Do not let the
+        // Anthropic wire adapter bypass that mutation with the original body.
+        service_request.original_request = None;
+    }
     let redaction_map = Arc::new(redaction_map);
 
     // Check if streaming is requested

@@ -187,7 +187,22 @@ impl AmlRepository for PostgresAmlRepository {
             let rows = client
                 .query(
                     r#"
-                    SELECT *
+                    SELECT
+                        id,
+                        user_id,
+                        flow,
+                        provider,
+                        account_id,
+                        address_type,
+                        risk_level,
+                        score,
+                        report_id,
+                        reason,
+                        provider_report_time,
+                        '{}'::jsonb AS result_json,
+                        active,
+                        created_at,
+                        updated_at
                     FROM aml_reports
                     ORDER BY created_at DESC, id DESC
                     LIMIT $1 OFFSET $2

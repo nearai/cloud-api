@@ -421,8 +421,24 @@ fn aml_service_error(error: AmlError) -> (StatusCode, ResponseJson<ErrorResponse
                 "account_error".to_string(),
             )),
         ),
-        AmlError::ProviderFailure(_) | AmlError::RepositoryFailure(_) => {
-            error!(error = %error, "AML admin operation failed");
+        AmlError::ProviderFailure(_) => {
+            error!(
+                error_kind = "provider_failure",
+                "AML admin operation failed"
+            );
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ResponseJson(ErrorResponse::new(
+                    "AML operation failed".to_string(),
+                    "internal_server_error".to_string(),
+                )),
+            )
+        }
+        AmlError::RepositoryFailure(_) => {
+            error!(
+                error_kind = "repository_failure",
+                "AML admin operation failed"
+            );
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 ResponseJson(ErrorResponse::new(

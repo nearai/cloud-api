@@ -2130,17 +2130,18 @@ pub fn build_admin_routes(
     use crate::routes::admin::{
         batch_upsert_models, cancel_model_pricing_change, confirm_model_deprecation,
         confirm_model_pricing_changes, create_admin_access_token, create_service,
-        delete_admin_access_token, delete_model, deprecate_model, get_admin_organization_balance,
-        get_billing_summary, get_infra_summary, get_model_consumption_timeseries,
-        get_model_history, get_model_revenue, get_org_revenue,
+        delete_admin_access_token, delete_aml_allowlist_entry, delete_model, deprecate_model,
+        get_admin_organization_balance, get_billing_summary, get_infra_summary,
+        get_model_consumption_timeseries, get_model_history, get_model_revenue, get_org_revenue,
         get_organization as get_admin_organization, get_organization_concurrent_limit,
         get_organization_limits_history, get_organization_metrics, get_organization_timeseries,
         get_performance_timeseries, get_platform_metrics, get_platform_timeseries,
-        get_revenue_density, list_admin_access_tokens, list_invitation_email_deliveries,
-        list_model_pricing_changes, list_models as admin_list_models, list_organization_members,
-        list_organizations, list_users, preview_model_deprecation, preview_model_pricing_changes,
-        resend_invitation_email, update_organization_concurrent_limit, update_organization_limits,
-        update_service, AdminAppState,
+        get_revenue_density, list_admin_access_tokens, list_aml_allowlist, list_aml_reports,
+        list_invitation_email_deliveries, list_model_pricing_changes,
+        list_models as admin_list_models, list_organization_members, list_organizations,
+        list_users, preview_model_deprecation, preview_model_pricing_changes,
+        resend_invitation_email, update_aml_report_status, update_organization_concurrent_limit,
+        update_organization_limits, update_service, upsert_aml_allowlist_entry, AdminAppState,
     };
     use crate::routes::staking_farm::{
         get_admin_organization_staking_farm, sync_admin_organization_staking_farm,
@@ -2257,6 +2258,19 @@ pub fn build_admin_routes(
         .route(
             "/admin/organizations/{org_id}/staking/farm/sync",
             axum::routing::post(sync_admin_organization_staking_farm),
+        )
+        .route("/admin/aml/reports", axum::routing::get(list_aml_reports))
+        .route(
+            "/admin/aml/reports/{report_id}/status",
+            axum::routing::patch(update_aml_report_status),
+        )
+        .route(
+            "/admin/aml/allowlist",
+            axum::routing::get(list_aml_allowlist).post(upsert_aml_allowlist_entry),
+        )
+        .route(
+            "/admin/aml/allowlist/{account_id}",
+            axum::routing::delete(delete_aml_allowlist_entry),
         )
         .route(
             "/admin/organizations/{org_id}/concurrent-limit",
@@ -2641,6 +2655,42 @@ mod tests {
                 "OpenAPI path is missing /v1 prefix: {path}"
             );
         }
+    }
+
+    #[test]
+    fn test_openapi_admin_aml_paths_require_session_security() {
+        let spec = serde_json::to_value(ApiDoc::openapi()).unwrap();
+        let paths = spec["paths"].as_object().unwrap();
+
+        for (path, method) in [
+            ("/v1/admin/aml/reports", "get"),
+            ("/v1/admin/aml/reports/{report_id}/status", "patch"),
+            ("/v1/admin/aml/allowlist", "get"),
+            ("/v1/admin/aml/allowlist", "post"),
+            ("/v1/admin/aml/allowlist/{account_id}", "delete"),
+        ] {
+            let operation = &paths[path][method];
+            assert!(
+                operation.is_object(),
+                "missing OpenAPI operation: {method} {path}"
+            );
+            assert_eq!(
+                operation["security"],
+                serde_json::json!([{ "session_token": [] }]),
+                "{method} {path} must require session_token security"
+            );
+        }
+    }
+
+    #[test]
+    fn test_openapi_admin_aml_report_response_excludes_raw_provider_result() {
+        let spec = serde_json::to_value(ApiDoc::openapi()).unwrap();
+        let properties = spec["components"]["schemas"]["AdminAmlReportResponse"]["properties"]
+            .as_object()
+            .expect("AdminAmlReportResponse should have schema properties");
+
+        assert!(!properties.contains_key("result_json"));
+        assert!(!properties.contains_key("resultJson"));
     }
 
     /// Example of how to set up the application for E2E testing

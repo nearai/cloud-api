@@ -654,10 +654,18 @@ impl AmlService {
         report_id: Uuid,
         active: bool,
     ) -> Result<Option<AmlReport>, AmlError> {
-        self.repository
+        let report = self
+            .repository
             .set_report_active(report_id, active)
             .await
-            .map_err(|error| AmlError::RepositoryFailure(error.to_string()))
+            .map_err(|error| AmlError::RepositoryFailure(error.to_string()))?;
+
+        if let Some(report) = &report {
+            self.cache.invalidate(&report.account_id).await;
+            self.unknown_cache.invalidate(&report.account_id).await;
+        }
+
+        Ok(report)
     }
 
     pub async fn list_allowlist_entries(&self) -> Result<Vec<AmlAllowlistEntry>, AmlError> {
@@ -1499,25 +1507,41 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn report_status_mutation_updates_active_and_returns_none_for_unknown_report() {
+    async fn report_status_mutation_invalidates_cached_decision() {
         let repo = Arc::new(MockAmlRepository::default());
         let stored = report_to_stored(new_report(AmlRiskLevel::High));
         let report_id = stored.id;
-        repo.reports.lock().unwrap().push(stored);
-        let provider = Arc::new(StaticProvider(new_report(AmlRiskLevel::Low)));
-        let service = AmlService::new(repo, provider, enabled_config());
+        repo.reports.lock().unwrap().push(stored.clone());
+        *repo.latest_fresh_active.lock().unwrap() = Some(stored);
+        let provider = Arc::new(StaticProvider(NewAmlReport {
+            risk_level: AmlRiskLevel::Low,
+            score: Some(10),
+            ..new_report(AmlRiskLevel::Low)
+        }));
+        let service = AmlService::new(repo.clone(), provider, enabled_config());
+
+        let first = service
+            .check_near_account(None, "gregoshes.near", AmlFlow::UserStatus)
+            .await;
+        assert!(matches!(first, Err(AmlError::AccountBlocked)));
 
         let updated = service
             .set_report_active(report_id, false)
             .await
             .unwrap()
             .expect("known report should update");
+        *repo.latest_fresh_active.lock().unwrap() = None;
+        *repo.latest_active.lock().unwrap() = None;
+        let second = service
+            .check_near_account(None, "gregoshes.near", AmlFlow::UserStatus)
+            .await;
         let missing = service
             .set_report_active(Uuid::new_v4(), false)
             .await
             .unwrap();
 
         assert!(!updated.active);
+        assert!(matches!(second, Ok(AmlDecision::Allowed)));
         assert!(missing.is_none());
     }
 

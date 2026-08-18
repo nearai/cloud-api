@@ -1525,8 +1525,57 @@ pub fn build_completion_routes(
 ) -> Router {
     use crate::routes::files::MAX_FILE_SIZE;
 
-    // Text-based inference routes (chat/completions, image generation, audio transcription, rerank, score)
-    // Use default body limit (~2 MB) since they only accept JSON
+    // Native Anthropic Messages support is staging-gated and hard-off by
+    // default. Keep it on its own router so enabling it cannot alter the
+    // existing OpenAI-compatible routes or middleware behavior.
+    let anthropic_routes = if app_state
+        .config
+        .external_providers
+        .enable_anthropic_messages
+    {
+        let messages = Router::new()
+            .route("/messages", post(routes::anthropic::messages))
+            .layer(DefaultBodyLimit::max(AUDIO_TRANSCRIPTION_MAX_BODY_SIZE))
+            .with_state(app_state.clone())
+            .layer(from_fn_with_state(
+                usage_state.clone(),
+                middleware::usage::anthropic_usage_check_middleware,
+            ))
+            .layer(from_fn_with_state(
+                rate_limit_state.clone(),
+                middleware::rate_limit::anthropic_api_key_rate_limit_middleware,
+            ))
+            .layer(from_fn_with_state(
+                auth_state_middleware.clone(),
+                middleware::auth::anthropic_auth_middleware_with_workspace_context,
+            ));
+
+        // Token counting is free and has its own Anthropic rate-limit class.
+        // Authenticate it, but do not run spend-limit or usage-recording
+        // middleware and do not let it consume the inference request bucket.
+        let count_tokens = Router::new()
+            .route(
+                "/messages/count_tokens",
+                post(routes::anthropic::count_tokens),
+            )
+            .layer(DefaultBodyLimit::max(AUDIO_TRANSCRIPTION_MAX_BODY_SIZE))
+            .with_state(app_state.clone())
+            .layer(from_fn_with_state(
+                rate_limit_state.clone(),
+                middleware::rate_limit::anthropic_count_tokens_rate_limit_middleware,
+            ))
+            .layer(from_fn_with_state(
+                auth_state_middleware.clone(),
+                middleware::auth::anthropic_auth_middleware_with_workspace_context,
+            ));
+
+        messages.merge(count_tokens)
+    } else {
+        Router::new()
+    };
+
+    // Text-based inference routes (chat/completions, image generation, audio transcription, rerank, score).
+    // The shared 25 MiB cap accommodates inline multimodal JSON payloads.
     let text_inference_routes = Router::new()
         .route("/chat/completions", post(chat_completions))
         .route("/completions", post(completions))
@@ -1598,6 +1647,7 @@ pub fn build_completion_routes(
         .merge(text_inference_routes)
         .merge(file_inference_routes)
         .merge(metadata_routes)
+        .merge(anthropic_routes)
 }
 
 /// Build response routes with auth

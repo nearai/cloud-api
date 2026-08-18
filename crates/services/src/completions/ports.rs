@@ -3,10 +3,35 @@ use crate::UserId;
 use async_trait::async_trait;
 use inference_providers::StreamingResult;
 use serde::{Deserialize, Serialize};
+use std::sync::{
+    atomic::{AtomicU32, Ordering},
+    Arc,
+};
 use uuid::Uuid;
 
 /// Default concurrent request limit per organization per model
 pub const DEFAULT_CONCURRENT_LIMIT: u32 = 64;
+
+/// RAII lease for one organization/model concurrency slot.
+///
+/// Routes that bypass the typed completion request path can hold this guard
+/// until their upstream response body completes or is dropped.
+#[derive(Debug)]
+pub struct ConcurrentRequestGuard {
+    counter: Arc<AtomicU32>,
+}
+
+impl ConcurrentRequestGuard {
+    pub(crate) fn new(counter: Arc<AtomicU32>) -> Self {
+        Self { counter }
+    }
+}
+
+impl Drop for ConcurrentRequestGuard {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(1, Ordering::Release);
+    }
+}
 
 // Domain types defined directly here (following dependency inversion)
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -131,6 +156,15 @@ pub trait OrganizationConcurrentLimitRepository: Send + Sync {
 
 #[async_trait]
 pub trait CompletionServiceTrait: Send + Sync {
+    /// Acquire one organization/model concurrency slot for a direct transport
+    /// route. The returned lease releases the slot when dropped.
+    async fn acquire_concurrent_slot(
+        &self,
+        organization_id: Uuid,
+        model_id: Uuid,
+        model_name: &str,
+    ) -> Result<ConcurrentRequestGuard, CompletionError>;
+
     /// Create a streaming completion
     async fn create_chat_completion_stream(
         &self,

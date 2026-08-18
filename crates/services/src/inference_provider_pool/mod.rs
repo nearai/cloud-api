@@ -7,11 +7,11 @@ use inference_providers::spki_verifier::{FingerprintState, SharedTlsRoots};
 use inference_providers::{
     is_client_audio_input_status,
     models::{AttestationError, CompletionError},
-    AudioTranscriptionError, AudioTranscriptionParams, AudioTranscriptionResponse,
-    ChatCompletionParams, ExternalProvider, ExternalProviderConfig, ImageEditError,
-    ImageEditParams, ImageEditResponseWithBytes, ImageGenerationError, ImageGenerationParams,
-    ImageGenerationResponseWithBytes, InferenceProvider, ProviderConfig, RerankError, RerankParams,
-    RerankResponse, StreamingResult, StreamingResultExt,
+    AnthropicRawError, AnthropicRawRequest, AudioTranscriptionError, AudioTranscriptionParams,
+    AudioTranscriptionResponse, ChatCompletionParams, ExternalProvider, ExternalProviderConfig,
+    ImageEditError, ImageEditParams, ImageEditResponseWithBytes, ImageGenerationError,
+    ImageGenerationParams, ImageGenerationResponseWithBytes, InferenceProvider, ProviderConfig,
+    RerankError, RerankParams, RerankResponse, StreamingResult, StreamingResultExt,
 };
 use regex::Regex;
 use std::{
@@ -28,8 +28,8 @@ pub use context_routing::expand_inference_endpoints;
 mod provider_attribution;
 use provider_attribution::{served_provider_attribution, ServedProviderResult};
 pub use provider_attribution::{
-    AttributedChatCompletion, AttributedChatCompletionStream, AttributedImageEdit,
-    AttributedImageGeneration,
+    AttributedAnthropicRawResponse, AttributedChatCompletion, AttributedChatCompletionStream,
+    AttributedImageEdit, AttributedImageGeneration,
 };
 
 type InferenceProviderTrait = dyn InferenceProvider + Send + Sync;
@@ -3759,6 +3759,33 @@ impl InferenceProviderPool {
             None => inference_providers::EmbeddingError::RequestFailed(
                 "No providers available for embeddings".to_string(),
             ),
+        })
+    }
+
+    /// Dispatch one native Anthropic request without retrying or crossing
+    /// protocol/provider boundaries.
+    pub async fn anthropic_raw(
+        &self,
+        model: &str,
+        request: AnthropicRawRequest,
+    ) -> Result<AttributedAnthropicRawResponse, AnthropicRawError> {
+        tracing::debug!(model = %model, endpoint = ?request.endpoint, "Starting native Anthropic request");
+
+        let providers = self
+            .get_providers_with_fallback(model, None, &ChatRoutingHints::default())
+            .await
+            .ok_or(AnthropicRawError::UnsupportedProvider)?;
+        let provider = providers
+            .into_iter()
+            .find(|provider| provider.supports_anthropic_raw())
+            .ok_or(AnthropicRawError::UnsupportedProvider)?;
+
+        let provider_attribution = served_provider_attribution(provider.as_ref(), false);
+        let response = provider.anthropic_raw(request).await?;
+
+        Ok(AttributedAnthropicRawResponse {
+            response,
+            provider_attribution,
         })
     }
 

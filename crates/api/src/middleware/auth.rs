@@ -11,6 +11,45 @@ use services::reporting_tokens::{ReportingTokenScope, ValidatedOrganizationRepor
 use std::sync::Arc;
 use tracing::{debug, error};
 
+type AnthropicAuthRejection = (
+    StatusCode,
+    axum::Json<crate::models::AnthropicErrorResponse>,
+);
+
+fn anthropic_auth_token(headers: &axum::http::HeaderMap) -> Result<&str, &'static str> {
+    if let Some(value) = headers.get("x-api-key") {
+        return value
+            .to_str()
+            .ok()
+            .filter(|value| !value.is_empty())
+            .ok_or("Invalid x-api-key header");
+    }
+
+    headers
+        .get("authorization")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .filter(|value| !value.is_empty())
+        .ok_or("Missing x-api-key or Bearer authorization")
+}
+
+fn anthropic_auth_rejection(
+    status: StatusCode,
+    message: impl Into<String>,
+) -> AnthropicAuthRejection {
+    let error_type = if status == StatusCode::UNAUTHORIZED {
+        "authentication_error"
+    } else {
+        "api_error"
+    };
+    (
+        status,
+        axum::Json(crate::models::AnthropicErrorResponse::new(
+            error_type, message,
+        )),
+    )
+}
+
 /// Authenticated user information passed to route handlers
 #[derive(Clone)]
 pub struct AuthenticatedUser(pub DbUser);
@@ -158,6 +197,27 @@ pub async fn auth_middleware_with_workspace_context(
         }
         Err(error) => Err(error),
     }
+}
+
+/// Native Anthropic auth accepts the SDK's `x-api-key` header as well as the
+/// Cloud API Bearer form, while keeping Cloud API as the credential authority.
+pub async fn anthropic_auth_middleware_with_workspace_context(
+    State(state): State<AuthState>,
+    request: Request,
+    next: Next,
+) -> Result<Response, AnthropicAuthRejection> {
+    let token = anthropic_auth_token(request.headers())
+        .map_err(|message| anthropic_auth_rejection(StatusCode::UNAUTHORIZED, message))?;
+
+    let authenticated = authenticate_api_key_with_context(&state, token)
+        .await
+        .map_err(|(status, axum::Json(error))| {
+            anthropic_auth_rejection(status, error.error.message)
+        })?;
+
+    let mut request = request;
+    request.extensions_mut().insert(authenticated);
+    Ok(next.run(request).await)
 }
 
 /// Authentication middleware that validates session tokens only
@@ -817,5 +877,38 @@ fn convert_user_to_db_user(user: services::auth::User) -> DbUser {
         auth_provider: user.auth_provider,
         provider_user_id: user.provider_user_id,
         tokens_revoked_at: user.tokens_revoked_at,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::{HeaderMap, HeaderValue};
+
+    #[test]
+    fn anthropic_auth_accepts_sdk_and_bearer_credentials() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-api-key", HeaderValue::from_static("sk-sdk"));
+        assert_eq!(anthropic_auth_token(&headers), Ok("sk-sdk"));
+
+        headers.remove("x-api-key");
+        headers.insert(
+            "authorization",
+            HeaderValue::from_static("Bearer sk-bearer"),
+        );
+        assert_eq!(anthropic_auth_token(&headers), Ok("sk-bearer"));
+    }
+
+    #[test]
+    fn anthropic_auth_prefers_x_api_key_and_rejects_missing_credentials() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-api-key", HeaderValue::from_static("sk-sdk"));
+        headers.insert(
+            "authorization",
+            HeaderValue::from_static("Bearer sk-bearer"),
+        );
+        assert_eq!(anthropic_auth_token(&headers), Ok("sk-sdk"));
+
+        assert!(anthropic_auth_token(&HeaderMap::new()).is_err());
     }
 }

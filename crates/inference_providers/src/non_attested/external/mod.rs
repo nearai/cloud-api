@@ -30,13 +30,13 @@ pub mod gemini;
 pub mod openai_compatible;
 
 use crate::{
-    AttestationError, AudioTranscriptionError, AudioTranscriptionParams,
-    AudioTranscriptionResponse, ChatCompletionParams, ChatCompletionResponseWithBytes,
-    ChatSignature, CompletionError, CompletionParams, EmbeddingError, ImageEditError,
-    ImageEditParams, ImageEditResponseWithBytes, ImageGenerationError, ImageGenerationParams,
-    ImageGenerationResponseWithBytes, InferenceProvider, ListModelsError, ModelsResponse,
-    PrivacyClassifyError, RerankError, RerankParams, RerankResponse, ScoreError, ScoreParams,
-    ScoreResponse, StreamingResult,
+    AnthropicRawError, AnthropicRawRequest, AnthropicRawResponse, AttestationError,
+    AudioTranscriptionError, AudioTranscriptionParams, AudioTranscriptionResponse,
+    ChatCompletionParams, ChatCompletionResponseWithBytes, ChatSignature, CompletionError,
+    CompletionParams, EmbeddingError, ImageEditError, ImageEditParams, ImageEditResponseWithBytes,
+    ImageGenerationError, ImageGenerationParams, ImageGenerationResponseWithBytes,
+    InferenceProvider, ListModelsError, ModelsResponse, PrivacyClassifyError, RerankError,
+    RerankParams, RerankResponse, ScoreError, ScoreParams, ScoreResponse, StreamingResult,
 };
 use async_trait::async_trait;
 use backend::{BackendConfig, ExternalBackend};
@@ -438,6 +438,19 @@ impl InferenceProvider for ExternalProvider {
         self.backend
             .privacy_classify_raw(&self.config, body, extra)
             .await
+    }
+
+    async fn anthropic_raw(
+        &self,
+        request: AnthropicRawRequest,
+    ) -> Result<AnthropicRawResponse, AnthropicRawError> {
+        self.backend
+            .anthropic_raw(&self.config, &self.model_name, request)
+            .await
+    }
+
+    fn supports_anthropic_raw(&self) -> bool {
+        self.backend.backend_type() == "anthropic"
     }
 }
 
@@ -1056,5 +1069,33 @@ mod tests {
         assert_eq!(privacy.get("data_collection").unwrap(), "deny");
         assert_eq!(privacy.get("training").unwrap(), true);
         assert_eq!(preferences.get("latency").unwrap(), "low");
+    }
+
+    #[test]
+    fn native_anthropic_capability_is_backend_specific() {
+        let anthropic = ExternalProvider::new(ExternalProviderConfig {
+            model_name: "anthropic/claude-test".to_string(),
+            provider_config: ProviderConfig::Anthropic {
+                base_url: "https://api.anthropic.com/v1".to_string(),
+                version: "2023-06-01".to_string(),
+                model_name: Some("claude-test".to_string()),
+            },
+            api_key: "test-key".to_string(),
+            timeout_seconds: 30,
+        });
+        let openai = ExternalProvider::new(ExternalProviderConfig {
+            model_name: "openai/test".to_string(),
+            provider_config: ProviderConfig::OpenAiCompatible {
+                base_url: "https://api.openai.com/v1".to_string(),
+                organization_id: None,
+                model_name: None,
+                extra_request_body: None,
+            },
+            api_key: "test-key".to_string(),
+            timeout_seconds: 30,
+        });
+
+        assert!(anthropic.supports_anthropic_raw());
+        assert!(!openai.supports_anthropic_raw());
     }
 }

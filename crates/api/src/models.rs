@@ -1239,6 +1239,33 @@ pub struct ErrorDetail {
     pub code: Option<String>,
 }
 
+/// Anthropic-compatible error envelope used by the native Messages routes.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct AnthropicErrorResponse {
+    #[serde(rename = "type")]
+    pub type_: String,
+    pub error: AnthropicErrorDetail,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct AnthropicErrorDetail {
+    #[serde(rename = "type")]
+    pub type_: String,
+    pub message: String,
+}
+
+impl AnthropicErrorResponse {
+    pub fn new(error_type: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            type_: "error".to_string(),
+            error: AnthropicErrorDetail {
+                type_: error_type.into(),
+                message: message.into(),
+            },
+        }
+    }
+}
+
 // ============================================
 // Web Search (GET /v1/web/search)
 // ============================================

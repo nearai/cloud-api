@@ -3884,6 +3884,7 @@ dependencies = [
  "getrandom 0.4.1",
  "hex",
  "hkdf 0.13.0",
+ "http 1.4.1",
  "ml-kem",
  "regex",
  "reqwest 0.12.28",

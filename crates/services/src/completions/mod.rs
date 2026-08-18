@@ -1394,6 +1394,17 @@ impl CompletionServiceImpl {
 
 #[async_trait::async_trait]
 impl ports::CompletionServiceTrait for CompletionServiceImpl {
+    async fn acquire_concurrent_slot(
+        &self,
+        organization_id: Uuid,
+        model_id: Uuid,
+        model_name: &str,
+    ) -> Result<ports::ConcurrentRequestGuard, ports::CompletionError> {
+        self.try_acquire_concurrent_slot(organization_id, model_id, model_name)
+            .await
+            .map(ports::ConcurrentRequestGuard::new)
+    }
+
     async fn create_chat_completion_stream(
         &self,
         request: ports::CompletionRequest,

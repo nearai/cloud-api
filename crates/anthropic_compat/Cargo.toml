@@ -1,0 +1,11 @@
+[package]
+name = "anthropic_compat"
+edition.workspace = true
+version.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Pure OpenAI Chat Completions to Anthropic Messages compatibility"
+
+[dependencies]
+serde_json = "1.0"
+thiserror = "2.0"

@@ -1,0 +1,54 @@
+{
+  "model": "anthropic/claude-sonnet-4-6",
+  "messages": [
+    {
+      "role": "system",
+      "content": [
+        {
+          "type": "text",
+          "text": "Use the synthetic lookup tool.",
+          "cache_control": {"type": "ephemeral"}
+        }
+      ]
+    },
+    {"role": "user", "content": "Look up item 42."},
+    {
+      "role": "assistant",
+      "content": null,
+      "tool_calls": [
+        {
+          "id": "call_fixture_1",
+          "type": "function",
+          "function": {"name": "lookup", "arguments": "{\"id\":42}"}
+        }
+      ]
+    },
+    {
+      "role": "tool",
+      "tool_call_id": "call_fixture_1",
+      "content": [
+        {
+          "type": "text",
+          "text": "synthetic-result-42",
+          "cache_control": {"type": "ephemeral"}
+        }
+      ]
+    },
+    {"role": "assistant", "content": "Item 42 is available."},
+    {"role": "user", "content": "Summarize that."}
+  ],
+  "max_tokens": 128,
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "lookup",
+        "parameters": {
+          "type": "object",
+          "properties": {"id": {"type": "integer"}},
+          "required": ["id"]
+        }
+      }
+    }
+  ]
+}

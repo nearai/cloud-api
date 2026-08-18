@@ -122,6 +122,7 @@ impl From<ChatCompletionRequest> for ChatCompletionParams {
             store: None,
             stream_options,
             modalities,
+            original_request: None,
             extra,
         }
     }

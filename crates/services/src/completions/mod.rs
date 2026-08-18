@@ -1465,6 +1465,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
             store: request.store,
             stream_options,
             modalities: None,
+            original_request: request.original_request.clone(),
             extra,
         };
 
@@ -1643,6 +1644,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
             store: request.store,
             stream_options,
             modalities: None,
+            original_request: request.original_request.clone(),
             extra,
         };
 
@@ -3351,6 +3353,7 @@ mod tests {
             store: None,
             stream_options: None,
             modalities: None,
+            original_request: None,
             extra: std::collections::HashMap::new(),
         }
     }

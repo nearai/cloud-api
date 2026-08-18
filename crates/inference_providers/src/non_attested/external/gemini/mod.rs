@@ -524,6 +524,7 @@ mod tests {
             store: None,
             stream_options: None,
             modalities: None,
+            original_request: None,
             extra: std::collections::HashMap::new(),
         }
     }

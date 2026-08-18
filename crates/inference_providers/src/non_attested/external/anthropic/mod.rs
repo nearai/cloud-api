@@ -6,18 +6,18 @@
 pub mod converter;
 
 use super::backend::{BackendConfig, ExternalBackend};
+#[cfg(test)]
+use crate::MessageRole;
 use crate::{
     AnthropicRawError, AnthropicRawRequest, AnthropicRawResponse, BufferedSSEParser,
-    ChatCompletionParams, ChatCompletionResponse, ChatCompletionResponseChoice,
-    ChatCompletionResponseWithBytes, ChatResponseMessage, CompletionError, MessageRole,
-    StreamingResult, TokenUsage,
+    ChatCompletionParams, ChatCompletionResponse, ChatCompletionResponseWithBytes, CompletionError,
+    StreamingResult,
 };
 use async_trait::async_trait;
 use bytes::Bytes;
 use converter::{
-    convert_messages, convert_tool_choice, convert_tools, extract_response_content,
-    map_finish_reason_string, AnthropicEventParser, AnthropicParserState, AnthropicRequest,
-    AnthropicResponse, AnthropicUsage,
+    convert_messages, convert_tool_choice, convert_tools, AnthropicEventParser,
+    AnthropicParserState, AnthropicRequest,
 };
 use futures_util::{Stream, StreamExt as _};
 use reqwest::{header::HeaderValue, Client};
@@ -64,60 +64,6 @@ fn wants_json_output(extra: &std::collections::HashMap<String, serde_json::Value
         .unwrap_or(false)
 }
 
-/// Strip a single leading/trailing markdown code fence from `content`.
-///
-/// Anthropic has no native JSON-output mode, so when a caller requests
-/// `response_format: json_object`/`json_schema` the model frequently wraps the
-/// JSON in a ` ```json … ``` ` block. This unwraps that fence so the content is
-/// raw parseable JSON (#668). Content without a fence is returned unchanged.
-fn strip_json_code_fence(content: &str) -> String {
-    let trimmed = content.trim();
-    let Some(rest) = trimmed.strip_prefix("```") else {
-        return content.to_string();
-    };
-    // Drop the optional language tag on the opening fence line (e.g. `json`).
-    let after_lang = match rest.find('\n') {
-        Some(idx) => &rest[idx + 1..],
-        None => return content.to_string(),
-    };
-    let Some(inner) = after_lang.trim_end().strip_suffix("```") else {
-        return content.to_string();
-    };
-    inner.trim().to_string()
-}
-
-/// Map a non-streaming Anthropic `usage` block to OpenAI-shaped [`TokenUsage`].
-///
-/// #666: surface Anthropic prompt-cache stats so the existing billing path
-/// (which reads `usage.cached_tokens()` and bills `cache_read_tokens`) lights
-/// up. CRITICAL accounting: Anthropic reports cache reads and cache creation
-/// SEPARATELY from `input_tokens`, whereas OpenAI's `cached_tokens` is a SUBSET
-/// of `prompt_tokens` (and `TokenUsage::cached_tokens()` caps it to
-/// `[0, prompt_tokens]`). To preserve that invariant AND bill the cache-read
-/// cost, we ADD both cache figures into `prompt_tokens` and report the read and
-/// creation portions separately. When there is no cache activity,
-/// `prompt_tokens_details` stays `None` so an uncached response is byte-identical
-/// to before.
-fn map_usage(usage: &AnthropicUsage) -> TokenUsage {
-    let prompt_tokens =
-        usage.input_tokens + usage.cache_read_input_tokens + usage.cache_creation_input_tokens;
-    let prompt_tokens_details =
-        if usage.cache_read_input_tokens > 0 || usage.cache_creation_input_tokens > 0 {
-            Some(serde_json::json!({
-                "cached_tokens": usage.cache_read_input_tokens,
-                "cache_creation_tokens": usage.cache_creation_input_tokens,
-            }))
-        } else {
-            None
-        };
-    TokenUsage {
-        prompt_tokens,
-        completion_tokens: usage.output_tokens,
-        total_tokens: prompt_tokens + usage.output_tokens,
-        prompt_tokens_details,
-    }
-}
-
 /// Pick the allowlisted reasoning-control fields out of `extra`.
 fn extract_passthrough(
     extra: &std::collections::HashMap<String, serde_json::Value>,
@@ -126,73 +72,6 @@ fn extract_passthrough(
         .iter()
         .filter_map(|&key| extra.get(key).map(|value| (key.to_string(), value.clone())))
         .collect()
-}
-
-/// Build our normalized OpenAI-shaped response from a parsed Anthropic
-/// non-streaming response.
-///
-/// `sent_model` is the model name cloud-api sent to Anthropic (the `model`
-/// argument threaded through the backend call), NOT `anthropic_response.model`.
-///
-/// #632: the response `model` field uses the requested/sent model name to stay
-/// consistent with the streaming path, which seeds its chunk model from the
-/// same sent name (see `AnthropicParserState::new` in `converter.rs`).
-/// Upstream's dated canonical name (e.g. `claude-haiku-4-5-20251001`) is
-/// intentionally NOT surfaced, so both transports echo the same value for an
-/// identical request.
-fn build_openai_response(
-    anthropic_response: AnthropicResponse,
-    sent_model: &str,
-    wants_json: bool,
-) -> ChatCompletionResponse {
-    // Convert to OpenAI format using the converter
-    let (content, tool_calls) = extract_response_content(&anthropic_response.content);
-
-    // #668: Anthropic has no native JSON-output mode, so when the caller
-    // requested `response_format: json_object`/`json_schema` it tends to
-    // wrap the JSON in a markdown ```json … ``` fence, breaking
-    // `JSON.parse`. Strip that fence so the content is raw parseable JSON.
-    let content = if wants_json {
-        content.map(|c| strip_json_code_fence(&c))
-    } else {
-        content
-    };
-
-    ChatCompletionResponse {
-        id: anthropic_response.id,
-        object: "chat.completion".to_string(),
-        created: chrono::Utc::now().timestamp(),
-        // #632: echo the requested/sent model name (not upstream's dated name)
-        // so non-streaming matches the streaming path for the same request.
-        model: sent_model.to_string(),
-        choices: vec![ChatCompletionResponseChoice {
-            index: 0,
-            message: ChatResponseMessage {
-                role: MessageRole::Assistant,
-                content,
-                refusal: None,
-                annotations: None,
-                audio: None,
-                function_call: None,
-                tool_calls,
-                reasoning_content: None,
-                reasoning: None,
-            },
-            logprobs: None,
-            finish_reason: map_finish_reason_string(anthropic_response.stop_reason),
-            token_ids: None,
-            extra: Default::default(),
-        }],
-        service_tier: None,
-        system_fingerprint: None,
-        // #666: fold Anthropic cache-read/creation tokens into prompt_tokens and
-        // surface the read portion as prompt_tokens_details.cached_tokens.
-        usage: map_usage(&anthropic_response.usage),
-        prompt_logprobs: None,
-        prompt_token_ids: None,
-        kv_transfer_params: None,
-        extra: Default::default(),
-    }
 }
 
 /// Anthropic backend - handles HTTP communication with Anthropic's API
@@ -209,26 +88,6 @@ impl AnthropicBackend {
             .expect("Failed to create HTTP client");
 
         Self { client }
-    }
-
-    fn build_headers(&self, config: &BackendConfig) -> Result<reqwest::header::HeaderMap, String> {
-        let mut headers = reqwest::header::HeaderMap::new();
-        headers.insert("Content-Type", HeaderValue::from_static("application/json"));
-
-        let header_value = HeaderValue::from_str(&config.api_key)
-            .map_err(|e| format!("Invalid API key format: {e}"))?;
-        headers.insert("x-api-key", header_value);
-
-        let version = config
-            .extra
-            .get("version")
-            .map(|s| s.as_str())
-            .unwrap_or(DEFAULT_ANTHROPIC_VERSION);
-        if let Ok(value) = HeaderValue::from_str(version) {
-            headers.insert("anthropic-version", value);
-        }
-
-        Ok(headers)
     }
 
     fn build_raw_headers(
@@ -325,6 +184,51 @@ impl AnthropicBackend {
             extra: extract_passthrough(&params.extra),
         }
     }
+
+    /// Build the Messages body from the original Chat Completions JSON when it
+    /// is available. Requests synthesized by internal callers (for example the
+    /// Responses API) retain the legacy typed conversion during migration.
+    fn build_request_body(
+        &self,
+        model: &str,
+        params: &ChatCompletionParams,
+        stream: bool,
+    ) -> Result<serde_json::Value, CompletionError> {
+        if let Some(original) = params.original_request.as_ref() {
+            let converted = anthropic_compat::convert_openai_request(
+                original,
+                &anthropic_compat::ConvertOptions {
+                    model: model.to_string(),
+                    stream,
+                },
+            )
+            .map_err(|error| CompletionError::HttpError {
+                status_code: 400,
+                message: error.message,
+                is_external: false,
+            })?;
+
+            if !converted.warnings.is_empty() {
+                let parameters = converted
+                    .warnings
+                    .iter()
+                    .map(|warning| warning.parameter.as_str())
+                    .collect::<Vec<_>>();
+                tracing::debug!(
+                    model,
+                    ?parameters,
+                    "Anthropic compatibility adapter omitted parameters"
+                );
+            }
+            return Ok(converted.body);
+        }
+
+        serde_json::to_value(self.build_request(model, params, stream)).map_err(|error| {
+            CompletionError::CompletionError(format!(
+                "Failed to serialize Anthropic request: {error}"
+            ))
+        })
+    }
 }
 
 impl Default for AnthropicBackend {
@@ -333,13 +237,37 @@ impl Default for AnthropicBackend {
     }
 }
 
+fn map_raw_transport_error(error: AnthropicRawError) -> CompletionError {
+    match error {
+        AnthropicRawError::InvalidRequest(message) => CompletionError::HttpError {
+            status_code: 400,
+            message,
+            is_external: false,
+        },
+        AnthropicRawError::UnsupportedProvider => CompletionError::CompletionError(
+            "Anthropic Messages transport is unavailable".to_string(),
+        ),
+        AnthropicRawError::Transport(message) => CompletionError::CompletionError(message),
+    }
+}
+
+async fn collect_raw_body(
+    response: &mut AnthropicRawResponse,
+) -> Result<Vec<u8>, AnthropicRawError> {
+    let mut body = Vec::new();
+    while let Some(chunk) = response.body.next().await {
+        body.extend_from_slice(&chunk?);
+    }
+    Ok(body)
+}
+
 /// SSE parser type alias for Anthropic
-pub type AnthropicSSEParser<S> = BufferedSSEParser<S, AnthropicEventParser>;
+pub type AnthropicSSEParser<S, E = reqwest::Error> = BufferedSSEParser<S, AnthropicEventParser, E>;
 
 /// Create a new Anthropic SSE parser
-pub fn new_anthropic_sse_parser<S>(stream: S, model: String) -> AnthropicSSEParser<S>
+pub fn new_anthropic_sse_parser<S, E>(stream: S, model: String) -> AnthropicSSEParser<S, E>
 where
-    S: Stream<Item = Result<Bytes, reqwest::Error>> + Unpin,
+    S: Stream<Item = Result<Bytes, E>> + Unpin,
 {
     BufferedSSEParser::new(stream, AnthropicParserState::new(model))
 }
@@ -363,30 +291,27 @@ impl ExternalBackend for AnthropicBackend {
         // model's own behaviour with the json hint is usually fence-free when
         // streaming; callers needing guaranteed raw JSON should use the
         // non-streaming endpoint.
-        let url = format!("{}/messages", config.base_url);
-        let request = self.build_request(model, &params, true);
-
-        let headers = self
-            .build_headers(config)
-            .map_err(CompletionError::CompletionError)?;
-        let timeout = std::time::Duration::from_secs(config.timeout_seconds as u64);
-
-        let response = self
-            .client
-            .post(&url)
-            .headers(headers)
-            .timeout(timeout)
-            .json(&request)
-            .send()
+        let request = self.build_request_body(model, &params, true)?;
+        let mut response = self
+            .anthropic_raw(
+                config,
+                model,
+                AnthropicRawRequest {
+                    endpoint: crate::AnthropicRawEndpoint::Messages,
+                    beta: false,
+                    body: request,
+                    headers: crate::AnthropicRawHeaders::default(),
+                },
+            )
             .await
-            .map_err(|e| CompletionError::CompletionError(e.to_string()))?;
+            .map_err(map_raw_transport_error)?;
 
-        if !response.status().is_success() {
-            let status_code = response.status().as_u16();
-            let error_text = response
-                .text()
+        if !response.status.is_success() {
+            let status_code = response.status.as_u16();
+            let error_text = collect_raw_body(&mut response)
                 .await
-                .unwrap_or_else(|e| format!("Failed to read error response body: {e}"));
+                .map(|body| String::from_utf8_lossy(&body).into_owned())
+                .unwrap_or_else(|_| "Failed to read error response body".to_string());
             return Err(CompletionError::HttpError {
                 status_code,
                 message: crate::extract_error_message(&error_text),
@@ -394,7 +319,7 @@ impl ExternalBackend for AnthropicBackend {
             });
         }
 
-        let sse_stream = new_anthropic_sse_parser(response.bytes_stream(), model.to_string());
+        let sse_stream = new_anthropic_sse_parser(response.body, model.to_string());
         Ok(Box::pin(sse_stream))
     }
 
@@ -404,30 +329,27 @@ impl ExternalBackend for AnthropicBackend {
         model: &str,
         params: ChatCompletionParams,
     ) -> Result<ChatCompletionResponseWithBytes, CompletionError> {
-        let url = format!("{}/messages", config.base_url);
-        let request = self.build_request(model, &params, false);
-
-        let headers = self
-            .build_headers(config)
-            .map_err(CompletionError::CompletionError)?;
-        let timeout = std::time::Duration::from_secs(config.timeout_seconds as u64);
-
-        let response = self
-            .client
-            .post(&url)
-            .headers(headers)
-            .timeout(timeout)
-            .json(&request)
-            .send()
+        let request = self.build_request_body(model, &params, false)?;
+        let mut response = self
+            .anthropic_raw(
+                config,
+                model,
+                AnthropicRawRequest {
+                    endpoint: crate::AnthropicRawEndpoint::Messages,
+                    beta: false,
+                    body: request,
+                    headers: crate::AnthropicRawHeaders::default(),
+                },
+            )
             .await
-            .map_err(|e| CompletionError::CompletionError(e.to_string()))?;
+            .map_err(map_raw_transport_error)?;
 
-        if !response.status().is_success() {
-            let status_code = response.status().as_u16();
-            let error_text = response
-                .text()
+        if !response.status.is_success() {
+            let status_code = response.status.as_u16();
+            let error_text = collect_raw_body(&mut response)
                 .await
-                .unwrap_or_else(|e| format!("Failed to read error response body: {e}"));
+                .map(|body| String::from_utf8_lossy(&body).into_owned())
+                .unwrap_or_else(|_| "Failed to read error response body".to_string());
             return Err(CompletionError::HttpError {
                 status_code,
                 message: crate::extract_error_message(&error_text),
@@ -435,19 +357,38 @@ impl ExternalBackend for AnthropicBackend {
             });
         }
 
-        let raw_bytes = response
-            .bytes()
+        let raw_bytes = collect_raw_body(&mut response)
             .await
-            .map_err(|e| CompletionError::CompletionError(e.to_string()))?
-            .to_vec();
+            .map_err(map_raw_transport_error)?;
 
-        let anthropic_response: AnthropicResponse =
+        let anthropic_response: serde_json::Value =
             serde_json::from_slice(&raw_bytes).map_err(|e| {
                 CompletionError::CompletionError(format!("Failed to parse response: {e}"))
             })?;
-
-        let openai_response =
-            build_openai_response(anthropic_response, model, wants_json_output(&params.extra));
+        let (converted, warnings) = anthropic_compat::convert_anthropic_response(
+            &anthropic_response,
+            &anthropic_compat::ResponseOptions {
+                model: model.to_string(),
+                created: chrono::Utc::now().timestamp(),
+                strip_json_fence: wants_json_output(&params.extra),
+            },
+        )
+        .map_err(|error| CompletionError::CompletionError(error.message))?;
+        if !warnings.is_empty() {
+            let parameters = warnings
+                .iter()
+                .map(|warning| warning.parameter.as_str())
+                .collect::<Vec<_>>();
+            tracing::debug!(
+                model,
+                ?parameters,
+                "Anthropic compatibility adapter omitted response fields"
+            );
+        }
+        let openai_response: ChatCompletionResponse =
+            serde_json::from_value(converted).map_err(|e| {
+                CompletionError::CompletionError(format!("Failed to convert response: {e}"))
+            })?;
 
         // Serialize our normalized response. We intentionally overwrite fields
         // like `usage` (and any future cost-related fields derived from it) instead of passing
@@ -677,7 +618,7 @@ mod tests {
     }
 
     #[test]
-    fn test_build_headers_default_version() {
+    fn test_build_raw_headers_default_version() {
         let backend = AnthropicBackend::new();
         let config = BackendConfig {
             base_url: "https://api.anthropic.com".to_string(),
@@ -687,7 +628,17 @@ mod tests {
             extra_request_body: std::collections::HashMap::new(),
         };
 
-        let headers = backend.build_headers(&config).unwrap();
+        let headers = backend
+            .build_raw_headers(
+                &config,
+                &AnthropicRawRequest {
+                    endpoint: AnthropicRawEndpoint::Messages,
+                    beta: false,
+                    body: serde_json::json!({}),
+                    headers: AnthropicRawHeaders::default(),
+                },
+            )
+            .unwrap();
 
         assert_eq!(
             headers.get("x-api-key").unwrap().to_str().unwrap(),
@@ -700,7 +651,7 @@ mod tests {
     }
 
     #[test]
-    fn test_build_headers_custom_version() {
+    fn test_build_raw_headers_custom_version() {
         let backend = AnthropicBackend::new();
         let mut extra = std::collections::HashMap::new();
         extra.insert("version".to_string(), "2024-01-01".to_string());
@@ -713,7 +664,17 @@ mod tests {
             extra_request_body: std::collections::HashMap::new(),
         };
 
-        let headers = backend.build_headers(&config).unwrap();
+        let headers = backend
+            .build_raw_headers(
+                &config,
+                &AnthropicRawRequest {
+                    endpoint: AnthropicRawEndpoint::Messages,
+                    beta: false,
+                    body: serde_json::json!({}),
+                    headers: AnthropicRawHeaders::default(),
+                },
+            )
+            .unwrap();
 
         assert_eq!(
             headers.get("anthropic-version").unwrap().to_str().unwrap(),
@@ -752,8 +713,222 @@ mod tests {
             store: None,
             stream_options: None,
             modalities: None,
+            original_request: None,
             extra: std::collections::HashMap::new(),
         }
+    }
+
+    #[test]
+    fn original_wire_request_uses_anthropic_compat_adapter() {
+        let backend = AnthropicBackend::new();
+        let mut params = make_params(None, None);
+        params.original_request = Some(serde_json::json!({
+            "model": "anthropic/alias",
+            "messages": [
+                {"role": "system", "content": "first"},
+                {"role": "developer", "content": "second"},
+                {"role": "user", "content": "hello", "future_message_field": true}
+            ],
+            "max_completion_tokens": 37,
+            "thinking": {"type": "enabled", "budget_tokens": 1024},
+            "future_top_level": {"not": "forwarded"}
+        }));
+
+        let body = backend
+            .build_request_body("claude-upstream", &params, true)
+            .expect("wire conversion should succeed");
+
+        assert_eq!(body["model"], "claude-upstream");
+        assert_eq!(body["max_tokens"], 37);
+        assert_eq!(body["stream"], true);
+        assert_eq!(body["system"].as_array().unwrap().len(), 2);
+        assert_eq!(body["thinking"]["budget_tokens"], 1024);
+        assert!(body.get("future_top_level").is_none());
+    }
+
+    fn canonicalize_anthropic_content(body: &mut serde_json::Value) {
+        fn string_to_text_blocks(value: &mut serde_json::Value) {
+            let serde_json::Value::String(text) = value else {
+                return;
+            };
+            *value = serde_json::json!([{"type": "text", "text": text}]);
+        }
+
+        if let Some(system) = body.get_mut("system") {
+            string_to_text_blocks(system);
+        }
+        if let Some(messages) = body
+            .get_mut("messages")
+            .and_then(serde_json::Value::as_array_mut)
+        {
+            for message in messages {
+                if let Some(content) = message.get_mut("content") {
+                    string_to_text_blocks(content);
+                }
+            }
+        }
+    }
+
+    const COMPAT_REQUEST_FIXTURES: &[(&str, &str)] = &[
+        (
+            "basic-system",
+            include_str!("../../../../tests/fixtures/anthropic_compat/basic_system.json"),
+        ),
+        (
+            "sampling-and-tools",
+            include_str!("../../../../tests/fixtures/anthropic_compat/sampling_tools.json"),
+        ),
+        (
+            "cached-tool-loop",
+            include_str!("../../../../tests/fixtures/anthropic_compat/cached_tool_loop.json"),
+        ),
+        (
+            "vision",
+            include_str!("../../../../tests/fixtures/anthropic_compat/vision.json"),
+        ),
+    ];
+
+    #[test]
+    fn compat_request_matches_legacy_semantics_over_fixture_corpus() {
+        let backend = AnthropicBackend::new();
+
+        for (name, fixture) in COMPAT_REQUEST_FIXTURES {
+            let wire: serde_json::Value = serde_json::from_str(fixture)
+                .unwrap_or_else(|error| panic!("fixture {name} is invalid JSON: {error}"));
+            let mut params: ChatCompletionParams = serde_json::from_value(wire.clone())
+                .unwrap_or_else(|error| panic!("fixture {name} is not a chat request: {error}"));
+            let stream = params.stream.unwrap_or(false);
+
+            let mut legacy =
+                serde_json::to_value(backend.build_request("claude-sonnet-4-6", &params, stream))
+                    .unwrap_or_else(|error| {
+                        panic!("legacy fixture {name} did not serialize: {error}")
+                    });
+            params.original_request = Some(wire);
+            let mut compat = backend
+                .build_request_body("claude-sonnet-4-6", &params, stream)
+                .unwrap_or_else(|error| panic!("compat fixture {name} did not convert: {error:?}"));
+
+            // The compatibility crate intentionally emits canonical block arrays
+            // even when the legacy converter used a bare string. Normalize only
+            // that representation detail; all protocol semantics must match.
+            canonicalize_anthropic_content(&mut legacy);
+            canonicalize_anthropic_content(&mut compat);
+            assert_eq!(compat, legacy, "fixture {name} drifted");
+        }
+    }
+
+    #[tokio::test]
+    async fn chat_completion_uses_compat_body_and_shared_raw_transport() {
+        use wiremock::matchers::{body_json, header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/messages"))
+            .and(header("x-api-key", "upstream-secret"))
+            .and(body_json(serde_json::json!({
+                "model": "claude-upstream",
+                "messages": [{
+                    "role": "user",
+                    "content": [{"type": "text", "text": "hello"}]
+                }],
+                "max_tokens": 37,
+                "stream": false,
+                "thinking": {"type": "enabled", "budget_tokens": 1024}
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "msg_compat_1",
+                "type": "message",
+                "role": "assistant",
+                "model": "claude-upstream-dated",
+                "content": [{"type": "text", "text": "done"}],
+                "stop_reason": "end_turn",
+                "usage": {
+                    "input_tokens": 10,
+                    "output_tokens": 2,
+                    "cache_read_input_tokens": 3,
+                    "cache_creation_input_tokens": 4
+                }
+            })))
+            .mount(&server)
+            .await;
+
+        let backend = AnthropicBackend::new();
+        let mut params = make_params(None, None);
+        params.original_request = Some(serde_json::json!({
+            "model": "anthropic/alias",
+            "messages": [{"role": "user", "content": "hello"}],
+            "max_completion_tokens": 37,
+            "thinking": {"type": "enabled", "budget_tokens": 1024},
+            "future_top_level": "not forwarded"
+        }));
+        let response = backend
+            .chat_completion(&raw_test_config(server.uri()), "claude-upstream", params)
+            .await
+            .expect("converted completion should succeed");
+
+        assert_eq!(response.response.id, "msg_compat_1");
+        assert_eq!(response.response.usage.prompt_tokens, 17);
+        assert_eq!(response.response.usage.cached_tokens(), 3);
+        assert_eq!(response.response.usage.cache_creation_tokens(), 4);
+    }
+
+    #[tokio::test]
+    async fn streaming_chat_completion_uses_shared_raw_transport() {
+        use futures_util::StreamExt;
+        use wiremock::matchers::{body_json, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let sse = concat!(
+            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_stream_1\",\"usage\":{\"input_tokens\":10,\"output_tokens\":0,\"cache_read_input_tokens\":3,\"cache_creation_input_tokens\":4}}}\n\n",
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"done\"}}\n\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"input_tokens\":10,\"output_tokens\":2,\"cache_read_input_tokens\":3,\"cache_creation_input_tokens\":4}}\n\n",
+            "data: {\"type\":\"message_stop\"}\n\n"
+        );
+        Mock::given(method("POST"))
+            .and(path("/messages"))
+            .and(body_json(serde_json::json!({
+                "model": "claude-upstream",
+                "messages": [{
+                    "role": "user",
+                    "content": [{"type": "text", "text": "hello"}]
+                }],
+                "max_tokens": 37,
+                "stream": true
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(sse, "text/event-stream"))
+            .mount(&server)
+            .await;
+
+        let backend = AnthropicBackend::new();
+        let mut params = make_params(None, None);
+        params.original_request = Some(serde_json::json!({
+            "model": "anthropic/alias",
+            "messages": [{"role": "user", "content": "hello"}],
+            "max_completion_tokens": 37,
+            "stream": true
+        }));
+        let mut stream = backend
+            .chat_completion_stream(&raw_test_config(server.uri()), "claude-upstream", params)
+            .await
+            .expect("converted stream should start");
+
+        let mut final_usage = None;
+        while let Some(event) = stream.next().await {
+            let event = event.expect("stream event should parse");
+            if let Some(crate::StreamChunk::Chat(chunk)) = event.chunk {
+                if chunk.usage.is_some() {
+                    final_usage = chunk.usage;
+                }
+            }
+        }
+        let usage = final_usage.expect("stream should carry usage");
+        assert_eq!(usage.prompt_tokens, 17);
+        assert_eq!(usage.cached_tokens(), 3);
+        assert_eq!(usage.cache_creation_tokens(), 4);
     }
 
     #[test]
@@ -1005,143 +1180,6 @@ mod tests {
         assert!(wants_json_output(&json_format_extra("json_schema")));
         assert!(!wants_json_output(&json_format_extra("text")));
         assert!(!wants_json_output(&std::collections::HashMap::new()));
-    }
-
-    #[test]
-    fn test_strip_json_code_fence_unwraps_fenced_json() {
-        let fenced = "```json\n{\n  \"city\": \"Paris\"\n}\n```";
-        let stripped = strip_json_code_fence(fenced);
-        assert_eq!(stripped, "{\n  \"city\": \"Paris\"\n}");
-        // Result is valid parseable JSON.
-        let v: serde_json::Value = serde_json::from_str(&stripped).unwrap();
-        assert_eq!(v["city"], "Paris");
-    }
-
-    #[test]
-    fn test_strip_json_code_fence_handles_no_language_tag() {
-        let fenced = "```\n{\"a\":1}\n```";
-        assert_eq!(strip_json_code_fence(fenced), "{\"a\":1}");
-    }
-
-    #[test]
-    fn test_strip_json_code_fence_passes_through_raw_json() {
-        let raw = "{\"city\":\"Paris\"}";
-        assert_eq!(strip_json_code_fence(raw), raw);
-    }
-
-    // ── #666: non-streaming usage maps cache reads -> cached_tokens ──────────
-
-    #[test]
-    fn test_map_usage_folds_cache_into_prompt_tokens() {
-        // Anthropic reports cache reads/creation separately from input_tokens.
-        // map_usage adds them into prompt_tokens and reports the read portion as
-        // cached_tokens, so cached <= prompt holds and the cache read is billed.
-        let usage = AnthropicUsage {
-            input_tokens: 10,
-            output_tokens: 30,
-            cache_read_input_tokens: 80,
-            cache_creation_input_tokens: 5,
-        };
-        let mapped = map_usage(&usage);
-
-        // prompt_tokens = 10 + 80 + 5 = 95.
-        assert_eq!(mapped.prompt_tokens, 95);
-        assert_eq!(mapped.completion_tokens, 30);
-        assert_eq!(mapped.total_tokens, 125);
-        // cached_tokens surfaced via prompt_tokens_details, and clamped helper
-        // confirms the invariant cached <= prompt.
-        assert_eq!(mapped.cached_tokens(), 80);
-        assert_eq!(mapped.cache_creation_tokens(), 5);
-        assert!(mapped.cached_tokens() <= mapped.prompt_tokens);
-    }
-
-    #[test]
-    fn test_map_usage_cache_creation_without_read_emits_details() {
-        let mapped = map_usage(&AnthropicUsage {
-            input_tokens: 10,
-            output_tokens: 3,
-            cache_read_input_tokens: 0,
-            cache_creation_input_tokens: 7,
-        });
-
-        assert_eq!(mapped.prompt_tokens, 17);
-        assert_eq!(mapped.cached_tokens(), 0);
-        assert_eq!(mapped.cache_creation_tokens(), 7);
-    }
-
-    #[test]
-    fn test_map_usage_no_cache_omits_details() {
-        // No cache reads -> prompt_tokens_details stays None (no regression).
-        let usage = AnthropicUsage {
-            input_tokens: 100,
-            output_tokens: 20,
-            cache_read_input_tokens: 0,
-            cache_creation_input_tokens: 0,
-        };
-        let mapped = map_usage(&usage);
-        assert_eq!(mapped.prompt_tokens, 100);
-        assert_eq!(mapped.total_tokens, 120);
-        assert!(mapped.prompt_tokens_details.is_none());
-        assert_eq!(mapped.cached_tokens(), 0);
-    }
-
-    // ── #632: non-streaming response echoes the SENT model name ─────────────
-
-    /// Build a minimal Anthropic non-streaming response whose `model` field is
-    /// the upstream dated canonical name, as Anthropic actually returns.
-    fn make_anthropic_response(upstream_dated_model: &str) -> AnthropicResponse {
-        serde_json::from_value(serde_json::json!({
-            "id": "msg_test_632",
-            "model": upstream_dated_model,
-            "stop_reason": "end_turn",
-            "content": [{ "type": "text", "text": "Hello" }],
-            "usage": { "input_tokens": 3, "output_tokens": 1 }
-        }))
-        .expect("test AnthropicResponse should deserialize")
-    }
-
-    #[test]
-    fn test_non_streaming_response_model_is_sent_name_not_upstream_dated() {
-        // For the SAME request, streaming echoes the SENT name (the `model` arg
-        // threaded into the backend, seeded into AnthropicParserState), while
-        // Anthropic's non-streaming JSON carries the UPSTREAM dated name. Plan A
-        // for #632 makes non-streaming match streaming: the response `model`
-        // must be the sent name, not the upstream dated name.
-        let sent = "claude-haiku-4-5";
-        let upstream_dated = "claude-haiku-4-5-20251001";
-
-        let anthropic_response = make_anthropic_response(upstream_dated);
-        // Sanity: the parsed upstream payload really carries the dated name, so
-        // this test would catch a regression that surfaces it.
-        assert_eq!(anthropic_response.model, upstream_dated);
-
-        let openai_response = build_openai_response(anthropic_response, sent, false);
-
-        assert_eq!(
-            openai_response.model, sent,
-            "non-streaming response must echo the SENT model name (transport consistency, #632)"
-        );
-        assert_ne!(
-            openai_response.model, upstream_dated,
-            "non-streaming response must NOT surface upstream's dated canonical name"
-        );
-    }
-
-    #[test]
-    fn test_non_streaming_response_model_matches_streaming_seed() {
-        // The streaming path seeds its per-chunk `model` from the same sent name
-        // via AnthropicParserState::new(model). Confirm the non-streaming helper
-        // and the streaming parser state agree on the model echoed for an
-        // identical request, regardless of what upstream returned (#632).
-        let sent = "claude-sonnet-4-5";
-        let upstream_dated = "claude-sonnet-4-5-20250929";
-
-        let non_streaming =
-            build_openai_response(make_anthropic_response(upstream_dated), sent, false);
-        let streaming_state = AnthropicParserState::new(sent.to_string());
-
-        assert_eq!(non_streaming.model, streaming_state.model);
-        assert_eq!(non_streaming.model, sent);
     }
 
     #[tokio::test]

@@ -319,16 +319,27 @@ pub struct AnthropicResponse {
 // =============================================================================
 
 /// Pull the raw `cache_control` object (if any) out of a single OpenAI content
-/// part. Anthropic accepts the breakpoint object verbatim
-/// (`{"type":"ephemeral"}`), so we forward it untouched rather than inventing
-/// our own shape (#666). The shared `parse_content` discards unknown fields, so
-/// we read this directly from the raw JSON here in the Anthropic converter
-/// instead of widening the shared `ContentPart` enum.
+/// part. The shared `parse_content` discards unknown fields, so we read this
+/// directly from the raw JSON here instead of widening the shared
+/// `ContentPart` enum. Explicit unsupported TTLs are removed so the provider
+/// uses its five-minute default, the cache-write tier Cloud currently bills.
 fn cache_control_of(item: &serde_json::Value) -> Option<serde_json::Value> {
-    item.as_object()
+    let mut cache_control = item
+        .as_object()
         .and_then(|obj| obj.get("cache_control"))
         .filter(|v| !v.is_null())
-        .cloned()
+        .cloned()?;
+
+    // Cloud currently bills only Anthropic's five-minute cache-write tier.
+    // Downgrade unsupported explicit TTLs to Anthropic's default five-minute
+    // tier instead of forwarding a one-hour write that would be underbilled.
+    if let Some(object) = cache_control.as_object_mut() {
+        if object.get("ttl").and_then(serde_json::Value::as_str) != Some("5m") {
+            object.remove("ttl");
+        }
+    }
+
+    Some(cache_control)
 }
 
 /// Whether a string content value carries any per-part `cache_control`. A bare
@@ -892,12 +903,14 @@ impl AnthropicParserState {
         self.input_tokens + self.cache_read_tokens + self.cache_creation_tokens
     }
 
-    /// `prompt_tokens_details` for a chunk: `cached_tokens` when there was a
-    /// cache read, else `None` (so an uncached stream is byte-identical to
-    /// before).
+    /// `prompt_tokens_details` for a chunk: cache reads and writes when either
+    /// occurred, else `None` (so an uncached stream is byte-identical to before).
     fn prompt_tokens_details(&self) -> Option<serde_json::Value> {
-        if self.cache_read_tokens > 0 {
-            Some(serde_json::json!({ "cached_tokens": self.cache_read_tokens }))
+        if self.cache_read_tokens > 0 || self.cache_creation_tokens > 0 {
+            Some(serde_json::json!({
+                "cached_tokens": self.cache_read_tokens,
+                "cache_creation_tokens": self.cache_creation_tokens,
+            }))
         } else {
             None
         }
@@ -1720,9 +1733,10 @@ mod tests {
     }
 
     #[test]
-    fn test_cache_control_on_user_text_part_appears_in_request() {
+    fn test_one_hour_cache_control_is_downgraded_to_five_minutes() {
         // A user text part with cache_control forces the block form (even with
-        // no image) and forwards the breakpoint verbatim.
+        // no image). Unsupported one-hour TTLs are removed so Anthropic uses
+        // its default five-minute tier, which Cloud can bill correctly.
         let messages = vec![ChatMessage {
             role: MessageRole::User,
             content: Some(serde_json::json!([
@@ -1755,7 +1769,7 @@ mod tests {
                 assert_eq!(text, "Cached context");
                 assert_eq!(
                     *cache_control,
-                    Some(serde_json::json!({"type": "ephemeral", "ttl": "1h"}))
+                    Some(serde_json::json!({"type": "ephemeral"}))
                 );
             }
             other => panic!("expected text block, got {other:?}"),
@@ -1772,10 +1786,10 @@ mod tests {
             other => panic!("expected text block, got {other:?}"),
         }
 
-        // The serialized outgoing request carries the breakpoint verbatim.
+        // The serialized outgoing request carries the breakpoint without 1h.
         let json = serde_json::to_string(&anthropic_messages[0]).unwrap();
         assert!(json.contains("\"cache_control\""));
-        assert!(json.contains("\"ttl\":\"1h\""));
+        assert!(!json.contains("\"ttl\":\"1h\""));
     }
 
     #[test]
@@ -2143,12 +2157,12 @@ mod tests {
         };
         assert_eq!(
             *cache_control,
-            Some(serde_json::json!({"type": "ephemeral", "ttl": "1h"}))
+            Some(serde_json::json!({"type": "ephemeral"}))
         );
         let json = serde_json::to_value(&anthropic_messages[0]).unwrap();
         assert_eq!(
             json["content"][0]["cache_control"],
-            serde_json::json!({"type": "ephemeral", "ttl": "1h"})
+            serde_json::json!({"type": "ephemeral"})
         );
     }
 
@@ -2322,6 +2336,7 @@ mod tests {
         // prompt_tokens = input + cache_read + cache_creation = 10 + 80 + 5 = 95.
         assert_eq!(usage.prompt_tokens, 95);
         assert_eq!(cached_tokens_of(&usage), 80);
+        assert_eq!(usage.cache_creation_tokens(), 5);
         assert!(
             cached_tokens_of(&usage) <= usage.prompt_tokens as i64,
             "cached_tokens must not exceed prompt_tokens"
@@ -2339,6 +2354,7 @@ mod tests {
         assert_eq!(usage.completion_tokens, 30);
         assert_eq!(usage.total_tokens, 125);
         assert_eq!(cached_tokens_of(&usage), 80);
+        assert_eq!(usage.cache_creation_tokens(), 5);
         assert!(cached_tokens_of(&usage) <= usage.prompt_tokens as i64);
     }
 

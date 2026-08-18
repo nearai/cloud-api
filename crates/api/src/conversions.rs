@@ -1082,6 +1082,8 @@ mod tests {
         }
 
         // The user turn must carry the breakpoint on the cached text block only.
+        // One-hour TTL is intentionally removed because Cloud API currently bills
+        // cache writes at Anthropic's five-minute rate.
         assert_eq!(anthropic_messages.len(), 1);
         let blocks = match &anthropic_messages[0].content {
             AnthropicMessageContent::Blocks(b) => b,
@@ -1098,7 +1100,7 @@ mod tests {
                 assert_eq!(text, "Cached context");
                 assert_eq!(
                     *cache_control,
-                    Some(serde_json::json!({"type": "ephemeral", "ttl": "1h"}))
+                    Some(serde_json::json!({"type": "ephemeral"}))
                 );
             }
             other => panic!("expected text block, got {other:?}"),

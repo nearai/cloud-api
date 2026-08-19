@@ -7,6 +7,7 @@ pub const METRIC_LATENCY_STREAMING_TTFT_BY_INPUT: &str =
     "cloud_api.latency.streaming_time_to_first_token_by_input";
 pub const METRIC_LATENCY_STREAMING_TTFT_TOTAL_BY_INPUT: &str =
     "cloud_api.latency.streaming_time_to_first_token_total_by_input";
+pub const METRIC_LATENCY_BACKEND: &str = "cloud_api.latency.backend";
 pub const METRIC_LATENCY_TOTAL: &str = "cloud_api.latency.total";
 pub const METRIC_LATENCY_QUEUE_TIME: &str = "cloud_api.latency.queue_time";
 pub const METRIC_LATENCY_DECODING_TIME: &str = "cloud_api.latency.decoding_time";

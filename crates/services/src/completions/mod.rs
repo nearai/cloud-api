@@ -322,6 +322,30 @@ where
         // which helps prevent data loss compared to regular spawn.
         let handle_clone = handle.clone();
         handle.spawn_blocking(move || {
+            // These streaming-only TTFT series require the final usage chunk so
+            // the real input-token bucket is known. They intentionally exclude
+            // streams that produced a first token but ended without billable
+            // usage or a response ID (for example, interrupted/error streams),
+            // so they are a billable-completion subset of the unbucketed TTFT
+            // series rather than a directly comparable population. Emit them
+            // before the billing timeout so a stalled usage write cannot also
+            // discard already-observed latency telemetry.
+            let ttft_tags: Vec<&str> = metric_tags.iter().map(|s| s.as_str()).collect();
+            if let Some(duration) = backend_ttft {
+                metrics_service.record_latency(
+                    METRIC_LATENCY_STREAMING_TTFT_BY_INPUT,
+                    duration,
+                    &ttft_tags,
+                );
+            }
+            if let Some(duration) = e2e_ttft {
+                metrics_service.record_latency(
+                    METRIC_LATENCY_STREAMING_TTFT_TOTAL_BY_INPUT,
+                    duration,
+                    &ttft_tags,
+                );
+            }
+
             handle_clone.block_on(
                 async move {
                     let result = tokio::time::timeout(Duration::from_secs(2), async move {
@@ -366,25 +390,6 @@ where
                         // Record metrics
                         let tags: Vec<&str> = metric_tags.iter().map(|s| s.as_str()).collect();
                         metrics_service.record_latency(METRIC_LATENCY_TOTAL, e2e_duration, &tags);
-
-                        // These streaming-only TTFT series are emitted after the
-                        // provider reports usage, when the real input-token bucket
-                        // is known. The first-token hot path intentionally keeps
-                        // emitting the existing unbucketed TTFT series immediately.
-                        if let Some(duration) = backend_ttft {
-                            metrics_service.record_latency(
-                                METRIC_LATENCY_STREAMING_TTFT_BY_INPUT,
-                                duration,
-                                &tags,
-                            );
-                        }
-                        if let Some(duration) = e2e_ttft {
-                            metrics_service.record_latency(
-                                METRIC_LATENCY_STREAMING_TTFT_TOTAL_BY_INPUT,
-                                duration,
-                                &tags,
-                            );
-                        }
 
                         if let Some(first_token_instant) = first_token_time {
                             let decoding_duration = first_token_instant.elapsed();
@@ -1807,6 +1812,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
 
             metrics_service.record_count(METRIC_REQUEST_COUNT, 1, &tags_str);
             metrics_service.record_latency(METRIC_LATENCY_QUEUE_TIME, queue_time, &tags_str);
+            metrics_service.record_latency(METRIC_LATENCY_BACKEND, backend_latency, &tags_str);
             metrics_service.record_latency(METRIC_LATENCY_TOTAL, e2e_latency, &tags_str);
 
             if backend_latency.as_secs_f64() > 0.0 {

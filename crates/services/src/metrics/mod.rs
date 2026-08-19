@@ -67,6 +67,9 @@ impl MetricsServiceTrait for OtlpMetricsService {
                 consts::METRIC_LATENCY_STREAMING_TTFT_TOTAL_BY_INPUT => {
                     "Streaming E2E TTFT grouped by final prompt-token bucket"
                 }
+                consts::METRIC_LATENCY_BACKEND => {
+                    "Backend processing latency for non-streaming completions"
+                }
                 consts::METRIC_LATENCY_QUEUE_TIME => {
                     "Queue/Wait time: Internal overhead before provider call"
                 }

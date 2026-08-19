@@ -178,6 +178,9 @@ def compare_catalog_metadata(
 
     for field, value in expected_metadata.items():
         actual_value = actual.get(field)
+        if field == "aliases" and value == [] and actual_value is None:
+            # The admin response omits an empty alias set as null.
+            actual_value = []
         if field == "providerConfig":
             # The admin response may contain a redacted global/provider key. It
             # is intentionally outside the checked-in manifest; all routing

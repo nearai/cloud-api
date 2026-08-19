@@ -30,7 +30,6 @@ use utoipa::{Modify, OpenApi};
         (name = "Organizations", description = "Organization management"),
         (name = "Organization Members", description = "Organization member and invitation management"),
         (name = "Workspaces", description = "Workspace and API key management"),
-        (name = "Files", description = "File upload and management"),
         (name = "Users", description = "User profile and token management"),
         (name = "Invitations", description = "Token-based invitation handling"),
         (name = "Usage", description = "Usage tracking and billing information"),
@@ -102,12 +101,6 @@ use utoipa::{Modify, OpenApi};
         crate::routes::workspaces::revoke_workspace_api_key,
         crate::routes::workspaces::update_api_key_spend_limit,
         crate::routes::workspaces::update_workspace_api_key,
-        // Files endpoints
-        crate::routes::files::upload_file,
-        crate::routes::files::list_files,
-        crate::routes::files::get_file,
-        crate::routes::files::delete_file,
-        crate::routes::files::get_file_content,
         // Users endpoints
         crate::routes::users::get_current_user,
         crate::routes::users::get_user_status,
@@ -346,8 +339,6 @@ use utoipa::{Modify, OpenApi};
             crate::routes::billing::BillingCostsRequest,
             crate::routes::billing::BillingCostsResponse,
             crate::routes::billing::RequestCost,
-            // File models
-            FileUploadResponse, ExpiresAfter, FileListResponse, FileDeleteResponse,
             // Platform Stats analytics models
             services::admin::PlatformMetrics,
             services::admin::PlatformProviderUsage,

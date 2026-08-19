@@ -284,7 +284,7 @@ async fn test_vpc_login_api_key_works() {
 
     let body = response.json::<VpcLoginResponse>();
 
-    // Try to use the API key on an authenticated endpoint
+    // A valid API key reaches the retired Files endpoint.
     let auth_response = server
         .get("/v1/files?limit=1")
         .add_header("Authorization", format!("Bearer {}", body.api_key))
@@ -293,8 +293,8 @@ async fn test_vpc_login_api_key_works() {
 
     assert_eq!(
         auth_response.status_code(),
-        200,
-        "API key from VPC login should work for authenticated requests"
+        410,
+        "API key from VPC login should reach the Files API retirement response"
     );
 
     println!("✅ API key from VPC login works correctly");

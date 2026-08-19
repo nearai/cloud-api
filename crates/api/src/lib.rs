@@ -1874,15 +1874,18 @@ pub fn build_workspace_routes(app_state: AppState, auth_state_middleware: &AuthS
         ))
 }
 
-/// Build file upload routes
+/// Build the retired Files API surface.
+///
+/// Keep the authenticated route boundary while preventing every Files request
+/// from reaching the legacy service, storage, or repository layers. The
+/// dormant wiring is intentionally retained until the follow-up cleanup.
 pub fn build_files_routes(app_state: AppState, auth_state_middleware: &AuthState) -> Router {
-    use crate::routes::files::MAX_FILE_SIZE;
-    use crate::routes::files::*;
+    use crate::routes::files::files_api_deprecated;
+
     Router::new()
-        .route("/files", post(upload_file).get(list_files))
-        .route("/files/{file_id}", get(get_file).delete(delete_file))
-        .route("/files/{file_id}/content", get(get_file_content))
-        .layer(DefaultBodyLimit::max(MAX_FILE_SIZE))
+        .route("/files", axum::routing::any(files_api_deprecated))
+        .route("/files/", axum::routing::any(files_api_deprecated))
+        .route("/files/{*path}", axum::routing::any(files_api_deprecated))
         .with_state(app_state)
         .layer(from_fn_with_state(
             auth_state_middleware.clone(),

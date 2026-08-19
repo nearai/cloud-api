@@ -125,36 +125,15 @@ async fn test_non_streaming_web_search_with_citations() {
     let api_key = get_api_key_for_org(&server, org.id).await;
     let model = setup_glm_model(&server).await;
 
-    // Create a conversation
-    let conversation_response = server
-        .post("/v1/conversations")
-        .add_header("Authorization", format!("Bearer {api_key}"))
-        .json(&json!({
-            "metadata": {
-                "title": "Non-Streaming Web Search Citation Test"
-            }
-        }))
-        .await;
-
-    assert_eq!(conversation_response.status_code(), 201);
-
-    let conversation_data = conversation_response.json::<serde_json::Value>();
-    let conversation_id = conversation_data
-        .get("id")
-        .and_then(|v| v.as_str())
-        .expect("Conversation ID should be present");
-
-    println!("✓ Created conversation: {conversation_id}");
-
     // Create non-streaming response with web search
     // Use a specific query that requires current information and citations
     let response = server
          .post("/v1/responses")
          .add_header("Authorization", format!("Bearer {api_key}"))
          .json(&json!({
-             "conversation": conversation_id,
              "model": model,
              "input": "What is the weather in San Francisco today? Search the web for current weather conditions.",
+             "store": false,
              "stream": false,
              "max_output_tokens": 512,
              "temperature": 0.7,
@@ -275,35 +254,14 @@ async fn test_streaming_web_search_with_citations() {
     let api_key = get_api_key_for_org(&server, org.id).await;
     let model = setup_glm_model(&server).await;
 
-    // Create a conversation
-    let conversation_response = server
-        .post("/v1/conversations")
-        .add_header("Authorization", format!("Bearer {api_key}"))
-        .json(&json!({
-            "metadata": {
-                "title": "Streaming Web Search Citation Test"
-            }
-        }))
-        .await;
-
-    assert_eq!(conversation_response.status_code(), 201);
-
-    let conversation_data = conversation_response.json::<serde_json::Value>();
-    let conversation_id = conversation_data
-        .get("id")
-        .and_then(|v| v.as_str())
-        .expect("Conversation ID should be present");
-
-    println!("✓ Created conversation: {conversation_id}");
-
     // Create streaming response with web search
     let response = server
          .post("/v1/responses")
          .add_header("Authorization", format!("Bearer {api_key}"))
          .json(&json!({
-             "conversation": conversation_id,
              "model": model,
              "input": "What is the current weather in New York City? Search the web for real-time weather conditions.",
+             "store": false,
              "stream": true,
              "max_output_tokens": 512,
              "temperature": 0.7,
@@ -576,35 +534,14 @@ async fn capture_streaming_citations_to_file() {
     let api_key = get_api_key_for_org(&server, org.id).await;
     let model = setup_glm_model(&server).await;
 
-    // Create a conversation
-    let conversation_response = server
-        .post("/v1/conversations")
-        .add_header("Authorization", format!("Bearer {api_key}"))
-        .json(&json!({
-            "metadata": {
-                "title": "Streaming Citations Capture Test"
-            }
-        }))
-        .await;
-
-    assert_eq!(conversation_response.status_code(), 201);
-
-    let conversation_data = conversation_response.json::<serde_json::Value>();
-    let conversation_id = conversation_data
-        .get("id")
-        .and_then(|v| v.as_str())
-        .expect("Conversation ID should be present");
-
-    println!("✓ Created conversation: {conversation_id}");
-
     // Create streaming response with web search
     let response = server
          .post("/v1/responses")
          .add_header("Authorization", format!("Bearer {api_key}"))
          .json(&json!({
-             "conversation": conversation_id,
              "model": model,
              "input": "What are the latest developments in AI? Search the web and provide current information with citations.",
+            "store": false,
             "stream": true,
             "max_output_tokens": 256,
             "temperature": 0.7,

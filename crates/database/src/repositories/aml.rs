@@ -5,8 +5,8 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use services::aml::{
-    AmlAllowlistEntry, AmlAllowlistPage, AmlReport, AmlReportPage, AmlRepository, AmlRiskLevel,
-    NewAmlAllowlistEntry, NewAmlReport,
+    AmlAllowlistEntry, AmlAllowlistPage, AmlReport, AmlReportPage, AmlReportPolicySignals,
+    AmlRepository, AmlRiskLevel, NewAmlAllowlistEntry, NewAmlReport,
 };
 use services::common::RepositoryError;
 use tokio_postgres::Row;
@@ -254,8 +254,11 @@ impl AmlRepository for PostgresAmlRepository {
         Ok(row.map(Self::row_to_report))
     }
 
-    async fn report_risk_level(&self, report_id: uuid::Uuid) -> Result<Option<AmlRiskLevel>> {
-        let row = retry_db!("get_aml_report_risk_level", {
+    async fn report_policy_signals(
+        &self,
+        report_id: uuid::Uuid,
+    ) -> Result<Option<AmlReportPolicySignals>> {
+        let row = retry_db!("get_aml_report_policy_signals", {
             let client = self
                 .pool
                 .get()
@@ -266,7 +269,7 @@ impl AmlRepository for PostgresAmlRepository {
             client
                 .query_opt(
                     r#"
-                    SELECT risk_level
+                    SELECT risk_level, score
                     FROM aml_reports
                     WHERE id = $1
                     "#,
@@ -276,7 +279,10 @@ impl AmlRepository for PostgresAmlRepository {
                 .map_err(map_db_error)
         })?;
 
-        Ok(row.map(|row| db_risk_level(row.get::<_, String>("risk_level").as_str())))
+        Ok(row.map(|row| AmlReportPolicySignals {
+            risk_level: db_risk_level(row.get::<_, String>("risk_level").as_str()),
+            score: row.get("score"),
+        }))
     }
 
     async fn is_allowlisted(&self, account_id: &str, address_type: &str) -> Result<bool> {

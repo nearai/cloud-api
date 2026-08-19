@@ -54,13 +54,16 @@ impl PostgresAmlRepository {
 
 #[async_trait]
 impl AmlRepository for PostgresAmlRepository {
-    async fn latest_active_report(
+    async fn latest_active_report_with_policy_signal(
         &self,
         account_id: &str,
         address_type: &str,
         provider: &str,
+        fresh_after: Option<DateTime<Utc>>,
+        risk_level_policy_configured: bool,
+        score_policy_configured: bool,
     ) -> Result<Option<AmlReport>> {
-        let row = retry_db!("get_latest_active_aml_report", {
+        let row = retry_db!("get_active_aml_report_with_policy_signal", {
             let client = self
                 .pool
                 .get()
@@ -77,47 +80,22 @@ impl AmlRepository for PostgresAmlRepository {
                       AND address_type = $2
                       AND account_id = $3
                       AND active = true
+                      AND ($4::TIMESTAMPTZ IS NULL OR created_at >= $4)
+                      AND (
+                        ($5::BOOL AND risk_level <> 'UNKNOWN')
+                        OR ($6::BOOL AND score IS NOT NULL)
+                      )
                     ORDER BY created_at DESC
                     LIMIT 1
                     "#,
-                    &[&provider, &address_type, &account_id],
-                )
-                .await
-                .map_err(map_db_error)
-        })?;
-
-        Ok(row.map(Self::row_to_report))
-    }
-
-    async fn latest_fresh_active_report(
-        &self,
-        account_id: &str,
-        address_type: &str,
-        provider: &str,
-        fresh_after: DateTime<Utc>,
-    ) -> Result<Option<AmlReport>> {
-        let row = retry_db!("get_fresh_active_aml_report", {
-            let client = self
-                .pool
-                .get()
-                .await
-                .context("Failed to get database connection")
-                .map_err(RepositoryError::PoolError)?;
-
-            client
-                .query_opt(
-                    r#"
-                    SELECT *
-                    FROM aml_reports
-                    WHERE provider = $1
-                      AND address_type = $2
-                      AND account_id = $3
-                      AND active = true
-                      AND created_at >= $4
-                    ORDER BY created_at DESC
-                    LIMIT 1
-                    "#,
-                    &[&provider, &address_type, &account_id, &fresh_after],
+                    &[
+                        &provider,
+                        &address_type,
+                        &account_id,
+                        &fresh_after,
+                        &risk_level_policy_configured,
+                        &score_policy_configured,
+                    ],
                 )
                 .await
                 .map_err(map_db_error)

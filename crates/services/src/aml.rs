@@ -130,8 +130,8 @@ pub enum AmlError {
     AccountBlocked,
     #[error("invalid NEAR account id")]
     InvalidAccountId,
-    #[error("invalid AML report status update")]
-    InvalidReportStatus,
+    #[error("AML report has no signal for the configured policy")]
+    ReportLacksPolicySignal,
     #[error("AML provider request failed: {0}")]
     ProviderFailure(String),
     #[error("AML repository request failed: {0}")]
@@ -140,19 +140,14 @@ pub enum AmlError {
 
 #[async_trait]
 pub trait AmlRepository: Send + Sync {
-    async fn latest_active_report(
+    async fn latest_active_report_with_policy_signal(
         &self,
         account_id: &str,
         address_type: &str,
         provider: &str,
-    ) -> anyhow::Result<Option<AmlReport>>;
-
-    async fn latest_fresh_active_report(
-        &self,
-        account_id: &str,
-        address_type: &str,
-        provider: &str,
-        fresh_after: DateTime<Utc>,
+        fresh_after: Option<DateTime<Utc>>,
+        risk_level_policy_configured: bool,
+        score_policy_configured: bool,
     ) -> anyhow::Result<Option<AmlReport>>;
 
     async fn create_report(&self, report: NewAmlReport) -> anyhow::Result<AmlReport>;
@@ -427,9 +422,8 @@ fn normalize_lukka_report(
         .as_ref()
         .and_then(|section| section.risk_level.as_deref());
     let (risk_level, mut risk_reason) = normalize_provider_risk_level(provider_risk_level);
-    let active = (risk_level_policy_configured && risk_level != AmlRiskLevel::Unknown)
-        || (score_policy_configured && score.is_some());
-    if !active && score_policy_configured && !risk_level_policy_configured && score.is_none() {
+    let active = risk_level != AmlRiskLevel::Unknown || score.is_some();
+    if score_policy_configured && !risk_level_policy_configured && score.is_none() {
         risk_reason = Some("missing_score".to_string());
     }
     NewAmlReport {
@@ -587,19 +581,10 @@ impl AmlService {
 
         let fresh_after = Utc::now() - Duration::days(self.config.refresh_window_days);
         if let Some(report) = self
-            .repository
-            .latest_fresh_active_report(
-                &account_id,
-                AML_ADDRESS_TYPE_NEAR,
-                AML_PROVIDER_LUKKA,
-                fresh_after,
-            )
-            .await
-            .map_err(|error| AmlError::RepositoryFailure(error.to_string()))?
+            .latest_active_report_with_policy_signal(&account_id, Some(fresh_after))
+            .await?
         {
-            if !self.report_is_unknown_for_policy(&report) {
-                return self.decision_from_report(&report);
-            }
+            return self.decision_from_report(&report);
         }
 
         if let Some(report) = self.unknown_cache.get(&account_id).await {
@@ -678,7 +663,7 @@ impl AmlService {
                 return Ok(None);
             };
             if !self.has_policy_signal(&signals.risk_level, signals.score) {
-                return Err(AmlError::InvalidReportStatus);
+                return Err(AmlError::ReportLacksPolicySignal);
             }
         }
 
@@ -762,6 +747,24 @@ impl AmlService {
         has_risk_level_signal || has_score_signal
     }
 
+    async fn latest_active_report_with_policy_signal(
+        &self,
+        account_id: &str,
+        fresh_after: Option<DateTime<Utc>>,
+    ) -> Result<Option<AmlReport>, AmlError> {
+        self.repository
+            .latest_active_report_with_policy_signal(
+                account_id,
+                AML_ADDRESS_TYPE_NEAR,
+                AML_PROVIDER_LUKKA,
+                fresh_after,
+                !self.config.blocked_risk_levels.is_empty(),
+                self.config.score_block_threshold.is_some(),
+            )
+            .await
+            .map_err(|error| AmlError::RepositoryFailure(error.to_string()))
+    }
+
     async fn decision_from_unknown_report(
         &self,
         account_id: &str,
@@ -777,10 +780,8 @@ impl AmlService {
         }
 
         if let Some(stale_report) = self
-            .repository
-            .latest_active_report(account_id, AML_ADDRESS_TYPE_NEAR, AML_PROVIDER_LUKKA)
-            .await
-            .map_err(|error| AmlError::RepositoryFailure(error.to_string()))?
+            .latest_active_report_with_policy_signal(account_id, None)
+            .await?
         {
             if self.should_block_report(&stale_report) {
                 self.enqueue_high_risk_slack_alert(
@@ -1047,7 +1048,7 @@ mod tests {
     }
 
     #[test]
-    fn lukka_score_only_missing_score_maps_to_inactive_unknown() {
+    fn lukka_score_only_missing_score_preserves_provider_risk_metadata() {
         let report = normalize_lukka_report(
             None,
             AmlFlow::UserStatus,
@@ -1068,11 +1069,11 @@ mod tests {
         assert_eq!(report.risk_level, AmlRiskLevel::High);
         assert_eq!(report.score, None);
         assert_eq!(report.reason.as_deref(), Some("missing_score"));
-        assert!(!report.active);
+        assert!(report.active);
     }
 
     #[test]
-    fn lukka_score_only_malformed_score_maps_to_inactive_unknown() {
+    fn lukka_score_only_malformed_score_preserves_provider_risk_metadata() {
         let report = normalize_lukka_report(
             None,
             AmlFlow::UserStatus,
@@ -1094,7 +1095,7 @@ mod tests {
         assert_eq!(report.risk_level, AmlRiskLevel::High);
         assert_eq!(report.score, None);
         assert_eq!(report.reason.as_deref(), Some("missing_score"));
-        assert!(!report.active);
+        assert!(report.active);
     }
 
     #[test]
@@ -1195,23 +1196,37 @@ mod tests {
 
     #[async_trait]
     impl AmlRepository for MockAmlRepository {
-        async fn latest_active_report(
+        async fn latest_active_report_with_policy_signal(
             &self,
             _account_id: &str,
             _address_type: &str,
             _provider: &str,
+            fresh_after: Option<DateTime<Utc>>,
+            risk_level_policy_configured: bool,
+            score_policy_configured: bool,
         ) -> anyhow::Result<Option<AmlReport>> {
-            Ok(self.latest_active.lock().unwrap().clone())
-        }
+            let mut reports = self.reports.lock().unwrap().clone();
+            if fresh_after.is_some() {
+                if let Some(report) = self.latest_fresh_active.lock().unwrap().clone() {
+                    reports.push(report);
+                }
+            } else if let Some(report) = self.latest_active.lock().unwrap().clone() {
+                reports.push(report);
+            }
+            reports.sort_by(|left, right| {
+                right
+                    .created_at
+                    .cmp(&left.created_at)
+                    .then_with(|| right.id.cmp(&left.id))
+            });
 
-        async fn latest_fresh_active_report(
-            &self,
-            _account_id: &str,
-            _address_type: &str,
-            _provider: &str,
-            _fresh_after: DateTime<Utc>,
-        ) -> anyhow::Result<Option<AmlReport>> {
-            Ok(self.latest_fresh_active.lock().unwrap().clone())
+            Ok(reports.into_iter().find(|report| {
+                report.active
+                    && fresh_after.is_none_or(|fresh_after| report.created_at >= fresh_after)
+                    && ((risk_level_policy_configured
+                        && report.risk_level != AmlRiskLevel::Unknown)
+                        || (score_policy_configured && report.score.is_some()))
+            }))
         }
 
         async fn create_report(&self, report: NewAmlReport) -> anyhow::Result<AmlReport> {
@@ -1535,7 +1550,7 @@ mod tests {
         let provider = Arc::new(StaticProvider(NewAmlReport {
             risk_level: AmlRiskLevel::High,
             score: None,
-            active: false,
+            active: true,
             reason: Some("missing_score".to_string()),
             ..new_report(AmlRiskLevel::High)
         }));
@@ -1554,7 +1569,7 @@ mod tests {
         let reports = repo.reports.lock().unwrap();
         assert_eq!(reports[0].risk_level, AmlRiskLevel::High);
         assert_eq!(reports[0].score, None);
-        assert!(!reports[0].active);
+        assert!(reports[0].active);
     }
 
     #[tokio::test]
@@ -1570,7 +1585,7 @@ mod tests {
         let provider = Arc::new(StaticProvider(NewAmlReport {
             risk_level: AmlRiskLevel::High,
             score: None,
-            active: false,
+            active: true,
             reason: Some("missing_score".to_string()),
             ..new_report(AmlRiskLevel::High)
         }));
@@ -1591,6 +1606,83 @@ mod tests {
         assert!(matches!(first, Ok(AmlDecision::Allowed)));
         assert!(matches!(second, Ok(AmlDecision::Allowed)));
         assert_eq!(repo.created.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn stale_provider_failure_uses_prior_risk_level_signal_after_policy_change() {
+        let repo = Arc::new(MockAmlRepository::default());
+        let mut prior_score_only_report = report_to_stored(NewAmlReport {
+            risk_level: AmlRiskLevel::High,
+            score: None,
+            active: true,
+            reason: Some("missing_score".to_string()),
+            ..new_report(AmlRiskLevel::High)
+        });
+        prior_score_only_report.created_at = Utc::now() - Duration::days(31);
+        repo.reports.lock().unwrap().push(prior_score_only_report);
+        let provider = Arc::new(StaticProvider(NewAmlReport {
+            risk_level: AmlRiskLevel::Unknown,
+            score: None,
+            active: false,
+            reason: Some("timeout".to_string()),
+            ..new_report(AmlRiskLevel::Unknown)
+        }));
+        let config = AmlConfig {
+            blocked_risk_levels: vec!["HIGH".to_string()],
+            score_block_threshold: None,
+            refresh_window_days: 30,
+            ..enabled_config()
+        };
+        let service = AmlService::new(repo, provider, config);
+
+        let result = service
+            .check_near_account(None, "alice.near", AmlFlow::UserStatus)
+            .await;
+
+        assert!(matches!(result, Err(AmlError::AccountBlocked)));
+    }
+
+    #[tokio::test]
+    async fn newer_incompatible_active_report_does_not_mask_score_policy_signal() {
+        let repo = Arc::new(MockAmlRepository::default());
+        let mut older_score_report = report_to_stored(NewAmlReport {
+            risk_level: AmlRiskLevel::Low,
+            score: Some(90),
+            active: true,
+            ..new_report(AmlRiskLevel::Low)
+        });
+        older_score_report.created_at = Utc::now() - Duration::days(1);
+        let mut newer_no_score_report = report_to_stored(NewAmlReport {
+            risk_level: AmlRiskLevel::Low,
+            score: None,
+            active: true,
+            ..new_report(AmlRiskLevel::Low)
+        });
+        newer_no_score_report.created_at = Utc::now();
+        repo.reports
+            .lock()
+            .unwrap()
+            .extend([older_score_report, newer_no_score_report]);
+        let provider = Arc::new(StaticProvider(NewAmlReport {
+            risk_level: AmlRiskLevel::Unknown,
+            score: None,
+            active: false,
+            reason: Some("timeout".to_string()),
+            ..new_report(AmlRiskLevel::Unknown)
+        }));
+        let config = AmlConfig {
+            blocked_risk_levels: vec![],
+            score_block_threshold: Some(75),
+            ..enabled_config()
+        };
+        let service = AmlService::new(repo.clone(), provider, config);
+
+        let result = service
+            .check_near_account(None, "alice.near", AmlFlow::UserStatus)
+            .await;
+
+        assert!(matches!(result, Err(AmlError::AccountBlocked)));
+        assert!(repo.created.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -1853,7 +1945,32 @@ mod tests {
 
         let result = service.set_report_active(report_id, true).await;
 
-        assert!(matches!(result, Err(AmlError::InvalidReportStatus)));
+        assert!(matches!(result, Err(AmlError::ReportLacksPolicySignal)));
+        assert!(!repo.reports.lock().unwrap()[0].active);
+    }
+
+    #[tokio::test]
+    async fn report_status_mutation_rejects_known_report_without_policy_signal() {
+        let repo = Arc::new(MockAmlRepository::default());
+        let stored = report_to_stored(NewAmlReport {
+            risk_level: AmlRiskLevel::High,
+            score: None,
+            active: false,
+            ..new_report(AmlRiskLevel::High)
+        });
+        let report_id = stored.id;
+        repo.reports.lock().unwrap().push(stored);
+        let provider = Arc::new(StaticProvider(new_report(AmlRiskLevel::Low)));
+        let config = AmlConfig {
+            blocked_risk_levels: vec![],
+            score_block_threshold: Some(75),
+            ..enabled_config()
+        };
+        let service = AmlService::new(repo.clone(), provider, config);
+
+        let result = service.set_report_active(report_id, true).await;
+
+        assert!(matches!(result, Err(AmlError::ReportLacksPolicySignal)));
         assert!(!repo.reports.lock().unwrap()[0].active);
     }
 

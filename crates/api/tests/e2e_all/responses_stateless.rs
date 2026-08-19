@@ -97,3 +97,93 @@ async fn stateless_responses_reject_persistent_fields() {
         assert_eq!(error.error.r#type, "invalid_request_error");
     }
 }
+
+#[tokio::test]
+async fn completed_stateless_response_exposes_gateway_signature_when_persisted() {
+    let server = setup_test_server().await;
+    let model = setup_qwen_model(&server).await;
+    let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
+    let api_key = get_api_key_for_org(&server, org.id).await;
+
+    let request = serde_json::json!({
+        "model": model,
+        "input": "Respond with a short attested answer.",
+        "stream": false,
+        "store": false
+    });
+    let expected_request_hash = compute_sha256(
+        &serde_json::to_string(&request).expect("serialize stateless Responses request"),
+    );
+
+    let response = server
+        .post("/v1/responses")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .json(&request)
+        .await;
+
+    assert_eq!(
+        response.status_code(),
+        200,
+        "stateless Responses request should succeed: {}",
+        response.text()
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("cache-control")
+            .and_then(|value| value.to_str().ok()),
+        Some("no-store")
+    );
+
+    let response_text = response.text();
+    let expected_response_hash = compute_sha256(&response_text);
+    let response_json: serde_json::Value =
+        serde_json::from_str(&response_text).expect("Responses result must be JSON");
+    let response_id = response_json
+        .get("id")
+        .and_then(|value| value.as_str())
+        .expect("completed response must have an ID");
+    assert!(response_id.starts_with("resp_"));
+
+    let signature = server
+        .get(&format!("/v1/signature/{response_id}?signing_algo=ecdsa"))
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .await;
+    assert_eq!(
+        signature.status_code(),
+        200,
+        "completed response signature should be available when persistence succeeds: {}",
+        signature.text()
+    );
+
+    let signature: serde_json::Value = signature.json();
+    assert_eq!(
+        signature
+            .get("signature_kind")
+            .and_then(|value| value.as_str()),
+        Some("gateway")
+    );
+    assert_eq!(
+        signature
+            .get("signing_algo")
+            .and_then(|value| value.as_str()),
+        Some("ecdsa")
+    );
+    assert!(
+        signature
+            .get("signature")
+            .and_then(|value| value.as_str())
+            .is_some_and(|value| !value.is_empty()),
+        "gateway signature must be present"
+    );
+
+    let signed_hashes = signature
+        .get("text")
+        .and_then(|value| value.as_str())
+        .expect("gateway signature must include its signed hashes");
+    let (request_hash, response_hash) = signed_hashes
+        .split_once(':')
+        .expect("gateway signature text must be request_hash:response_hash");
+    assert_eq!(request_hash, expected_request_hash);
+    assert_eq!(response_hash, expected_response_hash);
+}

@@ -287,12 +287,17 @@ value is treated as `false`). Cloud API does not retain raw request or response
 content, response items, or response history; clients must supply any needed
 prior context with each request.
 
-The narrow exception is the attestation record needed for later
-`GET /v1/signature/resp_*` lookup: response ID, SHA-256 request/response
-digests, signatures, signing metadata, and timestamps. These are
-content-derived sensitive metadata rather than raw content. In particular,
-deterministic hashes must not be treated as anonymous if the underlying content
-could be guessed and compared offline.
+Existing completed-response gateway attestation is preserved on a best-effort
+basis. When its signature write succeeds, `GET /v1/signature/resp_*` can
+retrieve the response ID and signatures over SHA-256 request/response digests;
+the signature material contains no raw request or response content. A stream
+that disconnects before completion creates no `resp_*` attestation record or
+legacy disconnect fallback.
+
+Stateful operations are rejected: Conversations, response history, file input
+and file search, function tools and function-call continuation, code
+interpreter, computer, and every MCP approval mode other than
+`require_approval: "never"`.
 
 ## 7. Troubleshooting
 

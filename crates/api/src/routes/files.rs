@@ -15,6 +15,22 @@ use uuid::Uuid;
 
 pub const MAX_FILE_SIZE: usize = 512 * 1024 * 1024; // 512 MB
 
+/// Returns the documented retirement response for the former Files API.
+///
+/// The service and its stored data remain in place for now so existing data can
+/// be handled by a separate retention effort, but no Files API request may
+/// trigger a new upload, read, or deletion.
+pub async fn files_api_deprecated() -> (StatusCode, Json<ErrorResponse>) {
+    (
+        StatusCode::GONE,
+        Json(ErrorResponse::new(
+            "The Files API has been deprecated and is no longer available. Manage file content in your application and use stateless POST /v1/responses requests with store: false."
+                .to_string(),
+            "gone".to_string(),
+        )),
+    )
+}
+
 #[utoipa::path(
     post,
     path = "/v1/files",

@@ -391,7 +391,7 @@ async fn test_deleted_api_key_cannot_be_used() {
 
     let api_key = api_key_resp.key.clone().unwrap();
 
-    // Verify key works before deletion
+    // A valid key reaches the retired Files endpoint before deletion.
     let response = server
         .get("/v1/files?limit=1")
         .add_header("Authorization", format!("Bearer {api_key}"))
@@ -399,8 +399,8 @@ async fn test_deleted_api_key_cannot_be_used() {
 
     assert_eq!(
         response.status_code(),
-        200,
-        "API key should work before deletion"
+        410,
+        "Valid API key should reach the Files API retirement response before deletion"
     );
 
     // Delete the API key
@@ -892,7 +892,7 @@ async fn test_api_key_authentication() {
 
     let (api_key, _) = create_org_and_api_key(&server).await;
 
-    // Test valid API key
+    // A valid API key reaches the retired Files endpoint.
     let response = server
         .get("/v1/files?limit=1")
         .add_header("Authorization", format!("Bearer {api_key}"))
@@ -900,8 +900,8 @@ async fn test_api_key_authentication() {
 
     assert_eq!(
         response.status_code(),
-        200,
-        "Valid API key should be accepted"
+        410,
+        "Valid API key should reach the Files API retirement response"
     );
 
     // Test invalid API key

@@ -438,9 +438,9 @@ fn aml_allowlist_response(entry: AmlAllowlistEntry) -> AdminAmlAllowlistEntryRes
 fn aml_service_error(error: AmlError) -> (StatusCode, ResponseJson<ErrorResponse>) {
     match error {
         AmlError::InvalidAccountId => bad_request("Invalid NEAR account ID", "invalid_account_id"),
-        AmlError::InvalidReportStatus => bad_request(
-            "UNKNOWN AML reports cannot be activated",
-            "invalid_report_status",
+        AmlError::ReportLacksPolicySignal => bad_request(
+            "AML report cannot be activated because it has no signal for the configured policy",
+            "aml_report_lacks_policy_signal",
         ),
         AmlError::AccountBlocked => (
             StatusCode::FORBIDDEN,

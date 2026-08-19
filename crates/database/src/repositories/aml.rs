@@ -5,8 +5,8 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use services::aml::{
-    AmlAllowlistEntry, AmlAllowlistPage, AmlReport, AmlReportPage, AmlRepository, AmlRiskLevel,
-    NewAmlAllowlistEntry, NewAmlReport,
+    AmlAllowlistEntry, AmlAllowlistPage, AmlReport, AmlReportPage, AmlReportPolicySignals,
+    AmlRepository, AmlRiskLevel, NewAmlAllowlistEntry, NewAmlReport,
 };
 use services::common::RepositoryError;
 use tokio_postgres::Row;
@@ -54,13 +54,16 @@ impl PostgresAmlRepository {
 
 #[async_trait]
 impl AmlRepository for PostgresAmlRepository {
-    async fn latest_active_report(
+    async fn latest_active_report_with_policy_signal(
         &self,
         account_id: &str,
         address_type: &str,
         provider: &str,
+        fresh_after: Option<DateTime<Utc>>,
+        risk_level_policy_configured: bool,
+        score_policy_configured: bool,
     ) -> Result<Option<AmlReport>> {
-        let row = retry_db!("get_latest_active_aml_report", {
+        let row = retry_db!("get_active_aml_report_with_policy_signal", {
             let client = self
                 .pool
                 .get()
@@ -77,47 +80,22 @@ impl AmlRepository for PostgresAmlRepository {
                       AND address_type = $2
                       AND account_id = $3
                       AND active = true
+                      AND ($4::TIMESTAMPTZ IS NULL OR created_at >= $4)
+                      AND (
+                        ($5::BOOL AND risk_level <> 'UNKNOWN')
+                        OR ($6::BOOL AND score IS NOT NULL)
+                      )
                     ORDER BY created_at DESC
                     LIMIT 1
                     "#,
-                    &[&provider, &address_type, &account_id],
-                )
-                .await
-                .map_err(map_db_error)
-        })?;
-
-        Ok(row.map(Self::row_to_report))
-    }
-
-    async fn latest_fresh_active_report(
-        &self,
-        account_id: &str,
-        address_type: &str,
-        provider: &str,
-        fresh_after: DateTime<Utc>,
-    ) -> Result<Option<AmlReport>> {
-        let row = retry_db!("get_fresh_active_aml_report", {
-            let client = self
-                .pool
-                .get()
-                .await
-                .context("Failed to get database connection")
-                .map_err(RepositoryError::PoolError)?;
-
-            client
-                .query_opt(
-                    r#"
-                    SELECT *
-                    FROM aml_reports
-                    WHERE provider = $1
-                      AND address_type = $2
-                      AND account_id = $3
-                      AND active = true
-                      AND created_at >= $4
-                    ORDER BY created_at DESC
-                    LIMIT 1
-                    "#,
-                    &[&provider, &address_type, &account_id, &fresh_after],
+                    &[
+                        &provider,
+                        &address_type,
+                        &account_id,
+                        &fresh_after,
+                        &risk_level_policy_configured,
+                        &score_policy_configured,
+                    ],
                 )
                 .await
                 .map_err(map_db_error)
@@ -254,8 +232,11 @@ impl AmlRepository for PostgresAmlRepository {
         Ok(row.map(Self::row_to_report))
     }
 
-    async fn report_risk_level(&self, report_id: uuid::Uuid) -> Result<Option<AmlRiskLevel>> {
-        let row = retry_db!("get_aml_report_risk_level", {
+    async fn report_policy_signals(
+        &self,
+        report_id: uuid::Uuid,
+    ) -> Result<Option<AmlReportPolicySignals>> {
+        let row = retry_db!("get_aml_report_policy_signals", {
             let client = self
                 .pool
                 .get()
@@ -266,7 +247,7 @@ impl AmlRepository for PostgresAmlRepository {
             client
                 .query_opt(
                     r#"
-                    SELECT risk_level
+                    SELECT risk_level, score
                     FROM aml_reports
                     WHERE id = $1
                     "#,
@@ -276,7 +257,10 @@ impl AmlRepository for PostgresAmlRepository {
                 .map_err(map_db_error)
         })?;
 
-        Ok(row.map(|row| db_risk_level(row.get::<_, String>("risk_level").as_str())))
+        Ok(row.map(|row| AmlReportPolicySignals {
+            risk_level: db_risk_level(row.get::<_, String>("risk_level").as_str()),
+            score: row.get("score"),
+        }))
     }
 
     async fn is_allowlisted(&self, account_id: &str, address_type: &str) -> Result<bool> {

@@ -207,7 +207,10 @@ impl AmlConfig {
         if config.request_timeout_seconds == 0 || config.request_timeout_seconds > 300 {
             return Err("LUKKA_AML_REQUEST_TIMEOUT_SECONDS must be between 1 and 300".to_string());
         }
-        if config.blocked_risk_levels.is_empty() && config.score_block_threshold.is_none() {
+        if requested_enabled
+            && config.blocked_risk_levels.is_empty()
+            && config.score_block_threshold.is_none()
+        {
             return Err(
                 "At least one AML risk policy must be configured via LUKKA_AML_BLOCKED_RISK_LEVELS or LUKKA_AML_SCORE_BLOCK_THRESHOLD"
                     .to_string(),
@@ -1424,6 +1427,8 @@ mod tests {
         clear_aml_env();
         std::env::set_var("LUKKA_AML_BLOCKED_RISK_LEVELS", "");
         std::env::set_var("LUKKA_AML_SCORE_BLOCK_THRESHOLD", "disabled");
+        std::env::set_var("LUKKA_AML_ENABLED", "true");
+        std::env::set_var("LUKKA_AML_BEARER_TOKEN", "token");
         let error = AmlConfig::from_env().unwrap_err();
         assert!(error.contains("At least one AML risk policy"));
 

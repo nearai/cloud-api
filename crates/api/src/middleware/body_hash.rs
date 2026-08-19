@@ -49,9 +49,8 @@ pub async fn body_hash_middleware(request: Request, next: Next) -> Result<Respon
     let hash = hex::encode(hash_bytes);
 
     debug!(
-        "Request body hash computed: {} (body size: {} bytes)",
-        hash,
-        body_bytes.len()
+        body_size_bytes = body_bytes.len(),
+        "Request body hash computed"
     );
 
     // Create the hash info struct

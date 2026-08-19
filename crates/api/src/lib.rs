@@ -1704,6 +1704,10 @@ pub fn build_response_routes(
     Router::new()
         .merge(inference_routes)
         .merge(retired_history_routes)
+        // Responses can contain user-provided prompts and model output. Apply
+        // this outside the route groups so extractor, authentication, and
+        // rate-limit rejections are no-store too.
+        .layer(map_response(no_store_response))
 }
 
 /// Build explicit not-implemented handlers for recognized OpenAI-compatible
@@ -2051,6 +2055,16 @@ async fn cache_control_on_success(
         res.headers_mut().insert(CACHE_CONTROL, value);
     }
     res
+}
+
+/// Force every response for a request-scoped Responses route to bypass shared
+/// and browser caches. Unlike public catalog routes, even error responses may
+/// include request-specific details from validation or authentication.
+async fn no_store_response(mut response: Response) -> Response {
+    response
+        .headers_mut()
+        .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
 }
 
 // Type aliases for `cache_control_layer`'s return type. They name the
@@ -3059,6 +3073,47 @@ mod tests {
     use axum::response::IntoResponse;
     use axum::routing::get;
     use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn no_store_response_layer_covers_extractor_rejections() {
+        #[derive(serde::Deserialize)]
+        struct RequestPayload {
+            #[allow(dead_code)]
+            model: String,
+        }
+
+        async fn handler(
+            crate::routes::extractors::OpenAiJson(_): crate::routes::extractors::OpenAiJson<
+                RequestPayload,
+            >,
+        ) -> StatusCode {
+            StatusCode::OK
+        }
+
+        let app = Router::new()
+            .route("/responses", axum::routing::post(handler))
+            .layer(map_response(no_store_response));
+        let response = app
+            .oneshot(
+                HttpRequest::builder()
+                    .method("POST")
+                    .uri("/responses")
+                    .header("content-type", "application/json")
+                    .body(Body::from("{not json"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            response
+                .headers()
+                .get(CACHE_CONTROL)
+                .and_then(|value| value.to_str().ok()),
+            Some("no-store"),
+        );
+    }
 
     fn cache_test_app() -> Router {
         async fn ok_handler() -> impl IntoResponse {

@@ -61,6 +61,12 @@ impl MetricsServiceTrait for OtlpMetricsService {
                 consts::METRIC_LATENCY_TTFT_TOTAL => {
                     "E2E TTFT: Time from service request to first token (includes queue time)"
                 }
+                consts::METRIC_LATENCY_STREAMING_TTFT_BY_INPUT => {
+                    "Streaming backend TTFT grouped by final prompt-token bucket"
+                }
+                consts::METRIC_LATENCY_STREAMING_TTFT_TOTAL_BY_INPUT => {
+                    "Streaming E2E TTFT grouped by final prompt-token bucket"
+                }
                 consts::METRIC_LATENCY_QUEUE_TIME => {
                     "Queue/Wait time: Internal overhead before provider call"
                 }

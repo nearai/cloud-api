@@ -1,6 +1,12 @@
 // Latency metrics
 pub const METRIC_LATENCY_TTFT: &str = "cloud_api.latency.time_to_first_token";
 pub const METRIC_LATENCY_TTFT_TOTAL: &str = "cloud_api.latency.time_to_first_token_total";
+// Streaming-only TTFT histograms emitted after usage arrives, so the actual
+// prompt-token bucket can be attached without mixing in non-streaming latency.
+pub const METRIC_LATENCY_STREAMING_TTFT_BY_INPUT: &str =
+    "cloud_api.latency.streaming_time_to_first_token_by_input";
+pub const METRIC_LATENCY_STREAMING_TTFT_TOTAL_BY_INPUT: &str =
+    "cloud_api.latency.streaming_time_to_first_token_total_by_input";
 pub const METRIC_LATENCY_TOTAL: &str = "cloud_api.latency.total";
 pub const METRIC_LATENCY_QUEUE_TIME: &str = "cloud_api.latency.queue_time";
 pub const METRIC_LATENCY_DECODING_TIME: &str = "cloud_api.latency.decoding_time";

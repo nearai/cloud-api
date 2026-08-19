@@ -66,7 +66,7 @@ The API has two mutually-exclusive auth methods:
 - **Session auth** (cookies / `Authorization: Bearer rt_…`) for the
   management plane: organizations, workspaces, users, API keys.
 - **API key auth** (`Authorization: Bearer sk-…`) for the data plane:
-  chat completions, responses, conversations, attestation.
+  chat completions, responses, and attestation.
 
 ### Mock session auth (no real OAuth)
 
@@ -273,7 +273,6 @@ Provider refresh runs every 300s by default
 | `GET  /v1/models`                           | public   | OpenAI-compatible model catalog with pricing metadata       |
 | `POST /v1/chat/completions`                 | API key  | OpenAI-compatible. Add `"stream": true` for SSE             |
 | `POST /v1/responses`                        | API key  | Platform-specific event-streamed responses                  |
-| `POST /v1/conversations`                    | API key  | Conversation lifecycle                                      |
 | `GET  /v1/attestation/report`               | API key  | TEE attestation (503 outside a CVM unless `DEV=true` in debug builds) |
 | `GET  /v1/attestation/ita-token`            | public   | Intel Trust Authority JWT wrapper (requires ITA env vars)   |
 | `GET  /v1/signature/{chat_id}`              | API key  | Per-completion signature lookup                             |

@@ -272,13 +272,27 @@ Provider refresh runs every 300s by default
 | `POST /v1/workspaces/{id}/api-keys`         | session  | Returns plaintext `key` — store it, it isn't shown again    |
 | `GET  /v1/models`                           | public   | OpenAI-compatible model catalog with pricing metadata       |
 | `POST /v1/chat/completions`                 | API key  | OpenAI-compatible. Add `"stream": true` for SSE             |
-| `POST /v1/responses`                        | API key  | Single-turn no-store response inference; response history is unavailable |
+| `POST /v1/responses`                        | API key  | Single-turn `store: false` inference; response history is unavailable |
 | `GET  /v1/attestation/report`               | API key  | TEE attestation (503 outside a CVM unless `DEV=true` in debug builds) |
 | `GET  /v1/attestation/ita-token`            | public   | Intel Trust Authority JWT wrapper (requires ITA env vars)   |
-| `GET  /v1/signature/{chat_id}`              | API key  | Per-completion signature lookup                             |
+| `GET  /v1/signature/{chat_id}`              | API key  | Per-completion and `resp_*` signature lookup                |
 
 The Scalar UI at `http://localhost:3000/docs` lets you fire each of these
 interactively and inspect request/response schemas.
+
+### Stateless Responses and attestation retention
+
+`POST /v1/responses` is single-turn and accepts only `store: false` (an omitted
+value is treated as `false`). Cloud API does not retain raw request or response
+content, response items, or response history; clients must supply any needed
+prior context with each request.
+
+The narrow exception is the attestation record needed for later
+`GET /v1/signature/resp_*` lookup: response ID, SHA-256 request/response
+digests, signatures, signing metadata, and timestamps. These are
+content-derived sensitive metadata rather than raw content. In particular,
+deterministic hashes must not be treated as anonymous if the underlying content
+could be guessed and compared offline.
 
 ## 7. Troubleshooting
 

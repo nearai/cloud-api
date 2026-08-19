@@ -23,6 +23,7 @@ from urllib.request import Request, urlopen
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_MANIFEST = ROOT / "config" / "openai_text_pricing.v1.json"
 GPT56_PREFIX = "openai/gpt-5.6"
+DEFAULT_USER_AGENT = "cloud-api-openai-pricing-catalog/1"
 
 
 class CatalogError(RuntimeError):
@@ -105,6 +106,7 @@ def request_json(
     method: str,
     url: str,
     token: str,
+    user_agent: str,
     body: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     data = None if body is None else json.dumps(body, separators=(",", ":")).encode()
@@ -116,7 +118,7 @@ def request_json(
             "Authorization": f"Bearer {token}",
             "Accept": "application/json",
             "Content-Type": "application/json",
-            "User-Agent": "cloud-api-openai-pricing-catalog/1",
+            "User-Agent": user_agent,
         },
     )
     try:
@@ -129,9 +131,14 @@ def request_json(
         raise CatalogError(f"admin API request failed: {error}") from error
 
 
-def fetch_catalog(base_url: str, token: str) -> dict[str, dict[str, Any]]:
+def fetch_catalog(base_url: str, token: str, user_agent: str) -> dict[str, dict[str, Any]]:
     query = urlencode({"include_inactive": "true", "limit": 500, "offset": 0})
-    response = request_json("GET", f"{base_url.rstrip('/')}/v1/admin/models?{query}", token)
+    response = request_json(
+        "GET",
+        f"{base_url.rstrip('/')}/v1/admin/models?{query}",
+        token,
+        user_agent,
+    )
     models = response.get("models")
     if not isinstance(models, list):
         raise CatalogError("admin model response did not contain a models array")
@@ -171,6 +178,9 @@ def compare_catalog_metadata(
 
     for field, value in expected_metadata.items():
         actual_value = actual.get(field)
+        if field == "aliases" and value == [] and actual_value is None:
+            # The admin response omits an empty alias set as null.
+            actual_value = []
         if field == "providerConfig":
             # The admin response may contain a redacted global/provider key. It
             # is intentionally outside the checked-in manifest; all routing
@@ -264,6 +274,14 @@ def parse_args() -> argparse.Namespace:
         default="NEAR_AI_CLOUD_ADMIN_ACCESS_TOKEN",
         help="environment variable holding the admin token",
     )
+    parser.add_argument(
+        "--user-agent-env",
+        help=(
+            "optional environment variable holding the User-Agent bound to the admin "
+            "token; defaults to the catalog command's own User-Agent, which will be "
+            "rejected with HTTP 401 when the token is bound to a different value"
+        ),
+    )
     parser.add_argument("--apply", action="store_true", help="apply differences via PATCH")
     parser.add_argument(
         "--activate-gpt56",
@@ -290,7 +308,18 @@ def main() -> int:
         token = os.environ.get(args.admin_token_env)
         if not token:
             raise CatalogError(f"admin token environment variable {args.admin_token_env} is unset")
-        catalog = fetch_catalog(args.base_url, token)
+        user_agent = DEFAULT_USER_AGENT
+        if args.user_agent_env:
+            user_agent = os.environ.get(args.user_agent_env, "")
+            if not user_agent.strip():
+                raise CatalogError(
+                    f"user-agent environment variable {args.user_agent_env} is unset or empty"
+                )
+            if "\r" in user_agent or "\n" in user_agent:
+                raise CatalogError("admin User-Agent must not contain a newline")
+            if not user_agent.isascii():
+                raise CatalogError("admin User-Agent must contain only ASCII characters")
+        catalog = fetch_catalog(args.base_url, token, user_agent)
         differences = audit(manifest, catalog, args.activate_gpt56)
         if not differences:
             print("audit clean: 18 canonical OpenAI rows match the manifest")
@@ -302,10 +331,16 @@ def main() -> int:
             return 1
 
         payload = apply_payload(manifest, catalog, args.activate_gpt56)
-        request_json("PATCH", f"{args.base_url.rstrip('/')}/v1/admin/models", token, payload)
+        request_json(
+            "PATCH",
+            f"{args.base_url.rstrip('/')}/v1/admin/models",
+            token,
+            user_agent,
+            payload,
+        )
         remaining = audit(
             manifest,
-            fetch_catalog(args.base_url, token),
+            fetch_catalog(args.base_url, token, user_agent),
             args.activate_gpt56,
         )
         if remaining:

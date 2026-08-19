@@ -75,8 +75,6 @@ pub struct AmlConfig {
     pub memory_cache_ttl_seconds: u64,
     pub unknown_cache_ttl_seconds: u64,
     pub request_timeout_seconds: u64,
-    /// Deprecated: provider risk level is retained for audit display, but AML
-    /// blocking is enforced only by `score_block_threshold`.
     pub blocked_risk_levels: Vec<String>,
     pub score_block_threshold: Option<i32>,
     pub high_risk_slack_webhook_url: Option<String>,
@@ -128,7 +126,7 @@ impl Default for AmlConfig {
             memory_cache_ttl_seconds: 300,
             unknown_cache_ttl_seconds: 60,
             request_timeout_seconds: 10,
-            blocked_risk_levels: vec![],
+            blocked_risk_levels: vec!["HIGH".to_string()],
             score_block_threshold: Some(75),
             high_risk_slack_webhook_url: None,
             high_risk_slack_timeout_ms: 3_000,
@@ -209,9 +207,12 @@ impl AmlConfig {
         if config.request_timeout_seconds == 0 || config.request_timeout_seconds > 300 {
             return Err("LUKKA_AML_REQUEST_TIMEOUT_SECONDS must be between 1 and 300".to_string());
         }
-        if requested_enabled && config.score_block_threshold.is_none() {
+        if requested_enabled
+            && config.blocked_risk_levels.is_empty()
+            && config.score_block_threshold.is_none()
+        {
             return Err(
-                "LUKKA_AML_SCORE_BLOCK_THRESHOLD must be configured when LUKKA_AML_ENABLED=true"
+                "At least one AML risk policy must be configured via LUKKA_AML_BLOCKED_RISK_LEVELS or LUKKA_AML_SCORE_BLOCK_THRESHOLD"
                     .to_string(),
             );
         }
@@ -1371,7 +1372,7 @@ mod tests {
 
     #[test]
     #[serial]
-    fn aml_score_policy_env_overrides_defaults() {
+    fn aml_risk_policy_env_overrides_defaults() {
         clear_aml_env();
         std::env::set_var("LUKKA_AML_BLOCKED_RISK_LEVELS", "medium, high, medium");
         std::env::set_var("LUKKA_AML_SCORE_BLOCK_THRESHOLD", "82");
@@ -1429,7 +1430,7 @@ mod tests {
         std::env::set_var("LUKKA_AML_ENABLED", "true");
         std::env::set_var("LUKKA_AML_BEARER_TOKEN", "token");
         let error = AmlConfig::from_env().unwrap_err();
-        assert!(error.contains("LUKKA_AML_SCORE_BLOCK_THRESHOLD"));
+        assert!(error.contains("At least one AML risk policy"));
 
         clear_aml_env();
         std::env::set_var("LUKKA_AML_UNKNOWN_CACHE_TTL_SECONDS", "86401");

@@ -19,6 +19,7 @@ Production runs at **info level and above**. We ABSOLUTELY CANNOT and SHOULD NOT
 - **AI responses** - Model outputs, completions, or generated text
 - **Metadata that reveals customer information** - Custom fields, tags, labels that could expose user activity
 - **File contents** - Uploaded file data or processed file content
+- **Content-derived metadata** - Request/response digests, signature payloads, or other stable derivations of customer content
 - **Any PII** - Names, emails (except for auth flow), addresses, phone numbers in user content
 
 #### ✓ OK TO LOG (Permitted for Debugging)
@@ -103,14 +104,14 @@ cargo test --lib --bins
 # Run ALL e2e tests (requires PostgreSQL running)
 cargo test --test e2e_test
 
-# Run a single e2e test file
-cargo test --test e2e_conversations
+# Run the stateless Responses e2e module
+cargo test -p api --test e2e_all responses_stateless
 
 # Run vLLM integration tests (requires vLLM server)
 cargo test --test integration_tests
 
-# Run a specific test by name
-cargo test test_create_conversation
+# Run a specific Responses test by name
+cargo test -p api --test e2e_all responses_stateless
 ```
 
 ### Database Setup for Tests
@@ -172,8 +173,8 @@ Organization (Tenant Root)
 - Storage: Hashed session token in database, returned as HTTP-only cookie
 
 **2. API Key-Based (AI Inference Operations)**
-- Used for: Chat completions, conversations, responses, attestation
-- Endpoints: `/v1/chat/completions`, `/v1/responses/*`, `/v1/conversations/*`
+- Used for: Chat completions, Responses, and attestation
+- Endpoints: `/v1/chat/completions`, `POST /v1/responses`, `/v1/signature/{chat_id}`, `/v1/attestation/*`
 - Format: `Authorization: Bearer sk-live-xxx` or `Authorization: Bearer sk-test-xxx`
 - Storage: SHA-256 hashed, workspace-scoped
 - Tracking: Last used timestamp, optional expiration
@@ -191,19 +192,17 @@ POST /v1/completions
 - Supports streaming (SSE) and non-streaming
 - Standard OpenAI format with `[DONE]` terminator
 
-**B. Response API (Platform-specific)**
+**B. Responses API (single-turn, stateless)**
 ```
 POST /v1/responses
 ```
-- Links to conversation history for context
-- Rich metadata and event types
+- `store: false` is the only supported mode; an omitted `store` is treated as `false` and `store: true` is rejected
+- Clients send all needed prior context in each request. Conversations, `previous_response_id`, background responses, and response-history endpoints are retired or unsupported.
+- Raw request/response content, response items, and conversation history are not persisted.
+- **Narrow attestation exception**: to support later `GET /v1/signature/resp_*` lookup, the service retains the response ID, SHA-256 request/response digests, signatures, signing metadata, and timestamps. These are content-derived sensitive metadata, not raw content; do not log them, and do not treat deterministic hashes as anonymous when the underlying content may be guessable.
 - Event types: `response.created`, `response.output_text.delta`, `response.completed`, `response.failed`
-- **Tool use**: Supports external function calls, code_interpreter, computer tools (client-executed),
-  plus server-executed web_search, file_search, and MCP tools
-- **Function call flow**: LLM requests a function, response pauses with status `incomplete`,
-  client executes and resumes via `previous_response_id` + `FunctionCallOutput` input.
-  Resumption verifies workspace ownership on `previous_response_id` and validates
-  each `call_id` maps to exactly one stored FunctionCall
+- `/v1/conversations/*` and `/v1/files/*` return authenticated `410 Gone` responses.
+- Stateful tools and continuations are unsupported: file input/file search, function tools and function-call continuation, code interpreter, computer, and MCP approval continuation. Only request-scoped MCP calls with `require_approval: "never"` are supported.
 
 **Streaming Flow**:
 ```
@@ -217,7 +216,7 @@ Client → CompletionService → Provider Pool (round-robin)
 - Discovery Server polled every 5 minutes (configurable)
 - `GET /models` returns available models and their vLLM endpoints
 - Provider Pool updated dynamically (no hardcoded models)
-- Load balancing: round-robin for new requests, sticky routing for conversations
+- Load balancing: round-robin for new requests
 
 ### Database Layer (Patroni High-Availability)
 - PostgreSQL 16 with deadpool connection pooling
@@ -225,6 +224,10 @@ Client → CompletionService → Provider Pool (round-robin)
 - **20+ Repositories**: User, Organization, Workspace, APIKey, Session, Conversation, Response, Model, Usage, Attestation
 - **Migrations**: SQL-based using Refinery, run on startup
 - Located at: `crates/database/src/migrations/sql/`
+
+Historical Conversation, Response, ResponseItem, and File schemas/repositories remain for now,
+but the retired public APIs must not be wired back to them. Data deletion and schema removal are
+separate work.
 
 ### External Billing / Credits Service
 
@@ -256,14 +259,14 @@ Located in `crates/services/src/`:
 - `workspace` - Workspace CRUD, settings
 - `user` - User profiles, session management
 - `completions` - AI completion orchestration
-- `conversations` - Conversation lifecycle
-- `responses` - Response streaming with token tracking, tool orchestration (function calls, web search, file search, MCP)
+- `conversations` - Legacy module; its public API surface is retired
+- `responses` - Request-scoped, stateless response orchestration and supported one-turn tools
 - `attestation` - TEE attestation reports, chat signatures
 - `models` - Model catalog and pricing
 - `usage` - Token tracking, limit enforcement, billing
 - `inference_provider_pool` - Model discovery, load balancing
 - `mcp` - Model Context Protocol client management
-- `files` - File storage (AWS S3)
+- `files` - Legacy module; its public API surface is retired
 - `metrics` - OpenTelemetry metrics
 - `admin` - Admin operations, analytics
 - `common` - Shared utilities
@@ -276,13 +279,13 @@ Located in `crates/api/src/routes/`:
 - `workspaces.rs` - Workspace & API key management
 - `users.rs` - User profile, invitations, sessions
 - `completions.rs` - Chat & text completions
-- `conversations.rs` - Conversation management
-- `responses.rs` - AI response streaming
+- `conversations.rs` - Retired API surface (authenticated `410 Gone`)
+- `responses.rs` - Stateless AI response streaming
 - `models.rs` - Model catalog
 - `usage.rs` - Usage tracking, billing
 - `attestation.rs` - TEE verification, signatures
 - `admin.rs` - Admin endpoints
-- `files.rs` - File upload/download
+- `files.rs` - Retired API surface (authenticated `410 Gone`)
 - `health.rs` - Health checks
 - `api.rs` - API versioning
 
@@ -355,7 +358,6 @@ Comprehensive C4 diagrams and flows: `docs/architecture/c4-diagrams.md`
 - No hardcoded model configuration
 - Automatic scaling as inference servers added/removed
 - Graceful handling of provider failures
-- Conversation consistency via sticky routing
 
 ## API Documentation
 

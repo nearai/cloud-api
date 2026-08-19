@@ -1,6 +1,6 @@
 # NEAR AI Cloud API
 
-A Rust-based cloud API for AI model inference, conversation management, and organization administration. Part of the NEAR AI platform alongside the Chat API.
+A Rust-based cloud API for AI model inference and organization administration. Part of the NEAR AI platform alongside the Chat API.
 
 ## Quick Start
 
@@ -170,6 +170,12 @@ Once all checks pass, you're ready to commit!
 
 
 ## API Documentation
+
+### Retired Conversations API
+
+The `/v1/conversations` API is retired and every request to that path returns
+`410 Gone`. Use stateless `POST /v1/responses` requests with `store: false` and
+send any conversation history needed for inference in each request.
 
 Interactive API documentation is available when running the server:
 

@@ -14,6 +14,27 @@ use std::sync::Arc;
 use tracing::debug;
 use uuid::Uuid;
 
+const CONVERSATIONS_API_RETIRED_MESSAGE: &str = "The Conversations API has been deprecated and is no longer available. Use stateless POST /v1/responses with store: false and include any prior conversation history in the request.";
+
+/// Return a stable migration response for every retired Conversation API route.
+///
+/// API-key authentication is enforced by the router. This handler intentionally
+/// has no service dependencies, so retired requests cannot read or write
+/// existing conversation data.
+pub async fn conversation_api_gone() -> (StatusCode, ResponseJson<ErrorResponse>) {
+    (
+        StatusCode::GONE,
+        ResponseJson(ErrorResponse {
+            error: ErrorDetail {
+                message: CONVERSATIONS_API_RETIRED_MESSAGE.to_string(),
+                r#type: "gone".to_string(),
+                param: None,
+                code: Some("conversation_api_retired".to_string()),
+            },
+        }),
+    )
+}
+
 // Helper functions for ID conversion
 fn parse_conversation_id(id_str: &str) -> Result<ConversationId, ConversationError> {
     // Handle both prefixed (conv_*) and raw UUID formats

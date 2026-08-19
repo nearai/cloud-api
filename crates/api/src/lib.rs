@@ -43,7 +43,7 @@ use axum::{
     extract::DefaultBodyLimit,
     middleware::{from_fn, from_fn_with_state, map_response, Next},
     response::Html,
-    routing::{get, post},
+    routing::{any, get, post},
     Router,
 };
 use config::ApiConfig;
@@ -1256,10 +1256,7 @@ pub fn build_app_with_config(
         rate_limit_state.clone(),
     );
 
-    let conversation_routes = build_conversation_routes(
-        domain_services.conversation_service,
-        &auth_components.auth_state_middleware,
-    );
+    let conversation_routes = build_conversation_routes(&auth_components.auth_state_middleware);
 
     let management_routes = build_management_router(
         app_state.clone(),
@@ -1752,57 +1749,26 @@ pub fn build_mcp_routes(
         ))
 }
 
-/// Build conversation routes with auth
-pub fn build_conversation_routes(
-    conversation_service: Arc<services::ConversationService>,
-    auth_state_middleware: &AuthState,
-) -> Router {
+/// Build retired Conversation API routes.
+///
+/// Conversation data remains in place for now, but the public API no longer
+/// permits reading or writing it. Keep the route catch-all so callers receive
+/// a stable migration response rather than a generic 404 or 405.
+pub fn build_conversation_routes(auth_state_middleware: &AuthState) -> Router {
+    build_retired_conversation_routes().layer(from_fn_with_state(
+        auth_state_middleware.clone(),
+        auth_middleware_with_api_key,
+    ))
+}
+
+fn build_retired_conversation_routes() -> Router {
     Router::new()
-        .route("/conversations", post(conversations::create_conversation))
+        .route("/conversations", any(conversations::conversation_api_gone))
+        .route("/conversations/", any(conversations::conversation_api_gone))
         .route(
-            "/conversations/batch",
-            post(conversations::batch_get_conversations),
+            "/conversations/{*path}",
+            any(conversations::conversation_api_gone),
         )
-        .route(
-            "/conversations/{conversation_id}",
-            get(conversations::get_conversation),
-        )
-        .route(
-            "/conversations/{conversation_id}",
-            post(conversations::update_conversation),
-        )
-        .route(
-            "/conversations/{conversation_id}",
-            axum::routing::delete(conversations::delete_conversation),
-        )
-        .route(
-            "/conversations/{conversation_id}/pin",
-            post(conversations::pin_conversation).delete(conversations::unpin_conversation),
-        )
-        .route(
-            "/conversations/{conversation_id}/archive",
-            post(conversations::archive_conversation).delete(conversations::unarchive_conversation),
-        )
-        .route(
-            "/conversations/{conversation_id}/clone",
-            post(conversations::clone_conversation),
-        )
-        .route(
-            "/conversations/{conversation_id}/items",
-            get(conversations::list_conversation_items),
-        )
-        .route(
-            "/conversations/{conversation_id}/items",
-            post(conversations::create_conversation_items),
-        )
-        .with_state(
-            conversation_service
-                as Arc<dyn services::conversations::ports::ConversationServiceTrait>,
-        )
-        .layer(from_fn_with_state(
-            auth_state_middleware.clone(),
-            auth_middleware_with_api_key,
-        ))
 }
 
 /// Build attestation routes with auth.
@@ -2635,27 +2601,33 @@ mod tests {
     }
 
     #[test]
-    fn test_openapi_conversation_action_paths_use_v1_prefix() {
+    fn test_openapi_excludes_retired_conversation_api() {
         let spec = serde_json::to_value(ApiDoc::openapi()).unwrap();
         let paths = spec["paths"].as_object().unwrap();
+        assert!(
+            paths
+                .keys()
+                .all(|path| !path.starts_with("/v1/conversations")),
+            "OpenAPI must not advertise retired Conversation routes"
+        );
 
-        // Pin/unpin and archive/unarchive share path keys with different methods.
-        for path in [
-            "/v1/conversations/{conversation_id}/archive",
-            "/v1/conversations/{conversation_id}/clone",
-            "/v1/conversations/{conversation_id}/pin",
-        ] {
-            assert!(paths.contains_key(path), "missing OpenAPI path: {path}");
-        }
+        let tags = spec["tags"].as_array().unwrap();
+        assert!(
+            tags.iter().all(|tag| tag["name"] != "Conversations"),
+            "OpenAPI must not advertise the Conversations tag"
+        );
 
-        for path in [
-            "/conversations/{conversation_id}/archive",
-            "/conversations/{conversation_id}/clone",
-            "/conversations/{conversation_id}/pin",
+        let schemas = spec["components"]["schemas"].as_object().unwrap();
+        for schema in [
+            "CreateConversationRequest",
+            "ConversationObject",
+            "UpdateConversationRequest",
+            "ConversationDeleteResult",
+            "ConversationItemList",
         ] {
             assert!(
-                !paths.contains_key(path),
-                "OpenAPI path is missing /v1 prefix: {path}"
+                !schemas.contains_key(schema),
+                "OpenAPI must not expose retired Conversation schema {schema}"
             );
         }
     }
@@ -2696,6 +2668,83 @@ mod tests {
         assert!(!properties.contains_key("resultJson"));
     }
 
+    #[tokio::test]
+    async fn conversation_routes_return_gone_for_every_retired_surface() {
+        let app = Router::new().nest("/v1", build_retired_conversation_routes());
+        let routes = [
+            (axum::http::Method::POST, "/v1/conversations"),
+            (axum::http::Method::GET, "/v1/conversations/"),
+            (axum::http::Method::POST, "/v1/conversations/batch"),
+            (axum::http::Method::GET, "/v1/conversations/conv_example"),
+            (axum::http::Method::POST, "/v1/conversations/conv_example"),
+            (axum::http::Method::DELETE, "/v1/conversations/conv_example"),
+            (
+                axum::http::Method::POST,
+                "/v1/conversations/conv_example/pin",
+            ),
+            (
+                axum::http::Method::DELETE,
+                "/v1/conversations/conv_example/pin",
+            ),
+            (
+                axum::http::Method::POST,
+                "/v1/conversations/conv_example/archive",
+            ),
+            (
+                axum::http::Method::DELETE,
+                "/v1/conversations/conv_example/archive",
+            ),
+            (
+                axum::http::Method::POST,
+                "/v1/conversations/conv_example/clone",
+            ),
+            (
+                axum::http::Method::GET,
+                "/v1/conversations/conv_example/items",
+            ),
+            (
+                axum::http::Method::POST,
+                "/v1/conversations/conv_example/items",
+            ),
+            // The catch-all also keeps unknown legacy subpaths from becoming
+            // misleading 404 or 405 responses.
+            (
+                axum::http::Method::PATCH,
+                "/v1/conversations/conv_example/unknown",
+            ),
+        ];
+
+        for (method, path) in routes {
+            let response = app
+                .clone()
+                .oneshot(
+                    HttpRequest::builder()
+                        .method(method.clone())
+                        .uri(path)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(
+                response.status(),
+                StatusCode::GONE,
+                "{method} {path} must return 410 Gone"
+            );
+
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let error: crate::models::ErrorResponse = serde_json::from_slice(&body).unwrap();
+            assert_eq!(error.error.r#type, "gone");
+            assert_eq!(
+                error.error.code.as_deref(),
+                Some("conversation_api_retired")
+            );
+            assert!(error.error.message.contains("POST /v1/responses"));
+        }
+    }
     /// Example of how to set up the application for E2E testing
     #[tokio::test]
     #[ignore] // Remove ignore to run with a real database and Patroni cluster

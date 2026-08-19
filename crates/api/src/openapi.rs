@@ -25,7 +25,6 @@ use utoipa::{Modify, OpenApi};
         (name = "Score", description = "Text similarity scoring endpoints"),
         (name = "Privacy", description = "Privacy classification (PII span detection) endpoints"),
         (name = "Models", description = "Public model catalog and information"),
-        (name = "Conversations", description = "Conversation management"),
         (name = "Responses", description = "Response handling and streaming"),
         (name = "Organizations", description = "Organization management"),
         (name = "Organization Members", description = "Organization member and invitation management"),
@@ -57,18 +56,6 @@ use utoipa::{Modify, OpenApi};
         // Model endpoints (public model catalog)
         crate::routes::models::list_models,
         crate::routes::models::get_model_by_name,
-        // Conversation endpoints
-        crate::routes::conversations::create_conversation,
-        crate::routes::conversations::get_conversation,
-        crate::routes::conversations::update_conversation,
-        crate::routes::conversations::delete_conversation,
-        crate::routes::conversations::pin_conversation,
-        crate::routes::conversations::unpin_conversation,
-        crate::routes::conversations::archive_conversation,
-        crate::routes::conversations::unarchive_conversation,
-        crate::routes::conversations::clone_conversation,
-        crate::routes::conversations::list_conversation_items,
-        crate::routes::conversations::create_conversation_items,
         // Response endpoints
         crate::routes::responses::create_response,
         crate::routes::responses::get_response,
@@ -243,9 +230,6 @@ use utoipa::{Modify, OpenApi};
             AdminUserResponse,
             crate::routes::users::UpdateUserProfileRequest,
             crate::routes::users::UserStatusResponse,
-            // Conversation models
-            CreateConversationRequest, ConversationObject,
-            UpdateConversationRequest, ConversationDeleteResult, ConversationItemList,
             // Response models
             CreateResponseRequest, ResponseObject,
             // Attestation models

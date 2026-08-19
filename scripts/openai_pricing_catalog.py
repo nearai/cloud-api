@@ -278,7 +278,8 @@ def parse_args() -> argparse.Namespace:
         "--user-agent-env",
         help=(
             "optional environment variable holding the User-Agent bound to the admin "
-            "token; defaults to the catalog command's own User-Agent"
+            "token; defaults to the catalog command's own User-Agent, which will be "
+            "rejected with HTTP 401 when the token is bound to a different value"
         ),
     )
     parser.add_argument("--apply", action="store_true", help="apply differences via PATCH")
@@ -310,12 +311,14 @@ def main() -> int:
         user_agent = DEFAULT_USER_AGENT
         if args.user_agent_env:
             user_agent = os.environ.get(args.user_agent_env, "")
-            if not user_agent:
+            if not user_agent.strip():
                 raise CatalogError(
-                    f"user-agent environment variable {args.user_agent_env} is unset"
+                    f"user-agent environment variable {args.user_agent_env} is unset or empty"
                 )
             if "\r" in user_agent or "\n" in user_agent:
                 raise CatalogError("admin User-Agent must not contain a newline")
+            if not user_agent.isascii():
+                raise CatalogError("admin User-Agent must contain only ASCII characters")
         catalog = fetch_catalog(args.base_url, token, user_agent)
         differences = audit(manifest, catalog, args.activate_gpt56)
         if not differences:

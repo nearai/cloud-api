@@ -6,7 +6,7 @@ use crate::{
 use axum::{
     body::Body,
     extract::{Extension, State},
-    http::{header, HeaderMap, HeaderValue, Response, StatusCode},
+    http::{header, HeaderMap, Response, StatusCode},
     response::{IntoResponse, Json as ResponseJson},
 };
 use bytes::Bytes;
@@ -66,13 +66,6 @@ fn error_response_from_response_event(
     let mut response = ErrorResponse::new(error.message, error.type_);
     response.error.param = error.param;
     response.error.code = error.code;
-    response
-}
-
-fn with_no_store_cache_header(mut response: axum::response::Response) -> axum::response::Response {
-    response
-        .headers_mut()
-        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     response
 }
 
@@ -162,9 +155,9 @@ impl From<ServiceResponseError> for ErrorResponse {
 #[derive(Clone)]
 pub struct ResponseRouteState {
     pub response_service: Arc<ResponseServiceImpl>,
-    /// Stateless Responses retain only attestation material: the response ID,
-    /// request/response digests, and their signatures. No response or item
-    /// records are retained by this route.
+    /// Existing completed-response gateway attestation remains best-effort.
+    /// Its stored material is a response ID plus signatures over
+    /// request/response digests, never raw response or item records.
     pub attestation_service: Arc<dyn AttestationServiceTrait>,
 }
 
@@ -262,8 +255,9 @@ async fn persist_non_streaming_response_attestation(
 }
 
 /// Convert response events into signed SSE frames. The response-completed
-/// frame is held until its attestation write has finished, so a client that has
-/// received that frame can immediately look up its `resp_*` signature.
+/// frame is held until its best-effort attestation write has been attempted.
+/// A successful write is available for subsequent `resp_*` lookup; a failed or
+/// timed-out write does not change the inference result.
 fn signed_response_sse_stream(
     stream: Pin<Box<dyn futures::Stream<Item = ResponseStreamEvent> + Send>>,
     attestation_service: Arc<dyn AttestationServiceTrait>,
@@ -308,17 +302,14 @@ fn signed_response_sse_stream(
 /// separate from the create endpoint makes it clear that only a new, single
 /// stateless request is supported.
 pub async fn response_history_gone() -> axum::response::Response {
-    with_no_store_cache_header(
-        (
-            StatusCode::GONE,
-            ResponseJson(ErrorResponse::new(
-                "Response history is unavailable because the Responses API is stateless."
-                    .to_string(),
-                "gone".to_string(),
-            )),
-        )
-            .into_response(),
+    (
+        StatusCode::GONE,
+        ResponseJson(ErrorResponse::new(
+            "Response history is unavailable because the Responses API is stateless.".to_string(),
+            "gone".to_string(),
+        )),
     )
+        .into_response()
 }
 
 /// Create response
@@ -356,35 +347,31 @@ pub async fn create_response(
 
     // Validate the request
     if let Err(error) = request.validate() {
-        return with_no_store_cache_header(
-            (
-                StatusCode::BAD_REQUEST,
-                ResponseJson(ErrorResponse::new(
-                    error,
-                    "invalid_request_error".to_string(),
-                )),
-            )
-                .into_response(),
-        );
+        return (
+            StatusCode::BAD_REQUEST,
+            ResponseJson(ErrorResponse::new(
+                error,
+                "invalid_request_error".to_string(),
+            )),
+        )
+            .into_response();
     }
 
     if let Err(error) = request.validate_stateless() {
-        return with_no_store_cache_header(
-            (
-                StatusCode::BAD_REQUEST,
-                ResponseJson(ErrorResponse::new(
-                    error,
-                    "invalid_request_error".to_string(),
-                )),
-            )
-                .into_response(),
-        );
+        return (
+            StatusCode::BAD_REQUEST,
+            ResponseJson(ErrorResponse::new(
+                error,
+                "invalid_request_error".to_string(),
+            )),
+        )
+            .into_response();
     }
 
     // Extract and validate encryption headers if present
     let encryption_headers = match crate::routes::common::validate_encryption_headers(&headers) {
         Ok(headers) => headers,
-        Err(err) => return with_no_store_cache_header(err.into_response()),
+        Err(err) => return err.into_response(),
     };
 
     let signing_algo = encryption_headers.signing_algo;
@@ -395,17 +382,14 @@ pub async fn create_response(
     // Encryption requires streaming mode because encrypted chunks from vLLM are independently
     // encrypted and cannot be concatenated. Non-streaming mode would produce corrupted data.
     if signing_algo.is_some() && client_pub_key.is_some() && request.stream != Some(true) {
-        return with_no_store_cache_header(
-            (
-                StatusCode::BAD_REQUEST,
-                ResponseJson(ErrorResponse::new(
-                    "Non-streaming mode is not supported with encryption. Use stream=true."
-                        .to_string(),
-                    "encryption_requires_streaming".to_string(),
-                )),
-            )
-                .into_response(),
-        );
+        return (
+            StatusCode::BAD_REQUEST,
+            ResponseJson(ErrorResponse::new(
+                "Non-streaming mode is not supported with encryption. Use stream=true.".to_string(),
+                "encryption_requires_streaming".to_string(),
+            )),
+        )
+            .into_response();
     }
 
     // Set defaults for internal fields
@@ -473,9 +457,7 @@ pub async fn create_response(
                     "Failed to create streaming response"
                 );
                 let status_code = map_response_error_to_status(&error);
-                with_no_store_cache_header(
-                    (status_code, ResponseJson::<ErrorResponse>(error.into())).into_response(),
-                )
+                (status_code, ResponseJson::<ErrorResponse>(error.into())).into_response()
             }
         }
     } else {
@@ -625,9 +607,7 @@ pub async fn create_response(
                     if let Some(error) = failed_error {
                         let status_code = status_code_from_response_event(failed_status_code);
                         let error_response = error_response_from_response_event(error);
-                        return with_no_store_cache_header(
-                            (status_code, ResponseJson(error_response)).into_response(),
-                        );
+                        return (status_code, ResponseJson(error_response)).into_response();
                     }
                 }
 
@@ -696,10 +676,10 @@ pub async fn create_response(
                     response.id, api_key.api_key.created_by_user_id.0
                 );
 
-                // Store the signature before returning so an immediate
-                // GET /v1/signature/resp_* lookup is deterministic. This only
-                // writes the response ID, request/response digests, and
-                // signatures; the response body remains no-store.
+                // Attempt the existing gateway signature write before returning.
+                // It stores only the response ID and signatures over
+                // request/response digests, never the response body. Failures
+                // and timeouts leave the no-store inference response unchanged.
                 persist_non_streaming_response_attestation(
                     state.attestation_service.as_ref(),
                     &response,
@@ -707,7 +687,7 @@ pub async fn create_response(
                 )
                 .await;
 
-                with_no_store_cache_header((StatusCode::OK, ResponseJson(response)).into_response())
+                (StatusCode::OK, ResponseJson(response)).into_response()
             }
             Err(error) => {
                 tracing::error!(
@@ -717,9 +697,7 @@ pub async fn create_response(
                     "Failed to create non-streaming response"
                 );
                 let status_code = map_response_error_to_status(&error);
-                with_no_store_cache_header(
-                    (status_code, ResponseJson::<ErrorResponse>(error.into())).into_response(),
-                )
+                (status_code, ResponseJson::<ErrorResponse>(error.into())).into_response()
             }
         }
     }
@@ -875,29 +853,15 @@ mod tests {
         }
     }
 
-    #[test]
-    fn response_results_are_marked_no_store() {
-        let response = with_no_store_cache_header(StatusCode::OK.into_response());
-        assert_eq!(
-            response
-                .headers()
-                .get(header::CACHE_CONTROL)
-                .and_then(|value| value.to_str().ok()),
-            Some("no-store")
-        );
-    }
-
     #[tokio::test]
     async fn response_history_is_explicitly_gone() {
         let response = response_history_gone().await;
         assert_eq!(response.status(), StatusCode::GONE);
-        assert_eq!(
-            response
-                .headers()
-                .get(header::CACHE_CONTROL)
-                .and_then(|value| value.to_str().ok()),
-            Some("no-store")
-        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body");
+        let error: ErrorResponse = serde_json::from_slice(&body).expect("gone error body");
+        assert_eq!(error.error.r#type, "gone");
     }
 
     #[tokio::test]

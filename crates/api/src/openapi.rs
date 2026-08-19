@@ -25,7 +25,7 @@ use utoipa::{Modify, OpenApi};
         (name = "Score", description = "Text similarity scoring endpoints"),
         (name = "Privacy", description = "Privacy classification (PII span detection) endpoints"),
         (name = "Models", description = "Public model catalog and information"),
-        (name = "Responses", description = "Single-turn, stateless response inference (`store: false` only). Raw request/response content, response items, and history are not persisted. To support `GET /v1/signature/resp_*`, the service retains a narrow attestation record: response ID, SHA-256 request/response digests, signatures, signing metadata, and timestamps. These content-derived values are treated as sensitive metadata."),
+        (name = "Responses", description = "Single-turn, stateless response inference (`store: false` only). Raw request/response content, response items, and history are not persisted. Existing completed-response gateway attestation is preserved best-effort: when the signature write succeeds, `GET /v1/signature/resp_*` retrieves signatures over SHA-256 request/response digests, never raw content. Interrupted streams create no `resp_*` attestation record or legacy disconnect fallback. Conversations, response history, file input/search, function/code-interpreter/computer tools, and MCP approval modes other than `require_approval: \"never\"` are rejected."),
         (name = "Organizations", description = "Organization management"),
         (name = "Organization Members", description = "Organization member and invitation management"),
         (name = "Workspaces", description = "Workspace and API key management"),

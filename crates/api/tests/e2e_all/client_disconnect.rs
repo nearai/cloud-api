@@ -1,8 +1,9 @@
 //! Client-disconnect coverage for the supported Chat Completions API.
 //!
-//! Responses no longer retain response IDs, items, or attestation signatures,
-//! so their former persistence-focused disconnect tests are intentionally not
-//! retained here.
+//! Stateless Responses preserve gateway attestation only after a completed
+//! response. A disconnected Responses stream creates no `resp_*` attestation
+//! record or legacy disconnect fallback because it has no persisted response
+//! ID, so this module keeps the supported Chat Completions fallback coverage.
 
 use crate::common::*;
 

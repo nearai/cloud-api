@@ -19,7 +19,6 @@ Production runs at **info level and above**. We ABSOLUTELY CANNOT and SHOULD NOT
 - **AI responses** - Model outputs, completions, or generated text
 - **Metadata that reveals customer information** - Custom fields, tags, labels that could expose user activity
 - **File contents** - Uploaded file data or processed file content
-- **Content-derived metadata** - Request/response digests, signature payloads, or other stable derivations of customer content
 - **Any PII** - Names, emails (except for auth flow), addresses, phone numbers in user content
 
 #### ✓ OK TO LOG (Permitted for Debugging)
@@ -199,10 +198,10 @@ POST /v1/responses
 - `store: false` is the only supported mode; an omitted `store` is treated as `false` and `store: true` is rejected
 - Clients send all needed prior context in each request. Conversations, `previous_response_id`, background responses, and response-history endpoints are retired or unsupported.
 - Raw request/response content, response items, and conversation history are not persisted.
-- **Narrow attestation exception**: to support later `GET /v1/signature/resp_*` lookup, the service retains the response ID, SHA-256 request/response digests, signatures, signing metadata, and timestamps. These are content-derived sensitive metadata, not raw content; do not log them, and do not treat deterministic hashes as anonymous when the underlying content may be guessable.
+- **Existing completed-response attestation is preserved best-effort**: when its signature write succeeds, `GET /v1/signature/resp_*` can retrieve the response ID and signatures over SHA-256 request/response digests. The signature material contains no raw request or response content. A disconnected stream has no completed `resp_*` attestation record or legacy disconnect fallback.
 - Event types: `response.created`, `response.output_text.delta`, `response.completed`, `response.failed`
 - `/v1/conversations/*` and `/v1/files/*` return authenticated `410 Gone` responses.
-- Stateful tools and continuations are unsupported: file input/file search, function tools and function-call continuation, code interpreter, computer, and MCP approval continuation. Only request-scoped MCP calls with `require_approval: "never"` are supported.
+- The following stateful operations are rejected: file input/file search, function tools and function-call continuation, code interpreter, computer, and every MCP approval mode other than `require_approval: "never"`. Only request-scoped MCP calls with that exact mode are supported.
 
 **Streaming Flow**:
 ```

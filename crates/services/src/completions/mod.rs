@@ -293,6 +293,10 @@ where
 
         let e2e_duration = self.service_start_time.elapsed();
         let first_token_time = self.first_token_time;
+        let backend_ttft = first_token_time
+            .map(|first_token| first_token.duration_since(self.provider_start_time));
+        let e2e_ttft =
+            first_token_time.map(|first_token| first_token.duration_since(self.service_start_time));
         let stream_completed = self.stream_completed;
         let provider_attribution = self.provider_attribution;
         let cache_write = self
@@ -318,6 +322,30 @@ where
         // which helps prevent data loss compared to regular spawn.
         let handle_clone = handle.clone();
         handle.spawn_blocking(move || {
+            // These streaming-only TTFT series require the final usage chunk so
+            // the real input-token bucket is known. They intentionally exclude
+            // streams that produced a first token but ended without billable
+            // usage or a response ID (for example, interrupted/error streams),
+            // so they are a billable-completion subset of the unbucketed TTFT
+            // series rather than a directly comparable population. Emit them
+            // before the billing timeout so a stalled usage write cannot also
+            // discard already-observed latency telemetry.
+            let ttft_tags: Vec<&str> = metric_tags.iter().map(|s| s.as_str()).collect();
+            if let Some(duration) = backend_ttft {
+                metrics_service.record_latency(
+                    METRIC_LATENCY_STREAMING_TTFT_BY_INPUT,
+                    duration,
+                    &ttft_tags,
+                );
+            }
+            if let Some(duration) = e2e_ttft {
+                metrics_service.record_latency(
+                    METRIC_LATENCY_STREAMING_TTFT_TOTAL_BY_INPUT,
+                    duration,
+                    &ttft_tags,
+                );
+            }
+
             handle_clone.block_on(
                 async move {
                     let result = tokio::time::timeout(Duration::from_secs(2), async move {
@@ -1784,8 +1812,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
 
             metrics_service.record_count(METRIC_REQUEST_COUNT, 1, &tags_str);
             metrics_service.record_latency(METRIC_LATENCY_QUEUE_TIME, queue_time, &tags_str);
-            metrics_service.record_latency(METRIC_LATENCY_TTFT, backend_latency, &tags_str);
-            metrics_service.record_latency(METRIC_LATENCY_TTFT_TOTAL, e2e_latency, &tags_str);
+            metrics_service.record_latency(METRIC_LATENCY_BACKEND, backend_latency, &tags_str);
             metrics_service.record_latency(METRIC_LATENCY_TOTAL, e2e_latency, &tags_str);
 
             if backend_latency.as_secs_f64() > 0.0 {
@@ -2296,6 +2323,24 @@ mod tests {
         assert!(ttft
             .tags
             .contains(&format!("{}:{}", TAG_MODEL, "test-model")));
+
+        let bucketed_ttft = metrics
+            .iter()
+            .find(|m| m.name == METRIC_LATENCY_STREAMING_TTFT_BY_INPUT)
+            .expect("bucketed streaming TTFT metric missing");
+        assert!(matches!(bucketed_ttft.value, MetricValue::Latency(_)));
+        assert!(bucketed_ttft
+            .tags
+            .contains(&format!("{}:{}", TAG_INPUT_BUCKET, "0-1k")));
+
+        let bucketed_e2e_ttft = metrics
+            .iter()
+            .find(|m| m.name == METRIC_LATENCY_STREAMING_TTFT_TOTAL_BY_INPUT)
+            .expect("bucketed streaming E2E TTFT metric missing");
+        assert!(matches!(bucketed_e2e_ttft.value, MetricValue::Latency(_)));
+        assert!(bucketed_e2e_ttft
+            .tags
+            .contains(&format!("{}:{}", TAG_INPUT_BUCKET, "0-1k")));
 
         let total_latency = metrics
             .iter()

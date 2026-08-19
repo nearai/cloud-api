@@ -2973,6 +2973,9 @@ pub struct AdminAmlAllowlistEntryResponse {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ListAdminAmlAllowlistResponse {
     pub entries: Vec<AdminAmlAllowlistEntryResponse>,
+    pub total: i64,
+    pub limit: i64,
+    pub offset: i64,
 }
 
 /// Admin AML allowlist upsert request.

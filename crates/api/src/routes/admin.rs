@@ -193,6 +193,14 @@ pub struct AdminAmlReportsQuery {
     pub offset: i64,
 }
 
+#[derive(Debug, serde::Deserialize)]
+pub struct AdminAmlAllowlistQuery {
+    #[serde(default = "crate::routes::common::default_limit")]
+    pub limit: i64,
+    #[serde(default)]
+    pub offset: i64,
+}
+
 /// List AML reports (Admin only)
 #[utoipa::path(
     get,
@@ -281,8 +289,13 @@ pub async fn update_aml_report_status(
     get,
     path = "/v1/admin/aml/allowlist",
     tag = "Admin",
+    params(
+        ("limit" = Option<i64>, Query, description = "Maximum number of allowlist entries to return (default: 100)"),
+        ("offset" = Option<i64>, Query, description = "Number of allowlist entries to skip (default: 0)")
+    ),
     responses(
         (status = 200, description = "AML allowlist entries retrieved successfully", body = ListAdminAmlAllowlistResponse),
+        (status = 400, description = "Invalid request", body = ErrorResponse),
         (status = 401, description = "Unauthorized", body = ErrorResponse),
         (status = 403, description = "Forbidden", body = ErrorResponse),
         (status = 500, description = "Internal server error", body = ErrorResponse)
@@ -294,18 +307,29 @@ pub async fn update_aml_report_status(
 pub async fn list_aml_allowlist(
     State(app_state): State<AdminAppState>,
     Extension(_admin_user): Extension<AdminUser>,
+    Query(params): Query<AdminAmlAllowlistQuery>,
 ) -> Result<ResponseJson<ListAdminAmlAllowlistResponse>, (StatusCode, ResponseJson<ErrorResponse>)>
 {
-    let entries = app_state
+    crate::routes::common::validate_limit_offset(params.limit, params.offset)?;
+
+    let page = app_state
         .aml_service
-        .list_allowlist_entries()
+        .list_allowlist_entries(params.limit, params.offset)
         .await
-        .map_err(aml_service_error)?
+        .map_err(aml_service_error)?;
+
+    let entries = page
+        .entries
         .into_iter()
         .map(aml_allowlist_response)
         .collect();
 
-    Ok(ResponseJson(ListAdminAmlAllowlistResponse { entries }))
+    Ok(ResponseJson(ListAdminAmlAllowlistResponse {
+        entries,
+        total: page.total,
+        limit: page.limit,
+        offset: page.offset,
+    }))
 }
 
 /// Add or update an AML allowlist entry (Admin only)
@@ -414,6 +438,10 @@ fn aml_allowlist_response(entry: AmlAllowlistEntry) -> AdminAmlAllowlistEntryRes
 fn aml_service_error(error: AmlError) -> (StatusCode, ResponseJson<ErrorResponse>) {
     match error {
         AmlError::InvalidAccountId => bad_request("Invalid NEAR account ID", "invalid_account_id"),
+        AmlError::InvalidReportStatus => bad_request(
+            "UNKNOWN AML reports cannot be activated",
+            "invalid_report_status",
+        ),
         AmlError::AccountBlocked => (
             StatusCode::FORBIDDEN,
             ResponseJson(ErrorResponse::new(

@@ -5,8 +5,8 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use services::aml::{
-    AmlAllowlistEntry, AmlReport, AmlReportPage, AmlRepository, AmlRiskLevel, NewAmlAllowlistEntry,
-    NewAmlReport,
+    AmlAllowlistEntry, AmlAllowlistPage, AmlReport, AmlReportPage, AmlRepository, AmlRiskLevel,
+    NewAmlAllowlistEntry, NewAmlReport,
 };
 use services::common::RepositoryError;
 use tokio_postgres::Row;
@@ -254,6 +254,31 @@ impl AmlRepository for PostgresAmlRepository {
         Ok(row.map(Self::row_to_report))
     }
 
+    async fn report_risk_level(&self, report_id: uuid::Uuid) -> Result<Option<AmlRiskLevel>> {
+        let row = retry_db!("get_aml_report_risk_level", {
+            let client = self
+                .pool
+                .get()
+                .await
+                .context("Failed to get database connection")
+                .map_err(RepositoryError::PoolError)?;
+
+            client
+                .query_opt(
+                    r#"
+                    SELECT risk_level
+                    FROM aml_reports
+                    WHERE id = $1
+                    "#,
+                    &[&report_id],
+                )
+                .await
+                .map_err(map_db_error)
+        })?;
+
+        Ok(row.map(|row| db_risk_level(row.get::<_, String>("risk_level").as_str())))
+    }
+
     async fn is_allowlisted(&self, account_id: &str, address_type: &str) -> Result<bool> {
         let row = retry_db!("is_aml_account_allowlisted", {
             let client = self
@@ -279,8 +304,8 @@ impl AmlRepository for PostgresAmlRepository {
         Ok(row.is_some())
     }
 
-    async fn list_allowlist_entries(&self) -> Result<Vec<AmlAllowlistEntry>> {
-        let rows = retry_db!("list_aml_allowlist_entries", {
+    async fn list_allowlist_entries(&self, limit: i64, offset: i64) -> Result<AmlAllowlistPage> {
+        let (total, rows) = retry_db!("list_aml_allowlist_entries", {
             let client = self
                 .pool
                 .get()
@@ -288,20 +313,37 @@ impl AmlRepository for PostgresAmlRepository {
                 .context("Failed to get database connection")
                 .map_err(RepositoryError::PoolError)?;
 
-            client
+            let total = client
+                .query_one(
+                    "SELECT COUNT(*) AS total_count FROM aml_allowlisted_accounts",
+                    &[],
+                )
+                .await
+                .map_err(map_db_error)?
+                .get::<_, i64>("total_count");
+
+            let rows = client
                 .query(
                     r#"
                     SELECT account_id, address_type, reason, created_by_user_id, created_at
                     FROM aml_allowlisted_accounts
                     ORDER BY created_at DESC, account_id ASC
+                    LIMIT $1 OFFSET $2
                     "#,
-                    &[],
+                    &[&limit, &offset],
                 )
                 .await
-                .map_err(map_db_error)
+                .map_err(map_db_error)?;
+
+            Ok::<_, RepositoryError>((total, rows))
         })?;
 
-        Ok(rows.into_iter().map(Self::row_to_allowlist_entry).collect())
+        Ok(AmlAllowlistPage {
+            entries: rows.into_iter().map(Self::row_to_allowlist_entry).collect(),
+            total,
+            limit,
+            offset,
+        })
     }
 
     async fn upsert_allowlist_entry(

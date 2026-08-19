@@ -12,6 +12,15 @@ use tokio_postgres::Row;
 // Default reason for soft delete operations
 const DEFAULT_SOFT_DELETE_REASON: &str = "Model soft deleted";
 
+fn parse_text_pricing(
+    value: Option<serde_json::Value>,
+) -> Result<Option<services::usage::TextPricingProfile>> {
+    value
+        .map(services::usage::TextPricingProfile::from_json)
+        .transpose()
+        .map_err(|error| anyhow::anyhow!(error.to_string()))
+}
+
 /// Serialize optional modalities to JSON value for database storage.
 /// Returns Ok(None) if input is None, Ok(Some(value)) if serialization succeeds,
 /// or an error if serialization fails.
@@ -77,7 +86,7 @@ impl ModelRepository {
                     r#"
                     SELECT
                         m.id, m.model_name, m.model_display_name, m.model_description, m.model_icon,
-                        m.input_cost_per_token, m.output_cost_per_token, m.cost_per_image, m.cache_read_cost_per_token,
+                        m.input_cost_per_token, m.output_cost_per_token, m.cost_per_image, m.cache_read_cost_per_token, m.text_pricing,
                         m.context_length, m.verifiable, m.is_active, m.owned_by, m.created_at, m.updated_at,
                         m.provider_type, m.provider_config, m.attestation_supported,
                         m.input_modalities, m.output_modalities, m.inference_url,
@@ -160,7 +169,7 @@ impl ModelRepository {
                         r#"
                         SELECT
                             m.id, m.model_name, m.model_display_name, m.model_description, m.model_icon,
-                            m.input_cost_per_token, m.output_cost_per_token, m.cost_per_image, m.cache_read_cost_per_token,
+                            m.input_cost_per_token, m.output_cost_per_token, m.cost_per_image, m.cache_read_cost_per_token, m.text_pricing,
                             m.context_length, m.verifiable, m.is_active, m.owned_by, m.created_at, m.updated_at,
                             m.provider_type, m.provider_config, m.attestation_supported,
                             m.input_modalities, m.output_modalities, m.inference_url,
@@ -184,7 +193,7 @@ impl ModelRepository {
                         r#"
                         SELECT
                             m.id, m.model_name, m.model_display_name, m.model_description, m.model_icon,
-                            m.input_cost_per_token, m.output_cost_per_token, m.cost_per_image, m.cache_read_cost_per_token,
+                            m.input_cost_per_token, m.output_cost_per_token, m.cost_per_image, m.cache_read_cost_per_token, m.text_pricing,
                             m.context_length, m.verifiable, m.is_active, m.owned_by, m.created_at, m.updated_at,
                             m.provider_type, m.provider_config, m.attestation_supported,
                             m.input_modalities, m.output_modalities, m.inference_url,
@@ -229,7 +238,7 @@ impl ModelRepository {
                     r#"
                     SELECT
                         id, model_name, model_display_name, model_description, model_icon,
-                        input_cost_per_token, output_cost_per_token, cost_per_image, cache_read_cost_per_token,
+                        input_cost_per_token, output_cost_per_token, cost_per_image, cache_read_cost_per_token, text_pricing,
                         context_length, verifiable, is_active, owned_by, created_at, updated_at,
                         provider_type, provider_config, attestation_supported,
                         input_modalities, output_modalities, inference_url, hugging_face_id, quantization, max_output_length, supported_sampling_parameters, supported_features, datacenters, is_ready, deprecation_date, openrouter_slug, allow_free
@@ -264,7 +273,7 @@ impl ModelRepository {
                     r#"
                     SELECT
                         id, model_name, model_display_name, model_description, model_icon,
-                        input_cost_per_token, output_cost_per_token, cost_per_image, cache_read_cost_per_token,
+                        input_cost_per_token, output_cost_per_token, cost_per_image, cache_read_cost_per_token, text_pricing,
                         context_length, verifiable, is_active, owned_by, created_at, updated_at,
                         provider_type, provider_config, attestation_supported,
                         input_modalities, output_modalities, inference_url, hugging_face_id, quantization, max_output_length, supported_sampling_parameters, supported_features, datacenters, is_ready, deprecation_date, openrouter_slug, allow_free
@@ -308,6 +317,7 @@ impl ModelRepository {
                         m.output_cost_per_token,
                         m.cost_per_image,
                         m.cache_read_cost_per_token,
+                        m.text_pricing,
                         m.context_length,
                         m.verifiable,
                         m.is_active,
@@ -417,6 +427,9 @@ impl ModelRepository {
         // Tri-state as well: explicit `null` disables cache pricing (NULL column).
         let cache_read_value: Option<i64> = update_request.cache_read_cost_per_token.flatten();
         let cache_read_clear: bool = matches!(update_request.cache_read_cost_per_token, Some(None));
+        let text_pricing_value: Option<serde_json::Value> =
+            update_request.text_pricing.clone().flatten();
+        let text_pricing_clear: bool = matches!(update_request.text_pricing, Some(None));
 
         let row = retry_db!("upsert_model_pricing", {
             let client = self
@@ -436,6 +449,7 @@ impl ModelRepository {
                             output_cost_per_token = COALESCE($3, output_cost_per_token),
                             cost_per_image = COALESCE($4, cost_per_image),
                             cache_read_cost_per_token = CASE WHEN $32 THEN NULL ELSE COALESCE($5, cache_read_cost_per_token) END,
+                            text_pricing = CASE WHEN $34 THEN NULL ELSE COALESCE($33, text_pricing) END,
                             model_display_name = COALESCE($6, model_display_name),
                             model_description = COALESCE($7, model_description),
                             model_icon = COALESCE($8, model_icon),
@@ -462,7 +476,7 @@ impl ModelRepository {
                             updated_at = NOW()
                         WHERE model_name = $1
                         RETURNING id, model_name, model_display_name, model_description, model_icon,
-                                  input_cost_per_token, output_cost_per_token, cost_per_image, cache_read_cost_per_token,
+                                  input_cost_per_token, output_cost_per_token, cost_per_image, cache_read_cost_per_token, text_pricing,
                                   context_length, verifiable, is_active, owned_by, created_at, updated_at,
                                   provider_type, provider_config, attestation_supported,
                                   input_modalities, output_modalities, inference_url, hugging_face_id, quantization, max_output_length, supported_sampling_parameters, supported_features, datacenters, is_ready, deprecation_date, openrouter_slug, allow_free
@@ -500,6 +514,8 @@ impl ModelRepository {
                             &openrouter_slug_clear,
                             &update_request.allow_free,
                             &cache_read_clear,
+                            &text_pricing_value,
+                            &text_pricing_clear,
                         ],
                     )
                     .await
@@ -533,7 +549,7 @@ impl ModelRepository {
                             context_length, verifiable, is_active, owned_by,
                             provider_type, provider_config, attestation_supported,
                             input_modalities, output_modalities, inference_url, hugging_face_id, quantization, max_output_length, supported_sampling_parameters, supported_features, datacenters,
-                            is_ready, deprecation_date, openrouter_slug, allow_free
+                            is_ready, deprecation_date, openrouter_slug, allow_free, text_pricing
                         ) VALUES (
                             $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11,
                             COALESCE($12, $13),
@@ -548,13 +564,14 @@ impl ModelRepository {
                             COALESCE($23, ARRAY[]::TEXT[]),
                             COALESCE($24, ARRAY[]::TEXT[]),
                             $25, $26, $27, $30,
-                            COALESCE($32, false)
+                            COALESCE($32, false), $33
                         )
                         ON CONFLICT (model_name) DO UPDATE SET
                             input_cost_per_token = EXCLUDED.input_cost_per_token,
                             output_cost_per_token = EXCLUDED.output_cost_per_token,
                             cost_per_image = EXCLUDED.cost_per_image,
                             cache_read_cost_per_token = EXCLUDED.cache_read_cost_per_token,
+                            text_pricing = CASE WHEN $34 THEN NULL ELSE COALESCE($33, models.text_pricing) END,
                             model_display_name = EXCLUDED.model_display_name,
                             model_description = EXCLUDED.model_description,
                             model_icon = EXCLUDED.model_icon,
@@ -583,7 +600,7 @@ impl ModelRepository {
                             allow_free = COALESCE($32, models.allow_free),
                             updated_at = NOW()
                         RETURNING id, model_name, model_display_name, model_description, model_icon,
-                                  input_cost_per_token, output_cost_per_token, cost_per_image, cache_read_cost_per_token,
+                                  input_cost_per_token, output_cost_per_token, cost_per_image, cache_read_cost_per_token, text_pricing,
                                   context_length, verifiable, is_active, owned_by, created_at, updated_at,
                                   provider_type, provider_config, attestation_supported,
                                   input_modalities, output_modalities, inference_url, hugging_face_id, quantization, max_output_length, supported_sampling_parameters, supported_features, datacenters, is_ready, deprecation_date, openrouter_slug, allow_free
@@ -624,6 +641,8 @@ impl ModelRepository {
                             &openrouter_slug_value,
                             &openrouter_slug_clear,
                             &update_request.allow_free,
+                            &text_pricing_value,
+                            &text_pricing_clear,
                         ],
                     )
                     .await
@@ -689,6 +708,7 @@ impl ModelRepository {
         let openrouter_slug_value: Option<String> = req.openrouter_slug.clone().flatten();
         // Absent and explicit-null both insert NULL = cache pricing disabled.
         let cache_read_value: Option<i64> = req.cache_read_cost_per_token.flatten();
+        let text_pricing_value: Option<serde_json::Value> = req.text_pricing.clone().flatten();
 
         let row = retry_db!("seed_model_if_absent", {
             let client = self
@@ -710,7 +730,7 @@ impl ModelRepository {
                         context_length, verifiable, is_active, owned_by,
                         provider_type, provider_config, attestation_supported,
                         input_modalities, output_modalities, inference_url, hugging_face_id, quantization, max_output_length, supported_sampling_parameters, supported_features, datacenters,
-                        is_ready, deprecation_date, openrouter_slug, allow_free
+                        is_ready, deprecation_date, openrouter_slug, allow_free, text_pricing
                     ) VALUES (
                         $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11,
                         COALESCE($12, $13),
@@ -722,11 +742,11 @@ impl ModelRepository {
                         COALESCE($23, ARRAY[]::TEXT[]),
                         COALESCE($24, ARRAY[]::TEXT[]),
                         $25, $26, $27, $28,
-                        COALESCE($29, false)
+                        COALESCE($29, false), $30
                     )
                     ON CONFLICT (model_name) DO NOTHING
                     RETURNING id, model_name, model_display_name, model_description, model_icon,
-                              input_cost_per_token, output_cost_per_token, cost_per_image, cache_read_cost_per_token,
+                              input_cost_per_token, output_cost_per_token, cost_per_image, cache_read_cost_per_token, text_pricing,
                               context_length, verifiable, is_active, owned_by, created_at, updated_at,
                               provider_type, provider_config, attestation_supported,
                               input_modalities, output_modalities, inference_url, hugging_face_id, quantization, max_output_length, supported_sampling_parameters, supported_features, datacenters, is_ready, deprecation_date, openrouter_slug, allow_free
@@ -761,6 +781,7 @@ impl ModelRepository {
                         &deprecation_date_value,
                         &openrouter_slug_value,
                         &req.allow_free,
+                        &text_pricing_value,
                     ],
                 )
                 .await
@@ -812,14 +833,14 @@ impl ModelRepository {
                         context_length, verifiable, is_active, owned_by,
                         provider_type, provider_config, attestation_supported,
                         input_modalities, output_modalities, inference_url, hugging_face_id, quantization, max_output_length, supported_sampling_parameters, supported_features, datacenters,
-                        is_ready, deprecation_date, openrouter_slug, allow_free
+                        is_ready, deprecation_date, openrouter_slug, allow_free, text_pricing
                     ) VALUES (
                         $1, $2, $3, $4, $5, $6, $7, $8,
                         $9, $10, $11, $12, $13, $14, $15, $16, $17, $18,
-                        $19, $20, $21, $22, $23, $24, $25, $26, $27, $28
+                        $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29
                     )
                     RETURNING id, model_name, model_display_name, model_description, model_icon,
-                              input_cost_per_token, output_cost_per_token, cost_per_image, cache_read_cost_per_token,
+                              input_cost_per_token, output_cost_per_token, cost_per_image, cache_read_cost_per_token, text_pricing,
                               context_length, verifiable, is_active, owned_by, created_at, updated_at,
                               provider_type, provider_config, attestation_supported,
                               input_modalities, output_modalities, inference_url, hugging_face_id, quantization, max_output_length, supported_sampling_parameters, supported_features, datacenters, is_ready, deprecation_date, openrouter_slug, allow_free
@@ -853,6 +874,7 @@ impl ModelRepository {
                         &model.deprecation_date,
                         &model.openrouter_slug,
                         &model.allow_free,
+                        &model.text_pricing,
                     ],
                 )
                 .await
@@ -876,7 +898,7 @@ impl ModelRepository {
                 .query(
                     r#"
                     SELECT
-                        id, model_id, input_cost_per_token, output_cost_per_token, cost_per_image, cache_read_cost_per_token,
+                        id, model_id, input_cost_per_token, output_cost_per_token, cost_per_image, cache_read_cost_per_token, text_pricing,
                         context_length, model_name, model_display_name, model_description,
                         model_icon, verifiable, is_active, owned_by,
                         provider_type, provider_config, attestation_supported,
@@ -919,7 +941,7 @@ impl ModelRepository {
                 .query(
                     r#"
                     SELECT
-                        id, model_id, input_cost_per_token, output_cost_per_token, cost_per_image, cache_read_cost_per_token,
+                        id, model_id, input_cost_per_token, output_cost_per_token, cost_per_image, cache_read_cost_per_token, text_pricing,
                         context_length, model_name, model_display_name, model_description,
                         model_icon, verifiable, is_active, owned_by,
                         provider_type, provider_config, attestation_supported,
@@ -992,7 +1014,7 @@ impl ModelRepository {
                 .query(
                     r#"
                     SELECT
-                        h.id, h.model_id, h.input_cost_per_token, h.output_cost_per_token, h.cost_per_image, h.cache_read_cost_per_token,
+                        h.id, h.model_id, h.input_cost_per_token, h.output_cost_per_token, h.cost_per_image, h.cache_read_cost_per_token, h.text_pricing,
                         h.context_length, h.model_name, h.model_display_name, h.model_description,
                         h.model_icon, h.verifiable, h.is_active, h.owned_by,
                         h.provider_type, h.provider_config, h.attestation_supported,
@@ -1044,7 +1066,7 @@ impl ModelRepository {
                     SET is_active = false, updated_at = NOW()
                     WHERE model_name = $1 AND is_active = true
                     RETURNING id, model_name, model_display_name, model_description, model_icon,
-                              input_cost_per_token, output_cost_per_token, cost_per_image, cache_read_cost_per_token,
+                              input_cost_per_token, output_cost_per_token, cost_per_image, cache_read_cost_per_token, text_pricing,
                               context_length, verifiable, is_active, owned_by, created_at, updated_at,
                               provider_type, provider_config, attestation_supported,
                               input_modalities, output_modalities, inference_url, hugging_face_id, quantization, max_output_length, supported_sampling_parameters, supported_features, datacenters, is_ready, deprecation_date, openrouter_slug, allow_free
@@ -1143,14 +1165,15 @@ impl ModelRepository {
                     changed_by_user_id,
                     changed_by_user_email,
                     change_reason,
-                    created_at
+                    created_at,
+                    text_pricing
                 ) VALUES (
                     $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19,
                     $20, $21, $22,
                     COALESCE($23, ARRAY[]::TEXT[]),
                     COALESCE($24, ARRAY[]::TEXT[]),
                     $25, $26, $27, $28, $29,
-                    NOW(), NULL, $30, $31, $32, NOW()
+                    NOW(), NULL, $30, $31, $32, NOW(), $33
                 )
                 "#,
                 &[
@@ -1221,6 +1244,10 @@ impl ModelRepository {
                     &changed_by_user_id,
                     &changed_by_user_email,
                     change_reason,
+                    &model_row
+                        .try_get::<_, Option<serde_json::Value>>("text_pricing")
+                        .ok()
+                        .flatten(),
                 ],
             )
             .await
@@ -1286,6 +1313,7 @@ impl ModelRepository {
                         m.output_cost_per_token,
                         m.cost_per_image,
                         m.cache_read_cost_per_token,
+                        m.text_pricing,
                         m.context_length,
                         m.verifiable,
                         m.is_active,
@@ -1353,6 +1381,7 @@ impl ModelRepository {
             output_cost_per_token: row.get("output_cost_per_token"),
             cost_per_image: row.get("cost_per_image"),
             cache_read_cost_per_token: row.get("cache_read_cost_per_token"),
+            text_pricing: row.try_get("text_pricing").ok().flatten(),
             context_length: row.get("context_length"),
             verifiable: row.get("verifiable"),
             is_active: row.get("is_active"),
@@ -1405,6 +1434,7 @@ impl ModelRepository {
             output_cost_per_token: row.get("output_cost_per_token"),
             cost_per_image: row.get("cost_per_image"),
             cache_read_cost_per_token: row.get("cache_read_cost_per_token"),
+            text_pricing: row.try_get("text_pricing").ok().flatten(),
             context_length: row.get("context_length"),
             model_name: model_name.clone(),
             model_display_name: row.get("model_display_name"),
@@ -1515,7 +1545,7 @@ impl ModelRepository {
                     r#"
                     SELECT
                         m.id, m.model_name, m.model_display_name, m.model_description, m.model_icon,
-                        m.input_cost_per_token, m.output_cost_per_token, m.cost_per_image, m.cache_read_cost_per_token,
+                        m.input_cost_per_token, m.output_cost_per_token, m.cost_per_image, m.cache_read_cost_per_token, m.text_pricing,
                         m.context_length, m.verifiable, m.is_active, m.owned_by, m.created_at, m.updated_at,
                         m.provider_type, m.provider_config, m.attestation_supported,
                         m.input_modalities, m.output_modalities, m.inference_url,
@@ -1576,40 +1606,43 @@ impl services::inference_provider_pool::ExternalModelsSource for ModelRepository
 impl services::models::ModelsRepository for ModelRepository {
     async fn get_all_active_models(&self) -> Result<Vec<services::models::ModelWithPricing>> {
         let models = self.get_all_active_models().await?;
-        Ok(models
+        models
             .into_iter()
-            .map(|m| services::models::ModelWithPricing {
-                id: m.id,
-                model_name: m.model_name,
-                model_display_name: m.model_display_name,
-                model_description: m.model_description,
-                model_icon: m.model_icon,
-                input_cost_per_token: m.input_cost_per_token,
-                output_cost_per_token: m.output_cost_per_token,
-                cost_per_image: m.cost_per_image,
-                cache_read_cost_per_token: m.cache_read_cost_per_token,
-                context_length: m.context_length,
-                verifiable: m.verifiable,
-                aliases: m.aliases,
-                owned_by: m.owned_by,
-                provider_type: m.provider_type,
-                provider_config: m.provider_config,
-                attestation_supported: m.attestation_supported,
-                input_modalities: m.input_modalities,
-                output_modalities: m.output_modalities,
-                inference_url: m.inference_url,
-                hugging_face_id: m.hugging_face_id,
-                quantization: m.quantization,
-                max_output_length: m.max_output_length,
-                supported_sampling_parameters: m.supported_sampling_parameters,
-                supported_features: m.supported_features,
-                datacenters: m.datacenters,
-                is_ready: m.is_ready,
-                deprecation_date: m.deprecation_date,
-                openrouter_slug: m.openrouter_slug,
-                created_at: m.created_at,
+            .map(|m| {
+                Ok(services::models::ModelWithPricing {
+                    id: m.id,
+                    model_name: m.model_name,
+                    model_display_name: m.model_display_name,
+                    model_description: m.model_description,
+                    model_icon: m.model_icon,
+                    input_cost_per_token: m.input_cost_per_token,
+                    output_cost_per_token: m.output_cost_per_token,
+                    cost_per_image: m.cost_per_image,
+                    cache_read_cost_per_token: m.cache_read_cost_per_token,
+                    text_pricing: parse_text_pricing(m.text_pricing)?,
+                    context_length: m.context_length,
+                    verifiable: m.verifiable,
+                    aliases: m.aliases,
+                    owned_by: m.owned_by,
+                    provider_type: m.provider_type,
+                    provider_config: m.provider_config,
+                    attestation_supported: m.attestation_supported,
+                    input_modalities: m.input_modalities,
+                    output_modalities: m.output_modalities,
+                    inference_url: m.inference_url,
+                    hugging_face_id: m.hugging_face_id,
+                    quantization: m.quantization,
+                    max_output_length: m.max_output_length,
+                    supported_sampling_parameters: m.supported_sampling_parameters,
+                    supported_features: m.supported_features,
+                    datacenters: m.datacenters,
+                    is_ready: m.is_ready,
+                    deprecation_date: m.deprecation_date,
+                    openrouter_slug: m.openrouter_slug,
+                    created_at: m.created_at,
+                })
             })
-            .collect())
+            .collect()
     }
 
     async fn get_model_by_name(
@@ -1617,37 +1650,42 @@ impl services::models::ModelsRepository for ModelRepository {
         model_name: &str,
     ) -> Result<Option<services::models::ModelWithPricing>> {
         let model_opt = self.get_active_model_by_name(model_name).await?;
-        Ok(model_opt.map(|m| services::models::ModelWithPricing {
-            id: m.id,
-            model_name: m.model_name,
-            model_display_name: m.model_display_name,
-            model_description: m.model_description,
-            model_icon: m.model_icon,
-            input_cost_per_token: m.input_cost_per_token,
-            output_cost_per_token: m.output_cost_per_token,
-            cost_per_image: m.cost_per_image,
-            cache_read_cost_per_token: m.cache_read_cost_per_token,
-            context_length: m.context_length,
-            verifiable: m.verifiable,
-            aliases: m.aliases,
-            owned_by: m.owned_by,
-            provider_type: m.provider_type,
-            provider_config: m.provider_config,
-            attestation_supported: m.attestation_supported,
-            input_modalities: m.input_modalities,
-            output_modalities: m.output_modalities,
-            inference_url: m.inference_url,
-            hugging_face_id: m.hugging_face_id,
-            quantization: m.quantization,
-            max_output_length: m.max_output_length,
-            supported_sampling_parameters: m.supported_sampling_parameters,
-            supported_features: m.supported_features,
-            datacenters: m.datacenters,
-            is_ready: m.is_ready,
-            deprecation_date: m.deprecation_date,
-            openrouter_slug: m.openrouter_slug,
-            created_at: m.created_at,
-        }))
+        model_opt
+            .map(|m| {
+                Ok(services::models::ModelWithPricing {
+                    id: m.id,
+                    model_name: m.model_name,
+                    model_display_name: m.model_display_name,
+                    model_description: m.model_description,
+                    model_icon: m.model_icon,
+                    input_cost_per_token: m.input_cost_per_token,
+                    output_cost_per_token: m.output_cost_per_token,
+                    cost_per_image: m.cost_per_image,
+                    cache_read_cost_per_token: m.cache_read_cost_per_token,
+                    text_pricing: parse_text_pricing(m.text_pricing)?,
+                    context_length: m.context_length,
+                    verifiable: m.verifiable,
+                    aliases: m.aliases,
+                    owned_by: m.owned_by,
+                    provider_type: m.provider_type,
+                    provider_config: m.provider_config,
+                    attestation_supported: m.attestation_supported,
+                    input_modalities: m.input_modalities,
+                    output_modalities: m.output_modalities,
+                    inference_url: m.inference_url,
+                    hugging_face_id: m.hugging_face_id,
+                    quantization: m.quantization,
+                    max_output_length: m.max_output_length,
+                    supported_sampling_parameters: m.supported_sampling_parameters,
+                    supported_features: m.supported_features,
+                    datacenters: m.datacenters,
+                    is_ready: m.is_ready,
+                    deprecation_date: m.deprecation_date,
+                    openrouter_slug: m.openrouter_slug,
+                    created_at: m.created_at,
+                })
+            })
+            .transpose()
     }
 
     async fn resolve_and_get_model(
@@ -1655,37 +1693,42 @@ impl services::models::ModelsRepository for ModelRepository {
         identifier: &str,
     ) -> Result<Option<services::models::ModelWithPricing>> {
         let model_opt = self.resolve_and_get_model(identifier).await?;
-        Ok(model_opt.map(|m| services::models::ModelWithPricing {
-            id: m.id,
-            model_name: m.model_name,
-            model_display_name: m.model_display_name,
-            model_description: m.model_description,
-            model_icon: m.model_icon,
-            input_cost_per_token: m.input_cost_per_token,
-            output_cost_per_token: m.output_cost_per_token,
-            cost_per_image: m.cost_per_image,
-            cache_read_cost_per_token: m.cache_read_cost_per_token,
-            context_length: m.context_length,
-            verifiable: m.verifiable,
-            aliases: m.aliases,
-            owned_by: m.owned_by,
-            provider_type: m.provider_type,
-            provider_config: m.provider_config,
-            attestation_supported: m.attestation_supported,
-            input_modalities: m.input_modalities,
-            output_modalities: m.output_modalities,
-            inference_url: m.inference_url,
-            hugging_face_id: m.hugging_face_id,
-            quantization: m.quantization,
-            max_output_length: m.max_output_length,
-            supported_sampling_parameters: m.supported_sampling_parameters,
-            supported_features: m.supported_features,
-            datacenters: m.datacenters,
-            is_ready: m.is_ready,
-            deprecation_date: m.deprecation_date,
-            openrouter_slug: m.openrouter_slug,
-            created_at: m.created_at,
-        }))
+        model_opt
+            .map(|m| {
+                Ok(services::models::ModelWithPricing {
+                    id: m.id,
+                    model_name: m.model_name,
+                    model_display_name: m.model_display_name,
+                    model_description: m.model_description,
+                    model_icon: m.model_icon,
+                    input_cost_per_token: m.input_cost_per_token,
+                    output_cost_per_token: m.output_cost_per_token,
+                    cost_per_image: m.cost_per_image,
+                    cache_read_cost_per_token: m.cache_read_cost_per_token,
+                    text_pricing: parse_text_pricing(m.text_pricing)?,
+                    context_length: m.context_length,
+                    verifiable: m.verifiable,
+                    aliases: m.aliases,
+                    owned_by: m.owned_by,
+                    provider_type: m.provider_type,
+                    provider_config: m.provider_config,
+                    attestation_supported: m.attestation_supported,
+                    input_modalities: m.input_modalities,
+                    output_modalities: m.output_modalities,
+                    inference_url: m.inference_url,
+                    hugging_face_id: m.hugging_face_id,
+                    quantization: m.quantization,
+                    max_output_length: m.max_output_length,
+                    supported_sampling_parameters: m.supported_sampling_parameters,
+                    supported_features: m.supported_features,
+                    datacenters: m.datacenters,
+                    is_ready: m.is_ready,
+                    deprecation_date: m.deprecation_date,
+                    openrouter_slug: m.openrouter_slug,
+                    created_at: m.created_at,
+                })
+            })
+            .transpose()
     }
 
     async fn get_configured_model_names(&self) -> Result<Vec<String>> {

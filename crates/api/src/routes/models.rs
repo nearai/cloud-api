@@ -131,6 +131,9 @@ pub async fn list_models(
                 scale: 9,
                 currency: "USD".to_string(),
             }),
+            text_pricing: model
+                .text_pricing
+                .map(|profile| serde_json::to_value(profile).expect("text pricing serializes")),
             metadata: ModelMetadata {
                 verifiable: model.verifiable,
                 context_length: model.context_length,
@@ -249,6 +252,9 @@ pub async fn get_model_by_name(
             scale: 9,
             currency: "USD".to_string(),
         }),
+        text_pricing: model
+            .text_pricing
+            .map(|profile| serde_json::to_value(profile).expect("text pricing serializes")),
         metadata: ModelMetadata {
             verifiable: model.verifiable,
             context_length: model.context_length,
@@ -311,6 +317,7 @@ mod tests {
             output_cost_per_token: 0,
             cost_per_image: 0,
             cache_read_cost_per_token: None,
+            text_pricing: None,
             context_length: 16_384,
             verifiable: false,
             aliases: vec!["public-alias".to_string()],

@@ -85,6 +85,7 @@ pub struct CompletionRequest {
     pub stop: Option<Vec<String>>,
     pub stream: Option<bool>,
     pub n: Option<i64>,
+    pub service_tier: Option<inference_providers::ChatServiceTier>,
     pub user_id: UserId,    // For provider user field
     pub api_key_id: String, // For usage tracking (ID only, no name)
     pub organization_id: Uuid,

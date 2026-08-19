@@ -899,6 +899,7 @@ pub fn e2e_qwen_model_pricing_no_cache() -> ModelPricing {
         output_cost_per_token: E2E_QWEN_OUTPUT_COST_PER_TOKEN,
         cost_per_image: 0,
         cache_read_cost_per_token: E2E_QWEN_CACHE_READ_COST_NO_CACHE,
+        text_pricing: None,
     }
 }
 
@@ -911,6 +912,7 @@ pub fn e2e_qwen_model_pricing_with_cache() -> ModelPricing {
         output_cost_per_token: E2E_QWEN_OUTPUT_COST_PER_TOKEN,
         cost_per_image: 0,
         cache_read_cost_per_token: Some(E2E_QWEN_CACHE_READ_COST_WITH_CACHE),
+        text_pricing: None,
     }
 }
 

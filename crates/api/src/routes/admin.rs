@@ -550,6 +550,17 @@ pub async fn batch_upsert_models(
             &request.cache_read_cost_per_token.clone().flatten(),
             "cacheReadCostPerToken",
         )?;
+        if let Some(Some(value)) = &request.text_pricing {
+            services::usage::TextPricingProfile::from_json(value.clone()).map_err(|error| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    ResponseJson(ErrorResponse::new(
+                        format!("model '{model_name}': {error}"),
+                        "invalid_request".to_string(),
+                    )),
+                )
+            })?;
+        }
 
         // OpenRouter vocabulary checks. The provider spec at
         // https://openrouter.ai/docs/guides/community/for-providers enumerates
@@ -683,18 +694,41 @@ pub async fn batch_upsert_models(
     let models = batch_request
         .iter()
         .map(|(model_name, request)| {
+            let text_pricing = request.text_pricing.as_ref().map(|profile| {
+                profile.as_ref().map(|value| {
+                    services::usage::TextPricingProfile::from_json(value.clone())
+                        .expect("textPricing was validated above")
+                })
+            });
+            let projection = text_pricing
+                .as_ref()
+                .and_then(|profile| profile.as_ref())
+                .map(|profile| {
+                    profile
+                        .legacy_projection()
+                        .expect("textPricing was validated above")
+                });
             (
                 model_name.clone(),
                 UpdateModelAdminRequest {
-                    input_cost_per_token: request.input_cost_per_token.as_ref().map(|p| p.amount),
-                    output_cost_per_token: request.output_cost_per_token.as_ref().map(|p| p.amount),
+                    input_cost_per_token: projection
+                        .map(|(input, _, _)| input)
+                        .or_else(|| request.input_cost_per_token.as_ref().map(|p| p.amount)),
+                    output_cost_per_token: projection
+                        .map(|(_, _, output)| output)
+                        .or_else(|| request.output_cost_per_token.as_ref().map(|p| p.amount)),
                     cost_per_image: request.cost_per_image.as_ref().map(|p| p.amount),
                     // Tri-state passes through: outer None = leave unchanged,
                     // Some(None) = disable cache pricing, Some(Some(p)) = set.
-                    cache_read_cost_per_token: request
-                        .cache_read_cost_per_token
-                        .as_ref()
-                        .map(|inner| inner.as_ref().map(|p| p.amount)),
+                    cache_read_cost_per_token: projection
+                        .map(|(_, cached, _)| Some(cached))
+                        .or_else(|| {
+                            request
+                                .cache_read_cost_per_token
+                                .as_ref()
+                                .map(|inner| inner.as_ref().map(|p| p.amount))
+                        }),
+                    text_pricing,
                     model_display_name: request.model_display_name.clone(),
                     model_description: request.model_description.clone(),
                     model_icon: request.model_icon.clone(),
@@ -949,6 +983,9 @@ pub async fn batch_upsert_models(
                 currency: "USD".to_string(),
             },
             cache_read_cost_per_token: updated_model.cache_read_cost_per_token.map(usd_price),
+            text_pricing: updated_model
+                .text_pricing
+                .map(|profile| serde_json::to_value(profile).expect("text pricing serializes")),
             metadata: ModelMetadata {
                 verifiable: updated_model.verifiable,
                 context_length: updated_model.context_length,
@@ -1055,6 +1092,9 @@ pub async fn list_models(
                 currency: "USD".to_string(),
             },
             cache_read_cost_per_token: model.cache_read_cost_per_token.map(usd_price),
+            text_pricing: model
+                .text_pricing
+                .map(|profile| serde_json::to_value(profile).expect("text pricing serializes")),
             metadata: ModelMetadata {
                 verifiable: model.verifiable,
                 context_length: model.context_length,
@@ -1191,6 +1231,9 @@ pub async fn get_model_history(
                 currency: "USD".to_string(),
             },
             cache_read_cost_per_token: h.cache_read_cost_per_token.map(usd_price),
+            text_pricing: h
+                .text_pricing
+                .map(|profile| serde_json::to_value(profile).expect("text pricing serializes")),
             context_length: h.context_length,
             model_name: h.model_name,
             model_display_name: h.model_display_name,
@@ -1747,6 +1790,9 @@ pub async fn deprecate_model(
             currency: "USD".to_string(),
         },
         cache_read_cost_per_token: m.cache_read_cost_per_token.map(usd_price),
+        text_pricing: m
+            .text_pricing
+            .map(|profile| serde_json::to_value(profile).expect("text pricing serializes")),
         metadata: ModelMetadata {
             verifiable: m.verifiable,
             context_length: m.context_length,
@@ -1943,16 +1989,31 @@ fn pricing_change_inputs_from_request(
                     )));
                 }
             }
+            let text_pricing = item
+                .text_pricing
+                .clone()
+                .map(services::usage::TextPricingProfile::from_json)
+                .transpose()
+                .map_err(|error| invalid(format!("model '{}': {error}", item.model_id)))?;
+            let projection = text_pricing
+                .as_ref()
+                .map(services::usage::TextPricingProfile::legacy_projection)
+                .transpose()
+                .map_err(|error| invalid(format!("model '{}': {error}", item.model_id)))?;
             Ok(services::admin::PricingChangeInput {
                 model_name: item.model_id.clone(),
                 effective_at,
-                new_input_cost_per_token: item.input_cost_per_token.as_ref().map(|p| p.amount),
-                new_output_cost_per_token: item.output_cost_per_token.as_ref().map(|p| p.amount),
-                new_cache_read_cost_per_token: item
-                    .cache_read_cost_per_token
-                    .as_ref()
-                    .map(|p| p.amount),
+                new_input_cost_per_token: projection
+                    .map(|(input, _, _)| input)
+                    .or_else(|| item.input_cost_per_token.as_ref().map(|p| p.amount)),
+                new_output_cost_per_token: projection
+                    .map(|(_, _, output)| output)
+                    .or_else(|| item.output_cost_per_token.as_ref().map(|p| p.amount)),
+                new_cache_read_cost_per_token: projection
+                    .map(|(_, cached, _)| cached)
+                    .or_else(|| item.cache_read_cost_per_token.as_ref().map(|p| p.amount)),
                 new_cost_per_image: item.cost_per_image.as_ref().map(|p| p.amount),
+                new_text_pricing: text_pricing,
             })
         })
         .collect()
@@ -1973,12 +2034,18 @@ fn scheduled_pricing_change_to_dto(
             output_cost_per_token: usd_price(change.old_output_cost_per_token),
             cache_read_cost_per_token: change.old_cache_read_cost_per_token.map(usd_price),
             cost_per_image: usd_price(change.old_cost_per_image),
+            text_pricing: change
+                .old_text_pricing
+                .map(|profile| serde_json::to_value(profile).expect("text pricing serializes")),
         },
         new_pricing: PricingFieldUpdates {
             input_cost_per_token: change.new_input_cost_per_token.map(usd_price),
             output_cost_per_token: change.new_output_cost_per_token.map(usd_price),
             cache_read_cost_per_token: change.new_cache_read_cost_per_token.map(usd_price),
             cost_per_image: change.new_cost_per_image.map(usd_price),
+            text_pricing: change
+                .new_text_pricing
+                .map(|profile| serde_json::to_value(profile).expect("text pricing serializes")),
         },
         applied_at: change.applied_at.map(|dt| dt.to_rfc3339()),
         last_error: change.last_error,
@@ -2036,12 +2103,18 @@ pub async fn preview_model_pricing_changes(
                     output_cost_per_token: usd_price(m.old_output_cost_per_token),
                     cache_read_cost_per_token: m.old_cache_read_cost_per_token.map(usd_price),
                     cost_per_image: usd_price(m.old_cost_per_image),
+                    text_pricing: m.old_text_pricing.map(|profile| {
+                        serde_json::to_value(profile).expect("text pricing serializes")
+                    }),
                 },
                 new_pricing: PricingFieldUpdates {
                     input_cost_per_token: m.new_input_cost_per_token.map(usd_price),
                     output_cost_per_token: m.new_output_cost_per_token.map(usd_price),
                     cache_read_cost_per_token: m.new_cache_read_cost_per_token.map(usd_price),
                     cost_per_image: m.new_cost_per_image.map(usd_price),
+                    text_pricing: m.new_text_pricing.map(|profile| {
+                        serde_json::to_value(profile).expect("text pricing serializes")
+                    }),
                 },
             })
             .collect(),

@@ -1,13 +1,14 @@
 pub mod ports;
 pub mod provider_attribution;
 pub mod reporting;
+pub mod text_pricing;
 
 use crate::metrics::{
     consts::{
         get_environment, METRIC_BILLED_CACHE_READ_TOKENS, METRIC_BILLED_CACHE_WRITE_TOKENS,
         METRIC_BILLED_INPUT_COST_USD, METRIC_BILLED_INPUT_TOKENS, METRIC_BILLED_OUTPUT_COST_USD,
-        METRIC_BILLED_OUTPUT_TOKENS, METRIC_BILLED_REQUESTS, METRIC_COST_USD, TAG_ENVIRONMENT,
-        TAG_INFERENCE_TYPE, TAG_MODEL,
+        METRIC_BILLED_OUTPUT_TOKENS, METRIC_BILLED_REQUESTS, METRIC_BILLING_PRICING_FALLBACK,
+        METRIC_COST_USD, TAG_ENVIRONMENT, TAG_INFERENCE_TYPE, TAG_MODEL,
     },
     MetricsServiceTrait,
 };
@@ -15,6 +16,7 @@ pub use ports::*;
 pub use provider_attribution::*;
 pub use reporting::*;
 use std::sync::Arc;
+pub use text_pricing::*;
 use uuid::Uuid;
 
 /// Dedicated UUID v5 namespace for `inference_id`s derived from external `id`s
@@ -225,7 +227,20 @@ impl UsageServiceTrait for UsageServiceImpl {
             .map_err(|e| UsageError::InternalError(format!("Failed to get model: {e}")))?
             .ok_or_else(|| UsageError::ModelNotFound(format!("Model '{model_id}' not found")))?;
 
-        compute_token_cost(input_tokens, output_tokens, cache_read_tokens, &model)
+        if let Some(profile) = &model.text_pricing {
+            Ok(compute_profiled_text_cost(
+                input_tokens,
+                output_tokens,
+                cache_read_tokens,
+                0,
+                TextServiceTier::Default,
+                None,
+                profile,
+            )?
+            .cost)
+        } else {
+            compute_token_cost(input_tokens, output_tokens, cache_read_tokens, &model)
+        }
     }
 
     /// Record usage after an API call completes
@@ -244,7 +259,11 @@ impl UsageServiceTrait for UsageServiceImpl {
                 .max(0),
             cost_per_token: write.cost_per_token,
         });
-        let cache_write_tokens = cache_write.map(|write| write.tokens).unwrap_or(0);
+        let legacy_cache_write_tokens = cache_write.map(|write| write.tokens).unwrap_or(0);
+        let profiled_cache_write_tokens = request
+            .profiled_cache_write_tokens
+            .min(request.input_tokens.saturating_sub(cache_read_tokens))
+            .max(0);
 
         // Look up the model to get pricing (model_id is already a UUID)
         let model = self
@@ -257,7 +276,15 @@ impl UsageServiceTrait for UsageServiceImpl {
             })?;
 
         // Calculate costs based on inference type
-        let (input_cost, output_cost, total_cost) = match request.inference_type {
+        let (
+            input_cost,
+            output_cost,
+            total_cost,
+            cache_write_tokens,
+            billing_details,
+            service_tier,
+            context_band,
+        ) = match request.inference_type {
             ports::InferenceType::ImageGeneration | ports::InferenceType::ImageEdit => {
                 // For image-based operations: use image_count and cost_per_image
                 let image_count = request.image_count.unwrap_or(0);
@@ -270,7 +297,15 @@ impl UsageServiceTrait for UsageServiceImpl {
                             image_count, model.cost_per_image
                         ))
                     })?;
-                (0, image_cost, image_cost)
+                (
+                    0,
+                    image_cost,
+                    image_cost,
+                    legacy_cache_write_tokens,
+                    None,
+                    None,
+                    None,
+                )
             }
             ports::InferenceType::AudioTranscription => {
                 // For audio transcription: bill by duration in seconds (stored in input_tokens).
@@ -285,7 +320,15 @@ impl UsageServiceTrait for UsageServiceImpl {
                             request.input_tokens, model.input_cost_per_token
                         ))
                     })?;
-                (duration_cost, 0, duration_cost)
+                (
+                    duration_cost,
+                    0,
+                    duration_cost,
+                    legacy_cache_write_tokens,
+                    None,
+                    None,
+                    None,
+                )
             }
             ports::InferenceType::Rerank
             | ports::InferenceType::Embedding
@@ -305,18 +348,84 @@ impl UsageServiceTrait for UsageServiceImpl {
                             model.input_cost_per_token
                         ))
                     })?;
-                (cost, 0, cost)
+                (cost, 0, cost, legacy_cache_write_tokens, None, None, None)
             }
             _ => {
                 // For token-based models (chat completions, etc.)
-                let cost = compute_token_cost_with_cache_write(
-                    request.input_tokens,
-                    request.output_tokens,
-                    cache_read_tokens,
-                    cache_write,
-                    &model,
-                )?;
-                (cost.input_cost, cost.output_cost, cost.total_cost)
+                if let Some(profile) = &model.text_pricing {
+                    let requested_tier = request
+                        .requested_service_tier
+                        .unwrap_or(TextServiceTier::Default);
+                    if !profile.supports_tier(requested_tier) {
+                        return Err(UsageError::ValidationError(format!(
+                            "{} service tier is not configured for model '{}'",
+                            requested_tier.as_str(),
+                            model.model_name
+                        )));
+                    }
+                    let priced = compute_profiled_text_cost(
+                        request.input_tokens,
+                        request.output_tokens,
+                        cache_read_tokens,
+                        profiled_cache_write_tokens,
+                        requested_tier,
+                        request.provider_service_tier.as_deref(),
+                        profile,
+                    )?;
+                    if let Some(reason) = priced.snapshot.critical_fallback_reason.as_deref() {
+                        let environment = get_environment();
+                        let tags = [
+                            format!("{}:{}", TAG_MODEL, model.model_name),
+                            format!("reason:{reason}"),
+                            format!("{TAG_ENVIRONMENT}:{environment}"),
+                        ];
+                        let tag_refs: Vec<&str> = tags.iter().map(String::as_str).collect();
+                        self.metrics_service.record_count(
+                            METRIC_BILLING_PRICING_FALLBACK,
+                            1,
+                            &tag_refs,
+                        );
+                        tracing::error!(
+                            model = %model.model_name,
+                            reason,
+                            "Critical billing pricing fallback applied"
+                        );
+                    }
+                    let service_tier = Some(priced.snapshot.actual_tier.clone());
+                    let context_band = Some(priced.snapshot.context_band.as_str().to_string());
+                    let billing_details =
+                        Some(serde_json::to_value(&priced.snapshot).map_err(|error| {
+                            UsageError::InternalError(format!(
+                                "Failed to serialize billing snapshot: {error}"
+                            ))
+                        })?);
+                    (
+                        priced.cost.input_cost,
+                        priced.cost.output_cost,
+                        priced.cost.total_cost,
+                        profiled_cache_write_tokens,
+                        billing_details,
+                        service_tier,
+                        context_band,
+                    )
+                } else {
+                    let cost = compute_token_cost_with_cache_write(
+                        request.input_tokens,
+                        request.output_tokens,
+                        cache_read_tokens,
+                        cache_write,
+                        &model,
+                    )?;
+                    (
+                        cost.input_cost,
+                        cost.output_cost,
+                        cost.total_cost,
+                        legacy_cache_write_tokens,
+                        None,
+                        None,
+                        None,
+                    )
+                }
             }
         };
 
@@ -334,6 +443,9 @@ impl UsageServiceTrait for UsageServiceImpl {
             output_tokens: request.output_tokens,
             cache_read_tokens,
             cache_write_tokens,
+            billing_details,
+            service_tier: service_tier.clone(),
+            context_band: context_band.clone(),
             input_cost,
             output_cost,
             total_cost,
@@ -362,11 +474,17 @@ impl UsageServiceTrait for UsageServiceImpl {
         // dimensioned by model + inference_type.
         if log.was_inserted {
             let environment = get_environment();
-            let tags = [
+            let mut tags = vec![
                 format!("{}:{}", TAG_MODEL, model.model_name),
                 format!("{}:{}", TAG_INFERENCE_TYPE, request.inference_type.as_str()),
                 format!("{TAG_ENVIRONMENT}:{environment}"),
             ];
+            if let Some(tier) = &service_tier {
+                tags.push(format!("service_tier:{tier}"));
+            }
+            if let Some(band) = &context_band {
+                tags.push(format!("context_band:{band}"));
+            }
             let tags_str: Vec<&str> = tags.iter().map(|s| s.as_str()).collect();
 
             let metrics = &self.metrics_service;
@@ -608,6 +726,9 @@ impl UsageServiceTrait for UsageServiceImpl {
             output_tokens,
             cache_read_tokens,
             cache_write: None,
+            profiled_cache_write_tokens: 0,
+            requested_service_tier: None,
+            provider_service_tier: None,
             inference_type,
             ttft_ms: None,
             avg_itl_ms: None,
@@ -898,6 +1019,7 @@ mod tests {
             output_cost_per_token,
             cost_per_image: 0,
             cache_read_cost_per_token,
+            text_pricing: None,
         }
     }
 

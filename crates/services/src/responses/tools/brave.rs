@@ -272,14 +272,14 @@ impl WebSearchProviderTrait for BraveWebSearchProvider {
 
         // Parse JSON
         let brave_response: BraveSearchResponse =
-            serde_json::from_str(&response_text).map_err(|_| {
+            serde_json::from_str(&response_text).map_err(|e| {
                 tracing::error!(
                     endpoint = "web_search",
                     error_category = "invalid_json",
                     elapsed_ms = started_at.elapsed().as_millis() as u64,
                     "Failed to parse Brave response"
                 );
-                WebSearchError::WebSearchResponseParsingFailed("JSON parsing error".to_string())
+                WebSearchError::WebSearchResponseParsingFailed(format!("JSON parsing error: {e}"))
             })?;
 
         // Extract web results and convert to our internal format
@@ -421,14 +421,14 @@ impl WebContextSearchProviderTrait for BraveWebSearchProvider {
         })?;
 
         let context_response: BraveContextResponse =
-            serde_json::from_str(&response_text).map_err(|_| {
+            serde_json::from_str(&response_text).map_err(|e| {
                 tracing::error!(
                     endpoint = "llm_context",
                     error_category = "invalid_json",
                     elapsed_ms = started_at.elapsed().as_millis() as u64,
                     "Failed to parse Brave response"
                 );
-                WebSearchError::WebSearchResponseParsingFailed("JSON parsing error".to_string())
+                WebSearchError::WebSearchResponseParsingFailed(format!("JSON parsing error: {e}"))
             })?;
 
         let results = context_response_to_web_results(context_response);

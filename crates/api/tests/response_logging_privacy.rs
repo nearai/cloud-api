@@ -11,6 +11,10 @@ const RESPONSE_LOG_SOURCES: &[(&str, &str)] = &[
         include_str!("../src/routes/responses.rs"),
     ),
     (
+        "request body hash middleware",
+        include_str!("../src/middleware/body_hash.rs"),
+    ),
+    (
         "response errors",
         include_str!("../../services/src/responses/errors.rs"),
     ),
@@ -80,7 +84,7 @@ const RESPONSE_LOG_SOURCES: &[(&str, &str)] = &[
     ),
 ];
 
-fn tracing_invocations(source: &str) -> Vec<&str> {
+fn tracing_invocations(source: &str) -> Result<Vec<&str>, String> {
     const MACRO_PREFIXES: &[&str] = &[
         "tracing::debug!(",
         "tracing::event!(",
@@ -105,43 +109,62 @@ fn tracing_invocations(source: &str) -> Vec<&str> {
     starts.sort_unstable();
     starts.dedup();
 
-    starts
-        .into_iter()
-        .filter_map(|start| {
-            let invocation = &source[start..];
-            let open_paren = invocation.find('(')?;
-            let mut depth = 0_usize;
-            let mut in_string = false;
-            let mut escaped = false;
+    let mut invocations = Vec::with_capacity(starts.len());
 
-            for (offset, character) in invocation[open_paren..].char_indices() {
-                if in_string {
-                    if escaped {
-                        escaped = false;
-                    } else if character == '\\' {
-                        escaped = true;
-                    } else if character == '"' {
-                        in_string = false;
-                    }
-                    continue;
-                }
+    for start in starts {
+        let invocation = &source[start..];
+        let open_paren = invocation.find('(').ok_or_else(|| {
+            format!(
+                "matched tracing macro prefix without an opening parenthesis: {}",
+                invocation.lines().next().unwrap_or_default().trim()
+            )
+        })?;
+        let mut depth = 0_usize;
+        let mut in_string = false;
+        let mut escaped = false;
+        let mut end = None;
 
-                match character {
-                    '"' => in_string = true,
-                    '(' => depth += 1,
-                    ')' => {
-                        depth = depth.checked_sub(1)?;
-                        if depth == 0 {
-                            return Some(&invocation[..open_paren + offset + 1]);
-                        }
-                    }
-                    _ => {}
+        for (offset, character) in invocation[open_paren..].char_indices() {
+            if in_string {
+                if escaped {
+                    escaped = false;
+                } else if character == '\\' {
+                    escaped = true;
+                } else if character == '"' {
+                    in_string = false;
                 }
+                continue;
             }
 
-            None
-        })
-        .collect()
+            match character {
+                '"' => in_string = true,
+                '(' => depth += 1,
+                ')' => {
+                    depth = depth.checked_sub(1).ok_or_else(|| {
+                        format!(
+                            "unbalanced closing parenthesis in tracing invocation: {}",
+                            invocation.lines().next().unwrap_or_default().trim()
+                        )
+                    })?;
+                    if depth == 0 {
+                        end = Some(open_paren + offset + 1);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let end = end.ok_or_else(|| {
+            format!(
+                "unterminated tracing invocation: {}",
+                invocation.lines().next().unwrap_or_default().trim()
+            )
+        })?;
+        invocations.push(&invocation[..end]);
+    }
+
+    Ok(invocations)
 }
 
 fn is_outside_string(value: &str, index: usize) -> bool {
@@ -194,15 +217,60 @@ fn contains_rendered_identifier(invocation: &str, prefix: &str, identifier: &str
     })
 }
 
-fn contains_error_rendering(invocation: &str) -> bool {
-    ["%", "?", "{"]
+fn format_message_contains_capture(invocation: &str, identifier: &str) -> bool {
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut message_string = false;
+    let mut string_start = 0;
+
+    for (index, character) in invocation.char_indices() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if character == '\\' {
+                escaped = true;
+            } else if character == '"' {
+                if message_string
+                    && format_string_contains_capture(&invocation[string_start..index], identifier)
+                {
+                    return true;
+                }
+                in_string = false;
+            }
+            continue;
+        }
+
+        if character == '"' {
+            message_string = matches!(
+                invocation[..index].trim_end().chars().next_back(),
+                Some('(' | ',')
+            );
+            string_start = index + 1;
+            in_string = true;
+        }
+    }
+
+    false
+}
+
+fn format_string_contains_capture(format_string: &str, identifier: &str) -> bool {
+    let pattern = format!("{{{identifier}");
+
+    format_string.match_indices(&pattern).any(|(index, _)| {
+        let is_escaped = format_string[..index].ends_with('{');
+        let format_specifier = format_string[index + pattern.len()..].chars().next();
+
+        !is_escaped && matches!(format_specifier, Some('}' | ':'))
+    })
+}
+
+fn contains_rendered_value(invocation: &str, identifier: &str) -> bool {
+    ["%", "?"]
         .into_iter()
-        .any(|prefix| contains_rendered_identifier(invocation, prefix, "e"))
-        || ["%", "?", "{"]
-            .into_iter()
-            .any(|prefix| contains_rendered_identifier(invocation, prefix, "error"))
-        || [", e)", ", e,", ", error)", ", error,"]
-            .into_iter()
+        .any(|prefix| contains_rendered_identifier(invocation, prefix, identifier))
+        || format_message_contains_capture(invocation, identifier)
+        || [format!(", {identifier})"), format!(", {identifier},")]
+            .iter()
             .any(|pattern| {
                 invocation
                     .match_indices(pattern)
@@ -222,9 +290,11 @@ fn responses_tracing_does_not_include_customer_data_or_error_text() {
         "conversation_title",
         "content",
         "delta",
+        "e",
         "error",
         "event",
         "filename",
+        "hash",
         "image_url",
         "inferred_tool",
         "input",
@@ -252,11 +322,16 @@ fn responses_tracing_does_not_include_customer_data_or_error_text() {
         "tool_name = %tool_name",
         "tool_name = %name",
     ];
+    const PROHIBITED_RENDERED_IDENTIFIERS: &[&str] = &["e", "error", "hash"];
 
     let mut violations = Vec::new();
 
     for (source_name, source) in RESPONSE_LOG_SOURCES {
-        for invocation in tracing_invocations(source) {
+        let invocations = tracing_invocations(source).unwrap_or_else(|error| {
+            panic!("Failed to parse {source_name} tracing invocation: {error}")
+        });
+
+        for invocation in invocations {
             for field in PROHIBITED_FIELDS {
                 if contains_field(invocation, field) {
                     violations.push(format!(
@@ -264,10 +339,12 @@ fn responses_tracing_does_not_include_customer_data_or_error_text() {
                     ));
                 }
             }
-            if contains_error_rendering(invocation) {
-                violations.push(format!(
-                    "{source_name} tracing invocation renders an error value: {invocation}"
-                ));
+            for identifier in PROHIBITED_RENDERED_IDENTIFIERS {
+                if contains_rendered_value(invocation, identifier) {
+                    violations.push(format!(
+                        "{source_name} tracing invocation renders sensitive value `{identifier}`: {invocation}"
+                    ));
+                }
             }
             for field in PROHIBITED_DERIVED_FIELDS {
                 if invocation.contains(field) {
@@ -284,4 +361,21 @@ fn responses_tracing_does_not_include_customer_data_or_error_text() {
         "Responses tracing privacy violations:\n{}",
         violations.join("\n")
     );
+}
+
+#[test]
+fn tracing_privacy_parser_rejects_sensitive_rendering_and_malformed_invocations() {
+    assert!(contains_rendered_value(
+        r#"tracing::error!("Failed to parse response: {e}")"#,
+        "e"
+    ));
+    assert!(contains_rendered_value(
+        r#"tracing::error!("Failed to parse response: {error:?}")"#,
+        "error"
+    ));
+    assert!(contains_rendered_value(
+        r#"debug!("Request body hash computed: {}", hash)"#,
+        "hash"
+    ));
+    assert!(tracing_invocations(r#"tracing::error!("missing closing parenthesis"#).is_err());
 }

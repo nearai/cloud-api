@@ -1741,7 +1741,7 @@ pub fn build_completion_routes(
 pub fn build_response_routes(
     native_app_state: AppState,
     response_service: Arc<services::ResponseService>,
-    attestation_service: Arc<dyn services::attestation::ports::AttestationServiceTrait>,
+    _attestation_service: Arc<dyn services::attestation::ports::AttestationServiceTrait>,
     auth_state_middleware: &AuthState,
     usage_state: middleware::UsageState,
     rate_limit_state: middleware::RateLimitState,
@@ -1756,7 +1756,6 @@ pub fn build_response_routes(
             attestation_service: native_app_state.attestation_service,
         },
         response_service: response_service.clone(),
-        attestation_service: attestation_service.clone(),
     };
 
     let inference_routes = Router::new()
@@ -1776,19 +1775,20 @@ pub fn build_response_routes(
         ))
         .layer(from_fn(middleware::body_hash_middleware));
 
-    let other_routes = Router::new()
-        .route("/responses/{response_id}", get(responses::get_response))
+    let retired_history_routes = Router::new()
+        // Keep retired response-history paths explicit so authenticated clients
+        // receive a useful migration signal instead of an ambiguous 404/405.
         .route(
             "/responses/{response_id}",
-            axum::routing::delete(responses::delete_response),
+            any(responses::response_history_gone),
         )
         .route(
             "/responses/{response_id}/cancel",
-            post(responses::cancel_response),
+            any(responses::response_history_gone),
         )
         .route(
             "/responses/{response_id}/input_items",
-            get(responses::list_input_items),
+            any(responses::response_history_gone),
         )
         .with_state(route_state)
         .layer(from_fn_with_state(
@@ -1800,7 +1800,9 @@ pub fn build_response_routes(
             middleware::auth::auth_middleware_with_workspace_context,
         ));
 
-    Router::new().merge(inference_routes).merge(other_routes)
+    Router::new()
+        .merge(inference_routes)
+        .merge(retired_history_routes)
 }
 
 /// Build explicit not-implemented handlers for recognized OpenAI-compatible
@@ -2787,6 +2789,22 @@ mod tests {
             serde_json::json!([{ "api_key": [] }]),
             "/v1/attestation/report must require api_key security"
         );
+    }
+
+    #[test]
+    fn test_openapi_omits_retired_response_history_paths() {
+        let spec = serde_json::to_value(ApiDoc::openapi()).unwrap();
+
+        for path in [
+            "/v1/responses/{response_id}",
+            "/v1/responses/{response_id}/cancel",
+            "/v1/responses/{response_id}/input_items",
+        ] {
+            assert!(
+                spec["paths"].get(path).is_none(),
+                "retired response-history path {path} must not be in OpenAPI"
+            );
+        }
     }
 
     #[test]

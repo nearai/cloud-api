@@ -195,7 +195,6 @@ pub struct LukkaAmlClient {
     client: reqwest::Client,
     base_url: String,
     bearer_token: String,
-    score_block_threshold: Option<i32>,
 }
 
 impl LukkaAmlClient {
@@ -205,7 +204,6 @@ impl LukkaAmlClient {
             client: reqwest::Client::builder().timeout(timeout).build()?,
             base_url: config.lukka_base_url.trim_end_matches('/').to_string(),
             bearer_token: config.lukka_bearer_token.clone().unwrap_or_default(),
-            score_block_threshold: config.score_block_threshold,
         })
     }
 }
@@ -326,13 +324,7 @@ impl AmlProviderClient for LukkaAmlClient {
                 ));
             }
         };
-        Ok(normalize_lukka_report(
-            user_id,
-            flow,
-            &normalized,
-            value,
-            self.score_block_threshold,
-        ))
+        Ok(normalize_lukka_report(user_id, flow, &normalized, value))
     }
 }
 
@@ -363,7 +355,6 @@ fn normalize_lukka_report(
     flow: AmlFlow,
     requested_account_id: &str,
     value: serde_json::Value,
-    score_block_threshold: Option<i32>,
 ) -> NewAmlReport {
     let parsed = serde_json::from_value::<LukkaReport>(value.clone());
     let Ok(report) = parsed else {
@@ -413,8 +404,11 @@ fn normalize_lukka_report(
         .cscore_section
         .as_ref()
         .and_then(|section| section.risk_level.as_deref());
-    let (risk_level, risk_reason) =
-        normalize_provider_risk_level(provider_risk_level, score, score_block_threshold);
+    let (risk_level, risk_reason) = if score.is_none() {
+        (AmlRiskLevel::Unknown, Some("missing_score".to_string()))
+    } else {
+        normalize_provider_risk_level(provider_risk_level)
+    };
     let active = risk_level != AmlRiskLevel::Unknown;
     NewAmlReport {
         user_id,
@@ -432,11 +426,7 @@ fn normalize_lukka_report(
     }
 }
 
-fn normalize_provider_risk_level(
-    value: Option<&str>,
-    score: Option<i32>,
-    score_block_threshold: Option<i32>,
-) -> (AmlRiskLevel, Option<String>) {
+fn normalize_provider_risk_level(value: Option<&str>) -> (AmlRiskLevel, Option<String>) {
     let value = value.map(str::trim).filter(|value| !value.is_empty());
     match value.map(|value| value.to_ascii_uppercase()) {
         Some(value) if value == "LOW" => (AmlRiskLevel::Low, None),
@@ -444,15 +434,10 @@ fn normalize_provider_risk_level(
         Some(value) if value == "HIGH" => (AmlRiskLevel::High, None),
         Some(_) => {
             let raw_value = value.unwrap_or_default();
-            let reason = Some(format!("unrecognized_risk_level:{raw_value}"));
-            if score_block_threshold
-                .zip(score)
-                .is_some_and(|(threshold, score)| score >= threshold)
-            {
-                (AmlRiskLevel::High, reason)
-            } else {
-                (AmlRiskLevel::Unknown, reason)
-            }
+            (
+                AmlRiskLevel::Unknown,
+                Some(format!("unrecognized_risk_level:{raw_value}")),
+            )
         }
         None => (
             AmlRiskLevel::Unknown,
@@ -737,10 +722,7 @@ impl AmlService {
     }
 
     fn should_block_report(&self, report: &AmlReport) -> bool {
-        self.config.blocked_risk_levels.iter().any(|level| {
-            report.risk_level != AmlRiskLevel::Unknown && level == report.risk_level.as_str()
-        }) || self
-            .config
+        self.config
             .score_block_threshold
             .zip(report.score)
             .is_some_and(|(threshold, score)| score >= threshold)
@@ -796,7 +778,13 @@ impl AmlService {
         let Some(webhook_url) = self.reserve_high_risk_slack_alert(report, action).await else {
             return;
         };
-        let payload = high_risk_slack_payload(report, user_id, flow, action);
+        let payload = high_risk_slack_payload(
+            report,
+            user_id,
+            flow,
+            action,
+            self.config.score_block_threshold,
+        );
         let client = self.slack_client.clone();
         tokio::spawn(async move {
             match client.post(webhook_url).json(&payload).send().await {
@@ -837,6 +825,7 @@ fn high_risk_slack_payload(
     user_id: Option<Uuid>,
     flow: AmlFlow,
     action: &str,
+    score_block_threshold: Option<i32>,
 ) -> serde_json::Value {
     let user_id = user_id
         .map(|id| id.to_string())
@@ -851,12 +840,15 @@ fn high_risk_slack_payload(
         .provider_report_time
         .map(|time| time.to_rfc3339())
         .unwrap_or_else(|| "-".to_string());
+    let score_block_threshold = score_block_threshold
+        .map(|threshold| threshold.to_string())
+        .unwrap_or_else(|| "-".to_string());
 
     serde_json::json!({
         "text": format!(
-            "High-risk Lukka AML account detected: {} ({})",
+            "High-risk Lukka AML account detected by score threshold: {} (score {})",
             report.account_id,
-            report.risk_level.as_str()
+            score
         ),
         "attachments": [
             {
@@ -870,6 +862,7 @@ fn high_risk_slack_payload(
                     { "title": "Address Type", "value": report.address_type, "short": true },
                     { "title": "Risk Level", "value": report.risk_level.as_str(), "short": true },
                     { "title": "Score", "value": score, "short": true },
+                    { "title": "Score Threshold", "value": score_block_threshold, "short": true },
                     { "title": "Report ID", "value": report_id, "short": false },
                     { "title": "Reason", "value": reason, "short": false },
                     { "title": "Provider Report Time", "value": provider_report_time, "short": false }
@@ -902,7 +895,6 @@ mod tests {
                     "risk_level": "HIGH"
                 }
             }),
-            Some(75),
         );
 
         assert_eq!(report.risk_level, AmlRiskLevel::High);
@@ -926,7 +918,6 @@ mod tests {
                     "risk_level": "LOW"
                 }
             }),
-            Some(75),
         );
 
         assert_eq!(report.risk_level, AmlRiskLevel::Unknown);
@@ -939,7 +930,7 @@ mod tests {
     }
 
     #[test]
-    fn lukka_missing_risk_level_maps_to_inactive_unknown() {
+    fn lukka_missing_score_maps_to_inactive_unknown() {
         let report = normalize_lukka_report(
             None,
             AmlFlow::UserStatus,
@@ -950,15 +941,16 @@ mod tests {
                     "address_type": "NEAR"
                 }
             }),
-            Some(75),
         );
 
         assert_eq!(report.risk_level, AmlRiskLevel::Unknown);
+        assert_eq!(report.score, None);
+        assert_eq!(report.reason.as_deref(), Some("missing_score"));
         assert!(!report.active);
     }
 
     #[test]
-    fn lukka_missing_risk_level_preserves_score_for_policy() {
+    fn lukka_missing_risk_level_preserves_score_for_threshold_policy() {
         let report = normalize_lukka_report(
             None,
             AmlFlow::UserStatus,
@@ -972,12 +964,58 @@ mod tests {
                     "cscore": 99
                 }
             }),
-            Some(75),
         );
 
         assert_eq!(report.risk_level, AmlRiskLevel::Unknown);
         assert_eq!(report.score, Some(99));
         assert_eq!(report.reason.as_deref(), Some("missing_risk_level"));
+        assert!(!report.active);
+    }
+
+    #[test]
+    fn lukka_high_provider_risk_with_missing_score_maps_to_unknown() {
+        let report = normalize_lukka_report(
+            None,
+            AmlFlow::UserStatus,
+            "alice.near",
+            serde_json::json!({
+                "report_info_section": {
+                    "address": "alice.near",
+                    "address_type": "NEAR"
+                },
+                "cscore_section": {
+                    "risk_level": "HIGH"
+                }
+            }),
+        );
+
+        assert_eq!(report.risk_level, AmlRiskLevel::Unknown);
+        assert_eq!(report.score, None);
+        assert_eq!(report.reason.as_deref(), Some("missing_score"));
+        assert!(!report.active);
+    }
+
+    #[test]
+    fn lukka_high_provider_risk_with_malformed_score_maps_to_unknown() {
+        let report = normalize_lukka_report(
+            None,
+            AmlFlow::UserStatus,
+            "alice.near",
+            serde_json::json!({
+                "report_info_section": {
+                    "address": "alice.near",
+                    "address_type": "NEAR"
+                },
+                "cscore_section": {
+                    "cscore": "not-a-number",
+                    "risk_level": "HIGH"
+                }
+            }),
+        );
+
+        assert_eq!(report.risk_level, AmlRiskLevel::Unknown);
+        assert_eq!(report.score, None);
+        assert_eq!(report.reason.as_deref(), Some("missing_score"));
         assert!(!report.active);
     }
 
@@ -999,7 +1037,6 @@ mod tests {
                     "risk_level": "HIGH"
                 }
             }),
-            Some(75),
         );
 
         assert_eq!(report.risk_level, AmlRiskLevel::High);
@@ -1010,7 +1047,7 @@ mod tests {
     }
 
     #[test]
-    fn lukka_unrecognized_risk_level_uses_high_score_fallback() {
+    fn lukka_unrecognized_risk_level_preserves_score_without_reclassifying_risk() {
         let report = normalize_lukka_report(
             None,
             AmlFlow::UserStatus,
@@ -1025,15 +1062,15 @@ mod tests {
                     "risk_level": "SEVERE"
                 }
             }),
-            Some(75),
         );
 
-        assert_eq!(report.risk_level, AmlRiskLevel::High);
+        assert_eq!(report.risk_level, AmlRiskLevel::Unknown);
+        assert_eq!(report.score, Some(99));
         assert_eq!(
             report.reason.as_deref(),
             Some("unrecognized_risk_level:SEVERE")
         );
-        assert!(report.active);
+        assert!(!report.active);
     }
 
     #[test]
@@ -1052,7 +1089,6 @@ mod tests {
                     "risk_level": "NEW_LOW_TIER"
                 }
             }),
-            Some(75),
         );
 
         assert_eq!(report.risk_level, AmlRiskLevel::Unknown);
@@ -1261,9 +1297,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn high_risk_blocks_unless_allowlisted() {
+    async fn score_threshold_blocks_unless_allowlisted() {
         let repo = Arc::new(MockAmlRepository::default());
-        let provider = Arc::new(StaticProvider(new_report(AmlRiskLevel::High)));
+        let provider = Arc::new(StaticProvider(NewAmlReport {
+            risk_level: AmlRiskLevel::Low,
+            score: Some(99),
+            ..new_report(AmlRiskLevel::Low)
+        }));
         let service = AmlService::new(repo.clone(), provider, enabled_config());
 
         let blocked = service
@@ -1279,33 +1319,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn configured_risk_level_blocks_matching_report() {
-        let repo = Arc::new(MockAmlRepository::default());
-        let provider = Arc::new(StaticProvider(new_report(AmlRiskLevel::Medium)));
-        let config = AmlConfig {
-            blocked_risk_levels: vec!["MEDIUM".to_string()],
-            score_block_threshold: None,
-            ..enabled_config()
-        };
-        let service = AmlService::new(repo, provider, config);
-
-        let result = service
-            .check_near_account(None, "alice.near", AmlFlow::UserStatus)
-            .await;
-
-        assert!(matches!(result, Err(AmlError::AccountBlocked)));
-    }
-
-    #[tokio::test]
-    async fn configured_score_threshold_blocks_matching_report() {
+    async fn configured_risk_level_is_audit_metadata_not_block_predicate() {
         let repo = Arc::new(MockAmlRepository::default());
         let provider = Arc::new(StaticProvider(NewAmlReport {
-            risk_level: AmlRiskLevel::Low,
-            score: Some(80),
-            ..new_report(AmlRiskLevel::Low)
+            risk_level: AmlRiskLevel::Medium,
+            score: Some(10),
+            ..new_report(AmlRiskLevel::Medium)
         }));
         let config = AmlConfig {
-            blocked_risk_levels: vec![],
+            blocked_risk_levels: vec!["MEDIUM".to_string()],
             score_block_threshold: Some(75),
             ..enabled_config()
         };
@@ -1315,7 +1337,31 @@ mod tests {
             .check_near_account(None, "alice.near", AmlFlow::UserStatus)
             .await;
 
+        assert!(matches!(result, Ok(AmlDecision::Allowed)));
+    }
+
+    #[tokio::test]
+    async fn configured_score_threshold_blocks_non_high_provider_risk_report() {
+        let repo = Arc::new(MockAmlRepository::default());
+        let provider = Arc::new(StaticProvider(NewAmlReport {
+            risk_level: AmlRiskLevel::Low,
+            score: Some(80),
+            ..new_report(AmlRiskLevel::Low)
+        }));
+        let config = AmlConfig {
+            score_block_threshold: Some(75),
+            ..enabled_config()
+        };
+        let service = AmlService::new(repo.clone(), provider, config);
+
+        let result = service
+            .check_near_account(None, "alice.near", AmlFlow::UserStatus)
+            .await;
+
         assert!(matches!(result, Err(AmlError::AccountBlocked)));
+        let reports = repo.reports.lock().unwrap();
+        assert_eq!(reports[0].risk_level, AmlRiskLevel::Low);
+        assert_eq!(reports[0].score, Some(80));
     }
 
     #[tokio::test]
@@ -1329,7 +1375,6 @@ mod tests {
             ..new_report(AmlRiskLevel::Unknown)
         }));
         let config = AmlConfig {
-            blocked_risk_levels: vec![],
             score_block_threshold: Some(75),
             ..enabled_config()
         };
@@ -1348,21 +1393,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unknown_risk_level_fails_open_even_if_policy_contains_unknown() {
+    async fn missing_score_follows_unknown_provider_result_path() {
         let repo = Arc::new(MockAmlRepository::default());
         let provider = Arc::new(StaticProvider(NewAmlReport {
             risk_level: AmlRiskLevel::Unknown,
             score: None,
             active: false,
-            reason: Some("missing_risk_level".to_string()),
+            reason: Some("missing_score".to_string()),
             ..new_report(AmlRiskLevel::Unknown)
         }));
-        let config = AmlConfig {
-            blocked_risk_levels: vec!["UNKNOWN".to_string()],
-            score_block_threshold: None,
-            ..enabled_config()
-        };
-        let service = AmlService::new(repo, provider, config);
+        let service = AmlService::new(repo, provider, enabled_config());
 
         let result = service
             .check_near_account(None, "alice.near", AmlFlow::UserStatus)
@@ -1372,12 +1412,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn high_level_is_allowed_when_policy_excludes_it_and_score_disabled() {
+    async fn high_provider_risk_below_score_threshold_is_allowed() {
         let repo = Arc::new(MockAmlRepository::default());
-        let provider = Arc::new(StaticProvider(new_report(AmlRiskLevel::High)));
+        let provider = Arc::new(StaticProvider(NewAmlReport {
+            risk_level: AmlRiskLevel::High,
+            score: Some(10),
+            ..new_report(AmlRiskLevel::High)
+        }));
         let config = AmlConfig {
-            blocked_risk_levels: vec!["MEDIUM".to_string()],
-            score_block_threshold: None,
+            blocked_risk_levels: vec!["HIGH".to_string()],
+            score_block_threshold: Some(75),
             ..enabled_config()
         };
         let service = AmlService::new(repo, provider, config);
@@ -1401,12 +1445,17 @@ mod tests {
             ..new_report(AmlRiskLevel::High)
         });
 
-        let payload =
-            high_risk_slack_payload(&report, Some(user_id), AmlFlow::StakingFarmSync, "test");
+        let payload = high_risk_slack_payload(
+            &report,
+            Some(user_id),
+            AmlFlow::StakingFarmSync,
+            "test",
+            Some(75),
+        );
 
         assert_eq!(
             payload["text"].as_str(),
-            Some("High-risk Lukka AML account detected: gregoshes.near (HIGH)")
+            Some("High-risk Lukka AML account detected by score threshold: gregoshes.near (score 91)")
         );
         let fields = payload["attachments"][0]["fields"]
             .as_array()
@@ -1417,6 +1466,9 @@ mod tests {
         assert!(fields
             .iter()
             .any(|field| field["title"] == "Score" && field["value"] == "91"));
+        assert!(fields
+            .iter()
+            .any(|field| field["title"] == "Score Threshold" && field["value"] == "75"));
         assert!(fields
             .iter()
             .any(|field| field["title"] == "Action" && field["value"] == "test"));

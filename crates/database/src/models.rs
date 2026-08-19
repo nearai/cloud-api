@@ -436,6 +436,8 @@ pub struct Model {
     /// tokens billed at `input_cost_per_token`); `Some(x)` (x >= 0) = cached
     /// tokens billed at `x` (`Some(0)` = genuinely free).
     pub cache_read_cost_per_token: Option<i64>,
+    /// Versioned exact USD-per-million text pricing profile.
+    pub text_pricing: Option<serde_json::Value>,
 
     // Model metadata
     pub context_length: i32,
@@ -506,6 +508,9 @@ pub struct UpdateModelPricingRequest {
     /// pricing (set column to NULL), `Some(Some(v))` = set to `v`
     /// (`Some(Some(0))` = genuinely free cache reads).
     pub cache_read_cost_per_token: Option<Option<i64>>,
+    /// Tri-state: `None` = unchanged, `Some(None)` = remove the profile,
+    /// `Some(Some(value))` = replace it with a validated profile.
+    pub text_pricing: Option<Option<serde_json::Value>>,
     pub model_display_name: Option<String>,
     pub model_description: Option<String>,
     pub model_icon: Option<String>,
@@ -563,6 +568,7 @@ pub struct ModelHistory {
     /// `None` = cache pricing disabled at this point in time; `Some(x)` =
     /// cached tokens billed at `x` (`Some(0)` = genuinely free).
     pub cache_read_cost_per_token: Option<i64>,
+    pub text_pricing: Option<serde_json::Value>,
 
     // Model metadata snapshot
     pub context_length: i32,
@@ -713,6 +719,10 @@ pub struct OrganizationUsageLog {
     pub cache_read_tokens: i32,
     /// Prompt tokens written to provider cache (subset of input_tokens)
     pub cache_write_tokens: i32,
+    /// Privacy-safe exact pricing decision captured at billing time.
+    pub billing_details: Option<serde_json::Value>,
+    pub service_tier: Option<String>,
+    pub context_band: Option<String>,
     pub served_provider_tier: Option<ServedProviderTier>,
     pub served_provider_type: Option<ServedProviderType>,
     pub served_via_fallback: bool,
@@ -764,6 +774,9 @@ pub struct RecordUsageRequest {
     pub cache_read_tokens: i32,
     /// Prompt tokens written to provider cache (subset of input_tokens)
     pub cache_write_tokens: i32,
+    pub billing_details: Option<serde_json::Value>,
+    pub service_tier: Option<String>,
+    pub context_band: Option<String>,
     pub served_provider_tier: Option<ServedProviderTier>,
     pub served_provider_type: Option<ServedProviderType>,
     pub served_via_fallback: bool,

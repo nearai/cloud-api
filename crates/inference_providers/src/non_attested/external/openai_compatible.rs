@@ -93,6 +93,12 @@ fn strip_reasoning_effort_if_unsupported(
     if !is_openai_source(base_url) {
         return;
     }
+    // GPT-5.6 Chat Completions supports reasoning effort together with
+    // function tools. Preserve the caller's selector for every pinned 5.6
+    // variant; older OpenAI reasoning models keep the compatibility shim.
+    if model.starts_with("gpt-5.6") {
+        return;
+    }
     if params.extra.remove("reasoning_effort").is_some() {
         tracing::warn!(
             model = %model,
@@ -776,6 +782,7 @@ mod tests {
             metadata: None,
             store: None,
             stream_options: None,
+            service_tier: None,
             modalities: None,
             original_request: None,
             extra,
@@ -801,6 +808,19 @@ mod tests {
         let mut params = make_chat_params(Some(bash_tool()), Some("low"));
         strip_reasoning_effort_if_unsupported(&mut params, "https://api.openai.com/v1", "gpt-5.5");
         assert!(!params.extra.contains_key("reasoning_effort"));
+    }
+
+    #[test]
+    fn test_gpt_5_6_keeps_reasoning_effort_with_tools() {
+        for model in ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"] {
+            let mut params = make_chat_params(Some(bash_tool()), Some("high"));
+            strip_reasoning_effort_if_unsupported(&mut params, "https://api.openai.com/v1", model);
+            assert_eq!(
+                params.extra.get("reasoning_effort"),
+                Some(&serde_json::Value::String("high".to_string())),
+                "reasoning effort should survive for {model}"
+            );
+        }
     }
 
     /// `reasoning_effort` on OpenAI without tools is fine — model still

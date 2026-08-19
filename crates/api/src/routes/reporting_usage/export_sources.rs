@@ -131,7 +131,10 @@ async fn list_inference_rows(
             services::usage::UsageError::ReportingTimeout => timeout_error(),
             _ => internal_error("Failed to list inference usage export"),
         })?;
-    Ok(rows.into_iter().map(ExportRow::Inference).collect())
+    Ok(rows
+        .into_iter()
+        .map(|row| ExportRow::Inference(Box::new(row)))
+        .collect())
 }
 
 async fn list_service_rows(

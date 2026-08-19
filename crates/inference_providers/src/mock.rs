@@ -7,14 +7,14 @@ use crate::{
     AttestationError, AudioTranscriptionError, AudioTranscriptionParams,
     AudioTranscriptionResponse, ChatChoice, ChatCompletionChunk, ChatCompletionParams,
     ChatCompletionResponse, ChatCompletionResponseChoice, ChatCompletionResponseWithBytes,
-    ChatDelta, ChatResponseMessage, ChatSignature, CompletionChunk, CompletionError,
-    CompletionParams, EmbeddingError, FinishReason, FunctionCallDelta, ImageData, ImageEditError,
-    ImageEditParams, ImageEditResponseWithBytes, ImageGenerationError, ImageGenerationParams,
-    ImageGenerationResponse, ImageGenerationResponseWithBytes, ListModelsError, MessageRole,
-    ModelInfo, ModelsResponse, PrivacyClassifyError, RerankError, RerankParams, RerankResponse,
-    RerankResult, RerankUsage, SSEEvent, ScoreError, ScoreParams, ScoreResponse, ScoreResult,
-    ScoreUsage, StreamChunk, StreamingResult, TokenUsage, ToolCallDelta, TranscriptionSegment,
-    TranscriptionWord,
+    ChatDelta, ChatResponseMessage, ChatServiceTier, ChatSignature, CompletionChunk,
+    CompletionError, CompletionParams, EmbeddingError, FinishReason, FunctionCallDelta, ImageData,
+    ImageEditError, ImageEditParams, ImageEditResponseWithBytes, ImageGenerationError,
+    ImageGenerationParams, ImageGenerationResponse, ImageGenerationResponseWithBytes,
+    ListModelsError, MessageRole, ModelInfo, ModelsResponse, PrivacyClassifyError, RerankError,
+    RerankParams, RerankResponse, RerankResult, RerankUsage, SSEEvent, ScoreError, ScoreParams,
+    ScoreResponse, ScoreResult, ScoreUsage, StreamChunk, StreamingResult, TokenUsage,
+    ToolCallDelta, TranscriptionSegment, TranscriptionWord,
 };
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -82,6 +82,18 @@ fn compute_sha256_hex(data: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(data);
     hex::encode(hasher.finalize())
+}
+
+fn service_tier_name(tier: Option<ChatServiceTier>) -> Option<String> {
+    tier.map(|tier| {
+        match tier {
+            ChatServiceTier::Auto => "auto",
+            ChatServiceTier::Default => "default",
+            ChatServiceTier::Flex => "flex",
+            ChatServiceTier::Priority => "priority",
+        }
+        .to_string()
+    })
 }
 
 /// Hash pair for signature generation
@@ -218,6 +230,11 @@ pub struct ResponseTemplate {
     tool_calls: Option<Vec<ToolCall>>,
     /// If set, usage will include prompt_tokens_details.cached_tokens (for cache-hit tests)
     cache_tokens: Option<i32>,
+    /// If set, usage will include OpenAI prompt_tokens_details.cache_write_tokens.
+    cache_write_tokens: Option<i32>,
+    /// Actual provider tier override. When absent, the mock echoes the canonical
+    /// requested tier, which mirrors OpenAI's normal response behavior.
+    service_tier_override: Option<String>,
     /// If set, the response `model` field echoes this value instead of the
     /// request's model param — simulates external backends that answer with
     /// their upstream model name (`provider_config.model_name` overrides).
@@ -234,6 +251,8 @@ impl ResponseTemplate {
             stream_error_after_chunks: None,
             tool_calls: None,
             cache_tokens: None,
+            cache_write_tokens: None,
+            service_tier_override: None,
             model_override: None,
         }
     }
@@ -251,11 +270,32 @@ impl ResponseTemplate {
         self
     }
 
+    /// Set OpenAI cache-write tokens in prompt_tokens_details.
+    pub fn with_cache_write_tokens(mut self, cache_write_tokens: i32) -> Self {
+        self.cache_write_tokens = Some(cache_write_tokens);
+        self
+    }
+
+    /// Override the provider-reported processing tier, for example to model a
+    /// Fast request that OpenAI downgraded to Standard.
+    pub fn with_service_tier(mut self, service_tier: impl Into<String>) -> Self {
+        self.service_tier_override = Some(service_tier.into());
+        self
+    }
+
     fn token_usage(&self, input_tokens: i32, output_tokens: i32) -> TokenUsage {
-        match self.cache_tokens {
-            Some(c) => TokenUsage::new_with_cache(input_tokens, output_tokens, c),
-            None => TokenUsage::new(input_tokens, output_tokens),
+        let mut usage = TokenUsage::new(input_tokens, output_tokens);
+        let mut details = serde_json::Map::new();
+        if let Some(tokens) = self.cache_tokens {
+            details.insert("cached_tokens".to_string(), tokens.into());
         }
+        if let Some(tokens) = self.cache_write_tokens {
+            details.insert("cache_write_tokens".to_string(), tokens.into());
+        }
+        if !details.is_empty() {
+            usage.prompt_tokens_details = Some(details.into());
+        }
+        usage
     }
 
     /// Set reasoning content for this template
@@ -290,6 +330,7 @@ impl ResponseTemplate {
         created: i64,
         model: String,
         input_tokens: i32,
+        requested_service_tier: Option<String>,
     ) -> ChatCompletionResponse {
         let model = self.model_override.clone().unwrap_or(model);
         // Calculate output tokens as word count of content
@@ -346,7 +387,10 @@ impl ResponseTemplate {
                 token_ids: None,
                 extra: Default::default(),
             }],
-            service_tier: None,
+            service_tier: self
+                .service_tier_override
+                .clone()
+                .or(requested_service_tier),
             system_fingerprint: None,
             usage: self.token_usage(input_tokens, output_tokens),
             prompt_logprobs: None,
@@ -365,6 +409,7 @@ impl ResponseTemplate {
         created: i64,
         model: String,
         input_tokens: i32,
+        requested_service_tier: Option<String>,
     ) -> Vec<ChatCompletionChunk> {
         let model = self.model_override.clone().unwrap_or(model);
         let mut chunks = Vec::new();
@@ -403,6 +448,10 @@ impl ResponseTemplate {
                         token_ids: None,
                     }],
                     usage: Some(self.token_usage(input_tokens, output_token_count)),
+                    service_tier: self
+                        .service_tier_override
+                        .clone()
+                        .or_else(|| requested_service_tier.clone()),
                     prompt_token_ids: None,
                     modality: None,
                     extra: Default::default(),
@@ -449,6 +498,10 @@ impl ResponseTemplate {
                         token_ids: None,
                     }],
                     usage: Some(self.token_usage(input_tokens, output_token_count)),
+                    service_tier: self
+                        .service_tier_override
+                        .clone()
+                        .or_else(|| requested_service_tier.clone()),
                     prompt_token_ids: None,
                     modality: None,
                     extra: Default::default(),
@@ -496,6 +549,10 @@ impl ResponseTemplate {
                         token_ids: None,
                     }],
                     usage: Some(self.token_usage(input_tokens, output_token_count)),
+                    service_tier: self
+                        .service_tier_override
+                        .clone()
+                        .or_else(|| requested_service_tier.clone()),
                     prompt_token_ids: None,
                     modality: None,
                     extra: Default::default(),
@@ -548,6 +605,10 @@ impl ResponseTemplate {
                             token_ids: None,
                         }],
                         usage: Some(self.token_usage(input_tokens, output_token_count)),
+                        service_tier: self
+                            .service_tier_override
+                            .clone()
+                            .or_else(|| requested_service_tier.clone()),
                         prompt_token_ids: None,
                         modality: None,
                         extra: Default::default(),
@@ -565,6 +626,10 @@ impl ResponseTemplate {
             system_fingerprint: None,
             choices: vec![],
             usage: Some(self.token_usage(input_tokens, output_token_count)),
+            service_tier: self
+                .service_tier_override
+                .clone()
+                .or(requested_service_tier),
             prompt_token_ids: None,
             modality: None,
             extra: Default::default(),
@@ -1028,7 +1093,14 @@ impl crate::InferenceProvider for MockProvider {
         let id = self.generate_chat_id();
         let created = self.current_timestamp();
         let model = params.model.clone();
-        let mut chunks = response_template.generate_chunks(id, created, model, input_tokens);
+        let requested_service_tier = service_tier_name(params.service_tier);
+        let mut chunks = response_template.generate_chunks(
+            id,
+            created,
+            model,
+            input_tokens,
+            requested_service_tier,
+        );
 
         // If disconnect simulation is enabled, truncate chunks (simulates client disconnect)
         // The stream will end abruptly without the final usage chunk
@@ -1144,8 +1216,13 @@ impl crate::InferenceProvider for MockProvider {
         let input_tokens = input_tokens.max(6);
 
         // Keep a stable chat_id for both the response and signature registration.
-        let response =
-            response_template.generate_response(id.clone(), created, model, input_tokens);
+        let response = response_template.generate_response(
+            id.clone(),
+            created,
+            model,
+            input_tokens,
+            service_tier_name(params.service_tier),
+        );
 
         let raw_bytes = serde_json::to_vec(&response)
             .map_err(|e| CompletionError::CompletionError(format!("Failed to serialize: {e}")))?;

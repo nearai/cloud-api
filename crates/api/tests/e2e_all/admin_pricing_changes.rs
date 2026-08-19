@@ -35,6 +35,24 @@ fn change_item(model: &str, effective_at: &str, input_amount: i64) -> serde_json
     })
 }
 
+fn scheduled_text_pricing() -> serde_json::Value {
+    serde_json::json!({
+        "version": 1,
+        "currency": "USD",
+        "unit": "million_tokens",
+        "tiers": {
+            "default": {
+                "short": {
+                    "uncachedInput": "1.50",
+                    "cachedInput": "0.25",
+                    "cacheWrite": "1.50",
+                    "output": "4.00"
+                }
+            }
+        }
+    })
+}
+
 async fn post_pricing_changes(
     server: &axum_test::TestServer,
     action: &str,
@@ -214,6 +232,22 @@ async fn test_validation_errors() {
     .await;
     assert_eq!(resp.status_code(), 400, "{}", resp.text());
     assert!(resp.text().contains("at least one pricing field"));
+
+    // A profile is the source of truth for its legacy projection; accepting
+    // both shapes would make it ambiguous which requested prices were applied.
+    let resp = post_pricing_changes(
+        &server,
+        "preview",
+        serde_json::json!({ "changes": [{
+            "modelId": model,
+            "effectiveAt": "2030-01-01",
+            "inputCostPerToken": { "amount": 1_500, "currency": "USD" },
+            "textPricing": scheduled_text_pricing()
+        }] }),
+    )
+    .await;
+    assert_eq!(resp.status_code(), 400, "{}", resp.text());
+    assert!(resp.text().contains("cannot be combined"));
 
     // Negative amount
     let resp = post_pricing_changes(
@@ -503,8 +537,7 @@ async fn test_scheduler_applies_due_changes() {
             "changes": [serde_json::json!({
                 "modelId": model,
                 "effectiveAt": "2030-01-01T00:00:00Z",
-                "inputCostPerToken":  { "amount": 1_500, "currency": "USD" },
-                "outputCostPerToken": { "amount": 4_000, "currency": "USD" },
+                "textPricing": scheduled_text_pricing(),
             })],
             "changeReason": "e2e apply test"
         }),
@@ -513,6 +546,11 @@ async fn test_scheduler_applies_due_changes() {
     assert_eq!(resp.status_code(), 200, "{}", resp.text());
     let body: serde_json::Value = serde_json::from_str(&resp.text()).unwrap();
     let batch_id = body["batchId"].as_str().unwrap().to_string();
+    assert!(body["changes"][0]["oldPricing"]["textPricing"].is_null());
+    assert_eq!(
+        body["changes"][0]["newPricing"]["textPricing"],
+        scheduled_text_pricing()
+    );
 
     // Not due yet: a scheduler pass must not touch it.
     let scheduler = make_scheduler(&database);
@@ -552,7 +590,9 @@ async fn test_scheduler_applies_due_changes() {
         .find(|m| m["modelId"] == model.as_str())
         .expect("model should exist");
     assert_eq!(updated["inputCostPerToken"]["amount"], 1_500);
+    assert_eq!(updated["cacheReadCostPerToken"]["amount"], 250);
     assert_eq!(updated["outputCostPerToken"]["amount"], 4_000);
+    assert_eq!(updated["textPricing"], scheduled_text_pricing());
 
     // ...and model history records the batch in its change reason.
     let history_resp = server
@@ -570,6 +610,10 @@ async fn test_scheduler_applies_due_changes() {
                 .as_str()
                 .is_some_and(|r| r.contains(&batch_id))),
         "history should record the scheduled change: {history}"
+    );
+    assert_eq!(
+        history["history"][0]["textPricing"],
+        scheduled_text_pricing()
     );
 
     // An applied change can no longer be cancelled.

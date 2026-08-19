@@ -188,6 +188,9 @@ fn build_image_usage_request(
         output_tokens: 0,
         cache_read_tokens: 0,
         cache_write: None,
+        profiled_cache_write_tokens: 0,
+        requested_service_tier: None,
+        provider_service_tier: None,
         inference_type: record.inference_type,
         ttft_ms: None,
         avg_itl_ms: None,
@@ -546,6 +549,7 @@ fn build_final_usage_chunk_bytes(
             system_fingerprint: system_fingerprint.clone(),
             choices: Vec::new(),
             usage: Some(usage),
+            service_tier: None,
             prompt_token_ids: None,
             modality: None,
             extra: std::collections::HashMap::new(),
@@ -638,6 +642,7 @@ fn convert_chat_request_to_service(
         stream: request.stream,
         user_id: user_id.into(),
         n: request.n,
+        service_tier: request.service_tier,
         api_key_id,
         organization_id,
         workspace_id,
@@ -806,6 +811,9 @@ async fn bill_auto_redact_classify(
         output_tokens: 0,
         cache_read_tokens: 0,
         cache_write: None,
+        profiled_cache_write_tokens: 0,
+        requested_service_tier: None,
+        provider_service_tier: None,
         inference_type: services::usage::ports::InferenceType::PrivacyClassify,
         ttft_ms: None,
         avg_itl_ms: None,
@@ -1148,6 +1156,7 @@ fn build_flush_chunks(states: &mut StreamUnredactStates, template: &ChunkTemplat
                 token_ids: None,
             }],
             usage: None,
+            service_tier: None,
             prompt_token_ids: None,
             modality: None,
             extra: Default::default(),
@@ -1210,6 +1219,7 @@ fn build_flush_chunks(states: &mut StreamUnredactStates, template: &ChunkTemplat
                 token_ids: None,
             }],
             usage: None,
+            service_tier: None,
             prompt_token_ids: None,
             modality: None,
             extra: Default::default(),
@@ -1269,6 +1279,7 @@ fn convert_text_request_to_service(
         stream: request.stream,
         user_id: user_id.into(),
         n: request.n,
+        service_tier: None,
         api_key_id,
         organization_id,
         workspace_id,
@@ -2803,6 +2814,9 @@ fn model_with_pricing_to_info(model: services::models::ModelWithPricing) -> Mode
         hugging_face_id: model.hugging_face_id,
         quantization: model.quantization,
         pricing: Some(pricing),
+        text_pricing: model
+            .text_pricing
+            .map(|profile| serde_json::to_value(profile).unwrap_or(serde_json::Value::Null)),
         context_length: Some(model.context_length),
         max_output_length: model.max_output_length,
         architecture,
@@ -2899,6 +2913,7 @@ mod tests {
             output_cost_per_token: 0,
             cost_per_image: 0,
             cache_read_cost_per_token: None,
+            text_pricing: None,
             context_length: 4096,
             verifiable: false,
             aliases: vec![],
@@ -3025,6 +3040,37 @@ mod tests {
     }
 
     #[test]
+    fn profiled_model_exposes_text_pricing_and_keeps_standard_short_projection() {
+        let mut model = make_model_with_pricing(None, None);
+        model.input_cost_per_token = 5_000;
+        model.cache_read_cost_per_token = Some(500);
+        model.output_cost_per_token = 30_000;
+        model.text_pricing = Some(
+            services::usage::TextPricingProfile::from_json(serde_json::json!({
+                "version": 1,
+                "currency": "USD",
+                "unit": "million_tokens",
+                "tiers": {
+                    "default": {"short": {
+                        "uncachedInput": "5.00",
+                        "cachedInput": "0.50",
+                        "cacheWrite": "6.25",
+                        "output": "30.00"
+                    }}
+                }
+            }))
+            .unwrap(),
+        );
+
+        let json = serde_json::to_value(model_with_pricing_to_info(model)).unwrap();
+        assert_eq!(json["textPricing"]["version"], 1);
+        assert_eq!(json["pricing"]["input"], 5.0);
+        assert_eq!(json["pricing"]["output"], 30.0);
+        assert_eq!(json["pricing"]["prompt"], "0.000005");
+        assert_eq!(json["pricing"]["input_cache_read"], "0.0000005");
+    }
+
+    #[test]
     fn model_without_openrouter_slug_omits_nested_object() {
         // No override set → the public ModelInfo must not carry the nested
         // `openrouter` object at all (serde skips it when None).
@@ -3071,6 +3117,7 @@ mod tests {
             system_fingerprint: None,
             choices: vec![],
             usage: None,
+            service_tier: None,
             prompt_token_ids: None,
             modality: None,
             extra: Default::default(),
@@ -3096,6 +3143,7 @@ mod tests {
             stop: None,
             presence_penalty: None,
             frequency_penalty: None,
+            service_tier: None,
             extra,
         }
     }
@@ -3111,6 +3159,7 @@ mod tests {
             system_fingerprint: None,
             choices,
             usage: Some(inference_providers::models::TokenUsage::new(10, 5)),
+            service_tier: None,
             prompt_token_ids: None,
             modality: None,
             extra: Default::default(),
@@ -3662,6 +3711,7 @@ mod tests {
                 token_ids: None,
             }],
             usage: None,
+            service_tier: None,
             prompt_token_ids: None,
             modality: None,
             extra: Default::default(),
@@ -3883,6 +3933,7 @@ mod tests {
             system_fingerprint: None,
             choices: vec![],
             usage: Some(inference_providers::models::TokenUsage::new(10, 5)),
+            service_tier: None,
             prompt_token_ids: None,
             modality: None,
             extra: Default::default(),
@@ -4753,6 +4804,9 @@ pub async fn audio_transcriptions(
                 output_tokens: 0,
                 cache_read_tokens: 0,
                 cache_write: None,
+                profiled_cache_write_tokens: 0,
+                requested_service_tier: None,
+                provider_service_tier: None,
                 inference_type: services::usage::ports::InferenceType::AudioTranscription,
                 ttft_ms: None,
                 avg_itl_ms: None,
@@ -5603,6 +5657,9 @@ pub async fn rerank(
                 output_tokens: 0,
                 cache_read_tokens: 0,
                 cache_write: None,
+                profiled_cache_write_tokens: 0,
+                requested_service_tier: None,
+                provider_service_tier: None,
                 inference_type: services::usage::ports::InferenceType::Rerank,
                 ttft_ms: None,
                 avg_itl_ms: None,
@@ -5948,6 +6005,9 @@ pub async fn embeddings(
                 output_tokens: 0,
                 cache_read_tokens: 0,
                 cache_write: None,
+                profiled_cache_write_tokens: 0,
+                requested_service_tier: None,
+                provider_service_tier: None,
                 inference_type: services::usage::ports::InferenceType::Embedding,
                 ttft_ms: None,
                 avg_itl_ms: None,
@@ -6280,6 +6340,9 @@ pub async fn privacy_classify(
                 output_tokens: 0,
                 cache_read_tokens: 0,
                 cache_write: None,
+                profiled_cache_write_tokens: 0,
+                requested_service_tier: None,
+                provider_service_tier: None,
                 inference_type: services::usage::ports::InferenceType::PrivacyClassify,
                 ttft_ms: None,
                 avg_itl_ms: None,
@@ -6801,6 +6864,9 @@ pub async fn privacy_redact(
         output_tokens: 0,
         cache_read_tokens: 0,
         cache_write: None,
+        profiled_cache_write_tokens: 0,
+        requested_service_tier: None,
+        provider_service_tier: None,
         // Redact reuses the privacy-filter classifier under the hood, so
         // bill it the same way. If we ever want analytics to distinguish
         // redact vs classify, add a separate InferenceType variant and a
@@ -7015,6 +7081,9 @@ pub async fn score(
                 output_tokens: 0,
                 cache_read_tokens: 0,
                 cache_write: None,
+                profiled_cache_write_tokens: 0,
+                requested_service_tier: None,
+                provider_service_tier: None,
                 inference_type: services::usage::ports::InferenceType::Score,
                 ttft_ms: None,
                 avg_itl_ms: None,
@@ -7050,6 +7119,9 @@ pub async fn score(
                         output_tokens: 0,
                         cache_read_tokens: 0,
                         cache_write: None,
+                        profiled_cache_write_tokens: 0,
+                        requested_service_tier: None,
+                        provider_service_tier: None,
                         inference_type: services::usage::ports::InferenceType::Score,
                         ttft_ms: None,
                         avg_itl_ms: None,
@@ -7088,6 +7160,9 @@ pub async fn score(
                         output_tokens: 0,
                         cache_read_tokens: 0,
                         cache_write: None,
+                        profiled_cache_write_tokens: 0,
+                        requested_service_tier: None,
+                        provider_service_tier: None,
                         inference_type: services::usage::ports::InferenceType::Score,
                         ttft_ms: None,
                         avg_itl_ms: None,

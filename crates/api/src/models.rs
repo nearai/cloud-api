@@ -52,6 +52,9 @@ pub struct ChatCompletionRequest {
     pub stop: Option<StopSequences>,
     pub presence_penalty: Option<f32>,
     pub frequency_penalty: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<String>)]
+    pub service_tier: Option<inference_providers::ChatServiceTier>,
 
     #[serde(flatten)]
     pub extra: HashMap<String, Value>,
@@ -1077,6 +1080,10 @@ pub struct ModelInfo {
     /// Pricing information (HuggingFace + OpenRouter compatible).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pricing: Option<ModelPricing>,
+    /// Exact, versioned USD-per-million text pricing. The legacy `pricing`
+    /// projection remains Standard-short for compatibility.
+    #[serde(rename = "textPricing", skip_serializing_if = "Option::is_none")]
+    pub text_pricing: Option<serde_json::Value>,
     /// Context length in tokens.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context_length: Option<i32>,
@@ -1631,6 +1638,9 @@ pub struct CreateResponseRequest {
     pub safety_identifier: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prompt_cache_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<String>)]
+    pub service_tier: Option<inference_providers::ChatServiceTier>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub signing_algo: Option<String>,
 }
@@ -2422,6 +2432,16 @@ impl CreateResponseRequest {
             if top_p <= 0.0 || top_p > 1.0 {
                 return Err("top_p must be between 0.0 and 1.0".to_string());
             }
+        }
+
+        if matches!(
+            self.service_tier,
+            Some(
+                inference_providers::ChatServiceTier::Flex
+                    | inference_providers::ChatServiceTier::Priority
+            )
+        ) {
+            return Err("service_tier must be 'auto' or 'default' for /v1/responses".to_string());
         }
 
         // Validate mutual exclusivity
@@ -3394,6 +3414,8 @@ pub struct AdminModelWithPricing {
         skip_serializing_if = "Option::is_none"
     )]
     pub cache_read_cost_per_token: Option<DecimalPrice>,
+    #[serde(rename = "textPricing", skip_serializing_if = "Option::is_none")]
+    pub text_pricing: Option<serde_json::Value>,
     pub metadata: ModelMetadata,
     #[serde(rename = "isActive")]
     pub is_active: bool,
@@ -3421,6 +3443,8 @@ pub struct ModelWithPricing {
         skip_serializing_if = "Option::is_none"
     )]
     pub cache_read_cost_per_token: Option<DecimalPrice>,
+    #[serde(rename = "textPricing", skip_serializing_if = "Option::is_none")]
+    pub text_pricing: Option<serde_json::Value>,
     pub metadata: ModelMetadata,
 }
 
@@ -3590,6 +3614,16 @@ pub struct UpdateModelApiRequest {
     )]
     #[schema(value_type = Option<DecimalPriceRequest>)]
     pub cache_read_cost_per_token: Nullable<DecimalPriceRequest>,
+    /// Exact, versioned USD-per-million text pricing profile.
+    /// Omitted leaves it unchanged; null removes it.
+    #[serde(
+        rename = "textPricing",
+        default,
+        deserialize_with = "deserialize_nullable",
+        skip_serializing_if = "Option::is_none"
+    )]
+    #[schema(value_type = Option<Object>)]
+    pub text_pricing: Nullable<serde_json::Value>,
     #[serde(rename = "modelDisplayName")]
     pub model_display_name: Option<String>,
     #[serde(rename = "modelDescription")]
@@ -3827,6 +3861,9 @@ pub struct PricingChangeItemRequest {
     pub cache_read_cost_per_token: Option<DecimalPriceRequest>,
     #[serde(rename = "costPerImage", skip_serializing_if = "Option::is_none")]
     pub cost_per_image: Option<DecimalPriceRequest>,
+    #[serde(rename = "textPricing", skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<Object>)]
+    pub text_pricing: Option<serde_json::Value>,
 }
 
 /// Request to preview or confirm a batch of scheduled pricing changes.
@@ -3858,6 +3895,8 @@ pub struct PricingFields {
     pub cache_read_cost_per_token: Option<DecimalPrice>,
     #[serde(rename = "costPerImage")]
     pub cost_per_image: DecimalPrice,
+    #[serde(rename = "textPricing", skip_serializing_if = "Option::is_none")]
+    pub text_pricing: Option<serde_json::Value>,
 }
 
 /// Partial pricing update; omitted fields are unchanged.
@@ -3874,6 +3913,8 @@ pub struct PricingFieldUpdates {
     pub cache_read_cost_per_token: Option<DecimalPrice>,
     #[serde(rename = "costPerImage", skip_serializing_if = "Option::is_none")]
     pub cost_per_image: Option<DecimalPrice>,
+    #[serde(rename = "textPricing", skip_serializing_if = "Option::is_none")]
+    pub text_pricing: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
@@ -3976,6 +4017,8 @@ pub struct ModelHistoryEntry {
         skip_serializing_if = "Option::is_none"
     )]
     pub cache_read_cost_per_token: Option<DecimalPrice>,
+    #[serde(rename = "textPricing", skip_serializing_if = "Option::is_none")]
+    pub text_pricing: Option<serde_json::Value>,
     #[serde(rename = "contextLength")]
     pub context_length: i32,
     #[serde(rename = "modelName")]
@@ -4543,6 +4586,7 @@ mod tests {
             stop: None,
             presence_penalty: None,
             frequency_penalty: None,
+            service_tier: None,
             extra: std::collections::HashMap::new(),
         };
 
@@ -4728,6 +4772,7 @@ mod tests {
             stop: None,
             presence_penalty: None,
             frequency_penalty: None,
+            service_tier: None,
             extra: std::collections::HashMap::new(),
         };
 
@@ -4765,6 +4810,7 @@ mod tests {
             stop: None,
             presence_penalty: None,
             frequency_penalty: None,
+            service_tier: None,
             extra: std::collections::HashMap::new(),
         };
 
@@ -4797,6 +4843,7 @@ mod tests {
             stop: None,
             presence_penalty: None,
             frequency_penalty: None,
+            service_tier: None,
             extra: std::collections::HashMap::new(),
         };
 
@@ -4827,6 +4874,7 @@ mod tests {
             stop: None,
             presence_penalty: None,
             frequency_penalty: None,
+            service_tier: None,
             extra: std::collections::HashMap::new(),
         };
 
@@ -4855,6 +4903,7 @@ mod tests {
             stop: None,
             presence_penalty: None,
             frequency_penalty: None,
+            service_tier: None,
             extra: std::collections::HashMap::new(),
         }
     }

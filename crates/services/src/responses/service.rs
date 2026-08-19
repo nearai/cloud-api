@@ -1,5 +1,4 @@
-use std::pin::Pin;
-use std::sync::Arc;
+use std::{collections::HashSet, pin::Pin, sync::Arc};
 
 use async_trait::async_trait;
 use futures::Stream;
@@ -1024,8 +1023,10 @@ impl ResponseServiceImpl {
             Uuid::parse_str(uuid_str).ok().map(ConversationId)
         });
 
-        // Store user input messages as response_items
-        if let Some(input) = &context.request.input {
+        // Store request input as response items and keep the IDs created for
+        // this request. Input may contain historical assistant messages, so
+        // role alone cannot distinguish it from generated output later.
+        let input_item_ids = if let Some(input) = &context.request.input {
             Self::store_input_as_response_items(
                 &context.response_items_repository,
                 response_id.clone(),
@@ -1035,8 +1036,10 @@ impl ResponseServiceImpl {
                 &context.request.model,
                 context.request.metadata.as_ref(),
             )
-            .await?;
-        }
+            .await?
+        } else {
+            HashSet::new()
+        };
 
         // Initialize context and emitter
         let mut ctx = crate::responses::service_helpers::ResponseStreamContext::new(
@@ -1237,17 +1240,7 @@ impl ResponseServiceImpl {
                 errors::ResponseError::InternalError(format!("Failed to load response items: {e}"))
             })?;
 
-        // Filter to get only assistant-generated output items.
-        // Exclude user input messages and client-provided FunctionCallOutput items,
-        // which are stored for history but should not appear in the response output.
-        let mut output_items: Vec<_> = response_items
-            .into_iter()
-            .filter(|item| match item {
-                models::ResponseOutputItem::Message { role, .. } => role == "assistant",
-                models::ResponseOutputItem::FunctionCallOutput { .. } => false,
-                _ => true,
-            })
-            .collect();
+        let mut output_items = Self::select_output_items(response_items, &input_item_ids);
 
         // Prepend MCP list tools items (emitted but not stored in DB)
         if let Some(ref mcp_executor) = context.mcp_executor {
@@ -2047,7 +2040,9 @@ impl ResponseServiceImpl {
         Ok(messages)
     }
 
-    /// Store user input messages as response_items
+    /// Store request input as response items and return the IDs that originated
+    /// from the client. The IDs are kept only for this request and ensure that
+    /// historical assistant messages are never returned as new output.
     async fn store_input_as_response_items(
         response_items_repository: &Arc<dyn ports::ResponseItemRepositoryTrait>,
         response_id: models::ResponseId,
@@ -2056,7 +2051,9 @@ impl ResponseServiceImpl {
         input: &models::ResponseInput,
         model: &str,
         request_metadata: Option<&serde_json::Value>,
-    ) -> Result<(), errors::ResponseError> {
+    ) -> Result<HashSet<String>, errors::ResponseError> {
+        let mut input_item_ids = HashSet::new();
+
         match input {
             models::ResponseInput::Text(text) => {
                 // Create a message item for simple text input
@@ -2078,7 +2075,7 @@ impl ResponseServiceImpl {
                     metadata: request_metadata.cloned(),
                 };
 
-                response_items_repository
+                let stored_item = response_items_repository
                     .create(
                         response_id.clone(),
                         api_key_id,
@@ -2091,6 +2088,7 @@ impl ResponseServiceImpl {
                             "Failed to store user input: {e}"
                         ))
                     })?;
+                input_item_ids.insert(stored_item.id().to_string());
             }
             models::ResponseInput::Items(items) => {
                 // Store each input item as a response_item
@@ -2124,7 +2122,7 @@ impl ResponseServiceImpl {
                                 call_id: call_id.clone(),
                                 output: output.clone(),
                             };
-                            response_items_repository
+                            let stored_item = response_items_repository
                                 .create(response_id.clone(), api_key_id, conversation_id, fco_item)
                                 .await
                                 .map_err(|e| {
@@ -2132,6 +2130,7 @@ impl ResponseServiceImpl {
                                         "Failed to store function call output: {e}"
                                     ))
                                 })?;
+                            input_item_ids.insert(stored_item.id().to_string());
                             continue;
                         }
                     };
@@ -2193,7 +2192,7 @@ impl ResponseServiceImpl {
                         metadata,
                     };
 
-                    response_items_repository
+                    let stored_item = response_items_repository
                         .create(
                             response_id.clone(),
                             api_key_id,
@@ -2206,6 +2205,7 @@ impl ResponseServiceImpl {
                                 "Failed to store user input item: {e}"
                             ))
                         })?;
+                    input_item_ids.insert(stored_item.id().to_string());
                 }
             }
         }
@@ -2214,7 +2214,25 @@ impl ResponseServiceImpl {
             "Stored user input messages as response_items for response {}",
             response_id.0
         );
-        Ok(())
+        Ok(input_item_ids)
+    }
+
+    /// Select items created while producing this response, never request input.
+    fn select_output_items(
+        response_items: Vec<models::ResponseOutputItem>,
+        input_item_ids: &HashSet<String>,
+    ) -> Vec<models::ResponseOutputItem> {
+        response_items
+            .into_iter()
+            .filter(|item| {
+                !input_item_ids.contains(item.id())
+                    && match item {
+                        models::ResponseOutputItem::Message { role, .. } => role == "assistant",
+                        models::ResponseOutputItem::FunctionCallOutput { .. } => false,
+                        _ => true,
+                    }
+            })
+            .collect()
     }
 
     /// Load conversation context based on conversation_id or previous_response_id.
@@ -3607,6 +3625,93 @@ impl ResponseServiceImpl {
 mod tests {
     use super::*;
     use crate::responses::tools::WEB_SEARCH_TOOL_NAME;
+
+    #[tokio::test]
+    async fn historical_assistant_input_is_not_returned_as_response_output() {
+        let (response_repository, response_items_repository) = transient::repositories();
+        let workspace_id = crate::workspace::WorkspaceId(Uuid::new_v4());
+        let api_key_id = Uuid::new_v4();
+        let request = models::CreateResponseRequest {
+            model: "test-model".to_string(),
+            input: None,
+            instructions: None,
+            conversation: None,
+            previous_response_id: None,
+            max_output_tokens: None,
+            max_tool_calls: None,
+            temperature: None,
+            top_p: None,
+            stream: None,
+            store: Some(false),
+            background: Some(false),
+            tools: None,
+            tool_choice: None,
+            parallel_tool_calls: None,
+            reasoning: None,
+            include: None,
+            metadata: None,
+            safety_identifier: None,
+            prompt_cache_key: None,
+        };
+        let response = response_repository
+            .create(workspace_id, api_key_id, request)
+            .await
+            .unwrap();
+        let response_id = ResponseServiceImpl::extract_response_uuid(&response).unwrap();
+
+        let input = models::ResponseInput::Items(vec![models::ResponseInputItem::Message {
+            role: "assistant".to_string(),
+            content: models::ResponseContent::Text("historical answer".to_string()),
+            metadata: None,
+        }]);
+        let input_item_ids = ResponseServiceImpl::store_input_as_response_items(
+            &response_items_repository,
+            response_id.clone(),
+            api_key_id,
+            None,
+            &input,
+            "test-model",
+            None,
+        )
+        .await
+        .unwrap();
+
+        let generated_item_id = format!("msg_{}", Uuid::new_v4().simple());
+        response_items_repository
+            .create(
+                response_id.clone(),
+                api_key_id,
+                None,
+                models::ResponseOutputItem::Message {
+                    id: generated_item_id.clone(),
+                    response_id: String::new(),
+                    previous_response_id: None,
+                    next_response_ids: vec![],
+                    created_at: 0,
+                    status: models::ResponseItemStatus::Completed,
+                    role: "assistant".to_string(),
+                    content: vec![models::ResponseContentItem::OutputText {
+                        text: "new answer".to_string(),
+                        annotations: vec![],
+                        logprobs: vec![],
+                    }],
+                    model: "test-model".to_string(),
+                    metadata: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        let response_items = response_items_repository
+            .list_by_response(response_id)
+            .await
+            .unwrap();
+        let output_items =
+            ResponseServiceImpl::select_output_items(response_items, &input_item_ids);
+
+        assert_eq!(output_items.len(), 1);
+        assert_eq!(output_items[0].id(), generated_item_id);
+    }
 
     #[test]
     fn test_process_reasoning_tags_simple_think() {

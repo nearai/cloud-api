@@ -2925,6 +2925,66 @@ pub struct ListUsersResponse {
     pub offset: i64,
 }
 
+/// Admin AML report audit entry.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct AdminAmlReportResponse {
+    pub id: String,
+    pub user_id: Option<String>,
+    pub flow: String,
+    pub provider: String,
+    pub account_id: String,
+    pub address_type: String,
+    pub risk_level: String,
+    pub score: Option<i32>,
+    pub report_id: Option<String>,
+    pub reason: Option<String>,
+    pub provider_report_time: Option<DateTime<Utc>>,
+    pub active: bool,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// Paginated admin AML reports response.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ListAdminAmlReportsResponse {
+    pub reports: Vec<AdminAmlReportResponse>,
+    pub total: i64,
+    pub limit: i64,
+    pub offset: i64,
+}
+
+/// Admin AML report status update request.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct UpdateAmlReportStatusRequest {
+    pub active: bool,
+}
+
+/// Admin AML allowlist entry response.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct AdminAmlAllowlistEntryResponse {
+    pub account_id: String,
+    pub address_type: String,
+    pub reason: Option<String>,
+    pub created_by_user_id: Option<String>,
+    pub created_at: DateTime<Utc>,
+}
+
+/// Admin AML allowlist response.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ListAdminAmlAllowlistResponse {
+    pub accounts: Vec<AdminAmlAllowlistEntryResponse>,
+    pub total: i64,
+    pub limit: i64,
+    pub offset: i64,
+}
+
+/// Admin AML allowlist upsert request.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct UpsertAmlAllowlistEntryRequest {
+    pub account_id: String,
+    pub reason: Option<String>,
+}
+
 /// Organization details for admin organization listing
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct AdminOrganizationResponse {

@@ -4,22 +4,24 @@ use crate::conversions::{
 };
 use crate::middleware::AdminUser;
 use crate::models::{
-    AdminAccessTokenResponse, AdminInvitationEmailResendResultResponse, AdminModelListResponse,
-    AdminModelWithPricing, AdminOrganizationMemberResponse, AdminOrganizationResponse,
-    AdminServiceResponse, AdminUserOrganizationDetails, AdminUserResponse,
-    BatchUpdateModelApiRequest, CreateAdminAccessTokenRequest, CreateServiceRequest, CreditType,
-    DecimalPrice, DecimalPriceRequest, DeleteAdminAccessTokenRequest, DeleteModelRequest,
-    DeprecateModelRequest, DeprecateModelResponse, ErrorResponse,
-    GetOrganizationConcurrentLimitResponse, ListAdminInvitationEmailDeliveriesResponse,
-    ListAdminOrganizationMembersResponse, ListOrganizationsAdminResponse,
-    ListPricingChangesResponse, ListUsersResponse, MemberRole, ModelArchitecture,
-    ModelDeprecationConfirmResponse, ModelDeprecationPreviewResponse, ModelDeprecationRequest,
-    ModelHistoryEntry, ModelHistoryResponse, ModelMetadata, ModelWithPricing,
-    OrgLimitsHistoryEntry, OrgLimitsHistoryResponse, OrganizationUsage, PricingChangeBatchRequest,
-    PricingChangeConfirmResponse, PricingChangeModelPreviewDto, PricingChangePreviewResponse,
-    PricingFieldUpdates, PricingFields, ScheduledPricingChangeDto, SpendLimit,
-    UpdateOrganizationConcurrentLimitRequest, UpdateOrganizationConcurrentLimitResponse,
-    UpdateOrganizationLimitsRequest, UpdateOrganizationLimitsResponse, UpdateServiceRequest,
+    AdminAccessTokenResponse, AdminAmlAllowlistEntryResponse, AdminAmlReportResponse,
+    AdminInvitationEmailResendResultResponse, AdminModelListResponse, AdminModelWithPricing,
+    AdminOrganizationMemberResponse, AdminOrganizationResponse, AdminServiceResponse,
+    AdminUserOrganizationDetails, AdminUserResponse, BatchUpdateModelApiRequest,
+    CreateAdminAccessTokenRequest, CreateServiceRequest, CreditType, DecimalPrice,
+    DecimalPriceRequest, DeleteAdminAccessTokenRequest, DeleteModelRequest, DeprecateModelRequest,
+    DeprecateModelResponse, ErrorResponse, GetOrganizationConcurrentLimitResponse,
+    ListAdminAmlAllowlistResponse, ListAdminAmlReportsResponse,
+    ListAdminInvitationEmailDeliveriesResponse, ListAdminOrganizationMembersResponse,
+    ListOrganizationsAdminResponse, ListPricingChangesResponse, ListUsersResponse, MemberRole,
+    ModelArchitecture, ModelDeprecationConfirmResponse, ModelDeprecationPreviewResponse,
+    ModelDeprecationRequest, ModelHistoryEntry, ModelHistoryResponse, ModelMetadata,
+    ModelWithPricing, OrgLimitsHistoryEntry, OrgLimitsHistoryResponse, OrganizationUsage,
+    PricingChangeBatchRequest, PricingChangeConfirmResponse, PricingChangeModelPreviewDto,
+    PricingChangePreviewResponse, PricingFieldUpdates, PricingFields, ScheduledPricingChangeDto,
+    SpendLimit, UpdateAmlReportStatusRequest, UpdateOrganizationConcurrentLimitRequest,
+    UpdateOrganizationConcurrentLimitResponse, UpdateOrganizationLimitsRequest,
+    UpdateOrganizationLimitsResponse, UpdateServiceRequest, UpsertAmlAllowlistEntryRequest,
 };
 use crate::routes::common::format_amount;
 use crate::routes::usage::{compute_organization_balance_response, OrganizationBalanceResponse};
@@ -33,6 +35,7 @@ use axum::{
 use chrono::{DateTime, Duration, Timelike, Utc};
 use config::ApiConfig;
 use services::admin::{AdminService, AnalyticsService, UpdateModelAdminRequest};
+use services::aml::{AmlAllowlistEntry, AmlError, AmlReport};
 use services::auth::AuthServiceTrait;
 use services::github_dispatch::GitHubDispatcher;
 use services::usage::UsageServiceTrait;
@@ -178,6 +181,306 @@ fn bad_request(
 ) -> (StatusCode, ResponseJson<ErrorResponse>) {
     (
         StatusCode::BAD_REQUEST,
+        ResponseJson(ErrorResponse::new(message.into(), code.to_string())),
+    )
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct AdminAmlReportsQuery {
+    #[serde(default = "crate::routes::common::default_limit")]
+    pub limit: i64,
+    #[serde(default)]
+    pub offset: i64,
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct AdminAmlAllowlistQuery {
+    #[serde(default = "crate::routes::common::default_limit")]
+    pub limit: i64,
+    #[serde(default)]
+    pub offset: i64,
+}
+
+/// List AML reports (Admin only)
+#[utoipa::path(
+    get,
+    path = "/v1/admin/aml/reports",
+    tag = "Admin",
+    params(
+        ("limit" = Option<i64>, Query, description = "Maximum number of reports to return (default: 100)"),
+        ("offset" = Option<i64>, Query, description = "Number of reports to skip (default: 0)")
+    ),
+    responses(
+        (status = 200, description = "AML reports retrieved successfully", body = ListAdminAmlReportsResponse),
+        (status = 400, description = "Invalid request", body = ErrorResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 403, description = "Forbidden", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    ),
+    security(
+        ("session_token" = [])
+    )
+)]
+pub async fn list_aml_reports(
+    State(app_state): State<AdminAppState>,
+    Extension(_admin_user): Extension<AdminUser>,
+    Query(params): Query<AdminAmlReportsQuery>,
+) -> Result<ResponseJson<ListAdminAmlReportsResponse>, (StatusCode, ResponseJson<ErrorResponse>)> {
+    crate::routes::common::validate_limit_offset(params.limit, params.offset)?;
+
+    let page = app_state
+        .aml_service
+        .list_reports(params.limit, params.offset)
+        .await
+        .map_err(aml_service_error)?;
+
+    Ok(ResponseJson(ListAdminAmlReportsResponse {
+        reports: page.reports.into_iter().map(aml_report_response).collect(),
+        total: page.total,
+        limit: page.limit,
+        offset: page.offset,
+    }))
+}
+
+/// Update AML report active status (Admin only)
+#[utoipa::path(
+    patch,
+    path = "/v1/admin/aml/reports/{report_id}/status",
+    tag = "Admin",
+    params(
+        ("report_id" = String, Path, description = "AML report UUID")
+    ),
+    request_body = UpdateAmlReportStatusRequest,
+    responses(
+        (status = 200, description = "AML report status updated successfully", body = AdminAmlReportResponse),
+        (status = 400, description = "Invalid request", body = ErrorResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 403, description = "Forbidden", body = ErrorResponse),
+        (status = 404, description = "AML report not found", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    ),
+    security(
+        ("session_token" = [])
+    )
+)]
+pub async fn update_aml_report_status(
+    State(app_state): State<AdminAppState>,
+    Extension(_admin_user): Extension<AdminUser>,
+    Path(report_id): Path<String>,
+    ResponseJson(request): ResponseJson<UpdateAmlReportStatusRequest>,
+) -> Result<ResponseJson<AdminAmlReportResponse>, (StatusCode, ResponseJson<ErrorResponse>)> {
+    let report_id = Uuid::parse_str(&report_id)
+        .map_err(|_| bad_request("report_id must be a valid UUID", "invalid_parameter"))?;
+
+    let Some(report) = app_state
+        .aml_service
+        .set_report_active(report_id, request.active)
+        .await
+        .map_err(aml_service_error)?
+    else {
+        return Err(not_found("AML report not found", "not_found"));
+    };
+
+    Ok(ResponseJson(aml_report_response(report)))
+}
+
+/// List AML allowlist entries (Admin only)
+#[utoipa::path(
+    get,
+    path = "/v1/admin/aml/allowlist",
+    tag = "Admin",
+    params(
+        ("limit" = Option<i64>, Query, description = "Maximum number of allowlist entries to return (default: 100)"),
+        ("offset" = Option<i64>, Query, description = "Number of allowlist entries to skip (default: 0)")
+    ),
+    responses(
+        (status = 200, description = "AML allowlist entries retrieved successfully", body = ListAdminAmlAllowlistResponse),
+        (status = 400, description = "Invalid request", body = ErrorResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 403, description = "Forbidden", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    ),
+    security(
+        ("session_token" = [])
+    )
+)]
+pub async fn list_aml_allowlist(
+    State(app_state): State<AdminAppState>,
+    Extension(_admin_user): Extension<AdminUser>,
+    Query(params): Query<AdminAmlAllowlistQuery>,
+) -> Result<ResponseJson<ListAdminAmlAllowlistResponse>, (StatusCode, ResponseJson<ErrorResponse>)>
+{
+    crate::routes::common::validate_limit_offset(params.limit, params.offset)?;
+
+    let page = app_state
+        .aml_service
+        .list_allowlist_entries(params.limit, params.offset)
+        .await
+        .map_err(aml_service_error)?;
+
+    let accounts = page
+        .entries
+        .into_iter()
+        .map(aml_allowlist_response)
+        .collect();
+
+    Ok(ResponseJson(ListAdminAmlAllowlistResponse {
+        accounts,
+        total: page.total,
+        limit: page.limit,
+        offset: page.offset,
+    }))
+}
+
+/// Add or update an AML allowlist entry (Admin only)
+#[utoipa::path(
+    post,
+    path = "/v1/admin/aml/allowlist",
+    tag = "Admin",
+    request_body = UpsertAmlAllowlistEntryRequest,
+    responses(
+        (status = 200, description = "AML allowlist entry upserted successfully", body = AdminAmlAllowlistEntryResponse),
+        (status = 400, description = "Invalid request", body = ErrorResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 403, description = "Forbidden", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    ),
+    security(
+        ("session_token" = [])
+    )
+)]
+pub async fn upsert_aml_allowlist_entry(
+    State(app_state): State<AdminAppState>,
+    Extension(admin_user): Extension<AdminUser>,
+    ResponseJson(request): ResponseJson<UpsertAmlAllowlistEntryRequest>,
+) -> Result<ResponseJson<AdminAmlAllowlistEntryResponse>, (StatusCode, ResponseJson<ErrorResponse>)>
+{
+    let reason = request
+        .reason
+        .map(|reason| reason.trim().to_string())
+        .filter(|reason| !reason.is_empty());
+    let entry = app_state
+        .aml_service
+        .upsert_allowlist_entry(&request.account_id, reason, Some(admin_user.0.id))
+        .await
+        .map_err(aml_service_error)?;
+
+    Ok(ResponseJson(aml_allowlist_response(entry)))
+}
+
+/// Remove an AML allowlist entry (Admin only)
+#[utoipa::path(
+    delete,
+    path = "/v1/admin/aml/allowlist/{account_id}",
+    tag = "Admin",
+    params(
+        ("account_id" = String, Path, description = "NEAR account ID")
+    ),
+    responses(
+        (status = 204, description = "AML allowlist entry removed successfully"),
+        (status = 400, description = "Invalid request", body = ErrorResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 403, description = "Forbidden", body = ErrorResponse),
+        (status = 404, description = "AML allowlist entry not found", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    ),
+    security(
+        ("session_token" = [])
+    )
+)]
+pub async fn delete_aml_allowlist_entry(
+    State(app_state): State<AdminAppState>,
+    Extension(_admin_user): Extension<AdminUser>,
+    Path(account_id): Path<String>,
+) -> Result<StatusCode, (StatusCode, ResponseJson<ErrorResponse>)> {
+    let removed = app_state
+        .aml_service
+        .remove_allowlist_entry(&account_id)
+        .await
+        .map_err(aml_service_error)?;
+
+    if !removed {
+        return Err(not_found("AML allowlist entry not found", "not_found"));
+    }
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+fn aml_report_response(report: AmlReport) -> AdminAmlReportResponse {
+    AdminAmlReportResponse {
+        id: report.id.to_string(),
+        user_id: report.user_id.map(|id| id.to_string()),
+        flow: report.flow,
+        provider: report.provider,
+        account_id: report.account_id,
+        address_type: report.address_type,
+        risk_level: report.risk_level.as_str().to_string(),
+        score: report.score,
+        report_id: report.report_id,
+        reason: report.reason,
+        provider_report_time: report.provider_report_time,
+        active: report.active,
+        created_at: report.created_at,
+        updated_at: report.updated_at,
+    }
+}
+
+fn aml_allowlist_response(entry: AmlAllowlistEntry) -> AdminAmlAllowlistEntryResponse {
+    AdminAmlAllowlistEntryResponse {
+        account_id: entry.account_id,
+        address_type: entry.address_type,
+        reason: entry.reason,
+        created_by_user_id: entry.created_by_user_id.map(|id| id.to_string()),
+        created_at: entry.created_at,
+    }
+}
+
+fn aml_service_error(error: AmlError) -> (StatusCode, ResponseJson<ErrorResponse>) {
+    match error {
+        AmlError::InvalidAccountId => bad_request("Invalid NEAR account ID", "invalid_account_id"),
+        AmlError::InvalidReportStatus => bad_request(
+            "UNKNOWN AML reports cannot be activated",
+            "invalid_report_status",
+        ),
+        AmlError::AccountBlocked => (
+            StatusCode::FORBIDDEN,
+            ResponseJson(ErrorResponse::new(
+                "Account error".to_string(),
+                "account_error".to_string(),
+            )),
+        ),
+        AmlError::ProviderFailure(_) => {
+            error!(
+                error_kind = "provider_failure",
+                "AML admin operation failed"
+            );
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ResponseJson(ErrorResponse::new(
+                    "AML operation failed".to_string(),
+                    "internal_server_error".to_string(),
+                )),
+            )
+        }
+        AmlError::RepositoryFailure(_) => {
+            error!(
+                error_kind = "repository_failure",
+                "AML admin operation failed"
+            );
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ResponseJson(ErrorResponse::new(
+                    "AML operation failed".to_string(),
+                    "internal_server_error".to_string(),
+                )),
+            )
+        }
+    }
+}
+
+fn not_found(message: impl Into<String>, code: &str) -> (StatusCode, ResponseJson<ErrorResponse>) {
+    (
+        StatusCode::NOT_FOUND,
         ResponseJson(ErrorResponse::new(message.into(), code.to_string())),
     )
 }

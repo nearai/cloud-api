@@ -64,6 +64,22 @@ pub struct AmlReport {
     pub updated_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AmlReportPage {
+    pub reports: Vec<AmlReport>,
+    pub total: i64,
+    pub limit: i64,
+    pub offset: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AmlAllowlistPage {
+    pub entries: Vec<AmlAllowlistEntry>,
+    pub total: i64,
+    pub limit: i64,
+    pub offset: i64,
+}
+
 #[derive(Debug, Clone)]
 pub struct NewAmlReport {
     pub user_id: Option<Uuid>,
@@ -80,6 +96,23 @@ pub struct NewAmlReport {
     pub active: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AmlAllowlistEntry {
+    pub account_id: String,
+    pub address_type: String,
+    pub reason: Option<String>,
+    pub created_by_user_id: Option<Uuid>,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+pub struct NewAmlAllowlistEntry {
+    pub account_id: String,
+    pub address_type: String,
+    pub reason: Option<String>,
+    pub created_by_user_id: Option<Uuid>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AmlDecision {
     Allowed,
@@ -89,6 +122,10 @@ pub enum AmlDecision {
 pub enum AmlError {
     #[error("account blocked by AML policy")]
     AccountBlocked,
+    #[error("invalid NEAR account id")]
+    InvalidAccountId,
+    #[error("invalid AML report status update")]
+    InvalidReportStatus,
     #[error("AML provider request failed: {0}")]
     ProviderFailure(String),
     #[error("AML repository request failed: {0}")]
@@ -114,7 +151,34 @@ pub trait AmlRepository: Send + Sync {
 
     async fn create_report(&self, report: NewAmlReport) -> anyhow::Result<AmlReport>;
 
+    async fn list_reports(&self, limit: i64, offset: i64) -> anyhow::Result<AmlReportPage>;
+
+    async fn report_risk_level(&self, report_id: Uuid) -> anyhow::Result<Option<AmlRiskLevel>>;
+
+    async fn set_report_active(
+        &self,
+        report_id: Uuid,
+        active: bool,
+    ) -> anyhow::Result<Option<AmlReport>>;
+
     async fn is_allowlisted(&self, account_id: &str, address_type: &str) -> anyhow::Result<bool>;
+
+    async fn list_allowlist_entries(
+        &self,
+        limit: i64,
+        offset: i64,
+    ) -> anyhow::Result<AmlAllowlistPage>;
+
+    async fn upsert_allowlist_entry(
+        &self,
+        entry: NewAmlAllowlistEntry,
+    ) -> anyhow::Result<AmlAllowlistEntry>;
+
+    async fn remove_allowlist_entry(
+        &self,
+        account_id: &str,
+        address_type: &str,
+    ) -> anyhow::Result<bool>;
 }
 
 #[async_trait]
@@ -284,6 +348,14 @@ fn provider_failure_reason(error: &reqwest::Error) -> String {
 
 pub fn normalize_near_account_id(account_id: &str) -> String {
     account_id.trim().to_ascii_lowercase()
+}
+
+pub fn validate_near_account_id(account_id: &str) -> Result<String, AmlError> {
+    let normalized = normalize_near_account_id(account_id);
+    let Ok(_) = normalized.parse::<near_api::AccountId>() else {
+        return Err(AmlError::InvalidAccountId);
+    };
+    Ok(normalized)
 }
 
 fn normalize_lukka_report(
@@ -506,10 +578,6 @@ impl AmlService {
             return Ok(AmlDecision::Allowed);
         }
 
-        if let Some(cached) = self.cache.get(&account_id).await {
-            return self.decision_from_report(&cached);
-        }
-
         let fresh_after = Utc::now() - Duration::days(self.config.refresh_window_days);
         if let Some(report) = self
             .repository
@@ -522,10 +590,11 @@ impl AmlService {
             .await
             .map_err(|error| AmlError::RepositoryFailure(error.to_string()))?
         {
-            if report.risk_level != AmlRiskLevel::Unknown {
-                self.cache.insert(account_id, report.clone()).await;
+            if report.risk_level == AmlRiskLevel::Unknown {
+                self.unknown_cache.invalidate(&account_id).await;
+            } else {
+                return self.decision_from_report(&report);
             }
-            return self.decision_from_report(&report);
         }
 
         if let Some(report) = self.unknown_cache.get(&account_id).await {
@@ -546,10 +615,6 @@ impl AmlService {
             .create_report(provider_result)
             .await
             .map_err(|error| AmlError::RepositoryFailure(error.to_string()))?;
-
-        if report.risk_level != AmlRiskLevel::Unknown {
-            self.cache.insert(account_id.clone(), report.clone()).await;
-        }
 
         if report.risk_level == AmlRiskLevel::Unknown {
             self.unknown_cache
@@ -584,6 +649,83 @@ impl AmlService {
         }
         self.check_near_account(Some(user_id), provider_user_id, flow)
             .await
+    }
+
+    pub async fn list_reports(&self, limit: i64, offset: i64) -> Result<AmlReportPage, AmlError> {
+        self.repository
+            .list_reports(limit, offset)
+            .await
+            .map_err(|error| AmlError::RepositoryFailure(error.to_string()))
+    }
+
+    pub async fn set_report_active(
+        &self,
+        report_id: Uuid,
+        active: bool,
+    ) -> Result<Option<AmlReport>, AmlError> {
+        if active {
+            let Some(risk_level) = self
+                .repository
+                .report_risk_level(report_id)
+                .await
+                .map_err(|error| AmlError::RepositoryFailure(error.to_string()))?
+            else {
+                return Ok(None);
+            };
+            if risk_level == AmlRiskLevel::Unknown {
+                return Err(AmlError::InvalidReportStatus);
+            }
+        }
+
+        let report = self
+            .repository
+            .set_report_active(report_id, active)
+            .await
+            .map_err(|error| AmlError::RepositoryFailure(error.to_string()))?;
+
+        if let Some(report) = &report {
+            self.cache.invalidate(&report.account_id).await;
+            self.unknown_cache.invalidate(&report.account_id).await;
+        }
+
+        Ok(report)
+    }
+
+    pub async fn list_allowlist_entries(
+        &self,
+        limit: i64,
+        offset: i64,
+    ) -> Result<AmlAllowlistPage, AmlError> {
+        self.repository
+            .list_allowlist_entries(limit, offset)
+            .await
+            .map_err(|error| AmlError::RepositoryFailure(error.to_string()))
+    }
+
+    pub async fn upsert_allowlist_entry(
+        &self,
+        account_id: &str,
+        reason: Option<String>,
+        created_by_user_id: Option<Uuid>,
+    ) -> Result<AmlAllowlistEntry, AmlError> {
+        let account_id = validate_near_account_id(account_id)?;
+        self.repository
+            .upsert_allowlist_entry(NewAmlAllowlistEntry {
+                account_id,
+                address_type: AML_ADDRESS_TYPE_NEAR.to_string(),
+                reason,
+                created_by_user_id,
+            })
+            .await
+            .map_err(|error| AmlError::RepositoryFailure(error.to_string()))
+    }
+
+    pub async fn remove_allowlist_entry(&self, account_id: &str) -> Result<bool, AmlError> {
+        let account_id = validate_near_account_id(account_id)?;
+        self.repository
+            .remove_allowlist_entry(&account_id, AML_ADDRESS_TYPE_NEAR)
+            .await
+            .map_err(|error| AmlError::RepositoryFailure(error.to_string()))
     }
 
     fn decision_from_report(&self, report: &AmlReport) -> Result<AmlDecision, AmlError> {
@@ -927,6 +1069,8 @@ mod tests {
         latest_fresh_active: Mutex<Option<AmlReport>>,
         allowlisted: Mutex<bool>,
         created: Mutex<Vec<NewAmlReport>>,
+        reports: Mutex<Vec<AmlReport>>,
+        allowlist_entries: Mutex<Vec<AmlAllowlistEntry>>,
     }
 
     #[async_trait]
@@ -956,15 +1100,119 @@ mod tests {
             if stored.active {
                 *self.latest_active.lock().unwrap() = Some(stored.clone());
             }
+            self.reports.lock().unwrap().push(stored.clone());
             Ok(stored)
+        }
+
+        async fn list_reports(&self, limit: i64, offset: i64) -> anyhow::Result<AmlReportPage> {
+            let reports = self.reports.lock().unwrap();
+            let total = reports.len() as i64;
+            let page = reports
+                .iter()
+                .skip(offset as usize)
+                .take(limit as usize)
+                .cloned()
+                .collect();
+            Ok(AmlReportPage {
+                reports: page,
+                total,
+                limit,
+                offset,
+            })
+        }
+
+        async fn set_report_active(
+            &self,
+            report_id: Uuid,
+            active: bool,
+        ) -> anyhow::Result<Option<AmlReport>> {
+            let mut reports = self.reports.lock().unwrap();
+            let Some(report) = reports.iter_mut().find(|report| report.id == report_id) else {
+                return Ok(None);
+            };
+            report.active = active;
+            report.updated_at = Utc::now();
+            Ok(Some(report.clone()))
+        }
+
+        async fn report_risk_level(&self, report_id: Uuid) -> anyhow::Result<Option<AmlRiskLevel>> {
+            Ok(self
+                .reports
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|report| report.id == report_id)
+                .map(|report| report.risk_level.clone()))
         }
 
         async fn is_allowlisted(
             &self,
-            _account_id: &str,
-            _address_type: &str,
+            account_id: &str,
+            address_type: &str,
         ) -> anyhow::Result<bool> {
-            Ok(*self.allowlisted.lock().unwrap())
+            Ok(*self.allowlisted.lock().unwrap()
+                || self.allowlist_entries.lock().unwrap().iter().any(|entry| {
+                    entry.account_id == account_id && entry.address_type == address_type
+                }))
+        }
+
+        async fn list_allowlist_entries(
+            &self,
+            limit: i64,
+            offset: i64,
+        ) -> anyhow::Result<AmlAllowlistPage> {
+            let entries = self.allowlist_entries.lock().unwrap();
+            let total = entries.len() as i64;
+            let page = entries
+                .iter()
+                .skip(offset as usize)
+                .take(limit as usize)
+                .cloned()
+                .collect();
+            Ok(AmlAllowlistPage {
+                entries: page,
+                total,
+                limit,
+                offset,
+            })
+        }
+
+        async fn upsert_allowlist_entry(
+            &self,
+            entry: NewAmlAllowlistEntry,
+        ) -> anyhow::Result<AmlAllowlistEntry> {
+            let mut entries = self.allowlist_entries.lock().unwrap();
+            let stored = AmlAllowlistEntry {
+                account_id: entry.account_id,
+                address_type: entry.address_type,
+                reason: entry.reason,
+                created_by_user_id: entry.created_by_user_id,
+                created_at: Utc::now(),
+            };
+            if let Some(existing) = entries.iter_mut().find(|existing| {
+                existing.account_id == stored.account_id
+                    && existing.address_type == stored.address_type
+            }) {
+                if stored.reason.is_some() {
+                    existing.reason = stored.reason.clone();
+                }
+                return Ok(existing.clone());
+            }
+            entries.push(stored.clone());
+            Ok(stored)
+        }
+
+        async fn remove_allowlist_entry(
+            &self,
+            account_id: &str,
+            address_type: &str,
+        ) -> anyhow::Result<bool> {
+            let mut entries = self.allowlist_entries.lock().unwrap();
+            let before = entries.len();
+            entries.retain(|entry| {
+                entry.account_id != account_id || entry.address_type != address_type
+            });
+            Ok(entries.len() != before)
         }
     }
 
@@ -1290,6 +1538,198 @@ mod tests {
         assert!(matches!(first, Err(AmlError::AccountBlocked)));
         assert!(matches!(second, Err(AmlError::AccountBlocked)));
         assert_eq!(repo.created.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn report_list_pagination_preserves_limit_and_offset() {
+        let repo = Arc::new(MockAmlRepository::default());
+        repo.reports.lock().unwrap().extend(
+            [
+                new_report(AmlRiskLevel::Low),
+                new_report(AmlRiskLevel::High),
+            ]
+            .map(report_to_stored),
+        );
+        let provider = Arc::new(StaticProvider(new_report(AmlRiskLevel::Low)));
+        let service = AmlService::new(repo, provider, enabled_config());
+
+        let page = service.list_reports(1, 1).await.unwrap();
+
+        assert_eq!(page.total, 2);
+        assert_eq!(page.limit, 1);
+        assert_eq!(page.offset, 1);
+        assert_eq!(page.reports.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn report_status_mutation_invalidates_cached_decision() {
+        let repo = Arc::new(MockAmlRepository::default());
+        let stored = report_to_stored(new_report(AmlRiskLevel::High));
+        let report_id = stored.id;
+        repo.reports.lock().unwrap().push(stored.clone());
+        *repo.latest_fresh_active.lock().unwrap() = Some(stored);
+        let provider = Arc::new(StaticProvider(NewAmlReport {
+            risk_level: AmlRiskLevel::Low,
+            score: Some(10),
+            ..new_report(AmlRiskLevel::Low)
+        }));
+        let service = AmlService::new(repo.clone(), provider, enabled_config());
+
+        let first = service
+            .check_near_account(None, "gregoshes.near", AmlFlow::UserStatus)
+            .await;
+        assert!(matches!(first, Err(AmlError::AccountBlocked)));
+
+        let updated = service
+            .set_report_active(report_id, false)
+            .await
+            .unwrap()
+            .expect("known report should update");
+        *repo.latest_fresh_active.lock().unwrap() = None;
+        *repo.latest_active.lock().unwrap() = None;
+        let second = service
+            .check_near_account(None, "gregoshes.near", AmlFlow::UserStatus)
+            .await;
+        let missing = service
+            .set_report_active(Uuid::new_v4(), false)
+            .await
+            .unwrap();
+
+        assert!(!updated.active);
+        assert!(matches!(second, Ok(AmlDecision::Allowed)));
+        assert!(missing.is_none());
+    }
+
+    #[tokio::test]
+    async fn report_status_mutation_rejects_activating_unknown_report() {
+        let repo = Arc::new(MockAmlRepository::default());
+        let stored = report_to_stored(new_report(AmlRiskLevel::Unknown));
+        let report_id = stored.id;
+        repo.reports.lock().unwrap().push(stored);
+        let provider = Arc::new(StaticProvider(new_report(AmlRiskLevel::Low)));
+        let service = AmlService::new(repo.clone(), provider, enabled_config());
+
+        let result = service.set_report_active(report_id, true).await;
+
+        assert!(matches!(result, Err(AmlError::InvalidReportStatus)));
+        assert!(!repo.reports.lock().unwrap()[0].active);
+    }
+
+    #[tokio::test]
+    async fn report_status_mutation_from_another_service_does_not_leave_stale_decision() {
+        let repo = Arc::new(MockAmlRepository::default());
+        let stored = report_to_stored(new_report(AmlRiskLevel::High));
+        let report_id = stored.id;
+        repo.reports.lock().unwrap().push(stored.clone());
+        *repo.latest_fresh_active.lock().unwrap() = Some(stored);
+        let low_score_report = NewAmlReport {
+            score: Some(10),
+            ..new_report(AmlRiskLevel::Low)
+        };
+        let first_provider = Arc::new(StaticProvider(low_score_report.clone()));
+        let second_provider = Arc::new(StaticProvider(low_score_report));
+        let first_service = AmlService::new(repo.clone(), first_provider, enabled_config());
+        let second_service = AmlService::new(repo.clone(), second_provider, enabled_config());
+
+        let first = first_service
+            .check_near_account(None, "gregoshes.near", AmlFlow::UserStatus)
+            .await;
+        assert!(matches!(first, Err(AmlError::AccountBlocked)));
+
+        second_service
+            .set_report_active(report_id, false)
+            .await
+            .unwrap()
+            .expect("known report should update");
+        *repo.latest_fresh_active.lock().unwrap() = None;
+        *repo.latest_active.lock().unwrap() = None;
+
+        let second = first_service
+            .check_near_account(None, "gregoshes.near", AmlFlow::UserStatus)
+            .await;
+
+        assert!(matches!(second, Ok(AmlDecision::Allowed)));
+    }
+
+    #[tokio::test]
+    async fn allowlist_list_pagination_preserves_limit_offset_and_total() {
+        let repo = Arc::new(MockAmlRepository::default());
+        let now = Utc::now();
+        repo.allowlist_entries.lock().unwrap().extend([
+            AmlAllowlistEntry {
+                account_id: "alice.near".to_string(),
+                address_type: AML_ADDRESS_TYPE_NEAR.to_string(),
+                reason: Some("first".to_string()),
+                created_by_user_id: None,
+                created_at: now,
+            },
+            AmlAllowlistEntry {
+                account_id: "bob.near".to_string(),
+                address_type: AML_ADDRESS_TYPE_NEAR.to_string(),
+                reason: Some("second".to_string()),
+                created_by_user_id: None,
+                created_at: now,
+            },
+        ]);
+        let provider = Arc::new(StaticProvider(new_report(AmlRiskLevel::Low)));
+        let service = AmlService::new(repo, provider, enabled_config());
+
+        let page = service.list_allowlist_entries(1, 1).await.unwrap();
+
+        assert_eq!(page.total, 2);
+        assert_eq!(page.limit, 1);
+        assert_eq!(page.offset, 1);
+        assert_eq!(page.entries.len(), 1);
+        assert_eq!(page.entries[0].account_id, "bob.near");
+    }
+
+    #[tokio::test]
+    async fn allowlist_upsert_normalizes_and_remove_deletes_entry() {
+        let repo = Arc::new(MockAmlRepository::default());
+        let provider = Arc::new(StaticProvider(new_report(AmlRiskLevel::Low)));
+        let service = AmlService::new(repo.clone(), provider, enabled_config());
+        let user_id = Uuid::new_v4();
+        let second_user_id = Uuid::new_v4();
+
+        let created = service
+            .upsert_allowlist_entry(
+                "  Alice.NEAR  ",
+                Some("Compliance approval reference".to_string()),
+                Some(user_id),
+            )
+            .await
+            .unwrap();
+        let updated = service
+            .upsert_allowlist_entry("alice.near", Some("Updated".to_string()), Some(user_id))
+            .await
+            .unwrap();
+        let preserved = service
+            .upsert_allowlist_entry("alice.near", None, Some(second_user_id))
+            .await
+            .unwrap();
+        let removed = service.remove_allowlist_entry("ALICE.near").await.unwrap();
+        let removed_again = service.remove_allowlist_entry("alice.near").await.unwrap();
+
+        assert_eq!(created.account_id, "alice.near");
+        assert_eq!(updated.reason.as_deref(), Some("Updated"));
+        assert_eq!(preserved.reason.as_deref(), Some("Updated"));
+        assert_eq!(preserved.created_by_user_id, Some(user_id));
+        assert!(removed);
+        assert!(!removed_again);
+        assert!(repo.allowlist_entries.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn allowlist_upsert_rejects_invalid_near_account_id() {
+        let repo = Arc::new(MockAmlRepository::default());
+        let provider = Arc::new(StaticProvider(new_report(AmlRiskLevel::Low)));
+        let service = AmlService::new(repo, provider, enabled_config());
+
+        let result = service
+            .upsert_allowlist_entry("not valid", None, Some(Uuid::new_v4()))
+            .await;
+
+        assert!(matches!(result, Err(AmlError::InvalidAccountId)));
     }
 
     fn enabled_config() -> AmlConfig {

@@ -1225,6 +1225,108 @@ impl CreateResponseRequest {
 
         Ok(())
     }
+
+    /// Validate that a request can be handled without platform-side response
+    /// or conversation persistence.
+    ///
+    /// The Responses API is intentionally limited to a single request/response
+    /// interaction. Clients that need a multi-turn flow must include the full
+    /// context in the new request instead of referring to stored server state.
+    pub fn validate_stateless(&self) -> Result<(), String> {
+        if self.store == Some(true) {
+            return Err("The Responses API only supports store: false.".to_string());
+        }
+
+        if self.conversation.is_some() {
+            return Err("The stateless Responses API does not support conversation.".to_string());
+        }
+
+        if self.previous_response_id.is_some() {
+            return Err(
+                "The stateless Responses API does not support previous_response_id.".to_string(),
+            );
+        }
+
+        if self.background == Some(true) {
+            return Err("The stateless Responses API does not support background.".to_string());
+        }
+
+        if let Some(ResponseInput::Items(items)) = &self.input {
+            for item in items {
+                match item {
+                    ResponseInputItem::McpApprovalResponse { .. } => {
+                        return Err(
+                            "The stateless Responses API does not support MCP approval continuation."
+                                .to_string(),
+                        );
+                    }
+                    ResponseInputItem::FunctionCallOutput { .. } => {
+                        return Err(
+                            "The stateless Responses API does not support function continuation."
+                                .to_string(),
+                        );
+                    }
+                    ResponseInputItem::Message {
+                        content: ResponseContent::Parts(parts),
+                        ..
+                    } if parts
+                        .iter()
+                        .any(|part| matches!(part, ResponseContentPart::InputFile { .. })) =>
+                    {
+                        return Err(
+                            "The stateless Responses API does not support input_file.".to_string()
+                        );
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        if let Some(tools) = &self.tools {
+            for tool in tools {
+                match tool {
+                    ResponseTool::FileSearch { .. } => {
+                        return Err(
+                            "The stateless Responses API does not support file_search.".to_string()
+                        );
+                    }
+                    ResponseTool::Function { .. } => {
+                        return Err(
+                            "The stateless Responses API does not support function tools because they require continuation."
+                                .to_string(),
+                        );
+                    }
+                    ResponseTool::CodeInterpreter {} => {
+                        return Err(
+                            "The stateless Responses API does not support code_interpreter because it requires continuation."
+                                .to_string(),
+                        );
+                    }
+                    ResponseTool::Computer {} => {
+                        return Err(
+                            "The stateless Responses API does not support computer because it requires continuation."
+                                .to_string(),
+                        );
+                    }
+                    ResponseTool::Mcp {
+                        require_approval, ..
+                    } if !matches!(
+                        require_approval,
+                        McpApprovalRequirement::Simple(McpApprovalMode::Never)
+                    ) =>
+                    {
+                        return Err(
+                            "The stateless Responses API does not support MCP tools that require approval."
+                                .to_string(),
+                        );
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        Ok(())
+    }
 }
 
 impl CreateConversationRequest {
@@ -1283,6 +1385,31 @@ impl Usage {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn stateless_request() -> CreateResponseRequest {
+        CreateResponseRequest {
+            model: "gpt-4".to_string(),
+            input: Some(ResponseInput::Text("Hello".to_string())),
+            instructions: None,
+            conversation: None,
+            previous_response_id: None,
+            max_output_tokens: None,
+            max_tool_calls: None,
+            temperature: None,
+            top_p: None,
+            stream: None,
+            store: None,
+            background: None,
+            tools: None,
+            tool_choice: None,
+            parallel_tool_calls: None,
+            reasoning: None,
+            include: None,
+            metadata: None,
+            safety_identifier: None,
+            prompt_cache_key: None,
+        }
+    }
 
     #[test]
     fn test_response_status_serializes_in_progress_with_underscore() {
@@ -1926,5 +2053,135 @@ mod tests {
         };
 
         assert!(mcp_item.metadata().is_none());
+    }
+
+    #[test]
+    fn stateless_requests_accept_omitted_or_false_store() {
+        let request = stateless_request();
+        assert!(request.validate_stateless().is_ok());
+
+        let mut explicit_no_store = request;
+        explicit_no_store.store = Some(false);
+        assert!(explicit_no_store.validate_stateless().is_ok());
+    }
+
+    #[test]
+    fn stateless_requests_reject_persistent_response_fields() {
+        let mut store = stateless_request();
+        store.store = Some(true);
+        assert!(store
+            .validate_stateless()
+            .unwrap_err()
+            .contains("store: false"));
+
+        let mut conversation = stateless_request();
+        conversation.conversation = Some(ConversationReference::Id("conv_test".to_string()));
+        assert!(conversation
+            .validate_stateless()
+            .unwrap_err()
+            .contains("conversation"));
+
+        let mut previous_response = stateless_request();
+        previous_response.previous_response_id = Some("resp_test".to_string());
+        assert!(previous_response
+            .validate_stateless()
+            .unwrap_err()
+            .contains("previous_response_id"));
+
+        let mut background = stateless_request();
+        background.background = Some(true);
+        assert!(background
+            .validate_stateless()
+            .unwrap_err()
+            .contains("background"));
+    }
+
+    #[test]
+    fn stateless_requests_reject_stateful_inputs_and_tools() {
+        let mut input_file = stateless_request();
+        input_file.input = Some(ResponseInput::Items(vec![ResponseInputItem::Message {
+            role: "user".to_string(),
+            content: ResponseContent::Parts(vec![ResponseContentPart::InputFile {
+                file_id: "file_test".to_string(),
+                detail: None,
+            }]),
+            metadata: None,
+        }]));
+        assert!(input_file
+            .validate_stateless()
+            .unwrap_err()
+            .contains("input_file"));
+
+        let mut function_continuation = stateless_request();
+        function_continuation.input = Some(ResponseInput::Items(vec![
+            ResponseInputItem::FunctionCallOutput {
+                type_: FunctionCallOutputType::FunctionCallOutput,
+                call_id: "call_test".to_string(),
+                output: "{}".to_string(),
+            },
+        ]));
+        assert!(function_continuation
+            .validate_stateless()
+            .unwrap_err()
+            .contains("function continuation"));
+
+        let mut mcp_approval = stateless_request();
+        mcp_approval.input = Some(ResponseInput::Items(vec![
+            ResponseInputItem::McpApprovalResponse {
+                type_: McpApprovalResponseType::McpApprovalResponse,
+                approval_request_id: "apr_test".to_string(),
+                approve: true,
+            },
+        ]));
+        assert!(mcp_approval
+            .validate_stateless()
+            .unwrap_err()
+            .contains("MCP approval continuation"));
+
+        let mut file_search = stateless_request();
+        file_search.tools = Some(vec![ResponseTool::FileSearch {}]);
+        assert!(file_search
+            .validate_stateless()
+            .unwrap_err()
+            .contains("file_search"));
+
+        let mut function_tool = stateless_request();
+        function_tool.tools = Some(vec![ResponseTool::Function {
+            name: "lookup".to_string(),
+            description: None,
+            parameters: None,
+        }]);
+        assert!(function_tool
+            .validate_stateless()
+            .unwrap_err()
+            .contains("function tools"));
+
+        let mut code_interpreter = stateless_request();
+        code_interpreter.tools = Some(vec![ResponseTool::CodeInterpreter {}]);
+        assert!(code_interpreter
+            .validate_stateless()
+            .unwrap_err()
+            .contains("code_interpreter"));
+
+        let mut computer = stateless_request();
+        computer.tools = Some(vec![ResponseTool::Computer {}]);
+        assert!(computer
+            .validate_stateless()
+            .unwrap_err()
+            .contains("computer"));
+
+        let mut mcp_tool = stateless_request();
+        mcp_tool.tools = Some(vec![ResponseTool::Mcp {
+            server_label: "test".to_string(),
+            server_url: "https://example.com/mcp".to_string(),
+            server_description: None,
+            authorization: None,
+            require_approval: McpApprovalRequirement::Simple(McpApprovalMode::Always),
+            allowed_tools: None,
+        }]);
+        assert!(mcp_tool
+            .validate_stateless()
+            .unwrap_err()
+            .contains("require approval"));
     }
 }

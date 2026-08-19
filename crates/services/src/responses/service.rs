@@ -12,7 +12,7 @@ use crate::conversations::ports::ConversationServiceTrait;
 use crate::files::FileServiceTrait;
 use crate::inference_provider_pool::InferenceProviderPool;
 use crate::responses::tools;
-use crate::responses::{citation_tracker, errors, models, ports};
+use crate::responses::{citation_tracker, errors, models, ports, transient};
 
 use tools::{ERROR_TOOL_TYPE, MAX_CONSECUTIVE_TOOL_FAILURES};
 
@@ -157,26 +157,26 @@ impl ports::ResponseServiceTrait for ResponseServiceImpl {
         use futures::channel::mpsc;
         use futures::SinkExt;
 
-        // Validate: function_call_output items require a previous_response_id
-        let has_function_outputs = match &request.input {
-            Some(models::ResponseInput::Items(items)) => {
-                items.iter().any(|item| item.is_function_call_output())
-            }
-            _ => false,
-        };
-        if has_function_outputs && request.previous_response_id.is_none() {
-            return Err(errors::ResponseError::InvalidParams(
-                "function_call_output requires previous_response_id to resume a response"
-                    .to_string(),
-            ));
-        }
+        // Defend the service boundary as well as the HTTP route: this service
+        // only executes a single stateless request and never uses the
+        // persistent response repositories supplied to ResponseServiceImpl.
+        request
+            .validate()
+            .and_then(|_| request.validate_stateless())
+            .map_err(errors::ResponseError::InvalidParams)?;
+        let mut request = request;
+        request.store = Some(false);
+        request.background = Some(false);
 
         // Create a channel for streaming events
         let (mut tx, rx) = mpsc::unbounded::<models::ResponseStreamEvent>();
 
+        // Each request gets its own in-memory repositories. This preserves the
+        // existing event and tool execution flow without creating, reading, or
+        // updating rows in `responses` or `response_items`.
+        let (response_repository, response_items_repository) = transient::repositories();
+
         // Clone necessary references for the async task
-        let response_repository = self.response_repository.clone();
-        let response_items_repository = self.response_items_repository.clone();
         let completion_service = self.completion_service.clone();
         let conversation_service = self.conversation_service.clone();
         let web_search_provider = self.web_search_provider.clone();
@@ -1469,7 +1469,9 @@ impl ResponseServiceImpl {
                 metadata: process_context.request.metadata.clone(),
                 store: process_context.request.store,
                 body_hash: process_context.body_hash.to_string(),
-                response_id: Some(ctx.response_id.clone()),
+                // The response ID is an in-memory event identifier only. Do
+                // not link usage records to a database response row.
+                response_id: None,
                 skip_provider_chat_signature: false,
                 original_request: None,
                 n: None,

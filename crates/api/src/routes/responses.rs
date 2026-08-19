@@ -1,95 +1,23 @@
 use crate::{
     middleware::{auth::AuthenticatedApiKey, RequestBodyHash, RequestCorrelation},
-    models::{ErrorResponse, ResponseInputItemList},
-    routes::common::{HEADER_SHOULD_RETRY, SHOULD_RETRY_FALSE},
+    models::ErrorResponse,
     routes::extractors::OpenAiJson,
 };
 use axum::{
     body::Body,
-    extract::{Extension, Path, Query, State},
-    http::{header, HeaderMap, Response, StatusCode},
+    extract::{Extension, State},
+    http::{header, HeaderMap, HeaderValue, Response, StatusCode},
     response::{IntoResponse, Json as ResponseJson},
 };
 use bytes::Bytes;
 use futures::stream::StreamExt;
-use serde::Deserialize;
-use services::attestation::ports::AttestationServiceTrait;
 use services::responses::errors::ResponseError as ServiceResponseError;
 use services::responses::models::*;
 use services::responses::ports::ResponseServiceTrait;
 use services::responses::service::ResponseServiceImpl;
-use sha2::{Digest, Sha256};
 use std::convert::Infallible;
 use std::sync::Arc;
 use tracing::debug;
-use uuid::Uuid;
-
-type NotImplementedErrorResponse = (
-    StatusCode,
-    [(&'static str, &'static str); 1],
-    ResponseJson<ErrorResponse>,
-);
-
-fn not_implemented_error(message: impl Into<String>) -> NotImplementedErrorResponse {
-    (
-        StatusCode::NOT_IMPLEMENTED,
-        [(HEADER_SHOULD_RETRY, SHOULD_RETRY_FALSE)],
-        ResponseJson(ErrorResponse::new(
-            message.into(),
-            "not_implemented".to_string(),
-        )),
-    )
-}
-
-#[cfg(test)]
-mod tests {
-    use super::not_implemented_error;
-    use crate::routes::common::{HEADER_SHOULD_RETRY, SHOULD_RETRY_FALSE};
-    use axum::{http::StatusCode, response::IntoResponse};
-
-    #[test]
-    fn not_implemented_error_disables_sdk_retries() {
-        let response = not_implemented_error("Permanent error").into_response();
-
-        assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
-        assert_eq!(
-            response
-                .headers()
-                .get(HEADER_SHOULD_RETRY)
-                .and_then(|value| value.to_str().ok()),
-            Some(SHOULD_RETRY_FALSE)
-        );
-    }
-}
-
-// Helper function to convert service ResponseContentItem to API ResponseContentPart (input-only)
-fn convert_to_input_part(
-    item: services::responses::models::ResponseContentItem,
-) -> Option<crate::models::ResponseContentPart> {
-    match item {
-        ResponseContentItem::InputText { text } => {
-            Some(crate::models::ResponseContentPart::InputText { text })
-        }
-        ResponseContentItem::InputImage { image_url, detail } => {
-            Some(crate::models::ResponseContentPart::InputImage { image_url, detail })
-        }
-        ResponseContentItem::InputFile { file_id, detail } => {
-            Some(crate::models::ResponseContentPart::InputFile { file_id, detail })
-        }
-        ResponseContentItem::OutputText { text, .. } => {
-            // Backward compatibility: check for legacy file reference
-            match crate::routes::common::parse_legacy_file_reference(&text) {
-                Ok(Some(file_id)) => Some(crate::models::ResponseContentPart::InputFile {
-                    file_id,
-                    detail: None,
-                }),
-                Ok(None) | Err(_) => Some(crate::models::ResponseContentPart::InputText { text }),
-            }
-        }
-        ResponseContentItem::ToolCalls { .. } => None,
-        ResponseContentItem::OutputImage { .. } => None,
-    }
-}
 
 // Helper functions for error mapping
 fn map_response_error_to_status(error: &ServiceResponseError) -> StatusCode {
@@ -133,11 +61,11 @@ fn error_response_from_response_event(
     response
 }
 
-/// Compute SHA256 hash of data
-fn compute_sha256(data: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(data);
-    hex::encode(hasher.finalize())
+fn with_no_store_cache_header(mut response: axum::response::Response) -> axum::response::Response {
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
 }
 
 impl From<ServiceResponseError> for ErrorResponse {
@@ -226,12 +154,30 @@ impl From<ServiceResponseError> for ErrorResponse {
 #[derive(Clone)]
 pub struct ResponseRouteState {
     pub response_service: Arc<ResponseServiceImpl>,
-    pub attestation_service: Arc<dyn AttestationServiceTrait>,
+}
+
+/// Return an explicit migration response for the retired response-history API.
+///
+/// The route is mounted behind the standard API-key middleware.  Keeping it
+/// separate from the create endpoint makes it clear that only a new, single
+/// stateless request is supported.
+pub async fn response_history_gone() -> axum::response::Response {
+    with_no_store_cache_header(
+        (
+            StatusCode::GONE,
+            ResponseJson(ErrorResponse::new(
+                "Response history is unavailable because the Responses API is stateless."
+                    .to_string(),
+                "gone".to_string(),
+            )),
+        )
+            .into_response(),
+    )
 }
 
 /// Create response
 ///
-/// Generate an AI response for a conversation with tool calling and streaming support.
+/// Generate a single-turn, stateless AI response with optional streaming.
 #[utoipa::path(
     post,
     path = "/v1/responses",
@@ -257,7 +203,6 @@ pub async fn create_response(
     OpenAiJson(mut request): OpenAiJson<CreateResponseRequest>,
 ) -> axum::response::Response {
     let service = state.response_service.clone();
-    let attestation_service = state.attestation_service.clone();
     debug!(
         "Create response request from api key: {:?}",
         api_key.api_key.id
@@ -265,20 +210,35 @@ pub async fn create_response(
 
     // Validate the request
     if let Err(error) = request.validate() {
-        return (
-            StatusCode::BAD_REQUEST,
-            ResponseJson(ErrorResponse::new(
-                error,
-                "invalid_request_error".to_string(),
-            )),
-        )
-            .into_response();
+        return with_no_store_cache_header(
+            (
+                StatusCode::BAD_REQUEST,
+                ResponseJson(ErrorResponse::new(
+                    error,
+                    "invalid_request_error".to_string(),
+                )),
+            )
+                .into_response(),
+        );
+    }
+
+    if let Err(error) = request.validate_stateless() {
+        return with_no_store_cache_header(
+            (
+                StatusCode::BAD_REQUEST,
+                ResponseJson(ErrorResponse::new(
+                    error,
+                    "invalid_request_error".to_string(),
+                )),
+            )
+                .into_response(),
+        );
     }
 
     // Extract and validate encryption headers if present
     let encryption_headers = match crate::routes::common::validate_encryption_headers(&headers) {
         Ok(headers) => headers,
-        Err(err) => return err.into_response(),
+        Err(err) => return with_no_store_cache_header(err.into_response()),
     };
 
     let signing_algo = encryption_headers.signing_algo;
@@ -289,19 +249,22 @@ pub async fn create_response(
     // Encryption requires streaming mode because encrypted chunks from vLLM are independently
     // encrypted and cannot be concatenated. Non-streaming mode would produce corrupted data.
     if signing_algo.is_some() && client_pub_key.is_some() && request.stream != Some(true) {
-        return (
-            StatusCode::BAD_REQUEST,
-            ResponseJson(ErrorResponse::new(
-                "Non-streaming mode is not supported with encryption. Use stream=true.".to_string(),
-                "encryption_requires_streaming".to_string(),
-            )),
-        )
-            .into_response();
+        return with_no_store_cache_header(
+            (
+                StatusCode::BAD_REQUEST,
+                ResponseJson(ErrorResponse::new(
+                    "Non-streaming mode is not supported with encryption. Use stream=true."
+                        .to_string(),
+                    "encryption_requires_streaming".to_string(),
+                )),
+            )
+                .into_response(),
+        );
     }
 
     // Set defaults for internal fields
     request.max_tool_calls = request.max_tool_calls.or(Some(10));
-    request.store = request.store.or(Some(true));
+    request.store = Some(false);
     request.background = request.background.or(Some(false));
     request.reasoning = request
         .reasoning
@@ -338,88 +301,23 @@ pub async fn create_response(
             Ok(stream) => {
                 tracing::debug!(
                     user_id = %api_key.api_key.created_by_user_id.0,
-                    "Successfully created streaming response, returning SSE stream with signature accumulation"
+                    "Successfully created streaming response"
                 );
 
-                // Shared state for accumulating bytes and tracking response_id
-                let accumulated_bytes = Arc::new(tokio::sync::Mutex::new(Vec::new()));
-                let response_id_state = Arc::new(tokio::sync::Mutex::new(None::<String>));
-                let request_hash = body_hash.hash.clone();
-
-                // Clone for closures
-                let accumulated_clone = accumulated_bytes.clone();
-                let response_id_clone = response_id_state.clone();
-                let attestation_clone = attestation_service.clone();
-
-                // Format events as SSE bytes and accumulate them
-                let byte_stream = stream.then(move |event| {
-                    let accumulated_inner = accumulated_clone.clone();
-                    let response_id_inner = response_id_clone.clone();
-                    let attestation_inner = attestation_clone.clone();
-                    let request_hash_inner = request_hash.clone();
-                    async move {
-                        // Extract response_id from response.created event
-                        if event.event_type == "response.created" {
-                            if let Some(ref response) = event.response {
-                                let mut rid = response_id_inner.lock().await;
-                                if rid.is_none() {
-                                    *rid = Some(response.id.clone());
-                                    tracing::debug!("Extracted response_id: {}", response.id);
-                                }
-                            }
-                        }
-
-                        // Format as SSE: "event: {type}\ndata: {json}\n\n"
-                        let json = serde_json::to_string(&event)
-                            .expect("event serialization failed");
-                        let sse_bytes = format!("event: {}\ndata: {}\n\n", event.event_type, json);
-                        let bytes = Bytes::from(sse_bytes);
-
-                        // Accumulate bytes synchronously - this ensures all bytes are captured
-                        // before the stream chunk is yielded to the client
-                        accumulated_inner.lock().await.extend_from_slice(&bytes);
-
-                        // Check if stream is completing - store signature
-                        if event.event_type == "response.completed" {
-                            // At this point, all bytes have been accumulated synchronously
-                            // Now we can safely compute the hash and store the signature
-                            let bytes_accumulated = accumulated_inner.lock().await.clone();
-                            let response_hash = compute_sha256(&bytes_accumulated);
-                            if let Some(rid) = response_id_inner.lock().await.as_ref() {
-                                let rid = rid.clone();
-                                let req_hash = request_hash_inner.clone();
-                                let attest = attestation_inner.clone();
-                                tracing::debug!(
-                                    "Storing signature for response_id: {}, request_hash: {}, response_hash: {}",
-                                    rid, req_hash, response_hash
-                                );
-
-                                // Spawn task to store signature asynchronously (doesn't block stream)
-                                // but we've already computed the hash with complete data
-                                tokio::spawn(async move {
-                                    // Store both ECDSA and ED25519 signatures
-                                    if let Err(e) = attest.store_response_signature(
-                                        &rid,
-                                        req_hash.clone(),
-                                        response_hash.clone(),
-                                    ).await {
-                                        tracing::error!("Failed to store response signature: {}", e);
-                                    } else {
-                                        tracing::debug!("Successfully stored signature for response_id: {}", rid);
-                                    }
-                                });
-                            }
-                        }
-
-                        Ok::<Bytes, Infallible>(bytes)
-                    }
+                // Format events as SSE without retaining the stream payload or
+                // writing a response attestation. A no-store response has no
+                // durable response record to associate with such data.
+                let byte_stream = stream.map(|event| {
+                    let json = serde_json::to_string(&event).expect("event serialization failed");
+                    let sse_bytes = format!("event: {}\ndata: {}\n\n", event.event_type, json);
+                    Ok::<Bytes, Infallible>(Bytes::from(sse_bytes))
                 });
 
                 // Return as raw byte stream with SSE headers
                 Response::builder()
                     .status(StatusCode::OK)
                     .header(header::CONTENT_TYPE, "text/event-stream")
-                    .header(header::CACHE_CONTROL, "no-cache")
+                    .header(header::CACHE_CONTROL, "no-store")
                     .header(header::CONNECTION, "keep-alive")
                     .body(Body::from_stream(byte_stream))
                     .unwrap()
@@ -432,7 +330,9 @@ pub async fn create_response(
                     "Failed to create streaming response"
                 );
                 let status_code = map_response_error_to_status(&error);
-                (status_code, ResponseJson::<ErrorResponse>(error.into())).into_response()
+                with_no_store_cache_header(
+                    (status_code, ResponseJson::<ErrorResponse>(error.into())).into_response(),
+                )
             }
         }
     } else {
@@ -582,7 +482,9 @@ pub async fn create_response(
                     if let Some(error) = failed_error {
                         let status_code = status_code_from_response_event(failed_status_code);
                         let error_response = error_response_from_response_event(error);
-                        return (status_code, ResponseJson(error_response)).into_response();
+                        return with_no_store_cache_header(
+                            (status_code, ResponseJson(error_response)).into_response(),
+                        );
                     }
                 }
 
@@ -594,26 +496,15 @@ pub async fn create_response(
                     // Fallback: Build response from collected data (for compatibility)
                     // Trim accumulated content to remove leading/trailing whitespace
                     let trimmed_content = content.trim().to_string();
-                    let resp_id =
-                        response_id.unwrap_or_else(|| format!("resp_{}", Uuid::new_v4().simple()));
+                    let resp_id = response_id
+                        .unwrap_or_else(|| format!("resp_{}", uuid::Uuid::new_v4().simple()));
                     ResponseObject {
                         id: resp_id.clone(),
                         object: "response".to_string(),
                         created_at: chrono::Utc::now().timestamp(),
                         status,
-                        background: request.background.unwrap_or(false),
-                        conversation: request.conversation.as_ref().map(|conv_ref| {
-                            let id = match conv_ref {
-                                services::responses::models::ConversationReference::Id(id) => {
-                                    id.clone()
-                                }
-                                services::responses::models::ConversationReference::Object {
-                                    id,
-                                    ..
-                                } => id.clone(),
-                            };
-                            services::responses::models::ConversationResponseReference { id }
-                        }),
+                        background: false,
+                        conversation: None,
                         error: None,
                         incomplete_details: None,
                         instructions: request.instructions,
@@ -621,9 +512,9 @@ pub async fn create_response(
                         max_tool_calls: request.max_tool_calls,
                         model: request.model.clone(),
                         output: vec![ResponseOutputItem::Message {
-                            id: format!("msg_{}", Uuid::new_v4().simple()),
+                            id: format!("msg_{}", uuid::Uuid::new_v4().simple()),
                             response_id: resp_id.clone(),
-                            previous_response_id: request.previous_response_id.clone(),
+                            previous_response_id: None,
                             next_response_ids: vec![],
                             created_at: chrono::Utc::now().timestamp(),
                             status: ResponseItemStatus::Completed,
@@ -637,14 +528,14 @@ pub async fn create_response(
                             metadata: None,
                         }],
                         parallel_tool_calls: request.parallel_tool_calls.unwrap_or(false),
-                        previous_response_id: request.previous_response_id.clone(),
+                        previous_response_id: None,
                         next_response_ids: vec![],
                         prompt_cache_key: request.prompt_cache_key,
                         prompt_cache_retention: None,
                         reasoning: None,
                         safety_identifier: request.safety_identifier,
                         service_tier: "default".to_string(),
-                        store: request.store.unwrap_or(false),
+                        store: false,
                         temperature: request.temperature.unwrap_or(1.0),
                         tool_choice: ResponseToolChoiceOutput::Auto("auto".to_string()),
                         tools: request.tools.unwrap_or_default(),
@@ -662,23 +553,7 @@ pub async fn create_response(
                     response.id, api_key.api_key.created_by_user_id.0
                 );
 
-                // Store signature for non-streaming response
-                let response_id = response.id.clone();
-                let response_json =
-                    serde_json::to_string(&response).expect("response serialization failed");
-                let response_hash = compute_sha256(response_json.as_bytes());
-
-                if let Err(e) = attestation_service
-                    .store_response_signature(&response_id, body_hash.hash.clone(), response_hash)
-                    .await
-                {
-                    tracing::error!(
-                        "Failed to store response signature for non-streaming: {}",
-                        e
-                    );
-                }
-
-                (StatusCode::OK, ResponseJson(response)).into_response()
+                with_no_store_cache_header((StatusCode::OK, ResponseJson(response)).into_response())
             }
             Err(error) => {
                 tracing::error!(
@@ -688,262 +563,40 @@ pub async fn create_response(
                     "Failed to create non-streaming response"
                 );
                 let status_code = map_response_error_to_status(&error);
-                (status_code, ResponseJson::<ErrorResponse>(error.into())).into_response()
+                with_no_store_cache_header(
+                    (status_code, ResponseJson::<ErrorResponse>(error.into())).into_response(),
+                )
             }
         }
     }
 }
 
-/// Get a response by ID
-///
-/// Retrieve details of a specific response.
-#[utoipa::path(
-    get,
-    path = "/v1/responses/{response_id}",
-    tag = "Responses",
-    params(
-        ("response_id" = String, Path, description = "Response ID")
-    ),
-    responses(
-        (status = 200, description = "Response details", body = ResponseObject),
-        (status = 401, description = "Invalid or missing API key", body = ErrorResponse),
-        (status = 404, description = "Response not found", body = ErrorResponse),
-        (status = 501, description = "Not implemented", body = ErrorResponse)
-    ),
-    security(
-        ("api_key" = [])
-    )
-)]
-pub async fn get_response(
-    Path(_response_id): Path<String>,
-    Query(_params): Query<GetResponseQuery>,
-    State(_state): State<ResponseRouteState>,
-    Extension(_api_key): Extension<AuthenticatedApiKey>,
-) -> Result<ResponseJson<ResponseObject>, NotImplementedErrorResponse> {
-    // TODO: Implement get_response method in ResponseService
-    Err(not_implemented_error("Get response not yet implemented"))
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-/// Delete a response
-///
-/// Delete a specific response.
-#[utoipa::path(
-    delete,
-    path = "/v1/responses/{response_id}",
-    tag = "Responses",
-    params(
-        ("response_id" = String, Path, description = "Response ID")
-    ),
-    responses(
-        (status = 200, description = "Response deleted successfully"),
-        (status = 401, description = "Invalid or missing API key", body = ErrorResponse),
-        (status = 404, description = "Response not found", body = ErrorResponse),
-        (status = 501, description = "Not implemented", body = ErrorResponse)
-    ),
-    security(
-        ("api_key" = [])
-    )
-)]
-pub async fn delete_response(
-    Path(_response_id): Path<String>,
-    State(_state): State<ResponseRouteState>,
-    Extension(_api_key): Extension<AuthenticatedApiKey>,
-) -> Result<ResponseJson<ResponseDeleteResult>, NotImplementedErrorResponse> {
-    // TODO: Implement delete_response method in ResponseService
-    Err(not_implemented_error("Delete response not yet implemented"))
-}
-
-/// Cancel a response (for background responses)
-///
-/// Cancel an in-progress background response.
-#[utoipa::path(
-    post,
-    path = "/v1/responses/{response_id}/cancel",
-    tag = "Responses",
-    params(
-        ("response_id" = String, Path, description = "Response ID")
-    ),
-    responses(
-        (status = 200, description = "Response cancelled successfully", body = ResponseObject),
-        (status = 401, description = "Invalid or missing API key", body = ErrorResponse),
-        (status = 404, description = "Response not found", body = ErrorResponse),
-        (status = 501, description = "Not implemented", body = ErrorResponse)
-    ),
-    security(
-        ("api_key" = [])
-    )
-)]
-pub async fn cancel_response(
-    Path(_response_id): Path<String>,
-    State(_state): State<ResponseRouteState>,
-    Extension(_api_key): Extension<AuthenticatedApiKey>,
-) -> Result<ResponseJson<ResponseObject>, NotImplementedErrorResponse> {
-    // TODO: Implement cancel_response method in ResponseService
-    Err(not_implemented_error("Cancel response not yet implemented"))
-}
-
-/// List input items for a response
-///
-/// Retrieve all input items (user messages and files) for a specific response.
-#[utoipa::path(
-    get,
-    path = "/v1/responses/{response_id}/input_items",
-    tag = "Responses",
-    params(
-        ("response_id" = String, Path, description = "Response ID")
-    ),
-    responses(
-        (status = 200, description = "List of input items", body = ResponseInputItemList),
-        (status = 400, description = "Invalid response ID", body = ErrorResponse),
-        (status = 401, description = "Invalid or missing API key", body = ErrorResponse),
-        (status = 404, description = "Response not found", body = ErrorResponse),
-        (status = 500, description = "Server error", body = ErrorResponse)
-    ),
-    security(
-        ("api_key" = [])
-    )
-)]
-pub async fn list_input_items(
-    Path(response_id): Path<String>,
-    Query(params): Query<ListInputItemsQuery>,
-    State(state): State<ResponseRouteState>,
-    Extension(auth): Extension<AuthenticatedApiKey>,
-) -> Result<ResponseJson<ResponseInputItemList>, (StatusCode, ResponseJson<ErrorResponse>)> {
-    let service = state.response_service.clone();
-    debug!(
-        "List input items for response {} from workspace {}",
-        response_id, auth.workspace.id.0
-    );
-
-    // Parse response ID (format: "resp_{uuid}")
-    let response_uuid = response_id
-        .strip_prefix("resp_")
-        .unwrap_or(&response_id)
-        .parse::<Uuid>()
-        .map_err(|_| {
-            (
-                StatusCode::BAD_REQUEST,
-                ResponseJson(ErrorResponse::new(
-                    "Invalid response ID format".to_string(),
-                    "invalid_request_error".to_string(),
-                )),
-            )
-        })?;
-
-    let parsed_response_id = ResponseId(response_uuid);
-
-    // Verify the response belongs to this workspace
-    match service
-        .response_repository
-        .get_by_id(parsed_response_id.clone(), auth.workspace.id.clone())
-        .await
-    {
-        Ok(Some(_)) => {
-            // Response exists and belongs to workspace, proceed
-        }
-        Ok(None) => {
-            return Err((
-                StatusCode::NOT_FOUND,
-                ResponseJson(ErrorResponse::new(
-                    "Response not found".to_string(),
-                    "not_found".to_string(),
-                )),
-            ));
-        }
-        Err(e) => {
-            return Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                ResponseJson(ErrorResponse::new(
-                    format!("Failed to fetch response: {e}"),
-                    "internal_server_error".to_string(),
-                )),
-            ));
-        }
+    #[test]
+    fn response_results_are_marked_no_store() {
+        let response = with_no_store_cache_header(StatusCode::OK.into_response());
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CACHE_CONTROL)
+                .and_then(|value| value.to_str().ok()),
+            Some("no-store")
+        );
     }
 
-    // Get all response items
-    let items = service
-        .response_items_repository
-        .list_by_response(parsed_response_id)
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                ResponseJson(ErrorResponse::new(
-                    format!("Failed to fetch response items: {e}"),
-                    "internal_server_error".to_string(),
-                )),
-            )
-        })?;
-
-    // Filter to only user input items and convert to API format
-    let mut input_items: Vec<crate::models::ResponseInputItem> = Vec::new();
-
-    for item in items {
-        if let ResponseOutputItem::Message {
-            role,
-            content,
-            metadata,
-            ..
-        } = item
-        {
-            if role == "user" {
-                // Convert service ResponseContentItem to API ResponseContentPart (input-only)
-                // This provides type safety - only input variants can exist here
-                let api_content: Vec<crate::models::ResponseContentPart> = content
-                    .into_iter()
-                    .filter_map(convert_to_input_part)
-                    .collect();
-
-                input_items.push(crate::models::ResponseInputItem {
-                    role,
-                    content: crate::models::ResponseContent::Parts(api_content),
-                    metadata,
-                });
-            }
-        }
+    #[tokio::test]
+    async fn response_history_is_explicitly_gone() {
+        let response = response_history_gone().await;
+        assert_eq!(response.status(), StatusCode::GONE);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CACHE_CONTROL)
+                .and_then(|value| value.to_str().ok()),
+            Some("no-store")
+        );
     }
-
-    // Apply pagination if needed (for now, return all)
-    let limit = params.limit.unwrap_or(100).min(1000);
-    let has_more = input_items.len() > limit as usize;
-    let input_items: Vec<_> = input_items.into_iter().take(limit as usize).collect();
-
-    let first_id = if input_items.is_empty() {
-        String::new()
-    } else {
-        "0".to_string()
-    };
-    let last_id = if input_items.is_empty() {
-        String::new()
-    } else {
-        (input_items.len() - 1).to_string()
-    };
-
-    Ok(ResponseJson(ResponseInputItemList {
-        object: "list".to_string(),
-        data: input_items,
-        first_id,
-        last_id,
-        has_more,
-    }))
-}
-
-// Query parameter structs
-#[derive(Debug, Deserialize)]
-pub struct GetResponseQuery {
-    #[serde(default)]
-    pub include: Vec<String>,
-    #[serde(default)]
-    pub include_obfuscation: Option<bool>,
-    pub starting_after: Option<i64>,
-    pub stream: Option<bool>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct ListInputItemsQuery {
-    pub after: Option<String>,
-    pub include: Option<Vec<String>>,
-    pub limit: Option<i64>,
-    pub order: Option<String>, // "asc" or "desc"
 }

@@ -25,7 +25,7 @@ use utoipa::{Modify, OpenApi};
         (name = "Score", description = "Text similarity scoring endpoints"),
         (name = "Privacy", description = "Privacy classification (PII span detection) endpoints"),
         (name = "Models", description = "Public model catalog and information"),
-        (name = "Responses", description = "Response handling and streaming"),
+        (name = "Responses", description = "Single-turn, stateless response inference. Response and item content are not persisted; billing, rate limiting, and operations retain only the minimum non-content metadata."),
         (name = "Organizations", description = "Organization management"),
         (name = "Organization Members", description = "Organization member and invitation management"),
         (name = "Workspaces", description = "Workspace and API key management"),
@@ -58,10 +58,6 @@ use utoipa::{Modify, OpenApi};
         crate::routes::models::get_model_by_name,
         // Response endpoints
         crate::routes::responses::create_response,
-        crate::routes::responses::get_response,
-        crate::routes::responses::delete_response,
-        crate::routes::responses::cancel_response,
-        crate::routes::responses::list_input_items,
         // Organization endpoints
         crate::routes::organizations::list_organizations,
         crate::routes::organizations::create_organization,

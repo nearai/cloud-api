@@ -401,8 +401,8 @@ impl CitationTracker {
         // If there's pending token_buffer (incomplete tag at end), treat as literal
         if !self.token_buffer.is_empty() {
             tracing::debug!(
-                "CitationTracker: Flushing incomplete token_buffer at finalize: token_buffer_len={}",
-                self.token_buffer.len()
+                token_buffer_len = self.token_buffer.len(),
+                "CitationTracker: Flushing incomplete token buffer at finalize"
             );
             let buffer_content = self.token_buffer.clone();
             let _ = self.do_flush_to_clean_text(&buffer_content);

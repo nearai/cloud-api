@@ -262,3 +262,40 @@ async fn responses_rejects_non_standard_processing_tiers() {
     assert_eq!(response.status_code(), 400, "{}", response.text());
     assert!(response.text().contains("service_tier"));
 }
+
+#[tokio::test]
+async fn admin_rejects_conflicting_or_unprojectable_text_pricing() {
+    ensure_env();
+    let server = setup_test_server().await;
+    let model = format!("openai/pricing-validation-{}", uuid::Uuid::new_v4());
+
+    let conflicting_body = std::collections::HashMap::from([(
+        model.clone(),
+        json!({
+            "textPricing": profile_json(),
+            "inputCostPerToken": {"amount": 1, "currency": "USD"}
+        }),
+    )]);
+    let conflicting = server
+        .patch("/v1/admin/models")
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .add_header("User-Agent", MOCK_USER_AGENT)
+        .json(&conflicting_body)
+        .await;
+    assert_eq!(conflicting.status_code(), 400, "{}", conflicting.text());
+    assert!(conflicting.text().contains("cannot be combined"));
+
+    let mut unprojectable = profile_json();
+    unprojectable["tiers"]["default"]["short"]["uncachedInput"] =
+        Value::String("10000000000000000".to_string());
+    let overflow_body =
+        std::collections::HashMap::from([(model, json!({"textPricing": unprojectable}))]);
+    let overflow = server
+        .patch("/v1/admin/models")
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .add_header("User-Agent", MOCK_USER_AGENT)
+        .json(&overflow_body)
+        .await;
+    assert_eq!(overflow.status_code(), 400, "{}", overflow.text());
+    assert!(overflow.text().contains("exceeds i64"));
+}

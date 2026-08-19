@@ -246,18 +246,29 @@ impl TextPricingProfile {
         }
     }
 
-    fn highest_rates(&self, band: TextContextBand) -> Result<TextTokenRates, UsageError> {
+    fn highest_rates(&self) -> Result<TextTokenRates, UsageError> {
+        // A missing tier/band or an unknown provider tier is a critical
+        // fail-safe path. Scan every configured tier and band so a short-only
+        // Priority rate cannot be undercut by a cheaper long-context tier.
         let candidates: Vec<&TextTokenRates> = [
-            self.rates(TextServiceTier::Default, band),
-            self.rates(TextServiceTier::Flex, band),
-            self.rates(TextServiceTier::Priority, band),
+            Some(&self.tiers.default.short),
+            self.tiers.default.long.as_ref(),
+            self.tiers.flex.as_ref().map(|tier| &tier.short),
+            self.tiers.flex.as_ref().and_then(|tier| tier.long.as_ref()),
+            self.tiers.priority.as_ref().map(|tier| &tier.short),
+            self.tiers
+                .priority
+                .as_ref()
+                .and_then(|tier| tier.long.as_ref()),
         ]
         .into_iter()
         .flatten()
         .collect();
-        let first = candidates.first().ok_or_else(|| {
-            UsageError::ValidationError(format!("textPricing has no {} rates", band.as_str()))
-        })?;
+        if candidates.is_empty() {
+            return Err(UsageError::ValidationError(
+                "textPricing has no configured rates".to_string(),
+            ));
+        }
 
         fn highest(
             candidates: &[&TextTokenRates],
@@ -275,7 +286,6 @@ impl TextPricingProfile {
             Ok(selected)
         }
 
-        let _ = first;
         Ok(TextTokenRates {
             uncached_input: highest(&candidates, |rates| &rates.uncached_input)?,
             cached_input: highest(&candidates, |rates| &rates.cached_input)?,
@@ -376,7 +386,7 @@ pub fn compute_profiled_text_cost(
                 ),
                 None => (
                     requested_tier,
-                    profile.highest_rates(band)?,
+                    profile.highest_rates()?,
                     "highest_configured".to_string(),
                     Some("forwarded_tier_context_band_not_priced".to_string()),
                 ),
@@ -390,13 +400,13 @@ pub fn compute_profiled_text_cost(
                 ),
                 Ok(actual) => (
                     actual,
-                    profile.highest_rates(band)?,
+                    profile.highest_rates()?,
                     "highest_configured".to_string(),
                     Some("returned_tier_not_priced".to_string()),
                 ),
                 Err(_) => (
                     requested_tier,
-                    profile.highest_rates(band)?,
+                    profile.highest_rates()?,
                     "highest_configured".to_string(),
                     Some("unknown_provider_tier".to_string()),
                 ),
@@ -743,7 +753,7 @@ mod tests {
             &profile(),
         )
         .unwrap();
-        assert_eq!(result.cost.total_cost, 10_000_000);
+        assert_eq!(result.cost.total_cost, 20_000_000);
         assert_eq!(result.snapshot.priced_tier, "highest_configured");
         assert_eq!(
             result.snapshot.critical_fallback_reason.as_deref(),
@@ -805,6 +815,46 @@ mod tests {
         assert_eq!(
             result.snapshot.critical_fallback_reason.as_deref(),
             Some("returned_tier_not_priced")
+        );
+    }
+
+    #[test]
+    fn short_only_priority_long_fallback_never_uses_cheaper_long_rates() {
+        let mut profile = profile();
+        profile.tiers.priority.as_mut().unwrap().long = None;
+        let result = compute_profiled_text_cost(
+            272_001,
+            1,
+            0,
+            0,
+            TextServiceTier::Priority,
+            Some("priority"),
+            &profile,
+        )
+        .unwrap();
+
+        assert_eq!(result.snapshot.rates.uncached_input, "10.00");
+        assert_eq!(result.snapshot.rates.output, "60.00");
+        assert_eq!(result.snapshot.priced_tier, "highest_configured");
+        assert_eq!(
+            result.snapshot.critical_fallback_reason.as_deref(),
+            Some("returned_tier_not_priced")
+        );
+    }
+
+    #[test]
+    fn tier_removed_in_flight_falls_back_instead_of_dropping_usage() {
+        let mut profile = profile();
+        profile.tiers.priority = None;
+        let result =
+            compute_profiled_text_cost(1_000, 0, 0, 0, TextServiceTier::Priority, None, &profile)
+                .unwrap();
+
+        assert_eq!(result.snapshot.actual_tier, "priority");
+        assert_eq!(result.snapshot.priced_tier, "highest_configured");
+        assert_eq!(
+            result.snapshot.critical_fallback_reason.as_deref(),
+            Some("forwarded_tier_context_band_not_priced")
         );
     }
 

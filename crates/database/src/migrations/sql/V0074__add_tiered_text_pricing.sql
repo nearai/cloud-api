@@ -23,8 +23,8 @@ ALTER TABLE organization_usage_log
     ADD COLUMN service_tier TEXT,
     ADD COLUMN context_band TEXT,
     ADD CONSTRAINT usage_billing_details_object
-        CHECK (billing_details IS NULL OR jsonb_typeof(billing_details) = 'object'),
+        CHECK (billing_details IS NULL OR jsonb_typeof(billing_details) = 'object') NOT VALID,
     ADD CONSTRAINT usage_service_tier_known
-        CHECK (service_tier IS NULL OR service_tier IN ('default', 'flex', 'priority')),
+        CHECK (service_tier IS NULL OR service_tier IN ('default', 'flex', 'priority')) NOT VALID,
     ADD CONSTRAINT usage_context_band_known
-        CHECK (context_band IS NULL OR context_band IN ('short', 'long'));
+        CHECK (context_band IS NULL OR context_band IN ('short', 'long')) NOT VALID;

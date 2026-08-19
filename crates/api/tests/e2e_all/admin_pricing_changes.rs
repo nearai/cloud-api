@@ -233,6 +233,22 @@ async fn test_validation_errors() {
     assert_eq!(resp.status_code(), 400, "{}", resp.text());
     assert!(resp.text().contains("at least one pricing field"));
 
+    // A profile is the source of truth for its legacy projection; accepting
+    // both shapes would make it ambiguous which requested prices were applied.
+    let resp = post_pricing_changes(
+        &server,
+        "preview",
+        serde_json::json!({ "changes": [{
+            "modelId": model,
+            "effectiveAt": "2030-01-01",
+            "inputCostPerToken": { "amount": 1_500, "currency": "USD" },
+            "textPricing": scheduled_text_pricing()
+        }] }),
+    )
+    .await;
+    assert_eq!(resp.status_code(), 400, "{}", resp.text());
+    assert!(resp.text().contains("cannot be combined"));
+
     // Negative amount
     let resp = post_pricing_changes(
         &server,

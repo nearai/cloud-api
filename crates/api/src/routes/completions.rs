@@ -2816,7 +2816,7 @@ fn model_with_pricing_to_info(model: services::models::ModelWithPricing) -> Mode
         pricing: Some(pricing),
         text_pricing: model
             .text_pricing
-            .map(|profile| serde_json::to_value(profile).expect("text pricing serializes")),
+            .map(|profile| serde_json::to_value(profile).unwrap_or(serde_json::Value::Null)),
         context_length: Some(model.context_length),
         max_output_length: model.max_output_length,
         architecture,

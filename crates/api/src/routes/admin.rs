@@ -551,7 +551,31 @@ pub async fn batch_upsert_models(
             "cacheReadCostPerToken",
         )?;
         if let Some(Some(value)) = &request.text_pricing {
-            services::usage::TextPricingProfile::from_json(value.clone()).map_err(|error| {
+            if request.input_cost_per_token.is_some()
+                || request.output_cost_per_token.is_some()
+                || request.cache_read_cost_per_token.is_some()
+            {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    ResponseJson(ErrorResponse::new(
+                        format!(
+                            "model '{model_name}': textPricing cannot be combined with flat text pricing fields"
+                        ),
+                        "invalid_request".to_string(),
+                    )),
+                ));
+            }
+            let profile =
+                services::usage::TextPricingProfile::from_json(value.clone()).map_err(|error| {
+                    (
+                        StatusCode::BAD_REQUEST,
+                        ResponseJson(ErrorResponse::new(
+                            format!("model '{model_name}': {error}"),
+                            "invalid_request".to_string(),
+                        )),
+                    )
+                })?;
+            profile.legacy_projection().map_err(|error| {
                 (
                     StatusCode::BAD_REQUEST,
                     ResponseJson(ErrorResponse::new(
@@ -693,84 +717,99 @@ pub async fn batch_upsert_models(
     // not here, so we can distinguish between CREATE (apply default) and UPDATE (preserve old)
     let models = batch_request
         .iter()
-        .map(|(model_name, request)| {
-            let text_pricing = request.text_pricing.as_ref().map(|profile| {
-                profile.as_ref().map(|value| {
-                    services::usage::TextPricingProfile::from_json(value.clone())
-                        .expect("textPricing was validated above")
-                })
-            });
-            let projection = text_pricing
-                .as_ref()
-                .and_then(|profile| profile.as_ref())
-                .map(|profile| {
-                    profile
-                        .legacy_projection()
-                        .expect("textPricing was validated above")
-                });
-            (
-                model_name.clone(),
-                UpdateModelAdminRequest {
-                    input_cost_per_token: projection
-                        .map(|(input, _, _)| input)
-                        .or_else(|| request.input_cost_per_token.as_ref().map(|p| p.amount)),
-                    output_cost_per_token: projection
-                        .map(|(_, _, output)| output)
-                        .or_else(|| request.output_cost_per_token.as_ref().map(|p| p.amount)),
-                    cost_per_image: request.cost_per_image.as_ref().map(|p| p.amount),
-                    // Tri-state passes through: outer None = leave unchanged,
-                    // Some(None) = disable cache pricing, Some(Some(p)) = set.
-                    cache_read_cost_per_token: projection
-                        .map(|(_, cached, _)| Some(cached))
-                        .or_else(|| {
-                            request
-                                .cache_read_cost_per_token
-                                .as_ref()
-                                .map(|inner| inner.as_ref().map(|p| p.amount))
-                        }),
-                    text_pricing,
-                    model_display_name: request.model_display_name.clone(),
-                    model_description: request.model_description.clone(),
-                    model_icon: request.model_icon.clone(),
-                    context_length: request.context_length,
-                    verifiable: request.verifiable,
-                    is_active: request.is_active,
-                    allow_free: request.allow_free,
-                    aliases: request.aliases.clone(),
-                    owned_by: request.owned_by.clone(),
-                    provider_type: request.provider_type.clone(),
-                    provider_config: request.provider_config.clone(),
-                    attestation_supported: request.attestation_supported,
-                    input_modalities: request.input_modalities.clone(),
-                    output_modalities: request.output_modalities.clone(),
-                    inference_url: request.inference_url.clone(),
-                    hugging_face_id: request.hugging_face_id.clone(),
-                    quantization: request.quantization.clone(),
-                    max_output_length: request.max_output_length,
-                    supported_sampling_parameters: request.supported_sampling_parameters.clone(),
-                    supported_features: request.supported_features.clone(),
-                    datacenters: crate::models::Datacenter::to_codes(request.datacenters.clone()),
-                    // Tri-state passes straight through: outer None = leave
-                    // unchanged, Some(None) = clear, Some(Some(v)) = set.
-                    is_ready: request.is_ready,
-                    // Tri-state. Outer None = leave unchanged, Some(None) =
-                    // clear. For Some(Some(s)) the string was already validated
-                    // above, so parse+normalize it to a stored timestamp.
-                    deprecation_date: request
-                        .deprecation_date
-                        .as_ref()
-                        .map(|inner| inner.as_deref().and_then(parse_deprecation_date)),
-                    // Tri-state passes straight through: outer None = leave
-                    // unchanged, Some(None) = clear, Some(Some(v)) = set. The
-                    // value was already shape-validated above.
-                    openrouter_slug: request.openrouter_slug.clone(),
-                    change_reason: request.change_reason.clone(),
-                    changed_by_user_id: Some(admin_user_id),
-                    changed_by_user_email: Some(admin_user_email.clone()),
-                },
-            )
-        })
-        .collect();
+        .map(
+            |(model_name, request)| -> Result<_, (StatusCode, ResponseJson<ErrorResponse>)> {
+                let invalid_text_pricing = |error| {
+                    (
+                        StatusCode::BAD_REQUEST,
+                        ResponseJson(ErrorResponse::new(
+                            format!("model '{model_name}': {error}"),
+                            "invalid_request".to_string(),
+                        )),
+                    )
+                };
+                let text_pricing = match &request.text_pricing {
+                    None => None,
+                    Some(None) => Some(None),
+                    Some(Some(value)) => Some(Some(
+                        services::usage::TextPricingProfile::from_json(value.clone())
+                            .map_err(invalid_text_pricing)?,
+                    )),
+                };
+                let projection = text_pricing
+                    .as_ref()
+                    .and_then(|profile| profile.as_ref())
+                    .map(services::usage::TextPricingProfile::legacy_projection)
+                    .transpose()
+                    .map_err(invalid_text_pricing)?;
+                Ok((
+                    model_name.clone(),
+                    UpdateModelAdminRequest {
+                        input_cost_per_token: projection
+                            .map(|(input, _, _)| input)
+                            .or_else(|| request.input_cost_per_token.as_ref().map(|p| p.amount)),
+                        output_cost_per_token: projection
+                            .map(|(_, _, output)| output)
+                            .or_else(|| request.output_cost_per_token.as_ref().map(|p| p.amount)),
+                        cost_per_image: request.cost_per_image.as_ref().map(|p| p.amount),
+                        // Tri-state passes through: outer None = leave unchanged,
+                        // Some(None) = disable cache pricing, Some(Some(p)) = set.
+                        cache_read_cost_per_token: projection
+                            .map(|(_, cached, _)| Some(cached))
+                            .or_else(|| {
+                                request
+                                    .cache_read_cost_per_token
+                                    .as_ref()
+                                    .map(|inner| inner.as_ref().map(|p| p.amount))
+                            }),
+                        text_pricing,
+                        model_display_name: request.model_display_name.clone(),
+                        model_description: request.model_description.clone(),
+                        model_icon: request.model_icon.clone(),
+                        context_length: request.context_length,
+                        verifiable: request.verifiable,
+                        is_active: request.is_active,
+                        allow_free: request.allow_free,
+                        aliases: request.aliases.clone(),
+                        owned_by: request.owned_by.clone(),
+                        provider_type: request.provider_type.clone(),
+                        provider_config: request.provider_config.clone(),
+                        attestation_supported: request.attestation_supported,
+                        input_modalities: request.input_modalities.clone(),
+                        output_modalities: request.output_modalities.clone(),
+                        inference_url: request.inference_url.clone(),
+                        hugging_face_id: request.hugging_face_id.clone(),
+                        quantization: request.quantization.clone(),
+                        max_output_length: request.max_output_length,
+                        supported_sampling_parameters: request
+                            .supported_sampling_parameters
+                            .clone(),
+                        supported_features: request.supported_features.clone(),
+                        datacenters: crate::models::Datacenter::to_codes(
+                            request.datacenters.clone(),
+                        ),
+                        // Tri-state passes straight through: outer None = leave
+                        // unchanged, Some(None) = clear, Some(Some(v)) = set.
+                        is_ready: request.is_ready,
+                        // Tri-state. Outer None = leave unchanged, Some(None) =
+                        // clear. For Some(Some(s)) the string was already validated
+                        // above, so parse+normalize it to a stored timestamp.
+                        deprecation_date: request
+                            .deprecation_date
+                            .as_ref()
+                            .map(|inner| inner.as_deref().and_then(parse_deprecation_date)),
+                        // Tri-state passes straight through: outer None = leave
+                        // unchanged, Some(None) = clear, Some(Some(v)) = set. The
+                        // value was already shape-validated above.
+                        openrouter_slug: request.openrouter_slug.clone(),
+                        change_reason: request.change_reason.clone(),
+                        changed_by_user_id: Some(admin_user_id),
+                        changed_by_user_email: Some(admin_user_email.clone()),
+                    },
+                ))
+            },
+        )
+        .collect::<Result<_, _>>()?;
 
     let updated_models = app_state
         .admin_service
@@ -1995,6 +2034,16 @@ fn pricing_change_inputs_from_request(
                 .map(services::usage::TextPricingProfile::from_json)
                 .transpose()
                 .map_err(|error| invalid(format!("model '{}': {error}", item.model_id)))?;
+            if text_pricing.is_some()
+                && (item.input_cost_per_token.is_some()
+                    || item.output_cost_per_token.is_some()
+                    || item.cache_read_cost_per_token.is_some())
+            {
+                return Err(invalid(format!(
+                    "model '{}': textPricing cannot be combined with flat text pricing fields",
+                    item.model_id
+                )));
+            }
             let projection = text_pricing
                 .as_ref()
                 .map(services::usage::TextPricingProfile::legacy_projection)

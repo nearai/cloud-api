@@ -1326,6 +1326,11 @@ impl CompletionServiceImpl {
         params: &mut inference_providers::ChatCompletionParams,
     ) -> Result<Option<TextServiceTier>, ports::CompletionError> {
         let Some(profile) = &model.text_pricing else {
+            // Processing tiers are an OpenAI catalog capability. Internal
+            // Responses calls set an explicit Standard tier so profiled models
+            // cannot inherit a provider project default, but legacy/self-hosted
+            // models must keep their pre-tier request shape.
+            params.service_tier = None;
             return Ok(None);
         };
         let requested = match params.service_tier {
@@ -3574,6 +3579,19 @@ mod tests {
             CompletionServiceImpl::normalize_profiled_service_tier(&model, &mut params),
             Err(ports::CompletionError::InvalidParams(_))
         ));
+    }
+
+    #[test]
+    fn unprofiled_model_strips_internal_default_tier() {
+        let mut model = profiled_gpt56_model();
+        model.text_pricing = None;
+        let mut params = chat_params_for_compat_tests("legacy/self-hosted-model");
+        params.service_tier = Some(inference_providers::ChatServiceTier::Default);
+
+        let tier =
+            CompletionServiceImpl::normalize_profiled_service_tier(&model, &mut params).unwrap();
+        assert_eq!(tier, None);
+        assert_eq!(params.service_tier, None);
     }
 
     fn thinking_kwargs(params: &inference_providers::ChatCompletionParams) -> &serde_json::Value {

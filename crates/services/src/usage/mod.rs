@@ -234,7 +234,10 @@ impl UsageServiceTrait for UsageServiceImpl {
                 cache_read_tokens,
                 0,
                 TextServiceTier::Default,
-                None,
+                // This API has no requested/actual tier parameter. Estimate
+                // conservatively instead of assuming Standard, so a preflight
+                // calculation cannot understate Flex/Priority catalog rates.
+                Some("unknown_preflight_tier"),
                 profile,
             )?
             .cost)
@@ -356,13 +359,6 @@ impl UsageServiceTrait for UsageServiceImpl {
                     let requested_tier = request
                         .requested_service_tier
                         .unwrap_or(TextServiceTier::Default);
-                    if !profile.supports_tier(requested_tier) {
-                        return Err(UsageError::ValidationError(format!(
-                            "{} service tier is not configured for model '{}'",
-                            requested_tier.as_str(),
-                            model.model_name
-                        )));
-                    }
                     let priced = compute_profiled_text_cost(
                         request.input_tokens,
                         request.output_tokens,

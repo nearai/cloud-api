@@ -321,7 +321,6 @@ impl McpToolExecutor {
 
                 if let Some(cached) = cached_tools.get(server_label) {
                     debug!(
-                        server_label = %server_label,
                         tool_count = cached.len(),
                         "Using cached MCP tools (skipping list_tools call)"
                     );
@@ -349,10 +348,7 @@ impl McpToolExecutor {
                     continue;
                 }
 
-                debug!(
-                    server_label = %server_label,
-                    "Connecting to MCP server (no cache)"
-                );
+                debug!("Connecting to MCP server (no cache)");
 
                 let client = self
                     .client_factory
@@ -361,7 +357,6 @@ impl McpToolExecutor {
 
                 let all_tools = client.list_tools().await?;
                 debug!(
-                    server_label = %server_label,
                     tool_count = all_tools.len(),
                     "Discovered tools from MCP server"
                 );
@@ -498,11 +493,7 @@ impl McpToolExecutor {
             ResponseError::McpConnectionFailed(format!("Server '{}' not connected", server_label))
         })?;
 
-        debug!(
-            server_label = %server_label,
-            tool_name = %tool_name,
-            "Executing MCP tool"
-        );
+        debug!("Executing MCP tool");
 
         conn.client.call_tool(tool_name, arguments).await
     }
@@ -683,7 +674,7 @@ impl ToolExecutor for McpToolExecutor {
 
                 // Store approval request in database
                 if let Some(repo) = &event_ctx.response_items_repository {
-                    if let Err(e) = repo
+                    if repo
                         .create(
                             event_ctx.stream_ctx.response_id.clone(),
                             event_ctx.stream_ctx.api_key_id,
@@ -691,14 +682,23 @@ impl ToolExecutor for McpToolExecutor {
                             approval_request.clone(),
                         )
                         .await
+                        .is_err()
                     {
-                        tracing::warn!("Failed to store MCP approval request: {}", e);
+                        tracing::warn!(
+                            response_id = %event_ctx.stream_ctx.response_id_str,
+                            approval_id = %approval_id,
+                            "Failed to store MCP approval request"
+                        );
                     }
                 }
 
                 // Emit approval request event
-                if let Err(e) = event_ctx.emit_item_added(approval_request).await {
-                    tracing::debug!("Failed to emit MCP approval request event: {}", e);
+                if event_ctx.emit_item_added(approval_request).await.is_err() {
+                    tracing::debug!(
+                        response_id = %event_ctx.stream_ctx.response_id_str,
+                        approval_id = %approval_id,
+                        "Failed to emit MCP approval request event"
+                    );
                 }
 
                 // Return None to signal approval is required (special control flow)

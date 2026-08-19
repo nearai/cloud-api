@@ -70,6 +70,34 @@ pub enum ResponseError {
 }
 
 impl ResponseError {
+    /// A stable, non-content category suitable for operational logs.
+    ///
+    /// Error display strings may include request- or provider-supplied text, so tracing
+    /// must use this category (and the HTTP status) instead of formatting the error.
+    pub fn log_category(&self) -> &'static str {
+        match self {
+            ResponseError::InvalidParams(_) => "invalid_params",
+            ResponseError::InternalError(_) => "internal_error",
+            ResponseError::Completion(_) => "completion_error",
+            ResponseError::UnknownTool(_) => "unknown_tool",
+            ResponseError::EmptyToolName => "empty_tool_name",
+            ResponseError::StreamInterrupted => "stream_interrupted",
+            ResponseError::ConversationNotFound => "conversation_not_found",
+            ResponseError::PreviousResponseNotFound => "previous_response_not_found",
+            ResponseError::McpConnectionFailed(_) => "mcp_connection_failed",
+            ResponseError::McpToolDiscoveryFailed(_) => "mcp_tool_discovery_failed",
+            ResponseError::McpToolExecutionFailed(_) => "mcp_tool_execution_failed",
+            ResponseError::McpServerLimitExceeded { .. } => "mcp_server_limit_exceeded",
+            ResponseError::McpToolLimitExceeded { .. } => "mcp_tool_limit_exceeded",
+            ResponseError::McpInsecureUrl => "mcp_insecure_url",
+            ResponseError::McpPrivateIpBlocked => "mcp_private_ip_blocked",
+            ResponseError::McpApprovalRequired { .. } => "mcp_approval_required",
+            ResponseError::McpApprovalRequestNotFound(_) => "mcp_approval_request_not_found",
+            ResponseError::FunctionCallRequired { .. } => "function_call_required",
+            ResponseError::FunctionCallNotFound(_) => "function_call_not_found",
+        }
+    }
+
     pub fn http_status_code(&self) -> u16 {
         match self {
             ResponseError::InvalidParams(_)

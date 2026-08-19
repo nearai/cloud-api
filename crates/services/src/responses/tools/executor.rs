@@ -61,7 +61,7 @@ impl<'a> ToolEventContext<'a> {
 
         // Store response item if repository is provided
         if let Some(repo) = &self.response_items_repository {
-            if let Err(e) = repo
+            if repo
                 .create(
                     self.stream_ctx.response_id.clone(),
                     self.stream_ctx.api_key_id,
@@ -69,8 +69,13 @@ impl<'a> ToolEventContext<'a> {
                     item,
                 )
                 .await
+                .is_err()
             {
-                tracing::warn!("Failed to store response item: {:?}", e);
+                tracing::warn!(
+                    response_id = %self.stream_ctx.response_id_str,
+                    item_id = %self.tool_call_id,
+                    "Failed to store response item"
+                );
             }
         }
 
@@ -253,20 +258,18 @@ impl ToolRegistry {
     }
 
     /// Log a tool error with retry-aware messaging
-    fn log_tool_error(&self, tool_type: &str, failure_count: u32) {
+    fn log_tool_error(&self, _tool_type: &str, failure_count: u32) {
         if failure_count > MAX_CONSECUTIVE_TOOL_FAILURES {
             tracing::error!(
-                tool = %tool_type,
-                failures = %failure_count,
-                "Tool failed after {} attempts. Error fed back to LLM for correction.",
-                MAX_CONSECUTIVE_TOOL_FAILURES,
+                failures = failure_count,
+                max_retries = MAX_CONSECUTIVE_TOOL_FAILURES,
+                "Tool failed after maximum retry attempts"
             );
         } else {
             tracing::warn!(
-                tool = %tool_type,
-                attempt = %failure_count,
+                attempt = failure_count,
                 max_retries = MAX_CONSECUTIVE_TOOL_FAILURES,
-                "Tool failed, feeding error back to LLM for retry",
+                "Tool failed and will be retried"
             );
         }
     }

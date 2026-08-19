@@ -258,10 +258,7 @@ pub async fn create_response(
 ) -> axum::response::Response {
     let service = state.response_service.clone();
     let attestation_service = state.attestation_service.clone();
-    debug!(
-        "Create response request from api key: {:?}",
-        api_key.api_key.id
-    );
+    debug!("Create response request");
 
     // Validate the request
     if let Err(error) = request.validate() {
@@ -389,23 +386,20 @@ pub async fn create_response(
                                 let rid = rid.clone();
                                 let req_hash = request_hash_inner.clone();
                                 let attest = attestation_inner.clone();
-                                tracing::debug!(
-                                    "Storing signature for response_id: {}, request_hash: {}, response_hash: {}",
-                                    rid, req_hash, response_hash
-                                );
+                                tracing::debug!(response_id = %rid, "Storing response signature");
 
                                 // Spawn task to store signature asynchronously (doesn't block stream)
                                 // but we've already computed the hash with complete data
                                 tokio::spawn(async move {
                                     // Store both ECDSA and ED25519 signatures
-                                    if let Err(e) = attest.store_response_signature(
+                                    if attest.store_response_signature(
                                         &rid,
                                         req_hash.clone(),
                                         response_hash.clone(),
-                                    ).await {
-                                        tracing::error!("Failed to store response signature: {}", e);
+                                    ).await.is_err() {
+                                        tracing::error!("Failed to store response signature");
                                     } else {
-                                        tracing::debug!("Successfully stored signature for response_id: {}", rid);
+                                        tracing::debug!(response_id = %rid, "Stored response signature");
                                     }
                                 });
                             }
@@ -425,13 +419,14 @@ pub async fn create_response(
                     .unwrap()
             }
             Err(error) => {
+                let status_code = map_response_error_to_status(&error);
                 tracing::error!(
                     user_id = %api_key.api_key.created_by_user_id.0,
                     model = %model,
-                    error = %error,
+                    status_code = status_code.as_u16(),
+                    error_category = error.log_category(),
                     "Failed to create streaming response"
                 );
-                let status_code = map_response_error_to_status(&error);
                 (status_code, ResponseJson::<ErrorResponse>(error.into())).into_response()
             }
         }
@@ -668,26 +663,27 @@ pub async fn create_response(
                     serde_json::to_string(&response).expect("response serialization failed");
                 let response_hash = compute_sha256(response_json.as_bytes());
 
-                if let Err(e) = attestation_service
+                if attestation_service
                     .store_response_signature(&response_id, body_hash.hash.clone(), response_hash)
                     .await
+                    .is_err()
                 {
                     tracing::error!(
-                        "Failed to store response signature for non-streaming: {}",
-                        e
+                        "Failed to store response signature for non-streaming response"
                     );
                 }
 
                 (StatusCode::OK, ResponseJson(response)).into_response()
             }
             Err(error) => {
+                let status_code = map_response_error_to_status(&error);
                 tracing::error!(
                     user_id = %api_key.api_key.created_by_user_id.0,
                     model = %model,
-                    error = %error,
+                    status_code = status_code.as_u16(),
+                    error_category = error.log_category(),
                     "Failed to create non-streaming response"
                 );
-                let status_code = map_response_error_to_status(&error);
                 (status_code, ResponseJson::<ErrorResponse>(error.into())).into_response()
             }
         }

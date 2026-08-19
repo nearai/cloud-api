@@ -20,6 +20,15 @@ use services::service_usage::ports::ServiceUnit;
 use std::sync::Arc;
 use uuid::Uuid;
 
+fn parse_text_pricing(
+    value: Option<serde_json::Value>,
+) -> Result<Option<services::usage::TextPricingProfile>> {
+    value
+        .map(services::usage::TextPricingProfile::from_json)
+        .transpose()
+        .map_err(|error| anyhow::anyhow!(error.to_string()))
+}
+
 /// Composite repository that implements AdminRepository for both model and organization operations
 #[derive(Clone)]
 pub struct AdminCompositeRepository {
@@ -64,6 +73,8 @@ fn row_to_scheduled_pricing_change(
         old_output_cost_per_token: row.get("old_output_cost_per_token"),
         old_cache_read_cost_per_token: row.get("old_cache_read_cost_per_token"),
         old_cost_per_image: row.get("old_cost_per_image"),
+        old_text_pricing: parse_text_pricing(row.get("old_text_pricing"))?,
+        new_text_pricing: parse_text_pricing(row.get("new_text_pricing"))?,
         effective_at: row.get("effective_at"),
         status,
         apply_attempts: row.get("apply_attempts"),
@@ -115,12 +126,18 @@ impl AdminRepository for AdminCompositeRepository {
         model_name: &str,
         request: UpdateModelAdminRequest,
     ) -> Result<ModelPricing> {
+        let text_pricing = request
+            .text_pricing
+            .as_ref()
+            .map(|profile| profile.as_ref().map(serde_json::to_value).transpose())
+            .transpose()?;
         // Convert service request to database request
         let db_request = UpdateModelPricingRequest {
             input_cost_per_token: request.input_cost_per_token,
             output_cost_per_token: request.output_cost_per_token,
             cost_per_image: request.cost_per_image,
             cache_read_cost_per_token: request.cache_read_cost_per_token,
+            text_pricing,
             model_display_name: request.model_display_name,
             model_description: request.model_description,
             model_icon: request.model_icon,
@@ -170,6 +187,7 @@ impl AdminRepository for AdminCompositeRepository {
             output_cost_per_token: model.output_cost_per_token,
             cost_per_image: model.cost_per_image,
             cache_read_cost_per_token: model.cache_read_cost_per_token,
+            text_pricing: parse_text_pricing(model.text_pricing)?,
             context_length: model.context_length,
             verifiable: model.verifiable,
             is_active: model.is_active,
@@ -227,42 +245,45 @@ impl AdminRepository for AdminCompositeRepository {
 
         let entries = history
             .into_iter()
-            .map(|h| ModelHistoryEntry {
-                id: h.id,
-                model_id: h.model_id,
-                input_cost_per_token: h.input_cost_per_token,
-                output_cost_per_token: h.output_cost_per_token,
-                cost_per_image: h.cost_per_image,
-                cache_read_cost_per_token: h.cache_read_cost_per_token,
-                context_length: h.context_length,
-                model_name: h.model_name,
-                model_display_name: h.model_display_name,
-                model_description: h.model_description,
-                model_icon: h.model_icon,
-                verifiable: h.verifiable,
-                is_active: h.is_active,
-                owned_by: h.owned_by,
-                input_modalities: h.input_modalities,
-                output_modalities: h.output_modalities,
-                inference_url: h.inference_url,
-                hugging_face_id: h.hugging_face_id,
-                quantization: h.quantization,
-                max_output_length: h.max_output_length,
-                supported_sampling_parameters: h.supported_sampling_parameters,
-                supported_features: h.supported_features,
-                datacenters: h.datacenters,
-                is_ready: h.is_ready,
-                deprecation_date: h.deprecation_date,
-                openrouter_slug: h.openrouter_slug,
-                allow_free: h.allow_free,
-                effective_from: h.effective_from,
-                effective_until: h.effective_until,
-                changed_by_user_id: h.changed_by_user_id,
-                changed_by_user_email: h.changed_by_user_email,
-                change_reason: h.change_reason,
-                created_at: h.created_at,
+            .map(|h| {
+                Ok(ModelHistoryEntry {
+                    id: h.id,
+                    model_id: h.model_id,
+                    input_cost_per_token: h.input_cost_per_token,
+                    output_cost_per_token: h.output_cost_per_token,
+                    cost_per_image: h.cost_per_image,
+                    cache_read_cost_per_token: h.cache_read_cost_per_token,
+                    text_pricing: parse_text_pricing(h.text_pricing)?,
+                    context_length: h.context_length,
+                    model_name: h.model_name,
+                    model_display_name: h.model_display_name,
+                    model_description: h.model_description,
+                    model_icon: h.model_icon,
+                    verifiable: h.verifiable,
+                    is_active: h.is_active,
+                    owned_by: h.owned_by,
+                    input_modalities: h.input_modalities,
+                    output_modalities: h.output_modalities,
+                    inference_url: h.inference_url,
+                    hugging_face_id: h.hugging_face_id,
+                    quantization: h.quantization,
+                    max_output_length: h.max_output_length,
+                    supported_sampling_parameters: h.supported_sampling_parameters,
+                    supported_features: h.supported_features,
+                    datacenters: h.datacenters,
+                    is_ready: h.is_ready,
+                    deprecation_date: h.deprecation_date,
+                    openrouter_slug: h.openrouter_slug,
+                    allow_free: h.allow_free,
+                    effective_from: h.effective_from,
+                    effective_until: h.effective_until,
+                    changed_by_user_id: h.changed_by_user_id,
+                    changed_by_user_email: h.changed_by_user_email,
+                    change_reason: h.change_reason,
+                    created_at: h.created_at,
+                })
             })
-            .collect();
+            .collect::<Result<Vec<_>>>()?;
 
         Ok((entries, total))
     }
@@ -375,7 +396,7 @@ impl AdminRepository for AdminCompositeRepository {
                 WHERE id = $1
                 RETURNING id, model_name, model_display_name, model_description, model_icon,
                           input_cost_per_token, output_cost_per_token, cost_per_image,
-                          cache_read_cost_per_token, context_length, verifiable, is_active,
+                          cache_read_cost_per_token, text_pricing, context_length, verifiable, is_active,
                           owned_by, created_at, updated_at, provider_type, provider_config,
                           attestation_supported, input_modalities, output_modalities, inference_url,
                           datacenters, hugging_face_id, quantization, max_output_length,
@@ -415,14 +436,14 @@ impl AdminRepository for AdminCompositeRepository {
                 supported_sampling_parameters, supported_features, is_ready, deprecation_date,
                 openrouter_slug, allow_free,
                 effective_from, effective_until, changed_by_user_id,
-                changed_by_user_email, change_reason, created_at
+                changed_by_user_email, change_reason, created_at, text_pricing
             ) VALUES (
                 $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19,
                 $20, $21, $22, $23,
                 COALESCE($24, ARRAY[]::TEXT[]),
                 COALESCE($25, ARRAY[]::TEXT[]),
                 $26, $27, $28, $29,
-                NOW(), NULL, $30, $31, $32, NOW()
+                NOW(), NULL, $30, $31, $32, NOW(), $33
             )
             "#,
             &[
@@ -500,6 +521,10 @@ impl AdminRepository for AdminCompositeRepository {
                 &changed_by_user_id,
                 &changed_by_user_email,
                 &reason,
+                &deprecated_row_after
+                    .try_get::<_, Option<serde_json::Value>>("text_pricing")
+                    .ok()
+                    .flatten(),
             ],
         )
         .await
@@ -513,57 +538,60 @@ impl AdminRepository for AdminCompositeRepository {
         //    txn keeps the response build atomic with the writes: either
         //    everything succeeds and the caller sees both models, or
         //    nothing is committed and the caller can safely retry.
-        let read_with_aliases = |row: &tokio_postgres::Row| ModelPricing {
-            model_display_name: row.get("model_display_name"),
-            model_description: row.get("model_description"),
-            model_icon: row.get("model_icon"),
-            input_cost_per_token: row.get("input_cost_per_token"),
-            output_cost_per_token: row.get("output_cost_per_token"),
-            cost_per_image: row.get("cost_per_image"),
-            cache_read_cost_per_token: row.get("cache_read_cost_per_token"),
-            context_length: row.get("context_length"),
-            verifiable: row.get("verifiable"),
-            is_active: row.get("is_active"),
-            aliases: row
-                .try_get::<_, Option<Vec<String>>>("aliases")
-                .ok()
-                .flatten()
-                .unwrap_or_default(),
-            owned_by: row.get("owned_by"),
-            provider_type: row
-                .try_get::<_, String>("provider_type")
-                .unwrap_or_else(|_| "vllm".to_string()),
-            provider_config: row.try_get("provider_config").ok().flatten(),
-            attestation_supported: row.try_get("attestation_supported").unwrap_or(true),
-            input_modalities: row
-                .try_get::<_, Option<serde_json::Value>>("input_modalities")
-                .ok()
-                .flatten()
-                .and_then(|v| serde_json::from_value(v).ok()),
-            output_modalities: row
-                .try_get::<_, Option<serde_json::Value>>("output_modalities")
-                .ok()
-                .flatten()
-                .and_then(|v| serde_json::from_value(v).ok()),
-            inference_url: row.try_get("inference_url").ok().flatten(),
-            hugging_face_id: row.try_get("hugging_face_id").ok().flatten(),
-            quantization: row.try_get("quantization").ok().flatten(),
-            max_output_length: row.try_get("max_output_length").ok().flatten(),
-            supported_sampling_parameters: row
-                .try_get("supported_sampling_parameters")
-                .unwrap_or_default(),
-            supported_features: row.try_get("supported_features").unwrap_or_default(),
-            datacenters: row.try_get("datacenters").ok().flatten(),
-            is_ready: row.try_get("is_ready").ok().flatten(),
-            deprecation_date: row.try_get("deprecation_date").ok().flatten(),
-            openrouter_slug: row.try_get("openrouter_slug").ok().flatten(),
+        let read_with_aliases = |row: &tokio_postgres::Row| -> Result<ModelPricing> {
+            Ok(ModelPricing {
+                model_display_name: row.get("model_display_name"),
+                model_description: row.get("model_description"),
+                model_icon: row.get("model_icon"),
+                input_cost_per_token: row.get("input_cost_per_token"),
+                output_cost_per_token: row.get("output_cost_per_token"),
+                cost_per_image: row.get("cost_per_image"),
+                cache_read_cost_per_token: row.get("cache_read_cost_per_token"),
+                text_pricing: parse_text_pricing(row.try_get("text_pricing").ok().flatten())?,
+                context_length: row.get("context_length"),
+                verifiable: row.get("verifiable"),
+                is_active: row.get("is_active"),
+                aliases: row
+                    .try_get::<_, Option<Vec<String>>>("aliases")
+                    .ok()
+                    .flatten()
+                    .unwrap_or_default(),
+                owned_by: row.get("owned_by"),
+                provider_type: row
+                    .try_get::<_, String>("provider_type")
+                    .unwrap_or_else(|_| "vllm".to_string()),
+                provider_config: row.try_get("provider_config").ok().flatten(),
+                attestation_supported: row.try_get("attestation_supported").unwrap_or(true),
+                input_modalities: row
+                    .try_get::<_, Option<serde_json::Value>>("input_modalities")
+                    .ok()
+                    .flatten()
+                    .and_then(|v| serde_json::from_value(v).ok()),
+                output_modalities: row
+                    .try_get::<_, Option<serde_json::Value>>("output_modalities")
+                    .ok()
+                    .flatten()
+                    .and_then(|v| serde_json::from_value(v).ok()),
+                inference_url: row.try_get("inference_url").ok().flatten(),
+                hugging_face_id: row.try_get("hugging_face_id").ok().flatten(),
+                quantization: row.try_get("quantization").ok().flatten(),
+                max_output_length: row.try_get("max_output_length").ok().flatten(),
+                supported_sampling_parameters: row
+                    .try_get("supported_sampling_parameters")
+                    .unwrap_or_default(),
+                supported_features: row.try_get("supported_features").unwrap_or_default(),
+                datacenters: row.try_get("datacenters").ok().flatten(),
+                is_ready: row.try_get("is_ready").ok().flatten(),
+                deprecation_date: row.try_get("deprecation_date").ok().flatten(),
+                openrouter_slug: row.try_get("openrouter_slug").ok().flatten(),
+            })
         };
 
         let select_with_aliases_sql = r#"
             SELECT
                 m.model_display_name, m.model_description, m.model_icon,
                 m.input_cost_per_token, m.output_cost_per_token, m.cost_per_image,
-                m.cache_read_cost_per_token, m.context_length, m.verifiable,
+                m.cache_read_cost_per_token, m.text_pricing, m.context_length, m.verifiable,
                 m.is_active, m.owned_by, m.provider_type, m.provider_config,
                 m.attestation_supported, m.input_modalities, m.output_modalities,
                 m.inference_url,
@@ -593,8 +621,8 @@ impl AdminRepository for AdminCompositeRepository {
             .await?
             .context("successor model row missing in same transaction (driver bug?)")?;
         let outcome = DeprecateModelOutcome {
-            deprecated: read_with_aliases(&deprecated_row_full),
-            successor: read_with_aliases(&successor_row_full),
+            deprecated: read_with_aliases(&deprecated_row_full)?,
+            successor: read_with_aliases(&successor_row_full)?,
             // `aliases_carried` is u64 from `tx.execute`. The number of
             // inbound aliases on a single model can never realistically
             // exceed u32::MAX; saturate via `min` rather than `try_from` so
@@ -786,6 +814,7 @@ impl AdminRepository for AdminCompositeRepository {
                 output_cost_per_token: m.output_cost_per_token,
                 cost_per_image: m.cost_per_image,
                 cache_read_cost_per_token: m.cache_read_cost_per_token,
+                text_pricing: m.text_pricing,
                 context_length: m.context_length,
                 verifiable: m.verifiable,
                 is_active: m.is_active,
@@ -988,7 +1017,7 @@ impl AdminRepository for AdminCompositeRepository {
                 r#"
                 SELECT id, model_name, model_display_name,
                        input_cost_per_token, output_cost_per_token,
-                       cache_read_cost_per_token, cost_per_image
+                       cache_read_cost_per_token, cost_per_image, text_pricing
                 FROM models
                 WHERE model_name = $1 AND is_active = true
                 "#,
@@ -996,15 +1025,19 @@ impl AdminRepository for AdminCompositeRepository {
             )
             .await?;
 
-        Ok(row.map(|row| ModelPricingSnapshot {
-            id: row.get("id"),
-            model_name: row.get("model_name"),
-            model_display_name: row.get("model_display_name"),
-            input_cost_per_token: row.get("input_cost_per_token"),
-            output_cost_per_token: row.get("output_cost_per_token"),
-            cache_read_cost_per_token: row.get("cache_read_cost_per_token"),
-            cost_per_image: row.get("cost_per_image"),
-        }))
+        row.map(|row| {
+            Ok(ModelPricingSnapshot {
+                id: row.get("id"),
+                model_name: row.get("model_name"),
+                model_display_name: row.get("model_display_name"),
+                input_cost_per_token: row.get("input_cost_per_token"),
+                output_cost_per_token: row.get("output_cost_per_token"),
+                cache_read_cost_per_token: row.get("cache_read_cost_per_token"),
+                cost_per_image: row.get("cost_per_image"),
+                text_pricing: parse_text_pricing(row.get("text_pricing"))?,
+            })
+        })
+        .transpose()
     }
 
     async fn list_pricing_change_recipients(
@@ -1102,6 +1135,16 @@ impl AdminRepository for AdminCompositeRepository {
         }
         let mut inserted = Vec::with_capacity(changes.len());
         for change in changes {
+            let old_text_pricing = change
+                .old_text_pricing
+                .as_ref()
+                .map(serde_json::to_value)
+                .transpose()?;
+            let new_text_pricing = change
+                .new_text_pricing
+                .as_ref()
+                .map(serde_json::to_value)
+                .transpose()?;
             let row = tx
                 .query_one(
                     r#"
@@ -1112,10 +1155,10 @@ impl AdminRepository for AdminCompositeRepository {
                         old_input_cost_per_token, old_output_cost_per_token,
                         old_cache_read_cost_per_token, old_cost_per_image,
                         effective_at, created_by_user_id, created_by_user_email,
-                        change_reason
+                        change_reason, old_text_pricing, new_text_pricing
                     ) VALUES (
                         $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
-                        $13, $14, $15, $16
+                        $13, $14, $15, $16, $17, $18
                     )
                     RETURNING *
                     "#,
@@ -1136,6 +1179,8 @@ impl AdminRepository for AdminCompositeRepository {
                         &created_by_user_id,
                         &created_by_user_email,
                         &change_reason,
+                        &old_text_pricing,
+                        &new_text_pricing,
                     ],
                 )
                 .await

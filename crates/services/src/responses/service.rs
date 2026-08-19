@@ -1473,6 +1473,7 @@ impl ResponseServiceImpl {
                 skip_provider_chat_signature: false,
                 original_request: None,
                 n: None,
+                service_tier: Some(inference_providers::ChatServiceTier::Default),
                 extra,
             };
 
@@ -3125,6 +3126,7 @@ impl ResponseServiceImpl {
             skip_provider_chat_signature: false,
             original_request: None,
             n: None,
+            service_tier: Some(inference_providers::ChatServiceTier::Default),
             extra: std::collections::HashMap::from([(
                 "chat_template_kwargs".to_string(),
                 serde_json::json!({ "enable_thinking": false }),

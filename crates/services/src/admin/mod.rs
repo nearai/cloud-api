@@ -183,7 +183,7 @@ impl AdminServiceImpl {
                 change.new_cache_read_cost_per_token,
                 change.new_cost_per_image,
             ];
-            if new_amounts.iter().all(Option::is_none) {
+            if new_amounts.iter().all(Option::is_none) && change.new_text_pricing.is_none() {
                 return Err(AdminError::InvalidPricing(format!(
                     "model '{model_name}': at least one pricing field must be provided"
                 )));
@@ -261,7 +261,8 @@ impl AdminServiceImpl {
                 && row.new_input_cost_per_token == change.new_input_cost_per_token
                 && row.new_output_cost_per_token == change.new_output_cost_per_token
                 && row.new_cache_read_cost_per_token == change.new_cache_read_cost_per_token
-                && row.new_cost_per_image == change.new_cost_per_image;
+                && row.new_cost_per_image == change.new_cost_per_image
+                && row.new_text_pricing == change.new_text_pricing;
             if !matches {
                 return Err(conflict(format!(
                     "model '{model_name}' differs from the persisted change"
@@ -315,6 +316,8 @@ impl AdminServiceImpl {
                     new_output_cost_per_token: change.new_output_cost_per_token,
                     new_cache_read_cost_per_token: change.new_cache_read_cost_per_token,
                     new_cost_per_image: change.new_cost_per_image,
+                    old_text_pricing: snapshot.text_pricing.clone(),
+                    new_text_pricing: change.new_text_pricing.clone(),
                 }
             })
             .collect();
@@ -611,6 +614,7 @@ impl AdminService for AdminServiceImpl {
             output_cost_per_token: None,
             cost_per_image: None,
             cache_read_cost_per_token: None,
+            text_pricing: None,
             model_display_name: None,
             model_description: None,
             model_icon: None,
@@ -831,6 +835,8 @@ impl AdminService for AdminServiceImpl {
                     old_output_cost_per_token: snapshot.output_cost_per_token,
                     old_cache_read_cost_per_token: snapshot.cache_read_cost_per_token,
                     old_cost_per_image: snapshot.cost_per_image,
+                    old_text_pricing: snapshot.text_pricing.clone(),
+                    new_text_pricing: change.new_text_pricing.clone(),
                     effective_at: change.effective_at,
                 })
                 .collect();
@@ -1246,6 +1252,12 @@ impl AdminServiceImpl {
         repository: Arc<dyn AdminRepository>,
     ) -> Result<(), AdminError> {
         // All costs use fixed scale 9 (nano-dollars) and USD - no scale/currency validation needed
+
+        if let Some(Some(profile)) = &request.text_pricing {
+            profile
+                .validate()
+                .map_err(|error| AdminError::InvalidPricing(error.to_string()))?;
+        }
 
         // Validate model name
         if model_name.trim().is_empty() {

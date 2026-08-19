@@ -69,6 +69,9 @@ pub const METRIC_BILLED_CACHE_READ_TOKENS: &str = "cloud_api.billed.cache_read_t
 pub const METRIC_BILLED_CACHE_WRITE_TOKENS: &str = "cloud_api.billed.cache_write_tokens";
 pub const METRIC_BILLED_INPUT_COST_USD: &str = "cloud_api.billed.input_cost_usd";
 pub const METRIC_BILLED_OUTPUT_COST_USD: &str = "cloud_api.billed.output_cost_usd";
+/// Fail-safe pricing was required because the provider returned an unknown or
+/// unpriced service tier. This must page billing owners.
+pub const METRIC_BILLING_PRICING_FALLBACK: &str = "cloud_api.billing.pricing_fallback";
 
 // Provider data quality metrics
 pub const METRIC_PROVIDER_TOKEN_ANOMALIES: &str = "cloud_api.provider.token_anomalies";

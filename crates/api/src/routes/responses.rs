@@ -11,13 +11,21 @@ use axum::{
 };
 use bytes::Bytes;
 use futures::stream::StreamExt;
+use services::attestation::ports::AttestationServiceTrait;
 use services::responses::errors::ResponseError as ServiceResponseError;
 use services::responses::models::*;
 use services::responses::ports::ResponseServiceTrait;
 use services::responses::service::ResponseServiceImpl;
+use sha2::{Digest, Sha256};
 use std::convert::Infallible;
-use std::sync::Arc;
+use std::pin::Pin;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tracing::debug;
+
+/// Bound best-effort attestation persistence so a database problem never
+/// prevents a completed inference response from being delivered.
+const RESPONSE_ATTESTATION_STORE_TIMEOUT: Duration = Duration::from_secs(5);
 
 // Helper functions for error mapping
 fn map_response_error_to_status(error: &ServiceResponseError) -> StatusCode {
@@ -154,6 +162,144 @@ impl From<ServiceResponseError> for ErrorResponse {
 #[derive(Clone)]
 pub struct ResponseRouteState {
     pub response_service: Arc<ResponseServiceImpl>,
+    /// Stateless Responses retain only attestation material: the response ID,
+    /// request/response digests, and their signatures. No response or item
+    /// records are retained by this route.
+    pub attestation_service: Arc<dyn AttestationServiceTrait>,
+}
+
+/// Request-local state used to sign the exact SSE bytes returned to a client.
+///
+/// The state deliberately retains a running digest rather than accumulating
+/// stream content, so no response payload is kept after an event is emitted.
+struct StreamingResponseAttestation {
+    response_id: Option<String>,
+    response_hasher: Sha256,
+    completed: bool,
+}
+
+impl Default for StreamingResponseAttestation {
+    fn default() -> Self {
+        Self {
+            response_id: None,
+            response_hasher: Sha256::new(),
+            completed: false,
+        }
+    }
+}
+
+impl StreamingResponseAttestation {
+    /// Record one client-visible SSE frame and return attestation material when
+    /// the response has completed. The returned digest includes the completed
+    /// frame itself.
+    fn record_event(
+        &mut self,
+        event: &ResponseStreamEvent,
+        sse_bytes: &[u8],
+    ) -> Option<(String, String)> {
+        if self.response_id.is_none() {
+            self.response_id = event.response.as_ref().map(|response| response.id.clone());
+        }
+
+        self.response_hasher.update(sse_bytes);
+
+        if self.completed || event.event_type != "response.completed" {
+            return None;
+        }
+        self.completed = true;
+
+        self.response_id.clone().map(|response_id| {
+            let response_hash = hex::encode(self.response_hasher.clone().finalize());
+            (response_id, response_hash)
+        })
+    }
+}
+
+/// Persist the minimal metadata needed to retrieve an attestation later.
+///
+/// Attestation failures must not change the inference result. In particular,
+/// do not include provider/database error strings here: they may contain
+/// request-derived data or infrastructure details.
+async fn persist_response_attestation(
+    attestation_service: &dyn AttestationServiceTrait,
+    response_id: &str,
+    request_hash: String,
+    response_hash: String,
+) {
+    match tokio::time::timeout(
+        RESPONSE_ATTESTATION_STORE_TIMEOUT,
+        attestation_service.store_response_signature(response_id, request_hash, response_hash),
+    )
+    .await
+    {
+        Ok(Ok(())) => {}
+        Ok(Err(_)) => {
+            tracing::warn!(%response_id, "Response attestation persistence failed");
+        }
+        Err(_) => {
+            tracing::warn!(%response_id, "Response attestation persistence timed out");
+        }
+    }
+}
+
+/// Store an attestation for a non-streaming response before sending it.
+async fn persist_non_streaming_response_attestation(
+    attestation_service: &dyn AttestationServiceTrait,
+    response: &ResponseObject,
+    request_hash: String,
+) {
+    // This serialization is request-local and is immediately reduced to a
+    // digest. The response itself is not written to the attestation store.
+    let response_json = serde_json::to_vec(response).expect("response serialization failed");
+    let response_hash = hex::encode(Sha256::digest(&response_json));
+    persist_response_attestation(
+        attestation_service,
+        &response.id,
+        request_hash,
+        response_hash,
+    )
+    .await;
+}
+
+/// Convert response events into signed SSE frames. The response-completed
+/// frame is held until its attestation write has finished, so a client that has
+/// received that frame can immediately look up its `resp_*` signature.
+fn signed_response_sse_stream(
+    stream: Pin<Box<dyn futures::Stream<Item = ResponseStreamEvent> + Send>>,
+    attestation_service: Arc<dyn AttestationServiceTrait>,
+    request_hash: String,
+) -> Pin<Box<dyn futures::Stream<Item = Result<Bytes, Infallible>> + Send>> {
+    let signature_state = Arc::new(Mutex::new(StreamingResponseAttestation::default()));
+
+    Box::pin(stream.then(move |event| {
+        let signature_state = signature_state.clone();
+        let attestation_service = attestation_service.clone();
+        let request_hash = request_hash.clone();
+
+        async move {
+            let json = serde_json::to_string(&event).expect("event serialization failed");
+            let sse_bytes = format!("event: {}\ndata: {}\n\n", event.event_type, json);
+
+            let signature = {
+                let mut state = signature_state
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                state.record_event(&event, sse_bytes.as_bytes())
+            };
+
+            if let Some((response_id, response_hash)) = signature {
+                persist_response_attestation(
+                    attestation_service.as_ref(),
+                    &response_id,
+                    request_hash,
+                    response_hash,
+                )
+                .await;
+            }
+
+            Ok::<Bytes, Infallible>(Bytes::from(sse_bytes))
+        }
+    }))
 }
 
 /// Return an explicit migration response for the retired response-history API.
@@ -304,14 +450,11 @@ pub async fn create_response(
                     "Successfully created streaming response"
                 );
 
-                // Format events as SSE without retaining the stream payload or
-                // writing a response attestation. A no-store response has no
-                // durable response record to associate with such data.
-                let byte_stream = stream.map(|event| {
-                    let json = serde_json::to_string(&event).expect("event serialization failed");
-                    let sse_bytes = format!("event: {}\ndata: {}\n\n", event.event_type, json);
-                    Ok::<Bytes, Infallible>(Bytes::from(sse_bytes))
-                });
+                let byte_stream = signed_response_sse_stream(
+                    stream,
+                    state.attestation_service.clone(),
+                    body_hash.hash.clone(),
+                );
 
                 // Return as raw byte stream with SSE headers
                 Response::builder()
@@ -553,6 +696,17 @@ pub async fn create_response(
                     response.id, api_key.api_key.created_by_user_id.0
                 );
 
+                // Store the signature before returning so an immediate
+                // GET /v1/signature/resp_* lookup is deterministic. This only
+                // writes the response ID, request/response digests, and
+                // signatures; the response body remains no-store.
+                persist_non_streaming_response_attestation(
+                    state.attestation_service.as_ref(),
+                    &response,
+                    body_hash.hash.clone(),
+                )
+                .await;
+
                 with_no_store_cache_header((StatusCode::OK, ResponseJson(response)).into_response())
             }
             Err(error) => {
@@ -574,6 +728,152 @@ pub async fn create_response(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
+    use futures::StreamExt;
+    use services::attestation::{
+        ita::{ItaTokenQuery, ItaTokenResponse},
+        AttestationError, SignatureLookupResult,
+    };
+
+    #[derive(Clone, Default)]
+    struct RecordingAttestationService {
+        stored_response_signatures: Arc<Mutex<Vec<(String, String, String)>>>,
+    }
+
+    impl RecordingAttestationService {
+        fn stored_response_signatures(&self) -> Vec<(String, String, String)> {
+            self.stored_response_signatures
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone()
+        }
+    }
+
+    #[async_trait]
+    impl AttestationServiceTrait for RecordingAttestationService {
+        async fn get_chat_signature(
+            &self,
+            _chat_id: &str,
+            _signing_algo: Option<String>,
+        ) -> Result<SignatureLookupResult, AttestationError> {
+            Err(AttestationError::InternalError("unused".to_string()))
+        }
+
+        async fn store_chat_signature_from_provider(
+            &self,
+            _chat_id: &str,
+        ) -> Result<(), AttestationError> {
+            Ok(())
+        }
+
+        async fn store_chat_signature(
+            &self,
+            _chat_id: &str,
+            _request_hash: String,
+            _response_hash: String,
+        ) -> Result<(), AttestationError> {
+            Ok(())
+        }
+
+        async fn store_response_signature(
+            &self,
+            response_id: &str,
+            request_hash: String,
+            response_hash: String,
+        ) -> Result<(), AttestationError> {
+            self.stored_response_signatures
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push((response_id.to_string(), request_hash, response_hash));
+            Ok(())
+        }
+
+        async fn get_attestation_report(
+            &self,
+            _model: Option<String>,
+            _signing_algo: Option<String>,
+            _nonce: Option<String>,
+            _signing_address: Option<String>,
+            _include_tls_fingerprint: bool,
+            _provider_filter: Option<inference_providers::ProviderTier>,
+        ) -> Result<services::attestation::models::AttestationReport, AttestationError> {
+            Err(AttestationError::InternalError("unused".to_string()))
+        }
+
+        async fn get_ita_attestation_token(
+            &self,
+            _query: ItaTokenQuery,
+        ) -> Result<ItaTokenResponse, AttestationError> {
+            Err(AttestationError::InternalError("unused".to_string()))
+        }
+
+        async fn verify_vpc_signature(
+            &self,
+            _timestamp: i64,
+            _signature: String,
+        ) -> Result<bool, AttestationError> {
+            Ok(false)
+        }
+    }
+
+    fn sample_response(response_id: &str) -> ResponseObject {
+        ResponseObject {
+            id: response_id.to_string(),
+            object: "response".to_string(),
+            created_at: 0,
+            status: ResponseStatus::Completed,
+            background: false,
+            conversation: None,
+            error: None,
+            incomplete_details: None,
+            instructions: None,
+            max_output_tokens: None,
+            max_tool_calls: None,
+            model: "test-model".to_string(),
+            output: vec![],
+            parallel_tool_calls: false,
+            previous_response_id: None,
+            next_response_ids: vec![],
+            prompt_cache_key: None,
+            prompt_cache_retention: None,
+            reasoning: None,
+            safety_identifier: None,
+            service_tier: "default".to_string(),
+            store: false,
+            temperature: 1.0,
+            tool_choice: ResponseToolChoiceOutput::Auto("auto".to_string()),
+            tools: vec![],
+            top_logprobs: 0,
+            top_p: 1.0,
+            truncation: "disabled".to_string(),
+            usage: Usage::new(0, 0),
+            user: None,
+            metadata: None,
+        }
+    }
+
+    fn stream_event(event_type: &str, response: Option<ResponseObject>) -> ResponseStreamEvent {
+        ResponseStreamEvent {
+            event_type: event_type.to_string(),
+            sequence_number: None,
+            response,
+            output_index: None,
+            content_index: None,
+            item: None,
+            item_id: None,
+            part: None,
+            delta: None,
+            text: None,
+            error: None,
+            status_code: None,
+            logprobs: None,
+            obfuscation: None,
+            annotation_index: None,
+            annotation: None,
+            conversation_title: None,
+            usage: None,
+        }
+    }
 
     #[test]
     fn response_results_are_marked_no_store() {
@@ -598,5 +898,91 @@ mod tests {
                 .and_then(|value| value.to_str().ok()),
             Some("no-store")
         );
+    }
+
+    #[tokio::test]
+    async fn streaming_response_stores_signature_before_completed_frame() {
+        let attestation = Arc::new(RecordingAttestationService::default());
+        let response_id = "resp_11111111-1111-4111-8111-111111111111";
+        let events = vec![
+            stream_event("response.created", Some(sample_response(response_id))),
+            stream_event("response.completed", Some(sample_response(response_id))),
+        ];
+        let mut stream = signed_response_sse_stream(
+            Box::pin(futures::stream::iter(events)),
+            attestation.clone(),
+            "request-digest".to_string(),
+        );
+
+        let created_frame = stream
+            .next()
+            .await
+            .expect("created frame")
+            .expect("infallible frame");
+        assert!(attestation.stored_response_signatures().is_empty());
+
+        let completed_frame = stream
+            .next()
+            .await
+            .expect("completed frame")
+            .expect("infallible frame");
+
+        let signatures = attestation.stored_response_signatures();
+        assert_eq!(signatures.len(), 1);
+        let (stored_response_id, request_hash, response_hash) = &signatures[0];
+        assert_eq!(stored_response_id, response_id);
+        assert_eq!(request_hash, "request-digest");
+
+        let mut expected_hasher = Sha256::new();
+        expected_hasher.update(&created_frame);
+        expected_hasher.update(&completed_frame);
+        assert_eq!(response_hash, &hex::encode(expected_hasher.finalize()));
+    }
+
+    #[tokio::test]
+    async fn client_disconnect_before_completion_does_not_store_partial_signature() {
+        let attestation = Arc::new(RecordingAttestationService::default());
+        let response_id = "resp_22222222-2222-4222-8222-222222222222";
+        let mut stream = signed_response_sse_stream(
+            Box::pin(futures::stream::iter(vec![
+                stream_event("response.created", Some(sample_response(response_id))),
+                stream_event("response.output_text.delta", None),
+                stream_event("response.completed", Some(sample_response(response_id))),
+            ])),
+            attestation.clone(),
+            "request-digest".to_string(),
+        );
+
+        let _created_frame = stream
+            .next()
+            .await
+            .expect("created frame")
+            .expect("infallible frame");
+        drop(stream);
+
+        assert!(attestation.stored_response_signatures().is_empty());
+    }
+
+    #[tokio::test]
+    async fn non_streaming_response_stores_response_json_digest() {
+        let attestation = RecordingAttestationService::default();
+        let response = sample_response("resp_33333333-3333-4333-8333-333333333333");
+
+        persist_non_streaming_response_attestation(
+            &attestation,
+            &response,
+            "request-digest".to_string(),
+        )
+        .await;
+
+        let signatures = attestation.stored_response_signatures();
+        assert_eq!(signatures.len(), 1);
+        let (stored_response_id, request_hash, response_hash) = &signatures[0];
+        assert_eq!(stored_response_id, &response.id);
+        assert_eq!(request_hash, "request-digest");
+        let expected_hash = hex::encode(Sha256::digest(
+            serde_json::to_vec(&response).expect("response serialization"),
+        ));
+        assert_eq!(response_hash, &expected_hash);
     }
 }

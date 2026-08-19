@@ -1650,13 +1650,14 @@ pub fn build_completion_routes(
 /// Build response routes with auth
 pub fn build_response_routes(
     response_service: Arc<services::ResponseService>,
-    _attestation_service: Arc<dyn services::attestation::ports::AttestationServiceTrait>,
+    attestation_service: Arc<dyn services::attestation::ports::AttestationServiceTrait>,
     auth_state_middleware: &AuthState,
     usage_state: middleware::UsageState,
     rate_limit_state: middleware::RateLimitState,
 ) -> Router {
     let route_state = responses::ResponseRouteState {
         response_service: response_service.clone(),
+        attestation_service,
     };
 
     let inference_routes = Router::new()

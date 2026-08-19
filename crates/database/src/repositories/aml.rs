@@ -367,8 +367,7 @@ impl AmlRepository for PostgresAmlRepository {
                     VALUES ($1, $2, $3, $4)
                     ON CONFLICT (account_id, address_type)
                     DO UPDATE SET
-                        reason = EXCLUDED.reason,
-                        created_by_user_id = EXCLUDED.created_by_user_id
+                        reason = COALESCE(EXCLUDED.reason, aml_allowlisted_accounts.reason)
                     RETURNING account_id, address_type, reason, created_by_user_id, created_at
                     "#,
                     &[

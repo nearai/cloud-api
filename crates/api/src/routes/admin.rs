@@ -318,14 +318,14 @@ pub async fn list_aml_allowlist(
         .await
         .map_err(aml_service_error)?;
 
-    let entries = page
+    let accounts = page
         .entries
         .into_iter()
         .map(aml_allowlist_response)
         .collect();
 
     Ok(ResponseJson(ListAdminAmlAllowlistResponse {
-        entries,
+        accounts,
         total: page.total,
         limit: page.limit,
         offset: page.offset,

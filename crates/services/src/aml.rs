@@ -1193,8 +1193,9 @@ mod tests {
                 existing.account_id == stored.account_id
                     && existing.address_type == stored.address_type
             }) {
-                existing.reason = stored.reason.clone();
-                existing.created_by_user_id = stored.created_by_user_id;
+                if stored.reason.is_some() {
+                    existing.reason = stored.reason.clone();
+                }
                 return Ok(existing.clone());
             }
             entries.push(stored.clone());
@@ -1688,6 +1689,7 @@ mod tests {
         let provider = Arc::new(StaticProvider(new_report(AmlRiskLevel::Low)));
         let service = AmlService::new(repo.clone(), provider, enabled_config());
         let user_id = Uuid::new_v4();
+        let second_user_id = Uuid::new_v4();
 
         let created = service
             .upsert_allowlist_entry(
@@ -1701,11 +1703,17 @@ mod tests {
             .upsert_allowlist_entry("alice.near", Some("Updated".to_string()), Some(user_id))
             .await
             .unwrap();
+        let preserved = service
+            .upsert_allowlist_entry("alice.near", None, Some(second_user_id))
+            .await
+            .unwrap();
         let removed = service.remove_allowlist_entry("ALICE.near").await.unwrap();
         let removed_again = service.remove_allowlist_entry("alice.near").await.unwrap();
 
         assert_eq!(created.account_id, "alice.near");
         assert_eq!(updated.reason.as_deref(), Some("Updated"));
+        assert_eq!(preserved.reason.as_deref(), Some("Updated"));
+        assert_eq!(preserved.created_by_user_id, Some(user_id));
         assert!(removed);
         assert!(!removed_again);
         assert!(repo.allowlist_entries.lock().unwrap().is_empty());

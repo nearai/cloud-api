@@ -397,7 +397,10 @@ pub async fn create_response(
                                         req_hash.clone(),
                                         response_hash.clone(),
                                     ).await.is_err() {
-                                        tracing::error!("Failed to store response signature");
+                                        tracing::error!(
+                                            response_id = %rid,
+                                            "Failed to store response signature"
+                                        );
                                     } else {
                                         tracing::debug!(response_id = %rid, "Stored response signature");
                                     }
@@ -669,6 +672,7 @@ pub async fn create_response(
                     .is_err()
                 {
                     tracing::error!(
+                        response_id = %response_id,
                         "Failed to store response signature for non-streaming response"
                     );
                 }

@@ -296,6 +296,12 @@ impl ports::ResponseServiceTrait for ResponseServiceImpl {
 }
 
 impl ResponseServiceImpl {
+    const INPUT_FILE_FETCH_ERROR_MESSAGE: &str = "Failed to fetch input file content";
+
+    fn input_file_fetch_error() -> errors::ResponseError {
+        errors::ResponseError::InternalError(Self::INPUT_FILE_FETCH_ERROR_MESSAGE.to_string())
+    }
+
     /// Parse file ID from string (handles prefix)
     fn parse_file_id(file_id: &str) -> Result<Uuid, errors::ResponseError> {
         let id_str = file_id
@@ -335,11 +341,13 @@ impl ResponseServiceImpl {
                     }
                 }
             }
-            Err(e) => {
-                tracing::error!("Failed to fetch file content");
-                Err(errors::ResponseError::InternalError(format!(
-                    "Failed to fetch file content: {e}"
-                )))
+            Err(_) => {
+                tracing::error!(
+                    file_id = %file_uuid,
+                    error_category = "file_content_fetch_failed",
+                    "Failed to fetch input file content"
+                );
+                Err(Self::input_file_fetch_error())
             }
         }
     }
@@ -1462,11 +1470,19 @@ impl ResponseServiceImpl {
                 Ok(Ok(Ok(()))) => {
                     tracing::debug!("Title generation completed before response");
                 }
-                Ok(Ok(Err(_))) => {
-                    tracing::warn!("Title generation failed");
+                Ok(Ok(Err(error))) => {
+                    tracing::warn!(
+                        response_id = %ctx.response_id_str,
+                        error_category = error.log_category(),
+                        "Title generation failed"
+                    );
                 }
                 Ok(Err(_)) => {
-                    tracing::warn!("Title generation task panicked");
+                    tracing::warn!(
+                        response_id = %ctx.response_id_str,
+                        error_category = "title_generation_task_panicked",
+                        "Title generation task panicked"
+                    );
                 }
                 Err(_) => {
                     tracing::debug!("Title generation timed out, continuing with response");
@@ -2525,8 +2541,11 @@ impl ResponseServiceImpl {
                         for result in futures::future::join_all(results).await {
                             match result {
                                 Ok(text) => text_parts.push(text),
-                                Err(_) => {
-                                    tracing::error!("Failed to process content part");
+                                Err(error) => {
+                                    tracing::error!(
+                                        error_category = error.log_category(),
+                                        "Failed to process response content part"
+                                    );
                                 }
                             }
                         }
@@ -3368,7 +3387,10 @@ impl ResponseServiceImpl {
                 .image_edit(params, process_context.body_hash.clone())
                 .await
                 .map_err(|_| {
-                    tracing::error!("Image edit request failed");
+                    tracing::error!(
+                        error_category = "image_edit_provider_failure",
+                        "Image edit request failed"
+                    );
                     errors::ResponseError::InternalError(
                         "Image edit processing failed. Please try again later.".to_string(),
                     )
@@ -3391,7 +3413,10 @@ impl ResponseServiceImpl {
                 .image_generation(params, process_context.body_hash.clone())
                 .await
                 .map_err(|_| {
-                    tracing::error!("Image generation request failed");
+                    tracing::error!(
+                        error_category = "image_generation_provider_failure",
+                        "Image generation request failed"
+                    );
                     errors::ResponseError::InternalError(
                         "Image generation processing failed. Please try again later.".to_string(),
                     )
@@ -3696,6 +3721,17 @@ impl ResponseServiceImpl {
 mod tests {
     use super::*;
     use crate::responses::tools::WEB_SEARCH_TOOL_NAME;
+
+    #[test]
+    fn input_file_fetch_error_is_safe_for_clients() {
+        let error = ResponseServiceImpl::input_file_fetch_error().response_error();
+
+        assert_eq!(error.type_, "internal_server_error");
+        assert_eq!(
+            error.message,
+            "Internal server error: Failed to fetch input file content"
+        );
+    }
 
     #[test]
     fn test_process_reasoning_tags_simple_think() {

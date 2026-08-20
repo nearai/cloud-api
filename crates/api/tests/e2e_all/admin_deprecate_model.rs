@@ -1,9 +1,10 @@
-// E2E tests for POST /v1/admin/models/deprecate
+// E2E tests for model deprecation admin workflows.
 
 use crate::common::*;
 use api::models::{
     AdminModelListResponse, BatchUpdateModelApiRequest, DeprecateModelResponse, ErrorResponse,
 };
+use std::sync::Arc;
 
 /// Build a minimal model upsert payload — enough to satisfy the "new model"
 /// required-field validation (modelDisplayName, modelDescription, contextLength).
@@ -48,6 +49,90 @@ async fn deprecate(
         .add_header("User-Agent", MOCK_USER_AGENT)
         .json(&body)
         .await
+}
+
+async fn seed_recent_usage(
+    database: &Arc<database::Database>,
+    organization_id: uuid::Uuid,
+    workspace_id: uuid::Uuid,
+    api_key_id: uuid::Uuid,
+    model_name: &str,
+) {
+    let client = database.pool().get().await.unwrap();
+    let model_id: uuid::Uuid = client
+        .query_one(
+            "SELECT id FROM models WHERE model_name = $1",
+            &[&model_name],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    client
+        .execute(
+            r#"
+            INSERT INTO organization_usage_log (
+                id, organization_id, workspace_id, api_key_id,
+                model_id, model_name, input_tokens, output_tokens,
+                total_tokens, input_cost, output_cost, total_cost,
+                inference_type, created_at
+            ) VALUES ($1, $2, $3, $4, $5, $6, 10, 10, 20, 1, 1, 2,
+                      'chat_completion', NOW())
+            "#,
+            &[
+                &uuid::Uuid::new_v4(),
+                &organization_id,
+                &workspace_id,
+                &api_key_id,
+                &model_id,
+                &model_name,
+            ],
+        )
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn test_planned_deprecation_preview_counts_recent_recipient() {
+    let (server, database) = setup_test_server_with_database().await;
+    let old = format!("test-deprecation-preview-old-{}", uuid::Uuid::new_v4());
+    let successor = format!(
+        "test-deprecation-preview-successor-{}",
+        uuid::Uuid::new_v4()
+    );
+    create_model(&server, &old, &[]).await;
+    create_model(&server, &successor, &[]).await;
+
+    let organization = create_org(&server).await;
+    let organization_id = uuid::Uuid::parse_str(&organization.id).unwrap();
+    let workspaces = list_workspaces(&server, organization.id).await;
+    let workspace = workspaces.first().unwrap();
+    let api_key =
+        create_api_key_in_workspace(&server, workspace.id.clone(), "deprecation-preview".into())
+            .await;
+    seed_recent_usage(
+        &database,
+        organization_id,
+        uuid::Uuid::parse_str(&workspace.id).unwrap(),
+        uuid::Uuid::parse_str(&api_key.id).unwrap(),
+        &old,
+    )
+    .await;
+
+    let response = server
+        .post(&format!("/v1/admin/models/{old}/deprecation/preview"))
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .add_header("User-Agent", MOCK_USER_AGENT)
+        .json(&serde_json::json!({
+            "successorModelId": successor,
+            "deprecationDate": "2030-01-01"
+        }))
+        .await;
+
+    assert_eq!(response.status_code(), 200, "{}", response.text());
+    let preview: serde_json::Value = response.json();
+    assert_eq!(preview["recipientCount"], 1, "{preview}");
+    assert_eq!(preview["organizationCount"], 1, "{preview}");
+    assert_eq!(preview["usageWindowDays"], 30, "{preview}");
 }
 
 // ---------------------------------------------------------------------------

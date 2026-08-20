@@ -899,7 +899,7 @@ impl AdminRepository for AdminCompositeRepository {
                   AND o.is_active = true
                   AND u.is_active = true
                   AND om.role IN ('owner', 'admin')
-                ORDER BY lower(u.email), o.name
+                ORDER BY email, organization_name
                 "#,
                 &[&model_name, &since],
             )

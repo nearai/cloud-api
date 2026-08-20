@@ -35,6 +35,7 @@ pub struct ModelWithPricing {
     /// from the public catalog); `Some(x)` = cached tokens billed at `x`
     /// (`Some(0)` = genuinely free, rendered as `"0"`).
     pub cache_read_cost_per_token: Option<i64>,
+    pub text_pricing: Option<crate::usage::TextPricingProfile>,
 
     // Model metadata
     pub context_length: i32,

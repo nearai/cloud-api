@@ -163,6 +163,11 @@ use utoipa::{Modify, OpenApi};
         crate::routes::admin::get_organization_limits_history,
         crate::routes::staking_farm::get_admin_organization_staking_farm,
         crate::routes::staking_farm::sync_admin_organization_staking_farm,
+        crate::routes::admin::list_aml_reports,
+        crate::routes::admin::update_aml_report_status,
+        crate::routes::admin::list_aml_allowlist,
+        crate::routes::admin::upsert_aml_allowlist_entry,
+        crate::routes::admin::delete_aml_allowlist_entry,
         crate::routes::admin::update_organization_concurrent_limit,
         crate::routes::admin::get_organization_concurrent_limit,
         crate::routes::admin::get_organization_metrics,
@@ -283,6 +288,10 @@ use utoipa::{Modify, OpenApi};
             AdminInvitationEmailResendResultResponse,
             // User models (Admin)
             ListUsersResponse, AdminUserResponse,
+            // AML models (Admin)
+            AdminAmlReportResponse, ListAdminAmlReportsResponse, UpdateAmlReportStatusRequest,
+            AdminAmlAllowlistEntryResponse, ListAdminAmlAllowlistResponse,
+            UpsertAmlAllowlistEntryRequest,
             // Admin access token models
             CreateAdminAccessTokenRequest, AdminAccessTokenResponse,
             // Usage tracking models

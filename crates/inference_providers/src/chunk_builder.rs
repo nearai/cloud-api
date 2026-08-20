@@ -43,6 +43,7 @@ impl ChunkContext {
                 token_ids: None,
             }],
             usage,
+            service_tier: None,
             prompt_token_ids: None,
             modality: None,
             extra: Default::default(),

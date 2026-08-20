@@ -122,7 +122,8 @@ impl ModelPricingScheduler {
             let drifted = current.input_cost_per_token != change.old_input_cost_per_token
                 || current.output_cost_per_token != change.old_output_cost_per_token
                 || current.cache_read_cost_per_token != change.old_cache_read_cost_per_token
-                || current.cost_per_image != change.old_cost_per_image;
+                || current.cost_per_image != change.old_cost_per_image
+                || current.text_pricing != change.old_text_pricing;
             if drifted {
                 warn!(
                     change_id = %change.id,
@@ -147,7 +148,11 @@ impl ModelPricingScheduler {
                     .is_none_or(|v| Some(v) == current.cache_read_cost_per_token)
                 && change
                     .new_cost_per_image
-                    .is_none_or(|v| v == current.cost_per_image);
+                    .is_none_or(|v| v == current.cost_per_image)
+                && change
+                    .new_text_pricing
+                    .as_ref()
+                    .is_none_or(|profile| Some(profile) == current.text_pricing.as_ref());
             if already_at_target {
                 if let Err(e) = self.repository.mark_pricing_change_applied(change.id).await {
                     error!(
@@ -184,6 +189,7 @@ impl ModelPricingScheduler {
             // update-request's explicit-null `Some(None)` state; disabling is
             // done via PATCH /v1/admin/models instead).
             cache_read_cost_per_token: change.new_cache_read_cost_per_token.map(Some),
+            text_pricing: change.new_text_pricing.clone().map(Some),
             model_display_name: None,
             model_description: None,
             model_icon: None,

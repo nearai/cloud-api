@@ -1,6 +1,13 @@
 // Latency metrics
 pub const METRIC_LATENCY_TTFT: &str = "cloud_api.latency.time_to_first_token";
 pub const METRIC_LATENCY_TTFT_TOTAL: &str = "cloud_api.latency.time_to_first_token_total";
+// Streaming-only TTFT histograms emitted after usage arrives, so the actual
+// prompt-token bucket can be attached without mixing in non-streaming latency.
+pub const METRIC_LATENCY_STREAMING_TTFT_BY_INPUT: &str =
+    "cloud_api.latency.streaming_time_to_first_token_by_input";
+pub const METRIC_LATENCY_STREAMING_TTFT_TOTAL_BY_INPUT: &str =
+    "cloud_api.latency.streaming_time_to_first_token_total_by_input";
+pub const METRIC_LATENCY_BACKEND: &str = "cloud_api.latency.backend";
 pub const METRIC_LATENCY_TOTAL: &str = "cloud_api.latency.total";
 pub const METRIC_LATENCY_QUEUE_TIME: &str = "cloud_api.latency.queue_time";
 pub const METRIC_LATENCY_DECODING_TIME: &str = "cloud_api.latency.decoding_time";
@@ -62,6 +69,9 @@ pub const METRIC_BILLED_CACHE_READ_TOKENS: &str = "cloud_api.billed.cache_read_t
 pub const METRIC_BILLED_CACHE_WRITE_TOKENS: &str = "cloud_api.billed.cache_write_tokens";
 pub const METRIC_BILLED_INPUT_COST_USD: &str = "cloud_api.billed.input_cost_usd";
 pub const METRIC_BILLED_OUTPUT_COST_USD: &str = "cloud_api.billed.output_cost_usd";
+/// Fail-safe pricing was required because the provider returned an unknown or
+/// unpriced service tier. This must page billing owners.
+pub const METRIC_BILLING_PRICING_FALLBACK: &str = "cloud_api.billing.pricing_fallback";
 
 // Provider data quality metrics
 pub const METRIC_PROVIDER_TOKEN_ANOMALIES: &str = "cloud_api.provider.token_anomalies";

@@ -79,6 +79,11 @@ pub struct CreateResponseRequest {
     pub safety_identifier: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prompt_cache_key: Option<String>,
+    /// Responses is Standard-only for now. `auto` is accepted but normalized
+    /// to Standard before the internal Chat Completions call.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<String>)]
+    pub service_tier: Option<inference_providers::ChatServiceTier>,
 }
 
 /// Input for a response - can be text, array of items, or single item
@@ -1177,6 +1182,16 @@ impl CreateResponseRequest {
             }
         }
 
+        if matches!(
+            self.service_tier,
+            Some(
+                inference_providers::ChatServiceTier::Flex
+                    | inference_providers::ChatServiceTier::Priority
+            )
+        ) {
+            return Err("service_tier must be 'auto' or 'default' for /v1/responses".to_string());
+        }
+
         if let Some(metadata) = &self.metadata {
             let serialized =
                 serde_json::to_string(metadata).map_err(|_| "Invalid metadata".to_string())?;
@@ -1582,6 +1597,7 @@ mod tests {
             metadata: None,
             safety_identifier: None,
             prompt_cache_key: None,
+            service_tier: None,
         };
 
         for max_output_tokens in [-1, 0] {
@@ -1599,6 +1615,30 @@ mod tests {
             request.max_output_tokens = max_output_tokens;
 
             assert!(request.validate().is_ok());
+        }
+    }
+
+    #[test]
+    fn responses_only_accepts_standard_service_tier() {
+        for accepted in [None, Some("auto"), Some("default")] {
+            let mut value = serde_json::json!({"model": "openai/gpt-5.6-sol"});
+            if let Some(tier) = accepted {
+                value["service_tier"] = serde_json::json!(tier);
+            }
+            let request: CreateResponseRequest = serde_json::from_value(value).unwrap();
+            assert!(request.validate().is_ok());
+        }
+
+        for rejected in ["flex", "fast", "priority"] {
+            let request: CreateResponseRequest = serde_json::from_value(serde_json::json!({
+                "model": "openai/gpt-5.6-sol",
+                "service_tier": rejected,
+            }))
+            .unwrap();
+            assert_eq!(
+                request.validate().unwrap_err(),
+                "service_tier must be 'auto' or 'default' for /v1/responses"
+            );
         }
     }
 
@@ -1628,6 +1668,7 @@ mod tests {
             metadata: Some(json!({"key": "value"})),
             safety_identifier: None,
             prompt_cache_key: None,
+            service_tier: None,
         };
 
         assert!(
@@ -1658,6 +1699,7 @@ mod tests {
             metadata: Some(json!({"large_field": large_string})),
             safety_identifier: None,
             prompt_cache_key: None,
+            service_tier: None,
         };
 
         let result = request_with_large_metadata.validate();
@@ -1692,6 +1734,7 @@ mod tests {
             metadata: None,
             safety_identifier: None,
             prompt_cache_key: None,
+            service_tier: None,
         };
 
         assert!(
@@ -1804,6 +1847,7 @@ mod tests {
             metadata: None,
             safety_identifier: None,
             prompt_cache_key: None,
+            service_tier: None,
         };
 
         assert!(
@@ -1838,6 +1882,7 @@ mod tests {
             metadata: None,
             safety_identifier: None,
             prompt_cache_key: None,
+            service_tier: None,
         };
 
         let result = request_with_large_input_metadata.validate();

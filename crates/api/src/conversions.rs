@@ -121,6 +121,7 @@ impl From<ChatCompletionRequest> for ChatCompletionParams {
             metadata: None,
             store: None,
             stream_options,
+            service_tier: req.service_tier,
             modalities,
             original_request: None,
             extra,
@@ -931,6 +932,7 @@ mod tests {
             stop: Some(crate::models::StopSequences::Many(vec!["\\n".to_string()])),
             presence_penalty: None,
             frequency_penalty: None,
+            service_tier: None,
             extra,
         };
 
@@ -994,6 +996,7 @@ mod tests {
             stop: None,
             presence_penalty: None,
             frequency_penalty: None,
+            service_tier: None,
             extra,
         };
 

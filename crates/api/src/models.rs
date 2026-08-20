@@ -1087,7 +1087,11 @@ pub struct ModelInfo {
     /// Context length in tokens.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context_length: Option<i32>,
-    /// Maximum output tokens (OpenRouter `max_output_length`).
+    /// Advisory catalog metadata published for OpenRouter-schema compatibility. A positive
+    /// value advertised by the backend overrides the stored value on model-list cache refresh.
+    /// The gateway forwards request `max_tokens` unchanged and does not clamp it to this value.
+    /// The binding limit is the shared prompt and completion context window: `context_length`
+    /// (`max_model_len` on direct endpoints).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_output_length: Option<i32>,
     /// Model architecture (input/output modalities), legacy nested camelCase shape.
@@ -1103,8 +1107,10 @@ pub struct ModelInfo {
     pub supported_sampling_parameters: Vec<String>,
     /// Feature capabilities (OpenRouter `supported_features`).
     pub supported_features: Vec<String>,
-    /// OpenRouter `is_ready`: `false` keeps the model hidden on OpenRouter's
-    /// side, `true` enables auto-staging. Exposed verbatim; omitted when unset.
+    /// OpenRouter catalog publication flag, stored and exposed verbatim: `false` hides the
+    /// model on OpenRouter, while `true` enables auto-staging there. It may be absent and does
+    /// not indicate NEAR AI Cloud availability. Clients should use listing in `/v1/models`,
+    /// not `is_ready`, as the availability signal; listing does not guarantee live provider health.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub is_ready: Option<bool>,
     /// OpenRouter `deprecation_date`: planned deprecation date as an ISO 8601
@@ -1182,7 +1188,11 @@ pub struct TopProvider {
     /// Context length in tokens (mirrors top-level `context_length`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context_length: Option<i32>,
-    /// Maximum output tokens per response (mirrors top-level `max_output_length`).
+    /// Advisory catalog metadata mirroring top-level `max_output_length`, published for
+    /// OpenRouter-schema compatibility. A positive value advertised by the backend overrides
+    /// the stored value on model-list cache refresh. The gateway forwards request `max_tokens`
+    /// unchanged and does not clamp it to this value. The binding shared prompt/completion limit
+    /// is `context_length` (`max_model_len` directly).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_completion_tokens: Option<i32>,
     /// Whether the provider moderates content. We do not, so this is always false.
@@ -3554,7 +3564,11 @@ pub struct ModelMetadata {
     /// Quantization label (int4/int8/fp4/fp6/fp8/fp16/bf16/fp32).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub quantization: Option<String>,
-    /// Maximum output tokens per response (OpenRouter `max_output_length`).
+    /// Advisory catalog metadata published for OpenRouter-schema compatibility. A positive
+    /// value advertised by the backend overrides the stored value on model-list cache refresh.
+    /// The gateway forwards request `max_tokens` unchanged and does not clamp it to this value.
+    /// The binding limit is the shared prompt and completion context window: `context_length`
+    /// (`max_model_len` on direct endpoints).
     #[serde(rename = "maxOutputLength", skip_serializing_if = "Option::is_none")]
     pub max_output_length: Option<i32>,
     /// Sampling parameters accepted by the model (OpenRouter `supported_sampling_parameters`).
@@ -3575,7 +3589,10 @@ pub struct ModelMetadata {
     /// `[{ "country_code": "US" }]`. Omitted when unset.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub datacenters: Option<Vec<Datacenter>>,
-    /// OpenRouter `is_ready`: stored/exposed verbatim. Omitted when unset.
+    /// OpenRouter catalog publication flag, stored and exposed verbatim: `false` hides the
+    /// model on OpenRouter, while `true` enables auto-staging there. It may be absent and does
+    /// not indicate NEAR AI Cloud availability. Clients should use listing in `/v1/models`,
+    /// not `is_ready`, as the availability signal; listing does not guarantee live provider health.
     #[serde(rename = "isReady", skip_serializing_if = "Option::is_none")]
     pub is_ready: Option<bool>,
     /// OpenRouter `deprecation_date`: planned deprecation date as an ISO 8601
@@ -3669,7 +3686,13 @@ pub struct UpdateModelApiRequest {
     /// Quantization label (int4/int8/fp4/fp6/fp8/fp16/bf16/fp32).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub quantization: Option<String>,
-    /// Maximum number of output tokens the model can produce in a single response.
+    /// Advisory catalog metadata published for OpenRouter-schema compatibility. A positive
+    /// value advertised by the backend overrides the stored value on model-list cache refresh.
+    /// The gateway forwards request `max_tokens` unchanged and does not clamp it to this value.
+    /// The binding limit is the shared prompt and completion context window: `context_length`
+    /// (`max_model_len` on direct endpoints).
+    /// On PATCH, an omitted value or `null` leaves the value unchanged; the field cannot
+    /// currently be cleared.
     #[serde(rename = "maxOutputLength", skip_serializing_if = "Option::is_none")]
     pub max_output_length: Option<i32>,
     /// Sampling parameters accepted by the model (OpenRouter vocabulary).
@@ -3686,7 +3709,10 @@ pub struct UpdateModelApiRequest {
     /// uppercase ISO 3166 Alpha-2.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub datacenters: Option<Vec<Datacenter>>,
-    /// OpenRouter `is_ready`. Stored and exposed verbatim on `GET /v1/models`.
+    /// OpenRouter catalog publication flag, stored and exposed verbatim: `false` hides the
+    /// model on OpenRouter, while `true` enables auto-staging there. It may be absent and does
+    /// not indicate NEAR AI Cloud availability. Clients should use listing in `/v1/models`,
+    /// not `is_ready`, as the availability signal; listing does not guarantee live provider health.
     ///
     /// Tri-state PATCH semantics:
     /// - omitted → leave unchanged
@@ -4059,6 +4085,11 @@ pub struct ModelHistoryEntry {
     pub hugging_face_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub quantization: Option<String>,
+    /// Advisory catalog metadata published for OpenRouter-schema compatibility. A positive
+    /// value advertised by the backend overrides the stored value on model-list cache refresh.
+    /// The gateway forwards request `max_tokens` unchanged and does not clamp it to this value.
+    /// The binding limit is the shared prompt and completion context window: `context_length`
+    /// (`max_model_len` on direct endpoints).
     #[serde(rename = "maxOutputLength", skip_serializing_if = "Option::is_none")]
     pub max_output_length: Option<i32>,
     #[serde(
@@ -4077,6 +4108,10 @@ pub struct ModelHistoryEntry {
     /// `[{ "country_code": "US" }]`. Omitted when unset.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub datacenters: Option<Vec<Datacenter>>,
+    /// OpenRouter catalog publication flag, stored and exposed verbatim: `false` hides the
+    /// model on OpenRouter, while `true` enables auto-staging there. It may be absent and does
+    /// not indicate NEAR AI Cloud availability. Clients should use listing in `/v1/models`,
+    /// not `is_ready`, as the availability signal; listing does not guarantee live provider health.
     #[serde(rename = "isReady", skip_serializing_if = "Option::is_none")]
     pub is_ready: Option<bool>,
     #[serde(rename = "deprecationDate", skip_serializing_if = "Option::is_none")]

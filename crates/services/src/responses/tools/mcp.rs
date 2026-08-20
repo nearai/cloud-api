@@ -493,7 +493,7 @@ impl McpToolExecutor {
             ResponseError::McpConnectionFailed(format!("Server '{}' not connected", server_label))
         })?;
 
-        debug!("Executing MCP tool");
+        debug!(tool_type = "mcp", "Executing MCP tool");
 
         conn.client.call_tool(tool_name, arguments).await
     }

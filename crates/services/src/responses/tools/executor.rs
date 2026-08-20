@@ -73,7 +73,7 @@ impl<'a> ToolEventContext<'a> {
             {
                 tracing::warn!(
                     response_id = %self.stream_ctx.response_id_str,
-                    item_id = %self.tool_call_id,
+                    tool_call_id = %self.tool_call_id,
                     "Failed to store response item"
                 );
             }
@@ -258,7 +258,7 @@ impl ToolRegistry {
     }
 
     /// Log a tool error with retry-aware messaging
-    fn log_tool_error(&self, _tool_type: &str, failure_count: u32) {
+    fn log_tool_error(&self, failure_count: u32) {
         if failure_count > MAX_CONSECUTIVE_TOOL_FAILURES {
             tracing::error!(
                 failures = failure_count,
@@ -356,7 +356,7 @@ impl ToolRegistry {
     ) -> Result<Option<ToolOutput>, ResponseError> {
         // Track and log failure
         let failure_count = self.increment_failure_count(&tool_call.tool_type);
-        self.log_tool_error(&tool_call.tool_type, failure_count);
+        self.log_tool_error(failure_count);
 
         // Delegate to executor for custom handling (e.g., MCP approval)
         for executor in &self.executors {

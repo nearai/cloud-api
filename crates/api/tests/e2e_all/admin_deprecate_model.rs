@@ -4,7 +4,6 @@ use crate::common::*;
 use api::models::{
     AdminModelListResponse, BatchUpdateModelApiRequest, DeprecateModelResponse, ErrorResponse,
 };
-use std::sync::Arc;
 
 /// Build a minimal model upsert payload — enough to satisfy the "new model"
 /// required-field validation (modelDisplayName, modelDescription, contextLength).
@@ -52,7 +51,7 @@ async fn deprecate(
 }
 
 async fn seed_recent_usage(
-    database: &Arc<database::Database>,
+    database: &database::Database,
     organization_id: uuid::Uuid,
     workspace_id: uuid::Uuid,
     api_key_id: uuid::Uuid,

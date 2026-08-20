@@ -878,6 +878,7 @@ impl AdminRepository for AdminCompositeRepository {
                 SELECT DISTINCT
                     u.id AS user_id,
                     u.email AS email,
+                    lower(u.email) AS email_sort,
                     o.id AS organization_id,
                     o.name AS organization_name
                 FROM organization_usage_log ul
@@ -899,7 +900,7 @@ impl AdminRepository for AdminCompositeRepository {
                   AND o.is_active = true
                   AND u.is_active = true
                   AND om.role IN ('owner', 'admin')
-                ORDER BY lower(u.email), o.name
+                ORDER BY email_sort, organization_name
                 "#,
                 &[&model_name, &since],
             )

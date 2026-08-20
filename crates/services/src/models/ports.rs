@@ -65,7 +65,8 @@ pub struct ModelWithPricing {
     pub hugging_face_id: Option<String>,
     /// Quantization label: int4/int8/fp4/fp6/fp8/fp16/bf16/fp32.
     pub quantization: Option<String>,
-    /// Maximum number of output tokens the model can produce in a single response.
+    /// Advisory output-token metadata; not enforced. A positive backend-advertised value
+    /// overrides the stored value.
     pub max_output_length: Option<i32>,
     /// Sampling parameters accepted by the model (OpenRouter vocabulary).
     pub supported_sampling_parameters: Vec<String>,

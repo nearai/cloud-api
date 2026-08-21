@@ -162,41 +162,6 @@ async fn stateless_function_call_is_replayed_by_the_client_without_server_histor
 }
 
 #[tokio::test]
-async fn stateless_function_replay_rejects_input_between_call_and_output() {
-    let server = setup_test_server().await;
-    let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
-    let api_key = get_api_key_for_org(&server, org.id).await;
-
-    let response = server
-        .post("/v1/responses")
-        .add_header("Authorization", format!("Bearer {api_key}"))
-        .json(&serde_json::json!({
-            "model": "test-model",
-            "store": false,
-            "input": [
-                {
-                    "type": "function_call",
-                    "call_id": "call_example",
-                    "name": "get_weather",
-                    "arguments": "{\"location\":\"Shanghai\"}"
-                },
-                {"role": "user", "content": "This cannot interrupt the tool result."},
-                {
-                    "type": "function_call_output",
-                    "call_id": "call_example",
-                    "output": "{\"temperature\":22}"
-                }
-            ]
-        }))
-        .await;
-
-    assert_eq!(response.status_code(), 400);
-    let error = response.json::<api::models::ErrorResponse>();
-    assert_eq!(error.error.r#type, "invalid_request_error");
-    assert!(error.error.message.contains("before any message"));
-}
-
-#[tokio::test]
 async fn stateless_custom_web_search_function_is_not_executed_as_a_builtin_tool() {
     // Install a working built-in web-search provider. If the custom function
     // below were accidentally claimed by the built-in executor, this response

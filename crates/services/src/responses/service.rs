@@ -853,7 +853,7 @@ impl ResponseServiceImpl {
     /// Process the response stream - main logic
     async fn process_response_stream(
         tx: futures::channel::mpsc::UnboundedSender<models::ResponseStreamEvent>,
-        mut context: ProcessStreamContext,
+        context: ProcessStreamContext,
         usage_tracker: Arc<crate::responses::service_helpers::UsageTracker>,
     ) -> Result<(), errors::ResponseError> {
         tracing::info!("Starting response stream processing");

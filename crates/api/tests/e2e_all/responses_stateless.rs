@@ -1,6 +1,7 @@
 //! E2E boundary coverage for the stateless Responses API.
 
 use crate::common::*;
+use api::models::BatchUpdateModelApiRequest;
 use axum::http::Method;
 use std::sync::{atomic::Ordering, Arc};
 
@@ -175,6 +176,82 @@ async fn stateless_responses_reject_server_executed_tools_before_provider_work()
         web_search_call_count.load(Ordering::SeqCst),
         0,
         "Responses must not invoke the retained Web Search provider"
+    );
+}
+
+#[tokio::test]
+async fn stateless_responses_reject_image_output_models_before_provider_work() {
+    let (server, _pool, mock, _database) = setup_test_server_with_pool().await;
+
+    // Configure the capability explicitly instead of relying on the catalog
+    // defaults for the model name. Responses must remain a text-completion
+    // wrapper and reject image-generation models before asking a provider to
+    // do any work.
+    let model = "Qwen/Qwen-Image-2512";
+    let mut batch = BatchUpdateModelApiRequest::new();
+    batch.insert(
+        model.to_string(),
+        serde_json::from_value(serde_json::json!({
+            "inputCostPerToken": { "amount": 0, "currency": "USD" },
+            "outputCostPerToken": { "amount": 0, "currency": "USD" },
+            "costPerImage": { "amount": 40000000, "currency": "USD" },
+            "modelDisplayName": "Responses Image Output Test Model",
+            "modelDescription": "Active image-output model for Responses validation",
+            "contextLength": 4096,
+            "maxOutputLength": 1024,
+            "verifiable": true,
+            "isActive": true,
+            "inputModalities": ["text"],
+            "outputModalities": ["image"]
+        }))
+        .expect("image-output model configuration must be valid"),
+    );
+    let updated = admin_batch_upsert_models(&server, batch, get_session_id()).await;
+    assert_eq!(updated.len(), 1, "image-output model must be active");
+    assert_eq!(
+        updated[0]
+            .metadata
+            .architecture
+            .as_ref()
+            .expect("model architecture must be returned")
+            .output_modalities,
+        vec!["image".to_string()],
+        "test model must advertise image output"
+    );
+    // Keep this in step with the existing model setup helpers: the test
+    // server's model registry updates asynchronously after an admin upsert.
+    tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+
+    let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
+    let api_key = get_api_key_for_org(&server, org.id).await;
+
+    let response = server
+        .post("/v1/responses")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .json(&serde_json::json!({
+            "model": model,
+            "input": "Draw a small red square.",
+            "store": false,
+            "stream": false,
+        }))
+        .await;
+
+    assert_eq!(
+        response.status_code(),
+        400,
+        "image-output models must be rejected before inference: {}",
+        response.text()
+    );
+    let error = response.json::<api::models::ErrorResponse>();
+    assert_eq!(error.error.r#type, "invalid_request_error");
+    assert!(
+        error.error.message.to_ascii_lowercase().contains("image"),
+        "the client error must explain the unsupported image output: {}",
+        error.error.message
+    );
+    assert!(
+        mock.last_chat_params().await.is_none(),
+        "an image-output Responses request must be rejected before chat completion"
     );
 }
 

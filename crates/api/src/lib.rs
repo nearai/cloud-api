@@ -1776,8 +1776,8 @@ pub fn build_conversation_routes(
 ///
 /// Kept separate from service wiring so route precedence can be tested without
 /// a database; production uses this helper directly. The per-route fallbacks
-/// make unsupported methods 410, while the nested fallback handles unknown
-/// legacy descendants without conflicting with parameter routes.
+/// make unsupported methods 410, while ordinary descendant routes handle
+/// unknown legacy paths through the outer `/v1` nest.
 fn build_read_only_conversation_route_layout<S, H, T>(
     batch: MethodRouter<S>,
     conversation: MethodRouter<S>,
@@ -1790,10 +1790,14 @@ where
     T: 'static,
 {
     let descendants = Router::new()
+        .route("/", any(write_disabled.clone()))
         .route("/batch", batch)
         .route("/{conversation_id}", conversation)
         .route("/{conversation_id}/items", items)
-        .fallback(write_disabled.clone());
+        .route(
+            "/{conversation_id}/{*legacy_path}",
+            any(write_disabled.clone()),
+        );
 
     Router::new()
         .route("/conversations", any(write_disabled))
@@ -1897,8 +1901,8 @@ pub fn build_files_routes(app_state: AppState, auth_state_middleware: &AuthState
 ///
 /// Like Conversations, this is shared by production and route-precedence
 /// tests. Only the original GET views receive service handlers; other methods
-/// and descendants land on the authenticated 410 router through a scoped
-/// nested fallback.
+/// and descendants land on the authenticated 410 router through ordinary
+/// routes that survive the outer `/v1` nest.
 fn build_read_only_file_route_layout<S, H, T>(
     list: MethodRouter<S>,
     file: MethodRouter<S>,
@@ -1911,9 +1915,10 @@ where
     T: 'static,
 {
     let descendants = Router::new()
+        .route("/", any(write_disabled.clone()))
         .route("/{file_id}/content", content)
         .route("/{file_id}", file)
-        .fallback(write_disabled);
+        .route("/{file_id}/{*legacy_path}", any(write_disabled));
 
     Router::new()
         .route("/files", list)
@@ -2858,17 +2863,19 @@ mod tests {
         )
         .layer(map_response(no_store_response));
         let app = Router::new()
-            .merge(conversation_routes)
-            .merge(file_routes)
+            .nest(
+                "/v1",
+                Router::new().merge(conversation_routes).merge(file_routes),
+            )
             .fallback(unrelated_route);
 
         for (method, path) in [
-            ("POST", "/conversations/batch"),
-            ("GET", "/conversations/conv_example"),
-            ("GET", "/conversations/conv_example/items"),
-            ("GET", "/files"),
-            ("GET", "/files/file_example"),
-            ("GET", "/files/file_example/content"),
+            ("POST", "/v1/conversations/batch"),
+            ("GET", "/v1/conversations/conv_example"),
+            ("GET", "/v1/conversations/conv_example/items"),
+            ("GET", "/v1/files"),
+            ("GET", "/v1/files/file_example"),
+            ("GET", "/v1/files/file_example/content"),
         ] {
             let response = app
                 .clone()
@@ -2893,16 +2900,17 @@ mod tests {
         }
 
         for (method, path) in [
-            ("POST", "/conversations"),
-            ("GET", "/conversations/"),
-            ("GET", "/conversations/batch"),
-            ("POST", "/conversations/conv_example"),
-            ("POST", "/conversations/conv_example/items"),
-            ("PATCH", "/conversations/conv_example/unknown"),
-            ("POST", "/files"),
-            ("GET", "/files/"),
-            ("DELETE", "/files/file_example"),
-            ("PUT", "/files/legacy/nested/path"),
+            ("POST", "/v1/conversations"),
+            ("GET", "/v1/conversations/"),
+            ("GET", "/v1/conversations/batch"),
+            ("POST", "/v1/conversations/conv_example"),
+            ("POST", "/v1/conversations/conv_example/items"),
+            ("POST", "/v1/conversations/conv_example/pin"),
+            ("PATCH", "/v1/conversations/conv_example/unknown"),
+            ("POST", "/v1/files"),
+            ("GET", "/v1/files/"),
+            ("DELETE", "/v1/files/file_example"),
+            ("PUT", "/v1/files/legacy/nested/path"),
         ] {
             let response = app
                 .clone()

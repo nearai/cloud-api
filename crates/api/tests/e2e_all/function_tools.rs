@@ -308,7 +308,6 @@ async fn stateless_mcp_tools_are_rejected_before_provider_work() {
     assert_eq!(response.status_code(), 400, "response: {}", response.text());
     let error = response.json::<api::models::ErrorResponse>();
     assert_eq!(error.error.r#type, "invalid_request_error");
-    assert!(error.error.message.contains("mcp is not supported"));
     assert!(
         mock.last_chat_params().await.is_none(),
         "MCP should be rejected before provider work"

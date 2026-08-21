@@ -17,14 +17,14 @@ pub const MAX_FILE_SIZE: usize = 512 * 1024 * 1024; // 512 MB
 
 /// Return a stable migration response for Files mutations.
 ///
-/// Existing data remains available through the original read-only endpoints
-/// while export tooling is in use. Upload and deletion requests do not reach
-/// storage or repository layers.
+/// Existing data remains available through the original migration endpoints
+/// while export tooling is in use. Uploads and mutations other than the
+/// existing per-file DELETE route do not reach storage or repository layers.
 pub async fn files_write_disabled() -> (StatusCode, Json<ErrorResponse>) {
     (
         StatusCode::GONE,
         Json(ErrorResponse::new(
-            "The Files API is temporarily read-only while existing data remains available for export. This operation is no longer available. Only GET /v1/files, GET /v1/files/{file_id}, and GET /v1/files/{file_id}/content are supported."
+            "The Files API is temporarily limited while existing data remains available for export. This operation is no longer available. Only GET /v1/files, GET /v1/files/{file_id}, GET /v1/files/{file_id}/content, and DELETE /v1/files/{file_id} are supported."
                 .to_string(),
             "gone".to_string(),
         )),
@@ -499,7 +499,9 @@ pub async fn get_file(
         ("file_id" = String, Path, description = "The ID of the file to delete")
     ),
     responses(
-        (status = 200, description = "File deleted successfully", body = FileDeleteResponse),
+        (status = 200, description = "File deleted successfully", body = FileDeleteResponse,
+            headers(("Cache-Control" = String, description = "Always no-store for confidential migration data"))
+        ),
         (status = 400, description = "Bad request", body = ErrorResponse),
         (status = 401, description = "Unauthorized", body = ErrorResponse),
         (status = 404, description = "File not found", body = ErrorResponse)

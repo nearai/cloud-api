@@ -202,7 +202,7 @@ POST /v1/responses
 - Event types: `response.created`, `response.output_text.delta`, `response.completed`, `response.failed`
 - Only custom `type: "function"` tools are supported. They are client-managed: Cloud returns a `function_call` but never executes it; the client sends the original call and its matching `function_call_output` in a later fresh `store: false` request with its own history.
 - Server-executed Responses tools—including `web_search`, `web_context_search`, `file_search`, `code_interpreter`, `computer`, and remote `mcp`—plus file input and image-generation/editing output models are rejected. The independent root `POST /mcp` endpoint continues to expose web search and is not part of Responses execution.
-- During Stage I, existing Conversation/File data remains available only through authenticated, workspace-scoped migration views: `POST /v1/conversations/batch`, `GET /v1/conversations/{conversation_id}`, `GET /v1/conversations/{conversation_id}/items`, `GET /v1/files`, `GET /v1/files/{file_id}`, and `GET /v1/files/{file_id}/content`. They return `Cache-Control: no-store`; every Conversation/File mutation and unsupported legacy path returns `410 Gone`.
+- During Stage I, existing Conversation/File data remains available through authenticated, workspace-scoped migration routes: `POST /v1/conversations/batch`, `GET /v1/conversations/{conversation_id}`, `GET /v1/conversations/{conversation_id}/items`, `DELETE /v1/conversations/{conversation_id}`, `GET /v1/files`, `GET /v1/files/{file_id}`, `GET /v1/files/{file_id}/content`, and `DELETE /v1/files/{file_id}`. They return `Cache-Control: no-store`; creation, upload, all other mutations, and unsupported legacy paths return `410 Gone`.
 
 **Streaming Flow**:
 ```
@@ -259,14 +259,14 @@ Located in `crates/services/src/`:
 - `workspace` - Workspace CRUD, settings
 - `user` - User profiles, session management
 - `completions` - AI completion orchestration
-- `conversations` - Legacy state module with temporary Stage I migration read views; public mutations return `410 Gone`
+- `conversations` - Legacy state module with temporary Stage I migration routes; only per-conversation deletion remains enabled
 - `responses` - Request-scoped, stateless response orchestration with client-managed custom function calls
 - `attestation` - TEE attestation reports, chat signatures
 - `models` - Model catalog and pricing
 - `usage` - Token tracking, limit enforcement, billing
 - `inference_provider_pool` - Model discovery, load balancing
 - `mcp` - Model Context Protocol client management
-- `files` - Legacy state module with temporary Stage I migration read views; public mutations return `410 Gone`
+- `files` - Legacy state module with temporary Stage I migration routes; only per-file deletion remains enabled
 - `metrics` - OpenTelemetry metrics
 - `admin` - Admin operations, analytics
 - `common` - Shared utilities
@@ -279,13 +279,13 @@ Located in `crates/api/src/routes/`:
 - `workspaces.rs` - Workspace & API key management
 - `users.rs` - User profile, invitations, sessions
 - `completions.rs` - Chat & text completions
-- `conversations.rs` - Temporary authenticated, no-store Stage I migration read views; mutations return `410 Gone`
+- `conversations.rs` - Temporary authenticated, no-store Stage I migration routes; only per-conversation deletion remains enabled
 - `responses.rs` - Stateless AI response streaming with client-managed custom function calls
 - `models.rs` - Model catalog
 - `usage.rs` - Usage tracking, billing
 - `attestation.rs` - TEE verification, signatures
 - `admin.rs` - Admin endpoints
-- `files.rs` - Temporary authenticated, no-store Stage I migration read views; mutations return `410 Gone`
+- `files.rs` - Temporary authenticated, no-store Stage I migration routes; only per-file deletion remains enabled
 - `health.rs` - Health checks
 - `api.rs` - API versioning
 

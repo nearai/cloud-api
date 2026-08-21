@@ -14,13 +14,13 @@ use std::sync::Arc;
 use tracing::debug;
 use uuid::Uuid;
 
-const CONVERSATION_WRITE_DISABLED_MESSAGE: &str = "The Conversations API is temporarily read-only while existing data remains available for export. This operation is no longer available. Only POST /v1/conversations/batch, GET /v1/conversations/{conversation_id}, and GET /v1/conversations/{conversation_id}/items are supported.";
+const CONVERSATION_WRITE_DISABLED_MESSAGE: &str = "The Conversations API is temporarily limited while existing data remains available for export. This operation is no longer available. Only POST /v1/conversations/batch, GET /v1/conversations/{conversation_id}, GET /v1/conversations/{conversation_id}/items, and DELETE /v1/conversations/{conversation_id} are supported.";
 
 /// Return a stable migration response for Conversation mutations.
 ///
-/// API-key authentication is enforced by the router. The read-only routes use
-/// the same workspace-scoped service as before; this handler is only attached
-/// to writes and unsupported legacy paths.
+/// API-key authentication is enforced by the router. The temporary migration
+/// routes use the same workspace-scoped service as before; this handler is
+/// only attached to disabled writes and unsupported legacy paths.
 pub async fn conversation_write_disabled() -> (StatusCode, ResponseJson<ErrorResponse>) {
     (
         StatusCode::GONE,
@@ -424,7 +424,9 @@ pub async fn update_conversation(
         ("conversation_id" = String, Path, description = "Conversation ID")
     ),
     responses(
-        (status = 200, description = "Conversation deleted successfully", body = ConversationDeleteResult),
+        (status = 200, description = "Conversation deleted successfully", body = ConversationDeleteResult,
+            headers(("Cache-Control" = String, description = "Always no-store for confidential migration data"))
+        ),
         (status = 400, description = "Bad request", body = ErrorResponse),
         (status = 401, description = "Unauthorized", body = ErrorResponse),
         (status = 404, description = "Conversation not found", body = ErrorResponse),

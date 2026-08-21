@@ -1279,7 +1279,6 @@ impl CreateResponseRequest {
             let mut replayed_function_call_ids = HashSet::new();
             let mut completed_function_call_ids = HashSet::new();
             let mut pending_function_call_ids = HashSet::new();
-            let mut receiving_function_outputs = false;
 
             for item in items {
                 match item {
@@ -1290,12 +1289,6 @@ impl CreateResponseRequest {
                         );
                     }
                     ResponseInputItem::FunctionCall { call_id, name, .. } => {
-                        if receiving_function_outputs {
-                            return Err(
-                                "A replayed function_call block must list all function_call items before any function_call_output."
-                                    .to_string(),
-                            );
-                        }
                         if call_id.trim().is_empty() {
                             return Err(
                                 "A replayed function_call must include call_id.".to_string()
@@ -1325,15 +1318,8 @@ impl CreateResponseRequest {
                                 "function_call_output for call_id '{call_id}' must follow a matching function_call in the same stateless request"
                             ));
                         }
-                        receiving_function_outputs = !pending_function_call_ids.is_empty();
                     }
                     ResponseInputItem::Message { content, .. } => {
-                        if !pending_function_call_ids.is_empty() {
-                            return Err(
-                                "A replayed function_call block must be followed by its matching function_call_output items before any message."
-                                    .to_string(),
-                            );
-                        }
                         if let ResponseContent::Parts(parts) = content {
                             if parts
                                 .iter()
@@ -1345,14 +1331,6 @@ impl CreateResponseRequest {
                                 );
                             }
                         }
-                    }
-                    ResponseInputItem::McpListTools { .. }
-                        if !pending_function_call_ids.is_empty() =>
-                    {
-                        return Err(
-                            "A replayed function_call block must be followed by its matching function_call_output items before any other input item."
-                                .to_string(),
-                        );
                     }
                     _ => {}
                 }
@@ -2252,7 +2230,7 @@ mod tests {
     }
 
     #[test]
-    fn stateless_function_replay_validates_contiguous_call_output_blocks() {
+    fn stateless_function_replay_validates_call_output_correlations() {
         let duplicate_call = stateless_request_with_items(vec![
             replayed_function_call("call_one"),
             replayed_function_call("call_one"),
@@ -2296,17 +2274,26 @@ mod tests {
         ]);
         assert!(parallel_calls.validate_stateless().is_ok());
 
-        let call_after_outputs_start = stateless_request_with_items(vec![
+        let interleaved_calls_and_outputs = stateless_request_with_items(vec![
             replayed_function_call("call_one"),
             replayed_function_call("call_two"),
             function_call_output("call_one"),
             replayed_function_call("call_three"),
             function_call_output("call_two"),
+            function_call_output("call_three"),
         ]);
-        assert!(call_after_outputs_start
-            .validate_stateless()
-            .unwrap_err()
-            .contains("before any function_call_output"));
+        assert!(interleaved_calls_and_outputs.validate_stateless().is_ok());
+
+        let message_between_call_and_output = stateless_request_with_items(vec![
+            replayed_function_call("call_one"),
+            ResponseInputItem::Message {
+                role: "user".to_string(),
+                content: ResponseContent::Text("continue".to_string()),
+                metadata: None,
+            },
+            function_call_output("call_one"),
+        ]);
+        assert!(message_between_call_and_output.validate_stateless().is_ok());
     }
 
     #[test]
@@ -2368,30 +2355,6 @@ mod tests {
             .validate_stateless()
             .unwrap_err()
             .contains("matching function_call"));
-
-        let mut interleaved_function_result = stateless_request();
-        interleaved_function_result.input = Some(ResponseInput::Items(vec![
-            ResponseInputItem::FunctionCall {
-                type_: FunctionCallType::FunctionCall,
-                call_id: "call_test".to_string(),
-                name: "lookup".to_string(),
-                arguments: "{}".to_string(),
-            },
-            ResponseInputItem::Message {
-                role: "user".to_string(),
-                content: ResponseContent::Text("interleaved input".to_string()),
-                metadata: None,
-            },
-            ResponseInputItem::FunctionCallOutput {
-                type_: FunctionCallOutputType::FunctionCallOutput,
-                call_id: "call_test".to_string(),
-                output: "{}".to_string(),
-            },
-        ]));
-        assert!(interleaved_function_result
-            .validate_stateless()
-            .unwrap_err()
-            .contains("before any message"));
 
         let mut mcp_approval = stateless_request();
         mcp_approval.input = Some(ResponseInput::Items(vec![

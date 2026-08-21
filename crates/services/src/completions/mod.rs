@@ -945,7 +945,7 @@ impl CompletionServiceImpl {
         ]
     }
 
-    pub(crate) fn map_provider_error(
+    pub fn map_provider_error(
         model: &str,
         error: &inference_providers::CompletionError,
         operation: &str,

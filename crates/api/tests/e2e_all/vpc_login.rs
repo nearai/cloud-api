@@ -284,7 +284,7 @@ async fn test_vpc_login_api_key_works() {
 
     let body = response.json::<VpcLoginResponse>();
 
-    // A valid API key reaches the retired Files endpoint.
+    // A valid API key reaches the temporary read-only Files view.
     let auth_response = server
         .get("/v1/files?limit=1")
         .add_header("Authorization", format!("Bearer {}", body.api_key))
@@ -293,8 +293,8 @@ async fn test_vpc_login_api_key_works() {
 
     assert_eq!(
         auth_response.status_code(),
-        410,
-        "API key from VPC login should reach the Files API retirement response"
+        200,
+        "API key from VPC login should reach the temporary Files read view"
     );
 
     println!("✅ API key from VPC login works correctly");

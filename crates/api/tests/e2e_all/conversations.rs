@@ -24,11 +24,11 @@ fn assert_conversation_write_is_gone(response: axum_test::TestResponse) {
         error.error.code.as_deref(),
         Some("conversation_write_disabled")
     );
-    assert!(error.error.message.contains("read-only"));
+    assert!(error.error.message.contains("temporarily limited"));
 }
 
 #[tokio::test]
-async fn conversation_migration_views_require_an_api_key() {
+async fn conversation_migration_routes_require_an_api_key() {
     let server = setup_test_server().await;
 
     assert_eq!(
@@ -55,10 +55,17 @@ async fn conversation_migration_views_require_an_api_key() {
             .status_code(),
         401
     );
+    assert_eq!(
+        server
+            .delete(&format!("/v1/conversations/{UNKNOWN_CONVERSATION_ID}"))
+            .await
+            .status_code(),
+        401
+    );
 }
 
 #[tokio::test]
-async fn conversation_migration_views_reach_read_handlers_and_are_no_store() {
+async fn conversation_migration_routes_reach_workspace_scoped_handlers_and_are_no_store() {
     let server = setup_test_server().await;
     let (api_key, _) = create_org_and_api_key(&server).await;
 
@@ -87,21 +94,29 @@ async fn conversation_migration_views_reach_read_handlers_and_are_no_store() {
         );
         assert_no_store(&response);
     }
+
+    let delete = server
+        .delete(&format!("/v1/conversations/{UNKNOWN_CONVERSATION_ID}"))
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .await;
+    assert_eq!(
+        delete.status_code(),
+        404,
+        "DELETE must reach its original workspace-scoped handler rather than the 410 fallback"
+    );
+    assert_no_store(&delete);
 }
 
 #[tokio::test]
-async fn conversation_writes_and_unlisted_reads_remain_gone_after_authentication() {
+async fn all_conversation_mutations_except_delete_remain_gone_after_authentication() {
     let server = setup_test_server().await;
     let (api_key, _) = create_org_and_api_key(&server).await;
     let routes = [
         (Method::POST, "/v1/conversations"),
         (Method::GET, "/v1/conversations"),
+        (Method::DELETE, "/v1/conversations/batch"),
         (
             Method::POST,
-            "/v1/conversations/conv_00000000-0000-0000-0000-000000000000",
-        ),
-        (
-            Method::DELETE,
             "/v1/conversations/conv_00000000-0000-0000-0000-000000000000",
         ),
         (
@@ -132,6 +147,10 @@ async fn conversation_writes_and_unlisted_reads_remain_gone_after_authentication
             Method::PATCH,
             "/v1/conversations/conv_00000000-0000-0000-0000-000000000000/unknown",
         ),
+        (
+            Method::DELETE,
+            "/v1/conversations/conv_00000000-0000-0000-0000-000000000000/unknown",
+        ),
     ];
 
     for (method, path) in routes {
@@ -145,7 +164,7 @@ async fn conversation_writes_and_unlisted_reads_remain_gone_after_authentication
 }
 
 #[tokio::test]
-async fn openapi_advertises_only_temporary_read_only_migration_views() {
+async fn openapi_advertises_temporary_migration_routes_and_only_allowed_deletions() {
     let server = setup_test_server().await;
     let response = server.get("/api-docs/openapi.json").await;
     assert_eq!(response.status_code(), 200);
@@ -158,15 +177,17 @@ async fn openapi_advertises_only_temporary_read_only_migration_views() {
     for (path, method) in [
         ("/v1/conversations/batch", "post"),
         ("/v1/conversations/{conversation_id}", "get"),
+        ("/v1/conversations/{conversation_id}", "delete"),
         ("/v1/conversations/{conversation_id}/items", "get"),
         ("/v1/files", "get"),
         ("/v1/files/{file_id}", "get"),
+        ("/v1/files/{file_id}", "delete"),
         ("/v1/files/{file_id}/content", "get"),
     ] {
         let operation = paths.get(path).and_then(|path_item| path_item.get(method));
         assert!(
             operation.is_some_and(serde_json::Value::is_object),
-            "OpenAPI must advertise temporary read-only migration view: {method} {path}"
+            "OpenAPI must advertise temporary migration route: {method} {path}"
         );
         assert_eq!(
             operation.unwrap()["security"],
@@ -182,13 +203,13 @@ async fn openapi_advertises_only_temporary_read_only_migration_views() {
     for (path, method) in [
         ("/v1/conversations", "post"),
         ("/v1/conversations/{conversation_id}", "post"),
-        ("/v1/conversations/{conversation_id}", "delete"),
         ("/v1/conversations/{conversation_id}/pin", "post"),
+        ("/v1/conversations/{conversation_id}/pin", "delete"),
         ("/v1/conversations/{conversation_id}/archive", "post"),
+        ("/v1/conversations/{conversation_id}/archive", "delete"),
         ("/v1/conversations/{conversation_id}/clone", "post"),
         ("/v1/conversations/{conversation_id}/items", "post"),
         ("/v1/files", "post"),
-        ("/v1/files/{file_id}", "delete"),
     ] {
         assert!(
             paths
@@ -209,8 +230,8 @@ async fn openapi_advertises_only_temporary_read_only_migration_views() {
             .and_then(|tag| tag["description"].as_str())
             .unwrap_or_else(|| panic!("missing {tag_name} tag description"));
         assert!(
-            description.contains("Temporary authenticated, workspace-scoped read access"),
-            "{tag_name} must be documented as a temporary workspace-scoped read surface"
+            description.contains("Temporary authenticated, workspace-scoped migration access"),
+            "{tag_name} must be documented as a temporary workspace-scoped migration surface"
         );
         assert!(
             description.contains("410 Gone"),
@@ -230,8 +251,10 @@ async fn openapi_advertises_only_temporary_read_only_migration_views() {
         "ConversationItemList",
         "BatchConversationsRequest",
         "ConversationBatchResponse",
+        "ConversationDeleteResult",
         "FileUploadResponse",
         "FileListResponse",
+        "FileDeleteResponse",
     ] {
         assert!(
             schemas.contains_key(schema),
@@ -242,8 +265,6 @@ async fn openapi_advertises_only_temporary_read_only_migration_views() {
         "CreateConversationRequest",
         "UpdateConversationRequest",
         "CreateConversationItemsRequest",
-        "ConversationDeleteResult",
-        "FileDeleteResponse",
         "ExpiresAfter",
     ] {
         assert!(

@@ -272,7 +272,8 @@ Provider refresh runs every 300s by default
 | `POST /v1/workspaces/{id}/api-keys`         | session  | Returns plaintext `key` — store it, it isn't shown again    |
 | `GET  /v1/models`                           | public   | OpenAI-compatible model catalog with pricing metadata       |
 | `POST /v1/chat/completions`                 | API key  | OpenAI-compatible. Add `"stream": true` for SSE             |
-| `POST /v1/responses`                        | API key  | Stateless `store: false` inference; response history is unavailable |
+| `POST /v1/responses`                        | API key  | Stateless `store: false` inference; client-managed function tools only |
+| `POST /mcp`                                 | API key  | Independent MCP server exposing the `web_search` tool       |
 | `GET  /v1/attestation/report`               | API key  | TEE attestation (503 outside a CVM unless `DEV=true` in debug builds) |
 | `GET  /v1/attestation/ita-token`            | public   | Intel Trust Authority JWT wrapper (requires ITA env vars)   |
 | `GET  /v1/signature/{chat_id}`              | API key  | Per-completion and `resp_*` signature lookup                |
@@ -308,9 +309,14 @@ the signature material contains no raw request or response content. A stream
 that disconnects before completion creates no `resp_*` attestation record or
 legacy disconnect fallback.
 
-Stateful operations are rejected: Conversations, response history, file input
-and file search, code interpreter, computer, and every MCP approval mode other
-than `require_approval: "never"`.
+Only custom `function` tools are supported by `POST /v1/responses`.
+Server-executed tools are rejected locally: `web_search`,
+`web_context_search`, `file_search`, `code_interpreter`, `computer`, and
+remote `mcp` tools. This does not affect the separate `POST /mcp` MCP server,
+which continues to expose its independent `web_search` tool.
+
+Stateful operations are also rejected: Conversations, response history, and
+file input.
 
 ## 7. Troubleshooting
 

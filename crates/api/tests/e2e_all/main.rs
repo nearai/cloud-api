@@ -98,9 +98,6 @@ mod usage_provider_attribution;
 mod usage_recording;
 mod usage_responses;
 mod vpc_login;
-mod web_context_search;
-mod web_search_citations;
-
 /// Run by nextest's setup script after this E2E binary has already been built.
 /// Keeping bootstrap in the same binary avoids a second cold compile/link in CI.
 #[tokio::test]

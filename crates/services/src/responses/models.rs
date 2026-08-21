@@ -64,6 +64,7 @@ pub struct CreateResponseRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub background: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<Vec<ClientManagedResponseTool>>)]
     pub tools: Option<Vec<ResponseTool>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_choice: Option<ResponseToolChoice>,
@@ -330,6 +331,24 @@ pub enum ResponseTool {
     },
 }
 
+/// Public Responses tool schema.
+///
+/// Runtime request parsing retains the legacy server-executed variants long
+/// enough to return a clear 400 error, but the public Responses contract only
+/// accepts client-managed custom functions.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(tag = "type")]
+pub enum ClientManagedResponseTool {
+    #[serde(rename = "function")]
+    Function {
+        name: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        description: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        parameters: Option<serde_json::Value>,
+    },
+}
+
 /// User location for web search
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct UserLocation {
@@ -461,6 +480,7 @@ pub struct ResponseObject {
     pub store: bool,
     pub temperature: f32,
     pub tool_choice: ResponseToolChoiceOutput,
+    #[schema(value_type = Vec<ClientManagedResponseTool>)]
     pub tools: Vec<ResponseTool>,
     #[serde(default)]
     pub top_logprobs: i32,

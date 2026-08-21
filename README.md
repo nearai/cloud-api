@@ -171,11 +171,27 @@ Once all checks pass, you're ready to commit!
 
 ## API Documentation
 
-### Retired Conversations API
+### Temporary migration read APIs
 
-The `/v1/conversations` API is retired and every request to that path returns
-`410 Gone`. Use stateless `POST /v1/responses` requests with `store: false` and
-send any conversation history needed for inference in each request.
+During Stage I of the confidential-data migration, cloud-api keeps a small,
+authenticated, workspace-scoped read surface so existing migration/export
+tooling can retrieve data it already identifies. This is not a new export API
+and does not add a Conversation-list endpoint.
+
+- Conversations: `POST /v1/conversations/batch`,
+  `GET /v1/conversations/{conversation_id}`, and
+  `GET /v1/conversations/{conversation_id}/items`.
+- Files: `GET /v1/files`, `GET /v1/files/{file_id}`, and
+  `GET /v1/files/{file_id}/content`.
+
+Each temporary view requires an API key, is scoped to that key's workspace, and
+returns `Cache-Control: no-store`. Creation, upload, deletion, and every other
+Conversation or File mutation return `410 Gone`. The temporary views will be
+removed after data migration.
+
+`POST /v1/responses` remains stateless (`store: false`) and does not accept a
+Conversation reference, response history, or File input. Clients must send any
+inference history needed for a request themselves.
 
 Interactive API documentation is available when running the server:
 

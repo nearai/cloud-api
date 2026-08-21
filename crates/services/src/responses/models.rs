@@ -1319,17 +1319,16 @@ impl CreateResponseRequest {
                             ));
                         }
                     }
-                    ResponseInputItem::Message { content, .. } => {
-                        if let ResponseContent::Parts(parts) = content {
-                            if parts
-                                .iter()
-                                .any(|part| matches!(part, ResponseContentPart::InputFile { .. }))
-                            {
-                                return Err(
-                                    "The stateless Responses API does not support input_file."
-                                        .to_string(),
-                                );
-                            }
+                    ResponseInputItem::Message {
+                        content: ResponseContent::Parts(parts),
+                        ..
+                    } => {
+                        if parts
+                            .iter()
+                            .any(|part| matches!(part, ResponseContentPart::InputFile { .. }))
+                        {
+                            return Err("The stateless Responses API does not support input_file."
+                                .to_string());
                         }
                     }
                     _ => {}

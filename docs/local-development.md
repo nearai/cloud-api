@@ -312,8 +312,11 @@ legacy disconnect fallback.
 Only custom `function` tools are supported by `POST /v1/responses`.
 Server-executed tools are rejected locally: `web_search`,
 `web_context_search`, `file_search`, `code_interpreter`, `computer`, and
-remote `mcp` tools. This does not affect the separate `POST /mcp` MCP server,
-which continues to expose its independent `web_search` tool.
+remote `mcp` tools. Image-generation and image-editing models are also
+rejected so every successful Responses inference makes exactly one Chat
+Completions call. This does not affect the separate `POST /mcp` MCP server,
+which continues to expose its independent `web_search` tool, or the
+`/v1/images/*` endpoints.
 
 Stateful operations are also rejected: Conversations, response history, and
 file input.

@@ -2695,7 +2695,10 @@ mod tests {
         let description = responses_tag["description"]
             .as_str()
             .expect("Responses tag must document its contract");
+        assert!(description
+            .contains("successful Responses inference makes exactly one Chat Completions call"));
         assert!(description.contains("Only custom `function` tools are supported"));
+        assert!(description.contains("image-generation/editing models are rejected"));
         assert!(description.contains("POST /mcp"));
     }
 

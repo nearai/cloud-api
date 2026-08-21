@@ -436,10 +436,7 @@ pub async fn init_domain_services_with_pool(
     let brave_search_provider =
         Arc::new(services::responses::tools::brave::BraveWebSearchProvider::new());
     let web_search_provider: Arc<dyn services::responses::tools::WebSearchProviderTrait> =
-        brave_search_provider.clone();
-    let web_context_search_provider: Arc<
-        dyn services::responses::tools::WebContextSearchProviderTrait,
-    > = brave_search_provider;
+        brave_search_provider;
 
     // Create session repository for user service
     let session_repo = Arc::new(database::SessionRepository::new(database.pool().clone()))
@@ -482,10 +479,7 @@ pub async fn init_domain_services_with_pool(
         inference_provider_pool.clone(),
         conversation_service.clone(),
         completion_service.clone(),
-        Some(web_search_provider.clone()), // web_search_provider
-        Some(web_context_search_provider), // web_context_search_provider
-        None,                              // file_search_provider
-        files_service.clone(),             // file_service
+        files_service.clone(), // file_service
         organization_service.clone(),
     ));
 
@@ -560,8 +554,11 @@ pub async fn init_domain_services_with_pool(
     }
 }
 
-/// Initialize domain services with a custom MCP client factory (for testing)
-/// This is a thin wrapper that creates the response service with an injected factory
+/// Initialize domain services for legacy MCP tests.
+///
+/// Remote MCP tools are no longer supported by Responses. Keep this helper's
+/// signature temporarily so downstream test setup still compiles, but do not
+/// inject or construct an MCP client for the Responses service.
 #[allow(clippy::too_many_arguments)]
 pub async fn init_domain_services_with_mcp_factory(
     database: Arc<Database>,
@@ -569,7 +566,7 @@ pub async fn init_domain_services_with_mcp_factory(
     organization_service: Arc<dyn services::organization::OrganizationServiceTrait + Send + Sync>,
     inference_provider_pool: Arc<services::inference_provider_pool::InferenceProviderPool>,
     metrics_service: Arc<dyn services::metrics::MetricsServiceTrait>,
-    mcp_client_factory: Arc<dyn services::responses::tools::McpClientFactory>,
+    _mcp_client_factory: Arc<dyn services::responses::tools::McpClientFactory>,
 ) -> DomainServices {
     // Get the base domain services
     let mut domain_services = init_domain_services_with_pool(
@@ -581,33 +578,21 @@ pub async fn init_domain_services_with_mcp_factory(
     )
     .await;
 
-    // Replace the response service with one that has the MCP factory injected
+    // Replace the response service while retaining the caller-provided pool.
     let response_repo = Arc::new(database::PgResponseRepository::new(database.pool().clone()));
     let response_items_repo = Arc::new(database::PgResponseItemsRepository::new(
         database.pool().clone(),
     ))
         as Arc<dyn services::responses::ports::ResponseItemRepositoryTrait>;
 
-    let brave_search_provider =
-        Arc::new(services::responses::tools::brave::BraveWebSearchProvider::new());
-    let web_search_provider: Arc<dyn services::responses::tools::WebSearchProviderTrait> =
-        brave_search_provider.clone();
-    let web_context_search_provider: Arc<
-        dyn services::responses::tools::WebContextSearchProviderTrait,
-    > = brave_search_provider;
-
-    let response_service = Arc::new(services::ResponseService::with_mcp_client_factory(
+    let response_service = Arc::new(services::ResponseService::new(
         response_repo,
         response_items_repo,
         inference_provider_pool,
         domain_services.conversation_service.clone(),
         domain_services.completion_service.clone(),
-        Some(web_search_provider),
-        Some(web_context_search_provider),
-        None,
         domain_services.files_service.clone(), // Reuse files_service from base
         organization_service,
-        mcp_client_factory,
     ));
 
     domain_services.response_service = response_service;
@@ -637,8 +622,9 @@ pub async fn init_domain_services_with_pool_and_web_search_provider(
     .await
 }
 
-/// Like `init_domain_services_with_pool_and_web_search_provider`, but also lets tests
-/// inject a Responses-only context-search provider.
+/// Like `init_domain_services_with_pool_and_web_search_provider`, but keeps a
+/// compatibility argument for tests that previously injected a Responses-only
+/// context-search provider. Responses no longer accepts that built-in tool.
 pub async fn init_domain_services_with_pool_and_search_providers(
     database: Arc<Database>,
     config: &ApiConfig,
@@ -646,7 +632,7 @@ pub async fn init_domain_services_with_pool_and_search_providers(
     inference_provider_pool: Arc<services::inference_provider_pool::InferenceProviderPool>,
     metrics_service: Arc<dyn services::metrics::MetricsServiceTrait>,
     web_search_provider: Arc<dyn services::responses::tools::WebSearchProviderTrait>,
-    web_context_search_provider: Option<
+    _web_context_search_provider: Option<
         Arc<dyn services::responses::tools::WebContextSearchProviderTrait>,
     >,
 ) -> DomainServices {
@@ -671,9 +657,6 @@ pub async fn init_domain_services_with_pool_and_search_providers(
         inference_provider_pool,
         domain_services.conversation_service.clone(),
         domain_services.completion_service.clone(),
-        Some(web_search_provider.clone()),
-        web_context_search_provider,
-        None,
         domain_services.files_service.clone(),
         organization_service,
     ));
@@ -2526,6 +2509,58 @@ mod tests {
 
         // Verify servers are not hardcoded (will be set dynamically on client)
         assert!(spec.servers.is_none() || spec.servers.as_ref().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_openapi_stateless_responses_request_excludes_rejected_inputs() {
+        let spec = serde_json::to_value(ApiDoc::openapi()).unwrap();
+        let request_schema = &spec["paths"]["/v1/responses"]["post"]["requestBody"]["content"]
+            ["application/json"]["schema"];
+        assert_eq!(
+            request_schema["$ref"],
+            "#/components/schemas/StatelessCreateResponseRequestSchema"
+        );
+
+        let schemas = &spec["components"]["schemas"];
+        let request = &schemas["StatelessCreateResponseRequestSchema"];
+        for rejected_field in ["conversation", "previous_response_id", "background"] {
+            assert!(
+                request["properties"].get(rejected_field).is_none(),
+                "stateless Responses schema must not advertise {rejected_field}"
+            );
+        }
+        assert_eq!(request["properties"]["store"]["default"], false);
+
+        let input_items = serde_json::to_string(&schemas["StatelessResponseInputItemSchema"])
+            .expect("input item schema should serialize");
+        assert!(
+            !input_items.contains("mcp_approval_response")
+                && !input_items.contains("mcp_list_tools"),
+            "stateless Responses schema must not advertise MCP input items"
+        );
+
+        let content_parts = serde_json::to_string(&schemas["StatelessResponseContentPartSchema"])
+            .expect("content part schema should serialize");
+        assert!(
+            !content_parts.contains("input_file"),
+            "stateless Responses schema must not advertise input_file"
+        );
+
+        let tools = serde_json::to_string(&schemas["StatelessResponseToolSchema"])
+            .expect("tool schema should serialize");
+        for rejected_tool in [
+            "web_search",
+            "web_context_search",
+            "file_search",
+            "code_interpreter",
+            "computer",
+            "mcp",
+        ] {
+            assert!(
+                !tools.contains(rejected_tool),
+                "stateless Responses schema must not advertise {rejected_tool}"
+            );
+        }
     }
 
     fn assert_reporting_path_security(

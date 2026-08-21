@@ -122,6 +122,10 @@ pub enum ResponseInputItem {
         name: String,
         /// JSON-encoded arguments returned by the model.
         arguments: String,
+        /// Provider-specific metadata (for example Gemini's thought signature)
+        /// that must be echoed unchanged when this call is replayed.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        thought_signature: Option<String>,
     },
     /// Output from a client-executed function call
     FunctionCallOutput {
@@ -655,6 +659,10 @@ pub enum ResponseOutputItem {
         name: String,
         /// JSON-encoded arguments
         arguments: String,
+        /// Provider-specific metadata that clients must echo unchanged when
+        /// replaying the function call (for example Gemini's thought signature).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        thought_signature: Option<String>,
         /// Status: "in_progress" when pending client execution
         status: String,
         model: String,
@@ -1282,9 +1290,10 @@ impl CreateResponseRequest {
 
             for item in items {
                 match item {
-                    ResponseInputItem::McpApprovalResponse { .. } => {
+                    ResponseInputItem::McpApprovalResponse { .. }
+                    | ResponseInputItem::McpListTools { .. } => {
                         return Err(
-                            "The stateless Responses API does not support MCP approval continuation."
+                            "The stateless Responses API does not support mcp input items."
                                 .to_string(),
                         );
                     }
@@ -1344,22 +1353,22 @@ impl CreateResponseRequest {
         }
 
         if let Some(tools) = &self.tools {
-            let mut custom_function_names = HashSet::new();
-            let mut configured_builtin_names = HashSet::new();
-
             for tool in tools {
                 match tool {
-                    ResponseTool::Function { name, .. } => {
-                        custom_function_names.insert(name.as_str());
-                    }
+                    ResponseTool::Function { .. } => {}
                     ResponseTool::WebSearch { .. } => {
-                        configured_builtin_names.insert("web_search");
+                        return Err(
+                            "The stateless Responses API only supports custom function tools; web_search is not supported."
+                                .to_string(),
+                        );
                     }
                     ResponseTool::WebContextSearch {} => {
-                        configured_builtin_names.insert("web_context_search");
+                        return Err(
+                            "The stateless Responses API only supports custom function tools; web_context_search is not supported."
+                                .to_string(),
+                        );
                     }
                     ResponseTool::FileSearch { .. } => {
-                        configured_builtin_names.insert("file_search");
                         return Err(
                             "The stateless Responses API does not support file_search.".to_string()
                         );
@@ -1376,29 +1385,13 @@ impl CreateResponseRequest {
                                 .to_string(),
                         );
                     }
-                    ResponseTool::Mcp {
-                        require_approval, ..
-                    } if !matches!(
-                        require_approval,
-                        McpApprovalRequirement::Simple(McpApprovalMode::Never)
-                    ) =>
-                    {
+                    ResponseTool::Mcp { .. } => {
                         return Err(
-                            "The stateless Responses API does not support MCP tools that require approval."
+                            "The stateless Responses API only supports custom function tools; mcp is not supported."
                                 .to_string(),
                         );
                     }
-                    _ => {}
                 }
-            }
-
-            if let Some(name) = custom_function_names
-                .iter()
-                .find(|name| configured_builtin_names.contains(*name))
-            {
-                return Err(format!(
-                    "Custom function '{name}' conflicts with a configured built-in tool of the same name."
-                ));
             }
         }
 
@@ -1495,6 +1488,7 @@ mod tests {
             call_id: call_id.to_string(),
             name: "lookup".to_string(),
             arguments: "{}".to_string(),
+            thought_signature: None,
         }
     }
 
@@ -2366,7 +2360,25 @@ mod tests {
         assert!(mcp_approval
             .validate_stateless()
             .unwrap_err()
-            .contains("MCP approval continuation"));
+            .contains("mcp input items"));
+
+        let mut web_search = stateless_request();
+        web_search.tools = Some(vec![ResponseTool::WebSearch {
+            filters: None,
+            search_context_size: None,
+            user_location: None,
+        }]);
+        assert!(web_search
+            .validate_stateless()
+            .unwrap_err()
+            .contains("web_search is not supported"));
+
+        let mut web_context_search = stateless_request();
+        web_context_search.tools = Some(vec![ResponseTool::WebContextSearch {}]);
+        assert!(web_context_search
+            .validate_stateless()
+            .unwrap_err()
+            .contains("web_context_search is not supported"));
 
         let mut file_search = stateless_request();
         file_search.tools = Some(vec![ResponseTool::FileSearch {}]);
@@ -2401,11 +2413,11 @@ mod tests {
         assert!(mcp_tool
             .validate_stateless()
             .unwrap_err()
-            .contains("require approval"));
+            .contains("mcp is not supported"));
     }
 
     #[test]
-    fn stateless_requests_reject_custom_function_name_colliding_with_builtin_tool() {
+    fn stateless_requests_reject_builtin_tools_even_when_a_function_has_the_same_name() {
         let mut request = stateless_request();
         request.tools = Some(vec![
             ResponseTool::Function {
@@ -2423,6 +2435,6 @@ mod tests {
         assert!(request
             .validate_stateless()
             .unwrap_err()
-            .contains("conflicts with a configured built-in tool"));
+            .contains("web_search is not supported"));
     }
 }

@@ -227,7 +227,7 @@ use utoipa::{Modify, OpenApi};
             crate::routes::users::UpdateUserProfileRequest,
             crate::routes::users::UserStatusResponse,
             // Response models
-            CreateResponseRequest, ResponseObject,
+            crate::routes::responses::StatelessCreateResponseRequestSchema, ResponseObject,
             // Attestation models
             crate::routes::attestation::SignatureResponse,
             crate::routes::attestation::AttestationResponse,

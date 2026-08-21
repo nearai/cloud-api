@@ -1350,6 +1350,7 @@ fn convert_output_item_to_conversation_item(
             call_id,
             name,
             arguments,
+            thought_signature,
             status,
             model,
         } => ConversationItem::FunctionCall {
@@ -1361,6 +1362,7 @@ fn convert_output_item_to_conversation_item(
             call_id,
             name,
             arguments,
+            thought_signature,
             status,
             model,
         },

@@ -59,20 +59,6 @@ fn response_id_string(response_id: Uuid) -> String {
     format!("resp_{}", response_id.simple())
 }
 
-fn default_tools() -> Vec<models::ResponseTool> {
-    vec![models::ResponseTool::WebSearch {
-        filters: None,
-        search_context_size: Some("medium".to_string()),
-        user_location: Some(models::UserLocation {
-            type_: "approximate".to_string(),
-            city: None,
-            country: Some("US".to_string()),
-            region: None,
-            timezone: None,
-        }),
-    }]
-}
-
 fn initial_response(request: models::CreateResponseRequest) -> (Uuid, models::ResponseObject) {
     let response_id = Uuid::new_v4();
     let now = chrono::Utc::now().timestamp();
@@ -106,7 +92,10 @@ fn initial_response(request: models::CreateResponseRequest) -> (Uuid, models::Re
             store: false,
             temperature: request.temperature.unwrap_or(1.0),
             tool_choice: models::ResponseToolChoiceOutput::Auto("auto".to_string()),
-            tools: request.tools.unwrap_or_else(default_tools),
+            // Stateless Responses only supports caller-defined functions.
+            // Never advertise the formerly implicit server-side web_search
+            // builtin when the caller did not configure any tools.
+            tools: request.tools.unwrap_or_default(),
             top_logprobs: 0,
             top_p: request.top_p.unwrap_or(1.0),
             truncation: "disabled".to_string(),
@@ -519,6 +508,10 @@ mod tests {
         assert!(!response.store);
         assert!(!response.background);
         assert!(response.conversation.is_none());
+        assert!(
+            response.tools.is_empty(),
+            "a no-tools request must not advertise the retired web_search builtin"
+        );
 
         let response_id = models::ResponseId(
             Uuid::parse_str(response.id.strip_prefix("resp_").unwrap())

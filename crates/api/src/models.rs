@@ -2313,6 +2313,10 @@ pub enum ConversationItem {
         name: String,
         /// JSON-encoded arguments
         arguments: String,
+        /// Provider-specific metadata that must be echoed unchanged when
+        /// replaying the function call (for example Gemini's thought signature).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        thought_signature: Option<String>,
         /// Status: "in_progress" when pending client execution
         status: String,
         model: String,

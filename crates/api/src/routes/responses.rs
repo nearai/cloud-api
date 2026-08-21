@@ -27,6 +27,121 @@ use tracing::debug;
 /// prevents a completed inference response from being delivered.
 const RESPONSE_ATTESTATION_STORE_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// OpenAPI-only view of the stateless Responses request contract.
+///
+/// The runtime request type keeps legacy variants so it can return a precise
+/// `invalid_request_error` for them. The public endpoint schema should instead
+/// show only the items accepted by the stateless implementation.
+#[derive(serde::Deserialize, utoipa::ToSchema)]
+pub struct StatelessCreateResponseRequestSchema {
+    pub model: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input: Option<StatelessResponseInputSchema>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub instructions: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_output_tokens: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_tool_calls: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub top_p: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stream: Option<bool>,
+    /// Must be `false` when supplied; omitted is normalized to `false`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(default = false, example = false)]
+    pub store: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tools: Option<Vec<StatelessResponseToolSchema>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_choice: Option<ResponseToolChoice>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parallel_tool_calls: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<ResponseReasoningConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub include: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub safety_identifier: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_cache_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<String>)]
+    pub service_tier: Option<inference_providers::ChatServiceTier>,
+}
+
+#[derive(serde::Deserialize, utoipa::ToSchema)]
+#[serde(untagged)]
+pub enum StatelessResponseInputSchema {
+    Text(String),
+    Items(Vec<StatelessResponseInputItemSchema>),
+}
+
+#[derive(serde::Deserialize, utoipa::ToSchema)]
+#[serde(untagged)]
+pub enum StatelessResponseInputItemSchema {
+    FunctionCall {
+        #[serde(rename = "type")]
+        type_: FunctionCallType,
+        call_id: String,
+        name: String,
+        arguments: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        thought_signature: Option<String>,
+    },
+    FunctionCallOutput {
+        #[serde(rename = "type")]
+        type_: FunctionCallOutputType,
+        call_id: String,
+        output: String,
+    },
+    Message {
+        role: String,
+        content: StatelessResponseContentSchema,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        metadata: Option<serde_json::Value>,
+    },
+}
+
+#[derive(serde::Deserialize, utoipa::ToSchema)]
+#[serde(untagged)]
+pub enum StatelessResponseContentSchema {
+    Text(String),
+    Parts(Vec<StatelessResponseContentPartSchema>),
+}
+
+#[derive(serde::Deserialize, utoipa::ToSchema)]
+#[serde(tag = "type")]
+pub enum StatelessResponseContentPartSchema {
+    #[serde(rename = "input_text")]
+    InputText { text: String },
+    #[serde(rename = "output_text")]
+    OutputText { text: String },
+    #[serde(rename = "input_image")]
+    InputImage {
+        image_url: ResponseImageUrl,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
+    },
+}
+
+#[derive(serde::Deserialize, utoipa::ToSchema)]
+#[serde(tag = "type")]
+pub enum StatelessResponseToolSchema {
+    #[serde(rename = "function")]
+    Function {
+        name: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        description: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        parameters: Option<serde_json::Value>,
+    },
+}
+
 // Helper functions for error mapping
 fn map_response_error_to_status(error: &ServiceResponseError) -> StatusCode {
     match error {
@@ -319,7 +434,7 @@ pub async fn response_history_gone() -> axum::response::Response {
     post,
     path = "/v1/responses",
     tag = "Responses",
-    request_body = CreateResponseRequest,
+    request_body = StatelessCreateResponseRequestSchema,
     responses(
         (status = 200, description = "Response created", body = ResponseObject),
         (status = 400, description = "Invalid request", body = ErrorResponse),

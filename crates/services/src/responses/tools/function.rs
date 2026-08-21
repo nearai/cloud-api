@@ -123,6 +123,7 @@ impl ToolExecutor for FunctionToolExecutor {
                     call_id: call_id.clone(),
                     name: name.clone(),
                     arguments,
+                    thought_signature: tool_call.thought_signature.clone(),
                     status: "in_progress".to_string(),
                     model: event_ctx.stream_ctx.model.clone(),
                 };

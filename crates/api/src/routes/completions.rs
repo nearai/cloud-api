@@ -1550,7 +1550,21 @@ async fn chat_completions_inner(
                             }
                             true
                         }
-                        _ => break None,
+                        Some(Err(error)) => {
+                            let domain_error = services::CompletionServiceImpl::map_provider_error(
+                                &request.model,
+                                error,
+                                "chat completion stream",
+                                api_key.organization.id.0,
+                            );
+                            let status_code = map_domain_error_to_status(&domain_error);
+                            return (
+                                status_code,
+                                ResponseJson::<ErrorResponse>(domain_error.into()),
+                            )
+                                .into_response();
+                        }
+                        None => break None,
                     };
                     if is_control {
                         if leading_control.len() >= MAX_LEADING_CONTROL_EVENTS {

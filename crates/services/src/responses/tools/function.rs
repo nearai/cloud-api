@@ -9,19 +9,17 @@
 //! 2. LLM calls the function with arguments
 //! 3. Server returns response with status=incomplete, reason="function_call_required"
 //! 4. Client executes the function externally
-//! 5. Client submits function output via FunctionCallOutput input
-//!    with `previous_response_id` pointing to the incomplete response
-//! 6. Server verifies `previous_response_id` belongs to the caller's workspace,
-//!    matches each `call_id` to exactly one stored FunctionCall, then resumes
-//!    the response with function results in context
+//! 5. Client sends a new `store: false` request containing the returned
+//!    `function_call` item and the matching `function_call_output` item
+//! 6. Server reconstructs the supplied assistant/tool context for that request
+//!    without reading response history or executing the function
 //!
 //! Security invariants:
 //! - Every FunctionCall gets a unique `call_id`. If the LLM omits one, the
 //!   executor generates a `call_<uuid>` identifier to prevent ambiguous matching.
-//! - `process_function_call_outputs` enforces workspace-scoped ownership on
-//!   `previous_response_id` before fetching any items (prevents cross-workspace IDOR).
-//! - Each submitted `call_id` must match exactly one stored FunctionCall;
-//!   zero matches or duplicate matches are rejected.
+//! - Stateless continuation validation requires each output to follow exactly
+//!   one replayed function call in the same request; missing or duplicate IDs
+//!   are rejected.
 
 use async_trait::async_trait;
 use std::collections::HashSet;
@@ -46,8 +44,9 @@ impl FunctionToolExecutor {
     /// Create a new FunctionToolExecutor from a request
     ///
     /// Uses the canonical list of client-executed tool names from
-    /// [super::get_function_tool_names]. These are tools the client must execute
-    /// externally (Function, CodeInterpreter, Computer).
+    /// [super::get_function_tool_names]. The executor is shared with legacy
+    /// paths, but stateless Responses validation admits only custom
+    /// `ResponseTool::Function` tools.
     pub fn new(request: &CreateResponseRequest) -> Self {
         let function_names = super::get_function_tool_names(request)
             .into_iter()
@@ -128,7 +127,9 @@ impl ToolExecutor for FunctionToolExecutor {
                     model: event_ctx.stream_ctx.model.clone(),
                 };
 
-                // Store the function call in the database
+                // Keep the function call in the request-scoped response store
+                // so it is emitted in this response. The stateless route never
+                // uses a persistent response-item repository.
                 if let Some(repo) = &event_ctx.response_items_repository {
                     if let Err(e) = repo
                         .create(

@@ -167,6 +167,26 @@ impl ports::ResponseServiceTrait for ResponseServiceImpl {
         request.store = Some(false);
         request.background = Some(false);
 
+        // Only install server-side executors for built-in tools explicitly
+        // requested by this call. In particular, a client-defined function
+        // named `web_search` must remain client-managed rather than being
+        // claimed by the built-in executor.
+        let has_web_search = request.tools.as_ref().map_or(false, |tools| {
+            tools
+                .iter()
+                .any(|tool| matches!(tool, models::ResponseTool::WebSearch { .. }))
+        });
+        let has_web_context_search = request.tools.as_ref().map_or(false, |tools| {
+            tools
+                .iter()
+                .any(|tool| matches!(tool, models::ResponseTool::WebContextSearch {}))
+        });
+        let has_file_search = request.tools.as_ref().map_or(false, |tools| {
+            tools
+                .iter()
+                .any(|tool| matches!(tool, models::ResponseTool::FileSearch {}))
+        });
+
         // Create a channel for streaming events
         let (mut tx, rx) = mpsc::unbounded::<models::ResponseStreamEvent>();
 
@@ -191,15 +211,21 @@ impl ports::ResponseServiceTrait for ResponseServiceImpl {
 
         tokio::spawn(async move {
             let mut tool_registry = tools::ToolRegistry::new();
-            if let Some(provider) = web_search_provider {
-                tool_registry.register(Arc::new(tools::WebSearchToolExecutor::new(provider)));
+            if has_web_search {
+                if let Some(provider) = web_search_provider {
+                    tool_registry.register(Arc::new(tools::WebSearchToolExecutor::new(provider)));
+                }
             }
-            if let Some(provider) = web_context_search_provider {
-                tool_registry
-                    .register(Arc::new(tools::WebContextSearchToolExecutor::new(provider)));
+            if has_web_context_search {
+                if let Some(provider) = web_context_search_provider {
+                    tool_registry
+                        .register(Arc::new(tools::WebContextSearchToolExecutor::new(provider)));
+                }
             }
-            if let Some(provider) = file_search_provider {
-                tool_registry.register(Arc::new(tools::FileSearchToolExecutor::new(provider)));
+            if has_file_search {
+                if let Some(provider) = file_search_provider {
+                    tool_registry.register(Arc::new(tools::FileSearchToolExecutor::new(provider)));
+                }
             }
             // Note: MCP executor is added later after connecting to servers
 
@@ -291,6 +317,58 @@ impl ports::ResponseServiceTrait for ResponseServiceImpl {
 }
 
 impl ResponseServiceImpl {
+    /// Reject custom function names that conflict with a tool Cloud executes.
+    ///
+    /// Fixed built-ins are known during request validation; discovered MCP
+    /// names must be checked here, after MCP setup and before inference or
+    /// executor registration.
+    fn validate_custom_function_tool_name_collisions(
+        request: &models::CreateResponseRequest,
+        mcp_tool_definitions: &[inference_providers::ToolDefinition],
+    ) -> Result<(), errors::ResponseError> {
+        let mut server_executed_tool_names = HashSet::new();
+
+        if let Some(configured_tools) = &request.tools {
+            for tool in configured_tools {
+                match tool {
+                    models::ResponseTool::WebSearch { .. } => {
+                        server_executed_tool_names.insert(tools::WEB_SEARCH_TOOL_NAME.to_string());
+                    }
+                    models::ResponseTool::WebContextSearch {} => {
+                        server_executed_tool_names
+                            .insert(tools::WEB_CONTEXT_SEARCH_TOOL_NAME.to_string());
+                    }
+                    models::ResponseTool::FileSearch {} => {
+                        server_executed_tool_names.insert(tools::FILE_SEARCH_TOOL_NAME.to_string());
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        server_executed_tool_names.extend(
+            mcp_tool_definitions
+                .iter()
+                .map(|definition| definition.function.name.clone()),
+        );
+
+        let Some(configured_tools) = &request.tools else {
+            return Ok(());
+        };
+
+        for tool in configured_tools {
+            if let models::ResponseTool::Function { name, .. } = tool {
+                if server_executed_tool_names.contains(name) {
+                    return Err(errors::ResponseError::InvalidParams(format!(
+                        "Custom function '{name}' conflicts with a configured or discovered server-executed tool of the same name."
+                    )));
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     /// Parse file ID from string (handles prefix)
     fn parse_file_id(file_id: &str) -> Result<Uuid, errors::ResponseError> {
         let id_str = file_id
@@ -930,17 +1008,6 @@ impl ResponseServiceImpl {
 
         let workspace_id_domain = crate::workspace::WorkspaceId(context.workspace_id);
 
-        // Validate function call outputs early (before creating response) so invalid
-        // FunctionCallOutput items never get persisted. Required before load_conversation_context
-        // so we can pass validated tool messages for correct ordering.
-        let function_output_messages = Self::process_function_call_outputs(
-            &context.request,
-            &context.response_items_repository,
-            &context.response_repository,
-            context.workspace_id,
-        )
-        .await?;
-
         // Verify previous_response_id ownership before loading any history or
         // creating the response. Unknown and foreign response IDs get the same
         // non-enumerating 404-style error; without this check a foreign ID
@@ -990,7 +1057,6 @@ impl ResponseServiceImpl {
             context.organization_id,
             context.user_id.clone(),
             &context.organization_service,
-            &function_output_messages,
         )
         .await?;
 
@@ -1094,6 +1160,13 @@ impl ResponseServiceImpl {
         )
         .await?
         {
+            // MCP tool names are only known after discovery. Reject a custom
+            // function that would otherwise be claimed by the MCP executor,
+            // which is registered before the custom-function executor.
+            Self::validate_custom_function_tool_name_collisions(
+                &context.request,
+                &mcp_setup.tool_definitions,
+            )?;
             tools.extend(mcp_setup.tool_definitions);
             context.tool_registry.register(mcp_setup.executor.clone());
             context.mcp_executor = Some(mcp_setup.executor);
@@ -1916,130 +1989,6 @@ impl ResponseServiceImpl {
         Ok(())
     }
 
-    /// Process function call outputs from the request input.
-    ///
-    /// When resuming a response after function calls, the client provides
-    /// FunctionCallOutput items with the results. This function:
-    /// 1. Extracts FunctionCallOutput items from the request input
-    /// 2. Verifies `previous_response_id` belongs to the caller's workspace
-    ///    (workspace-scoped ownership check, prevents cross-workspace IDOR)
-    /// 3. Fetches stored FunctionCall items and validates each submitted
-    ///    `call_id` matches exactly one FunctionCall (rejects zero or ambiguous matches)
-    /// 4. Creates tool result messages for the conversation context
-    ///
-    /// Returns messages to add to the conversation context.
-    async fn process_function_call_outputs(
-        request: &models::CreateResponseRequest,
-        response_items_repository: &Arc<dyn ports::ResponseItemRepositoryTrait>,
-        response_repository: &Arc<dyn ports::ResponseRepositoryTrait>,
-        workspace_id: uuid::Uuid,
-    ) -> Result<Vec<crate::completions::ports::CompletionMessage>, errors::ResponseError> {
-        use crate::completions::ports::CompletionMessage;
-
-        let mut messages = Vec::new();
-
-        // Extract function call outputs from input
-        let function_outputs: Vec<_> = match &request.input {
-            Some(models::ResponseInput::Items(items)) => items
-                .iter()
-                .filter_map(|item| item.as_function_call_output())
-                .collect(),
-            _ => return Ok(messages),
-        };
-
-        if function_outputs.is_empty() {
-            return Ok(messages);
-        }
-
-        // Function call outputs are only valid when resuming a previous response.
-        let prev_response_id = request.previous_response_id.as_ref().ok_or_else(|| {
-            errors::ResponseError::InvalidParams(
-                "function_call_output requires previous_response_id to resume a response"
-                    .to_string(),
-            )
-        })?;
-
-        let uuid_str = prev_response_id
-            .strip_prefix(crate::id_prefixes::PREFIX_RESP)
-            .unwrap_or(prev_response_id);
-
-        let response_uuid = uuid::Uuid::parse_str(uuid_str).map_err(|e| {
-            errors::ResponseError::InvalidParams(format!("invalid previous_response_id: {e}"))
-        })?;
-
-        // Verify the previous response belongs to this workspace (prevents IDOR)
-        response_repository
-            .get_by_id(
-                models::ResponseId(response_uuid),
-                crate::workspace::WorkspaceId(workspace_id),
-            )
-            .await
-            .map_err(|e| {
-                errors::ResponseError::InternalError(format!(
-                    "Failed to verify previous response ownership: {e}"
-                ))
-            })?
-            .ok_or_else(|| {
-                errors::ResponseError::FunctionCallNotFound(
-                    "previous_response_id not found in this workspace".to_string(),
-                )
-            })?;
-
-        let prev_items = response_items_repository
-            .list_by_response(models::ResponseId(response_uuid))
-            .await
-            .map_err(|e| {
-                errors::ResponseError::InternalError(format!("Failed to fetch response items: {e}"))
-            })?;
-
-        let mut seen_call_ids = std::collections::HashSet::new();
-        for (call_id, output) in function_outputs {
-            if !seen_call_ids.insert(call_id) {
-                return Err(errors::ResponseError::InvalidParams(format!(
-                    "duplicate call_id '{}' in function_call_output items",
-                    call_id
-                )));
-            }
-
-            let match_count = prev_items
-                .iter()
-                .filter(|item| {
-                    matches!(item, models::ResponseOutputItem::FunctionCall {
-                        call_id: item_call_id,
-                        ..
-                    } if item_call_id == call_id)
-                })
-                .count();
-
-            if match_count == 0 {
-                return Err(errors::ResponseError::FunctionCallNotFound(
-                    call_id.to_string(),
-                ));
-            }
-            if match_count > 1 {
-                return Err(errors::ResponseError::InvalidParams(format!(
-                    "ambiguous call_id '{}' matches {} function calls",
-                    call_id, match_count
-                )));
-            }
-
-            // Create tool result message with the function output
-            messages.push(CompletionMessage {
-                role: "tool".to_string(),
-                content: serde_json::Value::String(output.to_string()),
-                tool_call_id: Some(call_id.to_string()),
-                tool_calls: None,
-            });
-        }
-
-        tracing::debug!(
-            "Processed {} function call outputs into tool result messages",
-            messages.len()
-        );
-
-        Ok(messages)
-    }
-
     /// Store request input as response items and return the IDs that originated
     /// from the client. The IDs are kept only for this request and ensure that
     /// historical assistant messages are never returned as new output.
@@ -2103,6 +2052,13 @@ impl ResponseServiceImpl {
                             continue;
                         }
                         models::ResponseInputItem::McpListTools { .. } => {
+                            continue;
+                        }
+                        // Replayed function calls only reconstruct the provider
+                        // context below. They are not part of this response's
+                        // output and must not be returned as newly generated
+                        // items.
+                        models::ResponseInputItem::FunctionCall { .. } => {
                             continue;
                         }
                         models::ResponseInputItem::FunctionCallOutput {
@@ -2235,11 +2191,64 @@ impl ResponseServiceImpl {
             .collect()
     }
 
+    /// Flush replayed function calls into the assistant message shape expected
+    /// by Chat Completions providers. The calls remain entirely client-owned:
+    /// this only reconstructs supplied context for the current request.
+    fn flush_replayed_function_calls(
+        messages: &mut Vec<crate::completions::ports::CompletionMessage>,
+        pending_function_calls: &mut Vec<crate::completions::ports::CompletionToolCall>,
+    ) {
+        if pending_function_calls.is_empty() {
+            return;
+        }
+
+        messages.push(crate::completions::ports::CompletionMessage {
+            role: "assistant".to_string(),
+            content: serde_json::Value::String(String::new()),
+            tool_call_id: None,
+            tool_calls: Some(std::mem::take(pending_function_calls)),
+        });
+    }
+
+    /// Append one client-replayed function item to the request's completion
+    /// context. Returns true when the item was handled.
+    fn append_replayed_function_call_item(
+        input_item: &models::ResponseInputItem,
+        messages: &mut Vec<crate::completions::ports::CompletionMessage>,
+        pending_function_calls: &mut Vec<crate::completions::ports::CompletionToolCall>,
+    ) -> bool {
+        match input_item {
+            models::ResponseInputItem::FunctionCall {
+                call_id,
+                name,
+                arguments,
+                ..
+            } => {
+                pending_function_calls.push(crate::completions::ports::CompletionToolCall {
+                    id: call_id.clone(),
+                    name: name.clone(),
+                    arguments: arguments.clone(),
+                    thought_signature: None,
+                });
+                true
+            }
+            models::ResponseInputItem::FunctionCallOutput {
+                call_id, output, ..
+            } => {
+                Self::flush_replayed_function_calls(messages, pending_function_calls);
+                messages.push(crate::completions::ports::CompletionMessage {
+                    role: "tool".to_string(),
+                    content: serde_json::Value::String(output.clone()),
+                    tool_call_id: Some(call_id.clone()),
+                    tool_calls: None,
+                });
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// Load conversation context based on conversation_id or previous_response_id.
-    ///
-    /// When `function_output_messages` is provided (resume with FunctionCallOutput), they are
-    /// interleaved with Message input items in request order so tool results immediately follow
-    /// the assistant message containing tool_calls, as required by LLM providers.
     #[allow(clippy::too_many_arguments)]
     async fn load_conversation_context(
         request: &models::CreateResponseRequest,
@@ -2250,7 +2259,6 @@ impl ResponseServiceImpl {
         organization_id: uuid::Uuid,
         user_id: crate::UserId,
         organization_service: &Arc<dyn crate::organization::OrganizationServiceTrait>,
-        function_output_messages: &[crate::completions::ports::CompletionMessage],
     ) -> Result<Vec<crate::completions::ports::CompletionMessage>, errors::ResponseError> {
         use crate::completions::ports::CompletionMessage;
 
@@ -2638,10 +2646,22 @@ impl ResponseServiceImpl {
                     });
                 }
                 models::ResponseInput::Items(items) => {
-                    let mut fco_idx = 0;
+                    let mut pending_function_calls = Vec::new();
                     for item in items {
+                        if Self::append_replayed_function_call_item(
+                            item,
+                            &mut messages,
+                            &mut pending_function_calls,
+                        ) {
+                            continue;
+                        }
+
                         match item {
                             models::ResponseInputItem::Message { role, content, .. } => {
+                                Self::flush_replayed_function_calls(
+                                    &mut messages,
+                                    &mut pending_function_calls,
+                                );
                                 let content = match content {
                                     models::ResponseContent::Text(text) => {
                                         serde_json::Value::String(text.clone())
@@ -2662,16 +2682,13 @@ impl ResponseServiceImpl {
                                     tool_calls: None,
                                 });
                             }
-                            models::ResponseInputItem::FunctionCallOutput { .. } => {
-                                if fco_idx < function_output_messages.len() {
-                                    messages.push(function_output_messages[fco_idx].clone());
-                                    fco_idx += 1;
-                                }
-                            }
                             models::ResponseInputItem::McpApprovalResponse { .. }
-                            | models::ResponseInputItem::McpListTools { .. } => {}
+                            | models::ResponseInputItem::McpListTools { .. }
+                            | models::ResponseInputItem::FunctionCall { .. }
+                            | models::ResponseInputItem::FunctionCallOutput { .. } => {}
                         }
                     }
+                    Self::flush_replayed_function_calls(&mut messages, &mut pending_function_calls);
                 }
             }
         }
@@ -3712,6 +3729,148 @@ mod tests {
 
         assert_eq!(output_items.len(), 1);
         assert_eq!(output_items[0].id(), generated_item_id);
+    }
+
+    #[test]
+    fn replayed_function_call_and_output_rebuild_client_managed_tool_context() {
+        // This path deliberately uses no repository or function executor: the
+        // client supplies both items in a fresh request and Cloud only rebuilds
+        // the provider message sequence.
+        let items = vec![
+            models::ResponseInputItem::FunctionCall {
+                type_: models::FunctionCallType::FunctionCall,
+                call_id: "call_weather".to_string(),
+                name: "get_weather".to_string(),
+                arguments: r#"{"location":"Shanghai"}"#.to_string(),
+            },
+            models::ResponseInputItem::FunctionCallOutput {
+                type_: models::FunctionCallOutputType::FunctionCallOutput,
+                call_id: "call_weather".to_string(),
+                output: r#"{"temperature_c":22}"#.to_string(),
+            },
+        ];
+
+        let mut messages = Vec::new();
+        let mut pending_function_calls = Vec::new();
+        for item in &items {
+            assert!(ResponseServiceImpl::append_replayed_function_call_item(
+                item,
+                &mut messages,
+                &mut pending_function_calls,
+            ));
+        }
+        ResponseServiceImpl::flush_replayed_function_calls(
+            &mut messages,
+            &mut pending_function_calls,
+        );
+
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].role, "assistant");
+        let tool_calls = messages[0]
+            .tool_calls
+            .as_ref()
+            .expect("replayed function call becomes an assistant tool call");
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0].id, "call_weather");
+        assert_eq!(tool_calls[0].name, "get_weather");
+        assert_eq!(tool_calls[0].arguments, r#"{"location":"Shanghai"}"#);
+
+        assert_eq!(messages[1].role, "tool");
+        assert_eq!(messages[1].tool_call_id.as_deref(), Some("call_weather"));
+        assert_eq!(
+            messages[1].content,
+            serde_json::json!(r#"{"temperature_c":22}"#)
+        );
+    }
+
+    #[test]
+    fn parallel_replayed_function_calls_are_grouped_before_their_outputs() {
+        let items = vec![
+            models::ResponseInputItem::FunctionCall {
+                type_: models::FunctionCallType::FunctionCall,
+                call_id: "call_weather".to_string(),
+                name: "get_weather".to_string(),
+                arguments: r#"{"location":"Shanghai"}"#.to_string(),
+            },
+            models::ResponseInputItem::FunctionCall {
+                type_: models::FunctionCallType::FunctionCall,
+                call_id: "call_time".to_string(),
+                name: "get_time".to_string(),
+                arguments: r#"{"timezone":"Asia/Shanghai"}"#.to_string(),
+            },
+            models::ResponseInputItem::FunctionCallOutput {
+                type_: models::FunctionCallOutputType::FunctionCallOutput,
+                call_id: "call_weather".to_string(),
+                output: r#"{"temperature_c":22}"#.to_string(),
+            },
+            models::ResponseInputItem::FunctionCallOutput {
+                type_: models::FunctionCallOutputType::FunctionCallOutput,
+                call_id: "call_time".to_string(),
+                output: r#"{"time":"12:00"}"#.to_string(),
+            },
+        ];
+
+        let mut messages = Vec::new();
+        let mut pending_function_calls = Vec::new();
+        for item in &items {
+            assert!(ResponseServiceImpl::append_replayed_function_call_item(
+                item,
+                &mut messages,
+                &mut pending_function_calls,
+            ));
+        }
+        ResponseServiceImpl::flush_replayed_function_calls(
+            &mut messages,
+            &mut pending_function_calls,
+        );
+
+        assert_eq!(messages.len(), 3);
+        let tool_calls = messages[0]
+            .tool_calls
+            .as_ref()
+            .expect("parallel calls are grouped in one assistant message");
+        assert_eq!(
+            tool_calls
+                .iter()
+                .map(|call| call.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["call_weather", "call_time"]
+        );
+        assert_eq!(messages[1].tool_call_id.as_deref(), Some("call_weather"));
+        assert_eq!(messages[2].tool_call_id.as_deref(), Some("call_time"));
+    }
+
+    #[test]
+    fn custom_function_name_colliding_with_discovered_mcp_tool_is_rejected() {
+        let request: models::CreateResponseRequest = serde_json::from_value(serde_json::json!({
+            "model": "test-model",
+            "store": false,
+            "tools": [{
+                "type": "function",
+                "name": "weather:get_weather",
+                "parameters": {"type": "object"}
+            }]
+        }))
+        .expect("test request should deserialize");
+        let mcp_tool_definitions = vec![inference_providers::ToolDefinition {
+            type_: "function".to_string(),
+            function: inference_providers::FunctionDefinition {
+                name: "weather:get_weather".to_string(),
+                description: None,
+                parameters: serde_json::json!({"type": "object"}),
+            },
+        }];
+
+        let error = ResponseServiceImpl::validate_custom_function_tool_name_collisions(
+            &request,
+            &mcp_tool_definitions,
+        )
+        .expect_err("same-name custom function must not be claimed by MCP");
+
+        assert!(matches!(error, errors::ResponseError::InvalidParams(_)));
+        assert!(error
+            .to_string()
+            .contains("conflicts with a configured or discovered server-executed tool"));
     }
 
     #[test]

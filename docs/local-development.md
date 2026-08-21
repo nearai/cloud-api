@@ -272,7 +272,7 @@ Provider refresh runs every 300s by default
 | `POST /v1/workspaces/{id}/api-keys`         | session  | Returns plaintext `key` — store it, it isn't shown again    |
 | `GET  /v1/models`                           | public   | OpenAI-compatible model catalog with pricing metadata       |
 | `POST /v1/chat/completions`                 | API key  | OpenAI-compatible. Add `"stream": true` for SSE             |
-| `POST /v1/responses`                        | API key  | Single-turn `store: false` inference; response history is unavailable |
+| `POST /v1/responses`                        | API key  | Stateless `store: false` inference; response history is unavailable |
 | `GET  /v1/attestation/report`               | API key  | TEE attestation (503 outside a CVM unless `DEV=true` in debug builds) |
 | `GET  /v1/attestation/ita-token`            | public   | Intel Trust Authority JWT wrapper (requires ITA env vars)   |
 | `GET  /v1/signature/{chat_id}`              | API key  | Per-completion and `resp_*` signature lookup                |
@@ -282,10 +282,24 @@ interactively and inspect request/response schemas.
 
 ### Stateless Responses and attestation retention
 
-`POST /v1/responses` is single-turn and accepts only `store: false` (an omitted
-value is treated as `false`). Cloud API does not retain raw request or response
-content, response items, or response history; clients must supply any needed
-prior context with each request.
+`POST /v1/responses` accepts only `store: false` (an omitted value is treated
+as `false`). Cloud API does not retain raw request or response content,
+response items, or response history; clients must supply any needed prior
+context with each request.
+
+Custom `function` tools are client-managed. Cloud returns a `function_call`
+item but does not execute it. To continue after running the function, the
+client sends a fresh `store: false` request containing the original
+`function_call` and its matching `function_call_output`; it must not use
+`previous_response_id` or `conversation`. Send the same custom function tool
+definitions again in `tools` on every request so the model can continue to
+call them if needed.
+
+This initial compatibility path accepts a raw `function_call` item from a
+previous response, its matching `function_call_output`, and assistant
+`message` content parts of type `output_text` as caller-managed message
+history. It does not support reasoning items or arbitrary full
+`response.output` replay; reasoning-model compatibility is separate work.
 
 Existing completed-response gateway attestation is preserved on a best-effort
 basis. When its signature write succeeds, `GET /v1/signature/resp_*` can
@@ -295,9 +309,8 @@ that disconnects before completion creates no `resp_*` attestation record or
 legacy disconnect fallback.
 
 Stateful operations are rejected: Conversations, response history, file input
-and file search, function tools and function-call continuation, code
-interpreter, computer, and every MCP approval mode other than
-`require_approval: "never"`.
+and file search, code interpreter, computer, and every MCP approval mode other
+than `require_approval: "never"`.
 
 ## 7. Troubleshooting
 

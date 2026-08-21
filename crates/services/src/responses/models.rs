@@ -111,6 +111,18 @@ pub enum ResponseInputItem {
         server_label: String,
         tools: Vec<McpDiscoveredTool>,
     },
+    /// A function call returned by a prior stateless response and replayed by
+    /// the client with its output. The platform never executes this function.
+    FunctionCall {
+        #[serde(rename = "type")]
+        type_: FunctionCallType,
+        /// The call ID used to correlate this request with its output.
+        call_id: String,
+        /// The client-defined function name requested by the model.
+        name: String,
+        /// JSON-encoded arguments returned by the model.
+        arguments: String,
+    },
     /// Output from a client-executed function call
     FunctionCallOutput {
         #[serde(rename = "type")]
@@ -141,6 +153,7 @@ impl ResponseInputItem {
             ResponseInputItem::Message { role, .. } => Some(role),
             ResponseInputItem::McpApprovalResponse { .. } => None,
             ResponseInputItem::McpListTools { .. } => None,
+            ResponseInputItem::FunctionCall { .. } => None,
             ResponseInputItem::FunctionCallOutput { .. } => None,
         }
     }
@@ -150,6 +163,7 @@ impl ResponseInputItem {
             ResponseInputItem::Message { content, .. } => Some(content),
             ResponseInputItem::McpApprovalResponse { .. } => None,
             ResponseInputItem::McpListTools { .. } => None,
+            ResponseInputItem::FunctionCall { .. } => None,
             ResponseInputItem::FunctionCallOutput { .. } => None,
         }
     }
@@ -159,6 +173,7 @@ impl ResponseInputItem {
             ResponseInputItem::Message { metadata, .. } => metadata.as_ref(),
             ResponseInputItem::McpApprovalResponse { .. } => None,
             ResponseInputItem::McpListTools { .. } => None,
+            ResponseInputItem::FunctionCall { .. } => None,
             ResponseInputItem::FunctionCallOutput { .. } => None,
         }
     }
@@ -176,6 +191,7 @@ impl ResponseInputItem {
             } => Some((approval_request_id, *approve)),
             ResponseInputItem::Message { .. } => None,
             ResponseInputItem::McpListTools { .. } => None,
+            ResponseInputItem::FunctionCall { .. } => None,
             ResponseInputItem::FunctionCallOutput { .. } => None,
         }
     }
@@ -192,6 +208,13 @@ impl ResponseInputItem {
             _ => None,
         }
     }
+}
+
+/// Type marker for a client-replayed function call input item.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq)]
+pub enum FunctionCallType {
+    #[serde(rename = "function_call")]
+    FunctionCall,
 }
 
 /// Type marker for MCP approval response input
@@ -220,7 +243,7 @@ pub enum ResponseContent {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(tag = "type")]
 pub enum ResponseContentPart {
-    #[serde(rename = "input_text")]
+    #[serde(rename = "input_text", alias = "output_text")]
     InputText { text: String },
     #[serde(rename = "input_image")]
     InputImage {
@@ -1229,9 +1252,10 @@ impl CreateResponseRequest {
     /// Validate that a request can be handled without platform-side response
     /// or conversation persistence.
     ///
-    /// The Responses API is intentionally limited to a single request/response
-    /// interaction. Clients that need a multi-turn flow must include the full
-    /// context in the new request instead of referring to stored server state.
+    /// The Responses API does not retain conversation state. Clients that need
+    /// a multi-turn flow must include the full context in a new request instead
+    /// of referring to stored server state. This includes replaying a custom
+    /// function call and its client-produced output in the same request.
     pub fn validate_stateless(&self) -> Result<(), String> {
         if self.store == Some(true) {
             return Err("The Responses API only supports store: false.".to_string());
@@ -1252,6 +1276,11 @@ impl CreateResponseRequest {
         }
 
         if let Some(ResponseInput::Items(items)) = &self.input {
+            let mut replayed_function_call_ids = HashSet::new();
+            let mut completed_function_call_ids = HashSet::new();
+            let mut pending_function_call_ids = HashSet::new();
+            let mut receiving_function_outputs = false;
+
             for item in items {
                 match item {
                     ResponseInputItem::McpApprovalResponse { .. } => {
@@ -1260,40 +1289,102 @@ impl CreateResponseRequest {
                                 .to_string(),
                         );
                     }
-                    ResponseInputItem::FunctionCallOutput { .. } => {
-                        return Err(
-                            "The stateless Responses API does not support function continuation."
-                                .to_string(),
-                        );
+                    ResponseInputItem::FunctionCall { call_id, name, .. } => {
+                        if receiving_function_outputs {
+                            return Err(
+                                "A replayed function_call block must list all function_call items before any function_call_output."
+                                    .to_string(),
+                            );
+                        }
+                        if call_id.trim().is_empty() {
+                            return Err(
+                                "A replayed function_call must include call_id.".to_string()
+                            );
+                        }
+                        if name.trim().is_empty() {
+                            return Err("A replayed function_call must include name.".to_string());
+                        }
+                        if !replayed_function_call_ids.insert(call_id.clone()) {
+                            return Err(format!(
+                                "duplicate call_id '{call_id}' in replayed function_call items"
+                            ));
+                        }
+                        pending_function_call_ids.insert(call_id.clone());
                     }
-                    ResponseInputItem::Message {
-                        content: ResponseContent::Parts(parts),
-                        ..
-                    } if parts
-                        .iter()
-                        .any(|part| matches!(part, ResponseContentPart::InputFile { .. })) =>
+                    ResponseInputItem::FunctionCallOutput { call_id, .. } => {
+                        if call_id.trim().is_empty() {
+                            return Err("A function_call_output must include call_id.".to_string());
+                        }
+                        if !completed_function_call_ids.insert(call_id.clone()) {
+                            return Err(format!(
+                                "duplicate call_id '{call_id}' in function_call_output items"
+                            ));
+                        }
+                        if !pending_function_call_ids.remove(call_id) {
+                            return Err(format!(
+                                "function_call_output for call_id '{call_id}' must follow a matching function_call in the same stateless request"
+                            ));
+                        }
+                        receiving_function_outputs = !pending_function_call_ids.is_empty();
+                    }
+                    ResponseInputItem::Message { content, .. } => {
+                        if !pending_function_call_ids.is_empty() {
+                            return Err(
+                                "A replayed function_call block must be followed by its matching function_call_output items before any message."
+                                    .to_string(),
+                            );
+                        }
+                        if let ResponseContent::Parts(parts) = content {
+                            if parts
+                                .iter()
+                                .any(|part| matches!(part, ResponseContentPart::InputFile { .. }))
+                            {
+                                return Err(
+                                    "The stateless Responses API does not support input_file."
+                                        .to_string(),
+                                );
+                            }
+                        }
+                    }
+                    ResponseInputItem::McpListTools { .. }
+                        if !pending_function_call_ids.is_empty() =>
                     {
                         return Err(
-                            "The stateless Responses API does not support input_file.".to_string()
+                            "A replayed function_call block must be followed by its matching function_call_output items before any other input item."
+                                .to_string(),
                         );
                     }
                     _ => {}
                 }
             }
+
+            if !pending_function_call_ids.is_empty() {
+                return Err(
+                    "Each replayed function_call must have a matching function_call_output in the same stateless request."
+                        .to_string(),
+                );
+            }
         }
 
         if let Some(tools) = &self.tools {
+            let mut custom_function_names = HashSet::new();
+            let mut configured_builtin_names = HashSet::new();
+
             for tool in tools {
                 match tool {
+                    ResponseTool::Function { name, .. } => {
+                        custom_function_names.insert(name.as_str());
+                    }
+                    ResponseTool::WebSearch { .. } => {
+                        configured_builtin_names.insert("web_search");
+                    }
+                    ResponseTool::WebContextSearch {} => {
+                        configured_builtin_names.insert("web_context_search");
+                    }
                     ResponseTool::FileSearch { .. } => {
+                        configured_builtin_names.insert("file_search");
                         return Err(
                             "The stateless Responses API does not support file_search.".to_string()
-                        );
-                    }
-                    ResponseTool::Function { .. } => {
-                        return Err(
-                            "The stateless Responses API does not support function tools because they require continuation."
-                                .to_string(),
                         );
                     }
                     ResponseTool::CodeInterpreter {} => {
@@ -1322,6 +1413,15 @@ impl CreateResponseRequest {
                     }
                     _ => {}
                 }
+            }
+
+            if let Some(name) = custom_function_names
+                .iter()
+                .find(|name| configured_builtin_names.contains(*name))
+            {
+                return Err(format!(
+                    "Custom function '{name}' conflicts with a configured built-in tool of the same name."
+                ));
             }
         }
 
@@ -1410,6 +1510,29 @@ mod tests {
             prompt_cache_key: None,
             service_tier: None,
         }
+    }
+
+    fn replayed_function_call(call_id: &str) -> ResponseInputItem {
+        ResponseInputItem::FunctionCall {
+            type_: FunctionCallType::FunctionCall,
+            call_id: call_id.to_string(),
+            name: "lookup".to_string(),
+            arguments: "{}".to_string(),
+        }
+    }
+
+    fn function_call_output(call_id: &str) -> ResponseInputItem {
+        ResponseInputItem::FunctionCallOutput {
+            type_: FunctionCallOutputType::FunctionCallOutput,
+            call_id: call_id.to_string(),
+            output: "{}".to_string(),
+        }
+    }
+
+    fn stateless_request_with_items(items: Vec<ResponseInputItem>) -> CreateResponseRequest {
+        let mut request = stateless_request();
+        request.input = Some(ResponseInput::Items(items));
+        request
     }
 
     #[test]
@@ -2067,6 +2190,126 @@ mod tests {
     }
 
     #[test]
+    fn stateless_function_call_replay_accepts_returned_output_without_server_state() {
+        // This is the second request in a client-managed two-turn loop. The
+        // `function_call` object is shaped like the first response's output
+        // item, including fields the input parser intentionally ignores.
+        let request: CreateResponseRequest = serde_json::from_value(json!({
+            "model": "gpt-4",
+            "store": false,
+            "input": [
+                {"role": "user", "content": "What is the weather?"},
+                {
+                    "type": "message",
+                    "id": "msg_first_turn",
+                    "status": "completed",
+                    "role": "assistant",
+                    "content": [{
+                        "type": "output_text",
+                        "text": "I will look that up.",
+                        "annotations": [],
+                        "logprobs": []
+                    }]
+                },
+                {
+                    "type": "function_call",
+                    "id": "fc_first_turn",
+                    "response_id": "resp_first_turn",
+                    "created_at": 0,
+                    "status": "in_progress",
+                    "model": "gpt-4",
+                    "call_id": "call_weather",
+                    "name": "get_weather",
+                    "arguments": "{\"location\":\"Shanghai\"}"
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_weather",
+                    "output": "{\"temperature_c\":22}"
+                }
+            ],
+            "tools": [{
+                "type": "function",
+                "name": "get_weather",
+                "parameters": {"type": "object"}
+            }]
+        }))
+        .expect("client replay request should deserialize");
+
+        assert!(request.previous_response_id.is_none());
+        assert!(request.conversation.is_none());
+        assert!(request.validate_stateless().is_ok());
+        assert!(matches!(
+            request.input,
+            Some(ResponseInput::Items(ref items))
+                if matches!(items[1], ResponseInputItem::Message {
+                    content: ResponseContent::Parts(ref parts),
+                    ..
+                } if matches!(parts[0], ResponseContentPart::InputText { .. }))
+                    && matches!(items[2], ResponseInputItem::FunctionCall { .. })
+                    && matches!(items[3], ResponseInputItem::FunctionCallOutput { .. })
+        ));
+    }
+
+    #[test]
+    fn stateless_function_replay_validates_contiguous_call_output_blocks() {
+        let duplicate_call = stateless_request_with_items(vec![
+            replayed_function_call("call_one"),
+            replayed_function_call("call_one"),
+            function_call_output("call_one"),
+        ]);
+        assert!(duplicate_call
+            .validate_stateless()
+            .unwrap_err()
+            .contains("duplicate call_id 'call_one' in replayed function_call"));
+
+        let duplicate_output = stateless_request_with_items(vec![
+            replayed_function_call("call_one"),
+            function_call_output("call_one"),
+            function_call_output("call_one"),
+        ]);
+        assert!(duplicate_output
+            .validate_stateless()
+            .unwrap_err()
+            .contains("duplicate call_id 'call_one' in function_call_output"));
+
+        let orphan_output = stateless_request_with_items(vec![
+            replayed_function_call("call_one"),
+            function_call_output("call_two"),
+        ]);
+        assert!(orphan_output
+            .validate_stateless()
+            .unwrap_err()
+            .contains("matching function_call"));
+
+        let missing_output = stateless_request_with_items(vec![replayed_function_call("call_one")]);
+        assert!(missing_output
+            .validate_stateless()
+            .unwrap_err()
+            .contains("Each replayed function_call must have a matching"));
+
+        let parallel_calls = stateless_request_with_items(vec![
+            replayed_function_call("call_one"),
+            replayed_function_call("call_two"),
+            function_call_output("call_one"),
+            function_call_output("call_two"),
+        ]);
+        assert!(parallel_calls.validate_stateless().is_ok());
+
+        let call_after_outputs_start = stateless_request_with_items(vec![
+            replayed_function_call("call_one"),
+            replayed_function_call("call_two"),
+            function_call_output("call_one"),
+            replayed_function_call("call_three"),
+            function_call_output("call_two"),
+        ]);
+        assert!(call_after_outputs_start
+            .validate_stateless()
+            .unwrap_err()
+            .contains("before any function_call_output"));
+    }
+
+    #[test]
     fn stateless_requests_reject_persistent_response_fields() {
         let mut store = stateless_request();
         store.store = Some(true);
@@ -2113,18 +2356,42 @@ mod tests {
             .unwrap_err()
             .contains("input_file"));
 
-        let mut function_continuation = stateless_request();
-        function_continuation.input = Some(ResponseInput::Items(vec![
+        let mut missing_function_call = stateless_request();
+        missing_function_call.input = Some(ResponseInput::Items(vec![
             ResponseInputItem::FunctionCallOutput {
                 type_: FunctionCallOutputType::FunctionCallOutput,
                 call_id: "call_test".to_string(),
                 output: "{}".to_string(),
             },
         ]));
-        assert!(function_continuation
+        assert!(missing_function_call
             .validate_stateless()
             .unwrap_err()
-            .contains("function continuation"));
+            .contains("matching function_call"));
+
+        let mut interleaved_function_result = stateless_request();
+        interleaved_function_result.input = Some(ResponseInput::Items(vec![
+            ResponseInputItem::FunctionCall {
+                type_: FunctionCallType::FunctionCall,
+                call_id: "call_test".to_string(),
+                name: "lookup".to_string(),
+                arguments: "{}".to_string(),
+            },
+            ResponseInputItem::Message {
+                role: "user".to_string(),
+                content: ResponseContent::Text("interleaved input".to_string()),
+                metadata: None,
+            },
+            ResponseInputItem::FunctionCallOutput {
+                type_: FunctionCallOutputType::FunctionCallOutput,
+                call_id: "call_test".to_string(),
+                output: "{}".to_string(),
+            },
+        ]));
+        assert!(interleaved_function_result
+            .validate_stateless()
+            .unwrap_err()
+            .contains("before any message"));
 
         let mut mcp_approval = stateless_request();
         mcp_approval.input = Some(ResponseInput::Items(vec![
@@ -2145,17 +2412,6 @@ mod tests {
             .validate_stateless()
             .unwrap_err()
             .contains("file_search"));
-
-        let mut function_tool = stateless_request();
-        function_tool.tools = Some(vec![ResponseTool::Function {
-            name: "lookup".to_string(),
-            description: None,
-            parameters: None,
-        }]);
-        assert!(function_tool
-            .validate_stateless()
-            .unwrap_err()
-            .contains("function tools"));
 
         let mut code_interpreter = stateless_request();
         code_interpreter.tools = Some(vec![ResponseTool::CodeInterpreter {}]);
@@ -2184,5 +2440,27 @@ mod tests {
             .validate_stateless()
             .unwrap_err()
             .contains("require approval"));
+    }
+
+    #[test]
+    fn stateless_requests_reject_custom_function_name_colliding_with_builtin_tool() {
+        let mut request = stateless_request();
+        request.tools = Some(vec![
+            ResponseTool::Function {
+                name: "web_search".to_string(),
+                description: None,
+                parameters: None,
+            },
+            ResponseTool::WebSearch {
+                filters: None,
+                search_context_size: None,
+                user_location: None,
+            },
+        ]);
+
+        assert!(request
+            .validate_stateless()
+            .unwrap_err()
+            .contains("conflicts with a configured built-in tool"));
     }
 }

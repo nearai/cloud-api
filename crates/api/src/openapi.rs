@@ -7,7 +7,7 @@ use utoipa::{Modify, OpenApi};
 #[openapi(
     info(
         title = "NEAR AI Cloud API",
-        description = "A comprehensive cloud API for AI model inference, conversation management, and organization administration.\n\n## Authentication\n\nThis API supports four authentication methods:\n\n1. **Access Token (JWT)**: Use `Authorization: Bearer <jwt_token>` with a short-lived JWT access token for most API endpoints. Obtain this by calling POST /users/me/access_tokens with a refresh token.\n2. **Refresh Token**: Use `Authorization: Bearer <refresh_token>` (prefix: `rt_`) only with POST /users/me/access_tokens to create new JWT access tokens. Obtained from OAuth login.\n3. **API Key (Programmatic Access)**: Use `Authorization: Bearer sk-<api_key>` with an API key (prefix: `sk-`).\n4. **Reporting Token (Read-only Usage Reporting)**: Use `Authorization: Bearer rpt-<reporting_token>` only with usage reporting endpoints.\n\nClick the **Authorize** button above to configure authentication.",
+        description = "A comprehensive cloud API for AI model inference, temporary confidential-data migration views, and organization administration.\n\n## Authentication\n\nThis API supports four authentication methods:\n\n1. **Access Token (JWT)**: Use `Authorization: Bearer <jwt_token>` with a short-lived JWT access token for most API endpoints. Obtain this by calling POST /users/me/access_tokens with a refresh token.\n2. **Refresh Token**: Use `Authorization: Bearer <refresh_token>` (prefix: `rt_`) only with POST /users/me/access_tokens to create new JWT access tokens. Obtained from OAuth login.\n3. **API Key (Programmatic Access)**: Use `Authorization: Bearer sk-<api_key>` with an API key (prefix: `sk-`).\n4. **Reporting Token (Read-only Usage Reporting)**: Use `Authorization: Bearer rpt-<reporting_token>` only with usage reporting endpoints.\n\nClick the **Authorize** button above to configure authentication.",
         version = "1.0.0",
         contact(
             name = "NEAR AI Team",
@@ -25,7 +25,9 @@ use utoipa::{Modify, OpenApi};
         (name = "Score", description = "Text similarity scoring endpoints"),
         (name = "Privacy", description = "Privacy classification (PII span detection) endpoints"),
         (name = "Models", description = "Public model catalog and information"),
-        (name = "Responses", description = "Stateless response inference (`store: false` only). Raw request/response content, response items, and history are not persisted. Clients must include any prior context in each request. Every successful Responses inference makes exactly one Chat Completions call. Only custom `function` tools are supported. They are client-managed: Cloud returns `function_call` items but never executes them; a later `store: false` request replays the individual call (the raw item from output is accepted) with its matching `function_call_output`, alongside caller-managed message history and the same function tool definitions. The minimal replay path also accepts assistant `message` text parts of type `output_text`, but not reasoning or arbitrary full `response.output` items. Server-executed tools (`web_search`, `web_context_search`, `file_search`, `code_interpreter`, `computer`, and remote `mcp`) and image-generation/editing models are rejected. The separate `POST /mcp` endpoint continues to expose its `web_search` tool independently of Responses; use `/v1/images/*` for image generation/editing. Existing completed-response gateway attestation is preserved best-effort: when the signature write succeeds, `GET /v1/signature/resp_*` retrieves signatures over SHA-256 request/response digests, never raw content. Interrupted streams create no `resp_*` attestation record or legacy disconnect fallback. Conversations, response history, and file input are rejected."),
+        (name = "Conversations", description = "Temporary authenticated, workspace-scoped read access for migration/export. Only `POST /v1/conversations/batch`, `GET /v1/conversations/{conversation_id}`, and `GET /v1/conversations/{conversation_id}/items` are available. Conversation creation and every mutation return `410 Gone`; this surface will be removed after data migration. Temporary-view responses use `Cache-Control: no-store`."),
+        (name = "Files", description = "Temporary authenticated, workspace-scoped read access for migration/export. Only `GET /v1/files`, `GET /v1/files/{file_id}`, and `GET /v1/files/{file_id}/content` are available. Upload and every mutation return `410 Gone`; this surface will be removed after data migration. Temporary-view responses use `Cache-Control: no-store`."),
+        (name = "Responses", description = "Stateless response inference (`store: false` only). Raw request/response content, response items, and history are not persisted. Clients must include any prior context in each request. Every successful Responses inference makes exactly one Chat Completions call. Only custom `function` tools are supported. They are client-managed: Cloud returns `function_call` items but never executes them; a later `store: false` request replays the individual call (the raw item from output is accepted) with its matching `function_call_output`, alongside caller-managed message history and the same function tool definitions. The minimal replay path also accepts assistant `message` text parts of type `output_text`, but not reasoning or arbitrary full `response.output` items. Server-executed tools (`web_search`, `web_context_search`, `file_search`, `code_interpreter`, `computer`, and remote `mcp`) and image-generation/editing models are rejected. The separate `POST /mcp` endpoint continues to expose its `web_search` tool independently of Responses; use `/v1/images/*` for image generation/editing. Existing completed-response gateway attestation is preserved best-effort: when the signature write succeeds, `GET /v1/signature/resp_*` retrieves signatures over SHA-256 request/response digests, never raw content. Interrupted streams create no `resp_*` attestation record or legacy disconnect fallback. Responses rejects conversation linkage, response history, and file input; the separate temporary Conversation and File read endpoints are not part of Responses inference."),
         (name = "Organizations", description = "Organization management"),
         (name = "Organization Members", description = "Organization member and invitation management"),
         (name = "Workspaces", description = "Workspace and API key management"),
@@ -56,6 +58,14 @@ use utoipa::{Modify, OpenApi};
         // Model endpoints (public model catalog)
         crate::routes::models::list_models,
         crate::routes::models::get_model_by_name,
+        // Temporary read-only Conversation migration views
+        crate::routes::conversations::batch_get_conversations,
+        crate::routes::conversations::get_conversation,
+        crate::routes::conversations::list_conversation_items,
+        // Temporary read-only File migration views
+        crate::routes::files::list_files,
+        crate::routes::files::get_file,
+        crate::routes::files::get_file_content,
         // Response endpoints
         crate::routes::responses::create_response,
         // Organization endpoints
@@ -226,6 +236,11 @@ use utoipa::{Modify, OpenApi};
             AdminUserResponse,
             crate::routes::users::UpdateUserProfileRequest,
             crate::routes::users::UserStatusResponse,
+            // Temporary read-only Conversation migration-view models
+            BatchConversationsRequest, ConversationBatchResponse, ConversationObject,
+            ConversationItemList,
+            // Temporary read-only File migration-view models
+            FileUploadResponse, FileListResponse,
             // Response models
             crate::routes::responses::StatelessCreateResponseRequestSchema, ResponseObject,
             // Attestation models

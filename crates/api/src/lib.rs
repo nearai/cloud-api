@@ -2652,6 +2652,54 @@ mod tests {
     }
 
     #[test]
+    fn test_openapi_responses_only_advertises_client_managed_function_tools() {
+        let spec = serde_json::to_value(ApiDoc::openapi()).unwrap();
+        let request_tools_schema = &spec["components"]["schemas"]
+            ["StatelessCreateResponseRequestSchema"]["properties"]["tools"];
+        assert!(
+            serde_json::to_string(request_tools_schema)
+                .unwrap()
+                .contains("StatelessResponseToolSchema"),
+            "Responses create-request schema must reference only the client-managed tool schema"
+        );
+
+        let response_tool_schema = &spec["components"]["schemas"]["ClientManagedResponseTool"];
+        assert!(
+            response_tool_schema.is_object(),
+            "Responses OpenAPI schema must describe its supported tool type"
+        );
+
+        let serialized_tool_schema = serde_json::to_string(response_tool_schema).unwrap();
+        assert!(
+            serialized_tool_schema.contains("function"),
+            "Responses OpenAPI schema must retain custom function tools"
+        );
+        for server_executed_tool in [
+            "web_search",
+            "web_context_search",
+            "file_search",
+            "code_interpreter",
+            "computer",
+            "mcp",
+        ] {
+            assert!(
+                !serialized_tool_schema.contains(server_executed_tool),
+                "Responses OpenAPI schema must not advertise the rejected {server_executed_tool} tool"
+            );
+        }
+
+        let responses_tag = spec["tags"]
+            .as_array()
+            .and_then(|tags| tags.iter().find(|tag| tag["name"] == "Responses"))
+            .expect("Responses tag must be present in OpenAPI");
+        let description = responses_tag["description"]
+            .as_str()
+            .expect("Responses tag must document its contract");
+        assert!(description.contains("Only custom `function` tools are supported"));
+        assert!(description.contains("POST /mcp"));
+    }
+
+    #[test]
     fn test_openapi_signature_requires_api_key() {
         // nearai/infra#193: /v1/signature/{chat_id} stays API-key-protected.
         let spec = serde_json::to_value(ApiDoc::openapi()).unwrap();

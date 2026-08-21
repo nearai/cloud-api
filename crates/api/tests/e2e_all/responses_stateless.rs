@@ -2,6 +2,7 @@
 
 use crate::common::*;
 use axum::http::Method;
+use std::sync::{atomic::Ordering, Arc};
 
 fn assert_response_history_is_gone(response: axum_test::TestResponse) {
     assert_eq!(response.status_code(), 410);
@@ -96,6 +97,115 @@ async fn stateless_responses_reject_persistent_fields() {
         let error = response.json::<api::models::ErrorResponse>();
         assert_eq!(error.error.r#type, "invalid_request_error");
     }
+}
+
+#[tokio::test]
+async fn stateless_responses_reject_server_executed_tools_before_provider_work() {
+    // A mock keeps a regression local while its counter proves Responses did
+    // not start a server-side web-search request before returning the client
+    // error. The MCP URL uses the reserved `.invalid` TLD so it cannot point
+    // to a real third-party server if this validation ever regresses.
+    let web_search_provider = Arc::new(MockWebSearchProvider::default_results());
+    let web_search_call_count = web_search_provider.call_count();
+    let (server, _database, mock) =
+        setup_test_server_with_search_providers(web_search_provider, None).await;
+    let model = setup_qwen_model(&server).await;
+    let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
+    let api_key = get_api_key_for_org(&server, org.id).await;
+
+    let rejected_tools = [
+        ("web_search", serde_json::json!({"type": "web_search"})),
+        (
+            "web_context_search",
+            serde_json::json!({"type": "web_context_search"}),
+        ),
+        ("file_search", serde_json::json!({"type": "file_search"})),
+        (
+            "code_interpreter",
+            serde_json::json!({"type": "code_interpreter"}),
+        ),
+        ("computer", serde_json::json!({"type": "computer"})),
+        (
+            "mcp",
+            serde_json::json!({
+                "type": "mcp",
+                "server_label": "test",
+                "server_url": "https://mcp.invalid/tools",
+                "require_approval": "never"
+            }),
+        ),
+    ];
+
+    for (tool_type, tool) in rejected_tools {
+        let response = server
+            .post("/v1/responses")
+            .add_header("Authorization", format!("Bearer {api_key}"))
+            .json(&serde_json::json!({
+                "model": model.clone(),
+                "input": "Use the configured tool.",
+                "store": false,
+                "stream": false,
+                "tools": [tool],
+            }))
+            .await;
+
+        assert_eq!(
+            response.status_code(),
+            400,
+            "{tool_type} must be rejected locally: {}",
+            response.text()
+        );
+        let error = response.json::<api::models::ErrorResponse>();
+        assert_eq!(
+            error.error.r#type, "invalid_request_error",
+            "{tool_type} must have a stable client error envelope"
+        );
+        assert!(
+            error.error.message.contains(tool_type),
+            "{tool_type} rejection should identify the unsupported tool: {}",
+            error.error.message
+        );
+        assert!(
+            mock.last_chat_params().await.is_none(),
+            "{tool_type} must be rejected before inference"
+        );
+    }
+
+    assert_eq!(
+        web_search_call_count.load(Ordering::SeqCst),
+        0,
+        "Responses must not invoke the retained Web Search provider"
+    );
+}
+
+#[tokio::test]
+async fn stateless_responses_reject_mcp_approval_continuations_before_inference() {
+    let (server, _pool, mock, _database) = setup_test_server_with_pool().await;
+    let model = setup_qwen_model(&server).await;
+    let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
+    let api_key = get_api_key_for_org(&server, org.id).await;
+
+    let response = server
+        .post("/v1/responses")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .json(&serde_json::json!({
+            "model": model,
+            "store": false,
+            "input": [{
+                "type": "mcp_approval_response",
+                "approval_request_id": "mcpr_example",
+                "approve": true
+            }]
+        }))
+        .await;
+
+    assert_eq!(response.status_code(), 400, "response: {}", response.text());
+    let error = response.json::<api::models::ErrorResponse>();
+    assert_eq!(error.error.r#type, "invalid_request_error");
+    assert!(
+        mock.last_chat_params().await.is_none(),
+        "MCP approval continuation must be rejected before inference"
+    );
 }
 
 #[tokio::test]

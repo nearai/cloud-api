@@ -9,14 +9,21 @@ use inference_providers::{models::ChatCompletionChunk, StreamChunk};
 #[tokio::test]
 async fn test_models_api() {
     let server = setup_test_server().await;
-    setup_qwen_model(&server).await;
+    let chat_id = setup_qwen_model(&server).await;
     let (api_key, _) = create_org_and_api_key(&server).await;
     let response = list_models(&server, api_key).await;
 
     assert!(!response.data.is_empty());
 
-    // Verify pricing and context_length are present (HuggingFace integration)
-    let model = response.data.first().unwrap();
+    // Assert pricing/context_length on the model we configured, located by id.
+    // The e2e suite shares one model catalog, which can also contain other
+    // models (e.g. a zero-priced classification model), so keying off whichever
+    // entry happens to sort first would be order- and collation-dependent.
+    let model = response
+        .data
+        .iter()
+        .find(|m| m.id == chat_id)
+        .expect("configured chat model must be listed");
     assert!(model.pricing.is_some(), "Model should have pricing");
     let pricing = model.pricing.as_ref().unwrap();
     assert!(pricing.input > 0.0, "Input price should be positive");
@@ -28,6 +35,83 @@ async fn test_models_api() {
     assert!(
         model.context_length.unwrap() > 0,
         "Context length should be positive"
+    );
+}
+
+/// A token-classification model (like `openai/privacy-filter`) does not serve
+/// `/v1/chat/completions` — it exposes bespoke `/v1/privacy/*` routes — but it
+/// must still be LISTED in `GET /v1/models`, tagged with its true modality, so a
+/// client can tell it is not a completion model. This mirrors how image models
+/// are listed and tagged (`outputModalities = ["image"]`) rather than hidden: it
+/// is distinguished by its `output_modalities` / `architecture.outputModalities`
+/// reporting `["classification"]`, alongside an ordinary chat model that still
+/// reports `["text"]` (issue #615).
+#[tokio::test]
+async fn test_classification_model_listed_and_tagged() {
+    let server = setup_test_server().await;
+    let chat_id = setup_qwen_model(&server).await;
+
+    let classifier = "openai/privacy-filter".to_string();
+    let mut batch = BatchUpdateModelApiRequest::new();
+    batch.insert(
+        classifier.clone(),
+        serde_json::from_value(serde_json::json!({
+            "inputCostPerToken": { "amount": 1_000_000, "currency": "USD" },
+            "outputCostPerToken": { "amount": 0, "currency": "USD" },
+            "modelDisplayName": "Privacy Filter",
+            "modelDescription": "PII span detection (token classification)",
+            "contextLength": 512,
+            "maxOutputLength": 1024,
+            "verifiable": false,
+            "isActive": true,
+            "inputModalities": ["text"],
+            "outputModalities": ["classification"]
+        }))
+        .unwrap(),
+    );
+    admin_batch_upsert_models(&server, batch, get_session_id()).await;
+
+    let (api_key, _) = create_org_and_api_key(&server).await;
+    let response = list_models(&server, api_key).await;
+
+    // Both models are LISTED — the classifier is tagged, not hidden.
+    let chat = response
+        .data
+        .iter()
+        .find(|m| m.id == chat_id)
+        .expect("generative chat model must be listed");
+    let filter = response
+        .data
+        .iter()
+        .find(|m| m.id == classifier)
+        .unwrap_or_else(|| {
+            let ids: Vec<&str> = response.data.iter().map(|m| m.id.as_str()).collect();
+            panic!("classification model must be listed (tagged, not hidden); got {ids:?}")
+        });
+
+    // The classification model carries its true modality so a client can tell it
+    // is not a completion model — exactly how an image model reports ["image"].
+    // Both the OpenRouter-flat field and the nested architecture surface it.
+    assert_eq!(
+        filter.output_modalities,
+        Some(vec!["classification".to_string()]),
+        "privacy-filter must report output_modalities = [\"classification\"]"
+    );
+    assert_eq!(
+        filter
+            .architecture
+            .as_ref()
+            .map(|a| a.output_modalities.clone()),
+        Some(vec!["classification".to_string()]),
+        "privacy-filter architecture.outputModalities must be [\"classification\"]"
+    );
+
+    // The ordinary chat model still reports text output — the contrast a client
+    // uses to distinguish a completion model from the classifier.
+    assert_eq!(
+        chat.output_modalities,
+        Some(vec!["text".to_string()]),
+        "chat model must report output_modalities = [\"text\"]"
     );
 }
 

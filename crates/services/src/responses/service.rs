@@ -171,17 +171,17 @@ impl ports::ResponseServiceTrait for ResponseServiceImpl {
         // requested by this call. In particular, a client-defined function
         // named `web_search` must remain client-managed rather than being
         // claimed by the built-in executor.
-        let has_web_search = request.tools.as_ref().map_or(false, |tools| {
+        let has_web_search = request.tools.as_ref().is_some_and(|tools| {
             tools
                 .iter()
                 .any(|tool| matches!(tool, models::ResponseTool::WebSearch { .. }))
         });
-        let has_web_context_search = request.tools.as_ref().map_or(false, |tools| {
+        let has_web_context_search = request.tools.as_ref().is_some_and(|tools| {
             tools
                 .iter()
                 .any(|tool| matches!(tool, models::ResponseTool::WebContextSearch {}))
         });
-        let has_file_search = request.tools.as_ref().map_or(false, |tools| {
+        let has_file_search = request.tools.as_ref().is_some_and(|tools| {
             tools
                 .iter()
                 .any(|tool| matches!(tool, models::ResponseTool::FileSearch {}))

@@ -101,11 +101,11 @@ async fn stateless_responses_reject_persistent_fields() {
 }
 
 #[tokio::test]
-async fn stateless_responses_reject_server_executed_tools_before_provider_work() {
-    // A mock keeps a regression local while its counter proves Responses did
-    // not start a server-side web-search request before returning the client
-    // error. The MCP URL uses the reserved `.invalid` TLD so it cannot point
-    // to a real third-party server if this validation ever regresses.
+async fn stateless_responses_reject_unsupported_tool_types_during_deserialization() {
+    // The request enum must reject builtin types before the handler reaches
+    // service validation or provider work. A mock makes that boundary
+    // observable. The MCP URL uses the reserved `.invalid` TLD so it cannot
+    // point to a real third party if this behavior ever regresses.
     let web_search_provider = Arc::new(MockWebSearchProvider::default_results());
     let web_search_call_count = web_search_provider.call_count();
     let (server, _database, mock) =
@@ -163,12 +163,17 @@ async fn stateless_responses_reject_server_executed_tools_before_provider_work()
         );
         assert!(
             error.error.message.contains(tool_type),
-            "{tool_type} rejection should identify the unsupported tool: {}",
+            "deserialization rejection should identify {tool_type}: {}",
+            error.error.message
+        );
+        assert!(
+            error.error.message.contains("function"),
+            "the function-only tool enum should reject {tool_type}: {}",
             error.error.message
         );
         assert!(
             mock.last_chat_params().await.is_none(),
-            "{tool_type} must be rejected before inference"
+            "{tool_type} must be rejected before service/provider work"
         );
     }
 

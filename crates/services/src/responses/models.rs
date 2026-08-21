@@ -65,6 +65,10 @@ pub struct CreateResponseRequest {
     pub background: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(value_type = Option<Vec<ClientManagedResponseTool>>)]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_client_managed_response_tools"
+    )]
     pub tools: Option<Vec<ResponseTool>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_choice: Option<ResponseToolChoice>,
@@ -331,11 +335,12 @@ pub enum ResponseTool {
     },
 }
 
-/// Public Responses tool schema.
+/// The only tool shape accepted from a public Responses request.
 ///
-/// Runtime request parsing retains the legacy server-executed variants long
-/// enough to return a clear 400 error, but the public Responses contract only
-/// accepts client-managed custom functions.
+/// `ResponseTool` retains legacy variants for dormant/internal code paths, but
+/// the `CreateResponseRequest::tools` deserializer first parses this enum. That
+/// makes unsupported builtin types ordinary request-deserialization failures,
+/// before the route or a provider can do any work.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(tag = "type")]
 pub enum ClientManagedResponseTool {
@@ -347,6 +352,32 @@ pub enum ClientManagedResponseTool {
         #[serde(skip_serializing_if = "Option::is_none")]
         parameters: Option<serde_json::Value>,
     },
+}
+
+impl From<ClientManagedResponseTool> for ResponseTool {
+    fn from(tool: ClientManagedResponseTool) -> Self {
+        match tool {
+            ClientManagedResponseTool::Function {
+                name,
+                description,
+                parameters,
+            } => Self::Function {
+                name,
+                description,
+                parameters,
+            },
+        }
+    }
+}
+
+fn deserialize_client_managed_response_tools<'de, D>(
+    deserializer: D,
+) -> Result<Option<Vec<ResponseTool>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<Vec<ClientManagedResponseTool>>::deserialize(deserializer)
+        .map(|tools| tools.map(|tools| tools.into_iter().map(ResponseTool::from).collect()))
 }
 
 /// User location for web search
@@ -1372,6 +1403,9 @@ impl CreateResponseRequest {
             }
         }
 
+        // The HTTP parser only admits `ClientManagedResponseTool`, but retain
+        // this defense for programmatic callers that construct the legacy
+        // internal `ResponseTool` enum directly.
         if let Some(tools) = &self.tools {
             for tool in tools {
                 match tool {
@@ -2456,5 +2490,42 @@ mod tests {
             .validate_stateless()
             .unwrap_err()
             .contains("web_search is not supported"));
+    }
+
+    #[test]
+    fn response_request_deserialization_accepts_only_function_tools() {
+        let request: CreateResponseRequest = serde_json::from_value(json!({
+            "model": "gpt-4",
+            "tools": [{
+                "type": "function",
+                "name": "web_search",
+                "parameters": {"type": "object"}
+            }]
+        }))
+        .expect("custom functions must deserialize");
+        assert!(matches!(
+            request.tools.as_deref(),
+            Some([ResponseTool::Function { name, .. }]) if name == "web_search"
+        ));
+
+        for unsupported_type in [
+            "web_search",
+            "web_context_search",
+            "file_search",
+            "code_interpreter",
+            "computer",
+            "mcp",
+        ] {
+            let error = serde_json::from_value::<CreateResponseRequest>(json!({
+                "model": "gpt-4",
+                "tools": [{"type": unsupported_type}]
+            }))
+            .expect_err("{unsupported_type} must fail request deserialization");
+
+            assert!(
+                error.to_string().contains(unsupported_type),
+                "deserialization error should identify {unsupported_type}: {error}"
+            );
+        }
     }
 }

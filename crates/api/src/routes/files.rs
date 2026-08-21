@@ -15,16 +15,16 @@ use uuid::Uuid;
 
 pub const MAX_FILE_SIZE: usize = 512 * 1024 * 1024; // 512 MB
 
-/// Returns the documented retirement response for the former Files API.
+/// Return a stable migration response for Files mutations.
 ///
-/// The service and its stored data remain in place for now so existing data can
-/// be handled by a separate retention effort, but no Files API request may
-/// trigger a new upload, read, or deletion.
-pub async fn files_api_deprecated() -> (StatusCode, Json<ErrorResponse>) {
+/// Existing data remains available through the original read-only endpoints
+/// while export tooling is in use. Upload and deletion requests do not reach
+/// storage or repository layers.
+pub async fn files_write_disabled() -> (StatusCode, Json<ErrorResponse>) {
     (
         StatusCode::GONE,
         Json(ErrorResponse::new(
-            "The Files API has been deprecated and is no longer available. Manage file content in your application and use stateless POST /v1/responses requests with store: false."
+            "The Files API is temporarily read-only while existing data remains available for export. This operation is no longer available. Only GET /v1/files, GET /v1/files/{file_id}, and GET /v1/files/{file_id}/content are supported."
                 .to_string(),
             "gone".to_string(),
         )),
@@ -302,7 +302,9 @@ pub async fn upload_file(
         ("purpose" = Option<String>, Query, description = "Filter files by purpose")
     ),
     responses(
-        (status = 200, description = "List of files retrieved successfully", body = FileListResponse),
+        (status = 200, description = "List of files retrieved successfully", body = FileListResponse,
+            headers(("Cache-Control" = String, description = "Always no-store for confidential migration data"))
+        ),
         (status = 400, description = "Bad request", body = ErrorResponse),
         (status = 401, description = "Unauthorized", body = ErrorResponse)
     ),
@@ -415,7 +417,9 @@ pub async fn list_files(
         ("file_id" = String, Path, description = "The ID of the file to retrieve")
     ),
     responses(
-        (status = 200, description = "File information retrieved successfully", body = FileUploadResponse),
+        (status = 200, description = "File information retrieved successfully", body = FileUploadResponse,
+            headers(("Cache-Control" = String, description = "Always no-store for confidential migration data"))
+        ),
         (status = 400, description = "Bad request", body = ErrorResponse),
         (status = 401, description = "Unauthorized", body = ErrorResponse),
         (status = 404, description = "File not found", body = ErrorResponse)
@@ -583,7 +587,9 @@ pub async fn delete_file(
         ("file_id" = String, Path, description = "The ID of the file to retrieve content from")
     ),
     responses(
-        (status = 200, description = "File content retrieved successfully", content_type = "application/octet-stream"),
+        (status = 200, description = "File content retrieved successfully", content_type = "application/octet-stream",
+            headers(("Cache-Control" = String, description = "Always no-store for confidential migration data"))
+        ),
         (status = 400, description = "Bad request", body = ErrorResponse),
         (status = 401, description = "Unauthorized", body = ErrorResponse),
         (status = 404, description = "File not found", body = ErrorResponse)

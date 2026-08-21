@@ -43,7 +43,7 @@ use axum::{
     extract::DefaultBodyLimit,
     middleware::{from_fn, from_fn_with_state, map_response, Next},
     response::Html,
-    routing::{any, get, post},
+    routing::{any, get, post, MethodRouter},
     Router,
 };
 use config::ApiConfig;
@@ -1239,7 +1239,10 @@ pub fn build_app_with_config(
         rate_limit_state.clone(),
     );
 
-    let conversation_routes = build_conversation_routes(&auth_components.auth_state_middleware);
+    let conversation_routes = build_conversation_routes(
+        domain_services.conversation_service.clone(),
+        &auth_components.auth_state_middleware,
+    );
 
     let management_routes = build_management_router(
         app_state.clone(),
@@ -1739,26 +1742,62 @@ pub fn build_mcp_routes(
         ))
 }
 
-/// Build retired Conversation API routes.
+/// Build the temporary read-only Conversation API surface.
 ///
-/// Conversation data remains in place for now, but the public API no longer
-/// permits reading or writing it. Keep the route catch-all so callers receive
-/// a stable migration response rather than a generic 404 or 405.
-pub fn build_conversation_routes(auth_state_middleware: &AuthState) -> Router {
-    build_retired_conversation_routes().layer(from_fn_with_state(
+/// Existing conversation data remains available through its original view
+/// routes so chat-api can export it. All mutations and unsupported legacy
+/// paths stay authenticated and return 410 until the data-retention migration
+/// is complete.
+pub fn build_conversation_routes(
+    conversation_service: Arc<services::ConversationService>,
+    auth_state_middleware: &AuthState,
+) -> Router {
+    build_read_only_conversation_route_layout(
+        post(conversations::batch_get_conversations)
+            .fallback(conversations::conversation_write_disabled),
+        get(conversations::get_conversation).fallback(conversations::conversation_write_disabled),
+        get(conversations::list_conversation_items)
+            .fallback(conversations::conversation_write_disabled),
+        conversations::conversation_write_disabled,
+    )
+    .with_state(
+        conversation_service as Arc<dyn services::conversations::ports::ConversationServiceTrait>,
+    )
+    .layer(from_fn_with_state(
         auth_state_middleware.clone(),
         auth_middleware_with_api_key,
     ))
+    // Conversation records can contain confidential prompt and completion
+    // data. Apply this outside auth so rejects are no-store as well.
+    .layer(map_response(no_store_response))
 }
 
-fn build_retired_conversation_routes() -> Router {
+/// Install the exact temporary Conversation API route layout.
+///
+/// Kept separate from service wiring so route precedence can be tested without
+/// a database; production uses this helper directly. The per-route fallbacks
+/// make unsupported methods 410, while the nested fallback handles unknown
+/// legacy descendants without conflicting with parameter routes.
+fn build_read_only_conversation_route_layout<S, H, T>(
+    batch: MethodRouter<S>,
+    conversation: MethodRouter<S>,
+    items: MethodRouter<S>,
+    write_disabled: H,
+) -> Router<S>
+where
+    S: Clone + Send + Sync + 'static,
+    H: axum::handler::Handler<T, S>,
+    T: 'static,
+{
+    let descendants = Router::new()
+        .route("/batch", batch)
+        .route("/{conversation_id}", conversation)
+        .route("/{conversation_id}/items", items)
+        .fallback(write_disabled.clone());
+
     Router::new()
-        .route("/conversations", any(conversations::conversation_api_gone))
-        .route("/conversations/", any(conversations::conversation_api_gone))
-        .route(
-            "/conversations/{*path}",
-            any(conversations::conversation_api_gone),
-        )
+        .route("/conversations", any(write_disabled))
+        .nest("/conversations/", descendants)
 }
 
 /// Build attestation routes with auth.
@@ -1830,23 +1869,55 @@ pub fn build_workspace_routes(app_state: AppState, auth_state_middleware: &AuthS
         ))
 }
 
-/// Build the retired Files API surface.
+/// Build the temporary read-only Files API surface.
 ///
-/// Keep the authenticated route boundary while preventing every Files request
-/// from reaching the legacy service, storage, or repository layers. The
-/// dormant wiring is intentionally retained until the follow-up cleanup.
+/// Existing metadata and content stay available through the original GET
+/// routes so chat-api can export data. Uploads, deletion, and unsupported
+/// legacy paths remain authenticated 410 responses and never reach storage.
 pub fn build_files_routes(app_state: AppState, auth_state_middleware: &AuthState) -> Router {
-    use crate::routes::files::files_api_deprecated;
+    use crate::routes::files::{files_write_disabled, get_file, get_file_content, list_files};
+
+    build_read_only_file_route_layout(
+        get(list_files).fallback(files_write_disabled),
+        get(get_file).fallback(files_write_disabled),
+        get(get_file_content).fallback(files_write_disabled),
+        files_write_disabled,
+    )
+    .with_state(app_state)
+    .layer(from_fn_with_state(
+        auth_state_middleware.clone(),
+        auth_middleware_with_api_key,
+    ))
+    // File metadata and content are confidential. Keep both the temporary
+    // view routes and their 410 responses out of shared/browser caches.
+    .layer(map_response(no_store_response))
+}
+
+/// Install the exact temporary Files API route layout.
+///
+/// Like Conversations, this is shared by production and route-precedence
+/// tests. Only the original GET views receive service handlers; other methods
+/// and descendants land on the authenticated 410 router through a scoped
+/// nested fallback.
+fn build_read_only_file_route_layout<S, H, T>(
+    list: MethodRouter<S>,
+    file: MethodRouter<S>,
+    content: MethodRouter<S>,
+    write_disabled: H,
+) -> Router<S>
+where
+    S: Clone + Send + Sync + 'static,
+    H: axum::handler::Handler<T, S>,
+    T: 'static,
+{
+    let descendants = Router::new()
+        .route("/{file_id}/content", content)
+        .route("/{file_id}", file)
+        .fallback(write_disabled);
 
     Router::new()
-        .route("/files", axum::routing::any(files_api_deprecated))
-        .route("/files/", axum::routing::any(files_api_deprecated))
-        .route("/files/{*path}", axum::routing::any(files_api_deprecated))
-        .with_state(app_state)
-        .layer(from_fn_with_state(
-            auth_state_middleware.clone(),
-            auth_middleware_with_api_key,
-        ))
+        .route("/files", list)
+        .nest("/files/", descendants)
 }
 
 /// Build feature request routes for user submissions and admin aggregation.
@@ -2041,8 +2112,8 @@ async fn cache_control_on_success(
     res
 }
 
-/// Force every response for a request-scoped Responses route to bypass shared
-/// and browser caches. Unlike public catalog routes, even error responses may
+/// Force every response for a confidential-data route to bypass shared and
+/// browser caches. Unlike public catalog routes, even error responses may
 /// include request-specific details from validation or authentication.
 async fn no_store_response(mut response: Response) -> Response {
     response
@@ -2720,38 +2791,6 @@ mod tests {
     }
 
     #[test]
-    fn test_openapi_excludes_retired_conversation_api() {
-        let spec = serde_json::to_value(ApiDoc::openapi()).unwrap();
-        let paths = spec["paths"].as_object().unwrap();
-        assert!(
-            paths
-                .keys()
-                .all(|path| !path.starts_with("/v1/conversations")),
-            "OpenAPI must not advertise retired Conversation routes"
-        );
-
-        let tags = spec["tags"].as_array().unwrap();
-        assert!(
-            tags.iter().all(|tag| tag["name"] != "Conversations"),
-            "OpenAPI must not advertise the Conversations tag"
-        );
-
-        let schemas = spec["components"]["schemas"].as_object().unwrap();
-        for schema in [
-            "CreateConversationRequest",
-            "ConversationObject",
-            "UpdateConversationRequest",
-            "ConversationDeleteResult",
-            "ConversationItemList",
-        ] {
-            assert!(
-                !schemas.contains_key(schema),
-                "OpenAPI must not expose retired Conversation schema {schema}"
-            );
-        }
-    }
-
-    #[test]
     fn test_openapi_admin_aml_paths_require_session_security() {
         let spec = serde_json::to_value(ApiDoc::openapi()).unwrap();
         let paths = spec["paths"].as_object().unwrap();
@@ -2788,81 +2827,117 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn conversation_routes_return_gone_for_every_retired_surface() {
-        let app = Router::new().nest("/v1", build_retired_conversation_routes());
-        let routes = [
-            (axum::http::Method::POST, "/v1/conversations"),
-            (axum::http::Method::GET, "/v1/conversations/"),
-            (axum::http::Method::POST, "/v1/conversations/batch"),
-            (axum::http::Method::GET, "/v1/conversations/conv_example"),
-            (axum::http::Method::POST, "/v1/conversations/conv_example"),
-            (axum::http::Method::DELETE, "/v1/conversations/conv_example"),
-            (
-                axum::http::Method::POST,
-                "/v1/conversations/conv_example/pin",
-            ),
-            (
-                axum::http::Method::DELETE,
-                "/v1/conversations/conv_example/pin",
-            ),
-            (
-                axum::http::Method::POST,
-                "/v1/conversations/conv_example/archive",
-            ),
-            (
-                axum::http::Method::DELETE,
-                "/v1/conversations/conv_example/archive",
-            ),
-            (
-                axum::http::Method::POST,
-                "/v1/conversations/conv_example/clone",
-            ),
-            (
-                axum::http::Method::GET,
-                "/v1/conversations/conv_example/items",
-            ),
-            (
-                axum::http::Method::POST,
-                "/v1/conversations/conv_example/items",
-            ),
-            // The catch-all also keeps unknown legacy subpaths from becoming
-            // misleading 404 or 405 responses.
-            (
-                axum::http::Method::PATCH,
-                "/v1/conversations/conv_example/unknown",
-            ),
-        ];
+    async fn read_only_data_route_layout_preserves_views_and_rejects_mutations() {
+        async fn view() -> StatusCode {
+            StatusCode::OK
+        }
 
-        for (method, path) in routes {
+        async fn write_disabled() -> StatusCode {
+            StatusCode::GONE
+        }
+
+        async fn unrelated_route() -> StatusCode {
+            StatusCode::NOT_FOUND
+        }
+
+        // These are the production route-layout helpers. Using lightweight
+        // handlers here isolates Axum's static/parameter/catch-all matching
+        // from database state while proving the exact public layout builds.
+        let conversation_routes = build_read_only_conversation_route_layout(
+            axum::routing::post(view).fallback(write_disabled),
+            axum::routing::get(view).fallback(write_disabled),
+            axum::routing::get(view).fallback(write_disabled),
+            write_disabled,
+        )
+        .layer(map_response(no_store_response));
+        let file_routes = build_read_only_file_route_layout(
+            axum::routing::get(view).fallback(write_disabled),
+            axum::routing::get(view).fallback(write_disabled),
+            axum::routing::get(view).fallback(write_disabled),
+            write_disabled,
+        )
+        .layer(map_response(no_store_response));
+        let app = Router::new()
+            .merge(conversation_routes)
+            .merge(file_routes)
+            .fallback(unrelated_route);
+
+        for (method, path) in [
+            ("POST", "/conversations/batch"),
+            ("GET", "/conversations/conv_example"),
+            ("GET", "/conversations/conv_example/items"),
+            ("GET", "/files"),
+            ("GET", "/files/file_example"),
+            ("GET", "/files/file_example/content"),
+        ] {
             let response = app
                 .clone()
                 .oneshot(
                     HttpRequest::builder()
-                        .method(method.clone())
+                        .method(method)
                         .uri(path)
                         .body(Body::empty())
                         .unwrap(),
                 )
                 .await
                 .unwrap();
-
+            assert_eq!(response.status(), StatusCode::OK, "{method} {path}");
             assert_eq!(
-                response.status(),
-                StatusCode::GONE,
-                "{method} {path} must return 410 Gone"
+                response
+                    .headers()
+                    .get(CACHE_CONTROL)
+                    .and_then(|value| value.to_str().ok()),
+                Some("no-store"),
+                "{method} {path}"
             );
+        }
 
-            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        for (method, path) in [
+            ("POST", "/conversations"),
+            ("GET", "/conversations/"),
+            ("GET", "/conversations/batch"),
+            ("POST", "/conversations/conv_example"),
+            ("POST", "/conversations/conv_example/items"),
+            ("PATCH", "/conversations/conv_example/unknown"),
+            ("POST", "/files"),
+            ("GET", "/files/"),
+            ("DELETE", "/files/file_example"),
+            ("PUT", "/files/legacy/nested/path"),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    HttpRequest::builder()
+                        .method(method)
+                        .uri(path)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
                 .await
                 .unwrap();
-            let error: crate::models::ErrorResponse = serde_json::from_slice(&body).unwrap();
-            assert_eq!(error.error.r#type, "gone");
+            assert_eq!(response.status(), StatusCode::GONE, "{method} {path}");
             assert_eq!(
-                error.error.code.as_deref(),
-                Some("conversation_api_retired")
+                response
+                    .headers()
+                    .get(CACHE_CONTROL)
+                    .and_then(|value| value.to_str().ok()),
+                Some("no-store"),
+                "{method} {path}"
             );
-            assert!(error.error.message.contains("POST /v1/responses"));
         }
+
+        let unrelated = app
+            .oneshot(
+                HttpRequest::builder()
+                    .method("GET")
+                    .uri("/unrelated")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unrelated.status(), StatusCode::NOT_FOUND);
+        assert!(unrelated.headers().get(CACHE_CONTROL).is_none());
     }
     /// Example of how to set up the application for E2E testing
     #[tokio::test]

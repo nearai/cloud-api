@@ -14,22 +14,22 @@ use std::sync::Arc;
 use tracing::debug;
 use uuid::Uuid;
 
-const CONVERSATIONS_API_RETIRED_MESSAGE: &str = "The Conversations API has been deprecated and is no longer available. Use stateless POST /v1/responses with store: false and include any prior conversation history in the request.";
+const CONVERSATION_WRITE_DISABLED_MESSAGE: &str = "The Conversations API is temporarily read-only while existing data remains available for export. This operation is no longer available. Only POST /v1/conversations/batch, GET /v1/conversations/{conversation_id}, and GET /v1/conversations/{conversation_id}/items are supported.";
 
-/// Return a stable migration response for every retired Conversation API route.
+/// Return a stable migration response for Conversation mutations.
 ///
-/// API-key authentication is enforced by the router. This handler intentionally
-/// has no service dependencies, so retired requests cannot read or write
-/// existing conversation data.
-pub async fn conversation_api_gone() -> (StatusCode, ResponseJson<ErrorResponse>) {
+/// API-key authentication is enforced by the router. The read-only routes use
+/// the same workspace-scoped service as before; this handler is only attached
+/// to writes and unsupported legacy paths.
+pub async fn conversation_write_disabled() -> (StatusCode, ResponseJson<ErrorResponse>) {
     (
         StatusCode::GONE,
         ResponseJson(ErrorResponse {
             error: ErrorDetail {
-                message: CONVERSATIONS_API_RETIRED_MESSAGE.to_string(),
+                message: CONVERSATION_WRITE_DISABLED_MESSAGE.to_string(),
                 r#type: "gone".to_string(),
                 param: None,
-                code: Some("conversation_api_retired".to_string()),
+                code: Some("conversation_write_disabled".to_string()),
             },
         }),
     )
@@ -140,7 +140,9 @@ pub async fn create_conversation(
     tag = "Conversations",
     request_body = BatchConversationsRequest,
     responses(
-        (status = 200, description = "Conversations retrieved", body = ConversationBatchResponse),
+        (status = 200, description = "Conversations retrieved", body = ConversationBatchResponse,
+            headers(("Cache-Control" = String, description = "Always no-store for confidential migration data"))
+        ),
         (status = 400, description = "Bad request (empty IDs or invalid format)", body = ErrorResponse),
         (status = 401, description = "Unauthorized", body = ErrorResponse),
         (status = 500, description = "Internal server error", body = ErrorResponse)
@@ -271,7 +273,9 @@ pub async fn batch_get_conversations(
         ("conversation_id" = String, Path, description = "Conversation ID")
     ),
     responses(
-        (status = 200, description = "Conversation details", body = ConversationObject),
+        (status = 200, description = "Conversation details", body = ConversationObject,
+            headers(("Cache-Control" = String, description = "Always no-store for confidential migration data"))
+        ),
         (status = 400, description = "Bad request", body = ErrorResponse),
         (status = 401, description = "Unauthorized", body = ErrorResponse),
         (status = 404, description = "Conversation not found", body = ErrorResponse),
@@ -843,7 +847,9 @@ pub async fn clone_conversation(
         ("offset" = Option<i64>, Query, description = "Number of items to skip")
     ),
     responses(
-        (status = 200, description = "List of conversation items", body = ConversationItemList),
+        (status = 200, description = "List of conversation items", body = ConversationItemList,
+            headers(("Cache-Control" = String, description = "Always no-store for confidential migration data"))
+        ),
         (status = 400, description = "Bad request", body = ErrorResponse),
         (status = 401, description = "Unauthorized", body = ErrorResponse),
         (status = 404, description = "Conversation not found", body = ErrorResponse),

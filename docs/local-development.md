@@ -273,6 +273,8 @@ Provider refresh runs every 300s by default
 | `GET  /v1/models`                           | public   | OpenAI-compatible model catalog with pricing metadata       |
 | `POST /v1/chat/completions`                 | API key  | OpenAI-compatible. Add `"stream": true` for SSE             |
 | `POST /v1/responses`                        | API key  | Stateless `store: false` inference; client-managed function tools only |
+| `POST /v1/conversations/batch`, `GET /v1/conversations/{id}`, `GET /v1/conversations/{id}/items` | API key | Temporary workspace-scoped migration/export reads; all Conversation writes return `410` |
+| `GET /v1/files`, `GET /v1/files/{id}`, `GET /v1/files/{id}/content` | API key | Temporary workspace-scoped migration/export reads; upload and all File writes return `410` |
 | `POST /mcp`                                 | API key  | Independent MCP server exposing the `web_search` tool       |
 | `GET  /v1/attestation/report`               | API key  | TEE attestation (503 outside a CVM unless `DEV=true` in debug builds) |
 | `GET  /v1/attestation/ita-token`            | public   | Intel Trust Authority JWT wrapper (requires ITA env vars)   |
@@ -318,8 +320,18 @@ Completions call. This does not affect the separate `POST /mcp` MCP server,
 which continues to expose its independent `web_search` tool, or the
 `/v1/images/*` endpoints.
 
-Stateful operations are also rejected: Conversations, response history, and
-file input.
+Responses itself rejects conversation linkage, response history, and file
+input. During the temporary migration/export window, the authenticated,
+workspace-scoped read views remain available:
+
+- `POST /v1/conversations/batch`, `GET /v1/conversations/{id}`, and
+  `GET /v1/conversations/{id}/items`;
+- `GET /v1/files`, `GET /v1/files/{id}`, and `GET /v1/files/{id}/content`.
+
+These views preserve existing retrieval behavior only; they are not a new
+export API or a new Conversation-list endpoint. They send `Cache-Control:
+no-store`. Creation, upload, deletion, pinning, archiving, cloning, item
+creation, and every other Conversation or File mutation return `410 Gone`.
 
 ## 7. Troubleshooting
 

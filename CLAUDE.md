@@ -200,8 +200,9 @@ POST /v1/responses
 - Raw request/response content, response items, and conversation history are not persisted.
 - **Existing completed-response attestation is preserved best-effort**: when its signature write succeeds, `GET /v1/signature/resp_*` can retrieve the response ID and signatures over SHA-256 request/response digests. The signature material contains no raw request or response content. A disconnected stream has no completed `resp_*` attestation record or legacy disconnect fallback.
 - Event types: `response.created`, `response.output_text.delta`, `response.completed`, `response.failed`
-- `/v1/conversations/*` and `/v1/files/*` return authenticated `410 Gone` responses.
-- The following stateful operations are rejected: file input/file search, function tools and function-call continuation, code interpreter, computer, and every MCP approval mode other than `require_approval: "never"`. Only request-scoped MCP calls with that exact mode are supported.
+- Only custom `type: "function"` tools are supported. They are client-managed: Cloud returns a `function_call` but never executes it; the client sends the original call and its matching `function_call_output` in a later fresh `store: false` request with its own history.
+- Server-executed Responses tools—including `web_search`, `web_context_search`, `file_search`, `code_interpreter`, `computer`, and remote `mcp`—plus file input and image-generation/editing output models are rejected. The independent root `POST /mcp` endpoint continues to expose web search and is not part of Responses execution.
+- During Stage I, existing Conversation/File data remains available only through authenticated, workspace-scoped migration views: `POST /v1/conversations/batch`, `GET /v1/conversations/{conversation_id}`, `GET /v1/conversations/{conversation_id}/items`, `GET /v1/files`, `GET /v1/files/{file_id}`, and `GET /v1/files/{file_id}/content`. They return `Cache-Control: no-store`; every Conversation/File mutation and unsupported legacy path returns `410 Gone`.
 
 **Streaming Flow**:
 ```
@@ -258,14 +259,14 @@ Located in `crates/services/src/`:
 - `workspace` - Workspace CRUD, settings
 - `user` - User profiles, session management
 - `completions` - AI completion orchestration
-- `conversations` - Legacy module; its public API surface is retired
-- `responses` - Request-scoped, stateless response orchestration and supported one-turn tools
+- `conversations` - Legacy state module with temporary Stage I migration read views; public mutations return `410 Gone`
+- `responses` - Request-scoped, stateless response orchestration with client-managed custom function calls
 - `attestation` - TEE attestation reports, chat signatures
 - `models` - Model catalog and pricing
 - `usage` - Token tracking, limit enforcement, billing
 - `inference_provider_pool` - Model discovery, load balancing
 - `mcp` - Model Context Protocol client management
-- `files` - Legacy module; its public API surface is retired
+- `files` - Legacy state module with temporary Stage I migration read views; public mutations return `410 Gone`
 - `metrics` - OpenTelemetry metrics
 - `admin` - Admin operations, analytics
 - `common` - Shared utilities
@@ -278,13 +279,13 @@ Located in `crates/api/src/routes/`:
 - `workspaces.rs` - Workspace & API key management
 - `users.rs` - User profile, invitations, sessions
 - `completions.rs` - Chat & text completions
-- `conversations.rs` - Retired API surface (authenticated `410 Gone`)
-- `responses.rs` - Stateless AI response streaming
+- `conversations.rs` - Temporary authenticated, no-store Stage I migration read views; mutations return `410 Gone`
+- `responses.rs` - Stateless AI response streaming with client-managed custom function calls
 - `models.rs` - Model catalog
 - `usage.rs` - Usage tracking, billing
 - `attestation.rs` - TEE verification, signatures
 - `admin.rs` - Admin endpoints
-- `files.rs` - Retired API surface (authenticated `410 Gone`)
+- `files.rs` - Temporary authenticated, no-store Stage I migration read views; mutations return `410 Gone`
 - `health.rs` - Health checks
 - `api.rs` - API versioning
 

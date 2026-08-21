@@ -5,12 +5,7 @@ use inference_providers::{
     mock::{RequestMatcher, ResponseTemplate, ToolCall},
     MessageRole,
 };
-use services::responses::models::McpDiscoveredTool;
-use services::responses::tools::{MockMcpClient, MockMcpClientFactory};
-use std::sync::{
-    atomic::{AtomicUsize, Ordering},
-    Arc,
-};
+use std::sync::Arc;
 
 #[tokio::test]
 async fn stateless_function_call_is_replayed_by_the_client_without_server_history() {
@@ -28,7 +23,8 @@ async fn stateless_function_call_is_replayed_by_the_client_without_server_histor
         ResponseTemplate::new("").with_tool_calls(vec![ToolCall::new(
             "get_weather",
             r#"{"location":"Shanghai"}"#,
-        )]),
+        )
+        .with_thought_signature("gemini-thought-signature")]),
     )
     .await;
     mock.set_default_response(ResponseTemplate::new(
@@ -71,6 +67,11 @@ async fn stateless_function_call_is_replayed_by_the_client_without_server_histor
         first["incomplete_details"]["reason"],
         "function_call_required"
     );
+    assert_eq!(
+        mock.chat_completion_call_count(),
+        1,
+        "a client-managed function call must not trigger a follow-up completion"
+    );
     let function_call = first["output"]
         .as_array()
         .expect("first response has output")
@@ -82,6 +83,10 @@ async fn stateless_function_call_is_replayed_by_the_client_without_server_histor
         .as_str()
         .expect("function call has call_id")
         .to_string();
+    assert_eq!(
+        function_call["thought_signature"],
+        "gemini-thought-signature"
+    );
 
     // The caller executes the function and sends both the returned call item
     // and its result in a new stateless request. No response ID is referenced.
@@ -148,6 +153,10 @@ async fn stateless_function_call_is_replayed_by_the_client_without_server_histor
     assert_eq!(tool_calls.len(), 1);
     assert_eq!(tool_calls[0].id.as_deref(), Some(call_id.as_str()));
     assert_eq!(tool_calls[0].function.name.as_deref(), Some("get_weather"));
+    assert_eq!(
+        tool_calls[0].thought_signature.as_deref(),
+        Some("gemini-thought-signature")
+    );
 
     let tool_result = params
         .messages
@@ -159,6 +168,44 @@ async fn stateless_function_call_is_replayed_by_the_client_without_server_histor
         tool_result.content.as_ref(),
         Some(&serde_json::json!("{\"temperature_c\":22}"))
     );
+    assert_eq!(
+        mock.chat_completion_call_count(),
+        2,
+        "each client request should result in exactly one completion"
+    );
+}
+
+#[tokio::test]
+async fn stateless_response_without_tools_completes_after_one_completion() {
+    let (server, _pool, mock, _database) = setup_test_server_with_pool().await;
+    let model = setup_qwen_model(&server).await;
+    let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
+    let api_key = get_api_key_for_org(&server, org.id).await;
+
+    mock.set_default_response(ResponseTemplate::new("A normal answer."))
+        .await;
+
+    let response = server
+        .post("/v1/responses")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .json(&serde_json::json!({
+            "model": model,
+            "input": "Say hello.",
+            "store": false,
+            "stream": false,
+        }))
+        .await;
+
+    assert_eq!(
+        response.status_code(),
+        200,
+        "response failed: {}",
+        response.text()
+    );
+    let response = response.json::<serde_json::Value>();
+    assert_eq!(response["status"], "completed");
+    assert_eq!(response["tools"], serde_json::json!([]));
+    assert_eq!(mock.chat_completion_call_count(), 1);
 }
 
 #[tokio::test]
@@ -228,46 +275,9 @@ async fn stateless_custom_web_search_function_is_not_executed_as_a_builtin_tool(
 }
 
 #[tokio::test]
-async fn stateless_custom_function_colliding_with_discovered_mcp_tool_is_rejected_before_execution()
-{
-    let list_tools_calls = Arc::new(AtomicUsize::new(0));
-    let mcp_tool_calls = Arc::new(AtomicUsize::new(0));
-    let list_tools_calls_for_factory = list_tools_calls.clone();
-    let mcp_tool_calls_for_factory = mcp_tool_calls.clone();
-
-    let mut mock_factory = MockMcpClientFactory::new();
-    mock_factory
-        .expect_create_client()
-        .withf(|url: &str, _| url == "https://example.com/mcp")
-        .returning(move |_, _| {
-            let list_tools_calls = list_tools_calls_for_factory.clone();
-            let mcp_tool_calls = mcp_tool_calls_for_factory.clone();
-            let mut client = MockMcpClient::new();
-
-            client.expect_list_tools().returning(move || {
-                list_tools_calls.fetch_add(1, Ordering::SeqCst);
-                Ok(vec![McpDiscoveredTool {
-                    name: "get_weather".to_string(),
-                    description: Some("Get weather for a location".to_string()),
-                    input_schema: Some(serde_json::json!({
-                        "type": "object",
-                        "properties": {"location": {"type": "string"}}
-                    })),
-                    annotations: None,
-                }])
-            });
-            // The collision must be rejected before the model can cause an
-            // MCP call. Allow a call only so the counter produces a clear
-            // regression assertion rather than a mock expectation panic.
-            client.expect_call_tool().times(0..).returning(move |_, _| {
-                mcp_tool_calls.fetch_add(1, Ordering::SeqCst);
-                Ok("unexpected MCP execution".to_string())
-            });
-
-            Ok(Box::new(client) as Box<dyn services::responses::tools::mcp::McpClient>)
-        });
-
-    let (server, _pool, mock) = setup_test_server_with_mcp_factory(Arc::new(mock_factory)).await;
+async fn stateless_mcp_tools_are_rejected_before_provider_work() {
+    let (server, _pool, mock, _database) = setup_test_server_with_pool().await;
+    let model = setup_qwen_model(&server).await;
     let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
     let api_key = get_api_key_for_org(&server, org.id).await;
 
@@ -275,7 +285,7 @@ async fn stateless_custom_function_colliding_with_discovered_mcp_tool_is_rejecte
         .post("/v1/responses")
         .add_header("Authorization", format!("Bearer {api_key}"))
         .json(&serde_json::json!({
-            "model": "test-model",
+            "model": model,
             "input": "What is the weather?",
             "store": false,
             "stream": false,
@@ -298,14 +308,9 @@ async fn stateless_custom_function_colliding_with_discovered_mcp_tool_is_rejecte
     assert_eq!(response.status_code(), 400, "response: {}", response.text());
     let error = response.json::<api::models::ErrorResponse>();
     assert_eq!(error.error.r#type, "invalid_request_error");
-    assert!(error
-        .error
-        .message
-        .contains("conflicts with a configured or discovered server-executed tool"));
-    assert_eq!(list_tools_calls.load(Ordering::SeqCst), 1);
-    assert_eq!(mcp_tool_calls.load(Ordering::SeqCst), 0);
+    assert!(error.error.message.contains("mcp is not supported"));
     assert!(
         mock.last_chat_params().await.is_none(),
-        "the request must be rejected before inference"
+        "MCP should be rejected before provider work"
     );
 }

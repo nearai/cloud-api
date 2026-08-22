@@ -247,9 +247,9 @@ impl CitationTracker {
                         self.parse_digits_from_buffer(3, self.token_buffer.len() - 1)
                     {
                         tracing::debug!(
-                            "CitationTracker: Citation tag opened [s:{}] at clean_position={}",
                             source_id,
-                            self.clean_position
+                            clean_position = self.clean_position,
+                            "Citation tag opened"
                         );
                         self.current_state = TagState::InsideTag { source_id };
 
@@ -325,11 +325,11 @@ impl CitationTracker {
                         if let Some(active) = self.active_citation.take() {
                             if active.source_id == source_id {
                                 tracing::debug!(
-                                    "CitationTracker: Citation tag closed [/s:{}] - indices=[{}, {}], cited_text_len={}",
                                     source_id,
-                                    active.start_index,
-                                    self.clean_position,
-                                    active.accumulated_content.len()
+                                    start_index = active.start_index,
+                                    end_index = self.clean_position,
+                                    cited_text_len = active.accumulated_content.len(),
+                                    "Citation tag closed"
                                 );
                                 let citation = Citation {
                                     start_index: active.start_index,
@@ -401,24 +401,24 @@ impl CitationTracker {
         // If there's pending token_buffer (incomplete tag at end), treat as literal
         if !self.token_buffer.is_empty() {
             tracing::debug!(
-                "CitationTracker: Flushing incomplete token_buffer at finalize: token_buffer_len={}",
-                self.token_buffer.len()
+                token_buffer_len = self.token_buffer.len(),
+                "Flushing incomplete citation token buffer"
             );
             let buffer_content = self.token_buffer.clone();
             let _ = self.do_flush_to_clean_text(&buffer_content);
         }
 
         tracing::debug!(
-            "CitationTracker: Finalizing with {} completed citations",
-            self.completed_citations.len()
+            citation_count = self.completed_citations.len(),
+            "Finalizing citation tracker"
         );
         for (idx, citation) in self.completed_citations.iter().enumerate() {
             tracing::debug!(
-                "CitationTracker: Citation {}: source_id={}, indices=[{}, {}]",
-                idx,
-                citation.source_id,
-                citation.start_index,
-                citation.end_index
+                citation_index = idx,
+                source_id = citation.source_id,
+                start_index = citation.start_index,
+                end_index = citation.end_index,
+                "Completed citation"
             );
         }
 

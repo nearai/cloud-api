@@ -804,7 +804,7 @@ impl ResponseServiceImpl {
                         ),
                     );
                     tracing::warn!(
-                        status = error_cause.http_status_code(),
+                        status_code = error_cause.http_status_code(),
                         error_category = error_cause.log_category(),
                         "Completion stream failed"
                     );
@@ -1250,7 +1250,7 @@ impl ResponseServiceImpl {
                     {
                         tracing::warn!(
                             response_id = %ctx.response_id_str,
-                            status = "failed",
+                            response_status = "failed",
                             "Failed to update response status"
                         );
                     }
@@ -1299,7 +1299,7 @@ impl ResponseServiceImpl {
                 // Log error but continue - we want to save partial response even on disconnect
                 tracing::warn!(
                     response_id = %ctx.response_id_str,
-                    status = e.http_status_code(),
+                    status_code = e.http_status_code(),
                     error_category = e.log_category(),
                     "Agent loop stopped with a recoverable error"
                 );
@@ -1349,11 +1349,11 @@ impl ResponseServiceImpl {
             ctx.total_cached_tokens,
         );
         tracing::debug!(
-            "Final response usage: input={}, output={}, reasoning={}, total={}",
-            ctx.total_input_tokens,
-            ctx.total_output_tokens,
-            ctx.reasoning_tokens,
-            ctx.total_input_tokens + ctx.total_output_tokens
+            input_tokens = ctx.total_input_tokens,
+            output_tokens = ctx.total_output_tokens,
+            reasoning_tokens = ctx.reasoning_tokens,
+            total_tokens = ctx.total_input_tokens + ctx.total_output_tokens,
+            "Final response usage"
         );
 
         // Serialize usage to JSON for database storage
@@ -1415,7 +1415,7 @@ impl ResponseServiceImpl {
                 {
                     tracing::warn!(
                         response_id = %ctx.response_id_str,
-                        status = "failed",
+                        response_status = "failed",
                         "Failed to update response status"
                     );
                 }
@@ -1436,7 +1436,7 @@ impl ResponseServiceImpl {
                 {
                     tracing::warn!(
                         response_id = %ctx.response_id_str,
-                        status = "failed",
+                        response_status = "failed",
                         "Failed to update partial response status"
                     );
                 }
@@ -1522,7 +1522,7 @@ impl ResponseServiceImpl {
                 break;
             }
 
-            tracing::debug!("Agent loop iteration {}", iteration);
+            tracing::debug!(iteration = *iteration, "Agent loop iteration");
 
             // Prepare extra params with tools and encryption headers
             let mut extra = std::collections::HashMap::new();
@@ -1683,8 +1683,8 @@ impl ResponseServiceImpl {
                 consecutive_error_count += 1;
                 if consecutive_error_count >= MAX_CONSECUTIVE_TOOL_FAILURES {
                     tracing::error!(
-                        "Agent loop: {} consecutive iterations with tool call errors, stopping to prevent infinite retry",
-                        consecutive_error_count
+                        consecutive_error_count,
+                        "Agent loop stopped after consecutive tool call errors"
                     );
                     return Err(errors::ResponseError::InternalError(
                         format!("Tool calls failed {} consecutive iterations due to malformed arguments from model", MAX_CONSECUTIVE_TOOL_FAILURES),
@@ -1694,7 +1694,10 @@ impl ResponseServiceImpl {
                 consecutive_error_count = 0;
             }
 
-            tracing::debug!("Executing {} tool calls", stream_result.tool_calls.len());
+            tracing::debug!(
+                tool_call_count = stream_result.tool_calls.len(),
+                "Executing tool calls"
+            );
 
             // Execute each tool call, collecting any deferred instructions
             // Also track pending function calls for batching
@@ -2145,8 +2148,8 @@ impl ResponseServiceImpl {
         }
 
         tracing::debug!(
-            "Processed {} function call outputs into tool result messages",
-            messages.len()
+            tool_result_message_count = messages.len(),
+            "Processed function call outputs into tool result messages"
         );
 
         Ok(messages)
@@ -2316,8 +2319,8 @@ impl ResponseServiceImpl {
         }
 
         tracing::debug!(
-            "Stored user input messages as response_items for response {}",
-            response_id.0
+            response_id = response_id.0.to_string(),
+            "Stored user input messages as response items"
         );
         Ok(())
     }
@@ -2710,9 +2713,9 @@ impl ResponseServiceImpl {
 
             let loaded_count = messages.len() - messages_before;
             tracing::info!(
-                "Loaded {} messages from conversation {}",
-                loaded_count,
-                conversation_id
+                loaded_message_count = loaded_count,
+                conversation_id = %conversation_id,
+                "Loaded messages from conversation"
             );
         }
 
@@ -2943,30 +2946,39 @@ impl ResponseServiceImpl {
                         // Self-closing reasoning tag: treat as no-op (empty reasoning block)
                         // Don't change inside_reasoning state, just ignore the tag
                         tag_transition = TagTransition::None;
-                        tracing::debug!("Detected self-closing reasoning tag: <{}/>", tag_name);
+                        tracing::debug!(
+                            tag_name = tag_name.as_str(),
+                            "Detected self-closing reasoning tag"
+                        );
                         // Don't include the tag itself in any output
                         continue;
                     } else if is_closing && *inside_reasoning {
                         // Closing reasoning tag
                         *inside_reasoning = false;
                         tag_transition = TagTransition::ClosingTag(tag_name.clone());
-                        tracing::debug!("Detected closing reasoning tag: </{}>", tag_name);
+                        tracing::debug!(
+                            tag_name = tag_name.as_str(),
+                            "Detected closing reasoning tag"
+                        );
                     } else if !is_closing && !*inside_reasoning {
                         // Opening reasoning tag (even with attributes)
                         *inside_reasoning = true;
                         tag_transition = TagTransition::OpeningTag(tag_name.clone());
-                        tracing::debug!("Detected opening reasoning tag: <{}>", tag_name);
+                        tracing::debug!(
+                            tag_name = tag_name.as_str(),
+                            "Detected opening reasoning tag"
+                        );
                     } else if is_closing && !*inside_reasoning {
                         // Closing tag encountered but not inside reasoning (malformed or extra closing tag)
                         tracing::debug!(
-                            "Ignoring closing reasoning tag </{}> - not currently inside reasoning block",
-                            tag_name
+                            tag_name = tag_name.as_str(),
+                            "Ignoring closing reasoning tag outside a reasoning block"
                         );
                     } else if !is_closing && *inside_reasoning {
                         // Opening tag encountered while already inside reasoning (nested or malformed)
                         tracing::debug!(
-                            "Ignoring opening reasoning tag <{}> - already inside reasoning block",
-                            tag_name
+                            tag_name = tag_name.as_str(),
+                            "Ignoring nested reasoning tag"
                         );
                     }
                     // Don't include the tag itself in any output
@@ -3010,9 +3022,9 @@ impl ResponseServiceImpl {
         if let Some(StreamChunk::Chat(chat_chunk)) = &event.chunk {
             if let Some(usage) = &chat_chunk.usage {
                 tracing::debug!(
-                    "Extracted usage from completion stream: input={}, output={}",
-                    usage.prompt_tokens,
-                    usage.completion_tokens
+                    input_tokens = usage.prompt_tokens,
+                    output_tokens = usage.completion_tokens,
+                    "Extracted usage from completion stream"
                 );
                 ctx.update_usage(
                     usage.prompt_tokens,

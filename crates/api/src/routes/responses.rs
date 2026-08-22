@@ -361,7 +361,10 @@ pub async fn create_response(
                                 let mut rid = response_id_inner.lock().await;
                                 if rid.is_none() {
                                     *rid = Some(response.id.clone());
-                                    tracing::debug!("Extracted response_id: {}", response.id);
+                                    tracing::debug!(
+                                        response_id = response.id.as_str(),
+                                        "Extracted response ID"
+                                    );
                                 }
                             }
                         }
@@ -493,8 +496,8 @@ pub async fn create_response(
                             if let Some(response) = &event.response {
                                 response_id = Some(response.id.clone());
                                 tracing::debug!(
-                                    "Non-streaming: extracted response_id={}",
-                                    response.id
+                                    response_id = response.id.as_str(),
+                                    "Non-streaming response ID extracted"
                                 );
                             }
                         }
@@ -503,9 +506,9 @@ pub async fn create_response(
                             if let Some(delta) = &event.delta {
                                 delta_count += 1;
                                 tracing::debug!(
-                                    "Non-streaming: delta #{} len={}",
                                     delta_count,
-                                    delta.len()
+                                    delta_len = delta.len(),
+                                    "Non-streaming response delta"
                                 );
                                 content.push_str(delta);
                             }
@@ -516,8 +519,8 @@ pub async fn create_response(
                                 tracked_usage = event.usage.clone();
                             }
                             tracing::debug!(
-                                "Non-streaming: response.completed event, accumulated_content_len={}",
-                                content.len()
+                                accumulated_content_len = content.len(),
+                                "Non-streaming response completed"
                             );
                             // The response object is already in the right format
                             if let Some(response_obj) = event.response {
@@ -545,8 +548,10 @@ pub async fn create_response(
                                                 } = content_part
                                                 {
                                                     tracing::debug!(
-                                                        "Non-streaming: final_response output[{}].content[{}] text_len={}",
-                                                        idx, cidx, text.len()
+                                                        output_index = idx,
+                                                        content_index = cidx,
+                                                        text_len = text.len(),
+                                                        "Non-streaming final response text"
                                                     );
                                                 }
                                             }
@@ -570,10 +575,10 @@ pub async fn create_response(
                     }
                 }
                 tracing::info!(
-                    "Non-streaming: collected {} events, {} deltas, accumulated_content_len={}",
                     event_count,
                     delta_count,
-                    content.len()
+                    accumulated_content_len = content.len(),
+                    "Collected non-streaming response events"
                 );
 
                 if final_response.is_none() {
@@ -656,8 +661,9 @@ pub async fn create_response(
                 };
 
                 debug!(
-                    "Created response {} for key {}",
-                    response.id, api_key.api_key.created_by_user_id.0
+                    response_id = response.id.as_str(),
+                    user_id = %api_key.api_key.created_by_user_id.0,
+                    "Created response"
                 );
 
                 // Store signature for non-streaming response
@@ -811,8 +817,9 @@ pub async fn list_input_items(
 ) -> Result<ResponseJson<ResponseInputItemList>, (StatusCode, ResponseJson<ErrorResponse>)> {
     let service = state.response_service.clone();
     debug!(
-        "List input items for response {} from workspace {}",
-        response_id, auth.workspace.id.0
+        response_id = response_id.as_str(),
+        workspace_id = auth.workspace.id.0.to_string(),
+        "Listing input items"
     );
 
     // Parse response ID (format: "resp_{uuid}")

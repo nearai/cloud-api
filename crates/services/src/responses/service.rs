@@ -1528,22 +1528,33 @@ impl ResponseServiceImpl {
     }
 
     /// Flush replayed function calls into the assistant message shape expected
-    /// by Chat Completions providers. The calls remain entirely client-owned:
-    /// this only reconstructs supplied context for the current request.
+    /// by Chat Completions providers. When a client replays an assistant
+    /// message followed immediately by its `function_call` items, those
+    /// are one logical assistant turn in the provider transcript. The calls
+    /// remain entirely client-owned: this only reconstructs supplied context
+    /// for the current request without validating or reordering it.
     fn flush_replayed_function_calls(
         messages: &mut Vec<crate::completions::ports::CompletionMessage>,
+        pending_assistant_message: &mut Option<crate::completions::ports::CompletionMessage>,
         pending_function_calls: &mut Vec<crate::completions::ports::CompletionToolCall>,
     ) {
         if pending_function_calls.is_empty() {
+            if let Some(message) = pending_assistant_message.take() {
+                messages.push(message);
+            }
             return;
         }
 
-        messages.push(crate::completions::ports::CompletionMessage {
-            role: "assistant".to_string(),
-            content: serde_json::Value::String(String::new()),
-            tool_call_id: None,
-            tool_calls: Some(std::mem::take(pending_function_calls)),
+        let mut message = pending_assistant_message.take().unwrap_or_else(|| {
+            crate::completions::ports::CompletionMessage {
+                role: "assistant".to_string(),
+                content: serde_json::Value::String(String::new()),
+                tool_call_id: None,
+                tool_calls: None,
+            }
         });
+        message.tool_calls = Some(std::mem::take(pending_function_calls));
+        messages.push(message);
     }
 
     /// Append one client-replayed function item to the request's completion
@@ -1551,6 +1562,7 @@ impl ResponseServiceImpl {
     fn append_replayed_function_call_item(
         input_item: &models::ResponseInputItem,
         messages: &mut Vec<crate::completions::ports::CompletionMessage>,
+        pending_assistant_message: &mut Option<crate::completions::ports::CompletionMessage>,
         pending_function_calls: &mut Vec<crate::completions::ports::CompletionToolCall>,
     ) -> bool {
         match input_item {
@@ -1572,7 +1584,11 @@ impl ResponseServiceImpl {
             models::ResponseInputItem::FunctionCallOutput {
                 call_id, output, ..
             } => {
-                Self::flush_replayed_function_calls(messages, pending_function_calls);
+                Self::flush_replayed_function_calls(
+                    messages,
+                    pending_assistant_message,
+                    pending_function_calls,
+                );
                 messages.push(crate::completions::ports::CompletionMessage {
                     role: "tool".to_string(),
                     content: serde_json::Value::String(output.clone()),
@@ -1985,10 +2001,12 @@ impl ResponseServiceImpl {
                 }
                 models::ResponseInput::Items(items) => {
                     let mut pending_function_calls = Vec::new();
+                    let mut pending_assistant_message = None;
                     for item in items {
                         if Self::append_replayed_function_call_item(
                             item,
                             &mut messages,
+                            &mut pending_assistant_message,
                             &mut pending_function_calls,
                         ) {
                             continue;
@@ -1996,10 +2014,6 @@ impl ResponseServiceImpl {
 
                         match item {
                             models::ResponseInputItem::Message { role, content, .. } => {
-                                Self::flush_replayed_function_calls(
-                                    &mut messages,
-                                    &mut pending_function_calls,
-                                );
                                 let content = match content {
                                     models::ResponseContent::Text(text) => {
                                         serde_json::Value::String(text.clone())
@@ -2013,12 +2027,31 @@ impl ResponseServiceImpl {
                                         .await?
                                     }
                                 };
-                                messages.push(CompletionMessage {
+                                let message = CompletionMessage {
                                     role: role.clone(),
                                     content,
                                     tool_call_id: None,
                                     tool_calls: None,
-                                });
+                                };
+                                // An assistant message immediately before
+                                // replayed function calls belongs to the same
+                                // provider assistant turn. Other roles remain
+                                // individual messages in caller-supplied order.
+                                if role == "assistant" {
+                                    Self::flush_replayed_function_calls(
+                                        &mut messages,
+                                        &mut pending_assistant_message,
+                                        &mut pending_function_calls,
+                                    );
+                                    pending_assistant_message = Some(message);
+                                } else {
+                                    Self::flush_replayed_function_calls(
+                                        &mut messages,
+                                        &mut pending_assistant_message,
+                                        &mut pending_function_calls,
+                                    );
+                                    messages.push(message);
+                                }
                             }
                             models::ResponseInputItem::McpApprovalResponse { .. }
                             | models::ResponseInputItem::McpListTools { .. }
@@ -2026,7 +2059,11 @@ impl ResponseServiceImpl {
                             | models::ResponseInputItem::FunctionCallOutput { .. } => {}
                         }
                     }
-                    Self::flush_replayed_function_calls(&mut messages, &mut pending_function_calls);
+                    Self::flush_replayed_function_calls(
+                        &mut messages,
+                        &mut pending_assistant_message,
+                        &mut pending_function_calls,
+                    );
                 }
             }
         }
@@ -2449,16 +2486,19 @@ mod tests {
         ];
 
         let mut messages = Vec::new();
+        let mut pending_assistant_message = None;
         let mut pending_function_calls = Vec::new();
         for item in &items {
             assert!(ResponseServiceImpl::append_replayed_function_call_item(
                 item,
                 &mut messages,
+                &mut pending_assistant_message,
                 &mut pending_function_calls,
             ));
         }
         ResponseServiceImpl::flush_replayed_function_calls(
             &mut messages,
+            &mut pending_assistant_message,
             &mut pending_function_calls,
         );
 
@@ -2618,16 +2658,19 @@ mod tests {
         ];
 
         let mut messages = Vec::new();
+        let mut pending_assistant_message = None;
         let mut pending_function_calls = Vec::new();
         for item in &items {
             assert!(ResponseServiceImpl::append_replayed_function_call_item(
                 item,
                 &mut messages,
+                &mut pending_assistant_message,
                 &mut pending_function_calls,
             ));
         }
         ResponseServiceImpl::flush_replayed_function_calls(
             &mut messages,
+            &mut pending_assistant_message,
             &mut pending_function_calls,
         );
 

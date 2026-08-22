@@ -241,7 +241,8 @@ pub trait CompletionServiceTrait: Send + Sync {
         params: inference_providers::ScoreParams,
     ) -> Result<inference_providers::ScoreResponse, CompletionError>;
 
-    /// Get model information by name (for checking output_modalities, etc.)
+    /// Get model information by canonical name or active alias (for checking
+    /// output modalities and other model capabilities).
     async fn get_model(
         &self,
         model_name: &str,

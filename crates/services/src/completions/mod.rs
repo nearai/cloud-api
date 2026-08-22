@@ -2237,7 +2237,12 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         &self,
         model_name: &str,
     ) -> Result<Option<crate::models::ModelWithPricing>, anyhow::Error> {
-        self.models_repository.get_model_by_name(model_name).await
+        // Match the model resolution used by the completion path. Capability
+        // guards that run before dispatch (such as Responses rejecting image
+        // output) must apply to aliases as well as canonical model names.
+        self.models_repository
+            .resolve_and_get_model(model_name)
+            .await
     }
 
     fn get_inference_provider_pool(

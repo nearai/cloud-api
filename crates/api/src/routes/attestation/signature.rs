@@ -58,15 +58,16 @@ pub struct SignatureUnavailableResponse {
     pub message: String,
 }
 
-/// Get completion signature
+/// Get completion or Responses API signature
 ///
-/// Get cryptographic signature for a chat completion for verification.
-/// Returns signature data on success, or an unavailable response if the stream was disconnected.
+/// Get a cryptographic signature for a chat completion or completed stateless
+/// `resp_*` response. Returns signature data on success, or an unavailable
+/// response if a chat-completion stream was disconnected.
 #[utoipa::path(
     get,
     path = "/v1/signature/{chat_id}",
     params(
-        ("chat_id" = String, Path, description = "Chat completion ID"),
+        ("chat_id" = String, Path, description = "Chat completion ID or resp_* Responses API ID"),
         SignatureQuery
     ),
     responses(

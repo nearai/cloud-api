@@ -130,18 +130,13 @@ async fn stateless_function_call_is_replayed_by_the_client_without_server_histor
     let second = second.json::<serde_json::Value>();
     assert_eq!(second["status"], "completed");
 
-    // The provider receives the raw assistant output text, then a standard
-    // assistant-tool-call and the client-produced tool result; Cloud did not
-    // execute the custom function.
+    // The provider receives the raw assistant output text and replayed custom
+    // tool call in one assistant turn, followed by the client-produced tool
+    // result. Cloud did not execute the custom function.
     let params = mock
         .last_chat_params()
         .await
         .expect("second request reached provider");
-    assert!(params.messages.iter().any(|message| {
-        message.role == MessageRole::Assistant
-            && message.tool_calls.is_none()
-            && message.content.as_ref() == Some(&serde_json::json!("I will look that up."))
-    }));
     let assistant = params
         .messages
         .iter()
@@ -149,6 +144,11 @@ async fn stateless_function_call_is_replayed_by_the_client_without_server_histor
             message.role == MessageRole::Assistant && message.tool_calls.as_ref().is_some()
         })
         .expect("provider received replayed assistant tool call");
+    assert_eq!(
+        assistant.content.as_ref(),
+        Some(&serde_json::json!("I will look that up.")),
+        "assistant output text and its function call must remain one provider turn"
+    );
     let tool_calls = assistant.tool_calls.as_ref().expect("tool calls present");
     assert_eq!(tool_calls.len(), 1);
     assert_eq!(tool_calls[0].id.as_deref(), Some(call_id.as_str()));

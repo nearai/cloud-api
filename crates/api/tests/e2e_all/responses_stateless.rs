@@ -185,17 +185,18 @@ async fn stateless_responses_reject_unsupported_tool_types_during_deserializatio
 }
 
 #[tokio::test]
-async fn stateless_responses_reject_image_output_models_before_provider_work() {
+async fn stateless_responses_reject_image_output_model_aliases_before_provider_work() {
     let (server, _pool, mock, _database) = setup_test_server_with_pool().await;
 
     // Configure the capability explicitly instead of relying on the catalog
     // defaults for the model name. Responses must remain a text-completion
     // wrapper and reject image-generation models before asking a provider to
     // do any work.
-    let model = "Qwen/Qwen-Image-2512";
+    let model = format!("responses-image-output-model-{}", uuid::Uuid::new_v4());
+    let model_alias = format!("responses-image-output-alias-{}", uuid::Uuid::new_v4());
     let mut batch = BatchUpdateModelApiRequest::new();
     batch.insert(
-        model.to_string(),
+        model,
         serde_json::from_value(serde_json::json!({
             "inputCostPerToken": { "amount": 0, "currency": "USD" },
             "outputCostPerToken": { "amount": 0, "currency": "USD" },
@@ -206,6 +207,7 @@ async fn stateless_responses_reject_image_output_models_before_provider_work() {
             "maxOutputLength": 1024,
             "verifiable": true,
             "isActive": true,
+            "aliases": [model_alias.clone()],
             "inputModalities": ["text"],
             "outputModalities": ["image"]
         }))
@@ -234,7 +236,7 @@ async fn stateless_responses_reject_image_output_models_before_provider_work() {
         .post("/v1/responses")
         .add_header("Authorization", format!("Bearer {api_key}"))
         .json(&serde_json::json!({
-            "model": model,
+            "model": model_alias,
             "input": "Draw a small red square.",
             "store": false,
             "stream": false,

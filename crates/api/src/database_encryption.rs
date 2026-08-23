@@ -358,12 +358,7 @@ fn envelope(key: &[u8; 32], f: &Field, id: Uuid, plain: &str) -> anyhow::Result<
 }
 
 #[cfg(test)]
-fn decrypt_envelope(
-    key: &[u8; 32],
-    f: &Field,
-    id: Uuid,
-    encoded: &str,
-) -> anyhow::Result<String> {
+fn decrypt_envelope(key: &[u8; 32], f: &Field, id: Uuid, encoded: &str) -> anyhow::Result<String> {
     let value: Value = serde_json::from_str(encoded)?;
     anyhow::ensure!(value[MARKER] == true, "missing encryption marker");
     anyhow::ensure!(value["version"] == 1, "unsupported envelope version");

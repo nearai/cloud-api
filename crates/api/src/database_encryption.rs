@@ -341,6 +341,36 @@ fn envelope(key: &[u8; 32], f: &Field, id: Uuid, plain: &str) -> anyhow::Result<
         .map_err(|_| anyhow::anyhow!("encryption failed"))?;
     Ok(json!({MARKER:true,"version":1,"alg":"AES-256-GCM","key_id":"s3-v1","nonce":BASE64.encode(nonce),"ciphertext":BASE64.encode(ct)}).to_string())
 }
+
+fn decrypt_envelope(key: &[u8; 32], f: &Field, id: Uuid, encoded: &str) -> anyhow::Result<String> {
+    let value: Value = serde_json::from_str(encoded)?;
+    anyhow::ensure!(value[MARKER] == true, "missing encryption marker");
+    anyhow::ensure!(value["version"] == 1, "unsupported envelope version");
+    anyhow::ensure!(
+        value["alg"] == "AES-256-GCM",
+        "unsupported envelope algorithm"
+    );
+    let nonce = BASE64.decode(
+        value["nonce"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("missing nonce"))?,
+    )?;
+    let ciphertext = BASE64.decode(
+        value["ciphertext"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("missing ciphertext"))?,
+    )?;
+    let cipher = Aes256Gcm::new_from_slice(key).map_err(|_| anyhow::anyhow!("invalid key"))?;
+    let aad = format!("{}:{}:{}", f.table, f.column, id);
+    let plaintext = cipher.decrypt(
+        Nonce::from_slice(&nonce),
+        Payload {
+            msg: &ciphertext,
+            aad: aad.as_bytes(),
+        },
+    )?;
+    Ok(String::from_utf8(plaintext)?)
+}
 pub async fn create_job(
     Extension(state): Extension<DatabaseEncryptionState>,
     Extension(admin): Extension<AdminUser>,
@@ -520,6 +550,23 @@ mod tests {
         let v = envelope(&[7; 32], &FIELDS[0], Uuid::nil(), "secret").unwrap();
         assert!(v.contains(MARKER));
         assert!(!v.contains("secret"));
+        assert_eq!(
+            decrypt_envelope(&[7; 32], &FIELDS[0], Uuid::nil(), &v).unwrap(),
+            "secret"
+        );
+    }
+    #[test]
+    fn envelope_authenticates_context_and_key() {
+        let v = envelope(&[7; 32], &FIELDS[0], Uuid::nil(), "secret").unwrap();
+        assert!(decrypt_envelope(&[8; 32], &FIELDS[0], Uuid::nil(), &v).is_err());
+        assert!(decrypt_envelope(&[7; 32], &FIELDS[1], Uuid::nil(), &v).is_err());
+        assert!(decrypt_envelope(&[7; 32], &FIELDS[0], Uuid::new_v4(), &v).is_err());
+    }
+    #[test]
+    fn key_requires_32_decoded_bytes() {
+        assert!(hex::decode("not-hex").is_err());
+        let short: Result<[u8; 32], _> = hex::decode("00").unwrap().try_into();
+        assert!(short.is_err());
     }
     #[test]
     fn registry_unique() {

@@ -1,4 +1,5 @@
 pub mod consts;
+pub mod database_encryption;
 pub mod conversions;
 pub mod middleware;
 pub mod models;
@@ -2189,12 +2190,18 @@ pub fn build_admin_routes(
         usage_service: services.usage_service,
         staking_farm_service: services.staking_farm_service,
         aml_service: services.aml_service,
-        config,
+        config: config.clone(),
         admin_access_token_repository,
         inference_provider_pool: services.inference_provider_pool,
         github_dispatcher,
         infra_service,
     };
+
+    let database_encryption_state = crate::database_encryption::DatabaseEncryptionState::new(
+        database.pool().clone(),
+        &config.s3.encryption_key,
+    )
+    .expect("S3 encryption key must be a 32-byte hex key for database encryption");
 
     Router::new()
         .route(
@@ -2354,7 +2361,28 @@ pub fn build_admin_routes(
             "/admin/access-tokens/{token_id}",
             axum::routing::delete(delete_admin_access_token),
         )
+        .route(
+            "/admin/database-encryption/scan",
+            axum::routing::post(crate::database_encryption::scan),
+        )
+        .route(
+            "/admin/database-encryption/jobs",
+            axum::routing::post(crate::database_encryption::create_job),
+        )
+        .route(
+            "/admin/database-encryption/jobs/{id}",
+            axum::routing::get(crate::database_encryption::get_job),
+        )
+        .route(
+            "/admin/database-encryption/jobs/{id}/cancel",
+            axum::routing::post(crate::database_encryption::cancel_job),
+        )
+        .route(
+            "/admin/database-encryption/verify",
+            axum::routing::post(crate::database_encryption::verify),
+        )
         .with_state(admin_app_state)
+        .layer(axum::Extension(database_encryption_state))
         // Admin middleware handles both authentication and authorization
         .layer(from_fn_with_state(
             auth_state_middleware.clone(),

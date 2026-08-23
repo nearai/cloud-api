@@ -12,6 +12,7 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 
 const MARKER: &str = "__near_db_encrypted";
+
 #[derive(Clone, Copy, Debug, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum Kind {
@@ -120,6 +121,7 @@ pub struct DatabaseEncryptionState {
     pub pool: DbPool,
     key: [u8; 32],
 }
+
 impl DatabaseEncryptionState {
     pub fn new(pool: DbPool, hex_key: &str) -> anyhow::Result<Self> {
         let bytes = hex::decode(hex_key)?;
@@ -143,6 +145,7 @@ struct FieldName {
     table: String,
     column: String,
 }
+
 #[derive(Debug, Deserialize, Default)]
 pub struct ScanRequest {
     #[serde(default)]
@@ -151,12 +154,14 @@ pub struct ScanRequest {
     #[serde(default)]
     include_approved_plaintext: bool,
 }
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum Mode {
     DryRun,
     Execute,
 }
+
 #[derive(Debug, Deserialize)]
 pub struct CreateJobRequest {
     mode: Mode,
@@ -168,12 +173,14 @@ pub struct CreateJobRequest {
     #[serde(default = "actions_default")]
     actions: Vec<String>,
 }
+
 fn batch_default() -> i64 {
     100
 }
 fn actions_default() -> Vec<String> {
     vec!["encrypt".into()]
 }
+
 #[derive(Debug, Serialize)]
 pub struct FieldCount {
     table: String,
@@ -184,6 +191,7 @@ pub struct FieldCount {
     empty: i64,
     invalid_envelope: i64,
 }
+
 #[derive(Debug, Serialize)]
 pub struct ScanResponse {
     run_id: Uuid,
@@ -191,6 +199,7 @@ pub struct ScanResponse {
     fields: Vec<FieldCount>,
     totals: Value,
 }
+
 #[derive(Debug, Serialize)]
 pub struct JobResponse {
     job_id: Uuid,
@@ -205,7 +214,9 @@ pub struct JobResponse {
     last_error_class: Option<String>,
     last_error_message: Option<String>,
 }
+
 type ApiResult<T> = Result<Json<T>, (StatusCode, Json<Value>)>;
+
 fn bad(m: &str) -> (StatusCode, Json<Value>) {
     (
         StatusCode::BAD_REQUEST,
@@ -213,7 +224,11 @@ fn bad(m: &str) -> (StatusCode, Json<Value>) {
     )
 }
 fn internal(e: impl std::fmt::Display) -> (StatusCode, Json<Value>) {
-    tracing::error!(error_class="database_encryption",error=%e,"database encryption operation failed");
+    let _ = e;
+    tracing::error!(
+        error_class = "database_encryption",
+        "database encryption operation failed"
+    );
     (
         StatusCode::INTERNAL_SERVER_ERROR,
         Json(
@@ -332,7 +347,7 @@ fn envelope(key: &[u8; 32], f: &Field, id: Uuid, plain: &str) -> anyhow::Result<
     let cipher = Aes256Gcm::new_from_slice(key).map_err(|_| anyhow::anyhow!("invalid key"))?;
     let ct = cipher
         .encrypt(
-            Nonce::from_slice(&nonce),
+            Nonce::from(nonce),
             Payload {
                 msg: plain.as_bytes(),
                 aad: aad.as_bytes(),
@@ -342,7 +357,12 @@ fn envelope(key: &[u8; 32], f: &Field, id: Uuid, plain: &str) -> anyhow::Result<
     Ok(json!({MARKER:true,"version":1,"alg":"AES-256-GCM","key_id":"s3-v1","nonce":BASE64.encode(nonce),"ciphertext":BASE64.encode(ct)}).to_string())
 }
 
-fn decrypt_envelope(key: &[u8; 32], f: &Field, id: Uuid, encoded: &str) -> anyhow::Result<String> {
+pub(crate) fn decrypt_envelope(
+    key: &[u8; 32],
+    f: &Field,
+    id: Uuid,
+    encoded: &str,
+) -> anyhow::Result<String> {
     let value: Value = serde_json::from_str(encoded)?;
     anyhow::ensure!(value[MARKER] == true, "missing encryption marker");
     anyhow::ensure!(value["version"] == 1, "unsupported envelope version");
@@ -350,11 +370,14 @@ fn decrypt_envelope(key: &[u8; 32], f: &Field, id: Uuid, encoded: &str) -> anyho
         value["alg"] == "AES-256-GCM",
         "unsupported envelope algorithm"
     );
-    let nonce = BASE64.decode(
-        value["nonce"]
-            .as_str()
-            .ok_or_else(|| anyhow::anyhow!("missing nonce"))?,
-    )?;
+    let nonce: [u8; 12] = BASE64
+        .decode(
+            value["nonce"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("missing nonce"))?,
+        )?
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("invalid nonce length"))?;
     let ciphertext = BASE64.decode(
         value["ciphertext"]
             .as_str()
@@ -363,7 +386,7 @@ fn decrypt_envelope(key: &[u8; 32], f: &Field, id: Uuid, encoded: &str) -> anyho
     let cipher = Aes256Gcm::new_from_slice(key).map_err(|_| anyhow::anyhow!("invalid key"))?;
     let aad = format!("{}:{}:{}", f.table, f.column, id);
     let plaintext = cipher.decrypt(
-        Nonce::from_slice(&nonce),
+        Nonce::from(nonce),
         Payload {
             msg: &ciphertext,
             aad: aad.as_bytes(),
@@ -396,8 +419,8 @@ pub async fn create_job(
     let actions = json!(req.actions);
     let client = state.pool.get().await.map_err(internal)?;
     client.execute("INSERT INTO database_encryption_jobs(id,mode,status,scope,actions,batch_size,max_rows,admin_actor,started_at) VALUES($1,$2,'running',$3,$4,$5,$6,$7,NOW())",&[&id,&mode,&scope,&actions,&req.batch_size,&req.max_rows,&admin.0.id]).await.map_err(internal)?;
-    if let Err(e) = run(&state, id, mode, &fs, req.batch_size, req.max_rows).await {
-        let msg = e.to_string().chars().take(300).collect::<String>();
+    if let Err(_e) = run(&state, id, mode, &fs, req.batch_size, req.max_rows).await {
+        let msg = "batch_failed";
         client.execute("UPDATE database_encryption_jobs SET status='failed',last_error_class='batch_failed',last_error_message=$2,completed_at=NOW() WHERE id=$1",&[&id,&msg]).await.map_err(internal)?;
     }
     get_inner(&state, id).await

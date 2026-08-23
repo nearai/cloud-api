@@ -347,7 +347,7 @@ fn envelope(key: &[u8; 32], f: &Field, id: Uuid, plain: &str) -> anyhow::Result<
     let cipher = Aes256Gcm::new_from_slice(key).map_err(|_| anyhow::anyhow!("invalid key"))?;
     let ct = cipher
         .encrypt(
-            Nonce::from(nonce),
+            &Nonce::from(nonce),
             Payload {
                 msg: plain.as_bytes(),
                 aad: aad.as_bytes(),
@@ -357,7 +357,8 @@ fn envelope(key: &[u8; 32], f: &Field, id: Uuid, plain: &str) -> anyhow::Result<
     Ok(json!({MARKER:true,"version":1,"alg":"AES-256-GCM","key_id":"s3-v1","nonce":BASE64.encode(nonce),"ciphertext":BASE64.encode(ct)}).to_string())
 }
 
-pub(crate) fn decrypt_envelope(
+#[cfg(test)]
+fn decrypt_envelope(
     key: &[u8; 32],
     f: &Field,
     id: Uuid,
@@ -386,7 +387,7 @@ pub(crate) fn decrypt_envelope(
     let cipher = Aes256Gcm::new_from_slice(key).map_err(|_| anyhow::anyhow!("invalid key"))?;
     let aad = format!("{}:{}:{}", f.table, f.column, id);
     let plaintext = cipher.decrypt(
-        Nonce::from(nonce),
+        &Nonce::from(nonce),
         Payload {
             msg: &ciphertext,
             aad: aad.as_bytes(),

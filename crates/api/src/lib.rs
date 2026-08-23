@@ -1,6 +1,6 @@
 pub mod consts;
-pub mod database_encryption;
 pub mod conversions;
+pub mod database_encryption;
 pub mod middleware;
 pub mod models;
 pub mod ohttp_gateway;

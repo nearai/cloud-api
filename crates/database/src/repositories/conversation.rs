@@ -345,7 +345,7 @@ impl ConversationRepository for PgConversationRepository {
         // Step 2: Get all responses from the original conversation
         let original_responses = transaction
             .query(
-                "SELECT id FROM responses WHERE conversation_id = $1 AND workspace_id = $2 ORDER BY created_at ASC",
+                "SELECT id, instructions, metadata FROM responses WHERE conversation_id = $1 AND workspace_id = $2 ORDER BY created_at ASC",
                 &[&id.0, &workspace_id.0],
             )
             .await
@@ -358,6 +358,50 @@ impl ConversationRepository for PgConversationRepository {
             let old_response_id: Uuid = orig_row.try_get("id")?;
             let new_response_id = Uuid::new_v4();
             id_map.insert(old_response_id, new_response_id);
+            let instructions: Option<String> = orig_row.try_get("instructions")?;
+            let metadata: serde_json::Value = orig_row.try_get("metadata")?;
+            let (stored_instructions, stored_response_metadata) =
+                if let Some(key) = self.pool.encryption_key() {
+                    let instructions = instructions
+                        .map(|value| {
+                            crate::field_encryption::decrypt_if_encrypted(
+                                &key,
+                                "responses",
+                                "instructions",
+                                old_response_id,
+                                value,
+                            )
+                            .and_then(|plain| {
+                                crate::field_encryption::encrypt(
+                                    &key,
+                                    "responses",
+                                    "instructions",
+                                    new_response_id,
+                                    &plain,
+                                )
+                            })
+                        })
+                        .transpose()?;
+                    let metadata = crate::field_encryption::decrypt_json_if_encrypted(
+                        &key,
+                        "responses",
+                        "metadata",
+                        old_response_id,
+                        metadata,
+                    )?;
+                    (
+                        instructions,
+                        crate::field_encryption::encrypt_json(
+                            &key,
+                            "responses",
+                            "metadata",
+                            new_response_id,
+                            &metadata,
+                        )?,
+                    )
+                } else {
+                    (instructions, metadata)
+                };
 
             // Clone the response with new ID and new conversation_id
             transaction
@@ -370,19 +414,27 @@ impl ConversationRepository for PgConversationRepository {
                     $2,
                     model,
                     status,
-                    instructions,
+                    $4,
                     $3,
                     previous_response_id,
                     next_response_ids,
                     usage,
-                    metadata,
+                    $5,
                     is_root_response,
-                    $4,
-                    $5
+                    $6,
+                    $6
                 FROM responses
-                WHERE id = $6
+                WHERE id = $7
                 "#,
-                    &[&new_response_id, &api_key_id, &new_conv_id, &now, &now, &old_response_id],
+                    &[
+                        &new_response_id,
+                        &api_key_id,
+                        &new_conv_id,
+                        &stored_instructions,
+                        &stored_response_metadata,
+                        &now,
+                        &old_response_id,
+                    ],
                 )
                 .await
                 .context("Failed to clone response")?;

@@ -447,7 +447,7 @@ pub async fn init_domain_services_with_pool(
         as Arc<dyn services::user::UserServiceTrait + Send + Sync>;
 
     // Create S3 storage and FileService for temporary authenticated read views
-    // and supported image-edit operations.
+    // and retained per-file delete operations.
     let s3_storage: Arc<dyn services::files::storage::StorageTrait> = if config.s3.mock {
         tracing::info!("Using mock S3 storage for temporary file views");
         Arc::new(services::files::storage::MockStorage::new(

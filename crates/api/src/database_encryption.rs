@@ -13,6 +13,8 @@ use uuid::Uuid;
 
 const MARKER: &str = "__near_db_encrypted";
 
+// Confidential fields and API contracts.
+
 #[derive(Clone, Copy, Debug, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum Kind {
@@ -217,6 +219,8 @@ pub struct JobResponse {
 
 type ApiResult<T> = Result<Json<T>, (StatusCode, Json<Value>)>;
 
+// Request validation and database inventory helpers.
+
 fn bad(m: &str) -> (StatusCode, Json<Value>) {
     (
         StatusCode::BAD_REQUEST,
@@ -322,6 +326,8 @@ async fn counts(
 fn totals(c: &[FieldCount]) -> Value {
     json!({"plaintext":c.iter().map(|x|x.plaintext).sum::<i64>(),"encrypted":c.iter().map(|x|x.encrypted).sum::<i64>(),"empty":c.iter().map(|x|x.empty).sum::<i64>(),"invalid_envelope":0})
 }
+
+// Admin scan and verification endpoints.
 pub async fn scan(
     Extension(state): Extension<DatabaseEncryptionState>,
     Extension(_): Extension<AdminUser>,
@@ -356,6 +362,8 @@ fn envelope(key: &[u8; 32], f: &Field, id: Uuid, plain: &str) -> anyhow::Result<
         .map_err(|_| anyhow::anyhow!("encryption failed"))?;
     Ok(json!({MARKER:true,"version":1,"alg":"AES-256-GCM","key_id":"s3-v1","nonce":BASE64.encode(nonce),"ciphertext":BASE64.encode(ct)}).to_string())
 }
+
+// Job lifecycle and authenticated envelope helpers.
 
 #[cfg(test)]
 fn decrypt_envelope(key: &[u8; 32], f: &Field, id: Uuid, encoded: &str) -> anyhow::Result<String> {

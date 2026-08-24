@@ -522,6 +522,18 @@ async fn run_job(state: &DatabaseEncryptionState, id: Uuid) -> anyhow::Result<()
         return Ok(());
     }
 
+    let result = run_locked_job(state, id, &mut client).await;
+    let _ = client
+        .query_one("SELECT pg_advisory_unlock($1)", &[&lock_key])
+        .await;
+    result
+}
+
+async fn run_locked_job(
+    state: &DatabaseEncryptionState,
+    id: Uuid,
+    client: &mut tokio_postgres::Client,
+) -> anyhow::Result<()> {
     let job = client
         .query_opt(
             "UPDATE database_encryption_jobs SET status='running',started_at=COALESCE(started_at,NOW()) WHERE id=$1 AND status IN ('queued','running') RETURNING mode,scope,batch_size,max_rows,cursor,progress",

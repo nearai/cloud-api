@@ -20,8 +20,8 @@ CREATE INDEX idx_database_encryption_jobs_status ON database_encryption_jobs(sta
 CREATE UNIQUE INDEX idx_database_encryption_jobs_active_scope ON database_encryption_jobs ((scope::text)) WHERE status IN ('queued', 'running');
 
 -- Encrypted envelopes are larger than the original catalog VARCHAR limits.
--- Execute mode is gated until repository decrypt-on-read support is enabled,
--- but the columns are widened before any backfill can be enabled.
+-- Encrypted columns are widened before repository writes or backfill jobs can
+-- persist authenticated envelopes.
 ALTER TABLE files
     ALTER COLUMN filename TYPE TEXT,
     ALTER COLUMN storage_key TYPE TEXT,

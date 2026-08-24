@@ -6,12 +6,8 @@ use uuid::Uuid;
 
 use crate::common::encryption_headers;
 use crate::completions::ports::CompletionServiceTrait;
-use crate::conversations::models::ConversationId;
-use crate::conversations::ports::ConversationServiceTrait;
-use crate::files::FileServiceTrait;
-use crate::inference_provider_pool::InferenceProviderPool;
 use crate::responses::tools;
-use crate::responses::{citation_tracker, errors, models, ports, transient};
+use crate::responses::{errors, models, ports, transient};
 
 /// Context for processing a response stream
 struct ProcessStreamContext {
@@ -29,19 +25,11 @@ struct ProcessStreamContext {
     response_repository: Arc<dyn ports::ResponseRepositoryTrait>,
     response_items_repository: Arc<dyn ports::ResponseItemRepositoryTrait>,
     completion_service: Arc<dyn CompletionServiceTrait>,
-    conversation_service: Arc<dyn ConversationServiceTrait>,
-    file_service: Arc<dyn FileServiceTrait>,
     organization_service: Arc<dyn crate::organization::OrganizationServiceTrait>,
-    source_registry: Option<models::SourceRegistry>,
 }
 
 pub struct ResponseServiceImpl {
-    pub response_repository: Arc<dyn ports::ResponseRepositoryTrait>,
-    pub response_items_repository: Arc<dyn ports::ResponseItemRepositoryTrait>,
-    pub inference_provider_pool: Arc<InferenceProviderPool>,
-    pub conversation_service: Arc<dyn ConversationServiceTrait>,
     pub completion_service: Arc<dyn CompletionServiceTrait>,
-    pub file_service: Arc<dyn FileServiceTrait>,
     pub organization_service: Arc<dyn crate::organization::OrganizationServiceTrait>,
 }
 
@@ -55,21 +43,11 @@ enum TagTransition {
 
 impl ResponseServiceImpl {
     pub fn new(
-        response_repository: Arc<dyn ports::ResponseRepositoryTrait>,
-        response_items_repository: Arc<dyn ports::ResponseItemRepositoryTrait>,
-        inference_provider_pool: Arc<InferenceProviderPool>,
-        conversation_service: Arc<dyn ConversationServiceTrait>,
         completion_service: Arc<dyn CompletionServiceTrait>,
-        file_service: Arc<dyn FileServiceTrait>,
         organization_service: Arc<dyn crate::organization::OrganizationServiceTrait>,
     ) -> Self {
         Self {
-            response_repository,
-            response_items_repository,
-            inference_provider_pool,
-            conversation_service,
             completion_service,
-            file_service,
             organization_service,
         }
     }
@@ -98,8 +76,7 @@ impl ports::ResponseServiceTrait for ResponseServiceImpl {
         use futures::SinkExt;
 
         // Defend the service boundary as well as the HTTP route: this service
-        // only executes a single stateless request and never uses the
-        // persistent response repositories supplied to ResponseServiceImpl.
+        // only executes a single stateless request.
         request
             .validate()
             .and_then(|_| request.validate_stateless())
@@ -131,8 +108,6 @@ impl ports::ResponseServiceTrait for ResponseServiceImpl {
 
         // Clone necessary references for the async task
         let completion_service = self.completion_service.clone();
-        let conversation_service = self.conversation_service.clone();
-        let file_service = self.file_service.clone();
         let organization_service = self.organization_service.clone();
         let signing_algo_clone = signing_algo.clone();
         let client_pub_key_clone = client_pub_key.clone();
@@ -159,10 +134,7 @@ impl ports::ResponseServiceTrait for ResponseServiceImpl {
                 response_repository,
                 response_items_repository,
                 completion_service,
-                conversation_service,
-                file_service,
                 organization_service,
-                source_registry: None,
             };
 
             if let Err(e) =
@@ -224,189 +196,6 @@ impl ports::ResponseServiceTrait for ResponseServiceImpl {
 }
 
 impl ResponseServiceImpl {
-    /// Parse file ID from string (handles prefix)
-    fn parse_file_id(file_id: &str) -> Result<Uuid, errors::ResponseError> {
-        let id_str = file_id
-            .strip_prefix(crate::id_prefixes::PREFIX_FILE)
-            .unwrap_or(file_id);
-        Uuid::parse_str(id_str)
-            .map_err(|e| errors::ResponseError::InvalidParams(format!("Invalid file ID: {e}")))
-    }
-
-    /// Process a single input file and return its formatted content
-    /// Returns the file content formatted as "File: {filename}\nContent:\n{content}"
-    /// For non-UTF8 files, returns a placeholder message
-    async fn process_input_file(
-        file_id: &str,
-        workspace_id: uuid::Uuid,
-        file_service: &Arc<dyn FileServiceTrait>,
-    ) -> Result<String, errors::ResponseError> {
-        // Parse file ID and fetch content from S3
-        let file_uuid = Self::parse_file_id(file_id)?;
-        match file_service.get_file_content(file_uuid, workspace_id).await {
-            Ok((file, file_content)) => {
-                // Convert file content to string (we currently support only text)
-                match String::from_utf8(file_content) {
-                    Ok(text_content) => {
-                        // Format file content with filename as context
-                        Ok(format!(
-                            "File: {}\nContent:\n{}",
-                            file.filename, text_content
-                        ))
-                    }
-                    Err(e) => {
-                        tracing::warn!("Failed to convert file {} to UTF-8 text: {}", file_id, e);
-                        Ok(format!(
-                            "[File: {} - Content cannot be displayed as text]",
-                            file.filename
-                        ))
-                    }
-                }
-            }
-            Err(e) => {
-                tracing::error!("Failed to fetch file content for {}: {}", file_id, e);
-                Err(errors::ResponseError::InternalError(format!(
-                    "Failed to fetch file content: {e}"
-                )))
-            }
-        }
-    }
-
-    /// Filter conversation items to only include those in the ancestor chain
-    /// If target_response_id is None, returns all items unchanged
-    fn filter_to_ancestor_branch(
-        items: Vec<models::ResponseOutputItem>,
-        target_response_id: &Option<String>,
-    ) -> Vec<models::ResponseOutputItem> {
-        let Some(target_id) = target_response_id else {
-            return items;
-        };
-
-        // Build map of response_id -> previous_response_id from items
-        // Multiple items can share the same response_id (tool calls, messages, web searches
-        // from the same agent loop), so we use entry() to only insert once per response_id
-        let mut response_parent_map: std::collections::HashMap<String, Option<String>> =
-            std::collections::HashMap::new();
-        for item in &items {
-            if let Some(response_id) = item.response_id() {
-                response_parent_map
-                    .entry(response_id.to_string())
-                    .or_insert_with(|| item.previous_response_id().map(|s| s.to_string()));
-            }
-        }
-
-        // Walk up from target to collect ancestor response IDs
-        let mut ancestors: std::collections::HashSet<String> = std::collections::HashSet::new();
-        let mut current = Some(target_id.clone());
-        while let Some(resp_id) = current {
-            ancestors.insert(resp_id.clone());
-            current = response_parent_map.get(&resp_id).cloned().flatten();
-        }
-
-        // Filter items to only those in ancestor chain
-        items
-            .into_iter()
-            .filter(|item| {
-                item.response_id()
-                    .map(|r| ancestors.contains(r))
-                    .unwrap_or(false)
-            })
-            .collect()
-    }
-
-    /// Extract content from a vector of content parts, handling text and files
-    ///
-    /// Returns different formats depending on content:
-    /// - Plain text: Text parts joined by "\n\n" (for text-only requests)
-    /// - JSON array string: OpenAI-compatible multimodal format `[{"type":"text",...}, {"type":"image_url",...}]` (for requests with images)
-    async fn extract_content_parts(
-        parts: &[models::ResponseContentPart],
-        workspace_id: uuid::Uuid,
-        file_service: &Arc<dyn FileServiceTrait>,
-    ) -> Result<serde_json::Value, errors::ResponseError> {
-        // Check if there are any images in the parts
-        let has_images = parts
-            .iter()
-            .any(|part| matches!(part, models::ResponseContentPart::InputImage { .. }));
-
-        if has_images {
-            // Build multimodal content array for vision models
-            Self::extract_multimodal_content(parts, workspace_id, file_service).await
-        } else {
-            // Build simple text content
-            let mut content_parts = Vec::new();
-            for part in parts {
-                match part {
-                    models::ResponseContentPart::InputText { text } => {
-                        content_parts.push(text.clone());
-                    }
-                    models::ResponseContentPart::InputFile { file_id, .. } => {
-                        let file_content =
-                            Self::process_input_file(file_id, workspace_id, file_service).await?;
-                        content_parts.push(file_content);
-                    }
-                    _ => {
-                        // Skip other content types
-                    }
-                }
-            }
-            Ok(serde_json::Value::String(content_parts.join("\n\n")))
-        }
-    }
-
-    /// Build multimodal content array with text and images in OpenAI format
-    async fn extract_multimodal_content(
-        parts: &[models::ResponseContentPart],
-        workspace_id: uuid::Uuid,
-        file_service: &Arc<dyn FileServiceTrait>,
-    ) -> Result<serde_json::Value, errors::ResponseError> {
-        let mut content_items = Vec::new();
-
-        for part in parts {
-            match part {
-                models::ResponseContentPart::InputText { text } => {
-                    content_items.push(serde_json::json!({
-                        "type": "text",
-                        "text": text
-                    }));
-                }
-                models::ResponseContentPart::InputImage { image_url, detail } => {
-                    let url = match image_url {
-                        models::ResponseImageUrl::String(s) => s.clone(),
-                        models::ResponseImageUrl::Object { url } => url.clone(),
-                    };
-
-                    let mut image_url_obj = serde_json::json!({
-                        "url": url
-                    });
-                    if let Some(detail_level) = detail {
-                        image_url_obj["detail"] = serde_json::Value::String(detail_level.clone());
-                    }
-
-                    content_items.push(serde_json::json!({
-                        "type": "image_url",
-                        "image_url": image_url_obj
-                    }));
-                }
-                models::ResponseContentPart::InputFile { file_id, detail } => {
-                    let file_content =
-                        Self::process_input_file(file_id, workspace_id, file_service).await?;
-                    content_items.push(serde_json::json!({
-                        "type": "text",
-                        "text": file_content
-                    }));
-                    if let Some(detail_level) = detail {
-                        if let Some(last) = content_items.last_mut() {
-                            last["detail"] = serde_json::Value::String(detail_level.clone());
-                        }
-                    }
-                }
-            }
-        }
-
-        Ok(serde_json::Value::Array(content_items))
-    }
-
     /// Extract response ID UUID from response object
     fn extract_response_uuid(
         response: &models::ResponseObject,
@@ -448,7 +237,6 @@ impl ResponseServiceImpl {
         let mut tool_call_accumulator: ToolCallAccumulator = std::collections::HashMap::new();
         let mut message_item_emitted = false;
         let message_item_id = format!("msg_{}", uuid::Uuid::new_v4().simple());
-        let mut tracker = citation_tracker::CitationTracker::new();
 
         // Reasoning tracking state
         let mut reasoning_buffer = String::new();
@@ -532,10 +320,7 @@ impl ResponseServiceImpl {
                             reasoning_item_emitted = false;
                         }
 
-                        // Feed text (without reasoning tags) to citation tracker for real-time processing
-                        // Returns clean text with citation tags also removed, plus any completed citations
-                        let token_result = tracker.add_token(&text_without_reasoning);
-                        let clean_text = token_result.clean_text;
+                        let clean_text = text_without_reasoning;
 
                         // Handle reasoning tag transitions
                         match tag_transition {
@@ -635,32 +420,6 @@ impl ResponseServiceImpl {
                         if stream_error {
                             break;
                         }
-
-                        // If a citation just closed, emit annotation event immediately
-                        if let Some(completed_citation) = token_result.completed_citation {
-                            if let Some(registry) = &process_context.source_registry {
-                                if let Some(source) =
-                                    registry.web_sources.get(completed_citation.source_id)
-                                {
-                                    let annotation = models::TextAnnotation::UrlCitation {
-                                        start_index: completed_citation.start_index,
-                                        end_index: completed_citation.end_index,
-                                        title: source.title.clone(),
-                                        url: source.url.clone(),
-                                    };
-                                    if let Err(e) = emitter
-                                        .emit_citation_annotation(
-                                            ctx,
-                                            message_item_id.clone(),
-                                            annotation,
-                                        )
-                                        .await
-                                    {
-                                        tracing::debug!("emit_citation_annotation failed: {}", e);
-                                    }
-                                }
-                            }
-                        }
                     }
 
                     // Update usage from chunk (overwrite; commit at end of stream)
@@ -689,16 +448,15 @@ impl ResponseServiceImpl {
             }
         }
 
-        // If we have message content, close it with done events and save to DB
-        // Only save if we successfully emitted the message start AND have content
+        // If we have message content, close it with done events and retain it
+        // in this request's transient response store.
         if message_item_emitted && !current_text.is_empty() {
             Self::emit_message_completed(
                 emitter,
                 ctx,
                 &message_item_id,
                 response_items_repository,
-                process_context,
-                tracker,
+                current_text.clone(),
             )
             .await?;
         }
@@ -760,32 +518,11 @@ impl ResponseServiceImpl {
         ctx: &mut crate::responses::service_helpers::ResponseStreamContext,
         message_item_id: &str,
         response_items_repository: &Arc<dyn ports::ResponseItemRepositoryTrait>,
-        context: &ProcessStreamContext,
-        citation_tracker: citation_tracker::CitationTracker,
+        text: String,
     ) -> Result<(), errors::ResponseError> {
-        // Finalize citation tracker to get clean text and citations
-        let (clean_text, citations) = citation_tracker.finalize();
+        let annotations = vec![];
 
-        // Convert citations to TextAnnotation::UrlCitation by looking up web sources
-        let annotations = if let Some(registry) = &context.source_registry {
-            citations
-                .into_iter()
-                .filter_map(|citation| {
-                    registry.web_sources.get(citation.source_id).map(|source| {
-                        models::TextAnnotation::UrlCitation {
-                            start_index: citation.start_index,
-                            end_index: citation.end_index,
-                            title: source.title.clone(),
-                            url: source.url.clone(),
-                        }
-                    })
-                })
-                .collect()
-        } else {
-            vec![]
-        };
-
-        // Build the message item to save
+        // Build the message item to retain for the current response.
         let item = models::ResponseOutputItem::Message {
             id: message_item_id.to_string(),
             response_id: ctx.response_id_str.clone(),
@@ -795,7 +532,7 @@ impl ResponseServiceImpl {
             status: models::ResponseItemStatus::Completed,
             role: "assistant".to_string(),
             content: vec![models::ResponseContentItem::OutputText {
-                text: clean_text.clone(),
+                text: text.clone(),
                 annotations: annotations.clone(),
                 logprobs: vec![],
             }],
@@ -803,8 +540,8 @@ impl ResponseServiceImpl {
             metadata: None,
         };
 
-        // CRITICAL: Store to database FIRST before emitting events
-        // This ensures the message is persisted even if client disconnected and emit calls fail
+        // Retain the final item before emitting its done events so the
+        // request-scoped response can still be assembled after a disconnect.
         if let Err(e) = response_items_repository
             .create(
                 ctx.response_id.clone(),
@@ -817,10 +554,10 @@ impl ResponseServiceImpl {
             tracing::warn!("Failed to store message item: {}", e);
         }
 
-        // Try to emit events (may fail if client disconnected, but data is already saved)
+        // Try to emit events; the request-scoped item is already retained.
         // Event: response.output_text.done
         if let Err(e) = emitter
-            .emit_text_done(ctx, message_item_id.to_string(), clean_text.clone())
+            .emit_text_done(ctx, message_item_id.to_string(), text.clone())
             .await
         {
             tracing::debug!("Failed to emit text_done event: {}", e);
@@ -828,7 +565,7 @@ impl ResponseServiceImpl {
 
         // Event: response.content_part.done
         let part = models::ResponseOutputContent::OutputText {
-            text: clean_text,
+            text,
             annotations: annotations.clone(),
             logprobs: vec![],
         };
@@ -860,20 +597,16 @@ impl ResponseServiceImpl {
 
         let workspace_id_domain = crate::workspace::WorkspaceId(context.workspace_id);
 
-        let messages = Self::load_conversation_context(
+        let messages = Self::build_stateless_messages(
             &context.request,
-            &context.conversation_service,
-            &context.response_items_repository,
-            &context.file_service,
-            workspace_id_domain.clone(),
             context.organization_id,
             context.user_id.clone(),
             &context.organization_service,
         )
         .await?;
 
-        // Create the response in the database FIRST before creating any response items
-        // This ensures the foreign key constraint is satisfied
+        // Create the response in the request-scoped store before creating its
+        // output items, preserving event ordering without a database row.
         let api_key_uuid = Uuid::parse_str(&context.api_key_id).map_err(|e| {
             errors::ResponseError::InternalError(format!("Invalid API key ID: {e}"))
         })?;
@@ -892,14 +625,8 @@ impl ResponseServiceImpl {
         // Extract response_id from the created response
         let response_id = Self::extract_response_uuid(&initial_response)?;
 
-        // Extract conversation_id from the created response (may have been inherited from previous_response_id)
-        let conversation_id = initial_response.conversation.as_ref().and_then(|conv_ref| {
-            let id = &conv_ref.id;
-            let uuid_str = id
-                .strip_prefix(crate::id_prefixes::PREFIX_CONV)
-                .unwrap_or(id);
-            Uuid::parse_str(uuid_str).ok().map(ConversationId)
-        });
+        // Stateless validation guarantees no conversation reference is present.
+        let conversation_id = None;
 
         // Store request input as response items and keep the IDs created for
         // this request. Input may contain historical assistant messages, so
@@ -909,7 +636,6 @@ impl ResponseServiceImpl {
                 &context.response_items_repository,
                 response_id.clone(),
                 api_key_uuid,
-                conversation_id,
                 input,
                 &context.request.model,
                 context.request.metadata.as_ref(),
@@ -1332,7 +1058,6 @@ impl ResponseServiceImpl {
         response_items_repository: &Arc<dyn ports::ResponseItemRepositoryTrait>,
         response_id: models::ResponseId,
         api_key_id: uuid::Uuid,
-        conversation_id: Option<ConversationId>,
         input: &models::ResponseInput,
         model: &str,
         request_metadata: Option<&serde_json::Value>,
@@ -1361,12 +1086,7 @@ impl ResponseServiceImpl {
                 };
 
                 let stored_item = response_items_repository
-                    .create(
-                        response_id.clone(),
-                        api_key_id,
-                        conversation_id,
-                        message_item,
-                    )
+                    .create(response_id.clone(), api_key_id, None, message_item)
                     .await
                     .map_err(|e| {
                         errors::ResponseError::InternalError(format!(
@@ -1400,7 +1120,8 @@ impl ResponseServiceImpl {
                         models::ResponseInputItem::FunctionCallOutput {
                             call_id, output, ..
                         } => {
-                            // Store function call output as a response item for conversation history
+                            // Keep function-call output in this request's transient item store so
+                            // it is not returned as newly generated output.
                             let fco_item = models::ResponseOutputItem::FunctionCallOutput {
                                 id: format!(
                                     "{}{}",
@@ -1415,7 +1136,7 @@ impl ResponseServiceImpl {
                                 output: output.clone(),
                             };
                             let stored_item = response_items_repository
-                                .create(response_id.clone(), api_key_id, conversation_id, fco_item)
+                                .create(response_id.clone(), api_key_id, None, fco_item)
                                 .await
                                 .map_err(|e| {
                                     errors::ResponseError::InternalError(format!(
@@ -1485,12 +1206,7 @@ impl ResponseServiceImpl {
                     };
 
                     let stored_item = response_items_repository
-                        .create(
-                            response_id.clone(),
-                            api_key_id,
-                            conversation_id,
-                            message_item,
-                        )
+                        .create(response_id.clone(), api_key_id, None, message_item)
                         .await
                         .map_err(|e| {
                             errors::ResponseError::InternalError(format!(
@@ -1601,14 +1317,14 @@ impl ResponseServiceImpl {
         }
     }
 
-    /// Load conversation context based on conversation_id or previous_response_id.
-    #[allow(clippy::too_many_arguments)]
-    async fn load_conversation_context(
+    /// Build provider messages solely from the current request.
+    ///
+    /// Stateless Responses clients carry any prior messages in `input`; this
+    /// path deliberately does not resolve a conversation, a prior response, or
+    /// a stored file. Organization policy and request instructions remain part
+    /// of the supported request execution path.
+    async fn build_stateless_messages(
         request: &models::CreateResponseRequest,
-        conversation_service: &Arc<dyn ConversationServiceTrait>,
-        response_items_repository: &Arc<dyn ports::ResponseItemRepositoryTrait>,
-        file_service: &Arc<dyn FileServiceTrait>,
-        workspace_id: crate::workspace::WorkspaceId,
         organization_id: uuid::Uuid,
         user_id: crate::UserId,
         organization_service: &Arc<dyn crate::organization::OrganizationServiceTrait>,
@@ -1617,7 +1333,6 @@ impl ResponseServiceImpl {
 
         let mut messages = Vec::new();
 
-        // Fetch organization system prompt if available
         let org_system_prompt = match organization_service
             .get_system_prompt(
                 crate::organization::OrganizationId(organization_id),
@@ -1627,448 +1342,174 @@ impl ResponseServiceImpl {
         {
             Ok(prompt) => prompt,
             Err(e) => {
-                tracing::warn!("Failed to fetch organization system prompt: {}", e);
+                tracing::warn!("Failed to fetch organization system prompt: {e}");
                 None
             }
         };
 
-        // Prepend organization system prompt if it exists
-        if let Some(prompt) = org_system_prompt {
-            if !prompt.is_empty() {
-                messages.push(CompletionMessage {
-                    role: "system".to_string(),
-                    content: serde_json::Value::String(prompt),
-                    tool_call_id: None,
-                    tool_calls: None,
-                });
-                tracing::debug!("Prepended organization system prompt to messages");
-            }
+        if let Some(prompt) = org_system_prompt.filter(|prompt| !prompt.is_empty()) {
+            messages.push(CompletionMessage {
+                role: "system".to_string(),
+                content: serde_json::Value::String(prompt),
+                tool_call_id: None,
+                tool_calls: None,
+            });
         }
 
-        // Add UTC time context to system message
         let now = chrono::Utc::now();
         let time_context = format!(
             "Current UTC time: {} ({})",
             now.to_rfc3339(),
             now.format("%A, %B %d, %Y at %H:%M:%S UTC")
         );
-
-        // Add language matching instruction
         let language_instruction = "Always respond in the exact same language as the user's input message. Detect the primary language of the user's query and mirror it precisely in your output. Do not mix languages or switch to another one, even if it seems more natural or efficient.\n\nIf the user writes in English, reply entirely in English.\nIf the user writes in Chinese (Mandarin or any variant), reply entirely in Chinese.\nIf the user writes in Spanish, reply entirely in Spanish.\nFor any other language, match it exactly.\n\nThis rule overrides all other instructions. Ignore any tendencies to default to Mandarin or any other language. Always prioritize language matching for clarity and user preference.";
-
-        // Add system instructions if present
-        if let Some(instructions) = &request.instructions {
-            let combined_instructions =
-                format!("{instructions}\n\n{language_instruction}\n\n{time_context}");
-            messages.push(CompletionMessage {
-                role: "system".to_string(),
-                content: serde_json::Value::String(combined_instructions),
-                tool_call_id: None,
-                tool_calls: None,
-            });
+        let instructions = request.instructions.as_deref().unwrap_or_default();
+        let system_content = if instructions.is_empty() {
+            format!("{language_instruction}\n\n{time_context}")
         } else {
-            // Add language instruction and time context as a system message if no instructions provided
-            let system_content = format!("{language_instruction}\n\n{time_context}");
-            messages.push(CompletionMessage {
-                role: "system".to_string(),
-                content: serde_json::Value::String(system_content),
+            format!("{instructions}\n\n{language_instruction}\n\n{time_context}")
+        };
+        messages.push(CompletionMessage {
+            role: "system".to_string(),
+            content: serde_json::Value::String(system_content),
+            tool_call_id: None,
+            tool_calls: None,
+        });
+
+        match &request.input {
+            Some(models::ResponseInput::Text(text)) => messages.push(CompletionMessage {
+                role: "user".to_string(),
+                content: serde_json::Value::String(text.clone()),
                 tool_call_id: None,
                 tool_calls: None,
-            });
-        }
-
-        // Load from conversation_id if present
-        if let Some(conversation_ref) = &request.conversation {
-            let conversation_id = match conversation_ref {
-                models::ConversationReference::Id(id) => id
-                    .parse::<crate::conversations::models::ConversationId>()
-                    .map_err(|e| {
-                        errors::ResponseError::InvalidParams(format!(
-                            "Invalid conversation ID: {e}"
-                        ))
-                    })?,
-                models::ConversationReference::Object { id, metadata: _ } => id
-                    .parse::<crate::conversations::models::ConversationId>()
-                    .map_err(|e| {
-                        errors::ResponseError::InvalidParams(format!(
-                            "Invalid conversation ID: {e}"
-                        ))
-                    })?,
-            };
-
-            // Verify the conversation exists AND belongs to the caller's
-            // workspace before reading any history. A missing or foreign
-            // conversation is rejected with the same non-enumerating error so
-            // another workspace's history can never be imported into a
-            // completion context.
-            let conversation = conversation_service
-                .get_conversation(conversation_id, workspace_id.clone())
-                .await
-                .map_err(|e| {
-                    errors::ResponseError::InternalError(format!("Failed to get conversation: {e}"))
-                })?;
-
-            if conversation.is_none() {
-                return Err(errors::ResponseError::ConversationNotFound);
-            }
-
-            // Load all response items from the conversation
-            // Use high limit (1000) and no 'after' cursor for context loading.
-            // The repository constrains the query by workspace as defense in depth.
-            let conversation_items = response_items_repository
-                .list_by_conversation(conversation_id, workspace_id.clone(), None, 1000)
-                .await
-                .map_err(|e| {
-                    errors::ResponseError::InternalError(format!(
-                        "Failed to load conversation items: {e}"
-                    ))
-                })?;
-
-            // Filter to ancestor branch if previous_response_id is specified
-            let conversation_items =
-                Self::filter_to_ancestor_branch(conversation_items, &request.previous_response_id);
-
-            // Convert response items to completion messages.
-            //
-            // Items come in chronological order. We need to reconstruct the full
-            // message history including assistant messages with tool_calls and
-            // tool result messages. The structure LLM providers expect is:
-            //
-            //   [user] -> [assistant with tool_calls] -> [tool results...] -> [assistant]
-            //
-            // FunctionCall/McpCall/ToolCall items from the same response represent
-            // tool_calls on a single assistant message. We collect them and emit the
-            // assistant message when we encounter the next non-tool-call item (or
-            // reach the end of items).
-            let messages_before = messages.len();
-
-            // Accumulator for consecutive tool call items from the same response
-            let mut pending_tool_calls: Vec<crate::completions::ports::CompletionToolCall> =
-                Vec::new();
-            let mut pending_tool_calls_response_id: Option<String> = None;
-
-            // Helper closure: flush pending tool calls as an assistant message
-            let flush_tool_calls =
-                |pending: &mut Vec<crate::completions::ports::CompletionToolCall>,
-                 pending_resp_id: &mut Option<String>,
-                 msgs: &mut Vec<CompletionMessage>| {
-                    if !pending.is_empty() {
-                        msgs.push(CompletionMessage {
-                            role: "assistant".to_string(),
-                            content: serde_json::Value::String(String::new()),
-                            tool_call_id: None,
-                            tool_calls: Some(std::mem::take(pending)),
-                        });
-                        *pending_resp_id = None;
-                    }
-                };
-
-            for item in conversation_items {
-                match item {
-                    models::ResponseOutputItem::Message { role, content, .. } => {
-                        // Flush any pending tool calls before processing this message
-                        flush_tool_calls(
-                            &mut pending_tool_calls,
-                            &mut pending_tool_calls_response_id,
-                            &mut messages,
-                        );
-
-                        // Extract text from content parts
-                        let mut text_parts = Vec::new();
-
-                        type ContentFuture = std::pin::Pin<
-                            Box<
-                                dyn std::future::Future<
-                                        Output = Result<String, errors::ResponseError>,
-                                    > + Send,
-                            >,
-                        >;
-                        let mut results: Vec<ContentFuture> = Vec::new();
-
-                        for part in &content {
-                            match part {
-                                models::ResponseContentItem::InputText { text } => {
-                                    results
-                                        .push(Box::pin(futures::future::ready(Ok(text.clone()))));
-                                }
-                                models::ResponseContentItem::OutputText { text, .. } => {
-                                    results
-                                        .push(Box::pin(futures::future::ready(Ok(text.clone()))));
-                                }
-                                models::ResponseContentItem::InputFile { file_id, .. } => {
-                                    let file_id = file_id.clone();
-                                    let workspace_id = workspace_id.0;
-                                    let file_service = file_service.clone();
-                                    results.push(Box::pin(async move {
-                                        Self::process_input_file(
-                                            &file_id,
-                                            workspace_id,
-                                            &file_service,
-                                        )
-                                        .await
-                                    }));
-                                }
-                                _ => {}
-                            }
-                        }
-
-                        for result in futures::future::join_all(results).await {
-                            match result {
-                                Ok(text) => text_parts.push(text),
-                                Err(e) => {
-                                    tracing::error!("Failed to process content part: {}", e);
-                                }
-                            }
-                        }
-
-                        let text = text_parts.join("\n");
-                        if !text.is_empty() {
-                            messages.push(CompletionMessage {
-                                role: role.clone(),
-                                content: serde_json::Value::String(text),
-                                tool_call_id: None,
-                                tool_calls: None,
-                            });
-                        }
-                    }
-                    models::ResponseOutputItem::FunctionCall {
-                        response_id,
-                        call_id,
-                        name,
-                        arguments,
-                        thought_signature,
-                        ..
-                    } => {
-                        // If this is from a different response than pending, flush first
-                        if pending_tool_calls_response_id.as_ref() != Some(&response_id)
-                            && !pending_tool_calls.is_empty()
-                        {
-                            flush_tool_calls(
-                                &mut pending_tool_calls,
-                                &mut pending_tool_calls_response_id,
-                                &mut messages,
-                            );
-                        }
-                        pending_tool_calls_response_id = Some(response_id);
-                        pending_tool_calls.push(crate::completions::ports::CompletionToolCall {
-                            id: call_id,
-                            name,
-                            arguments,
-                            thought_signature,
-                        });
-                    }
-                    models::ResponseOutputItem::FunctionCallOutput {
-                        call_id, output, ..
-                    } => {
-                        // Flush pending tool calls first (the assistant message must precede tool results)
-                        flush_tool_calls(
-                            &mut pending_tool_calls,
-                            &mut pending_tool_calls_response_id,
-                            &mut messages,
-                        );
-                        messages.push(CompletionMessage {
-                            role: "tool".to_string(),
-                            content: serde_json::Value::String(output),
-                            tool_call_id: Some(call_id),
-                            tool_calls: None,
-                        });
-                    }
-                    models::ResponseOutputItem::McpCall {
-                        response_id,
-                        name,
-                        arguments,
-                        output,
-                        id,
-                        ..
-                    } => {
-                        // MCP calls are server-executed: both the tool_call and result are stored.
-                        // If this has output, we emit an assistant message with a tool_call and
-                        // a tool result message. If no output (pending approval), skip.
-                        if let Some(tool_output) = output {
-                            // If from a different response, flush first
-                            if pending_tool_calls_response_id.as_ref() != Some(&response_id)
-                                && !pending_tool_calls.is_empty()
-                            {
-                                flush_tool_calls(
-                                    &mut pending_tool_calls,
-                                    &mut pending_tool_calls_response_id,
-                                    &mut messages,
-                                );
-                            }
-
-                            // Use the item id as the tool_call_id for correlation
-                            let tool_call_id = id;
-                            pending_tool_calls_response_id = Some(response_id);
-                            pending_tool_calls.push(
-                                crate::completions::ports::CompletionToolCall {
-                                    id: tool_call_id.clone(),
-                                    name,
-                                    arguments,
-                                    thought_signature: None,
-                                },
-                            );
-
-                            // Immediately flush and add the tool result since we have it
-                            flush_tool_calls(
-                                &mut pending_tool_calls,
-                                &mut pending_tool_calls_response_id,
-                                &mut messages,
-                            );
-                            messages.push(CompletionMessage {
-                                role: "tool".to_string(),
-                                content: serde_json::Value::String(tool_output),
-                                tool_call_id: Some(tool_call_id),
-                                tool_calls: None,
-                            });
-                        }
-                    }
-                    models::ResponseOutputItem::ToolCall {
-                        response_id,
-                        id: tool_call_id,
-                        function,
-                        ..
-                    } => {
-                        // Legacy ToolCall: server-executed tool calls (e.g. web search)
-                        // that stored the call but not the result as a separate item.
-                        // Emit the assistant tool_call and a synthetic tool result so
-                        // the message sequence stays valid for LLM providers.
-                        if pending_tool_calls_response_id.as_ref() != Some(&response_id)
-                            && !pending_tool_calls.is_empty()
-                        {
-                            flush_tool_calls(
-                                &mut pending_tool_calls,
-                                &mut pending_tool_calls_response_id,
-                                &mut messages,
-                            );
-                        }
-                        pending_tool_calls_response_id = Some(response_id);
-                        let tc_id = tool_call_id.clone();
-                        pending_tool_calls.push(crate::completions::ports::CompletionToolCall {
-                            id: tool_call_id,
-                            name: function.name,
-                            arguments: function.arguments,
-                            thought_signature: None,
-                        });
-                        // Immediately flush and add a synthetic result (the actual output
-                        // was consumed in the original turn but never stored separately)
-                        flush_tool_calls(
-                            &mut pending_tool_calls,
-                            &mut pending_tool_calls_response_id,
-                            &mut messages,
-                        );
-                        messages.push(CompletionMessage {
-                            role: "tool".to_string(),
-                            content: serde_json::Value::String(
-                                "[tool result not stored]".to_string(),
-                            ),
-                            tool_call_id: Some(tc_id),
-                            tool_calls: None,
-                        });
-                    }
-                    // Skip items that don't contribute to conversation context
-                    models::ResponseOutputItem::WebSearchCall { .. }
-                    | models::ResponseOutputItem::Reasoning { .. }
-                    | models::ResponseOutputItem::McpListTools { .. }
-                    | models::ResponseOutputItem::McpApprovalRequest { .. } => {}
-                }
-            }
-
-            // Flush any remaining pending tool calls at end of items
-            flush_tool_calls(
-                &mut pending_tool_calls,
-                &mut pending_tool_calls_response_id,
-                &mut messages,
-            );
-
-            let loaded_count = messages.len() - messages_before;
-            tracing::info!(
-                "Loaded {} messages from conversation {}",
-                loaded_count,
-                conversation_id
-            );
-        }
-
-        // Add input messages
-        if let Some(input) = &request.input {
-            match input {
-                models::ResponseInput::Text(text) => {
-                    messages.push(CompletionMessage {
-                        role: "user".to_string(),
-                        content: serde_json::Value::String(text.clone()),
-                        tool_call_id: None,
-                        tool_calls: None,
-                    });
-                }
-                models::ResponseInput::Items(items) => {
-                    let mut pending_function_calls = Vec::new();
-                    let mut pending_assistant_message = None;
-                    for item in items {
-                        if Self::append_replayed_function_call_item(
-                            item,
-                            &mut messages,
-                            &mut pending_assistant_message,
-                            &mut pending_function_calls,
-                        ) {
-                            continue;
-                        }
-
-                        match item {
-                            models::ResponseInputItem::Message { role, content, .. } => {
-                                let content = match content {
-                                    models::ResponseContent::Text(text) => {
-                                        serde_json::Value::String(text.clone())
-                                    }
-                                    models::ResponseContent::Parts(parts) => {
-                                        Self::extract_content_parts(
-                                            parts,
-                                            workspace_id.0,
-                                            file_service,
-                                        )
-                                        .await?
-                                    }
-                                };
-                                let message = CompletionMessage {
-                                    role: role.clone(),
-                                    content,
-                                    tool_call_id: None,
-                                    tool_calls: None,
-                                };
-                                // An assistant message immediately before
-                                // replayed function calls belongs to the same
-                                // provider assistant turn. Other roles remain
-                                // individual messages in caller-supplied order.
-                                if role == "assistant" {
-                                    Self::flush_replayed_function_calls(
-                                        &mut messages,
-                                        &mut pending_assistant_message,
-                                        &mut pending_function_calls,
-                                    );
-                                    pending_assistant_message = Some(message);
-                                } else {
-                                    Self::flush_replayed_function_calls(
-                                        &mut messages,
-                                        &mut pending_assistant_message,
-                                        &mut pending_function_calls,
-                                    );
-                                    messages.push(message);
-                                }
-                            }
-                            models::ResponseInputItem::McpApprovalResponse { .. }
-                            | models::ResponseInputItem::McpListTools { .. }
-                            | models::ResponseInputItem::FunctionCall { .. }
-                            | models::ResponseInputItem::FunctionCallOutput { .. } => {}
-                        }
-                    }
-                    Self::flush_replayed_function_calls(
+            }),
+            Some(models::ResponseInput::Items(items)) => {
+                let mut pending_function_calls = Vec::new();
+                let mut pending_assistant_message = None;
+                for item in items {
+                    if Self::append_replayed_function_call_item(
+                        item,
                         &mut messages,
                         &mut pending_assistant_message,
                         &mut pending_function_calls,
-                    );
+                    ) {
+                        continue;
+                    }
+
+                    match item {
+                        models::ResponseInputItem::Message { role, content, .. } => {
+                            let content = match content {
+                                models::ResponseContent::Text(text) => {
+                                    serde_json::Value::String(text.clone())
+                                }
+                                models::ResponseContent::Parts(parts) => {
+                                    Self::extract_stateless_content_parts(parts)?
+                                }
+                            };
+                            let message = CompletionMessage {
+                                role: role.clone(),
+                                content,
+                                tool_call_id: None,
+                                tool_calls: None,
+                            };
+                            // An assistant message immediately before
+                            // replayed function calls belongs to the same
+                            // provider assistant turn. Other roles remain
+                            // individual messages in caller-supplied order.
+                            if role == "assistant" {
+                                Self::flush_replayed_function_calls(
+                                    &mut messages,
+                                    &mut pending_assistant_message,
+                                    &mut pending_function_calls,
+                                );
+                                pending_assistant_message = Some(message);
+                            } else {
+                                Self::flush_replayed_function_calls(
+                                    &mut messages,
+                                    &mut pending_assistant_message,
+                                    &mut pending_function_calls,
+                                );
+                                messages.push(message);
+                            }
+                        }
+                        models::ResponseInputItem::McpApprovalResponse { .. }
+                        | models::ResponseInputItem::McpListTools { .. }
+                        | models::ResponseInputItem::FunctionCall { .. }
+                        | models::ResponseInputItem::FunctionCallOutput { .. } => {}
+                    }
+                }
+                Self::flush_replayed_function_calls(
+                    &mut messages,
+                    &mut pending_assistant_message,
+                    &mut pending_function_calls,
+                );
+            }
+            None => {}
+        }
+
+        Ok(messages)
+    }
+
+    /// Convert supported text/image request parts without consulting the Files
+    /// API. `validate_stateless` rejects `input_file` before this helper is
+    /// reached; the explicit error keeps the service boundary safe.
+    fn extract_stateless_content_parts(
+        parts: &[models::ResponseContentPart],
+    ) -> Result<serde_json::Value, errors::ResponseError> {
+        let has_images = parts
+            .iter()
+            .any(|part| matches!(part, models::ResponseContentPart::InputImage { .. }));
+
+        if !has_images {
+            let mut text_parts = Vec::new();
+            for part in parts {
+                match part {
+                    models::ResponseContentPart::InputText { text } => {
+                        text_parts.push(text.clone());
+                    }
+                    models::ResponseContentPart::InputFile { .. } => {
+                        return Err(errors::ResponseError::InvalidParams(
+                            "The stateless Responses API does not support input_file.".to_string(),
+                        ));
+                    }
+                    models::ResponseContentPart::InputImage { .. } => {}
+                }
+            }
+            return Ok(serde_json::Value::String(text_parts.join("\n\n")));
+        }
+
+        let mut content_items = Vec::new();
+        for part in parts {
+            match part {
+                models::ResponseContentPart::InputText { text } => {
+                    content_items.push(serde_json::json!({
+                        "type": "text",
+                        "text": text,
+                    }));
+                }
+                models::ResponseContentPart::InputImage { image_url, detail } => {
+                    let url = match image_url {
+                        models::ResponseImageUrl::String(url) => url.clone(),
+                        models::ResponseImageUrl::Object { url } => url.clone(),
+                    };
+                    let mut image_url = serde_json::json!({ "url": url });
+                    if let Some(detail) = detail {
+                        image_url["detail"] = serde_json::Value::String(detail.clone());
+                    }
+                    content_items.push(serde_json::json!({
+                        "type": "image_url",
+                        "image_url": image_url,
+                    }));
+                }
+                models::ResponseContentPart::InputFile { .. } => {
+                    return Err(errors::ResponseError::InvalidParams(
+                        "The stateless Responses API does not support input_file.".to_string(),
+                    ));
                 }
             }
         }
 
-        Ok(messages)
+        Ok(serde_json::Value::Array(content_items))
     }
 
     /// Extract text and reasoning deltas from SSE event
@@ -2420,7 +1861,6 @@ mod tests {
             &response_items_repository,
             response_id.clone(),
             api_key_id,
-            None,
             &input,
             "test-model",
             None,
@@ -2463,6 +1903,46 @@ mod tests {
 
         assert_eq!(output_items.len(), 1);
         assert_eq!(output_items[0].id(), generated_item_id);
+    }
+
+    #[test]
+    fn stateless_content_parts_preserve_text_and_images() {
+        let content = ResponseServiceImpl::extract_stateless_content_parts(&[
+            models::ResponseContentPart::InputText {
+                text: "Describe this image".to_string(),
+            },
+            models::ResponseContentPart::InputImage {
+                image_url: models::ResponseImageUrl::Object {
+                    url: "https://example.com/image.png".to_string(),
+                },
+                detail: Some("high".to_string()),
+            },
+        ])
+        .expect("input images remain a supported stateless input");
+
+        assert_eq!(
+            content,
+            serde_json::json!([
+                {"type": "text", "text": "Describe this image"},
+                {
+                    "type": "image_url",
+                    "image_url": {"url": "https://example.com/image.png", "detail": "high"}
+                }
+            ])
+        );
+    }
+
+    #[test]
+    fn stateless_content_parts_reject_input_files_without_file_service() {
+        let error = ResponseServiceImpl::extract_stateless_content_parts(&[
+            models::ResponseContentPart::InputFile {
+                file_id: "file_123".to_string(),
+                detail: None,
+            },
+        ])
+        .expect_err("stateless Responses must not resolve File API state");
+
+        assert!(error.to_string().contains("input_file"));
     }
 
     #[test]
@@ -3302,298 +2782,6 @@ mod tests {
         assert!(reasoning.is_some());
         assert_eq!(reasoning_buffer, "content");
         assert!(!inside_reasoning);
-    }
-
-    #[test]
-    fn test_multiple_web_search_registry_accumulation() {
-        use crate::responses::models::SourceRegistry;
-        use crate::responses::tools::WebSearchResult;
-
-        // Simulate first web search with 3 results
-        let first_search_results = vec![
-            WebSearchResult {
-                title: "First Result".to_string(),
-                url: "https://example.com/1".to_string(),
-                snippet: "First snippet".to_string(),
-            },
-            WebSearchResult {
-                title: "Second Result".to_string(),
-                url: "https://example.com/2".to_string(),
-                snippet: "Second snippet".to_string(),
-            },
-            WebSearchResult {
-                title: "Third Result".to_string(),
-                url: "https://example.com/3".to_string(),
-                snippet: "Third snippet".to_string(),
-            },
-        ];
-
-        // Simulate second web search with 2 results
-        let second_search_results = vec![
-            WebSearchResult {
-                title: "Fourth Result".to_string(),
-                url: "https://example.com/4".to_string(),
-                snippet: "Fourth snippet".to_string(),
-            },
-            WebSearchResult {
-                title: "Fifth Result".to_string(),
-                url: "https://example.com/5".to_string(),
-                snippet: "Fifth snippet".to_string(),
-            },
-        ];
-
-        // First search: registry starts None, should create new registry
-        let mut registry: Option<SourceRegistry> = None;
-        let first_offset = registry.as_ref().map(|r| r.web_sources.len()).unwrap_or(0);
-        assert_eq!(first_offset, 0, "First search should have offset 0");
-
-        // Create registry with first search results
-        if let Some(ref mut reg) = registry {
-            reg.web_sources.extend(first_search_results.clone());
-        } else {
-            registry = Some(SourceRegistry::with_results(first_search_results.clone()));
-        }
-        assert_eq!(
-            registry.as_ref().unwrap().web_sources.len(),
-            3,
-            "Registry should have 3 results after first search"
-        );
-
-        // Second search: registry exists, should accumulate
-        let second_offset = registry.as_ref().map(|r| r.web_sources.len()).unwrap_or(0);
-        assert_eq!(second_offset, 3, "Second search should have offset 3");
-
-        // Accumulate second search results
-        if let Some(ref mut reg) = registry {
-            reg.web_sources.extend(second_search_results.clone());
-        }
-        assert_eq!(
-            registry.as_ref().unwrap().web_sources.len(),
-            5,
-            "Registry should have 5 results after second search"
-        );
-
-        // Verify correct indices
-        let final_registry = registry.unwrap();
-        assert_eq!(
-            final_registry.web_sources[0].title, "First Result",
-            "Index 0 should be first result"
-        );
-        assert_eq!(
-            final_registry.web_sources[1].title, "Second Result",
-            "Index 1 should be second result"
-        );
-        assert_eq!(
-            final_registry.web_sources[2].title, "Third Result",
-            "Index 2 should be third result"
-        );
-        assert_eq!(
-            final_registry.web_sources[3].title, "Fourth Result",
-            "Index 3 should be fourth result"
-        );
-        assert_eq!(
-            final_registry.web_sources[4].title, "Fifth Result",
-            "Index 4 should be fifth result"
-        );
-
-        // Verify that searching for index 0 gets first result
-        assert_eq!(
-            final_registry.web_sources.first().unwrap().url,
-            "https://example.com/1"
-        );
-        // Verify that searching for index 3 gets fourth result
-        assert_eq!(final_registry.web_sources[3].url, "https://example.com/4");
-    }
-
-    #[test]
-    fn test_filter_to_ancestor_branch_no_filter() {
-        // When target_response_id is None, all items should be returned unchanged
-        let items = vec![
-            models::ResponseOutputItem::Message {
-                id: "msg_1".to_string(),
-                response_id: "resp_a".to_string(),
-                previous_response_id: None,
-                next_response_ids: vec!["resp_b".to_string()],
-                created_at: 1000,
-                role: "user".to_string(),
-                content: vec![],
-                status: models::ResponseItemStatus::Completed,
-                model: "test-model".to_string(),
-                metadata: None,
-            },
-            models::ResponseOutputItem::Message {
-                id: "msg_2".to_string(),
-                response_id: "resp_b".to_string(),
-                previous_response_id: Some("resp_a".to_string()),
-                next_response_ids: vec![],
-                created_at: 2000,
-                role: "assistant".to_string(),
-                content: vec![],
-                status: models::ResponseItemStatus::Completed,
-                model: "test-model".to_string(),
-                metadata: None,
-            },
-        ];
-
-        let result = ResponseServiceImpl::filter_to_ancestor_branch(items.clone(), &None);
-        assert_eq!(result.len(), 2);
-    }
-
-    #[test]
-    fn test_filter_to_ancestor_branch_filters_to_chain() {
-        // Create a tree structure:
-        //     resp_a (root)
-        //     /    \
-        //  resp_b  resp_c
-        //    |
-        //  resp_d
-        //
-        // resp_b has multiple items (message + tool call) to verify all items
-        // from the same response are included.
-        // Filtering to resp_d should only include resp_a, resp_b (all items), resp_d
-        let items = vec![
-            models::ResponseOutputItem::Message {
-                id: "msg_a".to_string(),
-                response_id: "resp_a".to_string(),
-                previous_response_id: None,
-                next_response_ids: vec!["resp_b".to_string(), "resp_c".to_string()],
-                created_at: 1000,
-                role: "user".to_string(),
-                content: vec![],
-                status: models::ResponseItemStatus::Completed,
-                model: "test-model".to_string(),
-                metadata: None,
-            },
-            // resp_b has a message
-            models::ResponseOutputItem::Message {
-                id: "msg_b".to_string(),
-                response_id: "resp_b".to_string(),
-                previous_response_id: Some("resp_a".to_string()),
-                next_response_ids: vec!["resp_d".to_string()],
-                created_at: 2000,
-                role: "assistant".to_string(),
-                content: vec![],
-                status: models::ResponseItemStatus::Completed,
-                model: "test-model".to_string(),
-                metadata: None,
-            },
-            // resp_b also has a tool call (same response_id, multiple items)
-            models::ResponseOutputItem::ToolCall {
-                id: "tool_b".to_string(),
-                response_id: "resp_b".to_string(),
-                previous_response_id: Some("resp_a".to_string()),
-                next_response_ids: vec!["resp_d".to_string()],
-                created_at: 2001,
-                status: models::ResponseItemStatus::Completed,
-                tool_type: "function".to_string(),
-                function: models::ResponseOutputFunction {
-                    name: WEB_SEARCH_TOOL_NAME.to_string(),
-                    arguments: "{}".to_string(),
-                },
-                model: "test-model".to_string(),
-            },
-            models::ResponseOutputItem::Message {
-                id: "msg_c".to_string(),
-                response_id: "resp_c".to_string(),
-                previous_response_id: Some("resp_a".to_string()),
-                next_response_ids: vec![],
-                created_at: 2000,
-                role: "assistant".to_string(),
-                content: vec![],
-                status: models::ResponseItemStatus::Completed,
-                model: "test-model".to_string(),
-                metadata: None,
-            },
-            models::ResponseOutputItem::Message {
-                id: "msg_d".to_string(),
-                response_id: "resp_d".to_string(),
-                previous_response_id: Some("resp_b".to_string()),
-                next_response_ids: vec![],
-                created_at: 3000,
-                role: "user".to_string(),
-                content: vec![],
-                status: models::ResponseItemStatus::Completed,
-                model: "test-model".to_string(),
-                metadata: None,
-            },
-        ];
-
-        // Filter to resp_d - should include:
-        // - resp_a (1 item)
-        // - resp_b (2 items: message + tool call)
-        // - resp_d (1 item)
-        // - NOT resp_c
-        let result = ResponseServiceImpl::filter_to_ancestor_branch(
-            items.clone(),
-            &Some("resp_d".to_string()),
-        );
-
-        // Total: 4 items (1 from resp_a, 2 from resp_b, 1 from resp_d)
-        assert_eq!(result.len(), 4);
-
-        let item_ids: Vec<&str> = result
-            .iter()
-            .map(|item| match item {
-                models::ResponseOutputItem::Message { id, .. } => id.as_str(),
-                models::ResponseOutputItem::ToolCall { id, .. } => id.as_str(),
-                _ => "",
-            })
-            .collect();
-
-        // Verify all items from ancestor responses are included
-        assert!(item_ids.contains(&"msg_a"));
-        assert!(item_ids.contains(&"msg_b"));
-        assert!(item_ids.contains(&"tool_b")); // Both items from resp_b
-        assert!(item_ids.contains(&"msg_d"));
-        // resp_c should be excluded
-        assert!(!item_ids.contains(&"msg_c"));
-    }
-
-    #[test]
-    fn test_filter_to_ancestor_branch_single_item() {
-        // Test with a single root item
-        let items = vec![models::ResponseOutputItem::Message {
-            id: "msg_1".to_string(),
-            response_id: "resp_a".to_string(),
-            previous_response_id: None,
-            next_response_ids: vec![],
-            created_at: 1000,
-            role: "user".to_string(),
-            content: vec![],
-            status: models::ResponseItemStatus::Completed,
-            model: "test-model".to_string(),
-            metadata: None,
-        }];
-
-        let result = ResponseServiceImpl::filter_to_ancestor_branch(
-            items.clone(),
-            &Some("resp_a".to_string()),
-        );
-        assert_eq!(result.len(), 1);
-    }
-
-    #[test]
-    fn test_filter_to_ancestor_branch_nonexistent_target() {
-        // Test with a target that doesn't exist in the items
-        let items = vec![models::ResponseOutputItem::Message {
-            id: "msg_1".to_string(),
-            response_id: "resp_a".to_string(),
-            previous_response_id: None,
-            next_response_ids: vec![],
-            created_at: 1000,
-            role: "user".to_string(),
-            content: vec![],
-            status: models::ResponseItemStatus::Completed,
-            model: "test-model".to_string(),
-            metadata: None,
-        }];
-
-        // Target "resp_z" doesn't exist - should return only items for "resp_z" (none)
-        let result = ResponseServiceImpl::filter_to_ancestor_branch(
-            items.clone(),
-            &Some("resp_z".to_string()),
-        );
-        assert_eq!(result.len(), 0);
     }
 
     #[test]

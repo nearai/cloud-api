@@ -20,14 +20,25 @@ async fn get_assistant_item_from_db(
 
     let rows = client
         .query(
-            "SELECT item FROM response_items WHERE conversation_id = $1 ORDER BY created_at DESC",
+            "SELECT id, item FROM response_items WHERE conversation_id = $1 ORDER BY created_at DESC",
             &[&conv_uuid],
         )
         .await
         .expect("Failed to query response_items");
 
     for row in rows {
-        let item: serde_json::Value = row.get("item");
+        let id: uuid::Uuid = row.get("id");
+        let mut item: serde_json::Value = row.get("item");
+        if let Some(key) = pool.encryption_key() {
+            item = database::field_encryption::decrypt_json_if_encrypted(
+                &key,
+                "response_items",
+                "item",
+                id,
+                item,
+            )
+            .expect("Failed to decrypt response item");
+        }
         if item.get("role").and_then(|v| v.as_str()) == Some("assistant") {
             return Some(item);
         }

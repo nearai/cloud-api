@@ -318,28 +318,41 @@ async fn counts(
     let client = state.pool.get().await?;
     let mut out = vec![];
     for f in fields {
-        let p = predicate(f);
-        let from = limit
-            .map(|n| {
-                format!(
-                    "FROM (SELECT {} FROM {} LIMIT {}) s",
-                    f.column,
-                    f.table,
-                    n.clamp(1, 100_000)
-                )
-            })
-            .unwrap_or_else(|| format!("FROM {}", f.table));
-        let q=format!("SELECT count(*) FILTER(WHERE {0} IS NULL),count(*) FILTER(WHERE {p}),count(*) FILTER(WHERE {0} IS NOT NULL AND NOT({p})) {from}",f.column);
-        let r = client.query_one(&q, &[]).await?;
-        out.push(FieldCount {
+        let limit = limit.unwrap_or(100_000).clamp(1, 100_000);
+        let query = format!(
+            "SELECT id, {}::text FROM {} WHERE {} IS NOT NULL ORDER BY id LIMIT $1",
+            f.column, f.table, f.column
+        );
+        let rows = client.query(&query, &[&limit]).await?;
+        let mut count = FieldCount {
             table: f.table.into(),
             column: f.column.into(),
             classification: "encrypt",
-            empty: r.get(0),
-            encrypted: r.get(1),
-            plaintext: r.get(2),
+            empty: 0,
+            encrypted: 0,
+            plaintext: 0,
             invalid_envelope: 0,
-        });
+        };
+        let null_query = format!(
+            "SELECT count(*) FROM {} WHERE {} IS NULL",
+            f.table, f.column
+        );
+        count.empty = client.query_one(&null_query, &[]).await?.get(0);
+        for row in rows {
+            let id: Uuid = row.get(0);
+            let raw: String = row.get(1);
+            match serde_json::from_str::<Value>(&raw) {
+                Ok(value) if value[MARKER] == true => {
+                    if decrypt_envelope(&state.key, f, id, &raw).is_ok() {
+                        count.encrypted += 1;
+                    } else {
+                        count.invalid_envelope += 1;
+                    }
+                }
+                _ => count.plaintext += 1,
+            }
+        }
+        out.push(count);
     }
     Ok(out)
 }
@@ -386,7 +399,6 @@ fn envelope(key: &[u8; 32], f: &Field, id: Uuid, plain: &str) -> anyhow::Result<
 
 // Job lifecycle and authenticated envelope helpers.
 
-#[cfg(test)]
 fn decrypt_envelope(key: &[u8; 32], f: &Field, id: Uuid, encoded: &str) -> anyhow::Result<String> {
     let value: Value = serde_json::from_str(encoded)?;
     anyhow::ensure!(value[MARKER] == true, "missing encryption marker");
@@ -631,6 +643,12 @@ mod tests {
         assert!(decrypt_envelope(&[8; 32], &FIELDS[0], Uuid::nil(), &v).is_err());
         assert!(decrypt_envelope(&[7; 32], &FIELDS[1], Uuid::nil(), &v).is_err());
         assert!(decrypt_envelope(&[7; 32], &FIELDS[0], Uuid::new_v4(), &v).is_err());
+    }
+
+    #[test]
+    fn malformed_envelope_is_rejected() {
+        let malformed = json!({MARKER: true, "version": 1, "alg": "AES-256-GCM"}).to_string();
+        assert!(decrypt_envelope(&[7; 32], &FIELDS[0], Uuid::nil(), &malformed).is_err());
     }
     #[test]
     fn key_requires_32_decoded_bytes() {

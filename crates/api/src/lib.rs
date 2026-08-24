@@ -2373,6 +2373,7 @@ pub fn build_admin_routes(
         .with_state(admin_app_state);
 
     let admin_routes = if let Some(database_encryption_state) = database_encryption_state {
+        database_encryption_state.recover_jobs();
         admin_routes.merge(
             Router::new()
                 .route(

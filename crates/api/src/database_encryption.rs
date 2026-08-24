@@ -130,6 +130,32 @@ impl DatabaseEncryptionState {
             .map_err(|_| anyhow::anyhow!("database encryption key must be 32 bytes, got {len}"))?;
         Ok(Self { pool, key })
     }
+
+    pub fn recover_jobs(&self) {
+        let state = self.clone();
+        tokio::spawn(async move {
+            let result = async {
+                let client = state.pool.get().await?;
+                let rows = client
+                    .query(
+                        "SELECT id FROM database_encryption_jobs WHERE status IN ('queued', 'running') ORDER BY created_at",
+                        &[],
+                    )
+                    .await?;
+                for row in rows {
+                    spawn_job(state.clone(), row.get(0));
+                }
+                anyhow::Ok(())
+            }
+            .await;
+            if result.is_err() {
+                tracing::error!(
+                    error_class = "database_encryption_job_recovery_failed",
+                    "Failed to recover database encryption jobs"
+                );
+            }
+        });
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize, Default)]
@@ -388,11 +414,6 @@ pub async fn create_job(
     Extension(admin): Extension<AdminUser>,
     Json(req): Json<CreateJobRequest>,
 ) -> ApiResult<JobResponse> {
-    if matches!(&req.mode, Mode::Execute) {
-        return Err(bad(
-            "execute mode is disabled until repository decrypt-on-read support is enabled",
-        ));
-    }
     if req.scope.tables.is_empty() && req.scope.fields.is_empty() {
         return Err(bad(
             "an explicit scope is required for database encryption jobs",
@@ -410,7 +431,7 @@ pub async fn create_job(
     }
     let mut scope_request = req.scope;
     normalize_scope(&mut scope_request);
-    let fs = selected(&scope_request)?;
+    selected(&scope_request)?;
     let id = Uuid::new_v4();
     let mode = match req.mode {
         Mode::DryRun => "dry_run",
@@ -419,75 +440,148 @@ pub async fn create_job(
     let scope = serde_json::to_value(&scope_request).map_err(internal)?;
     let actions = json!(req.actions);
     let client = state.pool.get().await.map_err(internal)?;
-    client.execute("INSERT INTO database_encryption_jobs(id,mode,status,scope,actions,batch_size,max_rows,admin_actor,started_at) VALUES($1,$2,'running',$3,$4,$5,$6,$7,NOW())",&[&id,&mode,&scope,&actions,&req.batch_size,&req.max_rows,&admin.0.id]).await.map_err(internal)?;
-    if let Err(_e) = run(&state, id, mode, &fs, req.batch_size, req.max_rows).await {
-        let msg = "batch_failed";
-        client.execute("UPDATE database_encryption_jobs SET status='failed',last_error_class='batch_failed',last_error_message=$2,completed_at=NOW() WHERE id=$1",&[&id,&msg]).await.map_err(internal)?;
-    }
+    client.execute("INSERT INTO database_encryption_jobs(id,mode,status,scope,actions,batch_size,max_rows,admin_actor) VALUES($1,$2,'queued',$3,$4,$5,$6,$7)",&[&id,&mode,&scope,&actions,&req.batch_size,&req.max_rows,&admin.0.id]).await.map_err(internal)?;
+    drop(client);
+    spawn_job(state.clone(), id);
     get_inner(&state, id).await
 }
 
-async fn run(
-    state: &DatabaseEncryptionState,
-    id: Uuid,
-    mode: &str,
-    fields: &[&Field],
-    batch: i64,
-    max: Option<i64>,
-) -> anyhow::Result<()> {
-    let client = state.pool.get().await?;
-    let (mut processed, mut encrypted) = (0i64, 0i64);
-    for f in fields {
-        loop {
-            if max.is_some_and(|m| processed >= m) {
-                break;
+fn spawn_job(state: DatabaseEncryptionState, id: Uuid) {
+    tokio::spawn(async move {
+        if run_job(&state, id).await.is_err() {
+            if let Ok(client) = state.pool.get().await {
+                let _ = client
+                    .execute(
+                        "UPDATE database_encryption_jobs SET status='failed',last_error_class='batch_failed',last_error_message='batch_failed',completed_at=NOW() WHERE id=$1 AND status IN ('queued','running')",
+                        &[&id],
+                    )
+                    .await;
             }
-            let cap = max.map(|m| (m - processed).min(batch)).unwrap_or(batch);
-            let p = predicate(f);
-            let q=format!("SELECT id,{0}::text FROM {1} WHERE {0} IS NOT NULL AND NOT({p}) ORDER BY id LIMIT $1",f.column,f.table);
-            let rows = client.query(&q, &[&cap]).await?;
-            if rows.is_empty() {
-                break;
-            }
-            if mode == "execute" {
-                for row in &rows {
-                    let rid: Uuid = row.get(0);
-                    let plain: String = row.get(1);
-                    let value = envelope(&state.key, f, rid, &plain)?;
-                    let q = match f.kind {
+            tracing::error!(
+                job_id = %id,
+                error_class = "database_encryption_batch_failed",
+                "Database encryption job failed"
+            );
+        }
+    });
+}
+
+fn advisory_lock_key(id: Uuid) -> i64 {
+    i64::from_be_bytes(
+        id.as_bytes()[..8]
+            .try_into()
+            .expect("UUID prefix is 8 bytes"),
+    )
+}
+
+async fn run_job(state: &DatabaseEncryptionState, id: Uuid) -> anyhow::Result<()> {
+    let mut client = state.pool.get().await?;
+    let lock_key = advisory_lock_key(id);
+    let locked: bool = client
+        .query_one("SELECT pg_try_advisory_lock($1)", &[&lock_key])
+        .await?
+        .get(0);
+    if !locked {
+        return Ok(());
+    }
+
+    let job = client
+        .query_opt(
+            "UPDATE database_encryption_jobs SET status='running',started_at=COALESCE(started_at,NOW()) WHERE id=$1 AND status IN ('queued','running') RETURNING mode,scope,batch_size,max_rows,cursor,progress",
+            &[&id],
+        )
+        .await?;
+    let Some(job) = job else {
+        return Ok(());
+    };
+    let mode: String = job.get("mode");
+    let scope: Scope = serde_json::from_value(job.get("scope"))?;
+    let fields = selected(&scope).map_err(|_| anyhow::anyhow!("invalid persisted scope"))?;
+    let batch: i64 = job.get("batch_size");
+    let max: Option<i64> = job.get("max_rows");
+    let cursor: Value = job.get("cursor");
+    let progress: Value = job.get("progress");
+    let mut field_index = cursor["field_index"].as_u64().unwrap_or(0) as usize;
+    let mut after_id = cursor["after_id"]
+        .as_str()
+        .and_then(|value| Uuid::parse_str(value).ok())
+        .unwrap_or(Uuid::nil());
+    let mut processed = progress["processed"].as_i64().unwrap_or(0);
+    let mut encrypted = progress["encrypted"].as_i64().unwrap_or(0);
+
+    while field_index < fields.len() && max.is_none_or(|limit| processed < limit) {
+        let field = fields[field_index];
+        let cap = max
+            .map(|limit| (limit - processed).min(batch))
+            .unwrap_or(batch);
+        let predicate = predicate(field);
+        let transaction = client.transaction().await?;
+        let cancelled: bool = transaction
+            .query_one(
+                "SELECT cancel_requested_at IS NOT NULL FROM database_encryption_jobs WHERE id=$1 FOR UPDATE",
+                &[&id],
+            )
+            .await?
+            .get(0);
+        if cancelled {
+            transaction
+                .execute(
+                    "UPDATE database_encryption_jobs SET status='cancelled',completed_at=NOW() WHERE id=$1",
+                    &[&id],
+                )
+                .await?;
+            transaction.commit().await?;
+            return Ok(());
+        }
+
+        let query = format!(
+            "SELECT id,{0}::text FROM {1} WHERE id>$1 AND {0} IS NOT NULL AND NOT({predicate}) ORDER BY id LIMIT $2 FOR UPDATE SKIP LOCKED",
+            field.column, field.table
+        );
+        let rows = transaction.query(&query, &[&after_id, &cap]).await?;
+        if rows.is_empty() {
+            field_index += 1;
+            after_id = Uuid::nil();
+        } else {
+            for row in &rows {
+                let row_id: Uuid = row.get(0);
+                after_id = row_id;
+                if mode == "execute" {
+                    let plaintext: String = row.get(1);
+                    let value = envelope(&state.key, field, row_id, &plaintext)?;
+                    let update = match field.kind {
                         Kind::Json => format!(
                             "UPDATE {} SET {}=$1::jsonb WHERE id=$2 AND NOT({})",
-                            f.table, f.column, p
+                            field.table, field.column, predicate
                         ),
                         Kind::Text => format!(
                             "UPDATE {} SET {}=$1 WHERE id=$2 AND NOT({})",
-                            f.table, f.column, p
+                            field.table, field.column, predicate
                         ),
                     };
-                    encrypted += client.execute(&q, &[&value, &rid]).await? as i64;
+                    encrypted += transaction.execute(&update, &[&value, &row_id]).await? as i64;
                 }
             }
             processed += rows.len() as i64;
-            client
-                .execute(
-                    "UPDATE database_encryption_jobs SET progress=$2,cursor=$3 WHERE id=$1",
-                    &[
-                        &id,
-                        &json!({"processed":processed,"encrypted":encrypted}),
-                        &json!({"table":f.table,"column":f.column}),
-                    ],
-                )
-                .await?;
-            let cancel:bool=client.query_one("SELECT cancel_requested_at IS NOT NULL FROM database_encryption_jobs WHERE id=$1",&[&id]).await?.get(0);
-            if cancel {
-                client.execute("UPDATE database_encryption_jobs SET status='cancelled',completed_at=NOW() WHERE id=$1",&[&id]).await?;
-                return Ok(());
-            }
-            if mode != "execute" {
-                break;
+            if mode == "dry_run" {
+                field_index += 1;
+                after_id = Uuid::nil();
             }
         }
+
+        transaction
+            .execute(
+                "UPDATE database_encryption_jobs SET progress=$2,cursor=$3 WHERE id=$1",
+                &[
+                    &id,
+                    &json!({"processed":processed,"encrypted":encrypted}),
+                    &json!({"field_index":field_index,"after_id":after_id}),
+                ],
+            )
+            .await?;
+        transaction.commit().await?;
     }
+
     client
         .execute(
             "UPDATE database_encryption_jobs SET status='completed',completed_at=NOW() WHERE id=$1",

@@ -502,6 +502,7 @@ impl ConversationRepository for PgConversationRepository {
             .context("Failed to get original response items")?;
 
         for item_row in &original_items {
+            let old_item_id: Uuid = item_row.try_get("id")?;
             let old_response_id: Uuid = item_row.try_get("response_id")?;
             let mut item_json: serde_json::Value = item_row.try_get("item")?;
             let original_created_at: chrono::DateTime<Utc> = item_row.try_get("created_at")?;
@@ -513,12 +514,32 @@ impl ConversationRepository for PgConversationRepository {
                 .unwrap_or(old_response_id);
             let new_item_id = Uuid::new_v4();
 
+            if let Some(key) = self.pool.encryption_key() {
+                item_json = crate::field_encryption::decrypt_json_if_encrypted(
+                    &key,
+                    "response_items",
+                    "item",
+                    old_item_id,
+                    item_json,
+                )?;
+            }
+
             // Update the "id" field inside the item JSON to use the new item ID
             // The item JSON has a structure like: { "id": "msg_...", "type": "message", ... }
             if let Some(obj) = item_json.as_object_mut() {
                 // Generate a new message ID in the format "msg_<uuid without hyphens>"
                 let new_msg_id = format!("msg_{}", new_item_id.as_simple());
                 obj.insert("id".to_string(), serde_json::Value::String(new_msg_id));
+            }
+
+            if let Some(key) = self.pool.encryption_key() {
+                item_json = crate::field_encryption::encrypt_json(
+                    &key,
+                    "response_items",
+                    "item",
+                    new_item_id,
+                    &item_json,
+                )?;
             }
 
             transaction

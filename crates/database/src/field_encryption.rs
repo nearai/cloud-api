@@ -155,4 +155,25 @@ mod tests {
             "legacy.txt"
         );
     }
+
+    #[test]
+    fn json_envelope_round_trips_and_legacy_json_remains_readable() {
+        let key = [9; 32];
+        let id = Uuid::new_v4();
+        let value = json!({"token": "secret", "nested": [1, 2, 3]});
+
+        let encrypted = encrypt_json(&key, "mcp_connectors", "auth_config", id, &value).unwrap();
+        assert_eq!(encrypted[MARKER], true);
+        assert!(!encrypted.to_string().contains("secret"));
+        assert_eq!(
+            decrypt_json_if_encrypted(&key, "mcp_connectors", "auth_config", id, encrypted)
+                .unwrap(),
+            value
+        );
+        assert_eq!(
+            decrypt_json_if_encrypted(&key, "mcp_connectors", "auth_config", id, value.clone())
+                .unwrap(),
+            value
+        );
+    }
 }

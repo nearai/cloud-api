@@ -35,6 +35,7 @@
 //! let items = repo.list_by_response(response_id).await?;
 //! ```
 
+use crate::field_encryption;
 use crate::pool::DbPool;
 use crate::repositories::utils::map_db_error;
 use crate::retry_db;
@@ -60,7 +61,17 @@ impl PgResponseItemsRepository {
     /// Helper method to convert database row to ResponseOutputItem
     /// Enriches the item with response metadata (response_id, previous_response_id, next_response_ids, created_at)
     fn row_to_item(&self, row: tokio_postgres::Row) -> Result<ResponseOutputItem> {
-        let item_json: serde_json::Value = row.try_get("item")?;
+        let id: Uuid = row.try_get("id")?;
+        let mut item_json: serde_json::Value = row.try_get("item")?;
+        if let Some(key) = self.pool.encryption_key() {
+            item_json = field_encryption::decrypt_json_if_encrypted(
+                &key,
+                "response_items",
+                "item",
+                id,
+                item_json,
+            )?;
+        }
         let mut item: ResponseOutputItem = serde_json::from_value(item_json)
             .context("Failed to deserialize response item from database")?;
 
@@ -256,7 +267,12 @@ impl ResponseItemRepositoryTrait for PgResponseItemsRepository {
         let id = Self::extract_uuid_from_item_id(item_id);
 
         // Serialize the item to JSON for storage
-        let item_json = serde_json::to_value(&item).context("Failed to serialize response item")?;
+        let mut item_json =
+            serde_json::to_value(&item).context("Failed to serialize response item")?;
+        if let Some(key) = self.pool.encryption_key() {
+            item_json =
+                field_encryption::encrypt_json(&key, "response_items", "item", id, &item_json)?;
+        }
 
         let conversation_uuid = conversation_id.map(|cid| cid.0);
 
@@ -353,7 +369,12 @@ impl ResponseItemRepositoryTrait for PgResponseItemsRepository {
         item: ResponseOutputItem,
     ) -> Result<ResponseOutputItem> {
         // Serialize the updated item to JSON
-        let item_json = serde_json::to_value(&item).context("Failed to serialize response item")?;
+        let mut item_json =
+            serde_json::to_value(&item).context("Failed to serialize response item")?;
+        if let Some(key) = self.pool.encryption_key() {
+            item_json =
+                field_encryption::encrypt_json(&key, "response_items", "item", id.0, &item_json)?;
+        }
 
         let row = retry_db!("update_response_item", {
             let now = Utc::now();
@@ -367,10 +388,20 @@ impl ResponseItemRepositoryTrait for PgResponseItemsRepository {
             client
                 .query_opt(
                     r#"
-                    UPDATE response_items
-                    SET item = $2, updated_at = $3
-                    WHERE id = $1
-                    RETURNING *
+                    WITH updated AS (
+                        UPDATE response_items
+                        SET item = $2, updated_at = $3
+                        WHERE id = $1
+                        RETURNING *
+                    )
+                    SELECT
+                        updated.*,
+                        r.previous_response_id,
+                        r.next_response_ids,
+                        r.created_at AS response_created_at,
+                        r.model
+                    FROM updated
+                    JOIN responses r ON updated.response_id = r.id
                     "#,
                     &[&id.0, &item_json, &now],
                 )

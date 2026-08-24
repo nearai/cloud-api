@@ -458,12 +458,11 @@ pub async fn create_job(
     if !(1..=1000).contains(&req.batch_size) {
         return Err(bad("batch_size must be between 1 and 1000"));
     }
-    if req
-        .actions
-        .iter()
-        .any(|a| a != "encrypt" && a != "verify_only")
-    {
-        return Err(bad("unsupported action"));
+    if req.actions.as_slice() != ["encrypt"] {
+        return Err(bad("actions must contain exactly one encrypt action"));
+    }
+    if req.max_rows.is_some_and(|max_rows| max_rows <= 0) {
+        return Err(bad("max_rows must be greater than zero"));
     }
     let mut scope_request = req.scope;
     normalize_scope(&mut scope_request);
@@ -565,6 +564,9 @@ async fn run_locked_job(
             .unwrap_or(batch);
         let predicate = predicate(field);
         let transaction = client.transaction().await?;
+        transaction
+            .batch_execute("SET LOCAL statement_timeout = '30s'")
+            .await?;
         let cancelled: bool = transaction
             .query_one(
                 "SELECT cancel_requested_at IS NOT NULL FROM database_encryption_jobs WHERE id=$1 FOR UPDATE",

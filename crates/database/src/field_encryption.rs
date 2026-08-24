@@ -9,6 +9,15 @@ use uuid::Uuid;
 
 pub const MARKER: &str = "__near_db_encrypted";
 
+pub fn is_envelope(value: &Value) -> bool {
+    value[MARKER] == true
+        && value["version"] == 1
+        && value["alg"] == "AES-256-GCM"
+        && value["key_id"].as_str().is_some()
+        && value["nonce"].as_str().is_some()
+        && value["ciphertext"].as_str().is_some()
+}
+
 pub fn parse_key(hex_key: &str) -> Result<[u8; 32]> {
     let bytes = hex::decode(hex_key).context("database encryption key must be hex encoded")?;
     let len = bytes.len();
@@ -83,7 +92,7 @@ pub fn decrypt_if_encrypted(
     value: String,
 ) -> Result<String> {
     match serde_json::from_str::<Value>(&value) {
-        Ok(envelope) if envelope[MARKER] == true => decrypt(key, table, column, id, &value),
+        Ok(envelope) if is_envelope(&envelope) => decrypt(key, table, column, id, &value),
         _ => Ok(value),
     }
 }
@@ -111,7 +120,7 @@ pub fn decrypt_json_if_encrypted(
     id: Uuid,
     value: Value,
 ) -> Result<Value> {
-    if value[MARKER] != true {
+    if !is_envelope(&value) {
         return Ok(value);
     }
     Ok(serde_json::from_str(&decrypt(
@@ -153,6 +162,22 @@ mod tests {
             )
             .unwrap(),
             "legacy.txt"
+        );
+    }
+
+    #[test]
+    fn user_json_with_marker_is_not_treated_as_an_envelope() {
+        let id = Uuid::new_v4();
+        let text = json!({MARKER: true, "user": "value"}).to_string();
+        assert_eq!(
+            decrypt_if_encrypted(&[7; 32], "files", "filename", id, text.clone()).unwrap(),
+            text
+        );
+
+        let json = json!({MARKER: true, "user": "value"});
+        assert_eq!(
+            decrypt_json_if_encrypted(&[7; 32], "responses", "metadata", id, json.clone()).unwrap(),
+            json
         );
     }
 

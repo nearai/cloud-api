@@ -2474,7 +2474,7 @@ async fn test_clone_conversation() {
 
 #[tokio::test]
 async fn test_clone_conversation_with_responses_and_items() {
-    let server = setup_test_server().await;
+    let (server, database) = setup_test_server_with_database().await;
     let model_id = setup_qwen_model(&server).await;
     let org = setup_org_with_credits(&server, 10000000000i64).await; // $10.00 USD
     let api_key = get_api_key_for_org(&server, org.id).await;
@@ -2516,6 +2516,21 @@ async fn test_clone_conversation_with_responses_and_items() {
     .await;
     println!("Created response 2: {}", response2.id);
 
+    let confidential_response = server
+        .post("/v1/responses")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .json(&serde_json::json!({
+            "conversation": {"id": original_conv.id},
+            "input": "Response with confidential fields",
+            "instructions": "private system instruction",
+            "metadata": {"private": "response metadata"},
+            "max_output_tokens": 50,
+            "stream": false,
+            "model": model_id
+        }))
+        .await;
+    assert_eq!(confidential_response.status_code(), 200);
+
     // Get original conversation items count
     let original_items =
         list_conversation_items(&server, original_conv.id.clone(), api_key.clone()).await;
@@ -2543,6 +2558,50 @@ async fn test_clone_conversation_with_responses_and_items() {
         cloned_conv.metadata.get("title").and_then(|v| v.as_str()),
         Some("Original Conversation with Messages (Copy)")
     );
+
+    let original_uuid = uuid::Uuid::parse_str(
+        original_conv
+            .id
+            .strip_prefix("conv_")
+            .unwrap_or(&original_conv.id),
+    )
+    .expect("original conversation UUID");
+    let cloned_uuid = uuid::Uuid::parse_str(
+        cloned_conv
+            .id
+            .strip_prefix("conv_")
+            .unwrap_or(&cloned_conv.id),
+    )
+    .expect("cloned conversation UUID");
+    let client = database.pool().get().await.expect("database connection");
+    for conversation_id in [original_uuid, cloned_uuid] {
+        let metadata: serde_json::Value = client
+            .query_one(
+                "SELECT metadata FROM conversations WHERE id=$1",
+                &[&conversation_id],
+            )
+            .await
+            .expect("stored conversation metadata")
+            .get(0);
+        assert_eq!(metadata[database::field_encryption::MARKER], true);
+
+        let response_row = client
+            .query_one(
+                "SELECT instructions,metadata FROM responses WHERE conversation_id=$1 AND instructions IS NOT NULL LIMIT 1",
+                &[&conversation_id],
+            )
+            .await
+            .expect("stored confidential response fields");
+        assert!(response_row
+            .get::<_, String>("instructions")
+            .contains(database::field_encryption::MARKER));
+        assert_eq!(
+            response_row.get::<_, serde_json::Value>("metadata")
+                [database::field_encryption::MARKER],
+            true
+        );
+    }
+    drop(client);
 
     // Get cloned conversation items
     let cloned_items =

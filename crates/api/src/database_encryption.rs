@@ -21,6 +21,7 @@ enum Kind {
     Text,
     Json,
 }
+
 #[derive(Clone, Copy, Debug, Serialize)]
 struct Field {
     table: &'static str,
@@ -29,6 +30,7 @@ struct Field {
     action: &'static str,
     reason: &'static str,
 }
+
 const fn f(table: &'static str, column: &'static str, kind: Kind, reason: &'static str) -> Field {
     Field {
         table,
@@ -38,6 +40,7 @@ const fn f(table: &'static str, column: &'static str, kind: Kind, reason: &'stat
         reason,
     }
 }
+
 const FIELDS: &[Field] = &[
     f(
         "response_items",
@@ -142,6 +145,7 @@ pub struct Scope {
     #[serde(default)]
     fields: Vec<FieldName>,
 }
+
 #[derive(Debug, Deserialize, Serialize)]
 struct FieldName {
     table: String,
@@ -179,6 +183,7 @@ pub struct CreateJobRequest {
 fn batch_default() -> i64 {
     100
 }
+
 fn actions_default() -> Vec<String> {
     vec!["encrypt".into()]
 }
@@ -227,6 +232,7 @@ fn bad(m: &str) -> (StatusCode, Json<Value>) {
         Json(json!({"error":{"code":"invalid_request","message":m}})),
     )
 }
+
 fn internal(e: impl std::fmt::Display) -> (StatusCode, Json<Value>) {
     let _ = e;
     tracing::error!(
@@ -240,6 +246,7 @@ fn internal(e: impl std::fmt::Display) -> (StatusCode, Json<Value>) {
         ),
     )
 }
+
 fn selected(scope: &Scope) -> Result<Vec<&'static Field>, (StatusCode, Json<Value>)> {
     let known_tables = FIELDS
         .iter()
@@ -289,6 +296,7 @@ fn normalize_scope(scope: &mut Scope) {
         .fields
         .dedup_by(|left, right| left.table == right.table && left.column == right.column);
 }
+
 fn predicate(f: &Field) -> String {
     match f.kind {
         Kind::Json => format!(
@@ -301,6 +309,7 @@ fn predicate(f: &Field) -> String {
         ),
     }
 }
+
 async fn counts(
     state: &DatabaseEncryptionState,
     fields: &[&Field],
@@ -334,6 +343,7 @@ async fn counts(
     }
     Ok(out)
 }
+
 fn totals(c: &[FieldCount]) -> Value {
     json!({"plaintext":c.iter().map(|x|x.plaintext).sum::<i64>(),"encrypted":c.iter().map(|x|x.encrypted).sum::<i64>(),"empty":c.iter().map(|x|x.empty).sum::<i64>(),"invalid_envelope":0})
 }
@@ -409,6 +419,7 @@ fn decrypt_envelope(key: &[u8; 32], f: &Field, id: Uuid, encoded: &str) -> anyho
     )?;
     Ok(String::from_utf8(plaintext)?)
 }
+
 pub async fn create_job(
     Extension(state): Extension<DatabaseEncryptionState>,
     Extension(admin): Extension<AdminUser>,
@@ -452,6 +463,7 @@ pub async fn create_job(
     }
     get_inner(&state, id).await
 }
+
 async fn run(
     state: &DatabaseEncryptionState,
     id: Uuid,
@@ -521,6 +533,7 @@ async fn run(
         .await?;
     Ok(())
 }
+
 pub async fn get_job(
     Extension(state): Extension<DatabaseEncryptionState>,
     Extension(_): Extension<AdminUser>,
@@ -528,6 +541,7 @@ pub async fn get_job(
 ) -> ApiResult<JobResponse> {
     get_inner(&state, id).await
 }
+
 async fn get_inner(state: &DatabaseEncryptionState, id: Uuid) -> ApiResult<JobResponse> {
     let c = state.pool.get().await.map_err(internal)?;
     let r=c.query_opt("SELECT id,status,mode,scope,actions,progress,cursor,created_at,completed_at,last_error_class,last_error_message FROM database_encryption_jobs WHERE id=$1",&[&id]).await.map_err(internal)?.ok_or_else(||(StatusCode::NOT_FOUND,Json(json!({"error":{"code":"job_not_found","message":"Database encryption job not found"}}))))?;
@@ -545,6 +559,7 @@ async fn get_inner(state: &DatabaseEncryptionState, id: Uuid) -> ApiResult<JobRe
         last_error_message: r.get(10),
     }))
 }
+
 pub async fn cancel_job(
     Extension(state): Extension<DatabaseEncryptionState>,
     Extension(_): Extension<AdminUser>,
@@ -557,6 +572,7 @@ pub async fn cancel_job(
     }
     get_inner(&state, id).await
 }
+
 #[derive(Debug, Deserialize, Default)]
 pub struct VerifyRequest {
     #[serde(default)]
@@ -564,15 +580,18 @@ pub struct VerifyRequest {
     #[serde(default = "yes")]
     fail_on_approved_plaintext_without_reason: bool,
 }
+
 fn yes() -> bool {
     true
 }
+
 #[derive(Debug, Serialize)]
 pub struct VerifyResponse {
     pass: bool,
     fields: Vec<FieldCount>,
     failing_fields: Vec<Value>,
 }
+
 pub async fn verify(
     Extension(state): Extension<DatabaseEncryptionState>,
     Extension(_): Extension<AdminUser>,
@@ -592,6 +611,7 @@ pub async fn verify(
         failing_fields: fails,
     }))
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;

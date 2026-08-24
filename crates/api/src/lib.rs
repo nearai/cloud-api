@@ -320,6 +320,9 @@ pub async fn init_domain_services_with_pool(
     inference_provider_pool: Arc<services::inference_provider_pool::InferenceProviderPool>,
     metrics_service: Arc<dyn services::metrics::MetricsServiceTrait>,
 ) -> DomainServices {
+    if let Ok(key) = database::field_encryption::parse_key(&config.s3.encryption_key) {
+        database.pool().set_encryption_key(key);
+    }
     // Give the provider pool the metrics sink so it can emit the per-tier /
     // fallback counter (cloud_api.provider.requests) from the one layer that
     // knows which trust tier served each request.

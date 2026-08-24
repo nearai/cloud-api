@@ -48,7 +48,6 @@ aws-sdk-s3 = { version = "1.134", default-features = false, features = ["sigv4a"
 # NEAR wallet authentication
 near-api = "0.8.6"
 base64 = "0.22"
-aes-gcm = "0.10"
 # Ordered collections
 indexmap = "2"
 moka = { version = "0.12.15", features = ["future"] }

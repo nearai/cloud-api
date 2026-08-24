@@ -1,10 +1,5 @@
 use crate::middleware::AdminUser;
-use aes_gcm::{
-    aead::{Aead, Payload},
-    Aes256Gcm, KeyInit, Nonce,
-};
 use axum::{extract::Path, http::StatusCode, Extension, Json};
-use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use chrono::{DateTime, Utc};
 use database::DbPool;
 use serde::{Deserialize, Serialize};
@@ -379,56 +374,13 @@ pub async fn scan(
 }
 
 fn envelope(key: &[u8; 32], f: &Field, id: Uuid, plain: &str) -> anyhow::Result<String> {
-    use aes_gcm::aead::rand_core::{OsRng, RngCore};
-    let mut nonce = [0; 12];
-    OsRng.fill_bytes(&mut nonce);
-    let aad = format!("{}:{}:{}", f.table, f.column, id);
-    let cipher = Aes256Gcm::new_from_slice(key).map_err(|_| anyhow::anyhow!("invalid key"))?;
-    let ct = cipher
-        .encrypt(
-            &Nonce::from(nonce),
-            Payload {
-                msg: plain.as_bytes(),
-                aad: aad.as_bytes(),
-            },
-        )
-        .map_err(|_| anyhow::anyhow!("encryption failed"))?;
-    Ok(json!({MARKER:true,"version":1,"alg":"AES-256-GCM","key_id":"s3-v1","nonce":BASE64.encode(nonce),"ciphertext":BASE64.encode(ct)}).to_string())
+    database::field_encryption::encrypt(key, f.table, f.column, id, plain)
 }
 
 // Job lifecycle and authenticated envelope helpers.
 
 fn decrypt_envelope(key: &[u8; 32], f: &Field, id: Uuid, encoded: &str) -> anyhow::Result<String> {
-    let value: Value = serde_json::from_str(encoded)?;
-    anyhow::ensure!(value[MARKER] == true, "missing encryption marker");
-    anyhow::ensure!(value["version"] == 1, "unsupported envelope version");
-    anyhow::ensure!(
-        value["alg"] == "AES-256-GCM",
-        "unsupported envelope algorithm"
-    );
-    let nonce: [u8; 12] = BASE64
-        .decode(
-            value["nonce"]
-                .as_str()
-                .ok_or_else(|| anyhow::anyhow!("missing nonce"))?,
-        )?
-        .try_into()
-        .map_err(|_| anyhow::anyhow!("invalid nonce length"))?;
-    let ciphertext = BASE64.decode(
-        value["ciphertext"]
-            .as_str()
-            .ok_or_else(|| anyhow::anyhow!("missing ciphertext"))?,
-    )?;
-    let cipher = Aes256Gcm::new_from_slice(key).map_err(|_| anyhow::anyhow!("invalid key"))?;
-    let aad = format!("{}:{}:{}", f.table, f.column, id);
-    let plaintext = cipher.decrypt(
-        &Nonce::from(nonce),
-        Payload {
-            msg: &ciphertext,
-            aad: aad.as_bytes(),
-        },
-    )?;
-    Ok(String::from_utf8(plaintext)?)
+    database::field_encryption::decrypt(key, f.table, f.column, id, encoded)
 }
 
 pub async fn create_job(

@@ -107,6 +107,7 @@ pub fn create_pool_with_native_tls(
 #[derive(Clone)]
 pub struct DbPool {
     inner: std::sync::Arc<std::sync::RwLock<Option<Pool>>>,
+    encryption_key: std::sync::Arc<std::sync::RwLock<Option<[u8; 32]>>>,
 }
 
 impl DbPool {
@@ -114,6 +115,7 @@ impl DbPool {
     pub fn new(pool: Pool) -> Self {
         Self {
             inner: std::sync::Arc::new(std::sync::RwLock::new(Some(pool))),
+            encryption_key: std::sync::Arc::new(std::sync::RwLock::new(None)),
         }
     }
 
@@ -122,6 +124,7 @@ impl DbPool {
     pub fn uninitialized() -> Self {
         Self {
             inner: std::sync::Arc::new(std::sync::RwLock::new(None)),
+            encryption_key: std::sync::Arc::new(std::sync::RwLock::new(None)),
         }
     }
 
@@ -137,6 +140,20 @@ impl DbPool {
     /// The currently installed pool, if any.
     pub fn current(&self) -> Option<Pool> {
         self.inner.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    pub fn set_encryption_key(&self, key: [u8; 32]) {
+        *self
+            .encryption_key
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = Some(key);
+    }
+
+    pub fn encryption_key(&self) -> Option<[u8; 32]> {
+        *self
+            .encryption_key
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
     }
 
     /// Acquire a connection from the currently installed pool.

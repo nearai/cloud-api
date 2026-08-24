@@ -516,7 +516,6 @@ checksum = "2a4385e2e34eb35d6b3efe798b9eb88096925d87726c0798709bf56d9ed84af3"
 name = "api"
 version = "0.0.0"
 dependencies = [
- "aes-gcm",
  "anyhow",
  "async-trait",
  "aws-config",
@@ -2384,8 +2383,10 @@ checksum = "2a2330da5de22e8a3cb63252ce2abb30116bf5265e89c0e01bc17015ce30a476"
 name = "database"
 version = "0.0.0"
 dependencies = [
+ "aes-gcm",
  "anyhow",
  "async-trait",
+ "base64 0.22.1",
  "chrono",
  "config",
  "deadpool",

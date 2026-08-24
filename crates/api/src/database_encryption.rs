@@ -217,6 +217,8 @@ pub struct FieldCount {
     encrypted: i64,
     empty: i64,
     invalid_envelope: i64,
+    scanned: i64,
+    complete: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -335,15 +337,12 @@ async fn counts(
     fields: &[&Field],
     limit: Option<i64>,
 ) -> anyhow::Result<Vec<FieldCount>> {
-    let client = state.pool.get().await?;
+    let mut client = state.pool.get().await?;
     let mut out = vec![];
     for f in fields {
-        let limit = limit.unwrap_or(100_000).clamp(1, 100_000);
-        let query = format!(
-            "SELECT id, {}::text FROM {} WHERE {} IS NOT NULL ORDER BY id LIMIT $1",
-            f.column, f.table, f.column
-        );
-        let rows = client.query(&query, &[&limit]).await?;
+        let scan_limit = limit.map(|value| value.clamp(1, 100_000));
+        let max_id_query = format!("SELECT max(id) FROM {}", f.table);
+        let max_id: Option<Uuid> = client.query_one(&max_id_query, &[]).await?.get(0);
         let mut count = FieldCount {
             table: f.table.into(),
             column: f.column.into(),
@@ -352,24 +351,61 @@ async fn counts(
             encrypted: 0,
             plaintext: 0,
             invalid_envelope: 0,
+            scanned: 0,
+            complete: true,
         };
-        let null_query = format!(
-            "SELECT count(*) FROM {} WHERE {} IS NULL",
-            f.table, f.column
-        );
-        count.empty = client.query_one(&null_query, &[]).await?.get(0);
-        for row in rows {
-            let id: Uuid = row.get(0);
-            let raw: String = row.get(1);
-            match serde_json::from_str::<Value>(&raw) {
-                Ok(value) if value[MARKER] == true => {
-                    if decrypt_envelope(&state.key, f, id, &raw).is_ok() {
-                        count.encrypted += 1;
-                    } else {
-                        count.invalid_envelope += 1;
+        let Some(max_id) = max_id else {
+            out.push(count);
+            continue;
+        };
+        let mut after_id = Uuid::nil();
+
+        loop {
+            let remaining = scan_limit
+                .map(|value| value - count.scanned)
+                .unwrap_or(1_000);
+            if remaining <= 0 {
+                count.complete = false;
+                break;
+            }
+            let page_size = remaining.min(1_000);
+            let transaction = client.transaction().await?;
+            transaction
+                .batch_execute("SET LOCAL statement_timeout = '5s'")
+                .await?;
+            let query = format!(
+                "SELECT id,{}::text FROM {} WHERE id>$1 AND id<=$2 ORDER BY id LIMIT $3",
+                f.column, f.table
+            );
+            let rows = transaction
+                .query(&query, &[&after_id, &max_id, &page_size])
+                .await?;
+            transaction.commit().await?;
+            if rows.is_empty() {
+                break;
+            }
+            for row in &rows {
+                let id: Uuid = row.get(0);
+                after_id = id;
+                let raw: Option<String> = row.get(1);
+                let Some(raw) = raw else {
+                    count.empty += 1;
+                    continue;
+                };
+                match serde_json::from_str::<Value>(&raw) {
+                    Ok(value) if value[MARKER] == true => {
+                        if decrypt_envelope(&state.key, f, id, &raw).is_ok() {
+                            count.encrypted += 1;
+                        } else {
+                            count.invalid_envelope += 1;
+                        }
                     }
+                    _ => count.plaintext += 1,
                 }
-                _ => count.plaintext += 1,
+            }
+            count.scanned += rows.len() as i64;
+            if after_id == max_id {
+                break;
             }
         }
         out.push(count);
@@ -378,7 +414,7 @@ async fn counts(
 }
 
 fn totals(c: &[FieldCount]) -> Value {
-    json!({"plaintext":c.iter().map(|x|x.plaintext).sum::<i64>(),"encrypted":c.iter().map(|x|x.encrypted).sum::<i64>(),"empty":c.iter().map(|x|x.empty).sum::<i64>(),"invalid_envelope":0})
+    json!({"plaintext":c.iter().map(|x|x.plaintext).sum::<i64>(),"encrypted":c.iter().map(|x|x.encrypted).sum::<i64>(),"empty":c.iter().map(|x|x.empty).sum::<i64>(),"invalid_envelope":c.iter().map(|x|x.invalid_envelope).sum::<i64>(),"scanned":c.iter().map(|x|x.scanned).sum::<i64>(),"complete":c.iter().all(|x|x.complete)})
 }
 
 // Admin scan and verification endpoints.
@@ -659,7 +695,14 @@ pub async fn verify(
     let fails = cs
         .iter()
         .filter(|x| x.plaintext > 0 || x.invalid_envelope > 0)
-        .map(|x| json!({"table":x.table,"column":x.column,"reason_code":"plaintext_remaining"}))
+        .map(|x| {
+            let reason = if x.invalid_envelope > 0 {
+                "invalid_envelope"
+            } else {
+                "plaintext_remaining"
+            };
+            json!({"table":x.table,"column":x.column,"reason_code":reason})
+        })
         .collect::<Vec<_>>();
     let _ = req.fail_on_approved_plaintext_without_reason;
     Ok(Json(VerifyResponse {

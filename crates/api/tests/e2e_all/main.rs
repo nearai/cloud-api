@@ -34,6 +34,7 @@ mod concurrent_limit;
 mod conversations;
 mod credit_types;
 mod cross_workspace;
+mod database_encryption;
 mod deser_error_envelope;
 mod duplicate_names;
 mod embeddings;

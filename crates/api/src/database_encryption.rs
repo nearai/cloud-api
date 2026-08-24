@@ -449,7 +449,7 @@ pub async fn create_job(
     Extension(state): Extension<DatabaseEncryptionState>,
     Extension(admin): Extension<AdminUser>,
     Json(req): Json<CreateJobRequest>,
-) -> ApiResult<JobResponse> {
+) -> Result<(StatusCode, Json<JobResponse>), (StatusCode, Json<Value>)> {
     if req.scope.tables.is_empty() && req.scope.fields.is_empty() {
         return Err(bad(
             "an explicit scope is required for database encryption jobs",
@@ -479,7 +479,8 @@ pub async fn create_job(
     client.execute("INSERT INTO database_encryption_jobs(id,mode,status,scope,actions,batch_size,max_rows,admin_actor) VALUES($1,$2,'queued',$3,$4,$5,$6,$7)",&[&id,&mode,&scope,&actions,&req.batch_size,&req.max_rows,&admin.0.id]).await.map_err(internal)?;
     drop(client);
     spawn_job(state.clone(), id);
-    get_inner(&state, id).await
+    let response = get_inner(&state, id).await?;
+    Ok((StatusCode::ACCEPTED, response))
 }
 
 fn spawn_job(state: DatabaseEncryptionState, id: Uuid) {

@@ -2204,9 +2204,15 @@ pub fn build_admin_routes(
         database.pool().clone(),
         &config.s3.encryption_key,
     )
-    .expect("S3 encryption key must be a 32-byte hex key for database encryption");
+    .map_err(|_| {
+        tracing::error!(
+            error_class = "invalid_database_encryption_key",
+            "Database encryption admin routes are disabled"
+        );
+    })
+    .ok();
 
-    Router::new()
+    let admin_routes = Router::new()
         .route(
             "/admin/models",
             axum::routing::get(admin_list_models).patch(batch_upsert_models),
@@ -2364,28 +2370,38 @@ pub fn build_admin_routes(
             "/admin/access-tokens/{token_id}",
             axum::routing::delete(delete_admin_access_token),
         )
-        .route(
-            "/admin/database-encryption/scan",
-            axum::routing::post(crate::database_encryption::scan),
+        .with_state(admin_app_state);
+
+    let admin_routes = if let Some(database_encryption_state) = database_encryption_state {
+        admin_routes.merge(
+            Router::new()
+                .route(
+                    "/admin/database-encryption/scan",
+                    axum::routing::post(crate::database_encryption::scan),
+                )
+                .route(
+                    "/admin/database-encryption/jobs",
+                    axum::routing::post(crate::database_encryption::create_job),
+                )
+                .route(
+                    "/admin/database-encryption/jobs/{id}",
+                    axum::routing::get(crate::database_encryption::get_job),
+                )
+                .route(
+                    "/admin/database-encryption/jobs/{id}/cancel",
+                    axum::routing::post(crate::database_encryption::cancel_job),
+                )
+                .route(
+                    "/admin/database-encryption/verify",
+                    axum::routing::post(crate::database_encryption::verify),
+                )
+                .layer(axum::Extension(database_encryption_state)),
         )
-        .route(
-            "/admin/database-encryption/jobs",
-            axum::routing::post(crate::database_encryption::create_job),
-        )
-        .route(
-            "/admin/database-encryption/jobs/{id}",
-            axum::routing::get(crate::database_encryption::get_job),
-        )
-        .route(
-            "/admin/database-encryption/jobs/{id}/cancel",
-            axum::routing::post(crate::database_encryption::cancel_job),
-        )
-        .route(
-            "/admin/database-encryption/verify",
-            axum::routing::post(crate::database_encryption::verify),
-        )
-        .with_state(admin_app_state)
-        .layer(axum::Extension(database_encryption_state))
+    } else {
+        admin_routes
+    };
+
+    admin_routes
         // Admin middleware handles both authentication and authorization
         .layer(from_fn_with_state(
             auth_state_middleware.clone(),

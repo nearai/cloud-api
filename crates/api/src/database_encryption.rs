@@ -69,7 +69,6 @@ const FIELDS: &[Field] = &[
     f("files", "filename", Kind::Text, "User file metadata"),
     f("files", "storage_key", Kind::Text, "Private object pointer"),
     f("files", "content_type", Kind::Text, "File metadata"),
-    f("mcp_connectors", "name", Kind::Text, "Connector label"),
     f(
         "mcp_connectors",
         "description",

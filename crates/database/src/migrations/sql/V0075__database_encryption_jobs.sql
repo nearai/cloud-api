@@ -32,3 +32,17 @@ ALTER TABLE mcp_connectors
     ALTER COLUMN description TYPE TEXT,
     ALTER COLUMN mcp_server_url TYPE TEXT,
     ALTER COLUMN error_message TYPE TEXT;
+
+-- Keep the structural root marker queryable after response metadata is
+-- encrypted. Backfill before replacing the metadata-based partial index.
+ALTER TABLE responses
+    ADD COLUMN is_root_response BOOLEAN NOT NULL DEFAULT FALSE;
+
+UPDATE responses
+SET is_root_response = TRUE
+WHERE metadata->>'root_response' = 'true';
+
+DROP INDEX IF EXISTS idx_responses_root_response_unique_per_conversation;
+CREATE UNIQUE INDEX idx_responses_root_response_unique_per_conversation
+    ON responses(conversation_id)
+    WHERE is_root_response;

@@ -324,7 +324,7 @@ impl ConversationRepository for PgConversationRepository {
             transaction
                 .execute(
                     r#"
-                INSERT INTO responses (id, workspace_id, api_key_id, model, status, instructions, conversation_id, previous_response_id, next_response_ids, usage, metadata, created_at, updated_at)
+                INSERT INTO responses (id, workspace_id, api_key_id, model, status, instructions, conversation_id, previous_response_id, next_response_ids, usage, metadata, is_root_response, created_at, updated_at)
                 SELECT 
                     $1,
                     workspace_id,
@@ -337,6 +337,7 @@ impl ConversationRepository for PgConversationRepository {
                     next_response_ids,
                     usage,
                     metadata,
+                    is_root_response,
                     $4,
                     $5
                 FROM responses

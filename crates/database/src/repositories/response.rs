@@ -20,7 +20,7 @@ impl PgResponseRepository {
     }
 
     /// Fetch the ID of the structural root response for a conversation, if it exists.
-    /// Root rows are identified by metadata->>'root_response' = 'true'.
+    /// Root rows are identified by the dedicated structural flag.
     async fn fetch_root_id_opt(
         &self,
         conversation_uuid: Uuid,
@@ -41,7 +41,7 @@ impl PgResponseRepository {
                     FROM responses
                     WHERE conversation_id = $1
                       AND workspace_id = $2
-                      AND metadata->>'root_response' = 'true'
+                      AND is_root_response
                     ORDER BY created_at ASC
                     LIMIT 1
                     "#,
@@ -103,11 +103,11 @@ impl PgResponseRepository {
                     r#"
                     INSERT INTO responses (
                         workspace_id, api_key_id, model, status, instructions, conversation_id,
-                        previous_response_id, next_response_ids, usage, metadata,
+                        previous_response_id, next_response_ids, usage, metadata, is_root_response,
                         created_at, updated_at
                     )
-                    VALUES ($1, $2, $3, $4, NULL, $5, NULL, $6, $7, $8, $9, $9)
-                    ON CONFLICT (conversation_id) WHERE metadata->>'root_response' = 'true'
+                    VALUES ($1, $2, $3, $4, NULL, $5, NULL, $6, $7, $8, TRUE, $9, $9)
+                    ON CONFLICT (conversation_id) WHERE is_root_response
                     DO NOTHING
                     RETURNING id
                     "#,
@@ -784,7 +784,7 @@ impl ResponseRepositoryTrait for PgResponseRepository {
                     FROM responses
                     WHERE conversation_id = $1
                       AND workspace_id = $2
-                      AND COALESCE((metadata->>'root_response')::boolean, false) = false
+                      AND NOT is_root_response
                     ORDER BY created_at DESC
                     LIMIT 1
                     "#,

@@ -273,7 +273,7 @@ async fn test_response_stream_fails_with_failed_event_when_inference_fails_at_st
 
     let item_rows = client
         .query(
-            "SELECT item FROM response_items WHERE conversation_id = $1 ORDER BY created_at ASC",
+            "SELECT id, item FROM response_items WHERE conversation_id = $1 ORDER BY created_at ASC",
             &[&conv_uuid],
         )
         .await
@@ -281,7 +281,18 @@ async fn test_response_stream_fails_with_failed_event_when_inference_fails_at_st
     let assistant_items: Vec<serde_json::Value> = item_rows
         .into_iter()
         .filter_map(|row| {
-            let item: serde_json::Value = row.get("item");
+            let id: uuid::Uuid = row.get("id");
+            let mut item: serde_json::Value = row.get("item");
+            if let Some(key) = pool.encryption_key() {
+                item = database::field_encryption::decrypt_json_if_encrypted(
+                    &key,
+                    "response_items",
+                    "item",
+                    id,
+                    item,
+                )
+                .expect("decrypt response item");
+            }
             if item.get("role").and_then(|v| v.as_str()) == Some("assistant") {
                 Some(item)
             } else {

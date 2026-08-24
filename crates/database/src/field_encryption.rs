@@ -88,6 +88,41 @@ pub fn decrypt_if_encrypted(
     }
 }
 
+pub fn encrypt_json(
+    key: &[u8; 32],
+    table: &str,
+    column: &str,
+    id: Uuid,
+    value: &Value,
+) -> Result<Value> {
+    Ok(serde_json::from_str(&encrypt(
+        key,
+        table,
+        column,
+        id,
+        &serde_json::to_string(value)?,
+    )?)?)
+}
+
+pub fn decrypt_json_if_encrypted(
+    key: &[u8; 32],
+    table: &str,
+    column: &str,
+    id: Uuid,
+    value: Value,
+) -> Result<Value> {
+    if value[MARKER] != true {
+        return Ok(value);
+    }
+    Ok(serde_json::from_str(&decrypt(
+        key,
+        table,
+        column,
+        id,
+        &serde_json::to_string(&value)?,
+    )?)?)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

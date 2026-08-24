@@ -20,6 +20,36 @@ impl PgConversationRepository {
         Self { pool }
     }
 
+    fn encrypt_metadata(
+        &self,
+        id: Uuid,
+        metadata: &serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        match self.pool.encryption_key() {
+            Some(key) => crate::field_encryption::encrypt_json(
+                &key,
+                "conversations",
+                "metadata",
+                id,
+                metadata,
+            ),
+            None => Ok(metadata.clone()),
+        }
+    }
+
+    fn decrypt_metadata(&self, id: Uuid, metadata: serde_json::Value) -> Result<serde_json::Value> {
+        match self.pool.encryption_key() {
+            Some(key) => crate::field_encryption::decrypt_json_if_encrypted(
+                &key,
+                "conversations",
+                "metadata",
+                id,
+                metadata,
+            ),
+            None => Ok(metadata),
+        }
+    }
+
     // Helper method to convert database row to Conversation model
     fn row_to_conversation(&self, row: tokio_postgres::Row) -> Result<Conversation> {
         let id: Uuid = row.try_get("id")?;
@@ -36,7 +66,7 @@ impl PgConversationRepository {
             deleted_at: row.try_get("deleted_at")?,
             cloned_from_id: cloned_from_id.map(|id| id.into()),
             root_response_id: None,
-            metadata: row.try_get("metadata")?,
+            metadata: self.decrypt_metadata(id, row.try_get("metadata")?)?,
             created_at: row.try_get("created_at")?,
             updated_at: row.try_get("updated_at")?,
         })
@@ -53,6 +83,7 @@ impl ConversationRepository for PgConversationRepository {
         metadata: serde_json::Value,
     ) -> Result<Conversation> {
         let id = Uuid::new_v4();
+        let stored_metadata = self.encrypt_metadata(id, &metadata)?;
 
         let row = retry_db!("create_new_conversation", {
             let now = Utc::now();
@@ -70,7 +101,7 @@ impl ConversationRepository for PgConversationRepository {
             VALUES ($1, $2, $3, $4, $5, $6)
             RETURNING *
             "#,
-                &[&id, &workspace_id.0, &api_key_id, &metadata, &now, &now],
+                &[&id, &workspace_id.0, &api_key_id, &stored_metadata, &now, &now],
             )
             .await
             .map_err(map_db_error)
@@ -119,6 +150,7 @@ impl ConversationRepository for PgConversationRepository {
         workspace_id: WorkspaceId,
         metadata: serde_json::Value,
     ) -> Result<Option<Conversation>> {
+        let stored_metadata = self.encrypt_metadata(id.0, &metadata)?;
         let row = retry_db!("update_conversation_metadata", {
             let now = Utc::now();
             let client = self
@@ -136,7 +168,7 @@ impl ConversationRepository for PgConversationRepository {
             WHERE id = $1 AND workspace_id = $2 AND deleted_at IS NULL
             RETURNING *
             "#,
-                    &[&id.0, &workspace_id.0, &metadata, &now],
+                    &[&id.0, &workspace_id.0, &stored_metadata, &now],
                 )
                 .await
                 .map_err(map_db_error)
@@ -266,42 +298,49 @@ impl ConversationRepository for PgConversationRepository {
             .await
             .context("Failed to start transaction")?;
 
-        // Step 1: Clone the conversation with a new ID and append " (Copy)" to title in metadata
-        // Reset pinned_at, archived_at, deleted_at to NULL for the clone
-        let conv_row = transaction
+        // Decrypt and re-encrypt metadata because the envelope AAD includes the row ID.
+        let original = transaction
             .query_opt(
-                r#"
-            INSERT INTO conversations (id, workspace_id, api_key_id, pinned_at, archived_at, deleted_at, cloned_from_id, metadata, created_at, updated_at)
-            SELECT 
-                $1, 
-                workspace_id, 
-                $2, 
-                NULL,
-                NULL,
-                NULL,
-                id,
-                CASE 
-                    WHEN metadata->>'title' IS NOT NULL THEN 
-                        jsonb_set(metadata, '{title}', to_jsonb((metadata->>'title') || ' (Copy)'))
-                    ELSE 
-                        metadata
-                END,
-                $3, 
-                $4
-            FROM conversations
-            WHERE id = $5 AND workspace_id = $6 AND deleted_at IS NULL
-            RETURNING *
-            "#,
-                &[&new_conv_id, &api_key_id, &now, &now, &id.0, &workspace_id.0],
+                "SELECT metadata FROM conversations WHERE id = $1 AND workspace_id = $2 AND deleted_at IS NULL",
+                &[&id.0, &workspace_id.0],
             )
             .await
-            .context("Failed to clone conversation")?;
-
-        if conv_row.is_none() {
+            .context("Failed to load conversation metadata for clone")?;
+        let Some(original) = original else {
             // Conversation not found or is deleted, rollback and return None
             transaction.rollback().await.ok();
             return Ok(None);
+        };
+        let mut metadata = self.decrypt_metadata(id.0, original.try_get("metadata")?)?;
+        if let Some(title) = metadata.get_mut("title") {
+            if let Some(title) = title.as_str() {
+                *metadata.get_mut("title").expect("title exists") =
+                    serde_json::Value::String(format!("{title} (Copy)"));
+            }
         }
+        let stored_metadata = self.encrypt_metadata(new_conv_id, &metadata)?;
+        transaction
+            .execute(
+                r#"
+                INSERT INTO conversations (
+                    id, workspace_id, api_key_id, pinned_at, archived_at, deleted_at,
+                    cloned_from_id, metadata, created_at, updated_at
+                )
+                SELECT $1, workspace_id, $2, NULL, NULL, NULL, id, $3, $4, $4
+                FROM conversations
+                WHERE id = $5 AND workspace_id = $6 AND deleted_at IS NULL
+                "#,
+                &[
+                    &new_conv_id,
+                    &api_key_id,
+                    &stored_metadata,
+                    &now,
+                    &id.0,
+                    &workspace_id.0,
+                ],
+            )
+            .await
+            .context("Failed to clone conversation")?;
 
         // Step 2: Get all responses from the original conversation
         let original_responses = transaction

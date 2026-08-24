@@ -583,8 +583,9 @@ async fn run_locked_job(
             return Ok(());
         }
 
+        let locking_clause = if mode == "execute" { " FOR UPDATE" } else { "" };
         let query = format!(
-            "SELECT id,{0}::text FROM {1} WHERE id>$1 AND {0} IS NOT NULL AND NOT({predicate}) ORDER BY id LIMIT $2 FOR UPDATE SKIP LOCKED",
+            "SELECT id,{0}::text FROM {1} WHERE id>$1 AND {0} IS NOT NULL AND NOT({predicate}) ORDER BY id LIMIT $2{locking_clause}",
             field.column, field.table
         );
         let rows = transaction.query(&query, &[&after_id, &cap]).await?;
@@ -612,10 +613,6 @@ async fn run_locked_job(
                 }
             }
             processed += rows.len() as i64;
-            if mode == "dry_run" {
-                field_index += 1;
-                after_id = Uuid::nil();
-            }
         }
 
         transaction

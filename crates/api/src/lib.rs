@@ -1428,7 +1428,9 @@ pub fn build_app_with_config(
         .fallback(routes::unsupported::unknown_route)
         .method_not_allowed_fallback(routes::unsupported::method_not_allowed)
         .layer(cors)
-        // Add HTTP metrics middleware to track all requests
+        // Keep metrics on Router::layer: MatchedPath is populated inside Axum's
+        // router, and moving this middleware outside would label every route
+        // as /unmatched.
         .layer(from_fn_with_state(
             metrics_state,
             middleware::http_metrics_middleware,
@@ -1538,8 +1540,57 @@ pub fn build_completion_routes(
 ) -> Router {
     use crate::routes::files::MAX_FILE_SIZE;
 
-    // Text-based inference routes (chat/completions, image generation, audio transcription, rerank, score)
-    // Use default body limit (~2 MB) since they only accept JSON
+    // Native Anthropic Messages support is staging-gated and hard-off by
+    // default. Keep it on its own router so enabling it cannot alter the
+    // existing OpenAI-compatible routes or middleware behavior.
+    let anthropic_routes = if app_state
+        .config
+        .external_providers
+        .enable_anthropic_messages
+    {
+        let messages = Router::new()
+            .route("/messages", post(routes::anthropic::messages))
+            .layer(DefaultBodyLimit::max(AUDIO_TRANSCRIPTION_MAX_BODY_SIZE))
+            .with_state(app_state.clone())
+            .layer(from_fn_with_state(
+                usage_state.clone(),
+                middleware::usage::anthropic_usage_check_middleware,
+            ))
+            .layer(from_fn_with_state(
+                rate_limit_state.clone(),
+                middleware::rate_limit::anthropic_api_key_rate_limit_middleware,
+            ))
+            .layer(from_fn_with_state(
+                auth_state_middleware.clone(),
+                middleware::auth::anthropic_auth_middleware_with_workspace_context,
+            ));
+
+        // Token counting is free and has its own Anthropic rate-limit class.
+        // Authenticate it, but do not run spend-limit or usage-recording
+        // middleware and do not let it consume the inference request bucket.
+        let count_tokens = Router::new()
+            .route(
+                "/messages/count_tokens",
+                post(routes::anthropic::count_tokens),
+            )
+            .layer(DefaultBodyLimit::max(AUDIO_TRANSCRIPTION_MAX_BODY_SIZE))
+            .with_state(app_state.clone())
+            .layer(from_fn_with_state(
+                rate_limit_state.clone(),
+                middleware::rate_limit::anthropic_count_tokens_rate_limit_middleware,
+            ))
+            .layer(from_fn_with_state(
+                auth_state_middleware.clone(),
+                middleware::auth::anthropic_auth_middleware_with_workspace_context,
+            ));
+
+        messages.merge(count_tokens)
+    } else {
+        Router::new()
+    };
+
+    // Text-based inference routes (chat/completions, image generation, audio transcription, rerank, score).
+    // The shared 25 MiB cap accommodates inline multimodal JSON payloads.
     let text_inference_routes = Router::new()
         .route("/chat/completions", post(chat_completions))
         .route("/completions", post(completions))
@@ -1611,6 +1662,7 @@ pub fn build_completion_routes(
         .merge(text_inference_routes)
         .merge(file_inference_routes)
         .merge(metadata_routes)
+        .merge(anthropic_routes)
 }
 
 /// Build response routes with auth
@@ -2093,17 +2145,18 @@ pub fn build_admin_routes(
     use crate::routes::admin::{
         batch_upsert_models, cancel_model_pricing_change, confirm_model_deprecation,
         confirm_model_pricing_changes, create_admin_access_token, create_service,
-        delete_admin_access_token, delete_model, deprecate_model, get_admin_organization_balance,
-        get_billing_summary, get_infra_summary, get_model_consumption_timeseries,
-        get_model_history, get_model_revenue, get_org_revenue,
+        delete_admin_access_token, delete_aml_allowlist_entry, delete_model, deprecate_model,
+        get_admin_organization_balance, get_billing_summary, get_infra_summary,
+        get_model_consumption_timeseries, get_model_history, get_model_revenue, get_org_revenue,
         get_organization as get_admin_organization, get_organization_concurrent_limit,
         get_organization_limits_history, get_organization_metrics, get_organization_timeseries,
         get_performance_timeseries, get_platform_metrics, get_platform_timeseries,
-        get_revenue_density, list_admin_access_tokens, list_invitation_email_deliveries,
-        list_model_pricing_changes, list_models as admin_list_models, list_organization_members,
-        list_organizations, list_users, preview_model_deprecation, preview_model_pricing_changes,
-        resend_invitation_email, update_organization_concurrent_limit, update_organization_limits,
-        update_service, AdminAppState,
+        get_revenue_density, list_admin_access_tokens, list_aml_allowlist, list_aml_reports,
+        list_invitation_email_deliveries, list_model_pricing_changes,
+        list_models as admin_list_models, list_organization_members, list_organizations,
+        list_users, preview_model_deprecation, preview_model_pricing_changes,
+        resend_invitation_email, update_aml_report_status, update_organization_concurrent_limit,
+        update_organization_limits, update_service, upsert_aml_allowlist_entry, AdminAppState,
     };
     use crate::routes::staking_farm::{
         get_admin_organization_staking_farm, sync_admin_organization_staking_farm,
@@ -2220,6 +2273,19 @@ pub fn build_admin_routes(
         .route(
             "/admin/organizations/{org_id}/staking/farm/sync",
             axum::routing::post(sync_admin_organization_staking_farm),
+        )
+        .route("/admin/aml/reports", axum::routing::get(list_aml_reports))
+        .route(
+            "/admin/aml/reports/{report_id}/status",
+            axum::routing::patch(update_aml_report_status),
+        )
+        .route(
+            "/admin/aml/allowlist",
+            axum::routing::get(list_aml_allowlist).post(upsert_aml_allowlist_entry),
+        )
+        .route(
+            "/admin/aml/allowlist/{account_id}",
+            axum::routing::delete(delete_aml_allowlist_entry),
         )
         .route(
             "/admin/organizations/{org_id}/concurrent-limit",
@@ -2606,6 +2672,42 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_openapi_admin_aml_paths_require_session_security() {
+        let spec = serde_json::to_value(ApiDoc::openapi()).unwrap();
+        let paths = spec["paths"].as_object().unwrap();
+
+        for (path, method) in [
+            ("/v1/admin/aml/reports", "get"),
+            ("/v1/admin/aml/reports/{report_id}/status", "patch"),
+            ("/v1/admin/aml/allowlist", "get"),
+            ("/v1/admin/aml/allowlist", "post"),
+            ("/v1/admin/aml/allowlist/{account_id}", "delete"),
+        ] {
+            let operation = &paths[path][method];
+            assert!(
+                operation.is_object(),
+                "missing OpenAPI operation: {method} {path}"
+            );
+            assert_eq!(
+                operation["security"],
+                serde_json::json!([{ "session_token": [] }]),
+                "{method} {path} must require session_token security"
+            );
+        }
+    }
+
+    #[test]
+    fn test_openapi_admin_aml_report_response_excludes_raw_provider_result() {
+        let spec = serde_json::to_value(ApiDoc::openapi()).unwrap();
+        let properties = spec["components"]["schemas"]["AdminAmlReportResponse"]["properties"]
+            .as_object()
+            .expect("AdminAmlReportResponse should have schema properties");
+
+        assert!(!properties.contains_key("result_json"));
+        assert!(!properties.contains_key("resultJson"));
+    }
+
     /// Example of how to set up the application for E2E testing
     #[tokio::test]
     #[ignore] // Remove ignore to run with a real database and Patroni cluster
@@ -2662,6 +2764,7 @@ mod tests {
             otlp: config::OtlpConfig {
                 endpoint: "http://localhost:4317".to_string(),
                 protocol: "grpc".to_string(),
+                instance_id: None,
             },
             cors: config::CorsConfig::default(),
             external_providers: config::ExternalProvidersConfig::default(),
@@ -2772,6 +2875,7 @@ mod tests {
             otlp: config::OtlpConfig {
                 endpoint: "http://localhost:4317".to_string(),
                 protocol: "grpc".to_string(),
+                instance_id: None,
             },
             cors: config::CorsConfig::default(),
             external_providers: config::ExternalProvidersConfig::default(),

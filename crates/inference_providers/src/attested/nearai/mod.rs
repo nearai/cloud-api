@@ -2621,6 +2621,7 @@ mod tests {
                 model: "test".to_string(),
                 choices: vec![],
                 usage: None,
+                service_tier: None,
                 prompt_token_ids: None,
                 system_fingerprint: None,
                 modality: None,
@@ -3672,7 +3673,9 @@ mod tests {
             metadata: None,
             store: None,
             stream_options: None,
+            service_tier: None,
             modalities: None,
+            original_request: None,
             extra: std::collections::HashMap::new(),
         };
 

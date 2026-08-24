@@ -55,6 +55,7 @@
 
 use reqwest::Client;
 
+pub mod anthropic_raw;
 pub mod attested;
 pub mod bucket_keepalive;
 pub mod chunk_builder;
@@ -78,19 +79,23 @@ use models::*;
 use tokio_stream::StreamExt;
 
 // Re-export commonly used types for convenience
+pub use anthropic_raw::{
+    AnthropicRawEndpoint, AnthropicRawError, AnthropicRawHeaders, AnthropicRawRequest,
+    AnthropicRawResponse,
+};
 pub use mock::MockProvider;
 pub use models::strip_cache_control;
 pub use models::{
     is_client_audio_input_status, AudioOutput, AudioTranscriptionError, AudioTranscriptionParams,
     AudioTranscriptionResponse, ChatCompletionParams, ChatCompletionResponse,
     ChatCompletionResponseChoice, ChatCompletionResponseWithBytes, ChatDelta, ChatMessage,
-    ChatResponseMessage, ChatSignature, CompletionError, CompletionParams, EmbeddingError,
-    FinishReason, FunctionChoice, FunctionDefinition, ImageData, ImageEditError, ImageEditParams,
-    ImageEditResponse, ImageEditResponseWithBytes, ImageGenerationError, ImageGenerationParams,
-    ImageGenerationResponse, ImageGenerationResponseWithBytes, MessageRole, ModelInfo,
-    PrivacyClassifyError, RerankError, RerankParams, RerankResponse, RerankResult, RerankUsage,
-    ScoreError, ScoreParams, ScoreResponse, ScoreResult, ScoreUsage, StreamChunk, StreamOptions,
-    TokenUsage, ToolChoice, ToolDefinition, TranscriptionSegment, TranscriptionWord,
+    ChatResponseMessage, ChatServiceTier, ChatSignature, CompletionError, CompletionParams,
+    EmbeddingError, FinishReason, FunctionChoice, FunctionDefinition, ImageData, ImageEditError,
+    ImageEditParams, ImageEditResponse, ImageEditResponseWithBytes, ImageGenerationError,
+    ImageGenerationParams, ImageGenerationResponse, ImageGenerationResponseWithBytes, MessageRole,
+    ModelInfo, PrivacyClassifyError, RerankError, RerankParams, RerankResponse, RerankResult,
+    RerankUsage, ScoreError, ScoreParams, ScoreResponse, ScoreResult, ScoreUsage, StreamChunk,
+    StreamOptions, TokenUsage, ToolChoice, ToolDefinition, TranscriptionSegment, TranscriptionWord,
 };
 pub use sse_parser::{
     new_external_sse_parser, new_sse_parser, BufferedSSEParser, SSEEvent, SSEEventParser, SSEParser,
@@ -337,6 +342,23 @@ pub trait InferenceProvider {
         body: bytes::Bytes,
         extra: std::collections::HashMap<String, serde_json::Value>,
     ) -> Result<bytes::Bytes, PrivacyClassifyError>;
+
+    /// Performs a native Anthropic Messages request without schema conversion.
+    ///
+    /// Implementations must preserve the upstream status, response headers, and
+    /// body bytes. The default rejects providers that are not backed by the
+    /// Anthropic Messages API.
+    async fn anthropic_raw(
+        &self,
+        _request: AnthropicRawRequest,
+    ) -> Result<AnthropicRawResponse, AnthropicRawError> {
+        Err(AnthropicRawError::UnsupportedProvider)
+    }
+
+    /// Whether [`Self::anthropic_raw`] is implemented for this provider.
+    fn supports_anthropic_raw(&self) -> bool {
+        false
+    }
 
     async fn get_signature(
         &self,

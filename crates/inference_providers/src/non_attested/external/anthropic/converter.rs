@@ -6,9 +6,11 @@
 //! - Response/event parsing (Anthropic → OpenAI)
 //! - Streaming state management for tool calls
 
+#[cfg(test)]
+use crate::TokenUsage;
 use crate::{
-    chunk_builder::ChunkContext, ChatMessage, CompletionError, FunctionCall, MessageRole,
-    SSEEventParser, StreamChunk, TokenUsage, ToolCall, ToolDefinition,
+    ChatMessage, CompletionError, FunctionCall, MessageRole, SSEEventParser, StreamChunk, ToolCall,
+    ToolDefinition,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -50,11 +52,23 @@ pub enum AnthropicContentPart {
         id: String,
         name: String,
         input: serde_json::Value,
+        /// Anthropic prompt-caching breakpoint. Anthropic documents `tool_use`
+        /// as cacheable, and a flattened assistant turn carries the turn's
+        /// breakpoint on its final block.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cache_control: Option<serde_json::Value>,
     },
     #[serde(rename = "tool_result")]
     ToolResult {
         tool_use_id: String,
         content: String,
+        /// Anthropic prompt-caching breakpoint on a tool-result block. Anthropic
+        /// documents tool_result as cacheable, and a tool loop's advancing anchor
+        /// normally rides the trailing tool result — without this field the caller's
+        /// breakpoint is silently dropped and the cache never advances past the
+        /// system prefix. Same verbatim forwarding as `Text::cache_control`.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cache_control: Option<serde_json::Value>,
     },
     #[serde(rename = "image")]
     Image {
@@ -65,6 +79,24 @@ pub enum AnthropicContentPart {
         cache_control: Option<serde_json::Value>,
     },
 }
+
+impl AnthropicContentPart {
+    /// Mutable handle on this block's prompt-caching breakpoint.
+    fn cache_control_mut(&mut self) -> &mut Option<serde_json::Value> {
+        match self {
+            Self::Text { cache_control, .. }
+            | Self::ToolUse { cache_control, .. }
+            | Self::ToolResult { cache_control, .. }
+            | Self::Image { cache_control, .. } => cache_control,
+        }
+    }
+}
+
+/// Anthropic rejects a request carrying more than four `cache_control` blocks
+/// with `400 invalid_request_error` ("A maximum of 4 blocks with cache_control
+/// may be provided"). Callers control the markers, so we clamp rather than let
+/// an over-marking client turn into an upstream error.
+const MAX_CACHE_BREAKPOINTS: usize = 4;
 
 /// Anthropic image source. Anthropic accepts either inline base64 bytes
 /// (`type: "base64"`) or a remote URL (`type: "url"`).
@@ -85,7 +117,7 @@ pub enum AnthropicImageSource {
 /// array of text blocks; the array form is required to attach a
 /// `cache_control` breakpoint to the system prompt (#666). We keep the bare
 /// string for the common (uncached) case so that request is byte-identical to
-/// before, and only switch to the block array when a cache_control is present.
+/// before, and use the block array for every message once caching is enabled.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(untagged)]
 pub enum AnthropicSystem {
@@ -289,16 +321,27 @@ pub struct AnthropicResponse {
 // =============================================================================
 
 /// Pull the raw `cache_control` object (if any) out of a single OpenAI content
-/// part. Anthropic accepts the breakpoint object verbatim
-/// (`{"type":"ephemeral"}`), so we forward it untouched rather than inventing
-/// our own shape (#666). The shared `parse_content` discards unknown fields, so
-/// we read this directly from the raw JSON here in the Anthropic converter
-/// instead of widening the shared `ContentPart` enum.
+/// part. The shared `parse_content` discards unknown fields, so we read this
+/// directly from the raw JSON here instead of widening the shared
+/// `ContentPart` enum. Explicit unsupported TTLs are removed so the provider
+/// uses its five-minute default, the cache-write tier Cloud currently bills.
 fn cache_control_of(item: &serde_json::Value) -> Option<serde_json::Value> {
-    item.as_object()
+    let mut cache_control = item
+        .as_object()
         .and_then(|obj| obj.get("cache_control"))
         .filter(|v| !v.is_null())
-        .cloned()
+        .cloned()?;
+
+    // Cloud currently bills only Anthropic's five-minute cache-write tier.
+    // Downgrade unsupported explicit TTLs to Anthropic's default five-minute
+    // tier instead of forwarding a one-hour write that would be underbilled.
+    if let Some(object) = cache_control.as_object_mut() {
+        if object.get("ttl").and_then(serde_json::Value::as_str) != Some("5m") {
+            object.remove("ttl");
+        }
+    }
+
+    Some(cache_control)
 }
 
 /// Whether a string content value carries any per-part `cache_control`. A bare
@@ -337,7 +380,7 @@ fn per_part_cache_controls(content: &serde_json::Value) -> Vec<Option<serde_json
 /// its breakpoint (#666). When several text parts each carry a breakpoint, the
 /// LAST one is the prefix boundary, so we surface that — attaching it to the one
 /// block that represents the concatenated text. Returns `None` when no text part
-/// carries a breakpoint (the common case stays the bare-string form).
+/// carries a breakpoint.
 fn flattened_text_cache_control(content: &serde_json::Value) -> Option<serde_json::Value> {
     per_part_cache_controls(content)
         .into_iter()
@@ -345,26 +388,127 @@ fn flattened_text_cache_control(content: &serde_json::Value) -> Option<serde_jso
         .next_back()
 }
 
+/// Clamp the number of forwarded `cache_control` breakpoints to Anthropic's
+/// limit of four.
+///
+/// Order is Anthropic's own prefix order — `system` blocks first, then messages
+/// in order, then blocks within a message. When the caller sends more than four
+/// we keep the FIRST to preserve the request's earliest, most-stable cache
+/// segment — the tools/system prefix when a system breakpoint exists, otherwise
+/// simply the oldest surviving prefix — and the LAST THREE as the advancing
+/// anchor. This is a heuristic: dropping a breakpoint costs a cache write,
+/// whereas exceeding the limit costs the whole request.
+fn enforce_breakpoint_limit(
+    system: &mut Option<AnthropicSystem>,
+    messages: &mut [AnthropicMessage],
+) {
+    enum BreakpointPosition {
+        System(usize),
+        Message {
+            message_index: usize,
+            part_index: usize,
+        },
+    }
+
+    let mut positions = Vec::new();
+    if let Some(AnthropicSystem::Blocks(blocks)) = system.as_mut() {
+        positions.extend(
+            blocks
+                .iter()
+                .enumerate()
+                .filter(|(_, block)| block.cache_control.is_some())
+                .map(|(index, _)| BreakpointPosition::System(index)),
+        );
+    }
+    for (message_index, message) in messages.iter_mut().enumerate() {
+        let AnthropicMessageContent::Blocks(parts) = &mut message.content else {
+            continue;
+        };
+        for (part_index, part) in parts.iter_mut().enumerate() {
+            if part.cache_control_mut().is_some() {
+                positions.push(BreakpointPosition::Message {
+                    message_index,
+                    part_index,
+                });
+            }
+        }
+    }
+
+    let count = positions.len();
+    if count <= MAX_CACHE_BREAKPOINTS {
+        return;
+    }
+
+    tracing::debug!(
+        breakpoints_sent = count,
+        breakpoints_kept = MAX_CACHE_BREAKPOINTS,
+        "Clamped Anthropic prompt-caching breakpoints to the provider limit"
+    );
+
+    for position in positions
+        .into_iter()
+        .skip(1)
+        .take(count - MAX_CACHE_BREAKPOINTS)
+    {
+        match position {
+            BreakpointPosition::System(index) => {
+                let block = match system.as_mut() {
+                    Some(AnthropicSystem::Blocks(blocks)) => blocks.get_mut(index),
+                    Some(AnthropicSystem::Text(_)) | None => None,
+                };
+                if let Some(block) = block {
+                    block.cache_control = None;
+                }
+            }
+            BreakpointPosition::Message {
+                message_index,
+                part_index,
+            } => {
+                let cache_control = messages.get_mut(message_index).and_then(|message| {
+                    match &mut message.content {
+                        AnthropicMessageContent::Blocks(parts) => parts
+                            .get_mut(part_index)
+                            .map(AnthropicContentPart::cache_control_mut),
+                        AnthropicMessageContent::Text(_) => None,
+                    }
+                });
+                if let Some(cache_control) = cache_control {
+                    *cache_control = None;
+                }
+            }
+        }
+    }
+}
+
 /// Build the Anthropic `system` value from a raw OpenAI system message content.
 ///
-/// Uses a bare string in the common case (no cache_control) so the request is
-/// byte-identical to the pre-#666 behaviour. If any part carries a
-/// `cache_control`, emit the block-array form Anthropic requires for caching,
-/// carrying the breakpoint on the matching text block.
-fn build_system(content: &serde_json::Value) -> AnthropicSystem {
+/// Uses a bare string when the request has no cache breakpoint so uncached
+/// requests stay byte-identical to the pre-#666 behaviour. Once caching is
+/// enabled anywhere in the request, emits block form for the system prompt so
+/// moving a breakpoint between turns cannot change the prompt's representation.
+fn build_system(content: &serde_json::Value, caching_enabled: bool) -> AnthropicSystem {
     use crate::non_attested::external::content::text_from_content as extract_content;
 
-    if !content_has_cache_control(content) {
+    if !caching_enabled {
         return AnthropicSystem::Text(extract_content(content));
     }
 
-    // Array form with at least one cache_control: emit one text block per
-    // `text` part, attaching its breakpoint. Image parts in a system prompt are
-    // dropped (matching the text-only flattening this path already did).
+    // Anthropic rejects empty text blocks. Keep an empty system prompt in the
+    // bare-string form even when a later message enables caching.
+    let flattened = extract_content(content);
+    if flattened.is_empty() {
+        return AnthropicSystem::Text(flattened);
+    }
+
+    // Array form while caching is enabled: emit one text block per `text` part,
+    // attaching its breakpoint. Image parts in a system prompt are dropped
+    // (matching the text-only flattening this path already did).
     let serde_json::Value::Array(items) = content else {
-        // Not an array but flagged as having cache_control is impossible
-        // (content_has_cache_control only returns true for arrays), but be safe.
-        return AnthropicSystem::Text(extract_content(content));
+        return AnthropicSystem::Blocks(vec![AnthropicSystemBlock {
+            type_: "text",
+            text: extract_content(content),
+            cache_control: None,
+        }]);
     };
 
     let mut blocks = Vec::new();
@@ -375,7 +519,11 @@ fn build_system(content: &serde_json::Value) -> AnthropicSystem {
         if obj.get("type").and_then(|t| t.as_str()) != Some("text") {
             continue;
         }
-        let Some(text) = obj.get("text").and_then(|t| t.as_str()) else {
+        let Some(text) = obj
+            .get("text")
+            .and_then(|t| t.as_str())
+            .filter(|text| !text.is_empty())
+        else {
             continue;
         };
         blocks.push(AnthropicSystemBlock {
@@ -400,6 +548,17 @@ pub fn convert_messages(
         parse_content, text_from_content as extract_content, ContentPart,
     };
 
+    // #920: a caching client moves its breakpoint forward each turn, so the message
+    // that was marked last turn arrives unmarked this turn. If the emitted shape
+    // depended on that marking, the same message would change representation
+    // underneath the previous turn's cache anchor. Once ANY breakpoint is present we
+    // therefore emit the block form for every message, marked or not. Requests with
+    // no caching at all keep the bare-string form and stay byte-identical to before.
+    let caching_enabled = messages
+        .iter()
+        .filter_map(|msg| msg.content.as_ref())
+        .any(content_has_cache_control);
+
     let mut system_message = None;
     let mut anthropic_messages = Vec::new();
 
@@ -407,7 +566,7 @@ pub fn convert_messages(
         match msg.role {
             MessageRole::System => {
                 if let Some(content) = &msg.content {
-                    system_message = Some(build_system(content));
+                    system_message = Some(build_system(content, caching_enabled));
                 }
             }
             MessageRole::User => {
@@ -418,16 +577,20 @@ pub fn convert_messages(
 
                 let has_image = parts.iter().any(|p| !matches!(p, ContentPart::Text(_)));
                 // Per-part cache_control breakpoints, forwarded verbatim (#666).
-                // When present we must emit content blocks (the bare-string form
-                // can't carry a breakpoint), even with no image part.
+                // Keep them aligned even when another message enabled caching,
+                // so only the originally marked parts carry a breakpoint.
                 let cache_controls = msg
                     .content
                     .as_ref()
                     .map(per_part_cache_controls)
                     .unwrap_or_default();
-                let has_cache_control = cache_controls.iter().any(Option::is_some);
 
-                if has_image || has_cache_control {
+                if has_image || caching_enabled {
+                    // Keep text parts separate so a caller's per-part cache
+                    // breakpoint remains attached to the exact prefix boundary it
+                    // selected. This intentionally differs from the uncached
+                    // newline-joined string form; flattening here would make the
+                    // representation stable only by coarsening breakpoint precision.
                     let mut blocks = Vec::with_capacity(parts.len());
                     for (idx, part) in parts.into_iter().enumerate() {
                         let cc = cache_controls.get(idx).cloned().flatten();
@@ -454,9 +617,19 @@ pub fn convert_messages(
                             }
                         }
                     }
+                    let content = if blocks.is_empty() {
+                        AnthropicMessageContent::Text(
+                            msg.content
+                                .as_ref()
+                                .map(&extract_content)
+                                .unwrap_or_default(),
+                        )
+                    } else {
+                        AnthropicMessageContent::Blocks(blocks)
+                    };
                     anthropic_messages.push(AnthropicMessage {
                         role: "user".to_string(),
-                        content: AnthropicMessageContent::Blocks(blocks),
+                        content,
                     });
                 } else {
                     let content = msg
@@ -475,7 +648,7 @@ pub fn convert_messages(
                 // does — Anthropic allows a breakpoint on an assistant content
                 // block, so a cached prefix ending at an assistant turn keeps it
                 // (#666). The assistant text is flattened into a single block, so
-                // we attach the last (prefix-boundary) breakpoint to that block.
+                // the last marker remains the turn's prefix boundary.
                 let text_cache_control =
                     msg.content.as_ref().and_then(flattened_text_cache_control);
 
@@ -490,7 +663,7 @@ pub fn convert_messages(
                             if !text.is_empty() {
                                 blocks.push(AnthropicContentPart::Text {
                                     text,
-                                    cache_control: text_cache_control,
+                                    cache_control: None,
                                 });
                             }
                         }
@@ -506,7 +679,19 @@ pub fn convert_messages(
                                 .and_then(|args| serde_json::from_str(args).ok())
                                 .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
 
-                            blocks.push(AnthropicContentPart::ToolUse { id, name, input });
+                            blocks.push(AnthropicContentPart::ToolUse {
+                                id,
+                                name,
+                                input,
+                                cache_control: None,
+                            });
+                        }
+
+                        // This branch requires non-empty tool_calls, so a final
+                        // tool_use block always exists and carries the whole
+                        // flattened turn's breakpoint.
+                        if let Some(last_block) = blocks.last_mut() {
+                            *last_block.cache_control_mut() = text_cache_control;
                         }
 
                         anthropic_messages.push(AnthropicMessage {
@@ -523,17 +708,17 @@ pub fn convert_messages(
                     .as_ref()
                     .map(&extract_content)
                     .unwrap_or_default();
-                // A bare string can't carry a breakpoint, so when this turn has a
-                // cache_control we emit the block-array form (mirroring the user
-                // branch). The common (uncached) case keeps the bare string so the
-                // request is byte-identical to before.
-                if let Some(cache_control) = text_cache_control {
+                // Once caching is enabled, every assistant turn uses block form so
+                // moving the breakpoint cannot change its representation. The text
+                // remains flattened into one block. Uncached requests keep the bare
+                // string form and remain byte-identical to before.
+                if caching_enabled && !content.is_empty() {
                     anthropic_messages.push(AnthropicMessage {
                         role: "assistant".to_string(),
                         content: AnthropicMessageContent::Blocks(vec![
                             AnthropicContentPart::Text {
                                 text: content,
-                                cache_control: Some(cache_control),
+                                cache_control: text_cache_control,
                             },
                         ]),
                     });
@@ -545,12 +730,14 @@ pub fn convert_messages(
                 }
             }
             MessageRole::Tool => {
-                // Tool results need special formatting for Anthropic
+                // Tool results need special formatting for Anthropic, including
+                // the flattened content's final prompt-caching breakpoint.
                 let content = msg
                     .content
                     .as_ref()
                     .map(&extract_content)
                     .unwrap_or_default();
+                let cache_control = msg.content.as_ref().and_then(flattened_text_cache_control);
                 let tool_use_id = msg.tool_call_id.clone().unwrap_or_default();
                 anthropic_messages.push(AnthropicMessage {
                     role: "user".to_string(),
@@ -558,6 +745,7 @@ pub fn convert_messages(
                         AnthropicContentPart::ToolResult {
                             tool_use_id,
                             content,
+                            cache_control,
                         },
                     ]),
                 });
@@ -565,6 +753,7 @@ pub fn convert_messages(
         }
     }
 
+    enforce_breakpoint_limit(&mut system_message, &mut anthropic_messages);
     (system_message, anthropic_messages)
 }
 
@@ -663,76 +852,21 @@ pub fn extract_response_content(
 // Streaming Parser State & Implementation
 // =============================================================================
 
-/// Active tool call being accumulated during streaming
-#[derive(Debug, Clone)]
-struct ActiveToolCall {
-    /// Accumulated JSON arguments
-    json_buffer: String,
-    /// Index in the tool_calls array (for OpenAI format)
-    index: i64,
-}
-
-/// Parser state for Anthropic streaming
+/// Thin inference-provider wrapper around the pure compatibility state machine.
 pub struct AnthropicParserState {
-    pub message_id: Option<String>,
-    pub model: String,
-    pub created: i64,
-    pub input_tokens: i32,
-    pub output_tokens: i32,
-    /// Prompt-cache tokens (read + creation) Anthropic charged us for. Reported
-    /// separately from `input_tokens` by Anthropic; we fold them into
-    /// `prompt_tokens` and surface the read portion as `cached_tokens` so the
-    /// existing OpenAI-shaped billing path bills cache reads (#666).
-    cache_read_tokens: i32,
-    cache_creation_tokens: i32,
-    tool_calls: HashMap<i64, ActiveToolCall>,
-    tool_call_counter: i64,
+    inner: anthropic_compat::StreamState,
 }
 
 impl AnthropicParserState {
     pub fn new(model: String) -> Self {
         Self {
-            message_id: None,
-            model,
-            created: chrono::Utc::now().timestamp(),
-            input_tokens: 0,
-            output_tokens: 0,
-            cache_read_tokens: 0,
-            cache_creation_tokens: 0,
-            tool_calls: HashMap::new(),
-            tool_call_counter: 0,
+            inner: anthropic_compat::StreamState::new(model, chrono::Utc::now().timestamp()),
         }
     }
 
-    /// Build the prompt-token usage for a streaming chunk.
-    ///
-    /// CRITICAL accounting (#666): Anthropic reports cache reads/creation
-    /// SEPARATELY from `input_tokens`, whereas OpenAI's `cached_tokens` is a
-    /// SUBSET of `prompt_tokens` (and `TokenUsage::cached_tokens()` caps it to
-    /// `[0, prompt_tokens]`). To both preserve that OpenAI invariant AND bill
-    /// the cache-read cost, we ADD the cache tokens into `prompt_tokens` and
-    /// report the read portion as `cached_tokens`.
-    fn prompt_tokens(&self) -> i32 {
-        self.input_tokens + self.cache_read_tokens + self.cache_creation_tokens
-    }
-
-    /// `prompt_tokens_details` for a chunk: `cached_tokens` when there was a
-    /// cache read, else `None` (so an uncached stream is byte-identical to
-    /// before).
-    fn prompt_tokens_details(&self) -> Option<serde_json::Value> {
-        if self.cache_read_tokens > 0 {
-            Some(serde_json::json!({ "cached_tokens": self.cache_read_tokens }))
-        } else {
-            None
-        }
-    }
-
-    fn chunk_context(&self) -> ChunkContext {
-        ChunkContext::new(
-            self.message_id.clone().unwrap_or_default(),
-            self.model.clone(),
-            self.created,
-        )
+    #[cfg(test)]
+    fn input_tokens(&self) -> i32 {
+        self.inner.input_tokens()
     }
 }
 
@@ -746,124 +880,32 @@ impl SSEEventParser for AnthropicEventParser {
         state: &mut Self::State,
         data: &str,
     ) -> Result<Option<StreamChunk>, CompletionError> {
-        let event: AnthropicStreamEvent = serde_json::from_str(data)
+        let event: serde_json::Value = serde_json::from_str(data)
             .map_err(|_| CompletionError::InvalidResponse("Failed to parse event".to_string()))?;
-
-        match event {
-            AnthropicStreamEvent::MessageStart { message } => {
-                state.message_id = Some(message.id);
-                state.input_tokens = message.usage.input_tokens;
-                // Cache-token counts are known up front (message_start), like
-                // input_tokens (#666). Capture them so an interrupted stream is
-                // still billed for the cache reads Anthropic charged us for.
-                state.cache_read_tokens = message.usage.cache_read_input_tokens;
-                state.cache_creation_tokens = message.usage.cache_creation_input_tokens;
-                let ctx = state.chunk_context();
-                // Anthropic reports input tokens up front in `message_start`, but
-                // completion tokens only in the final `message_delta`. Carry the
-                // known input tokens on the first chunk so an interrupted stream is
-                // still billed for the prompt tokens Anthropic charged us for
-                // (completion tokens stay 0 until the final chunk). On a clean
-                // stream the final chunk's full usage overwrites this.
-                let prompt_tokens = state.prompt_tokens();
-                let early_usage = TokenUsage {
-                    prompt_tokens,
-                    completion_tokens: 0,
-                    total_tokens: prompt_tokens,
-                    prompt_tokens_details: state.prompt_tokens_details(),
-                };
-                Ok(Some(StreamChunk::Chat(
-                    ctx.role_chunk_with_usage(Some(early_usage)),
-                )))
-            }
-
-            AnthropicStreamEvent::ContentBlockStart {
-                index,
-                content_block,
-            } => {
-                if content_block.is_tool_use() {
-                    if let (Some(id), Some(name)) = (content_block.id, content_block.name) {
-                        let tool_index = state.tool_call_counter;
-                        state.tool_call_counter += 1;
-
-                        state.tool_calls.insert(
-                            index,
-                            ActiveToolCall {
-                                json_buffer: String::new(),
-                                index: tool_index,
-                            },
-                        );
-
-                        let ctx = state.chunk_context();
-                        return Ok(Some(StreamChunk::Chat(
-                            ctx.tool_call_start_chunk(tool_index, id, name),
-                        )));
-                    }
+        let converted = state
+            .inner
+            .convert_event(&event)
+            .map_err(|error| match error.kind {
+                anthropic_compat::CompatErrorKind::Upstream => {
+                    CompletionError::CompletionError(error.message)
                 }
-                Ok(None)
-            }
-
-            AnthropicStreamEvent::ContentBlockDelta { index, delta } => {
-                let ctx = state.chunk_context();
-
-                if delta.is_text_delta() {
-                    if let Some(text) = delta.text {
-                        return Ok(Some(StreamChunk::Chat(ctx.text_chunk(text))));
-                    }
-                } else if delta.is_input_json_delta() {
-                    if let Some(partial_json) = delta.partial_json {
-                        if let Some(tool_call) = state.tool_calls.get_mut(&index) {
-                            tool_call.json_buffer.push_str(&partial_json);
-                            return Ok(Some(StreamChunk::Chat(
-                                ctx.tool_call_args_chunk(tool_call.index, partial_json),
-                            )));
-                        }
-                    }
+                anthropic_compat::CompatErrorKind::Conversion => {
+                    tracing::warn!(
+                        parameter = error.parameter.as_deref().unwrap_or("request"),
+                        "failed to convert Anthropic stream event"
+                    );
+                    CompletionError::InvalidResponse("Failed to convert event".to_string())
                 }
-                Ok(None)
-            }
-
-            AnthropicStreamEvent::ContentBlockStop { index } => {
-                state.tool_calls.remove(&index);
-                Ok(None)
-            }
-
-            AnthropicStreamEvent::MessageDelta { delta, usage } => {
-                state.output_tokens = usage.output_tokens;
-                // The final message_delta usage may also restate the cache
-                // counts; prefer non-zero values so the final chunk carries the
-                // authoritative figures even if message_start was missed (#666).
-                if usage.cache_read_input_tokens > 0 {
-                    state.cache_read_tokens = usage.cache_read_input_tokens;
-                }
-                if usage.cache_creation_input_tokens > 0 {
-                    state.cache_creation_tokens = usage.cache_creation_input_tokens;
-                }
-                let ctx = state.chunk_context();
-                let finish_reason = map_finish_reason(delta.stop_reason);
-                let prompt_tokens = state.prompt_tokens();
-                let token_usage = TokenUsage {
-                    prompt_tokens,
-                    completion_tokens: state.output_tokens,
-                    total_tokens: prompt_tokens + state.output_tokens,
-                    prompt_tokens_details: state.prompt_tokens_details(),
-                };
-                Ok(Some(StreamChunk::Chat(
-                    ctx.finish_chunk(finish_reason, token_usage),
-                )))
-            }
-
-            AnthropicStreamEvent::Error { error } => {
-                tracing::warn!(backend = "anthropic", error_type = %error.type_, "Stream error received");
-                Err(CompletionError::CompletionError(format!(
-                    "Anthropic error: {} - {}",
-                    error.type_, error.message
-                )))
-            }
-
-            // Ignore Ping, MessageStop
-            _ => Ok(None),
-        }
+            })?;
+        converted
+            .map(|chunk| {
+                serde_json::from_value(chunk)
+                    .map(StreamChunk::Chat)
+                    .map_err(|_| {
+                        CompletionError::InvalidResponse("Failed to convert event".to_string())
+                    })
+            })
+            .transpose()
     }
 }
 
@@ -1097,7 +1139,7 @@ mod tests {
         assert_eq!(usage.prompt_tokens, 42);
         assert_eq!(usage.completion_tokens, 0);
         assert_eq!(usage.total_tokens, 42);
-        assert_eq!(state.input_tokens, 42);
+        assert_eq!(state.input_tokens(), 42);
     }
 
     // ── #666: prompt-caching cache_control passthrough + cache-stat surfacing ──
@@ -1110,6 +1152,398 @@ mod tests {
             .and_then(|d| d.get("cached_tokens"))
             .and_then(|v| v.as_i64())
             .unwrap_or(0)
+    }
+
+    #[test]
+    fn test_serialization_stable_when_anchor_moves() {
+        let turn_n = vec![
+            ChatMessage {
+                role: MessageRole::System,
+                content: Some(serde_json::json!([
+                    {"type": "text", "text": "System A"},
+                    {
+                        "type": "text",
+                        "text": "System B",
+                        "cache_control": {"type": "ephemeral"}
+                    }
+                ])),
+                name: None,
+                tool_call_id: None,
+                tool_calls: None,
+            },
+            ChatMessage {
+                role: MessageRole::User,
+                content: Some(serde_json::json!([
+                    {"type": "text", "text": "User A1"},
+                    {
+                        "type": "text",
+                        "text": "User A2",
+                        "cache_control": {"type": "ephemeral"}
+                    }
+                ])),
+                name: None,
+                tool_call_id: None,
+                tool_calls: None,
+            },
+            ChatMessage {
+                role: MessageRole::Assistant,
+                content: Some(serde_json::Value::String("Assistant B".to_string())),
+                name: None,
+                tool_call_id: None,
+                tool_calls: None,
+            },
+            ChatMessage {
+                role: MessageRole::User,
+                content: Some(serde_json::Value::String("User C".to_string())),
+                name: None,
+                tool_call_id: None,
+                tool_calls: None,
+            },
+        ];
+        let turn_n_plus_one = vec![
+            ChatMessage {
+                role: MessageRole::System,
+                content: Some(serde_json::json!([
+                    {"type": "text", "text": "System A"},
+                    {
+                        "type": "text",
+                        "text": "System B",
+                        "cache_control": {"type": "ephemeral"}
+                    }
+                ])),
+                name: None,
+                tool_call_id: None,
+                tool_calls: None,
+            },
+            ChatMessage {
+                role: MessageRole::User,
+                content: Some(serde_json::json!([
+                    {"type": "text", "text": "User A1"},
+                    {"type": "text", "text": "User A2"}
+                ])),
+                name: None,
+                tool_call_id: None,
+                tool_calls: None,
+            },
+            ChatMessage {
+                role: MessageRole::Assistant,
+                content: Some(serde_json::Value::String("Assistant B".to_string())),
+                name: None,
+                tool_call_id: None,
+                tool_calls: None,
+            },
+            ChatMessage {
+                role: MessageRole::User,
+                content: Some(serde_json::json!([{
+                    "type": "text",
+                    "text": "User C",
+                    "cache_control": {"type": "ephemeral"}
+                }])),
+                name: None,
+                tool_call_id: None,
+                tool_calls: None,
+            },
+            ChatMessage {
+                role: MessageRole::Assistant,
+                content: Some(serde_json::Value::String("Assistant D".to_string())),
+                name: None,
+                tool_call_id: None,
+                tool_calls: None,
+            },
+        ];
+
+        let (system_n, messages_n) = convert_messages(&turn_n);
+        let (system_n_plus_one, messages_n_plus_one) = convert_messages(&turn_n_plus_one);
+        let mut system_n_json = serde_json::to_value(system_n.unwrap()).unwrap();
+        let mut system_n_plus_one_json = serde_json::to_value(system_n_plus_one.unwrap()).unwrap();
+        system_n_json[1]
+            .as_object_mut()
+            .unwrap()
+            .remove("cache_control");
+        system_n_plus_one_json[1]
+            .as_object_mut()
+            .unwrap()
+            .remove("cache_control");
+        assert_eq!(system_n_json, system_n_plus_one_json);
+
+        let mut user_a_n = serde_json::to_value(&messages_n[0]).unwrap();
+        let mut user_a_n_plus_one = serde_json::to_value(&messages_n_plus_one[0]).unwrap();
+        assert!(user_a_n["content"].is_array());
+        assert!(user_a_n_plus_one["content"].is_array());
+        assert_eq!(user_a_n["content"].as_array().unwrap().len(), 2);
+        assert_eq!(user_a_n_plus_one["content"].as_array().unwrap().len(), 2);
+        user_a_n["content"][1]
+            .as_object_mut()
+            .unwrap()
+            .remove("cache_control");
+        user_a_n_plus_one["content"][1]
+            .as_object_mut()
+            .unwrap()
+            .remove("cache_control");
+        assert_eq!(user_a_n, user_a_n_plus_one);
+
+        // The headline regression: an unmarked single-part message must have
+        // the same block shape when the moving anchor lands on it next turn.
+        let assistant_b_n = serde_json::to_value(&messages_n[1]).unwrap();
+        let assistant_b_n_plus_one = serde_json::to_value(&messages_n_plus_one[1]).unwrap();
+        assert_eq!(assistant_b_n, assistant_b_n_plus_one);
+
+        let user_c_n = serde_json::to_value(&messages_n[2]).unwrap();
+        let mut user_c_n_plus_one = serde_json::to_value(&messages_n_plus_one[2]).unwrap();
+        user_c_n_plus_one["content"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("cache_control");
+        assert_eq!(user_c_n, user_c_n_plus_one);
+    }
+
+    #[test]
+    fn test_empty_system_stays_bare_string_when_caching_is_enabled() {
+        let messages = vec![
+            ChatMessage {
+                role: MessageRole::System,
+                content: Some(serde_json::Value::String(String::new())),
+                name: None,
+                tool_call_id: None,
+                tool_calls: None,
+            },
+            ChatMessage {
+                role: MessageRole::User,
+                content: Some(serde_json::json!([{
+                    "type": "text",
+                    "text": "anchor",
+                    "cache_control": {"type": "ephemeral"}
+                }])),
+                name: None,
+                tool_call_id: None,
+                tool_calls: None,
+            },
+        ];
+
+        let (system, _messages) = convert_messages(&messages);
+        assert!(matches!(system, Some(AnthropicSystem::Text(text)) if text.is_empty()));
+    }
+
+    #[test]
+    fn test_empty_assistant_stays_bare_string_when_caching_is_enabled() {
+        for content in [None, Some(serde_json::Value::String(String::new()))] {
+            let messages = vec![
+                ChatMessage {
+                    role: MessageRole::User,
+                    content: Some(serde_json::json!([{
+                        "type": "text",
+                        "text": "anchor",
+                        "cache_control": {"type": "ephemeral"}
+                    }])),
+                    name: None,
+                    tool_call_id: None,
+                    tool_calls: None,
+                },
+                ChatMessage {
+                    role: MessageRole::Assistant,
+                    content,
+                    name: None,
+                    tool_call_id: None,
+                    tool_calls: Some(Vec::new()),
+                },
+            ];
+
+            let (_system, anthropic_messages) = convert_messages(&messages);
+            assert!(matches!(
+                &anthropic_messages[1].content,
+                AnthropicMessageContent::Text(text) if text.is_empty()
+            ));
+        }
+    }
+
+    #[test]
+    fn test_multipart_text_not_newline_joined_when_caching() {
+        let messages = vec![
+            ChatMessage {
+                role: MessageRole::User,
+                content: Some(serde_json::json!([
+                    {"type": "text", "text": "A"},
+                    {"type": "text", "text": "B"}
+                ])),
+                name: None,
+                tool_call_id: None,
+                tool_calls: None,
+            },
+            ChatMessage {
+                role: MessageRole::User,
+                content: Some(serde_json::json!([{
+                    "type": "text",
+                    "text": "anchor",
+                    "cache_control": {"type": "ephemeral"}
+                }])),
+                name: None,
+                tool_call_id: None,
+                tool_calls: None,
+            },
+        ];
+
+        let (_system, anthropic_messages) = convert_messages(&messages);
+        let AnthropicMessageContent::Blocks(blocks) = &anthropic_messages[0].content else {
+            panic!("expected multipart block form while caching is enabled");
+        };
+        assert_eq!(blocks.len(), 2);
+        let json = serde_json::to_value(&anthropic_messages[0]).unwrap();
+        assert_eq!(json["content"][0]["text"], "A");
+        assert_eq!(json["content"][1]["text"], "B");
+    }
+
+    #[test]
+    fn test_non_caching_request_bytes_unchanged() {
+        let messages = vec![
+            ChatMessage {
+                role: MessageRole::System,
+                content: Some(serde_json::Value::String("System".to_string())),
+                name: None,
+                tool_call_id: None,
+                tool_calls: None,
+            },
+            ChatMessage {
+                role: MessageRole::User,
+                content: Some(serde_json::json!([
+                    {"type": "text", "text": "User A"},
+                    {"type": "text", "text": "User B"}
+                ])),
+                name: None,
+                tool_call_id: None,
+                tool_calls: None,
+            },
+            ChatMessage {
+                role: MessageRole::Assistant,
+                content: Some(serde_json::json!([
+                    {"type": "text", "text": "Assistant A"},
+                    {"type": "text", "text": "Assistant B"}
+                ])),
+                name: None,
+                tool_call_id: None,
+                tool_calls: None,
+            },
+        ];
+
+        let (system, anthropic_messages) = convert_messages(&messages);
+        assert_eq!(system, Some(AnthropicSystem::Text("System".to_string())));
+        assert!(matches!(
+            &anthropic_messages[0].content,
+            AnthropicMessageContent::Text(text) if text == "User A\nUser B"
+        ));
+        assert!(matches!(
+            &anthropic_messages[1].content,
+            AnthropicMessageContent::Text(text) if text == "Assistant A\nAssistant B"
+        ));
+        let json = serde_json::to_string(&(system, anthropic_messages)).unwrap();
+        assert!(!json.contains("\"type\":\"text\""));
+    }
+
+    #[test]
+    fn test_system_bare_string_becomes_block_when_caching_enabled() {
+        let messages = vec![
+            ChatMessage {
+                role: MessageRole::System,
+                content: Some(serde_json::Value::String("System".to_string())),
+                name: None,
+                tool_call_id: None,
+                tool_calls: None,
+            },
+            ChatMessage {
+                role: MessageRole::User,
+                content: Some(serde_json::json!([{
+                    "type": "text",
+                    "text": "anchor",
+                    "cache_control": {"type": "ephemeral"}
+                }])),
+                name: None,
+                tool_call_id: None,
+                tool_calls: None,
+            },
+        ];
+
+        let (system, _anthropic_messages) = convert_messages(&messages);
+        let Some(AnthropicSystem::Blocks(blocks)) = system else {
+            panic!("expected block system while caching is enabled");
+        };
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].text, "System");
+        assert!(blocks[0].cache_control.is_none());
+        assert_eq!(
+            serde_json::to_value(&blocks).unwrap(),
+            serde_json::json!([{"type": "text", "text": "System"}])
+        );
+    }
+
+    #[test]
+    fn test_empty_user_content_falls_back_to_string_form() {
+        let messages = vec![ChatMessage {
+            role: MessageRole::User,
+            content: Some(serde_json::json!([{
+                "type": "text",
+                "text": "",
+                "cache_control": {"type": "ephemeral"}
+            }])),
+            name: None,
+            tool_call_id: None,
+            tool_calls: None,
+        }];
+
+        let (_system, anthropic_messages) = convert_messages(&messages);
+        assert!(matches!(
+            &anthropic_messages[0].content,
+            AnthropicMessageContent::Text(text) if text.is_empty()
+        ));
+        assert_eq!(
+            serde_json::to_value(&anthropic_messages[0]).unwrap()["content"],
+            ""
+        );
+    }
+
+    #[test]
+    fn test_assistant_flattening_unchanged() {
+        let assistant = ChatMessage {
+            role: MessageRole::Assistant,
+            content: Some(serde_json::json!([
+                {"type": "text", "text": "A"},
+                {"type": "text", "text": "B"}
+            ])),
+            name: None,
+            tool_call_id: None,
+            tool_calls: None,
+        };
+        let (_system, uncached_messages) = convert_messages(std::slice::from_ref(&assistant));
+        assert!(matches!(
+            &uncached_messages[0].content,
+            AnthropicMessageContent::Text(text) if text == "A\nB"
+        ));
+
+        let cached_request = vec![
+            ChatMessage {
+                role: MessageRole::User,
+                content: Some(serde_json::json!([{
+                    "type": "text",
+                    "text": "anchor",
+                    "cache_control": {"type": "ephemeral"}
+                }])),
+                name: None,
+                tool_call_id: None,
+                tool_calls: None,
+            },
+            assistant,
+        ];
+        let (_system, cached_messages) = convert_messages(&cached_request);
+        let AnthropicMessageContent::Blocks(blocks) = &cached_messages[1].content else {
+            panic!("expected assistant block form while caching is enabled");
+        };
+        let [AnthropicContentPart::Text {
+            text,
+            cache_control,
+        }] = blocks.as_slice()
+        else {
+            panic!("expected one flattened assistant text block");
+        };
+        assert_eq!(text, "A\nB");
+        assert!(cache_control.is_none());
     }
 
     #[test]
@@ -1152,9 +1586,10 @@ mod tests {
     }
 
     #[test]
-    fn test_cache_control_on_user_text_part_appears_in_request() {
+    fn test_one_hour_cache_control_is_downgraded_to_five_minutes() {
         // A user text part with cache_control forces the block form (even with
-        // no image) and forwards the breakpoint verbatim.
+        // no image). Unsupported one-hour TTLs are removed so Anthropic uses
+        // its default five-minute tier, which Cloud can bill correctly.
         let messages = vec![ChatMessage {
             role: MessageRole::User,
             content: Some(serde_json::json!([
@@ -1187,7 +1622,7 @@ mod tests {
                 assert_eq!(text, "Cached context");
                 assert_eq!(
                     *cache_control,
-                    Some(serde_json::json!({"type": "ephemeral", "ttl": "1h"}))
+                    Some(serde_json::json!({"type": "ephemeral"}))
                 );
             }
             other => panic!("expected text block, got {other:?}"),
@@ -1204,10 +1639,10 @@ mod tests {
             other => panic!("expected text block, got {other:?}"),
         }
 
-        // The serialized outgoing request carries the breakpoint verbatim.
+        // The serialized outgoing request carries the breakpoint without 1h.
         let json = serde_json::to_string(&anthropic_messages[0]).unwrap();
         assert!(json.contains("\"cache_control\""));
-        assert!(json.contains("\"ttl\":\"1h\""));
+        assert!(!json.contains("\"ttl\":\"1h\""));
     }
 
     #[test]
@@ -1318,7 +1753,9 @@ mod tests {
     #[test]
     fn test_cache_control_on_assistant_with_tool_calls_forwards_breakpoint() {
         // Assistant turn with BOTH text (carrying a breakpoint) and tool calls:
-        // the breakpoint must land on the text block, the tool_use blocks follow.
+        // the breakpoint moved to the final tool_use block because Anthropic
+        // caches up to and including the marked block, so the whole turn must
+        // be covered rather than only its leading text.
         let messages = vec![ChatMessage {
             role: MessageRole::Assistant,
             content: Some(serde_json::json!([
@@ -1354,14 +1791,55 @@ mod tests {
                 cache_control,
             } => {
                 assert_eq!(text, "Let me look that up.");
-                assert_eq!(
-                    *cache_control,
-                    Some(serde_json::json!({"type": "ephemeral"}))
+                assert!(
+                    cache_control.is_none(),
+                    "leading text must not end the cached prefix"
                 );
             }
             other => panic!("expected text block first, got {other:?}"),
         }
-        assert!(matches!(blocks[1], AnthropicContentPart::ToolUse { .. }));
+        let serialized_blocks = serde_json::to_value(blocks).unwrap();
+        assert_eq!(serialized_blocks[1]["type"], "tool_use");
+        assert_eq!(
+            serialized_blocks[1]["cache_control"],
+            serde_json::json!({"type": "ephemeral"})
+        );
+    }
+
+    #[test]
+    fn test_cache_control_on_empty_assistant_text_with_tool_calls_reaches_final_tool_use() {
+        let messages = vec![ChatMessage {
+            role: MessageRole::Assistant,
+            content: Some(serde_json::json!([{
+                "type": "text",
+                "text": "",
+                "cache_control": {"type": "ephemeral"}
+            }])),
+            name: None,
+            tool_call_id: None,
+            tool_calls: Some(vec![ToolCall {
+                id: Some("call_empty".to_string()),
+                type_: Some("function".to_string()),
+                function: FunctionCall {
+                    name: Some("search".to_string()),
+                    arguments: Some("{\"q\":\"x\"}".to_string()),
+                },
+                index: None,
+                thought_signature: None,
+            }]),
+        }];
+
+        let (_system, anthropic_messages) = convert_messages(&messages);
+        let AnthropicMessageContent::Blocks(blocks) = &anthropic_messages[0].content else {
+            panic!("expected block form");
+        };
+        assert_eq!(blocks.len(), 1, "empty text must not emit a text block");
+        let serialized_blocks = serde_json::to_value(blocks).unwrap();
+        assert_eq!(serialized_blocks[0]["type"], "tool_use");
+        assert_eq!(
+            serialized_blocks[0]["cache_control"],
+            serde_json::json!({"type": "ephemeral"})
+        );
     }
 
     #[test]
@@ -1424,6 +1902,257 @@ mod tests {
     }
 
     #[test]
+    fn test_cache_control_on_tool_message_reaches_tool_result() {
+        let messages = vec![ChatMessage {
+            role: MessageRole::Tool,
+            content: Some(serde_json::json!([{
+                "type": "text",
+                "text": "record 101: logged.",
+                "cache_control": {"type": "ephemeral"}
+            }])),
+            name: None,
+            tool_call_id: Some("toolu_101".to_string()),
+            tool_calls: None,
+        }];
+
+        let (_system, anthropic_messages) = convert_messages(&messages);
+        assert_eq!(anthropic_messages[0].role, "user");
+        let AnthropicMessageContent::Blocks(blocks) = &anthropic_messages[0].content else {
+            panic!("expected tool result blocks");
+        };
+        assert_eq!(blocks.len(), 1);
+        match &blocks[0] {
+            AnthropicContentPart::ToolResult {
+                tool_use_id,
+                content,
+                cache_control,
+            } => {
+                assert_eq!(tool_use_id, "toolu_101");
+                assert_eq!(content, "record 101: logged.");
+                assert_eq!(
+                    *cache_control,
+                    Some(serde_json::json!({"type": "ephemeral"}))
+                );
+            }
+            other => panic!("expected tool_result block, got {other:?}"),
+        }
+
+        let json = serde_json::to_value(&anthropic_messages[0]).unwrap();
+        assert_eq!(
+            json["content"][0]["cache_control"],
+            serde_json::json!({"type": "ephemeral"})
+        );
+    }
+
+    #[test]
+    fn test_tool_message_without_cache_control_is_unchanged() {
+        let messages = [
+            ChatMessage {
+                role: MessageRole::Tool,
+                content: Some(serde_json::Value::String("bare result".to_string())),
+                name: None,
+                tool_call_id: Some("toolu_bare".to_string()),
+                tool_calls: None,
+            },
+            ChatMessage {
+                role: MessageRole::Tool,
+                content: Some(serde_json::json!([{
+                    "type": "text",
+                    "text": "parts result"
+                }])),
+                name: None,
+                tool_call_id: Some("toolu_parts".to_string()),
+                tool_calls: None,
+            },
+        ];
+
+        let (_system, anthropic_messages) = convert_messages(&messages);
+        for message in &anthropic_messages {
+            let AnthropicMessageContent::Blocks(blocks) = &message.content else {
+                panic!("expected tool result blocks");
+            };
+            let [AnthropicContentPart::ToolResult { cache_control, .. }] = blocks.as_slice() else {
+                panic!("expected one tool result block");
+            };
+            assert!(cache_control.is_none());
+            let json = serde_json::to_value(message).unwrap();
+            assert!(json["content"][0].get("cache_control").is_none());
+        }
+    }
+
+    #[test]
+    fn test_tool_message_last_breakpoint_wins() {
+        let messages = vec![ChatMessage {
+            role: MessageRole::Tool,
+            content: Some(serde_json::json!([
+                {
+                    "type": "text",
+                    "text": "first",
+                    "cache_control": {"type": "ephemeral"}
+                },
+                {
+                    "type": "text",
+                    "text": "second",
+                    "cache_control": {"type": "ephemeral", "ttl": "1h"}
+                }
+            ])),
+            name: None,
+            tool_call_id: Some("toolu_last".to_string()),
+            tool_calls: None,
+        }];
+
+        let (_system, anthropic_messages) = convert_messages(&messages);
+        let AnthropicMessageContent::Blocks(blocks) = &anthropic_messages[0].content else {
+            panic!("expected tool result blocks");
+        };
+        let [AnthropicContentPart::ToolResult { cache_control, .. }] = blocks.as_slice() else {
+            panic!("expected one tool result block");
+        };
+        assert_eq!(
+            *cache_control,
+            Some(serde_json::json!({"type": "ephemeral"}))
+        );
+        let json = serde_json::to_value(&anthropic_messages[0]).unwrap();
+        assert_eq!(
+            json["content"][0]["cache_control"],
+            serde_json::json!({"type": "ephemeral"})
+        );
+    }
+
+    #[test]
+    fn test_breakpoint_cap_keeps_first_and_last_three() {
+        let mut messages = vec![ChatMessage {
+            role: MessageRole::System,
+            content: Some(serde_json::json!([{
+                "type": "text",
+                "text": "system",
+                "cache_control": {"type": "ephemeral", "label": "system"}
+            }])),
+            name: None,
+            tool_call_id: None,
+            tool_calls: None,
+        }];
+        messages.extend((1..=5).map(|index| ChatMessage {
+            role: MessageRole::User,
+            content: Some(serde_json::json!([{
+                "type": "text",
+                "text": format!("user {index}"),
+                "cache_control": {"type": "ephemeral", "label": format!("user-{index}")}
+            }])),
+            name: None,
+            tool_call_id: None,
+            tool_calls: None,
+        }));
+
+        let (system, anthropic_messages) = convert_messages(&messages);
+        let system = system.expect("system should be present");
+        let AnthropicSystem::Blocks(system_blocks) = &system else {
+            panic!("expected system blocks");
+        };
+        assert_eq!(
+            system_blocks[0].cache_control.as_ref().unwrap()["label"],
+            "system"
+        );
+
+        let serialized_messages = serde_json::to_value(&anthropic_messages).unwrap();
+        let labels = serialized_messages
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|message| message["content"][0].get("cache_control"))
+            .map(|cache_control| cache_control["label"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(labels, vec!["user-3", "user-4", "user-5"]);
+        assert_eq!(
+            serde_json::to_value(&system).unwrap()[0]["cache_control"]["label"],
+            "system"
+        );
+    }
+
+    #[test]
+    fn test_breakpoint_cap_no_op_at_or_below_limit() {
+        let messages = (1..=4)
+            .map(|index| ChatMessage {
+                role: MessageRole::User,
+                content: Some(serde_json::json!([{
+                    "type": "text",
+                    "text": format!("user {index}"),
+                    "cache_control": {"type": "ephemeral", "label": format!("user-{index}")}
+                }])),
+                name: None,
+                tool_call_id: None,
+                tool_calls: None,
+            })
+            .collect::<Vec<_>>();
+
+        let (_system, anthropic_messages) = convert_messages(&messages);
+        for (index, message) in anthropic_messages.iter().enumerate() {
+            let AnthropicMessageContent::Blocks(blocks) = &message.content else {
+                panic!("expected user blocks");
+            };
+            let AnthropicContentPart::Text { cache_control, .. } = &blocks[0] else {
+                panic!("expected text block");
+            };
+            assert_eq!(
+                cache_control.as_ref().unwrap()["label"],
+                format!("user-{}", index + 1)
+            );
+        }
+        let serialized = serde_json::to_string(&anthropic_messages).unwrap();
+        assert_eq!(serialized.matches("cache_control").count(), 4);
+    }
+
+    #[test]
+    fn test_breakpoint_cap_counts_tool_results() {
+        let mut messages = (1..=4)
+            .map(|index| ChatMessage {
+                role: MessageRole::User,
+                content: Some(serde_json::json!([{
+                    "type": "text",
+                    "text": format!("user {index}"),
+                    "cache_control": {"type": "ephemeral", "label": format!("user-{index}")}
+                }])),
+                name: None,
+                tool_call_id: None,
+                tool_calls: None,
+            })
+            .collect::<Vec<_>>();
+        messages.push(ChatMessage {
+            role: MessageRole::Tool,
+            content: Some(serde_json::json!([{
+                "type": "text",
+                "text": "tool result",
+                "cache_control": {"type": "ephemeral", "label": "tool"}
+            }])),
+            name: None,
+            tool_call_id: Some("toolu_cap".to_string()),
+            tool_calls: None,
+        });
+
+        let (_system, anthropic_messages) = convert_messages(&messages);
+        let AnthropicMessageContent::Blocks(tool_blocks) = &anthropic_messages[4].content else {
+            panic!("expected tool result blocks");
+        };
+        let [AnthropicContentPart::ToolResult { cache_control, .. }] = tool_blocks.as_slice()
+        else {
+            panic!("expected one tool result block");
+        };
+        assert_eq!(
+            cache_control.as_ref().unwrap()["label"],
+            serde_json::json!("tool")
+        );
+        let serialized = serde_json::to_value(&anthropic_messages).unwrap();
+        let labels = serialized
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|message| message["content"][0].get("cache_control"))
+            .map(|cache_control| cache_control["label"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(labels, vec!["user-1", "user-3", "user-4", "tool"]);
+    }
+
+    #[test]
     fn test_anthropic_usage_deserializes_cache_fields() {
         let json = r#"{"input_tokens":100,"output_tokens":20,"cache_read_input_tokens":80,"cache_creation_input_tokens":40}"#;
         let usage: AnthropicUsage = serde_json::from_str(json).unwrap();
@@ -1460,6 +2189,7 @@ mod tests {
         // prompt_tokens = input + cache_read + cache_creation = 10 + 80 + 5 = 95.
         assert_eq!(usage.prompt_tokens, 95);
         assert_eq!(cached_tokens_of(&usage), 80);
+        assert_eq!(usage.cache_creation_tokens(), 5);
         assert!(
             cached_tokens_of(&usage) <= usage.prompt_tokens as i64,
             "cached_tokens must not exceed prompt_tokens"
@@ -1477,6 +2207,7 @@ mod tests {
         assert_eq!(usage.completion_tokens, 30);
         assert_eq!(usage.total_tokens, 125);
         assert_eq!(cached_tokens_of(&usage), 80);
+        assert_eq!(usage.cache_creation_tokens(), 5);
         assert!(cached_tokens_of(&usage) <= usage.prompt_tokens as i64);
     }
 

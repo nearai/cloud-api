@@ -1,12 +1,14 @@
 pub mod ports;
 pub mod provider_attribution;
 pub mod reporting;
+pub mod text_pricing;
 
 use crate::metrics::{
     consts::{
-        get_environment, METRIC_BILLED_CACHE_READ_TOKENS, METRIC_BILLED_INPUT_COST_USD,
-        METRIC_BILLED_INPUT_TOKENS, METRIC_BILLED_OUTPUT_COST_USD, METRIC_BILLED_OUTPUT_TOKENS,
-        METRIC_BILLED_REQUESTS, METRIC_COST_USD, TAG_ENVIRONMENT, TAG_INFERENCE_TYPE, TAG_MODEL,
+        get_environment, METRIC_BILLED_CACHE_READ_TOKENS, METRIC_BILLED_CACHE_WRITE_TOKENS,
+        METRIC_BILLED_INPUT_COST_USD, METRIC_BILLED_INPUT_TOKENS, METRIC_BILLED_OUTPUT_COST_USD,
+        METRIC_BILLED_OUTPUT_TOKENS, METRIC_BILLED_REQUESTS, METRIC_BILLING_PRICING_FALLBACK,
+        METRIC_COST_USD, TAG_ENVIRONMENT, TAG_INFERENCE_TYPE, TAG_MODEL,
     },
     MetricsServiceTrait,
 };
@@ -14,6 +16,7 @@ pub use ports::*;
 pub use provider_attribution::*;
 pub use reporting::*;
 use std::sync::Arc;
+pub use text_pricing::*;
 use uuid::Uuid;
 
 /// Dedicated UUID v5 namespace for `inference_id`s derived from external `id`s
@@ -57,21 +60,63 @@ pub fn compute_token_cost(
     cache_read_tokens: i32,
     pricing: &ModelPricing,
 ) -> Result<CostBreakdown, UsageError> {
+    compute_token_cost_with_cache_write(
+        input_tokens,
+        output_tokens,
+        cache_read_tokens,
+        None,
+        pricing,
+    )
+}
+
+/// Anthropic's five-minute prompt-cache write rate is 1.25x the ordinary
+/// input rate. Prices use integer nano-dollars, so round half-up when the
+/// multiplier lands between representable values.
+pub fn five_minute_cache_write_rate(input_cost_per_token: i64) -> Option<i64> {
+    if input_cost_per_token < 0 {
+        return None;
+    }
+    input_cost_per_token
+        .checked_mul(5)?
+        .checked_add(2)?
+        .checked_div(4)
+}
+
+/// Compute token cost with an optional separately-priced cache-write subset.
+/// Cache reads and writes are both included in `input_tokens` and are normalized
+/// to non-overlapping subsets before applying their rates.
+pub fn compute_token_cost_with_cache_write(
+    input_tokens: i32,
+    output_tokens: i32,
+    cache_read_tokens: i32,
+    cache_write: Option<CacheWriteBilling>,
+    pricing: &ModelPricing,
+) -> Result<CostBreakdown, UsageError> {
     // Basic validation: token counts must be non-negative. This protects both direct callers
     // (e.g., calculate_cost) and internal usage from accidentally computing negative costs.
-    if input_tokens < 0 || output_tokens < 0 || cache_read_tokens < 0 {
+    if input_tokens < 0
+        || output_tokens < 0
+        || cache_read_tokens < 0
+        || cache_write.is_some_and(|write| write.tokens < 0 || write.cost_per_token < 0)
+    {
         return Err(UsageError::ValidationError(
-            "token counts must be non-negative".into(),
+            "token counts and cache-write price must be non-negative".into(),
         ));
     }
 
     let cache_read = cache_read_tokens.min(input_tokens).max(0) as i64;
-    let non_cached_input = (input_tokens as i64) - cache_read;
+    let cache_write_tokens = cache_write
+        .map(|write| write.tokens)
+        .unwrap_or(0)
+        .min(input_tokens.saturating_sub(cache_read as i32))
+        .max(0) as i64;
+    let non_cached_input = (input_tokens as i64) - cache_read - cache_write_tokens;
     // If cache_read_cost_per_token is None, cache pricing is disabled: bill cached tokens
     // at the normal input rate. Some(0) is a genuinely free cache-read price.
     let effective_cache_rate = pricing
         .cache_read_cost_per_token
         .unwrap_or(pricing.input_cost_per_token);
+    let cache_write_rate = cache_write.map_or(0, |write| write.cost_per_token);
     let input_cost = non_cached_input
         .checked_mul(pricing.input_cost_per_token)
         .and_then(|c| {
@@ -79,10 +124,15 @@ pub fn compute_token_cost(
                 .checked_mul(effective_cache_rate)
                 .and_then(|cr| c.checked_add(cr))
         })
+        .and_then(|c| {
+            cache_write_tokens
+                .checked_mul(cache_write_rate)
+                .and_then(|cw| c.checked_add(cw))
+        })
         .ok_or_else(|| {
             UsageError::CostCalculationOverflow(format!(
-                "Input cost calculation overflow: input_tokens={} cache_read_tokens={}",
-                input_tokens, cache_read_tokens
+                "Input cost calculation overflow: input_tokens={} cache_read_tokens={} cache_write_tokens={}",
+                input_tokens, cache_read_tokens, cache_write_tokens
             ))
         })?;
     let output_cost = (output_tokens as i64)
@@ -177,7 +227,23 @@ impl UsageServiceTrait for UsageServiceImpl {
             .map_err(|e| UsageError::InternalError(format!("Failed to get model: {e}")))?
             .ok_or_else(|| UsageError::ModelNotFound(format!("Model '{model_id}' not found")))?;
 
-        compute_token_cost(input_tokens, output_tokens, cache_read_tokens, &model)
+        if let Some(profile) = &model.text_pricing {
+            Ok(compute_profiled_text_cost(
+                input_tokens,
+                output_tokens,
+                cache_read_tokens,
+                0,
+                TextServiceTier::Default,
+                // This API has no requested/actual tier parameter. Estimate
+                // conservatively instead of assuming Standard, so a preflight
+                // calculation cannot understate Flex/Priority catalog rates.
+                Some("unknown_preflight_tier"),
+                profile,
+            )?
+            .cost)
+        } else {
+            compute_token_cost(input_tokens, output_tokens, cache_read_tokens, &model)
+        }
     }
 
     /// Record usage after an API call completes
@@ -189,6 +255,18 @@ impl UsageServiceTrait for UsageServiceImpl {
         // Ensures cost computation and persisted usage stay consistent across all callers
         // (API, provider parsing, etc.).
         let cache_read_tokens = request.cache_read_tokens.min(request.input_tokens).max(0);
+        let cache_write = request.cache_write.map(|write| CacheWriteBilling {
+            tokens: write
+                .tokens
+                .min(request.input_tokens.saturating_sub(cache_read_tokens))
+                .max(0),
+            cost_per_token: write.cost_per_token,
+        });
+        let legacy_cache_write_tokens = cache_write.map(|write| write.tokens).unwrap_or(0);
+        let profiled_cache_write_tokens = request
+            .profiled_cache_write_tokens
+            .min(request.input_tokens.saturating_sub(cache_read_tokens))
+            .max(0);
 
         // Look up the model to get pricing (model_id is already a UUID)
         let model = self
@@ -201,7 +279,15 @@ impl UsageServiceTrait for UsageServiceImpl {
             })?;
 
         // Calculate costs based on inference type
-        let (input_cost, output_cost, total_cost) = match request.inference_type {
+        let (
+            input_cost,
+            output_cost,
+            total_cost,
+            cache_write_tokens,
+            billing_details,
+            service_tier,
+            context_band,
+        ) = match request.inference_type {
             ports::InferenceType::ImageGeneration | ports::InferenceType::ImageEdit => {
                 // For image-based operations: use image_count and cost_per_image
                 let image_count = request.image_count.unwrap_or(0);
@@ -214,7 +300,15 @@ impl UsageServiceTrait for UsageServiceImpl {
                             image_count, model.cost_per_image
                         ))
                     })?;
-                (0, image_cost, image_cost)
+                (
+                    0,
+                    image_cost,
+                    image_cost,
+                    legacy_cache_write_tokens,
+                    None,
+                    None,
+                    None,
+                )
             }
             ports::InferenceType::AudioTranscription => {
                 // For audio transcription: bill by duration in seconds (stored in input_tokens).
@@ -229,7 +323,15 @@ impl UsageServiceTrait for UsageServiceImpl {
                             request.input_tokens, model.input_cost_per_token
                         ))
                     })?;
-                (duration_cost, 0, duration_cost)
+                (
+                    duration_cost,
+                    0,
+                    duration_cost,
+                    legacy_cache_write_tokens,
+                    None,
+                    None,
+                    None,
+                )
             }
             ports::InferenceType::Rerank
             | ports::InferenceType::Embedding
@@ -249,17 +351,77 @@ impl UsageServiceTrait for UsageServiceImpl {
                             model.input_cost_per_token
                         ))
                     })?;
-                (cost, 0, cost)
+                (cost, 0, cost, legacy_cache_write_tokens, None, None, None)
             }
             _ => {
                 // For token-based models (chat completions, etc.)
-                let cost = compute_token_cost(
-                    request.input_tokens,
-                    request.output_tokens,
-                    cache_read_tokens,
-                    &model,
-                )?;
-                (cost.input_cost, cost.output_cost, cost.total_cost)
+                if let Some(profile) = &model.text_pricing {
+                    let requested_tier = request
+                        .requested_service_tier
+                        .unwrap_or(TextServiceTier::Default);
+                    let priced = compute_profiled_text_cost(
+                        request.input_tokens,
+                        request.output_tokens,
+                        cache_read_tokens,
+                        profiled_cache_write_tokens,
+                        requested_tier,
+                        request.provider_service_tier.as_deref(),
+                        profile,
+                    )?;
+                    if let Some(reason) = priced.snapshot.critical_fallback_reason.as_deref() {
+                        let environment = get_environment();
+                        let tags = [
+                            format!("{}:{}", TAG_MODEL, model.model_name),
+                            format!("reason:{reason}"),
+                            format!("{TAG_ENVIRONMENT}:{environment}"),
+                        ];
+                        let tag_refs: Vec<&str> = tags.iter().map(String::as_str).collect();
+                        self.metrics_service.record_count(
+                            METRIC_BILLING_PRICING_FALLBACK,
+                            1,
+                            &tag_refs,
+                        );
+                        tracing::error!(
+                            model = %model.model_name,
+                            reason,
+                            "Critical billing pricing fallback applied"
+                        );
+                    }
+                    let service_tier = Some(priced.snapshot.actual_tier.clone());
+                    let context_band = Some(priced.snapshot.context_band.as_str().to_string());
+                    let billing_details =
+                        Some(serde_json::to_value(&priced.snapshot).map_err(|error| {
+                            UsageError::InternalError(format!(
+                                "Failed to serialize billing snapshot: {error}"
+                            ))
+                        })?);
+                    (
+                        priced.cost.input_cost,
+                        priced.cost.output_cost,
+                        priced.cost.total_cost,
+                        profiled_cache_write_tokens,
+                        billing_details,
+                        service_tier,
+                        context_band,
+                    )
+                } else {
+                    let cost = compute_token_cost_with_cache_write(
+                        request.input_tokens,
+                        request.output_tokens,
+                        cache_read_tokens,
+                        cache_write,
+                        &model,
+                    )?;
+                    (
+                        cost.input_cost,
+                        cost.output_cost,
+                        cost.total_cost,
+                        legacy_cache_write_tokens,
+                        None,
+                        None,
+                        None,
+                    )
+                }
             }
         };
 
@@ -276,6 +438,10 @@ impl UsageServiceTrait for UsageServiceImpl {
             input_tokens: request.input_tokens,
             output_tokens: request.output_tokens,
             cache_read_tokens,
+            cache_write_tokens,
+            billing_details,
+            service_tier: service_tier.clone(),
+            context_band: context_band.clone(),
             input_cost,
             output_cost,
             total_cost,
@@ -304,11 +470,17 @@ impl UsageServiceTrait for UsageServiceImpl {
         // dimensioned by model + inference_type.
         if log.was_inserted {
             let environment = get_environment();
-            let tags = [
+            let mut tags = vec![
                 format!("{}:{}", TAG_MODEL, model.model_name),
                 format!("{}:{}", TAG_INFERENCE_TYPE, request.inference_type.as_str()),
                 format!("{TAG_ENVIRONMENT}:{environment}"),
             ];
+            if let Some(tier) = &service_tier {
+                tags.push(format!("service_tier:{tier}"));
+            }
+            if let Some(band) = &context_band {
+                tags.push(format!("context_band:{band}"));
+            }
             let tags_str: Vec<&str> = tags.iter().map(|s| s.as_str()).collect();
 
             let metrics = &self.metrics_service;
@@ -326,6 +498,11 @@ impl UsageServiceTrait for UsageServiceImpl {
             metrics.record_count(
                 METRIC_BILLED_CACHE_READ_TOKENS,
                 cache_read_tokens as i64,
+                &tags_str,
+            );
+            metrics.record_count(
+                METRIC_BILLED_CACHE_WRITE_TOKENS,
+                cache_write_tokens as i64,
                 &tags_str,
             );
             metrics.record_count(METRIC_BILLED_INPUT_COST_USD, input_cost, &tags_str);
@@ -544,6 +721,10 @@ impl UsageServiceTrait for UsageServiceImpl {
             input_tokens,
             output_tokens,
             cache_read_tokens,
+            cache_write: None,
+            profiled_cache_write_tokens: 0,
+            requested_service_tier: None,
+            provider_service_tier: None,
             inference_type,
             ttft_ms: None,
             avg_itl_ms: None,
@@ -816,7 +997,10 @@ impl UsageServiceTrait for UsageServiceImpl {
 
 #[cfg(test)]
 mod tests {
-    use super::{compute_token_cost, CostBreakdown, ModelPricing, UsageError};
+    use super::{
+        compute_token_cost, compute_token_cost_with_cache_write, five_minute_cache_write_rate,
+        CacheWriteBilling, CostBreakdown, ModelPricing, UsageError,
+    };
     use uuid::Uuid;
 
     fn make_pricing(
@@ -831,11 +1015,21 @@ mod tests {
             output_cost_per_token,
             cost_per_image: 0,
             cache_read_cost_per_token,
+            text_pricing: None,
         }
     }
 
     fn unwrap_cost(result: Result<CostBreakdown, UsageError>) -> CostBreakdown {
         result.expect("cost calculation should not overflow in this test")
+    }
+
+    #[test]
+    fn five_minute_cache_write_rate_rounds_half_up() {
+        assert_eq!(five_minute_cache_write_rate(4), Some(5));
+        assert_eq!(five_minute_cache_write_rate(250), Some(313));
+        assert_eq!(five_minute_cache_write_rate(251), Some(314));
+        assert_eq!(five_minute_cache_write_rate(-1), None);
+        assert_eq!(five_minute_cache_write_rate(i64::MAX), None);
     }
 
     #[test]
@@ -858,6 +1052,44 @@ mod tests {
         assert_eq!(cost.input_cost, 60 * 10 + 40 * 5);
         assert_eq!(cost.output_cost, 50 * 20);
         assert_eq!(cost.total_cost, cost.input_cost + cost.output_cost);
+    }
+
+    #[test]
+    fn test_compute_token_cost_with_cache_read_and_write() {
+        let pricing = make_pricing(10, 20, Some(2));
+        let cost = unwrap_cost(compute_token_cost_with_cache_write(
+            100,
+            5,
+            30,
+            Some(CacheWriteBilling {
+                tokens: 20,
+                cost_per_token: 15,
+            }),
+            &pricing,
+        ));
+
+        // 50 uncached * 10 + 30 reads * 2 + 20 writes * 15.
+        assert_eq!(cost.input_cost, 500 + 60 + 300);
+        assert_eq!(cost.output_cost, 100);
+        assert_eq!(cost.total_cost, 960);
+    }
+
+    #[test]
+    fn test_compute_token_cost_caps_cache_write_after_cache_read() {
+        let pricing = make_pricing(10, 20, Some(2));
+        let cost = unwrap_cost(compute_token_cost_with_cache_write(
+            100,
+            0,
+            80,
+            Some(CacheWriteBilling {
+                tokens: 50,
+                cost_per_token: 15,
+            }),
+            &pricing,
+        ));
+
+        // Reads consume 80 of the 100 input tokens, so writes are capped at 20.
+        assert_eq!(cost.input_cost, 80 * 2 + 20 * 15);
     }
 
     #[test]

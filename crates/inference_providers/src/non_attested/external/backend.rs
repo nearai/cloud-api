@@ -5,11 +5,12 @@
 //! and the provider's native format.
 
 use crate::{
-    AudioTranscriptionError, AudioTranscriptionParams, AudioTranscriptionResponse,
-    ChatCompletionParams, ChatCompletionResponseWithBytes, CompletionError, EmbeddingError,
-    ImageEditError, ImageEditParams, ImageEditResponseWithBytes, ImageGenerationError,
-    ImageGenerationParams, ImageGenerationResponseWithBytes, PrivacyClassifyError, RerankError,
-    RerankParams, RerankResponse, ScoreError, ScoreParams, ScoreResponse, StreamingResult,
+    AnthropicRawError, AnthropicRawRequest, AnthropicRawResponse, AudioTranscriptionError,
+    AudioTranscriptionParams, AudioTranscriptionResponse, ChatCompletionParams,
+    ChatCompletionResponseWithBytes, CompletionError, EmbeddingError, ImageEditError,
+    ImageEditParams, ImageEditResponseWithBytes, ImageGenerationError, ImageGenerationParams,
+    ImageGenerationResponseWithBytes, PrivacyClassifyError, RerankError, RerankParams,
+    RerankResponse, ScoreError, ScoreParams, ScoreResponse, StreamingResult,
 };
 use async_trait::async_trait;
 use std::collections::HashMap;
@@ -202,5 +203,15 @@ pub trait ExternalBackend: Send + Sync {
             "Privacy classification is not supported by the {} backend.",
             self.backend_type()
         )))
+    }
+
+    /// Performs a native Anthropic Messages request as a raw HTTP passthrough.
+    async fn anthropic_raw(
+        &self,
+        _config: &BackendConfig,
+        _model: &str,
+        _request: AnthropicRawRequest,
+    ) -> Result<AnthropicRawResponse, AnthropicRawError> {
+        Err(AnthropicRawError::UnsupportedProvider)
     }
 }

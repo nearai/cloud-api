@@ -33,6 +33,7 @@ pub struct UsageSeed {
     pub input_tokens: i32,
     pub output_tokens: i32,
     pub cache_read_tokens: i32,
+    pub cache_write_tokens: i32,
     pub input_cost: i64,
     pub output_cost: i64,
     pub total_cost: i64,
@@ -175,10 +176,10 @@ pub async fn insert_usage(pool: &DbPool, seed: &UsageSeed) -> anyhow::Result<()>
         .execute(
             "INSERT INTO organization_usage_log (
                 id, organization_id, workspace_id, api_key_id, response_id, model_id, model_name,
-                input_tokens, output_tokens, cache_read_tokens, total_tokens,
+                input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, total_tokens,
                 input_cost, output_cost, total_cost, request_type, inference_type, created_at,
                 inference_id, provider_request_id, stop_reason
-             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, NULL, $15, $16, $17, $18, 'completed')",
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, NULL, $16, $17, $18, $19, 'completed')",
             &[
                 &seed.id,
                 &seed.org_id,
@@ -190,6 +191,7 @@ pub async fn insert_usage(pool: &DbPool, seed: &UsageSeed) -> anyhow::Result<()>
                 &seed.input_tokens,
                 &seed.output_tokens,
                 &seed.cache_read_tokens,
+                &seed.cache_write_tokens,
                 &(seed.input_tokens + seed.output_tokens),
                 &seed.input_cost,
                 &seed.output_cost,

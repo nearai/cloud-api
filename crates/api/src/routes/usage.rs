@@ -216,6 +216,14 @@ pub struct UsageHistoryEntryResponse {
     pub output_tokens: i32,
     /// Number of prompt tokens that were cache hits
     pub cache_read_tokens: i32,
+    /// Number of prompt tokens written to provider cache
+    pub cache_write_tokens: i32,
+    #[serde(rename = "serviceTier", skip_serializing_if = "Option::is_none")]
+    pub service_tier: Option<String>,
+    #[serde(rename = "contextBand", skip_serializing_if = "Option::is_none")]
+    pub context_band: Option<String>,
+    #[serde(rename = "billingDetails", skip_serializing_if = "Option::is_none")]
+    pub billing_details: Option<serde_json::Value>,
     pub total_tokens: i32,
     pub total_cost: i64,            // In nano-dollars (scale 9)
     pub total_cost_display: String, // Human readable, e.g., "$0.00123"
@@ -433,6 +441,10 @@ pub async fn get_organization_usage_history(
             input_tokens: entry.input_tokens,
             output_tokens: entry.output_tokens,
             cache_read_tokens: entry.cache_read_tokens,
+            cache_write_tokens: entry.cache_write_tokens,
+            service_tier: entry.service_tier,
+            context_band: entry.context_band,
+            billing_details: entry.billing_details,
             total_tokens: entry.total_tokens,
             total_cost: entry.total_cost,
             total_cost_display: format_amount(entry.total_cost),
@@ -588,6 +600,13 @@ fn usage_report_row_response(
         input_tokens: checked_usage_history_i32(row.input_tokens, "input_tokens")?,
         output_tokens: checked_usage_history_i32(row.output_tokens, "output_tokens")?,
         cache_read_tokens: checked_usage_history_i32(row.cache_read_tokens, "cache_read_tokens")?,
+        cache_write_tokens: checked_usage_history_i32(
+            row.cache_write_tokens,
+            "cache_write_tokens",
+        )?,
+        service_tier: row.service_tier,
+        context_band: row.context_band,
+        billing_details: row.billing_details,
         total_tokens: checked_usage_history_i32(row.total_tokens, "total_tokens")?,
         total_cost: row.total_cost_nano_usd,
         total_cost_display: format_amount(row.total_cost_nano_usd),
@@ -833,6 +852,10 @@ pub async fn get_api_key_usage_history(
             input_tokens: entry.input_tokens,
             output_tokens: entry.output_tokens,
             cache_read_tokens: entry.cache_read_tokens,
+            cache_write_tokens: entry.cache_write_tokens,
+            service_tier: entry.service_tier,
+            context_band: entry.context_band,
+            billing_details: entry.billing_details,
             total_tokens: entry.total_tokens,
             total_cost: entry.total_cost,
             total_cost_display: format_amount(entry.total_cost),
@@ -878,6 +901,8 @@ pub enum RecordUsageResponse {
         total_tokens: i32,
         /// Number of prompt tokens that were cache hits (subset of input_tokens)
         cache_read_tokens: i32,
+        /// Number of prompt tokens written to provider cache (subset of input_tokens)
+        cache_write_tokens: i32,
         /// Input cost in nano-dollars (scale 9)
         input_cost: i64,
         /// Output cost in nano-dollars (scale 9)
@@ -936,6 +961,7 @@ fn build_record_usage_response(entry: services::usage::UsageLogEntry) -> RecordU
             output_tokens: entry.output_tokens,
             total_tokens: entry.total_tokens,
             cache_read_tokens: entry.cache_read_tokens,
+            cache_write_tokens: entry.cache_write_tokens,
             input_cost: entry.input_cost,
             output_cost: entry.output_cost,
             total_cost: entry.total_cost,

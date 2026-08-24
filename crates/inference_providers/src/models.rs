@@ -190,6 +190,18 @@ pub struct StreamOptions {
     pub extra: std::collections::HashMap<String, serde_json::Value>,
 }
 
+/// OpenAI Chat Completions processing tier. `fast` is accepted as the public
+/// alias and normalized to the canonical `priority` value before forwarding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ChatServiceTier {
+    Auto,
+    Default,
+    Flex,
+    #[serde(alias = "fast")]
+    Priority,
+}
+
 /// Parameters for chat completion requests (matches OpenAI API)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatCompletionParams {
@@ -279,9 +291,17 @@ pub struct ChatCompletionParams {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stream_options: Option<StreamOptions>,
 
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub service_tier: Option<ChatServiceTier>,
+
     /// Output modalities: ["text"], ["audio"], or ["text", "audio"] (for Qwen3-Omni)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub modalities: Option<Vec<String>>,
+
+    /// Original Chat Completions JSON for protocol-specific adapters. This
+    /// in-memory sidecar is never serialized to an upstream provider.
+    #[serde(default, skip_serializing, skip_deserializing)]
+    pub original_request: Option<serde_json::Value>,
 
     #[serde(flatten)]
     pub extra: std::collections::HashMap<String, serde_json::Value>,
@@ -421,6 +441,41 @@ impl TokenUsage {
             .unwrap_or(0);
         n.min(self.prompt_tokens).max(0)
     }
+
+    /// Number of prompt tokens used to create an Anthropic prompt-cache entry.
+    /// This provider-specific detail is a non-overlapping subset of
+    /// `prompt_tokens`, after cache-read tokens are accounted for.
+    pub fn cache_creation_tokens(&self) -> i32 {
+        let Some(ref details) = self.prompt_tokens_details else {
+            return 0;
+        };
+        let Some(value) = details.get("cache_creation_tokens") else {
+            return 0;
+        };
+        let tokens = value
+            .as_i64()
+            .and_then(|value| i32::try_from(value).ok())
+            .unwrap_or(0)
+            .max(0);
+        tokens.min(self.prompt_tokens.saturating_sub(self.cached_tokens()))
+    }
+
+    /// Number of OpenAI prompt tokens written to implicit cache. This remains
+    /// separate from Anthropic's `cache_creation_tokens` field.
+    pub fn cache_write_tokens(&self) -> i32 {
+        let Some(ref details) = self.prompt_tokens_details else {
+            return 0;
+        };
+        let Some(value) = details.get("cache_write_tokens") else {
+            return 0;
+        };
+        let tokens = value
+            .as_i64()
+            .and_then(|value| i32::try_from(value).ok())
+            .unwrap_or(0)
+            .max(0);
+        tokens.min(self.prompt_tokens.saturating_sub(self.cached_tokens()))
+    }
 }
 
 /// Audio output data (for Qwen3-Omni and similar models)
@@ -460,6 +515,11 @@ pub struct ChatCompletionChunk {
     /// Usage statistics (typically only in final chunk). OpenAI-compatible
     /// streaming chunks carry this as `null` until final usage is available.
     pub usage: Option<TokenUsage>,
+
+    /// Actual processing tier used by the provider. Kept as a string so an
+    /// unknown future value reaches the billing fail-safe.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub service_tier: Option<String>,
 
     /// Token IDs for the prompt (typically only in first chunk)
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1690,6 +1750,78 @@ mod tests {
 
         let reserialized = serde_json::to_string(&response).unwrap();
         assert!(reserialized.contains("\"sglext\""));
+    }
+
+    #[test]
+    fn token_usage_keeps_openai_and_anthropic_cache_writes_separate() {
+        let usage: TokenUsage = serde_json::from_value(serde_json::json!({
+            "prompt_tokens": 1_000,
+            "completion_tokens": 10,
+            "total_tokens": 1_010,
+            "prompt_tokens_details": {
+                "cached_tokens": 200,
+                "cache_write_tokens": 300,
+                "cache_creation_tokens": 400
+            }
+        }))
+        .unwrap();
+
+        assert_eq!(usage.cached_tokens(), 200);
+        assert_eq!(usage.cache_write_tokens(), 300);
+        assert_eq!(usage.cache_creation_tokens(), 400);
+    }
+
+    #[test]
+    fn token_usage_clamps_cache_classes_to_non_overlapping_prompt_tokens() {
+        let usage: TokenUsage = serde_json::from_value(serde_json::json!({
+            "prompt_tokens": 100,
+            "completion_tokens": 0,
+            "total_tokens": 100,
+            "prompt_tokens_details": {
+                "cached_tokens": 80,
+                "cache_write_tokens": 90,
+                "cache_creation_tokens": 90
+            }
+        }))
+        .unwrap();
+
+        assert_eq!(usage.cached_tokens(), 80);
+        assert_eq!(usage.cache_write_tokens(), 20);
+        assert_eq!(usage.cache_creation_tokens(), 20);
+    }
+
+    #[test]
+    fn chat_responses_preserve_actual_service_tier() {
+        let response: ChatCompletionResponse = serde_json::from_value(serde_json::json!({
+            "id": "chatcmpl-tier",
+            "object": "chat.completion",
+            "created": 1,
+            "model": "gpt-5.6-sol",
+            "choices": [],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            "service_tier": "default"
+        }))
+        .unwrap();
+        assert_eq!(response.service_tier.as_deref(), Some("default"));
+
+        let chunk: ChatCompletionChunk = serde_json::from_value(serde_json::json!({
+            "id": "chatcmpl-tier",
+            "object": "chat.completion.chunk",
+            "created": 1,
+            "model": "gpt-5.6-sol",
+            "choices": [],
+            "usage": null,
+            "service_tier": "priority"
+        }))
+        .unwrap();
+        assert_eq!(chunk.service_tier.as_deref(), Some("priority"));
+    }
+
+    #[test]
+    fn fast_service_tier_alias_serializes_canonically_as_priority() {
+        let tier: ChatServiceTier = serde_json::from_str("\"fast\"").unwrap();
+        assert_eq!(tier, ChatServiceTier::Priority);
+        assert_eq!(serde_json::to_string(&tier).unwrap(), "\"priority\"");
     }
 }
 

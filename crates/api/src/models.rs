@@ -52,6 +52,9 @@ pub struct ChatCompletionRequest {
     pub stop: Option<StopSequences>,
     pub presence_penalty: Option<f32>,
     pub frequency_penalty: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<String>)]
+    pub service_tier: Option<inference_providers::ChatServiceTier>,
 
     #[serde(flatten)]
     pub extra: HashMap<String, Value>,
@@ -1077,6 +1080,10 @@ pub struct ModelInfo {
     /// Pricing information (HuggingFace + OpenRouter compatible).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pricing: Option<ModelPricing>,
+    /// Exact, versioned USD-per-million text pricing. The legacy `pricing`
+    /// projection remains Standard-short for compatibility.
+    #[serde(rename = "textPricing", skip_serializing_if = "Option::is_none")]
+    pub text_pricing: Option<serde_json::Value>,
     /// Context length in tokens.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context_length: Option<i32>,
@@ -1237,6 +1244,33 @@ pub struct ErrorDetail {
     pub r#type: String,
     pub param: Option<String>,
     pub code: Option<String>,
+}
+
+/// Anthropic-compatible error envelope used by the native Messages routes.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct AnthropicErrorResponse {
+    #[serde(rename = "type")]
+    pub type_: String,
+    pub error: AnthropicErrorDetail,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct AnthropicErrorDetail {
+    #[serde(rename = "type")]
+    pub type_: String,
+    pub message: String,
+}
+
+impl AnthropicErrorResponse {
+    pub fn new(error_type: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            type_: "error".to_string(),
+            error: AnthropicErrorDetail {
+                type_: error_type.into(),
+                message: message.into(),
+            },
+        }
+    }
 }
 
 // ============================================
@@ -1604,6 +1638,9 @@ pub struct CreateResponseRequest {
     pub safety_identifier: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prompt_cache_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<String>)]
+    pub service_tier: Option<inference_providers::ChatServiceTier>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub signing_algo: Option<String>,
 }
@@ -2397,6 +2434,16 @@ impl CreateResponseRequest {
             }
         }
 
+        if matches!(
+            self.service_tier,
+            Some(
+                inference_providers::ChatServiceTier::Flex
+                    | inference_providers::ChatServiceTier::Priority
+            )
+        ) {
+            return Err("service_tier must be 'auto' or 'default' for /v1/responses".to_string());
+        }
+
         // Validate mutual exclusivity
         if self.conversation.is_some() && self.previous_response_id.is_some() {
             return Err("Cannot specify both conversation and previous_response_id".to_string());
@@ -2898,6 +2945,66 @@ pub struct ListUsersResponse {
     pub offset: i64,
 }
 
+/// Admin AML report audit entry.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct AdminAmlReportResponse {
+    pub id: String,
+    pub user_id: Option<String>,
+    pub flow: String,
+    pub provider: String,
+    pub account_id: String,
+    pub address_type: String,
+    pub risk_level: String,
+    pub score: Option<i32>,
+    pub report_id: Option<String>,
+    pub reason: Option<String>,
+    pub provider_report_time: Option<DateTime<Utc>>,
+    pub active: bool,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// Paginated admin AML reports response.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ListAdminAmlReportsResponse {
+    pub reports: Vec<AdminAmlReportResponse>,
+    pub total: i64,
+    pub limit: i64,
+    pub offset: i64,
+}
+
+/// Admin AML report status update request.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct UpdateAmlReportStatusRequest {
+    pub active: bool,
+}
+
+/// Admin AML allowlist entry response.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct AdminAmlAllowlistEntryResponse {
+    pub account_id: String,
+    pub address_type: String,
+    pub reason: Option<String>,
+    pub created_by_user_id: Option<String>,
+    pub created_at: DateTime<Utc>,
+}
+
+/// Admin AML allowlist response.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ListAdminAmlAllowlistResponse {
+    pub accounts: Vec<AdminAmlAllowlistEntryResponse>,
+    pub total: i64,
+    pub limit: i64,
+    pub offset: i64,
+}
+
+/// Admin AML allowlist upsert request.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct UpsertAmlAllowlistEntryRequest {
+    pub account_id: String,
+    pub reason: Option<String>,
+}
+
 /// Organization details for admin organization listing
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct AdminOrganizationResponse {
@@ -3307,6 +3414,8 @@ pub struct AdminModelWithPricing {
         skip_serializing_if = "Option::is_none"
     )]
     pub cache_read_cost_per_token: Option<DecimalPrice>,
+    #[serde(rename = "textPricing", skip_serializing_if = "Option::is_none")]
+    pub text_pricing: Option<serde_json::Value>,
     pub metadata: ModelMetadata,
     #[serde(rename = "isActive")]
     pub is_active: bool,
@@ -3334,6 +3443,8 @@ pub struct ModelWithPricing {
         skip_serializing_if = "Option::is_none"
     )]
     pub cache_read_cost_per_token: Option<DecimalPrice>,
+    #[serde(rename = "textPricing", skip_serializing_if = "Option::is_none")]
+    pub text_pricing: Option<serde_json::Value>,
     pub metadata: ModelMetadata,
 }
 
@@ -3503,6 +3614,16 @@ pub struct UpdateModelApiRequest {
     )]
     #[schema(value_type = Option<DecimalPriceRequest>)]
     pub cache_read_cost_per_token: Nullable<DecimalPriceRequest>,
+    /// Exact, versioned USD-per-million text pricing profile.
+    /// Omitted leaves it unchanged; null removes it.
+    #[serde(
+        rename = "textPricing",
+        default,
+        deserialize_with = "deserialize_nullable",
+        skip_serializing_if = "Option::is_none"
+    )]
+    #[schema(value_type = Option<Object>)]
+    pub text_pricing: Nullable<serde_json::Value>,
     #[serde(rename = "modelDisplayName")]
     pub model_display_name: Option<String>,
     #[serde(rename = "modelDescription")]
@@ -3740,6 +3861,9 @@ pub struct PricingChangeItemRequest {
     pub cache_read_cost_per_token: Option<DecimalPriceRequest>,
     #[serde(rename = "costPerImage", skip_serializing_if = "Option::is_none")]
     pub cost_per_image: Option<DecimalPriceRequest>,
+    #[serde(rename = "textPricing", skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<Object>)]
+    pub text_pricing: Option<serde_json::Value>,
 }
 
 /// Request to preview or confirm a batch of scheduled pricing changes.
@@ -3771,6 +3895,8 @@ pub struct PricingFields {
     pub cache_read_cost_per_token: Option<DecimalPrice>,
     #[serde(rename = "costPerImage")]
     pub cost_per_image: DecimalPrice,
+    #[serde(rename = "textPricing", skip_serializing_if = "Option::is_none")]
+    pub text_pricing: Option<serde_json::Value>,
 }
 
 /// Partial pricing update; omitted fields are unchanged.
@@ -3787,6 +3913,8 @@ pub struct PricingFieldUpdates {
     pub cache_read_cost_per_token: Option<DecimalPrice>,
     #[serde(rename = "costPerImage", skip_serializing_if = "Option::is_none")]
     pub cost_per_image: Option<DecimalPrice>,
+    #[serde(rename = "textPricing", skip_serializing_if = "Option::is_none")]
+    pub text_pricing: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
@@ -3889,6 +4017,8 @@ pub struct ModelHistoryEntry {
         skip_serializing_if = "Option::is_none"
     )]
     pub cache_read_cost_per_token: Option<DecimalPrice>,
+    #[serde(rename = "textPricing", skip_serializing_if = "Option::is_none")]
+    pub text_pricing: Option<serde_json::Value>,
     #[serde(rename = "contextLength")]
     pub context_length: i32,
     #[serde(rename = "modelName")]
@@ -4456,6 +4586,7 @@ mod tests {
             stop: None,
             presence_penalty: None,
             frequency_penalty: None,
+            service_tier: None,
             extra: std::collections::HashMap::new(),
         };
 
@@ -4641,6 +4772,7 @@ mod tests {
             stop: None,
             presence_penalty: None,
             frequency_penalty: None,
+            service_tier: None,
             extra: std::collections::HashMap::new(),
         };
 
@@ -4678,6 +4810,7 @@ mod tests {
             stop: None,
             presence_penalty: None,
             frequency_penalty: None,
+            service_tier: None,
             extra: std::collections::HashMap::new(),
         };
 
@@ -4710,6 +4843,7 @@ mod tests {
             stop: None,
             presence_penalty: None,
             frequency_penalty: None,
+            service_tier: None,
             extra: std::collections::HashMap::new(),
         };
 
@@ -4740,6 +4874,7 @@ mod tests {
             stop: None,
             presence_penalty: None,
             frequency_penalty: None,
+            service_tier: None,
             extra: std::collections::HashMap::new(),
         };
 
@@ -4768,6 +4903,7 @@ mod tests {
             stop: None,
             presence_penalty: None,
             frequency_penalty: None,
+            service_tier: None,
             extra: std::collections::HashMap::new(),
         }
     }

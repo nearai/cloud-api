@@ -118,6 +118,7 @@ pub fn test_config() -> ApiConfig {
             endpoint: std::env::var("TELEMETRY_OTLP_ENDPOINT")
                 .unwrap_or_else(|_| "http://localhost:4317".to_string()),
             protocol: std::env::var("TELEMETRY_OTLP_PROTOCOL").unwrap_or("grpc".to_string()),
+            instance_id: None,
         },
         cors: config::CorsConfig::default(),
         external_providers: config::ExternalProvidersConfig::default(),
@@ -929,6 +930,7 @@ pub fn e2e_qwen_model_pricing_no_cache() -> ModelPricing {
         output_cost_per_token: E2E_QWEN_OUTPUT_COST_PER_TOKEN,
         cost_per_image: 0,
         cache_read_cost_per_token: E2E_QWEN_CACHE_READ_COST_NO_CACHE,
+        text_pricing: None,
     }
 }
 
@@ -941,6 +943,7 @@ pub fn e2e_qwen_model_pricing_with_cache() -> ModelPricing {
         output_cost_per_token: E2E_QWEN_OUTPUT_COST_PER_TOKEN,
         cost_per_image: 0,
         cache_read_cost_per_token: Some(E2E_QWEN_CACHE_READ_COST_WITH_CACHE),
+        text_pricing: None,
     }
 }
 

@@ -1,4 +1,5 @@
 use super::provider_attribution::ProviderAttribution;
+use super::text_pricing::{TextPricingProfile, TextServiceTier};
 use crate::responses::models::ResponseId;
 pub use crate::usage::reporting::{
     InferenceUsageHistoryQuery, InferenceUsageReportCursor, InferenceUsageReportQuery,
@@ -499,6 +500,14 @@ pub enum RecordUsageApiRequest {
 }
 
 /// Request to record usage (service layer)
+#[derive(Debug, Clone, Copy)]
+pub struct CacheWriteBilling {
+    /// Cache-write tokens, included in `input_tokens`.
+    pub tokens: i32,
+    /// Explicit cache-write price in nano-dollars per token.
+    pub cost_per_token: i64,
+}
+
 #[derive(Debug, Clone)]
 pub struct RecordUsageServiceRequest {
     pub organization_id: Uuid,
@@ -509,6 +518,16 @@ pub struct RecordUsageServiceRequest {
     pub output_tokens: i32,
     /// Number of prompt tokens that were cache hits (subset of input_tokens)
     pub cache_read_tokens: i32,
+    /// Optional separately-priced cache writes (also a subset of input_tokens).
+    pub cache_write: Option<CacheWriteBilling>,
+    /// Cache-write tokens for an exact text pricing profile. These are also a
+    /// subset of input_tokens; the rate comes from the selected profile row.
+    pub profiled_cache_write_tokens: i32,
+    /// Explicit tier forwarded to the provider for profiled text models.
+    pub requested_service_tier: Option<TextServiceTier>,
+    /// Tier returned by the provider. Kept as a string so unknown future
+    /// values can trigger fail-safe pricing instead of deserialization loss.
+    pub provider_service_tier: Option<String>,
     pub inference_type: InferenceType,
     /// Time to first token in milliseconds
     pub ttft_ms: Option<i32>,
@@ -539,6 +558,10 @@ pub struct RecordUsageDbRequest {
     pub input_tokens: i32,
     pub output_tokens: i32,
     pub cache_read_tokens: i32,
+    pub cache_write_tokens: i32,
+    pub billing_details: Option<serde_json::Value>,
+    pub service_tier: Option<String>,
+    pub context_band: Option<String>,
     pub input_cost: i64,
     pub output_cost: i64,
     pub total_cost: i64,
@@ -573,6 +596,7 @@ pub struct ModelPricing {
     /// tokens billed at `input_cost_per_token`); `Some(x)` (x >= 0) = cached
     /// tokens billed at `x` (`Some(0)` = genuinely free).
     pub cache_read_cost_per_token: Option<i64>,
+    pub text_pricing: Option<TextPricingProfile>,
 }
 
 /// Organization spending limit
@@ -656,6 +680,10 @@ pub struct UsageLogEntry {
     pub input_tokens: i32,
     pub output_tokens: i32,
     pub cache_read_tokens: i32,
+    pub cache_write_tokens: i32,
+    pub billing_details: Option<serde_json::Value>,
+    pub service_tier: Option<String>,
+    pub context_band: Option<String>,
     pub total_tokens: i32,
     pub input_cost: i64,
     pub output_cost: i64,

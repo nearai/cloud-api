@@ -121,7 +121,9 @@ impl From<ChatCompletionRequest> for ChatCompletionParams {
             metadata: None,
             store: None,
             stream_options,
+            service_tier: req.service_tier,
             modalities,
+            original_request: None,
             extra,
         }
     }
@@ -930,6 +932,7 @@ mod tests {
             stop: Some(crate::models::StopSequences::Many(vec!["\\n".to_string()])),
             presence_penalty: None,
             frequency_penalty: None,
+            service_tier: None,
             extra,
         };
 
@@ -993,6 +996,7 @@ mod tests {
             stop: None,
             presence_penalty: None,
             frequency_penalty: None,
+            service_tier: None,
             extra,
         };
 
@@ -1019,10 +1023,12 @@ mod tests {
         assert_eq!(domain.stop, Some(vec!["a".to_string(), "b".to_string()]));
     }
 
-    /// END-TO-END (#666): cache_control must survive the REAL public path —
-    /// `api::models::Message` (deserialized from the HTTP body) -> `From<Message>
-    /// for ChatMessage` (which re-serializes the converted content into
-    /// `ChatMessage.content`) -> the Anthropic converter's `convert_messages`.
+    /// BRIDGE COVERAGE (#666): cache_control must survive `From<Message> for
+    /// ChatMessage`, which re-serializes converted content into
+    /// `ChatMessage.content`, and then the Anthropic `convert_messages` bridge.
+    /// The `/v1/chat/completions` handler instead uses the equivalent `Message ->
+    /// CompletionMessage -> ChatMessage` path; both conversions handle content
+    /// independently of message role.
     ///
     /// Before the Part-1 change, `MessageContentPart::Text`/`ImageUrl` had no
     /// `cache_control` field, so serde dropped the breakpoint at deserialization
@@ -1035,8 +1041,8 @@ mod tests {
             convert_messages, AnthropicContentPart, AnthropicMessageContent, AnthropicSystem,
         };
 
-        // Deserialize from a wire body so the WHOLE path is exercised: the HTTP
-        // JSON -> `MessageContentPart` (the enum the reviewer flagged) -> the rest.
+        // Deserialize wire-shaped JSON through `MessageContentPart`, the enum the
+        // reviewer flagged, before exercising this conversion bridge.
         let system: crate::models::Message = serde_json::from_value(serde_json::json!({
             "role": "system",
             "content": [
@@ -1061,7 +1067,7 @@ mod tests {
         }))
         .expect("user message should deserialize");
 
-        // The REAL From impl: re-serializes converted content into ChatMessage.content.
+        // This From impl re-serializes converted content into ChatMessage.content.
         let chat_messages: Vec<ChatMessage> = vec![system.into(), user.into()];
 
         let (anthropic_system, anthropic_messages) = convert_messages(&chat_messages);
@@ -1080,6 +1086,8 @@ mod tests {
         }
 
         // The user turn must carry the breakpoint on the cached text block only.
+        // One-hour TTL is intentionally removed because Cloud API currently bills
+        // cache writes at Anthropic's five-minute rate.
         assert_eq!(anthropic_messages.len(), 1);
         let blocks = match &anthropic_messages[0].content {
             AnthropicMessageContent::Blocks(b) => b,
@@ -1096,7 +1104,7 @@ mod tests {
                 assert_eq!(text, "Cached context");
                 assert_eq!(
                     *cache_control,
-                    Some(serde_json::json!({"type": "ephemeral", "ttl": "1h"}))
+                    Some(serde_json::json!({"type": "ephemeral"}))
                 );
             }
             other => panic!("expected text block, got {other:?}"),
@@ -1114,6 +1122,46 @@ mod tests {
             }
             other => panic!("expected text block, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn cache_control_on_tool_message_survives_to_anthropic_request() {
+        use inference_providers::non_attested::external::anthropic::converter::{
+            convert_messages, AnthropicContentPart, AnthropicMessageContent,
+        };
+
+        let tool: crate::models::Message = serde_json::from_value(serde_json::json!({
+            "role": "tool",
+            "tool_call_id": "toolu_api_boundary",
+            "content": [{
+                "type": "text",
+                "text": "Tool output to cache",
+                "cache_control": {"type": "ephemeral"}
+            }]
+        }))
+        .expect("tool message should deserialize");
+
+        let chat_messages: Vec<ChatMessage> = vec![tool.into()];
+        let (_system, anthropic_messages) = convert_messages(&chat_messages);
+
+        assert_eq!(anthropic_messages.len(), 1);
+        let AnthropicMessageContent::Blocks(blocks) = &anthropic_messages[0].content else {
+            panic!("expected tool result blocks");
+        };
+        let [AnthropicContentPart::ToolResult {
+            tool_use_id,
+            content,
+            cache_control,
+        }] = blocks.as_slice()
+        else {
+            panic!("expected one tool_result block");
+        };
+        assert_eq!(tool_use_id, "toolu_api_boundary");
+        assert_eq!(content, "Tool output to cache");
+        assert_eq!(
+            *cache_control,
+            Some(serde_json::json!({"type": "ephemeral"}))
+        );
     }
 
     /// Companion guard: the SAME public path must NOT leak cache_control toward a

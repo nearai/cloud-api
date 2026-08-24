@@ -121,7 +121,9 @@ async fn test_chat_completion_streaming() {
         metadata: None,
         store: None,
         stream_options: None,
+        service_tier: None,
         modalities: None,
+        original_request: None,
         extra: std::collections::HashMap::new(),
     };
 
@@ -356,7 +358,9 @@ async fn test_error_handling() {
         metadata: None,
         store: None,
         stream_options: None,
+        service_tier: None,
         modalities: None,
+        original_request: None,
         extra: std::collections::HashMap::new(),
     };
 
@@ -446,7 +450,9 @@ async fn test_chat_completion_streaming_with_tool_calls() {
         metadata: None,
         store: None,
         stream_options: None,
+        service_tier: None,
         modalities: None,
+        original_request: None,
         extra: std::collections::HashMap::new(),
     };
 
@@ -641,7 +647,9 @@ async fn test_reasoning_content() {
         metadata: None,
         store: None,
         stream_options: None,
+        service_tier: None,
         modalities: None,
+        original_request: None,
         extra: std::collections::HashMap::new(),
     };
 

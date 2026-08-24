@@ -1,0 +1,25 @@
+{
+  "model": "anthropic/claude-sonnet-4-6",
+  "messages": [
+    {"role": "user", "content": "Look up the weather."}
+  ],
+  "max_tokens": 99,
+  "temperature": 1.7,
+  "top_p": 0.4,
+  "stop": ["END"],
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "lookup_weather",
+        "description": "Look up synthetic weather data",
+        "parameters": {
+          "type": "object",
+          "properties": {"city": {"type": "string"}},
+          "required": ["city"]
+        }
+      }
+    }
+  ],
+  "tool_choice": "auto"
+}

@@ -9,6 +9,32 @@ use uuid::Uuid;
 /// Default concurrent request limit per organization per model
 pub const DEFAULT_CONCURRENT_LIMIT: u32 = 64;
 
+/// RAII lease for one organization/model concurrency slot.
+///
+/// Routes that bypass the typed completion request path can hold this guard
+/// until their upstream response body completes or is dropped.
+pub struct ConcurrentRequestGuard {
+    slot: super::ConcurrentSlot,
+}
+
+impl std::fmt::Debug for ConcurrentRequestGuard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ConcurrentRequestGuard")
+    }
+}
+
+impl ConcurrentRequestGuard {
+    pub(crate) fn new(slot: super::ConcurrentSlot) -> Self {
+        Self { slot }
+    }
+}
+
+impl Drop for ConcurrentRequestGuard {
+    fn drop(&mut self) {
+        self.slot.release();
+    }
+}
+
 // Domain types defined directly here (following dependency inversion)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompletionId(Uuid);
@@ -61,6 +87,7 @@ pub struct CompletionRequest {
     pub stop: Option<Vec<String>>,
     pub stream: Option<bool>,
     pub n: Option<i64>,
+    pub service_tier: Option<inference_providers::ChatServiceTier>,
     pub user_id: UserId,    // For provider user field
     pub api_key_id: String, // For usage tracking (ID only, no name)
     pub organization_id: Uuid,
@@ -74,6 +101,11 @@ pub struct CompletionRequest {
     /// Skip provider-side chat signature fetch/storage because the API route
     /// will store a gateway signature over bytes it rewrites before returning.
     pub skip_provider_chat_signature: bool,
+
+    /// Original Chat Completions JSON, retained in memory only for a
+    /// provider-specific wire adapter. It is never logged or persisted.
+    #[serde(default, skip_serializing, skip_deserializing)]
+    pub original_request: Option<serde_json::Value>,
 
     pub extra: std::collections::HashMap<String, serde_json::Value>,
 }
@@ -181,6 +213,15 @@ pub trait ConcurrencyLeaseRepository: Send + Sync {
 
 #[async_trait]
 pub trait CompletionServiceTrait: Send + Sync {
+    /// Acquire one organization/model concurrency slot for a direct transport
+    /// route. The returned lease releases the slot when dropped.
+    async fn acquire_concurrent_slot(
+        &self,
+        organization_id: Uuid,
+        model_id: Uuid,
+        model_name: &str,
+    ) -> Result<ConcurrentRequestGuard, CompletionError>;
+
     /// Create a streaming completion
     async fn create_chat_completion_stream(
         &self,

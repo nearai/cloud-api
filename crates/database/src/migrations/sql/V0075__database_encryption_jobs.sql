@@ -4,7 +4,7 @@ CREATE TABLE database_encryption_jobs (
     status TEXT NOT NULL CHECK (status IN ('queued', 'running', 'completed', 'failed', 'cancelled')),
     scope JSONB NOT NULL,
     actions JSONB NOT NULL,
-    batch_size INTEGER NOT NULL,
+    batch_size BIGINT NOT NULL CHECK (batch_size BETWEEN 1 AND 1000),
     max_rows BIGINT,
     cursor JSONB NOT NULL DEFAULT '{}'::jsonb,
     progress JSONB NOT NULL DEFAULT '{}'::jsonb,
@@ -18,3 +18,17 @@ CREATE TABLE database_encryption_jobs (
 );
 CREATE INDEX idx_database_encryption_jobs_status ON database_encryption_jobs(status, created_at);
 CREATE UNIQUE INDEX idx_database_encryption_jobs_active_scope ON database_encryption_jobs ((scope::text)) WHERE status IN ('queued', 'running');
+
+-- Encrypted envelopes are larger than the original catalog VARCHAR limits.
+-- Execute mode is gated until repository decrypt-on-read support is enabled,
+-- but the columns are widened before any backfill can be enabled.
+ALTER TABLE files
+    ALTER COLUMN filename TYPE TEXT,
+    ALTER COLUMN storage_key TYPE TEXT,
+    ALTER COLUMN content_type TYPE TEXT;
+
+ALTER TABLE mcp_connectors
+    ALTER COLUMN name TYPE TEXT,
+    ALTER COLUMN description TYPE TEXT,
+    ALTER COLUMN mcp_server_url TYPE TEXT,
+    ALTER COLUMN error_message TYPE TEXT;

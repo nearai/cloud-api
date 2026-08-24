@@ -278,6 +278,17 @@ fn selected(scope: &Scope) -> Result<Vec<&'static Field>, (StatusCode, Json<Valu
         Ok(v)
     }
 }
+
+fn normalize_scope(scope: &mut Scope) {
+    scope.tables.sort();
+    scope.tables.dedup();
+    scope
+        .fields
+        .sort_by(|left, right| (&left.table, &left.column).cmp(&(&right.table, &right.column)));
+    scope
+        .fields
+        .dedup_by(|left, right| left.table == right.table && left.column == right.column);
+}
 fn predicate(f: &Field) -> String {
     match f.kind {
         Kind::Json => format!(
@@ -423,13 +434,15 @@ pub async fn create_job(
     {
         return Err(bad("unsupported action"));
     }
-    let fs = selected(&req.scope)?;
+    let mut scope_request = req.scope;
+    normalize_scope(&mut scope_request);
+    let fs = selected(&scope_request)?;
     let id = Uuid::new_v4();
     let mode = match req.mode {
         Mode::DryRun => "dry_run",
         Mode::Execute => "execute",
     };
-    let scope = serde_json::to_value(&req.scope).map_err(internal)?;
+    let scope = serde_json::to_value(&scope_request).map_err(internal)?;
     let actions = json!(req.actions);
     let client = state.pool.get().await.map_err(internal)?;
     client.execute("INSERT INTO database_encryption_jobs(id,mode,status,scope,actions,batch_size,max_rows,admin_actor,started_at) VALUES($1,$2,'running',$3,$4,$5,$6,$7,NOW())",&[&id,&mode,&scope,&actions,&req.batch_size,&req.max_rows,&admin.0.id]).await.map_err(internal)?;

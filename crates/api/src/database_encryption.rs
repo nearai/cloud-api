@@ -403,6 +403,16 @@ pub async fn create_job(
     Extension(admin): Extension<AdminUser>,
     Json(req): Json<CreateJobRequest>,
 ) -> ApiResult<JobResponse> {
+    if matches!(&req.mode, Mode::Execute) {
+        return Err(bad(
+            "execute mode is disabled until repository decrypt-on-read support is enabled",
+        ));
+    }
+    if req.scope.tables.is_empty() && req.scope.fields.is_empty() {
+        return Err(bad(
+            "an explicit scope is required for database encryption jobs",
+        ));
+    }
     if !(1..=1000).contains(&req.batch_size) {
         return Err(bad("batch_size must be between 1 and 1000"));
     }

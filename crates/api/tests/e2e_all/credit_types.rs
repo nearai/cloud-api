@@ -276,6 +276,58 @@ async fn test_update_same_type_replaces_previous() {
     assert_eq!(history.history[1].spend_limit.amount, 10_000_000_000);
 }
 
+/// Billing services may identify PingPay alone or as part of an aggregate source.
+/// Payment updates are absolute totals: the second write replaces, rather than adds
+/// to, the first active payment limit.
+#[tokio::test]
+async fn test_pingpay_payment_sources_use_absolute_active_limit() {
+    let server = setup_test_server().await;
+    let org = create_org(&server).await;
+
+    let pingpay = add_credits_with_type(
+        &server,
+        &org.id,
+        "payment",
+        Some("pingpay"),
+        10_000_000_000,
+        "USD",
+        &get_session_id(),
+    )
+    .await;
+    assert_eq!(pingpay.source.as_deref(), Some("pingpay"));
+
+    let aggregate = add_credits_with_type(
+        &server,
+        &org.id,
+        "payment",
+        Some("stripe+hot-pay+pingpay"),
+        25_000_000_000,
+        "USD",
+        &get_session_id(),
+    )
+    .await;
+    assert_eq!(aggregate.source.as_deref(), Some("stripe+hot-pay+pingpay"));
+
+    let response = server
+        .get(format!("/v1/organizations/{}/usage/balance", org.id).as_str())
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .add_header("User-Agent", MOCK_USER_AGENT)
+        .await;
+    assert_eq!(response.status_code(), 200);
+    let balance = response.json::<api::routes::usage::OrganizationBalanceResponse>();
+    let payment_limits: Vec<_> = balance
+        .credit_limits
+        .iter()
+        .filter(|limit| limit.credit_type == "payment")
+        .collect();
+    assert_eq!(payment_limits.len(), 1);
+    assert_eq!(payment_limits[0].amount, 25_000_000_000);
+    assert_eq!(
+        payment_limits[0].source.as_deref(),
+        Some("stripe+hot-pay+pingpay")
+    );
+}
+
 /// Test that different credit types can coexist and be updated independently
 #[tokio::test]
 async fn test_independent_credit_type_updates() {

@@ -288,8 +288,13 @@ async fn test_signature_returns_stream_disconnected_on_client_disconnect() {
         )
         .await
         .expect("Failed to delete signature");
+    drop(client);
 
     // Update the stop_reason to client_disconnect
+    // Reacquire after the deliberately disconnected stream: the connection
+    // used by the request can be closed asynchronously while this test is
+    // preparing the assertion.
+    let client = pool.get().await.expect("Failed to get database connection");
     client
         .execute(
             "UPDATE organization_usage_log SET stop_reason = 'client_disconnect' WHERE response_id = $1",

@@ -341,8 +341,11 @@ async fn counts(
     let mut out = vec![];
     for f in fields {
         let scan_limit = limit.map(|value| value.clamp(1, 100_000));
-        let max_id_query = format!("SELECT max(id) FROM {}", f.table);
-        let max_id: Option<Uuid> = client.query_one(&max_id_query, &[]).await?.get(0);
+        let max_id_query = format!("SELECT id FROM {} ORDER BY id DESC LIMIT 1", f.table);
+        let max_id = client
+            .query_opt(&max_id_query, &[])
+            .await?
+            .map(|row| row.get::<_, Uuid>(0));
         let mut count = FieldCount {
             table: f.table.into(),
             column: f.column.into(),
@@ -569,7 +572,7 @@ async fn run_locked_job(
             .await?;
         let cancelled: bool = transaction
             .query_one(
-                "SELECT cancel_requested_at IS NOT NULL FROM database_encryption_jobs WHERE id=$1 FOR UPDATE",
+                "SELECT cancel_requested_at IS NOT NULL FROM database_encryption_jobs WHERE id=$1",
                 &[&id],
             )
             .await?
@@ -595,24 +598,32 @@ async fn run_locked_job(
             field_index += 1;
             after_id = Uuid::nil();
         } else {
+            let mut row_ids = Vec::with_capacity(rows.len());
+            let mut encrypted_values = Vec::with_capacity(rows.len());
             for row in &rows {
                 let row_id: Uuid = row.get(0);
                 after_id = row_id;
                 if mode == "execute" {
                     let plaintext: String = row.get(1);
-                    let value = envelope(&state.key, field, row_id, &plaintext)?;
-                    let update = match field.kind {
-                        Kind::Json => format!(
-                            "UPDATE {} SET {}=$1::jsonb WHERE id=$2 AND NOT({})",
-                            field.table, field.column, predicate
-                        ),
-                        Kind::Text => format!(
-                            "UPDATE {} SET {}=$1 WHERE id=$2 AND NOT({})",
-                            field.table, field.column, predicate
-                        ),
-                    };
-                    encrypted += transaction.execute(&update, &[&value, &row_id]).await? as i64;
+                    row_ids.push(row_id);
+                    encrypted_values.push(envelope(&state.key, field, row_id, &plaintext)?);
                 }
+            }
+            if mode == "execute" {
+                let value_expression = match field.kind {
+                    Kind::Json => "batch.value::jsonb",
+                    Kind::Text => "batch.value",
+                };
+                let update = format!(
+                    "UPDATE {table} AS target SET {column}={value_expression} \
+                     FROM UNNEST($1::uuid[], $2::text[]) AS batch(id,value) \
+                     WHERE target.id=batch.id",
+                    table = field.table,
+                    column = field.column,
+                );
+                encrypted += transaction
+                    .execute(&update, &[&row_ids, &encrypted_values])
+                    .await? as i64;
             }
             processed += rows.len() as i64;
         }

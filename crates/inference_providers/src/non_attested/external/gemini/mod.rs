@@ -523,6 +523,7 @@ mod tests {
             metadata: None,
             store: None,
             stream_options: None,
+            service_tier: None,
             modalities: None,
             original_request: None,
             extra: std::collections::HashMap::new(),

@@ -1,0 +1,297 @@
+{
+  "manifestVersion": 1,
+  "sourceUrl": "https://developers.openai.com/api/docs/pricing",
+  "verifiedAt": "2026-08-19",
+  "currency": "USD",
+  "unit": "million_tokens",
+  "notes": "Rates are copied explicitly from the public OpenAI pricing table. For pre-GPT-5.6 models, OpenAI publishes no cache-write price, so cacheWrite is omitted; an unexpected positive cache-write class is billed at the highest configured applicable input rate and emits a critical billing signal.",
+  "models": [
+    {
+      "modelId": "openai/gpt-4.1",
+      "upstreamModel": "gpt-4.1",
+      "expectedActive": true,
+      "textPricing": {
+        "version": 1, "currency": "USD", "unit": "million_tokens",
+        "tiers": {
+          "default": {"short": {"uncachedInput": "2.00", "cachedInput": "0.50", "output": "8.00"}},
+          "priority": {"short": {"uncachedInput": "3.50", "cachedInput": "0.875", "output": "14.00"}}
+        }
+      }
+    },
+    {
+      "modelId": "openai/gpt-4.1-mini",
+      "upstreamModel": "gpt-4.1-mini",
+      "expectedActive": true,
+      "textPricing": {
+        "version": 1, "currency": "USD", "unit": "million_tokens",
+        "tiers": {
+          "default": {"short": {"uncachedInput": "0.40", "cachedInput": "0.10", "output": "1.60"}},
+          "priority": {"short": {"uncachedInput": "0.70", "cachedInput": "0.175", "output": "2.80"}}
+        }
+      }
+    },
+    {
+      "modelId": "openai/gpt-4.1-nano",
+      "upstreamModel": "gpt-4.1-nano",
+      "expectedActive": true,
+      "textPricing": {
+        "version": 1, "currency": "USD", "unit": "million_tokens",
+        "tiers": {
+          "default": {"short": {"uncachedInput": "0.10", "cachedInput": "0.025", "output": "0.40"}},
+          "priority": {"short": {"uncachedInput": "0.20", "cachedInput": "0.05", "output": "0.80"}}
+        }
+      }
+    },
+    {
+      "modelId": "openai/gpt-5",
+      "upstreamModel": "gpt-5",
+      "expectedActive": true,
+      "textPricing": {
+        "version": 1, "currency": "USD", "unit": "million_tokens",
+        "tiers": {
+          "default": {"short": {"uncachedInput": "1.25", "cachedInput": "0.125", "output": "10.00"}},
+          "flex": {"short": {"uncachedInput": "0.625", "cachedInput": "0.0625", "output": "5.00"}},
+          "priority": {"short": {"uncachedInput": "2.50", "cachedInput": "0.25", "output": "20.00"}}
+        }
+      }
+    },
+    {
+      "modelId": "openai/gpt-5.1",
+      "upstreamModel": "gpt-5.1",
+      "expectedActive": true,
+      "textPricing": {
+        "version": 1, "currency": "USD", "unit": "million_tokens",
+        "tiers": {
+          "default": {"short": {"uncachedInput": "1.25", "cachedInput": "0.125", "output": "10.00"}},
+          "flex": {"short": {"uncachedInput": "0.625", "cachedInput": "0.0625", "output": "5.00"}},
+          "priority": {"short": {"uncachedInput": "2.50", "cachedInput": "0.25", "output": "20.00"}}
+        }
+      }
+    },
+    {
+      "modelId": "openai/gpt-5.2",
+      "upstreamModel": "gpt-5.2",
+      "expectedActive": true,
+      "textPricing": {
+        "version": 1, "currency": "USD", "unit": "million_tokens",
+        "tiers": {
+          "default": {"short": {"uncachedInput": "1.75", "cachedInput": "0.175", "output": "14.00"}},
+          "flex": {"short": {"uncachedInput": "0.875", "cachedInput": "0.0875", "output": "7.00"}},
+          "priority": {"short": {"uncachedInput": "3.50", "cachedInput": "0.35", "output": "28.00"}}
+        }
+      }
+    },
+    {
+      "modelId": "openai/gpt-5.4",
+      "upstreamModel": "gpt-5.4",
+      "expectedActive": true,
+      "textPricing": {
+        "version": 1, "currency": "USD", "unit": "million_tokens", "longContextThreshold": 272000,
+        "tiers": {
+          "default": {
+            "short": {"uncachedInput": "2.50", "cachedInput": "0.25", "output": "15.00"},
+            "long": {"uncachedInput": "5.00", "cachedInput": "0.50", "output": "22.50"}
+          },
+          "flex": {
+            "short": {"uncachedInput": "1.25", "cachedInput": "0.13", "output": "7.50"},
+            "long": {"uncachedInput": "2.50", "cachedInput": "0.25", "output": "11.25"}
+          },
+          "priority": {"short": {"uncachedInput": "5.00", "cachedInput": "0.50", "output": "30.00"}}
+        }
+      }
+    },
+    {
+      "modelId": "openai/gpt-5.4-mini",
+      "upstreamModel": "gpt-5.4-mini",
+      "expectedActive": true,
+      "textPricing": {
+        "version": 1, "currency": "USD", "unit": "million_tokens",
+        "tiers": {
+          "default": {"short": {"uncachedInput": "0.75", "cachedInput": "0.075", "output": "4.50"}},
+          "flex": {"short": {"uncachedInput": "0.375", "cachedInput": "0.0375", "output": "2.25"}},
+          "priority": {"short": {"uncachedInput": "1.50", "cachedInput": "0.15", "output": "9.00"}}
+        }
+      }
+    },
+    {
+      "modelId": "openai/gpt-5.4-nano",
+      "upstreamModel": "gpt-5.4-nano",
+      "expectedActive": true,
+      "textPricing": {
+        "version": 1, "currency": "USD", "unit": "million_tokens",
+        "tiers": {
+          "default": {"short": {"uncachedInput": "0.20", "cachedInput": "0.02", "output": "1.25"}},
+          "flex": {"short": {"uncachedInput": "0.10", "cachedInput": "0.01", "output": "0.625"}}
+        }
+      }
+    },
+    {
+      "modelId": "openai/gpt-5.5",
+      "upstreamModel": "gpt-5.5",
+      "expectedActive": true,
+      "textPricing": {
+        "version": 1, "currency": "USD", "unit": "million_tokens", "longContextThreshold": 272000,
+        "tiers": {
+          "default": {
+            "short": {"uncachedInput": "5.00", "cachedInput": "0.50", "output": "30.00"},
+            "long": {"uncachedInput": "10.00", "cachedInput": "1.00", "output": "45.00"}
+          },
+          "flex": {
+            "short": {"uncachedInput": "2.50", "cachedInput": "0.25", "output": "15.00"},
+            "long": {"uncachedInput": "5.00", "cachedInput": "0.50", "output": "22.50"}
+          },
+          "priority": {"short": {"uncachedInput": "12.50", "cachedInput": "1.25", "output": "75.00"}}
+        }
+      }
+    },
+    {
+      "modelId": "openai/gpt-5-mini",
+      "upstreamModel": "gpt-5-mini",
+      "expectedActive": true,
+      "textPricing": {
+        "version": 1, "currency": "USD", "unit": "million_tokens",
+        "tiers": {
+          "default": {"short": {"uncachedInput": "0.25", "cachedInput": "0.025", "output": "2.00"}},
+          "flex": {"short": {"uncachedInput": "0.125", "cachedInput": "0.0125", "output": "1.00"}},
+          "priority": {"short": {"uncachedInput": "0.45", "cachedInput": "0.045", "output": "3.60"}}
+        }
+      }
+    },
+    {
+      "modelId": "openai/gpt-5-nano",
+      "upstreamModel": "gpt-5-nano",
+      "expectedActive": true,
+      "textPricing": {
+        "version": 1, "currency": "USD", "unit": "million_tokens",
+        "tiers": {
+          "default": {"short": {"uncachedInput": "0.05", "cachedInput": "0.005", "output": "0.40"}},
+          "flex": {"short": {"uncachedInput": "0.025", "cachedInput": "0.0025", "output": "0.20"}}
+        }
+      }
+    },
+    {
+      "modelId": "openai/o3",
+      "upstreamModel": "o3",
+      "expectedActive": true,
+      "textPricing": {
+        "version": 1, "currency": "USD", "unit": "million_tokens",
+        "tiers": {
+          "default": {"short": {"uncachedInput": "2.00", "cachedInput": "0.50", "output": "8.00"}},
+          "flex": {"short": {"uncachedInput": "1.00", "cachedInput": "0.25", "output": "4.00"}},
+          "priority": {"short": {"uncachedInput": "3.50", "cachedInput": "0.875", "output": "14.00"}}
+        }
+      }
+    },
+    {
+      "modelId": "openai/o3-mini",
+      "upstreamModel": "o3-mini",
+      "expectedActive": true,
+      "textPricing": {
+        "version": 1, "currency": "USD", "unit": "million_tokens",
+        "tiers": {
+          "default": {"short": {"uncachedInput": "1.10", "cachedInput": "0.55", "output": "4.40"}}
+        }
+      }
+    },
+    {
+      "modelId": "openai/o4-mini",
+      "upstreamModel": "o4-mini",
+      "expectedActive": true,
+      "textPricing": {
+        "version": 1, "currency": "USD", "unit": "million_tokens",
+        "tiers": {
+          "default": {"short": {"uncachedInput": "1.10", "cachedInput": "0.275", "output": "4.40"}},
+          "flex": {"short": {"uncachedInput": "0.55", "cachedInput": "0.138", "output": "2.20"}},
+          "priority": {"short": {"uncachedInput": "2.00", "cachedInput": "0.50", "output": "8.00"}}
+        }
+      }
+    },
+    {
+      "modelId": "openai/gpt-5.6-sol",
+      "upstreamModel": "gpt-5.6-sol",
+      "expectedActive": false,
+      "catalog": {
+        "modelDisplayName": "GPT-5.6 Sol",
+        "modelDescription": "OpenAI frontier model for complex professional work",
+        "contextLength": 1050000,
+        "maxOutputLength": 128000,
+        "aliases": ["openai/gpt-5.6"],
+        "ownedBy": "openai",
+        "providerType": "external",
+        "providerConfig": {"backend": "openai_compatible", "base_url": "https://api.openai.com/v1", "model_name": "gpt-5.6-sol"},
+        "attestationSupported": false,
+        "inputModalities": ["text", "image"],
+        "outputModalities": ["text"],
+        "supportedSamplingParameters": ["temperature", "top_p", "frequency_penalty", "presence_penalty", "stop", "seed", "max_tokens", "logit_bias"],
+        "supportedFeatures": ["tools", "json_mode", "structured_outputs", "logprobs", "reasoning"],
+        "verifiable": false
+      },
+      "textPricing": {
+        "version": 1, "currency": "USD", "unit": "million_tokens", "longContextThreshold": 272000,
+        "tiers": {
+          "default": {"short": {"uncachedInput": "5.00", "cachedInput": "0.50", "cacheWrite": "6.25", "output": "30.00"}, "long": {"uncachedInput": "10.00", "cachedInput": "1.00", "cacheWrite": "12.50", "output": "45.00"}},
+          "flex": {"short": {"uncachedInput": "2.50", "cachedInput": "0.25", "cacheWrite": "3.125", "output": "15.00"}, "long": {"uncachedInput": "5.00", "cachedInput": "0.50", "cacheWrite": "6.25", "output": "22.50"}},
+          "priority": {"short": {"uncachedInput": "10.00", "cachedInput": "1.00", "cacheWrite": "12.50", "output": "60.00"}, "long": {"uncachedInput": "20.00", "cachedInput": "2.00", "cacheWrite": "25.00", "output": "90.00"}}
+        }
+      }
+    },
+    {
+      "modelId": "openai/gpt-5.6-terra",
+      "upstreamModel": "gpt-5.6-terra",
+      "expectedActive": false,
+      "catalog": {
+        "modelDisplayName": "GPT-5.6 Terra",
+        "modelDescription": "OpenAI GPT-5.6 model balancing intelligence and cost",
+        "contextLength": 1050000,
+        "maxOutputLength": 128000,
+        "aliases": [],
+        "ownedBy": "openai",
+        "providerType": "external",
+        "providerConfig": {"backend": "openai_compatible", "base_url": "https://api.openai.com/v1", "model_name": "gpt-5.6-terra"},
+        "attestationSupported": false,
+        "inputModalities": ["text", "image"],
+        "outputModalities": ["text"],
+        "supportedSamplingParameters": ["temperature", "top_p", "frequency_penalty", "presence_penalty", "stop", "seed", "max_tokens", "logit_bias"],
+        "supportedFeatures": ["tools", "json_mode", "structured_outputs", "logprobs", "reasoning"],
+        "verifiable": false
+      },
+      "textPricing": {
+        "version": 1, "currency": "USD", "unit": "million_tokens", "longContextThreshold": 272000,
+        "tiers": {
+          "default": {"short": {"uncachedInput": "2.00", "cachedInput": "0.20", "cacheWrite": "2.50", "output": "12.00"}, "long": {"uncachedInput": "4.00", "cachedInput": "0.40", "cacheWrite": "5.00", "output": "18.00"}},
+          "flex": {"short": {"uncachedInput": "1.00", "cachedInput": "0.10", "cacheWrite": "1.25", "output": "6.00"}, "long": {"uncachedInput": "2.00", "cachedInput": "0.20", "cacheWrite": "2.50", "output": "9.00"}},
+          "priority": {"short": {"uncachedInput": "4.00", "cachedInput": "0.40", "cacheWrite": "5.00", "output": "24.00"}, "long": {"uncachedInput": "8.00", "cachedInput": "0.80", "cacheWrite": "10.00", "output": "36.00"}}
+        }
+      }
+    },
+    {
+      "modelId": "openai/gpt-5.6-luna",
+      "upstreamModel": "gpt-5.6-luna",
+      "expectedActive": false,
+      "catalog": {
+        "modelDisplayName": "GPT-5.6 Luna",
+        "modelDescription": "OpenAI GPT-5.6 model optimized for cost-sensitive workloads",
+        "contextLength": 1050000,
+        "maxOutputLength": 128000,
+        "aliases": [],
+        "ownedBy": "openai",
+        "providerType": "external",
+        "providerConfig": {"backend": "openai_compatible", "base_url": "https://api.openai.com/v1", "model_name": "gpt-5.6-luna"},
+        "attestationSupported": false,
+        "inputModalities": ["text", "image"],
+        "outputModalities": ["text"],
+        "supportedSamplingParameters": ["temperature", "top_p", "frequency_penalty", "presence_penalty", "stop", "seed", "max_tokens", "logit_bias"],
+        "supportedFeatures": ["tools", "json_mode", "structured_outputs", "logprobs", "reasoning"],
+        "verifiable": false
+      },
+      "textPricing": {
+        "version": 1, "currency": "USD", "unit": "million_tokens", "longContextThreshold": 272000,
+        "tiers": {
+          "default": {"short": {"uncachedInput": "0.20", "cachedInput": "0.02", "cacheWrite": "0.25", "output": "1.20"}, "long": {"uncachedInput": "0.40", "cachedInput": "0.04", "cacheWrite": "0.50", "output": "1.80"}},
+          "flex": {"short": {"uncachedInput": "0.10", "cachedInput": "0.01", "cacheWrite": "0.125", "output": "0.60"}, "long": {"uncachedInput": "0.20", "cachedInput": "0.02", "cacheWrite": "0.25", "output": "0.90"}},
+          "priority": {"short": {"uncachedInput": "0.40", "cachedInput": "0.04", "cacheWrite": "0.50", "output": "2.40"}, "long": {"uncachedInput": "0.80", "cachedInput": "0.08", "cacheWrite": "1.00", "output": "3.60"}}
+        }
+      }
+    }
+  ]
+}

@@ -143,6 +143,7 @@ mod tests {
             metadata: None,
             safety_identifier: None,
             prompt_cache_key: None,
+            service_tier: None,
         }
     }
 
@@ -168,6 +169,7 @@ mod tests {
             metadata: None,
             safety_identifier: None,
             prompt_cache_key: None,
+            service_tier: None,
         }
     }
 

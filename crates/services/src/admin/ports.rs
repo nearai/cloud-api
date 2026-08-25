@@ -14,6 +14,7 @@ pub struct UpdateModelAdminRequest {
     /// pricing (cached tokens billed at the full input rate), `Some(Some(v))`
     /// = set to `v` (`Some(Some(0))` = genuinely free cache reads).
     pub cache_read_cost_per_token: Option<Option<i64>>,
+    pub text_pricing: Option<Option<crate::usage::TextPricingProfile>>,
     pub model_display_name: Option<String>,
     pub model_description: Option<String>,
     pub model_icon: Option<String>,
@@ -82,6 +83,8 @@ pub struct ModelPricing {
     /// `None` = cache pricing disabled; `Some(x)` = cached tokens billed at
     /// `x` (`Some(0)` = genuinely free).
     pub cache_read_cost_per_token: Option<i64>,
+    /// Versioned exact text-pricing profile, when tiered billing is enabled.
+    pub text_pricing: Option<crate::usage::TextPricingProfile>,
     pub context_length: i32,
     pub verifiable: bool,
     pub is_active: bool,
@@ -124,6 +127,7 @@ pub struct ModelHistoryEntry {
     pub cost_per_image: i64,
     /// `None` = cache pricing disabled at this point in time.
     pub cache_read_cost_per_token: Option<i64>,
+    pub text_pricing: Option<crate::usage::TextPricingProfile>,
     pub context_length: i32,
     pub model_name: String,
     pub model_display_name: String,
@@ -244,6 +248,7 @@ pub struct AdminModelInfo {
     /// `None` = cache pricing disabled; `Some(x)` = cached tokens billed at
     /// `x` (`Some(0)` = genuinely free).
     pub cache_read_cost_per_token: Option<i64>,
+    pub text_pricing: Option<serde_json::Value>,
     pub context_length: i32,
     pub verifiable: bool,
     pub is_active: bool,
@@ -392,6 +397,7 @@ pub struct PricingChangeInput {
     pub new_output_cost_per_token: Option<i64>,
     pub new_cache_read_cost_per_token: Option<i64>,
     pub new_cost_per_image: Option<i64>,
+    pub new_text_pricing: Option<crate::usage::TextPricingProfile>,
 }
 
 /// Current pricing + identity snapshot of an active model, captured at
@@ -406,6 +412,7 @@ pub struct ModelPricingSnapshot {
     /// `None` = cache pricing disabled at confirm time.
     pub cache_read_cost_per_token: Option<i64>,
     pub cost_per_image: i64,
+    pub text_pricing: Option<crate::usage::TextPricingProfile>,
 }
 
 /// One row to insert into `scheduled_model_pricing_changes`.
@@ -423,6 +430,8 @@ pub struct ScheduledPricingChangeInsert {
     /// `None` = cache pricing was disabled at confirm time.
     pub old_cache_read_cost_per_token: Option<i64>,
     pub old_cost_per_image: i64,
+    pub old_text_pricing: Option<crate::usage::TextPricingProfile>,
+    pub new_text_pricing: Option<crate::usage::TextPricingProfile>,
     pub effective_at: chrono::DateTime<chrono::Utc>,
 }
 
@@ -443,6 +452,8 @@ pub struct ScheduledPricingChange {
     /// `None` = cache pricing was disabled at confirm time.
     pub old_cache_read_cost_per_token: Option<i64>,
     pub old_cost_per_image: i64,
+    pub old_text_pricing: Option<crate::usage::TextPricingProfile>,
+    pub new_text_pricing: Option<crate::usage::TextPricingProfile>,
     pub effective_at: chrono::DateTime<chrono::Utc>,
     pub status: ScheduledPricingChangeStatus,
     pub apply_attempts: i32,
@@ -484,6 +495,8 @@ pub struct PricingChangeModelPreview {
     pub new_output_cost_per_token: Option<i64>,
     pub new_cache_read_cost_per_token: Option<i64>,
     pub new_cost_per_image: Option<i64>,
+    pub old_text_pricing: Option<crate::usage::TextPricingProfile>,
+    pub new_text_pricing: Option<crate::usage::TextPricingProfile>,
 }
 
 #[derive(Debug, Clone)]

@@ -50,7 +50,7 @@ impl OrganizationUsageRepository {
                         model_name, inference_type, input_tokens, output_tokens,
                         cache_read_tokens, cache_write_tokens, total_tokens, input_cost, output_cost,
                         total_cost, response_id, provider_request_id, inference_id,
-                        stop_reason, image_count
+                        stop_reason, image_count, service_tier, context_band, billing_details
                     FROM organization_usage_log
                     WHERE organization_id = $1
                       AND ($2::TIMESTAMPTZ IS NULL OR created_at >= $2)
@@ -111,7 +111,7 @@ impl OrganizationUsageRepository {
                         model_name, inference_type, input_tokens, output_tokens,
                         cache_read_tokens, cache_write_tokens, total_tokens, input_cost, output_cost,
                         total_cost, response_id, provider_request_id, inference_id,
-                        stop_reason, image_count
+                        stop_reason, image_count, service_tier, context_band, billing_details
                     FROM organization_usage_log
                     WHERE organization_id = $1
                       AND ($2::TIMESTAMPTZ IS NULL OR created_at >= $2)
@@ -211,6 +211,9 @@ fn row_to_report(row: &Row) -> InferenceUsageReportRow {
         output_tokens: i64::from(row.get::<_, i32>("output_tokens")),
         cache_read_tokens: i64::from(row.get::<_, i32>("cache_read_tokens")),
         cache_write_tokens: i64::from(row.get::<_, i32>("cache_write_tokens")),
+        service_tier: row.try_get("service_tier").ok().flatten(),
+        context_band: row.try_get("context_band").ok().flatten(),
+        billing_details: row.try_get("billing_details").ok().flatten(),
         total_tokens: i64::from(row.get::<_, i32>("total_tokens")),
         input_cost_nano_usd: row.get("input_cost"),
         output_cost_nano_usd: row.get("output_cost"),

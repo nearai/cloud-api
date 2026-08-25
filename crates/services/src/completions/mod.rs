@@ -5,7 +5,8 @@ use crate::inference_provider_pool::InferenceProviderPool;
 use crate::models::ModelsRepository;
 use crate::responses::models::ResponseId;
 use crate::usage::{
-    five_minute_cache_write_rate, CacheWriteBilling, RecordUsageServiceRequest, UsageServiceTrait,
+    five_minute_cache_write_rate, CacheWriteBilling, RecordUsageServiceRequest, TextServiceTier,
+    UsageServiceTrait,
 };
 use inference_providers::{ChatMessage, MessageRole, SSEEvent, StreamChunk, StreamingResult};
 use moka::future::Cache;
@@ -120,6 +121,10 @@ where
     provider_attribution: crate::usage::ProviderAttribution,
     /// Five-minute prompt-cache write price for Anthropic-backed models.
     cache_write_cost_per_token: Option<i64>,
+    /// Canonical tier explicitly forwarded for profiled text pricing.
+    requested_service_tier: Option<TextServiceTier>,
+    /// Last actual tier reported in a streaming chunk.
+    provider_service_tier: Option<String>,
     /// Callback to report observed TTFT back to the provider pool for latency-aware
     /// routing. Called once with the backend TTFT (ms) from record_usage_and_metrics.
     latency_reporter: Option<super::inference_provider_pool::ProviderLatencyReporter>,
@@ -195,15 +200,20 @@ where
         )
         .entered();
 
-        let (input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, chat_id) = match (
-            &self.last_usage_stats,
-            &self.last_chat_id,
-        ) {
+        let (
+            input_tokens,
+            output_tokens,
+            cache_read_tokens,
+            anthropic_cache_write_tokens,
+            profiled_cache_write_tokens,
+            chat_id,
+        ) = match (&self.last_usage_stats, &self.last_chat_id) {
             (Some(usage), Some(chat_id)) => (
                 usage.prompt_tokens,
                 usage.completion_tokens,
                 usage.cached_tokens(),
                 usage.cache_creation_tokens(),
+                usage.cache_write_tokens(),
                 chat_id.clone(),
             ),
             (None, None) => {
@@ -293,15 +303,21 @@ where
 
         let e2e_duration = self.service_start_time.elapsed();
         let first_token_time = self.first_token_time;
+        let backend_ttft = first_token_time
+            .map(|first_token| first_token.duration_since(self.provider_start_time));
+        let e2e_ttft =
+            first_token_time.map(|first_token| first_token.duration_since(self.service_start_time));
         let stream_completed = self.stream_completed;
         let provider_attribution = self.provider_attribution;
         let cache_write = self
             .cache_write_cost_per_token
-            .filter(|_| cache_write_tokens > 0)
+            .filter(|_| anthropic_cache_write_tokens > 0)
             .map(|cost_per_token| CacheWriteBilling {
-                tokens: cache_write_tokens,
+                tokens: anthropic_cache_write_tokens,
                 cost_per_token,
             });
+        let requested_service_tier = self.requested_service_tier;
+        let provider_service_tier = self.provider_service_tier.clone();
 
         let avg_itl_ms = if self.token_count > 0 {
             Some(self.total_itl_ms / self.token_count as f64)
@@ -318,6 +334,30 @@ where
         // which helps prevent data loss compared to regular spawn.
         let handle_clone = handle.clone();
         handle.spawn_blocking(move || {
+            // These streaming-only TTFT series require the final usage chunk so
+            // the real input-token bucket is known. They intentionally exclude
+            // streams that produced a first token but ended without billable
+            // usage or a response ID (for example, interrupted/error streams),
+            // so they are a billable-completion subset of the unbucketed TTFT
+            // series rather than a directly comparable population. Emit them
+            // before the billing timeout so a stalled usage write cannot also
+            // discard already-observed latency telemetry.
+            let ttft_tags: Vec<&str> = metric_tags.iter().map(|s| s.as_str()).collect();
+            if let Some(duration) = backend_ttft {
+                metrics_service.record_latency(
+                    METRIC_LATENCY_STREAMING_TTFT_BY_INPUT,
+                    duration,
+                    &ttft_tags,
+                );
+            }
+            if let Some(duration) = e2e_ttft {
+                metrics_service.record_latency(
+                    METRIC_LATENCY_STREAMING_TTFT_TOTAL_BY_INPUT,
+                    duration,
+                    &ttft_tags,
+                );
+            }
+
             handle_clone.block_on(
                 async move {
                     let result = tokio::time::timeout(Duration::from_secs(2), async move {
@@ -343,6 +383,9 @@ where
                                 output_tokens,
                                 cache_read_tokens,
                                 cache_write,
+                                profiled_cache_write_tokens,
+                                requested_service_tier,
+                                provider_service_tier,
                                 inference_type,
                                 ttft_ms,
                                 avg_itl_ms,
@@ -476,6 +519,10 @@ where
                                 // Track usage stats (updated on each chunk that has usage)
                                 if let Some(usage) = &chat_chunk.usage {
                                     self.last_usage_stats = Some(usage.clone());
+                                }
+
+                                if let Some(service_tier) = &chat_chunk.service_tier {
+                                    self.provider_service_tier = Some(service_tier.clone());
                                 }
 
                                 // Track finish_reason from the final chunk (only set once at end)
@@ -1274,6 +1321,40 @@ impl CompletionServiceImpl {
             .collect()
     }
 
+    fn normalize_profiled_service_tier(
+        model: &crate::models::ModelWithPricing,
+        params: &mut inference_providers::ChatCompletionParams,
+    ) -> Result<Option<TextServiceTier>, ports::CompletionError> {
+        let Some(profile) = &model.text_pricing else {
+            // Processing tiers are an OpenAI catalog capability. Internal
+            // Responses calls set an explicit Standard tier so profiled models
+            // cannot inherit a provider project default, but legacy/self-hosted
+            // models must keep their pre-tier request shape.
+            params.service_tier = None;
+            return Ok(None);
+        };
+        let requested = match params.service_tier {
+            None
+            | Some(inference_providers::ChatServiceTier::Auto)
+            | Some(inference_providers::ChatServiceTier::Default) => TextServiceTier::Default,
+            Some(inference_providers::ChatServiceTier::Flex) => TextServiceTier::Flex,
+            Some(inference_providers::ChatServiceTier::Priority) => TextServiceTier::Priority,
+        };
+        if !profile.supports_tier(requested) {
+            return Err(ports::CompletionError::InvalidParams(format!(
+                "{} service tier is not available for model '{}'",
+                requested.as_str(),
+                model.model_name
+            )));
+        }
+        params.service_tier = Some(match requested {
+            TextServiceTier::Default => inference_providers::ChatServiceTier::Default,
+            TextServiceTier::Flex => inference_providers::ChatServiceTier::Flex,
+            TextServiceTier::Priority => inference_providers::ChatServiceTier::Priority,
+        });
+        Ok(Some(requested))
+    }
+
     async fn try_acquire_concurrent_slot(
         &self,
         organization_id: Uuid,
@@ -1340,6 +1421,7 @@ impl CompletionServiceImpl {
         store_provider_chat_signature: bool,
         provider_attribution: crate::usage::ProviderAttribution,
         cache_write_cost_per_token: Option<i64>,
+        requested_service_tier: Option<TextServiceTier>,
         latency_reporter: Option<super::inference_provider_pool::ProviderLatencyReporter>,
     ) -> StreamingResult {
         // Create low-cardinality metric tags (no org/workspace/key - those go to database)
@@ -1386,6 +1468,8 @@ impl CompletionServiceImpl {
             store_provider_chat_signature,
             provider_attribution,
             cache_write_cost_per_token,
+            requested_service_tier,
+            provider_service_tier: None,
             latency_reporter,
         };
         Box::pin(intercepted_stream)
@@ -1464,6 +1548,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
             },
             store: request.store,
             stream_options,
+            service_tier: request.service_tier,
             modalities: None,
             original_request: request.original_request.clone(),
             extra,
@@ -1497,6 +1582,8 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
 
         let canonical_name = &model.model_name;
         let cache_write_cost_per_token = Self::anthropic_cache_write_rate(&model)?;
+        let requested_service_tier =
+            Self::normalize_profiled_service_tier(&model, &mut chat_params)?;
 
         // Update params with canonical name if it's different
         if canonical_name != &request.model {
@@ -1589,6 +1676,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
                 !request.skip_provider_chat_signature,
                 provider_attribution,
                 cache_write_cost_per_token,
+                requested_service_tier,
                 Some(latency_reporter),
             )
             .await;
@@ -1643,6 +1731,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
             },
             store: request.store,
             stream_options,
+            service_tier: request.service_tier,
             modalities: None,
             original_request: request.original_request.clone(),
             extra,
@@ -1676,6 +1765,8 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
 
         let canonical_name = &model.model_name;
         let cache_write_cost_per_token = Self::anthropic_cache_write_rate(&model)?;
+        let requested_service_tier =
+            Self::normalize_profiled_service_tier(&model, &mut chat_params)?;
 
         let api_key_id = match uuid::Uuid::parse_str(&request.api_key_id) {
             Ok(id) => id,
@@ -1773,7 +1864,10 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         let input_tokens = response_with_bytes.response.usage.prompt_tokens;
         let output_tokens = response_with_bytes.response.usage.completion_tokens;
         let cache_read_tokens = response_with_bytes.response.usage.cached_tokens();
-        let cache_write_tokens = response_with_bytes.response.usage.cache_creation_tokens();
+        let anthropic_cache_write_tokens =
+            response_with_bytes.response.usage.cache_creation_tokens();
+        let profiled_cache_write_tokens = response_with_bytes.response.usage.cache_write_tokens();
+        let provider_service_tier = response_with_bytes.response.service_tier.clone();
         let model_name = model.model_name.clone();
 
         tokio::spawn(async move {
@@ -1784,8 +1878,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
 
             metrics_service.record_count(METRIC_REQUEST_COUNT, 1, &tags_str);
             metrics_service.record_latency(METRIC_LATENCY_QUEUE_TIME, queue_time, &tags_str);
-            metrics_service.record_latency(METRIC_LATENCY_TTFT, backend_latency, &tags_str);
-            metrics_service.record_latency(METRIC_LATENCY_TTFT_TOTAL, e2e_latency, &tags_str);
+            metrics_service.record_latency(METRIC_LATENCY_BACKEND, backend_latency, &tags_str);
             metrics_service.record_latency(METRIC_LATENCY_TOTAL, e2e_latency, &tags_str);
 
             if backend_latency.as_secs_f64() > 0.0 {
@@ -1834,11 +1927,14 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
                 output_tokens,
                 cache_read_tokens,
                 cache_write: cache_write_cost_per_token
-                    .filter(|_| cache_write_tokens > 0)
+                    .filter(|_| anthropic_cache_write_tokens > 0)
                     .map(|cost_per_token| CacheWriteBilling {
-                        tokens: cache_write_tokens,
+                        tokens: anthropic_cache_write_tokens,
                         cost_per_token,
                     }),
+                profiled_cache_write_tokens,
+                requested_service_tier,
+                provider_service_tier,
                 inference_type: crate::usage::ports::InferenceType::ChatCompletion,
                 ttft_ms: None,    // N/A for non-streaming
                 avg_itl_ms: None, // N/A for non-streaming
@@ -2192,6 +2288,7 @@ mod tests {
                 model: "test-model".to_string(),
                 choices: vec![],
                 usage: None,
+                service_tier: None,
                 prompt_token_ids: None,
                 system_fingerprint: None,
                 modality: None,
@@ -2218,8 +2315,12 @@ mod tests {
                     prompt_tokens: 10,
                     completion_tokens: 20,
                     total_tokens: 30,
-                    prompt_tokens_details: None,
+                    prompt_tokens_details: Some(serde_json::json!({
+                        "cached_tokens": 3,
+                        "cache_write_tokens": 4,
+                    })),
                 }),
+                service_tier: Some("priority".to_string()),
                 prompt_token_ids: None,
                 system_fingerprint: None,
                 modality: None,
@@ -2232,7 +2333,7 @@ mod tests {
         let metric_tags = CompletionServiceImpl::create_metric_tags("test-model");
 
         let now = Instant::now();
-        let intercept_stream = InterceptStream {
+        let mut intercept_stream = InterceptStream {
             inner: stream,
             attestation_service,
             usage_service,
@@ -2265,11 +2366,27 @@ mod tests {
             store_provider_chat_signature: true,
             provider_attribution: crate::usage::ProviderAttribution::default(),
             cache_write_cost_per_token: None,
+            requested_service_tier: None,
+            provider_service_tier: None,
             latency_reporter: None,
         };
 
-        // Consume the stream
-        let _ = intercept_stream.collect::<Vec<_>>().await;
+        // Consume both provider chunks, then verify the usage dimensions captured
+        // by the streaming interceptor before it finalizes and records billing.
+        assert!(intercept_stream.next().await.is_some());
+        assert!(intercept_stream.next().await.is_some());
+        assert_eq!(
+            intercept_stream.provider_service_tier.as_deref(),
+            Some("priority")
+        );
+        let captured_usage = intercept_stream
+            .last_usage_stats
+            .as_ref()
+            .expect("stream usage should be captured");
+        assert_eq!(captured_usage.cached_tokens(), 3);
+        assert_eq!(captured_usage.cache_write_tokens(), 4);
+        assert!(intercept_stream.next().await.is_none());
+        drop(intercept_stream);
 
         // Wait for async usage recording in Drop to complete
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -2296,6 +2413,24 @@ mod tests {
         assert!(ttft
             .tags
             .contains(&format!("{}:{}", TAG_MODEL, "test-model")));
+
+        let bucketed_ttft = metrics
+            .iter()
+            .find(|m| m.name == METRIC_LATENCY_STREAMING_TTFT_BY_INPUT)
+            .expect("bucketed streaming TTFT metric missing");
+        assert!(matches!(bucketed_ttft.value, MetricValue::Latency(_)));
+        assert!(bucketed_ttft
+            .tags
+            .contains(&format!("{}:{}", TAG_INPUT_BUCKET, "0-1k")));
+
+        let bucketed_e2e_ttft = metrics
+            .iter()
+            .find(|m| m.name == METRIC_LATENCY_STREAMING_TTFT_TOTAL_BY_INPUT)
+            .expect("bucketed streaming E2E TTFT metric missing");
+        assert!(matches!(bucketed_e2e_ttft.value, MetricValue::Latency(_)));
+        assert!(bucketed_e2e_ttft
+            .tags
+            .contains(&format!("{}:{}", TAG_INPUT_BUCKET, "0-1k")));
 
         let total_latency = metrics
             .iter()
@@ -2362,6 +2497,7 @@ mod tests {
                         "cache_creation_tokens": 2,
                     })),
                 }),
+                service_tier: None,
                 prompt_token_ids: None,
                 system_fingerprint: None,
                 modality: None,
@@ -2402,6 +2538,8 @@ mod tests {
             store_provider_chat_signature: true,
             provider_attribution: crate::usage::ProviderAttribution::default(),
             cache_write_cost_per_token: Some(125),
+            requested_service_tier: None,
+            provider_service_tier: None,
             latency_reporter: None,
         };
         let _ = intercept_stream.collect::<Vec<_>>().await;
@@ -2456,6 +2594,7 @@ mod tests {
                 model: "test-model".to_string(),
                 choices: vec![],
                 usage: None,
+                service_tier: None,
                 prompt_token_ids: None,
                 system_fingerprint: None,
                 modality: None,
@@ -2473,6 +2612,7 @@ mod tests {
                 model: "test-model".to_string(),
                 choices: vec![],
                 usage: None,
+                service_tier: None,
                 prompt_token_ids: None,
                 system_fingerprint: None,
                 modality: None,
@@ -2501,6 +2641,7 @@ mod tests {
                     total_tokens: 30,
                     prompt_tokens_details: None,
                 }),
+                service_tier: None,
                 prompt_token_ids: None,
                 modality: None,
                 system_fingerprint: None,
@@ -2550,6 +2691,8 @@ mod tests {
             store_provider_chat_signature: true,
             provider_attribution: crate::usage::ProviderAttribution::default(),
             cache_write_cost_per_token: None,
+            requested_service_tier: None,
+            provider_service_tier: None,
             latency_reporter: None,
         };
 
@@ -2630,6 +2773,7 @@ mod tests {
                     total_tokens: 6,
                     prompt_tokens_details: None,
                 }),
+                service_tier: None,
                 prompt_token_ids: None,
                 modality: None,
                 system_fingerprint: None,
@@ -2674,6 +2818,8 @@ mod tests {
             store_provider_chat_signature: true,
             provider_attribution: crate::usage::ProviderAttribution::default(),
             cache_write_cost_per_token: None,
+            requested_service_tier: None,
+            provider_service_tier: None,
             latency_reporter: None,
         };
 
@@ -2882,6 +3028,8 @@ mod tests {
                 store_provider_chat_signature: true,
                 provider_attribution: crate::usage::ProviderAttribution::default(),
                 cache_write_cost_per_token: None,
+                requested_service_tier: None,
+                provider_service_tier: None,
                 latency_reporter: None,
             };
             // InterceptStream goes out of scope here and Drop is called
@@ -3352,10 +3500,98 @@ mod tests {
             metadata: None,
             store: None,
             stream_options: None,
+            service_tier: None,
             modalities: None,
             original_request: None,
             extra: std::collections::HashMap::new(),
         }
+    }
+
+    fn profiled_gpt56_model() -> crate::models::ModelWithPricing {
+        let manifest: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../../config/openai_text_pricing.v1.json"
+        ))
+        .unwrap();
+        let profile = manifest["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["modelId"] == "openai/gpt-5.6-sol")
+            .unwrap()["textPricing"]
+            .clone();
+        crate::models::ModelWithPricing {
+            id: Uuid::new_v4(),
+            model_name: "openai/gpt-5.6-sol".to_string(),
+            model_display_name: "GPT-5.6 Sol".to_string(),
+            model_description: String::new(),
+            model_icon: None,
+            input_cost_per_token: 5_000,
+            output_cost_per_token: 30_000,
+            cost_per_image: 0,
+            cache_read_cost_per_token: Some(500),
+            text_pricing: Some(crate::usage::TextPricingProfile::from_json(profile).unwrap()),
+            context_length: 1_050_000,
+            verifiable: false,
+            aliases: vec!["openai/gpt-5.6".to_string()],
+            owned_by: "openai".to_string(),
+            provider_type: "external".to_string(),
+            provider_config: None,
+            attestation_supported: false,
+            input_modalities: Some(vec!["text".to_string(), "image".to_string()]),
+            output_modalities: Some(vec!["text".to_string()]),
+            inference_url: None,
+            hugging_face_id: None,
+            quantization: None,
+            max_output_length: Some(128_000),
+            supported_sampling_parameters: vec![],
+            supported_features: vec![],
+            datacenters: None,
+            is_ready: None,
+            deprecation_date: None,
+            openrouter_slug: None,
+            created_at: chrono::Utc::now(),
+        }
+    }
+
+    #[test]
+    fn profiled_model_normalizes_omitted_and_auto_tier_to_explicit_default() {
+        let model = profiled_gpt56_model();
+        for input in [None, Some(inference_providers::ChatServiceTier::Auto)] {
+            let mut params = chat_params_for_compat_tests("openai/gpt-5.6");
+            params.service_tier = input;
+            let tier = CompletionServiceImpl::normalize_profiled_service_tier(&model, &mut params)
+                .unwrap();
+            assert_eq!(tier, Some(TextServiceTier::Default));
+            assert_eq!(
+                params.service_tier,
+                Some(inference_providers::ChatServiceTier::Default)
+            );
+        }
+    }
+
+    #[test]
+    fn profiled_model_rejects_unadvertised_tier() {
+        let mut model = profiled_gpt56_model();
+        model.text_pricing.as_mut().unwrap().tiers.flex = None;
+        let mut params = chat_params_for_compat_tests("openai/gpt-5.6");
+        params.service_tier = Some(inference_providers::ChatServiceTier::Flex);
+        assert!(matches!(
+            CompletionServiceImpl::normalize_profiled_service_tier(&model, &mut params),
+            Err(ports::CompletionError::InvalidParams(_))
+        ));
+    }
+
+    #[test]
+    fn unprofiled_model_strips_internal_default_tier() {
+        let mut model = profiled_gpt56_model();
+        model.text_pricing = None;
+        let mut params = chat_params_for_compat_tests("legacy/self-hosted-model");
+        params.service_tier = Some(inference_providers::ChatServiceTier::Default);
+
+        let tier =
+            CompletionServiceImpl::normalize_profiled_service_tier(&model, &mut params).unwrap();
+        assert_eq!(tier, None);
+        assert_eq!(params.service_tier, None);
     }
 
     fn thinking_kwargs(params: &inference_providers::ChatCompletionParams) -> &serde_json::Value {

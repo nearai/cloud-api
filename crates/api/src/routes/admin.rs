@@ -4,22 +4,24 @@ use crate::conversions::{
 };
 use crate::middleware::AdminUser;
 use crate::models::{
-    AdminAccessTokenResponse, AdminInvitationEmailResendResultResponse, AdminModelListResponse,
-    AdminModelWithPricing, AdminOrganizationMemberResponse, AdminOrganizationResponse,
-    AdminServiceResponse, AdminUserOrganizationDetails, AdminUserResponse,
-    BatchUpdateModelApiRequest, CreateAdminAccessTokenRequest, CreateServiceRequest, CreditType,
-    DecimalPrice, DecimalPriceRequest, DeleteAdminAccessTokenRequest, DeleteModelRequest,
-    DeprecateModelRequest, DeprecateModelResponse, ErrorResponse,
-    GetOrganizationConcurrentLimitResponse, ListAdminInvitationEmailDeliveriesResponse,
-    ListAdminOrganizationMembersResponse, ListOrganizationsAdminResponse,
-    ListPricingChangesResponse, ListUsersResponse, MemberRole, ModelArchitecture,
-    ModelDeprecationConfirmResponse, ModelDeprecationPreviewResponse, ModelDeprecationRequest,
-    ModelHistoryEntry, ModelHistoryResponse, ModelMetadata, ModelWithPricing,
-    OrgLimitsHistoryEntry, OrgLimitsHistoryResponse, OrganizationUsage, PricingChangeBatchRequest,
-    PricingChangeConfirmResponse, PricingChangeModelPreviewDto, PricingChangePreviewResponse,
-    PricingFieldUpdates, PricingFields, ScheduledPricingChangeDto, SpendLimit,
-    UpdateOrganizationConcurrentLimitRequest, UpdateOrganizationConcurrentLimitResponse,
-    UpdateOrganizationLimitsRequest, UpdateOrganizationLimitsResponse, UpdateServiceRequest,
+    AdminAccessTokenResponse, AdminAmlAllowlistEntryResponse, AdminAmlReportResponse,
+    AdminInvitationEmailResendResultResponse, AdminModelListResponse, AdminModelWithPricing,
+    AdminOrganizationMemberResponse, AdminOrganizationResponse, AdminServiceResponse,
+    AdminUserOrganizationDetails, AdminUserResponse, BatchUpdateModelApiRequest,
+    CreateAdminAccessTokenRequest, CreateServiceRequest, CreditType, DecimalPrice,
+    DecimalPriceRequest, DeleteAdminAccessTokenRequest, DeleteModelRequest, DeprecateModelRequest,
+    DeprecateModelResponse, ErrorResponse, GetOrganizationConcurrentLimitResponse,
+    ListAdminAmlAllowlistResponse, ListAdminAmlReportsResponse,
+    ListAdminInvitationEmailDeliveriesResponse, ListAdminOrganizationMembersResponse,
+    ListOrganizationsAdminResponse, ListPricingChangesResponse, ListUsersResponse, MemberRole,
+    ModelArchitecture, ModelDeprecationConfirmResponse, ModelDeprecationPreviewResponse,
+    ModelDeprecationRequest, ModelHistoryEntry, ModelHistoryResponse, ModelMetadata,
+    ModelWithPricing, OrgLimitsHistoryEntry, OrgLimitsHistoryResponse, OrganizationUsage,
+    PricingChangeBatchRequest, PricingChangeConfirmResponse, PricingChangeModelPreviewDto,
+    PricingChangePreviewResponse, PricingFieldUpdates, PricingFields, ScheduledPricingChangeDto,
+    SpendLimit, UpdateAmlReportStatusRequest, UpdateOrganizationConcurrentLimitRequest,
+    UpdateOrganizationConcurrentLimitResponse, UpdateOrganizationLimitsRequest,
+    UpdateOrganizationLimitsResponse, UpdateServiceRequest, UpsertAmlAllowlistEntryRequest,
 };
 use crate::routes::common::format_amount;
 use crate::routes::usage::{compute_organization_balance_response, OrganizationBalanceResponse};
@@ -33,6 +35,7 @@ use axum::{
 use chrono::{DateTime, Duration, Timelike, Utc};
 use config::ApiConfig;
 use services::admin::{AdminService, AnalyticsService, UpdateModelAdminRequest};
+use services::aml::{AmlAllowlistEntry, AmlError, AmlReport};
 use services::auth::AuthServiceTrait;
 use services::github_dispatch::GitHubDispatcher;
 use services::usage::UsageServiceTrait;
@@ -182,6 +185,306 @@ fn bad_request(
     )
 }
 
+#[derive(Debug, serde::Deserialize)]
+pub struct AdminAmlReportsQuery {
+    #[serde(default = "crate::routes::common::default_limit")]
+    pub limit: i64,
+    #[serde(default)]
+    pub offset: i64,
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct AdminAmlAllowlistQuery {
+    #[serde(default = "crate::routes::common::default_limit")]
+    pub limit: i64,
+    #[serde(default)]
+    pub offset: i64,
+}
+
+/// List AML reports (Admin only)
+#[utoipa::path(
+    get,
+    path = "/v1/admin/aml/reports",
+    tag = "Admin",
+    params(
+        ("limit" = Option<i64>, Query, description = "Maximum number of reports to return (default: 100)"),
+        ("offset" = Option<i64>, Query, description = "Number of reports to skip (default: 0)")
+    ),
+    responses(
+        (status = 200, description = "AML reports retrieved successfully", body = ListAdminAmlReportsResponse),
+        (status = 400, description = "Invalid request", body = ErrorResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 403, description = "Forbidden", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    ),
+    security(
+        ("session_token" = [])
+    )
+)]
+pub async fn list_aml_reports(
+    State(app_state): State<AdminAppState>,
+    Extension(_admin_user): Extension<AdminUser>,
+    Query(params): Query<AdminAmlReportsQuery>,
+) -> Result<ResponseJson<ListAdminAmlReportsResponse>, (StatusCode, ResponseJson<ErrorResponse>)> {
+    crate::routes::common::validate_limit_offset(params.limit, params.offset)?;
+
+    let page = app_state
+        .aml_service
+        .list_reports(params.limit, params.offset)
+        .await
+        .map_err(aml_service_error)?;
+
+    Ok(ResponseJson(ListAdminAmlReportsResponse {
+        reports: page.reports.into_iter().map(aml_report_response).collect(),
+        total: page.total,
+        limit: page.limit,
+        offset: page.offset,
+    }))
+}
+
+/// Update AML report active status (Admin only)
+#[utoipa::path(
+    patch,
+    path = "/v1/admin/aml/reports/{report_id}/status",
+    tag = "Admin",
+    params(
+        ("report_id" = String, Path, description = "AML report UUID")
+    ),
+    request_body = UpdateAmlReportStatusRequest,
+    responses(
+        (status = 200, description = "AML report status updated successfully", body = AdminAmlReportResponse),
+        (status = 400, description = "Invalid request", body = ErrorResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 403, description = "Forbidden", body = ErrorResponse),
+        (status = 404, description = "AML report not found", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    ),
+    security(
+        ("session_token" = [])
+    )
+)]
+pub async fn update_aml_report_status(
+    State(app_state): State<AdminAppState>,
+    Extension(_admin_user): Extension<AdminUser>,
+    Path(report_id): Path<String>,
+    ResponseJson(request): ResponseJson<UpdateAmlReportStatusRequest>,
+) -> Result<ResponseJson<AdminAmlReportResponse>, (StatusCode, ResponseJson<ErrorResponse>)> {
+    let report_id = Uuid::parse_str(&report_id)
+        .map_err(|_| bad_request("report_id must be a valid UUID", "invalid_parameter"))?;
+
+    let Some(report) = app_state
+        .aml_service
+        .set_report_active(report_id, request.active)
+        .await
+        .map_err(aml_service_error)?
+    else {
+        return Err(not_found("AML report not found", "not_found"));
+    };
+
+    Ok(ResponseJson(aml_report_response(report)))
+}
+
+/// List AML allowlist entries (Admin only)
+#[utoipa::path(
+    get,
+    path = "/v1/admin/aml/allowlist",
+    tag = "Admin",
+    params(
+        ("limit" = Option<i64>, Query, description = "Maximum number of allowlist entries to return (default: 100)"),
+        ("offset" = Option<i64>, Query, description = "Number of allowlist entries to skip (default: 0)")
+    ),
+    responses(
+        (status = 200, description = "AML allowlist entries retrieved successfully", body = ListAdminAmlAllowlistResponse),
+        (status = 400, description = "Invalid request", body = ErrorResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 403, description = "Forbidden", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    ),
+    security(
+        ("session_token" = [])
+    )
+)]
+pub async fn list_aml_allowlist(
+    State(app_state): State<AdminAppState>,
+    Extension(_admin_user): Extension<AdminUser>,
+    Query(params): Query<AdminAmlAllowlistQuery>,
+) -> Result<ResponseJson<ListAdminAmlAllowlistResponse>, (StatusCode, ResponseJson<ErrorResponse>)>
+{
+    crate::routes::common::validate_limit_offset(params.limit, params.offset)?;
+
+    let page = app_state
+        .aml_service
+        .list_allowlist_entries(params.limit, params.offset)
+        .await
+        .map_err(aml_service_error)?;
+
+    let accounts = page
+        .entries
+        .into_iter()
+        .map(aml_allowlist_response)
+        .collect();
+
+    Ok(ResponseJson(ListAdminAmlAllowlistResponse {
+        accounts,
+        total: page.total,
+        limit: page.limit,
+        offset: page.offset,
+    }))
+}
+
+/// Add or update an AML allowlist entry (Admin only)
+#[utoipa::path(
+    post,
+    path = "/v1/admin/aml/allowlist",
+    tag = "Admin",
+    request_body = UpsertAmlAllowlistEntryRequest,
+    responses(
+        (status = 200, description = "AML allowlist entry upserted successfully", body = AdminAmlAllowlistEntryResponse),
+        (status = 400, description = "Invalid request", body = ErrorResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 403, description = "Forbidden", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    ),
+    security(
+        ("session_token" = [])
+    )
+)]
+pub async fn upsert_aml_allowlist_entry(
+    State(app_state): State<AdminAppState>,
+    Extension(admin_user): Extension<AdminUser>,
+    ResponseJson(request): ResponseJson<UpsertAmlAllowlistEntryRequest>,
+) -> Result<ResponseJson<AdminAmlAllowlistEntryResponse>, (StatusCode, ResponseJson<ErrorResponse>)>
+{
+    let reason = request
+        .reason
+        .map(|reason| reason.trim().to_string())
+        .filter(|reason| !reason.is_empty());
+    let entry = app_state
+        .aml_service
+        .upsert_allowlist_entry(&request.account_id, reason, Some(admin_user.0.id))
+        .await
+        .map_err(aml_service_error)?;
+
+    Ok(ResponseJson(aml_allowlist_response(entry)))
+}
+
+/// Remove an AML allowlist entry (Admin only)
+#[utoipa::path(
+    delete,
+    path = "/v1/admin/aml/allowlist/{account_id}",
+    tag = "Admin",
+    params(
+        ("account_id" = String, Path, description = "NEAR account ID")
+    ),
+    responses(
+        (status = 204, description = "AML allowlist entry removed successfully"),
+        (status = 400, description = "Invalid request", body = ErrorResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 403, description = "Forbidden", body = ErrorResponse),
+        (status = 404, description = "AML allowlist entry not found", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    ),
+    security(
+        ("session_token" = [])
+    )
+)]
+pub async fn delete_aml_allowlist_entry(
+    State(app_state): State<AdminAppState>,
+    Extension(_admin_user): Extension<AdminUser>,
+    Path(account_id): Path<String>,
+) -> Result<StatusCode, (StatusCode, ResponseJson<ErrorResponse>)> {
+    let removed = app_state
+        .aml_service
+        .remove_allowlist_entry(&account_id)
+        .await
+        .map_err(aml_service_error)?;
+
+    if !removed {
+        return Err(not_found("AML allowlist entry not found", "not_found"));
+    }
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+fn aml_report_response(report: AmlReport) -> AdminAmlReportResponse {
+    AdminAmlReportResponse {
+        id: report.id.to_string(),
+        user_id: report.user_id.map(|id| id.to_string()),
+        flow: report.flow,
+        provider: report.provider,
+        account_id: report.account_id,
+        address_type: report.address_type,
+        risk_level: report.risk_level.as_str().to_string(),
+        score: report.score,
+        report_id: report.report_id,
+        reason: report.reason,
+        provider_report_time: report.provider_report_time,
+        active: report.active,
+        created_at: report.created_at,
+        updated_at: report.updated_at,
+    }
+}
+
+fn aml_allowlist_response(entry: AmlAllowlistEntry) -> AdminAmlAllowlistEntryResponse {
+    AdminAmlAllowlistEntryResponse {
+        account_id: entry.account_id,
+        address_type: entry.address_type,
+        reason: entry.reason,
+        created_by_user_id: entry.created_by_user_id.map(|id| id.to_string()),
+        created_at: entry.created_at,
+    }
+}
+
+fn aml_service_error(error: AmlError) -> (StatusCode, ResponseJson<ErrorResponse>) {
+    match error {
+        AmlError::InvalidAccountId => bad_request("Invalid NEAR account ID", "invalid_account_id"),
+        AmlError::ReportLacksPolicySignal => bad_request(
+            "AML report cannot be activated because it has no signal for the configured policy",
+            "aml_report_lacks_policy_signal",
+        ),
+        AmlError::AccountBlocked => (
+            StatusCode::FORBIDDEN,
+            ResponseJson(ErrorResponse::new(
+                "Account error".to_string(),
+                "account_error".to_string(),
+            )),
+        ),
+        AmlError::ProviderFailure(_) => {
+            error!(
+                error_kind = "provider_failure",
+                "AML admin operation failed"
+            );
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ResponseJson(ErrorResponse::new(
+                    "AML operation failed".to_string(),
+                    "internal_server_error".to_string(),
+                )),
+            )
+        }
+        AmlError::RepositoryFailure(_) => {
+            error!(
+                error_kind = "repository_failure",
+                "AML admin operation failed"
+            );
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ResponseJson(ErrorResponse::new(
+                    "AML operation failed".to_string(),
+                    "internal_server_error".to_string(),
+                )),
+            )
+        }
+    }
+}
+
+fn not_found(message: impl Into<String>, code: &str) -> (StatusCode, ResponseJson<ErrorResponse>) {
+    (
+        StatusCode::NOT_FOUND,
+        ResponseJson(ErrorResponse::new(message.into(), code.to_string())),
+    )
+}
+
 /// Batch upsert models metadata (Admin only)
 ///
 /// Upserts (inserts or updates) pricing and metadata for one or more models. Only authenticated admins can perform this operation.
@@ -247,6 +550,41 @@ pub async fn batch_upsert_models(
             &request.cache_read_cost_per_token.clone().flatten(),
             "cacheReadCostPerToken",
         )?;
+        if let Some(Some(value)) = &request.text_pricing {
+            if request.input_cost_per_token.is_some()
+                || request.output_cost_per_token.is_some()
+                || request.cache_read_cost_per_token.is_some()
+            {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    ResponseJson(ErrorResponse::new(
+                        format!(
+                            "model '{model_name}': textPricing cannot be combined with flat text pricing fields"
+                        ),
+                        "invalid_request".to_string(),
+                    )),
+                ));
+            }
+            let profile =
+                services::usage::TextPricingProfile::from_json(value.clone()).map_err(|error| {
+                    (
+                        StatusCode::BAD_REQUEST,
+                        ResponseJson(ErrorResponse::new(
+                            format!("model '{model_name}': {error}"),
+                            "invalid_request".to_string(),
+                        )),
+                    )
+                })?;
+            profile.legacy_projection().map_err(|error| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    ResponseJson(ErrorResponse::new(
+                        format!("model '{model_name}': {error}"),
+                        "invalid_request".to_string(),
+                    )),
+                )
+            })?;
+        }
 
         // OpenRouter vocabulary checks. The provider spec at
         // https://openrouter.ai/docs/guides/community/for-providers enumerates
@@ -379,61 +717,99 @@ pub async fn batch_upsert_models(
     // not here, so we can distinguish between CREATE (apply default) and UPDATE (preserve old)
     let models = batch_request
         .iter()
-        .map(|(model_name, request)| {
-            (
-                model_name.clone(),
-                UpdateModelAdminRequest {
-                    input_cost_per_token: request.input_cost_per_token.as_ref().map(|p| p.amount),
-                    output_cost_per_token: request.output_cost_per_token.as_ref().map(|p| p.amount),
-                    cost_per_image: request.cost_per_image.as_ref().map(|p| p.amount),
-                    // Tri-state passes through: outer None = leave unchanged,
-                    // Some(None) = disable cache pricing, Some(Some(p)) = set.
-                    cache_read_cost_per_token: request
-                        .cache_read_cost_per_token
-                        .as_ref()
-                        .map(|inner| inner.as_ref().map(|p| p.amount)),
-                    model_display_name: request.model_display_name.clone(),
-                    model_description: request.model_description.clone(),
-                    model_icon: request.model_icon.clone(),
-                    context_length: request.context_length,
-                    verifiable: request.verifiable,
-                    is_active: request.is_active,
-                    allow_free: request.allow_free,
-                    aliases: request.aliases.clone(),
-                    owned_by: request.owned_by.clone(),
-                    provider_type: request.provider_type.clone(),
-                    provider_config: request.provider_config.clone(),
-                    attestation_supported: request.attestation_supported,
-                    input_modalities: request.input_modalities.clone(),
-                    output_modalities: request.output_modalities.clone(),
-                    inference_url: request.inference_url.clone(),
-                    hugging_face_id: request.hugging_face_id.clone(),
-                    quantization: request.quantization.clone(),
-                    max_output_length: request.max_output_length,
-                    supported_sampling_parameters: request.supported_sampling_parameters.clone(),
-                    supported_features: request.supported_features.clone(),
-                    datacenters: crate::models::Datacenter::to_codes(request.datacenters.clone()),
-                    // Tri-state passes straight through: outer None = leave
-                    // unchanged, Some(None) = clear, Some(Some(v)) = set.
-                    is_ready: request.is_ready,
-                    // Tri-state. Outer None = leave unchanged, Some(None) =
-                    // clear. For Some(Some(s)) the string was already validated
-                    // above, so parse+normalize it to a stored timestamp.
-                    deprecation_date: request
-                        .deprecation_date
-                        .as_ref()
-                        .map(|inner| inner.as_deref().and_then(parse_deprecation_date)),
-                    // Tri-state passes straight through: outer None = leave
-                    // unchanged, Some(None) = clear, Some(Some(v)) = set. The
-                    // value was already shape-validated above.
-                    openrouter_slug: request.openrouter_slug.clone(),
-                    change_reason: request.change_reason.clone(),
-                    changed_by_user_id: Some(admin_user_id),
-                    changed_by_user_email: Some(admin_user_email.clone()),
-                },
-            )
-        })
-        .collect();
+        .map(
+            |(model_name, request)| -> Result<_, (StatusCode, ResponseJson<ErrorResponse>)> {
+                let invalid_text_pricing = |error| {
+                    (
+                        StatusCode::BAD_REQUEST,
+                        ResponseJson(ErrorResponse::new(
+                            format!("model '{model_name}': {error}"),
+                            "invalid_request".to_string(),
+                        )),
+                    )
+                };
+                let text_pricing = match &request.text_pricing {
+                    None => None,
+                    Some(None) => Some(None),
+                    Some(Some(value)) => Some(Some(
+                        services::usage::TextPricingProfile::from_json(value.clone())
+                            .map_err(invalid_text_pricing)?,
+                    )),
+                };
+                let projection = text_pricing
+                    .as_ref()
+                    .and_then(|profile| profile.as_ref())
+                    .map(services::usage::TextPricingProfile::legacy_projection)
+                    .transpose()
+                    .map_err(invalid_text_pricing)?;
+                Ok((
+                    model_name.clone(),
+                    UpdateModelAdminRequest {
+                        input_cost_per_token: projection
+                            .map(|(input, _, _)| input)
+                            .or_else(|| request.input_cost_per_token.as_ref().map(|p| p.amount)),
+                        output_cost_per_token: projection
+                            .map(|(_, _, output)| output)
+                            .or_else(|| request.output_cost_per_token.as_ref().map(|p| p.amount)),
+                        cost_per_image: request.cost_per_image.as_ref().map(|p| p.amount),
+                        // Tri-state passes through: outer None = leave unchanged,
+                        // Some(None) = disable cache pricing, Some(Some(p)) = set.
+                        cache_read_cost_per_token: projection
+                            .map(|(_, cached, _)| Some(cached))
+                            .or_else(|| {
+                                request
+                                    .cache_read_cost_per_token
+                                    .as_ref()
+                                    .map(|inner| inner.as_ref().map(|p| p.amount))
+                            }),
+                        text_pricing,
+                        model_display_name: request.model_display_name.clone(),
+                        model_description: request.model_description.clone(),
+                        model_icon: request.model_icon.clone(),
+                        context_length: request.context_length,
+                        verifiable: request.verifiable,
+                        is_active: request.is_active,
+                        allow_free: request.allow_free,
+                        aliases: request.aliases.clone(),
+                        owned_by: request.owned_by.clone(),
+                        provider_type: request.provider_type.clone(),
+                        provider_config: request.provider_config.clone(),
+                        attestation_supported: request.attestation_supported,
+                        input_modalities: request.input_modalities.clone(),
+                        output_modalities: request.output_modalities.clone(),
+                        inference_url: request.inference_url.clone(),
+                        hugging_face_id: request.hugging_face_id.clone(),
+                        quantization: request.quantization.clone(),
+                        max_output_length: request.max_output_length,
+                        supported_sampling_parameters: request
+                            .supported_sampling_parameters
+                            .clone(),
+                        supported_features: request.supported_features.clone(),
+                        datacenters: crate::models::Datacenter::to_codes(
+                            request.datacenters.clone(),
+                        ),
+                        // Tri-state passes straight through: outer None = leave
+                        // unchanged, Some(None) = clear, Some(Some(v)) = set.
+                        is_ready: request.is_ready,
+                        // Tri-state. Outer None = leave unchanged, Some(None) =
+                        // clear. For Some(Some(s)) the string was already validated
+                        // above, so parse+normalize it to a stored timestamp.
+                        deprecation_date: request
+                            .deprecation_date
+                            .as_ref()
+                            .map(|inner| inner.as_deref().and_then(parse_deprecation_date)),
+                        // Tri-state passes straight through: outer None = leave
+                        // unchanged, Some(None) = clear, Some(Some(v)) = set. The
+                        // value was already shape-validated above.
+                        openrouter_slug: request.openrouter_slug.clone(),
+                        change_reason: request.change_reason.clone(),
+                        changed_by_user_id: Some(admin_user_id),
+                        changed_by_user_email: Some(admin_user_email.clone()),
+                    },
+                ))
+            },
+        )
+        .collect::<Result<_, _>>()?;
 
     let updated_models = app_state
         .admin_service
@@ -646,6 +1022,9 @@ pub async fn batch_upsert_models(
                 currency: "USD".to_string(),
             },
             cache_read_cost_per_token: updated_model.cache_read_cost_per_token.map(usd_price),
+            text_pricing: updated_model
+                .text_pricing
+                .map(|profile| serde_json::to_value(profile).expect("text pricing serializes")),
             metadata: ModelMetadata {
                 verifiable: updated_model.verifiable,
                 context_length: updated_model.context_length,
@@ -752,6 +1131,9 @@ pub async fn list_models(
                 currency: "USD".to_string(),
             },
             cache_read_cost_per_token: model.cache_read_cost_per_token.map(usd_price),
+            text_pricing: model
+                .text_pricing
+                .map(|profile| serde_json::to_value(profile).expect("text pricing serializes")),
             metadata: ModelMetadata {
                 verifiable: model.verifiable,
                 context_length: model.context_length,
@@ -888,6 +1270,9 @@ pub async fn get_model_history(
                 currency: "USD".to_string(),
             },
             cache_read_cost_per_token: h.cache_read_cost_per_token.map(usd_price),
+            text_pricing: h
+                .text_pricing
+                .map(|profile| serde_json::to_value(profile).expect("text pricing serializes")),
             context_length: h.context_length,
             model_name: h.model_name,
             model_display_name: h.model_display_name,
@@ -1444,6 +1829,9 @@ pub async fn deprecate_model(
             currency: "USD".to_string(),
         },
         cache_read_cost_per_token: m.cache_read_cost_per_token.map(usd_price),
+        text_pricing: m
+            .text_pricing
+            .map(|profile| serde_json::to_value(profile).expect("text pricing serializes")),
         metadata: ModelMetadata {
             verifiable: m.verifiable,
             context_length: m.context_length,
@@ -1640,16 +2028,41 @@ fn pricing_change_inputs_from_request(
                     )));
                 }
             }
+            let text_pricing = item
+                .text_pricing
+                .clone()
+                .map(services::usage::TextPricingProfile::from_json)
+                .transpose()
+                .map_err(|error| invalid(format!("model '{}': {error}", item.model_id)))?;
+            if text_pricing.is_some()
+                && (item.input_cost_per_token.is_some()
+                    || item.output_cost_per_token.is_some()
+                    || item.cache_read_cost_per_token.is_some())
+            {
+                return Err(invalid(format!(
+                    "model '{}': textPricing cannot be combined with flat text pricing fields",
+                    item.model_id
+                )));
+            }
+            let projection = text_pricing
+                .as_ref()
+                .map(services::usage::TextPricingProfile::legacy_projection)
+                .transpose()
+                .map_err(|error| invalid(format!("model '{}': {error}", item.model_id)))?;
             Ok(services::admin::PricingChangeInput {
                 model_name: item.model_id.clone(),
                 effective_at,
-                new_input_cost_per_token: item.input_cost_per_token.as_ref().map(|p| p.amount),
-                new_output_cost_per_token: item.output_cost_per_token.as_ref().map(|p| p.amount),
-                new_cache_read_cost_per_token: item
-                    .cache_read_cost_per_token
-                    .as_ref()
-                    .map(|p| p.amount),
+                new_input_cost_per_token: projection
+                    .map(|(input, _, _)| input)
+                    .or_else(|| item.input_cost_per_token.as_ref().map(|p| p.amount)),
+                new_output_cost_per_token: projection
+                    .map(|(_, _, output)| output)
+                    .or_else(|| item.output_cost_per_token.as_ref().map(|p| p.amount)),
+                new_cache_read_cost_per_token: projection
+                    .map(|(_, cached, _)| cached)
+                    .or_else(|| item.cache_read_cost_per_token.as_ref().map(|p| p.amount)),
                 new_cost_per_image: item.cost_per_image.as_ref().map(|p| p.amount),
+                new_text_pricing: text_pricing,
             })
         })
         .collect()
@@ -1670,12 +2083,18 @@ fn scheduled_pricing_change_to_dto(
             output_cost_per_token: usd_price(change.old_output_cost_per_token),
             cache_read_cost_per_token: change.old_cache_read_cost_per_token.map(usd_price),
             cost_per_image: usd_price(change.old_cost_per_image),
+            text_pricing: change
+                .old_text_pricing
+                .map(|profile| serde_json::to_value(profile).expect("text pricing serializes")),
         },
         new_pricing: PricingFieldUpdates {
             input_cost_per_token: change.new_input_cost_per_token.map(usd_price),
             output_cost_per_token: change.new_output_cost_per_token.map(usd_price),
             cache_read_cost_per_token: change.new_cache_read_cost_per_token.map(usd_price),
             cost_per_image: change.new_cost_per_image.map(usd_price),
+            text_pricing: change
+                .new_text_pricing
+                .map(|profile| serde_json::to_value(profile).expect("text pricing serializes")),
         },
         applied_at: change.applied_at.map(|dt| dt.to_rfc3339()),
         last_error: change.last_error,
@@ -1733,12 +2152,18 @@ pub async fn preview_model_pricing_changes(
                     output_cost_per_token: usd_price(m.old_output_cost_per_token),
                     cache_read_cost_per_token: m.old_cache_read_cost_per_token.map(usd_price),
                     cost_per_image: usd_price(m.old_cost_per_image),
+                    text_pricing: m.old_text_pricing.map(|profile| {
+                        serde_json::to_value(profile).expect("text pricing serializes")
+                    }),
                 },
                 new_pricing: PricingFieldUpdates {
                     input_cost_per_token: m.new_input_cost_per_token.map(usd_price),
                     output_cost_per_token: m.new_output_cost_per_token.map(usd_price),
                     cache_read_cost_per_token: m.new_cache_read_cost_per_token.map(usd_price),
                     cost_per_image: m.new_cost_per_image.map(usd_price),
+                    text_pricing: m.new_text_pricing.map(|profile| {
+                        serde_json::to_value(profile).expect("text pricing serializes")
+                    }),
                 },
             })
             .collect(),

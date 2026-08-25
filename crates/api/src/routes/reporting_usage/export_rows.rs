@@ -6,7 +6,7 @@ use services::{service_usage::ports::ServiceUsageReportEntry, usage::InferenceUs
 use uuid::Uuid;
 
 pub(super) enum ExportRow {
-    Inference(InferenceUsageReportRow),
+    Inference(Box<InferenceUsageReportRow>),
     Service(ServiceUsageReportEntry),
 }
 
@@ -40,7 +40,7 @@ impl ExportRow {
 impl From<ExportRow> for ReportingUsageExportRow {
     fn from(row: ExportRow) -> Self {
         match row {
-            ExportRow::Inference(row) => inference_export_row(row),
+            ExportRow::Inference(row) => inference_export_row(*row),
             ExportRow::Service(row) => service_export_row(row),
         }
     }

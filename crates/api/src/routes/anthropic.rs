@@ -10,6 +10,7 @@ use crate::routes::api::AppState;
 use crate::routes::common::{
     no_aliasing_requested, HEADER_MODEL_ALIAS_RESOLVED, HEADER_NO_ALIASING,
 };
+use crate::routes::completions::HEADER_INFERENCE_ID;
 use axum::body::{Body, Bytes};
 use axum::extract::{Extension, RawQuery, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
@@ -19,12 +20,14 @@ use inference_providers::{
     anthropic_raw::AnthropicRawBody, AnthropicRawEndpoint, AnthropicRawError, AnthropicRawHeaders,
     AnthropicRawRequest, AnthropicRawResponse,
 };
+use services::completions::hash_inference_id_to_uuid;
 use services::completions::ports::{CompletionError, ConcurrentRequestGuard};
 use services::models::{ModelWithPricing, ModelsError, ModelsServiceTrait};
 use services::usage::{
     five_minute_cache_write_rate, CacheWriteBilling, InferenceType, ProviderAttribution,
     RecordUsageServiceRequest, StopReason, UsageServiceTrait,
 };
+use std::collections::VecDeque;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -32,6 +35,11 @@ use std::time::Duration;
 use uuid::Uuid;
 
 const MAX_SSE_USAGE_LINE_BYTES: usize = 256 * 1024;
+/// Cap on bytes buffered while waiting for `message_start` to reveal the
+/// provider message id at stream start. The id normally arrives in the first
+/// few hundred bytes; past the cap the response streams without an
+/// `inference-id` header rather than stalling or buffering unbounded.
+const MAX_STREAM_ID_PEEK_BYTES: usize = 64 * 1024;
 const ALLOWED_ANTHROPIC_BETAS: &[&str] = &[
     // Current Claude Code transport marker and token-only request controls.
     "claude-code-20250219",
@@ -136,6 +144,17 @@ impl NativeUsage {
         let input_tokens = self.input_tokens_for_billing();
         saturating_token_count(self.cache_creation_input_tokens)
             .min(input_tokens.saturating_sub(self.cache_read_tokens_for_billing()))
+    }
+
+    /// Billing lookup key for /v1/billing/costs: the same deterministic hash
+    /// of the provider message id that the OpenAI-compatible plane stores and
+    /// exposes via the `inference-id` header. `None` when the upstream
+    /// response carried no id (the usage record then falls back to a random
+    /// UUID so the row still exists, but it is not client-correlatable).
+    fn inference_id(&self) -> Option<Uuid> {
+        self.provider_request_id
+            .as_deref()
+            .map(hash_inference_id_to_uuid)
     }
 }
 
@@ -248,6 +267,13 @@ impl SseUsageParser {
 struct NativeUsageStream {
     inner: AnthropicRawBody,
     parser: SseUsageParser,
+    /// Bytes (and at most one trailing error) already read while peeking for
+    /// the `message_start` id. They were fed to `parser` at peek time, so
+    /// they are replayed to the client verbatim without re-parsing.
+    prelude: VecDeque<Result<Bytes, AnthropicRawError>>,
+    /// True when the peek already observed the upstream end (EOF or error):
+    /// `inner` must not be polled again after the prelude drains.
+    inner_done: bool,
     billing: Option<NativeBillingContext>,
     concurrent_slot: Option<ConcurrentRequestGuard>,
     runtime_handle: tokio::runtime::Handle,
@@ -304,6 +330,16 @@ impl Stream for NativeUsageStream {
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
+        if let Some(item) = this.prelude.pop_front() {
+            if item.is_err() {
+                this.finish_billing(StopReason::ProviderError);
+            }
+            return Poll::Ready(Some(item));
+        }
+        if this.inner_done {
+            this.finish_billing(StopReason::Completed);
+            return Poll::Ready(None);
+        }
         match this.inner.as_mut().poll_next(cx) {
             Poll::Ready(Some(Ok(bytes))) => {
                 this.parser.push(&bytes);
@@ -326,6 +362,36 @@ impl Drop for NativeUsageStream {
     fn drop(&mut self) {
         self.finish_billing(StopReason::ClientDisconnect);
     }
+}
+
+/// Read leading stream bytes until the SSE parser sees the `message_start`
+/// id, so the response can expose the same `inference-id` header as the
+/// OpenAI-compatible plane before the body starts. All peeked bytes are
+/// returned for verbatim replay to the client; the second element is true
+/// when the upstream terminated (EOF, or an error captured as the final
+/// prelude item) during the peek.
+async fn peek_stream_message_id(
+    body: &mut AnthropicRawBody,
+    parser: &mut SseUsageParser,
+) -> (VecDeque<Result<Bytes, AnthropicRawError>>, bool) {
+    use futures_util::StreamExt as _;
+    let mut prelude = VecDeque::new();
+    let mut peeked_bytes = 0usize;
+    while parser.usage.provider_request_id.is_none() && peeked_bytes < MAX_STREAM_ID_PEEK_BYTES {
+        match body.next().await {
+            Some(Ok(bytes)) => {
+                parser.push(&bytes);
+                peeked_bytes += bytes.len();
+                prelude.push_back(Ok(bytes));
+            }
+            Some(Err(error)) => {
+                prelude.push_back(Err(error));
+                return (prelude, true);
+            }
+            None => return (prelude, true),
+        }
+    }
+    (prelude, false)
 }
 
 pub async fn messages(
@@ -885,6 +951,7 @@ async fn build_upstream_response(
             }
         };
         let reason = usage.stop_reason.clone().unwrap_or(StopReason::Completed);
+        let inference_id = usage.inference_id();
         if let Some(billing) = billing {
             if let Err(error) = record_native_usage(billing, usage, reason).await {
                 tracing::error!(error = %error, "Failed to record native Anthropic usage");
@@ -895,13 +962,24 @@ async fn build_upstream_response(
                 );
             }
         }
-        return response_from_bytes(status, upstream.headers, bytes, alias_from);
+        return response_from_bytes(status, upstream.headers, bytes, alias_from, inference_id);
     }
 
+    let mut inference_id = None;
     let body = if status.is_success() && endpoint == AnthropicRawEndpoint::Messages && stream {
+        let mut parser = SseUsageParser::default();
+        let (prelude, inner_done) = peek_stream_message_id(&mut upstream.body, &mut parser).await;
+        inference_id = parser.usage.inference_id();
+        if inference_id.is_none() {
+            tracing::warn!(
+                "Native Anthropic stream did not reveal a message id before response start"
+            );
+        }
         Body::from_stream(NativeUsageStream {
             inner: upstream.body,
-            parser: SseUsageParser::default(),
+            parser,
+            prelude,
+            inner_done,
             billing,
             concurrent_slot,
             runtime_handle: tokio::runtime::Handle::current(),
@@ -909,7 +987,7 @@ async fn build_upstream_response(
     } else {
         Body::from_stream(upstream.body)
     };
-    response_from_body(status, upstream.headers, body, alias_from)
+    response_from_body(status, upstream.headers, body, alias_from, inference_id)
 }
 
 async fn collect_body(upstream: &mut AnthropicRawResponse) -> Result<Vec<u8>, AnthropicRawError> {
@@ -970,6 +1048,12 @@ async fn record_native_usage(
         return Ok(());
     }
 
+    // Key the usage row by the deterministic hash of the provider message id
+    // (also exposed as the `inference-id` response header) so data-plane
+    // clients can look the request up via /v1/billing/costs, exactly like the
+    // OpenAI-compatible plane. Random fallback keeps the row when the
+    // upstream response carried no id.
+    let inference_id = usage.inference_id().unwrap_or_else(Uuid::new_v4);
     let request = RecordUsageServiceRequest {
         organization_id: context.organization_id,
         workspace_id: context.workspace_id,
@@ -988,7 +1072,7 @@ async fn record_native_usage(
         inference_type: context.inference_type,
         ttft_ms: None,
         avg_itl_ms: None,
-        inference_id: Some(Uuid::new_v4()),
+        inference_id: Some(inference_id),
         provider_request_id: usage.provider_request_id,
         stop_reason: Some(stop_reason),
         response_id: None,
@@ -1008,8 +1092,9 @@ fn response_from_bytes(
     headers: HeaderMap,
     body: Vec<u8>,
     alias_from: Option<String>,
+    inference_id: Option<Uuid>,
 ) -> Response {
-    response_from_body(status, headers, Body::from(body), alias_from)
+    response_from_body(status, headers, Body::from(body), alias_from, inference_id)
 }
 
 fn response_from_body(
@@ -1017,6 +1102,7 @@ fn response_from_body(
     headers: HeaderMap,
     body: Body,
     alias_from: Option<String>,
+    inference_id: Option<Uuid>,
 ) -> Response {
     let mut response = Response::new(body);
     *response.status_mut() = status;
@@ -1030,6 +1116,11 @@ fn response_from_body(
         "x-serving-provider",
         HeaderValue::from_static("non-attested"),
     );
+    if let Some(inference_id) = inference_id {
+        if let Ok(value) = HeaderValue::from_str(&inference_id.to_string()) {
+            response.headers_mut().insert(HEADER_INFERENCE_ID, value);
+        }
+    }
     if let Some(alias) = alias_from.and_then(|alias| HeaderValue::from_str(&alias).ok()) {
         response
             .headers_mut()
@@ -1326,6 +1417,7 @@ mod tests {
             headers,
             br#"{"type":"error"}"#.to_vec(),
             None,
+            None,
         );
         assert!(response.headers().get(header::CONTENT_LENGTH).is_none());
         assert_eq!(
@@ -1345,5 +1437,111 @@ mod tests {
             .headers()
             .get("anthropic-ratelimit-requests-remaining")
             .is_none());
+    }
+
+    #[test]
+    fn usage_inference_id_matches_the_chat_plane_hash_of_the_message_id() {
+        let usage = parse_non_stream_usage(
+            br#"{"id":"msg_1","usage":{"input_tokens":1,"output_tokens":1}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            usage.inference_id(),
+            Some(hash_inference_id_to_uuid("msg_1"))
+        );
+
+        let no_id =
+            parse_non_stream_usage(br#"{"usage":{"input_tokens":1,"output_tokens":1}}"#).unwrap();
+        assert_eq!(no_id.inference_id(), None);
+    }
+
+    #[test]
+    fn responses_expose_the_inference_id_header_when_known() {
+        let inference_id = hash_inference_id_to_uuid("msg_header");
+        let response = response_from_bytes(
+            StatusCode::OK,
+            HeaderMap::new(),
+            br#"{"type":"message"}"#.to_vec(),
+            None,
+            Some(inference_id),
+        );
+        assert_eq!(
+            response.headers().get(HEADER_INFERENCE_ID).unwrap(),
+            &inference_id.to_string()
+        );
+    }
+
+    fn raw_body_from(items: Vec<Result<Bytes, AnthropicRawError>>) -> AnthropicRawBody {
+        Box::pin(futures_util::stream::iter(items))
+    }
+
+    #[tokio::test]
+    async fn stream_peek_reveals_the_message_id_and_replays_bytes_verbatim() {
+        let first = Bytes::from_static(b"event: message_start\nda");
+        let second = Bytes::from_static(
+            b"ta: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_stream\",\"usage\":{\"input_tokens\":4}}}\n\n",
+        );
+        let tail = Bytes::from_static(
+            b"data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":9}}\n\n",
+        );
+        let mut body = raw_body_from(vec![
+            Ok(first.clone()),
+            Ok(second.clone()),
+            Ok(tail.clone()),
+        ]);
+        let mut parser = SseUsageParser::default();
+        let (prelude, inner_done) = peek_stream_message_id(&mut body, &mut parser).await;
+
+        assert_eq!(
+            parser.usage.inference_id(),
+            Some(hash_inference_id_to_uuid("msg_stream"))
+        );
+        assert!(!inner_done);
+
+        // The client must receive every byte exactly once and in order, and
+        // the tee parser must keep accounting for post-peek usage events.
+        let stream = NativeUsageStream {
+            inner: body,
+            parser,
+            prelude,
+            inner_done,
+            billing: None,
+            concurrent_slot: None,
+            runtime_handle: tokio::runtime::Handle::current(),
+        };
+        use futures_util::StreamExt as _;
+        let mut stream = Box::pin(stream);
+        let mut replayed = Vec::new();
+        while let Some(item) = stream.next().await {
+            replayed.extend_from_slice(&item.unwrap());
+        }
+        let mut expected = Vec::new();
+        expected.extend_from_slice(&first);
+        expected.extend_from_slice(&second);
+        expected.extend_from_slice(&tail);
+        assert_eq!(replayed, expected);
+        assert_eq!(stream.parser.finish().output_tokens_for_billing(), 9);
+    }
+
+    #[tokio::test]
+    async fn stream_peek_gives_up_at_the_byte_cap_without_dropping_bytes() {
+        let preamble = Bytes::from(vec![b'x'; MAX_STREAM_ID_PEEK_BYTES + 1]);
+        let mut body = raw_body_from(vec![Ok(preamble.clone()), Ok(Bytes::from_static(b"tail"))]);
+        let mut parser = SseUsageParser::default();
+        let (prelude, inner_done) = peek_stream_message_id(&mut body, &mut parser).await;
+
+        assert_eq!(parser.usage.inference_id(), None);
+        assert!(!inner_done);
+        assert_eq!(prelude.len(), 1);
+        assert_eq!(prelude[0].as_ref().unwrap(), &preamble);
+    }
+
+    #[tokio::test]
+    async fn stream_peek_captures_an_immediate_upstream_end() {
+        let mut body = raw_body_from(vec![]);
+        let mut parser = SseUsageParser::default();
+        let (prelude, inner_done) = peek_stream_message_id(&mut body, &mut parser).await;
+        assert!(prelude.is_empty());
+        assert!(inner_done);
     }
 }

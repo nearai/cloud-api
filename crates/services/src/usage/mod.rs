@@ -934,7 +934,7 @@ impl UsageServiceTrait for UsageServiceImpl {
         organization_id: Uuid,
         inference_ids: Vec<Uuid>,
     ) -> Result<Vec<InferenceCost>, UsageError> {
-        let requested = inference_ids.len();
+        let requested = inference_ids.clone();
         let results = self
             .usage_repository
             .get_costs_by_inference_ids(organization_id, inference_ids)
@@ -945,8 +945,12 @@ impl UsageServiceTrait for UsageServiceImpl {
 
         // Callers routinely probe with IDs that may not exist (wrong header,
         // recent request not yet recorded), so a miss is expected traffic,
-        // not a server error.
-        let not_found_count = requested.saturating_sub(results.len());
+        // not a server error. Count by membership: the repository returns one
+        // entry per distinct found ID, so a length comparison would report
+        // phantom misses for duplicated request IDs.
+        let found: std::collections::HashSet<Uuid> =
+            results.iter().map(|cost| cost.inference_id).collect();
+        let not_found_count = requested.iter().filter(|id| !found.contains(id)).count();
         if not_found_count > 0 {
             tracing::debug!(
                 "Inference IDs not found in usage log: count={}",

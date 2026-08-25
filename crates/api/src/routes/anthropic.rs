@@ -40,6 +40,12 @@ const MAX_SSE_USAGE_LINE_BYTES: usize = 256 * 1024;
 /// few hundred bytes; past the cap the response streams without an
 /// `inference-id` header rather than stalling or buffering unbounded.
 const MAX_STREAM_ID_PEEK_BYTES: usize = 64 * 1024;
+/// Elapsed-time bound on the same peek. The provider timeout covers only
+/// connection setup, not body reads, so an upstream that stalls (or drips
+/// keepalives that never reach the byte cap) before `message_start` would
+/// otherwise delay response start indefinitely. Generous because the peek
+/// ends at the first stream event, well before first content.
+const STREAM_ID_PEEK_TIMEOUT: Duration = Duration::from_secs(30);
 const ALLOWED_ANTHROPIC_BETAS: &[&str] = &[
     // Current Claude Code transport marker and token-only request controls.
     "claude-code-20250219",
@@ -364,34 +370,41 @@ impl Drop for NativeUsageStream {
     }
 }
 
-/// Read leading stream bytes until the SSE parser sees the `message_start`
-/// id, so the response can expose the same `inference-id` header as the
-/// OpenAI-compatible plane before the body starts. All peeked bytes are
-/// returned for verbatim replay to the client; the second element is true
-/// when the upstream terminated (EOF, or an error captured as the final
-/// prelude item) during the peek.
-async fn peek_stream_message_id(
-    body: &mut AnthropicRawBody,
-    parser: &mut SseUsageParser,
-) -> (VecDeque<Result<Bytes, AnthropicRawError>>, bool) {
-    use futures_util::StreamExt as _;
-    let mut prelude = VecDeque::new();
-    let mut peeked_bytes = 0usize;
-    while parser.usage.provider_request_id.is_none() && peeked_bytes < MAX_STREAM_ID_PEEK_BYTES {
-        match body.next().await {
-            Some(Ok(bytes)) => {
-                parser.push(&bytes);
-                peeked_bytes += bytes.len();
-                prelude.push_back(Ok(bytes));
+impl NativeUsageStream {
+    /// Read leading upstream bytes until the SSE parser sees the
+    /// `message_start` id, so the response can expose the same `inference-id`
+    /// header as the OpenAI-compatible plane before the body starts. Peeked
+    /// bytes (and a terminal error, if one arrives) land in `self.prelude`
+    /// for verbatim replay to the client.
+    ///
+    /// All state lives in `self` so the peek is cancellation-safe: wrapping
+    /// it in a timeout, or the client disconnecting mid-peek, cannot lose
+    /// already-peeked bytes or skip billing — dropping the stream still runs
+    /// `finish_billing` with everything the parser has seen.
+    async fn peek_message_id(&mut self) {
+        use futures_util::StreamExt as _;
+        let mut peeked_bytes = 0usize;
+        while self.parser.usage.provider_request_id.is_none()
+            && peeked_bytes < MAX_STREAM_ID_PEEK_BYTES
+        {
+            match self.inner.next().await {
+                Some(Ok(bytes)) => {
+                    self.parser.push(&bytes);
+                    peeked_bytes += bytes.len();
+                    self.prelude.push_back(Ok(bytes));
+                }
+                Some(Err(error)) => {
+                    self.prelude.push_back(Err(error));
+                    self.inner_done = true;
+                    return;
+                }
+                None => {
+                    self.inner_done = true;
+                    return;
+                }
             }
-            Some(Err(error)) => {
-                prelude.push_back(Err(error));
-                return (prelude, true);
-            }
-            None => return (prelude, true),
         }
     }
-    (prelude, false)
 }
 
 pub async fn messages(
@@ -967,23 +980,26 @@ async fn build_upstream_response(
 
     let mut inference_id = None;
     let body = if status.is_success() && endpoint == AnthropicRawEndpoint::Messages && stream {
-        let mut parser = SseUsageParser::default();
-        let (prelude, inner_done) = peek_stream_message_id(&mut upstream.body, &mut parser).await;
-        inference_id = parser.usage.inference_id();
+        // Construct the billing-owning stream before the first await so a
+        // client disconnect (or the peek timeout) during the peek still runs
+        // its Drop and records whatever usage the parser has seen.
+        let mut usage_stream = NativeUsageStream {
+            inner: upstream.body,
+            parser: SseUsageParser::default(),
+            prelude: VecDeque::new(),
+            inner_done: false,
+            billing,
+            concurrent_slot,
+            runtime_handle: tokio::runtime::Handle::current(),
+        };
+        let _ = tokio::time::timeout(STREAM_ID_PEEK_TIMEOUT, usage_stream.peek_message_id()).await;
+        inference_id = usage_stream.parser.usage.inference_id();
         if inference_id.is_none() {
             tracing::warn!(
                 "Native Anthropic stream did not reveal a message id before response start"
             );
         }
-        Body::from_stream(NativeUsageStream {
-            inner: upstream.body,
-            parser,
-            prelude,
-            inner_done,
-            billing,
-            concurrent_slot,
-            runtime_handle: tokio::runtime::Handle::current(),
-        })
+        Body::from_stream(usage_stream)
     } else {
         Body::from_stream(upstream.body)
     };
@@ -1475,6 +1491,21 @@ mod tests {
         Box::pin(futures_util::stream::iter(items))
     }
 
+    fn usage_stream_over(
+        items: Vec<Result<Bytes, AnthropicRawError>>,
+        billing: Option<NativeBillingContext>,
+    ) -> NativeUsageStream {
+        NativeUsageStream {
+            inner: raw_body_from(items),
+            parser: SseUsageParser::default(),
+            prelude: VecDeque::new(),
+            inner_done: false,
+            billing,
+            concurrent_slot: None,
+            runtime_handle: tokio::runtime::Handle::current(),
+        }
+    }
+
     #[tokio::test]
     async fn stream_peek_reveals_the_message_id_and_replays_bytes_verbatim() {
         let first = Bytes::from_static(b"event: message_start\nda");
@@ -1484,31 +1515,20 @@ mod tests {
         let tail = Bytes::from_static(
             b"data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":9}}\n\n",
         );
-        let mut body = raw_body_from(vec![
-            Ok(first.clone()),
-            Ok(second.clone()),
-            Ok(tail.clone()),
-        ]);
-        let mut parser = SseUsageParser::default();
-        let (prelude, inner_done) = peek_stream_message_id(&mut body, &mut parser).await;
+        let mut stream = usage_stream_over(
+            vec![Ok(first.clone()), Ok(second.clone()), Ok(tail.clone())],
+            None,
+        );
+        stream.peek_message_id().await;
 
         assert_eq!(
-            parser.usage.inference_id(),
+            stream.parser.usage.inference_id(),
             Some(hash_inference_id_to_uuid("msg_stream"))
         );
-        assert!(!inner_done);
+        assert!(!stream.inner_done);
 
         // The client must receive every byte exactly once and in order, and
         // the tee parser must keep accounting for post-peek usage events.
-        let stream = NativeUsageStream {
-            inner: body,
-            parser,
-            prelude,
-            inner_done,
-            billing: None,
-            concurrent_slot: None,
-            runtime_handle: tokio::runtime::Handle::current(),
-        };
         use futures_util::StreamExt as _;
         let mut stream = Box::pin(stream);
         let mut replayed = Vec::new();
@@ -1526,22 +1546,268 @@ mod tests {
     #[tokio::test]
     async fn stream_peek_gives_up_at_the_byte_cap_without_dropping_bytes() {
         let preamble = Bytes::from(vec![b'x'; MAX_STREAM_ID_PEEK_BYTES + 1]);
-        let mut body = raw_body_from(vec![Ok(preamble.clone()), Ok(Bytes::from_static(b"tail"))]);
-        let mut parser = SseUsageParser::default();
-        let (prelude, inner_done) = peek_stream_message_id(&mut body, &mut parser).await;
+        let mut stream = usage_stream_over(
+            vec![Ok(preamble.clone()), Ok(Bytes::from_static(b"tail"))],
+            None,
+        );
+        stream.peek_message_id().await;
 
-        assert_eq!(parser.usage.inference_id(), None);
-        assert!(!inner_done);
-        assert_eq!(prelude.len(), 1);
-        assert_eq!(prelude[0].as_ref().unwrap(), &preamble);
+        assert_eq!(stream.parser.usage.inference_id(), None);
+        assert!(!stream.inner_done);
+        assert_eq!(stream.prelude.len(), 1);
+        assert_eq!(stream.prelude[0].as_ref().unwrap(), &preamble);
     }
 
     #[tokio::test]
     async fn stream_peek_captures_an_immediate_upstream_end() {
-        let mut body = raw_body_from(vec![]);
-        let mut parser = SseUsageParser::default();
-        let (prelude, inner_done) = peek_stream_message_id(&mut body, &mut parser).await;
-        assert!(prelude.is_empty());
-        assert!(inner_done);
+        let mut stream = usage_stream_over(vec![], None);
+        stream.peek_message_id().await;
+        assert!(stream.prelude.is_empty());
+        assert!(stream.inner_done);
+    }
+
+    /// Captures `record_usage` requests for assertion. Recording is the only
+    /// method the streaming billing path calls; the rest stay unimplemented.
+    /// Returning Err spares constructing a full UsageLogEntry — the request
+    /// is captured before the result is inspected.
+    #[derive(Default)]
+    struct RecordingUsageService {
+        records: std::sync::Mutex<Vec<RecordUsageServiceRequest>>,
+    }
+
+    #[async_trait::async_trait]
+    impl UsageServiceTrait for RecordingUsageService {
+        async fn calculate_cost(
+            &self,
+            _model_id: &str,
+            _input_tokens: i32,
+            _output_tokens: i32,
+            _cache_read_tokens: i32,
+        ) -> Result<services::usage::CostBreakdown, services::usage::UsageError> {
+            unimplemented!()
+        }
+
+        async fn record_usage(
+            &self,
+            request: RecordUsageServiceRequest,
+        ) -> Result<services::usage::UsageLogEntry, services::usage::UsageError> {
+            self.records
+                .lock()
+                .expect("records mutex should not poison")
+                .push(request);
+            Err(services::usage::UsageError::InternalError(
+                "recorded".to_string(),
+            ))
+        }
+
+        async fn record_usage_from_api(
+            &self,
+            _organization_id: Uuid,
+            _workspace_id: Uuid,
+            _api_key_id: Uuid,
+            _request: services::usage::RecordUsageApiRequest,
+        ) -> Result<services::usage::UsageLogEntry, services::usage::UsageError> {
+            unimplemented!()
+        }
+
+        async fn check_can_use(
+            &self,
+            _organization_id: Uuid,
+        ) -> Result<services::usage::UsageCheckResult, services::usage::UsageError> {
+            unimplemented!()
+        }
+
+        async fn get_balance(
+            &self,
+            _organization_id: Uuid,
+        ) -> Result<Option<services::usage::OrganizationBalanceInfo>, services::usage::UsageError>
+        {
+            unimplemented!()
+        }
+
+        async fn get_usage_history(
+            &self,
+            _organization_id: Uuid,
+            _limit: Option<i64>,
+            _offset: Option<i64>,
+        ) -> Result<(Vec<services::usage::UsageLogEntry>, i64), services::usage::UsageError>
+        {
+            unimplemented!()
+        }
+
+        async fn get_limit(
+            &self,
+            _organization_id: Uuid,
+        ) -> Result<Option<services::usage::OrganizationLimit>, services::usage::UsageError>
+        {
+            unimplemented!()
+        }
+
+        async fn get_credit_limits(
+            &self,
+            _organization_id: Uuid,
+        ) -> Result<Vec<services::usage::OrganizationCreditLimit>, services::usage::UsageError>
+        {
+            unimplemented!()
+        }
+
+        async fn get_usage_history_by_api_key(
+            &self,
+            _api_key_id: Uuid,
+            _limit: Option<i64>,
+            _offset: Option<i64>,
+        ) -> Result<(Vec<services::usage::UsageLogEntry>, i64), services::usage::UsageError>
+        {
+            unimplemented!()
+        }
+
+        async fn get_api_key_usage_history_with_permissions(
+            &self,
+            _workspace_id: Uuid,
+            _api_key_id: Uuid,
+            _user_id: Uuid,
+            _limit: Option<i64>,
+            _offset: Option<i64>,
+        ) -> Result<(Vec<services::usage::UsageLogEntry>, i64), services::usage::UsageError>
+        {
+            unimplemented!()
+        }
+
+        async fn get_costs_by_inference_ids(
+            &self,
+            _organization_id: Uuid,
+            _inference_ids: Vec<Uuid>,
+        ) -> Result<Vec<services::usage::InferenceCost>, services::usage::UsageError> {
+            unimplemented!()
+        }
+
+        async fn get_usage_by_model(
+            &self,
+            _organization_id: Uuid,
+            _start_date: chrono::DateTime<chrono::Utc>,
+        ) -> Result<Vec<services::usage::UsageByModelEntry>, services::usage::UsageError> {
+            unimplemented!()
+        }
+
+        async fn list_inference_usage_report(
+            &self,
+            _query: services::usage::InferenceUsageReportQuery,
+        ) -> Result<Vec<services::usage::InferenceUsageReportRow>, services::usage::UsageError>
+        {
+            unimplemented!()
+        }
+
+        async fn list_inference_usage_history(
+            &self,
+            _query: services::usage::InferenceUsageHistoryQuery,
+        ) -> Result<(Vec<services::usage::InferenceUsageReportRow>, i64), services::usage::UsageError>
+        {
+            unimplemented!()
+        }
+    }
+
+    fn billing_context(usage_service: Arc<RecordingUsageService>) -> NativeBillingContext {
+        NativeBillingContext {
+            usage_service,
+            organization_id: Uuid::new_v4(),
+            workspace_id: Uuid::new_v4(),
+            api_key_id: Uuid::new_v4(),
+            model_id: Uuid::new_v4(),
+            inference_type: InferenceType::ChatCompletionStream,
+            provider_attribution: ProviderAttribution::default(),
+            cache_write_cost_per_token: 0,
+        }
+    }
+
+    /// Billing runs on a spawned blocking task after the stream finishes;
+    /// poll briefly instead of racing it.
+    async fn wait_for_recorded_usage(
+        usage_service: &RecordingUsageService,
+    ) -> RecordUsageServiceRequest {
+        for _ in 0..200 {
+            {
+                let mut records = usage_service
+                    .records
+                    .lock()
+                    .expect("records mutex should not poison");
+                if let Some(request) = records.pop() {
+                    return request;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("usage was not recorded within 2s");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn completed_stream_records_usage_under_the_derived_inference_id() {
+        let usage_service = Arc::new(RecordingUsageService::default());
+        let mut stream = usage_stream_over(
+            vec![
+                Ok(Bytes::from_static(
+                    b"data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_stream\",\"usage\":{\"input_tokens\":4}}}\n\n",
+                )),
+                Ok(Bytes::from_static(
+                    b"data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":9}}\n\n",
+                )),
+            ],
+            Some(billing_context(usage_service.clone())),
+        );
+        stream.peek_message_id().await;
+
+        use futures_util::StreamExt as _;
+        let mut stream = Box::pin(stream);
+        while let Some(item) = stream.next().await {
+            item.unwrap();
+        }
+        drop(stream);
+
+        let recorded = wait_for_recorded_usage(&usage_service).await;
+        assert_eq!(
+            recorded.inference_id,
+            Some(hash_inference_id_to_uuid("msg_stream"))
+        );
+        assert_eq!(recorded.provider_request_id.as_deref(), Some("msg_stream"));
+        assert_eq!(recorded.stop_reason, Some(StopReason::Completed));
+        assert_eq!(recorded.input_tokens, 4);
+        assert_eq!(recorded.output_tokens, 9);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn upstream_error_during_peek_is_replayed_and_billed_as_provider_error() {
+        let usage_service = Arc::new(RecordingUsageService::default());
+        // No trailing newline: the peek cannot parse the id from the
+        // buffered line, so it keeps reading and captures the error;
+        // `finish()` still recovers the id and tokens for billing.
+        let leading = Bytes::from_static(
+            b"data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_stream\",\"usage\":{\"input_tokens\":4}}}",
+        );
+        let mut stream = usage_stream_over(
+            vec![
+                Ok(leading.clone()),
+                Err(AnthropicRawError::Transport("upstream died".to_string())),
+            ],
+            Some(billing_context(usage_service.clone())),
+        );
+        stream.peek_message_id().await;
+        assert!(stream.inner_done);
+        assert_eq!(stream.prelude.len(), 2);
+
+        use futures_util::StreamExt as _;
+        let mut stream = Box::pin(stream);
+        let first = stream.next().await.expect("peeked bytes replay first");
+        assert_eq!(first.unwrap(), leading);
+        let second = stream.next().await.expect("the captured error replays");
+        assert!(second.is_err());
+        assert!(stream.next().await.is_none());
+        drop(stream);
+
+        let recorded = wait_for_recorded_usage(&usage_service).await;
+        assert_eq!(
+            recorded.inference_id,
+            Some(hash_inference_id_to_uuid("msg_stream"))
+        );
+        assert_eq!(recorded.stop_reason, Some(StopReason::ProviderError));
+        assert_eq!(recorded.input_tokens, 4);
     }
 }

@@ -1,3 +1,4 @@
+use crate::database_encryption_inventory::{policy_for, Classification};
 use crate::middleware::AdminUser;
 use axum::{extract::Path, http::StatusCode, Extension, Json};
 use chrono::{DateTime, Utc};
@@ -322,7 +323,10 @@ fn normalize_scope(scope: &mut Scope) {
 fn predicate(f: &Field) -> String {
     match f.kind {
         Kind::Json => format!(
-            "{0} IS NOT NULL AND jsonb_typeof({0})='object' AND {0} ? '{MARKER}'",
+            "{0} IS NOT NULL AND jsonb_typeof({0})='object' \
+             AND {0}->>'{MARKER}'='true' AND {0}->>'version'='1' \
+             AND {0}->>'alg'='AES-256-GCM' \
+             AND {0} ?& ARRAY['key_id','nonce','ciphertext']",
             f.column
         ),
         Kind::Text => format!(
@@ -330,6 +334,175 @@ fn predicate(f: &Field) -> String {
             f.column
         ),
     }
+}
+
+fn operational_scope(entries: Vec<String>) -> anyhow::Result<Scope> {
+    let mut scope = Scope::default();
+    for entry in entries {
+        if let Some((table, column)) = entry.split_once('.') {
+            scope.fields.push(FieldName {
+                table: table.to_string(),
+                column: column.to_string(),
+            });
+        } else {
+            scope.tables.push(entry);
+        }
+    }
+    normalize_scope(&mut scope);
+    selected(&scope).map_err(|(_, Json(value))| anyhow::anyhow!("invalid scope: {value}"))?;
+    Ok(scope)
+}
+
+async fn verify_classification_inventory(state: &DatabaseEncryptionState) -> anyhow::Result<Value> {
+    let client = state.pool.get().await?;
+    let rows = client
+        .query(
+            "SELECT table_name,column_name FROM information_schema.columns \
+             WHERE table_schema='public' \
+               AND (data_type IN ('text','json','jsonb','character varying','character') OR udt_name='citext') \
+               AND table_name <> 'refinery_schema_history' \
+             ORDER BY table_name,column_name",
+            &[],
+        )
+        .await?;
+    let mut classified = Vec::with_capacity(rows.len());
+    let mut missing = Vec::new();
+    for row in rows {
+        let table: String = row.get(0);
+        let column: String = row.get(1);
+        match policy_for(&table, &column) {
+            Some(policy) => classified.push(json!({
+                "table": table,
+                "column": column,
+                "classification": policy.classification,
+                "reason": policy.reason,
+            })),
+            None => missing.push(format!("{table}.{column}")),
+        }
+    }
+    if !missing.is_empty() {
+        anyhow::bail!("unclassified text/JSON database columns: {missing:?}");
+    }
+    let encrypted_inventory: std::collections::HashSet<_> = classified
+        .iter()
+        .filter(|field| field["classification"] == json!(Classification::Encrypt))
+        .filter_map(|field| Some((field["table"].as_str()?, field["column"].as_str()?)))
+        .collect();
+    for field in FIELDS {
+        if !encrypted_inventory.contains(&(field.table, field.column)) {
+            anyhow::bail!(
+                "encryption registry field has no encrypt policy: {}.{}",
+                field.table,
+                field.column
+            );
+        }
+    }
+    let registry: std::collections::HashSet<_> = FIELDS
+        .iter()
+        .map(|field| (field.table, field.column))
+        .collect();
+    for field in &encrypted_inventory {
+        if !registry.contains(field) {
+            anyhow::bail!(
+                "encrypt policy has no implementation in the encryption registry: {}.{}",
+                field.0,
+                field.1
+            );
+        }
+    }
+    Ok(json!({"complete": true, "fields": classified}))
+}
+
+pub async fn operational_scan(
+    state: &DatabaseEncryptionState,
+    entries: Vec<String>,
+) -> anyhow::Result<Value> {
+    let inventory = verify_classification_inventory(state).await?;
+    let scope = operational_scope(entries)?;
+    let fields = selected(&scope).map_err(|_| anyhow::anyhow!("invalid scope"))?;
+    let counts = counts(state, &fields, None).await?;
+    Ok(json!({"inventory": inventory, "fields": counts, "totals": totals(&counts)}))
+}
+
+pub async fn operational_verify(
+    state: &DatabaseEncryptionState,
+    entries: Vec<String>,
+) -> anyhow::Result<Value> {
+    let report = operational_scan(state, entries).await?;
+    let totals = &report["totals"];
+    let pass = totals["plaintext"].as_i64() == Some(0)
+        && totals["invalid_envelope"].as_i64() == Some(0)
+        && totals["complete"].as_bool() == Some(true);
+    Ok(json!({"pass": pass, "report": report}))
+}
+
+pub async fn operational_migrate(
+    state: &DatabaseEncryptionState,
+    entries: Vec<String>,
+    batch_size: i64,
+    max_rows: Option<i64>,
+    resume: Option<Uuid>,
+    operator: &str,
+) -> anyhow::Result<Uuid> {
+    if !(1..=1000).contains(&batch_size) {
+        anyhow::bail!("batch_size must be between 1 and 1000");
+    }
+    if max_rows.is_some_and(|value| value <= 0) {
+        anyhow::bail!("max_rows must be greater than zero");
+    }
+    let verification_entries = entries.clone();
+    let scope = operational_scope(entries)?;
+    if scope.tables.is_empty() && scope.fields.is_empty() {
+        anyhow::bail!("an explicit scope is required");
+    }
+    let id = if let Some(id) = resume {
+        let client = state.pool.get().await?;
+        let persisted_scope: Value = client
+            .query_opt(
+                "SELECT scope FROM database_encryption_jobs \
+                 WHERE id=$1 AND status IN ('queued','running','failed')",
+                &[&id],
+            )
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("job does not exist or is not resumable"))?
+            .get(0);
+        if persisted_scope != serde_json::to_value(&scope)? {
+            anyhow::bail!("resume scope does not match the persisted job scope");
+        }
+        client
+            .execute(
+                "UPDATE database_encryption_jobs SET status='queued',completed_at=NULL,last_error_class=NULL,last_error_message=NULL WHERE id=$1",
+                &[&id],
+            )
+            .await?;
+        id
+    } else {
+        let id = Uuid::new_v4();
+        let client = state.pool.get().await?;
+        client.execute(
+            "INSERT INTO database_encryption_jobs(id,mode,status,scope,actions,batch_size,max_rows,admin_actor,operator) \
+             VALUES($1,'execute','queued',$2,$3,$4,$5,NULL,$6)",
+            &[&id, &serde_json::to_value(&scope)?, &json!(["encrypt"]), &batch_size, &max_rows, &operator],
+        ).await?;
+        id
+    };
+    run_job(state, id).await?;
+    let client = state.pool.get().await?;
+    let status: String = client
+        .query_one(
+            "SELECT status FROM database_encryption_jobs WHERE id=$1",
+            &[&id],
+        )
+        .await?
+        .get(0);
+    if status != "completed" {
+        anyhow::bail!("database encryption job ended with status {status}");
+    }
+    let verification = operational_verify(state, verification_entries).await?;
+    if verification["pass"] != true {
+        anyhow::bail!("post-migration verification failed");
+    }
+    Ok(id)
 }
 
 async fn counts(

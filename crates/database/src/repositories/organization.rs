@@ -697,6 +697,40 @@ impl OrganizationRepository for PgOrganizationRepository {
                         .await
                         .map_err(map_db_error)?;
 
+                    if rows_affected > 0 {
+                        // Deactivating only the organization row leaves its workspaces and
+                        // API keys marked active while every lookup for them joins
+                        // `organizations` with `is_active = true` and fails. Those rows are
+                        // dead but still advertised: `/v1/users/me` kept listing the
+                        // workspaces, so clients that pick the current org from that list
+                        // pinned themselves to a deleted org. Cascade in the same
+                        // transaction so the deletion is all-or-nothing and `is_active`
+                        // stays truthful at every level.
+                        transaction
+                            .execute(
+                                r#"
+                                UPDATE api_keys
+                                SET is_active = false
+                                WHERE is_active = true
+                                  AND workspace_id IN (
+                                      SELECT id FROM workspaces WHERE organization_id = $1
+                                  )
+                                "#,
+                                &[&id],
+                            )
+                            .await
+                            .map_err(map_db_error)?;
+
+                        transaction
+                            .execute(
+                                "UPDATE workspaces SET is_active = false, updated_at = NOW() \
+                                 WHERE organization_id = $1 AND is_active = true",
+                                &[&id],
+                            )
+                            .await
+                            .map_err(map_db_error)?;
+                    }
+
                     transaction.commit().await.map_err(map_db_error)?;
 
                     if rows_affected > 0 {

@@ -575,10 +575,13 @@ impl services::workspace::ports::WorkspaceRepository for WorkspaceRepository {
                     r#"
                     SELECT w.*
                     FROM workspaces w
+                    INNER JOIN organizations o
+                        ON w.organization_id = o.id
                     INNER JOIN organization_members om
                         ON w.organization_id = om.organization_id
                     WHERE om.user_id = $1
                       AND w.is_active = true
+                      AND o.is_active = true
                     ORDER BY w.created_at ASC
                     LIMIT $2
                     "#,

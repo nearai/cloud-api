@@ -34,6 +34,7 @@ pub const TAG_RESULT: &str = "result";
 pub const METRIC_CONCURRENCY_ADMITTED: &str = "cloud_api.concurrency.admitted";
 pub const METRIC_CONCURRENCY_REJECTED: &str = "cloud_api.concurrency.rejected";
 pub const METRIC_CONCURRENCY_DEGRADED: &str = "cloud_api.concurrency.degraded";
+pub const METRIC_CONCURRENCY_WOULD_REJECT: &str = "cloud_api.concurrency.would_reject";
 
 // What the lease store adds to the inference hot path, and the health of the
 // background loops that keep leases accurate.

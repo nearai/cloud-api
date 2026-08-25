@@ -667,6 +667,8 @@ pub struct CompletionServiceImpl {
 
 enum LeaseAdmission {
     AtLimit(ports::CompletionError),
+    /// Over the fleet limit while shadowing, so the per-process limit decides.
+    Shadowed,
     /// The lease store could not answer, so admission falls back to the
     /// per-process limit rather than rejecting the request.
     Unavailable(anyhow::Error),
@@ -778,6 +780,7 @@ struct FleetConcurrency {
     release: mpsc::UnboundedSender<Uuid>,
     instance_id: String,
     ttl: Duration,
+    enforcing: bool,
 }
 
 /// Renewals attempted within one lease TTL. Three gives two spare attempts
@@ -938,6 +941,7 @@ impl CompletionServiceImpl {
         repository: Arc<dyn ports::ConcurrencyLeaseRepository>,
         instance_id: String,
         ttl: Duration,
+        enforcing: bool,
     ) -> Self {
         let (release, mut released) = mpsc::unbounded_channel::<Uuid>();
         let releaser = repository.clone();
@@ -1086,6 +1090,7 @@ impl CompletionServiceImpl {
             release,
             instance_id,
             ttl,
+            enforcing,
         });
         self
     }
@@ -1801,6 +1806,14 @@ impl CompletionServiceImpl {
             }
             ports::LeaseOutcome::AtLimit { limit, in_flight } => {
                 self.last_known_limits.insert(organization_id, limit).await;
+                if !fleet.enforcing {
+                    self.record_concurrency(
+                        METRIC_CONCURRENCY_WOULD_REJECT,
+                        model_name,
+                        SCOPE_FLEET,
+                    );
+                    return Err(LeaseAdmission::Shadowed);
+                }
                 self.record_concurrency(METRIC_CONCURRENCY_REJECTED, model_name, SCOPE_FLEET);
                 tracing::warn!(
                     organization_id = %organization_id,
@@ -1871,6 +1884,7 @@ impl CompletionServiceImpl {
             {
                 Ok(slot) => return Ok(slot),
                 Err(LeaseAdmission::AtLimit(error)) => return Err(error),
+                Err(LeaseAdmission::Shadowed) => {}
                 Err(LeaseAdmission::Unavailable(error)) => {
                     self.record_concurrency(METRIC_CONCURRENCY_DEGRADED, model_name, SCOPE_REPLICA);
                     tracing::warn!(

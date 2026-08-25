@@ -433,7 +433,7 @@ pub async fn init_domain_services_with_pool(
         org_limit_repository,
     );
 
-    if config.fleet_concurrency.mode == config::FleetConcurrencyMode::Enforce {
+    if config.fleet_concurrency.mode != config::FleetConcurrencyMode::Off {
         let lease_repository = Arc::new(
             database::repositories::concurrency_lease::PostgresConcurrencyLeaseRepository::new(
                 database.pool().clone(),
@@ -443,6 +443,7 @@ pub async fn init_domain_services_with_pool(
             lease_repository,
             config.fleet_concurrency.instance_id.clone(),
             std::time::Duration::from_secs(config.fleet_concurrency.lease_ttl_seconds),
+            config.fleet_concurrency.mode == config::FleetConcurrencyMode::Enforce,
         );
     }
 

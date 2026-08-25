@@ -182,6 +182,15 @@ fn replica(
     metrics: Arc<CapturingMetricsService>,
     limits: Arc<dyn ports::OrganizationConcurrentLimitRepository>,
 ) -> CompletionServiceImpl {
+    replica_with(store, metrics, limits, true)
+}
+
+fn replica_with(
+    store: Arc<SharedLeaseStore>,
+    metrics: Arc<CapturingMetricsService>,
+    limits: Arc<dyn ports::OrganizationConcurrentLimitRepository>,
+    enforcing: bool,
+) -> CompletionServiceImpl {
     let pool = Arc::new(InferenceProviderPool::new(
         None,
         config::ExternalProvidersConfig::default(),
@@ -194,7 +203,12 @@ fn replica(
         Arc::new(EmptyModelsRepository),
         limits,
     )
-    .with_fleet_concurrency(store, "test-instance".to_string(), Duration::from_secs(60))
+    .with_fleet_concurrency(
+        store,
+        "test-instance".to_string(),
+        Duration::from_secs(60),
+        enforcing,
+    )
 }
 
 fn counts(metrics: &CapturingMetricsService, name: &str) -> usize {
@@ -387,4 +401,98 @@ async fn an_unknown_limit_falls_back_to_the_default() {
         slot.is_ok(),
         "with no limit ever read the default applies rather than rejecting"
     );
+}
+
+/// Shadow mode is only useful if it measures without rejecting: the fleet
+/// count goes over the limit and the request still proceeds.
+#[tokio::test]
+async fn shadowing_records_the_verdict_without_rejecting() {
+    const REPLICAS: usize = 4;
+    const ATTEMPTS: usize = 20;
+
+    let store = Arc::new(SharedLeaseStore::with_limit(LIMIT));
+    let metrics = Arc::new(CapturingMetricsService::new());
+    let organization_id = Uuid::new_v4();
+    let model_id = Uuid::new_v4();
+
+    let replicas: Vec<Arc<CompletionServiceImpl>> = (0..REPLICAS)
+        .map(|_| {
+            Arc::new(replica_with(
+                store.clone(),
+                metrics.clone(),
+                Arc::new(StaticLimitRepository(Some(LIMIT))),
+                false,
+            ))
+        })
+        .collect();
+
+    let mut slots = Vec::new();
+    for attempt in 0..ATTEMPTS {
+        let service = &replicas[attempt % REPLICAS];
+        if let Ok(slot) = service
+            .try_acquire_concurrent_slot(organization_id, model_id, MODEL_NAME)
+            .await
+        {
+            slots.push(slot);
+        }
+    }
+
+    assert!(
+        slots.len() > LIMIT as usize,
+        "shadowing must not enforce the fleet limit, admitted {}",
+        slots.len()
+    );
+    assert!(
+        counts(&metrics, METRIC_CONCURRENCY_WOULD_REJECT) > 0,
+        "the over-limit verdict is the whole signal shadow mode exists to give"
+    );
+    assert_eq!(
+        counts(&metrics, METRIC_CONCURRENCY_REJECTED),
+        0,
+        "nothing is rejected while shadowing"
+    );
+}
+
+/// The guard handed to direct transport routes must free fleet capacity when
+/// dropped, or those routes hold leases until the TTL expires.
+#[tokio::test]
+async fn dropping_a_transport_guard_frees_fleet_capacity() {
+    use ports::CompletionServiceTrait;
+
+    let store = Arc::new(SharedLeaseStore::with_limit(1));
+    let metrics = Arc::new(CapturingMetricsService::new());
+    let organization_id = Uuid::new_v4();
+    let model_id = Uuid::new_v4();
+    let service = replica(
+        store.clone(),
+        metrics.clone(),
+        Arc::new(StaticLimitRepository(Some(1))),
+    );
+
+    let guard = service
+        .acquire_concurrent_slot(organization_id, model_id, MODEL_NAME)
+        .await
+        .expect("the first request takes the only slot");
+    assert_eq!(store.live_count(organization_id, model_id), 1);
+
+    assert!(
+        service
+            .acquire_concurrent_slot(organization_id, model_id, MODEL_NAME)
+            .await
+            .is_err(),
+        "the limit is one, so a second transport request is refused"
+    );
+
+    drop(guard);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    assert_eq!(
+        store.live_count(organization_id, model_id),
+        0,
+        "the released lease must leave the store, not linger until it expires"
+    );
+    service
+        .acquire_concurrent_slot(organization_id, model_id, MODEL_NAME)
+        .await
+        .expect("the freed slot admits the next transport request");
 }

@@ -37,6 +37,8 @@ pub enum FleetConcurrencyMode {
     /// Each replica counts only its own in-flight requests.
     #[default]
     Off,
+    /// Leases are counted fleet-wide but rejection stays per-replica.
+    Shadow,
     /// Admission is decided by the fleet-wide lease count.
     Enforce,
 }
@@ -63,6 +65,7 @@ impl FleetConcurrencyConfig {
         let requested = env::var("FLEET_CONCURRENCY_MODE").unwrap_or_default();
         let mode = match requested.to_ascii_lowercase().as_str() {
             "enforce" => FleetConcurrencyMode::Enforce,
+            "shadow" => FleetConcurrencyMode::Shadow,
             "" | "off" => FleetConcurrencyMode::Off,
             _ => {
                 // eprintln for the reason given on the CHUTES_MODELS warning

@@ -1,6 +1,7 @@
 pub mod consts;
 pub mod conversions;
 pub mod database_encryption;
+pub mod database_encryption_inventory;
 pub mod middleware;
 pub mod models;
 pub mod ohttp_gateway;
@@ -2200,18 +2201,6 @@ pub fn build_admin_routes(
         infra_service,
     };
 
-    let database_encryption_state = crate::database_encryption::DatabaseEncryptionState::new(
-        database.pool().clone(),
-        &config.s3.encryption_key,
-    )
-    .map_err(|_| {
-        tracing::error!(
-            error_class = "invalid_database_encryption_key",
-            "Database encryption admin routes are disabled"
-        );
-    })
-    .ok();
-
     let admin_routes = Router::new()
         .route(
             "/admin/models",
@@ -2371,36 +2360,6 @@ pub fn build_admin_routes(
             axum::routing::delete(delete_admin_access_token),
         )
         .with_state(admin_app_state);
-
-    let admin_routes = if let Some(database_encryption_state) = database_encryption_state {
-        database_encryption_state.recover_jobs();
-        admin_routes.merge(
-            Router::new()
-                .route(
-                    "/admin/database-encryption/scan",
-                    axum::routing::post(crate::database_encryption::scan),
-                )
-                .route(
-                    "/admin/database-encryption/jobs",
-                    axum::routing::post(crate::database_encryption::create_job),
-                )
-                .route(
-                    "/admin/database-encryption/jobs/{id}",
-                    axum::routing::get(crate::database_encryption::get_job),
-                )
-                .route(
-                    "/admin/database-encryption/jobs/{id}/cancel",
-                    axum::routing::post(crate::database_encryption::cancel_job),
-                )
-                .route(
-                    "/admin/database-encryption/verify",
-                    axum::routing::post(crate::database_encryption::verify),
-                )
-                .layer(axum::Extension(database_encryption_state)),
-        )
-    } else {
-        admin_routes
-    };
 
     admin_routes
         // Admin middleware handles both authentication and authorization

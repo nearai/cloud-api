@@ -40,7 +40,7 @@ COPY crates/ ./crates/
 COPY .cargo/ ./.cargo/
 
 # Build the application in release mode
-RUN cargo build --release --locked --bin api
+RUN cargo build --release --locked --bin api --bin database_encryption_worker
 
 
 # Runtime stage
@@ -86,6 +86,7 @@ WORKDIR /app
 
 # Copy the built binary
 COPY --from=builder /app/target/release/api /app/api
+COPY --from=builder /app/target/release/database_encryption_worker /app/database_encryption_worker
 
 # Copy the migration SQL files
 RUN mkdir -p /app/crates/database/src/migrations/sql

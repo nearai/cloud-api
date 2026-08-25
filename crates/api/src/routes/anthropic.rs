@@ -44,6 +44,10 @@ const ALLOWED_ANTHROPIC_BETAS: &[&str] = &[
     "fine-grained-tool-streaming-2025-05-14",
     "token-efficient-tools-2025-02-19",
     "prompt-caching-2024-07-31",
+    // Sent by Claude Code for [1m]-suffixed models. Upstream treats it as a
+    // no-op: every current 1M-window model serves the full window by default
+    // at standard per-token pricing, so relaying it has no billing effect.
+    "context-1m-2025-08-07",
     // Claude Code currently sends this marker on ordinary requests. The
     // separate typed-tool body gate still rejects invocation of the advisor.
     "advisor-tool-2026-03-01",
@@ -1148,7 +1152,7 @@ mod tests {
         headers.insert(
             "anthropic-beta",
             HeaderValue::from_static(
-                "claude-code-20250219,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,advisor-tool-2026-03-01,effort-2025-11-24,structured-outputs-2025-12-15",
+                "claude-code-20250219,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,advisor-tool-2026-03-01,effort-2025-11-24,structured-outputs-2025-12-15,context-1m-2025-08-07",
             ),
         );
         let prepared = prepare_request(

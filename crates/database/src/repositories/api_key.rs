@@ -38,14 +38,26 @@ impl ApiKeyRepository {
                 .context("Failed to get database connection")
                 .map_err(RepositoryError::PoolError)?;
 
+            // Permissions are checked in the service layer, in a separate statement.
+            // Without this guard a request that read the workspace as live can land
+            // its INSERT after a concurrent organization deletion has cascaded,
+            // minting a usable key under a deleted org — and the routes that
+            // authenticate on the key alone, without resolving workspace and
+            // organization context, would accept it.
             client
-                .query_one(
+                .query_opt(
                     r#"
                 INSERT INTO api_keys (
                     id, key_hash, key_prefix, name, workspace_id, created_by_user_id,
                     created_at, expires_at, last_used_at, is_active, deleted_at, spend_limit
                 )
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NULL, true, NULL, $9)
+                SELECT $1, $2, $3, $4, $5, $6, $7, $8, NULL, true, NULL, $9
+                WHERE EXISTS (
+                    SELECT 1
+                    FROM workspaces w
+                    JOIN organizations o ON w.organization_id = o.id
+                    WHERE w.id = $5 AND w.is_active = true AND o.is_active = true
+                )
                 RETURNING *
                 "#,
                     &[
@@ -62,6 +74,10 @@ impl ApiKeyRepository {
                 )
                 .await
                 .map_err(map_db_error)
+        })?;
+
+        let _row = _row.ok_or_else(|| {
+            RepositoryError::NotFound("active workspace for new API key".to_string())
         })?;
 
         debug!(

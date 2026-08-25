@@ -313,28 +313,6 @@ impl PgOrganizationRepository {
             .map_err(RepositoryError::DataConversionError)
     }
 
-    /// Delete an organization (soft delete)
-    pub async fn delete(&self, id: Uuid) -> Result<bool> {
-        let rows_affected = retry_db!("delete_organization", {
-            let client = self
-                .pool
-                .get()
-                .await
-                .context("Failed to get database connection")
-                .map_err(RepositoryError::PoolError)?;
-
-            client
-                .execute(
-                    "UPDATE organizations SET is_active = false WHERE id = $1 AND is_active = true",
-                    &[&id],
-                )
-                .await
-                .map_err(map_db_error)
-        })?;
-
-        Ok(rows_affected > 0)
-    }
-
     /// Add a member to an organization - internal method
     async fn add_member_internal(
         &self,
@@ -706,16 +684,34 @@ impl OrganizationRepository for PgOrganizationRepository {
                         // pinned themselves to a deleted org. Cascade in the same
                         // transaction so the deletion is all-or-nothing and `is_active`
                         // stays truthful at every level.
+                        // `deleted_at` as well as `is_active`: a normal revoke sets
+                        // `deleted_at` (see `ApiKeyRepository::revoke`) and the listing
+                        // queries key off it, so setting only `is_active` would leave
+                        // these rows reading as "not deleted, merely inactive".
                         transaction
                             .execute(
                                 r#"
                                 UPDATE api_keys
-                                SET is_active = false
-                                WHERE is_active = true
+                                SET is_active = false,
+                                    deleted_at = COALESCE(deleted_at, NOW())
+                                WHERE (is_active = true OR deleted_at IS NULL)
                                   AND workspace_id IN (
                                       SELECT id FROM workspaces WHERE organization_id = $1
                                   )
                                 "#,
+                                &[&id],
+                            )
+                            .await
+                            .map_err(map_db_error)?;
+
+                        // Reporting tokens are validated on hash, revocation and expiry
+                        // alone — nothing joins the organization — so an unrevoked token
+                        // would keep reading usage data for a deleted org. No
+                        // `revoked_by_user_id`: this is a system revocation, not a user's.
+                        transaction
+                            .execute(
+                                "UPDATE organization_reporting_tokens SET revoked_at = NOW() \
+                                 WHERE organization_id = $1 AND revoked_at IS NULL",
                                 &[&id],
                             )
                             .await

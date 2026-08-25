@@ -39,14 +39,22 @@ impl WorkspaceRepository {
                 .context("Failed to get database connection")
                 .map_err(RepositoryError::PoolError)?;
 
+            // The membership check happens in the service layer, in a separate
+            // statement — a request that read the org as active can otherwise land
+            // its INSERT after a concurrent org deletion has already cascaded,
+            // leaving an active workspace under a deleted org. The foreign key
+            // does not catch it: the soft-deleted parent row still exists.
             client
-                .query_one(
+                .query_opt(
                     r#"
                 INSERT INTO workspaces (
                     id, name, description, organization_id,
                     created_by_user_id, created_at, updated_at, is_active
                 )
-                VALUES ($1, $2, $3, $4, $5, $6, $7, true)
+                SELECT $1, $2, $3, $4, $5, $6, $7, true
+                WHERE EXISTS (
+                    SELECT 1 FROM organizations WHERE id = $4 AND is_active = true
+                )
                 RETURNING *
                 "#,
                     &[
@@ -61,6 +69,10 @@ impl WorkspaceRepository {
                 )
                 .await
                 .map_err(map_db_error)
+        })?;
+
+        let row = row.ok_or_else(|| {
+            RepositoryError::NotFound("active organization for new workspace".to_string())
         })?;
 
         debug!(

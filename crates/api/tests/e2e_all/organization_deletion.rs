@@ -60,10 +60,13 @@ async fn test_delete_organization_removes_its_workspaces_from_users_me() {
     );
 }
 
-/// API keys under a deleted organization must stop authenticating, and their
-/// rows must be deactivated rather than left advertising `is_active = true`.
+/// Every credential under a deleted organization must stop working. API keys
+/// authenticate on some routes without any workspace/organization context, and
+/// reporting tokens are validated on hash, revocation and expiry alone — so
+/// neither fails closed on the organization's `is_active` flag, and both have to
+/// be revoked by the deletion itself.
 #[tokio::test]
-async fn test_delete_organization_revokes_its_api_keys() {
+async fn test_delete_organization_revokes_its_credentials() {
     let (server, database) = setup_test_server_with_database().await;
     let (session_id, _email) = setup_unique_test_session(&database).await;
 
@@ -75,6 +78,7 @@ async fn test_delete_organization_revokes_its_api_keys() {
         .id
         .clone();
     let api_key = get_api_key_for_org_with_session(&server, org.id.clone(), &session_id).await;
+    let reporting_token = create_reporting_token(&server, &org.id, &session_id).await;
 
     let response = server
         .delete(format!("/v1/organizations/{}", org.id).as_str())
@@ -112,6 +116,21 @@ async fn test_delete_organization_revokes_its_api_keys() {
         "API keys under a deleted org must be deactivated, not left marked active"
     );
 
+    // A normal revoke stamps `deleted_at`, and the listing queries key off it —
+    // the cascade has to match, not just flip `is_active`.
+    let undeleted_keys: i64 = client
+        .query_one(
+            "SELECT COUNT(*) FROM api_keys WHERE workspace_id = $1 AND deleted_at IS NULL",
+            &[&uuid::Uuid::parse_str(&workspace_id).unwrap()],
+        )
+        .await
+        .expect("failed to count api keys")
+        .get(0);
+    assert_eq!(
+        undeleted_keys, 0,
+        "API keys under a deleted org must be stamped deleted_at, like a normal revoke"
+    );
+
     let active_workspaces: i64 = client
         .query_one(
             "SELECT COUNT(*) FROM workspaces WHERE id = $1 AND is_active = true",
@@ -123,6 +142,110 @@ async fn test_delete_organization_revokes_its_api_keys() {
     assert_eq!(
         active_workspaces, 0,
         "workspaces under a deleted org must be deactivated"
+    );
+
+    // Reporting tokens never join the organization during validation, so the
+    // deletion is the only thing standing between a live token and usage data.
+    let response = server
+        .get(
+            format!(
+                "/v1/organizations/{}/usage/reporting-token-auth-probe",
+                org.id
+            )
+            .as_str(),
+        )
+        .add_header("Authorization", format!("Bearer {reporting_token}"))
+        .add_header("User-Agent", MOCK_USER_AGENT)
+        .await;
+    assert_eq!(
+        response.status_code(),
+        401,
+        "reporting token of a deleted org must not authenticate: {}",
+        response.text()
+    );
+
+    let unrevoked_tokens: i64 = client
+        .query_one(
+            "SELECT COUNT(*) FROM organization_reporting_tokens \
+             WHERE organization_id = $1 AND revoked_at IS NULL",
+            &[&uuid::Uuid::parse_str(&org.id).unwrap()],
+        )
+        .await
+        .expect("failed to count reporting tokens")
+        .get(0);
+    assert_eq!(
+        unrevoked_tokens, 0,
+        "reporting tokens under a deleted org must be revoked"
+    );
+}
+
+/// A workspace must not be creatable under a deleted organization. The
+/// membership check that guards workspace creation reads
+/// `organization_members`, which the deletion does not touch, so it still
+/// passes — only the insert's own guard stops the orphan being written. That
+/// guard is what closes the race between the check and the insert.
+#[tokio::test]
+async fn test_workspace_cannot_be_created_under_deleted_organization() {
+    let (server, database) = setup_test_server_with_database().await;
+    let (session_id, _email) = setup_unique_test_session(&database).await;
+
+    let org = create_org_with_session(&server, &session_id).await;
+
+    let response = server
+        .delete(format!("/v1/organizations/{}", org.id).as_str())
+        .add_header("Authorization", format!("Bearer {session_id}"))
+        .add_header("User-Agent", MOCK_USER_AGENT)
+        .await;
+    assert_eq!(response.status_code(), 200, "{}", response.text());
+
+    let response = server
+        .post(format!("/v1/organizations/{}/workspaces", org.id).as_str())
+        .add_header("Authorization", format!("Bearer {session_id}"))
+        .add_header("User-Agent", MOCK_USER_AGENT)
+        .json(&serde_json::json!({ "name": "orphan" }))
+        .await;
+    assert_eq!(
+        response.status_code(),
+        404,
+        "creating a workspace under a deleted org must fail: {}",
+        response.text()
+    );
+
+    // Straight at the repository, bypassing the service-layer membership check —
+    // this is the state the race leaves behind, and only the insert's own guard
+    // can reject it.
+    let repository = database::repositories::WorkspaceRepository::new(database.pool().clone());
+    let result = repository
+        .create(
+            database::models::CreateWorkspaceRequest {
+                name: "raced-orphan".to_string(),
+                description: None,
+            },
+            uuid::Uuid::parse_str(&org.id).unwrap(),
+            uuid::Uuid::parse_str(session_id.strip_prefix("rt_").unwrap()).unwrap(),
+        )
+        .await;
+    assert!(
+        result.is_err(),
+        "the insert itself must refuse a deleted parent org"
+    );
+
+    let client = database
+        .pool()
+        .get()
+        .await
+        .expect("failed to get database connection");
+    let workspaces: i64 = client
+        .query_one(
+            "SELECT COUNT(*) FROM workspaces WHERE organization_id = $1 AND is_active = true",
+            &[&uuid::Uuid::parse_str(&org.id).unwrap()],
+        )
+        .await
+        .expect("failed to count workspaces")
+        .get(0);
+    assert_eq!(
+        workspaces, 0,
+        "no active workspace may exist under a deleted org"
     );
 }
 
@@ -402,4 +525,25 @@ async fn list_members(
         .as_array()
         .expect("members array")
         .clone()
+}
+
+async fn create_reporting_token(
+    server: &axum_test::TestServer,
+    org_id: &str,
+    session_id: &str,
+) -> String {
+    let response = server
+        .post(format!("/v1/organizations/{org_id}/reporting-tokens").as_str())
+        .add_header("Authorization", format!("Bearer {session_id}"))
+        .add_header("User-Agent", MOCK_USER_AGENT)
+        .json(&serde_json::json!({
+            "name": "org deletion cascade",
+            "expires_at": (chrono::Utc::now() + chrono::Duration::days(30)).to_rfc3339(),
+        }))
+        .await;
+    assert_eq!(response.status_code(), 201, "{}", response.text());
+    response.json::<serde_json::Value>()["token"]
+        .as_str()
+        .expect("create response should include the raw token once")
+        .to_string()
 }

@@ -8,13 +8,14 @@
 -- found"). The workspaces were already unusable: every workspace lookup joins
 -- `organizations` with `is_active = true`.
 --
--- The credentials underneath them did not fail closed, though:
+-- The credentials underneath them did not fail closed when this migration was
+-- introduced:
 --
 --   * API keys still authenticated on the routes that validate the key alone
 --     without resolving workspace/organization context (files, conversations,
 --     attestation report/signature).
---   * Reporting tokens are validated on hash, revocation and expiry only —
---     nothing joins the organization — so they kept reading usage data.
+--   * Reporting tokens were validated on hash, revocation and expiry only —
+--     nothing joined the organization — so they kept reading usage data.
 --
 -- Revoke both, matching the conventions of their normal revoke paths
 -- (`deleted_at` for API keys, `revoked_at` for reporting tokens).

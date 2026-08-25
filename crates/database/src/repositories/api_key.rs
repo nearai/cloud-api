@@ -39,11 +39,12 @@ impl ApiKeyRepository {
                 .map_err(RepositoryError::PoolError)?;
 
             // Permissions are checked in the service layer, in a separate statement.
-            // Without this guard a request that read the workspace as live can land
-            // its INSERT after a concurrent organization deletion has cascaded,
-            // minting a usable key under a deleted org — and the routes that
-            // authenticate on the key alone, without resolving workspace and
-            // organization context, would accept it.
+            // Lock the active organization here too: an unlocked EXISTS can read
+            // the pre-delete version under READ COMMITTED while organization
+            // deletion holds an uncommitted FOR UPDATE lock. FOR SHARE waits and
+            // rechecks after the delete commits, so this cannot mint a key under a
+            // deleted org. Locking only the organization preserves the deletion
+            // path's organization-first lock order.
             client
                 .query_opt(
                     r#"
@@ -57,6 +58,7 @@ impl ApiKeyRepository {
                     FROM workspaces w
                     JOIN organizations o ON w.organization_id = o.id
                     WHERE w.id = $5 AND w.is_active = true AND o.is_active = true
+                    FOR SHARE OF o
                 )
                 RETURNING *
                 "#,
@@ -149,11 +151,16 @@ impl ApiKeyRepository {
             client
                 .query_opt(
                     r#"
-            SELECT * FROM api_keys 
-            WHERE key_hash = $1 
-              AND is_active = true 
-              AND deleted_at IS NULL
-              AND (expires_at IS NULL OR expires_at > NOW())
+            SELECT ak.*
+            FROM api_keys ak
+            JOIN workspaces w ON w.id = ak.workspace_id
+            JOIN organizations o ON o.id = w.organization_id
+            WHERE ak.key_hash = $1
+              AND ak.is_active = true
+              AND ak.deleted_at IS NULL
+              AND (ak.expires_at IS NULL OR ak.expires_at > NOW())
+              AND w.is_active = true
+              AND o.is_active = true
             "#,
                     &[&key_hash],
                 )

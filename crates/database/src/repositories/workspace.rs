@@ -40,10 +40,13 @@ impl WorkspaceRepository {
                 .map_err(RepositoryError::PoolError)?;
 
             // The membership check happens in the service layer, in a separate
-            // statement — a request that read the org as active can otherwise land
-            // its INSERT after a concurrent org deletion has already cascaded,
-            // leaving an active workspace under a deleted org. The foreign key
-            // does not catch it: the soft-deleted parent row still exists.
+            // statement. Lock the active organization here as well: an unlocked
+            // EXISTS can read the pre-delete version under READ COMMITTED while
+            // deletion holds an uncommitted FOR UPDATE lock. Waiting on FOR SHARE
+            // makes this statement recheck the active flag after that deletion
+            // commits, so it cannot leave an active workspace under a deleted org.
+            // The foreign key alone does not catch it because the soft-deleted
+            // parent row still exists.
             client
                 .query_opt(
                     r#"
@@ -53,7 +56,10 @@ impl WorkspaceRepository {
                 )
                 SELECT $1, $2, $3, $4, $5, $6, $7, true
                 WHERE EXISTS (
-                    SELECT 1 FROM organizations WHERE id = $4 AND is_active = true
+                    SELECT 1
+                    FROM organizations
+                    WHERE id = $4 AND is_active = true
+                    FOR SHARE
                 )
                 RETURNING *
                 "#,

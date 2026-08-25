@@ -704,10 +704,11 @@ impl OrganizationRepository for PgOrganizationRepository {
                             .await
                             .map_err(map_db_error)?;
 
-                        // Reporting tokens are validated on hash, revocation and expiry
-                        // alone — nothing joins the organization — so an unrevoked token
-                        // would keep reading usage data for a deleted org. No
-                        // `revoked_by_user_id`: this is a system revocation, not a user's.
+                        // Reporting-token validation also requires an active organization,
+                        // but revoke the persisted rows so credential state remains truthful
+                        // and a deleted org cannot regain access through a future validation
+                        // path. No `revoked_by_user_id`: this is a system revocation, not a
+                        // user's.
                         transaction
                             .execute(
                                 "UPDATE organization_reporting_tokens SET revoked_at = NOW() \

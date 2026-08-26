@@ -42,6 +42,8 @@ pub const METRIC_CONCURRENCY_ADMISSION_LATENCY: &str = "cloud_api.concurrency.ad
 pub const METRIC_CONCURRENCY_IN_FLIGHT: &str = "cloud_api.concurrency.in_flight";
 pub const METRIC_CONCURRENCY_RENEW_FAILED: &str = "cloud_api.concurrency.renew_failed";
 pub const METRIC_CONCURRENCY_RECLAIMED: &str = "cloud_api.concurrency.reclaimed";
+pub const METRIC_CONCURRENCY_RELEASE_DROPPED: &str = "cloud_api.concurrency.release_dropped";
+pub const METRIC_CONCURRENCY_SWEEP_FAILED: &str = "cloud_api.concurrency.sweep_failed";
 
 // Whether admission was decided fleet-wide or by this replica alone.
 pub const TAG_SCOPE: &str = "scope";

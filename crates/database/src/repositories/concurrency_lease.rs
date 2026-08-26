@@ -71,9 +71,10 @@ impl ConcurrencyLeaseRepository for PostgresConcurrencyLeaseRepository {
                             WHERE organization_id = $1
                               AND model_id = $2
                               AND expires_at > NOW()
+                              AND id <> $3
                         ) AS in_flight
                     "#,
-                    &[&organization_id, &model_id],
+                    &[&organization_id, &model_id, &lease_id],
                 )
                 .await
                 .map_err(map_db_error)?;

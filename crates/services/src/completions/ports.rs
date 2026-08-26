@@ -177,11 +177,11 @@ pub struct HeldLease {
     pub model_id: Uuid,
 }
 
-/// Repository trait for fleet-wide concurrency leases
-/// Used by CompletionService so replicas admit against one shared count
+/// Holds the shared in-flight count so replicas admit against one limit
+/// rather than one each.
 #[async_trait]
 pub trait ConcurrencyLeaseRepository: Send + Sync {
-    /// Record a lease if the organization is below its limit for the model
+    /// Record a lease if the organization is below its limit for the model.
     async fn try_acquire(
         &self,
         lease_id: Uuid,
@@ -192,6 +192,7 @@ pub trait ConcurrencyLeaseRepository: Send + Sync {
         ttl: Duration,
     ) -> Result<LeaseOutcome, anyhow::Error>;
 
+    /// Give back leases whose requests have finished.
     async fn release(&self, lease_ids: &[Uuid]) -> Result<(), anyhow::Error>;
 
     /// Extend leases the store already has, returning the ids still there.

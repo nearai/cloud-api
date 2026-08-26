@@ -587,7 +587,7 @@ pub(crate) enum ConcurrentSlot {
         organization_id: Uuid,
         model_id: Uuid,
         held: Arc<HeldLeases>,
-        release: mpsc::UnboundedSender<Uuid>,
+        release: mpsc::Sender<Uuid>,
     },
 }
 
@@ -609,11 +609,12 @@ impl ConcurrentSlot {
                 release,
             } => {
                 held.remove(*organization_id, *model_id, *id);
-                if release.send(*id).is_err() {
+                if release.try_send(*id).is_err() {
+                    held.record_dropped_release();
                     tracing::error!(
                         lease_id = %id,
-                        "Concurrency lease release channel is closed; the lease will \
-                         hold capacity until it expires"
+                        "Could not queue a concurrency lease release; it will hold \
+                         capacity until it expires"
                     );
                 }
             }
@@ -679,6 +680,7 @@ enum LeaseAdmission {
 #[derive(Default)]
 pub(crate) struct HeldLeases {
     by_model: std::sync::Mutex<HashMap<(Uuid, Uuid), HashMap<Uuid, LeaseState>>>,
+    dropped_releases: std::sync::atomic::AtomicU64,
 }
 
 /// Whether the store already has the row. Renewal updates stored leases and
@@ -709,6 +711,16 @@ impl HeldLeases {
                 }
             }
         }
+    }
+
+    fn record_dropped_release(&self) {
+        self.dropped_releases
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn take_dropped_releases(&self) -> u64 {
+        self.dropped_releases
+            .swap(0, std::sync::atomic::Ordering::Relaxed)
     }
 
     fn remove(&self, organization_id: Uuid, model_id: Uuid, lease_id: Uuid) {
@@ -777,7 +789,7 @@ impl HeldLeases {
 struct FleetConcurrency {
     repository: Arc<dyn ports::ConcurrencyLeaseRepository>,
     held: Arc<HeldLeases>,
-    release: mpsc::UnboundedSender<Uuid>,
+    release: mpsc::Sender<Uuid>,
     instance_id: String,
     ttl: Duration,
     enforcing: bool,
@@ -786,6 +798,10 @@ struct FleetConcurrency {
 /// Renewals attempted within one lease TTL. Three gives two spare attempts
 /// before a live request's lease could lapse.
 const LEASE_RENEWALS_PER_TTL: u32 = 3;
+
+/// Bounded so a stalled lease store cannot let this queue grow without limit.
+/// A dropped release costs one lease until its TTL, which the sweeper reclaims.
+const RELEASE_QUEUE_DEPTH: usize = 8192;
 
 /// Each of these loops silently stops enforcing something if it exits, so a
 /// death is reported rather than discarded.
@@ -943,7 +959,7 @@ impl CompletionServiceImpl {
         ttl: Duration,
         enforcing: bool,
     ) -> Self {
-        let (release, mut released) = mpsc::unbounded_channel::<Uuid>();
+        let (release, mut released) = mpsc::channel::<Uuid>(RELEASE_QUEUE_DEPTH);
         let releaser = repository.clone();
 
         let drain = tokio::spawn(async move {
@@ -1016,6 +1032,14 @@ impl CompletionServiceImpl {
                     renewing.held_ids().len() as f64,
                     &tags,
                 );
+                let dropped = renewing.take_dropped_releases();
+                if dropped > 0 {
+                    renew_metrics.record_count(
+                        METRIC_CONCURRENCY_RELEASE_DROPPED,
+                        dropped as i64,
+                        &tags,
+                    );
+                }
 
                 if pending.is_empty() {
                     continue;
@@ -1074,10 +1098,13 @@ impl CompletionServiceImpl {
                             "Reclaimed concurrency leases whose holder stopped renewing"
                         )
                     }
-                    Err(error) => tracing::warn!(
-                        error = %error,
-                        "Failed to sweep expired concurrency leases"
-                    ),
+                    Err(error) => {
+                        sweep_metrics.record_count(METRIC_CONCURRENCY_SWEEP_FAILED, 1, &tags);
+                        tracing::warn!(
+                            error = %error,
+                            "Failed to sweep expired concurrency leases"
+                        )
+                    }
                 }
             }
         });

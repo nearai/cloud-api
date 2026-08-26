@@ -1,3 +1,5 @@
+-- One row per in-flight request, so replicas count against a shared limit
+-- rather than one each. Rows outlive a dead replica and are swept on expiry.
 CREATE TABLE concurrency_leases (
     id UUID PRIMARY KEY,
     organization_id UUID NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,

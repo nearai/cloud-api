@@ -1,5 +1,6 @@
 use crate::ita::ItaAttestationConfig;
 use std::{collections::HashMap, env};
+use uuid::Uuid;
 
 #[derive(Debug, Clone)]
 pub struct ApiConfig {
@@ -81,17 +82,25 @@ impl FleetConcurrencyConfig {
 
         Self {
             mode,
-            lease_ttl_seconds: env::var("FLEET_CONCURRENCY_LEASE_TTL_SECONDS")
-                .ok()
-                .and_then(|value| value.parse::<u64>().ok())
-                .filter(|seconds| *seconds > 0)
-                .unwrap_or(60),
+            lease_ttl_seconds: match env::var("FLEET_CONCURRENCY_LEASE_TTL_SECONDS") {
+                Ok(value) => match value.parse::<u64>() {
+                    Ok(seconds) if seconds > 0 => seconds,
+                    _ => {
+                        eprintln!(
+                            "WARN: invalid FLEET_CONCURRENCY_LEASE_TTL_SECONDS '{value}', \
+                             falling back to 60"
+                        );
+                        60
+                    }
+                },
+                Err(_) => 60,
+            },
             instance_id: env::var("FLEET_CONCURRENCY_INSTANCE_ID")
                 .ok()
                 .filter(|value| !value.is_empty())
                 .unwrap_or_else(|| {
                     let host = env::var("HOSTNAME").unwrap_or_else(|_| "unknown".to_string());
-                    format!("{host}-{}", std::process::id())
+                    format!("{host}-{}", Uuid::new_v4().simple())
                 }),
         }
     }

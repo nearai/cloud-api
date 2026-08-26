@@ -313,28 +313,6 @@ impl PgOrganizationRepository {
             .map_err(RepositoryError::DataConversionError)
     }
 
-    /// Delete an organization (soft delete)
-    pub async fn delete(&self, id: Uuid) -> Result<bool> {
-        let rows_affected = retry_db!("delete_organization", {
-            let client = self
-                .pool
-                .get()
-                .await
-                .context("Failed to get database connection")
-                .map_err(RepositoryError::PoolError)?;
-
-            client
-                .execute(
-                    "UPDATE organizations SET is_active = false WHERE id = $1 AND is_active = true",
-                    &[&id],
-                )
-                .await
-                .map_err(map_db_error)
-        })?;
-
-        Ok(rows_affected > 0)
-    }
-
     /// Add a member to an organization - internal method
     async fn add_member_internal(
         &self,
@@ -696,6 +674,59 @@ impl OrganizationRepository for PgOrganizationRepository {
                         )
                         .await
                         .map_err(map_db_error)?;
+
+                    if rows_affected > 0 {
+                        // Deactivating only the organization row leaves its workspaces and
+                        // API keys marked active while every lookup for them joins
+                        // `organizations` with `is_active = true` and fails. Those rows are
+                        // dead but still advertised: `/v1/users/me` kept listing the
+                        // workspaces, so clients that pick the current org from that list
+                        // pinned themselves to a deleted org. Cascade in the same
+                        // transaction so the deletion is all-or-nothing and `is_active`
+                        // stays truthful at every level.
+                        // `deleted_at` as well as `is_active`: a normal revoke sets
+                        // `deleted_at` (see `ApiKeyRepository::revoke`) and the listing
+                        // queries key off it, so setting only `is_active` would leave
+                        // these rows reading as "not deleted, merely inactive".
+                        transaction
+                            .execute(
+                                r#"
+                                UPDATE api_keys
+                                SET is_active = false,
+                                    deleted_at = COALESCE(deleted_at, NOW())
+                                WHERE (is_active = true OR deleted_at IS NULL)
+                                  AND workspace_id IN (
+                                      SELECT id FROM workspaces WHERE organization_id = $1
+                                  )
+                                "#,
+                                &[&id],
+                            )
+                            .await
+                            .map_err(map_db_error)?;
+
+                        // Reporting-token validation also requires an active organization,
+                        // but revoke the persisted rows so credential state remains truthful
+                        // and a deleted org cannot regain access through a future validation
+                        // path. No `revoked_by_user_id`: this is a system revocation, not a
+                        // user's.
+                        transaction
+                            .execute(
+                                "UPDATE organization_reporting_tokens SET revoked_at = NOW() \
+                                 WHERE organization_id = $1 AND revoked_at IS NULL",
+                                &[&id],
+                            )
+                            .await
+                            .map_err(map_db_error)?;
+
+                        transaction
+                            .execute(
+                                "UPDATE workspaces SET is_active = false, updated_at = NOW() \
+                                 WHERE organization_id = $1 AND is_active = true",
+                                &[&id],
+                            )
+                            .await
+                            .map_err(map_db_error)?;
+                    }
 
                     transaction.commit().await.map_err(map_db_error)?;
 

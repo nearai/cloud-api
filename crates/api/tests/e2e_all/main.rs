@@ -59,6 +59,7 @@ mod oauth_frontend_callback;
 mod openai_tiered_pricing;
 mod openrouter_params;
 mod org_system_prompt;
+mod organization_deletion;
 mod pagination_validation;
 mod patroni_failover;
 mod privacy_classify;

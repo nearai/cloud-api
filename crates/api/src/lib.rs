@@ -1826,8 +1826,9 @@ pub fn build_conversation_routes(
 /// Route classification (nearai/infra#193) — see `routes/attestation.rs` for
 /// the full table:
 /// - `GET /v1/attestation/report` and `GET /v1/signature/{chat_id}` require an
-///   API key (`auth_middleware_with_api_key`). The middleware only validates
-///   the key (rejecting missing/invalid/expired/revoked keys with 401); like
+///   API key (`auth_middleware_with_api_key`). The middleware validates the key
+///   and confirms its workspace and organization remain active (rejecting
+///   missing/invalid/expired/deactivated credentials with 401); like
 ///   the signature route, report retrieval is non-billable — no usage or
 ///   billing records are created.
 /// - `GET /v1/attestation/ita-token` is deliberately public; the rationale is

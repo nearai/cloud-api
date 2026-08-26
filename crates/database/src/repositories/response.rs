@@ -21,7 +21,7 @@ impl PgResponseRepository {
 
     fn encrypt_text(&self, id: Uuid, column: &str, value: Option<&str>) -> Result<Option<String>> {
         value
-            .map(|value| match self.pool.encryption_key() {
+            .map(|value| match self.pool.encryption_write_key() {
                 Some(key) => crate::field_encryption::encrypt(&key, "responses", column, id, value),
                 None => Ok(value.to_string()),
             })
@@ -49,7 +49,7 @@ impl PgResponseRepository {
     }
 
     fn encrypt_metadata(&self, id: Uuid, value: &serde_json::Value) -> Result<serde_json::Value> {
-        match self.pool.encryption_key() {
+        match self.pool.encryption_write_key() {
             Some(key) => {
                 crate::field_encryption::encrypt_json(&key, "responses", "metadata", id, value)
             }

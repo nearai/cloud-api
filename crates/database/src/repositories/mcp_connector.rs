@@ -21,7 +21,7 @@ impl McpConnectorRepository {
     }
 
     fn encrypt_text(&self, table: &str, column: &str, id: Uuid, value: String) -> Result<String> {
-        match self.pool.encryption_key() {
+        match self.pool.encryption_write_key() {
             Some(key) => crate::field_encryption::encrypt(&key, table, column, id, &value),
             None => Ok(value),
         }
@@ -43,7 +43,7 @@ impl McpConnectorRepository {
         id: Uuid,
         value: serde_json::Value,
     ) -> Result<serde_json::Value> {
-        match self.pool.encryption_key() {
+        match self.pool.encryption_write_key() {
             Some(key) => crate::field_encryption::encrypt_json(&key, table, column, id, &value),
             None => Ok(value),
         }

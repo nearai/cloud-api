@@ -23,7 +23,9 @@ impl FileRepository {
         params: services::files::ports::CreateFileParams,
     ) -> Result<File, RepositoryError> {
         let id = Uuid::new_v4();
-        let (filename, content_type, storage_key) = if let Some(key) = self.pool.encryption_key() {
+        let (filename, content_type, storage_key) = if let Some(key) =
+            self.pool.encryption_write_key()
+        {
             (
                 crate::field_encryption::encrypt(&key, "files", "filename", id, &params.filename)
                     .map_err(RepositoryError::DataConversionError)?,

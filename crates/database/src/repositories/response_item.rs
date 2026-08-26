@@ -269,7 +269,7 @@ impl ResponseItemRepositoryTrait for PgResponseItemsRepository {
         // Serialize the item to JSON for storage
         let mut item_json =
             serde_json::to_value(&item).context("Failed to serialize response item")?;
-        if let Some(key) = self.pool.encryption_key() {
+        if let Some(key) = self.pool.encryption_write_key() {
             item_json =
                 field_encryption::encrypt_json(&key, "response_items", "item", id, &item_json)?;
         }
@@ -371,7 +371,7 @@ impl ResponseItemRepositoryTrait for PgResponseItemsRepository {
         // Serialize the updated item to JSON
         let mut item_json =
             serde_json::to_value(&item).context("Failed to serialize response item")?;
-        if let Some(key) = self.pool.encryption_key() {
+        if let Some(key) = self.pool.encryption_write_key() {
             item_json =
                 field_encryption::encrypt_json(&key, "response_items", "item", id.0, &item_json)?;
         }

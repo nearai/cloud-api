@@ -458,6 +458,9 @@ pub async fn create_job(
             "an explicit scope is required for database encryption jobs",
         ));
     }
+    if matches!(req.mode, Mode::Execute) && !state.pool.encryption_write_enabled() {
+        return Err(bad("execute jobs require DB_ENCRYPTION_WRITE_ENABLED=true"));
+    }
     if !(1..=1000).contains(&req.batch_size) {
         return Err(bad("batch_size must be between 1 and 1000"));
     }
@@ -546,6 +549,9 @@ async fn run_locked_job(
         return Ok(());
     };
     let mode: String = job.get("mode");
+    if mode == "execute" && !state.pool.encryption_write_enabled() {
+        anyhow::bail!("execute jobs require DB_ENCRYPTION_WRITE_ENABLED=true");
+    }
     let scope: Scope = serde_json::from_value(job.get("scope"))?;
     let fields = selected(&scope).map_err(|_| anyhow::anyhow!("invalid persisted scope"))?;
     let batch: i64 = job.get("batch_size");

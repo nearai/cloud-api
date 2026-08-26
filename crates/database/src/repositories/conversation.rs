@@ -25,7 +25,7 @@ impl PgConversationRepository {
         id: Uuid,
         metadata: &serde_json::Value,
     ) -> Result<serde_json::Value> {
-        match self.pool.encryption_key() {
+        match self.pool.encryption_write_key() {
             Some(key) => crate::field_encryption::encrypt_json(
                 &key,
                 "conversations",
@@ -360,9 +360,10 @@ impl ConversationRepository for PgConversationRepository {
             id_map.insert(old_response_id, new_response_id);
             let instructions: Option<String> = orig_row.try_get("instructions")?;
             let metadata: serde_json::Value = orig_row.try_get("metadata")?;
-            let (stored_instructions, stored_response_metadata) =
-                if let Some(key) = self.pool.encryption_key() {
-                    let instructions = instructions
+            let (plain_instructions, plain_metadata) = if let Some(key) = self.pool.encryption_key()
+            {
+                (
+                    instructions
                         .map(|value| {
                             crate::field_encryption::decrypt_if_encrypted(
                                 &key,
@@ -371,7 +372,24 @@ impl ConversationRepository for PgConversationRepository {
                                 old_response_id,
                                 value,
                             )
-                            .and_then(|plain| {
+                        })
+                        .transpose()?,
+                    crate::field_encryption::decrypt_json_if_encrypted(
+                        &key,
+                        "responses",
+                        "metadata",
+                        old_response_id,
+                        metadata,
+                    )?,
+                )
+            } else {
+                (instructions, metadata)
+            };
+            let (stored_instructions, stored_response_metadata) =
+                if let Some(key) = self.pool.encryption_write_key() {
+                    (
+                        plain_instructions
+                            .map(|plain| {
                                 crate::field_encryption::encrypt(
                                     &key,
                                     "responses",
@@ -380,27 +398,17 @@ impl ConversationRepository for PgConversationRepository {
                                     &plain,
                                 )
                             })
-                        })
-                        .transpose()?;
-                    let metadata = crate::field_encryption::decrypt_json_if_encrypted(
-                        &key,
-                        "responses",
-                        "metadata",
-                        old_response_id,
-                        metadata,
-                    )?;
-                    (
-                        instructions,
+                            .transpose()?,
                         crate::field_encryption::encrypt_json(
                             &key,
                             "responses",
                             "metadata",
                             new_response_id,
-                            &metadata,
+                            &plain_metadata,
                         )?,
                     )
                 } else {
-                    (instructions, metadata)
+                    (plain_instructions, plain_metadata)
                 };
 
             // Clone the response with new ID and new conversation_id
@@ -532,7 +540,7 @@ impl ConversationRepository for PgConversationRepository {
                 obj.insert("id".to_string(), serde_json::Value::String(new_msg_id));
             }
 
-            if let Some(key) = self.pool.encryption_key() {
+            if let Some(key) = self.pool.encryption_write_key() {
                 item_json = crate::field_encryption::encrypt_json(
                     &key,
                     "response_items",

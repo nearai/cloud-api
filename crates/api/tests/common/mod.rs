@@ -105,6 +105,8 @@ pub fn test_config() -> ApiConfig {
             refresh_interval: 30,
             mock: false,
         },
+        // Preserve encrypted-write coverage in E2E tests; production defaults off.
+        database_encryption_write_enabled: true,
         s3: config::S3Config {
             mock: true,
             bucket: std::env::var("AWS_S3_BUCKET").unwrap_or_else(|_| "test-bucket".to_string()),

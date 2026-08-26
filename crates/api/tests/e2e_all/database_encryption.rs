@@ -1,6 +1,32 @@
 use crate::common::*;
 use uuid::Uuid;
 
+#[tokio::test]
+async fn execute_job_is_rejected_until_encrypted_writes_are_enabled() {
+    let (server, _) = setup_test_server_with_config_and_database(|config| {
+        config.database_encryption_write_enabled = false;
+    })
+    .await;
+
+    let response = server
+        .post("/v1/admin/database-encryption/jobs")
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .add_header("User-Agent", MOCK_USER_AGENT)
+        .json(&serde_json::json!({
+            "mode": "execute",
+            "scope": {"fields": [{"table": "files", "column": "filename"}]},
+            "batch_size": 1,
+            "actions": ["encrypt"]
+        }))
+        .await;
+
+    assert_eq!(response.status_code(), 400);
+    assert_eq!(
+        response.json::<serde_json::Value>()["error"]["message"],
+        "execute jobs require DB_ENCRYPTION_WRITE_ENABLED=true"
+    );
+}
+
 async fn wait_for_database_encryption_job(
     server: &axum_test::TestServer,
     job_id: &str,

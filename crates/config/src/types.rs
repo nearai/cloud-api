@@ -17,6 +17,9 @@ pub struct ApiConfig {
     pub dstack_client: DstackClientConfig,
     pub auth: AuthConfig,
     pub database: DatabaseConfig,
+    /// Enables encryption for newly written confidential database fields.
+    /// Defaults off so dual-read support can be deployed fleet-wide first.
+    pub database_encryption_write_enabled: bool,
     pub s3: S3Config,
     pub invitation_email: InvitationEmailConfig,
     pub otlp: OtlpConfig,
@@ -51,6 +54,10 @@ impl ApiConfig {
             staking_farm: StakingFarmConfig::from_env(&auth.near),
             auth,
             database: DatabaseConfig::from_env()?,
+            database_encryption_write_enabled: parse_bool_env(
+                "DB_ENCRYPTION_WRITE_ENABLED",
+                false,
+            )?,
             s3: S3Config::from_env()?,
             invitation_email: InvitationEmailConfig::from_env()?,
             otlp: OtlpConfig::from_env()?,

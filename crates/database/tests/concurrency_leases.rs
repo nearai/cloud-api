@@ -306,6 +306,82 @@ async fn pending_leases_are_written_back() {
     assert_eq!(live, 1, "a degraded-path lease must reach the store");
 }
 
+/// A lost response makes `retry_db!` run the acquire again under the same id.
+/// If the remaining capacity went to someone else meanwhile, the rejection has
+/// to drop the row the first attempt committed; nothing else would, because the
+/// caller takes the rejection and never registers the lease to release it.
+#[tokio::test]
+async fn a_rejected_retry_drops_the_lease_its_first_attempt_committed() {
+    let pool = support::test_pool().await.expect("test pool");
+    let org = support::insert_org_fixture(&pool)
+        .await
+        .expect("org fixture");
+    let model = support::insert_model(&pool, &format!("lease-{}", Uuid::new_v4()))
+        .await
+        .expect("model fixture");
+
+    pool.get()
+        .await
+        .expect("connection")
+        .execute(
+            "UPDATE organizations SET rate_limit = 1 WHERE id = $1",
+            &[&org.org_id],
+        )
+        .await
+        .expect("rate limit update");
+
+    let repository = PostgresConcurrencyLeaseRepository::new(pool.clone());
+    let lease_id = Uuid::new_v4();
+    let already_committed = [
+        HeldLease {
+            id: lease_id,
+            organization_id: org.org_id,
+            model_id: model.id,
+        },
+        HeldLease {
+            id: Uuid::new_v4(),
+            organization_id: org.org_id,
+            model_id: model.id,
+        },
+    ];
+    repository
+        .persist(&already_committed, "instance-a", TTL)
+        .await
+        .expect("persist");
+
+    let outcome = repository
+        .try_acquire(
+            lease_id,
+            org.org_id,
+            model.id,
+            "instance-a",
+            DEFAULT_LIMIT,
+            TTL,
+        )
+        .await
+        .expect("acquire");
+    assert!(
+        matches!(outcome, LeaseOutcome::AtLimit { .. }),
+        "the other lease holds the only slot, got {outcome:?}"
+    );
+
+    let surviving: i64 = pool
+        .get()
+        .await
+        .expect("connection")
+        .query_one(
+            "SELECT COUNT(*) FROM concurrency_leases WHERE id = $1",
+            &[&lease_id],
+        )
+        .await
+        .expect("count")
+        .get(0);
+    assert_eq!(
+        surviving, 0,
+        "a rejected acquire must not leave its lease holding capacity"
+    );
+}
+
 /// A zero or negative rate_limit means unset, not a limit of zero. Reading it
 /// literally would reject every request for the organization.
 #[tokio::test]

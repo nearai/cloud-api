@@ -84,6 +84,12 @@ impl ConcurrencyLeaseRepository for PostgresConcurrencyLeaseRepository {
             let in_flight: i64 = row.get("in_flight");
 
             if in_flight >= i64::from(limit) {
+                // A retry after a lost response finds the row its first attempt
+                // committed. Rejecting without dropping it holds a slot for a
+                // request nobody went on to track or release.
+                tx.execute("DELETE FROM concurrency_leases WHERE id = $1", &[&lease_id])
+                    .await
+                    .map_err(map_db_error)?;
                 tx.commit().await.map_err(map_db_error)?;
                 return Ok::<LeaseOutcome, RepositoryError>(LeaseOutcome::AtLimit {
                     limit,

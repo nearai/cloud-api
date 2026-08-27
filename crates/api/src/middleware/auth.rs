@@ -681,8 +681,10 @@ async fn authenticate_session_refresh(
     Err(StatusCode::UNAUTHORIZED)
 }
 
-/// Authenticate using API key
-async fn authenticate_api_key(
+/// Validate API-key material itself. Callers must still resolve its parent
+/// workspace and organization before accepting it for a request, because the
+/// in-process API-key cache can outlive a workspace or organization deletion.
+async fn validate_api_key_credentials(
     state: &AuthState,
     api_key: &str,
 ) -> Result<services::workspace::ApiKey, (StatusCode, axum::Json<crate::models::ErrorResponse>)> {
@@ -725,6 +727,18 @@ async fn authenticate_api_key(
             ))
         }
     }
+}
+
+/// Authenticate an API key for a route that needs only the key. The parent
+/// lookup is intentionally still required: a cached key must not remain usable
+/// after its workspace or organization is deactivated.
+async fn authenticate_api_key(
+    state: &AuthState,
+    api_key: &str,
+) -> Result<services::workspace::ApiKey, (StatusCode, axum::Json<crate::models::ErrorResponse>)> {
+    Ok(authenticate_api_key_with_context(state, api_key)
+        .await?
+        .api_key)
 }
 
 async fn authenticate_reporting_token(
@@ -774,8 +788,9 @@ async fn authenticate_api_key_with_context(
     state: &AuthState,
     api_key: &str,
 ) -> Result<AuthenticatedApiKey, (StatusCode, axum::Json<crate::models::ErrorResponse>)> {
-    // First validate the API key
-    let validated_api_key = authenticate_api_key(state, api_key).await?;
+    // First validate the API key material. The parent lookup below is required
+    // even after a cache hit so deactivated/deleted parents fail closed immediately.
+    let validated_api_key = validate_api_key_credentials(state, api_key).await?;
 
     debug!(
         "Resolving workspace and organization for API key: {:?}",

@@ -589,17 +589,27 @@ pub(crate) enum ConcurrentSlot {
         held: Arc<HeldLeases>,
         release: mpsc::Sender<Uuid>,
     },
+    Shadowed {
+        lease: Box<ConcurrentSlot>,
+        local: Arc<AtomicU32>,
+    },
 }
 
 impl ConcurrentSlot {
+    fn release_local(counter: &Arc<AtomicU32>) {
+        // Saturating: an underflow here would read as a permanently
+        // full counter and lock the organization out of the model.
+        let _ = counter.fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+            Some(current.saturating_sub(1))
+        });
+    }
+
     fn release(&self) {
         match self {
-            Self::Local(counter) => {
-                // Saturating: an underflow here would read as a permanently
-                // full counter and lock the organization out of the model.
-                let _ = counter.fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-                    Some(current.saturating_sub(1))
-                });
+            Self::Local(counter) => Self::release_local(counter),
+            Self::Shadowed { lease, local } => {
+                lease.release();
+                Self::release_local(local);
             }
             Self::Lease {
                 id,
@@ -1904,12 +1914,15 @@ impl CompletionServiceImpl {
         model_id: Uuid,
         model_name: &str,
     ) -> Result<ConcurrentSlot, ports::CompletionError> {
+        let mut shadow_lease: Option<ConcurrentSlot> = None;
+
         if let Some(fleet) = &self.fleet_concurrency {
             match self
                 .try_acquire_lease(fleet, organization_id, model_id, model_name)
                 .await
             {
-                Ok(slot) => return Ok(slot),
+                Ok(slot) if fleet.enforcing => return Ok(slot),
+                Ok(slot) => shadow_lease = Some(slot),
                 Err(LeaseAdmission::AtLimit(error)) => return Err(error),
                 Err(LeaseAdmission::Shadowed) => {}
                 Err(LeaseAdmission::Unavailable(error)) => {
@@ -1920,9 +1933,11 @@ impl CompletionServiceImpl {
                         error = %error,
                         "Fleet concurrency unavailable, falling back to this replica's leases"
                     );
-                    return self
-                        .admit_from_held_leases(fleet, organization_id, model_id, model_name)
-                        .await;
+                    if fleet.enforcing {
+                        return self
+                            .admit_from_held_leases(fleet, organization_id, model_id, model_name)
+                            .await;
+                    }
                 }
             }
         }
@@ -1956,13 +1971,22 @@ impl CompletionServiceImpl {
                     &ports::CompletionError::RateLimitExceeded(msg.clone()),
                     Some(model_name),
                 );
+                if let Some(lease) = shadow_lease {
+                    lease.release();
+                }
                 return Err(ports::CompletionError::RateLimitExceeded(msg));
             }
             if counter
                 .compare_exchange_weak(current, current + 1, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok()
             {
-                return Ok(ConcurrentSlot::Local(counter));
+                return Ok(match shadow_lease.take() {
+                    Some(lease) => ConcurrentSlot::Shadowed {
+                        lease: Box::new(lease),
+                        local: counter,
+                    },
+                    None => ConcurrentSlot::Local(counter),
+                });
             }
         }
     }

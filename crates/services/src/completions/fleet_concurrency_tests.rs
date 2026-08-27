@@ -496,3 +496,78 @@ async fn dropping_a_transport_guard_frees_fleet_capacity() {
         .await
         .expect("the freed slot admits the next transport request");
 }
+
+/// Shadowing must not widen admission. The fleet lease is observation, so one
+/// replica still admits no more than the organization limit.
+#[tokio::test]
+async fn shadowing_does_not_admit_past_the_replica_limit() {
+    const ATTEMPTS: usize = 20;
+
+    let store = Arc::new(SharedLeaseStore::with_limit(LIMIT));
+    let metrics = Arc::new(CapturingMetricsService::new());
+    let organization_id = Uuid::new_v4();
+    let model_id = Uuid::new_v4();
+    let service = replica_with(
+        store.clone(),
+        metrics.clone(),
+        Arc::new(StaticLimitRepository(Some(LIMIT))),
+        false,
+    );
+
+    let mut slots = Vec::new();
+    for _ in 0..ATTEMPTS {
+        if let Ok(slot) = service
+            .try_acquire_concurrent_slot(organization_id, model_id, MODEL_NAME)
+            .await
+        {
+            slots.push(slot);
+        }
+    }
+
+    assert_eq!(
+        slots.len(),
+        LIMIT as usize,
+        "one shadowing replica admitted {} against a limit of {LIMIT}",
+        slots.len()
+    );
+    assert_eq!(
+        store.live_count(organization_id, model_id),
+        LIMIT as usize,
+        "a lease is held for each admitted request and released for the rest"
+    );
+}
+
+/// A lease-store outage while shadowing must not switch the decision over to
+/// the degraded limiter; the per-replica count still owns admission.
+#[tokio::test]
+async fn a_store_outage_while_shadowing_still_defers_to_the_replica_limit() {
+    let store = Arc::new(SharedLeaseStore::with_limit(LIMIT));
+    let metrics = Arc::new(CapturingMetricsService::new());
+    let organization_id = Uuid::new_v4();
+    let model_id = Uuid::new_v4();
+    let service = replica_with(
+        store.clone(),
+        metrics.clone(),
+        Arc::new(StaticLimitRepository(Some(LIMIT))),
+        false,
+    );
+
+    store.set_unavailable(true);
+
+    let mut slots = Vec::new();
+    for _ in 0..10 {
+        if let Ok(slot) = service
+            .try_acquire_concurrent_slot(organization_id, model_id, MODEL_NAME)
+            .await
+        {
+            slots.push(slot);
+        }
+    }
+
+    assert_eq!(
+        slots.len(),
+        LIMIT as usize,
+        "shadowing through an outage admitted {} against a limit of {LIMIT}",
+        slots.len()
+    );
+}

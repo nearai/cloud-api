@@ -84,7 +84,14 @@ fn inner_event(plaintext: &[u8]) -> Result<Option<SSEEvent>, CompletionError> {
     if content == "[DONE]" {
         return Ok(Some(done_event()));
     }
-    let chunk: crate::ChatCompletionChunk = serde_json::from_str(content)
+    let mut chunk_json: serde_json::Value = serde_json::from_str(content)
+        .map_err(|e| CompletionError::CompletionError(format!("Chutes stream chunk parse: {e}")))?;
+    if let Some(object) = chunk_json.as_object_mut() {
+        object
+            .entry("id")
+            .or_insert_with(|| serde_json::Value::String(String::new()));
+    }
+    let chunk: crate::ChatCompletionChunk = serde_json::from_value(chunk_json)
         .map_err(|e| CompletionError::CompletionError(format!("Chutes stream chunk parse: {e}")))?;
     Ok(Some(SSEEvent {
         // Hand clients a clean, well-framed OpenAI SSE line.
@@ -256,6 +263,56 @@ mod tests {
     fn inner_event_parses_bare_json_chunk() {
         let line = b"{\"id\":\"x\",\"object\":\"chat.completion.chunk\",\"created\":0,\"model\":\"m\",\"choices\":[]}";
         assert!(inner_event(line).unwrap().is_some());
+    }
+
+    #[test]
+    fn inner_event_accepts_missing_id_and_preserves_raw_bytes() {
+        // Given: a valid Chutes frame whose provider-specific shape omits `id`.
+        let frame = concat!(
+            "data: ",
+            r#"{"object":"chat.completion.chunk","created":0,"model":"m","choices":[]}"#,
+            "\n\n"
+        );
+
+        // When: the decrypted frame crosses the Chutes-only parser boundary.
+        let event = inner_event(frame.as_bytes()).unwrap().unwrap();
+
+        // Then: the typed chunk is usable without inventing an id, and signed bytes are unchanged.
+        let Some(StreamChunk::Chat(chunk)) = event.chunk else {
+            panic!("expected a parsed chat chunk");
+        };
+        assert!(chunk.id.is_empty());
+        assert_eq!(event.raw_bytes.as_ref(), frame.as_bytes());
+    }
+
+    #[test]
+    fn inner_event_preserves_unknown_top_level_fields() {
+        // Given: a valid provider frame with a field outside the shared schema.
+        let frame = br#"{"id":"x","object":"chat.completion.chunk","created":0,"model":"m","choices":[],"prompt_text":null}"#;
+
+        // When: the frame is parsed at the Chutes boundary.
+        let event = inner_event(frame).unwrap().unwrap();
+
+        // Then: the shared chunk's flatten map preserves the provider field.
+        let Some(StreamChunk::Chat(chunk)) = event.chunk else {
+            panic!("expected a parsed chat chunk");
+        };
+        assert_eq!(
+            chunk.extra.get("prompt_text"),
+            Some(&serde_json::Value::Null)
+        );
+    }
+
+    #[test]
+    fn inner_event_rejects_missing_choices() {
+        // Given: JSON that is not a valid completion chunk because `choices` is absent.
+        let frame = br#"{"id":"x","object":"chat.completion.chunk","created":0,"model":"m"}"#;
+
+        // When: it crosses the Chutes parser boundary.
+        let error = inner_event(frame).unwrap_err();
+
+        // Then: tolerance for a missing id does not weaken required completion data.
+        assert!(format!("{error}").contains("missing field `choices`"));
     }
 
     #[test]

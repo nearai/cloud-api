@@ -562,12 +562,12 @@ fn build_final_usage_chunk_bytes(
 }
 
 // Helper function to extract inference ID from a parsed stream chunk
-fn extract_inference_id_from_chunk(chunk: &inference_providers::StreamChunk) -> Uuid {
+fn extract_inference_id_from_chunk(chunk: &inference_providers::StreamChunk) -> Option<Uuid> {
     let id = match chunk {
         inference_providers::StreamChunk::Chat(c) => &c.id,
         inference_providers::StreamChunk::Text(c) => &c.id,
     };
-    hash_inference_id_to_uuid(id)
+    (!id.is_empty()).then(|| hash_inference_id_to_uuid(id))
 }
 
 // Convert MessageContent to serde_json::Value, preserving multimodal parts (images, audio, etc.)
@@ -1547,8 +1547,9 @@ async fn chat_completions_inner(
                                 stream_chat_id = Some(match chunk {
                                     inference_providers::StreamChunk::Chat(c) => c.id.clone(),
                                     inference_providers::StreamChunk::Text(c) => c.id.clone(),
-                                });
-                                break Some(extract_inference_id_from_chunk(chunk));
+                                })
+                                .filter(|id| !id.is_empty());
+                                break extract_inference_id_from_chunk(chunk);
                             }
                             true
                         }
@@ -2406,8 +2407,9 @@ async fn completions_inner(
                                 stream_chat_id = Some(match chunk {
                                     inference_providers::StreamChunk::Chat(c) => c.id.clone(),
                                     inference_providers::StreamChunk::Text(c) => c.id.clone(),
-                                });
-                                break Some(extract_inference_id_from_chunk(chunk));
+                                })
+                                .filter(|id| !id.is_empty());
+                                break extract_inference_id_from_chunk(chunk);
                             }
                             true
                         }
@@ -3673,13 +3675,14 @@ mod tests {
 
     #[test]
     fn test_extract_inference_id_from_chunk_empty_id() {
+        // Given: Chutes omitted its provider inference id at the parsing boundary.
         let chunk = make_chat_chunk("");
+
+        // When: the route derives the optional public inference id.
         let result = extract_inference_id_from_chunk(&chunk);
-        // Empty string should still produce a valid UUID
-        assert!(
-            !result.is_nil(),
-            "empty provider ID should still produce a non-nil UUID"
-        );
+
+        // Then: absence stays absent instead of becoming a hash of the empty string.
+        assert_eq!(result, None);
     }
 
     fn empty_delta() -> inference_providers::models::ChatDelta {

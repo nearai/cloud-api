@@ -3302,24 +3302,32 @@ impl InferenceProviderPool {
             }
         }
 
-        if let Some(Ok(event)) = peekable.peek().await {
-            if let Some(inference_providers::StreamChunk::Chat(chat_chunk)) = &event.chunk {
-                let chat_id = chat_chunk.id.clone();
-                tracing::info!(
-                    chat_id = %chat_id,
-                    "Storing chat_id mapping for streaming completion"
-                );
-                // Pin the dedicated TLS connection so signature fetches
-                // reuse the same connection that served this completion.
-                provider.pin_chat_connection(&request_hash, &chat_id);
-                pinned = true;
-                self.store_chat_id_mapping(chat_id, provider.clone()).await;
+        let first_error = match peekable.peek().await {
+            Some(Ok(event)) => {
+                if let Some(inference_providers::StreamChunk::Chat(chat_chunk)) = &event.chunk {
+                    let chat_id = chat_chunk.id.clone();
+                    tracing::info!(
+                        chat_id = %chat_id,
+                        "Storing chat_id mapping for streaming completion"
+                    );
+                    // Pin the dedicated TLS connection so signature fetches
+                    // reuse the same connection that served this completion.
+                    provider.pin_chat_connection(&request_hash, &chat_id);
+                    pinned = true;
+                    self.store_chat_id_mapping(chat_id, provider.clone()).await;
+                }
+                None
             }
-        }
+            Some(Err(error)) => Some(error.clone()),
+            None => None,
+        };
         if !pinned {
             // Clean up orphaned pending client when peek fails or yields no chat_id
             provider.pin_chat_connection(&request_hash, "");
             provider.unpin_chat_connection("");
+        }
+        if let Some(error) = first_error {
+            return Err(error);
         }
         let stream: StreamingResult = if leading_control.is_empty() {
             Box::pin(peekable)
@@ -6128,6 +6136,84 @@ mod tests {
 
         while stream.next().await.is_some() {}
         assert!(pool.get_provider_by_chat_id(&chat_id).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_first_stream_error_is_returned_before_stream() {
+        use inference_providers::mock::MockProvider;
+
+        // Given
+        let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
+        let mock_provider = Arc::new(MockProvider::new());
+        let model_id = "Qwen/Qwen3-30B-A3B-Instruct-2507".to_string();
+        mock_provider
+            .set_stream_error_override(Some(CompletionError::HttpError {
+                status_code: 400,
+                message: "Grammar error: unsupported schema keyword".to_string(),
+                is_external: true,
+            }))
+            .await;
+        pool.register_provider(model_id.clone(), mock_provider.clone())
+            .await;
+        let params = inference_providers::ChatCompletionParams {
+            model: model_id,
+            messages: vec![inference_providers::ChatMessage {
+                role: inference_providers::MessageRole::User,
+                content: Some(serde_json::Value::String("Hello".to_string())),
+                name: None,
+                tool_call_id: None,
+                tool_calls: None,
+            }],
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            stop: None,
+            stream: Some(true),
+            tools: None,
+            max_completion_tokens: None,
+            n: None,
+            frequency_penalty: None,
+            presence_penalty: None,
+            logit_bias: None,
+            logprobs: None,
+            top_logprobs: None,
+            user: None,
+            seed: None,
+            tool_choice: None,
+            parallel_tool_calls: None,
+            metadata: None,
+            store: None,
+            stream_options: None,
+            service_tier: None,
+            modalities: None,
+            original_request: None,
+            extra: std::collections::HashMap::new(),
+        };
+
+        // When
+        let result = pool
+            .chat_completion_stream(
+                params,
+                "test-request-hash".to_string(),
+                ChatRoutingHints::default(),
+            )
+            .await;
+
+        // Then
+        match result {
+            Err(CompletionError::HttpError {
+                status_code,
+                message,
+                is_external,
+            }) => {
+                assert_eq!(status_code, 400);
+                assert_eq!(message, "Grammar error: unsupported schema keyword");
+                assert!(is_external);
+            }
+            Err(other) => panic!("Expected HttpError, got {other:?}"),
+            Ok(_) => panic!("Expected the pool to return the first stream error"),
+        }
+        assert_eq!(mock_provider.unpinned_chat_ids(), vec![String::new()]);
     }
 
     // ==================== Provider Tests ====================

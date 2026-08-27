@@ -1849,9 +1849,11 @@ async fn chat_completions_inner(
                                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                     if count == 0 {
                                         tracing::error!(
+                                            %request_id,
                                             %organization_id,
                                             model = %model_for_err,
                                             error_type = %completion_stream_error_category(&e),
+                                            error_detail = %e,
                                             "Completion stream error"
                                         );
                                     }

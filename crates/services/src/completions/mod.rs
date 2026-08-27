@@ -187,6 +187,11 @@ where
         let api_key_id = self.api_key_id;
         let model_id = self.model_id;
         let inference_type = self.inference_type;
+        let total_duration_ms = self.service_start_time.elapsed().as_millis() as u64;
+        let ms_since_last_token = self
+            .last_token_time
+            .map(|last| last.elapsed().as_millis() as u64);
+        let error_detail = self.last_error.as_ref().map(|error| error.to_string());
 
         // Create span with context BEFORE any early returns so all error logs have context
         let _span = tracing::error_span!(
@@ -227,9 +232,13 @@ where
                 // (stream_completed == true) after e.g. a backend queue abort before
                 // the first token. That is a provider error, not a mystery.
                 if !self.stream_completed || self.last_error.is_some() {
-                    tracing::warn!(%organization_id, %model_id, model = %self.model_name,
+                    tracing::warn!(%request_id, %organization_id, %model_id,
+                        model = %self.model_name,
                         stream_completed = self.stream_completed,
                         stream_error = self.last_error.is_some(),
+                        error_detail = error_detail.as_deref(),
+                        total_duration_ms,
+                        ms_since_last_token,
                         "Stream interrupted before usage stats or chat_id received (client disconnect or provider error)");
                 } else {
                     tracing::error!(%organization_id, %model_id, model = %self.model_name,
@@ -239,9 +248,13 @@ where
             }
             (None, Some(chat_id)) => {
                 if !self.stream_completed || self.last_error.is_some() {
-                    tracing::warn!(%chat_id, %organization_id, %model_id, model = %self.model_name,
+                    tracing::warn!(%request_id, %chat_id, %organization_id, %model_id,
+                        model = %self.model_name,
                         stream_completed = self.stream_completed,
                         stream_error = self.last_error.is_some(),
+                        error_detail = error_detail.as_deref(),
+                        total_duration_ms,
+                        ms_since_last_token,
                         "Stream interrupted before usage stats received (client disconnect or provider error)");
                 } else {
                     tracing::error!(%chat_id, %organization_id, %model_id, model = %self.model_name,
@@ -3040,6 +3053,195 @@ mod tests {
             counter.load(Ordering::Relaxed),
             0,
             "Counter should be 0 after stream dropped"
+        );
+    }
+
+    #[derive(Clone, Default)]
+    struct CapturedLogs(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturedLogs {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLogs {
+        type Writer = Self;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    impl CapturedLogs {
+        fn event_containing(&self, needle: &str) -> serde_json::Value {
+            let raw = self.0.lock().unwrap().clone();
+            String::from_utf8(raw)
+                .expect("log output is utf8")
+                .lines()
+                .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("json log line"))
+                .find(|event| {
+                    event["fields"]["message"]
+                        .as_str()
+                        .is_some_and(|message| message.contains(needle))
+                })
+                .unwrap_or_else(|| panic!("no log event containing {needle}"))
+        }
+    }
+
+    /// Mirrors the production JSON layer, which sets `with_current_span(false)` and
+    /// `with_span_list(false)` (`crates/api/src/main.rs`). Under those settings a
+    /// `request_id` carried only by the enclosing span is discarded, so these
+    /// assertions fail unless the fields are on the event itself.
+    fn interrupted_stream_event(
+        request_id: Uuid,
+        last_token_time: Option<Instant>,
+        last_chat_id: Option<String>,
+        last_error: Option<inference_providers::CompletionError>,
+    ) -> serde_json::Value {
+        let needle = if last_chat_id.is_some() {
+            "Stream interrupted before usage stats received"
+        } else {
+            "Stream interrupted before usage stats or chat_id received"
+        };
+        let logs = CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .with_current_span(false)
+            .with_span_list(false)
+            .with_max_level(tracing::Level::WARN)
+            .with_writer(logs.clone())
+            .finish();
+
+        tracing::subscriber::with_default(subscriber, || {
+            let _interrupted = InterceptStream {
+                inner: stream::iter::<Vec<Result<SSEEvent, inference_providers::CompletionError>>>(
+                    vec![],
+                ),
+                attestation_service: Arc::new(MockAttestationService),
+                usage_service: Arc::new(MockUsageService),
+                metrics_service: Arc::new(CapturingMetricsService::new()),
+                request_id,
+                organization_id: Uuid::new_v4(),
+                workspace_id: Uuid::new_v4(),
+                api_key_id: Uuid::new_v4(),
+                model_id: Uuid::new_v4(),
+                model_name: "test-model".to_string(),
+                inference_type: crate::usage::ports::InferenceType::ChatCompletionStream,
+                service_start_time: Instant::now(),
+                provider_start_time: Instant::now(),
+                first_token_received: last_token_time.is_some(),
+                first_token_time: last_token_time,
+                ttft_ms: None,
+                token_count: 0,
+                last_token_time,
+                total_itl_ms: 0.0,
+                metric_tags: vec![],
+                concurrent_counter: None,
+                last_usage_stats: None,
+                last_chat_id,
+                stream_completed: false,
+                response_id: None,
+                last_finish_reason: None,
+                last_error,
+                state: StreamState::Streaming,
+                attestation_supported: true,
+                store_provider_chat_signature: true,
+                provider_attribution: crate::usage::ProviderAttribution::default(),
+                cache_write_cost_per_token: None,
+                requested_service_tier: None,
+                provider_service_tier: None,
+                latency_reporter: None,
+            };
+        });
+
+        logs.event_containing(needle)
+    }
+
+    #[tokio::test]
+    async fn interrupted_stream_logs_request_id_and_total_duration() {
+        let request_id = Uuid::new_v4();
+        let event = interrupted_stream_event(request_id, None, None, None);
+
+        assert_eq!(
+            event["fields"]["request_id"],
+            serde_json::Value::String(request_id.to_string()),
+            "without this field the record cannot be joined to any other log line"
+        );
+        assert!(
+            event["fields"]["total_duration_ms"].is_u64(),
+            "duration must be numeric, got {}",
+            event["fields"]["total_duration_ms"]
+        );
+    }
+
+    /// The arm reached once a chat_id has arrived logs separately from the one that
+    /// runs before it, so both carry the fields or half the records stay unjoinable.
+    #[tokio::test]
+    async fn an_interrupted_stream_holding_a_chat_id_logs_the_same_fields() {
+        let request_id = Uuid::new_v4();
+        let event = interrupted_stream_event(request_id, None, Some("chat-abc".to_string()), None);
+
+        assert_eq!(
+            event["fields"]["request_id"],
+            serde_json::Value::String(request_id.to_string())
+        );
+        assert!(event["fields"]["total_duration_ms"].is_u64());
+    }
+
+    /// `stream_error` only says an error existed. Both arms hold the error itself, so
+    /// both must report it or the record still cannot say what went wrong.
+    #[tokio::test]
+    async fn an_interrupted_stream_reports_the_error_it_holds() {
+        let failure =
+            inference_providers::CompletionError::CompletionError("upstream gone".to_string());
+
+        for chat_id in [None, Some("chat-abc".to_string())] {
+            let event =
+                interrupted_stream_event(Uuid::new_v4(), None, chat_id, Some(failure.clone()));
+
+            assert_eq!(
+                event["fields"]["stream_error"],
+                serde_json::Value::Bool(true)
+            );
+            assert_eq!(
+                event["fields"]["error_detail"],
+                serde_json::Value::String(failure.to_string()),
+                "the error is in scope at this site and must not be reduced to a boolean"
+            );
+        }
+
+        let clean = interrupted_stream_event(Uuid::new_v4(), None, None, None);
+        assert_eq!(
+            clean["fields"]["error_detail"],
+            serde_json::Value::Null,
+            "a client disconnect carries no error, so the field must be absent"
+        );
+    }
+
+    /// A stream that died before the first token must stay distinguishable from one
+    /// that died after it, so the field is omitted rather than zeroed, which also
+    /// keeps it numeric and therefore comparable in a query.
+    #[tokio::test]
+    async fn interrupted_stream_separates_no_token_from_a_measured_gap() {
+        let before_any_token = interrupted_stream_event(Uuid::new_v4(), None, None, None);
+        assert_eq!(
+            before_any_token["fields"]["ms_since_last_token"],
+            serde_json::Value::Null,
+            "no token arrived, so the field must be absent rather than zero or a string"
+        );
+
+        let after_a_token =
+            interrupted_stream_event(Uuid::new_v4(), Some(Instant::now()), None, None);
+        assert!(
+            after_a_token["fields"]["ms_since_last_token"].is_u64(),
+            "a delivered token must produce a numeric gap, got {}",
+            after_a_token["fields"]["ms_since_last_token"]
         );
     }
 

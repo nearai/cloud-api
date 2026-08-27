@@ -90,8 +90,10 @@ fn insert_request_id_header(
     );
 }
 
-// Custom header for exposing the inference ID as a UUID
-const HEADER_INFERENCE_ID: &str = "Inference-Id";
+// Custom header for exposing the inference ID as a UUID. Shared with the
+// native Anthropic Messages plane so /v1/billing/costs lookups work the same
+// way against both.
+pub(crate) const HEADER_INFERENCE_ID: &str = "Inference-Id";
 
 // Custom header surfacing which trust tier served a completion.
 // Value is "near" for NEAR AI's own TEE fleet, "chutes" for the attested Chutes

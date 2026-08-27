@@ -66,7 +66,10 @@ fn done_event() -> SSEEvent {
 /// Parse one *decrypted* plaintext frame (a raw OpenAI SSE line, e.g.
 /// `data: {chunk}` or bare `{chunk}`) into an [`SSEEvent`]. Returns `None` for an
 /// empty frame. Pure — unit-tested without any crypto.
-fn inner_event(plaintext: &[u8]) -> Result<Option<SSEEvent>, CompletionError> {
+fn inner_event(
+    plaintext: &[u8],
+    synthetic_stream_id: &str,
+) -> Result<Option<SSEEvent>, CompletionError> {
     let s = String::from_utf8_lossy(plaintext);
     let s = s.trim();
     // An SSE comment / keepalive line (e.g. `: ping`) — vLLM/SGLang backends emit
@@ -86,16 +89,36 @@ fn inner_event(plaintext: &[u8]) -> Result<Option<SSEEvent>, CompletionError> {
     }
     let mut chunk_json: serde_json::Value = serde_json::from_str(content)
         .map_err(|e| CompletionError::CompletionError(format!("Chutes stream chunk parse: {e}")))?;
-    if let Some(object) = chunk_json.as_object_mut() {
-        object
-            .entry("id")
-            .or_insert_with(|| serde_json::Value::String(String::new()));
-    }
+    let needs_synthetic_id = if let Some(object) = chunk_json.as_object_mut() {
+        let needs_synthetic_id = match object.get("id") {
+            None => true,
+            Some(serde_json::Value::String(id)) => id.is_empty(),
+            Some(_) => false,
+        };
+        if needs_synthetic_id {
+            object.insert(
+                "id".to_string(),
+                serde_json::Value::String(synthetic_stream_id.to_string()),
+            );
+        }
+        needs_synthetic_id
+    } else {
+        false
+    };
+    let normalized_content;
+    let raw_content = if needs_synthetic_id {
+        normalized_content = serde_json::to_string(&chunk_json).map_err(|e| {
+            CompletionError::CompletionError(format!("Chutes stream chunk parse: {e}"))
+        })?;
+        normalized_content.as_str()
+    } else {
+        content
+    };
     let chunk: crate::ChatCompletionChunk = serde_json::from_value(chunk_json)
         .map_err(|e| CompletionError::CompletionError(format!("Chutes stream chunk parse: {e}")))?;
     Ok(Some(SSEEvent {
         // Hand clients a clean, well-framed OpenAI SSE line.
-        raw_bytes: Bytes::from(format!("data: {content}\n\n")),
+        raw_bytes: Bytes::from(format!("data: {raw_content}\n\n")),
         chunk: Some(StreamChunk::Chat(chunk)),
         raw_passthrough: true,
     }))
@@ -153,7 +176,7 @@ fn handle_outer_payload(
         let plaintext = key.decrypt_chunk(&frame).map_err(|e| {
             CompletionError::CompletionError(format!("Chutes stream chunk decrypt: {e}"))
         })?;
-        inner_event(&plaintext)
+        inner_event(&plaintext, session.synthetic_stream_id())
     } else if let Some(err) = obj.get("e2e_error").and_then(|x| x.as_str()) {
         Err(CompletionError::CompletionError(format!(
             "Chutes stream error: {err}"
@@ -235,6 +258,8 @@ mod tests {
     use ml_kem::kem::{Kem, KeyExport};
     use ml_kem::MlKem768;
 
+    const SYNTHETIC_STREAM_ID: &str = "chutes-gateway-test";
+
     fn fresh_session() -> ResponseSession {
         // A valid instance pubkey so build_request succeeds; we only exercise the
         // non-crypto control paths ([DONE], e2e_error) with the returned session.
@@ -253,20 +278,39 @@ mod tests {
     #[test]
     fn inner_event_parses_data_prefixed_chunk() {
         let line = b"data: {\"id\":\"x\",\"object\":\"chat.completion.chunk\",\"created\":0,\"model\":\"m\",\"choices\":[]}";
-        let ev = inner_event(line).unwrap().unwrap();
+        let ev = inner_event(line, SYNTHETIC_STREAM_ID).unwrap().unwrap();
         assert!(matches!(ev.chunk, Some(StreamChunk::Chat(_))));
         assert!(ev.raw_passthrough);
         assert!(ev.raw_bytes.starts_with(b"data: "));
     }
 
     #[test]
-    fn inner_event_parses_bare_json_chunk() {
-        let line = b"{\"id\":\"x\",\"object\":\"chat.completion.chunk\",\"created\":0,\"model\":\"m\",\"choices\":[]}";
-        assert!(inner_event(line).unwrap().is_some());
+    fn inner_event_preserves_raw_bytes_when_id_is_present() {
+        // Given: a valid provider frame whose key order and whitespace differ
+        // from serde_json's normalized representation.
+        let frame = concat!(
+            "data: ",
+            r#"{"model": "m", "id": "provider-id", "object": "chat.completion.chunk", "created": 0, "choices": []}"#,
+            "\n\n"
+        );
+
+        // When: the frame crosses the Chutes parser without needing an id.
+        let event = inner_event(frame.as_bytes(), SYNTHETIC_STREAM_ID)
+            .unwrap()
+            .unwrap();
+
+        // Then: passthrough bytes remain exactly as the provider emitted them.
+        assert_eq!(event.raw_bytes.as_ref(), frame.as_bytes());
     }
 
     #[test]
-    fn inner_event_accepts_missing_id_and_preserves_raw_bytes() {
+    fn inner_event_parses_bare_json_chunk() {
+        let line = b"{\"id\":\"x\",\"object\":\"chat.completion.chunk\",\"created\":0,\"model\":\"m\",\"choices\":[]}";
+        assert!(inner_event(line, SYNTHETIC_STREAM_ID).unwrap().is_some());
+    }
+
+    #[test]
+    fn inner_event_accepts_missing_id_and_normalizes_raw_bytes() {
         // Given: a valid Chutes frame whose provider-specific shape omits `id`.
         let frame = concat!(
             "data: ",
@@ -275,14 +319,147 @@ mod tests {
         );
 
         // When: the decrypted frame crosses the Chutes-only parser boundary.
-        let event = inner_event(frame.as_bytes()).unwrap().unwrap();
+        let event = inner_event(frame.as_bytes(), SYNTHETIC_STREAM_ID)
+            .unwrap()
+            .unwrap();
 
-        // Then: the typed chunk is usable without inventing an id, and signed bytes are unchanged.
+        // Then: the typed and reconstructed raw representations are semantically
+        // equivalent and carry the same injected stream id.
         let Some(StreamChunk::Chat(chunk)) = event.chunk else {
             panic!("expected a parsed chat chunk");
         };
-        assert!(chunk.id.is_empty());
-        assert_eq!(event.raw_bytes.as_ref(), frame.as_bytes());
+        assert_eq!(chunk.id, SYNTHETIC_STREAM_ID);
+
+        let raw_line = std::str::from_utf8(&event.raw_bytes).unwrap();
+        let raw: serde_json::Value = serde_json::from_str(
+            raw_line
+                .strip_prefix("data: ")
+                .expect("normalized event is a framed SSE data line")
+                .trim_end(),
+        )
+        .unwrap();
+        let mut expected: serde_json::Value = serde_json::from_str(
+            frame
+                .strip_prefix("data: ")
+                .expect("fixture is a framed SSE data line")
+                .trim_end(),
+        )
+        .unwrap();
+        expected["id"] = serde_json::Value::String(SYNTHETIC_STREAM_ID.to_string());
+        assert_eq!(raw, expected);
+    }
+
+    #[test]
+    fn inner_event_replaces_empty_id_in_raw_and_typed_chunk() {
+        // Given: a valid Chutes frame whose provider id is an empty string.
+        let frame =
+            br#"{"id":"","object":"chat.completion.chunk","created":0,"model":"m","choices":[]}"#;
+
+        // When: the decrypted frame crosses the Chutes-only parser boundary.
+        let event = inner_event(frame, SYNTHETIC_STREAM_ID).unwrap().unwrap();
+
+        // Then: both emitted representations carry the same synthetic id.
+        let raw: serde_json::Value = serde_json::from_slice(
+            event
+                .raw_bytes
+                .strip_prefix(b"data: ")
+                .expect("normalized event is a framed SSE data line"),
+        )
+        .unwrap();
+        let Some(StreamChunk::Chat(chunk)) = event.chunk else {
+            panic!("expected a parsed chat chunk");
+        };
+        assert_eq!(raw["id"], SYNTHETIC_STREAM_ID);
+        assert_eq!(chunk.id, SYNTHETIC_STREAM_ID);
+    }
+
+    #[test]
+    fn missing_id_raw_and_typed_round_trip_sanitizes_provider_fields() {
+        // Given: an id-less provider frame carrying fields that the Chutes
+        // client-facing allowlist must remove.
+        let frame = br#"{"object":"chat.completion.chunk","created":0,"model":"provider/model","prompt_token_ids":[1,2],"prompt_sha256":"secret","choices":[]}"#;
+        let session = fresh_session();
+        let event = inner_event(frame, session.synthetic_stream_id())
+            .unwrap()
+            .unwrap();
+
+        // When: the downstream Chutes rewrite sanitizes and canonicalizes it.
+        let rewritten =
+            super::super::rewrite_sse_event_model(event, Some("canonical/model"), false);
+
+        // Then: both client-facing representations carry the same sanitized,
+        // canonical shape. Re-serialized typed chunks are used on route paths
+        // that cannot forward raw bytes, so provider internals must be absent.
+        let Some(StreamChunk::Chat(chunk)) = &rewritten.chunk else {
+            panic!("expected a rewritten chat chunk");
+        };
+        let typed = serde_json::to_value(chunk).unwrap();
+        assert!(
+            typed.get("prompt_token_ids").is_none(),
+            "typed chunk must not re-expose provider prompt_token_ids"
+        );
+        assert!(
+            typed.get("prompt_sha256").is_none(),
+            "typed chunk must not re-expose provider prompt_sha256"
+        );
+        assert_eq!(typed["model"], "canonical/model");
+
+        let raw_line = std::str::from_utf8(&rewritten.raw_bytes).unwrap();
+        let raw: serde_json::Value = serde_json::from_str(
+            raw_line
+                .strip_prefix("data: ")
+                .expect("rewritten event is a framed SSE data line")
+                .trim_end(),
+        )
+        .unwrap();
+        assert_eq!(raw.get("id"), typed.get("id"));
+        assert!(
+            raw["id"].as_str().is_some_and(|id| !id.is_empty()),
+            "missing provider id must be replaced before emitting the event"
+        );
+    }
+
+    #[test]
+    fn missing_id_streams_use_stable_unique_synthetic_ids() {
+        // Given: two id-less frames from one completion and another id-less
+        // frame from a different completion.
+        let first_session = fresh_session();
+        let second_session = fresh_session();
+        let parse_id = |frame: &[u8], session: &ResponseSession| {
+            let event = inner_event(frame, session.synthetic_stream_id())
+                .unwrap()
+                .unwrap();
+            let Some(StreamChunk::Chat(chunk)) = event.chunk else {
+                panic!("expected a parsed chat chunk");
+            };
+            chunk.id
+        };
+
+        // When: every frame crosses the Chutes parser boundary.
+        let first_id = parse_id(
+            br#"{"object":"chat.completion.chunk","created":0,"model":"m","choices":[{"index":0,"delta":{"content":"a"}}]}"#,
+            &first_session,
+        );
+        let next_id = parse_id(
+            br#"{"object":"chat.completion.chunk","created":0,"model":"m","choices":[{"index":0,"delta":{"content":"b"}}]}"#,
+            &first_session,
+        );
+        let other_id = parse_id(
+            br#"{"object":"chat.completion.chunk","created":0,"model":"m","choices":[{"index":0,"delta":{"content":"c"}}]}"#,
+            &second_session,
+        );
+
+        // Then: identity is visibly gateway-synthetic, stable within one stream,
+        // and unique across completions.
+        assert!(
+            first_id.starts_with("chutes-gateway-"),
+            "missing provider id must be visibly gateway-synthetic"
+        );
+        assert_eq!(first_id, next_id, "one stream must keep one chat id");
+        assert_ne!(
+            first_id, other_id,
+            "different completions must not collide in the signature key"
+        );
     }
 
     #[test]
@@ -291,7 +468,7 @@ mod tests {
         let frame = br#"{"id":"x","object":"chat.completion.chunk","created":0,"model":"m","choices":[],"prompt_text":null}"#;
 
         // When: the frame is parsed at the Chutes boundary.
-        let event = inner_event(frame).unwrap().unwrap();
+        let event = inner_event(frame, SYNTHETIC_STREAM_ID).unwrap().unwrap();
 
         // Then: the shared chunk's flatten map preserves the provider field.
         let Some(StreamChunk::Chat(chunk)) = event.chunk else {
@@ -309,7 +486,7 @@ mod tests {
         let frame = br#"{"id":"x","object":"chat.completion.chunk","created":0,"model":"m"}"#;
 
         // When: it crosses the Chutes parser boundary.
-        let error = inner_event(frame).unwrap_err();
+        let error = inner_event(frame, SYNTHETIC_STREAM_ID).unwrap_err();
 
         // Then: tolerance for a missing id does not weaken required completion data.
         assert!(format!("{error}").contains("missing field `choices`"));
@@ -317,11 +494,11 @@ mod tests {
 
     #[test]
     fn inner_event_done_and_empty() {
-        assert!(inner_event(b"data: [DONE]")
+        assert!(inner_event(b"data: [DONE]", SYNTHETIC_STREAM_ID)
             .unwrap()
             .unwrap()
             .is_done_marker());
-        assert!(inner_event(b"   ").unwrap().is_none());
+        assert!(inner_event(b"   ", SYNTHETIC_STREAM_ID).unwrap().is_none());
     }
 
     #[test]
@@ -329,10 +506,14 @@ mod tests {
         // A decrypted SSE comment / keepalive line (vLLM/SGLang emit these) must
         // be skipped, not fed to the JSON parser — otherwise a healthy stream dies
         // with a parse error mid-flight.
-        assert!(inner_event(b": ping").unwrap().is_none());
-        assert!(inner_event(b":keepalive").unwrap().is_none());
+        assert!(inner_event(b": ping", SYNTHETIC_STREAM_ID)
+            .unwrap()
+            .is_none());
+        assert!(inner_event(b":keepalive", SYNTHETIC_STREAM_ID)
+            .unwrap()
+            .is_none());
         // Still a fatal error for genuinely non-JSON data content.
-        assert!(inner_event(b"data: not json").is_err());
+        assert!(inner_event(b"data: not json", SYNTHETIC_STREAM_ID).is_err());
     }
 
     #[tokio::test]

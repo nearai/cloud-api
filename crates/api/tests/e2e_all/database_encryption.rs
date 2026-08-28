@@ -798,7 +798,7 @@ async fn recovery_resumes_the_cursor_and_duplicate_workers_do_not_double_process
     let periodically_recovered_id = Uuid::new_v4();
     client
         .execute(
-            "INSERT INTO database_encryption_jobs(id,mode,status,scope,actions,batch_size,admin_actor) VALUES($1,'dry_run','queued',$2,$3,1,$4)",
+            "INSERT INTO database_encryption_jobs(id,mode,status,scope,actions,batch_size,max_rows,admin_actor) VALUES($1,'dry_run','queued',$2,$3,1,1,$4)",
             &[&periodically_recovered_id, &scope, &actions, &admin_id],
         )
         .await

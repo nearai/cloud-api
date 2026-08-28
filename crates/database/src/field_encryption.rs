@@ -8,7 +8,19 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 
 pub const MARKER: &str = "__near_db_encrypted";
-pub const KEY_ID: &str = "db-v1";
+pub const DEFAULT_KEY_ID: &str = "db-v1";
+
+pub fn validate_key_id(key_id: &str) -> Result<()> {
+    ensure!(
+        !key_id.is_empty()
+            && key_id.len() <= 64
+            && key_id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.')),
+        "database encryption key id must be 1-64 ASCII letters, digits, '.', '_' or '-'"
+    );
+    Ok(())
+}
 
 pub fn is_envelope(value: &Value) -> bool {
     value[MARKER] == true
@@ -28,6 +40,18 @@ pub fn parse_key(hex_key: &str) -> Result<[u8; 32]> {
 }
 
 pub fn encrypt(key: &[u8; 32], table: &str, column: &str, id: Uuid, plain: &str) -> Result<String> {
+    encrypt_with_key_id(key, DEFAULT_KEY_ID, table, column, id, plain)
+}
+
+pub fn encrypt_with_key_id(
+    key: &[u8; 32],
+    key_id: &str,
+    table: &str,
+    column: &str,
+    id: Uuid,
+    plain: &str,
+) -> Result<String> {
+    validate_key_id(key_id)?;
     let mut nonce = [0; 12];
     OsRng.fill_bytes(&mut nonce);
     let aad = format!("{table}:{column}:{id}");
@@ -41,7 +65,7 @@ pub fn encrypt(key: &[u8; 32], table: &str, column: &str, id: Uuid, plain: &str)
             },
         )
         .map_err(|_| anyhow!("encryption failed"))?;
-    Ok(json!({MARKER:true,"version":1,"alg":"AES-256-GCM","key_id":KEY_ID,"nonce":BASE64.encode(nonce),"ciphertext":BASE64.encode(ciphertext)}).to_string())
+    Ok(json!({MARKER:true,"version":1,"alg":"AES-256-GCM","key_id":key_id,"nonce":BASE64.encode(nonce),"ciphertext":BASE64.encode(ciphertext)}).to_string())
 }
 
 pub fn decrypt(
@@ -51,6 +75,18 @@ pub fn decrypt(
     id: Uuid,
     encoded: &str,
 ) -> Result<String> {
+    decrypt_with_key_id(key, DEFAULT_KEY_ID, table, column, id, encoded)
+}
+
+pub fn decrypt_with_key_id(
+    key: &[u8; 32],
+    expected_key_id: &str,
+    table: &str,
+    column: &str,
+    id: Uuid,
+    encoded: &str,
+) -> Result<String> {
+    validate_key_id(expected_key_id)?;
     let value: Value = serde_json::from_str(encoded)?;
     ensure!(value[MARKER] == true, "missing encryption marker");
     ensure!(value["version"] == 1, "unsupported envelope version");
@@ -58,7 +94,10 @@ pub fn decrypt(
         value["alg"] == "AES-256-GCM",
         "unsupported envelope algorithm"
     );
-    ensure!(value["key_id"] == KEY_ID, "unsupported encryption key id");
+    ensure!(
+        value["key_id"] == expected_key_id,
+        "unsupported encryption key id"
+    );
     let nonce: [u8; 12] = BASE64
         .decode(
             value["nonce"]
@@ -93,8 +132,21 @@ pub fn decrypt_if_encrypted(
     id: Uuid,
     value: String,
 ) -> Result<String> {
+    decrypt_if_encrypted_with_key_id(key, DEFAULT_KEY_ID, table, column, id, value)
+}
+
+pub fn decrypt_if_encrypted_with_key_id(
+    key: &[u8; 32],
+    key_id: &str,
+    table: &str,
+    column: &str,
+    id: Uuid,
+    value: String,
+) -> Result<String> {
     match serde_json::from_str::<Value>(&value) {
-        Ok(envelope) if is_envelope(&envelope) => decrypt(key, table, column, id, &value),
+        Ok(envelope) if is_envelope(&envelope) => {
+            decrypt_with_key_id(key, key_id, table, column, id, &value)
+        }
         _ => Ok(value),
     }
 }
@@ -106,8 +158,20 @@ pub fn encrypt_json(
     id: Uuid,
     value: &Value,
 ) -> Result<Value> {
-    Ok(serde_json::from_str(&encrypt(
+    encrypt_json_with_key_id(key, DEFAULT_KEY_ID, table, column, id, value)
+}
+
+pub fn encrypt_json_with_key_id(
+    key: &[u8; 32],
+    key_id: &str,
+    table: &str,
+    column: &str,
+    id: Uuid,
+    value: &Value,
+) -> Result<Value> {
+    Ok(serde_json::from_str(&encrypt_with_key_id(
         key,
+        key_id,
         table,
         column,
         id,
@@ -122,11 +186,23 @@ pub fn decrypt_json_if_encrypted(
     id: Uuid,
     value: Value,
 ) -> Result<Value> {
+    decrypt_json_if_encrypted_with_key_id(key, DEFAULT_KEY_ID, table, column, id, value)
+}
+
+pub fn decrypt_json_if_encrypted_with_key_id(
+    key: &[u8; 32],
+    key_id: &str,
+    table: &str,
+    column: &str,
+    id: Uuid,
+    value: Value,
+) -> Result<Value> {
     if !is_envelope(&value) {
         return Ok(value);
     }
-    Ok(serde_json::from_str(&decrypt(
+    Ok(serde_json::from_str(&decrypt_with_key_id(
         key,
+        key_id,
         table,
         column,
         id,
@@ -144,6 +220,14 @@ mod tests {
         assert!(parse_key("not-hex").is_err());
         assert!(parse_key(&"07".repeat(31)).is_err());
         assert!(parse_key(&"07".repeat(33)).is_err());
+    }
+
+    #[test]
+    fn key_id_validation_rejects_empty_oversized_and_unsafe_values() {
+        assert!(validate_key_id("db-2026.08_v1").is_ok());
+        assert!(validate_key_id("").is_err());
+        assert!(validate_key_id(&"a".repeat(65)).is_err());
+        assert!(validate_key_id("db key").is_err());
     }
 
     #[test]

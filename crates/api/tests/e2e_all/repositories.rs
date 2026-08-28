@@ -400,6 +400,13 @@ mod database_encryption_at_rest {
         assert_eq!(fetched.content_type, "text/plain");
         assert_eq!(fetched.storage_key, "private/object/key");
 
+        let configured_key_id = database.pool().encryption_key_id();
+        database
+            .pool()
+            .set_encryption_key_id("wrong-db-key-id".to_string());
+        assert!(repository.get_by_id(created.id).await.is_err());
+        database.pool().set_encryption_key_id(configured_key_id);
+
         let client = database.pool().get().await.expect("database connection");
         client
             .execute(

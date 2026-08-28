@@ -63,9 +63,10 @@ impl PgResponseItemsRepository {
     fn row_to_item(&self, row: tokio_postgres::Row) -> Result<ResponseOutputItem> {
         let id: Uuid = row.try_get("id")?;
         let mut item_json: serde_json::Value = row.try_get("item")?;
-        if let Some(key) = self.pool.encryption_key() {
-            item_json = field_encryption::decrypt_json_if_encrypted(
+        if let Some((key, key_id)) = self.pool.encryption_context() {
+            item_json = field_encryption::decrypt_json_if_encrypted_with_key_id(
                 &key,
+                &key_id,
                 "response_items",
                 "item",
                 id,
@@ -269,9 +270,15 @@ impl ResponseItemRepositoryTrait for PgResponseItemsRepository {
         // Serialize the item to JSON for storage
         let mut item_json =
             serde_json::to_value(&item).context("Failed to serialize response item")?;
-        if let Some(key) = self.pool.encryption_write_key() {
-            item_json =
-                field_encryption::encrypt_json(&key, "response_items", "item", id, &item_json)?;
+        if let Some((key, key_id)) = self.pool.encryption_write_context() {
+            item_json = field_encryption::encrypt_json_with_key_id(
+                &key,
+                &key_id,
+                "response_items",
+                "item",
+                id,
+                &item_json,
+            )?;
         }
 
         let conversation_uuid = conversation_id.map(|cid| cid.0);
@@ -371,9 +378,15 @@ impl ResponseItemRepositoryTrait for PgResponseItemsRepository {
         // Serialize the updated item to JSON
         let mut item_json =
             serde_json::to_value(&item).context("Failed to serialize response item")?;
-        if let Some(key) = self.pool.encryption_write_key() {
-            item_json =
-                field_encryption::encrypt_json(&key, "response_items", "item", id.0, &item_json)?;
+        if let Some((key, key_id)) = self.pool.encryption_write_context() {
+            item_json = field_encryption::encrypt_json_with_key_id(
+                &key,
+                &key_id,
+                "response_items",
+                "item",
+                id.0,
+                &item_json,
+            )?;
         }
 
         let row = retry_db!("update_response_item", {

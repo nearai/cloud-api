@@ -497,8 +497,10 @@ async fn scan_and_verify_classify_plaintext_valid_and_invalid_envelopes() {
         .pool()
         .encryption_key()
         .expect("database encryption key");
-    let valid = database::field_encryption::encrypt(
+    let key_id = database.pool().encryption_key_id();
+    let valid = database::field_encryption::encrypt_with_key_id(
         &key,
+        &key_id,
         "responses",
         "instructions",
         encrypted_id,
@@ -509,7 +511,7 @@ async fn scan_and_verify_classify_plaintext_valid_and_invalid_envelopes() {
         database::field_encryption::MARKER: true,
         "version": 1,
         "alg": "AES-256-GCM",
-        "key_id": database::field_encryption::KEY_ID,
+        "key_id": key_id,
         "nonce": "invalid",
         "ciphertext": "invalid"
     })
@@ -535,7 +537,7 @@ async fn scan_and_verify_classify_plaintext_valid_and_invalid_envelopes() {
         .post("/v1/admin/database-encryption/scan")
         .add_header("Authorization", format!("Bearer {}", get_session_id()))
         .add_header("User-Agent", MOCK_USER_AGENT)
-        .json(&serde_json::json!({"scope": scope}))
+        .json(&serde_json::json!({"scope": scope, "batch_size": 1}))
         .await;
     assert_eq!(scan.status_code(), 200);
     let scan = scan.json::<serde_json::Value>();
@@ -550,22 +552,33 @@ async fn scan_and_verify_classify_plaintext_valid_and_invalid_envelopes() {
         .add_header("User-Agent", MOCK_USER_AGENT)
         .json(&serde_json::json!({"scope": scope}))
         .await;
-    assert_eq!(verify.status_code(), 200);
-    let verify = verify.json::<serde_json::Value>();
-    assert_eq!(verify["pass"], false);
-    assert!(verify["failing_fields"]
+    assert_eq!(verify.status_code(), 202);
+    let verify_id = verify.json::<serde_json::Value>()["job_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let verify = wait_for_database_encryption_job(&server, &verify_id).await;
+    assert_eq!(verify["progress"]["pass"], false);
+    assert!(verify["progress"]["processed"].as_i64().unwrap_or(0) >= 3);
+    assert!(verify["progress"]["invalid_envelope_rows"]
         .as_array()
-        .expect("failing fields")
+        .expect("invalid envelope rows")
         .iter()
-        .any(|field| field["reason_code"] == "invalid_envelope"));
+        .any(|row| row["id"] == malformed_id.to_string()));
 
     for (id, plaintext) in [
         (plaintext_id, "legacy plaintext instructions"),
         (malformed_id, "recovered malformed instructions"),
     ] {
-        let repaired =
-            database::field_encryption::encrypt(&key, "responses", "instructions", id, plaintext)
-                .expect("replacement envelope");
+        let repaired = database::field_encryption::encrypt_with_key_id(
+            &key,
+            &database.pool().encryption_key_id(),
+            "responses",
+            "instructions",
+            id,
+            plaintext,
+        )
+        .expect("replacement envelope");
         client
             .execute(
                 "UPDATE responses SET instructions=$2 WHERE id=$1",
@@ -579,14 +592,21 @@ async fn scan_and_verify_classify_plaintext_valid_and_invalid_envelopes() {
         .post("/v1/admin/database-encryption/verify")
         .add_header("Authorization", format!("Bearer {}", get_session_id()))
         .add_header("User-Agent", MOCK_USER_AGENT)
-        .json(&serde_json::json!({"scope": scope}))
+        .json(&serde_json::json!({"scope": scope, "batch_size": 1}))
         .await;
-    assert_eq!(verify.status_code(), 200);
-    let verify = verify.json::<serde_json::Value>();
-    assert_eq!(verify["pass"], true, "verification response: {verify}");
-    assert!(verify["failing_fields"]
+    assert_eq!(verify.status_code(), 202);
+    let verify_id = verify.json::<serde_json::Value>()["job_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let verify = wait_for_database_encryption_job(&server, &verify_id).await;
+    assert_eq!(
+        verify["progress"]["pass"], true,
+        "verification response: {verify}"
+    );
+    assert!(verify["progress"]["unclassified"]
         .as_array()
-        .expect("failing fields")
+        .expect("unclassified columns")
         .is_empty());
 }
 
@@ -754,8 +774,10 @@ async fn recovery_resumes_the_cursor_and_duplicate_workers_do_not_double_process
     let state = api::database_encryption::DatabaseEncryptionState::new(
         database.pool().clone(),
         &hex::encode(key),
+        &database.pool().encryption_key_id(),
     )
-    .expect("database encryption state");
+    .expect("database encryption state")
+    .with_recovery_interval(std::time::Duration::from_millis(20));
     state.recover_jobs();
     wait_for_database_encryption_job_status(&server, &job_id.to_string(), "running").await;
     state.recover_jobs();
@@ -771,4 +793,34 @@ async fn recovery_resumes_the_cursor_and_duplicate_workers_do_not_double_process
         .expect("resumed response")
         .get(0);
     assert_eq!(stored[database::field_encryption::MARKER], true);
+
+    let periodically_recovered_id = Uuid::new_v4();
+    client
+        .execute(
+            "INSERT INTO database_encryption_jobs(id,mode,status,scope,actions,batch_size,admin_actor) VALUES($1,'dry_run','queued',$2,$3,1,$4)",
+            &[&periodically_recovered_id, &scope, &actions, &admin_id],
+        )
+        .await
+        .expect("job queued after recovery loop started");
+    let periodic =
+        wait_for_database_encryption_job(&server, &periodically_recovered_id.to_string()).await;
+    assert_eq!(periodic["status"], "completed");
+
+    let failed_id = Uuid::new_v4();
+    let invalid_scope = serde_json::json!({
+        "tables": [],
+        "fields": [{"table": "responses", "column": "unknown"}]
+    });
+    client
+        .execute(
+            "INSERT INTO database_encryption_jobs(id,mode,status,scope,actions,batch_size,admin_actor) VALUES($1,'dry_run','queued',$2,$3,1,$4)",
+            &[&failed_id, &invalid_scope, &actions, &admin_id],
+        )
+        .await
+        .expect("invalid persisted job fixture");
+    let failed =
+        wait_for_database_encryption_job_status(&server, &failed_id.to_string(), "failed").await;
+    assert_eq!(failed["last_error_class"], "worker_failed");
+    assert_eq!(failed["last_error_message"], "worker_failed");
+    assert_eq!(failed["progress"]["failure"]["class"], "worker_failed");
 }

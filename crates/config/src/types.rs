@@ -20,6 +20,8 @@ pub struct ApiConfig {
     /// Dedicated AES-256 key for confidential database fields. This must not
     /// reuse the object-storage encryption key.
     pub database_encryption_key: String,
+    /// Identifier embedded in and validated against every database envelope.
+    pub database_encryption_key_id: String,
     /// Enables encryption for newly written confidential database fields.
     /// Defaults off so dual-read support can be deployed fleet-wide first.
     pub database_encryption_write_enabled: bool,
@@ -61,6 +63,8 @@ impl ApiConfig {
                 "DB_ENCRYPTION_KEY_FILE",
                 "DB_ENCRYPTION_KEY",
             )?,
+            database_encryption_key_id: non_empty_env("DB_ENCRYPTION_KEY_ID")
+                .unwrap_or_else(|| "db-v1".to_string()),
             database_encryption_write_enabled: parse_bool_env(
                 "DB_ENCRYPTION_WRITE_ENABLED",
                 false,

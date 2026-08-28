@@ -108,6 +108,7 @@ pub fn create_pool_with_native_tls(
 pub struct DbPool {
     inner: std::sync::Arc<std::sync::RwLock<Option<Pool>>>,
     encryption_key: std::sync::Arc<std::sync::RwLock<Option<[u8; 32]>>>,
+    encryption_key_id: std::sync::Arc<std::sync::RwLock<String>>,
     encryption_write_enabled: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
@@ -117,6 +118,9 @@ impl DbPool {
         Self {
             inner: std::sync::Arc::new(std::sync::RwLock::new(Some(pool))),
             encryption_key: std::sync::Arc::new(std::sync::RwLock::new(None)),
+            encryption_key_id: std::sync::Arc::new(std::sync::RwLock::new(
+                crate::field_encryption::DEFAULT_KEY_ID.to_string(),
+            )),
             encryption_write_enabled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
                 false,
             )),
@@ -129,6 +133,9 @@ impl DbPool {
         Self {
             inner: std::sync::Arc::new(std::sync::RwLock::new(None)),
             encryption_key: std::sync::Arc::new(std::sync::RwLock::new(None)),
+            encryption_key_id: std::sync::Arc::new(std::sync::RwLock::new(
+                crate::field_encryption::DEFAULT_KEY_ID.to_string(),
+            )),
             encryption_write_enabled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
                 false,
             )),
@@ -163,6 +170,20 @@ impl DbPool {
             .unwrap_or_else(|e| e.into_inner())
     }
 
+    pub fn set_encryption_key_id(&self, key_id: String) {
+        *self
+            .encryption_key_id
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = key_id;
+    }
+
+    pub fn encryption_key_id(&self) -> String {
+        self.encryption_key_id
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
     pub fn set_encryption_write_enabled(&self, enabled: bool) {
         self.encryption_write_enabled
             .store(enabled, std::sync::atomic::Ordering::Release);
@@ -176,6 +197,17 @@ impl DbPool {
     pub fn encryption_write_key(&self) -> Option<[u8; 32]> {
         self.encryption_write_enabled()
             .then(|| self.encryption_key())
+            .flatten()
+    }
+
+    pub fn encryption_context(&self) -> Option<([u8; 32], String)> {
+        self.encryption_key()
+            .map(|key| (key, self.encryption_key_id()))
+    }
+
+    pub fn encryption_write_context(&self) -> Option<([u8; 32], String)> {
+        self.encryption_write_enabled()
+            .then(|| self.encryption_context())
             .flatten()
     }
 

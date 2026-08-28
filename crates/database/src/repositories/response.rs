@@ -21,8 +21,15 @@ impl PgResponseRepository {
 
     fn encrypt_text(&self, id: Uuid, column: &str, value: Option<&str>) -> Result<Option<String>> {
         value
-            .map(|value| match self.pool.encryption_write_key() {
-                Some(key) => crate::field_encryption::encrypt(&key, "responses", column, id, value),
+            .map(|value| match self.pool.encryption_write_context() {
+                Some((key, key_id)) => crate::field_encryption::encrypt_with_key_id(
+                    &key,
+                    &key_id,
+                    "responses",
+                    column,
+                    id,
+                    value,
+                ),
                 None => Ok(value.to_string()),
             })
             .transpose()
@@ -35,9 +42,10 @@ impl PgResponseRepository {
         value: Option<String>,
     ) -> Result<Option<String>> {
         value
-            .map(|value| match self.pool.encryption_key() {
-                Some(key) => crate::field_encryption::decrypt_if_encrypted(
+            .map(|value| match self.pool.encryption_context() {
+                Some((key, key_id)) => crate::field_encryption::decrypt_if_encrypted_with_key_id(
                     &key,
+                    &key_id,
                     "responses",
                     column,
                     id,
@@ -49,10 +57,15 @@ impl PgResponseRepository {
     }
 
     fn encrypt_metadata(&self, id: Uuid, value: &serde_json::Value) -> Result<serde_json::Value> {
-        match self.pool.encryption_write_key() {
-            Some(key) => {
-                crate::field_encryption::encrypt_json(&key, "responses", "metadata", id, value)
-            }
+        match self.pool.encryption_write_context() {
+            Some((key, key_id)) => crate::field_encryption::encrypt_json_with_key_id(
+                &key,
+                &key_id,
+                "responses",
+                "metadata",
+                id,
+                value,
+            ),
             None => Ok(value.clone()),
         }
     }
@@ -63,14 +76,17 @@ impl PgResponseRepository {
         value: Option<serde_json::Value>,
     ) -> Result<Option<serde_json::Value>> {
         value
-            .map(|value| match self.pool.encryption_key() {
-                Some(key) => crate::field_encryption::decrypt_json_if_encrypted(
-                    &key,
-                    "responses",
-                    "metadata",
-                    id,
-                    value,
-                ),
+            .map(|value| match self.pool.encryption_context() {
+                Some((key, key_id)) => {
+                    crate::field_encryption::decrypt_json_if_encrypted_with_key_id(
+                        &key,
+                        &key_id,
+                        "responses",
+                        "metadata",
+                        id,
+                        value,
+                    )
+                }
                 None => Ok(value),
             })
             .transpose()

@@ -326,7 +326,12 @@ pub async fn init_domain_services_with_pool(
     .unwrap_or_else(|_| {
         panic!("configured database encryption key is invalid");
     });
+    database::field_encryption::validate_key_id(&config.database_encryption_key_id)
+        .unwrap_or_else(|_| panic!("configured database encryption key id is invalid"));
     database.pool().set_encryption_key(database_encryption_key);
+    database
+        .pool()
+        .set_encryption_key_id(config.database_encryption_key_id.clone());
     database
         .pool()
         .set_encryption_write_enabled(config.database_encryption_write_enabled);
@@ -2211,6 +2216,7 @@ pub fn build_admin_routes(
     let database_encryption_state = crate::database_encryption::DatabaseEncryptionState::new(
         database.pool().clone(),
         &config.database_encryption_key,
+        &config.database_encryption_key_id,
     )
     .map_err(|_| {
         tracing::error!(
@@ -2796,6 +2802,7 @@ mod tests {
             },
             database_encryption_key:
                 "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789".to_string(),
+            database_encryption_key_id: "test-db-v1".to_string(),
             database_encryption_write_enabled: false,
             s3: config::S3Config {
                 mock: true,
@@ -2909,6 +2916,7 @@ mod tests {
             },
             database_encryption_key:
                 "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789".to_string(),
+            database_encryption_key_id: "test-db-v1".to_string(),
             database_encryption_write_enabled: false,
             s3: config::S3Config {
                 mock: true,

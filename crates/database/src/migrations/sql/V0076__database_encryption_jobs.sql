@@ -1,6 +1,6 @@
 CREATE TABLE database_encryption_jobs (
     id UUID PRIMARY KEY,
-    mode TEXT NOT NULL CHECK (mode IN ('dry_run', 'execute')),
+    mode TEXT NOT NULL CHECK (mode IN ('dry_run', 'execute', 'verify')),
     status TEXT NOT NULL CHECK (status IN ('queued', 'running', 'completed', 'failed', 'cancelled')),
     scope JSONB NOT NULL,
     actions JSONB NOT NULL,

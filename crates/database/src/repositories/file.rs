@@ -23,36 +23,44 @@ impl FileRepository {
         params: services::files::ports::CreateFileParams,
     ) -> Result<File, RepositoryError> {
         let id = Uuid::new_v4();
-        let (filename, content_type, storage_key) = if let Some(key) =
-            self.pool.encryption_write_key()
-        {
-            (
-                crate::field_encryption::encrypt(&key, "files", "filename", id, &params.filename)
+        let (filename, content_type, storage_key) =
+            if let Some((key, key_id)) = self.pool.encryption_write_context() {
+                (
+                    crate::field_encryption::encrypt_with_key_id(
+                        &key,
+                        &key_id,
+                        "files",
+                        "filename",
+                        id,
+                        &params.filename,
+                    )
                     .map_err(RepositoryError::DataConversionError)?,
-                crate::field_encryption::encrypt(
-                    &key,
-                    "files",
-                    "content_type",
-                    id,
-                    &params.content_type,
+                    crate::field_encryption::encrypt_with_key_id(
+                        &key,
+                        &key_id,
+                        "files",
+                        "content_type",
+                        id,
+                        &params.content_type,
+                    )
+                    .map_err(RepositoryError::DataConversionError)?,
+                    crate::field_encryption::encrypt_with_key_id(
+                        &key,
+                        &key_id,
+                        "files",
+                        "storage_key",
+                        id,
+                        &params.storage_key,
+                    )
+                    .map_err(RepositoryError::DataConversionError)?,
                 )
-                .map_err(RepositoryError::DataConversionError)?,
-                crate::field_encryption::encrypt(
-                    &key,
-                    "files",
-                    "storage_key",
-                    id,
-                    &params.storage_key,
+            } else {
+                (
+                    params.filename.clone(),
+                    params.content_type.clone(),
+                    params.storage_key.clone(),
                 )
-                .map_err(RepositoryError::DataConversionError)?,
-            )
-        } else {
-            (
-                params.filename.clone(),
-                params.content_type.clone(),
-                params.storage_key.clone(),
-            )
-        };
+            };
 
         let row = match retry_db!("create_new_file_record", {
             let now = Utc::now();
@@ -393,19 +401,21 @@ impl FileRepository {
         let mut filename: String = row.get("filename");
         let mut content_type: String = row.get("content_type");
         let mut storage_key: String = row.get("storage_key");
-        if let Some(key) = self.pool.encryption_key() {
-            filename = crate::field_encryption::decrypt_if_encrypted(
-                &key, "files", "filename", id, filename,
+        if let Some((key, key_id)) = self.pool.encryption_context() {
+            filename = crate::field_encryption::decrypt_if_encrypted_with_key_id(
+                &key, &key_id, "files", "filename", id, filename,
             )?;
-            content_type = crate::field_encryption::decrypt_if_encrypted(
+            content_type = crate::field_encryption::decrypt_if_encrypted_with_key_id(
                 &key,
+                &key_id,
                 "files",
                 "content_type",
                 id,
                 content_type,
             )?;
-            storage_key = crate::field_encryption::decrypt_if_encrypted(
+            storage_key = crate::field_encryption::decrypt_if_encrypted_with_key_id(
                 &key,
+                &key_id,
                 "files",
                 "storage_key",
                 id,

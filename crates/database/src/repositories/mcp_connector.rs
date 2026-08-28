@@ -21,17 +21,19 @@ impl McpConnectorRepository {
     }
 
     fn encrypt_text(&self, table: &str, column: &str, id: Uuid, value: String) -> Result<String> {
-        match self.pool.encryption_write_key() {
-            Some(key) => crate::field_encryption::encrypt(&key, table, column, id, &value),
+        match self.pool.encryption_write_context() {
+            Some((key, key_id)) => crate::field_encryption::encrypt_with_key_id(
+                &key, &key_id, table, column, id, &value,
+            ),
             None => Ok(value),
         }
     }
 
     fn decrypt_text(&self, table: &str, column: &str, id: Uuid, value: String) -> Result<String> {
-        match self.pool.encryption_key() {
-            Some(key) => {
-                crate::field_encryption::decrypt_if_encrypted(&key, table, column, id, value)
-            }
+        match self.pool.encryption_context() {
+            Some((key, key_id)) => crate::field_encryption::decrypt_if_encrypted_with_key_id(
+                &key, &key_id, table, column, id, value,
+            ),
             None => Ok(value),
         }
     }
@@ -43,8 +45,10 @@ impl McpConnectorRepository {
         id: Uuid,
         value: serde_json::Value,
     ) -> Result<serde_json::Value> {
-        match self.pool.encryption_write_key() {
-            Some(key) => crate::field_encryption::encrypt_json(&key, table, column, id, &value),
+        match self.pool.encryption_write_context() {
+            Some((key, key_id)) => crate::field_encryption::encrypt_json_with_key_id(
+                &key, &key_id, table, column, id, &value,
+            ),
             None => Ok(value),
         }
     }
@@ -56,10 +60,10 @@ impl McpConnectorRepository {
         id: Uuid,
         value: serde_json::Value,
     ) -> Result<serde_json::Value> {
-        match self.pool.encryption_key() {
-            Some(key) => {
-                crate::field_encryption::decrypt_json_if_encrypted(&key, table, column, id, value)
-            }
+        match self.pool.encryption_context() {
+            Some((key, key_id)) => crate::field_encryption::decrypt_json_if_encrypted_with_key_id(
+                &key, &key_id, table, column, id, value,
+            ),
             None => Ok(value),
         }
     }

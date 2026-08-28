@@ -4,7 +4,10 @@ use chrono::{DateTime, Utc};
 use database::DbPool;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc, Mutex,
+};
 use tokio::sync::Semaphore;
 use uuid::Uuid;
 
@@ -118,51 +121,129 @@ const FIELDS: &[Field] = &[
     ),
 ];
 
+#[derive(Clone, Copy)]
+struct ApprovedGroup {
+    table: &'static str,
+    columns: &'static [&'static str],
+    reason: &'static str,
+}
+
+const APPROVED: &[ApprovedGroup] = &[
+    ApprovedGroup { table: "admin_access_token", columns: &["token_hash", "name", "creation_reason", "revocation_reason", "user_agent"], reason: "Operational admin-token metadata; the credential itself is stored as a one-way hash" },
+    ApprovedGroup { table: "aml_allowlisted_accounts", columns: &["account_id", "address_type", "reason"], reason: "Queryable compliance allowlist and audit rationale" },
+    ApprovedGroup { table: "aml_reports", columns: &["flow", "provider", "account_id", "address_type", "risk_level", "report_id", "reason", "result_json"], reason: "Queryable compliance evidence with access restricted to AML/admin workflows" },
+    ApprovedGroup { table: "api_keys", columns: &["key_hash", "name", "key_prefix"], reason: "API credentials are one-way hashed; name and prefix are query/display metadata" },
+    ApprovedGroup { table: "chat_signatures", columns: &["chat_id", "text", "signature", "signing_address", "signing_algo", "signature_kind"], reason: "Publicly verifiable signature material required for lookup and verification" },
+    ApprovedGroup { table: "database_encryption_jobs", columns: &["mode", "status", "scope", "actions", "cursor", "progress", "last_error_class", "last_error_message"], reason: "Non-customer operational migration state with redacted diagnostics" },
+    ApprovedGroup { table: "feature_request_targets", columns: &["kind", "key", "title", "status"], reason: "Product catalog and workflow state" },
+    ApprovedGroup { table: "feature_request_votes", columns: &["note", "source"], reason: "User-submitted product feedback intentionally available to administrators" },
+    ApprovedGroup { table: "files", columns: &["purpose"], reason: "Queryable protocol enum; file-identifying fields are encrypted separately" },
+    ApprovedGroup { table: "mcp_connector_usage", columns: &["method"], reason: "Queryable protocol method; request, response, and error payloads are encrypted" },
+    ApprovedGroup { table: "mcp_connectors", columns: &["name", "auth_type", "connection_status"], reason: "Name is required by the per-organization uniqueness contract; remaining fields are protocol enums" },
+    ApprovedGroup { table: "model_aliases", columns: &["alias_name"], reason: "Public model routing identifier" },
+    ApprovedGroup { table: "model_deprecation_email_deliveries", columns: &["model_name", "model_display_name", "successor_model_name", "recipient_email", "organization_name", "status", "email_message_id", "email_last_error", "initiated_by_user_email"], reason: "Restricted operational email-delivery audit log" },
+    ApprovedGroup { table: "model_pricing_change_email_deliveries", columns: &["recipient_email", "organization_name", "model_names", "status", "email_message_id", "email_last_error", "initiated_by_user_email"], reason: "Restricted operational email-delivery audit log" },
+    ApprovedGroup { table: "models", columns: &["model_name", "model_display_name", "model_description", "model_icon", "owned_by", "provider_type", "provider_config", "input_modalities", "output_modalities", "inference_url", "hugging_face_id", "quantization", "supported_sampling_parameters", "supported_features", "datacenters", "attestation_policy", "openrouter_slug", "text_pricing"], reason: "Public or administrator-managed model catalog and routing configuration" },
+    ApprovedGroup { table: "model_history", columns: &["model_display_name", "model_description", "change_reason", "model_name", "model_icon", "owned_by", "changed_by_user_email", "provider_type", "provider_config", "input_modalities", "output_modalities", "inference_url", "hugging_face_id", "quantization", "supported_sampling_parameters", "supported_features", "datacenters", "attestation_policy", "openrouter_slug", "text_pricing"], reason: "Administrator-visible model configuration audit history" },
+    ApprovedGroup { table: "near_used_nonces", columns: &["nonce_hex"], reason: "Public-chain replay-prevention value" },
+    ApprovedGroup { table: "oauth_states", columns: &["state", "provider", "pkce_verifier", "frontend_callback"], reason: "Short-lived OAuth handshake state required for indexed callback lookup and PKCE completion" },
+    ApprovedGroup { table: "organization_invitations", columns: &["email", "role", "status", "token", "email_status", "email_last_error", "email_message_id"], reason: "Invitation workflow data required for indexed acceptance and delivery operations; tokens are short-lived" },
+    ApprovedGroup { table: "organization_limits_history", columns: &["changed_by", "change_reason", "changed_by_user_email", "credit_type", "source", "currency"], reason: "Restricted billing and limits audit history" },
+    ApprovedGroup { table: "organization_members", columns: &["role"], reason: "Queryable authorization role" },
+    ApprovedGroup { table: "organization_reporting_tokens", columns: &["name", "token_hash", "token_prefix"], reason: "Reporting credentials are one-way hashed; name and prefix are display metadata" },
+    ApprovedGroup { table: "organization_staking_farm_sources", columns: &["near_account_id", "network_id", "contract_id", "farm_product_id", "farm_price_id", "status", "sync_status", "last_sync_error", "active_positions"], reason: "Public-chain identifiers and restricted staking synchronization state" },
+    ApprovedGroup { table: "organization_usage_log", columns: &["request_type", "model_name", "inference_type", "provider_request_id", "stop_reason", "served_provider_tier", "served_provider_type", "billing_details", "service_tier", "context_band"], reason: "Restricted metering and billing dimensions" },
+    ApprovedGroup { table: "organizations", columns: &["name", "description", "settings"], reason: "Organization profile and administrator-managed settings" },
+    ApprovedGroup { table: "refresh_tokens", columns: &["token_hash", "ip_address", "user_agent"], reason: "Refresh credentials are one-way hashed; security telemetry supports session management" },
+    ApprovedGroup { table: "refinery_schema_history", columns: &["name", "applied_on", "checksum"], reason: "Database migration framework bookkeeping" },
+    ApprovedGroup { table: "responses", columns: &["model", "status", "usage", "next_response_ids"], reason: "Queryable response lifecycle, routing, usage, and structural relationship data" },
+    ApprovedGroup { table: "scheduled_model_pricing_changes", columns: &["model_name", "model_display_name", "status", "last_error", "cancelled_by_user_email", "created_by_user_email", "change_reason", "old_text_pricing", "new_text_pricing"], reason: "Restricted administrator pricing workflow and audit data" },
+    ApprovedGroup { table: "services", columns: &["service_name", "display_name", "description", "unit"], reason: "Public service catalog" },
+    ApprovedGroup { table: "users", columns: &["email", "username", "display_name", "avatar_url", "auth_provider", "provider_user_id"], reason: "Account identity fields required for login, uniqueness, and user-facing profiles" },
+    ApprovedGroup { table: "workspaces", columns: &["name", "description", "settings"], reason: "Workspace profile and administrator-managed settings" },
+];
+
+fn approved_reason(table: &str, column: &str) -> Option<&'static str> {
+    APPROVED
+        .iter()
+        .find(|group| group.table == table && group.columns.contains(&column))
+        .map(|group| group.reason)
+}
+
+fn is_encrypted_field(table: &str, column: &str) -> bool {
+    FIELDS
+        .iter()
+        .any(|field| field.table == table && field.column == column)
+}
+
 #[derive(Clone)]
 pub struct DatabaseEncryptionState {
     pub pool: DbPool,
     key: [u8; 32],
+    key_id: String,
     /// Database migrations are serialized so a backfill cannot consume the
     /// application's connection pool.
     worker_permit: Arc<Semaphore>,
+    recovery_started: Arc<AtomicBool>,
+    active_jobs: Arc<Mutex<std::collections::HashSet<Uuid>>>,
+    recovery_interval: std::time::Duration,
 }
 
 impl DatabaseEncryptionState {
-    pub fn new(pool: DbPool, hex_key: &str) -> anyhow::Result<Self> {
+    pub fn new(pool: DbPool, hex_key: &str, key_id: &str) -> anyhow::Result<Self> {
         let bytes = hex::decode(hex_key)?;
         let len = bytes.len();
         let key = bytes
             .try_into()
             .map_err(|_| anyhow::anyhow!("database encryption key must be 32 bytes, got {len}"))?;
+        database::field_encryption::validate_key_id(key_id)?;
         Ok(Self {
             pool,
             key,
+            key_id: key_id.to_string(),
             worker_permit: Arc::new(Semaphore::new(1)),
+            recovery_started: Arc::new(AtomicBool::new(false)),
+            active_jobs: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            recovery_interval: std::time::Duration::from_secs(30),
         })
     }
 
+    #[doc(hidden)]
+    pub fn with_recovery_interval(mut self, interval: std::time::Duration) -> Self {
+        self.recovery_interval = interval;
+        self
+    }
+
     pub fn recover_jobs(&self) {
+        if self.recovery_started.swap(true, Ordering::AcqRel) {
+            return;
+        }
         let state = self.clone();
         tokio::spawn(async move {
-            let result = async {
-                let client = state.pool.get().await?;
-                let rows = client
-                    .query(
-                        "SELECT id FROM database_encryption_jobs WHERE status IN ('queued', 'running') ORDER BY created_at",
-                        &[],
-                    )
-                    .await?;
-                for row in rows {
-                    spawn_job(state.clone(), row.get(0));
+            let mut interval = tokio::time::interval(state.recovery_interval);
+            loop {
+                interval.tick().await;
+                let result = async {
+                    let client = state.pool.get().await?;
+                    let rows = client
+                        .query(
+                            "SELECT id FROM database_encryption_jobs WHERE status IN ('queued', 'running') ORDER BY created_at",
+                            &[],
+                        )
+                        .await?;
+                    drop(client);
+                    for row in rows {
+                        spawn_job(state.clone(), row.get(0));
+                    }
+                    anyhow::Ok(())
                 }
-                anyhow::Ok(())
-            }
-            .await;
-            if result.is_err() {
-                tracing::error!(
-                    error_class = "database_encryption_job_recovery_failed",
-                    "Failed to recover database encryption jobs"
-                );
+                .await;
+                if result.is_err() {
+                    tracing::error!(
+                        error_class = "database_encryption_job_recovery_failed",
+                        "Failed to recover database encryption jobs"
+                    );
+                }
             }
         });
     }
@@ -191,11 +272,12 @@ pub struct ScanRequest {
     include_approved_plaintext: bool,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Copy, Debug, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum Mode {
     DryRun,
     Execute,
+    Verify,
 }
 
 #[derive(Debug, Deserialize)]
@@ -237,6 +319,8 @@ pub struct ScanResponse {
     status: &'static str,
     fields: Vec<FieldCount>,
     totals: Value,
+    approved_plaintext: Vec<Value>,
+    unclassified: Vec<Value>,
 }
 
 #[derive(Debug, Serialize)]
@@ -329,6 +413,53 @@ fn normalize_scope(scope: &mut Scope) {
         .dedup_by(|left, right| left.table == right.table && left.column == right.column);
 }
 
+async fn classify_schema(
+    client: &tokio_postgres::Client,
+) -> anyhow::Result<(Vec<Value>, Vec<Value>)> {
+    let rows = client
+        .query(
+            "SELECT c.table_name,c.column_name FROM information_schema.columns c \
+             JOIN information_schema.tables t ON t.table_schema=c.table_schema AND t.table_name=c.table_name \
+             WHERE c.table_schema='public' AND t.table_type='BASE TABLE' \
+             AND (c.data_type IN ('text','character varying','json','jsonb') OR c.data_type='ARRAY') \
+             ORDER BY c.table_name,c.ordinal_position",
+            &[],
+        )
+        .await?;
+    let mut approved = Vec::new();
+    let mut unclassified = Vec::new();
+    for row in rows {
+        let table: String = row.get(0);
+        let column: String = row.get(1);
+        if is_encrypted_field(&table, &column) {
+            continue;
+        }
+        if let Some(reason) = approved_reason(&table, &column) {
+            approved.push(json!({
+                "table": table,
+                "column": column,
+                "classification": "approved_plaintext",
+                "reason": reason,
+            }));
+        } else {
+            unclassified.push(json!({
+                "table": table,
+                "column": column,
+                "classification": "unclassified",
+                "reason": "classification_required",
+            }));
+        }
+    }
+    Ok((approved, unclassified))
+}
+
+async fn schema_classification(
+    state: &DatabaseEncryptionState,
+) -> anyhow::Result<(Vec<Value>, Vec<Value>)> {
+    let client = state.pool.get().await?;
+    classify_schema(&client).await
+}
+
 async fn counts(
     state: &DatabaseEncryptionState,
     fields: &[&Field],
@@ -394,7 +525,7 @@ async fn counts(
                 };
                 match serde_json::from_str::<Value>(&raw) {
                     Ok(value) if value[MARKER] == true => {
-                        if decrypt_envelope(&state.key, f, id, &raw).is_ok() {
+                        if decrypt_envelope(&state.key, &state.key_id, f, id, &raw).is_ok() {
                             count.encrypted += 1;
                         } else {
                             count.invalid_envelope += 1;
@@ -426,23 +557,41 @@ pub async fn scan(
     let fs = selected(&req.scope)?;
     let cs = counts(&state, &fs, req.limit).await.map_err(internal)?;
     let t = totals(&cs);
-    let _ = req.include_approved_plaintext;
+    let (approved, unclassified) = schema_classification(&state).await.map_err(internal)?;
     Ok(Json(ScanResponse {
         run_id: Uuid::new_v4(),
         status: "completed",
         fields: cs,
         totals: t,
+        approved_plaintext: if req.include_approved_plaintext {
+            approved
+        } else {
+            Default::default()
+        },
+        unclassified,
     }))
 }
 
-fn envelope(key: &[u8; 32], f: &Field, id: Uuid, plain: &str) -> anyhow::Result<String> {
-    database::field_encryption::encrypt(key, f.table, f.column, id, plain)
+fn envelope(
+    key: &[u8; 32],
+    key_id: &str,
+    f: &Field,
+    id: Uuid,
+    plain: &str,
+) -> anyhow::Result<String> {
+    database::field_encryption::encrypt_with_key_id(key, key_id, f.table, f.column, id, plain)
 }
 
 // Job lifecycle and authenticated envelope helpers.
 
-fn decrypt_envelope(key: &[u8; 32], f: &Field, id: Uuid, encoded: &str) -> anyhow::Result<String> {
-    database::field_encryption::decrypt(key, f.table, f.column, id, encoded)
+fn decrypt_envelope(
+    key: &[u8; 32],
+    key_id: &str,
+    f: &Field,
+    id: Uuid,
+    encoded: &str,
+) -> anyhow::Result<String> {
+    database::field_encryption::decrypt_with_key_id(key, key_id, f.table, f.column, id, encoded)
 }
 
 pub async fn create_job(
@@ -450,7 +599,10 @@ pub async fn create_job(
     Extension(admin): Extension<AdminUser>,
     Json(req): Json<CreateJobRequest>,
 ) -> Result<(StatusCode, Json<JobResponse>), (StatusCode, Json<Value>)> {
-    if req.scope.tables.is_empty() && req.scope.fields.is_empty() {
+    if !matches!(req.mode, Mode::Verify)
+        && req.scope.tables.is_empty()
+        && req.scope.fields.is_empty()
+    {
         return Err(bad(
             "an explicit scope is required for database encryption jobs",
         ));
@@ -470,8 +622,13 @@ pub async fn create_job(
     if !(1..=1000).contains(&req.batch_size) {
         return Err(bad("batch_size must be between 1 and 1000"));
     }
-    if req.actions.as_slice() != ["encrypt"] {
-        return Err(bad("actions must contain exactly one encrypt action"));
+    let expected_action = if matches!(req.mode, Mode::Verify) {
+        "verify"
+    } else {
+        "encrypt"
+    };
+    if req.actions.as_slice() != [expected_action] {
+        return Err(bad("actions do not match the requested job mode"));
     }
     if req.max_rows.is_some_and(|max_rows| max_rows <= 0) {
         return Err(bad("max_rows must be greater than zero"));
@@ -483,6 +640,7 @@ pub async fn create_job(
     let mode = match req.mode {
         Mode::DryRun => "dry_run",
         Mode::Execute => "execute",
+        Mode::Verify => "verify",
     };
     let scope = serde_json::to_value(&scope_request).map_err(internal)?;
     let actions = json!(req.actions);
@@ -495,32 +653,70 @@ pub async fn create_job(
 }
 
 fn spawn_job(state: DatabaseEncryptionState, id: Uuid) {
+    {
+        let mut active = state.active_jobs.lock().unwrap_or_else(|e| e.into_inner());
+        if !active.insert(id) {
+            return;
+        }
+    }
     tokio::spawn(async move {
-        if run_job(&state, id).await.is_err() {
+        let worker_state = state.clone();
+        let result = tokio::spawn(async move { run_job(&worker_state, id).await }).await;
+        let error_class = match result {
+            Ok(Ok(())) => {
+                state
+                    .active_jobs
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(&id);
+                return;
+            }
+            Ok(Err(error)) => classify_job_error(&error),
+            Err(_) => "worker_panicked",
+        };
+        {
             if let Ok(client) = state.pool.get().await {
                 let _ = client
                     .execute(
-                        "UPDATE database_encryption_jobs SET status='failed',last_error_class='batch_failed',last_error_message='batch_failed',completed_at=NOW() WHERE id=$1 AND status IN ('queued','running')",
-                        &[&id],
+                        "UPDATE database_encryption_jobs SET status='failed',last_error_class=$2,last_error_message=$2,progress=progress || jsonb_build_object('failure',jsonb_build_object('class',$2,'cursor',cursor)),completed_at=NOW() WHERE id=$1 AND status IN ('queued','running')",
+                        &[&id, &error_class],
                     )
                     .await;
             }
             tracing::error!(
                 job_id = %id,
-                error_class = "database_encryption_batch_failed",
+                error_class,
                 "Database encryption job failed"
             );
         }
+        state
+            .active_jobs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&id);
     });
 }
 
-fn advisory_lock_key(id: Uuid) -> i64 {
-    i64::from_be_bytes(
-        id.as_bytes()[..8]
-            .try_into()
-            .expect("UUID prefix is 8 bytes"),
-    )
+fn classify_job_error(error: &anyhow::Error) -> &'static str {
+    if error.chain().any(|cause| {
+        cause
+            .downcast_ref::<tokio_postgres::Error>()
+            .and_then(tokio_postgres::Error::code)
+            == Some(&tokio_postgres::error::SqlState::QUERY_CANCELED)
+    }) {
+        "db_timeout"
+    } else if error.to_string().contains("Pool") || error.to_string().contains("pool") {
+        "pool_unavailable"
+    } else if error.to_string().contains("encryption failed") {
+        "encrypt_failed"
+    } else if error.to_string().contains("invalid encrypted envelope") {
+        "invalid_envelope"
+    } else {
+        "worker_failed"
+    }
 }
+
+const GLOBAL_WORKER_LOCK_KEY: i64 = 0x4e454152444245;
 
 async fn run_job(state: &DatabaseEncryptionState, id: Uuid) -> anyhow::Result<()> {
     let _worker_permit = state
@@ -530,20 +726,7 @@ async fn run_job(state: &DatabaseEncryptionState, id: Uuid) -> anyhow::Result<()
         .await
         .map_err(|_| anyhow::anyhow!("database encryption worker stopped"))?;
     let mut client = state.pool.get().await?;
-    let lock_key = advisory_lock_key(id);
-    let locked: bool = client
-        .query_one("SELECT pg_try_advisory_lock($1)", &[&lock_key])
-        .await?
-        .get(0);
-    if !locked {
-        return Ok(());
-    }
-
-    let result = run_locked_job(state, id, &mut client).await;
-    let _ = client
-        .query_one("SELECT pg_advisory_unlock($1)", &[&lock_key])
-        .await;
-    result
+    run_locked_job(state, id, &mut client).await
 }
 
 async fn run_locked_job(
@@ -577,8 +760,14 @@ async fn run_locked_job(
         .unwrap_or(Uuid::nil());
     let mut processed = progress["processed"].as_i64().unwrap_or(0);
     let mut encrypted = progress["encrypted"].as_i64().unwrap_or(0);
+    let mut plaintext = progress["plaintext"].as_i64().unwrap_or(0);
+    let mut verified = progress["verified"].as_i64().unwrap_or(0);
     let mut invalid_envelopes = progress["invalid_envelopes"].as_i64().unwrap_or(0);
     let mut invalid_envelope_rows = progress["invalid_envelope_rows"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let mut plaintext_rows = progress["plaintext_rows"]
         .as_array()
         .cloned()
         .unwrap_or_default();
@@ -592,6 +781,17 @@ async fn run_locked_job(
         transaction
             .batch_execute("SET LOCAL statement_timeout = '30s'")
             .await?;
+        let locked: bool = transaction
+            .query_one(
+                "SELECT pg_try_advisory_xact_lock($1)",
+                &[&GLOBAL_WORKER_LOCK_KEY],
+            )
+            .await?
+            .get(0);
+        if !locked {
+            transaction.rollback().await?;
+            return Ok(());
+        }
         let cancelled: bool = transaction
             .query_one(
                 "SELECT cancel_requested_at IS NOT NULL FROM database_encryption_jobs WHERE id=$1",
@@ -637,11 +837,51 @@ async fn run_locked_job(
             for row in &rows {
                 let row_id: Uuid = row.get(0);
                 after_id = row_id;
+                if mode == "verify" {
+                    let raw: String = row.get(1);
+                    match serde_json::from_str::<Value>(&raw) {
+                        Ok(value) if database::field_encryption::is_envelope(&value) => {
+                            if decrypt_envelope(&state.key, &state.key_id, field, row_id, &raw)
+                                .is_ok()
+                            {
+                                verified += 1;
+                            } else {
+                                invalid_envelopes += 1;
+                                if invalid_envelope_rows.len() < 100 {
+                                    invalid_envelope_rows.push(json!({
+                                        "table": field.table,
+                                        "column": field.column,
+                                        "id": row_id,
+                                    }));
+                                }
+                            }
+                        }
+                        _ => {
+                            plaintext += 1;
+                            if plaintext_rows.len() < 100 {
+                                plaintext_rows.push(json!({
+                                    "table": field.table,
+                                    "column": field.column,
+                                    "id": row_id,
+                                }));
+                            }
+                        }
+                    }
+                    continue;
+                }
                 if mode == "execute" {
                     let plaintext: String = row.get(1);
                     if let Ok(value) = serde_json::from_str::<Value>(&plaintext) {
                         if database::field_encryption::is_envelope(&value) {
-                            if decrypt_envelope(&state.key, field, row_id, &plaintext).is_err() {
+                            if decrypt_envelope(
+                                &state.key,
+                                &state.key_id,
+                                field,
+                                row_id,
+                                &plaintext,
+                            )
+                            .is_err()
+                            {
                                 invalid_envelopes += 1;
                                 if invalid_envelope_rows.len() < 100 {
                                     invalid_envelope_rows.push(json!({
@@ -655,7 +895,13 @@ async fn run_locked_job(
                         }
                     }
                     row_ids.push(row_id);
-                    encrypted_values.push(envelope(&state.key, field, row_id, &plaintext)?);
+                    encrypted_values.push(envelope(
+                        &state.key,
+                        &state.key_id,
+                        field,
+                        row_id,
+                        &plaintext,
+                    )?);
                 }
             }
             if mode == "execute" && !row_ids.is_empty() {
@@ -693,22 +939,45 @@ async fn run_locked_job(
                     &json!({
                         "processed": processed,
                         "encrypted": encrypted,
+                        "verified": verified,
+                        "plaintext": plaintext,
                         "invalid_envelopes": invalid_envelopes,
                         "invalid_envelope_rows": invalid_envelope_rows,
+                        "plaintext_rows": plaintext_rows,
                     }),
-                    &json!({"field_index":field_index,"after_id":after_id}),
+                    &json!({
+                        "field_index": field_index,
+                        "table": field.table,
+                        "column": field.column,
+                        "after_id": after_id,
+                    }),
                 ],
             )
             .await?;
         transaction.commit().await?;
     }
 
-    client
-        .execute(
-            "UPDATE database_encryption_jobs SET status='completed',completed_at=NOW() WHERE id=$1",
-            &[&id],
-        )
-        .await?;
+    if mode == "verify" {
+        let (approved, unclassified) = classify_schema(client).await?;
+        let pass = plaintext == 0 && invalid_envelopes == 0 && unclassified.is_empty();
+        client
+            .execute(
+                "UPDATE database_encryption_jobs SET status='completed',completed_at=NOW(),progress=progress || $2 WHERE id=$1",
+                &[&id, &json!({
+                    "pass": pass,
+                    "approved_plaintext": approved,
+                    "unclassified": unclassified,
+                })],
+            )
+            .await?;
+    } else {
+        client
+            .execute(
+                "UPDATE database_encryption_jobs SET status='completed',completed_at=NOW() WHERE id=$1",
+                &[&id],
+            )
+            .await?;
+    }
     Ok(())
 }
 
@@ -758,44 +1027,35 @@ pub struct VerifyRequest {
     scope: Scope,
     #[serde(default = "yes")]
     fail_on_approved_plaintext_without_reason: bool,
+    batch_size: Option<i64>,
 }
 
 fn yes() -> bool {
     true
 }
 
-#[derive(Debug, Serialize)]
-pub struct VerifyResponse {
-    pass: bool,
-    fields: Vec<FieldCount>,
-    failing_fields: Vec<Value>,
-}
-
 pub async fn verify(
     Extension(state): Extension<DatabaseEncryptionState>,
-    Extension(_): Extension<AdminUser>,
+    Extension(admin): Extension<AdminUser>,
     Json(req): Json<VerifyRequest>,
-) -> ApiResult<VerifyResponse> {
-    let fs = selected(&req.scope)?;
-    let cs = counts(&state, &fs, None).await.map_err(internal)?;
-    let fails = cs
-        .iter()
-        .filter(|x| x.plaintext > 0 || x.invalid_envelope > 0)
-        .map(|x| {
-            let reason = if x.invalid_envelope > 0 {
-                "invalid_envelope"
-            } else {
-                "plaintext_remaining"
-            };
-            json!({"table":x.table,"column":x.column,"reason_code":reason})
-        })
-        .collect::<Vec<_>>();
-    let _ = req.fail_on_approved_plaintext_without_reason;
-    Ok(Json(VerifyResponse {
-        pass: fails.is_empty(),
-        fields: cs,
-        failing_fields: fails,
-    }))
+) -> Result<(StatusCode, Json<JobResponse>), (StatusCode, Json<Value>)> {
+    if !req.fail_on_approved_plaintext_without_reason {
+        return Err(bad(
+            "verification cannot ignore unclassified plaintext columns",
+        ));
+    }
+    create_job(
+        Extension(state),
+        Extension(admin),
+        Json(CreateJobRequest {
+            mode: Mode::Verify,
+            scope: req.scope,
+            batch_size: req.batch_size.unwrap_or_else(batch_default),
+            max_rows: None,
+            actions: vec!["verify".to_string()],
+        }),
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -803,26 +1063,29 @@ mod tests {
     use super::*;
     #[test]
     fn envelope_hides_plaintext() {
-        let v = envelope(&[7; 32], &FIELDS[0], Uuid::nil(), "secret").unwrap();
+        let v = envelope(&[7; 32], "test-v1", &FIELDS[0], Uuid::nil(), "secret").unwrap();
         assert!(v.contains(MARKER));
         assert!(!v.contains("secret"));
         assert_eq!(
-            decrypt_envelope(&[7; 32], &FIELDS[0], Uuid::nil(), &v).unwrap(),
+            decrypt_envelope(&[7; 32], "test-v1", &FIELDS[0], Uuid::nil(), &v).unwrap(),
             "secret"
         );
     }
     #[test]
     fn envelope_authenticates_context_and_key() {
-        let v = envelope(&[7; 32], &FIELDS[0], Uuid::nil(), "secret").unwrap();
-        assert!(decrypt_envelope(&[8; 32], &FIELDS[0], Uuid::nil(), &v).is_err());
-        assert!(decrypt_envelope(&[7; 32], &FIELDS[1], Uuid::nil(), &v).is_err());
-        assert!(decrypt_envelope(&[7; 32], &FIELDS[0], Uuid::new_v4(), &v).is_err());
+        let v = envelope(&[7; 32], "test-v1", &FIELDS[0], Uuid::nil(), "secret").unwrap();
+        assert!(decrypt_envelope(&[8; 32], "test-v1", &FIELDS[0], Uuid::nil(), &v).is_err());
+        assert!(decrypt_envelope(&[7; 32], "test-v1", &FIELDS[1], Uuid::nil(), &v).is_err());
+        assert!(decrypt_envelope(&[7; 32], "test-v1", &FIELDS[0], Uuid::new_v4(), &v).is_err());
+        assert!(decrypt_envelope(&[7; 32], "test-v2", &FIELDS[0], Uuid::nil(), &v).is_err());
     }
 
     #[test]
     fn malformed_envelope_is_rejected() {
         let malformed = json!({MARKER: true, "version": 1, "alg": "AES-256-GCM"}).to_string();
-        assert!(decrypt_envelope(&[7; 32], &FIELDS[0], Uuid::nil(), &malformed).is_err());
+        assert!(
+            decrypt_envelope(&[7; 32], "test-v1", &FIELDS[0], Uuid::nil(), &malformed).is_err()
+        );
     }
     #[test]
     fn key_requires_32_decoded_bytes() {
@@ -839,5 +1102,23 @@ mod tests {
         n.sort();
         n.dedup();
         assert_eq!(n.len(), FIELDS.len());
+
+        let mut approved = APPROVED
+            .iter()
+            .flat_map(|group| {
+                assert!(!group.reason.trim().is_empty());
+                group
+                    .columns
+                    .iter()
+                    .map(move |column| (group.table, *column))
+            })
+            .collect::<Vec<_>>();
+        let approved_len = approved.len();
+        approved.sort();
+        approved.dedup();
+        assert_eq!(approved.len(), approved_len);
+        assert!(approved
+            .iter()
+            .all(|(table, column)| !is_encrypted_field(table, column)));
     }
 }

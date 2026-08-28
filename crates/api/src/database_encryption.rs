@@ -1121,4 +1121,26 @@ mod tests {
             .iter()
             .all(|(table, column)| !is_encrypted_field(table, column)));
     }
+
+    #[test]
+    fn worker_errors_are_reduced_to_safe_classes() {
+        assert_eq!(
+            classify_job_error(&anyhow::anyhow!("database pool unavailable")),
+            "pool_unavailable"
+        );
+        assert_eq!(
+            classify_job_error(&anyhow::anyhow!("encryption failed: secret details")),
+            "encrypt_failed"
+        );
+        assert_eq!(
+            classify_job_error(&anyhow::anyhow!(
+                "invalid encrypted envelope: secret details"
+            )),
+            "invalid_envelope"
+        );
+        assert_eq!(
+            classify_job_error(&anyhow::anyhow!("unexpected secret details")),
+            "worker_failed"
+        );
+    }
 }

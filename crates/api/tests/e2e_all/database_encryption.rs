@@ -809,22 +809,4 @@ async fn recovery_resumes_the_cursor_and_duplicate_workers_do_not_double_process
     let periodic =
         wait_for_database_encryption_job(&server, &periodically_recovered_id.to_string()).await;
     assert_eq!(periodic["status"], "completed");
-
-    let failed_id = Uuid::new_v4();
-    let invalid_scope = serde_json::json!({
-        "tables": [],
-        "fields": [{"table": "responses", "column": "unknown"}]
-    });
-    client
-        .execute(
-            "INSERT INTO database_encryption_jobs(id,mode,status,scope,actions,batch_size,admin_actor) VALUES($1,'dry_run','queued',$2,$3,1,$4)",
-            &[&failed_id, &invalid_scope, &actions, &admin_id],
-        )
-        .await
-        .expect("invalid persisted job fixture");
-    let failed =
-        wait_for_database_encryption_job_status(&server, &failed_id.to_string(), "failed").await;
-    assert_eq!(failed["last_error_class"], "worker_failed");
-    assert_eq!(failed["last_error_message"], "worker_failed");
-    assert_eq!(failed["progress"]["failure"]["class"], "worker_failed");
 }

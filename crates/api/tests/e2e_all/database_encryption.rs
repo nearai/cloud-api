@@ -167,6 +167,10 @@ async fn execute_job_honors_max_rows_across_batches() {
         .await
         .expect("API key")
         .get(0);
+    client
+        .execute("DELETE FROM files", &[])
+        .await
+        .expect("clear seeded files for max_rows ordering");
     let file_id = Uuid::from_u128(1);
     let untouched_file_id = Uuid::from_u128(2);
     client

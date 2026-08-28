@@ -92,6 +92,7 @@ fn inner_event(
     let needs_synthetic_id = if let Some(object) = chunk_json.as_object_mut() {
         let needs_synthetic_id = match object.get("id") {
             None => true,
+            Some(serde_json::Value::Null) => true,
             Some(serde_json::Value::String(id)) => id.is_empty(),
             Some(_) => false,
         };
@@ -371,6 +372,35 @@ mod tests {
         };
         assert_eq!(raw["id"], SYNTHETIC_STREAM_ID);
         assert_eq!(chunk.id, SYNTHETIC_STREAM_ID);
+    }
+
+    #[test]
+    fn inner_event_normalizes_absent_empty_and_null_ids() {
+        // Given: equivalent Chutes frames with every replaceable id shape.
+        let frames: [&[u8]; 3] = [
+            br#"{"object":"chat.completion.chunk","created":0,"model":"m","choices":[]}"#,
+            br#"{"id":"","object":"chat.completion.chunk","created":0,"model":"m","choices":[]}"#,
+            br#"{"id":null,"object":"chat.completion.chunk","created":0,"model":"m","choices":[]}"#,
+        ];
+
+        // When: each frame crosses the Chutes-only parser for the same stream.
+        for frame in frames {
+            let event = inner_event(frame, SYNTHETIC_STREAM_ID).unwrap().unwrap();
+
+            // Then: raw and typed representations carry the same synthetic id.
+            let raw: serde_json::Value = serde_json::from_slice(
+                event
+                    .raw_bytes
+                    .strip_prefix(b"data: ")
+                    .expect("normalized event is a framed SSE data line"),
+            )
+            .unwrap();
+            let Some(StreamChunk::Chat(chunk)) = event.chunk else {
+                panic!("expected a parsed chat chunk");
+            };
+            assert_eq!(raw["id"], SYNTHETIC_STREAM_ID);
+            assert_eq!(chunk.id, SYNTHETIC_STREAM_ID);
+        }
     }
 
     #[test]

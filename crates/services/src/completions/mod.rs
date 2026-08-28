@@ -241,7 +241,9 @@ where
                         ms_since_last_token,
                         "Stream interrupted before usage stats or chat_id received (client disconnect or provider error)");
                 } else {
-                    tracing::error!(%organization_id, %model_id, model = %self.model_name,
+                    tracing::error!(%request_id, %organization_id, %model_id,
+                        model = %self.model_name,
+                        total_duration_ms,
                         "Stream completed but no usage stats and no chat_id available");
                 }
                 return;
@@ -257,18 +259,22 @@ where
                         ms_since_last_token,
                         "Stream interrupted before usage stats received (client disconnect or provider error)");
                 } else {
-                    tracing::error!(%chat_id, %organization_id, %model_id, model = %self.model_name,
+                    tracing::error!(%request_id, %chat_id, %organization_id, %model_id,
+                        model = %self.model_name,
+                        total_duration_ms,
                         "Stream completed but no usage stats available");
                 }
                 return;
             }
             (Some(usage), None) => {
                 tracing::error!(
+                    %request_id,
                     prompt_tokens = usage.prompt_tokens,
                     completion_tokens = usage.completion_tokens,
                     %organization_id,
                     %model_id,
                     model = %self.model_name,
+                    total_duration_ms,
                     "Stream ended but no chat_id available"
                 );
                 return;
@@ -284,7 +290,7 @@ where
         let handle = match tokio::runtime::Handle::try_current() {
             Ok(h) => h,
             Err(_) => {
-                tracing::error!("Cannot record usage: no Tokio runtime available");
+                tracing::error!(%request_id, "Cannot record usage: no Tokio runtime available");
                 return;
             }
         };

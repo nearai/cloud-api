@@ -77,7 +77,10 @@ impl PgResponseRepository {
     }
 
     /// Fetch the ID of the structural root response for a conversation, if it exists.
-    /// Root rows are identified by the dedicated structural flag.
+    ///
+    /// During a rolling deployment an old replica can still create a root using
+    /// only the legacy metadata marker. Find that row and repair its dedicated
+    /// flag before any new replica attempts to insert another root.
     async fn fetch_root_id_opt(
         &self,
         conversation_uuid: Uuid,
@@ -94,12 +97,28 @@ impl PgResponseRepository {
             client
                 .query_opt(
                     r#"
-                    SELECT id
-                    FROM responses
-                    WHERE conversation_id = $1
-                      AND workspace_id = $2
-                      AND is_root_response
-                    ORDER BY created_at ASC
+                    WITH candidate AS (
+                        SELECT id
+                        FROM responses
+                        WHERE conversation_id = $1
+                          AND workspace_id = $2
+                          AND (
+                              is_root_response
+                              OR metadata->>'root_response' = 'true'
+                          )
+                        ORDER BY is_root_response DESC, created_at ASC
+                        LIMIT 1
+                    ), repaired AS (
+                        UPDATE responses AS response
+                        SET is_root_response = TRUE
+                        FROM candidate
+                        WHERE response.id = candidate.id
+                          AND NOT response.is_root_response
+                        RETURNING response.id
+                    )
+                    SELECT id FROM repaired
+                    UNION ALL
+                    SELECT id FROM candidate
                     LIMIT 1
                     "#,
                     &[&conversation_uuid, &workspace_id.0],
@@ -187,10 +206,12 @@ impl PgResponseRepository {
                 )
                 .await
                 .map_err(map_db_error)
-        })?;
+        });
 
-        if let Some(row) = inserted_row_opt {
-            return Ok(row.get("id"));
+        match inserted_row_opt {
+            Ok(Some(row)) => return Ok(row.get("id")),
+            Ok(None) | Err(RepositoryError::AlreadyExists) => {}
+            Err(error) => return Err(error),
         }
 
         // Another request created the root concurrently; fetch and return it.

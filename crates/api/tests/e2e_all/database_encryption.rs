@@ -142,6 +142,88 @@ async fn execute_job_encrypts_plaintext_and_reports_durable_progress() {
 }
 
 #[tokio::test]
+async fn execute_job_encrypts_user_metadata_that_collides_with_the_marker() {
+    let (server, database) = setup_test_server_with_database().await;
+    let organization = create_org(&server).await;
+    let _api_key = get_api_key_for_org(&server, organization.id.clone()).await;
+    let organization_id = Uuid::parse_str(&organization.id).expect("organization UUID");
+    let client = database.pool().get().await.expect("database connection");
+    let workspace_id: Uuid = client
+        .query_one(
+            "SELECT id FROM workspaces WHERE organization_id=$1 LIMIT 1",
+            &[&organization_id],
+        )
+        .await
+        .expect("workspace")
+        .get(0);
+    let api_key_id: Uuid = client
+        .query_one(
+            "SELECT id FROM api_keys WHERE workspace_id=$1 LIMIT 1",
+            &[&workspace_id],
+        )
+        .await
+        .expect("API key")
+        .get(0);
+    let response_id = Uuid::new_v4();
+    let metadata = serde_json::json!({
+        database::field_encryption::MARKER: false,
+        "private": "legacy metadata"
+    });
+    client
+        .execute(
+            "INSERT INTO responses(id,workspace_id,api_key_id,model,status,metadata) VALUES($1,$2,$3,'marker-collision-test','completed',$4)",
+            &[&response_id, &workspace_id, &api_key_id, &metadata],
+        )
+        .await
+        .expect("marker collision response fixture");
+    drop(client);
+
+    let create = server
+        .post("/v1/admin/database-encryption/jobs")
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .add_header("User-Agent", MOCK_USER_AGENT)
+        .json(&serde_json::json!({
+            "mode": "execute",
+            "scope": {"fields": [{"table": "responses", "column": "metadata"}]},
+            "batch_size": 1000,
+            "actions": ["encrypt"]
+        }))
+        .await;
+    assert_eq!(create.status_code(), 202);
+    let job_id = create.json::<serde_json::Value>()["job_id"]
+        .as_str()
+        .expect("job ID")
+        .to_string();
+    wait_for_database_encryption_job(&server, &job_id).await;
+
+    let client = database.pool().get().await.expect("database connection");
+    let stored: serde_json::Value = client
+        .query_one(
+            "SELECT metadata FROM responses WHERE id=$1",
+            &[&response_id],
+        )
+        .await
+        .expect("encrypted marker collision metadata")
+        .get(0);
+    assert!(database::field_encryption::is_envelope(&stored));
+    let key = database
+        .pool()
+        .encryption_key()
+        .expect("database encryption key");
+    assert_eq!(
+        database::field_encryption::decrypt_json_if_encrypted(
+            &key,
+            "responses",
+            "metadata",
+            response_id,
+            stored,
+        )
+        .expect("decrypt marker collision metadata"),
+        metadata
+    );
+}
+
+#[tokio::test]
 async fn dry_run_pages_through_every_plaintext_row() {
     let (server, database) = setup_test_server_with_database().await;
     let organization = create_org(&server).await;

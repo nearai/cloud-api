@@ -320,9 +320,11 @@ pub async fn init_domain_services_with_pool(
     inference_provider_pool: Arc<services::inference_provider_pool::InferenceProviderPool>,
     metrics_service: Arc<dyn services::metrics::MetricsServiceTrait>,
 ) -> DomainServices {
-    if let Ok(key) = database::field_encryption::parse_key(&config.s3.encryption_key) {
-        database.pool().set_encryption_key(key);
-    }
+    let database_encryption_key = database::field_encryption::parse_key(&config.s3.encryption_key)
+        .unwrap_or_else(|_| {
+            panic!("configured database encryption key is invalid");
+        });
+    database.pool().set_encryption_key(database_encryption_key);
     database
         .pool()
         .set_encryption_write_enabled(config.database_encryption_write_enabled);

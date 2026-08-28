@@ -5,6 +5,7 @@ use crate::common::*;
 use api::models::{
     ConversationContentPart, ConversationItem, ResponseOutputContent, ResponseOutputItem,
 };
+use uuid::Uuid;
 
 // Helper functions for conversation and response tests
 async fn create_conversation(
@@ -3136,7 +3137,7 @@ async fn test_conversation_metadata_limits() {
 
 #[tokio::test]
 async fn test_create_and_clone_conversation_return_root_response_id() {
-    let server = setup_test_server().await;
+    let (server, database) = setup_test_server_with_database().await;
     let (api_key, _) = create_org_and_api_key(&server).await;
 
     // Create conversation: response metadata must include root_response_id for first-turn parallel responses
@@ -3161,6 +3162,20 @@ async fn test_create_and_clone_conversation_return_root_response_id() {
         root_id
     );
 
+    // Simulate a root written by an old replica after V0076 has run: the legacy
+    // metadata marker exists, but the new structural flag retains its default.
+    let root_uuid =
+        Uuid::parse_str(root_id.trim_start_matches("resp_")).expect("root response UUID");
+    let client = database.pool().get().await.expect("database connection");
+    client
+        .execute(
+            "UPDATE responses SET metadata='{\"root_response\":true}'::jsonb, is_root_response=FALSE WHERE id=$1",
+            &[&root_uuid],
+        )
+        .await
+        .expect("simulate root created by an old replica");
+    drop(client);
+
     // Clone conversation: response metadata must include root_response_id (cloned conversation has its own root)
     let clone_response = server
         .post(format!("/v1/conversations/{}/clone", created.id).as_str())
@@ -3180,6 +3195,22 @@ async fn test_create_and_clone_conversation_return_root_response_id() {
     assert_ne!(
         cloned_root_id, root_id,
         "cloned conversation must have a different root_response_id than the original"
+    );
+
+    let cloned_conversation_uuid =
+        Uuid::parse_str(cloned.id.trim_start_matches("conv_")).expect("cloned conversation UUID");
+    let client = database.pool().get().await.expect("database connection");
+    let structural_roots: i64 = client
+        .query_one(
+            "SELECT COUNT(*) FROM responses WHERE conversation_id=$1 AND is_root_response",
+            &[&cloned_conversation_uuid],
+        )
+        .await
+        .expect("count cloned structural roots")
+        .get(0);
+    assert_eq!(
+        structural_roots, 1,
+        "the cloned legacy root must be repaired instead of duplicated"
     );
     println!(
         "✅ Clone conversation returns root_response_id: {}",

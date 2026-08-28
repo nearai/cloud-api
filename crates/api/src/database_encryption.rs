@@ -319,19 +319,6 @@ fn normalize_scope(scope: &mut Scope) {
         .dedup_by(|left, right| left.table == right.table && left.column == right.column);
 }
 
-fn predicate(f: &Field) -> String {
-    match f.kind {
-        Kind::Json => format!(
-            "{0} IS NOT NULL AND jsonb_typeof({0})='object' AND {0} ? '{MARKER}'",
-            f.column
-        ),
-        Kind::Text => format!(
-            "{0} IS NOT NULL AND {0} LIKE '{{\"{MARKER}\":true,%'",
-            f.column
-        ),
-    }
-}
-
 async fn counts(
     state: &DatabaseEncryptionState,
     fields: &[&Field],
@@ -458,6 +445,15 @@ pub async fn create_job(
             "an explicit scope is required for database encryption jobs",
         ));
     }
+    if state
+        .pool
+        .status()
+        .is_some_and(|status| status.max_size < 2)
+    {
+        return Err(bad(
+            "database encryption jobs require a pool with at least two connections",
+        ));
+    }
     if matches!(req.mode, Mode::Execute) && !state.pool.encryption_write_enabled() {
         return Err(bad("execute jobs require DB_ENCRYPTION_WRITE_ENABLED=true"));
     }
@@ -571,7 +567,6 @@ async fn run_locked_job(
         let cap = max
             .map(|limit| (limit - processed).min(batch))
             .unwrap_or(batch);
-        let predicate = predicate(field);
         let transaction = client.transaction().await?;
         transaction
             .batch_execute("SET LOCAL statement_timeout = '30s'")
@@ -596,7 +591,7 @@ async fn run_locked_job(
 
         let locking_clause = if mode == "execute" { " FOR UPDATE" } else { "" };
         let query = format!(
-            "SELECT id,{0}::text FROM {1} WHERE id>$1 AND {0} IS NOT NULL AND NOT({predicate}) ORDER BY id LIMIT $2{locking_clause}",
+            "SELECT id,{0}::text FROM {1} WHERE id>$1 AND {0} IS NOT NULL ORDER BY id LIMIT $2{locking_clause}",
             field.column, field.table
         );
         let rows = transaction.query(&query, &[&after_id, &cap]).await?;
@@ -611,11 +606,26 @@ async fn run_locked_job(
                 after_id = row_id;
                 if mode == "execute" {
                     let plaintext: String = row.get(1);
+                    if let Ok(value) = serde_json::from_str::<Value>(&plaintext) {
+                        if database::field_encryption::is_envelope(&value) {
+                            decrypt_envelope(&state.key, field, row_id, &plaintext).map_err(
+                                |_| {
+                                    anyhow::anyhow!(
+                                        "invalid encrypted envelope in {}.{} at row {}",
+                                        field.table,
+                                        field.column,
+                                        row_id
+                                    )
+                                },
+                            )?;
+                            continue;
+                        }
+                    }
                     row_ids.push(row_id);
                     encrypted_values.push(envelope(&state.key, field, row_id, &plaintext)?);
                 }
             }
-            if mode == "execute" {
+            if mode == "execute" && !row_ids.is_empty() {
                 let value_expression = match field.kind {
                     Kind::Json => "batch.value::jsonb",
                     Kind::Text => "batch.value",

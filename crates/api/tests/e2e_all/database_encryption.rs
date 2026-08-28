@@ -27,6 +27,74 @@ async fn execute_job_is_rejected_until_encrypted_writes_are_enabled() {
     );
 }
 
+#[tokio::test]
+async fn create_job_rejects_invalid_request_parameters() {
+    let server = setup_test_server().await;
+    let cases = [
+        serde_json::json!({"mode":"dry_run","scope":{},"batch_size":1,"actions":["encrypt"]}),
+        serde_json::json!({"mode":"dry_run","scope":{"fields":[{"table":"files","column":"unknown"}]},"batch_size":1,"actions":["encrypt"]}),
+        serde_json::json!({"mode":"dry_run","scope":{"fields":[{"table":"files","column":"filename"}]},"batch_size":0,"actions":["encrypt"]}),
+        serde_json::json!({"mode":"dry_run","scope":{"fields":[{"table":"files","column":"filename"}]},"batch_size":1001,"actions":["encrypt"]}),
+        serde_json::json!({"mode":"dry_run","scope":{"fields":[{"table":"files","column":"filename"}]},"batch_size":1,"actions":["verify_only"]}),
+        serde_json::json!({"mode":"dry_run","scope":{"fields":[{"table":"files","column":"filename"}]},"batch_size":1,"actions":["encrypt","encrypt"]}),
+        serde_json::json!({"mode":"dry_run","scope":{"fields":[{"table":"files","column":"filename"}]},"batch_size":1,"max_rows":0,"actions":["encrypt"]}),
+    ];
+
+    for request in cases {
+        let response = server
+            .post("/v1/admin/database-encryption/jobs")
+            .add_header("Authorization", format!("Bearer {}", get_session_id()))
+            .add_header("User-Agent", MOCK_USER_AGENT)
+            .json(&request)
+            .await;
+        assert_eq!(response.status_code(), 400, "request: {request}");
+        assert!(response.json::<serde_json::Value>()["error"]["message"]
+            .as_str()
+            .is_some());
+    }
+}
+
+#[tokio::test]
+async fn job_lifecycle_rejects_missing_and_terminal_jobs() {
+    let server = setup_test_server().await;
+    let missing = Uuid::new_v4();
+    let get = server
+        .get(format!("/v1/admin/database-encryption/jobs/{missing}").as_str())
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .add_header("User-Agent", MOCK_USER_AGENT)
+        .await;
+    assert_eq!(get.status_code(), 404);
+    let cancel = server
+        .post(format!("/v1/admin/database-encryption/jobs/{missing}/cancel").as_str())
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .add_header("User-Agent", MOCK_USER_AGENT)
+        .await;
+    assert_eq!(cancel.status_code(), 400);
+
+    let create = server
+        .post("/v1/admin/database-encryption/jobs")
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .add_header("User-Agent", MOCK_USER_AGENT)
+        .json(&serde_json::json!({
+            "mode":"dry_run",
+            "scope":{"fields":[{"table":"files","column":"filename"}]},
+            "batch_size":1,
+            "actions":["encrypt"]
+        }))
+        .await;
+    let job_id = create.json::<serde_json::Value>()["job_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    wait_for_database_encryption_job(&server, &job_id).await;
+    let cancel = server
+        .post(format!("/v1/admin/database-encryption/jobs/{job_id}/cancel").as_str())
+        .add_header("Authorization", format!("Bearer {}", get_session_id()))
+        .add_header("User-Agent", MOCK_USER_AGENT)
+        .await;
+    assert_eq!(cancel.status_code(), 400);
+}
+
 async fn wait_for_database_encryption_job(
     server: &axum_test::TestServer,
     job_id: &str,
@@ -77,7 +145,7 @@ async fn wait_for_database_encryption_job_status(
 }
 
 #[tokio::test]
-async fn execute_job_encrypts_plaintext_and_reports_durable_progress() {
+async fn execute_job_honors_max_rows_across_batches() {
     let (server, database) = setup_test_server_with_database().await;
     let organization = create_org(&server).await;
     let _api_key = get_api_key_for_org(&server, organization.id.clone()).await;
@@ -99,7 +167,8 @@ async fn execute_job_encrypts_plaintext_and_reports_durable_progress() {
         .await
         .expect("API key")
         .get(0);
-    let file_id = Uuid::new_v4();
+    let file_id = Uuid::from_u128(1);
+    let untouched_file_id = Uuid::from_u128(2);
     client
         .execute(
             "INSERT INTO files(id,filename,bytes,content_type,purpose,storage_key,workspace_id,uploaded_by_api_key_id) VALUES($1,'legacy secret.txt',1,'text/plain','assistants','legacy/key',$2,$3)",
@@ -107,6 +176,13 @@ async fn execute_job_encrypts_plaintext_and_reports_durable_progress() {
         )
         .await
         .expect("legacy plaintext file");
+    client
+        .execute(
+            "INSERT INTO files(id,filename,bytes,content_type,purpose,storage_key,workspace_id,uploaded_by_api_key_id) VALUES($1,'later secret.txt',1,'text/plain','assistants','later/key',$2,$3)",
+            &[&untouched_file_id, &workspace_id, &api_key_id],
+        )
+        .await
+        .expect("later plaintext file");
     drop(client);
 
     let create = server
@@ -117,6 +193,7 @@ async fn execute_job_encrypts_plaintext_and_reports_durable_progress() {
             "mode": "execute",
             "scope": {"fields": [{"table": "files", "column": "filename"}]},
             "batch_size": 1,
+            "max_rows": 1,
             "actions": ["encrypt"]
         }))
         .await;
@@ -127,8 +204,8 @@ async fn execute_job_encrypts_plaintext_and_reports_durable_progress() {
         .to_string();
 
     let completed = wait_for_database_encryption_job(&server, &job_id).await;
-    assert!(completed["progress"]["processed"].as_i64().unwrap_or(0) >= 1);
-    assert!(completed["progress"]["encrypted"].as_i64().unwrap_or(0) >= 1);
+    assert_eq!(completed["progress"]["processed"], 1);
+    assert_eq!(completed["progress"]["encrypted"], 1);
     assert!(completed["cursor"]["field_index"].as_u64().is_some());
 
     let client = database.pool().get().await.expect("database connection");
@@ -139,6 +216,15 @@ async fn execute_job_encrypts_plaintext_and_reports_durable_progress() {
         .get(0);
     assert!(stored.contains(database::field_encryption::MARKER));
     assert!(!stored.contains("legacy secret.txt"));
+    let untouched: String = client
+        .query_one(
+            "SELECT filename FROM files WHERE id=$1",
+            &[&untouched_file_id],
+        )
+        .await
+        .expect("untouched later file")
+        .get(0);
+    assert_eq!(untouched, "later secret.txt");
 }
 
 #[tokio::test]

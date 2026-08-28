@@ -285,8 +285,9 @@ async fn test_response_stream_fails_with_failed_event_when_inference_fails_at_st
             let id: uuid::Uuid = row.get("id");
             let mut item: serde_json::Value = row.get("item");
             if let Some(key) = pool.encryption_key() {
-                item = database::field_encryption::decrypt_json_if_encrypted(
+                item = database::field_encryption::decrypt_json_if_encrypted_with_key_id(
                     &key,
+                    &pool.encryption_key_id(),
                     "response_items",
                     "item",
                     id,

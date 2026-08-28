@@ -301,8 +301,9 @@ async fn execute_job_encrypts_user_metadata_that_collides_with_the_marker() {
         .encryption_key()
         .expect("database encryption key");
     assert_eq!(
-        database::field_encryption::decrypt_json_if_encrypted(
+        database::field_encryption::decrypt_json_if_encrypted_with_key_id(
             &key,
+            &database.pool().encryption_key_id(),
             "responses",
             "metadata",
             response_id,

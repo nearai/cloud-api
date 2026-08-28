@@ -345,7 +345,7 @@ impl ConversationRepository for PgConversationRepository {
         // Step 2: Get all responses from the original conversation
         let original_responses = transaction
             .query(
-                "SELECT id, instructions, metadata FROM responses WHERE conversation_id = $1 AND workspace_id = $2 ORDER BY created_at ASC",
+                "SELECT id, instructions, metadata, is_root_response FROM responses WHERE conversation_id = $1 AND workspace_id = $2 ORDER BY created_at ASC",
                 &[&id.0, &workspace_id.0],
             )
             .await
@@ -359,7 +359,8 @@ impl ConversationRepository for PgConversationRepository {
             let new_response_id = Uuid::new_v4();
             id_map.insert(old_response_id, new_response_id);
             let instructions: Option<String> = orig_row.try_get("instructions")?;
-            let metadata: serde_json::Value = orig_row.try_get("metadata")?;
+            let metadata: Option<serde_json::Value> = orig_row.try_get("metadata")?;
+            let stored_root_flag: bool = orig_row.try_get("is_root_response")?;
             let (plain_instructions, plain_metadata) = if let Some(key) = self.pool.encryption_key()
             {
                 (
@@ -374,17 +375,28 @@ impl ConversationRepository for PgConversationRepository {
                             )
                         })
                         .transpose()?,
-                    crate::field_encryption::decrypt_json_if_encrypted(
-                        &key,
-                        "responses",
-                        "metadata",
-                        old_response_id,
-                        metadata,
-                    )?,
+                    metadata
+                        .map(|value| {
+                            crate::field_encryption::decrypt_json_if_encrypted(
+                                &key,
+                                "responses",
+                                "metadata",
+                                old_response_id,
+                                value,
+                            )
+                        })
+                        .transpose()?,
                 )
             } else {
                 (instructions, metadata)
             };
+            let is_root_response = stored_root_flag
+                || plain_metadata.as_ref().is_some_and(|metadata| {
+                    metadata
+                        .get("root_response")
+                        .and_then(|value| value.as_bool())
+                        == Some(true)
+                });
             let (stored_instructions, stored_response_metadata) =
                 if let Some(key) = self.pool.encryption_write_key() {
                     (
@@ -399,13 +411,18 @@ impl ConversationRepository for PgConversationRepository {
                                 )
                             })
                             .transpose()?,
-                        crate::field_encryption::encrypt_json(
-                            &key,
-                            "responses",
-                            "metadata",
-                            new_response_id,
-                            &plain_metadata,
-                        )?,
+                        plain_metadata
+                            .as_ref()
+                            .map(|plain| {
+                                crate::field_encryption::encrypt_json(
+                                    &key,
+                                    "responses",
+                                    "metadata",
+                                    new_response_id,
+                                    plain,
+                                )
+                            })
+                            .transpose()?,
                     )
                 } else {
                     (plain_instructions, plain_metadata)
@@ -428,11 +445,11 @@ impl ConversationRepository for PgConversationRepository {
                     next_response_ids,
                     usage,
                     $5,
-                    is_root_response,
                     $6,
-                    $6
+                    $7,
+                    $7
                 FROM responses
-                WHERE id = $7
+                WHERE id = $8
                 "#,
                     &[
                         &new_response_id,
@@ -440,6 +457,7 @@ impl ConversationRepository for PgConversationRepository {
                         &new_conv_id,
                         &stored_instructions,
                         &stored_response_metadata,
+                        &is_root_response,
                         &now,
                         &old_response_id,
                     ],

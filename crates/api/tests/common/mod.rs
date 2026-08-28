@@ -105,6 +105,9 @@ pub fn test_config() -> ApiConfig {
             refresh_interval: 30,
             mock: false,
         },
+        database_encryption_key: std::env::var("DB_ENCRYPTION_KEY").unwrap_or_else(|_| {
+            "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789".to_string()
+        }),
         // Preserve encrypted-write coverage in E2E tests; production defaults off.
         database_encryption_write_enabled: true,
         s3: config::S3Config {

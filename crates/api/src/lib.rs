@@ -320,10 +320,12 @@ pub async fn init_domain_services_with_pool(
     inference_provider_pool: Arc<services::inference_provider_pool::InferenceProviderPool>,
     metrics_service: Arc<dyn services::metrics::MetricsServiceTrait>,
 ) -> DomainServices {
-    let database_encryption_key = database::field_encryption::parse_key(&config.s3.encryption_key)
-        .unwrap_or_else(|_| {
-            panic!("configured database encryption key is invalid");
-        });
+    let database_encryption_key = database::field_encryption::parse_key(
+        &config.database_encryption_key,
+    )
+    .unwrap_or_else(|_| {
+        panic!("configured database encryption key is invalid");
+    });
     database.pool().set_encryption_key(database_encryption_key);
     database
         .pool()
@@ -2208,7 +2210,7 @@ pub fn build_admin_routes(
 
     let database_encryption_state = crate::database_encryption::DatabaseEncryptionState::new(
         database.pool().clone(),
-        &config.s3.encryption_key,
+        &config.database_encryption_key,
     )
     .map_err(|_| {
         tracing::error!(
@@ -2792,6 +2794,8 @@ mod tests {
                 refresh_interval: 30,
                 mock: false,
             },
+            database_encryption_key:
+                "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789".to_string(),
             database_encryption_write_enabled: false,
             s3: config::S3Config {
                 mock: true,
@@ -2903,6 +2907,8 @@ mod tests {
                 refresh_interval: 30,
                 mock: false,
             },
+            database_encryption_key:
+                "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789".to_string(),
             database_encryption_write_enabled: false,
             s3: config::S3Config {
                 mock: true,

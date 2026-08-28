@@ -4,9 +4,12 @@ use chrono::{DateTime, Utc};
 use database::DbPool;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::sync::Arc;
+use tokio::sync::Semaphore;
 use uuid::Uuid;
 
 const MARKER: &str = "__near_db_encrypted";
+const MAX_BATCH_PLAINTEXT_BYTES: i64 = 8 * 1024 * 1024;
 
 // Confidential fields and API contracts.
 
@@ -119,6 +122,9 @@ const FIELDS: &[Field] = &[
 pub struct DatabaseEncryptionState {
     pub pool: DbPool,
     key: [u8; 32],
+    /// Database migrations are serialized so a backfill cannot consume the
+    /// application's connection pool.
+    worker_permit: Arc<Semaphore>,
 }
 
 impl DatabaseEncryptionState {
@@ -128,7 +134,11 @@ impl DatabaseEncryptionState {
         let key = bytes
             .try_into()
             .map_err(|_| anyhow::anyhow!("database encryption key must be 32 bytes, got {len}"))?;
-        Ok(Self { pool, key })
+        Ok(Self {
+            pool,
+            key,
+            worker_permit: Arc::new(Semaphore::new(1)),
+        })
     }
 
     pub fn recover_jobs(&self) {
@@ -513,6 +523,12 @@ fn advisory_lock_key(id: Uuid) -> i64 {
 }
 
 async fn run_job(state: &DatabaseEncryptionState, id: Uuid) -> anyhow::Result<()> {
+    let _worker_permit = state
+        .worker_permit
+        .clone()
+        .acquire_owned()
+        .await
+        .map_err(|_| anyhow::anyhow!("database encryption worker stopped"))?;
     let mut client = state.pool.get().await?;
     let lock_key = advisory_lock_key(id);
     let locked: bool = client
@@ -561,6 +577,11 @@ async fn run_locked_job(
         .unwrap_or(Uuid::nil());
     let mut processed = progress["processed"].as_i64().unwrap_or(0);
     let mut encrypted = progress["encrypted"].as_i64().unwrap_or(0);
+    let mut invalid_envelopes = progress["invalid_envelopes"].as_i64().unwrap_or(0);
+    let mut invalid_envelope_rows = progress["invalid_envelope_rows"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
 
     while field_index < fields.len() && max.is_none_or(|limit| processed < limit) {
         let field = fields[field_index];
@@ -591,10 +612,22 @@ async fn run_locked_job(
 
         let locking_clause = if mode == "execute" { " FOR UPDATE" } else { "" };
         let query = format!(
-            "SELECT id,{0}::text FROM {1} WHERE id>$1 AND {0} IS NOT NULL ORDER BY id LIMIT $2{locking_clause}",
+            "WITH candidates AS (\
+                 SELECT id,{0}::text AS value FROM {1} \
+                 WHERE id>$1 AND {0} IS NOT NULL ORDER BY id LIMIT $2{locking_clause}\
+             ), sized AS (\
+                 SELECT id,value,\
+                    SUM(octet_length(value)) OVER (ORDER BY id) AS cumulative_bytes,\
+                    ROW_NUMBER() OVER (ORDER BY id) AS row_number \
+                 FROM candidates\
+             ) \
+             SELECT id,value FROM sized \
+             WHERE cumulative_bytes<=$3 OR row_number=1 ORDER BY id",
             field.column, field.table
         );
-        let rows = transaction.query(&query, &[&after_id, &cap]).await?;
+        let rows = transaction
+            .query(&query, &[&after_id, &cap, &MAX_BATCH_PLAINTEXT_BYTES])
+            .await?;
         if rows.is_empty() {
             field_index += 1;
             after_id = Uuid::nil();
@@ -608,16 +641,16 @@ async fn run_locked_job(
                     let plaintext: String = row.get(1);
                     if let Ok(value) = serde_json::from_str::<Value>(&plaintext) {
                         if database::field_encryption::is_envelope(&value) {
-                            decrypt_envelope(&state.key, field, row_id, &plaintext).map_err(
-                                |_| {
-                                    anyhow::anyhow!(
-                                        "invalid encrypted envelope in {}.{} at row {}",
-                                        field.table,
-                                        field.column,
-                                        row_id
-                                    )
-                                },
-                            )?;
+                            if decrypt_envelope(&state.key, field, row_id, &plaintext).is_err() {
+                                invalid_envelopes += 1;
+                                if invalid_envelope_rows.len() < 100 {
+                                    invalid_envelope_rows.push(json!({
+                                        "table": field.table,
+                                        "column": field.column,
+                                        "id": row_id,
+                                    }));
+                                }
+                            }
                             continue;
                         }
                     }
@@ -626,6 +659,14 @@ async fn run_locked_job(
                 }
             }
             if mode == "execute" && !row_ids.is_empty() {
+                if field.table == "responses" && field.column == "metadata" {
+                    transaction
+                        .execute(
+                            "UPDATE responses SET is_root_response=TRUE WHERE id=ANY($1) AND metadata->>'root_response'='true'",
+                            &[&row_ids],
+                        )
+                        .await?;
+                }
                 let value_expression = match field.kind {
                     Kind::Json => "batch.value::jsonb",
                     Kind::Text => "batch.value",
@@ -649,7 +690,12 @@ async fn run_locked_job(
                 "UPDATE database_encryption_jobs SET progress=$2,cursor=$3 WHERE id=$1",
                 &[
                     &id,
-                    &json!({"processed":processed,"encrypted":encrypted}),
+                    &json!({
+                        "processed": processed,
+                        "encrypted": encrypted,
+                        "invalid_envelopes": invalid_envelopes,
+                        "invalid_envelope_rows": invalid_envelope_rows,
+                    }),
                     &json!({"field_index":field_index,"after_id":after_id}),
                 ],
             )
@@ -702,6 +748,7 @@ pub async fn cancel_job(
     if n == 0 {
         return Err(bad("job is not cancellable"));
     }
+    drop(c);
     get_inner(&state, id).await
 }
 

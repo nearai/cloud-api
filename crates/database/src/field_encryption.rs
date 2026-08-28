@@ -8,6 +8,7 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 
 pub const MARKER: &str = "__near_db_encrypted";
+pub const KEY_ID: &str = "db-v1";
 
 pub fn is_envelope(value: &Value) -> bool {
     value[MARKER] == true
@@ -40,7 +41,7 @@ pub fn encrypt(key: &[u8; 32], table: &str, column: &str, id: Uuid, plain: &str)
             },
         )
         .map_err(|_| anyhow!("encryption failed"))?;
-    Ok(json!({MARKER:true,"version":1,"alg":"AES-256-GCM","key_id":"s3-v1","nonce":BASE64.encode(nonce),"ciphertext":BASE64.encode(ciphertext)}).to_string())
+    Ok(json!({MARKER:true,"version":1,"alg":"AES-256-GCM","key_id":KEY_ID,"nonce":BASE64.encode(nonce),"ciphertext":BASE64.encode(ciphertext)}).to_string())
 }
 
 pub fn decrypt(
@@ -57,6 +58,7 @@ pub fn decrypt(
         value["alg"] == "AES-256-GCM",
         "unsupported envelope algorithm"
     );
+    ensure!(value["key_id"] == KEY_ID, "unsupported encryption key id");
     let nonce: [u8; 12] = BASE64
         .decode(
             value["nonce"]
@@ -137,6 +139,14 @@ mod tests {
     use super::*;
 
     #[test]
+    fn parse_key_accepts_32_bytes_and_rejects_invalid_inputs() {
+        assert_eq!(parse_key(&"07".repeat(32)).unwrap(), [7; 32]);
+        assert!(parse_key("not-hex").is_err());
+        assert!(parse_key(&"07".repeat(31)).is_err());
+        assert!(parse_key(&"07".repeat(33)).is_err());
+    }
+
+    #[test]
     fn envelope_round_trips_and_authenticates_context() {
         let key = [7; 32];
         let id = Uuid::new_v4();
@@ -148,6 +158,21 @@ mod tests {
             "private.txt"
         );
         assert!(decrypt(&key, "files", "storage_key", id, &encrypted).is_err());
+    }
+
+    #[test]
+    fn envelope_rejects_an_unexpected_key_id() {
+        let encoded = encrypt(&[7; 32], "files", "filename", Uuid::nil(), "secret").unwrap();
+        let mut value: Value = serde_json::from_str(&encoded).unwrap();
+        value["key_id"] = json!("db-v2");
+        assert!(decrypt(
+            &[7; 32],
+            "files",
+            "filename",
+            Uuid::nil(),
+            &value.to_string()
+        )
+        .is_err());
     }
 
     #[test]

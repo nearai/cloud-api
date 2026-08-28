@@ -419,7 +419,7 @@ async fn scan_and_verify_classify_plaintext_valid_and_invalid_envelopes() {
         database::field_encryption::MARKER: true,
         "version": 1,
         "alg": "AES-256-GCM",
-        "key_id": "s3-v1",
+        "key_id": database::field_encryption::KEY_ID,
         "nonce": "invalid",
         "ciphertext": "invalid"
     })

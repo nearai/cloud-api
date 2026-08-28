@@ -38,10 +38,6 @@ ALTER TABLE mcp_connectors
 ALTER TABLE responses
     ADD COLUMN is_root_response BOOLEAN NOT NULL DEFAULT FALSE;
 
-UPDATE responses
-SET is_root_response = TRUE
-WHERE metadata->>'root_response' = 'true';
-
 -- Keep the legacy metadata-based index until every old binary has drained.
 -- Old replicas still use its predicate in ON CONFLICT inference during rolling deploys.
 CREATE UNIQUE INDEX idx_responses_is_root_response_unique_per_conversation

@@ -840,20 +840,21 @@ async fn run_locked_job(
                 if mode == "verify" {
                     let raw: String = row.get(1);
                     match serde_json::from_str::<Value>(&raw) {
-                        Ok(value) if database::field_encryption::is_envelope(&value) => {
-                            if decrypt_envelope(&state.key, &state.key_id, field, row_id, &raw)
-                                .is_ok()
+                        Ok(value) if value[MARKER] == true => {
+                            if database::field_encryption::is_envelope(&value)
+                                && decrypt_envelope(&state.key, &state.key_id, field, row_id, &raw)
+                                    .is_ok()
                             {
                                 verified += 1;
-                            } else {
-                                invalid_envelopes += 1;
-                                if invalid_envelope_rows.len() < 100 {
-                                    invalid_envelope_rows.push(json!({
-                                        "table": field.table,
-                                        "column": field.column,
-                                        "id": row_id,
-                                    }));
-                                }
+                                continue;
+                            }
+                            invalid_envelopes += 1;
+                            if invalid_envelope_rows.len() < 100 {
+                                invalid_envelope_rows.push(json!({
+                                    "table": field.table,
+                                    "column": field.column,
+                                    "id": row_id,
+                                }));
                             }
                         }
                         _ => {

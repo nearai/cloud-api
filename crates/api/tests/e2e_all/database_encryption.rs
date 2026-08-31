@@ -494,6 +494,7 @@ async fn scan_and_verify_classify_plaintext_valid_and_invalid_envelopes() {
     let plaintext_id = Uuid::new_v4();
     let encrypted_id = Uuid::new_v4();
     let malformed_id = Uuid::new_v4();
+    let incomplete_envelope_id = Uuid::new_v4();
     let key = database
         .pool()
         .encryption_key()
@@ -517,10 +518,17 @@ async fn scan_and_verify_classify_plaintext_valid_and_invalid_envelopes() {
         "ciphertext": "invalid"
     })
     .to_string();
+    let incomplete_envelope = serde_json::json!({
+        database::field_encryption::MARKER: true,
+        "version": 1,
+        "alg": "AES-256-GCM"
+    })
+    .to_string();
     for (id, instructions) in [
         (plaintext_id, "legacy plaintext instructions".to_string()),
         (encrypted_id, valid),
         (malformed_id, malformed),
+        (incomplete_envelope_id, incomplete_envelope),
     ] {
         client
             .execute(
@@ -560,16 +568,24 @@ async fn scan_and_verify_classify_plaintext_valid_and_invalid_envelopes() {
         .to_string();
     let verify = wait_for_database_encryption_job(&server, &verify_id).await;
     assert_eq!(verify["progress"]["pass"], false);
-    assert!(verify["progress"]["processed"].as_i64().unwrap_or(0) >= 3);
-    assert!(verify["progress"]["invalid_envelope_rows"]
+    assert!(verify["progress"]["processed"].as_i64().unwrap_or(0) >= 4);
+    let invalid_envelope_rows = verify["progress"]["invalid_envelope_rows"]
         .as_array()
-        .expect("invalid envelope rows")
+        .expect("invalid envelope rows");
+    assert!(invalid_envelope_rows
         .iter()
         .any(|row| row["id"] == malformed_id.to_string()));
+    assert!(invalid_envelope_rows
+        .iter()
+        .any(|row| row["id"] == incomplete_envelope_id.to_string()));
 
     for (id, plaintext) in [
         (plaintext_id, "legacy plaintext instructions"),
         (malformed_id, "recovered malformed instructions"),
+        (
+            incomplete_envelope_id,
+            "recovered incomplete envelope instructions",
+        ),
     ] {
         let repaired = database::field_encryption::encrypt_with_key_id(
             &key,

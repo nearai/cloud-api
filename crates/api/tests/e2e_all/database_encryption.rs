@@ -475,6 +475,13 @@ async fn scan_and_verify_classify_plaintext_valid_and_invalid_envelopes() {
     let _api_key = get_api_key_for_org(&server, organization.id.clone()).await;
     let organization_id = Uuid::parse_str(&organization.id).expect("organization UUID");
     let client = database.pool().get().await.expect("database connection");
+    client
+        .batch_execute(
+            "DROP TABLE IF EXISTS postgres_log; \
+             CREATE TABLE postgres_log(log_time text, message text)",
+        )
+        .await
+        .expect("create PostgreSQL log table fixture");
     let workspace_id: Uuid = client
         .query_one(
             "SELECT id FROM workspaces WHERE organization_id=$1 LIMIT 1",
@@ -554,6 +561,15 @@ async fn scan_and_verify_classify_plaintext_valid_and_invalid_envelopes() {
     assert!(scan["totals"]["encrypted"].as_i64().unwrap_or(0) >= 1);
     assert!(scan["totals"]["invalid_envelope"].as_i64().unwrap_or(0) >= 1);
     assert_eq!(scan["totals"]["complete"], true);
+    let excluded = scan["excluded"].as_array().expect("excluded columns");
+    assert!(excluded.iter().any(|entry| {
+        entry["table"] == "postgres_log"
+            && entry["column"] == "message"
+            && entry["classification"] == "excluded"
+            && entry["reason"]
+                .as_str()
+                .is_some_and(|reason| !reason.is_empty())
+    }));
 
     let verify = server
         .post("/v1/admin/database-encryption/verify")
@@ -625,6 +641,15 @@ async fn scan_and_verify_classify_plaintext_valid_and_invalid_envelopes() {
         .as_array()
         .expect("unclassified columns")
         .is_empty());
+    assert!(verify["progress"]["excluded"]
+        .as_array()
+        .expect("excluded columns")
+        .iter()
+        .any(|entry| entry["table"] == "postgres_log" && entry["column"] == "message"));
+    client
+        .batch_execute("DROP TABLE postgres_log")
+        .await
+        .expect("remove PostgreSQL log table fixture");
 }
 
 #[tokio::test]

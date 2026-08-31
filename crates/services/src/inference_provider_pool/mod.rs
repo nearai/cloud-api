@@ -144,6 +144,43 @@ fn record_provider_attempt(
     }
 }
 
+fn record_backend_key_divergence(
+    metrics: Option<&dyn crate::metrics::MetricsServiceTrait>,
+    model_name: &str,
+    outcome: &DiscoveryOutcome,
+) {
+    let identity_count = outcome.distinct_identities().len();
+    for algo in outcome.divergent_algos() {
+        let distinct_keys = outcome.distinct_key_count_for_algo(&algo);
+        let mut seen = HashSet::new();
+        let key_prefixes: Vec<String> = outcome
+            .backend_probes
+            .iter()
+            .filter(|probe| probe.algo == algo)
+            .filter(|probe| seen.insert(probe.pubkey.as_str()))
+            .map(|probe| probe.pubkey.chars().take(16).collect())
+            .collect();
+        warn!(
+            model = %model_name,
+            algo = %algo,
+            distinct_keys,
+            distinct_identities = identity_count,
+            key_prefixes = ?key_prefixes,
+            "Backend signing-key divergence discovered"
+        );
+        if let Some(metrics) = metrics {
+            let model_tag = format!("model:{model_name}");
+            let algo_tag = format!("algo:{algo}");
+            let key_count_tag = format!("distinct_keys:{distinct_keys}");
+            metrics.record_count(
+                crate::metrics::consts::METRIC_BACKEND_KEY_DIVERGENCE,
+                1,
+                &[&model_tag, &algo_tag, &key_count_tag],
+            );
+        }
+    }
+}
+
 /// Upper bound on leading SSE control events (keepalive comments, blank
 /// lines — chunk-less `SSEEvent`s) consumed while peeking for the first
 /// parsed chunk to establish sticky-routing. Real upstreams emit zero before
@@ -237,10 +274,10 @@ struct DiscoveryOutcome {
     new_fingerprints: usize,
     /// Total pinned fingerprints in `fingerprint_state` after this pass.
     total_pinned: usize,
-    /// Signing pubkeys extracted from verified reports, keyed by signing algorithm
-    /// ("ecdsa" / "ed25519"). Pubkeys are derived from the TEE compose hash so
-    /// they're identical across backends of the same model.
-    pubkeys_by_algo: HashMap<String, String>,
+    /// One entry per verified discovery response this cycle. Keys are
+    /// KMS-root-derived, so replicas under different roots serve different keys
+    /// for the same model and algorithm.
+    backend_probes: Vec<BackendProbe>,
     /// Per-call verified TLS fingerprints observed in this pass, in launch
     /// order (`futures::future::join_all` preserves input order, not
     /// completion order). One entry per call, not per backend, so under
@@ -272,6 +309,160 @@ struct DiscoveryOutcome {
     /// interval. `false` on any partial cycle to avoid evicting fingerprints
     /// we just couldn't reconfirm.
     replaced_state: bool,
+}
+
+/// A verified attestation probe and the TEE identity that derived its key.
+/// Missing identity is fail-open: that index is never excluded from a group.
+#[derive(Debug, Clone)]
+struct BackendProbe {
+    index: usize,
+    algo: String,
+    pubkey: String,
+    identity: Option<TeeIdentity>,
+}
+
+/// KMS root id and app id. Equal identities derive the same model keypair.
+type TeeIdentity = (String, String);
+
+impl DiscoveryOutcome {
+    /// All distinct pubkeys observed this cycle, preserving probe order.
+    fn distinct_pubkeys(&self) -> Vec<String> {
+        let mut seen = HashSet::new();
+        self.backend_probes
+            .iter()
+            .filter(|probe| seen.insert(probe.pubkey.clone()))
+            .map(|probe| probe.pubkey.clone())
+            .collect()
+    }
+
+    /// All distinct TEE identities observed this cycle, preserving probe order.
+    fn distinct_identities(&self) -> Vec<TeeIdentity> {
+        let mut seen = HashSet::new();
+        self.backend_probes
+            .iter()
+            .filter_map(|probe| {
+                let identity = probe.identity.as_ref()?;
+                seen.insert(identity.clone()).then(|| identity.clone())
+            })
+            .collect()
+    }
+
+    /// Algorithms for which more than one distinct key was observed.
+    fn divergent_algos(&self) -> Vec<String> {
+        let mut algos = Vec::new();
+        let mut keys_by_algo: HashMap<&str, HashSet<&str>> = HashMap::new();
+        for probe in &self.backend_probes {
+            if !keys_by_algo.contains_key(probe.algo.as_str()) {
+                algos.push(probe.algo.as_str());
+            }
+            keys_by_algo
+                .entry(probe.algo.as_str())
+                .or_default()
+                .insert(probe.pubkey.as_str());
+        }
+        algos
+            .into_iter()
+            .filter(|algo| keys_by_algo.get(algo).is_some_and(|keys| keys.len() > 1))
+            .map(str::to_string)
+            .collect()
+    }
+
+    fn distinct_key_count_for_algo(&self, algo: &str) -> usize {
+        self.backend_probes
+            .iter()
+            .filter(|probe| probe.algo == algo)
+            .map(|probe| probe.pubkey.as_str())
+            .collect::<HashSet<_>>()
+            .len()
+    }
+
+    /// Pubkey to backend indices that can derive it. An empty map is the
+    /// explicit no-restriction signal for a homogeneous fleet.
+    fn key_index_map(&self) -> HashMap<String, Vec<usize>> {
+        if self.distinct_identities().len() <= 1 {
+            return HashMap::new();
+        }
+
+        let mut identities_by_index: HashMap<usize, Option<&TeeIdentity>> = HashMap::new();
+        for probe in &self.backend_probes {
+            identities_by_index
+                .entry(probe.index)
+                .and_modify(|identity| {
+                    if identity.is_none() {
+                        *identity = probe.identity.as_ref();
+                    }
+                })
+                .or_insert_with(|| probe.identity.as_ref());
+        }
+
+        let mut processed = HashSet::new();
+        let mut groups: HashMap<String, Vec<usize>> = HashMap::new();
+        for probe in &self.backend_probes {
+            if !processed.insert((probe.algo.as_str(), probe.pubkey.as_str())) {
+                continue;
+            }
+            let key_identities: HashSet<&TeeIdentity> = self
+                .backend_probes
+                .iter()
+                .filter(|candidate| {
+                    candidate.algo == probe.algo && candidate.pubkey == probe.pubkey
+                })
+                .filter_map(|candidate| candidate.identity.as_ref())
+                .collect();
+            let key_has_unknown_identity = self.backend_probes.iter().any(|candidate| {
+                candidate.algo == probe.algo
+                    && candidate.pubkey == probe.pubkey
+                    && candidate.identity.is_none()
+            });
+
+            let indices = groups.entry(probe.pubkey.clone()).or_default();
+            for index in 0..self.backend_count {
+                let index_identity = identities_by_index.get(&index).copied().flatten();
+                if index_identity.is_none() {
+                    indices.push(index);
+                    continue;
+                }
+
+                let same_algo: Vec<&BackendProbe> = self
+                    .backend_probes
+                    .iter()
+                    .filter(|candidate| candidate.index == index && candidate.algo == probe.algo)
+                    .collect();
+                let include = if same_algo.is_empty() {
+                    key_has_unknown_identity
+                        || index_identity.is_some_and(|identity| key_identities.contains(identity))
+                } else {
+                    same_algo
+                        .iter()
+                        .any(|candidate| candidate.pubkey == probe.pubkey)
+                };
+                if include {
+                    indices.push(index);
+                }
+            }
+            indices.sort_unstable();
+            indices.dedup();
+        }
+        groups
+    }
+}
+
+fn tee_identity(report: &serde_json::Map<String, serde_json::Value>) -> Option<TeeIdentity> {
+    let info = report.get("info")?.as_object()?;
+    let app_id = info.get("app_id")?.as_str()?.to_string();
+    let key_provider_info = info.get("key_provider_info")?;
+    let root_id = if let Some(object) = key_provider_info.as_object() {
+        object.get("id")?.as_str()?.to_string()
+    } else {
+        let encoded = key_provider_info.as_str()?;
+        serde_json::from_str::<serde_json::Value>(encoded)
+            .ok()?
+            .as_object()?
+            .get("id")?
+            .as_str()?
+            .to_string()
+    };
+    Some((root_id, app_id))
 }
 
 /// Outcome of applying the cycle's verified fingerprints to a
@@ -1293,7 +1484,7 @@ impl InferenceProviderPool {
             failed_calls: 0,
             new_fingerprints: 0,
             total_pinned,
-            pubkeys_by_algo: HashMap::new(),
+            backend_probes: Vec::new(),
             observed_fingerprints: Vec::new(),
             failure_reasons,
             verify_failures: 0,
@@ -1551,7 +1742,7 @@ impl InferenceProviderPool {
                         elapsed_ms,
                         "Discovery call succeeded"
                     );
-                    Ok((report, nonce, algo))
+                    Ok((report, nonce, algo, backend_index))
                 }
             })
             .collect::<Vec<_>>();
@@ -1560,13 +1751,13 @@ impl InferenceProviderPool {
 
         let mut successful_calls = 0usize;
         let mut failed_calls = 0usize;
-        let mut pubkeys_by_algo: HashMap<String, String> = HashMap::new();
+        let mut backend_probes = Vec::new();
         let mut verified_this_round: HashSet<String> = HashSet::new();
         let mut observed_fingerprints: Vec<String> = Vec::new();
         let mut verify_failures = 0usize;
 
         for r in results {
-            let (report, nonce, algo) = match r {
+            let (report, nonce, algo, backend_index) = match r {
                 Ok(t) => t,
                 Err(reason) => {
                     failed_calls += 1;
@@ -1582,14 +1773,15 @@ impl InferenceProviderPool {
                         observed_fingerprints.push(vfp.clone());
                         verified_this_round.insert(vfp.clone());
                     }
-                    // Pubkey is trustworthy once the report is verified. Pubkeys
-                    // are derived from the TEE compose hash so they match
-                    // across all backends of the same model+algo; first-write
-                    // wins, later responses for the same algo are ignored.
+                    // Keys are KMS-root-derived: replicas under different roots
+                    // serve different keys for the same model and algorithm.
                     if let Some(pk) = report.get("signing_public_key").and_then(|v| v.as_str()) {
-                        pubkeys_by_algo
-                            .entry(algo.clone())
-                            .or_insert_with(|| pk.to_string());
+                        backend_probes.push(BackendProbe {
+                            index: backend_index,
+                            algo: algo.clone(),
+                            pubkey: pk.to_lowercase(),
+                            identity: tee_identity(&report),
+                        });
                     }
                 }
                 Err(e) => {
@@ -1639,7 +1831,7 @@ impl InferenceProviderPool {
             failed_calls,
             new_fingerprints,
             total_pinned,
-            pubkeys_by_algo,
+            backend_probes,
             observed_fingerprints,
             failure_reasons,
             verify_failures,
@@ -2920,7 +3112,7 @@ impl InferenceProviderPool {
         if let Some(pub_key) = model_pub_key {
             tracing::error!(
                 model_id = %model_id,
-                model_pub_key_prefix = %pub_key.chars().take(32).collect::<String>(),
+                model_pub_key_prefix = %pub_key.chars().take(16).collect::<String>(),
                 providers_tried = providers.len(),
                 model_provider_count,
                 pubkey_filtered = true,
@@ -3005,9 +3197,10 @@ impl InferenceProviderPool {
             return Err(AttestationError::ProviderNotFound(model));
         }
 
-        // Each inference_url points to a proxy that load-balances across CVMs.
-        // All CVMs behind the proxy share the same signing key (derived from model
-        // name via dstack KMS), so one attestation report is sufficient.
+        // Keys are KMS-root-derived, so replicas under different roots can
+        // return different reports. Returning one report is still correct:
+        // discovery registers every key and request-time backend affinity keeps
+        // a client-pinned key within the matching identity group.
         // Try providers in order and return the first successful response.
         let mut last_error = None;
         for provider in providers {
@@ -4139,6 +4332,7 @@ impl InferenceProviderPool {
         // `FingerprintState` with discovery, so every pin propagates.
         let verifier = self.attestation_verifier.clone();
         let tls_roots = self.tls_roots.clone();
+        let metrics_service = self.metrics_service.get().cloned();
         let endpoint_futures: Vec<_> = needs_creation
             .iter()
             .map(|(model_name, url, context_length)| {
@@ -4149,6 +4343,7 @@ impl InferenceProviderPool {
                 let verifier = verifier.clone();
                 let tls_roots = tls_roots.clone();
                 let pool_load_state = pool_load_state.clone();
+                let metrics_service = metrics_service.clone();
                 async move {
                     let state =
                         Arc::new(std::sync::RwLock::new(FingerprintState::Bootstrap));
@@ -4162,6 +4357,11 @@ impl InferenceProviderPool {
                         &verifier,
                     )
                     .await;
+                    record_backend_key_divergence(
+                        metrics_service.as_deref(),
+                        &model_name,
+                        &outcome,
+                    );
 
                     // Serving provider with inline backend verification.
                     // Bucket clients are created lazily: on first use, the verifier
@@ -4186,6 +4386,7 @@ impl InferenceProviderPool {
                     // on the first 5xx — without this, the very first 5xx
                     // before any refresh cycle would skip rotation entirely.
                     serving_provider.set_backend_count(outcome.backend_count);
+                    serving_provider.set_backend_keys(outcome.key_index_map());
 
                     // Store the configured context length so latency routing can
                     // filter out providers that can't serve oversized requests.
@@ -4222,7 +4423,9 @@ impl InferenceProviderPool {
                             new_fingerprints = outcome.new_fingerprints,
                             total_pinned = outcome.total_pinned,
                             replaced_state = outcome.replaced_state,
-                            pubkey_algos = ?outcome.pubkeys_by_algo.keys().collect::<Vec<_>>(),
+                            distinct_keys = outcome.distinct_pubkeys().len(),
+                            distinct_identities = outcome.distinct_identities().len(),
+                            divergent_algos = ?outcome.divergent_algos(),
                             observed_fingerprints = ?outcome.observed_fingerprints,
                             failure_reasons = ?outcome.failure_reasons,
                             "Initial attestation discovery complete"
@@ -4236,8 +4439,8 @@ impl InferenceProviderPool {
                     let serving_trait =
                         serving_provider.clone() as Arc<InferenceProviderTrait>;
                     let pub_keys: Vec<(String, Arc<InferenceProviderTrait>)> = outcome
-                        .pubkeys_by_algo
-                        .into_values()
+                        .distinct_pubkeys()
+                        .into_iter()
                         .map(|pk| (pk, serving_trait.clone()))
                         .collect();
 
@@ -4499,6 +4702,11 @@ impl InferenceProviderPool {
             let (discovery_results, legacy_results) = tokio::join!(drive_discovery, drive_legacy);
 
             for (model_name, url, provider, outcome) in discovery_results {
+                record_backend_key_divergence(
+                    self.metrics_service.get().map(Arc::as_ref),
+                    &model_name,
+                    &outcome,
+                );
                 if outcome.new_fingerprints > 0 || outcome.replaced_state {
                     info!(
                         model = %model_name,
@@ -4535,6 +4743,7 @@ impl InferenceProviderPool {
                 // this provider until the next cycle proves at least one
                 // backend healthy again.
                 provider.set_backend_count(outcome.backend_count);
+                provider.set_backend_keys(outcome.key_index_map());
 
                 let ptr = Arc::as_ptr(&provider) as *const () as usize;
                 let provider_has_any_pubkey_mapping = mapped_ptrs.contains(&ptr);
@@ -4543,7 +4752,7 @@ impl InferenceProviderPool {
                 // pair so we don't accumulate duplicates when an algo's
                 // mapping already exists but another algo was missing.
                 let mut backfilled = 0usize;
-                for pk in outcome.pubkeys_by_algo.into_values() {
+                for pk in outcome.distinct_pubkeys() {
                     if !existing_pubkey_entries.contains(&(pk.clone(), ptr)) {
                         backfilled += 1;
                         pub_key_updates.push((pk, provider.clone()));
@@ -5429,6 +5638,161 @@ mod tests {
         for algo in &algos {
             assert!(covered.contains(algo));
         }
+    }
+
+    fn backend_probe(
+        index: usize,
+        algo: &str,
+        pubkey: &str,
+        identity: Option<(&str, &str)>,
+    ) -> BackendProbe {
+        BackendProbe {
+            index,
+            algo: algo.to_string(),
+            pubkey: pubkey.to_string(),
+            identity: identity.map(|(root_id, app_id)| (root_id.to_string(), app_id.to_string())),
+        }
+    }
+
+    fn discovery_outcome_with_probes(
+        backend_count: usize,
+        backend_probes: Vec<BackendProbe>,
+    ) -> DiscoveryOutcome {
+        DiscoveryOutcome {
+            backend_count,
+            successful_calls: backend_probes.len(),
+            failed_calls: 0,
+            new_fingerprints: 0,
+            total_pinned: backend_count,
+            backend_probes,
+            observed_fingerprints: Vec::new(),
+            failure_reasons: Vec::new(),
+            verify_failures: 0,
+            replaced_state: false,
+        }
+    }
+
+    #[test]
+    fn homogeneous_interleaved_algos_do_not_restrict_the_fleet() {
+        // Given: discovery's real four-backend call plan samples only one algo
+        // per index, while every response carries the same TEE identity.
+        let identity = Some(("root-a", "app-a"));
+        let outcome = discovery_outcome_with_probes(
+            4,
+            vec![
+                backend_probe(0, "ecdsa", "key-a", identity),
+                backend_probe(1, "ed25519", "key-b", identity),
+                backend_probe(2, "ecdsa", "key-a", identity),
+                backend_probe(3, "ed25519", "key-b", identity),
+            ],
+        );
+
+        // When: key groups and divergence are derived.
+        let key_index_map = outcome.key_index_map();
+
+        // Then: homogeneous identity is the explicit unrestricted signal. In
+        // particular, ecdsa key-a must not be restricted to observed {0, 2}.
+        assert_eq!(key_index_map, HashMap::new());
+        assert!(!key_index_map.contains_key("key-a"));
+        assert!(outcome.divergent_algos().is_empty());
+    }
+
+    #[test]
+    fn mixed_roots_group_every_algo_by_tee_identity() {
+        // Given: two roots each answer one ecdsa and one ed25519 probe.
+        let outcome = discovery_outcome_with_probes(
+            4,
+            vec![
+                backend_probe(0, "ecdsa", "key-a", Some(("root-1", "app"))),
+                backend_probe(1, "ecdsa", "key-b", Some(("root-2", "app"))),
+                backend_probe(2, "ed25519", "key-c", Some(("root-1", "app"))),
+                backend_probe(3, "ed25519", "key-d", Some(("root-2", "app"))),
+            ],
+        );
+
+        // When.
+        let key_index_map = outcome.key_index_map();
+
+        // Then: unprobed algo/index pairs are filled from identity, not from
+        // whichever indices happened to serve each algorithm.
+        assert_eq!(key_index_map.get("key-a"), Some(&vec![0, 2]));
+        assert_eq!(key_index_map.get("key-b"), Some(&vec![1, 3]));
+        assert_eq!(key_index_map.get("key-c"), Some(&vec![0, 2]));
+        assert_eq!(key_index_map.get("key-d"), Some(&vec![1, 3]));
+        assert_eq!(
+            outcome.divergent_algos(),
+            vec!["ecdsa".to_string(), "ed25519".to_string()]
+        );
+    }
+
+    #[test]
+    fn unknown_identity_never_excludes_an_index_from_any_key_group() {
+        // Given: index 2 has an older report with no usable TEE identity.
+        let outcome = discovery_outcome_with_probes(
+            3,
+            vec![
+                backend_probe(0, "ecdsa", "key-a", Some(("root-1", "app"))),
+                backend_probe(1, "ecdsa", "key-b", Some(("root-2", "app"))),
+                backend_probe(2, "ed25519", "key-c", None),
+            ],
+        );
+
+        // When.
+        let key_index_map = outcome.key_index_map();
+
+        // Then: unknown identity fails open for every group.
+        assert!(key_index_map.values().all(|indices| indices.contains(&2)));
+    }
+
+    #[test]
+    fn distinct_pubkeys_keeps_divergent_keys_for_one_algo() {
+        // Given: the same algo returns a different key under each root.
+        let outcome = discovery_outcome_with_probes(
+            2,
+            vec![
+                backend_probe(0, "ecdsa", "key-a", Some(("root-1", "app"))),
+                backend_probe(1, "ecdsa", "key-b", Some(("root-2", "app"))),
+            ],
+        );
+
+        // When / Then: neither key is collapsed by first-write-wins behavior.
+        assert_eq!(
+            outcome.distinct_pubkeys(),
+            vec!["key-a".to_string(), "key-b".to_string()]
+        );
+    }
+
+    #[test]
+    fn tee_identity_accepts_object_and_json_string_key_provider_info() {
+        // Given: current and older inference-proxy report shapes.
+        let object_report = serde_json::json!({
+            "info": {
+                "app_id": "app-a",
+                "key_provider_info": {"name": "kms", "id": "root-a"}
+            }
+        })
+        .as_object()
+        .expect("test report is an object")
+        .clone();
+        let string_report = serde_json::json!({
+            "info": {
+                "app_id": "app-b",
+                "key_provider_info": "{\"name\":\"kms\",\"id\":\"root-b\"}"
+            }
+        })
+        .as_object()
+        .expect("test report is an object")
+        .clone();
+
+        // When / Then.
+        assert_eq!(
+            tee_identity(&object_report),
+            Some(("root-a".to_string(), "app-a".to_string()))
+        );
+        assert_eq!(
+            tee_identity(&string_report),
+            Some(("root-b".to_string(), "app-b".to_string()))
+        );
     }
 
     /// Helper for `apply_pin_update` tests: build a state, run the policy,

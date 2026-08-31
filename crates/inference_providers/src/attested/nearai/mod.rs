@@ -115,7 +115,6 @@ pub(crate) mod encryption_headers {
     /// Key for model public key (x-model-pub-key header)
     /// Note: This is not forwarded to vllm-proxy (vllm-proxy doesn't accept it),
     /// but kept here for consistency with other encryption header constants
-    #[allow(dead_code)]
     pub const MODEL_PUB_KEY: &str = "x_model_pub_key";
     /// Key for encryption version (x-encryption-version header)
     pub const ENCRYPTION_VERSION: &str = "x_encryption_version";
@@ -741,7 +740,7 @@ impl Fleet {
         &self,
         headers: &mut reqwest::header::HeaderMap,
         extra: &mut std::collections::HashMap<String, serde_json::Value>,
-    ) {
+    ) -> Option<String> {
         // Extract and forward x_signing_algo as HTTP header, then remove from extra
         if let Some(algo) = extra
             .remove(encryption_headers::SIGNING_ALGO)
@@ -764,8 +763,11 @@ impl Fleet {
             }
         }
 
-        // Remove x_model_pub_key from extra (not forwarded to vllm-proxy, used only for routing)
-        extra.remove(encryption_headers::MODEL_PUB_KEY);
+        // Capture x_model_pub_key for backend affinity, but do not forward it
+        // to vllm-proxy or leave it in the serialized request body.
+        let pinned_pub_key = extra
+            .remove(encryption_headers::MODEL_PUB_KEY)
+            .and_then(|value| value.as_str().map(str::to_string));
 
         // Extract and forward x_encryption_version as HTTP header, then remove from extra
         if let Some(version) = extra
@@ -788,6 +790,8 @@ impl Fleet {
                 headers.insert("X-Encrypt-All-Fields", value);
             }
         }
+
+        pinned_pub_key
     }
 
     /// Prepare tracing headers by extracting correlation IDs from `extra` and forwarding
@@ -1713,7 +1717,8 @@ impl InferenceProvider for Fleet {
         // Prepare tracing headers (request_id, org_id, workspace_id)
         self.prepare_tracing_headers(&mut headers, &mut streaming_params.extra);
         // Prepare encryption headers
-        self.prepare_encryption_headers(&mut headers, &mut streaming_params.extra);
+        let pinned_pub_key =
+            self.prepare_encryption_headers(&mut headers, &mut streaming_params.extra);
 
         // Reserve a backend rotation index: deterministic prefix affinity keeps
         // initial requests cache-hot, established conversations stay on a
@@ -1722,22 +1727,23 @@ impl InferenceProvider for Fleet {
         // first count, or a non-rotation URL like `localhost`) — serve via the
         // canonical fallback path (no index, no per-backend measurement) so
         // those paths keep working unchanged.
-        let route_lease = match self.acquire_index(&streaming_params.messages) {
-            None => {
-                let url = format!("{}/v1/chat/completions", self.config.base_url);
-                let response = self
-                    .send_streaming_request(
-                        &url,
-                        headers.clone(),
-                        &streaming_params,
-                        Some(&self.fallback_client),
-                    )
-                    .await?;
-                let sse_stream = new_sse_parser(response.bytes_stream(), true);
-                return Ok(Box::pin(sse_stream));
-            }
-            Some(lease) => lease,
-        };
+        let route_lease =
+            match self.acquire_index(&streaming_params.messages, pinned_pub_key.as_deref()) {
+                None => {
+                    let url = format!("{}/v1/chat/completions", self.config.base_url);
+                    let response = self
+                        .send_streaming_request(
+                            &url,
+                            headers.clone(),
+                            &streaming_params,
+                            Some(&self.fallback_client),
+                        )
+                        .await?;
+                    let sse_stream = new_sse_parser(response.bytes_stream(), true);
+                    return Ok(Box::pin(sse_stream));
+                }
+                Some(lease) => lease,
+            };
         let index = route_lease.index();
         let route_key = route_lease.route_key();
 
@@ -1867,7 +1873,8 @@ impl InferenceProvider for Fleet {
         // Prepare tracing headers (request_id, org_id, workspace_id)
         self.prepare_tracing_headers(&mut headers, &mut non_streaming_params.extra);
         // Prepare encryption headers
-        self.prepare_encryption_headers(&mut headers, &mut non_streaming_params.extra);
+        let pinned_pub_key =
+            self.prepare_encryption_headers(&mut headers, &mut non_streaming_params.extra);
 
         let timeout_secs = self.config.completion_timeout_seconds.max(0) as u64;
         let timeout = Duration::from_secs(timeout_secs);
@@ -1891,7 +1898,9 @@ impl InferenceProvider for Fleet {
         // affinity, stable conversation homes, and latency steering). `None`
         // → canonical fallback path (cold-start / non-rotation URL): one shot
         // via the non-pinned fallback client, no index recorded.
-        let route_lease = match self.acquire_index(&non_streaming_params.messages) {
+        let route_lease = match self
+            .acquire_index(&non_streaming_params.messages, pinned_pub_key.as_deref())
+        {
             None => {
                 let url = format!("{}/v1/chat/completions", self.config.base_url);
                 let response = self
@@ -2075,7 +2084,7 @@ impl InferenceProvider for Fleet {
 
         // Forward tracing and encryption headers from extra to HTTP headers
         self.prepare_tracing_headers(&mut headers, &mut params.extra);
-        self.prepare_encryption_headers(&mut headers, &mut params.extra);
+        let _ = self.prepare_encryption_headers(&mut headers, &mut params.extra);
 
         let response = self
             .client
@@ -2156,7 +2165,7 @@ impl InferenceProvider for Fleet {
             .map_err(|e| AudioTranscriptionError::TranscriptionError(e.to_string()))?;
         // Forward tracing and encryption headers from extra to HTTP headers
         self.prepare_tracing_headers(&mut headers, &mut params.extra);
-        self.prepare_encryption_headers(&mut headers, &mut params.extra);
+        let _ = self.prepare_encryption_headers(&mut headers, &mut params.extra);
         // Remove Content-Type header - reqwest will set it automatically for multipart
         headers.remove("Content-Type");
         headers.insert(
@@ -2331,7 +2340,7 @@ impl InferenceProvider for Fleet {
 
         let mut headers = self.build_headers().map_err(to_score_error)?;
         self.prepare_tracing_headers(&mut headers, &mut params.extra);
-        self.prepare_encryption_headers(&mut headers, &mut params.extra);
+        let _ = self.prepare_encryption_headers(&mut headers, &mut params.extra);
         headers.insert(
             "X-Request-Hash",
             reqwest::header::HeaderValue::from_str(&request_hash).map_err(to_score_error)?,
@@ -2368,7 +2377,7 @@ impl InferenceProvider for Fleet {
 
         let mut headers = self.build_headers().map_err(to_rerank_error)?;
         self.prepare_tracing_headers(&mut headers, &mut params.extra);
-        self.prepare_encryption_headers(&mut headers, &mut params.extra);
+        let _ = self.prepare_encryption_headers(&mut headers, &mut params.extra);
 
         let response = self
             .client
@@ -2405,7 +2414,7 @@ impl InferenceProvider for Fleet {
 
         let mut headers = self.build_headers().map_err(to_embedding_error)?;
         self.prepare_tracing_headers(&mut headers, &mut extra);
-        self.prepare_encryption_headers(&mut headers, &mut extra);
+        let _ = self.prepare_encryption_headers(&mut headers, &mut extra);
 
         let response = self
             .client
@@ -2443,7 +2452,7 @@ impl InferenceProvider for Fleet {
 
         let mut headers = self.build_headers().map_err(to_privacy_classify_error)?;
         self.prepare_tracing_headers(&mut headers, &mut extra);
-        self.prepare_encryption_headers(&mut headers, &mut extra);
+        let _ = self.prepare_encryption_headers(&mut headers, &mut extra);
 
         let response = self
             .client
@@ -2565,6 +2574,9 @@ impl InferenceProvider for Provider {
     }
     fn set_backend_count(&self, count: usize) {
         self.fleet.set_backend_count(count)
+    }
+    fn set_backend_keys(&self, map: std::collections::HashMap<String, Vec<usize>>) {
+        self.fleet.set_backend_keys(map)
     }
     async fn count_tokens(&self, model: &str, text: String) -> Option<u64> {
         self.fleet.count_tokens(model, text).await
@@ -3046,9 +3058,11 @@ mod tests {
             serde_json::Value::String("2".to_string()),
         );
 
-        provider
+        let pinned_pub_key = provider
             .fleet
             .prepare_encryption_headers(&mut headers, &mut extra);
+
+        assert_eq!(pinned_pub_key.as_deref(), Some("def456"));
 
         // Verify all encryption keys removed from extra
         assert!(
@@ -3092,7 +3106,7 @@ mod tests {
             serde_json::Value::String("2".to_string()),
         );
 
-        provider
+        let _ = provider
             .fleet
             .prepare_encryption_headers(&mut headers, &mut extra);
 
@@ -3138,7 +3152,7 @@ mod tests {
             serde_json::Value::Number(serde_json::Number::from(42)),
         );
 
-        provider
+        let _ = provider
             .fleet
             .prepare_encryption_headers(&mut headers, &mut extra);
 
@@ -3220,7 +3234,7 @@ mod tests {
         );
 
         let mut headers = reqwest::header::HeaderMap::new();
-        provider
+        let _ = provider
             .fleet
             .prepare_encryption_headers(&mut headers, &mut extra);
 
@@ -4122,12 +4136,175 @@ mod tests {
     }
 
     #[test]
+    fn fleet_candidate_indices_none_preserves_unrestricted_order() {
+        // Given: an unwarmed four-backend fleet.
+        let provider = rotation_provider(4);
+
+        // When / Then: `allowed=None` preserves the exact pre-affinity order.
+        assert_eq!(
+            provider.fleet.candidate_indices(7, 4, None),
+            vec![3, 0, 2, 1]
+        );
+    }
+
+    #[test]
+    fn fleet_candidate_indices_restricts_preferred_and_spill_to_group() {
+        // Given.
+        let provider = rotation_provider(4);
+        let group = [0, 2];
+
+        // When.
+        let candidates = provider.fleet.candidate_indices(3, 4, Some(&group));
+
+        // Then: preferred is group[route_key % group.len()] and every spill
+        // candidate remains in the same key group.
+        assert_eq!(candidates[0], group[3 % group.len()]);
+        assert!(candidates.iter().all(|index| group.contains(index)));
+    }
+
+    #[test]
+    fn fleet_candidate_indices_single_member_group_ignores_route_key() {
+        // Given.
+        let provider = rotation_provider(4);
+        let group = [2];
+
+        // When / Then.
+        for route_key in [0, 1, 7, u64::MAX] {
+            assert_eq!(
+                provider.fleet.candidate_indices(route_key, 4, Some(&group)),
+                vec![2]
+            );
+        }
+    }
+
+    #[test]
+    fn fleet_pinned_conversation_stays_in_its_key_group() {
+        // Given: established assistant history and a two-backend key group.
+        let provider = rotation_provider(4);
+        provider
+            .fleet
+            .set_backend_keys(HashMap::from([("key-a".to_string(), vec![0, 2])]));
+        let messages = vec![
+            user_msg("synthetic initial turn"),
+            role_msg(crate::MessageRole::Assistant, "synthetic answer"),
+            user_msg("synthetic follow-up"),
+        ];
+
+        // When.
+        let indices: Vec<_> = (0..8)
+            .map(|_| {
+                provider
+                    .fleet
+                    .acquire_index(&messages, Some("KEY-A"))
+                    .expect("rotation active")
+                    .index()
+            })
+            .collect();
+
+        // Then.
+        assert!(indices.iter().all(|index| [0, 2].contains(index)));
+        assert!(indices.iter().all(|index| *index == indices[0]));
+    }
+
+    #[test]
+    fn fleet_backend_count_change_clears_key_restriction() {
+        // Given: an empty-message request pinned to a single nonzero index.
+        let provider = rotation_provider(4);
+        provider
+            .fleet
+            .set_backend_keys(HashMap::from([("key-a".to_string(), vec![2])]));
+        assert_eq!(
+            provider
+                .fleet
+                .acquire_index(&[], Some("key-a"))
+                .expect("rotation active")
+                .index(),
+            2
+        );
+
+        // When: the healthy count changes, invalidating index bindings.
+        provider.set_backend_count(3);
+
+        // Then: the stale map is cleared and routing fails open to today's
+        // unrestricted empty-message index zero.
+        assert_eq!(
+            provider
+                .fleet
+                .acquire_index(&[], Some("key-a"))
+                .expect("rotation active")
+                .index(),
+            0
+        );
+    }
+
+    #[test]
+    fn fleet_unknown_pinned_key_routes_unrestricted() {
+        // Given.
+        let provider = rotation_provider(4);
+        provider
+            .fleet
+            .set_backend_keys(HashMap::from([("known-key".to_string(), vec![2])]));
+
+        // When / Then: an unknown pin does not produce an empty candidate set.
+        assert_eq!(
+            provider
+                .fleet
+                .acquire_index(&[], Some("unknown-key"))
+                .expect("rotation active")
+                .index(),
+            0
+        );
+    }
+
+    #[test]
+    fn fleet_empty_backend_key_map_routes_unrestricted() {
+        // Given.
+        let provider = rotation_provider(4);
+        provider.fleet.set_backend_keys(HashMap::new());
+
+        // When / Then.
+        assert_eq!(
+            provider
+                .fleet
+                .acquire_index(&[], Some("key-a"))
+                .expect("rotation active")
+                .index(),
+            0
+        );
+    }
+
+    #[test]
+    fn fleet_empty_backend_key_map_is_unrestricted_without_warning() {
+        // Given: the normal homogeneous-fleet discovery state.
+        let provider = rotation_provider(4);
+        provider.fleet.set_backend_keys(HashMap::new());
+
+        // When / Then: empty discovery state takes the silent path, not the
+        // stale-client warning path.
+        assert!(matches!(
+            provider.fleet.key_group("key-a", 4),
+            super::fleet::KeyGroup::Unrestricted
+        ));
+    }
+
+    #[test]
+    fn fleet_key_affinity_kill_switch_values_disable_restriction() {
+        // Given / When / Then: the documented false values disable affinity;
+        // other and missing values preserve the default-enabled behavior.
+        assert!(!super::fleet::key_affinity_value_enabled(Some("0")));
+        assert!(!super::fleet::key_affinity_value_enabled(Some("false")));
+        assert!(!super::fleet::key_affinity_value_enabled(Some("FALSE")));
+        assert!(super::fleet::key_affinity_value_enabled(Some("1")));
+        assert!(super::fleet::key_affinity_value_enabled(None));
+    }
+
+    #[test]
     fn select_index_returns_none_when_rotation_disabled() {
         // localhost → no rotation parts → rotation_count()==0 → canonical
         // fallback path. Many tests (and cold-start) depend on this.
         let provider = create_test_provider();
         let msgs = vec![user_msg("hello")];
-        assert_eq!(provider.fleet.select_index(&msgs), None);
+        assert_eq!(provider.fleet.select_index(&msgs, None), None);
     }
 
     #[test]
@@ -4137,10 +4314,13 @@ mod tests {
         let provider = rotation_provider(8);
         let msgs = vec![user_msg("a stable system prompt")];
         let expected = (provider.fleet.prefix_router.route(&msgs) % 8) as usize;
-        let got = provider.fleet.select_index(&msgs).expect("rotation active");
+        let got = provider
+            .fleet
+            .select_index(&msgs, None)
+            .expect("rotation active");
         assert_eq!(got, expected);
         // Deterministic / stable across calls (same prefix → same backend).
-        assert_eq!(provider.fleet.select_index(&msgs), Some(expected));
+        assert_eq!(provider.fleet.select_index(&msgs, None), Some(expected));
     }
 
     #[test]
@@ -4151,14 +4331,14 @@ mod tests {
         for index in 0..100 {
             let message_a = vec![user_msg(&format!("provider-a-prefix-{index}"))];
             let message_b = vec![user_msg(&format!("provider-b-prefix-{}", 100 - index))];
-            provider_a.fleet.select_index(&message_a);
-            provider_b.fleet.select_index(&message_b);
+            provider_a.fleet.select_index(&message_a, None);
+            provider_b.fleet.select_index(&message_b, None);
         }
 
         let shared = vec![user_msg("shared prefix across Cloud API processes")];
         assert_eq!(
-            provider_a.fleet.select_index(&shared),
-            provider_b.fleet.select_index(&shared)
+            provider_a.fleet.select_index(&shared, None),
+            provider_b.fleet.select_index(&shared, None)
         );
     }
 
@@ -4168,14 +4348,14 @@ mod tests {
         let messages = vec![user_msg("shared hot prefix")];
         let primary = provider
             .fleet
-            .select_index(&messages)
+            .select_index(&messages, None)
             .expect("rotation active");
 
         let leases: Vec<_> = (0..9)
             .map(|_| {
                 provider
                     .fleet
-                    .acquire_index(&messages)
+                    .acquire_index(&messages, None)
                     .expect("rotation active")
             })
             .collect();
@@ -4191,7 +4371,7 @@ mod tests {
         assert_eq!(provider.fleet.active_prefix_loads(), 0);
         let after_release = provider
             .fleet
-            .acquire_index(&messages)
+            .acquire_index(&messages, None)
             .expect("rotation active");
         assert_eq!(after_release.index(), primary);
     }
@@ -4206,7 +4386,7 @@ mod tests {
         for index in 0..1_000 {
             let messages = vec![user_msg(&format!("collision-prefix-{index}"))];
             let route_key = provider.fleet.prefix_router.route(&messages);
-            let candidates = provider.fleet.candidate_indices(route_key, 3);
+            let candidates = provider.fleet.candidate_indices(route_key, 3, None);
             let primary = candidates[0];
             if let Some((other_key, other_candidates)) = by_primary.get(&primary) {
                 if candidates[1..] != other_candidates[1..] {
@@ -4232,20 +4412,20 @@ mod tests {
         let second = vec![user_msg("unrelated prefix")];
         let second_primary = provider
             .fleet
-            .select_index(&second)
+            .select_index(&second, None)
             .expect("rotation active");
 
         let held: Vec<_> = (0..8)
             .map(|_| {
                 provider
                     .fleet
-                    .acquire_index(&first)
+                    .acquire_index(&first, None)
                     .expect("rotation active")
             })
             .collect();
         let unrelated = provider
             .fleet
-            .acquire_index(&second)
+            .acquire_index(&second, None)
             .expect("rotation active");
 
         assert_eq!(unrelated.index(), second_primary);
@@ -4264,7 +4444,7 @@ mod tests {
             .map(|_| {
                 provider_a
                     .fleet
-                    .acquire_index(&messages)
+                    .acquire_index(&messages, None)
                     .expect("rotation active")
             })
             .collect();
@@ -4272,7 +4452,7 @@ mod tests {
             .map(|_| {
                 provider_b
                     .fleet
-                    .acquire_index(&messages)
+                    .acquire_index(&messages, None)
                     .expect("rotation active")
             })
             .collect();
@@ -4314,15 +4494,15 @@ mod tests {
 
         let turn_two_a = provider_a
             .fleet
-            .acquire_index(&turn_two)
+            .acquire_index(&turn_two, None)
             .expect("rotation active");
         let turn_three_a = provider_a
             .fleet
-            .acquire_index(&turn_three)
+            .acquire_index(&turn_three, None)
             .expect("rotation active");
         let turn_three_b = provider_b
             .fleet
-            .acquire_index(&turn_three)
+            .acquire_index(&turn_three, None)
             .expect("rotation active");
 
         assert_eq!(turn_two_a.index(), turn_three_a.index());
@@ -4343,7 +4523,7 @@ mod tests {
             .map(|_| {
                 provider
                     .fleet
-                    .acquire_index(&messages)
+                    .acquire_index(&messages, None)
                     .expect("rotation active")
             })
             .collect();
@@ -4366,7 +4546,7 @@ mod tests {
             ];
             let lease = provider
                 .fleet
-                .acquire_index(&messages)
+                .acquire_index(&messages, None)
                 .expect("rotation active");
             seen[lease.index()] = true;
             if seen.iter().all(|value| *value) {
@@ -4386,7 +4566,7 @@ mod tests {
                 .map(|_| {
                     provider
                         .fleet
-                        .acquire_index(&messages)
+                        .acquire_index(&messages, None)
                         .expect("rotation active")
                 })
                 .collect();
@@ -4412,7 +4592,7 @@ mod tests {
             .map(|_| {
                 provider
                     .fleet
-                    .acquire_index(&messages)
+                    .acquire_index(&messages, None)
                     .expect("rotation active")
             })
             .collect();
@@ -4422,7 +4602,7 @@ mod tests {
             .map(|_| {
                 provider
                     .fleet
-                    .acquire_index(&messages)
+                    .acquire_index(&messages, None)
                     .expect("rotation active")
             })
             .collect();
@@ -4433,7 +4613,7 @@ mod tests {
             .map(|_| {
                 provider
                     .fleet
-                    .acquire_index(&messages)
+                    .acquire_index(&messages, None)
                     .expect("rotation active")
             })
             .collect();
@@ -4463,7 +4643,9 @@ mod tests {
                 let release = release.clone();
                 let sender = sender.clone();
                 std::thread::spawn(move || {
-                    let lease = fleet.acquire_index(&messages).expect("rotation active");
+                    let lease = fleet
+                        .acquire_index(&messages, None)
+                        .expect("rotation active");
                     sender.send(lease.index()).expect("send selected index");
                     acquired.wait();
                     release.wait();
@@ -4490,7 +4672,12 @@ mod tests {
     fn acquire_index_keeps_empty_messages_on_zero() {
         let provider = rotation_provider(4);
         let leases: Vec<_> = (0..20)
-            .map(|_| provider.fleet.acquire_index(&[]).expect("rotation active"))
+            .map(|_| {
+                provider
+                    .fleet
+                    .acquire_index(&[], None)
+                    .expect("rotation active")
+            })
             .collect();
         assert!(leases.iter().all(|lease| lease.index() == 0));
     }
@@ -4510,7 +4697,10 @@ mod tests {
             provider.fleet.record_ttft(fast, 100.0);
         }
 
-        let got = provider.fleet.select_index(&msgs).expect("rotation active");
+        let got = provider
+            .fleet
+            .select_index(&msgs, None)
+            .expect("rotation active");
         assert_eq!(
             got, fast,
             "should steer from the slow preferred backend to the fastest warmed one"
@@ -4525,7 +4715,7 @@ mod tests {
             provider2.fleet.record_ttft(other2, 600.0);
         }
         assert_eq!(
-            provider2.fleet.select_index(&msgs),
+            provider2.fleet.select_index(&msgs, None),
             Some(preferred2),
             "below the 2x slow ratio, prefix affinity wins"
         );
@@ -4535,7 +4725,7 @@ mod tests {
             .map(|_| {
                 provider
                     .fleet
-                    .acquire_index(&msgs)
+                    .acquire_index(&msgs, None)
                     .expect("rotation active")
             })
             .collect();
@@ -4722,7 +4912,7 @@ mod tests {
         let messages = vec![user_msg("streamed prefix")];
         let lease = provider
             .fleet
-            .acquire_index(&messages)
+            .acquire_index(&messages, None)
             .expect("rotation active");
         assert_eq!(provider.fleet.active_prefix_loads(), 1);
         let inner: StreamingResult = Box::pin(futures_util::stream::empty());

@@ -398,24 +398,26 @@ impl DiscoveryOutcome {
         let mut processed = HashSet::new();
         let mut groups: HashMap<String, Vec<usize>> = HashMap::new();
         for probe in &self.backend_probes {
-            if !processed.insert((probe.algo.as_str(), probe.pubkey.as_str())) {
+            let normalized_pubkey = probe.pubkey.to_lowercase();
+            if !processed.insert((probe.algo.as_str(), normalized_pubkey.clone())) {
                 continue;
             }
             let key_identities: HashSet<&TeeIdentity> = self
                 .backend_probes
                 .iter()
                 .filter(|candidate| {
-                    candidate.algo == probe.algo && candidate.pubkey == probe.pubkey
+                    candidate.algo == probe.algo
+                        && candidate.pubkey.eq_ignore_ascii_case(&probe.pubkey)
                 })
                 .filter_map(|candidate| candidate.identity.as_ref())
                 .collect();
             let key_has_unknown_identity = self.backend_probes.iter().any(|candidate| {
                 candidate.algo == probe.algo
-                    && candidate.pubkey == probe.pubkey
+                    && candidate.pubkey.eq_ignore_ascii_case(&probe.pubkey)
                     && candidate.identity.is_none()
             });
 
-            let indices = groups.entry(probe.pubkey.clone()).or_default();
+            let indices = groups.entry(normalized_pubkey).or_default();
             for index in 0..self.backend_count {
                 let index_identity = identities_by_index.get(&index).copied().flatten();
                 if index_identity.is_none() {
@@ -434,7 +436,7 @@ impl DiscoveryOutcome {
                 } else {
                     same_algo
                         .iter()
-                        .any(|candidate| candidate.pubkey == probe.pubkey)
+                        .any(|candidate| candidate.pubkey.eq_ignore_ascii_case(&probe.pubkey))
                 };
                 if include {
                     indices.push(index);
@@ -1779,7 +1781,7 @@ impl InferenceProviderPool {
                         backend_probes.push(BackendProbe {
                             index: backend_index,
                             algo: algo.clone(),
-                            pubkey: pk.to_lowercase(),
+                            pubkey: pk.to_string(),
                             identity: tee_identity(&report),
                         });
                     }
@@ -3421,7 +3423,18 @@ impl InferenceProviderPool {
         )
         .await;
 
-        let params_for_provider = params.clone();
+        let mut params_for_provider = params.clone();
+        // Carry the pin to the provider for backend-key affinity. The NEAR provider
+        // strips it in `prepare_encryption_headers` before serializing the request, so
+        // it never reaches vllm-proxy. Safe to carry: a pubkey-routed request is only
+        // ever served by a provider registered in `pubkey_to_providers`, which Chutes
+        // and external providers are never in (they have no signing-address pubkey).
+        if let Some(pub_key) = model_pub_key_str.as_ref() {
+            params_for_provider.extra.insert(
+                encryption_headers::MODEL_PUB_KEY.to_string(),
+                serde_json::Value::String(pub_key.clone()),
+            );
+        }
 
         tracing::debug!(
             model = %model_id,
@@ -3588,8 +3601,20 @@ impl InferenceProviderPool {
             "Starting chat completion request"
         );
 
-        // Clone params after removing model_pub_key to ensure it's not in the cloned version
-        let params_for_provider = params.clone();
+        // Carry the pin only in the dispatched clone so pool-side context refinement
+        // continues to see params with the routing-only field removed.
+        let mut params_for_provider = params.clone();
+        // Carry the pin to the provider for backend-key affinity. The NEAR provider
+        // strips it in `prepare_encryption_headers` before serializing the request, so
+        // it never reaches vllm-proxy. Safe to carry: a pubkey-routed request is only
+        // ever served by a provider registered in `pubkey_to_providers`, which Chutes
+        // and external providers are never in (they have no signing-address pubkey).
+        if let Some(pub_key) = model_pub_key_str.as_ref() {
+            params_for_provider.extra.insert(
+                encryption_headers::MODEL_PUB_KEY.to_string(),
+                serde_json::Value::String(pub_key.clone()),
+            );
+        }
 
         let served = self
             .retry_with_fallback_caps(
@@ -5763,6 +5788,39 @@ mod tests {
     }
 
     #[test]
+    fn key_index_map_normalizes_keys_without_changing_probe_pubkeys() {
+        // Given: each KMS root returns the same key with different casing.
+        let outcome = discovery_outcome_with_probes(
+            4,
+            vec![
+                backend_probe(0, "ecdsa", "AbCd", Some(("root-1", "app"))),
+                backend_probe(1, "ecdsa", "EfGh", Some(("root-2", "app"))),
+                backend_probe(2, "ecdsa", "aBcD", Some(("root-1", "app"))),
+                backend_probe(3, "ecdsa", "eFgH", Some(("root-2", "app"))),
+            ],
+        );
+
+        // When: raw registration keys and fleet-local index groups are derived.
+        let distinct_pubkeys = outcome.distinct_pubkeys();
+        let key_index_map = outcome.key_index_map();
+
+        // Then: registration preserves exactly what clients pin, while fleet
+        // affinity normalizes and groups equivalent keys case-insensitively.
+        assert_eq!(
+            distinct_pubkeys,
+            vec![
+                "AbCd".to_string(),
+                "EfGh".to_string(),
+                "aBcD".to_string(),
+                "eFgH".to_string(),
+            ]
+        );
+        assert_eq!(key_index_map.get("abcd"), Some(&vec![0, 2]));
+        assert_eq!(key_index_map.get("efgh"), Some(&vec![1, 3]));
+        assert_eq!(key_index_map.len(), 2);
+    }
+
+    #[test]
     fn tee_identity_accepts_object_and_json_string_key_provider_info() {
         // Given: current and older inference-proxy report shapes.
         let object_report = serde_json::json!({
@@ -7523,6 +7581,78 @@ mod tests {
             )
             .await;
         assert!(result.is_err(), "Routing with wrong pubkey should fail");
+    }
+
+    #[tokio::test]
+    async fn chat_completion_carries_model_pub_key_to_provider() {
+        use inference_providers::mock::MockProvider;
+
+        // Given: a registered provider and a request pinned to its ECDSA key.
+        let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
+        let model_id = "Qwen/Qwen3-30B-A3B-Instruct-2507".to_string();
+        let mock = Arc::new(MockProvider::new());
+        pool.register_provider(model_id.clone(), mock.clone()).await;
+        let pinned_key = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let mut params = fallback_params(&model_id);
+        params.extra.insert(
+            encryption_headers::MODEL_PUB_KEY.to_string(),
+            serde_json::Value::String(pinned_key.to_string()),
+        );
+
+        // When: the request crosses the non-streaming pool boundary.
+        pool.chat_completion(params, "test-request-hash".to_string())
+            .await
+            .expect("provider was called");
+
+        // Then: the dispatched clone still carries the routing pin.
+        let received = mock.last_chat_params().await.expect("provider was called");
+        assert_eq!(
+            received
+                .extra
+                .get(encryption_headers::MODEL_PUB_KEY)
+                .and_then(|value| value.as_str()),
+            Some(pinned_key),
+            "pin must reach the provider or backend-key affinity is inert",
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_completion_stream_carries_model_pub_key_to_provider() {
+        use inference_providers::mock::MockProvider;
+
+        // Given: a registered provider and a streaming request pinned to its ECDSA key.
+        let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
+        let model_id = "Qwen/Qwen3-30B-A3B-Instruct-2507".to_string();
+        let mock = Arc::new(MockProvider::new());
+        pool.register_provider(model_id.clone(), mock.clone()).await;
+        let pinned_key = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let mut params = fallback_params(&model_id);
+        params.stream = Some(true);
+        params.extra.insert(
+            encryption_headers::MODEL_PUB_KEY.to_string(),
+            serde_json::Value::String(pinned_key.to_string()),
+        );
+
+        // When: the request crosses the streaming pool boundary.
+        let _stream = pool
+            .chat_completion_stream(
+                params,
+                "test-request-hash".to_string(),
+                ChatRoutingHints::default(),
+            )
+            .await
+            .expect("provider was called");
+
+        // Then: the dispatched clone still carries the routing pin.
+        let received = mock.last_chat_params().await.expect("provider was called");
+        assert_eq!(
+            received
+                .extra
+                .get(encryption_headers::MODEL_PUB_KEY)
+                .and_then(|value| value.as_str()),
+            Some(pinned_key),
+            "pin must reach the provider or backend-key affinity is inert",
+        );
     }
 
     #[tokio::test]

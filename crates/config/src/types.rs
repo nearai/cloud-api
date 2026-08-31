@@ -17,6 +17,14 @@ pub struct ApiConfig {
     pub dstack_client: DstackClientConfig,
     pub auth: AuthConfig,
     pub database: DatabaseConfig,
+    /// Dedicated AES-256 key for confidential database fields. This must not
+    /// reuse the object-storage encryption key.
+    pub database_encryption_key: String,
+    /// Identifier embedded in and validated against every database envelope.
+    pub database_encryption_key_id: String,
+    /// Enables encryption for newly written confidential database fields.
+    /// Defaults off so dual-read support can be deployed fleet-wide first.
+    pub database_encryption_write_enabled: bool,
     pub s3: S3Config,
     pub invitation_email: InvitationEmailConfig,
     pub otlp: OtlpConfig,
@@ -51,6 +59,16 @@ impl ApiConfig {
             staking_farm: StakingFarmConfig::from_env(&auth.near),
             auth,
             database: DatabaseConfig::from_env()?,
+            database_encryption_key: read_required_secret_env(
+                "DB_ENCRYPTION_KEY_FILE",
+                "DB_ENCRYPTION_KEY",
+            )?,
+            database_encryption_key_id: non_empty_env("DB_ENCRYPTION_KEY_ID")
+                .unwrap_or_else(|| "db-v1".to_string()),
+            database_encryption_write_enabled: parse_bool_env(
+                "DB_ENCRYPTION_WRITE_ENABLED",
+                false,
+            )?,
             s3: S3Config::from_env()?,
             invitation_email: InvitationEmailConfig::from_env()?,
             otlp: OtlpConfig::from_env()?,
@@ -1064,6 +1082,11 @@ pub(crate) fn non_empty_env(key: &str) -> Option<String> {
 
 fn read_optional_secret_env(file_key: &str, value_key: &str) -> Result<Option<String>, String> {
     read_optional_non_empty_file_env(file_key, Some(value_key))
+}
+
+fn read_required_secret_env(file_key: &str, value_key: &str) -> Result<String, String> {
+    read_optional_secret_env(file_key, value_key)?
+        .ok_or_else(|| format!("Either {file_key} or {value_key} environment variable must be set"))
 }
 
 pub(crate) fn read_optional_secret_env_absent_empty(

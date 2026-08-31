@@ -107,6 +107,9 @@ pub fn create_pool_with_native_tls(
 #[derive(Clone)]
 pub struct DbPool {
     inner: std::sync::Arc<std::sync::RwLock<Option<Pool>>>,
+    encryption_key: std::sync::Arc<std::sync::RwLock<Option<[u8; 32]>>>,
+    encryption_key_id: std::sync::Arc<std::sync::RwLock<String>>,
+    encryption_write_enabled: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl DbPool {
@@ -114,6 +117,13 @@ impl DbPool {
     pub fn new(pool: Pool) -> Self {
         Self {
             inner: std::sync::Arc::new(std::sync::RwLock::new(Some(pool))),
+            encryption_key: std::sync::Arc::new(std::sync::RwLock::new(None)),
+            encryption_key_id: std::sync::Arc::new(std::sync::RwLock::new(
+                crate::field_encryption::DEFAULT_KEY_ID.to_string(),
+            )),
+            encryption_write_enabled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+                false,
+            )),
         }
     }
 
@@ -122,6 +132,13 @@ impl DbPool {
     pub fn uninitialized() -> Self {
         Self {
             inner: std::sync::Arc::new(std::sync::RwLock::new(None)),
+            encryption_key: std::sync::Arc::new(std::sync::RwLock::new(None)),
+            encryption_key_id: std::sync::Arc::new(std::sync::RwLock::new(
+                crate::field_encryption::DEFAULT_KEY_ID.to_string(),
+            )),
+            encryption_write_enabled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+                false,
+            )),
         }
     }
 
@@ -137,6 +154,61 @@ impl DbPool {
     /// The currently installed pool, if any.
     pub fn current(&self) -> Option<Pool> {
         self.inner.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    pub fn set_encryption_key(&self, key: [u8; 32]) {
+        *self
+            .encryption_key
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = Some(key);
+    }
+
+    pub fn encryption_key(&self) -> Option<[u8; 32]> {
+        *self
+            .encryption_key
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    pub fn set_encryption_key_id(&self, key_id: String) {
+        *self
+            .encryption_key_id
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = key_id;
+    }
+
+    pub fn encryption_key_id(&self) -> String {
+        self.encryption_key_id
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    pub fn set_encryption_write_enabled(&self, enabled: bool) {
+        self.encryption_write_enabled
+            .store(enabled, std::sync::atomic::Ordering::Release);
+    }
+
+    pub fn encryption_write_enabled(&self) -> bool {
+        self.encryption_write_enabled
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    pub fn encryption_write_key(&self) -> Option<[u8; 32]> {
+        self.encryption_write_enabled()
+            .then(|| self.encryption_key())
+            .flatten()
+    }
+
+    pub fn encryption_context(&self) -> Option<([u8; 32], String)> {
+        self.encryption_key()
+            .map(|key| (key, self.encryption_key_id()))
+    }
+
+    pub fn encryption_write_context(&self) -> Option<([u8; 32], String)> {
+        self.encryption_write_enabled()
+            .then(|| self.encryption_context())
+            .flatten()
     }
 
     /// Acquire a connection from the currently installed pool.
@@ -173,6 +245,17 @@ mod tests {
     use super::*;
     use deadpool::managed::QueueMode;
 
+    #[test]
+    fn encryption_writes_are_disabled_until_explicitly_enabled() {
+        let pool = DbPool::uninitialized();
+        pool.set_encryption_key([7; 32]);
+
+        assert_eq!(pool.encryption_key(), Some([7; 32]));
+        assert_eq!(pool.encryption_write_key(), None);
+
+        pool.set_encryption_write_enabled(true);
+        assert_eq!(pool.encryption_write_key(), Some([7; 32]));
+    }
     fn lazy_pool(max_size: usize) -> Pool {
         // deadpool creates connections lazily, so building a pool against an
         // unreachable host is fine as long as no connection is acquired.

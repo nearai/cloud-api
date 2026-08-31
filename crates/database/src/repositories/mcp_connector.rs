@@ -20,6 +20,54 @@ impl McpConnectorRepository {
         Self { pool }
     }
 
+    fn encrypt_text(&self, table: &str, column: &str, id: Uuid, value: String) -> Result<String> {
+        match self.pool.encryption_write_context() {
+            Some((key, key_id)) => crate::field_encryption::encrypt_with_key_id(
+                &key, &key_id, table, column, id, &value,
+            ),
+            None => Ok(value),
+        }
+    }
+
+    fn decrypt_text(&self, table: &str, column: &str, id: Uuid, value: String) -> Result<String> {
+        match self.pool.encryption_context() {
+            Some((key, key_id)) => crate::field_encryption::decrypt_if_encrypted_with_key_id(
+                &key, &key_id, table, column, id, value,
+            ),
+            None => Ok(value),
+        }
+    }
+
+    fn encrypt_json(
+        &self,
+        table: &str,
+        column: &str,
+        id: Uuid,
+        value: serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        match self.pool.encryption_write_context() {
+            Some((key, key_id)) => crate::field_encryption::encrypt_json_with_key_id(
+                &key, &key_id, table, column, id, &value,
+            ),
+            None => Ok(value),
+        }
+    }
+
+    fn decrypt_json(
+        &self,
+        table: &str,
+        column: &str,
+        id: Uuid,
+        value: serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        match self.pool.encryption_context() {
+            Some((key, key_id)) => crate::field_encryption::decrypt_json_if_encrypted_with_key_id(
+                &key, &key_id, table, column, id, value,
+            ),
+            None => Ok(value),
+        }
+    }
+
     /// Create a new MCP connector for an organization
     pub async fn create(
         &self,
@@ -30,12 +78,25 @@ impl McpConnectorRepository {
         let id = Uuid::new_v4();
 
         // Convert bearer token to auth_config if present
-        let auth_config = request.bearer_token.as_ref().map(|token| {
+        let mut auth_config = request.bearer_token.as_ref().map(|token| {
             serde_json::to_value(McpBearerConfig {
                 token: token.clone(),
             })
             .unwrap()
         });
+        let description = request
+            .description
+            .map(|value| self.encrypt_text("mcp_connectors", "description", id, value))
+            .transpose()?;
+        let mcp_server_url = self.encrypt_text(
+            "mcp_connectors",
+            "mcp_server_url",
+            id,
+            request.mcp_server_url,
+        )?;
+        auth_config = auth_config
+            .map(|value| self.encrypt_json("mcp_connectors", "auth_config", id, value))
+            .transpose()?;
 
         let row = retry_db!("create_mcp_connector", {
             let now = Utc::now();
@@ -62,8 +123,8 @@ impl McpConnectorRepository {
                         &id,
                         &organization_id,
                         &request.name,
-                        &request.description,
-                        &request.mcp_server_url,
+                        &description,
+                        &mcp_server_url,
                         &request.auth_type.to_string(),
                         &auth_config,
                         &creator_user_id,
@@ -172,6 +233,20 @@ impl McpConnectorRepository {
         request: UpdateMcpConnectorRequest,
     ) -> Result<McpConnector> {
         let now = Utc::now();
+        let encrypted_description = request
+            .description
+            .map(|value| self.encrypt_text("mcp_connectors", "description", id, value))
+            .transpose()?;
+        let encrypted_url = request
+            .mcp_server_url
+            .map(|value| self.encrypt_text("mcp_connectors", "mcp_server_url", id, value))
+            .transpose()?;
+        let encrypted_auth_config = request
+            .bearer_token
+            .map(|token| serde_json::to_value(McpBearerConfig { token }))
+            .transpose()?
+            .map(|value| self.encrypt_json("mcp_connectors", "auth_config", id, value))
+            .transpose()?;
 
         // Build dynamic update query
         let mut query = String::from("UPDATE mcp_connectors SET updated_at = $1");
@@ -184,13 +259,13 @@ impl McpConnectorRepository {
             param_idx += 1;
         }
 
-        if let Some(ref description) = request.description {
+        if let Some(ref description) = encrypted_description {
             query.push_str(&format!(", description = ${param_idx}"));
             params.push(description);
             param_idx += 1;
         }
 
-        if let Some(ref url) = request.mcp_server_url {
+        if let Some(ref url) = encrypted_url {
             query.push_str(&format!(", mcp_server_url = ${param_idx}"));
             params.push(url);
             param_idx += 1;
@@ -204,14 +279,9 @@ impl McpConnectorRepository {
             param_idx += 1;
         }
 
-        let auth_config;
-        if let Some(ref bearer_token) = request.bearer_token {
-            auth_config = serde_json::to_value(McpBearerConfig {
-                token: bearer_token.clone(),
-            })
-            .unwrap();
+        if let Some(ref auth_config) = encrypted_auth_config {
             query.push_str(&format!(", auth_config = ${param_idx}"));
-            params.push(&auth_config);
+            params.push(auth_config);
             param_idx += 1;
         }
 
@@ -293,6 +363,12 @@ impl McpConnectorRepository {
 
         // Use separate variables to avoid type ambiguity
         let update_last_connected = status == McpConnectionStatus::Connected;
+        let error_message = error_message
+            .map(|value| self.encrypt_text("mcp_connectors", "error_message", id, value))
+            .transpose()?;
+        let capabilities = capabilities
+            .map(|value| self.encrypt_json("mcp_connectors", "capabilities", id, value))
+            .transpose()?;
 
         let rows_affected = retry_db!("update_mcp_connector_connection_status", {
             let now = Utc::now();
@@ -375,6 +451,15 @@ impl McpConnectorRepository {
         duration_ms: Option<i32>,
     ) -> Result<()> {
         let id = Uuid::new_v4();
+        let request_payload = request_payload
+            .map(|value| self.encrypt_json("mcp_connector_usage", "request_payload", id, value))
+            .transpose()?;
+        let response_payload = response_payload
+            .map(|value| self.encrypt_json("mcp_connector_usage", "response_payload", id, value))
+            .transpose()?;
+        let error_message = error_message
+            .map(|value| self.encrypt_text("mcp_connector_usage", "error_message", id, value))
+            .transpose()?;
 
         retry_db!("log_mcp_connector_usage", {
             let now = Utc::now();
@@ -449,6 +534,7 @@ impl McpConnectorRepository {
 
     /// Convert a database row to McpConnector
     fn row_to_connector(&self, row: tokio_postgres::Row) -> Result<McpConnector> {
+        let id: Uuid = row.get("id");
         let auth_type_str: String = row.get("auth_type");
         let auth_type = match auth_type_str.as_str() {
             "none" => McpAuthType::None,
@@ -465,36 +551,68 @@ impl McpConnectorRepository {
         };
 
         Ok(McpConnector {
-            id: row.get("id"),
+            id,
             organization_id: row.get("organization_id"),
             name: row.get("name"),
-            description: row.get("description"),
-            mcp_server_url: row.get("mcp_server_url"),
+            description: row
+                .get::<_, Option<String>>("description")
+                .map(|value| self.decrypt_text("mcp_connectors", "description", id, value))
+                .transpose()?,
+            mcp_server_url: self.decrypt_text(
+                "mcp_connectors",
+                "mcp_server_url",
+                id,
+                row.get("mcp_server_url"),
+            )?,
             auth_type,
-            auth_config: row.get("auth_config"),
+            auth_config: row
+                .get::<_, Option<serde_json::Value>>("auth_config")
+                .map(|value| self.decrypt_json("mcp_connectors", "auth_config", id, value))
+                .transpose()?,
             is_active: row.get("is_active"),
             created_by: row.get("created_by"),
             created_at: row.get("created_at"),
             updated_at: row.get("updated_at"),
             last_connected_at: row.get("last_connected_at"),
             connection_status,
-            error_message: row.get("error_message"),
-            capabilities: row.get("capabilities"),
-            metadata: row.get("metadata"),
+            error_message: row
+                .get::<_, Option<String>>("error_message")
+                .map(|value| self.decrypt_text("mcp_connectors", "error_message", id, value))
+                .transpose()?,
+            capabilities: row
+                .get::<_, Option<serde_json::Value>>("capabilities")
+                .map(|value| self.decrypt_json("mcp_connectors", "capabilities", id, value))
+                .transpose()?,
+            metadata: row
+                .get::<_, Option<serde_json::Value>>("metadata")
+                .map(|value| self.decrypt_json("mcp_connectors", "metadata", id, value))
+                .transpose()?,
         })
     }
 
     /// Convert a database row to McpConnectorUsage
     fn row_to_usage(&self, row: tokio_postgres::Row) -> Result<McpConnectorUsage> {
+        let id: Uuid = row.get("id");
         Ok(McpConnectorUsage {
-            id: row.get("id"),
+            id,
             connector_id: row.get("connector_id"),
             user_id: row.get("user_id"),
             method: row.get("method"),
-            request_payload: row.get("request_payload"),
-            response_payload: row.get("response_payload"),
+            request_payload: row
+                .get::<_, Option<serde_json::Value>>("request_payload")
+                .map(|value| self.decrypt_json("mcp_connector_usage", "request_payload", id, value))
+                .transpose()?,
+            response_payload: row
+                .get::<_, Option<serde_json::Value>>("response_payload")
+                .map(|value| {
+                    self.decrypt_json("mcp_connector_usage", "response_payload", id, value)
+                })
+                .transpose()?,
             status_code: row.get("status_code"),
-            error_message: row.get("error_message"),
+            error_message: row
+                .get::<_, Option<String>>("error_message")
+                .map(|value| self.decrypt_text("mcp_connector_usage", "error_message", id, value))
+                .transpose()?,
             duration_ms: row.get("duration_ms"),
             created_at: row.get("created_at"),
         })

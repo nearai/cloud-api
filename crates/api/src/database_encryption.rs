@@ -171,7 +171,8 @@ struct ExcludedTable {
 
 const EXCLUDED_TABLES: &[ExcludedTable] = &[ExcludedTable {
     table: "postgres_log",
-    reason: "PostgreSQL-managed operational log projection governed by infrastructure log-retention controls",
+    reason:
+        "PostgreSQL-managed operational log table governed by infrastructure log-retention controls",
 }];
 
 fn excluded_table_reason(table: &str) -> Option<&'static str> {
@@ -340,6 +341,7 @@ pub struct ScanResponse {
     fields: Vec<FieldCount>,
     totals: Value,
     approved_plaintext: Vec<Value>,
+    excluded: Vec<Value>,
     unclassified: Vec<Value>,
 }
 
@@ -435,7 +437,7 @@ fn normalize_scope(scope: &mut Scope) {
 
 async fn classify_schema(
     client: &tokio_postgres::Client,
-) -> anyhow::Result<(Vec<Value>, Vec<Value>)> {
+) -> anyhow::Result<(Vec<Value>, Vec<Value>, Vec<Value>)> {
     let rows = client
         .query(
             "SELECT c.table_name,c.column_name FROM information_schema.columns c \
@@ -447,11 +449,21 @@ async fn classify_schema(
         )
         .await?;
     let mut approved = Vec::new();
+    let mut excluded = Vec::new();
     let mut unclassified = Vec::new();
     for row in rows {
         let table: String = row.get(0);
         let column: String = row.get(1);
-        if excluded_table_reason(&table).is_some() {
+        // The staging postgres_log relation is a BASE TABLE and therefore reaches
+        // this branch. Keep the exclusion exact so similarly named application
+        // tables remain subject to the classification gate.
+        if let Some(reason) = excluded_table_reason(&table) {
+            excluded.push(json!({
+                "table": table,
+                "column": column,
+                "classification": "excluded",
+                "reason": reason,
+            }));
             continue;
         }
         if is_encrypted_field(&table, &column) {
@@ -473,12 +485,12 @@ async fn classify_schema(
             }));
         }
     }
-    Ok((approved, unclassified))
+    Ok((approved, excluded, unclassified))
 }
 
 async fn schema_classification(
     state: &DatabaseEncryptionState,
-) -> anyhow::Result<(Vec<Value>, Vec<Value>)> {
+) -> anyhow::Result<(Vec<Value>, Vec<Value>, Vec<Value>)> {
     let client = state.pool.get().await?;
     classify_schema(&client).await
 }
@@ -580,7 +592,8 @@ pub async fn scan(
     let fs = selected(&req.scope)?;
     let cs = counts(&state, &fs, req.limit).await.map_err(internal)?;
     let t = totals(&cs);
-    let (approved, unclassified) = schema_classification(&state).await.map_err(internal)?;
+    let (approved, excluded, unclassified) =
+        schema_classification(&state).await.map_err(internal)?;
     Ok(Json(ScanResponse {
         run_id: Uuid::new_v4(),
         status: "completed",
@@ -591,6 +604,7 @@ pub async fn scan(
         } else {
             Default::default()
         },
+        excluded,
         unclassified,
     }))
 }
@@ -982,7 +996,7 @@ async fn run_locked_job(
     }
 
     if mode == "verify" {
-        let (approved, unclassified) = classify_schema(client).await?;
+        let (approved, excluded, unclassified) = classify_schema(client).await?;
         let pass = plaintext == 0 && invalid_envelopes == 0 && unclassified.is_empty();
         client
             .execute(
@@ -990,6 +1004,7 @@ async fn run_locked_job(
                 &[&id, &json!({
                     "pass": pass,
                     "approved_plaintext": approved,
+                    "excluded": excluded,
                     "unclassified": unclassified,
                 })],
             )
@@ -1148,6 +1163,10 @@ mod tests {
         assert!(EXCLUDED_TABLES
             .iter()
             .all(|excluded| !excluded.reason.trim().is_empty()));
+        assert!(EXCLUDED_TABLES.iter().all(|excluded| {
+            !FIELDS.iter().any(|field| field.table == excluded.table)
+                && APPROVED.iter().all(|group| group.table != excluded.table)
+        }));
     }
 
     #[test]

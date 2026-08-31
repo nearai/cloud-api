@@ -444,10 +444,29 @@ impl Fleet {
 
     /// Ordering of indices to try as fallback after `tried` returned 5xx,
     /// fastest-EMA first (unwarmed backends sorted last, stable by index).
-    pub(super) fn fallback_indices(&self, tried: usize) -> Vec<usize> {
+    ///
+    /// When the request carries a pinned model pubkey and discovery resolved a
+    /// key group for it, candidates are restricted to that group: a backend
+    /// outside the group holds a different KMS-root-derived keypair and would
+    /// fail to decrypt, turning a retryable 5xx into a misleading
+    /// `400 "Decryption failed"`. An exhausted group yields an empty list, and
+    /// the caller then surfaces the original 5xx.
+    pub(super) fn fallback_indices_for(
+        &self,
+        tried: usize,
+        pinned_pub_key: Option<&str>,
+    ) -> Vec<usize> {
         let count = self.rotation_count();
+        let key_group = self.resolve_key_group(pinned_pub_key, count);
         let stats = lock(&self.backend_stats);
-        let mut idxs: Vec<usize> = (0..count).filter(|&i| i != tried).collect();
+        let mut idxs: Vec<usize> = match key_group.indices() {
+            Some(indices) => indices
+                .iter()
+                .copied()
+                .filter(|&index| index != tried)
+                .collect(),
+            None => (0..count).filter(|&index| index != tried).collect(),
+        };
         idxs.sort_by(|&a, &b| {
             let key = |i: usize| {
                 let s = stats[i];

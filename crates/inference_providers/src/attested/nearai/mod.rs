@@ -412,7 +412,7 @@ impl Fleet {
         index: usize,
     ) -> Result<Client, CompletionError> {
         // Defensive bound. By construction every caller derives `index` from
-        // `select_index`/`fallback_indices` (both bounded by `rotation_count()`
+        // `select_index`/`fallback_indices_for` (both bounded by `rotation_count()`
         // ≤ `MAX_FANOUT` = `index_clients.len()`) or from a `signature_rotation`
         // pin that was recorded under the same bound — so this never trips
         // today. Guard anyway rather than index-panic: this is attestation
@@ -1817,7 +1817,7 @@ impl InferenceProvider for Fleet {
                         drop(stream);
                         drop(route_lease);
                         self.try_stream_fallback_indices(
-                            &self.fallback_indices(index),
+                            &self.fallback_indices_for(index, pinned_pub_key.as_deref()),
                             route_key,
                             &streaming_params,
                             &headers,
@@ -1838,7 +1838,7 @@ impl InferenceProvider for Fleet {
                 {
                     drop(route_lease);
                     self.try_stream_fallback_indices(
-                        &self.fallback_indices(index),
+                        &self.fallback_indices_for(index, pinned_pub_key.as_deref()),
                         route_key,
                         &streaming_params,
                         &headers,
@@ -2003,7 +2003,7 @@ impl InferenceProvider for Fleet {
                 drop(route_lease);
                 return self
                     .try_chat_completion_fallback_indices(
-                        &self.fallback_indices(index),
+                        &self.fallback_indices_for(index, pinned_pub_key.as_deref()),
                         route_key,
                         &non_streaming_params,
                         &headers,
@@ -4854,6 +4854,68 @@ mod tests {
     }
 
     #[test]
+    fn fallback_indices_for_restricts_pinned_key_group() {
+        // Given: only indices 0 and 2 hold the pinned key.
+        let provider = rotation_provider(4);
+        provider
+            .fleet
+            .set_backend_keys(HashMap::from([("key-a".to_string(), vec![0, 2])]));
+
+        // When.
+        let order = provider.fleet.fallback_indices_for(0, Some("key-a"));
+
+        // Then: the tried backend and both foreign-key backends are excluded.
+        assert_eq!(order, vec![2]);
+        assert!(!order.contains(&1));
+        assert!(!order.contains(&3));
+    }
+
+    #[test]
+    fn fallback_indices_for_unpinned_request_is_unrestricted() {
+        // Given: a mixed-key fleet, but no request pin.
+        let provider = rotation_provider(4);
+        provider
+            .fleet
+            .set_backend_keys(HashMap::from([("key-a".to_string(), vec![0, 2])]));
+
+        // When.
+        let order = provider.fleet.fallback_indices_for(0, None);
+
+        // Then: today's all-other-indices behavior is unchanged.
+        assert_eq!(order, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn fallback_indices_for_exhausted_pinned_group_is_empty() {
+        // Given: the tried backend is the pinned key group's only member.
+        let provider = rotation_provider(4);
+        provider
+            .fleet
+            .set_backend_keys(HashMap::from([("key-a".to_string(), vec![1])]));
+
+        // When.
+        let order = provider.fleet.fallback_indices_for(1, Some("key-a"));
+
+        // Then: no foreign-key backend is attempted.
+        assert!(order.is_empty());
+    }
+
+    #[test]
+    fn fallback_indices_for_unknown_key_is_unrestricted() {
+        // Given: discovery has a key map that does not contain the request pin.
+        let provider = rotation_provider(4);
+        provider
+            .fleet
+            .set_backend_keys(HashMap::from([("known-key".to_string(), vec![2])]));
+
+        // When.
+        let order = provider.fleet.fallback_indices_for(0, Some("unknown-key"));
+
+        // Then: UnknownKey keeps the existing fall-open policy.
+        assert_eq!(order, vec![1, 2, 3]);
+    }
+
+    #[test]
     fn fallback_indices_orders_warmed_fastest_first_and_skips_tried() {
         let provider = rotation_provider(4);
         // Warm indices 1 (slow) and 3 (fast); leave 0 and 2 unwarmed.
@@ -4861,7 +4923,7 @@ mod tests {
             provider.fleet.record_ttft(1, 800.0);
             provider.fleet.record_ttft(3, 120.0);
         }
-        let order = provider.fleet.fallback_indices(0);
+        let order = provider.fleet.fallback_indices_for(0, None);
         assert!(!order.contains(&0), "tried index must be skipped");
         // Warmed fastest first (3 before 1), then unwarmed (just 2 here).
         assert_eq!(order, vec![3, 1, 2]);

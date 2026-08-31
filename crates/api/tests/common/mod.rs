@@ -30,7 +30,10 @@ use services::responses::tools::{
 };
 use services::usage::ModelPricing;
 use sha2::{Digest, Sha256};
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc, Mutex,
+};
 
 #[cfg(test)]
 use ed25519_dalek::{Signature as Ed25519Signature, VerifyingKey as Ed25519VerifyingKey};
@@ -240,11 +243,15 @@ async fn build_test_server_components_with_real_providers(
 /// Mock web search provider for e2e tests. Returns a fixed list of results without calling Brave.
 pub struct MockWebSearchProvider {
     results: Vec<WebSearchResult>,
+    call_count: Arc<AtomicUsize>,
 }
 
 impl MockWebSearchProvider {
     pub fn new(results: Vec<WebSearchResult>) -> Self {
-        Self { results }
+        Self {
+            results,
+            call_count: Arc::new(AtomicUsize::new(0)),
+        }
     }
 
     /// Default mock with one placeholder result.
@@ -255,6 +262,11 @@ impl MockWebSearchProvider {
             snippet: "Snippet from mock web search.".to_string(),
         }])
     }
+
+    /// Number of provider invocations observed by this mock.
+    pub fn call_count(&self) -> Arc<AtomicUsize> {
+        self.call_count.clone()
+    }
 }
 
 #[async_trait]
@@ -263,6 +275,7 @@ impl WebSearchProviderTrait for MockWebSearchProvider {
         &self,
         _params: WebSearchParams,
     ) -> Result<Vec<WebSearchResult>, WebSearchError> {
+        self.call_count.fetch_add(1, Ordering::SeqCst);
         Ok(self.results.clone())
     }
 }

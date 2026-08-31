@@ -66,7 +66,7 @@ The API has two mutually-exclusive auth methods:
 - **Session auth** (cookies / `Authorization: Bearer rt_…`) for the
   management plane: organizations, workspaces, users, API keys.
 - **API key auth** (`Authorization: Bearer sk-…`) for the data plane:
-  chat completions, responses, conversations, attestation.
+  chat completions, responses, and attestation.
 
 ### Mock session auth (no real OAuth)
 
@@ -272,14 +272,68 @@ Provider refresh runs every 300s by default
 | `POST /v1/workspaces/{id}/api-keys`         | session  | Returns plaintext `key` — store it, it isn't shown again    |
 | `GET  /v1/models`                           | public   | OpenAI-compatible model catalog with pricing metadata       |
 | `POST /v1/chat/completions`                 | API key  | OpenAI-compatible. Add `"stream": true` for SSE             |
-| `POST /v1/responses`                        | API key  | Platform-specific event-streamed responses                  |
-| `POST /v1/conversations`                    | API key  | Conversation lifecycle                                      |
+| `POST /v1/responses`                        | API key  | Stateless `store: false` inference; client-managed function tools only |
+| `POST /v1/conversations/batch`, `GET /v1/conversations/{id}`, `GET /v1/conversations/{id}/items`, `DELETE /v1/conversations/{id}` | API key | Temporary workspace-scoped migration routes; only per-conversation deletion remains enabled |
+| `GET /v1/files`, `GET /v1/files/{id}`, `GET /v1/files/{id}/content`, `DELETE /v1/files/{id}` | API key | Temporary workspace-scoped migration routes; only per-file deletion remains enabled |
+| `POST /mcp`                                 | API key  | Independent MCP server exposing the `web_search` tool       |
 | `GET  /v1/attestation/report`               | API key  | TEE attestation (503 outside a CVM unless `DEV=true` in debug builds) |
 | `GET  /v1/attestation/ita-token`            | public   | Intel Trust Authority JWT wrapper (requires ITA env vars)   |
-| `GET  /v1/signature/{chat_id}`              | API key  | Per-completion signature lookup                             |
+| `GET  /v1/signature/{chat_id}`              | API key  | Per-completion and `resp_*` signature lookup                |
 
 The Scalar UI at `http://localhost:3000/docs` lets you fire each of these
 interactively and inspect request/response schemas.
+
+### Stateless Responses and attestation retention
+
+`POST /v1/responses` accepts only `store: false` (an omitted value is treated
+as `false`). Cloud API does not retain raw request or response content,
+response items, or response history; clients must supply any needed prior
+context with each request.
+
+Custom `function` tools are client-managed. Cloud returns a `function_call`
+item but does not execute it. To continue after running the function, the
+client sends a fresh `store: false` request containing the original
+`function_call` and its matching `function_call_output`; it must not use
+`previous_response_id` or `conversation`. Send the same custom function tool
+definitions again in `tools` on every request so the model can continue to
+call them if needed.
+
+This initial compatibility path accepts a raw `function_call` item from a
+previous response, its matching `function_call_output`, and assistant
+`message` content parts of type `output_text` as caller-managed message
+history. It does not support reasoning items or arbitrary full
+`response.output` replay; reasoning-model compatibility is separate work.
+
+Existing completed-response gateway attestation is preserved on a best-effort
+basis. When its signature write succeeds, `GET /v1/signature/resp_*` can
+retrieve the response ID and signatures over SHA-256 request/response digests;
+the signature material contains no raw request or response content. A stream
+that disconnects before completion creates no `resp_*` attestation record or
+legacy disconnect fallback.
+
+Only custom `function` tools are supported by `POST /v1/responses`.
+Server-executed tools are rejected locally: `web_search`,
+`web_context_search`, `file_search`, `code_interpreter`, `computer`, and
+remote `mcp` tools. Image-generation and image-editing models are also
+rejected so every successful Responses inference makes exactly one Chat
+Completions call. This does not affect the separate `POST /mcp` MCP server,
+which continues to expose its independent `web_search` tool, or the
+`/v1/images/*` endpoints.
+
+Responses itself rejects conversation linkage, response history, and file
+input. During the temporary migration/export window, the authenticated,
+workspace-scoped migration routes remain available:
+
+- `POST /v1/conversations/batch`, `GET /v1/conversations/{id}`,
+  `GET /v1/conversations/{id}/items`, and `DELETE /v1/conversations/{id}`;
+- `GET /v1/files`, `GET /v1/files/{id}`, `GET /v1/files/{id}/content`, and
+  `DELETE /v1/files/{id}`.
+
+These routes preserve existing retrieval behavior and keep per-resource
+deletion available to support existing account deletion; they are not a new
+export API or a new Conversation-list endpoint. They send `Cache-Control:
+no-store`. Creation, upload, pinning, archiving, cloning, item creation, and
+every other Conversation or File mutation return `410 Gone`.
 
 ## 7. Troubleshooting
 

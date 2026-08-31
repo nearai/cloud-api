@@ -43,7 +43,7 @@ use axum::{
     extract::DefaultBodyLimit,
     middleware::{from_fn, from_fn_with_state, map_response, Next},
     response::Html,
-    routing::{get, post},
+    routing::{any, get, post, MethodRouter},
     Router,
 };
 use config::ApiConfig;
@@ -436,10 +436,7 @@ pub async fn init_domain_services_with_pool(
     let brave_search_provider =
         Arc::new(services::responses::tools::brave::BraveWebSearchProvider::new());
     let web_search_provider: Arc<dyn services::responses::tools::WebSearchProviderTrait> =
-        brave_search_provider.clone();
-    let web_context_search_provider: Arc<
-        dyn services::responses::tools::WebContextSearchProviderTrait,
-    > = brave_search_provider;
+        brave_search_provider;
 
     // Create session repository for user service
     let session_repo = Arc::new(database::SessionRepository::new(database.pool().clone()))
@@ -482,10 +479,7 @@ pub async fn init_domain_services_with_pool(
         inference_provider_pool.clone(),
         conversation_service.clone(),
         completion_service.clone(),
-        Some(web_search_provider.clone()), // web_search_provider
-        Some(web_context_search_provider), // web_context_search_provider
-        None,                              // file_search_provider
-        files_service.clone(),             // file_service
+        files_service.clone(), // file_service
         organization_service.clone(),
     ));
 
@@ -560,8 +554,11 @@ pub async fn init_domain_services_with_pool(
     }
 }
 
-/// Initialize domain services with a custom MCP client factory (for testing)
-/// This is a thin wrapper that creates the response service with an injected factory
+/// Initialize domain services for legacy MCP tests.
+///
+/// Remote MCP tools are no longer supported by Responses. Keep this helper's
+/// signature temporarily so downstream test setup still compiles, but do not
+/// inject or construct an MCP client for the Responses service.
 #[allow(clippy::too_many_arguments)]
 pub async fn init_domain_services_with_mcp_factory(
     database: Arc<Database>,
@@ -569,7 +566,7 @@ pub async fn init_domain_services_with_mcp_factory(
     organization_service: Arc<dyn services::organization::OrganizationServiceTrait + Send + Sync>,
     inference_provider_pool: Arc<services::inference_provider_pool::InferenceProviderPool>,
     metrics_service: Arc<dyn services::metrics::MetricsServiceTrait>,
-    mcp_client_factory: Arc<dyn services::responses::tools::McpClientFactory>,
+    _mcp_client_factory: Arc<dyn services::responses::tools::McpClientFactory>,
 ) -> DomainServices {
     // Get the base domain services
     let mut domain_services = init_domain_services_with_pool(
@@ -581,33 +578,21 @@ pub async fn init_domain_services_with_mcp_factory(
     )
     .await;
 
-    // Replace the response service with one that has the MCP factory injected
+    // Replace the response service while retaining the caller-provided pool.
     let response_repo = Arc::new(database::PgResponseRepository::new(database.pool().clone()));
     let response_items_repo = Arc::new(database::PgResponseItemsRepository::new(
         database.pool().clone(),
     ))
         as Arc<dyn services::responses::ports::ResponseItemRepositoryTrait>;
 
-    let brave_search_provider =
-        Arc::new(services::responses::tools::brave::BraveWebSearchProvider::new());
-    let web_search_provider: Arc<dyn services::responses::tools::WebSearchProviderTrait> =
-        brave_search_provider.clone();
-    let web_context_search_provider: Arc<
-        dyn services::responses::tools::WebContextSearchProviderTrait,
-    > = brave_search_provider;
-
-    let response_service = Arc::new(services::ResponseService::with_mcp_client_factory(
+    let response_service = Arc::new(services::ResponseService::new(
         response_repo,
         response_items_repo,
         inference_provider_pool,
         domain_services.conversation_service.clone(),
         domain_services.completion_service.clone(),
-        Some(web_search_provider),
-        Some(web_context_search_provider),
-        None,
         domain_services.files_service.clone(), // Reuse files_service from base
         organization_service,
-        mcp_client_factory,
     ));
 
     domain_services.response_service = response_service;
@@ -637,8 +622,9 @@ pub async fn init_domain_services_with_pool_and_web_search_provider(
     .await
 }
 
-/// Like `init_domain_services_with_pool_and_web_search_provider`, but also lets tests
-/// inject a Responses-only context-search provider.
+/// Like `init_domain_services_with_pool_and_web_search_provider`, but keeps a
+/// compatibility argument for tests that previously injected a Responses-only
+/// context-search provider. Responses no longer accepts that built-in tool.
 pub async fn init_domain_services_with_pool_and_search_providers(
     database: Arc<Database>,
     config: &ApiConfig,
@@ -646,7 +632,7 @@ pub async fn init_domain_services_with_pool_and_search_providers(
     inference_provider_pool: Arc<services::inference_provider_pool::InferenceProviderPool>,
     metrics_service: Arc<dyn services::metrics::MetricsServiceTrait>,
     web_search_provider: Arc<dyn services::responses::tools::WebSearchProviderTrait>,
-    web_context_search_provider: Option<
+    _web_context_search_provider: Option<
         Arc<dyn services::responses::tools::WebContextSearchProviderTrait>,
     >,
 ) -> DomainServices {
@@ -671,9 +657,6 @@ pub async fn init_domain_services_with_pool_and_search_providers(
         inference_provider_pool,
         domain_services.conversation_service.clone(),
         domain_services.completion_service.clone(),
-        Some(web_search_provider.clone()),
-        web_context_search_provider,
-        None,
         domain_services.files_service.clone(),
         organization_service,
     ));
@@ -1257,7 +1240,7 @@ pub fn build_app_with_config(
     );
 
     let conversation_routes = build_conversation_routes(
-        domain_services.conversation_service,
+        domain_services.conversation_service.clone(),
         &auth_components.auth_state_middleware,
     );
 
@@ -1660,7 +1643,7 @@ pub fn build_response_routes(
 ) -> Router {
     let route_state = responses::ResponseRouteState {
         response_service: response_service.clone(),
-        attestation_service: attestation_service.clone(),
+        attestation_service,
     };
 
     let inference_routes = Router::new()
@@ -1680,19 +1663,20 @@ pub fn build_response_routes(
         ))
         .layer(from_fn(middleware::body_hash_middleware));
 
-    let other_routes = Router::new()
-        .route("/responses/{response_id}", get(responses::get_response))
+    let retired_history_routes = Router::new()
+        // Keep retired response-history paths explicit so authenticated clients
+        // receive a useful migration signal instead of an ambiguous 404/405.
         .route(
             "/responses/{response_id}",
-            axum::routing::delete(responses::delete_response),
+            any(responses::response_history_gone),
         )
         .route(
             "/responses/{response_id}/cancel",
-            post(responses::cancel_response),
+            any(responses::response_history_gone),
         )
         .route(
             "/responses/{response_id}/input_items",
-            get(responses::list_input_items),
+            any(responses::response_history_gone),
         )
         .with_state(route_state)
         .layer(from_fn_with_state(
@@ -1704,7 +1688,13 @@ pub fn build_response_routes(
             middleware::auth::auth_middleware_with_workspace_context,
         ));
 
-    Router::new().merge(inference_routes).merge(other_routes)
+    Router::new()
+        .merge(inference_routes)
+        .merge(retired_history_routes)
+        // Responses can contain user-provided prompts and model output. Apply
+        // this outside the route groups so extractor, authentication, and
+        // rate-limit rejections are no-store too.
+        .layer(map_response(no_store_response))
 }
 
 /// Build explicit not-implemented handlers for recognized OpenAI-compatible
@@ -1752,57 +1742,69 @@ pub fn build_mcp_routes(
         ))
 }
 
-/// Build conversation routes with auth
+/// Build the temporary Conversation API migration surface.
+///
+/// Existing conversation data remains available through its original view
+/// routes so chat-api can export it. The existing per-conversation DELETE
+/// route remains available for account deletion; all other mutations and
+/// unsupported legacy paths stay authenticated and return 410 until the
+/// data-retention migration is complete.
 pub fn build_conversation_routes(
     conversation_service: Arc<services::ConversationService>,
     auth_state_middleware: &AuthState,
 ) -> Router {
+    build_stage_one_conversation_route_layout(
+        post(conversations::batch_get_conversations)
+            .fallback(conversations::conversation_write_disabled),
+        get(conversations::get_conversation)
+            .delete(conversations::delete_conversation)
+            .fallback(conversations::conversation_write_disabled),
+        get(conversations::list_conversation_items)
+            .fallback(conversations::conversation_write_disabled),
+        conversations::conversation_write_disabled,
+    )
+    .with_state(
+        conversation_service as Arc<dyn services::conversations::ports::ConversationServiceTrait>,
+    )
+    .layer(from_fn_with_state(
+        auth_state_middleware.clone(),
+        auth_middleware_with_api_key,
+    ))
+    // Conversation records can contain confidential prompt and completion
+    // data. Apply this outside auth so rejects are no-store as well.
+    .layer(map_response(no_store_response))
+}
+
+/// Install the exact Stage I Conversation API route layout.
+///
+/// Kept separate from service wiring so route precedence can be tested without
+/// a database; production uses this helper directly. It preserves the
+/// existing workspace-scoped DELETE route needed by account deletion, while
+/// per-route fallbacks make every other unsupported method 410.
+fn build_stage_one_conversation_route_layout<S, H, T>(
+    batch: MethodRouter<S>,
+    conversation: MethodRouter<S>,
+    items: MethodRouter<S>,
+    write_disabled: H,
+) -> Router<S>
+where
+    S: Clone + Send + Sync + 'static,
+    H: axum::handler::Handler<T, S>,
+    T: 'static,
+{
+    let descendants = Router::new()
+        .route("/", any(write_disabled.clone()))
+        .route("/batch", batch)
+        .route("/{conversation_id}", conversation)
+        .route("/{conversation_id}/items", items)
+        .route(
+            "/{conversation_id}/{*legacy_path}",
+            any(write_disabled.clone()),
+        );
+
     Router::new()
-        .route("/conversations", post(conversations::create_conversation))
-        .route(
-            "/conversations/batch",
-            post(conversations::batch_get_conversations),
-        )
-        .route(
-            "/conversations/{conversation_id}",
-            get(conversations::get_conversation),
-        )
-        .route(
-            "/conversations/{conversation_id}",
-            post(conversations::update_conversation),
-        )
-        .route(
-            "/conversations/{conversation_id}",
-            axum::routing::delete(conversations::delete_conversation),
-        )
-        .route(
-            "/conversations/{conversation_id}/pin",
-            post(conversations::pin_conversation).delete(conversations::unpin_conversation),
-        )
-        .route(
-            "/conversations/{conversation_id}/archive",
-            post(conversations::archive_conversation).delete(conversations::unarchive_conversation),
-        )
-        .route(
-            "/conversations/{conversation_id}/clone",
-            post(conversations::clone_conversation),
-        )
-        .route(
-            "/conversations/{conversation_id}/items",
-            get(conversations::list_conversation_items),
-        )
-        .route(
-            "/conversations/{conversation_id}/items",
-            post(conversations::create_conversation_items),
-        )
-        .with_state(
-            conversation_service
-                as Arc<dyn services::conversations::ports::ConversationServiceTrait>,
-        )
-        .layer(from_fn_with_state(
-            auth_state_middleware.clone(),
-            auth_middleware_with_api_key,
-        ))
+        .route("/conversations", any(write_disabled))
+        .nest("/conversations/", descendants)
 }
 
 /// Build attestation routes with auth.
@@ -1875,20 +1877,61 @@ pub fn build_workspace_routes(app_state: AppState, auth_state_middleware: &AuthS
         ))
 }
 
-/// Build file upload routes
+/// Build the temporary Files API migration surface.
+///
+/// Existing metadata and content stay available through the original GET
+/// routes so chat-api can export data. The existing per-file DELETE route
+/// remains available for account deletion; uploads and all other unsupported
+/// legacy paths remain authenticated 410 responses and never reach storage.
 pub fn build_files_routes(app_state: AppState, auth_state_middleware: &AuthState) -> Router {
-    use crate::routes::files::MAX_FILE_SIZE;
-    use crate::routes::files::*;
+    use crate::routes::files::{
+        delete_file, files_write_disabled, get_file, get_file_content, list_files,
+    };
+
+    build_stage_one_file_route_layout(
+        get(list_files).fallback(files_write_disabled),
+        get(get_file)
+            .delete(delete_file)
+            .fallback(files_write_disabled),
+        get(get_file_content).fallback(files_write_disabled),
+        files_write_disabled,
+    )
+    .with_state(app_state)
+    .layer(from_fn_with_state(
+        auth_state_middleware.clone(),
+        auth_middleware_with_api_key,
+    ))
+    // File metadata and content are confidential. Keep both the temporary
+    // view routes and their 410 responses out of shared/browser caches.
+    .layer(map_response(no_store_response))
+}
+
+/// Install the exact Stage I Files API route layout.
+///
+/// Like Conversations, this is shared by production and route-precedence
+/// tests. The original GET views and per-file DELETE receive service handlers;
+/// other methods and descendants land on the authenticated 410 router through
+/// ordinary routes that survive the outer `/v1` nest.
+fn build_stage_one_file_route_layout<S, H, T>(
+    list: MethodRouter<S>,
+    file: MethodRouter<S>,
+    content: MethodRouter<S>,
+    write_disabled: H,
+) -> Router<S>
+where
+    S: Clone + Send + Sync + 'static,
+    H: axum::handler::Handler<T, S>,
+    T: 'static,
+{
+    let descendants = Router::new()
+        .route("/", any(write_disabled.clone()))
+        .route("/{file_id}/content", content)
+        .route("/{file_id}", file)
+        .route("/{file_id}/{*legacy_path}", any(write_disabled));
+
     Router::new()
-        .route("/files", post(upload_file).get(list_files))
-        .route("/files/{file_id}", get(get_file).delete(delete_file))
-        .route("/files/{file_id}/content", get(get_file_content))
-        .layer(DefaultBodyLimit::max(MAX_FILE_SIZE))
-        .with_state(app_state)
-        .layer(from_fn_with_state(
-            auth_state_middleware.clone(),
-            auth_middleware_with_api_key,
-        ))
+        .route("/files", list)
+        .nest("/files/", descendants)
 }
 
 /// Build feature request routes for user submissions and admin aggregation.
@@ -2081,6 +2124,16 @@ async fn cache_control_on_success(
         res.headers_mut().insert(CACHE_CONTROL, value);
     }
     res
+}
+
+/// Force every response for a confidential-data route to bypass shared and
+/// browser caches. Unlike public catalog routes, even error responses may
+/// include request-specific details from validation or authentication.
+async fn no_store_response(mut response: Response) -> Response {
+    response
+        .headers_mut()
+        .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
 }
 
 // Type aliases for `cache_control_layer`'s return type. They name the
@@ -2543,6 +2596,58 @@ mod tests {
         assert!(spec.servers.is_none() || spec.servers.as_ref().unwrap().is_empty());
     }
 
+    #[test]
+    fn test_openapi_stateless_responses_request_excludes_rejected_inputs() {
+        let spec = serde_json::to_value(ApiDoc::openapi()).unwrap();
+        let request_schema = &spec["paths"]["/v1/responses"]["post"]["requestBody"]["content"]
+            ["application/json"]["schema"];
+        assert_eq!(
+            request_schema["$ref"],
+            "#/components/schemas/StatelessCreateResponseRequestSchema"
+        );
+
+        let schemas = &spec["components"]["schemas"];
+        let request = &schemas["StatelessCreateResponseRequestSchema"];
+        for rejected_field in ["conversation", "previous_response_id", "background"] {
+            assert!(
+                request["properties"].get(rejected_field).is_none(),
+                "stateless Responses schema must not advertise {rejected_field}"
+            );
+        }
+        assert_eq!(request["properties"]["store"]["default"], false);
+
+        let input_items = serde_json::to_string(&schemas["StatelessResponseInputItemSchema"])
+            .expect("input item schema should serialize");
+        assert!(
+            !input_items.contains("mcp_approval_response")
+                && !input_items.contains("mcp_list_tools"),
+            "stateless Responses schema must not advertise MCP input items"
+        );
+
+        let content_parts = serde_json::to_string(&schemas["StatelessResponseContentPartSchema"])
+            .expect("content part schema should serialize");
+        assert!(
+            !content_parts.contains("input_file"),
+            "stateless Responses schema must not advertise input_file"
+        );
+
+        let tools = serde_json::to_string(&schemas["StatelessResponseToolSchema"])
+            .expect("tool schema should serialize");
+        for rejected_tool in [
+            "web_search",
+            "web_context_search",
+            "file_search",
+            "code_interpreter",
+            "computer",
+            "mcp",
+        ] {
+            assert!(
+                !tools.contains(rejected_tool),
+                "stateless Responses schema must not advertise {rejected_tool}"
+            );
+        }
+    }
+
     fn assert_reporting_path_security(
         spec: &serde_json::Value,
         path: &str,
@@ -2616,6 +2721,73 @@ mod tests {
     }
 
     #[test]
+    fn test_openapi_omits_retired_response_history_paths() {
+        let spec = serde_json::to_value(ApiDoc::openapi()).unwrap();
+
+        for path in [
+            "/v1/responses/{response_id}",
+            "/v1/responses/{response_id}/cancel",
+            "/v1/responses/{response_id}/input_items",
+        ] {
+            assert!(
+                spec["paths"].get(path).is_none(),
+                "retired response-history path {path} must not be in OpenAPI"
+            );
+        }
+    }
+
+    #[test]
+    fn test_openapi_responses_only_advertises_client_managed_function_tools() {
+        let spec = serde_json::to_value(ApiDoc::openapi()).unwrap();
+        let request_tools_schema = &spec["components"]["schemas"]
+            ["StatelessCreateResponseRequestSchema"]["properties"]["tools"];
+        assert!(
+            serde_json::to_string(request_tools_schema)
+                .unwrap()
+                .contains("StatelessResponseToolSchema"),
+            "Responses create-request schema must reference only the client-managed tool schema"
+        );
+
+        let response_tool_schema = &spec["components"]["schemas"]["ClientManagedResponseTool"];
+        assert!(
+            response_tool_schema.is_object(),
+            "Responses OpenAPI schema must describe its supported tool type"
+        );
+
+        let serialized_tool_schema = serde_json::to_string(response_tool_schema).unwrap();
+        assert!(
+            serialized_tool_schema.contains("function"),
+            "Responses OpenAPI schema must retain custom function tools"
+        );
+        for server_executed_tool in [
+            "web_search",
+            "web_context_search",
+            "file_search",
+            "code_interpreter",
+            "computer",
+            "mcp",
+        ] {
+            assert!(
+                !serialized_tool_schema.contains(server_executed_tool),
+                "Responses OpenAPI schema must not advertise the rejected {server_executed_tool} tool"
+            );
+        }
+
+        let responses_tag = spec["tags"]
+            .as_array()
+            .and_then(|tags| tags.iter().find(|tag| tag["name"] == "Responses"))
+            .expect("Responses tag must be present in OpenAPI");
+        let description = responses_tag["description"]
+            .as_str()
+            .expect("Responses tag must document its contract");
+        assert!(description
+            .contains("successful Responses inference makes exactly one Chat Completions call"));
+        assert!(description.contains("Only custom `function` tools are supported"));
+        assert!(description.contains("image-generation/editing models are rejected"));
+        assert!(description.contains("POST /mcp"));
+    }
+
+    #[test]
     fn test_openapi_signature_requires_api_key() {
         // nearai/infra#193: /v1/signature/{chat_id} stays API-key-protected.
         let spec = serde_json::to_value(ApiDoc::openapi()).unwrap();
@@ -2630,32 +2802,6 @@ mod tests {
             serde_json::json!([{ "api_key": [] }]),
             "/v1/signature/{{chat_id}} must require api_key security"
         );
-    }
-
-    #[test]
-    fn test_openapi_conversation_action_paths_use_v1_prefix() {
-        let spec = serde_json::to_value(ApiDoc::openapi()).unwrap();
-        let paths = spec["paths"].as_object().unwrap();
-
-        // Pin/unpin and archive/unarchive share path keys with different methods.
-        for path in [
-            "/v1/conversations/{conversation_id}/archive",
-            "/v1/conversations/{conversation_id}/clone",
-            "/v1/conversations/{conversation_id}/pin",
-        ] {
-            assert!(paths.contains_key(path), "missing OpenAPI path: {path}");
-        }
-
-        for path in [
-            "/conversations/{conversation_id}/archive",
-            "/conversations/{conversation_id}/clone",
-            "/conversations/{conversation_id}/pin",
-        ] {
-            assert!(
-                !paths.contains_key(path),
-                "OpenAPI path is missing /v1 prefix: {path}"
-            );
-        }
     }
 
     #[test]
@@ -2694,6 +2840,167 @@ mod tests {
         assert!(!properties.contains_key("resultJson"));
     }
 
+    #[test]
+    fn stage_one_openapi_exposes_only_allowed_resource_deletes() {
+        let spec = serde_json::to_value(ApiDoc::openapi()).unwrap();
+        let paths = spec["paths"]
+            .as_object()
+            .expect("OpenAPI paths must be an object");
+
+        for path in ["/v1/conversations/{conversation_id}", "/v1/files/{file_id}"] {
+            let delete = paths
+                .get(path)
+                .and_then(|path_item| path_item.get("delete"));
+            assert!(
+                delete.is_some_and(serde_json::Value::is_object),
+                "OpenAPI must expose the existing DELETE route: {path}"
+            );
+            assert_eq!(
+                delete.unwrap()["security"],
+                serde_json::json!([{ "api_key": [] }]),
+                "{path} DELETE must require an API key"
+            );
+            assert!(
+                delete.unwrap()["responses"]["200"]["headers"]["Cache-Control"].is_object(),
+                "{path} DELETE must document Cache-Control: no-store"
+            );
+        }
+
+        let conversation = paths
+            .get("/v1/conversations/{conversation_id}")
+            .expect("Conversation path must be present");
+        assert!(conversation.get("post").is_none());
+
+        let files = paths.get("/v1/files").expect("Files path must be present");
+        assert!(files.get("post").is_none());
+    }
+
+    #[tokio::test]
+    async fn stage_one_data_route_layout_preserves_views_and_only_allowed_deletions() {
+        async fn view() -> StatusCode {
+            StatusCode::OK
+        }
+
+        async fn write_disabled() -> StatusCode {
+            StatusCode::GONE
+        }
+
+        async fn unrelated_route() -> StatusCode {
+            StatusCode::NOT_FOUND
+        }
+
+        // These are the production route-layout helpers. Using lightweight
+        // handlers here isolates Axum's static/parameter/catch-all matching
+        // from database state while proving the exact public layout builds.
+        let conversation_routes = build_stage_one_conversation_route_layout(
+            axum::routing::post(view).fallback(write_disabled),
+            axum::routing::get(view)
+                .delete(view)
+                .fallback(write_disabled),
+            axum::routing::get(view).fallback(write_disabled),
+            write_disabled,
+        )
+        .layer(map_response(no_store_response));
+        let file_routes = build_stage_one_file_route_layout(
+            axum::routing::get(view).fallback(write_disabled),
+            axum::routing::get(view)
+                .delete(view)
+                .fallback(write_disabled),
+            axum::routing::get(view).fallback(write_disabled),
+            write_disabled,
+        )
+        .layer(map_response(no_store_response));
+        let app = Router::new()
+            .nest(
+                "/v1",
+                Router::new().merge(conversation_routes).merge(file_routes),
+            )
+            .fallback(unrelated_route);
+
+        for (method, path) in [
+            ("POST", "/v1/conversations/batch"),
+            ("GET", "/v1/conversations/conv_example"),
+            ("DELETE", "/v1/conversations/conv_example"),
+            ("GET", "/v1/conversations/conv_example/items"),
+            ("GET", "/v1/files"),
+            ("GET", "/v1/files/file_example"),
+            ("DELETE", "/v1/files/file_example"),
+            ("GET", "/v1/files/file_example/content"),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    HttpRequest::builder()
+                        .method(method)
+                        .uri(path)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{method} {path}");
+            assert_eq!(
+                response
+                    .headers()
+                    .get(CACHE_CONTROL)
+                    .and_then(|value| value.to_str().ok()),
+                Some("no-store"),
+                "{method} {path}"
+            );
+        }
+
+        for (method, path) in [
+            ("POST", "/v1/conversations"),
+            ("GET", "/v1/conversations/"),
+            ("GET", "/v1/conversations/batch"),
+            ("DELETE", "/v1/conversations/batch"),
+            ("POST", "/v1/conversations/conv_example"),
+            ("POST", "/v1/conversations/conv_example/items"),
+            ("POST", "/v1/conversations/conv_example/pin"),
+            ("DELETE", "/v1/conversations/conv_example/pin"),
+            ("DELETE", "/v1/conversations/conv_example/unknown"),
+            ("PATCH", "/v1/conversations/conv_example/unknown"),
+            ("POST", "/v1/files"),
+            ("DELETE", "/v1/files"),
+            ("GET", "/v1/files/"),
+            ("DELETE", "/v1/files/file_example/content"),
+            ("PUT", "/v1/files/legacy/nested/path"),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    HttpRequest::builder()
+                        .method(method)
+                        .uri(path)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::GONE, "{method} {path}");
+            assert_eq!(
+                response
+                    .headers()
+                    .get(CACHE_CONTROL)
+                    .and_then(|value| value.to_str().ok()),
+                Some("no-store"),
+                "{method} {path}"
+            );
+        }
+
+        let unrelated = app
+            .oneshot(
+                HttpRequest::builder()
+                    .method("GET")
+                    .uri("/unrelated")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unrelated.status(), StatusCode::NOT_FOUND);
+        assert!(unrelated.headers().get(CACHE_CONTROL).is_none());
+    }
     /// Example of how to set up the application for E2E testing
     #[tokio::test]
     #[ignore] // Remove ignore to run with a real database and Patroni cluster
@@ -2990,6 +3297,47 @@ mod tests {
     use axum::response::IntoResponse;
     use axum::routing::get;
     use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn no_store_response_layer_covers_extractor_rejections() {
+        #[derive(serde::Deserialize)]
+        struct RequestPayload {
+            #[allow(dead_code)]
+            model: String,
+        }
+
+        async fn handler(
+            crate::routes::extractors::OpenAiJson(_): crate::routes::extractors::OpenAiJson<
+                RequestPayload,
+            >,
+        ) -> StatusCode {
+            StatusCode::OK
+        }
+
+        let app = Router::new()
+            .route("/responses", axum::routing::post(handler))
+            .layer(map_response(no_store_response));
+        let response = app
+            .oneshot(
+                HttpRequest::builder()
+                    .method("POST")
+                    .uri("/responses")
+                    .header("content-type", "application/json")
+                    .body(Body::from("{not json"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            response
+                .headers()
+                .get(CACHE_CONTROL)
+                .and_then(|value| value.to_str().ok()),
+            Some("no-store"),
+        );
+    }
 
     fn cache_test_app() -> Router {
         async fn ok_handler() -> impl IntoResponse {

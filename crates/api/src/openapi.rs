@@ -7,7 +7,7 @@ use utoipa::{Modify, OpenApi};
 #[openapi(
     info(
         title = "NEAR AI Cloud API",
-        description = "A comprehensive cloud API for AI model inference, conversation management, and organization administration.\n\n## Authentication\n\nThis API supports four authentication methods:\n\n1. **Access Token (JWT)**: Use `Authorization: Bearer <jwt_token>` with a short-lived JWT access token for most API endpoints. Obtain this by calling POST /users/me/access_tokens with a refresh token.\n2. **Refresh Token**: Use `Authorization: Bearer <refresh_token>` (prefix: `rt_`) only with POST /users/me/access_tokens to create new JWT access tokens. Obtained from OAuth login.\n3. **API Key (Programmatic Access)**: Use `Authorization: Bearer sk-<api_key>` with an API key (prefix: `sk-`).\n4. **Reporting Token (Read-only Usage Reporting)**: Use `Authorization: Bearer rpt-<reporting_token>` only with usage reporting endpoints.\n\nClick the **Authorize** button above to configure authentication.",
+        description = "A comprehensive cloud API for AI model inference, temporary confidential-data migration views, and organization administration.\n\n## Authentication\n\nThis API supports four authentication methods:\n\n1. **Access Token (JWT)**: Use `Authorization: Bearer <jwt_token>` with a short-lived JWT access token for most API endpoints. Obtain this by calling POST /users/me/access_tokens with a refresh token.\n2. **Refresh Token**: Use `Authorization: Bearer <refresh_token>` (prefix: `rt_`) only with POST /users/me/access_tokens to create new JWT access tokens. Obtained from OAuth login.\n3. **API Key (Programmatic Access)**: Use `Authorization: Bearer sk-<api_key>` with an API key (prefix: `sk-`).\n4. **Reporting Token (Read-only Usage Reporting)**: Use `Authorization: Bearer rpt-<reporting_token>` only with usage reporting endpoints.\n\nClick the **Authorize** button above to configure authentication.",
         version = "1.0.0",
         contact(
             name = "NEAR AI Team",
@@ -25,12 +25,12 @@ use utoipa::{Modify, OpenApi};
         (name = "Score", description = "Text similarity scoring endpoints"),
         (name = "Privacy", description = "Privacy classification (PII span detection) endpoints"),
         (name = "Models", description = "Public model catalog and information"),
-        (name = "Conversations", description = "Conversation management"),
-        (name = "Responses", description = "Response handling and streaming"),
+        (name = "Conversations", description = "Temporary authenticated, workspace-scoped migration access for export and account deletion. Only `POST /v1/conversations/batch`, `GET /v1/conversations/{conversation_id}`, `GET /v1/conversations/{conversation_id}/items`, and `DELETE /v1/conversations/{conversation_id}` are available. Conversation creation and every other mutation return `410 Gone`; this surface will be removed after data migration. Migration responses use `Cache-Control: no-store`."),
+        (name = "Files", description = "Temporary authenticated, workspace-scoped migration access for export and account deletion. Only `GET /v1/files`, `GET /v1/files/{file_id}`, `GET /v1/files/{file_id}/content`, and `DELETE /v1/files/{file_id}` are available. Upload and every other mutation return `410 Gone`; this surface will be removed after data migration. Migration responses use `Cache-Control: no-store`."),
+        (name = "Responses", description = "Stateless response inference (`store: false` only). Raw request/response content, response items, and history are not persisted. Clients must include any prior context in each request. Every successful Responses inference makes exactly one Chat Completions call. Only custom `function` tools are supported. They are client-managed: Cloud returns `function_call` items but never executes them; a later `store: false` request replays the individual call (the raw item from output is accepted) with its matching `function_call_output`, alongside caller-managed message history and the same function tool definitions. The minimal replay path also accepts assistant `message` text parts of type `output_text`, but not reasoning or arbitrary full `response.output` items. Server-executed tools (`web_search`, `web_context_search`, `file_search`, `code_interpreter`, `computer`, and remote `mcp`) and image-generation/editing models are rejected. The separate `POST /mcp` endpoint continues to expose its `web_search` tool independently of Responses; use `/v1/images/*` for image generation/editing. Existing completed-response gateway attestation is preserved best-effort: when the signature write succeeds, `GET /v1/signature/resp_*` retrieves signatures over SHA-256 request/response digests, never raw content. Interrupted streams create no `resp_*` attestation record or legacy disconnect fallback. Responses rejects conversation linkage, response history, and file input; the separate temporary Conversation and File migration endpoints are not part of Responses inference."),
         (name = "Organizations", description = "Organization management"),
         (name = "Organization Members", description = "Organization member and invitation management"),
         (name = "Workspaces", description = "Workspace and API key management"),
-        (name = "Files", description = "File upload and management"),
         (name = "Users", description = "User profile and token management"),
         (name = "Invitations", description = "Token-based invitation handling"),
         (name = "Usage", description = "Usage tracking and billing information"),
@@ -58,24 +58,18 @@ use utoipa::{Modify, OpenApi};
         // Model endpoints (public model catalog)
         crate::routes::models::list_models,
         crate::routes::models::get_model_by_name,
-        // Conversation endpoints
-        crate::routes::conversations::create_conversation,
+        // Temporary Conversation migration routes
+        crate::routes::conversations::batch_get_conversations,
         crate::routes::conversations::get_conversation,
-        crate::routes::conversations::update_conversation,
-        crate::routes::conversations::delete_conversation,
-        crate::routes::conversations::pin_conversation,
-        crate::routes::conversations::unpin_conversation,
-        crate::routes::conversations::archive_conversation,
-        crate::routes::conversations::unarchive_conversation,
-        crate::routes::conversations::clone_conversation,
         crate::routes::conversations::list_conversation_items,
-        crate::routes::conversations::create_conversation_items,
+        crate::routes::conversations::delete_conversation,
+        // Temporary File migration routes
+        crate::routes::files::list_files,
+        crate::routes::files::get_file,
+        crate::routes::files::get_file_content,
+        crate::routes::files::delete_file,
         // Response endpoints
         crate::routes::responses::create_response,
-        crate::routes::responses::get_response,
-        crate::routes::responses::delete_response,
-        crate::routes::responses::cancel_response,
-        crate::routes::responses::list_input_items,
         // Organization endpoints
         crate::routes::organizations::list_organizations,
         crate::routes::organizations::create_organization,
@@ -102,12 +96,6 @@ use utoipa::{Modify, OpenApi};
         crate::routes::workspaces::revoke_workspace_api_key,
         crate::routes::workspaces::update_api_key_spend_limit,
         crate::routes::workspaces::update_workspace_api_key,
-        // Files endpoints
-        crate::routes::files::upload_file,
-        crate::routes::files::list_files,
-        crate::routes::files::get_file,
-        crate::routes::files::delete_file,
-        crate::routes::files::get_file_content,
         // Users endpoints
         crate::routes::users::get_current_user,
         crate::routes::users::get_user_status,
@@ -250,11 +238,13 @@ use utoipa::{Modify, OpenApi};
             AdminUserResponse,
             crate::routes::users::UpdateUserProfileRequest,
             crate::routes::users::UserStatusResponse,
-            // Conversation models
-            CreateConversationRequest, ConversationObject,
-            UpdateConversationRequest, ConversationDeleteResult, ConversationItemList,
+            // Temporary Conversation migration models
+            BatchConversationsRequest, ConversationBatchResponse, ConversationObject,
+            ConversationItemList, ConversationDeleteResult,
+            // Temporary File migration models
+            FileUploadResponse, FileListResponse, FileDeleteResponse,
             // Response models
-            CreateResponseRequest, ResponseObject,
+            crate::routes::responses::StatelessCreateResponseRequestSchema, ResponseObject,
             // Attestation models
             crate::routes::attestation::SignatureResponse,
             crate::routes::attestation::AttestationResponse,
@@ -346,8 +336,6 @@ use utoipa::{Modify, OpenApi};
             crate::routes::billing::BillingCostsRequest,
             crate::routes::billing::BillingCostsResponse,
             crate::routes::billing::RequestCost,
-            // File models
-            FileUploadResponse, ExpiresAfter, FileListResponse, FileDeleteResponse,
             // Platform Stats analytics models
             services::admin::PlatformMetrics,
             services::admin::PlatformProviderUsage,

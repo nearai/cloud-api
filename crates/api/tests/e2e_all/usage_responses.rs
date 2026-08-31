@@ -6,23 +6,6 @@ use crate::common::*;
 use serde_json::json;
 use services::usage::compute_token_cost;
 
-/// Helper: create a simple conversation for the given API key.
-async fn create_conversation(
-    server: &axum_test::TestServer,
-    api_key: String,
-) -> api::models::ConversationObject {
-    let response = server
-        .post("/v1/conversations")
-        .add_header("Authorization", format!("Bearer {api_key}"))
-        .json(&json!({
-            "name": "Test Conversation (usage)",
-            "description": "Conversation for responses usage tests"
-        }))
-        .await;
-    assert_eq!(response.status_code(), 201);
-    response.json::<api::models::ConversationObject>()
-}
-
 /// Non-streaming Responses API: set mock cache_tokens based on provider token estimate,
 /// then verify:
 /// - ResponseObject.usage.input_tokens_details.cached_tokens equals that cache_tokens
@@ -49,18 +32,15 @@ async fn test_responses_non_stream_records_cache_usage_in_history() {
         )
         .await;
 
-    // Create a conversation and then a non-streaming response
-    let conversation = create_conversation(&server, api_key.clone()).await;
-
     let resp = server
         .post("/v1/responses")
         .add_header("Authorization", format!("Bearer {api_key}"))
         .json(&json!({
-            "conversation": { "id": conversation.id },
             "input": message,
             "temperature": 0.7,
             "max_output_tokens": 64,
             "stream": false,
+            "store": false,
             "model": E2E_QWEN_MODEL_NAME
         }))
         .await;
@@ -161,17 +141,15 @@ async fn test_responses_stream_records_cache_usage_in_history() {
         )
         .await;
 
-    let conversation = create_conversation(&server, api_key.clone()).await;
-
     let resp = server
         .post("/v1/responses")
         .add_header("Authorization", format!("Bearer {api_key}"))
         .json(&json!({
-            "conversation": { "id": conversation.id },
             "input": message,
             "temperature": 0.7,
             "max_output_tokens": 64,
             "stream": true,
+            "store": false,
             "model": E2E_QWEN_MODEL_NAME
         }))
         .await;
@@ -183,7 +161,7 @@ async fn test_responses_stream_records_cache_usage_in_history() {
         resp.text()
     );
 
-    // Drain SSE stream: parse as Value then "response" -> api::models::ResponseObject (same as e2e_conversations create_response_stream)
+    // Drain SSE stream and parse the completed response payload.
     let sse_text = resp.text();
     let mut completed_response: Option<api::models::ResponseObject> = None;
 

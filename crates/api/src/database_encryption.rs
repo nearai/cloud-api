@@ -163,6 +163,26 @@ const APPROVED: &[ApprovedGroup] = &[
     ApprovedGroup { table: "workspaces", columns: &["name", "description", "settings"], reason: "Workspace profile and administrator-managed settings" },
 ];
 
+#[derive(Clone, Copy)]
+struct ExcludedTable {
+    table: &'static str,
+    reason: &'static str,
+}
+
+const EXCLUDED_TABLES: &[ExcludedTable] = &[ExcludedTable {
+    table: "postgres_log",
+    reason: "PostgreSQL-managed operational log projection governed by infrastructure log-retention controls",
+}];
+
+fn excluded_table_reason(table: &str) -> Option<&'static str> {
+    // Keep exclusions exact: a prefix such as `postgres_%` could hide a future
+    // application table and prevent the classification gate from detecting it.
+    EXCLUDED_TABLES
+        .iter()
+        .find(|excluded| excluded.table == table)
+        .map(|excluded| excluded.reason)
+}
+
 fn approved_reason(table: &str, column: &str) -> Option<&'static str> {
     APPROVED
         .iter()
@@ -431,6 +451,9 @@ async fn classify_schema(
     for row in rows {
         let table: String = row.get(0);
         let column: String = row.get(1);
+        if excluded_table_reason(&table).is_some() {
+            continue;
+        }
         if is_encrypted_field(&table, &column) {
             continue;
         }
@@ -1121,6 +1144,18 @@ mod tests {
         assert!(approved
             .iter()
             .all(|(table, column)| !is_encrypted_field(table, column)));
+
+        assert!(EXCLUDED_TABLES
+            .iter()
+            .all(|excluded| !excluded.reason.trim().is_empty()));
+    }
+
+    #[test]
+    fn schema_exclusion_is_exactly_scoped_to_postgres_log() {
+        assert!(excluded_table_reason("postgres_log").is_some());
+        assert!(excluded_table_reason("postgres_logs").is_none());
+        assert!(excluded_table_reason("postgres_log_archive").is_none());
+        assert!(excluded_table_reason("postgres_user_tokens").is_none());
     }
 
     #[test]

@@ -180,7 +180,7 @@ fn record_backend_key_divergence(
             let algo_tag = format!("algo:{algo}");
             metrics.record_count(
                 crate::metrics::consts::METRIC_BACKEND_KEY_DIVERGENCE,
-                distinct_keys as i64,
+                1,
                 &[&model_tag, &algo_tag],
             );
         }
@@ -285,8 +285,8 @@ struct DiscoveryOutcome {
     /// for the same model and algorithm.
     backend_probes: Vec<BackendProbe>,
     /// Per-call verified TLS fingerprints observed in this pass, in launch
-    /// order (`futures::future::join_all` preserves input order, not
-    /// completion order). One entry per call, not per backend, so under
+    /// order (the bounded probe collector preserves input order, not completion
+    /// order). One entry per call, not per backend, so under
     /// complete coverage `observed_fingerprints.len() == backend_count *
     /// ALGOS.len()`. Every backend is called once per algo, so fingerprints
     /// repeat per index — the set of *distinct* fingerprints is
@@ -332,10 +332,27 @@ type TeeIdentity = (String, String);
 
 const ALGOS: [&str; 2] = ["ecdsa", "ed25519"];
 
+/// Maximum attestation probes in flight per model-discovery pass.
+const PROBE_CONCURRENCY: usize = 8;
+
 fn probe_plan(backend_count: usize) -> Vec<(usize, &'static str)> {
     (0..backend_count)
         .flat_map(|backend_index| ALGOS.into_iter().map(move |algo| (backend_index, algo)))
         .collect()
+}
+
+async fn collect_probe_results<F>(probe_futures: Vec<F>) -> Vec<F::Output>
+where
+    F: std::future::Future,
+{
+    use futures::stream::{self, StreamExt};
+
+    // `buffered` bounds fan-out while retaining launch order; `buffer_unordered`
+    // would corrupt observed-fingerprint, failure-reason, and pin-update accounting.
+    stream::iter(probe_futures)
+        .buffered(PROBE_CONCURRENCY)
+        .collect()
+        .await
 }
 
 impl DiscoveryOutcome {
@@ -1767,7 +1784,7 @@ impl InferenceProviderPool {
             })
             .collect::<Vec<_>>();
 
-        let results = futures::future::join_all(futures).await;
+        let results = collect_probe_results(futures).await;
 
         let mut successful_calls = 0usize;
         let mut failed_calls = 0usize;
@@ -5633,6 +5650,43 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn discovery_probe_collection_caps_concurrency_and_preserves_order() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        // Given: probe plans below, at, and above the per-model concurrency cap.
+        for backend_count in [1, 2, 4, 8] {
+            let expected = probe_plan(backend_count);
+            let in_flight = Arc::new(AtomicUsize::new(0));
+            let peak = Arc::new(AtomicUsize::new(0));
+            let futures = expected
+                .iter()
+                .copied()
+                .map(|pair| {
+                    let in_flight = Arc::clone(&in_flight);
+                    let peak = Arc::clone(&peak);
+                    async move {
+                        let active = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                        peak.fetch_max(active, Ordering::SeqCst);
+                        tokio::task::yield_now().await;
+                        in_flight.fetch_sub(1, Ordering::SeqCst);
+                        pair
+                    }
+                })
+                .collect();
+
+            // When: discovery collects the plan through its production seam.
+            let actual = collect_probe_results(futures).await;
+
+            // Then: every result stays in launch order and no more than eight run at once.
+            assert_eq!(actual, expected);
+            assert_eq!(
+                peak.load(Ordering::SeqCst),
+                actual.len().min(PROBE_CONCURRENCY)
+            );
+        }
+    }
+
     fn backend_probe(
         index: usize,
         algo: &str,
@@ -5666,9 +5720,9 @@ mod tests {
     }
 
     #[test]
-    fn homogeneous_interleaved_algos_do_not_restrict_the_fleet() {
-        // Given: discovery's real four-backend call plan samples only one algo
-        // per index, while every response carries the same TEE identity.
+    fn partial_probe_coverage_on_a_homogeneous_fleet_does_not_restrict() {
+        // Given: some probes failed, leaving only one observed algo per index,
+        // while every successful response carries the same TEE identity.
         let identity = Some(("root-a", "app-a"));
         let outcome = discovery_outcome_with_probes(
             4,
@@ -5799,7 +5853,7 @@ mod tests {
     }
 
     #[test]
-    fn backend_key_divergence_records_count_as_value_without_count_tag() {
+    fn backend_key_divergence_emits_one_event_per_divergent_algo() {
         use crate::metrics::capturing::{CapturingMetricsService, MetricValue};
 
         // Given: one algorithm has two distinct KMS-root-derived keys.
@@ -5815,13 +5869,24 @@ mod tests {
         // When: divergence telemetry is recorded.
         record_backend_key_divergence(Some(&metrics), "test/model", &outcome);
 
-        // Then: the key count is the value and tags stay low-cardinality.
+        // Then: one event is emitted and the distinct-key level stays log-only.
         let recorded = metrics.get_metrics();
         assert_eq!(recorded.len(), 1);
-        assert!(matches!(recorded[0].value, MetricValue::Count(2)));
+        assert!(matches!(recorded[0].value, MetricValue::Count(1)));
+        assert!(
+            !matches!(recorded[0].value, MetricValue::Count(2)),
+            "distinct_keys must not be encoded as the counter value"
+        );
         assert_eq!(
             recorded[0].tags,
             vec!["model:test/model".to_string(), "algo:ecdsa".to_string()]
+        );
+        assert!(
+            recorded[0]
+                .tags
+                .iter()
+                .all(|tag| !tag.starts_with("distinct_keys:")),
+            "distinct_keys must not be encoded as a metric tag"
         );
     }
 

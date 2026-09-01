@@ -4123,6 +4123,38 @@ mod tests {
         provider
     }
 
+    fn verifier_rotation_provider(count: usize) -> Provider {
+        use crate::InferenceProvider;
+        use std::sync::Arc;
+
+        struct NoopVerifier;
+
+        #[async_trait::async_trait]
+        impl crate::BackendVerifier for NoopVerifier {
+            async fn create_verified_client(
+                &self,
+                _base_url: &str,
+            ) -> Result<reqwest::Client, String> {
+                Ok(reqwest::Client::new())
+            }
+        }
+
+        let provider = Provider::new_with_verifier(
+            Config {
+                base_url: "https://glm-5-1.completions.near.ai".to_string(),
+                api_key: None,
+                completion_timeout_seconds: 30,
+                control_timeout_seconds: 30,
+            },
+            Arc::new(std::sync::RwLock::new(
+                crate::spki_verifier::FingerprintState::Bootstrap,
+            )),
+            Arc::new(NoopVerifier),
+        );
+        provider.set_backend_count(count);
+        provider
+    }
+
     fn user_msg(content: &str) -> crate::ChatMessage {
         role_msg(crate::MessageRole::User, content)
     }
@@ -4866,6 +4898,63 @@ mod tests {
                 .all(|s| s.samples == 0 && s.ttft_ewma_ms == 0.0),
             "count change must still reset all backend stats in legacy mode"
         );
+    }
+
+    #[test]
+    fn set_backend_keys_same_map_preserves_index_state() {
+        // Given: a verifier-backed fleet with a published key map and live index state.
+        let provider = verifier_rotation_provider(4);
+        let map = HashMap::from([("key-a".to_string(), vec![0, 2])]);
+        provider.fleet.set_backend_keys(map.clone());
+        *provider.fleet.index_clients[0].lock().unwrap() = Some(reqwest::Client::new());
+        provider.fleet.record_ttft(0, 123.0);
+
+        // When: discovery publishes equal map content again.
+        provider.fleet.set_backend_keys(map);
+
+        // Then: neither the pinned client nor its per-index measurements are cleared.
+        assert!(provider.fleet.index_clients[0].lock().unwrap().is_some());
+        let stats = provider.fleet.backend_stats.lock().unwrap();
+        assert_eq!(stats[0].samples, 1);
+        assert_eq!(stats[0].ttft_ewma_ms, 123.0);
+    }
+
+    #[test]
+    fn set_backend_keys_changed_map_clears_verifier_clients_and_resets_stats() {
+        // Given: a verifier-backed fleet with index state tied to the current key map.
+        let provider = verifier_rotation_provider(4);
+        provider
+            .fleet
+            .set_backend_keys(HashMap::from([("key-a".to_string(), vec![0, 2])]));
+        *provider.fleet.index_clients[0].lock().unwrap() = Some(reqwest::Client::new());
+        provider.fleet.record_ttft(0, 123.0);
+
+        // When: the key map changes while backend count stays fixed.
+        provider
+            .fleet
+            .set_backend_keys(HashMap::from([("key-b".to_string(), vec![1, 3])]));
+
+        // Then: stale pinned clients and all index-bound measurements are cleared.
+        assert!(provider.fleet.index_clients[0].lock().unwrap().is_none());
+        let stats = provider.fleet.backend_stats.lock().unwrap();
+        assert!(stats
+            .iter()
+            .all(|stat| stat.samples == 0 && stat.ttft_ewma_ms == 0.0));
+    }
+
+    #[test]
+    fn set_backend_keys_empty_over_empty_preserves_index_stats() {
+        // Given: a homogeneous fleet with the default empty key map and live stats.
+        let provider = rotation_provider(4);
+        provider.fleet.record_ttft(0, 123.0);
+
+        // When: discovery publishes the same empty map.
+        provider.fleet.set_backend_keys(HashMap::new());
+
+        // Then: the common homogeneous update is a no-op.
+        let stats = provider.fleet.backend_stats.lock().unwrap();
+        assert_eq!(stats[0].samples, 1);
+        assert_eq!(stats[0].ttft_ewma_ms, 123.0);
     }
 
     #[test]

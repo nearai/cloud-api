@@ -573,7 +573,27 @@ impl Fleet {
     }
 
     pub(super) fn set_backend_keys(&self, map: HashMap<String, Vec<usize>>) {
-        *self.backend_keys.write().unwrap_or_else(|e| e.into_inner()) = map;
+        let mut backend_keys = self.backend_keys.write().unwrap_or_else(|e| e.into_inner());
+        if *backend_keys == map {
+            return;
+        }
+
+        // Only clear clients in verifier mode: there, a `None` slot is
+        // lazily re-verified on next use. In legacy/test mode (no verifier)
+        // the slots are eagerly pre-created and there is nothing to re-create
+        // them — clearing would wedge the provider with "no backend verifier
+        // configured". Those legacy clients aren't backend-pinned by
+        // attestation anyway, so leaving them is correct.
+        if self.backend_verifier.is_some() {
+            for slot in &self.index_clients {
+                *lock(slot) = None;
+            }
+        }
+        let mut stats = lock(&self.backend_stats);
+        for stat in stats.iter_mut() {
+            *stat = BackendStat::default();
+        }
+        *backend_keys = map;
     }
 
     pub(super) fn should_warn_unknown_key(&self, now_ms: u64) -> bool {

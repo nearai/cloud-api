@@ -2,11 +2,169 @@
 
 use crate::common::*;
 
+use bytes::Bytes;
 use inference_providers::StreamChunk;
 
 // ============================================
 // Streaming Signature Verification Tests
 // ============================================
+
+#[tokio::test]
+async fn test_legacy_completion_gateway_signature_hashes_public_json() {
+    let server = setup_test_server().await;
+    setup_qwen_model(&server).await;
+    let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
+    let api_key = get_api_key_for_org(&server, org.id).await;
+
+    let request_body = serde_json::json!({
+        "model": E2E_QWEN_MODEL_NAME,
+        "prompt": "Respond with only two words.",
+        "max_tokens": 16
+    });
+    let request_json = serde_json::to_string(&request_body).expect("request should serialize");
+    let response = server
+        .post("/v1/completions")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .content_type("application/json")
+        .bytes(Bytes::from(request_json.clone()))
+        .await;
+    assert_eq!(response.status_code(), 200, "{}", response.text());
+
+    let response_text = response.text();
+    let completion: serde_json::Value =
+        serde_json::from_str(&response_text).expect("legacy response should be JSON");
+    let chat_id = completion["id"]
+        .as_str()
+        .expect("legacy response should include an id");
+
+    let signature_response = server
+        .get(format!("/v1/signature/{chat_id}?signing_algo=ecdsa").as_str())
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .await;
+    assert_eq!(
+        signature_response.status_code(),
+        200,
+        "gateway signature should be available: {}",
+        signature_response.text()
+    );
+    let signature = signature_response.json::<serde_json::Value>();
+    assert_eq!(signature["signature_kind"], "gateway");
+    assert_eq!(
+        signature["text"],
+        format!(
+            "{}:{}",
+            compute_sha256(&request_json),
+            compute_sha256(&response_text)
+        )
+    );
+}
+
+#[tokio::test]
+async fn test_legacy_stream_gateway_signature_is_ready_at_done() {
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
+
+    let (server, router) = setup_test_server_and_router().await;
+    setup_qwen_model(&server).await;
+    let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
+    let api_key = get_api_key_for_org(&server, org.id).await;
+
+    let request_body = serde_json::json!({
+        "model": E2E_QWEN_MODEL_NAME,
+        "prompt": "Respond with only two words.",
+        "max_tokens": 16,
+        "stream": true
+    });
+    let request_json = serde_json::to_string(&request_body).expect("request should serialize");
+    let request = axum::http::Request::builder()
+        .method("POST")
+        .uri("/v1/completions")
+        .header("Authorization", format!("Bearer {api_key}"))
+        .header("Content-Type", "application/json")
+        .body(axum::body::Body::from(request_json.clone()))
+        .expect("request should build");
+    let response = router
+        .clone()
+        .oneshot(request)
+        .await
+        .expect("router should serve the streaming request");
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+
+    let mut body = response.into_body();
+    let mut received = Vec::new();
+    let mut saw_done = false;
+    while let Some(frame) = body.frame().await {
+        let frame = frame.expect("stream frame should not error");
+        let Some(data) = frame.data_ref() else {
+            continue;
+        };
+        received.extend_from_slice(data);
+        if String::from_utf8_lossy(&received).contains("data: [DONE]") {
+            saw_done = true;
+            break;
+        }
+    }
+    let response_text = String::from_utf8(received).expect("SSE body should be UTF-8");
+    assert!(
+        saw_done,
+        "legacy stream should end with [DONE]: {response_text}"
+    );
+
+    let chat_id = response_text
+        .lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .filter(|data| data.trim() != "[DONE]")
+        .find_map(|data| serde_json::from_str::<serde_json::Value>(data).ok())
+        .and_then(|chunk| chunk["id"].as_str().map(ToOwned::to_owned))
+        .expect("legacy stream should include an id");
+
+    let signature_request = axum::http::Request::builder()
+        .method("GET")
+        .uri(format!("/v1/signature/{chat_id}?signing_algo=ecdsa"))
+        .header("Authorization", format!("Bearer {api_key}"))
+        .body(axum::body::Body::empty())
+        .expect("signature request should build");
+    let signature_response = router
+        .clone()
+        .oneshot(signature_request)
+        .await
+        .expect("router should serve signature request");
+    let signature_status = signature_response.status();
+    let signature_bytes = signature_response
+        .into_body()
+        .collect()
+        .await
+        .expect("signature body should collect")
+        .to_bytes();
+    assert_eq!(
+        signature_status,
+        axum::http::StatusCode::OK,
+        "gateway signature must be available the instant [DONE] is decoded: {}",
+        String::from_utf8_lossy(&signature_bytes)
+    );
+    let signature: serde_json::Value =
+        serde_json::from_slice(&signature_bytes).expect("signature response should be JSON");
+    assert_eq!(signature["signature_kind"], "gateway");
+    assert_eq!(
+        signature["text"],
+        format!(
+            "{}:{}",
+            compute_sha256(&request_json),
+            compute_sha256(&response_text)
+        )
+    );
+
+    while let Some(frame) = body.frame().await {
+        let frame = frame.expect("trailing frame should not error");
+        if let Some(data) = frame.data_ref() {
+            assert!(
+                data.is_empty(),
+                "no bytes may follow [DONE]: {:?}",
+                String::from_utf8_lossy(data)
+            );
+        }
+    }
+}
 
 #[tokio::test]
 async fn test_streaming_chat_completion_signature_verification() {

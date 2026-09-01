@@ -403,7 +403,13 @@ impl DiscoveryOutcome {
     /// Pubkey to backend indices that can derive it. An empty map is the
     /// explicit no-restriction signal for a homogeneous fleet.
     fn key_index_map(&self) -> HashMap<String, Vec<usize>> {
-        if self.distinct_identities().len() <= 1 {
+        // Restrict only when some algo actually returned more than one distinct
+        // key. That is the same condition `record_backend_key_divergence` alerts
+        // on, so detection and enforcement cannot disagree. Gating on distinct
+        // TEE identities instead would miss a divergent key whose probe had no
+        // parseable identity, leaving that client unrestricted and landing its
+        // ciphertext on a backend that cannot decrypt it.
+        if self.divergent_algos().is_empty() {
             return HashMap::new();
         }
 
@@ -443,24 +449,28 @@ impl DiscoveryOutcome {
 
             let indices = groups.entry(normalized_pubkey).or_default();
             for index in 0..self.backend_count {
-                let index_identity = identities_by_index.get(&index).copied().flatten();
-                if index_identity.is_none() {
-                    indices.push(index);
-                    continue;
-                }
-
                 let same_algo: Vec<&BackendProbe> = self
                     .backend_probes
                     .iter()
                     .filter(|candidate| candidate.index == index && candidate.algo == probe.algo)
                     .collect();
-                let include = if same_algo.is_empty() {
-                    key_has_unknown_identity
-                        || index_identity.is_some_and(|identity| key_identities.contains(identity))
-                } else {
+                let include = if !same_algo.is_empty() {
+                    // We probed this index for this algo, so we know what it serves.
+                    // A direct observation always outranks identity inference: an index
+                    // observed serving a different key must be excluded even when its
+                    // identity did not parse.
                     same_algo
                         .iter()
                         .any(|candidate| candidate.pubkey.eq_ignore_ascii_case(&probe.pubkey))
+                } else {
+                    // No probe of this algo at this index — fall back to TEE identity,
+                    // failing open when identity is unknown on either side.
+                    match identities_by_index.get(&index).copied().flatten() {
+                        None => true,
+                        Some(identity) => {
+                            key_has_unknown_identity || key_identities.contains(identity)
+                        }
+                    }
                 };
                 if include {
                     indices.push(index);
@@ -5678,6 +5688,49 @@ mod tests {
         assert_eq!(key_index_map, HashMap::new());
         assert!(!key_index_map.contains_key("key-a"));
         assert!(outcome.divergent_algos().is_empty());
+    }
+
+    #[test]
+    fn divergent_keys_restrict_when_one_identity_is_unknown() {
+        // Given: one ecdsa probe has a parsed identity while the other reports
+        // a distinct key but no parseable identity.
+        let outcome = discovery_outcome_with_probes(
+            2,
+            vec![
+                backend_probe(0, "ecdsa", "key-a", Some(("root-1", "app"))),
+                backend_probe(1, "ecdsa", "key-b", None),
+            ],
+        );
+
+        // When.
+        let key_index_map = outcome.key_index_map();
+
+        // Then: key divergence activates affinity even though identity parsing
+        // did not succeed for every probe.
+        assert!(!key_index_map.is_empty());
+        assert_eq!(key_index_map.get("key-a"), Some(&vec![0]));
+        assert_eq!(key_index_map.get("key-b"), Some(&vec![1]));
+    }
+
+    #[test]
+    fn homogeneous_keys_with_unknown_identities_do_not_restrict_the_fleet() {
+        // Given: some probes have no parseable identity, but each algorithm
+        // still reports only one distinct key.
+        let outcome = discovery_outcome_with_probes(
+            3,
+            vec![
+                backend_probe(0, "ecdsa", "key-a", Some(("root-1", "app"))),
+                backend_probe(1, "ecdsa", "key-a", None),
+                backend_probe(2, "ed25519", "key-b", None),
+            ],
+        );
+
+        // When.
+        let key_index_map = outcome.key_index_map();
+
+        // Then: unknown identity alone never enables affinity restrictions.
+        assert!(outcome.divergent_algos().is_empty());
+        assert!(key_index_map.is_empty());
     }
 
     #[test]

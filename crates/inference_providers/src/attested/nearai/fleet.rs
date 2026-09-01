@@ -21,8 +21,9 @@ use reqwest::Client;
 use sha2::{Digest, Sha256};
 use std::cmp::Reverse;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, RwLock};
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::Semaphore;
 
 /// EMA smoothing for per-backend TTFT: fast warmup then stable.
@@ -40,6 +41,8 @@ const TTFT_SLOW_FLOOR_MS: f64 = 500.0;
 /// prefix from monopolizing a replica. The counter is process-local and tracks
 /// only live requests; it never stores message content.
 const PREFIX_AFFINITY_BURST: u32 = 4;
+/// Minimum interval between warnings for a stale or unknown pinned key.
+const UNKNOWN_KEY_WARN_INTERVAL_MS: u64 = 60_000;
 
 #[derive(Default, Clone, Copy)]
 pub(super) struct BackendStat {
@@ -165,6 +168,9 @@ pub(super) struct Fleet {
     /// last discovery cycle. Empty means no restriction. A backend-count
     /// change clears this because the index-to-backend binding is then stale.
     backend_keys: Arc<RwLock<HashMap<String, Vec<usize>>>>,
+    /// Epoch-ms of the last `UnknownKey` warning, so a client stuck on a stale
+    /// attestation cannot flood the log from the request hot path.
+    last_unknown_key_warn_ms: AtomicU64,
     /// Provider config (base_url, api_key, timeouts).
     pub(super) config: Config,
     /// General-purpose client for non-completion requests (attestation, models).
@@ -208,6 +214,7 @@ impl Fleet {
             ])),
             prefix_loads: Arc::new(Mutex::new(HashMap::new())),
             backend_keys: Arc::new(RwLock::new(HashMap::new())),
+            last_unknown_key_warn_ms: AtomicU64::new(0),
             config,
             client,
             fallback_client,
@@ -276,15 +283,25 @@ impl Fleet {
         }
         let key_group = self.resolve_key_group(pinned_pub_key, count);
         if matches!(key_group, KeyGroup::UnknownKey) {
-            let pub_key_prefix: String = pinned_pub_key
-                .unwrap_or_default()
-                .chars()
-                .take(16)
-                .collect();
-            tracing::warn!(
-                pub_key_prefix = %pub_key_prefix,
-                "No backend key group found for pinned model public key; routing unrestricted"
-            );
+            let now_ms = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |elapsed| {
+                    elapsed
+                        .as_secs()
+                        .saturating_mul(1_000)
+                        .saturating_add(u64::from(elapsed.subsec_millis()))
+                });
+            if self.should_warn_unknown_key(now_ms) {
+                let pub_key_prefix: String = pinned_pub_key
+                    .unwrap_or_default()
+                    .chars()
+                    .take(16)
+                    .collect();
+                tracing::warn!(
+                    pub_key_prefix = %pub_key_prefix,
+                    "No backend key group found for pinned model public key; routing unrestricted"
+                );
+            }
         }
         let allowed = key_group.indices();
         let has_history = has_conversation_history(messages);
@@ -557,6 +574,26 @@ impl Fleet {
 
     pub(super) fn set_backend_keys(&self, map: HashMap<String, Vec<usize>>) {
         *self.backend_keys.write().unwrap_or_else(|e| e.into_inner()) = map;
+    }
+
+    pub(super) fn should_warn_unknown_key(&self, now_ms: u64) -> bool {
+        let mut last_warn_ms = self.last_unknown_key_warn_ms.load(Ordering::Relaxed);
+        loop {
+            if last_warn_ms != 0
+                && now_ms.saturating_sub(last_warn_ms) < UNKNOWN_KEY_WARN_INTERVAL_MS
+            {
+                return false;
+            }
+            match self.last_unknown_key_warn_ms.compare_exchange(
+                last_warn_ms,
+                now_ms,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return true,
+                Err(observed) => last_warn_ms = observed,
+            }
+        }
     }
 
     fn resolve_key_group(&self, pinned_pub_key: Option<&str>, count: usize) -> KeyGroup {

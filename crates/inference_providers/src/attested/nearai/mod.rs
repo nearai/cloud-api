@@ -4274,6 +4274,19 @@ mod tests {
     }
 
     #[test]
+    fn fleet_unknown_key_warning_is_rate_limited() {
+        // Given: a fresh Fleet and a fixed epoch-millisecond timestamp.
+        let provider = rotation_provider(4);
+        let now_ms = 1_000_000;
+
+        // When / Then: the first occurrence warns, an immediate repeat is
+        // suppressed, and the interval boundary permits the next warning.
+        assert!(provider.fleet.should_warn_unknown_key(now_ms));
+        assert!(!provider.fleet.should_warn_unknown_key(now_ms));
+        assert!(provider.fleet.should_warn_unknown_key(now_ms + 60_000));
+    }
+
+    #[test]
     fn fleet_empty_backend_key_map_routes_unrestricted() {
         // Given.
         let provider = rotation_provider(4);

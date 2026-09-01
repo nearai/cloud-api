@@ -730,12 +730,14 @@ impl Provider {
 /// Network/IO helpers (rotation-SNI fallback + request header prep), owned by
 /// Fleet. Moved off Provider in step 4c.
 impl Fleet {
-    /// Prepare encryption headers by extracting them from `extra` and forwarding as HTTP headers.
-    /// Also removes encryption-related keys from `extra` to prevent them from leaking into the JSON body.
+    /// Move encryption values out of `extra` and onto HTTP headers, returning the
+    /// `x_model_pub_key` pin that was removed.
     ///
-    /// NOTE: `x_model_pub_key` is intentionally not forwarded to vllm-proxy. It is consumed by the
-    /// cloud API layer for provider routing and is not needed by the downstream vllm-proxy, so it
-    /// is stripped from `extra` without being added as an HTTP header.
+    /// The pin is deliberately not forwarded upstream because it is routing-only. Only
+    /// chat paths consume the return value, using it with `acquire_index` and
+    /// `fallback_indices_for` to select a backend holding that key. Other endpoints call
+    /// this for its header side effect alone; they use the canonical SNI without
+    /// backend-index affinity, so there is no pin for them to honour.
     fn prepare_encryption_headers(
         &self,
         headers: &mut reqwest::header::HeaderMap,
@@ -2084,7 +2086,7 @@ impl InferenceProvider for Fleet {
 
         // Forward tracing and encryption headers from extra to HTTP headers
         self.prepare_tracing_headers(&mut headers, &mut params.extra);
-        let _ = self.prepare_encryption_headers(&mut headers, &mut params.extra);
+        self.prepare_encryption_headers(&mut headers, &mut params.extra);
 
         let response = self
             .client
@@ -2165,7 +2167,7 @@ impl InferenceProvider for Fleet {
             .map_err(|e| AudioTranscriptionError::TranscriptionError(e.to_string()))?;
         // Forward tracing and encryption headers from extra to HTTP headers
         self.prepare_tracing_headers(&mut headers, &mut params.extra);
-        let _ = self.prepare_encryption_headers(&mut headers, &mut params.extra);
+        self.prepare_encryption_headers(&mut headers, &mut params.extra);
         // Remove Content-Type header - reqwest will set it automatically for multipart
         headers.remove("Content-Type");
         headers.insert(
@@ -2340,7 +2342,7 @@ impl InferenceProvider for Fleet {
 
         let mut headers = self.build_headers().map_err(to_score_error)?;
         self.prepare_tracing_headers(&mut headers, &mut params.extra);
-        let _ = self.prepare_encryption_headers(&mut headers, &mut params.extra);
+        self.prepare_encryption_headers(&mut headers, &mut params.extra);
         headers.insert(
             "X-Request-Hash",
             reqwest::header::HeaderValue::from_str(&request_hash).map_err(to_score_error)?,
@@ -2377,7 +2379,7 @@ impl InferenceProvider for Fleet {
 
         let mut headers = self.build_headers().map_err(to_rerank_error)?;
         self.prepare_tracing_headers(&mut headers, &mut params.extra);
-        let _ = self.prepare_encryption_headers(&mut headers, &mut params.extra);
+        self.prepare_encryption_headers(&mut headers, &mut params.extra);
 
         let response = self
             .client
@@ -2414,7 +2416,7 @@ impl InferenceProvider for Fleet {
 
         let mut headers = self.build_headers().map_err(to_embedding_error)?;
         self.prepare_tracing_headers(&mut headers, &mut extra);
-        let _ = self.prepare_encryption_headers(&mut headers, &mut extra);
+        self.prepare_encryption_headers(&mut headers, &mut extra);
 
         let response = self
             .client
@@ -2452,7 +2454,7 @@ impl InferenceProvider for Fleet {
 
         let mut headers = self.build_headers().map_err(to_privacy_classify_error)?;
         self.prepare_tracing_headers(&mut headers, &mut extra);
-        let _ = self.prepare_encryption_headers(&mut headers, &mut extra);
+        self.prepare_encryption_headers(&mut headers, &mut extra);
 
         let response = self
             .client

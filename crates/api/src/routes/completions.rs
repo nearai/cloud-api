@@ -36,6 +36,10 @@ use uuid::Uuid;
 // Timeout for synchronous usage recording before response is returned
 const USAGE_RECORDING_TIMEOUT_SECS: u64 = 5;
 
+// Bound the final Gateway-signature write before exposing a synthesized SSE
+// terminator. The provider routing pin has already been released on this path.
+const STREAM_SIGNATURE_STORE_TIMEOUT_SECS: u64 = 5;
+
 // Upper bound on leading SSE control events (keepalive comments, blank
 // lines) consumed while peeking for the first parsed chunk. Real upstreams
 // emit zero before the first data chunk; the cap stops a misbehaving or
@@ -1563,9 +1567,17 @@ async fn chat_completions_inner(
         || auto_redact_requires_gateway_signature(auto_redact_enabled, model_attestation_supported)
         || alias_requires_gateway_signature;
     let public_response_rewritten = auto_redact_enabled || alias_canonical.is_some();
-    // If model metadata is unavailable, we cannot safely mint a Gateway
-    // signature. Do not fall back to a provider signature over different
-    // public bytes.
+    // A raw stream can require a Gateway signature only after it reaches EOF:
+    // if its provider omitted `[DONE]`, the route appends one for the client.
+    // Hash attested streams as they are emitted so that tail path can decide
+    // whether the final client-visible bytes need a Gateway signature.
+    let may_need_synthesized_done_gateway_signature = model_attestation_supported == Some(true);
+    let hash_client_visible_stream =
+        gateway_signature_enabled || may_need_synthesized_done_gateway_signature;
+    // Never publish a provider signature over bytes that auto-redact or alias
+    // routing changes. If metadata is unavailable, we cannot safely create a
+    // Gateway signature either, but omitting a signature is still better than
+    // returning one that cannot verify.
     service_request.skip_provider_chat_signature =
         usage_mode.gateway_signature_enabled || public_response_rewritten;
     let redaction_map = Arc::new(redaction_map);
@@ -1707,6 +1719,7 @@ async fn chat_completions_inner(
                         let rewrite_public_stream_usage = rewrite_public_stream_usage;
                         let strip_intermediate_usage = strip_intermediate_usage;
                         let gateway_signature_enabled = gateway_signature_enabled;
+                        let hash_client_visible_stream = hash_client_visible_stream;
                         let public_signature_hasher = public_signature_hasher.clone();
                         let public_signature_chat_id = public_signature_chat_id.clone();
                         let final_stream_usage = final_stream_usage.clone();
@@ -1734,9 +1747,35 @@ async fn chat_completions_inner(
                                         && !rewrite_public_stream_usage
                                         && !strip_intermediate_usage
                                     {
+                                        if hash_client_visible_stream {
+                                            if let Some(chunk) = &event.chunk {
+                                                let candidate = match chunk {
+                                                    inference_providers::StreamChunk::Chat(chunk) => {
+                                                        chunk.id.clone()
+                                                    }
+                                                    inference_providers::StreamChunk::Text(chunk) => {
+                                                        chunk.id.clone()
+                                                    }
+                                                };
+                                                let mut chat_id =
+                                                    public_signature_chat_id.lock().await;
+                                                if chat_id.is_none() {
+                                                    *chat_id = Some(candidate);
+                                                }
+                                            }
+                                        }
                                         if event.is_done_marker() {
+                                            if gateway_signature_enabled {
+                                                return None;
+                                            }
                                             upstream_done
                                                 .store(true, std::sync::atomic::Ordering::Relaxed);
+                                        }
+                                        if hash_client_visible_stream {
+                                            public_signature_hasher
+                                                .lock()
+                                                .await
+                                                .update(&event.raw_bytes);
                                         }
                                         return Some(Ok::<Bytes, Infallible>(event.raw_bytes));
                                     }
@@ -1773,7 +1812,7 @@ async fn chat_completions_inner(
                                             Some(event.raw_bytes)
                                         };
                                         if let Some(control_bytes) = control_bytes {
-                                            if gateway_signature_enabled {
+                                            if hash_client_visible_stream {
                                                 public_signature_hasher
                                                     .lock()
                                                     .await
@@ -1783,6 +1822,20 @@ async fn chat_completions_inner(
                                         }
                                         return None;
                                     };
+                                    if hash_client_visible_stream || public_response_rewritten {
+                                        let candidate = match &chunk {
+                                            inference_providers::StreamChunk::Chat(chunk) => {
+                                                chunk.id.clone()
+                                            }
+                                            inference_providers::StreamChunk::Text(chunk) => {
+                                                chunk.id.clone()
+                                            }
+                                        };
+                                        let mut chat_id = public_signature_chat_id.lock().await;
+                                        if chat_id.is_none() {
+                                            *chat_id = Some(candidate);
+                                        }
+                                    }
                                     if let inference_providers::StreamChunk::Chat(chat) = &chunk {
                                         {
                                             let mut t = template.lock().await;
@@ -1793,12 +1846,6 @@ async fn chat_completions_inner(
                                                     chat.created,
                                                     chat.system_fingerprint.clone(),
                                                 ));
-                                            }
-                                        }
-                                        if gateway_signature_enabled || public_response_rewritten {
-                                            let mut chat_id = public_signature_chat_id.lock().await;
-                                            if chat_id.is_none() {
-                                                *chat_id = Some(chat.id.clone());
                                             }
                                         }
                                     }
@@ -1904,7 +1951,7 @@ async fn chat_completions_inner(
                                     }
                                     // Format as SSE event with proper newlines
                                     let sse_bytes = Bytes::from(format!("data: {json_data}\n\n"));
-                                    if gateway_signature_enabled {
+                                    if hash_client_visible_stream {
                                         public_signature_hasher
                                             .lock()
                                             .await
@@ -2007,9 +2054,9 @@ async fn chat_completions_inner(
                                     );
                                 }
 
-                                if !upstream_done_for_chain
-                                    .load(std::sync::atomic::Ordering::Relaxed)
-                                {
+                                let synthesized_done = !upstream_done_for_chain
+                                    .load(std::sync::atomic::Ordering::Relaxed);
+                                if synthesized_done {
                                     combined.extend_from_slice(b"data: [DONE]\n\n");
                                 }
 
@@ -2040,7 +2087,7 @@ async fn chat_completions_inner(
                                             if let Err(e) = attestation_service_for_chain
                                                 .store_chat_signature_and_unpin(
                                                     &chat_id,
-                                                    request_hash,
+                                                    request_hash.clone(),
                                                     response_hash,
                                                 )
                                                 .await
@@ -2066,6 +2113,55 @@ async fn chat_completions_inner(
                                         attestation_service_for_chain
                                             .release_chat_signature_pin(&chat_id)
                                             .await;
+                                    }
+                                } else if synthesized_done
+                                    && may_need_synthesized_done_gateway_signature
+                                    && error_count_final == 0
+                                {
+                                    // The service has already released the provider
+                                    // routing pin for this EOF-only path. Store a
+                                    // Gateway signature over the exact final stream
+                                    // without taking ownership of that pin again.
+                                    let chat_id =
+                                        public_signature_chat_id_for_chain.lock().await.clone();
+                                    if let Some(chat_id) = chat_id {
+                                        let response_hash = {
+                                            let mut hasher =
+                                                public_signature_hasher_for_chain.lock().await;
+                                            hasher.update(&combined);
+                                            hex::encode(hasher.clone().finalize())
+                                        };
+                                        match tokio::time::timeout(
+                                            Duration::from_secs(
+                                                STREAM_SIGNATURE_STORE_TIMEOUT_SECS,
+                                            ),
+                                            attestation_service_for_chain.store_chat_signature(
+                                                &chat_id,
+                                                request_hash.clone(),
+                                                response_hash,
+                                            ),
+                                        )
+                                        .await
+                                        {
+                                            Ok(Ok(())) => {}
+                                            Ok(Err(error)) => tracing::error!(
+                                                %organization_id,
+                                                model = %model_name,
+                                                error = %error,
+                                                "Failed to store synthesized-done stream signature"
+                                            ),
+                                            Err(_) => tracing::error!(
+                                                %organization_id,
+                                                model = %model_name,
+                                                "Timed out storing synthesized-done stream signature"
+                                            ),
+                                        }
+                                    } else {
+                                        tracing::warn!(
+                                            %organization_id,
+                                            model = %model_name,
+                                            "Cannot store synthesized-done stream signature: no chat_id observed"
+                                        );
                                     }
                                 } else if public_response_rewritten {
                                     if let Some(chat_id) =

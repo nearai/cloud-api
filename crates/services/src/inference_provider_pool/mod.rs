@@ -171,11 +171,10 @@ fn record_backend_key_divergence(
         if let Some(metrics) = metrics {
             let model_tag = format!("model:{model_name}");
             let algo_tag = format!("algo:{algo}");
-            let key_count_tag = format!("distinct_keys:{distinct_keys}");
             metrics.record_count(
                 crate::metrics::consts::METRIC_BACKEND_KEY_DIVERGENCE,
-                1,
-                &[&model_tag, &algo_tag, &key_count_tag],
+                distinct_keys as i64,
+                &[&model_tag, &algo_tag],
             );
         }
     }
@@ -281,10 +280,10 @@ struct DiscoveryOutcome {
     /// Per-call verified TLS fingerprints observed in this pass, in launch
     /// order (`futures::future::join_all` preserves input order, not
     /// completion order). One entry per call, not per backend, so under
-    /// complete coverage `observed_fingerprints.len() == max(backend_count,
-    /// ALGOS.len())`. When `backend_count == 1`, the two algo calls hit
-    /// the same backend and entries repeat — the set of *distinct*
-    /// fingerprints is `verified_this_round` (used for pin updates).
+    /// complete coverage `observed_fingerprints.len() == backend_count *
+    /// ALGOS.len()`. Every backend is called once per algo, so fingerprints
+    /// repeat per index — the set of *distinct* fingerprints is
+    /// `verified_this_round` (used for pin updates).
     observed_fingerprints: Vec<String>,
     /// Per-call failure reasons that prevented a fingerprint observation, in
     /// launch order. Each entry is `"{category}: {detail}"` where category
@@ -323,6 +322,14 @@ struct BackendProbe {
 
 /// KMS root id and app id. Equal identities derive the same model keypair.
 type TeeIdentity = (String, String);
+
+const ALGOS: [&str; 2] = ["ecdsa", "ed25519"];
+
+fn probe_plan(backend_count: usize) -> Vec<(usize, &'static str)> {
+    (0..backend_count)
+        .flat_map(|backend_index| ALGOS.into_iter().map(move |algo| (backend_index, algo)))
+        .collect()
+}
 
 impl DiscoveryOutcome {
     /// All distinct pubkeys observed this cycle, preserving probe order.
@@ -1406,13 +1413,10 @@ impl InferenceProviderPool {
     /// covering every (backend_index, signing_algo) pair needed to harvest
     /// both ECDSA and Ed25519 signing pubkeys in the same pass.
     ///
-    /// The number of calls is `max(backend_count, ALGOS.len())`: one per
-    /// backend (for TLS-cert fingerprint coverage across all serving CVMs)
-    /// and at least one per algo (so both ECDSA and Ed25519 pubkeys are
-    /// fetched even when a model has only a single backend). For
-    /// `backend_count >= ALGOS.len()`, this degenerates to one call per
-    /// backend; for `backend_count == 1` it issues two calls to the same
-    /// backend, one per algo.
+    /// The number of calls is `backend_count * ALGOS.len()`: one per
+    /// `(backend_index, algo)` pair. This covers every serving CVM's TLS
+    /// fingerprint and every KMS-root-derived ECDSA and Ed25519 key. A
+    /// single-backend model still issues exactly two calls, one per algo.
     ///
     /// Why a fresh client per call: reqwest with HTTP/2 multiplexes many
     /// concurrent requests onto a single TCP connection, which hashes to a
@@ -1426,16 +1430,13 @@ impl InferenceProviderPool {
     /// `/backends/count`, then fan out calls across backend indices and
     /// algos. One cycle = full coverage.
     ///
-    /// Single-backend floor: when `backend_count < ALGOS.len()`, the loop
-    /// would otherwise miss an algorithm — e.g., `backend_count=1` would
-    /// only fetch ECDSA and never harvest the Ed25519 pubkey, leaving
-    /// `pubkey_to_providers` permanently missing that entry and breaking
-    /// Ed25519 E2EE for that model (nearai/infra#167). We pad the iteration
-    /// count to `max(backend_count, ALGOS.len())` so every algo is hit at
-    /// least once; the rotation index wraps with `i % backend_count`, so
-    /// the extra iterations re-probe an existing backend with the missing
-    /// algo. Pubkeys are TEE-derived from the compose hash so the same
-    /// backend serves a deterministic pubkey per algo.
+    /// Full pair coverage is required because pubkeys are KMS-root-derived.
+    /// Sampling only one algo per index is unsafe on a mixed-root fleet: it
+    /// leaves the other algo's key for that root out of `pubkey_to_providers`,
+    /// resurfacing 421 `NoPubKeyProvider` for a client pinned to the unsampled
+    /// key. The fan-out is therefore `2N` calls per model per cycle instead of
+    /// `max(N, 2)`. `backend_count` is capped before planning so the cap never
+    /// truncates an index midway through its algo coverage.
     ///
     /// Why an isolated Bootstrap state per call: if discovery calls shared
     /// the caller's `fingerprint_state`, the first call that completed and
@@ -1448,20 +1449,17 @@ impl InferenceProviderPool {
     ///
     /// Why extract pubkeys here: the attestation report already contains
     /// `signing_public_key` for the requested `signing_algo`. The
-    /// `max(backend_count, ALGOS.len())` fan-out guarantees both ECDSA and
-    /// Ed25519 are queried at least once per cycle, even when a model has
-    /// only a single backend. Pubkeys are derived from the TEE compose
-    /// hash so they're identical across backends of the same model+algo;
-    /// the first verified response per algo wins.
+    /// full-pair fan-out queries both ECDSA and Ed25519 on every backend each
+    /// cycle. This is necessary because backends under different KMS roots
+    /// return different keys for the same model and algo.
     ///
-    /// Rapid eviction: when every healthy backend produced exactly one
-    /// verified fingerprint, the pin set is REPLACED with the observed set
-    /// — a backend that just went unhealthy or had its cert rotated is
+    /// Rapid eviction: when every healthy backend's distinct fingerprint was
+    /// verified and no probe failed, the pin set is REPLACED with the observed
+    /// set — a backend that just went unhealthy or had its cert rotated is
     /// dropped from the pin set within one refresh interval. On partial
-    /// coverage (any failure, or fewer distinct fingerprints than the
-    /// reported healthy count) we fall back to additive merging so a
-    /// transient hiccup doesn't evict verified fingerprints we just
-    /// couldn't reconfirm.
+    /// coverage (any failure, or fewer distinct fingerprints than the reported
+    /// healthy count) we fall back to additive merging so a transient hiccup
+    /// doesn't evict verified fingerprints we just couldn't reconfirm.
     ///
     /// The caller owns the `fingerprint_state` Arc and decides when to
     /// transition it to `Blocked` (e.g., when `outcome.total_pinned == 0`
@@ -1504,7 +1502,6 @@ impl InferenceProviderPool {
     ) -> DiscoveryOutcome {
         const PER_CALL_TIMEOUT: Duration = Duration::from_secs(10);
         const COUNT_TIMEOUT: Duration = Duration::from_secs(3);
-        const ALGOS: [&str; 2] = ["ecdsa", "ed25519"];
 
         /// Query parameters for `/v1/attestation/report`. Matches
         /// `nearai::Provider::get_attestation_report`'s Query struct; duplicated
@@ -1600,25 +1597,19 @@ impl InferenceProviderPool {
             backend_count
         };
 
-        // Step 2: fan out attestation calls across (backend_index, algo) pairs
-        // in parallel (no stagger). Total calls = max(backend_count,
-        // ALGOS.len()) so every algo is sampled at least once even when a
-        // model has only a single backend (which would otherwise leave one
-        // algo's pubkey out of pubkey_to_providers, breaking E2EE routing
-        // for that algo — see nearai/cloud-api#710).
-        //
-        // backend_index = i % backend_count maps the call sequence back to a
-        // rotation backend; for backend_count >= 2 this equals i and the
-        // loop degenerates to one call per backend (unchanged from before).
-        let call_count = backend_count.max(ALGOS.len());
-        let futures = (0..call_count)
-            .map(|i| {
-                let backend_index = i % backend_count;
+        // Every (index, algo) pair must be sampled: keys are KMS-root-derived,
+        // so mixed-root backends serve different keys for the same algo.
+        // Sampling one algo per index would leave half the fleet's keys
+        // unregistered and resurface 421 NoPubKeyProvider for clients pinned
+        // to an unsampled key.
+        let futures = probe_plan(backend_count)
+            .into_iter()
+            .map(|(backend_index, signing_algo)| {
                 let parts = parts.clone();
                 let api_key = api_key.clone();
                 let model = model_name.to_string();
                 let tls_roots = tls_roots.clone();
-                let algo = ALGOS[i % ALGOS.len()].to_string();
+                let algo = signing_algo.to_string();
                 async move {
                     // Isolated Bootstrap state per call — see function doc.
                     let local_state = Arc::new(std::sync::RwLock::new(FingerprintState::Bootstrap));
@@ -1778,11 +1769,20 @@ impl InferenceProviderPool {
                     // Keys are KMS-root-derived: replicas under different roots
                     // serve different keys for the same model and algorithm.
                     if let Some(pk) = report.get("signing_public_key").and_then(|v| v.as_str()) {
+                        let identity = tee_identity(&report);
+                        if identity.is_none() {
+                            warn!(
+                                model = %model_name,
+                                backend_index,
+                                algo = %algo,
+                                "Attestation report has no parseable TEE identity; backend remains eligible for every key group"
+                            );
+                        }
                         backend_probes.push(BackendProbe {
                             index: backend_index,
                             algo: algo.clone(),
                             pubkey: pk.to_string(),
-                            identity: tee_identity(&report),
+                            identity,
                         });
                     }
                 }
@@ -5357,20 +5357,6 @@ impl InferenceProviderPool {
 mod tests {
     use super::*;
 
-    /// Pure mirror of the `discover_model` call-plan: returns `(backend_idx, algo)`
-    /// for each of the `max(backend_count, algos.len())` calls. Lets us pin the
-    /// invariant without spinning up a real provider + verifier. Drifts only if
-    /// the loop in `discover_model` changes; bring this helper in sync if it does.
-    fn discover_model_call_plan<'a>(
-        backend_count: usize,
-        algos: &'a [&'a str],
-    ) -> Vec<(usize, &'a str)> {
-        let n_calls = backend_count.max(algos.len());
-        (0..n_calls)
-            .map(|i| (i % backend_count.max(1), algos[i % algos.len()]))
-            .collect()
-    }
-
     fn provider_model(
         model_id: &str,
         context_length: Option<i32>,
@@ -5617,51 +5603,26 @@ mod tests {
     }
 
     #[test]
-    fn discover_model_single_backend_covers_both_algos() {
-        // Regression for nearai/infra#167: pre-fix, `backend_count=1` produced
-        // exactly one call with `ALGOS[0]` ("ecdsa"), so Ed25519 was never
-        // harvested and E2EE-via-ed25519 failed with HTTP 421 NoPubKeyProvider.
-        let algos = ["ecdsa", "ed25519"];
-        let plan = discover_model_call_plan(1, &algos);
-        assert_eq!(plan.len(), 2, "expected 2 calls to cover both algos");
-        // Both calls target the only backend (index 0). The extra iteration
-        // wraps via `i % backend_count` so the rotation URL is buildable.
-        assert!(plan.iter().all(|(idx, _)| *idx == 0));
-        let covered: std::collections::HashSet<&str> = plan.iter().map(|(_, a)| *a).collect();
-        for algo in &algos {
-            assert!(
-                covered.contains(algo),
-                "missing algo {algo} in single-backend plan"
+    fn discovery_probe_plan_covers_every_backend_algo_pair() {
+        // Given: representative single- and multi-backend fleet sizes.
+        for backend_count in [1, 2, 4] {
+            // When: discovery builds its probe plan.
+            let plan = probe_plan(backend_count);
+            let actual = plan.iter().copied().collect::<HashSet<_>>();
+            let expected = (0..backend_count)
+                .flat_map(|index| {
+                    ["ecdsa", "ed25519"]
+                        .into_iter()
+                        .map(move |algo| (index, algo))
+                })
+                .collect::<HashSet<_>>();
+
+            // Then: every pair appears exactly once.
+            assert_eq!(
+                actual, expected,
+                "incomplete plan for {backend_count} backends"
             );
-        }
-    }
-
-    #[test]
-    fn discover_model_multi_backend_unchanged() {
-        // Multi-backend models were already correct (alternating algos across
-        // distinct backends); this test pins that pre-fix behavior.
-        let algos = ["ecdsa", "ed25519"];
-
-        // backend_count == ALGOS.len(): one call per backend, both algos.
-        let plan = discover_model_call_plan(2, &algos);
-        assert_eq!(plan, vec![(0, "ecdsa"), (1, "ed25519")]);
-
-        // backend_count > ALGOS.len(): every backend gets a call, algos alternate.
-        let plan = discover_model_call_plan(5, &algos);
-        assert_eq!(
-            plan,
-            vec![
-                (0, "ecdsa"),
-                (1, "ed25519"),
-                (2, "ecdsa"),
-                (3, "ed25519"),
-                (4, "ecdsa"),
-            ]
-        );
-        // Both algos still covered.
-        let covered: std::collections::HashSet<&str> = plan.iter().map(|(_, a)| *a).collect();
-        for algo in &algos {
-            assert!(covered.contains(algo));
+            assert_eq!(plan.len(), actual.len(), "duplicate probe pair");
         }
     }
 
@@ -5747,6 +5708,70 @@ mod tests {
         assert_eq!(
             outcome.divergent_algos(),
             vec!["ecdsa".to_string(), "ed25519".to_string()]
+        );
+    }
+
+    #[test]
+    fn mixed_root_two_backends_registers_all_four_keys() {
+        // Given: each of two backend indices is under a different KMS root.
+        let probes = probe_plan(2)
+            .into_iter()
+            .map(|(index, algo)| {
+                let (pubkey, identity) = match (index, algo) {
+                    (0, "ecdsa") => ("root-a-ecdsa", ("root-a", "app")),
+                    (0, "ed25519") => ("root-a-ed25519", ("root-a", "app")),
+                    (1, "ecdsa") => ("root-b-ecdsa", ("root-b", "app")),
+                    (1, "ed25519") => ("root-b-ed25519", ("root-b", "app")),
+                    _ => unreachable!("probe plan returned an unsupported pair"),
+                };
+                backend_probe(index, algo, pubkey, Some(identity))
+            })
+            .collect();
+        let outcome = discovery_outcome_with_probes(2, probes);
+
+        // When: discovery produces registration keys and affinity groups.
+        let distinct_pubkeys = outcome.distinct_pubkeys();
+        let key_index_map = outcome.key_index_map();
+
+        // Then: no root/algo key can miss pubkey_to_providers registration.
+        assert_eq!(
+            distinct_pubkeys,
+            vec![
+                "root-a-ecdsa".to_string(),
+                "root-a-ed25519".to_string(),
+                "root-b-ecdsa".to_string(),
+                "root-b-ed25519".to_string(),
+            ]
+        );
+        assert!(distinct_pubkeys
+            .iter()
+            .all(|pubkey| key_index_map.contains_key(pubkey)));
+    }
+
+    #[test]
+    fn backend_key_divergence_records_count_as_value_without_count_tag() {
+        use crate::metrics::capturing::{CapturingMetricsService, MetricValue};
+
+        // Given: one algorithm has two distinct KMS-root-derived keys.
+        let outcome = discovery_outcome_with_probes(
+            2,
+            vec![
+                backend_probe(0, "ecdsa", "key-a", Some(("root-a", "app"))),
+                backend_probe(1, "ecdsa", "key-b", Some(("root-b", "app"))),
+            ],
+        );
+        let metrics = CapturingMetricsService::new();
+
+        // When: divergence telemetry is recorded.
+        record_backend_key_divergence(Some(&metrics), "test/model", &outcome);
+
+        // Then: the key count is the value and tags stay low-cardinality.
+        let recorded = metrics.get_metrics();
+        assert_eq!(recorded.len(), 1);
+        assert!(matches!(recorded[0].value, MetricValue::Count(2)));
+        assert_eq!(
+            recorded[0].tags,
+            vec!["model:test/model".to_string(), "algo:ecdsa".to_string()]
         );
     }
 

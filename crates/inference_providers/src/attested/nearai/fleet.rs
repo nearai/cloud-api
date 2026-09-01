@@ -362,9 +362,10 @@ impl Fleet {
         allowed: Option<&[usize]>,
     ) -> Vec<usize> {
         let (preferred, indices) = match allowed {
-            Some(group) if !group.is_empty() => {
-                (group[route_key as usize % group.len()], group.to_vec())
-            }
+            Some(group) if !group.is_empty() => (
+                group[(route_key % group.len() as u64) as usize],
+                group.to_vec(),
+            ),
             Some(_) | None => (
                 (route_key % count as u64) as usize,
                 (0..count).collect::<Vec<_>>(),

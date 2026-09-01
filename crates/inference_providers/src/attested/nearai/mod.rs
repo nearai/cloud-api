@@ -4163,6 +4163,23 @@ mod tests {
     }
 
     #[test]
+    fn fleet_candidate_indices_restricted_group_uses_full_u64_route_key() {
+        // Given: a route key whose high 32 bits affect the group modulo.
+        let provider = rotation_provider(4);
+        let group = [0, 1, 2];
+        let route_key = u64::from(u32::MAX) + 2;
+
+        // When: the candidate order is restricted to the pinned key group.
+        let candidates = provider.fleet.candidate_indices(route_key, 4, Some(&group));
+
+        // Then: the full-width route key selects the preferred group member.
+        assert_eq!(
+            candidates[0],
+            group[(route_key % group.len() as u64) as usize]
+        );
+    }
+
+    #[test]
     fn fleet_candidate_indices_single_member_group_ignores_route_key() {
         // Given.
         let provider = rotation_provider(4);

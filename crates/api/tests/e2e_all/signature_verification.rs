@@ -336,6 +336,58 @@ async fn test_raw_provider_signature_is_available_when_done_is_emitted() {
 }
 
 #[tokio::test]
+async fn test_dropping_stream_releases_signature_routing_pin() {
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
+
+    let (server, router, _pool, mock, _database) = setup_test_server_with_pool_and_router().await;
+    setup_qwen_model(&server).await;
+    let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
+    let api_key = get_api_key_for_org(&server, org.id).await;
+
+    let request = axum::http::Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("Authorization", format!("Bearer {api_key}"))
+        .header("Content-Type", "application/json")
+        .body(axum::body::Body::from(
+            serde_json::json!({
+                "model": E2E_QWEN_MODEL_NAME,
+                "messages": [{ "role": "user", "content": "Respond with two words." }],
+                "stream": true,
+                "stream_options": { "continuous_usage_stats": true },
+                "nonce": 905
+            })
+            .to_string(),
+        ))
+        .expect("request should build");
+    let response = router
+        .oneshot(request)
+        .await
+        .expect("router should serve the streaming request");
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+
+    let mut body = response.into_body();
+    let frame = body
+        .frame()
+        .await
+        .expect("stream should yield a first frame")
+        .expect("first frame should not error");
+    let first_bytes = frame.data_ref().expect("first frame should contain data");
+    let first_response = String::from_utf8(first_bytes.to_vec()).expect("SSE should be UTF-8");
+    let chat_id = first_stream_chat_id(&first_response);
+
+    drop(body);
+    for _ in 0..16 {
+        if mock.unpinned_chat_ids() == vec![chat_id.clone()] {
+            return;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(mock.unpinned_chat_ids(), vec![chat_id]);
+}
+
+#[tokio::test]
 async fn test_raw_stream_error_does_not_store_a_signature() {
     let (server, _pool, mock, database) = setup_test_server_with_pool().await;
     setup_qwen_model(&server).await;

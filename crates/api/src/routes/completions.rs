@@ -87,6 +87,45 @@ impl Drop for StreamSignaturePinGuard {
 // lossless parser emits it separately, its blank SSE separator.
 const MAX_HELD_PROVIDER_TERMINAL_BYTES: usize = MAX_PROVIDER_DONE_EVENT_BYTES;
 
+/// Releases the provider-routing signature pin if a response body is dropped
+/// before its normal finalization path owns the release.
+struct StreamSignaturePinGuard {
+    attestation_service: Arc<dyn AttestationServiceTrait>,
+    chat_id: Option<String>,
+    armed: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Drop for StreamSignaturePinGuard {
+    fn drop(&mut self) {
+        let Some(chat_id) = self.chat_id.clone() else {
+            return;
+        };
+        if !self.armed.swap(false, std::sync::atomic::Ordering::AcqRel) {
+            return;
+        }
+
+        let attestation_service = self.attestation_service.clone();
+        let spawn_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let handle = match tokio::runtime::Handle::try_current() {
+                Ok(handle) => handle,
+                Err(_) => {
+                    tracing::error!(%chat_id, "Cannot release signature routing pin: no Tokio runtime available");
+                    return;
+                }
+            };
+            std::mem::drop(handle.spawn(async move {
+                attestation_service
+                    .release_chat_signature_pin(&chat_id)
+                    .await;
+                tracing::debug!(%chat_id, "Released signature routing pin after stream cancellation");
+            }));
+        }));
+        if spawn_result.is_err() {
+            tracing::error!("Could not schedule signature routing-pin cleanup during shutdown");
+        }
+    }
+}
+
 /// Insert validated E2EE headers into a provider `extra` HashMap.
 fn insert_encryption_headers(
     encryption_headers: &crate::routes::common::EncryptionHeaders,

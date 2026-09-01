@@ -4287,23 +4287,6 @@ mod tests {
     }
 
     #[test]
-    fn fleet_empty_backend_key_map_routes_unrestricted() {
-        // Given.
-        let provider = rotation_provider(4);
-        provider.fleet.set_backend_keys(HashMap::new());
-
-        // When / Then.
-        assert_eq!(
-            provider
-                .fleet
-                .acquire_index(&[], Some("key-a"))
-                .expect("rotation active")
-                .index(),
-            0
-        );
-    }
-
-    #[test]
     fn fleet_empty_backend_key_map_is_unrestricted_without_warning() {
         // Given: the normal homogeneous-fleet discovery state.
         let provider = rotation_provider(4);

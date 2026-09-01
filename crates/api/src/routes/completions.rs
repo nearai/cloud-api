@@ -1590,6 +1590,13 @@ async fn chat_completions_inner(
     // returning one that cannot verify.
     service_request.skip_provider_chat_signature =
         usage_mode.gateway_signature_enabled || public_response_rewritten;
+    // For an otherwise raw, provider-signed stream, hold the upstream terminal
+    // suffix until the completion service reaches EOF and persists the
+    // signature. This makes the signature available when the client observes
+    // the original `[DONE]` bytes.
+    let provider_signature_enabled = model_attestation_supported == Some(true)
+        && !service_request.skip_provider_chat_signature
+        && !public_response_rewritten;
     let redaction_map = Arc::new(redaction_map);
 
     // Check if streaming is requested
@@ -1674,10 +1681,20 @@ async fn chat_completions_inner(
                 let organization_id = api_key.organization.id.0;
 
                 // Set when the upstream's own `data: [DONE]` terminator was
-                // forwarded verbatim, so the end-of-stream tail doesn't
-                // append a second, gateway-minted one.
+                // observed, so the end-of-stream tail doesn't append a
+                // gateway-minted one. A provider-signed stream may hold its
+                // original terminal bytes until signature finalization.
                 let upstream_done_forwarded = Arc::new(std::sync::atomic::AtomicBool::new(false));
                 let upstream_done_for_chain = upstream_done_forwarded.clone();
+                let hold_provider_terminal_suffix =
+                    provider_signature_enabled && !gateway_signature_enabled;
+                let holding_provider_terminal_suffix =
+                    Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let holding_provider_terminal_suffix_for_chain =
+                    holding_provider_terminal_suffix.clone();
+                let held_provider_terminal_bytes =
+                    Arc::new(tokio::sync::Mutex::new(Vec::<u8>::new()));
+                let held_provider_terminal_bytes_for_chain = held_provider_terminal_bytes.clone();
 
                 // Per-stream un-redact state, keyed by choice index so n>1
                 // completions don't cross-contaminate sliding tails. When
@@ -1729,6 +1746,10 @@ async fn chat_completions_inner(
                         let rewrite_public_stream_usage = rewrite_public_stream_usage;
                         let strip_intermediate_usage = strip_intermediate_usage;
                         let gateway_signature_enabled = gateway_signature_enabled;
+                        let hold_provider_terminal_suffix = hold_provider_terminal_suffix;
+                        let holding_provider_terminal_suffix =
+                            holding_provider_terminal_suffix.clone();
+                        let held_provider_terminal_bytes = held_provider_terminal_bytes.clone();
                         let hash_client_visible_stream = hash_client_visible_stream;
                         let public_signature_hasher = public_signature_hasher.clone();
                         let public_signature_chat_id = public_signature_chat_id.clone();
@@ -1736,6 +1757,15 @@ async fn chat_completions_inner(
                         async move {
                             match result {
                                 Ok(event) => {
+                                    if holding_provider_terminal_suffix
+                                        .load(std::sync::atomic::Ordering::Relaxed)
+                                    {
+                                        held_provider_terminal_bytes
+                                            .lock()
+                                            .await
+                                            .extend_from_slice(&event.raw_bytes);
+                                        return None;
+                                    }
                                     // Byte-exact passthrough (issue #701): when no public
                                     // chunk rewriting is active, forward the upstream wire
                                     // bytes untouched. Explicit include_usage shaping needs
@@ -1780,6 +1810,17 @@ async fn chat_completions_inner(
                                             }
                                             upstream_done
                                                 .store(true, std::sync::atomic::Ordering::Relaxed);
+                                            if hold_provider_terminal_suffix {
+                                                holding_provider_terminal_suffix.store(
+                                                    true,
+                                                    std::sync::atomic::Ordering::Relaxed,
+                                                );
+                                                held_provider_terminal_bytes
+                                                    .lock()
+                                                    .await
+                                                    .extend_from_slice(&event.raw_bytes);
+                                                return None;
+                                            }
                                         }
                                         if hash_client_visible_stream {
                                             public_signature_hasher
@@ -2068,6 +2109,17 @@ async fn chat_completions_inner(
                                     .load(std::sync::atomic::Ordering::Relaxed);
                                 if synthesized_done {
                                     combined.extend_from_slice(b"data: [DONE]\n\n");
+                                } else if hold_provider_terminal_suffix
+                                    && holding_provider_terminal_suffix_for_chain
+                                        .load(std::sync::atomic::Ordering::Relaxed)
+                                {
+                                    let held = {
+                                        let mut bytes = held_provider_terminal_bytes_for_chain
+                                            .lock()
+                                            .await;
+                                        std::mem::take(&mut *bytes)
+                                    };
+                                    combined.extend_from_slice(&held);
                                 }
 
                                 if gateway_signature_enabled {

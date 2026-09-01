@@ -144,6 +144,20 @@ fn record_provider_attempt(
     }
 }
 
+/// Carry the routing pin to the provider for backend-key affinity. The NEAR
+/// provider strips it in `prepare_encryption_headers` before serialising, and
+/// the external provider strips it in `strip_internal_keys`, so it never
+/// reaches an upstream request body. A pubkey-routed request only ever selects
+/// a provider registered in `pubkey_to_providers`.
+fn reinsert_pubkey_pin(params: &mut ChatCompletionParams, pub_key: Option<&str>) {
+    if let Some(pub_key) = pub_key {
+        params.extra.insert(
+            encryption_headers::MODEL_PUB_KEY.to_string(),
+            serde_json::Value::String(pub_key.to_string()),
+        );
+    }
+}
+
 fn record_backend_key_divergence(
     metrics: Option<&dyn crate::metrics::MetricsServiceTrait>,
     model_name: &str,
@@ -152,14 +166,7 @@ fn record_backend_key_divergence(
     let identity_count = outcome.distinct_identities().len();
     for algo in outcome.divergent_algos() {
         let distinct_keys = outcome.distinct_key_count_for_algo(&algo);
-        let mut seen = HashSet::new();
-        let key_prefixes: Vec<String> = outcome
-            .backend_probes
-            .iter()
-            .filter(|probe| probe.algo == algo)
-            .filter(|probe| seen.insert(probe.pubkey.as_str()))
-            .map(|probe| probe.pubkey.chars().take(16).collect())
-            .collect();
+        let key_prefixes = outcome.key_prefixes_for_algo(&algo);
         warn!(
             model = %model_name,
             algo = %algo,
@@ -381,6 +388,16 @@ impl DiscoveryOutcome {
             .map(|probe| probe.pubkey.to_lowercase())
             .collect::<HashSet<_>>()
             .len()
+    }
+
+    fn key_prefixes_for_algo(&self, algo: &str) -> Vec<String> {
+        let mut seen = HashSet::new();
+        self.backend_probes
+            .iter()
+            .filter(|probe| probe.algo == algo)
+            .filter(|probe| seen.insert(probe.pubkey.to_lowercase()))
+            .map(|probe| probe.pubkey.chars().take(16).collect())
+            .collect()
     }
 
     /// Pubkey to backend indices that can derive it. An empty map is the
@@ -3424,17 +3441,7 @@ impl InferenceProviderPool {
         .await;
 
         let mut params_for_provider = params.clone();
-        // Carry the pin to the provider for backend-key affinity. The NEAR provider
-        // strips it in `prepare_encryption_headers` before serializing the request, so
-        // it never reaches vllm-proxy. Safe to carry: a pubkey-routed request is only
-        // ever served by a provider registered in `pubkey_to_providers`, which Chutes
-        // and external providers are never in (they have no signing-address pubkey).
-        if let Some(pub_key) = model_pub_key_str.as_ref() {
-            params_for_provider.extra.insert(
-                encryption_headers::MODEL_PUB_KEY.to_string(),
-                serde_json::Value::String(pub_key.clone()),
-            );
-        }
+        reinsert_pubkey_pin(&mut params_for_provider, model_pub_key_str.as_deref());
 
         tracing::debug!(
             model = %model_id,
@@ -3604,17 +3611,7 @@ impl InferenceProviderPool {
         // Carry the pin only in the dispatched clone so pool-side context refinement
         // continues to see params with the routing-only field removed.
         let mut params_for_provider = params.clone();
-        // Carry the pin to the provider for backend-key affinity. The NEAR provider
-        // strips it in `prepare_encryption_headers` before serializing the request, so
-        // it never reaches vllm-proxy. Safe to carry: a pubkey-routed request is only
-        // ever served by a provider registered in `pubkey_to_providers`, which Chutes
-        // and external providers are never in (they have no signing-address pubkey).
-        if let Some(pub_key) = model_pub_key_str.as_ref() {
-            params_for_provider.extra.insert(
-                encryption_headers::MODEL_PUB_KEY.to_string(),
-                serde_json::Value::String(pub_key.clone()),
-            );
-        }
+        reinsert_pubkey_pin(&mut params_for_provider, model_pub_key_str.as_deref());
 
         let served = self
             .retry_with_fallback_caps(
@@ -5863,6 +5860,27 @@ mod tests {
 
         // Then: key casing alone does not report a divergent fleet.
         assert!(divergent_algos.is_empty());
+        assert_eq!(distinct_key_count, 1);
+    }
+
+    #[test]
+    fn key_prefixes_and_count_deduplicate_case_variants_consistently() {
+        // Given: one algorithm returns the same key in two cases.
+        let outcome = discovery_outcome_with_probes(
+            2,
+            vec![
+                backend_probe(0, "ecdsa", "AbCdEf0123456789", Some(("root-1", "app"))),
+                backend_probe(1, "ecdsa", "aBcDeF0123456789", Some(("root-1", "app"))),
+            ],
+        );
+
+        // When: diagnostic prefixes and the adjacent key count are derived.
+        let key_prefixes = outcome.key_prefixes_for_algo("ecdsa");
+        let distinct_key_count = outcome.distinct_key_count_for_algo("ecdsa");
+
+        // Then: the original backend casing is retained without contradicting the count.
+        assert_eq!(key_prefixes, vec!["AbCdEf0123456789".to_string()]);
+        assert_eq!(key_prefixes.len(), distinct_key_count);
         assert_eq!(distinct_key_count, 1);
     }
 

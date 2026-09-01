@@ -250,6 +250,62 @@ async fn test_raw_stream_with_upstream_done_retains_provider_signature() {
 }
 
 #[tokio::test]
+async fn test_raw_stream_error_does_not_store_a_signature() {
+    let (server, _pool, mock, database) = setup_test_server_with_pool().await;
+    setup_qwen_model(&server).await;
+    let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
+    let api_key = get_api_key_for_org(&server, org.id).await;
+
+    mock.set_default_response(
+        inference_providers::mock::ResponseTemplate::new("partial output").with_stream_error_after(
+            1,
+            inference_providers::CompletionError::HttpError {
+                status_code: 503,
+                message: "upstream stream failed".to_string(),
+                is_external: false,
+            },
+        ),
+    )
+    .await;
+
+    let request_body = serde_json::json!({
+        "model": E2E_QWEN_MODEL_NAME,
+        "messages": [{ "role": "user", "content": "Respond with two words." }],
+        "stream": true,
+        "stream_options": { "continuous_usage_stats": true },
+        "nonce": 903
+    });
+    let response = server
+        .post("/v1/chat/completions")
+        .add_header("Authorization", format!("Bearer {api_key}"))
+        .json(&request_body)
+        .await;
+    assert_eq!(response.status_code(), 200, "{}", response.text());
+
+    let response_text = response.text();
+    assert!(response_text.contains("error"));
+    let chat_id = first_stream_chat_id(&response_text);
+    let client = database
+        .pool()
+        .get()
+        .await
+        .expect("database should connect");
+    let row = client
+        .query_one(
+            "SELECT COUNT(*) FROM chat_signatures WHERE chat_id = $1",
+            &[&chat_id],
+        )
+        .await
+        .expect("signature count query should succeed");
+    let signature_count: i64 = row.get(0);
+    assert_eq!(
+        signature_count, 0,
+        "error streams must not store a signature"
+    );
+    assert_eq!(mock.unpinned_chat_ids(), vec![chat_id]);
+}
+
+#[tokio::test]
 async fn test_legacy_completion_gateway_signature_hashes_public_json() {
     let server = setup_test_server().await;
     setup_qwen_model(&server).await;

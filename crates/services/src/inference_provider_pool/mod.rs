@@ -350,7 +350,7 @@ impl DiscoveryOutcome {
     /// Algorithms for which more than one distinct key was observed.
     fn divergent_algos(&self) -> Vec<String> {
         let mut algos = Vec::new();
-        let mut keys_by_algo: HashMap<&str, HashSet<&str>> = HashMap::new();
+        let mut keys_by_algo: HashMap<&str, HashSet<String>> = HashMap::new();
         for probe in &self.backend_probes {
             if !keys_by_algo.contains_key(probe.algo.as_str()) {
                 algos.push(probe.algo.as_str());
@@ -358,7 +358,7 @@ impl DiscoveryOutcome {
             keys_by_algo
                 .entry(probe.algo.as_str())
                 .or_default()
-                .insert(probe.pubkey.as_str());
+                .insert(probe.pubkey.to_lowercase());
         }
         algos
             .into_iter()
@@ -371,7 +371,7 @@ impl DiscoveryOutcome {
         self.backend_probes
             .iter()
             .filter(|probe| probe.algo == algo)
-            .map(|probe| probe.pubkey.as_str())
+            .map(|probe| probe.pubkey.to_lowercase())
             .collect::<HashSet<_>>()
             .len()
     }
@@ -5818,6 +5818,27 @@ mod tests {
         assert_eq!(key_index_map.get("abcd"), Some(&vec![0, 2]));
         assert_eq!(key_index_map.get("efgh"), Some(&vec![1, 3]));
         assert_eq!(key_index_map.len(), 2);
+    }
+
+    #[test]
+    fn case_variant_pubkeys_do_not_diverge() {
+        // Given: one algorithm returns the same key in different ASCII cases
+        // from backends with the same TEE identity.
+        let outcome = discovery_outcome_with_probes(
+            2,
+            vec![
+                backend_probe(0, "ecdsa", "AbCd", Some(("root-1", "app"))),
+                backend_probe(1, "ecdsa", "abcd", Some(("root-1", "app"))),
+            ],
+        );
+
+        // When: diagnostic divergence and key count are derived.
+        let divergent_algos = outcome.divergent_algos();
+        let distinct_key_count = outcome.distinct_key_count_for_algo("ecdsa");
+
+        // Then: key casing alone does not report a divergent fleet.
+        assert!(divergent_algos.is_empty());
+        assert_eq!(distinct_key_count, 1);
     }
 
     #[test]

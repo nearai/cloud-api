@@ -2196,6 +2196,10 @@ pub fn build_admin_routes(
     let infra_service = Arc::new(services::admin::InfraService::new(
         config.infra.machines_url.clone(),
         config.infra.cost_per_host_usd_month,
+        config.infra.prometheus_url.clone(),
+        config.infra.prometheus_bearer_token.clone(),
+        config.infra.prometheus_environment.clone(),
+        config.infra.cost_per_gpu_hour_usd,
     ));
 
     let admin_app_state = AdminAppState {

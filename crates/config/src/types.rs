@@ -446,15 +446,22 @@ impl StakingFarmConfig {
 
 /// Configuration for the executive "Stats" dashboard's infra burn metric.
 ///
-/// Both values are environment-specific and intentionally have NO hardcoded
-/// defaults — they are provided via deployment secrets/env only. When unset,
-/// the infra-summary endpoint reports no fleet data (stale).
+/// Values are environment-specific and supplied via deployment env. When a
+/// source is unset, the corresponding infra-summary data is marked stale.
 #[derive(Debug, Clone, Default)]
 pub struct InfraConfig {
     /// Internal host-inventory endpoint. `None` when unset.
     pub machines_url: Option<String>,
     /// Flat planning cost per GPU host per month (USD). `0.0` when unset.
     pub cost_per_host_usd_month: f64,
+    /// Prometheus-compatible base URL used for current GPU allocation.
+    pub prometheus_url: Option<String>,
+    /// Optional bearer token for the Prometheus-compatible endpoint.
+    pub prometheus_bearer_token: Option<String>,
+    /// Environment label selected from DCGM metrics.
+    pub prometheus_environment: String,
+    /// Flat planning cost per allocated physical GPU-hour (USD).
+    pub cost_per_gpu_hour_usd: f64,
 }
 
 impl InfraConfig {
@@ -464,6 +471,20 @@ impl InfraConfig {
                 .ok()
                 .filter(|s| !s.is_empty()),
             cost_per_host_usd_month: env::var("INFRA_COST_PER_HOST_USD_MONTH")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0.0),
+            prometheus_url: env::var("INFRA_PROMETHEUS_URL")
+                .ok()
+                .filter(|s| !s.is_empty()),
+            prometheus_bearer_token: env::var("INFRA_PROMETHEUS_BEARER_TOKEN")
+                .ok()
+                .filter(|s| !s.is_empty()),
+            prometheus_environment: env::var("INFRA_PROMETHEUS_ENV")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "prod".to_string()),
+            cost_per_gpu_hour_usd: env::var("INFRA_COST_PER_GPU_HOUR_USD")
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(0.0),

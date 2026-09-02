@@ -366,6 +366,7 @@ use utoipa::{Modify, OpenApi};
             services::admin::OrgRevenueReport,
             services::admin::OrgRevenueEntry,
             services::admin::InfraSummary,
+            services::admin::ModelGpuAllocation,
         ),
     ),
     modifiers(&SecurityAddon)

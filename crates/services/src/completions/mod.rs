@@ -191,7 +191,11 @@ where
         let ms_since_last_token = self
             .last_token_time
             .map(|last| last.elapsed().as_millis() as u64);
-        let error_detail = self.last_error.as_ref().map(|error| error.to_string());
+        let error_detail = self.last_error.as_ref().map(|error| {
+            super::inference_provider_pool::InferenceProviderPool::sanitize_error_message(
+                &error.to_string(),
+            )
+        });
 
         // Create span with context BEFORE any early returns so all error logs have context
         let _span = tracing::error_span!(
@@ -711,7 +715,7 @@ impl CompletionServiceImpl {
         workspace_id: Uuid,
     ) {
         extra.insert(
-            "x_request_id".to_string(),
+            inference_providers::attested::nearai::tracing_headers::REQUEST_ID.to_string(),
             serde_json::Value::String(request_id.to_string()),
         );
         extra.insert(
@@ -3100,10 +3104,8 @@ mod tests {
         }
     }
 
-    /// Mirrors the production JSON layer, which sets `with_current_span(false)` and
-    /// `with_span_list(false)` (`crates/api/src/main.rs`). Under those settings a
-    /// `request_id` carried only by the enclosing span is discarded, so these
-    /// assertions fail unless the fields are on the event itself.
+    /// Mirrors production's `with_current_span(false)` / `with_span_list(false)`
+    /// (`crates/api/src/main.rs`), which discard anything carried only by a span.
     fn interrupted_stream_event(
         request_id: Uuid,
         last_token_time: Option<Instant>,
@@ -3186,8 +3188,7 @@ mod tests {
         );
     }
 
-    /// The arm reached once a chat_id has arrived logs separately from the one that
-    /// runs before it, so both carry the fields or half the records stay unjoinable.
+    /// A second arm runs once a chat_id has arrived; both must carry the fields.
     #[tokio::test]
     async fn an_interrupted_stream_holding_a_chat_id_logs_the_same_fields() {
         let request_id = Uuid::new_v4();
@@ -3200,12 +3201,13 @@ mod tests {
         assert!(event["fields"]["total_duration_ms"].is_u64());
     }
 
-    /// `stream_error` only says an error existed. Both arms hold the error itself, so
-    /// both must report it or the record still cannot say what went wrong.
+    /// `stream_error` only says an error existed, and the upstream text it carries
+    /// can hold a client URL, so both arms must report it and both must redact.
     #[tokio::test]
     async fn an_interrupted_stream_reports_the_error_it_holds() {
-        let failure =
-            inference_providers::CompletionError::CompletionError("upstream gone".to_string());
+        let failure = inference_providers::CompletionError::CompletionError(
+            "Error fetching image https://records.example.com/scan.png?sig=abc: 403".to_string(),
+        );
 
         for chat_id in [None, Some("chat-abc".to_string())] {
             let event =
@@ -3215,10 +3217,20 @@ mod tests {
                 event["fields"]["stream_error"],
                 serde_json::Value::Bool(true)
             );
-            assert_eq!(
-                event["fields"]["error_detail"],
-                serde_json::Value::String(failure.to_string()),
-                "the error is in scope at this site and must not be reduced to a boolean"
+            let detail = event["fields"]["error_detail"]
+                .as_str()
+                .expect("the error is in scope here and must not be reduced to a boolean");
+            assert!(
+                detail.contains("[URL_REDACTED]"),
+                "a client-supplied URL must not reach the logs, got {detail}"
+            );
+            assert!(
+                !detail.contains("records.example.com"),
+                "redaction must remove the host as well, got {detail}"
+            );
+            assert!(
+                detail.contains("Error fetching image"),
+                "redaction must keep the diagnostic text, got {detail}"
             );
         }
 
@@ -3230,9 +3242,8 @@ mod tests {
         );
     }
 
-    /// A stream that died before the first token must stay distinguishable from one
-    /// that died after it, so the field is omitted rather than zeroed, which also
-    /// keeps it numeric and therefore comparable in a query.
+    /// Omitted rather than zeroed, so "died before the first token" stays distinct
+    /// and the field stays numeric for queries.
     #[tokio::test]
     async fn interrupted_stream_separates_no_token_from_a_measured_gap() {
         let before_any_token = interrupted_stream_event(Uuid::new_v4(), None, None, None);

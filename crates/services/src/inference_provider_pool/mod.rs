@@ -58,6 +58,15 @@ impl BackendModelMetadata {
     }
 }
 
+fn forwarded_request_id(
+    extra: &std::collections::HashMap<String, serde_json::Value>,
+) -> Option<String> {
+    extra
+        .get(inference_providers::attested::nearai::tracing_headers::REQUEST_ID)
+        .and_then(|value| value.as_str())
+        .map(str::to_string)
+}
+
 fn merge_positive_max(stored: &mut Option<i32>, candidate: Option<i32>) {
     if let Some(candidate) = candidate.filter(|value| *value > 0) {
         *stored = Some(stored.map_or(candidate, |stored| stored.max(candidate)));
@@ -2185,7 +2194,7 @@ impl InferenceProviderPool {
     }
 
     /// Sanitize error message by removing sensitive information like IP addresses, URLs, and internal details
-    fn sanitize_error_message(error: &str) -> String {
+    pub fn sanitize_error_message(error: &str) -> String {
         let mut sanitized = error.to_string();
 
         // Remove URLs (http://..., https://...)
@@ -3204,6 +3213,7 @@ impl InferenceProviderPool {
         mut hints: ChatRoutingHints,
     ) -> Result<AttributedChatCompletionStream, CompletionError> {
         let model_id = params.model.clone();
+        let forwarded_request_id = forwarded_request_id(&params.extra);
 
         // Extract model_pub_key from params.extra for routing
         let model_pub_key_str = params
@@ -3307,6 +3317,7 @@ impl InferenceProviderPool {
                 let chat_id = chat_chunk.id.clone();
                 tracing::info!(
                     chat_id = %chat_id,
+                    request_id = forwarded_request_id.as_deref(),
                     "Storing chat_id mapping for streaming completion"
                 );
                 // Pin the dedicated TLS connection so signature fetches
@@ -3351,6 +3362,7 @@ impl InferenceProviderPool {
         request_hash: String,
     ) -> Result<AttributedChatCompletion, CompletionError> {
         let model_id = params.model.clone();
+        let forwarded_request_id = forwarded_request_id(&params.extra);
         // Non-streaming requests carry no service-side routing hints (that
         // path predates PR #838's estimator and stays byte-identical for
         // single-capacity models); multi-tier models still get context
@@ -3413,6 +3425,7 @@ impl InferenceProviderPool {
         let chat_id = response.response.id.clone();
         tracing::info!(
             chat_id = %chat_id,
+            request_id = forwarded_request_id.as_deref(),
             "Storing chat_id mapping for non-streaming completion"
         );
         self.store_chat_id_mapping(chat_id.clone(), provider).await;

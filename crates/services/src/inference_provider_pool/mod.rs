@@ -3696,10 +3696,10 @@ impl InferenceProviderPool {
         mut hints: ChatRoutingHints,
     ) -> Result<AttributedChatCompletion, CompletionError> {
         let model_id = params.model.clone();
-        // Non-streaming requests carry no service-side routing hints (that
-        // path predates PR #838's estimator and stays byte-identical for
-        // single-capacity models); multi-tier models still get context
-        // routing because the refinement below computes its own estimate.
+        // Non-streaming requests may carry policy hints such as
+        // `fallback_disabled`, but do not carry the stream-side prefix hash or
+        // token estimate. Multi-capacity models still get context routing
+        // because the refinement below computes its own estimate.
         // Extract model_pub_key from params.extra for routing before any cloning.
         // This ensures the key is removed from params.extra so it won't be passed to the provider,
         // and we have a stable reference for routing even if retries occur.
